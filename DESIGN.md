@@ -23,8 +23,13 @@ Add camera controls — drag to pan, mouse wheel to zoom, smooth viewport moveme
 ### Phase 3 — Read real commits with gix ✅ (done)
 Implement `repo::walk_history()` to read real git history from a repository.
 
-### Phase 4 — Connect real data to the graph
-Wire the real commit data through the IPC layer into the frontend graph.
+### Phase 4 — Connect real data to the graph ✅ (done)
+Wire the real commit data into the frontend graph. (Done over **HTTP**, not Tauri
+IPC: git-vista is browser-first, and a browser can't reach a Tauri command — so a
+native `git-vista-server` (axum) serves the SPA + `/api/commits` and the frontend
+`fetch`es it. Also added basic lane layout with **compact reuse**: first parent
+stays in its lane; a merged-back branch frees its lane; new branches take the
+leftmost free lane.)
 
 ### Phase 5 — Commit rows & labels
 Display commit message, short hash, and author next to each node.
