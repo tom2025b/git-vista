@@ -1,12 +1,13 @@
 # Continuous Integration for git-vista.
 #
 # Workspace layout this pipeline cares about:
-#   - git-vista-core    pure logic crate — the ONLY crate with tests
+#   - git-vista-core    pure logic crate (model + layout); has tests
+#   - git-vista-git     native git reader via gix; has tests (uses the git binary)
 #   - git-vista         Leptos frontend, built to WASM by Trunk (crates/git-vista)
 #   - git-vista-tauri   native desktop shell (crates/git-vista/src-tauri)
 #
 # Three jobs run in parallel, each mapped to a concrete check:
-#   1. core      test + check the core logic crate
+#   1. core      test + check the pure-logic and git-reading crates
 #   2. tauri     check that the native shell compiles
 #   3. frontend  build the real WASM bundle with Trunk
 name: CI
@@ -30,10 +31,12 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. Core crate: build check + tests.
+  # 1. Core + git crates: build check + tests.
   #
-  # git-vista-core is pure logic with no UI or system dependencies, so this job
-  # needs nothing beyond stable Rust. It carries the project's actual test suite.
+  # git-vista-core is pure logic; git-vista-git reads real repos via gix and its
+  # tests shell out to the `git` binary (preinstalled on the runner). Neither
+  # needs GTK/WebKit, so this job needs nothing beyond stable Rust. Together they
+  # carry the project's actual test suite.
   # ---------------------------------------------------------------------------
   core:
     name: Core (check + test)
@@ -46,11 +49,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check core builds
-        run: cargo check -p git-vista-core
+      - name: Check core + git crates build
+        run: cargo check -p git-vista-core -p git-vista-git
 
-      - name: Test core
-        run: cargo test -p git-vista-core
+      - name: Test core + git crates
+        run: cargo test -p git-vista-core -p git-vista-git
 
   # ---------------------------------------------------------------------------
   # 2. Tauri shell: build check.
