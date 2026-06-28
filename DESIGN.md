@@ -17,7 +17,7 @@ Workspace setup, three-crate structure, build pipeline, and basic skeletons.
 ### Phase 1 — Static vertical graph (fake data) ✅ (done)
 Create a vertical graph component using fake commit data. Render nodes and edges as SVG.
 
-### Phase 2 — Interactive pan & zoom
+### Phase 2 — Interactive pan & zoom ✅ (done)
 Add camera controls — drag to pan, mouse wheel to zoom, smooth viewport movement.
 
 ### Phase 3 — Read real commits with gix
