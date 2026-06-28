@@ -28,13 +28,17 @@ html, body {
 .topbar h1 { margin: 0; font-size: 1.1rem; color: var(--accent); }
 .subtitle { color: var(--muted); font-size: 0.85rem; }
 
-.graph { flex: 1; overflow: auto; padding: 1rem; }
+.graph { flex: 1; overflow: hidden; }
 .placeholder { color: var(--muted); }
 
-/* Phase 1: the static vertical commit graph. */
+/* Phase 2: the SVG fills the panel and clips; pan/zoom happens via the inner
+   <g transform>, so there's no scrollbar — the camera moves the content. */
 .graph-svg {
   display: block;
-  /* Don't stretch — the SVG keeps its natural size and the .graph panel
-     scrolls when the history is taller/wider than the viewport. */
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+  touch-action: none;   /* take over wheel/touch gestures for pan/zoom */
+  user-select: none;    /* a drag pans, it doesn't select */
 }
-.graph-svg circle { cursor: default; }
+.graph-svg.grabbing { cursor: grabbing; }
