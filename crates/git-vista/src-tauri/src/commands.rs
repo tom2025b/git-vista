@@ -8,6 +8,6 @@ use git_vista_core::model::Graph;
 /// returns an empty graph for now.
 #[tauri::command]
 pub fn list_commits(path: String) -> Graph {
-    let _ = path; // TODO: git_vista_core::repo::walk_history(Path::new(&path), 5_000)
+    let _ = path; // TODO (Phase 4): git_vista_git::walk_history(Path::new(&path), 5_000)
     layout::layout(Vec::new())
 }
