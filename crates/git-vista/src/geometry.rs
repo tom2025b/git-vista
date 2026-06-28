@@ -29,17 +29,6 @@ pub fn node_cy(row: usize) -> i32 {
     PAD_Y + row as i32 * ROW_HEIGHT
 }
 
-/// Total SVG canvas size `(width, height)` needed to hold `lane_count` columns
-/// and `row_count` rows, including the outer padding. Counts are floored at 1 so
-/// an empty graph still yields a valid, non-negative box.
-pub fn canvas_size(lane_count: usize, row_count: usize) -> (i32, i32) {
-    let lanes = lane_count.max(1) as i32;
-    let rows = row_count.max(1) as i32;
-    let width = PAD_X * 2 + (lanes - 1) * LANE_WIDTH;
-    let height = PAD_Y * 2 + (rows - 1) * ROW_HEIGHT;
-    (width, height)
-}
-
 /// SVG path data for a commit->parent edge. Same-lane links are a straight
 /// vertical line; lane-changing links (branches/merges) get a smooth vertical
 /// S-curve so they read as flowing between columns rather than cutting across.
@@ -64,18 +53,6 @@ mod tests {
         assert_eq!(node_cx(2), PAD_X + 2 * LANE_WIDTH);
         assert_eq!(node_cy(0), PAD_Y);
         assert_eq!(node_cy(3), PAD_Y + 3 * ROW_HEIGHT);
-    }
-
-    #[test]
-    fn canvas_size_includes_padding_and_floors_at_one() {
-        // A single node still gets a full padded box.
-        assert_eq!(canvas_size(1, 1), (PAD_X * 2, PAD_Y * 2));
-        assert_eq!(canvas_size(0, 0), (PAD_X * 2, PAD_Y * 2));
-        // Multi-lane / multi-row grows by the gaps between cells.
-        assert_eq!(
-            canvas_size(3, 4),
-            (PAD_X * 2 + 2 * LANE_WIDTH, PAD_Y * 2 + 3 * ROW_HEIGHT)
-        );
     }
 
     #[test]

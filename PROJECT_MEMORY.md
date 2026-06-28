@@ -162,3 +162,56 @@ cargo check -p git-vista-tauri # shell still compiles
 ```
 
 **Next:** Phase 2 — Interactive pan & zoom (camera controls over the SVG canvas).
+
+
+## Phase 2 — Interactive pan & zoom (2026-06-28)
+**Status:** done
+**What changed:**
+- `crates/git-vista/src/camera.rs` (new): pure pan/zoom math, no Leptos/DOM. A
+  `Camera { tx, ty, scale }` (a screen-space `translate · scale`) with `panned`,
+  `zoomed_at` (focal-point zoom anchored under the cursor, scale clamped to
+  `[MIN_ZOOM, MAX_ZOOM]`), and `transform()` → an SVG `<g transform>` string.
+  4 host unit tests (anchor invariant, clamp, pan accumulation, transform fmt).
+- `crates/git-vista/src/app.rs`: graph moved inside one `<g transform=camera>`;
+  the `<svg>` now fills its panel (no `width`/`height`/`viewBox`). Added handlers:
+  `pointerdown` (set drag + `setPointerCapture`), `pointermove` (pan by
+  `movement_x/y` while dragging), `pointerup`/`pointercancel` (end drag), `wheel`
+  (`preventDefault`, zoom toward `offset_x/y`). `class:grabbing` toggles cursor.
+- `crates/git-vista/src/geometry.rs`: **removed `canvas_size`** + its test — the
+  SVG no longer sizes to content (it fills and clips; the camera moves content).
+  A viewport-aware fit/bounds helper belongs to Phase 8 if needed.
+- `crates/git-vista/src/main.rs`: declares `mod camera;` (same dead-code gating).
+- `crates/git-vista/Cargo.toml`: explicit `web-sys` (wasm-only) with the exact
+  event features used (`Element`, `Event`, `EventTarget`, `MouseEvent`,
+  `PointerEvent`, `WheelEvent`).
+- `crates/git-vista/styles.css`: `.graph` is `overflow: hidden`; `.graph-svg`
+  fills (`100%`), `cursor: grab` / `.grabbing`, `touch-action: none`,
+  `user-select: none`.
+
+**Decisions:**
+- **`<g transform>` + no `viewBox`** instead of mutating the `viewBox`. Without a
+  `viewBox`, 1 user unit = 1 CSS px, so `offset_x`/`movement_x` map straight onto
+  camera space — no `getBoundingClientRect` / `preserveAspectRatio` letterbox
+  math. Pan/zoom stays pure and host-testable.
+- **`setPointerCapture`** so a drag keeps tracking when the cursor leaves the SVG.
+- Zoom solves the translation from the *post-clamp* factor, so the focal point
+  stays anchored even at the min/max zoom limits.
+- `ZOOM_STEP` carries a `not(wasm32)` dead-code allow (view-only constant, like
+  `NODE_RADIUS`/`MERGE_FILL`); `MIN/MAX_ZOOM` are exercised by tests.
+
+**Gotchas:**
+- The `<svg>` having no intrinsic size means it relies on the flex `.graph`
+  parent for height — `.app` is `100vh` and `.graph` is `flex: 1`, so it fills.
+- Work is on branch `phase2-pan-zoom` (off `main`); not yet pushed/PR'd.
+
+**Verify:**
+```sh
+cargo test -p git-vista        # 9 pass (camera/geometry/color/graph)
+cargo test -p git-vista-core   # 6 pass
+cargo check -p git-vista-tauri # shell still compiles
+( cd crates/git-vista && trunk build )   # wasm bundle builds, no warnings
+```
+Then `cargo tauri dev` (or `trunk serve`): drag the graph to pan, scroll to zoom
+toward the cursor; the cursor shows grab/grabbing.
+
+**Next:** Phase 3 — Read real commits with `gix` (`repo::walk_history()`).
