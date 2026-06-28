@@ -7,11 +7,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Pure logic only — no platform/UI deps — so this crate compiles for wasm and
+# is shared by the browser frontend. Git reading (gix) lives in `git-vista-git`.
 [dependencies]
 serde = { workspace = true }
-thiserror = { workspace = true }
-
-# Git data layer — read-only history walking via pure-Rust gitoxide.
-# Enable when the `repo` walker lands (next milestone); kept out of the
-# initial scaffold so the first build needs only rock-stable crates:
-# gix = { version = "0.66", default-features = false, features = ["revision"] }

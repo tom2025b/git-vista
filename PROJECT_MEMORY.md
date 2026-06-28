@@ -215,3 +215,88 @@ Then `cargo tauri dev` (or `trunk serve`): drag the graph to pan, scroll to zoom
 toward the cursor; the cursor shows grab/grabbing.
 
 **Next:** Phase 3 — Read real commits with `gix` (`repo::walk_history()`).
+
+
+## Phase 3 — Read real commits with gix (2026-06-28)
+**Status:** done
+**What changed:**
+- **New crate `git-vista-git`** (`crates/git-vista-git`, native-only library):
+  `walk_history(path, limit)` via `gix`. Opens with `gix::open_opts(path,
+  Options::isolated())`, seeds tips from HEAD + every ref (peeled, de-duped),
+  walks `ByCommitTime(NewestFirst)`, maps each commit to `CommitSummary`
+  (id/parents as hex `Oid`, `summary()` first line, author *name*,
+  `commit_time()`). `RepoError` = `Open { path, message }` / `Walk(String)`.
+  3 tests build throwaway repos by shelling to `git` (linear + branch + merge
+  fixture): newest-first cross-branch order, merge/root parent shape, `limit`,
+  not-a-repo error. Owns the `gix` + `tempfile` deps.
+- `git-vista-core` is now **pure** (`model` + `layout` only, `serde` its only
+  dep). No gix, no `thiserror`, no `repo` module, **no `#[cfg]` anywhere** — it
+  compiles for wasm trivially and the browser frontend depends on it as-is.
+- Workspace: added `crates/git-vista-git` member + `git-vista-git` workspace dep.
+  CI `core` job now `check`/`test`s both `-p git-vista-core -p git-vista-git`.
+- **Not touched on purpose:** `src-tauri/commands.rs` still returns an empty
+  graph — wiring real data through is **Phase 4** (TODO now points at
+  `git_vista_git::walk_history`).
+
+**Decisions:**
+- **gix reading lives in its own native-only crate, NOT in core.** This is the
+  whole point of the Phase-3 redo (see the failed first attempt below): the
+  primary target is the **browser** (user runs git-vista in Safari on an iPad),
+  so `git-vista-core` MUST stay clean and wasm-compatible. A browser fundamentally
+  can't read a local repo, so gix is inherently a native concern. Splitting it
+  into `git-vista-git` means the frontend's dependency tree simply never contains
+  gix — no cfg gating, no feature juggling. The native backend depends on the git
+  crate; the frontend never does. **Don't move gix back into core, and don't
+  cfg-gate a `repo` module inside core — that was explicitly rejected.**
+- **`Options::isolated()`** (repo-local config only): a read-only viewer doesn't
+  need the user's global/system git config, and ignoring it avoids "failed to
+  load the git configuration" crashes from a malformed host config.
+- **Walk HEAD + all refs**, not just HEAD, so side branches show up.
+- **Author = name only** for now (model has a single `author: String`); email is
+  available if Phase 5 wants "Name <email>".
+
+**Superseded first attempt (do not repeat):** Phase 3 was first written with
+`repo.rs` *inside* `git-vista-core` and gix target-gated to non-wasm
+(`#[cfg(not(target_arch = "wasm32"))] pub mod repo`). That compiled but left core
+impure and was rejected — the browser is the main target and core must be clean.
+The crate split above replaced it before anything was pushed/merged.
+
+**Browser reality (context for Phase 4):** the Tauri `invoke` IPC only works in
+the desktop webview, not a plain browser. Reaching real git data from the iPad
+browser will need a native HTTP backend serving the SPA + a JSON API — but the
+delivery architecture (web server, Tauri's fate) is an **open decision the user
+wants to make explicitly**, so don't bake it in unprompted.
+
+**Gotchas:**
+- **gix pinned to `=0.84.0`.** With `default-features = false`, you MUST add the
+  `sha1` feature or every dependent fails to compile with *"Please set either the
+  `sha1` or the `sha256` feature flag"* (the `Kind` enum compiles empty → a flood
+  of non-exhaustive-match errors in `gix-hash`). But on gix **0.85**, the `sha1`
+  feature transitively (via a weak `gix-worktree-stream?/sha1` ref, which Cargo
+  still must *version-resolve*) requires `gix-worktree-stream 0.34`, which pins
+  `gix-attributes ^0.33.2` — unpublished on the index — so it won't resolve.
+  gix **0.84** uses worktree-stream 0.33 (→ gix-attributes 0.33.1) and resolves.
+  Revisit (unpin) once the gix 0.85 dep chain is fixed upstream.
+- Enabling only `gix-hash/sha1` directly (to dodge the meta-feature) makes
+  gix-hash compile but gix's *repository* layer still rejects sha1 objects
+  ("Cannot handle objects formatted as sha1") — that support is gated on gix's
+  own `sha1` feature. So the meta-feature is unavoidable; pinning is the fix.
+- git's raw-epoch date format for `GIT_*_DATE` is `@<seconds> <tz>` (e.g.
+  `@6 +0000`); bare `6 +0000` is rejected as "invalid date format".
+- The fixture tests shell out to the `git` binary (present locally and on the
+  CI ubuntu runners).
+
+**Verify:**
+```sh
+cargo test -p git-vista-core   # 6 pass (model/layout) — pure, no gix in tree
+cargo test -p git-vista-git    # 3 pass (walk_history fixtures; needs git binary)
+cargo test -p git-vista        # 9 pass (camera/geometry/color/graph)
+cargo check -p git-vista-tauri # shell compiles
+( cd crates/git-vista && trunk build )   # wasm builds (no gix in tree), no warnings
+cargo tree -p git-vista --target wasm32-unknown-unknown | grep gix  # → nothing
+```
+
+**Next:** Phase 4 — Connect real data to the graph: have the native backend call
+`git_vista_git::walk_history` + `layout::layout`, and point the frontend at that
+result instead of `fake_graph()`. NB: settle the browser delivery path first
+(HTTP API vs Tauri invoke) — see "Browser reality" above.
