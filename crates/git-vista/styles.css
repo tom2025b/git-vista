@@ -30,3 +30,11 @@ html, body {
 
 .graph { flex: 1; overflow: auto; padding: 1rem; }
 .placeholder { color: var(--muted); }
+
+/* Phase 1: the static vertical commit graph. */
+.graph-svg {
+  display: block;
+  /* Don't stretch — the SVG keeps its natural size and the .graph panel
+     scrolls when the history is taller/wider than the viewport. */
+}
+.graph-svg circle { cursor: default; }
