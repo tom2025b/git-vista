@@ -1,0 +1,29 @@
+[package]
+name = "git-vista-git"
+description = "Native git-history reading for git-vista via gix. Native-only; the wasm frontend never depends on this, so gix never reaches the browser build."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Shared data models; this crate produces `CommitSummary` values for it.
+git-vista-core = { workspace = true }
+thiserror = { workspace = true }
+
+# Read-only history walking via pure-Rust gitoxide. This crate is native-only and
+# is never in the wasm frontend's dependency tree, which is exactly why it lives
+# apart from `git-vista-core`: gix (filesystem, mmap) can't build for wasm, and
+# keeping it out of core lets core stay pure and browser-compatible.
+#
+# `sha1` enables the object-hash backend + repository sha1-object support;
+# `revision` provides the rev-walk used by `walk_history`.
+# Pinned to 0.84: gix 0.85's `sha1` feature transitively requires
+# gix-worktree-stream 0.34, which pins an unpublished gix-attributes 0.33.2 and
+# so won't resolve. 0.84 uses worktree-stream 0.33 and resolves cleanly.
+gix = { version = "=0.84.0", default-features = false, features = ["sha1", "revision"] }
+
+[dev-dependencies]
+# Throwaway repos for the headless `walk_history` tests.
+tempfile = "3"
