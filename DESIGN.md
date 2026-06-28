@@ -1,116 +1,60 @@
 # git-vista — Design & Development Roadmap
 
-A Rust desktop app that visualizes git history as a clean, **zoomable vertical
-graph**. Stack: **Tauri v2** (native shell) + **Leptos** (Rust→wasm UI, drawn as
-SVG in the webview) on top of a pure-logic **git-vista-core** crate.
-
-## Architecture recap
-
-```
-git-vista-core  (no UI deps)        git-vista (Leptos/wasm)      src-tauri (native)
-  model   ── serde types ───────────────► invoke() ◄── IPC ──── commands
-  repo    ── walk history (gix)                                    │
-  layout  ── commits → lanes/edges  ◄───────────────────────── run() builder
-```
-
-Data flows one way: `repo` reads commits → `layout` positions them into a
-`Graph` → a `#[tauri::command]` serializes it → Leptos deserializes the same
-types and renders SVG. The core never knows the UI exists, so it stays fast to
-build and trivial to unit-test.
+A clean, zoomable vertical git history visualizer built with Tauri + Leptos.
 
 ## Principles
 
-- **Small, shippable phases.** Each phase compiles, has a visible/testable result,
-  and is logged in `PROJECT_MEMORY.md` before moving on.
-- **Core-first.** The risky logic (history walking, lane assignment) lands in
-  `git-vista-core` with unit tests before any pixels.
-- **Test the algorithm headlessly.** Lane layout is verified against hand-built
-  histories — no GUI in the loop.
-
----
+- Show something on screen as early as possible
+- Small, shippable phases with clear completion criteria
+- Keep core logic separate from UI code
+- Document decisions in `PROJECT_MEMORY.md` after each phase
 
 ## Phases
 
-### Phase 0 — Scaffold ✅ (done 2026-06-28)
-Workspace, three crates, build pipeline (core tests, Trunk wasm build, Tauri
-shell compile). `repo`/`layout` are stubs.
+### Phase 0 — Scaffold ✅ (done)
+Workspace setup, three-crate structure, build pipeline, and basic skeletons.
 
-### Phase 1 — Read real commits
-- **Goal:** `repo::walk_history(path, limit)` returns real `CommitSummary`s.
-- **Do:** enable `gix`; open repo at HEAD; walk newest-first; map id/parents/
-  summary/author/time.
-- **Done when:** a unit test over a temp fixture repo returns the expected
-  commits in order; merges report 2+ parents.
+### Phase 1 — Static vertical graph (fake data)
+Create a vertical graph component using fake commit data. Render nodes and edges as SVG.
 
-### Phase 2 — Vertical lane layout (the core algorithm)
-- **Goal:** `layout()` assigns real lanes/columns, not all-lane-0.
-- **Do:** active-lane tracking; route first parent down the same lane, branch/
-  merge into allocated lanes; emit edges with correct lane transitions.
-- **Done when:** tests cover linear, one branch+merge, and an octopus merge; lane
-  count and edge endpoints match expected fixtures.
+### Phase 2 — Interactive pan & zoom
+Add camera controls — drag to pan, mouse wheel to zoom, smooth viewport movement.
 
-### Phase 3 — Wire IPC end-to-end
-- **Goal:** real graph crosses the boundary.
-- **Do:** `list_commits(path)` calls `repo`+`layout`; frontend `invoke`s it on
-  load and logs the row/edge counts to the console.
-- **Done when:** opening the app on this repo prints a non-empty Graph.
+### Phase 3 — Read real commits with gix
+Implement `repo::walk_history()` to read real git history from a repository.
 
-### Phase 4 — Render the static graph
-- **Goal:** see the vertical graph (no interaction yet).
-- **Do:** Leptos draws an SVG — a circle per `GraphRow` (y=row, x=lane), a line/
-  bézier per `Edge`. Newest at top.
-- **Done when:** the graph shape of a small repo is visually correct.
+### Phase 4 — Connect real data to the graph
+Wire the real commit data through the IPC layer into the frontend graph.
 
-### Phase 5 — Commit rows
-- **Goal:** readable rows beside the nodes.
-- **Do:** to the right of the gutter, render short-hash + summary + author per row.
-- **Done when:** rows align with their nodes and read cleanly.
+### Phase 5 — Commit rows & labels
+Display commit message, short hash, and author next to each node.
 
-### Phase 6 — Pan
-- **Goal:** move around a tall graph.
-- **Do:** a `camera { offset }`; drag / scroll translates the SVG viewport.
-- **Done when:** dragging moves the graph smoothly; nothing drifts.
+### Phase 6 — Robust lane assignment
+Improve the layout algorithm to properly handle branches and merges.
 
-### Phase 7 — Zoom
-- **Goal:** continuous zoom.
-- **Do:** add `camera.scale`; wheel zooms toward the cursor; screen↔graph transforms.
-- **Done when:** zoom in/out keeps the point under the cursor fixed.
+### Phase 7 — Refs & colors
+Show branch names, HEAD, tags, and assign consistent colors per branch.
 
 ### Phase 8 — Viewport virtualization
-- **Goal:** large repos stay responsive.
-- **Do:** render only rows/edges intersecting the viewport.
-- **Done when:** a 50k-commit repo scrolls without frame drops.
+Only render commits currently visible in the viewport for performance.
 
-### Phase 9 — Level of detail (overview ↔ detail)
-- **Goal:** "overview + detailed view" from one zoom.
-- **Do:** LOD thresholds on `scale` — hide text when tiny, collapse to lane
-  ribbons at overview zoom.
-- **Done when:** zooming far out shows topology only; zooming in restores rows.
+### Phase 9 — Level of detail
+Change level of detail based on zoom level (hide text when zoomed out, etc.).
 
-### Phase 10 — Refs & colors
-- **Goal:** orient the graph.
-- **Do:** branch/tag/HEAD badges; stable per-branch lane colors.
-- **Done when:** branches keep a consistent color; tips are labeled.
+### Phase 10 — Commit detail panel
+Clicking a commit opens a side panel with full details.
 
-### Phase 11 — Commit detail panel
-- **Goal:** inspect a commit.
-- **Do:** click a node → side panel with full hash, author/date, body, parents.
-- **Done when:** selection + panel update correctly; click-through works.
+### Phase 11 — Search & filter
+Search commits by message, author, or hash.
 
-### Phase 12 — Search & filter
-- **Goal:** find commits.
-- **Do:** search by message/author/hash; highlight and scroll-to matches.
-- **Done when:** typing filters/jumps to matches live.
+### Phase 12 — Open repository UX
+Add a proper way to open any local repository.
 
 ### Phase 13 — Packaging & polish
-- **Goal:** a real installable app.
-- **Do:** generate real icons (`cargo tauri icon`); `tauri build`; large-repo perf
-  pass; keyboard shortcuts; theming.
-- **Done when:** `tauri build` produces a working bundle that opens a repo picked
-  at runtime.
+Icons, performance tuning, keyboard shortcuts, build process, and final cleanup.
 
----
-
-## Backlog / later
-Open-a-repo dialog, remember recent repos, diff view on a commit, follow-file
-history, blame, dark/light toggle, minimap.
+## Backlog
+- Dark/light theme toggle
+- Minimap
+- Diff view
+- File history / blame
