@@ -1,0 +1,38 @@
+# Workspace root for git-vista.
+#
+# Two crates you care about:
+#   - git-vista-core : pure logic (git parsing, graph layout, data models)
+#   - git-vista      : the Leptos frontend GUI (the app you interact with)
+#
+# A third, thin crate -- git-vista/src-tauri -- is the native desktop shell.
+# Tauri requires its shell to be its own cargo package; it does nothing but
+# host the Leptos frontend in a webview and expose git-vista-core over IPC.
+[workspace]
+resolver = "2"
+members = [
+    "crates/git-vista-core",
+    "crates/git-vista",
+    "crates/git-vista/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Tom <thomaslane2010@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/tom2025b/git-vista"
+
+# Shared dependency versions, referenced from member crates with
+# `serde = { workspace = true }` so versions stay in lock-step.
+[workspace.dependencies]
+git-vista-core = { path = "crates/git-vista-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+# Smaller, faster release binaries for the desktop app.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

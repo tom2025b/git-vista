@@ -1,0 +1,4 @@
+[toolchain]
+channel = "stable"
+# The Leptos frontend compiles to WebAssembly; Trunk builds this target.
+targets = ["wasm32-unknown-unknown"]

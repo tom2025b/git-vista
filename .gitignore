@@ -1,0 +1,11 @@
+# Rust build output
+/target
+
+# Trunk build output for the Leptos frontend
+/crates/git-vista/dist
+
+# Tauri generated files (schemas, etc.)
+/crates/git-vista/src-tauri/gen
+
+# Claude Code local settings (machine-specific permissions)
+.claude/settings.local.json
