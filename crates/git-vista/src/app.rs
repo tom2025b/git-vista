@@ -1,32 +1,69 @@
 //! Leptos components for git-vista.
 //!
-//! Phase 1 rendered a static vertical commit graph from hardcoded demo data
-//! ([`crate::graph::fake_graph`]) as inline SVG — one circle per commit, one
-//! curved path per commit->parent link, lanes laid out left to right.
+//! Phase 4: on startup the frontend `fetch`es the real, laid-out commit
+//! [`Graph`] from the backend's `/api/commits` endpoint (same origin) and renders
+//! it as inline SVG — one circle per commit, one curved path per commit->parent
+//! link, lanes laid out left to right. The whole graph lives inside a single
+//! `<g transform>` driven by a [`Camera`]: pointer drags pan, the wheel zooms
+//! toward the cursor (Phase 2). Earlier phases used hardcoded demo data; that's
+//! gone from the render path now.
 //!
-//! Phase 2 makes that canvas interactive: the whole graph lives inside a single
-//! `<g transform>` driven by a [`Camera`], the SVG fills its panel, and pointer
-//! drags pan while the mouse wheel zooms toward the cursor. Later phases swap the
-//! demo data for real history over the Tauri IPC boundary and layer on labels
-//! and refs.
-//!
-//! This module is deliberately just *view assembly*: the spatial math lives in
-//! [`crate::geometry`], the lane palette in [`crate::color`], and the pan/zoom
-//! arithmetic in [`crate::camera`], so the component only decides what to draw
-//! and wires up events — it owns no constants or maths of its own.
+//! This module is deliberately just *view assembly* + the data fetch: spatial
+//! math lives in [`crate::geometry`], the lane palette in [`crate::color`], the
+//! pan/zoom arithmetic in [`crate::camera`], and the lane layout is computed on
+//! the backend by `git-vista-core`.
 
 use leptos::*;
 use wasm_bindgen::JsCast;
 
+use gloo_net::http::Request;
+
+use git_vista_core::model::Graph;
+
 use crate::camera::{Camera, ZOOM_STEP};
 use crate::color::{lane_color, MERGE_FILL};
 use crate::geometry::{edge_path, node_cx, node_cy, NODE_RADIUS};
-use crate::graph::fake_graph;
+
+/// Fetch the laid-out graph from the backend. Relative URL → same origin as the
+/// served SPA, so no CORS and no hardcoded host.
+async fn fetch_graph() -> Result<Graph, String> {
+    Request::get("/api/commits")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json::<Graph>()
+        .await
+        .map_err(|e| e.to_string())
+}
 
 #[component]
 pub fn App() -> impl IntoView {
-    let graph = fake_graph();
+    // Load real history once on startup. `create_local_resource` because the
+    // fetch future isn't `Send` (wasm).
+    let graph = create_local_resource(|| (), |_| fetch_graph());
 
+    view! {
+        <main class="app">
+            <header class="topbar">
+                <h1>"git-vista"</h1>
+                <span class="subtitle">"vertical git history — drag to pan, scroll to zoom"</span>
+            </header>
+            <section class="graph">
+                {move || match graph.get() {
+                    None => view! { <p class="status">"Loading history…"</p> }.into_view(),
+                    Some(Err(e)) => view! {
+                        <p class="status error">{format!("Failed to load history: {e}")}</p>
+                    }
+                    .into_view(),
+                    Some(Ok(g)) => graph_canvas(g).into_view(),
+                }}
+            </section>
+        </main>
+    }
+}
+
+/// Render a loaded [`Graph`] as a pan/zoomable SVG canvas.
+fn graph_canvas(graph: Graph) -> impl IntoView {
     // Edges first so the nodes paint on top of them.
     let edges = graph
         .edges
@@ -102,27 +139,19 @@ pub fn App() -> impl IntoView {
     };
 
     view! {
-        <main class="app">
-            <header class="topbar">
-                <h1>"git-vista"</h1>
-                <span class="subtitle">"vertical git history — drag to pan, scroll to zoom"</span>
-            </header>
-            <section class="graph">
-                <svg
-                    class="graph-svg"
-                    class:grabbing=move || dragging.get()
-                    on:pointerdown=on_pointerdown
-                    on:pointermove=on_pointermove
-                    on:pointerup=on_pointerup
-                    on:pointercancel=on_pointerup
-                    on:wheel=on_wheel
-                >
-                    <g transform=move || camera.get().transform()>
-                        {edges}
-                        {nodes}
-                    </g>
-                </svg>
-            </section>
-        </main>
+        <svg
+            class="graph-svg"
+            class:grabbing=move || dragging.get()
+            on:pointerdown=on_pointerdown
+            on:pointermove=on_pointermove
+            on:pointerup=on_pointerup
+            on:pointercancel=on_pointerup
+            on:wheel=on_wheel
+        >
+            <g transform=move || camera.get().transform()>
+                {edges}
+                {nodes}
+            </g>
+        </svg>
     }
 }
