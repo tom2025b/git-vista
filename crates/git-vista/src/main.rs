@@ -13,7 +13,9 @@ mod camera;
 mod color;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod geometry;
-#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+// Hardcoded demo history. No longer used in the render path (the frontend now
+// fetches real history from the backend), but kept for tests/fixtures.
+#[cfg(test)]
 mod graph;
 
 #[cfg(target_arch = "wasm32")]

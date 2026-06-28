@@ -1,0 +1,19 @@
+[package]
+name = "git-vista-server"
+description = "Native HTTP backend for git-vista: serves the wasm SPA and a JSON git-history API on one origin, so the browser (iPad Safari) can view real history."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "git-vista-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8.9"
+git-vista-core = { workspace = true }
+git-vista-git = { workspace = true }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net"] }
+tower-http = { version = "0.7.0", features = ["fs"] }

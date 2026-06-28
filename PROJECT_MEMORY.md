@@ -300,3 +300,73 @@ cargo tree -p git-vista --target wasm32-unknown-unknown | grep gix  # → nothin
 `git_vista_git::walk_history` + `layout::layout`, and point the frontend at that
 result instead of `fake_graph()`. NB: settle the browser delivery path first
 (HTTP API vs Tauri invoke) — see "Browser reality" above.
+
+
+## Phase 4 — Connect real data to the graph (2026-06-28)
+**Status:** done
+**What changed:**
+- **New crate `git-vista-server`** (`crates/git-vista-server`, native axum bin):
+  serves the wasm SPA **and** `GET /api/commits` on **one origin** (port 8080,
+  bound `0.0.0.0` so the iPad reaches it over the LAN). The handler reuses
+  `git_vista_git::walk_history(REPO_PATH, 5000)` + `git_vista_core::layout::layout`
+  → `Json<Graph>`. `REPO_PATH` is hardcoded to `/home/tom/projects/git-vista`
+  (Phase 4; configurable later). Serves `dist/` via `tower-http::ServeDir`, path
+  resolved at compile time from `CARGO_MANIFEST_DIR` so cwd doesn't matter.
+- **`git-vista-core::layout::layout`**: real **basic lane algorithm with compact
+  reuse** (was: all lane 0). Two passes. Pass 1 tracks active lanes
+  (`Vec<Option<Oid>>`, each lane "expects" the next older commit; `None` = free):
+  a commit takes the leftmost lane expecting it (freeing the others — branches
+  collapsing at a merge), else the **leftmost free lane**; **first parent
+  continues the lane**, extra (merge) parents take the **leftmost free lane**, and
+  a lane with no in-window parent to continue to is freed. So a merged-back
+  branch's lane is reused by the next new branch — the graph stays narrow. Pass 2
+  wires edges to each parent's *final* lane (lanes can shift left at a merge).
+  `lane_count = max row lane + 1`. 8 core tests incl. branch/merge + a reuse test.
+  (Earlier draft used always-increment/no-reuse; the user found it too wide and
+  switched to reuse — on this repo: 5 lanes → 2.)
+- **Frontend** (`crates/git-vista`): `app.rs` now `fetch`es `/api/commits` via
+  `gloo-net` in a `create_local_resource` on startup and renders the returned
+  `Graph` (loading / error / graph states). Pan/zoom (Phase 2) unchanged, moved
+  into `graph_canvas()`. `fake_graph`/`graph.rs` dropped from the render path —
+  `mod graph` is now `#[cfg(test)]` (kept only as a test fixture).
+- Workspace: added `git-vista-server` member; CI `core` job also
+  `check`s it. `gloo-net` added to the frontend (wasm target, `http`+`json`).
+- **Tauri shell left untouched** (per the "don't decide architecture" rule): its
+  `list_commits` stub stays; the browser path is HTTP, not `invoke`. In the Tauri
+  webview the fetch would 404 — Tauri's role is a separate future decision.
+
+**Decisions (all confirmed with the user before coding):**
+- **Delivery = HTTP backend (axum), not Tauri IPC.** Browser-first: Safari on the
+  iPad has no Tauri runtime, so `invoke` can't work; the server hosts SPA + API on
+  one origin (no CORS). This was the open question flagged in Phase 3.
+- **Lane rule = compact reuse**: merged-back branches free their lane; new
+  branches take the leftmost free lane. (User first tried always-increment, then
+  switched to reuse because the graph got too wide.)
+- **Hardcoded repo path** = this git-vista checkout (has branches/merges to show).
+- Reused `git_vista_git::walk_history` (the Phase-3 rename of `repo::walk_history`)
+  and `layout::layout` — no new git/layout functions, per the brief.
+
+**Gotchas:**
+- The frontend must be **built** (`trunk build`) before the server can serve it —
+  the server reads `crates/git-vista/dist/`. `trunk serve` is not used in this
+  one-origin model; build then run `git-vista-server`.
+- `fetch("/api/commits")` is **same-origin relative** — works because the server
+  serves both. Don't hardcode a host.
+- axum 0.8 / tower-http 0.7 / tokio 1: server bind uses `axum::serve(listener, app)`
+  and `ServeDir` as `.fallback_service(...)`.
+
+**Verify:**
+```sh
+cargo test -p git-vista-core   # 8 pass (model/layout incl. lanes)
+cargo test -p git-vista-git    # 3 pass
+cargo test -p git-vista        # 9 pass
+cargo check -p git-vista-server -p git-vista-tauri
+( cd crates/git-vista && trunk build )                 # SPA bundle
+cargo run -p git-vista-server                          # then GET / and /api/commits
+```
+Manual (browser path): `trunk build`, run the server, open `http://<LAN-IP>:8080/`
+from the iPad — graph of this repo's real history, pan/zoom works.
+
+**Next:** Phase 5 — Commit rows & labels (message, short hash, author beside each
+node). Open architecture question for later: make the repo path configurable, and
+decide the Tauri shell's fate now that the browser path is HTTP.

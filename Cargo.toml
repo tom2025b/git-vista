@@ -15,6 +15,7 @@ resolver = "2"
 members = [
     "crates/git-vista-core",
     "crates/git-vista-git",
+    "crates/git-vista-server",
     "crates/git-vista",
     "crates/git-vista/src-tauri",
 ]
