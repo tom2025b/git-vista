@@ -1,16 +1,20 @@
 # Workspace root for git-vista.
 #
-# Two crates you care about:
-#   - git-vista-core : pure logic (git parsing, graph layout, data models)
+# Crates you care about:
+#   - git-vista-core : pure logic (graph layout + data models). No platform or UI
+#                      deps, so it compiles for wasm and is shared by the frontend.
+#   - git-vista-git  : native-only git reading via gix. Kept apart from core so
+#                      gix never reaches the wasm/browser build.
 #   - git-vista      : the Leptos frontend GUI (the app you interact with)
 #
-# A third, thin crate -- git-vista/src-tauri -- is the native desktop shell.
-# Tauri requires its shell to be its own cargo package; it does nothing but
-# host the Leptos frontend in a webview and expose git-vista-core over IPC.
+# A thin crate -- git-vista/src-tauri -- is the native desktop shell. Tauri
+# requires its shell to be its own cargo package; it hosts the Leptos frontend
+# in a webview and bridges to the native crates.
 [workspace]
 resolver = "2"
 members = [
     "crates/git-vista-core",
+    "crates/git-vista-git",
     "crates/git-vista",
     "crates/git-vista/src-tauri",
 ]
@@ -26,6 +30,7 @@ repository = "https://github.com/tom2025b/git-vista"
 # `serde = { workspace = true }` so versions stay in lock-step.
 [workspace.dependencies]
 git-vista-core = { path = "crates/git-vista-core" }
+git-vista-git = { path = "crates/git-vista-git" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
