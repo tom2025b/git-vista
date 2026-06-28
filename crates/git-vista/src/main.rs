@@ -8,6 +8,8 @@
 // the host too. Only the host's non-test build leaves it unused, hence the
 // targeted allows.
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+mod camera;
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod color;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod geometry;
