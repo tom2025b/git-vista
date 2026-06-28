@@ -31,6 +31,10 @@ html, body {
 .graph { flex: 1; overflow: hidden; }
 .placeholder { color: var(--muted); }
 
+/* Phase 4: loading / error states while the history is fetched. */
+.status { color: var(--muted); padding: 1rem; }
+.status.error { color: #f78166; }
+
 /* Phase 2: the SVG fills the panel and clips; pan/zoom happens via the inner
    <g transform>, so there's no scrollbar — the camera moves the content. */
 .graph-svg {

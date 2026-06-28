@@ -35,3 +35,4 @@ web-sys = { version = "0.3", features = [
     "PointerEvent",
     "WheelEvent",
 ] }
+gloo-net = { version = "0.7.0", default-features = false, features = ["http", "json"] }
