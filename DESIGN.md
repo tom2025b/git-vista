@@ -14,7 +14,7 @@ A clean, zoomable vertical git history visualizer built with Tauri + Leptos.
 ### Phase 0 — Scaffold ✅ (done)
 Workspace setup, three-crate structure, build pipeline, and basic skeletons.
 
-### Phase 1 — Static vertical graph (fake data)
+### Phase 1 — Static vertical graph (fake data) ✅ (done)
 Create a vertical graph component using fake commit data. Render nodes and edges as SVG.
 
 ### Phase 2 — Interactive pan & zoom
