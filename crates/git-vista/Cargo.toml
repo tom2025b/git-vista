@@ -1,0 +1,27 @@
+[package]
+name = "git-vista"
+description = "git-vista Leptos frontend — renders the vertical git graph inside the Tauri webview."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Single binary, built by Trunk for the wasm32 target.
+[[bin]]
+name = "git-vista-ui"
+path = "src/main.rs"
+
+[dependencies]
+# Shared data models (compiles for wasm too — pure logic, no UI deps).
+git-vista-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# The frontend is only ever built for wasm32 (by Trunk). Keeping the UI deps
+# here means a host-target `cargo build --workspace` compiles a tiny native stub
+# instead of pulling Leptos/wasm-bindgen for a target they can't run on.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+leptos = { version = "0.6", features = ["csr"] }
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"

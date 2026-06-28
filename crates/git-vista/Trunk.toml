@@ -1,0 +1,7 @@
+[build]
+target = "index.html"
+
+[serve]
+# Match the port Tauri expects in tauri.conf.json (build.devUrl).
+port = 1420
+open = false

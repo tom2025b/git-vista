@@ -1,0 +1,32 @@
+:root {
+  --bg: #0d1117;
+  --fg: #e6edf3;
+  --muted: #8b949e;
+  --accent: #2f81f7;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+.app { display: flex; flex-direction: column; height: 100vh; }
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid #21262d;
+}
+
+.topbar h1 { margin: 0; font-size: 1.1rem; color: var(--accent); }
+.subtitle { color: var(--muted); font-size: 0.85rem; }
+
+.graph { flex: 1; overflow: auto; padding: 1rem; }
+.placeholder { color: var(--muted); }
