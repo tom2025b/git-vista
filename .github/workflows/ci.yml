@@ -1,0 +1,122 @@
+# Continuous Integration for git-vista.
+#
+# Workspace layout this pipeline cares about:
+#   - git-vista-core    pure logic crate — the ONLY crate with tests
+#   - git-vista         Leptos frontend, built to WASM by Trunk (crates/git-vista)
+#   - git-vista-tauri   native desktop shell (crates/git-vista/src-tauri)
+#
+# Three jobs run in parallel, each mapped to a concrete check:
+#   1. core      test + check the core logic crate
+#   2. tauri     check that the native shell compiles
+#   3. frontend  build the real WASM bundle with Trunk
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same ref cancels an in-flight run, so PRs don't queue up
+# stale builds.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"   # CI builds are one-shot; incremental only adds overhead.
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Core crate: build check + tests.
+  #
+  # git-vista-core is pure logic with no UI or system dependencies, so this job
+  # needs nothing beyond stable Rust. It carries the project's actual test suite.
+  # ---------------------------------------------------------------------------
+  core:
+    name: Core (check + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check core builds
+        run: cargo check -p git-vista-core
+
+      - name: Test core
+        run: cargo test -p git-vista-core
+
+  # ---------------------------------------------------------------------------
+  # 2. Tauri shell: build check.
+  #
+  # The shell links against system WebKitGTK/GTK, so those libraries must be
+  # installed before cargo can compile it. We only `check` here — a successful
+  # type/link check is enough to catch breakage without a full release build.
+  # ---------------------------------------------------------------------------
+  tauri:
+    name: Tauri shell (check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri v2 Linux build dependencies.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check Tauri shell builds
+        run: cargo check -p git-vista-tauri
+
+  # ---------------------------------------------------------------------------
+  # 3. Frontend: build the WASM bundle with Trunk.
+  #
+  # This is the closest CI gets to "the real app builds" — Trunk compiles the
+  # Leptos frontend to wasm32 and emits the dist/ bundle the shell loads.
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: Frontend (Trunk / WASM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + wasm32)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Install a pinned Trunk release from its prebuilt binary — faster and more
+      # reproducible than `cargo install trunk` from source.
+      - name: Install Trunk
+        env:
+          TRUNK_VERSION: v0.21.7
+        run: |
+          wget -qO- \
+            "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xzf- -C /usr/local/bin trunk
+          trunk --version
+
+      # Trunk reads Trunk.toml / index.html from the frontend crate dir and
+      # fetches the matching wasm-bindgen automatically.
+      - name: Build frontend
+        run: cd crates/git-vista && trunk build
