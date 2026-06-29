@@ -22,6 +22,7 @@ use git_vista_core::model::{Graph, RefKind};
 
 use crate::camera::{Camera, ZOOM_STEP};
 use crate::color::{branch_color, BADGE_DARK, HEAD_BADGE, MERGE_FILL, TAG_BADGE};
+use crate::datetime::local_timestamp;
 use crate::geometry::{
     badge_text_dx, badge_text_y, badge_top_y, badge_width, edge_path, label_bottom_y, label_top_y,
     label_x, node_cx, node_cy, BADGE_GAP, BADGE_HEIGHT, BADGE_RADIUS, NODE_RADIUS,
@@ -174,7 +175,13 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
             let msg_x = bx; // past the last badge, or text_x when there were none
 
             let msg = truncate(&gr.commit.summary, MAX_SUMMARY_CHARS);
-            let meta = format!("{} · {}", gr.commit.id.short(), gr.commit.author);
+            // hash · author · local date+time, so the timeline is visible per row.
+            let meta = format!(
+                "{} · {} · {}",
+                gr.commit.id.short(),
+                gr.commit.author,
+                local_timestamp(gr.commit.time),
+            );
             view! {
                 {badges}
                 <text x=msg_x y=label_top_y(gr.row) class="label-msg">
