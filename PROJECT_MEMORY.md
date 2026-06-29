@@ -439,3 +439,70 @@ labels pan/zoom with the graph.
 
 **Next:** Phase 6 — Robust lane assignment (handle complex branch/merge topologies
 better than the current basic reuse algorithm).
+
+
+## Phase 6 — Robust lane assignment (2026-06-29)
+**Status:** done
+**What changed (core-only — model, server, and frontend untouched):**
+- `crates/git-vista-core/src/layout.rs`: rewrote the basic compact-reuse pass as
+  a documented **active-lane tracker**. Same two-pass shape (pass 1 assigns each
+  commit its final lane + reserves parents' lanes; pass 2 wires edges to parents'
+  *final* lanes), but the rules are now explicit and robust:
+  1. A commit takes the **leftmost lane reserved** for it (its children's lanes),
+     **freeing the other reserved lanes** (sibling branch lines converging here);
+     a branch tip with no reservation takes the **leftmost free** lane.
+  2. Its **first parent continues in the same lane** → stable branch columns, and
+     the mainline (HEAD's first-parent chain) stays in lane 0.
+  3. Each **additional (merge) parent** reuses an existing reservation if one
+     exists, else takes the **leftmost free lane strictly to the RIGHT** of the
+     commit (new helper `leftmost_free_right_of`) — so merge lines fan out
+     rightward and never cross back left over the mainline.
+- New/expanded tests (8 layout tests, up from 5; 11 total in the crate incl.
+  model): `linear`, `dangling_parents`, `branch_and_merge_routes_to_the_right`,
+  `octopus_merge_fans_each_parent_into_its_own_lane`,
+  `sequential_branches_reuse_a_freed_lane`,
+  `concurrent_branches_get_distinct_lanes`,
+  `a_long_running_branch_keeps_one_stable_lane`, plus `empty`. Each asserts both
+  the **lane fixture** and the **edge fixture**; a shared `assert_well_formed`
+  helper checks the structural invariants (sequential rows, in-range lanes,
+  downward edges, exactly one edge per in-window link). New `edge(g, from, to)`
+  test helper looks an edge up by id so assertions don't depend on edge order.
+
+**Decisions:**
+- **Kept the endpoints-only `Edge` model and the one-curve-per-link renderer.**
+  The frontend's `edge_path` (Phase 1/5) deliberately draws a flowing S-curve per
+  commit→parent link "rather than cutting across"; Phase 6 is about correct lane
+  *assignment*, so the model/renderer didn't change. Crossing avoidance comes from
+  assignment (right-biased merge parents, stable first-parent lanes, no lane
+  sharing between concurrent branches), not from edge waypoints/segmentation.
+- **Merge parents bias RIGHT** (`leftmost_free_right_of(lane)`) while branch tips
+  use plain `leftmost_free` — a tip has no incoming edge so any free lane is
+  crossing-safe and the leftmost keeps things narrow; a merge parent has an
+  incoming edge from the merge, so forcing it rightward stops it crossing the
+  mainline. This is the key behavioural change vs the old `leftmost_free`-for-all.
+- **First-parent reservation is unconditional** (even if that parent is already
+  reserved in another lane): keeps each sibling branch line in its own column down
+  to the shared merge base (gitk-style), instead of collapsing early.
+
+**Gotchas:**
+- `model::Edge` is not `Copy` (just `Clone`) — the `edge()` test helper uses
+  `.cloned()`, not `.copied()`.
+- `lane_count = max row lane + 1`. A lane transiently reserved for a merge parent
+  that ultimately collapses into a leftmost lane is never a node's final lane, so
+  it correctly doesn't inflate `lane_count` (no node/edge ever lives there).
+
+**Verify:**
+```sh
+cargo test -p git-vista-core   # 11 pass (3 model + 8 layout)
+cargo clippy -p git-vista-core --all-targets   # clean
+cargo fmt -p git-vista-core -- --check         # clean
+cargo test -p git-vista-git -p git-vista       # 3 + 14 pass (unchanged)
+cargo check -p git-vista-server -p git-vista-tauri
+```
+Real-data smoke test: `cargo run -p git-vista-server`, then
+`curl -s localhost:8080/api/commits` → this repo's 16 commits / 6 merges lay out
+2 lanes wide; invariants hold (sequential rows, in-range lanes, downward edges,
+no two nodes in the same (row,lane) cell).
+
+**Next:** Phase 7 — Refs & colors (branch names, HEAD, tags; consistent per-branch
+colours instead of the current lane-indexed palette).
