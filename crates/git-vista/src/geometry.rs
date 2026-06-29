@@ -18,6 +18,8 @@ pub const LANE_WIDTH: i32 = 34; // horizontal gap between lanes
 pub const NODE_RADIUS: i32 = 7;
 pub const PAD_X: i32 = 28;
 pub const PAD_Y: i32 = 28;
+// Horizontal gap between the rightmost lane and the start of the label column.
+pub const LABEL_GAP: i32 = 18;
 
 /// Centre x of a node in the given lane.
 pub fn node_cx(lane: usize) -> i32 {
@@ -27,6 +29,24 @@ pub fn node_cx(lane: usize) -> i32 {
 /// Centre y of a node in the given row.
 pub fn node_cy(row: usize) -> i32 {
     PAD_Y + row as i32 * ROW_HEIGHT
+}
+
+/// Left edge (x) of the commit-label column: a fixed column just to the right of
+/// the widest lane, so every row's text is aligned regardless of its own lane.
+pub fn label_x(lane_count: usize) -> i32 {
+    // `lane_count` lanes occupy indices 0..lane_count; sit past the last one.
+    node_cx(lane_count.saturating_sub(1)) + LABEL_GAP
+}
+
+/// Baseline y of a row's first (message) label line — just above the node's
+/// centre, so the two-line label straddles the node.
+pub fn label_top_y(row: usize) -> i32 {
+    node_cy(row) - 3
+}
+
+/// Baseline y of a row's second (hash · author) label line — just below centre.
+pub fn label_bottom_y(row: usize) -> i32 {
+    node_cy(row) + 12
 }
 
 /// SVG path data for a commit->parent edge. Same-lane links are a straight
@@ -53,6 +73,16 @@ mod tests {
         assert_eq!(node_cx(2), PAD_X + 2 * LANE_WIDTH);
         assert_eq!(node_cy(0), PAD_Y);
         assert_eq!(node_cy(3), PAD_Y + 3 * ROW_HEIGHT);
+    }
+
+    #[test]
+    fn label_column_sits_past_the_widest_lane_and_rows_straddle_nodes() {
+        // One lane → column just right of lane 0; three lanes → right of lane 2.
+        assert_eq!(label_x(1), node_cx(0) + LABEL_GAP);
+        assert_eq!(label_x(3), node_cx(2) + LABEL_GAP);
+        // The two text baselines bracket the node centre.
+        assert!(label_top_y(2) < node_cy(2));
+        assert!(label_bottom_y(2) > node_cy(2));
     }
 
     #[test]

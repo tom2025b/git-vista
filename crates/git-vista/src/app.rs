@@ -22,7 +22,14 @@ use git_vista_core::model::Graph;
 
 use crate::camera::{Camera, ZOOM_STEP};
 use crate::color::{lane_color, MERGE_FILL};
-use crate::geometry::{edge_path, node_cx, node_cy, NODE_RADIUS};
+use crate::geometry::{
+    edge_path, label_bottom_y, label_top_y, label_x, node_cx, node_cy, NODE_RADIUS,
+};
+use crate::text::truncate;
+
+/// Commit messages longer than this are truncated with an ellipsis in the label
+/// (the full text stays available via the node/label hover tooltip).
+const MAX_SUMMARY_CHARS: usize = 60;
 
 /// Fetch the laid-out graph from the backend. Relative URL → same origin as the
 /// served SPA, so no CORS and no hardcoded host.
@@ -106,6 +113,28 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
         })
         .collect_view();
 
+    // Commit labels: a fixed text column to the right of the lanes, two lines per
+    // row — the (truncated) message on top, the short hash and author dimmed
+    // below. The full message stays available on hover.
+    let text_x = label_x(graph.lane_count);
+    let labels = graph
+        .rows
+        .iter()
+        .map(|gr| {
+            let msg = truncate(&gr.commit.summary, MAX_SUMMARY_CHARS);
+            let meta = format!("{} · {}", gr.commit.id.short(), gr.commit.author);
+            view! {
+                <text x=text_x y=label_top_y(gr.row) class="label-msg">
+                    {msg}
+                    <title>{gr.commit.summary.clone()}</title>
+                </text>
+                <text x=text_x y=label_bottom_y(gr.row) class="label-meta">
+                    {meta}
+                </text>
+            }
+        })
+        .collect_view();
+
     // Camera (pan/zoom) state, plus whether a drag is currently in progress.
     let camera = create_rw_signal(Camera::default());
     let dragging = create_rw_signal(false);
@@ -151,6 +180,7 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
             <g transform=move || camera.get().transform()>
                 {edges}
                 {nodes}
+                {labels}
             </g>
         </svg>
     }

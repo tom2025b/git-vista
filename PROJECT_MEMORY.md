@@ -41,6 +41,31 @@ cargo build -p git-vista-tauri               # native shell compiles
 ( cd crates/git-vista && trunk build )       # frontend → wasm in dist/
 ```
 
+## Troubleshooting — dev server unreachable from the iPad/another device
+**Symptom:** `http://localhost:8080/` works on the dev machine, but the iPad shows
+"the page cannot be reached." The server is fine; something between the devices is
+blocking it. The server binds `0.0.0.0:8080` (all interfaces) — confirm with
+`ss -ltn | grep 8080` (expect `0.0.0.0:8080`). Then, in order of likelihood:
+
+1. **Firewall on the dev machine (most common).** Loopback bypasses the firewall,
+   so localhost works while the LAN is blocked. This box has **`ufw`** installed.
+   Check/allow (needs root — run from the prompt with `! sudo …`):
+   ```sh
+   sudo ufw status            # is it active?
+   sudo ufw allow 8080/tcp    # allow the dev port
+   ```
+   (If using firewalld/nftables instead: open 8080/tcp there.)
+2. **Different network / subnet.** The dev machine is wired (`eno1`,
+   `192.168.254.206/24`); the iPad is on Wi-Fi. They must share the subnet
+   (`192.168.254.x`). Check the iPad's IP in Settings → Wi-Fi → (i). Guest Wi-Fi
+   or a second AP/mesh node on another subnet won't reach it.
+3. **Router AP/client isolation.** Some routers block device-to-device traffic;
+   disable "AP isolation" / "client isolation" (often only on guest networks).
+
+Find the right URL/IP: `hostname -I` (or `ip -4 addr show scope global`). The
+server now prints the LAN URL + these hints on startup, and gives a clear message
+if the port is already in use or the `dist/` bundle is missing.
+
 ---
 
 ## Phase 0 — Scaffold (2026-06-28)
@@ -370,3 +395,47 @@ from the iPad — graph of this repo's real history, pan/zoom works.
 **Next:** Phase 5 — Commit rows & labels (message, short hash, author beside each
 node). Open architecture question for later: make the repo path configurable, and
 decide the Tauri shell's fate now that the browser path is HTTP.
+
+
+## Phase 5 — Commit rows & labels (2026-06-28)
+**Status:** done
+**What changed (frontend-only — model already had message/hash/author):**
+- `crates/git-vista/src/text.rs` (new, pure/host-tested): `truncate(s, max)` —
+  char-aware truncation with a single `…`, result width ≤ max. 4 tests.
+- `crates/git-vista/src/geometry.rs`: `label_x(lane_count)` (a fixed text column
+  just right of the widest lane, `LABEL_GAP = 18`), `label_top_y(row)` /
+  `label_bottom_y(row)` (the two baselines straddling the node). +1 test.
+- `crates/git-vista/src/app.rs`: `graph_canvas` now also renders, per row, two
+  SVG `<text>` lines inside the pan/zoom `<g>`: truncated message
+  (`MAX_SUMMARY_CHARS = 60`, full text in a `<title>` hover) on top, and
+  `"<short-hash> · <author>"` dimmed below. Added after nodes in the group.
+- `crates/git-vista/styles.css`: `.label-msg` (fg, 13px) / `.label-meta`
+  (muted, 11px).
+- `crates/git-vista/src/main.rs`: declares `mod text;` (same dead-code gating).
+
+**Decisions (confirmed with the user):**
+- **Aligned label column** right of all lanes (gitk style), not inline per node.
+- **Two lines** per commit (message; then hash · author) for readability.
+- **Labels live inside the pan/zoom group** → they scale with the graph; hiding
+  text when zoomed far out is Phase 9 (level of detail).
+- **Truncate** long messages (~60 chars) with `…`; full text via hover `<title>`.
+
+**Gotchas:**
+- Labels render client-side in wasm, so the SVG `<text>` isn't in the served HTML
+  — `curl` can't verify it; check visually in the browser.
+- Text is interactive (has a `<title>`); `user-select: none` on `.graph-svg`
+  (Phase 2) keeps a drag from selecting label text, and pointer-capture keeps a
+  drag that starts on a label working.
+
+**Verify:**
+```sh
+cargo test -p git-vista        # 14 pass (camera/geometry/color/text/graph)
+( cd crates/git-vista && trunk build )                 # wasm bundle
+cargo run -p git-vista-server                          # then open in a browser
+```
+Manual: open the server URL — each node shows its message + `hash · author`
+beside it in a left-aligned column; long messages end in `…` (full on hover);
+labels pan/zoom with the graph.
+
+**Next:** Phase 6 — Robust lane assignment (handle complex branch/merge topologies
+better than the current basic reuse algorithm).
