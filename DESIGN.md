@@ -36,8 +36,15 @@ Display commit message, short hash, and author next to each node. (Two-line SVG
 labels in an aligned column right of the lanes; long messages truncated with `…`;
 labels pan/zoom with the graph.)
 
-### Phase 6 — Robust lane assignment
-Improve the layout algorithm to properly handle branches and merges.
+### Phase 6 — Robust lane assignment ✅ (done)
+Improve the layout algorithm to properly handle branches and merges. (Full
+active-lane tracker in `git-vista-core::layout`: each commit takes the leftmost
+lane reserved by a child else the leftmost free one; its first parent keeps that
+lane (stable branch columns, mainline in lane 0); merge parents fan out to the
+leftmost free lane **to the right** so they never cross back over the mainline.
+Handles octopus merges, reuses freed lanes for sequential branches, and keeps
+concurrent branches in distinct lanes. 8 layout tests cover linear, branch+merge,
+octopus, sequential reuse, concurrent branches, and stable-lane continuity.)
 
 ### Phase 7 — Refs & colors
 Show branch names, HEAD, tags, and assign consistent colors per branch.
