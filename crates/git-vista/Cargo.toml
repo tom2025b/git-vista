@@ -25,6 +25,8 @@ serde_json = { workspace = true }
 leptos = { version = "0.6", features = ["csr"] }
 console_error_panic_hook = "0.1"
 wasm-bindgen = "0.2"
+# The JS `Date`, used to format commit timestamps in the viewer's local timezone.
+js-sys = "0.3"
 # Event types used by the pan/zoom handlers. Leptos pulls web-sys in already;
 # we list the exact features we call so the build doesn't rely on its defaults.
 web-sys = { version = "0.3", features = [
