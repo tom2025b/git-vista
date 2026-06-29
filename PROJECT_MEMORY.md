@@ -726,3 +726,40 @@ isn't iOS).
 
 **Next:** Phase 8 — Viewport virtualization (only render commits visible in the
 viewport for performance).
+
+
+## Issue #13 — Commit timestamps in the labels (2026-06-29)
+**Status:** done (frontend-only; the model already carried `CommitSummary::time`).
+**What changed:**
+- `crates/git-vista/src/datetime.rs` (new): pure, host-tested `format_ymd_hm(y,m,d,h,min)
+  -> "YYYY-MM-DD HH:MM"` (zero-padded), plus a wasm-only `local_timestamp(epoch_secs)`
+  that uses the JS `Date` to break the instant down in the **viewer's local timezone**
+  (correct per-commit incl. DST). 3 tests.
+- `crates/git-vista/src/app.rs`: the dimmed meta label line is now
+  `"<short-hash> · <author> · <YYYY-MM-DD HH:MM>"` (was hash · author).
+- `crates/git-vista/src/main.rs`: declares `mod datetime;` (same dead-code gating
+  as the other pure modules).
+- `crates/git-vista/Cargo.toml`: added `js-sys` under the wasm-target deps.
+
+**Decisions:**
+- **Local timezone, not UTC nor the committer's tz.** The model only stores UTC
+  seconds (Phase 3 didn't capture the committer tz offset); for a personal viewer,
+  the reader's local time is the intuitive "when was this". JS `Date` gives correct
+  local + DST per commit.
+- **Split pure/impure** to match the codebase: string assembly is host-tested
+  (`format_ymd_hm`); only the `Date` getters are wasm-only (`local_timestamp`,
+  `#[cfg(target_arch = "wasm32")]`), so host tests don't touch js-sys.
+- Format is `YYYY-MM-DD HH:MM` (no seconds) — enough to read the timeline; full
+  precision can go in a hover later if wanted.
+
+**Verify:**
+```sh
+cargo test -p git-vista     # 22 pass (+3 datetime)
+cargo clippy -p git-vista --target wasm32-unknown-unknown   # clean
+( cd crates/git-vista && trunk build )                      # wasm bundle builds
+```
+Browser-confirmed (Playwright over the served bundle): meta lines render e.g.
+`6edb5b5 · tomb · 2026-06-29 03:28`; all sampled rows match `… · YYYY-MM-DD HH:MM`.
+
+**Next:** Phase 8 — Viewport virtualization (only render commits visible in the
+viewport for performance).
