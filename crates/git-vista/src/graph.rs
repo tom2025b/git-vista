@@ -109,6 +109,7 @@ pub fn fake_graph() -> Graph {
         rows,
         edges,
         lane_count,
+        repo_url: None,
     }
 }
 

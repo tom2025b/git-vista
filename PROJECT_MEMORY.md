@@ -767,3 +767,60 @@ Browser-confirmed (Playwright over the served bundle): meta lines render e.g.
 
 **Next:** Phase 8 — Viewport virtualization (only render commits visible in the
 viewport for performance).
+
+
+## Issue #12 — Clickable commits & badges, linking to GitHub (2026-06-29)
+**Status:** done. Touches all layers.
+**What changed:**
+- **`git-vista-git`**: `github_web_base(path) -> Option<String>` reads
+  `remote.origin.url` (gix `config_snapshot().string`) and parses it with the pure,
+  unit-tested `web_base_from_remote` → `"https://github.com/owner/repo"`, or `None`
+  if no origin / unparsable / host isn't github.com. Handles `git@github.com:o/r.git`,
+  `https://…/o/r(.git)(/)`, `ssh://git@github.com/o/r.git`, case-insensitive host.
+  +2 tests.
+- **`git-vista-core::model`**: `Graph` gains `repo_url: Option<String>` (`#[serde(default)]`).
+  `layout_topology` sets it `None`; the server fills it after layout (pure layout
+  doesn't know remotes). Frontend `graph.rs` fixture updated.
+- **`git-vista-server`**: sets `graph.repo_url = github_web_base(repo)` before JSON.
+- **Frontend `app.rs`**:
+  - Links (only when `repo_url` is `Some`): commit message → `{base}/commit/{full-sha}`;
+    branch & tag badges → `{base}/tree/{name}`; remote-branch badge → `{base}/tree/{name
+    sans "<remote>/"}`; HEAD badge → its commit. Opened in a **new tab** via
+    `window.open(url, "_blank")`. `None` => labels stay plain text (no cursor change).
+  - **Reworked the gesture layer for tap-vs-drag:** pointer capture and panning are
+    now **deferred until the pointer moves past `DRAG_THRESHOLD` (4px)**; a tap never
+    captures, so its `click` reaches the child element's link handler. A `moved`
+    flag (set on drag/pinch) makes click handlers ignore the click that ends a drag.
+    This was necessary because the previous code captured the pointer on
+    `pointerdown`, which would have sent the click to the SVG, not the badge/message.
+  - `.clickable { cursor: pointer; }` in styles.css; `Window` web-sys feature added.
+
+**Decisions (per user):** GitHub-only (no GitLab/etc.); tags link to `/tree/<tag>`
+(not `/releases/tag`); HEAD links to its commit; everything opens in a new tab.
+
+**Gotchas:**
+- An SVG `<text>`'s `textContent` includes its `<title>` child — don't match label
+  text by exact content in tests; click by position instead.
+- **Rebuild the server binary after server/core changes** — `cargo check` isn't
+  enough; a stale `target/debug/git-vista-server` will serve the old behaviour (here:
+  `repo_url` came back `null` until rebuilt). `gv` rebuilds the wasm but **not** the
+  server, so for server changes run `cargo build -p git-vista-server` (or just let
+  `gv`'s `cargo run` rebuild — it does, but a separately-launched stale binary won't).
+- Browser repro stubs `window.open` via `addInitScript` to capture the URL with no
+  network (github.com is unreachable in the sandbox).
+
+**Verify:**
+```sh
+cargo test -p git-vista-git    # 6 pass (incl. URL parsing)
+cargo test -p git-vista-core   # 15 pass (Graph gained repo_url)
+cargo test -p git-vista        # 24 pass
+cargo clippy -p git-vista --target wasm32-unknown-unknown   # clean
+( cd crates/git-vista && trunk build )
+```
+Playwright over the served git-vista repo (origin `tom2025b/git-vista`): clicking a
+commit message opened `…/commit/<sha>`, a branch badge `…/tree/<branch>`, the HEAD
+badge `…/commit/<sha>`; touch-pan and a drag starting on a message both panned and
+opened nothing. **Real-iPad tap check still owed** (headless simulates touch).
+
+**Next:** Phase 8 — Viewport virtualization (only render commits visible in the
+viewport for performance).
