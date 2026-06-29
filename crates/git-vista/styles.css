@@ -46,3 +46,13 @@ html, body {
   user-select: none;    /* a drag pans, it doesn't select */
 }
 .graph-svg.grabbing { cursor: grabbing; }
+
+/* Phase 5: commit labels — a text column right of the lanes, two lines per row. */
+.label-msg {
+  fill: var(--fg);
+  font-size: 13px;
+}
+.label-meta {
+  fill: var(--muted);
+  font-size: 11px;
+}
