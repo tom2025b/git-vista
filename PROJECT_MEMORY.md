@@ -632,3 +632,73 @@ graph.
 
 **Next:** Phase 8 — Viewport virtualization (only render commits visible in the
 viewport for performance).
+
+
+## Phase 7 fix — Touch interactivity: finger-drag pan + pinch zoom (2026-06-29)
+**Status:** done
+**What changed (frontend interactivity layer, `git-vista`):**
+- **The bug:** the app is built to be used in **Safari on an iPad**, but pan/zoom
+  were dead there (looked like a static image). Two mouse-only assumptions from
+  Phase 2: pan used `PointerEvent::movement_x/_y` (iOS Safari reports these as **0**
+  for touch), and zoom used the `wheel` event (a touch **pinch never raises a wheel
+  event**). On desktop both worked, which masked it. Verified with a headless-browser
+  repro: synthetic touch-style pointer moves (`movementX=0`) left the transform
+  unchanged; a `wheel` is never produced by pinch.
+- **`camera.rs`:** added pure `Camera::pinched(prev_dist, cur_dist, mx, my)` —
+  scales by the ratio of finger distances, anchored at the pinch midpoint (reuses
+  `zoomed_at`); a non-positive `prev_dist` is a no-op (first pinch sample just sets
+  the baseline). +3 host tests (ratio scaling, no-baseline no-op, midpoint stays
+  anchored). 7 camera tests now; 19 frontend tests total.
+- **`app.rs`:** rewrote the gesture layer on **Pointer Events** (unify mouse/pen/
+  touch; fire for touch on iOS). We track every pressed pointer's client position
+  ourselves in `store_value` and derive the gesture from the count: **1 pointer →
+  pan** by the change in its position (no more `movement_*`); **2 pointers → pinch**
+  by the change in their distance. Pointer is captured on `pointerdown`
+  (`set_pointer_capture` on `current_target`, the SVG — not `target`, which could be
+  a child node). Zoom anchor is made SVG-local by subtracting the SVG's
+  `getBoundingClientRect` origin. `wheel` zoom kept for desktop. Subtitle now reads
+  "drag to pan, pinch or scroll to zoom".
+- **`Cargo.toml`:** added web-sys feature **`DomRect`** (for `get_bounding_client_rect`).
+
+**Decisions:**
+- **Pointer Events, not Touch Events**, so one code path covers mouse, pen and
+  touch — and they're well-supported on iOS Safari ≥13. `touch-action: none`
+  (already set in styles.css since Phase 2) is what hands the browser's default
+  gestures to us; without it Safari would scroll/zoom the page instead.
+- **Pan from coordinate deltas** (current − previous client pos) rather than
+  `movementX/Y`: the latter is the exact thing iOS doesn't populate. Deltas in
+  client px map 1:1 onto camera space (no viewBox), so `panned` is unchanged.
+- **Pinch math stays pure in `camera.rs`** (host-tested), matching the project's
+  "DOM-free, unit-tested camera/geometry" split; the handler just feeds it
+  distances + midpoint.
+
+**Gotchas:**
+- `web_sys::PointerEvent` derefs to `MouseEvent`, so `client_x()/offset_x()` are
+  available on it directly (as `movement_x()` was).
+- Use `ev.current_target()` (the SVG with the listener), not `ev.target()` (the
+  child circle/text/badge actually under the finger), for pointer capture and for
+  the bounding-rect origin.
+- Don't `cargo fmt` this crate — only `git-vista-core` is kept stock-rustfmt-clean
+  (Phase 7 gotcha); match the compact hand style here. `cargo clippy -p git-vista
+  --target wasm32-unknown-unknown` is clean.
+- A harmless console warning remains on desktop: "Unable to preventDefault inside
+  passive event listener" on `wheel` — Leptos registers `wheel` as passive, so
+  `prevent_default()` is a no-op. Nothing scrolls (the page is fixed at `100vh`,
+  `.graph` is `overflow:hidden`), so it's cosmetic; revisit only if a real scroll
+  ever leaks.
+
+**Verify:**
+```sh
+cargo test -p git-vista        # 19 pass (7 camera incl. 3 pinch + geometry/color/text/graph)
+cargo clippy -p git-vista --target wasm32-unknown-unknown   # clean
+( cd crates/git-vista && trunk build )                      # wasm bundle builds
+```
+Headless-browser repro/confirmation (chromium via Playwright, `dist/` served by
+`git-vista-server`): touch-style drag with `movementX=0` now pans
+(`translate(0 0)`→`translate(120 80)`); two-finger spread zooms in (`scale` 1→~2.7);
+desktop mouse-drag + wheel still pan/zoom. **Real-device check still owed:** confirm
+on an actual iPad in Safari (the headless run simulates touch pointer events but
+isn't iOS).
+
+**Next:** Phase 8 — Viewport virtualization (only render commits visible in the
+viewport for performance).

@@ -19,6 +19,9 @@ Create a vertical graph component using fake commit data. Render nodes and edges
 
 ### Phase 2 — Interactive pan & zoom ✅ (done)
 Add camera controls — drag to pan, mouse wheel to zoom, smooth viewport movement.
+(Rebuilt on Pointer Events afterwards for proper **touch** support: single-finger
+drag to pan, two-finger pinch to zoom on iPad/Safari — the original mouse-only
+`movementX`/`wheel` approach was dead on touch. See PROJECT_MEMORY "Phase 7 fix".)
 
 ### Phase 3 — Read real commits with gix ✅ (done)
 Implement `repo::walk_history()` to read real git history from a repository.
