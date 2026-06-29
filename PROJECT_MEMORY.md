@@ -66,6 +66,27 @@ Find the right URL/IP: `hostname -I` (or `ip -4 addr show scope global`). The
 server now prints the LAN URL + these hints on startup, and gives a clear message
 if the port is already in use or the `dist/` bundle is missing.
 
+## Troubleshooting — exit code 144 when running the server
+**Symptom:** starting `git-vista-server` dies immediately with **exit code 144**
+(often no output). This has bitten multiple sessions.
+
+**Cause:** a previous `git-vista-server` instance is still running and holding port
+**8080**. The sandbox kills the new process, which surfaces as exit 144.
+
+**Fix:** kill the stale server before starting a new one:
+```sh
+pkill -9 git-vista-server
+```
+Then run the server again.
+
+> Note (background-job sandbox): in the automated background-job sandbox, even a
+> *first* server start (port free) can exit 144, because that sandbox blocks
+> binding a listening socket outright — `pkill` itself can also report 144 there.
+> So if `pkill -9` doesn't help and you're in a background job, you can't bind a
+> port at all; verify the data path another way (e.g. a throwaway
+> `cargo run --example` that calls `walk_history` + `read_refs` +
+> `layout_with_refs` directly, no socket).
+
 ---
 
 ## Phase 0 — Scaffold (2026-06-28)
@@ -506,3 +527,108 @@ no two nodes in the same (row,lane) cell).
 
 **Next:** Phase 7 — Refs & colors (branch names, HEAD, tags; consistent per-branch
 colours instead of the current lane-indexed palette).
+
+
+## Phase 7 — Branch, tag & HEAD labels + per-branch colours (2026-06-29)
+**Status:** done
+**What changed:**
+- **`git-vista-core::model`**: new `RefKind` (`Head`/`Branch`/`RemoteBranch`/`Tag`)
+  and `GitRef { name, kind, target }` (`is_branch()` helper). `GraphRow` gained two
+  fields: `refs: Vec<GitRef>` (badges pointing exactly at this commit) and
+  `color: usize` (stable per-branch palette **slot**, not a lane).
+- **`git-vista-core::layout`**: the old `layout(commits)` body is now private
+  `layout_topology`; `layout(commits)` = topology + `assign_branch_colors(&[])`
+  (so existing callers/tests are unchanged and every row still gets a colour). New
+  **`layout_with_refs(commits, refs)`** = topology + `assign_branch_colors(refs)` +
+  `attach_ref_badges(refs)`. `assign_branch_colors` colours each commit by the
+  branch that owns its **first-parent chain**: seeds = branch refs in priority
+  order (HEAD's branch first → trunk = slot 0, then local-before-remote, then by
+  name), each walks first-parents claiming unowned commits until it hits an
+  already-owned commit (the merge base); a synthetic fallback then claims any still
+  -unowned commit (top-to-bottom, keyed by short hash) so **every** commit is
+  coloured. `attach_ref_badges` pushes each ref onto its target row (off-window
+  refs dropped). 12 layout tests now (8 topology + 4 new colour/badge); 15 core
+  tests total (3 model + 12 layout).
+- **`git-vista-git`**: new `read_refs(path) -> Vec<GitRef>`. Emits HEAD (always,
+  as `RefKind::Head` named `"HEAD"`, when it resolves to a commit — attached or
+  detached), plus local branches, remote branches, and tags, classified via
+  `reference.name().category_and_short_name()` (`gix::refs::Category`) and peeled
+  with `peel_to_id()`. Skips `refs/remotes/*/HEAD` (the remote's symbolic default
+  pointer) and notes/worktree-private refs. +1 test (`read_refs_sees_head_branches
+  _and_tags`).
+- **`git-vista-server`**: `/api/commits` now calls `walk_history` + `read_refs` +
+  `layout_with_refs`.
+- **Frontend** (`git-vista`):
+  - `color.rs`: `lane_color` → **`branch_color(slot)`** (same 6-colour palette,
+    wrapping). Added `HEAD_BADGE` (bright neutral), `TAG_BADGE` (amber),
+    `BADGE_DARK` (dark text on filled pills; also the merge-node fill via
+    `MERGE_FILL` alias).
+  - `geometry.rs`: badge geometry — `badge_width(text)` (monospace: chars × 7 + 2×6
+    pad), `badge_top_y`/`badge_text_y`/`badge_text_dx`, consts `BADGE_HEIGHT/
+    _RADIUS/_GAP`. +1 test.
+  - `app.rs`: nodes coloured by `branch_color(row.color)`; edges by the **parent's**
+    branch (`branch_color(row_color[e.to_row])`) so a merge line takes the merged-in
+    branch's colour. Per row, ref badges are laid out left-to-right from the label
+    column (filled pill for local branches / HEAD / tags, **outlined** for remote
+    branches) and the commit message is shifted right past them. All inside the
+    pan/zoom `<g>`, so badges scale with the graph.
+  - `styles.css`: `.badge-text` (11px, 600).
+  - `graph.rs` test fixture updated for the two new `GraphRow` fields.
+
+**Decisions:**
+- **Colour is a per-branch *slot* computed in core, not a lane index.** The
+  requirement is "same colour for a branch across the whole graph"; first-parent
+  ownership gives that and survives lane reuse (sequential branches reuse a lane but
+  keep distinct colours). Core emits an abstract slot; the actual RGB palette stays
+  in the frontend's `color.rs` (per the long-standing "colour can evolve on its
+  own" split).
+- **Slots allocated lazily** — only when a seed actually claims ≥1 commit — so a
+  branch whose tip another branch already owns (e.g. `main` sitting on HEAD's
+  first-parent chain, or `origin/<x>` mirroring a local branch) costs no slot.
+  Keeps slots dense (0..N) so the palette wraps later / collides less. (First cut
+  pre-reserved a slot per seed and left gaps like 0,2,5,6,7,8,9; the dense version
+  gives 0..6 on this repo.)
+- **HEAD's branch seeded first** → the trunk is colour 0 (blue), matching the old
+  lane-0-is-blue look. Both a local branch and its `origin/` twin can share HEAD's
+  target; locals sort before remotes so the local wins slot 0.
+- **HEAD always badged** (even when it coincides with a branch) so a tip shows e.g.
+  `HEAD` + `phase6-lane-layout` + `origin/phase6-lane-layout` together.
+- **`layout(commits)` kept** (not changed to take refs) so the 8 existing topology
+  tests and the Tauri stub (`layout::layout(Vec::new())`) didn't churn; refs go
+  through the new `layout_with_refs`.
+
+**Gotchas:**
+- **Only `git-vista-core` is kept stock-`rustfmt`-clean** (the documented Phase-6
+  verify ran `cargo fmt -p git-vista-core -- --check`). The other crates use a
+  compact hand style that stock rustfmt would expand (e.g. `camera.rs`'s one-line
+  `Self {…}`, server's long `eprintln!`s) — so run `cargo fmt` **only on core**, and
+  match surrounding style by hand elsewhere. Don't blanket-`cargo fmt --all`.
+- **This sandbox kills any process that binds a listening socket** (the server
+  exits 144), and `pkill` also trips it. Couldn't smoke-test via `curl localhost`.
+  Verified the data path instead with a throwaway `cargo run --example` that called
+  `walk_history`+`read_refs`+`layout_with_refs` and printed the rows (since deleted
+  — `serde_json` isn't a server dep, so it printed a summary, not JSON).
+- Badge widths rely on the **monospace** UI font (`badge_width` = char count ×
+  fixed advance); if the font ever changes, retune `BADGE_CHAR_W`.
+- `gix`'s `peel_to_id_in_place` is deprecated → use `peel_to_id()`.
+- New `GraphRow` fields broke the frontend's `graph.rs` fixture construction —
+  updated it (`refs: Vec::new()`, `color: c.lane`).
+
+**Verify:**
+```sh
+cargo test -p git-vista-core      # 15 pass (3 model + 12 layout incl. colour/badge)
+cargo test -p git-vista-git       # 4 pass (incl. read_refs)
+cargo test -p git-vista           # 16 pass (camera/geometry/color/text/graph)
+cargo clippy -p git-vista-core --all-targets   # clean
+cargo fmt -p git-vista-core -- --check         # clean
+cargo check -p git-vista-server -p git-vista-tauri
+( cd crates/git-vista && trunk build )         # wasm bundle builds clean
+```
+Real-data check on this repo (17 commits, 2 lanes): HEAD's branch + `main` colour 0
+(trunk), each side branch its own dense slot (0..6); HEAD/branch/remote/tag badges
+attach to the right commits. Manual (browser): run the server, open the URL — every
+branch/tag/HEAD shows a pill at its commit and each branch keeps one colour down the
+graph.
+
+**Next:** Phase 8 — Viewport virtualization (only render commits visible in the
+viewport for performance).

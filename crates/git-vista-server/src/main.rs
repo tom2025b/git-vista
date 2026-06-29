@@ -16,7 +16,7 @@ use std::path::Path;
 use axum::{http::StatusCode, routing::get, Json, Router};
 use git_vista_core::layout;
 use git_vista_core::model::Graph;
-use git_vista_git::walk_history;
+use git_vista_git::{read_refs, walk_history};
 use tower_http::services::ServeDir;
 
 // Hardcoded for now (Phase 4); made configurable in a later phase.
@@ -94,9 +94,12 @@ fn lan_ip() -> Option<IpAddr> {
     sock.local_addr().ok().map(|addr| addr.ip())
 }
 
-/// Walk the (hardcoded) repository and return its laid-out graph as JSON.
+/// Walk the (hardcoded) repository and return its laid-out graph as JSON, with
+/// branch/tag/HEAD refs attached for badging and per-branch colouring.
 async fn commits() -> Result<Json<Graph>, (StatusCode, String)> {
-    let history = walk_history(Path::new(REPO_PATH), HISTORY_LIMIT)
+    let repo = Path::new(REPO_PATH);
+    let history = walk_history(repo, HISTORY_LIMIT)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(layout::layout(history)))
+    let refs = read_refs(repo).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(layout::layout_with_refs(history, refs)))
 }

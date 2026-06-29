@@ -36,6 +36,35 @@ impl CommitSummary {
     }
 }
 
+/// What a [`GitRef`] is, so the UI can badge and prioritise it. `Head` is the
+/// special `HEAD` pointer; `Branch`/`RemoteBranch` are local/remote branches;
+/// `Tag` is a (peeled) tag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RefKind {
+    Head,
+    Branch,
+    RemoteBranch,
+    Tag,
+}
+
+/// A ref pointing at a commit — drawn as a badge, and (for branches) used to give
+/// each branch a stable colour. `target` is always peeled to a commit id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRef {
+    /// Badge text: `"HEAD"`, `"main"`, `"origin/main"`, `"v1.0.0"`.
+    pub name: String,
+    pub kind: RefKind,
+    pub target: Oid,
+}
+
+impl GitRef {
+    /// Branches (local or remote) seed branch colouring; HEAD and tags are
+    /// badges only.
+    pub fn is_branch(&self) -> bool {
+        matches!(self.kind, RefKind::Branch | RefKind::RemoteBranch)
+    }
+}
+
 /// A commit placed in the vertical graph. `row` is the vertical position
 /// (0 = newest, at the top); `lane` is the horizontal column.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +72,14 @@ pub struct GraphRow {
     pub commit: CommitSummary,
     pub row: usize,
     pub lane: usize,
+    /// Refs (branches/tags/HEAD) that point exactly at this commit — the badges
+    /// drawn beside it. Usually empty.
+    pub refs: Vec<GitRef>,
+    /// Palette slot for the branch this commit belongs to. Stable per branch:
+    /// every commit on the same branch carries the same value across the whole
+    /// graph, so the UI can colour a branch consistently regardless of which
+    /// lane it happens to occupy. The UI maps the index onto its palette.
+    pub color: usize,
 }
 
 /// A line drawn between a commit and one of its parents.
