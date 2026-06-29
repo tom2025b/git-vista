@@ -131,5 +131,13 @@ async fn commits() -> Result<Json<Graph>, (StatusCode, String)> {
     // Attach the GitHub web base (if this repo has a github.com origin) so the UI
     // can link commits and refs. None => the frontend renders plain-text labels.
     graph.repo_url = git_vista_git::github_web_base(repo);
+    // Mark which commits are on the remote, so the UI only links pushed objects —
+    // an unpushed commit/ref would 404 on GitHub. Only worth computing when we
+    // have a web base to link to; on failure we leave it empty (nothing linked).
+    if graph.repo_url.is_some() {
+        if let Ok(remote) = git_vista_git::read_remote_commits(repo, HISTORY_LIMIT) {
+            graph.remote_commits = remote.into_iter().collect();
+        }
+    }
     Ok(Json(graph))
 }

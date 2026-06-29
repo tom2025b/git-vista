@@ -85,17 +85,32 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
     // github.com origin. `Some` => commit messages and ref badges become links;
     // `None` => they stay plain text. (Issue #12.)
     let repo_url = graph.repo_url.clone();
+    // Which objects are actually on the remote, so we only link pushed ones (an
+    // unpushed commit/ref 404s on GitHub). `remote_set` = commit ids on the
+    // remote; `remote_branches` = remote branch names (the part after the
+    // "<remote>/" prefix), derived from the RemoteBranch badges the graph already
+    // carries — a local branch is linkable only when a remote branch shares its
+    // name. Everything not linkable is shown dimmed (see the `.unpushed` style).
+    let remote_set: std::collections::HashSet<String> =
+        graph.remote_commits.iter().cloned().collect();
+    let remote_branches: std::collections::HashSet<String> = graph
+        .rows
+        .iter()
+        .flat_map(|r| &r.refs)
+        .filter(|rf| rf.kind == RefKind::RemoteBranch)
+        .filter_map(|rf| rf.name.split_once('/').map(|(_, b)| b.to_string()))
+        .collect();
     // Whether the current gesture has become a drag (set in pointermove). Defined
     // here so the link click handlers below can ignore the click that ends a drag.
     let moved = store_value(false);
-    // Open `url` in a new tab — used by the commit/ref links, suppressed when the
-    // click is really the tail of a drag.
-    let open_link = move |url: String| {
+    // Links are real SVG `<a target="_blank">` anchors (built below), so a tap is
+    // native link navigation. That works on iOS WebKit — which every iPad browser
+    // (Safari, Chrome, DuckDuckGo) runs on, and which silently blocks the scripted
+    // `window.open` pop-ups we used before. This handler only cancels the
+    // navigation when the "click" is actually the tail of a drag/pan (desktop).
+    let suppress = move |ev: web_sys::MouseEvent| {
         if moved.get_value() {
-            return;
-        }
-        if let Some(win) = web_sys::window() {
-            let _ = win.open_with_url_and_target(&url, "_blank");
+            ev.prevent_default();
         }
     };
 
@@ -154,6 +169,9 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
             // column; the message then starts just past them (or at the column
             // edge when there are none).
             let mut bx = text_x;
+            // Is this row's commit on the remote? Drives whether its message, HEAD
+            // badge and tag badges link out (an unpushed commit would 404).
+            let commit_on_remote = remote_set.contains(&gr.commit.id.0);
             let badges = gr
                 .refs
                 .iter()
@@ -171,24 +189,32 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
                         RefKind::RemoteBranch => ("none", branch, branch),
                     };
                     let name = r.name.clone();
-                    // Where this badge links on GitHub (Issue #12): branches/tags
-                    // to their tree page, HEAD to the commit it points at. A remote
-                    // branch's leading "<remote>/" is stripped to the branch name.
-                    let badge_url = repo_url.as_ref().map(|base| match r.kind {
-                        RefKind::Head => format!("{base}/commit/{}", gr.commit.id.0),
-                        RefKind::Tag | RefKind::Branch => format!("{base}/tree/{}", r.name),
+                    // Where this badge links on GitHub (Issue #12) — but only when
+                    // the target is actually on the remote, so a tap never 404s:
+                    //  * HEAD / tag -> the commit they sit on, when it's pushed. (A
+                    //    tag's own page can't be verified offline, so we link the
+                    //    commit it points at, which resolves whenever it's pushed.)
+                    //  * local branch -> its tree page, only if a remote branch of
+                    //    the same name exists.
+                    //  * remote branch -> its tree page (it's on the remote by
+                    //    definition); its leading "<remote>/" is stripped.
+                    let badge_url = repo_url.as_ref().and_then(|base| match r.kind {
+                        RefKind::Head | RefKind::Tag => {
+                            commit_on_remote.then(|| format!("{base}/commit/{}", gr.commit.id.0))
+                        }
+                        RefKind::Branch => remote_branches
+                            .contains(&r.name)
+                            .then(|| format!("{base}/tree/{}", r.name)),
                         RefKind::RemoteBranch => {
                             let branch = r.name.split_once('/').map_or(r.name.as_str(), |(_, b)| b);
-                            format!("{base}/tree/{branch}")
+                            Some(format!("{base}/tree/{branch}"))
                         }
                     });
                     let clickable = badge_url.is_some();
-                    let click = move |_| {
-                        if let Some(u) = &badge_url {
-                            open_link(u.clone());
-                        }
-                    };
-                    view! {
+                    // A GitHub repo where this ref simply isn't pushed: show it, but
+                    // dimmed and unlinked, so it's clear it has no GitHub page yet.
+                    let unpushed = repo_url.is_some() && badge_url.is_none();
+                    let pill = view! {
                         <rect
                             x=x
                             y=badge_top_y(gr.row)
@@ -200,18 +226,33 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
                             stroke=stroke
                             stroke-width="1"
                             class:clickable=clickable
-                            on:click=click.clone()
+                            class:unpushed=unpushed
                         />
                         <text
                             x=x + badge_text_dx()
                             y=badge_text_y(gr.row)
                             class="badge-text"
                             class:clickable=clickable
+                            class:unpushed=unpushed
                             fill=text_fill
-                            on:click=click
                         >
                             {name}
                         </text>
+                    };
+                    // Wrap in a real SVG anchor when this repo has a GitHub base.
+                    // The `<g>` puts the ambiguous `<a>` in an SVG-parent context so
+                    // Leptos resolves it to the SVG-namespaced anchor (an HTML `<a>`
+                    // wouldn't navigate inside the SVG tree).
+                    match badge_url {
+                        Some(url) => view! {
+                            <g>
+                                <a href=url target="_blank" rel="noopener" on:click=suppress>
+                                    {pill}
+                                </a>
+                            </g>
+                        }
+                        .into_view(),
+                        None => pill.into_view(),
                     }
                 })
                 .collect_view();
@@ -225,28 +266,47 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
                 gr.commit.author,
                 local_timestamp(gr.commit.time),
             );
-            // The message links to the commit page on GitHub (Issue #12).
+            // The message links to the commit page on GitHub (Issue #12), but only
+            // when the commit is on the remote — otherwise it's dimmed and the
+            // tooltip says why, rather than linking to a page that would 404.
             let msg_url = repo_url
                 .as_ref()
-                .map(|base| format!("{base}/commit/{}", gr.commit.id.0));
+                .and_then(|base| commit_on_remote.then(|| format!("{base}/commit/{}", gr.commit.id.0)));
             let msg_clickable = msg_url.is_some();
-            let msg_click = move |_| {
-                if let Some(u) = &msg_url {
-                    open_link(u.clone());
-                }
+            let msg_unpushed = repo_url.is_some() && msg_url.is_none();
+            let title = if msg_unpushed {
+                format!("{} — not pushed to GitHub", gr.commit.summary)
+            } else {
+                gr.commit.summary.clone()
             };
-            view! {
-                {badges}
+            let msg_text = view! {
                 <text
                     x=msg_x
                     y=label_top_y(gr.row)
                     class="label-msg"
                     class:clickable=msg_clickable
-                    on:click=msg_click
+                    class:unpushed=msg_unpushed
                 >
                     {msg}
-                    <title>{gr.commit.summary.clone()}</title>
+                    <title>{title}</title>
                 </text>
+            };
+            // Same SVG-anchor wrapping as the badges, so the commit link is a real
+            // tap-navigable link rather than a pop-up.
+            let msg_view = match msg_url {
+                Some(url) => view! {
+                    <g>
+                        <a href=url target="_blank" rel="noopener" on:click=suppress>
+                            {msg_text}
+                        </a>
+                    </g>
+                }
+                .into_view(),
+                None => msg_text.into_view(),
+            };
+            view! {
+                {badges}
+                {msg_view}
                 <text x=text_x y=label_bottom_y(gr.row) class="label-meta">
                     {meta}
                 </text>
