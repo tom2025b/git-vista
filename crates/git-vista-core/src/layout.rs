@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 
-use crate::model::{CommitSummary, Edge, Graph, GraphRow, Oid};
+use crate::model::{CommitSummary, Edge, GitRef, Graph, GraphRow, Oid};
 
 /// Leftmost free (`None`) lane, growing the lane set only if none is free.
 /// Used for branch tips, which have no incoming edge and so can safely take any
@@ -66,8 +66,32 @@ fn leftmost_free_right_of(lanes: &mut Vec<Option<Oid>>, after: usize) -> usize {
     }
 }
 
-/// Lay commits out into a [`Graph`]. `commits` must be newest-first.
+/// Lay commits out into a [`Graph`], with no ref information. `commits` must be
+/// newest-first. Every commit still gets a stable per-branch [`color`], derived
+/// purely from topology (first-parent chains). Use [`layout_with_refs`] to also
+/// attach branch/tag/HEAD badges and let real branch tips drive the colouring.
+///
+/// [`color`]: GraphRow::color
 pub fn layout(commits: Vec<CommitSummary>) -> Graph {
+    let mut graph = layout_topology(commits);
+    assign_branch_colors(&mut graph, &[]);
+    graph
+}
+
+/// Lay commits out and decorate the graph with `refs`: attach each ref as a badge
+/// on the commit it points at, and colour each branch consistently across the
+/// whole graph (branch tips seed the colouring; HEAD's branch is preferred for
+/// the trunk). `commits` must be newest-first.
+pub fn layout_with_refs(commits: Vec<CommitSummary>, refs: Vec<GitRef>) -> Graph {
+    let mut graph = layout_topology(commits);
+    assign_branch_colors(&mut graph, &refs);
+    attach_ref_badges(&mut graph, refs);
+    graph
+}
+
+/// The pure topology pass: assign each commit a lane and wire edges. Leaves every
+/// row's `refs` empty and `color` at 0 — [`assign_branch_colors`] fills those.
+fn layout_topology(commits: Vec<CommitSummary>) -> Graph {
     // Row index per commit id, so an edge can find its parent's row, and so we
     // can tell in-window parents from dangling ones.
     let index: HashMap<Oid, usize> = commits
@@ -132,6 +156,8 @@ pub fn layout(commits: Vec<CommitSummary>) -> Graph {
             commit: commit.clone(),
             row,
             lane,
+            refs: Vec::new(),
+            color: 0,
         });
     }
 
@@ -159,10 +185,140 @@ pub fn layout(commits: Vec<CommitSummary>) -> Graph {
     }
 }
 
+/// Give every commit a stable per-branch [`color`](GraphRow::color) palette slot.
+///
+/// A "branch" here is a **first-parent chain**: starting from a branch tip we
+/// walk first-parent links down until we reach a commit another branch already
+/// owns (the merge base), claiming each commit for that branch's colour. So a
+/// branch keeps one colour for its whole mainline, and that colour is the same
+/// everywhere the branch appears — independent of which lane it sits in (lanes
+/// get reused; colours don't).
+///
+/// Branch tips (from `refs`) seed the colouring in priority order: HEAD's branch
+/// first (so the trunk takes colour 0), then local branches, then remote ones,
+/// each group by name. Any commit still unclaimed afterwards (e.g. commits of a
+/// deleted branch, reachable only as a merge's second parent) starts its own
+/// synthetic line, walked the same way, so **every** commit ends up coloured.
+///
+/// Colour slots are handed out in order of first appearance, so the same branch
+/// always maps to the same slot for a given graph; the UI wraps the slot onto its
+/// palette.
+fn assign_branch_colors(graph: &mut Graph, refs: &[GitRef]) {
+    let index: HashMap<&Oid, usize> = graph.rows.iter().map(|r| (&r.commit.id, r.row)).collect();
+
+    // Branch refs, in colouring priority: HEAD's branch first, then local before
+    // remote, then by name — a total, deterministic order.
+    let head_target = refs
+        .iter()
+        .find(|r| matches!(r.kind, crate::model::RefKind::Head))
+        .map(|r| &r.target);
+    let mut seeds: Vec<&GitRef> = refs.iter().filter(|r| r.is_branch()).collect();
+    seeds.sort_by_key(|r| {
+        let is_head = head_target == Some(&r.target);
+        let is_remote = matches!(r.kind, crate::model::RefKind::RemoteBranch);
+        // false < true, so negate the ones we want first.
+        (!is_head, is_remote, r.name.clone())
+    });
+
+    // commit row -> colour slot, and branch key -> slot so the same branch reuses
+    // its slot even if it seeds several lines.
+    let mut color_of: HashMap<usize, usize> = HashMap::new();
+    let mut slot_of_key: HashMap<String, usize> = HashMap::new();
+
+    // Claim `tip`'s first-parent chain for `key`'s colour, stopping at the first
+    // commit already owned (the merge base) or once out of the walked window. A
+    // colour slot is allocated lazily — only if the chain actually owns a commit
+    // — so a branch whose tip another branch already claimed costs no slot, and
+    // slots stay dense (which spreads further before the palette has to wrap).
+    let claim = |tip: Option<usize>,
+                 key: String,
+                 color_of: &mut HashMap<usize, usize>,
+                 slot_of_key: &mut HashMap<String, usize>| {
+        // The unowned first-parent run this seed would claim.
+        let mut chain = Vec::new();
+        let mut cur = tip;
+        while let Some(row) = cur {
+            if color_of.contains_key(&row) {
+                break; // reached another branch's line
+            }
+            chain.push(row);
+            cur = graph.rows[row]
+                .commit
+                .parents
+                .first()
+                .and_then(|p| index.get(p).copied());
+        }
+        if chain.is_empty() {
+            return; // nothing of our own to colour — don't burn a slot
+        }
+        let next_slot = slot_of_key.len();
+        let slot = *slot_of_key.entry(key).or_insert(next_slot);
+        for row in chain {
+            color_of.insert(row, slot);
+        }
+    };
+
+    for seed in seeds {
+        let tip = index.get(&seed.target).copied();
+        claim(tip, seed.name.clone(), &mut color_of, &mut slot_of_key);
+    }
+    // Synthetic fallback: any commit still unowned, top-to-bottom, starts a line
+    // keyed by its own short hash so the slot is stable.
+    for row in 0..graph.rows.len() {
+        if color_of.contains_key(&row) {
+            continue;
+        }
+        let key = format!("~{}", graph.rows[row].commit.id.short());
+        claim(Some(row), key, &mut color_of, &mut slot_of_key);
+    }
+
+    for row in &mut graph.rows {
+        row.color = color_of.get(&row.row).copied().unwrap_or(0);
+    }
+}
+
+/// Attach each ref to the row of the commit it points at, so the UI can badge it.
+/// Refs whose target is outside the walked window are dropped (nothing to badge).
+fn attach_ref_badges(graph: &mut Graph, refs: Vec<GitRef>) {
+    let index: HashMap<Oid, usize> = graph
+        .rows
+        .iter()
+        .map(|r| (r.commit.id.clone(), r.row))
+        .collect();
+    for r in refs {
+        if let Some(&row) = index.get(&r.target) {
+            graph.rows[row].refs.push(r);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Oid;
+    use crate::model::{Oid, RefKind};
+
+    fn gitref(name: &str, kind: RefKind, target: &str) -> GitRef {
+        GitRef {
+            name: name.into(),
+            kind,
+            target: Oid(target.into()),
+        }
+    }
+
+    fn color_of(g: &Graph, id: &str) -> usize {
+        g.rows.iter().find(|r| r.commit.id.0 == id).unwrap().color
+    }
+
+    fn ref_names(g: &Graph, id: &str) -> Vec<String> {
+        g.rows
+            .iter()
+            .find(|r| r.commit.id.0 == id)
+            .unwrap()
+            .refs
+            .iter()
+            .map(|r| r.name.clone())
+            .collect()
+    }
 
     fn commit(id: &str, parents: &[&str]) -> CommitSummary {
         CommitSummary {
@@ -527,5 +683,112 @@ mod tests {
                 to_lane: 0
             }
         );
+    }
+
+    #[test]
+    fn linear_history_is_one_colour() {
+        let g = layout(vec![
+            commit("c", &["b"]),
+            commit("b", &["a"]),
+            commit("a", &[]),
+        ]);
+        // Nothing branches, so every commit shares branch colour 0.
+        assert!(
+            g.rows.iter().all(|r| r.color == 0),
+            "one branch, one colour"
+        );
+    }
+
+    #[test]
+    fn each_branch_gets_its_own_stable_colour() {
+        // HEAD on main; a feature branch tip at D. Main's first-parent chain
+        // (M→C→B→A) is one colour; the feature line (D) is a different one.
+        //
+        //   M        merge[C, D]
+        //   |\
+        //   C D      (D = feature tip)
+        //   |/
+        //   B
+        //   |
+        //   A
+        let g = layout_with_refs(
+            vec![
+                commit("M", &["C", "D"]),
+                commit("C", &["B"]),
+                commit("D", &["B"]),
+                commit("B", &["A"]),
+                commit("A", &[]),
+            ],
+            vec![
+                gitref("HEAD", RefKind::Head, "M"),
+                gitref("main", RefKind::Branch, "M"),
+                gitref("feature", RefKind::Branch, "D"),
+            ],
+        );
+
+        // The whole mainline (incl. the shared base B/A) is HEAD's branch colour.
+        let main = color_of(&g, "M");
+        for c in ["M", "C", "B", "A"] {
+            assert_eq!(color_of(&g, c), main, "{c} is on the main line");
+        }
+        assert_eq!(main, 0, "HEAD's branch takes colour slot 0 (the trunk)");
+        // The feature commit is a different, consistent colour.
+        assert_ne!(color_of(&g, "D"), main, "the feature branch differs");
+    }
+
+    #[test]
+    fn refs_are_badged_on_their_commits_and_off_window_refs_dropped() {
+        let g = layout_with_refs(
+            vec![commit("b", &["a"]), commit("a", &[])],
+            vec![
+                gitref("HEAD", RefKind::Head, "b"),
+                gitref("main", RefKind::Branch, "b"),
+                gitref("v1", RefKind::Tag, "a"),
+                // Points outside the walked window — must be dropped, not panic.
+                gitref("old", RefKind::Branch, "zzz"),
+            ],
+        );
+        assert_eq!(ref_names(&g, "b"), vec!["HEAD", "main"]);
+        assert_eq!(ref_names(&g, "a"), vec!["v1"]);
+        assert!(
+            g.rows
+                .iter()
+                .all(|r| r.refs.iter().all(|x| x.name != "old")),
+            "off-window ref isn't attached anywhere"
+        );
+    }
+
+    #[test]
+    fn a_tag_only_side_commit_still_gets_a_colour() {
+        // A side commit S reachable only as M's second parent, with no branch ref
+        // (only a tag). It must still be coloured — via the synthetic fallback —
+        // and distinct from the trunk.
+        //
+        //   M     merge[C, S]
+        //   |\
+        //   C S   (S tagged, no branch)
+        //   |/
+        //   B
+        let g = layout_with_refs(
+            vec![
+                commit("M", &["C", "S"]),
+                commit("C", &["B"]),
+                commit("S", &["B"]),
+                commit("B", &[]),
+            ],
+            vec![
+                gitref("HEAD", RefKind::Head, "M"),
+                gitref("main", RefKind::Branch, "M"),
+                gitref("v2", RefKind::Tag, "S"),
+            ],
+        );
+        assert_eq!(ref_names(&g, "S"), vec!["v2"], "the tag still badges S");
+        assert_ne!(
+            color_of(&g, "S"),
+            color_of(&g, "M"),
+            "the un-branched side line gets its own colour"
+        );
+        // Every row is coloured (no commit left out).
+        assert_eq!(g.rows.len(), 4);
     }
 }
