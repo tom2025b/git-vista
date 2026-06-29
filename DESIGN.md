@@ -31,8 +31,10 @@ native `git-vista-server` (axum) serves the SPA + `/api/commits` and the fronten
 stays in its lane; a merged-back branch frees its lane; new branches take the
 leftmost free lane.)
 
-### Phase 5 — Commit rows & labels
-Display commit message, short hash, and author next to each node.
+### Phase 5 — Commit rows & labels ✅ (done)
+Display commit message, short hash, and author next to each node. (Two-line SVG
+labels in an aligned column right of the lanes; long messages truncated with `…`;
+labels pan/zoom with the graph.)
 
 ### Phase 6 — Robust lane assignment
 Improve the layout algorithm to properly handle branches and merges.
