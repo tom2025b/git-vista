@@ -731,12 +731,14 @@ viewport for performance).
 ## Issue #13 — Commit timestamps in the labels (2026-06-29)
 **Status:** done (frontend-only; the model already carried `CommitSummary::time`).
 **What changed:**
-- `crates/git-vista/src/datetime.rs` (new): pure, host-tested `format_ymd_hm(y,m,d,h,min)
-  -> "YYYY-MM-DD HH:MM"` (zero-padded), plus a wasm-only `local_timestamp(epoch_secs)`
-  that uses the JS `Date` to break the instant down in the **viewer's local timezone**
-  (correct per-commit incl. DST). 3 tests.
+- `crates/git-vista/src/datetime.rs` (new): pure, host-tested `format_label(y,m,d,h,
+  min,current_year)` → compact US-readable `"Jun 29 14:32"`, showing the year only
+  when it isn't the current year (`"Jun 29 2024 14:32"`); day unpadded, 24h time
+  zero-padded. Plus a wasm-only `local_timestamp(epoch_secs)` that uses the JS
+  `Date` to break the instant down in the **viewer's local timezone** (correct
+  per-commit incl. DST) and reads the current year. 4 tests.
 - `crates/git-vista/src/app.rs`: the dimmed meta label line is now
-  `"<short-hash> · <author> · <YYYY-MM-DD HH:MM>"` (was hash · author).
+  `"<short-hash> · <author> · <Jun 29 14:32>"` (was hash · author).
 - `crates/git-vista/src/main.rs`: declares `mod datetime;` (same dead-code gating
   as the other pure modules).
 - `crates/git-vista/Cargo.toml`: added `js-sys` under the wasm-target deps.
@@ -747,19 +749,21 @@ viewport for performance).
   the reader's local time is the intuitive "when was this". JS `Date` gives correct
   local + DST per commit.
 - **Split pure/impure** to match the codebase: string assembly is host-tested
-  (`format_ymd_hm`); only the `Date` getters are wasm-only (`local_timestamp`,
+  (`format_label`); only the `Date` getters are wasm-only (`local_timestamp`,
   `#[cfg(target_arch = "wasm32")]`), so host tests don't touch js-sys.
-- Format is `YYYY-MM-DD HH:MM` (no seconds) — enough to read the timeline; full
-  precision can go in a hover later if wanted.
+- **Compact US format `"Jun 29 14:32"`, year hidden unless not current year**
+  (per user request 2026-06-29; the first cut used `YYYY-MM-DD HH:MM`, which read
+  wrong for US users). 24h time; seconds omitted — full precision could go in a
+  hover later if wanted.
 
 **Verify:**
 ```sh
-cargo test -p git-vista     # 22 pass (+3 datetime)
+cargo test -p git-vista     # 23 pass (+4 datetime)
 cargo clippy -p git-vista --target wasm32-unknown-unknown   # clean
 ( cd crates/git-vista && trunk build )                      # wasm bundle builds
 ```
 Browser-confirmed (Playwright over the served bundle): meta lines render e.g.
-`6edb5b5 · tomb · 2026-06-29 03:28`; all sampled rows match `… · YYYY-MM-DD HH:MM`.
+`6edb5b5 · tomb · Jun 29 03:28` (current-year rows show no year).
 
 **Next:** Phase 8 — Viewport virtualization (only render commits visible in the
 viewport for performance).
