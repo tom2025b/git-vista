@@ -183,6 +183,7 @@ fn layout_topology(commits: Vec<CommitSummary>) -> Graph {
         edges,
         lane_count,
         repo_url: None,
+        remote_commits: Vec::new(),
     }
 }
 

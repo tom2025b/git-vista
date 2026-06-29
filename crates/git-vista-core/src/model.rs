@@ -104,6 +104,13 @@ pub struct Graph {
     /// after layout (the pure layout doesn't know about remotes).
     #[serde(default)]
     pub repo_url: Option<String>,
+    /// Commit ids (hex) reachable from a remote-tracking ref — i.e. the commits
+    /// actually on the remote (GitHub). The UI links a commit/ref only when its
+    /// commit is in this set, so links never point at unpushed objects that would
+    /// 404; unpushed ones are shown dimmed and non-clickable. Empty when there's
+    /// no remote. Set by the backend after layout, alongside `repo_url`.
+    #[serde(default)]
+    pub remote_commits: Vec<String>,
 }
 
 #[cfg(test)]
