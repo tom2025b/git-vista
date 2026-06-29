@@ -18,12 +18,13 @@ use wasm_bindgen::JsCast;
 
 use gloo_net::http::Request;
 
-use git_vista_core::model::Graph;
+use git_vista_core::model::{Graph, RefKind};
 
 use crate::camera::{Camera, ZOOM_STEP};
-use crate::color::{lane_color, MERGE_FILL};
+use crate::color::{branch_color, BADGE_DARK, HEAD_BADGE, MERGE_FILL, TAG_BADGE};
 use crate::geometry::{
-    edge_path, label_bottom_y, label_top_y, label_x, node_cx, node_cy, NODE_RADIUS,
+    badge_text_dx, badge_text_y, badge_top_y, badge_width, edge_path, label_bottom_y, label_top_y,
+    label_x, node_cx, node_cy, BADGE_GAP, BADGE_HEIGHT, BADGE_RADIUS, NODE_RADIUS,
 };
 use crate::text::truncate;
 
@@ -71,15 +72,20 @@ pub fn App() -> impl IntoView {
 
 /// Render a loaded [`Graph`] as a pan/zoomable SVG canvas.
 fn graph_canvas(graph: Graph) -> impl IntoView {
+    // Per-branch colour slot for each row, indexed by row number (rows are stored
+    // in row order), so an edge can pick up its parent's branch colour.
+    let row_color: Vec<usize> = graph.rows.iter().map(|gr| gr.color).collect();
+
     // Edges first so the nodes paint on top of them.
     let edges = graph
         .edges
         .iter()
         .map(|e| {
             let d = edge_path(e);
-            // Colour a link by the busier of its two lanes: a branch/merge takes
-            // the side-branch colour, a straight link keeps its own.
-            let color = lane_color(e.from_lane.max(e.to_lane));
+            // Colour a link by the branch of its parent (the lower endpoint): a
+            // first-parent link keeps the branch colour, a merge link takes the
+            // merged-in branch's colour — consistent with its commits.
+            let color = branch_color(row_color[e.to_row]);
             view! {
                 <path d=d fill="none" stroke=color stroke-width="2" stroke-linecap="round" />
             }
@@ -92,7 +98,7 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
         .map(|gr| {
             let cx = node_cx(gr.lane);
             let cy = node_cy(gr.row);
-            let color = lane_color(gr.lane);
+            let color = branch_color(gr.color);
             // Draw merge commits as a hollow ring so they stand out from the
             // ordinary filled dots.
             let merge = gr.commit.is_merge();
@@ -114,17 +120,64 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
         .collect_view();
 
     // Commit labels: a fixed text column to the right of the lanes, two lines per
-    // row — the (truncated) message on top, the short hash and author dimmed
-    // below. The full message stays available on hover.
+    // row — any ref badges then the (truncated) message on top, the short hash and
+    // author dimmed below. The full message stays available on hover.
     let text_x = label_x(graph.lane_count);
     let labels = graph
         .rows
         .iter()
         .map(|gr| {
+            // Lay any ref badges out left-to-right from the start of the label
+            // column; the message then starts just past them (or at the column
+            // edge when there are none).
+            let mut bx = text_x;
+            let badges = gr
+                .refs
+                .iter()
+                .map(|r| {
+                    let w = badge_width(&r.name);
+                    let x = bx;
+                    bx += w + BADGE_GAP;
+                    // Branch badges take their branch's colour (filled for local,
+                    // outlined for remote); HEAD and tags get fixed colours.
+                    let branch = branch_color(gr.color);
+                    let (fill, stroke, text_fill) = match r.kind {
+                        RefKind::Head => (HEAD_BADGE, HEAD_BADGE, BADGE_DARK),
+                        RefKind::Tag => (TAG_BADGE, TAG_BADGE, BADGE_DARK),
+                        RefKind::Branch => (branch, branch, BADGE_DARK),
+                        RefKind::RemoteBranch => ("none", branch, branch),
+                    };
+                    let name = r.name.clone();
+                    view! {
+                        <rect
+                            x=x
+                            y=badge_top_y(gr.row)
+                            width=w
+                            height=BADGE_HEIGHT
+                            rx=BADGE_RADIUS
+                            ry=BADGE_RADIUS
+                            fill=fill
+                            stroke=stroke
+                            stroke-width="1"
+                        />
+                        <text
+                            x=x + badge_text_dx()
+                            y=badge_text_y(gr.row)
+                            class="badge-text"
+                            fill=text_fill
+                        >
+                            {name}
+                        </text>
+                    }
+                })
+                .collect_view();
+            let msg_x = bx; // past the last badge, or text_x when there were none
+
             let msg = truncate(&gr.commit.summary, MAX_SUMMARY_CHARS);
             let meta = format!("{} · {}", gr.commit.id.short(), gr.commit.author);
             view! {
-                <text x=text_x y=label_top_y(gr.row) class="label-msg">
+                {badges}
+                <text x=msg_x y=label_top_y(gr.row) class="label-msg">
                     {msg}
                     <title>{gr.commit.summary.clone()}</title>
                 </text>

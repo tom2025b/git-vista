@@ -21,6 +21,21 @@ pub const PAD_Y: i32 = 28;
 // Horizontal gap between the rightmost lane and the start of the label column.
 pub const LABEL_GAP: i32 = 18;
 
+// Ref badges (Phase 7): small pills drawn at the start of the label column,
+// before the commit message. The font is monospace, so a glyph's advance is a
+// fixed fraction of the font size and badge widths can be computed exactly.
+// Used only by the wasm-only `app` view, so they read as dead on host/test builds.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub const BADGE_HEIGHT: i32 = 16;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub const BADGE_RADIUS: i32 = 4;
+// Horizontal gap between adjacent badges (and after the last one, before text).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub const BADGE_GAP: i32 = 5;
+// Per-character advance and inner horizontal padding, in px (monospace @ ~11px).
+const BADGE_CHAR_W: i32 = 7;
+const BADGE_PAD_X: i32 = 6;
+
 /// Centre x of a node in the given lane.
 pub fn node_cx(lane: usize) -> i32 {
     PAD_X + lane as i32 * LANE_WIDTH
@@ -47,6 +62,30 @@ pub fn label_top_y(row: usize) -> i32 {
 /// Baseline y of a row's second (hash · author) label line — just below centre.
 pub fn label_bottom_y(row: usize) -> i32 {
     node_cy(row) + 12
+}
+
+/// Pixel width of a badge holding `text`, from the monospace glyph advance plus
+/// padding on both sides. Used to lay badges out left-to-right and to know how
+/// far to push the commit message past them.
+pub fn badge_width(text: &str) -> i32 {
+    text.chars().count() as i32 * BADGE_CHAR_W + 2 * BADGE_PAD_X
+}
+
+/// Left inset of a badge's text from its left edge.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn badge_text_dx() -> i32 {
+    BADGE_PAD_X
+}
+
+/// Top y of a row's badge pills — they sit on the message (top) label line,
+/// clear of the hash·author line below.
+pub fn badge_top_y(row: usize) -> i32 {
+    node_cy(row) - 12
+}
+
+/// Baseline y of a badge's text, vertically centred in the pill.
+pub fn badge_text_y(row: usize) -> i32 {
+    node_cy(row) - 1
 }
 
 /// SVG path data for a commit->parent edge. Same-lane links are a straight
@@ -83,6 +122,17 @@ mod tests {
         // The two text baselines bracket the node centre.
         assert!(label_top_y(2) < node_cy(2));
         assert!(label_bottom_y(2) > node_cy(2));
+    }
+
+    #[test]
+    fn badge_width_grows_with_text_and_has_padding() {
+        // Empty badge is just the two-sided padding; each char adds a fixed width.
+        assert_eq!(badge_width(""), 2 * BADGE_PAD_X);
+        assert_eq!(badge_width("ab"), 2 * BADGE_CHAR_W + 2 * BADGE_PAD_X);
+        assert!(badge_width("main") > badge_width("v1"));
+        // Pills sit on the top label line, above the hash·author line.
+        assert!(badge_top_y(2) < label_top_y(2));
+        assert!(badge_text_y(2) < label_bottom_y(2));
     }
 
     #[test]

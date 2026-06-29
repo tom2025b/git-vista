@@ -46,8 +46,16 @@ Handles octopus merges, reuses freed lanes for sequential branches, and keeps
 concurrent branches in distinct lanes. 8 layout tests cover linear, branch+merge,
 octopus, sequential reuse, concurrent branches, and stable-lane continuity.)
 
-### Phase 7 — Refs & colors
-Show branch names, HEAD, tags, and assign consistent colors per branch.
+### Phase 7 — Refs & colors ✅ (done)
+Show branch names, HEAD, tags, and assign consistent colors per branch. (The
+native `git-vista-git` crate gained `read_refs` — HEAD + local/remote branches +
+tags, each peeled to a commit. `git-vista-core::layout::layout_with_refs` attaches
+each ref as a badge on its commit and colours every commit by the branch that owns
+its first-parent chain — a **stable per-branch colour** that's the same wherever
+the branch appears, independent of lane reuse (HEAD's branch takes the trunk
+colour; un-branched side lines fall back to a synthetic colour so every commit is
+coloured). The frontend renders branch/tag/HEAD pills beside each commit and
+colours nodes/edges by branch.)
 
 ### Phase 8 — Viewport virtualization
 Only render commits currently visible in the viewport for performance.

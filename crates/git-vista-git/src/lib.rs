@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use gix::refs::Category;
 use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
 
-use git_vista_core::model::{CommitSummary, Oid};
+use git_vista_core::model::{CommitSummary, GitRef, Oid, RefKind};
 
 #[derive(Debug, Error)]
 pub enum RepoError {
@@ -111,6 +112,70 @@ pub fn walk_history(path: &Path, limit: usize) -> Result<Vec<CommitSummary>, Rep
     }
 
     Ok(commits)
+}
+
+/// Read the repository's refs — HEAD, local & remote branches, and tags — each
+/// peeled to the commit it ultimately points at, for badging and per-branch
+/// colouring in the UI.
+///
+/// HEAD is always emitted (as [`RefKind::Head`], named `"HEAD"`) when it resolves
+/// to a commit, whether it's on a branch or detached; when it's on a branch the
+/// branch is emitted too, so a tip shows both. Refs that don't resolve to a
+/// commit (an unborn HEAD, a broken ref) are skipped. Notes and worktree-private
+/// refs are ignored.
+pub fn read_refs(path: &Path) -> Result<Vec<GitRef>, RepoError> {
+    let repo = gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+
+    let mut refs = Vec::new();
+
+    // HEAD first, so it's the leading badge on its commit.
+    if let Ok(head) = repo.head() {
+        if let Some(id) = head.id() {
+            refs.push(GitRef {
+                name: "HEAD".to_string(),
+                kind: RefKind::Head,
+                target: Oid(id.detach().to_string()),
+            });
+        }
+    }
+
+    if let Ok(platform) = repo.references() {
+        if let Ok(all) = platform.all() {
+            for mut reference in all.filter_map(Result::ok) {
+                // Classify by ref category, keeping only branches and tags. The
+                // short name (owned now, before we consume the reference) is the
+                // badge text: "main", "origin/main", "v1.0.0".
+                let (kind, name) = match reference.name().category_and_short_name() {
+                    Some((Category::LocalBranch, short)) => (RefKind::Branch, short.to_string()),
+                    Some((Category::RemoteBranch, short)) => {
+                        let name = short.to_string();
+                        // Skip the remote's symbolic default-branch pointer
+                        // (`refs/remotes/<remote>/HEAD`): it just mirrors another
+                        // branch and isn't a branch tip worth badging.
+                        if name.ends_with("/HEAD") {
+                            continue;
+                        }
+                        (RefKind::RemoteBranch, name)
+                    }
+                    Some((Category::Tag, short)) => (RefKind::Tag, short.to_string()),
+                    _ => continue, // HEAD pseudo-ref, notes, worktree-private, …
+                };
+                // Peel through tag objects to the commit the ref resolves to.
+                if let Ok(id) = reference.peel_to_id() {
+                    refs.push(GitRef {
+                        name,
+                        kind,
+                        target: Oid(id.detach().to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(refs)
 }
 
 #[cfg(test)]
@@ -237,5 +302,34 @@ mod tests {
         // Still the three newest.
         assert_eq!(history[0].summary, "E merge feature");
         assert_eq!(history[2].summary, "C third");
+    }
+
+    #[test]
+    fn read_refs_sees_head_branches_and_tags() {
+        let dir = fixture();
+        let p = dir.path();
+        // Tag the root commit so there's a tag to find.
+        git(p, &["tag", "v1.0", "HEAD~2"]);
+        let refs = read_refs(p).unwrap();
+
+        let names = |k: RefKind| {
+            let mut v: Vec<String> = refs
+                .iter()
+                .filter(|r| r.kind == k)
+                .map(|r| r.name.clone())
+                .collect();
+            v.sort();
+            v
+        };
+
+        // HEAD is emitted exactly once, both branches and the tag are seen.
+        assert_eq!(names(RefKind::Head), vec!["HEAD"]);
+        assert_eq!(names(RefKind::Branch), vec!["feature", "main"]);
+        assert_eq!(names(RefKind::Tag), vec!["v1.0"]);
+
+        // On `main`, so HEAD resolves to the same commit as the `main` branch.
+        let head = refs.iter().find(|r| r.kind == RefKind::Head).unwrap();
+        let main = refs.iter().find(|r| r.name == "main").unwrap();
+        assert_eq!(head.target, main.target);
     }
 }
