@@ -41,6 +41,24 @@ cargo build -p git-vista-tauri               # native shell compiles
 ( cd crates/git-vista && trunk build )       # frontend → wasm in dist/
 ```
 
+## Running the app — the `gv` launcher & choosing which repo to view
+The repo to visualise is **no longer hardcoded**. `git-vista-server <path>` takes
+the repo as its first CLI arg (falling back to this checkout when omitted) — this
+closes the Phase 4/5 "make the repo path configurable" open item.
+
+The convenience launcher is **`gv`** (script at repo root `/home/tom/projects/git-vista/gv`,
+symlinked onto PATH at `~/.local/bin/gv` — NOT a shell alias, the user explicitly
+didn't want `~/.zshrc` touched). It builds the wasm bundle, kills any stale server,
+then runs the server for a repo:
+```sh
+gv                  # visualise the CURRENT directory's repo
+gv ~/code/myproj    # visualise another repo by path
+gv --no-build       # skip the wasm rebuild (fast restart); path arg optional too
+```
+`gv` validates the target is a git repo, resolves it to an absolute path, and
+passes it to the server. It finds the git-vista checkout via `readlink -f` on its
+own path, so it works through the PATH symlink from any directory.
+
 ## Troubleshooting — dev server unreachable from the iPad/another device
 **Symptom:** `http://localhost:8080/` works on the dev machine, but the iPad shows
 "the page cannot be reached." The server is fine; something between the devices is
@@ -73,11 +91,17 @@ if the port is already in use or the `dist/` bundle is missing.
 **Cause:** a previous `git-vista-server` instance is still running and holding port
 **8080**. The sandbox kills the new process, which surfaces as exit 144.
 
-**Fix:** kill the stale server before starting a new one:
+**Fix:** kill the stale server before starting a new one — **with `-f`**:
 ```sh
-pkill -9 git-vista-server
+pkill -9 -f git-vista-server
 ```
-Then run the server again.
+⚠️ **`pkill -9 git-vista-server` (no `-f`) silently matches NOTHING** and was the
+real reason this kept biting across sessions. The Linux process name (`comm`) is
+truncated to 15 chars — `git-vista-serve` — so the 16-char pattern never matches
+(pgrep even warns: *"pattern that searches for process name longer than 15
+characters will result in zero matches"*). `-f` matches the full command line
+(`target/.../git-vista-server`), which works. The `gv` launcher script does this.
+Confirm it's actually gone with `ss -ltn | grep 8080` (should be empty) before retrying.
 
 > Note (background-job sandbox): in the automated background-job sandbox, even a
 > *first* server start (port free) can exit 144, because that sandbox blocks
