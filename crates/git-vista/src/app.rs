@@ -54,7 +54,7 @@ pub fn App() -> impl IntoView {
         <main class="app">
             <header class="topbar">
                 <h1>"git-vista"</h1>
-                <span class="subtitle">"vertical git history — drag to pan, scroll to zoom"</span>
+                <span class="subtitle">"vertical git history — drag to pan, pinch or scroll to zoom"</span>
             </header>
             <section class="graph">
                 {move || match graph.get() {
@@ -188,31 +188,105 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
         })
         .collect_view();
 
-    // Camera (pan/zoom) state, plus whether a drag is currently in progress.
+    // Camera (pan/zoom) state.
     let camera = create_rw_signal(Camera::default());
+    // Whether any pointer is currently pressed (drives the grab/grabbing cursor).
     let dragging = create_rw_signal(false);
 
-    // Press: begin a drag and capture the pointer so moves keep arriving even
-    // if the cursor leaves the SVG mid-drag.
+    // --- Gesture tracking on Pointer Events ---------------------------------
+    // Pointer Events unify mouse, pen and touch — crucially they fire for touch
+    // on iOS Safari, where the old `movementX/Y`-on-mousemove + `wheel` approach
+    // was dead (Safari reports `movementX/Y` as 0 for touch, and pinch never
+    // raises a wheel event). We track every pressed pointer's position ourselves
+    // and derive the gesture from how many are down:
+    //   * one pointer  -> pan by the change in its position (finger or mouse);
+    //   * two pointers -> pinch-zoom by the change in the distance between them,
+    //                     anchored at their midpoint.
+    // `touch-action: none` (styles.css) hands the browser's default touch
+    // gestures to us so these fire cleanly.
+    //
+    // State is held in `store_value` (plain mutable cells, no reactivity needed):
+    // the live list of `(pointer_id, x, y)` in client coords, and the previous
+    // finger distance during a pinch.
+    let pointers = store_value(Vec::<(i32, f64, f64)>::new());
+    let pinch_dist = store_value(Option::<f64>::None);
+
+    // The SVG's top-left in client coords, so a client position can be made
+    // SVG-local for zoom anchoring (1 unit = 1px, no viewBox, so it's a shift).
+    let svg_origin = |ev: &web_sys::PointerEvent| -> (f64, f64) {
+        ev.current_target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+            .map(|el| {
+                let r = el.get_bounding_client_rect();
+                (r.left(), r.top())
+            })
+            .unwrap_or((0.0, 0.0))
+    };
+
+    // Press: record the pointer and capture it so moves keep arriving even if the
+    // finger/cursor strays outside the SVG mid-gesture.
     let on_pointerdown = move |ev: web_sys::PointerEvent| {
-        if let Some(target) = ev.target() {
+        if let Some(target) = ev.current_target() {
             if let Ok(el) = target.dyn_into::<web_sys::Element>() {
                 let _ = el.set_pointer_capture(ev.pointer_id());
             }
         }
+        let id = ev.pointer_id();
+        let (x, y) = (ev.client_x() as f64, ev.client_y() as f64);
+        pointers.update_value(|ps| match ps.iter_mut().find(|p| p.0 == id) {
+            Some(slot) => *slot = (id, x, y),
+            None => ps.push((id, x, y)),
+        });
+        // A new finger starting a pinch: reset the baseline so the first
+        // two-pointer move just samples the distance rather than jumping.
+        pinch_dist.set_value(None);
         dragging.set(true);
     };
-    // Move: while dragging, pan by the pointer's per-event delta (1:1 with the
-    // cursor, regardless of zoom).
+
+    // Move: update this pointer's position, then pan or pinch by how it changed.
     let on_pointermove = move |ev: web_sys::PointerEvent| {
-        if dragging.get() {
-            camera.update(|c| *c = c.panned(ev.movement_x() as f64, ev.movement_y() as f64));
+        let id = ev.pointer_id();
+        let (x, y) = (ev.client_x() as f64, ev.client_y() as f64);
+        let (ox, oy) = svg_origin(&ev);
+
+        // Previous position of this pointer, then store the new one.
+        let prev = pointers.with_value(|ps| ps.iter().find(|p| p.0 == id).map(|p| (p.1, p.2)));
+        pointers.update_value(|ps| {
+            if let Some(slot) = ps.iter_mut().find(|p| p.0 == id) {
+                *slot = (id, x, y);
+            }
+        });
+
+        let count = pointers.with_value(|ps| ps.len());
+        if count >= 2 {
+            // Pinch: zoom by the change in distance between the first two
+            // pointers, anchored at their (SVG-local) midpoint.
+            let (a, b) = pointers.with_value(|ps| (ps[0], ps[1]));
+            let dist = ((a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)).sqrt();
+            let (mx, my) = ((a.1 + b.1) / 2.0 - ox, (a.2 + b.2) / 2.0 - oy);
+            let prev_dist = pinch_dist.get_value().unwrap_or(0.0);
+            camera.update(|c| *c = c.pinched(prev_dist, dist, mx, my));
+            pinch_dist.set_value(Some(dist));
+        } else if let Some((px, py)) = prev {
+            // Pan: 1:1 with the pointer's movement, independent of zoom.
+            camera.update(|c| *c = c.panned(x - px, y - py));
         }
     };
-    // Release / cancel: end the drag.
-    let on_pointerup = move |_ev: web_sys::PointerEvent| dragging.set(false);
 
-    // Wheel: zoom toward the cursor. Up/away zooms in, down/toward zooms out.
+    // Release / cancel: drop the pointer; end the drag once none remain. Reset
+    // the pinch baseline so lifting one of two fingers doesn't make the next move
+    // jump.
+    let on_pointerup = move |ev: web_sys::PointerEvent| {
+        let id = ev.pointer_id();
+        pointers.update_value(|ps| ps.retain(|p| p.0 != id));
+        pinch_dist.set_value(None);
+        if pointers.with_value(|ps| ps.is_empty()) {
+            dragging.set(false);
+        }
+    };
+
+    // Wheel: zoom toward the cursor on desktop (trackpad/mouse). Up/away zooms
+    // in, down/toward zooms out. Touch pinch is handled above, not here.
     let on_wheel = move |ev: web_sys::WheelEvent| {
         ev.prevent_default(); // don't let the page scroll
         let factor = if ev.delta_y() < 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };

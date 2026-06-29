@@ -64,6 +64,18 @@ impl Camera {
         let ty = sy - (sy - self.ty) * f;
         Self { tx, ty, scale }
     }
+
+    /// Zoom from a two-finger pinch: the scale changes by the ratio of the
+    /// current finger distance to the previous one, anchored at the pinch
+    /// midpoint `(mx, my)` (screen-local coords) so the point between the fingers
+    /// stays put. A non-positive `prev_dist` (no prior sample) is a no-op, so the
+    /// first move of a pinch just establishes the baseline distance.
+    pub fn pinched(self, prev_dist: f64, cur_dist: f64, mx: f64, my: f64) -> Self {
+        if prev_dist <= 0.0 {
+            return self;
+        }
+        self.zoomed_at(cur_dist / prev_dist, mx, my)
+    }
 }
 
 #[cfg(test)]
@@ -99,5 +111,33 @@ mod tests {
     fn zoom_clamps_to_the_limits() {
         assert_eq!(Camera::default().zoomed_at(1000.0, 0.0, 0.0).scale, MAX_ZOOM);
         assert_eq!(Camera::default().zoomed_at(0.0001, 0.0, 0.0).scale, MIN_ZOOM);
+    }
+
+    #[test]
+    fn pinch_scales_by_finger_distance_ratio() {
+        // Fingers spreading from 100px to 200px apart doubles the scale.
+        let c = Camera::default().pinched(100.0, 200.0, 0.0, 0.0);
+        assert!((c.scale - 2.0).abs() < 1e-9);
+        // Pinching closed (200 -> 100) halves it.
+        let c = Camera { scale: 2.0, ..Camera::default() }.pinched(200.0, 100.0, 0.0, 0.0);
+        assert!((c.scale - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pinch_with_no_baseline_is_a_noop() {
+        // The first move of a pinch has no previous distance yet.
+        let c = Camera { tx: 5.0, ty: 6.0, scale: 1.5 };
+        assert_eq!(c.pinched(0.0, 120.0, 10.0, 10.0), c);
+    }
+
+    #[test]
+    fn pinch_keeps_the_midpoint_anchored() {
+        let c = Camera { tx: 3.0, ty: 7.0, scale: 1.0 };
+        let (mx, my) = (50.0, 30.0);
+        let cx = (mx - c.tx) / c.scale; // content point under the midpoint
+        let cy = (my - c.ty) / c.scale;
+        let z = c.pinched(100.0, 150.0, mx, my);
+        assert!((z.tx + z.scale * cx - mx).abs() < 1e-9);
+        assert!((z.ty + z.scale * cy - my).abs() < 1e-9);
     }
 }
