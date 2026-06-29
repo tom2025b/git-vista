@@ -98,6 +98,12 @@ pub struct Graph {
     pub edges: Vec<Edge>,
     /// Number of lanes (columns) used — the UI sizes the gutter from this.
     pub lane_count: usize,
+    /// Web base URL of the repo's GitHub `origin`, e.g.
+    /// `"https://github.com/owner/repo"`, when it has one. The UI links commits
+    /// and refs under it; `None` => labels stay plain text. Set by the backend
+    /// after layout (the pure layout doesn't know about remotes).
+    #[serde(default)]
+    pub repo_url: Option<String>,
 }
 
 #[cfg(test)]

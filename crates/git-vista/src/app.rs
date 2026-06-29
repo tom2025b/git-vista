@@ -33,6 +33,10 @@ use crate::text::truncate;
 /// (the full text stays available via the node/label hover tooltip).
 const MAX_SUMMARY_CHARS: usize = 60;
 
+/// Pointer travel (CSS px) past which a press becomes a pan/drag rather than a
+/// tap. Keeps a tap-to-open-link from being eaten by the pan handler.
+const DRAG_THRESHOLD: f64 = 4.0;
+
 /// Fetch the laid-out graph from the backend. Relative URL → same origin as the
 /// served SPA, so no CORS and no hardcoded host.
 async fn fetch_graph() -> Result<Graph, String> {
@@ -76,6 +80,24 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
     // Per-branch colour slot for each row, indexed by row number (rows are stored
     // in row order), so an edge can pick up its parent's branch colour.
     let row_color: Vec<usize> = graph.rows.iter().map(|gr| gr.color).collect();
+
+    // GitHub web base (e.g. "https://github.com/owner/repo"), if this repo has a
+    // github.com origin. `Some` => commit messages and ref badges become links;
+    // `None` => they stay plain text. (Issue #12.)
+    let repo_url = graph.repo_url.clone();
+    // Whether the current gesture has become a drag (set in pointermove). Defined
+    // here so the link click handlers below can ignore the click that ends a drag.
+    let moved = store_value(false);
+    // Open `url` in a new tab — used by the commit/ref links, suppressed when the
+    // click is really the tail of a drag.
+    let open_link = move |url: String| {
+        if moved.get_value() {
+            return;
+        }
+        if let Some(win) = web_sys::window() {
+            let _ = win.open_with_url_and_target(&url, "_blank");
+        }
+    };
 
     // Edges first so the nodes paint on top of them.
     let edges = graph
@@ -149,6 +171,23 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
                         RefKind::RemoteBranch => ("none", branch, branch),
                     };
                     let name = r.name.clone();
+                    // Where this badge links on GitHub (Issue #12): branches/tags
+                    // to their tree page, HEAD to the commit it points at. A remote
+                    // branch's leading "<remote>/" is stripped to the branch name.
+                    let badge_url = repo_url.as_ref().map(|base| match r.kind {
+                        RefKind::Head => format!("{base}/commit/{}", gr.commit.id.0),
+                        RefKind::Tag | RefKind::Branch => format!("{base}/tree/{}", r.name),
+                        RefKind::RemoteBranch => {
+                            let branch = r.name.split_once('/').map_or(r.name.as_str(), |(_, b)| b);
+                            format!("{base}/tree/{branch}")
+                        }
+                    });
+                    let clickable = badge_url.is_some();
+                    let click = move |_| {
+                        if let Some(u) = &badge_url {
+                            open_link(u.clone());
+                        }
+                    };
                     view! {
                         <rect
                             x=x
@@ -160,12 +199,16 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
                             fill=fill
                             stroke=stroke
                             stroke-width="1"
+                            class:clickable=clickable
+                            on:click=click.clone()
                         />
                         <text
                             x=x + badge_text_dx()
                             y=badge_text_y(gr.row)
                             class="badge-text"
+                            class:clickable=clickable
                             fill=text_fill
+                            on:click=click
                         >
                             {name}
                         </text>
@@ -182,9 +225,25 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
                 gr.commit.author,
                 local_timestamp(gr.commit.time),
             );
+            // The message links to the commit page on GitHub (Issue #12).
+            let msg_url = repo_url
+                .as_ref()
+                .map(|base| format!("{base}/commit/{}", gr.commit.id.0));
+            let msg_clickable = msg_url.is_some();
+            let msg_click = move |_| {
+                if let Some(u) = &msg_url {
+                    open_link(u.clone());
+                }
+            };
             view! {
                 {badges}
-                <text x=msg_x y=label_top_y(gr.row) class="label-msg">
+                <text
+                    x=msg_x
+                    y=label_top_y(gr.row)
+                    class="label-msg"
+                    class:clickable=msg_clickable
+                    on:click=msg_click
+                >
                     {msg}
                     <title>{gr.commit.summary.clone()}</title>
                 </text>
@@ -213,10 +272,15 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
     // gestures to us so these fire cleanly.
     //
     // State is held in `store_value` (plain mutable cells, no reactivity needed):
-    // the live list of `(pointer_id, x, y)` in client coords, and the previous
-    // finger distance during a pinch.
+    // the live list of `(pointer_id, x, y)` in client coords, the previous finger
+    // distance during a pinch, where the gesture started, and whether it has yet
+    // moved far enough to count as a drag (vs a tap).
     let pointers = store_value(Vec::<(i32, f64, f64)>::new());
     let pinch_dist = store_value(Option::<f64>::None);
+    let down_xy = store_value(Option::<(f64, f64)>::None);
+    // `moved` (declared at the top of this fn) distinguishes a drag/pinch from a
+    // tap: until the pointer travels past DRAG_THRESHOLD we neither pan nor
+    // capture, so a tap reaches the child element's link click handler.
 
     // The SVG's top-left in client coords, so a client position can be made
     // SVG-local for zoom anchoring (1 unit = 1px, no viewBox, so it's a shift).
@@ -230,24 +294,24 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
             .unwrap_or((0.0, 0.0))
     };
 
-    // Press: record the pointer and capture it so moves keep arriving even if the
-    // finger/cursor strays outside the SVG mid-gesture.
+    // Press: just record the pointer. We deliberately do NOT capture it or start a
+    // drag yet — that waits until the pointer actually moves (see pointermove), so
+    // a plain tap stays a tap and its click reaches the link underneath.
     let on_pointerdown = move |ev: web_sys::PointerEvent| {
-        if let Some(target) = ev.current_target() {
-            if let Ok(el) = target.dyn_into::<web_sys::Element>() {
-                let _ = el.set_pointer_capture(ev.pointer_id());
-            }
-        }
         let id = ev.pointer_id();
         let (x, y) = (ev.client_x() as f64, ev.client_y() as f64);
+        let first = pointers.with_value(|ps| ps.is_empty());
         pointers.update_value(|ps| match ps.iter_mut().find(|p| p.0 == id) {
             Some(slot) => *slot = (id, x, y),
             None => ps.push((id, x, y)),
         });
+        if first {
+            down_xy.set_value(Some((x, y)));
+            moved.set_value(false);
+        }
         // A new finger starting a pinch: reset the baseline so the first
         // two-pointer move just samples the distance rather than jumping.
         pinch_dist.set_value(None);
-        dragging.set(true);
     };
 
     // Move: update this pointer's position, then pan or pinch by how it changed.
@@ -264,10 +328,24 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
             }
         });
 
+        // Capture now that the gesture is live, so moves keep arriving even if the
+        // pointer leaves the SVG. (Deferred to first move so taps don't capture.)
+        let capture = |ev: &web_sys::PointerEvent| {
+            if let Some(t) = ev.current_target() {
+                if let Ok(el) = t.dyn_into::<web_sys::Element>() {
+                    let _ = el.set_pointer_capture(ev.pointer_id());
+                }
+            }
+        };
+
         let count = pointers.with_value(|ps| ps.len());
         if count >= 2 {
-            // Pinch: zoom by the change in distance between the first two
-            // pointers, anchored at their (SVG-local) midpoint.
+            // Two fingers => a pinch, never a tap.
+            moved.set_value(true);
+            dragging.set(true);
+            capture(&ev);
+            // Zoom by the change in distance between the first two pointers,
+            // anchored at their (SVG-local) midpoint.
             let (a, b) = pointers.with_value(|ps| (ps[0], ps[1]));
             let dist = ((a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)).sqrt();
             let (mx, my) = ((a.1 + b.1) / 2.0 - ox, (a.2 + b.2) / 2.0 - oy);
@@ -275,14 +353,28 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
             camera.update(|c| *c = c.pinched(prev_dist, dist, mx, my));
             pinch_dist.set_value(Some(dist));
         } else if let Some((px, py)) = prev {
-            // Pan: 1:1 with the pointer's movement, independent of zoom.
-            camera.update(|c| *c = c.panned(x - px, y - py));
+            // Single pointer: only treat it as a drag once it crosses the
+            // threshold from where it started; below that it's still a tap.
+            if !moved.get_value() {
+                let far = down_xy.get_value().is_some_and(|(sx, sy)| {
+                    ((x - sx).powi(2) + (y - sy).powi(2)).sqrt() > DRAG_THRESHOLD
+                });
+                if far {
+                    moved.set_value(true);
+                    dragging.set(true);
+                    capture(&ev);
+                }
+            }
+            if moved.get_value() {
+                // Pan 1:1 with the pointer's movement, independent of zoom.
+                camera.update(|c| *c = c.panned(x - px, y - py));
+            }
         }
     };
 
     // Release / cancel: drop the pointer; end the drag once none remain. Reset
     // the pinch baseline so lifting one of two fingers doesn't make the next move
-    // jump.
+    // jump. `moved` is left for the click that may follow, and reset on next press.
     let on_pointerup = move |ev: web_sys::PointerEvent| {
         let id = ev.pointer_id();
         pointers.update_value(|ps| ps.retain(|p| p.0 != id));

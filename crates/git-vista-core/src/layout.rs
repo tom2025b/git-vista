@@ -182,6 +182,7 @@ fn layout_topology(commits: Vec<CommitSummary>) -> Graph {
         rows,
         edges,
         lane_count,
+        repo_url: None,
     }
 }
 

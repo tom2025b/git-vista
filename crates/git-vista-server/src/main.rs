@@ -127,5 +127,9 @@ async fn commits() -> Result<Json<Graph>, (StatusCode, String)> {
     let history = walk_history(repo, HISTORY_LIMIT)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let refs = read_refs(repo).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(layout::layout_with_refs(history, refs)))
+    let mut graph = layout::layout_with_refs(history, refs);
+    // Attach the GitHub web base (if this repo has a github.com origin) so the UI
+    // can link commits and refs. None => the frontend renders plain-text labels.
+    graph.repo_url = git_vista_git::github_web_base(repo);
+    Ok(Json(graph))
 }
