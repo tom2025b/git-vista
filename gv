@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# gv — build the git-vista frontend and start the server for a git repo.
+#
+# Serves the SPA + /api/commits on http://0.0.0.0:8080 (reachable from the iPad
+# over the LAN). Run it from anywhere; it locates the git-vista repo from its own
+# path and visualises whichever repo you point it at.
+#
+#   gv                  visualise the CURRENT directory's repo
+#   gv ~/code/myproj    visualise another repo by path
+#   gv --no-build       skip the wasm rebuild (fast restart)
+#   gv ~/code/myproj --no-build
+set -euo pipefail
+
+# Where you ran gv from (the repo to visualise defaults to this).
+START_DIR="$PWD"
+
+# Parse args: an optional path plus an optional --no-build, in any order.
+BUILD=1
+TARGET=""
+for arg in "$@"; do
+  case "$arg" in
+    --no-build) BUILD=0 ;;
+    -*) echo "gv: unknown option: $arg" >&2; exit 2 ;;
+    *)  TARGET="$arg" ;;
+  esac
+done
+TARGET="${TARGET:-$START_DIR}"
+
+# Resolve the target to an absolute path and confirm it's a git repo, so the
+# server doesn't just serve an empty graph for a non-repo.
+TARGET="$(cd "$TARGET" 2>/dev/null && pwd)" || { echo "gv: no such directory: $TARGET" >&2; exit 1; }
+if ! git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "gv: '$TARGET' is not a git repository" >&2
+  exit 1
+fi
+
+# git-vista repo = the directory this script lives in. `readlink -f` resolves any
+# symlinks first (e.g. a `gv` symlink on PATH) back to the real file in the repo.
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+cd "$REPO"
+
+# Avoid the "exit 144 / port 8080 already in use" trap: a stale server from a
+# previous run holds the port and the new one gets killed on bind. NOTES:
+#   * plain `pkill git-vista-server` matches NOTHING — the process name (comm) is
+#     truncated to 15 chars ("git-vista-serve"), so the 16-char pattern misses;
+#   * so we match the full command line with `-f`, and use the `[g]...` bracket
+#     trick so the pattern doesn't match this script's own command line.
+pkill -9 -f '[g]it-vista-server' 2>/dev/null || true
+
+# Build the wasm SPA the server serves from crates/git-vista/dist/. This is a
+# near-instant no-op when nothing changed, so it's safe to run every time.
+if [[ "$BUILD" -eq 1 ]]; then
+  ( cd crates/git-vista && trunk build )
+fi
+
+# Hand off to the server (exec so Ctrl-C stops it cleanly). It prints the LAN URL.
+echo "gv: visualising $TARGET"
+exec cargo run -p git-vista-server -- "$TARGET"
