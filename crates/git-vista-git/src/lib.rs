@@ -114,6 +114,64 @@ pub fn walk_history(path: &Path, limit: usize) -> Result<Vec<CommitSummary>, Rep
     Ok(commits)
 }
 
+/// The set of commit ids (hex) reachable from the repository's remote-tracking
+/// refs (`refs/remotes/*`) — i.e. the commits that are actually on a remote
+/// (GitHub). The UI links a commit/ref only when its commit is in this set, so a
+/// link never points at an unpushed object whose GitHub page would 404.
+///
+/// Mirrors [`walk_history`]'s seeding/sorting but starts only from remote tips,
+/// capped at `limit` (the same cap the displayed history uses). That cap is safe:
+/// a commit's rank among remote commits is never worse than its rank among all
+/// commits, so any displayed (newest-`limit`) commit that is on a remote falls
+/// within the newest `limit` remote commits too. Empty when there's no remote.
+pub fn read_remote_commits(path: &Path, limit: usize) -> Result<HashSet<String>, RepoError> {
+    let repo = gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+
+    let mut seen = HashSet::new();
+    let mut tips: Vec<gix::ObjectId> = Vec::new();
+    if let Ok(platform) = repo.references() {
+        if let Ok(all) = platform.all() {
+            for reference in all.filter_map(Result::ok) {
+                // Remote-tracking refs only (`refs/remotes/<remote>/…`). The
+                // remote's symbolic `…/HEAD` is harmless here — it just mirrors a
+                // branch tip we already seed from.
+                if !matches!(
+                    reference.name().category_and_short_name(),
+                    Some((Category::RemoteBranch, _))
+                ) {
+                    continue;
+                }
+                if let Ok(id) = reference.into_fully_peeled_id() {
+                    let oid = id.detach();
+                    if seen.insert(oid) {
+                        tips.push(oid);
+                    }
+                }
+            }
+        }
+    }
+
+    if tips.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let walk = repo
+        .rev_walk(tips)
+        .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst))
+        .all()
+        .map_err(|e| RepoError::Walk(e.to_string()))?;
+
+    let mut ids = HashSet::new();
+    for info in walk.take(limit) {
+        let info = info.map_err(|e| RepoError::Walk(e.to_string()))?;
+        ids.insert(info.id().detach().to_string());
+    }
+    Ok(ids)
+}
+
 /// Read the repository's refs — HEAD, local & remote branches, and tags — each
 /// peeled to the commit it ultimately points at, for badging and per-branch
 /// colouring in the UI.
@@ -344,6 +402,37 @@ mod tests {
         // Still the three newest.
         assert_eq!(history[0].summary, "E merge feature");
         assert_eq!(history[2].summary, "C third");
+    }
+
+    #[test]
+    fn remote_commits_are_just_those_reachable_from_remote_tracking_refs() {
+        let dir = fixture();
+        let p = dir.path();
+
+        // No remotes yet => nothing is "on the remote".
+        assert!(read_remote_commits(p, 100).unwrap().is_empty());
+
+        // Simulate having pushed `main` up to C only (origin/main -> C). The
+        // remote thus has A, B, C but not the later merge E nor feature's D.
+        git(p, &["update-ref", "refs/remotes/origin/main", "main~1"]);
+
+        let history = walk_history(p, 100).unwrap();
+        let id = |summary: &str| {
+            history
+                .iter()
+                .find(|c| c.summary == summary)
+                .unwrap_or_else(|| panic!("commit {summary:?} should exist"))
+                .id
+                .0
+                .clone()
+        };
+
+        let remote = read_remote_commits(p, 100).unwrap();
+        assert!(remote.contains(&id("A root")));
+        assert!(remote.contains(&id("B second")));
+        assert!(remote.contains(&id("C third")));
+        assert!(!remote.contains(&id("D on feature")), "D is unpushed");
+        assert!(!remote.contains(&id("E merge feature")), "E is unpushed");
     }
 
     #[test]
