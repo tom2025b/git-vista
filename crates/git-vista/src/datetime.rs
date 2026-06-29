@@ -7,25 +7,49 @@
 //! actual string assembly is a pure, host-tested helper so the formatting is
 //! pinned independently of the wasm-only date plumbing.
 
-/// Format already-broken-down local date/time parts as `"YYYY-MM-DD HH:MM"`.
-/// Pure and host-testable; `month`/`day` are 1-based, `hour` is 24-hour.
-pub fn format_ymd_hm(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> String {
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Format broken-down local date/time as a compact, US-readable label:
+/// `"Jun 29 14:32"`. The year is shown only when it isn't `current_year`
+/// (e.g. `"Jun 29 2024 14:32"`), so the common case stays short. `month`/`day`
+/// are 1-based; `hour` is 24-hour. Pure and host-testable.
+pub fn format_label(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    current_year: i32,
+) -> String {
+    let mon = MONTHS
+        .get(month.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("???");
+    if year == current_year {
+        format!("{mon} {day} {hour:02}:{minute:02}")
+    } else {
+        format!("{mon} {day} {year} {hour:02}:{minute:02}")
+    }
 }
 
-/// Local-timezone `"YYYY-MM-DD HH:MM"` for a Unix timestamp (seconds). wasm-only:
-/// it uses the JS `Date`, which resolves the browser's timezone (and DST) for the
-/// commit's own instant.
+/// Compact local-timezone label for a Unix timestamp (seconds), e.g.
+/// `"Jun 29 14:32"`. wasm-only: it uses the JS `Date`, which resolves the
+/// browser's timezone (and DST) for the commit's own instant, and the current
+/// year (so older commits show their year).
 #[cfg(target_arch = "wasm32")]
 pub fn local_timestamp(epoch_secs: i64) -> String {
     // JS `Date` takes milliseconds since the epoch.
     let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(epoch_secs as f64 * 1000.0));
-    format_ymd_hm(
+    let current_year = js_sys::Date::new_0().get_full_year() as i32;
+    format_label(
         d.get_full_year() as i32,
         d.get_month() + 1, // JS months are 0-based
         d.get_date(),
         d.get_hours(),
         d.get_minutes(),
+        current_year,
     )
 }
 
@@ -34,17 +58,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zero_pads_every_field() {
-        assert_eq!(format_ymd_hm(2026, 6, 9, 4, 7), "2026-06-09 04:07");
+    fn current_year_hides_the_year() {
+        assert_eq!(format_label(2026, 6, 29, 14, 32, 2026), "Jun 29 14:32");
     }
 
     #[test]
-    fn keeps_wide_fields_intact() {
-        assert_eq!(format_ymd_hm(2026, 12, 31, 23, 59), "2026-12-31 23:59");
+    fn other_year_shows_the_year() {
+        assert_eq!(format_label(2024, 6, 29, 14, 32, 2026), "Jun 29 2024 14:32");
     }
 
     #[test]
-    fn midnight_is_zeroes_not_blank() {
-        assert_eq!(format_ymd_hm(1999, 1, 1, 0, 0), "1999-01-01 00:00");
+    fn pads_time_but_not_the_day() {
+        // Single-digit day reads naturally unpadded; time stays zero-padded.
+        assert_eq!(format_label(2026, 1, 5, 4, 7, 2026), "Jan 5 04:07");
+    }
+
+    #[test]
+    fn handles_december_and_midnight() {
+        assert_eq!(format_label(2026, 12, 31, 0, 0, 2026), "Dec 31 00:00");
     }
 }
