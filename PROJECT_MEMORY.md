@@ -738,7 +738,7 @@ viewport for performance).
   `Date` to break the instant down in the **viewer's local timezone** (correct
   per-commit incl. DST) and reads the current year. 4 tests.
 - `crates/git-vista/src/app.rs`: the dimmed meta label line is now
-  `"<short-hash> · <author> · <Jun 29 14:32>"` (was hash · author).
+  `"<short-hash> · <author> · <Jun 29 2:32 PM>"` (was hash · author).
 - `crates/git-vista/src/main.rs`: declares `mod datetime;` (same dead-code gating
   as the other pure modules).
 - `crates/git-vista/Cargo.toml`: added `js-sys` under the wasm-target deps.
@@ -751,14 +751,14 @@ viewport for performance).
 - **Split pure/impure** to match the codebase: string assembly is host-tested
   (`format_label`); only the `Date` getters are wasm-only (`local_timestamp`,
   `#[cfg(target_arch = "wasm32")]`), so host tests don't touch js-sys.
-- **Compact US format `"Jun 29 14:32"`, year hidden unless not current year**
-  (per user request 2026-06-29; the first cut used `YYYY-MM-DD HH:MM`, which read
-  wrong for US users). 24h time; seconds omitted — full precision could go in a
-  hover later if wanted.
+- **Compact US format `"Jun 29 2:32 PM"`, year hidden unless not current year**
+  (per user requests 2026-06-29; first cut was `YYYY-MM-DD HH:MM` → switched to
+  `Mon D` + 12-hour AM/PM time, both at the user's request). Day unpadded, minutes
+  zero-padded, seconds omitted — full precision could go in a hover later.
 
 **Verify:**
 ```sh
-cargo test -p git-vista     # 23 pass (+4 datetime)
+cargo test -p git-vista     # 24 pass (+5 datetime)
 cargo clippy -p git-vista --target wasm32-unknown-unknown   # clean
 ( cd crates/git-vista && trunk build )                      # wasm bundle builds
 ```

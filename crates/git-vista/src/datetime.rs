@@ -12,9 +12,10 @@ const MONTHS: [&str; 12] = [
 ];
 
 /// Format broken-down local date/time as a compact, US-readable label:
-/// `"Jun 29 14:32"`. The year is shown only when it isn't `current_year`
-/// (e.g. `"Jun 29 2024 14:32"`), so the common case stays short. `month`/`day`
-/// are 1-based; `hour` is 24-hour. Pure and host-testable.
+/// `"Jun 29 2:32 PM"` (12-hour clock with AM/PM). The year is shown only when it
+/// isn't `current_year` (e.g. `"Jun 29 2024 2:32 PM"`), so the common case stays
+/// short. `month`/`day` are 1-based; `hour` is given in 24-hour form (0–23).
+/// Pure and host-testable.
 pub fn format_label(
     year: i32,
     month: u32,
@@ -27,10 +28,16 @@ pub fn format_label(
         .get(month.saturating_sub(1) as usize)
         .copied()
         .unwrap_or("???");
+    let period = if hour < 12 { "AM" } else { "PM" };
+    // 24h -> 12h: 0 and 12 both display as 12; hour is not zero-padded.
+    let h12 = match hour % 12 {
+        0 => 12,
+        h => h,
+    };
     if year == current_year {
-        format!("{mon} {day} {hour:02}:{minute:02}")
+        format!("{mon} {day} {h12}:{minute:02} {period}")
     } else {
-        format!("{mon} {day} {year} {hour:02}:{minute:02}")
+        format!("{mon} {day} {year} {h12}:{minute:02} {period}")
     }
 }
 
@@ -59,22 +66,28 @@ mod tests {
 
     #[test]
     fn current_year_hides_the_year() {
-        assert_eq!(format_label(2026, 6, 29, 14, 32, 2026), "Jun 29 14:32");
+        assert_eq!(format_label(2026, 6, 29, 14, 32, 2026), "Jun 29 2:32 PM");
     }
 
     #[test]
     fn other_year_shows_the_year() {
-        assert_eq!(format_label(2024, 6, 29, 14, 32, 2026), "Jun 29 2024 14:32");
+        assert_eq!(format_label(2024, 6, 29, 14, 32, 2026), "Jun 29 2024 2:32 PM");
     }
 
     #[test]
-    fn pads_time_but_not_the_day() {
-        // Single-digit day reads naturally unpadded; time stays zero-padded.
-        assert_eq!(format_label(2026, 1, 5, 4, 7, 2026), "Jan 5 04:07");
+    fn morning_is_am_and_day_is_unpadded() {
+        // Single-digit day reads naturally unpadded; minutes stay zero-padded.
+        assert_eq!(format_label(2026, 1, 5, 4, 7, 2026), "Jan 5 4:07 AM");
     }
 
     #[test]
-    fn handles_december_and_midnight() {
-        assert_eq!(format_label(2026, 12, 31, 0, 0, 2026), "Dec 31 00:00");
+    fn midnight_and_noon_are_twelve() {
+        assert_eq!(format_label(2026, 12, 31, 0, 0, 2026), "Dec 31 12:00 AM");
+        assert_eq!(format_label(2026, 7, 1, 12, 0, 2026), "Jul 1 12:00 PM");
+    }
+
+    #[test]
+    fn late_evening_is_pm() {
+        assert_eq!(format_label(2026, 7, 1, 23, 5, 2026), "Jul 1 11:05 PM");
     }
 }
