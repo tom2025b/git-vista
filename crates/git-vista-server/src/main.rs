@@ -15,11 +15,18 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use axum::{http::StatusCode, routing::get, Json, Router};
+use axum::response::IntoResponse;
+use axum::{
+    http::{header, HeaderValue, StatusCode},
+    routing::get,
+    Json, Router,
+};
 use git_vista_core::layout;
-use git_vista_core::model::Graph;
+use git_vista_core::model::{CommitSummary, GitRef, RefKind};
 use git_vista_git::{read_refs, walk_history};
+use tower::Layer;
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 
 // Which repository to visualise. Taken from the first CLI argument
 // (`git-vista-server <path>`), falling back to this checkout when none is given.
@@ -64,10 +71,21 @@ async fn main() {
         eprintln!("         run `(cd crates/git-vista && trunk build)` first, or pages will 404.\n");
     }
 
+    // Serve the SPA bundle with `Cache-Control: no-cache` so the browser always
+    // revalidates index.html (and thus picks up a freshly built wasm hash) instead
+    // of running a stale, cached frontend — the cache layered on top of the live
+    // git data we already keep uncacheable below. The layer wraps only the static
+    // fallback, so it never overrides the API's stronger `no-store`.
+    let spa = SetResponseHeaderLayer::overriding(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    )
+    .layer(ServeDir::new(DIST_DIR).append_index_html_on_directories(true));
+
     let app = Router::new()
         .route("/api/commits", get(commits))
         // Anything that isn't the API is served from the built SPA bundle.
-        .fallback_service(ServeDir::new(DIST_DIR).append_index_html_on_directories(true));
+        .fallback_service(spa);
 
     let listener = match tokio::net::TcpListener::bind(ADDR).await {
         Ok(l) => l,
@@ -122,11 +140,27 @@ fn lan_ip() -> Option<IpAddr> {
 /// Walk the configured repository (see [`repo_path`]) and return its laid-out
 /// graph as JSON, with branch/tag/HEAD refs attached for badging and per-branch
 /// colouring.
-async fn commits() -> Result<Json<Graph>, (StatusCode, String)> {
+///
+/// Sent `Cache-Control: no-store` so the browser never caches the graph: the repo
+/// changes underneath us (new commits, new/switched branches) between launches,
+/// and iOS Safari's on-disk cache otherwise persists a stale graph across app —
+/// and even device — restarts, making freshly created branches never appear.
+async fn commits() -> Result<impl IntoResponse, (StatusCode, String)> {
     let repo = repo_path();
-    let history = walk_history(repo, HISTORY_LIMIT)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let refs = read_refs(repo).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let history = walk_history(repo, HISTORY_LIMIT).map_err(|e| {
+        eprintln!("git-vista: /api/commits failed reading history: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    let refs = read_refs(repo).map_err(|e| {
+        eprintln!("git-vista: /api/commits failed reading refs: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    // Log, to the local terminal, exactly which branches this read found. This is
+    // the diagnostic for issue #16's "a new branch doesn't show up": if the branch
+    // you just made is listed here but not on the iPad, the graph is being read
+    // fine and the browser is showing a cached copy; if it's missing here, the
+    // problem is the repo being served (wrong path) or a ref the walk couldn't read.
+    log_commits_summary(repo, &history, &refs);
     let mut graph = layout::layout_with_refs(history, refs);
     // Attach the GitHub web base (if this repo has a github.com origin) so the UI
     // can link commits and refs. None => the frontend renders plain-text labels.
@@ -139,5 +173,33 @@ async fn commits() -> Result<Json<Graph>, (StatusCode, String)> {
             graph.remote_commits = remote.into_iter().collect();
         }
     }
-    Ok(Json(graph))
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(graph)))
+}
+
+/// Print, to the local terminal, a one-line summary of what a `/api/commits` read
+/// found: the repo served, the commit count, and — crucially — the local branch
+/// names. It's the fastest answer to "I made a branch and it isn't showing":
+/// reload the page and look here. If the branch is in this list, the server sees
+/// it and the browser is caching a stale graph; if it's absent, the server is
+/// reading the wrong repo or couldn't read the ref (see any warnings above).
+fn log_commits_summary(repo: &Path, history: &[CommitSummary], refs: &[GitRef]) {
+    let mut local = Vec::new();
+    let (mut remote, mut tags, mut has_head) = (0usize, 0usize, false);
+    for r in refs {
+        match r.kind {
+            RefKind::Branch => local.push(r.name.as_str()),
+            RefKind::RemoteBranch => remote += 1,
+            RefKind::Tag => tags += 1,
+            RefKind::Head => has_head = true,
+        }
+    }
+    println!(
+        "[/api/commits] {} — {} commit(s); {} local branch(es) [{}]; {remote} remote, {tags} tag(s){}",
+        repo.display(),
+        history.len(),
+        local.len(),
+        local.join(", "),
+        if has_head { "; HEAD" } else { "" },
+    );
 }
