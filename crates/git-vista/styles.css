@@ -82,6 +82,53 @@ html, body {
   font-weight: 600;
 }
 
+/* Issue #18: the larger invisible hit target over each commit dot, so the small
+   circle is easy to tap (especially on the iPad). */
+.node-hit { cursor: pointer; }
+
+/* Issue #18: the per-commit context menu — an HTML overlay drawn at the click,
+   outside the SVG so it doesn't pan/zoom or get clipped. */
+.ctx-menu {
+  position: fixed;
+  z-index: 10;
+  min-width: 230px;
+  padding: 4px;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  font-size: 0.85rem;
+}
+.ctx-menu-header {
+  padding: 6px 10px 8px;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  border-bottom: 1px solid #21262d;
+}
+.ctx-item {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  font: inherit;
+  color: var(--fg);
+  text-decoration: none;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.ctx-item:hover { background: #21262d; }
+.ctx-item.disabled,
+.ctx-item:disabled {
+  color: var(--muted);
+  opacity: 0.6;
+  cursor: default;
+}
+.ctx-item.disabled:hover,
+.ctx-item:disabled:hover { background: transparent; }
+
 /* Issue #12: commit messages and ref badges that link to GitHub. */
 .clickable { cursor: pointer; }
 /* Commits/refs that aren't on the remote yet — shown but not linked (their

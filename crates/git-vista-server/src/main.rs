@@ -18,11 +18,11 @@ use std::sync::OnceLock;
 use axum::response::IntoResponse;
 use axum::{
     http::{header, HeaderValue, StatusCode},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use git_vista_core::layout;
-use git_vista_core::model::{CommitSummary, GitRef, RefKind};
+use git_vista_core::model::{CommitSummary, CreateBranchRequest, GitRef, RefKind};
 use git_vista_git::{read_refs, walk_history};
 use tower::Layer;
 use tower_http::services::ServeDir;
@@ -84,6 +84,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/commits", get(commits))
+        // Issue #18: create a branch at a commit (shells out to `git branch`).
+        .route("/api/branch", post(create_branch))
         // Anything that isn't the API is served from the built SPA bundle.
         .fallback_service(spa);
 
@@ -175,6 +177,62 @@ async fn commits() -> Result<impl IntoResponse, (StatusCode, String)> {
     }
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
     Ok((no_store, Json(graph)))
+}
+
+/// Create a branch in the served repository at a given commit (Issue #18).
+///
+/// B3 from the design discussion: shell out to `git branch <name> <commit>` rather
+/// than write the ref ourselves. git does the heavy lifting — it validates the ref
+/// name, refuses a name that already exists, resolves the start-point, and reports
+/// a clear message on stderr — which we forward verbatim to the UI on failure.
+///
+/// Args are passed as separate argv entries (never a shell line), so a crafted
+/// name/commit can't inject a command. We additionally reject an empty name and
+/// one starting with `-` so it can't be read as a git option.
+async fn create_branch(Json(req): Json<CreateBranchRequest>) -> (StatusCode, String) {
+    let name = req.name.trim();
+    let commit = req.commit.trim();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Branch name can't be empty.".to_string());
+    }
+    if name.starts_with('-') {
+        return (StatusCode::BAD_REQUEST, "Branch name can't start with '-'.".to_string());
+    }
+
+    let output = match tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path())
+        .arg("branch")
+        .arg(name)
+        .arg(commit)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("git-vista: /api/branch couldn't run git: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Couldn't run git: {e}"),
+            );
+        }
+    };
+
+    if output.status.success() {
+        println!("[/api/branch] created branch '{name}' at {commit}");
+        (StatusCode::OK, format!("Created branch '{name}'."))
+    } else {
+        // git already explains the failure (name exists, bad name, unknown commit,
+        // …) on stderr; surface that so the UI can show the real reason.
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if msg.is_empty() {
+            "git branch failed.".to_string()
+        } else {
+            msg
+        };
+        eprintln!("git-vista: /api/branch failed: {msg}");
+        (StatusCode::BAD_REQUEST, msg)
+    }
 }
 
 /// Print, to the local terminal, a one-line summary of what a `/api/commits` read

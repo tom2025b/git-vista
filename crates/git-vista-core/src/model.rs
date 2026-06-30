@@ -113,6 +113,15 @@ pub struct Graph {
     pub remote_commits: Vec<String>,
 }
 
+/// Body of a `POST /api/branch` request (Issue #18): create a branch named
+/// `name` pointing at the commit `commit` (full hex id). Shared so the frontend
+/// serialises exactly what the backend deserialises.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateBranchRequest {
+    pub name: String,
+    pub commit: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

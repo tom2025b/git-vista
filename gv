@@ -7,19 +7,21 @@
 #
 #   gv                  visualise the CURRENT directory's repo
 #   gv ~/code/myproj    visualise another repo by path
-#   gv --no-build       skip the wasm rebuild (fast restart)
-#   gv ~/code/myproj --no-build
+#
+# While actively developing, gv ALWAYS does a CLEAN rebuild of the wasm frontend
+# (trunk clean + trunk build) before starting the server, so a stale/cached bundle
+# can never be served. (We can reintroduce an incremental/--no-build fast path when
+# we're ready to ship to other people.)
 set -euo pipefail
 
 # Where you ran gv from (the repo to visualise defaults to this).
 START_DIR="$PWD"
 
-# Parse args: an optional path plus an optional --no-build, in any order.
-BUILD=1
+# Parse args: an optional path to the repo to visualise. (No --no-build while
+# developing — we always rebuild from scratch; see the header.)
 TARGET=""
 for arg in "$@"; do
   case "$arg" in
-    --no-build) BUILD=0 ;;
     -*) echo "gv: unknown option: $arg" >&2; exit 2 ;;
     *)  TARGET="$arg" ;;
   esac
@@ -47,11 +49,11 @@ cd "$REPO"
 #     trick so the pattern doesn't match this script's own command line.
 pkill -9 -f '[g]it-vista-server' 2>/dev/null || true
 
-# Build the wasm SPA the server serves from crates/git-vista/dist/. This is a
-# near-instant no-op when nothing changed, so it's safe to run every time.
-if [[ "$BUILD" -eq 1 ]]; then
-  ( cd crates/git-vista && trunk build )
-fi
+# Always rebuild the wasm SPA from scratch: `trunk clean` wipes dist/ and trunk's
+# build cache, then `trunk build` regenerates it. This guarantees the server
+# (which serves crates/git-vista/dist/) never hands out a stale frontend bundle —
+# the recurring "my new code isn't loading" trap during development.
+( cd crates/git-vista && trunk clean && trunk build )
 
 # Hand off to the server (exec so Ctrl-C stops it cleanly). It prints the LAN URL.
 echo "gv: visualising $TARGET"
