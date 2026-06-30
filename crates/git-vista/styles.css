@@ -28,6 +28,24 @@ html, body {
 .topbar h1 { margin: 0; font-size: 1.1rem; color: var(--accent); }
 .subtitle { color: var(--muted); font-size: 0.85rem; }
 
+/* Issue #16: pull the current repo state (new branches/commits) without a full
+   page reload. Pushed to the right edge of the topbar; sized for a comfortable
+   tap target on the iPad. */
+.refresh {
+  margin-left: auto;
+  align-self: center;
+  padding: 0.4rem 0.9rem;
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--fg);
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.refresh:hover { border-color: var(--accent); }
+.refresh:active { background: #30363d; }
+
 .graph { flex: 1; overflow: hidden; }
 .placeholder { color: var(--muted); }
 

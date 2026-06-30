@@ -61,13 +61,28 @@ pub fn walk_history(path: &Path, limit: usize) -> Result<Vec<CommitSummary>, Rep
             add_tip(id.detach(), &mut tips);
         }
     }
-    if let Ok(platform) = repo.references() {
-        if let Ok(refs) = platform.all() {
-            for reference in refs.filter_map(Result::ok) {
-                if let Ok(id) = reference.into_fully_peeled_id() {
-                    add_tip(id.detach(), &mut tips);
-                }
+    // Seed from every ref tip. Failing to open or list the ref store is a real
+    // error, not something to swallow: silently falling back to the HEAD tip alone
+    // is exactly how "the visualiser shows only the branch I'm on" goes unnoticed
+    // (issue #16), so surface it instead. A single ref that won't resolve to a
+    // commit is logged to the local terminal and skipped, not dropped in silence.
+    let platform = repo
+        .references()
+        .map_err(|e| RepoError::Walk(format!("opening the ref store: {e}")))?;
+    let all = platform
+        .all()
+        .map_err(|e| RepoError::Walk(format!("listing refs: {e}")))?;
+    for reference in all {
+        let reference = match reference {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("git-vista: skipping an unreadable ref while walking history: {e}");
+                continue;
             }
+        };
+        match reference.into_fully_peeled_id() {
+            Ok(id) => add_tip(id.detach(), &mut tips),
+            Err(e) => eprintln!("git-vista: skipping a ref that won't resolve to a commit: {e}"),
         }
     }
 
@@ -132,24 +147,33 @@ pub fn read_remote_commits(path: &Path, limit: usize) -> Result<HashSet<String>,
 
     let mut seen = HashSet::new();
     let mut tips: Vec<gix::ObjectId> = Vec::new();
-    if let Ok(platform) = repo.references() {
-        if let Ok(all) = platform.all() {
-            for reference in all.filter_map(Result::ok) {
-                // Remote-tracking refs only (`refs/remotes/<remote>/…`). The
-                // remote's symbolic `…/HEAD` is harmless here — it just mirrors a
-                // branch tip we already seed from.
-                if !matches!(
-                    reference.name().category_and_short_name(),
-                    Some((Category::RemoteBranch, _))
-                ) {
-                    continue;
-                }
-                if let Ok(id) = reference.into_fully_peeled_id() {
-                    let oid = id.detach();
-                    if seen.insert(oid) {
-                        tips.push(oid);
-                    }
-                }
+    let platform = repo
+        .references()
+        .map_err(|e| RepoError::Walk(format!("opening the ref store: {e}")))?;
+    let all = platform
+        .all()
+        .map_err(|e| RepoError::Walk(format!("listing refs: {e}")))?;
+    for reference in all {
+        let reference = match reference {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("git-vista: skipping an unreadable ref while scanning remotes: {e}");
+                continue;
+            }
+        };
+        // Remote-tracking refs only (`refs/remotes/<remote>/…`). The remote's
+        // symbolic `…/HEAD` is harmless here — it just mirrors a branch tip we
+        // already seed from.
+        if !matches!(
+            reference.name().category_and_short_name(),
+            Some((Category::RemoteBranch, _))
+        ) {
+            continue;
+        }
+        if let Ok(id) = reference.into_fully_peeled_id() {
+            let oid = id.detach();
+            if seen.insert(oid) {
+                tips.push(oid);
             }
         }
     }
@@ -200,36 +224,48 @@ pub fn read_refs(path: &Path) -> Result<Vec<GitRef>, RepoError> {
         }
     }
 
-    if let Ok(platform) = repo.references() {
-        if let Ok(all) = platform.all() {
-            for mut reference in all.filter_map(Result::ok) {
-                // Classify by ref category, keeping only branches and tags. The
-                // short name (owned now, before we consume the reference) is the
-                // badge text: "main", "origin/main", "v1.0.0".
-                let (kind, name) = match reference.name().category_and_short_name() {
-                    Some((Category::LocalBranch, short)) => (RefKind::Branch, short.to_string()),
-                    Some((Category::RemoteBranch, short)) => {
-                        let name = short.to_string();
-                        // Skip the remote's symbolic default-branch pointer
-                        // (`refs/remotes/<remote>/HEAD`): it just mirrors another
-                        // branch and isn't a branch tip worth badging.
-                        if name.ends_with("/HEAD") {
-                            continue;
-                        }
-                        (RefKind::RemoteBranch, name)
-                    }
-                    Some((Category::Tag, short)) => (RefKind::Tag, short.to_string()),
-                    _ => continue, // HEAD pseudo-ref, notes, worktree-private, …
-                };
-                // Peel through tag objects to the commit the ref resolves to.
-                if let Ok(id) = reference.peel_to_id() {
-                    refs.push(GitRef {
-                        name,
-                        kind,
-                        target: Oid(id.detach().to_string()),
-                    });
-                }
+    // As in `walk_history`, treat a ref-store open/list failure as a real error
+    // rather than silently returning only the HEAD badge (issue #16).
+    let platform = repo
+        .references()
+        .map_err(|e| RepoError::Walk(format!("opening the ref store: {e}")))?;
+    let all = platform
+        .all()
+        .map_err(|e| RepoError::Walk(format!("listing refs: {e}")))?;
+    for reference in all {
+        let mut reference = match reference {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("git-vista: skipping an unreadable ref while reading refs: {e}");
+                continue;
             }
+        };
+        // Classify by ref category, keeping only branches and tags. The short
+        // name (owned now, before we consume the reference) is the badge text:
+        // "main", "origin/main", "v1.0.0".
+        let (kind, name) = match reference.name().category_and_short_name() {
+            Some((Category::LocalBranch, short)) => (RefKind::Branch, short.to_string()),
+            Some((Category::RemoteBranch, short)) => {
+                let name = short.to_string();
+                // Skip the remote's symbolic default-branch pointer
+                // (`refs/remotes/<remote>/HEAD`): it just mirrors another branch
+                // and isn't a branch tip worth badging.
+                if name.ends_with("/HEAD") {
+                    continue;
+                }
+                (RefKind::RemoteBranch, name)
+            }
+            Some((Category::Tag, short)) => (RefKind::Tag, short.to_string()),
+            _ => continue, // HEAD pseudo-ref, notes, worktree-private, …
+        };
+        // Peel through tag objects to the commit the ref resolves to.
+        match reference.peel_to_id() {
+            Ok(id) => refs.push(GitRef {
+                name,
+                kind,
+                target: Oid(id.detach().to_string()),
+            }),
+            Err(e) => eprintln!("git-vista: ref {name:?} won't resolve to a commit ({e}); not badged"),
         }
     }
 
@@ -462,6 +498,47 @@ mod tests {
         let head = refs.iter().find(|r| r.kind == RefKind::Head).unwrap();
         let main = refs.iter().find(|r| r.name == "main").unwrap();
         assert_eq!(head.target, main.target);
+    }
+
+    #[test]
+    fn an_unmerged_side_branch_is_fully_discovered() {
+        // Issue #16's scenario: a freshly created local branch that's never been
+        // merged into (or off an ancestor of) the checked-out branch. Its commits
+        // aren't reachable from HEAD, so the walk must seed from the branch tip too,
+        // and the branch must be reported as a ref — otherwise it's invisible.
+        //
+        //   B (main, HEAD)        X — Y (full-version)
+        //    \                   /
+        //     A ----------------/
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        commit(p, "A root", 1);
+        commit(p, "B on main", 2);
+        git(p, &["checkout", "-q", "-b", "full-version", "HEAD~1"]); // branch off A
+        commit(p, "X on full-version", 3);
+        commit(p, "Y on full-version", 4);
+        git(p, &["checkout", "-q", "main"]); // HEAD back on main, side branch unmerged
+
+        // The walk reaches the side branch's commits even though HEAD can't.
+        let history = walk_history(p, 100).unwrap();
+        let summaries: HashSet<&str> = history.iter().map(|c| c.summary.as_str()).collect();
+        assert!(summaries.contains("X on full-version"), "side-branch commit X missing");
+        assert!(summaries.contains("Y on full-version"), "side-branch tip Y missing");
+        assert!(summaries.contains("B on main"));
+
+        // ...and the branch itself is reported, tip resolving to Y.
+        let refs = read_refs(p).unwrap();
+        let mut branches: Vec<&str> = refs
+            .iter()
+            .filter(|r| r.kind == RefKind::Branch)
+            .map(|r| r.name.as_str())
+            .collect();
+        branches.sort();
+        assert_eq!(branches, vec!["full-version", "main"]);
+        let tip = history.iter().find(|c| c.summary == "Y on full-version").unwrap();
+        let full_version = refs.iter().find(|r| r.name == "full-version").unwrap();
+        assert_eq!(full_version.target, tip.id, "full-version must point at its tip Y");
     }
 
     #[test]
