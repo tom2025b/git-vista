@@ -39,8 +39,14 @@ const DRAG_THRESHOLD: f64 = 4.0;
 
 /// Fetch the laid-out graph from the backend. Relative URL → same origin as the
 /// served SPA, so no CORS and no hardcoded host.
+///
+/// The URL carries a per-load cache-busting `t=<ms>` param: the backend already
+/// sends `Cache-Control: no-store`, but a unique URL each launch is belt-and-
+/// braces against iOS Safari's persistent cache serving a stale graph (so a branch
+/// created since the last launch never shows). The backend ignores the param.
 async fn fetch_graph() -> Result<Graph, String> {
-    Request::get("/api/commits")
+    let url = format!("/api/commits?t={}", js_sys::Date::now());
+    Request::get(&url)
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -51,15 +57,29 @@ async fn fetch_graph() -> Result<Graph, String> {
 
 #[component]
 pub fn App() -> impl IntoView {
-    // Load real history once on startup. `create_local_resource` because the
-    // fetch future isn't `Send` (wasm).
-    let graph = create_local_resource(|| (), |_| fetch_graph());
+    // A bump counter is the resource's reactive source, so changing it re-runs the
+    // fetch. The frontend used to fetch exactly once on load (`|| ()`, a constant
+    // source that never re-fires), so a branch or commit created *after* the page
+    // loaded never appeared until a full reload — the heart of issue #16. The
+    // Refresh button below bumps this to re-read the repo on demand. (Each fetch
+    // also cache-busts its URL, so the re-read reaches the server, not the cache.)
+    // `create_local_resource` because the fetch future isn't `Send` (wasm).
+    let reload = create_rw_signal(0u32);
+    let graph = create_local_resource(move || reload.get(), |_| fetch_graph());
+    let refresh = move |_| reload.update(|n| *n = n.wrapping_add(1));
 
     view! {
         <main class="app">
             <header class="topbar">
                 <h1>"git-vista"</h1>
                 <span class="subtitle">"vertical git history — drag to pan, pinch or scroll to zoom"</span>
+                <button
+                    class="refresh"
+                    on:click=refresh
+                    title="Re-read the repository — shows branches and commits created since the page loaded"
+                >
+                    "Refresh"
+                </button>
             </header>
             <section class="graph">
                 {move || match graph.get() {
