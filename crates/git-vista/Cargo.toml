@@ -37,5 +37,8 @@ web-sys = { version = "0.3", features = [
     "MouseEvent",
     "PointerEvent",
     "WheelEvent",
+    # Issue #18: `window()` plus the native prompt()/alert() dialogs used to ask
+    # for a branch name and report a failure.
+    "Window",
 ] }
 gloo-net = { version = "0.7.0", default-features = false, features = ["http", "json"] }
