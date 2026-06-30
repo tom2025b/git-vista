@@ -16,4 +16,7 @@ axum = "0.8.9"
 git-vista-core = { workspace = true }
 git-vista-git = { workspace = true }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net"] }
-tower-http = { version = "0.7.0", features = ["fs"] }
+# `tower::Layer` lets us wrap the static file service with a cache-control header
+# layer; `set-header` is the tower-http layer that applies it.
+tower = "0.5"
+tower-http = { version = "0.7.0", features = ["fs", "set-header"] }
