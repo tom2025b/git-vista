@@ -18,7 +18,7 @@ use wasm_bindgen::JsCast;
 
 use gloo_net::http::Request;
 
-use git_vista_core::model::{Graph, RefKind};
+use git_vista_core::model::{CreateBranchRequest, Graph, RefKind};
 
 use crate::camera::{Camera, ZOOM_STEP};
 use crate::color::{branch_color, BADGE_DARK, HEAD_BADGE, MERGE_FILL, TAG_BADGE};
@@ -32,6 +32,24 @@ use crate::text::truncate;
 /// Commit messages longer than this are truncated with an ellipsis in the label
 /// (the full text stays available via the node/label hover tooltip).
 const MAX_SUMMARY_CHARS: usize = 60;
+
+/// State for the per-commit context menu (Issue #18): which commit was tapped,
+/// where to draw the menu (client/viewport px, since it's an HTML overlay, not
+/// part of the pan/zoomed SVG), and the commit's GitHub URL when it has one.
+#[derive(Clone)]
+struct MenuData {
+    /// Full commit hash — what "Create branch" targets.
+    commit: String,
+    /// Short hash, shown as the menu's header.
+    short: String,
+    /// Viewport x/y of the click, used to position the overlay.
+    x: f64,
+    y: f64,
+    /// GitHub commit URL, `Some` only when this repo has a github.com origin *and*
+    /// the commit is pushed (otherwise the page would 404). Drives whether the
+    /// "Open on GitHub" item is a live link or a disabled entry.
+    github_url: Option<String>,
+}
 
 /// Pointer travel (CSS px) past which a press becomes a pan/drag rather than a
 /// tap. Keeps a tap-to-open-link from being eaten by the pan handler.
@@ -53,6 +71,30 @@ async fn fetch_graph() -> Result<Graph, String> {
         .json::<Graph>()
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Ask the backend to create `name` at `commit` (Issue #18, `POST /api/branch`).
+/// On a non-2xx response the body is git's own error text, returned as `Err` so
+/// the caller can show the real reason (branch exists, bad name, …).
+async fn create_branch_request(name: &str, commit: &str) -> Result<(), String> {
+    let body = CreateBranchRequest {
+        name: name.to_string(),
+        commit: commit.to_string(),
+    };
+    let resp = Request::post("/api/branch")
+        .json(&body)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
 }
 
 #[component]
@@ -88,15 +130,17 @@ pub fn App() -> impl IntoView {
                         <p class="status error">{format!("Failed to load history: {e}")}</p>
                     }
                     .into_view(),
-                    Some(Ok(g)) => graph_canvas(g).into_view(),
+                    Some(Ok(g)) => graph_canvas(g, reload).into_view(),
                 }}
             </section>
         </main>
     }
 }
 
-/// Render a loaded [`Graph`] as a pan/zoomable SVG canvas.
-fn graph_canvas(graph: Graph) -> impl IntoView {
+/// Render a loaded [`Graph`] as a pan/zoomable SVG canvas. `reload` is the App's
+/// fetch counter, bumped after a successful branch creation so the new branch
+/// shows without a full reload (Issue #18, reusing the Issue #16 refresh path).
+fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
     // Per-branch colour slot for each row, indexed by row number (rows are stored
     // in row order), so an edge can pick up its parent's branch colour.
     let row_color: Vec<usize> = graph.rows.iter().map(|gr| gr.color).collect();
@@ -123,6 +167,9 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
     // Whether the current gesture has become a drag (set in pointermove). Defined
     // here so the link click handlers below can ignore the click that ends a drag.
     let moved = store_value(false);
+    // The open context menu, if any (Issue #18). `None` => no menu. Set when a dot
+    // is tapped (below), cleared on a pan/tap-elsewhere (the SVG pointerdown).
+    let menu = create_rw_signal(None::<MenuData>);
     // Links are real SVG `<a target="_blank">` anchors (built below), so a tap is
     // native link navigation. That works on iOS WebKit — which every iPad browser
     // (Safari, Chrome, DuckDuckGo) runs on, and which silently blocks the scripted
@@ -162,17 +209,56 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
             let merge = gr.commit.is_merge();
             let fill = if merge { MERGE_FILL } else { color };
             let stroke_width = if merge { "3" } else { "2" };
+
+            // Issue #18: tapping a dot opens a context menu. Gather this commit's
+            // menu data now; the click handler clones it in (it may fire repeatedly).
+            let commit_id = gr.commit.id.0.clone();
+            let short = gr.commit.id.short().to_string();
+            // Link target only when the repo is on GitHub *and* this commit is
+            // pushed — same rule the labels use, so the menu never offers a 404.
+            let github_url = repo_url
+                .as_ref()
+                .and_then(|base| remote_set.contains(&commit_id).then(|| format!("{base}/commit/{commit_id}")));
+            let open_menu = move |ev: web_sys::MouseEvent| {
+                // Ignore the click that ends a pan; a real tap opens the menu where
+                // the pointer is (viewport coords for the fixed-position overlay).
+                if moved.get_value() {
+                    return;
+                }
+                ev.stop_propagation();
+                menu.set(Some(MenuData {
+                    commit: commit_id.clone(),
+                    short: short.clone(),
+                    x: ev.client_x() as f64,
+                    y: ev.client_y() as f64,
+                    github_url: github_url.clone(),
+                }));
+            };
+
             view! {
-                <circle
-                    cx=cx
-                    cy=cy
-                    r=NODE_RADIUS
-                    fill=fill
-                    stroke=color
-                    stroke-width=stroke_width
-                >
-                    <title>{format!("{} — {}", gr.commit.id.short(), gr.commit.summary)}</title>
-                </circle>
+                <g>
+                    <circle
+                        cx=cx
+                        cy=cy
+                        r=NODE_RADIUS
+                        fill=fill
+                        stroke=color
+                        stroke-width=stroke_width
+                    >
+                        <title>{format!("{} — {}", gr.commit.id.short(), gr.commit.summary)}</title>
+                    </circle>
+                    // A larger, invisible hit target on top so the small dot is easy
+                    // to tap (especially on the iPad). `transparent` (not `none`) so
+                    // it still receives the click.
+                    <circle
+                        cx=cx
+                        cy=cy
+                        r=NODE_RADIUS + 8
+                        fill="transparent"
+                        class="node-hit"
+                        on:click=open_menu
+                    />
+                </g>
             }
         })
         .collect_view();
@@ -378,6 +464,10 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
     // drag yet — that waits until the pointer actually moves (see pointermove), so
     // a plain tap stays a tap and its click reaches the link underneath.
     let on_pointerdown = move |ev: web_sys::PointerEvent| {
+        // Any press on the canvas dismisses an open menu. A tap on a dot reopens it
+        // on the click that follows (pointerdown fires before click), so this just
+        // handles "tap empty space / start panning to close".
+        menu.set(None);
         let id = ev.pointer_id();
         let (x, y) = (ev.client_x() as f64, ev.client_y() as f64);
         let first = pointers.with_value(|ps| ps.is_empty());
@@ -473,6 +563,77 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
         camera.update(|c| *c = c.zoomed_at(factor, sx, sy));
     };
 
+    // The context menu overlay (Issue #18): a plain HTML pop-up positioned at the
+    // click, rendered outside the SVG so it never pans/zooms and isn't clipped.
+    let menu_view = move || {
+        menu.get().map(|m| {
+            let open_github = match m.github_url.clone() {
+                // Live link: a real anchor, opening GitHub in a new tab. Tapping it
+                // also closes the menu.
+                Some(url) => view! {
+                    <a
+                        class="ctx-item"
+                        href=url
+                        target="_blank"
+                        rel="noopener"
+                        on:click=move |_| menu.set(None)
+                    >
+                        "Open on GitHub"
+                    </a>
+                }
+                .into_view(),
+                // No GitHub page for this commit (no github remote, or unpushed):
+                // show the option but disabled, with a reason on hover.
+                None => view! {
+                    <span
+                        class="ctx-item disabled"
+                        title="This commit has no GitHub page (no github.com remote, or it isn't pushed)"
+                    >
+                        "Open on GitHub"
+                    </span>
+                }
+                .into_view(),
+            };
+            // "Create branch from this commit": prompt for a name, POST it, then
+            // refresh the graph on success or show git's error on failure (B3).
+            let commit = m.commit.clone();
+            let on_branch = move |_| {
+                menu.set(None);
+                let Some(win) = web_sys::window() else { return };
+                // A native prompt — simple and works in iPad Safari. Empty / cancel
+                // does nothing.
+                let name = match win.prompt_with_message("Name for the new branch:") {
+                    Ok(Some(n)) => n.trim().to_string(),
+                    _ => return,
+                };
+                if name.is_empty() {
+                    return;
+                }
+                let commit = commit.clone();
+                spawn_local(async move {
+                    match create_branch_request(&name, &commit).await {
+                        // Bump the fetch counter so the new branch appears.
+                        Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+                        Err(e) => {
+                            if let Some(w) = web_sys::window() {
+                                let _ = w.alert_with_message(&format!("Couldn't create branch:\n{e}"));
+                            }
+                        }
+                    }
+                });
+            };
+            view! {
+                <div class="ctx-menu" style=format!("left: {}px; top: {}px;", m.x, m.y)>
+                    <div class="ctx-menu-header">{m.short.clone()}</div>
+                    {open_github}
+                    <button class="ctx-item" on:click=on_branch>
+                        "Create branch from this commit"
+                    </button>
+                </div>
+            }
+        })
+    };
+
     view! {
         <svg
             class="graph-svg"
@@ -489,5 +650,6 @@ fn graph_canvas(graph: Graph) -> impl IntoView {
                 {labels}
             </g>
         </svg>
+        {menu_view}
     }
 }
