@@ -36,6 +36,30 @@ impl CommitSummary {
     }
 }
 
+/// Full detail for one commit, read on demand when the user opens the detail
+/// panel (Phase 10). The graph's [`CommitSummary`] carries only what a row needs
+/// (first line, author name, commit time); this carries everything the panel
+/// shows — the whole message body, both the author and committer signatures with
+/// their emails and their own times — so it's fetched per-commit rather than
+/// bloating every row of the graph payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitDetail {
+    pub id: Oid,
+    /// Parent ids, in order. 0 = root, 1 = normal, 2+ = a merge commit.
+    pub parents: Vec<Oid>,
+    pub author_name: String,
+    pub author_email: String,
+    /// Author time (when the work was written) as a Unix timestamp (seconds).
+    pub author_time: i64,
+    pub committer_name: String,
+    pub committer_email: String,
+    /// Commit time (when it was recorded) as a Unix timestamp (seconds). Differs
+    /// from `author_time` for rebased/cherry-picked/amended commits.
+    pub commit_time: i64,
+    /// The full commit message, verbatim — summary line and body together.
+    pub message: String,
+}
+
 /// What a [`GitRef`] is, so the UI can badge and prioritise it. `Head` is the
 /// special `HEAD` pointer; `Branch`/`RemoteBranch` are local/remote branches;
 /// `Tag` is a (peeled) tag.

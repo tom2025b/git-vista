@@ -78,8 +78,14 @@ the view hides the message tier below 0.5× and the dimmed meta line below 0.8×
 so a zoomed-out graph reads as structure, not a smear. Phase 8 — viewport
 virtualization — was done afterwards; see above.)
 
-### Phase 10 — Commit detail panel
-Clicking a commit opens a side panel with full details.
+### Phase 10 — Commit detail panel ✅ (done)
+Clicking a commit's dot opens its context menu; "View details" opens a side panel
+docked to the right with the commit's full detail — the whole message body and
+both the author and committer signatures (name, email, own time). The panel
+fetches lazily from a new `GET /api/commit/<id>` (a fresh `git_vista_git::
+read_commit` via gix), so the graph payload stays lean; parent hashes in the panel
+re-point it at that parent so you can walk up the history, and it links out to
+GitHub when the commit is pushed.
 
 ### Phase 11 — Search & filter
 Search commits by message, author, or hash.
