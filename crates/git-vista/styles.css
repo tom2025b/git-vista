@@ -129,6 +129,11 @@ html, body {
 .ctx-item.disabled:hover,
 .ctx-item:disabled:hover { background: transparent; }
 
+/* Issue #33: the commit-message modal is styled inline in app.rs — its overlay
+   deliberately uses a <textarea> (not a void <input>, which panics Leptos' CSR
+   template walk on iOS WebKit) and inline viewport-sized styles that render
+   reliably there. Nothing to add here. */
+
 /* Issue #12: commit messages and ref badges that link to GitHub. */
 .clickable { cursor: pointer; }
 /* Commits/refs that aren't on the remote yet — shown but not linked (their
