@@ -60,15 +60,23 @@ colour; un-branched side lines fall back to a synthetic colour so every commit i
 coloured). The frontend renders branch/tag/HEAD pills beside each commit and
 colours nodes/edges by branch.)
 
-### Phase 8 — Viewport virtualization
-Only render commits currently visible in the viewport for performance.
+### Phase 8 — Viewport virtualization ✅ (done)
+Only render commits currently visible in the viewport for performance. (Done
+after Phase 9, at the user's request. A pure `viewport::visible_row_range(camera,
+viewport_h, row_count, overscan)` inverts the row→y mapping to the window of rows
+on screen, padded by an overscan margin; the frontend renders nodes, edges and
+both label tiers through keyed `<For>`s over that window instead of building every
+row eagerly. The range is a `Memo`, so a sub-row pan doesn't churn the DOM — only
+rows crossing the viewport edge are added/removed. Edges are kept whenever their
+row span intersects the window, so a long merge line passing through never
+disappears; stubs stay eager (only a handful, and they fan upward).)
 
 ### Phase 9 — Level of detail ✅ (done)
 Change level of detail based on zoom level (hide text when zoomed out, etc.).
 (Done: a pure `lod::detail_for(scale)` maps the camera zoom to a `Detail` level;
 the view hides the message tier below 0.5× and the dimmed meta line below 0.8×,
 so a zoomed-out graph reads as structure, not a smear. Phase 8 — viewport
-virtualization — was skipped for now and is still open.)
+virtualization — was done afterwards; see above.)
 
 ### Phase 10 — Commit detail panel
 Clicking a commit opens a side panel with full details.
