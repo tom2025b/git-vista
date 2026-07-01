@@ -22,7 +22,9 @@ use axum::{
     Json, Router,
 };
 use git_vista_core::layout;
-use git_vista_core::model::{CommitSummary, CreateBranchRequest, GitRef, RefKind};
+use git_vista_core::model::{
+    CommitSummary, CreateBranchRequest, CreateCommitRequest, GitRef, RefKind,
+};
 use git_vista_git::{read_refs, walk_history};
 use tower::Layer;
 use tower_http::services::ServeDir;
@@ -86,6 +88,8 @@ async fn main() {
         .route("/api/commits", get(commits))
         // Issue #18: create a branch at a commit (shells out to `git branch`).
         .route("/api/branch", post(create_branch))
+        // Issue #33: create a commit on top of HEAD (shells out to `git commit`).
+        .route("/api/commit", post(create_commit))
         // Anything that isn't the API is served from the built SPA bundle.
         .fallback_service(spa);
 
@@ -238,6 +242,67 @@ async fn create_branch(Json(req): Json<CreateBranchRequest>) -> (StatusCode, Str
             msg
         };
         eprintln!("git-vista: /api/branch failed: {msg}");
+        (StatusCode::BAD_REQUEST, msg)
+    }
+}
+
+/// Create a commit on top of the current HEAD in the served repository (Issue #33).
+///
+/// Same B3 posture as [`create_branch`]: shell out to `git commit` rather than
+/// build the commit ourselves. git validates the tree state, refuses an empty
+/// commit unless `--allow-empty` is passed, and reports a clear message on stderr
+/// (e.g. "nothing to commit") which we forward verbatim to the UI on failure.
+///
+/// The UI only offers this on the HEAD tip, so a plain `git commit` lands exactly
+/// where the user clicked — no ref moving here. Args are separate argv entries
+/// (never a shell line); the message is the value of `-m`, so even a message
+/// starting with `-` can't be read as an option. An empty message is rejected.
+async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (StatusCode, String) {
+    let message = req.message.trim();
+    if message.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Commit message can't be empty.".to_string(),
+        );
+    }
+
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C").arg(repo_path()).arg("commit");
+    if req.allow_empty {
+        cmd.arg("--allow-empty");
+    }
+    cmd.arg("-m").arg(message);
+
+    let output = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("git-vista: /api/commit couldn't run git: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Couldn't run git: {e}"),
+            );
+        }
+    };
+
+    if output.status.success() {
+        println!("[/api/commit] created commit (allow_empty={})", req.allow_empty);
+        (StatusCode::OK, "Created commit.".to_string())
+    } else {
+        // git explains the failure, but "nothing to commit, working tree clean"
+        // goes to *stdout* (not stderr) with a non-zero exit — so prefer stderr,
+        // fall back to stdout, and only then to a generic line.
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if !stderr.is_empty() {
+            stderr
+        } else {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if stdout.is_empty() {
+                "git commit failed.".to_string()
+            } else {
+                stdout
+            }
+        };
+        eprintln!("git-vista: /api/commit failed: {msg}");
         (StatusCode::BAD_REQUEST, msg)
     }
 }
