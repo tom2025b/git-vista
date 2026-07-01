@@ -34,6 +34,8 @@ web-sys = { version = "0.3", features = [
     "Element",
     "Event",
     "EventTarget",
+    # Phase 13: keyboard shortcuts (Esc / +/-/0 / r) via a window keydown listener.
+    "KeyboardEvent",
     "MouseEvent",
     "PointerEvent",
     "WheelEvent",

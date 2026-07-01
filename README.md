@@ -77,6 +77,10 @@ serves both the wasm bundle and the API on `:8080`.
   clickable to walk up the history.
 - **Open URL** (Phase 12): paste a public `https://`/`http://`/`git://` URL to
   clone and view any repo **read-only** (all write actions hidden + refused).
+- **Controls & shortcuts** (Phase 13): drag/one-finger to pan, wheel/pinch to zoom,
+  plus keyboard shortcuts on desktop and the iPad Magic Keyboard — `+`/`-` zoom, `0`
+  resets the view, `r` refreshes, `Esc` closes the open menu/panel. A **Reset view**
+  button recenters the camera for pure touch/trackpad use (no keyboard needed).
 
 See `DESIGN.md` for the phased roadmap and `PROJECT_MEMORY.md` for the running
 per-phase handoff notes.
@@ -132,5 +136,6 @@ the frontend is view-assembly over those tested pieces.
 ## Status
 
 Working browser-first git visualizer, complete through **Phase 12** (and the
-Phase 10 commit detail panel). Remaining open phases: **Phase 11** — search &
-filter, and **Phase 13** — packaging & polish. See `DESIGN.md`.
+Phase 10 commit detail panel). **Phase 13** — packaging & polish is **in progress**
+(icons, keyboard shortcuts, reset-view, shippable server defaults). Remaining:
+**Phase 11** — search & filter, and the rest of Phase 13. See `DESIGN.md`.

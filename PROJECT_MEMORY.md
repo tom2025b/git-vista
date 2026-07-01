@@ -1272,3 +1272,79 @@ the panel, parent-chip navigation, and the committer row appearing only on commi
 where it differs (e.g. a GitHub-merged commit).
 
 **Next:** Phase 11 — Search & filter, or Phase 13 — Packaging & polish.
+
+---
+
+## Phase 13 — Packaging & polish (2026-07-01)
+**Status:** in progress. First tranche ships on branch `phase10-commit-detail-panel`
+(alongside the Phase 10 work); Phase 11 (search) and a few Phase 13 items remain.
+
+**What changed.**
+- **Keyboard shortcuts (`crates/git-vista/src/app.rs`).** A `keydown` listener on
+  `window`, registered in `graph_canvas`:
+  - `Esc` backs out of the topmost overlay — the context menu first, then a modal
+    (commit / confirm), then the detail panel. **Esc is only a shortcut**: the user
+    runs an iPad Magic Keyboard with **no physical Esc key**, so every overlay still
+    closes via its Cancel button / a backdrop tap / tapping away. Don't ever make Esc
+    the *only* way out of anything.
+  - `+`/`=` zoom in, `-`/`_` zoom out (anchored at the viewport centre via
+    `Camera::zoomed_at`, since a key press has no cursor), `0` resets the camera.
+  - `r`/`R` bumps the `reload` counter (same as Refresh).
+  - Non-Esc keys are ignored when the keydown target is a `<textarea>`/`<input>` (so
+    typing an "r" in the commit/URL box doesn't refresh) and when Ctrl/Meta/Alt is
+    held (so the browser's own Cmd/Ctrl-R reload is untouched).
+  - Needs the **`KeyboardEvent`** web-sys feature — added to
+    `crates/git-vista/Cargo.toml`.
+- **Listener leak fix (same file).** The pre-existing `resize` listener — and the new
+  `keydown` one — are now removed via `on_cleanup` instead of `cb.forget()`.
+  `graph_canvas` reruns on every graph reload (each Refresh/clone), so `forget()` was
+  stacking a fresh listener bound to the *new* signals on top of the old, disposed
+  ones each time. `on_cleanup` drops the old one when the reactive owner is disposed.
+- **Reset-view button (same file + `styles.css`).** A floating `.reset-view` button
+  (bottom-left, clears the right-docked detail panel) calls `camera.set(Camera::
+  default())`. This is the *only* recenter path for a pure touch/trackpad user, so
+  it's not just a keyboard-`0` duplicate.
+- **Icons / mobile meta (`crates/git-vista/index.html`).** An inline SVG favicon as a
+  `data:image/svg+xml;base64,…` URI (no separate asset for Trunk to copy), plus
+  `theme-color`, `apple-mobile-web-app-*`, and `viewport-fit=cover` +
+  `user-scalable=no` on the viewport (so a stray pinch zooms *our* camera, not the
+  page). Trunk passes these through into `dist/index.html` untouched (verified).
+- **Server packaging (`crates/git-vista-server/src/main.rs`).**
+  - `DEFAULT_REPO` changed from the hardcoded `/home/tom/projects/git-vista` to `.`
+    (current working dir, canonicalised at startup). `gv` always passes a path, so
+    this only bites when the server is run directly with no arg — but a hardcoded
+    personal path is not shippable.
+  - On startup the server now `remove_dir_all`s `clones_root()` (guarded by
+    `.exists()`). `gv` SIGKILLs the previous server, so its last Phase 12 clone never
+    got cleaned up and piled up under the temp dir across runs. Nothing is served
+    from there yet at startup, so wiping it is safe; the next clone recreates it.
+
+**Decisions.**
+- Floating reset button lives in `graph_canvas` (where `camera` is), not the topbar
+  (in `App`) — avoids lifting the camera signal up through the load state just for
+  one button. Trade-off: the topbar (Open URL / Refresh) and the reset control are in
+  two different components.
+- Esc handling kept despite the user's keyboard lacking the key: it's harmless there
+  (never fires) and helps desktop users; the invariant is just "never the only exit".
+
+**Gotchas.**
+- `graph_canvas` is re-invoked on every reload — anything registered with
+  `Closure::forget()` there leaks and duplicates. Use `on_cleanup` + `remove_event_
+  listener_with_callback` (see the resize/keydown handlers).
+- Couldn't live-test the server changes here: port 8080 was held by the user's own
+  running `gv` session (my instance correctly refused to double-bind and exited — I
+  did **not** kill theirs). **Owed:** next `gv` run, confirm the favicon/tab icon, the
+  Reset-view button recenters, `0`/`+`/`-`/`r` work from the Magic Keyboard, and the
+  temp clones dir is cleared on startup.
+
+**Verify:**
+```sh
+cargo test -p git-vista-core -p git-vista-git -p git-vista   # 73 pass
+cargo clippy -p git-vista-server 2>&1 | tail                 # clean
+cargo clippy -p git-vista --target wasm32-unknown-unknown    # clean
+( cd crates/git-vista && trunk build )                       # bundle builds; favicon in dist/index.html
+```
+
+**Next:** finish Phase 13 (perf pass; consider removing the legacy Tauri shell — it's
+a Phase-4 stub that still costs a whole CI job + WebKitGTK deps), then Phase 11 —
+Search & filter.
