@@ -96,21 +96,45 @@ pub fn layout_with_refs(
     // distinct stub lines instead of a second badge on the shared commit.
     let (stub_seeds, used_slots) = assign_branch_colors(&mut graph, &refs, head_branch);
 
-    // Give each stub its own lane (right of the commit lanes) and its own colour
-    // slot (continuing past the ones the real branch lines used, so it's distinct).
-    let mut next_lane = graph.lane_count;
-    let mut stubs = Vec::with_capacity(stub_seeds.len());
+    // Lay the stubs out as *cascades*: all stubs that point at the same commit
+    // stack into a staircase, each forking off the previous one's tip rather than
+    // every one fanning back to the shared commit. So creating another branch at a
+    // commit that already has a stub adds a new hollow dot off the last dot — a
+    // visible fork from the stub you branched from, not another dot on the commit.
+    // Grouping preserves first-appearance order (seed order = branch name), which
+    // is the only deterministic order available (git records no "from which stub").
+    let mut groups: Vec<(usize, Vec<String>)> = Vec::new();
     let mut stub_names = HashSet::new();
-    for (i, (name, anchor_row)) in stub_seeds.into_iter().enumerate() {
+    for (name, anchor_row) in stub_seeds {
         stub_names.insert(name.clone());
-        stubs.push(BranchStub {
-            name,
-            anchor_row,
-            anchor_lane: graph.rows[anchor_row].lane,
-            lane: next_lane,
-            color: used_slots + i,
-        });
-        next_lane += 1;
+        match groups.iter_mut().find(|(row, _)| *row == anchor_row) {
+            Some((_, names)) => names.push(name),
+            None => groups.push((anchor_row, vec![name])),
+        }
+    }
+    // Each cascade gets its own block of consecutive lanes (right of the commit
+    // lanes) so stub `depth` maps to lane `base + depth` — the connector for a
+    // deeper stub starts one lane left, at the previous stub's dot. Colour slots
+    // continue past the real branch lines' so every stub stays distinct.
+    let mut next_lane = graph.lane_count;
+    let mut stubs = Vec::new();
+    let mut slot = used_slots;
+    for (anchor_row, names) in groups {
+        let base = next_lane;
+        for (depth, name) in names.into_iter().enumerate() {
+            stubs.push(BranchStub {
+                name,
+                anchor_row,
+                anchor_lane: graph.rows[anchor_row].lane,
+                lane: base + depth,
+                color: slot,
+                depth,
+            });
+            slot += 1;
+            // The cascade occupies lanes base..=base+depth; keep the next cascade
+            // clear of it.
+            next_lane = base + depth + 1;
+        }
     }
     // Widen the lane count to include the stub columns so the label column sits
     // to the right of them (and the gutter is wide enough to draw the stubs).
@@ -529,6 +553,46 @@ mod tests {
         );
         // And its colour slot is distinct from the branch it forked off.
         assert_ne!(stub.color, color_of(&g, "F2"), "a new branch differs from its parent");
+    }
+
+    /// Issue #30: several branches created at the *same* commit cascade — each is
+    /// its own stub, stacked so a deeper one forks off the previous stub's tip (one
+    /// lane to the right) rather than every stub fanning back to the shared commit.
+    /// This is what makes "create a branch from a hollow dot" draw a new dot off
+    /// the dot you clicked.
+    #[test]
+    fn stubs_sharing_a_commit_cascade_off_one_another() {
+        // main at c2; `aaa` and `bbb` both freshly created at c2 (own nothing).
+        let commits = vec![
+            commit("c2", &["c1"]),
+            commit("c1", &["c0"]),
+            commit("c0", &[]),
+        ];
+        let refs = vec![
+            gitref("HEAD", RefKind::Head, "c2"),
+            gitref("main", RefKind::Branch, "c2"),
+            gitref("aaa", RefKind::Branch, "c2"),
+            gitref("bbb", RefKind::Branch, "c2"),
+        ];
+        let g = layout_with_refs(commits, refs, Some("main"));
+
+        assert_eq!(g.stubs.len(), 2, "both new branches are stubs");
+        // Ordered deterministically by name: aaa is the base of the cascade, bbb
+        // stacks above it.
+        let aaa = g.stubs.iter().find(|s| s.name == "aaa").unwrap();
+        let bbb = g.stubs.iter().find(|s| s.name == "bbb").unwrap();
+        // Both anchor at the same commit (c2, row 0).
+        assert_eq!(aaa.anchor_row, 0);
+        assert_eq!(bbb.anchor_row, 0);
+        // First forks off the commit; second forks off the first (one deeper, one
+        // lane further right — that's how the connector finds the previous tip).
+        assert_eq!(aaa.depth, 0, "first stub forks off the commit");
+        assert_eq!(bbb.depth, 1, "second stub forks off the first stub's tip");
+        assert_eq!(bbb.lane, aaa.lane + 1, "the deeper stub sits one lane right");
+        // Distinct colours, and neither is the trunk slot.
+        assert_ne!(aaa.color, bbb.color);
+        assert_ne!(aaa.color, 0);
+        assert_ne!(bbb.color, 0);
     }
 
     /// Issue #28: a branch created at an *interior* commit of an existing branch's
