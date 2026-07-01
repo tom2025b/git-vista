@@ -173,6 +173,15 @@ pub struct CreateCommitRequest {
     pub allow_empty: bool,
 }
 
+/// Body of the three branch-operation requests (Issue #33 follow-up): merge
+/// (`POST /api/merge`), push (`POST /api/push`), and delete (`POST /api/delete-branch`).
+/// All three act on a single named branch, so they share one shape. `branch` is a
+/// local branch name; the backend validates it and forwards git's own error text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchRequest {
+    pub branch: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

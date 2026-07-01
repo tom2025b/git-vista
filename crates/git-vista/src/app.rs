@@ -18,7 +18,9 @@ use wasm_bindgen::JsCast;
 
 use gloo_net::http::Request;
 
-use git_vista_core::model::{CreateBranchRequest, CreateCommitRequest, Graph, RefKind};
+use git_vista_core::model::{
+    BranchRequest, CreateBranchRequest, CreateCommitRequest, Graph, RefKind,
+};
 
 use crate::camera::{Camera, ZOOM_STEP};
 use crate::color::{
@@ -67,6 +69,29 @@ struct MenuData {
     /// can land without moving HEAD, so the "Commit …" items are enabled only here
     /// (Issue #33). A branch stub is never the HEAD tip, so it's always false.
     is_head: bool,
+    /// Local branch names living at this target: a stub's own name, or every local
+    /// branch badge on a commit dot. Each yields a set of merge/push/delete items
+    /// (Issue #33 follow-up). Empty => the target carries no branch, so no branch
+    /// operations are shown.
+    branches: Vec<String>,
+}
+
+/// A branch operation awaiting confirmation in the modal (Issue #33 follow-up).
+/// Merge and delete change history/refs and push reaches the network, so each is
+/// confirmed before it runs — reusing the same in-app modal the commit dialog uses
+/// (a native `confirm()` gets blocked/flashed by the webview, same as `prompt()`).
+#[derive(Clone)]
+enum PendingOp {
+    /// Merge `branch` into the checked-out branch (`git merge <branch>`). `into` is
+    /// the live HEAD branch, fetched when the item is clicked, so the confirmation
+    /// names the true target; `None` => detached HEAD (the confirm button is disabled).
+    Merge { branch: String, into: Option<String> },
+    /// Push `branch` to origin (`git push origin <branch>`).
+    Push { branch: String },
+    /// Delete `branch` (`git branch -d <branch>`). `current` is the live HEAD branch,
+    /// fetched on click; when it equals `branch` the confirm button is disabled (git
+    /// refuses to delete the checked-out branch). `None` => detached HEAD (deletable).
+    Delete { branch: String, current: Option<String> },
 }
 
 /// Pointer travel (CSS px) past which a press becomes a pan/drag rather than a
@@ -129,6 +154,45 @@ async fn create_commit_request(message: &str, allow_empty: bool) -> Result<(), S
         allow_empty,
     };
     let resp = Request::post("/api/commit")
+        .json(&body)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
+/// Fetch the live checked-out branch (Issue #33 follow-up), used to name the merge
+/// target the moment the user clicks "Merge" — so it's correct even if the graph on
+/// screen predates a branch switch. `Ok(None)` => detached HEAD. Cache-busted like
+/// the graph fetch, since the answer changes as branches are switched.
+async fn fetch_head_branch() -> Result<Option<String>, String> {
+    let url = format!("/api/head-branch?t={}", js_sys::Date::now());
+    Request::get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json::<Option<String>>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Ask the backend to run a branch operation on `branch` (Issue #33 follow-up).
+/// `path` is the endpoint — `/api/merge`, `/api/push`, or `/api/delete-branch` —
+/// all of which take the same `{ branch }` body. As with the other requests, a
+/// non-2xx body is git's own error text, returned as `Err` for the caller to show.
+async fn branch_op_request(path: &str, branch: &str) -> Result<(), String> {
+    let body = BranchRequest {
+        branch: branch.to_string(),
+    };
+    let resp = Request::post(path)
         .json(&body)
         .map_err(|e| e.to_string())?
         .send()
@@ -235,6 +299,10 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
     let commit_dialog = create_rw_signal(None::<bool>);
     // The text currently typed into that dialog's message box.
     let commit_msg = create_rw_signal(String::new());
+    // The branch operation awaiting confirmation, if any (Issue #33 follow-up).
+    // `Some` => the confirm modal is showing; confirming runs the op then refreshes.
+    // Mutually exclusive with the commit dialog (only one overlay is ever open).
+    let confirm_op = create_rw_signal(None::<PendingOp>);
     // When the commit modal was opened (ms). iOS synthesizes a `click` a few ms
     // after a tap; opening the modal puts its full-screen backdrop under that tap
     // point, so the ghost click hits the backdrop and closes the modal instantly.
@@ -297,6 +365,14 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             // Only the commit HEAD points at can take a new commit without moving
             // HEAD, so the "Commit …" items are enabled only here (Issue #33).
             let is_head = gr.refs.iter().any(|r| r.kind == RefKind::Head);
+            // Local branch badges on this commit — each offers merge/push/delete
+            // (Issue #33 follow-up). A commit can carry several; a bare commit none.
+            let branches: Vec<String> = gr
+                .refs
+                .iter()
+                .filter(|r| r.kind == RefKind::Branch)
+                .map(|r| r.name.clone())
+                .collect();
             // Link target only when the repo is on GitHub *and* this commit is
             // pushed — same rule the labels use, so the menu never offers a 404.
             let github_url = repo_url
@@ -318,6 +394,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     github_label: "Open commit on GitHub",
                     create_label: "Create branch from this commit",
                     is_head,
+                    branches: branches.clone(),
                 }));
             };
 
@@ -536,6 +613,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             let anchor = &graph.rows[s.anchor_row].commit;
             let commit_id = anchor.id.0.clone();
             let header = s.name.clone();
+            let branch_name = s.name.clone();
             let github_url = repo_url.as_ref().and_then(|base| {
                 remote_branches
                     .contains(&s.name)
@@ -557,6 +635,8 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     create_label: "Create branch from this branch",
                     // A stub is a new empty branch, never the HEAD tip.
                     is_head: false,
+                    // The stub *is* one branch, so its ops act on that single name.
+                    branches: vec![branch_name.clone()],
                 }));
             };
             view! {
@@ -823,6 +903,75 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             };
             let commit_staged = make_commit_item("Commit staged changes", false);
             let commit_empty = make_commit_item("Create empty commit", true);
+            // The branch operations (Issue #33 follow-up): merge / push / delete, one
+            // set per local branch living at this target. Each opens the confirm modal
+            // rather than acting immediately — the actual POST + refresh happens there.
+            // Set `confirm_op` *before* `menu.set(None)`, which disposes this handler's
+            // reactive owner (same ordering caveat as the commit items above).
+            let branch_items = m
+                .branches
+                .iter()
+                .flat_map(|b| {
+                    let b = b.clone();
+                    // Merge into the checked-out branch. The target is resolved *live*
+                    // on click (not from the possibly-stale graph), so the item stays
+                    // generic — "into current branch" — and the confirm dialog names
+                    // the real HEAD branch once the fetch returns. Whether it's a
+                    // no-op self-merge or a detached HEAD is decided there too.
+                    let merge_item = {
+                        let branch = b.clone();
+                        let on = move |_| {
+                            let branch = branch.clone();
+                            menu.set(None);
+                            spawn_local(async move {
+                                let into = fetch_head_branch().await.unwrap_or(None);
+                                // Start the ghost-click guard when the modal opens.
+                                dialog_opened_at.set_value(js_sys::Date::now());
+                                confirm_op.set(Some(PendingOp::Merge { branch, into }));
+                            });
+                        };
+                        view! {
+                            <button class="ctx-item" on:click=on>
+                                {format!("Merge ‘{b}’ into current branch")}
+                            </button>
+                        }
+                        .into_view()
+                    };
+                    // Push: always available; git reports if there's no origin/upstream.
+                    let push_item = {
+                        let branch = b.clone();
+                        let on = move |_| {
+                            dialog_opened_at.set_value(js_sys::Date::now());
+                            confirm_op.set(Some(PendingOp::Push { branch: branch.clone() }));
+                            menu.set(None);
+                        };
+                        view! { <button class="ctx-item" on:click=on>{format!("Push ‘{b}’")}</button> }
+                            .into_view()
+                    };
+                    // Delete: like merge, the "is this the checked-out branch?" test is
+                    // resolved live on click, not from the possibly-stale graph. The
+                    // confirm dialog blocks deleting the current branch; git's safe
+                    // `-d` still refuses an unmerged one server-side.
+                    let delete_item = {
+                        let branch = b.clone();
+                        let on = move |_| {
+                            let branch = branch.clone();
+                            menu.set(None);
+                            spawn_local(async move {
+                                let current = fetch_head_branch().await.unwrap_or(None);
+                                // Start the ghost-click guard when the modal opens.
+                                dialog_opened_at.set_value(js_sys::Date::now());
+                                confirm_op.set(Some(PendingOp::Delete { branch, current }));
+                            });
+                        };
+                        view! {
+                            <button class="ctx-item danger" on:click=on>{format!("Delete ‘{b}’")}</button>
+                        }
+                        .into_view()
+                    };
+                    [merge_item, push_item, delete_item]
+                })
+                .collect_view();
             view! {
                 <div class="ctx-menu" style=format!("left: {}px; top: {}px;", m.x, m.y)>
                     <div class="ctx-menu-header">{m.header.clone()}</div>
@@ -832,6 +981,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     </button>
                     {commit_staged}
                     {commit_empty}
+                    {branch_items}
                 </div>
             }
         })
@@ -928,6 +1078,141 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
         })
     };
 
+    // The branch-op confirmation modal (Issue #33 follow-up). Reuses the commit
+    // modal's iPad-proven inline-styled overlay, minus any text input (so no void
+    // `<input>` to trip the WebKit CSR bug). Confirming runs the pending op and
+    // refreshes; cancelling or a backdrop tap closes it.
+    let run_confirmed = move || {
+        let Some(op) = confirm_op.get_untracked() else {
+            return;
+        };
+        confirm_op.set(None);
+        let (path, branch, verb) = match op {
+            PendingOp::Merge { branch, .. } => ("/api/merge", branch, "merge"),
+            PendingOp::Push { branch } => ("/api/push", branch, "push"),
+            PendingOp::Delete { branch, .. } => ("/api/delete-branch", branch, "delete"),
+        };
+        spawn_local(async move {
+            match branch_op_request(path, &branch).await {
+                Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+                Err(e) => {
+                    if let Some(w) = web_sys::window() {
+                        let _ = w.alert_with_message(&format!("Couldn't {verb} ‘{branch}’:\n{e}"));
+                    }
+                }
+            }
+        });
+    };
+    let confirm_modal_view = move || {
+        confirm_op.get().map(|op| {
+            // `enabled` gates the confirm button: a merge into itself or a detached
+            // HEAD has no valid target, so the dialog is informational (Cancel only).
+            let (title, body, confirm_label, danger, enabled) = match &op {
+                PendingOp::Merge { branch, into } => match into {
+                    Some(into) if into != branch => (
+                        "Merge branch",
+                        format!("Merge ‘{branch}’ into ‘{into}’? This updates ‘{into}’ in the working tree."),
+                        "Merge",
+                        false,
+                        true,
+                    ),
+                    Some(into) => (
+                        "Merge branch",
+                        format!("‘{into}’ is the branch you're on — there's nothing to merge into itself."),
+                        "Merge",
+                        false,
+                        false,
+                    ),
+                    None => (
+                        "Merge branch",
+                        format!("HEAD is detached, so there's no branch to merge ‘{branch}’ into. Check out a branch first."),
+                        "Merge",
+                        false,
+                        false,
+                    ),
+                },
+                PendingOp::Push { branch } => (
+                    "Push branch",
+                    format!("Push ‘{branch}’ to origin?"),
+                    "Push",
+                    false,
+                    true,
+                ),
+                PendingOp::Delete { branch, current } => match current {
+                    Some(current) if current == branch => (
+                        "Delete branch",
+                        format!("‘{branch}’ is the branch you're on — check out another branch before deleting it."),
+                        "Delete",
+                        true,
+                        false,
+                    ),
+                    // A different branch, or detached HEAD: safe to offer the delete.
+                    _ => (
+                        "Delete branch",
+                        format!("Delete branch ‘{branch}’? Only a fully-merged branch can be deleted here."),
+                        "Delete",
+                        true,
+                        true,
+                    ),
+                },
+            };
+            // The confirm button is muted when disabled, red for a destructive
+            // delete, green otherwise.
+            let confirm_style = if !enabled {
+                "padding:6px 14px; font:inherit; color:var(--muted); \
+                 background:#21262d; border:1px solid #30363d; border-radius:6px; \
+                 opacity:0.6;"
+            } else if danger {
+                "padding:6px 14px; font:inherit; color:#fff; \
+                 background:#da3633; border:1px solid #f85149; border-radius:6px;"
+            } else {
+                "padding:6px 14px; font:inherit; color:#fff; \
+                 background:#238636; border:1px solid #2ea043; border-radius:6px;"
+            };
+            view! {
+                <div
+                    style="position:fixed; top:0; left:0; width:100vw; height:100vh; \
+                           z-index:30; display:flex; align-items:center; \
+                           justify-content:center; background:rgba(1,4,9,0.6);"
+                    on:click=move |_| {
+                        // Ignore the iOS ghost click that fires just after opening.
+                        if js_sys::Date::now() - dialog_opened_at.get_value() > DIALOG_GUARD_MS {
+                            confirm_op.set(None);
+                        }
+                    }
+                >
+                    <div
+                        style="min-width:300px; max-width:90vw; padding:16px; \
+                               background:#161b22; border:1px solid #30363d; \
+                               border-radius:10px; color:var(--fg); \
+                               box-shadow:0 12px 32px rgba(0,0,0,0.6);"
+                        on:click=move |ev| ev.stop_propagation()
+                    >
+                        <div style="font-weight:600; margin-bottom:12px;">{title}</div>
+                        <div style="margin-bottom:14px; line-height:1.4;">{body}</div>
+                        <div style="display:flex; gap:8px; justify-content:flex-end;">
+                            <button
+                                style="padding:6px 14px; font:inherit; color:var(--fg); \
+                                       background:#21262d; border:1px solid #30363d; \
+                                       border-radius:6px;"
+                                on:click=move |_| confirm_op.set(None)
+                            >
+                                "Cancel"
+                            </button>
+                            <button
+                                style=confirm_style
+                                prop:disabled=!enabled
+                                on:click=move |_| run_confirmed()
+                            >
+                                {confirm_label}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            }
+        })
+    };
+
     view! {
         <svg
             class="graph-svg"
@@ -945,15 +1230,16 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 {stubs}
             </g>
         </svg>
-        // The context menu and the commit modal are the two overlays. They're
-        // mutually exclusive (opening the modal closes the menu), so a single
-        // reactive block renders whichever is active — the overlays are
+        // The overlays: the context menu, the commit modal, and the branch-op
+        // confirm modal. They're mutually exclusive (opening either modal closes the
+        // menu), so one reactive block renders whichever is active — all are
         // `position: fixed`, so this wrapper adds no layout.
         <div class="overlays">
             {move || {
                 let menu = menu_view();
                 let modal = commit_dialog_view();
-                view! { {menu} {modal} }
+                let confirm = confirm_modal_view();
+                view! { {menu} {modal} {confirm} }
             }}
         </div>
     }
