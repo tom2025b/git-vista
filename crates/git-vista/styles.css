@@ -128,6 +128,10 @@ html, body {
 }
 .ctx-item.disabled:hover,
 .ctx-item:disabled:hover { background: transparent; }
+/* Issue #33 follow-up: the destructive "Delete branch" item reads red so it's
+   distinct from the safe operations above it in the menu. */
+.ctx-item.danger { color: #f85149; }
+.ctx-item.danger:hover { background: #2d1517; }
 
 /* Issue #33: the commit-message modal is styled inline in app.rs — its overlay
    deliberately uses a <textarea> (not a void <input>, which panics Leptos' CSR
