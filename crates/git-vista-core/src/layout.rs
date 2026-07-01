@@ -256,11 +256,15 @@ fn assign_branch_colors(
     let index: HashMap<&Oid, usize> = graph.rows.iter().map(|r| (&r.commit.id, r.row)).collect();
 
     // Branch refs, in colouring priority. The order decides who *owns* a shared
-    // first-parent chain and who is demoted to a stub, so it matters a lot:
+    // first-parent chain (and so who takes the trunk colour and who is demoted to a
+    // stub), so it matters a lot:
     //
-    //  1. The checked-out branch first — it owns the trunk colour (slot 0) and,
-    //     by claiming its tip before anyone else, is never demoted to a stub even
-    //     when a sibling branch sits on the very same commit (exactly what happens
+    //  1. **The trunk first**, so it owns colour slot 0 — the one blue line. That
+    //     is `main` (then `master`) whenever a local one exists, so `main` is
+    //     *always* blue regardless of which branch happens to be checked out
+    //     (Issue #30). Only if neither exists do we fall back to the checked-out
+    //     branch. Claiming its tip before anyone else also keeps the trunk off the
+    //     stub list even when a sibling branch sits on its very tip (what happens
     //     right after you branch from it).
     //  2. Local before remote — so a local branch's tip is never pre-claimed by a
     //     remote-tracking ref; remotes like `origin/main` stay ordinary badges.
@@ -276,12 +280,21 @@ fn assign_branch_colors(
     //  4. Name — a final, deterministic tiebreak (e.g. two branches on one commit).
     let mut seeds: Vec<&GitRef> = refs.iter().filter(|r| r.is_branch()).collect();
     seeds.sort_by_key(|r| {
-        let is_checked_out = head_branch == Some(r.name.as_str())
-            && matches!(r.kind, crate::model::RefKind::Branch);
+        let is_local = matches!(r.kind, crate::model::RefKind::Branch);
+        // Which branch owns the trunk (slot 0, blue): prefer local `main`, then
+        // local `master`, then the checked-out branch — smaller rank wins.
+        let trunk_rank = if is_local && r.name == "main" {
+            0
+        } else if is_local && r.name == "master" {
+            1
+        } else if is_local && head_branch == Some(r.name.as_str()) {
+            2
+        } else {
+            3
+        };
         let is_remote = matches!(r.kind, crate::model::RefKind::RemoteBranch);
         let tip_row = index.get(&r.target).copied().unwrap_or(usize::MAX);
-        // false < true, so negate the one we want first.
-        (!is_checked_out, is_remote, tip_row, r.name.clone())
+        (trunk_rank, is_remote, tip_row, r.name.clone())
     });
 
     // commit row -> colour slot, and branch key -> slot so the same branch reuses
@@ -870,6 +883,32 @@ mod tests {
             g.rows.iter().all(|r| r.color == 0),
             "one branch, one colour"
         );
+    }
+
+    /// Issue #30: `main` owns the trunk colour (slot 0, the one blue line) even
+    /// when a *different* branch is checked out. Here HEAD is on `feature`, yet
+    /// `main`'s line must still be blue and `feature` a distinct non-trunk colour.
+    #[test]
+    fn main_owns_the_trunk_colour_even_when_not_checked_out() {
+        let g = layout_with_refs(
+            vec![
+                commit("M", &["C", "D"]),
+                commit("C", &["B"]),
+                commit("D", &["B"]),
+                commit("B", &["A"]),
+                commit("A", &[]),
+            ],
+            vec![
+                gitref("HEAD", RefKind::Head, "D"),
+                gitref("main", RefKind::Branch, "M"),
+                gitref("feature", RefKind::Branch, "D"),
+            ],
+            // Checked out on `feature`, not `main`.
+            Some("feature"),
+        );
+        assert_eq!(color_of(&g, "M"), 0, "main is the trunk (slot 0) regardless of HEAD");
+        assert_ne!(color_of(&g, "D"), 0, "the checked-out feature is not the trunk");
+        assert!(g.stubs.is_empty(), "both branches own commits — neither is a stub");
     }
 
     #[test]
