@@ -255,24 +255,33 @@ fn assign_branch_colors(
 ) -> (Vec<(String, usize)>, usize) {
     let index: HashMap<&Oid, usize> = graph.rows.iter().map(|r| (&r.commit.id, r.row)).collect();
 
-    // Branch refs, in colouring priority: HEAD's branch first, then local before
-    // remote, then by name — a total, deterministic order.
-    let head_target = refs
-        .iter()
-        .find(|r| matches!(r.kind, crate::model::RefKind::Head))
-        .map(|r| &r.target);
+    // Branch refs, in colouring priority. The order decides who *owns* a shared
+    // first-parent chain and who is demoted to a stub, so it matters a lot:
+    //
+    //  1. The checked-out branch first — it owns the trunk colour (slot 0) and,
+    //     by claiming its tip before anyone else, is never demoted to a stub even
+    //     when a sibling branch sits on the very same commit (exactly what happens
+    //     right after you branch from it).
+    //  2. Local before remote — so a local branch's tip is never pre-claimed by a
+    //     remote-tracking ref; remotes like `origin/main` stay ordinary badges.
+    //  3. **Newest tip first** (smallest row). This is the fix for issue #28: if
+    //     one branch's first-parent chain runs *through* another branch's tip —
+    //     e.g. a branch just created at an older/interior commit of an existing
+    //     line — the branch extending further has the newer tip (smaller row), so
+    //     it claims the whole line and the ancestor-tip branch, owning nothing of
+    //     its own, becomes a stub forking off that dot. Ordering by name instead
+    //     let the freshly-created branch claim first and steal the lower half of
+    //     the existing branch's line (splitting its colour and drawing a spurious
+    //     line back to an earlier dot). Tips outside the walked window sort last.
+    //  4. Name — a final, deterministic tiebreak (e.g. two branches on one commit).
     let mut seeds: Vec<&GitRef> = refs.iter().filter(|r| r.is_branch()).collect();
     seeds.sort_by_key(|r| {
-        // The checked-out branch wins outright: it owns the trunk colour and, by
-        // claiming its tip first, is never demoted to a stub even when a sibling
-        // branch sits on the very same commit (which is exactly what happens right
-        // after you branch from it).
         let is_checked_out = head_branch == Some(r.name.as_str())
             && matches!(r.kind, crate::model::RefKind::Branch);
-        let is_head = head_target == Some(&r.target);
         let is_remote = matches!(r.kind, crate::model::RefKind::RemoteBranch);
-        // false < true, so negate the ones we want first.
-        (!is_checked_out, !is_head, is_remote, r.name.clone())
+        let tip_row = index.get(&r.target).copied().unwrap_or(usize::MAX);
+        // false < true, so negate the one we want first.
+        (!is_checked_out, is_remote, tip_row, r.name.clone())
     });
 
     // commit row -> colour slot, and branch key -> slot so the same branch reuses
@@ -435,6 +444,53 @@ mod tests {
         // The lane count was widened to include the stub lane (so the label
         // column sits to the right of it).
         assert!(g.lane_count > stub.lane);
+    }
+
+    /// Issue #28: a branch created at an *interior* commit of an existing branch's
+    /// line must become a stub forking off that commit — it must NOT claim the
+    /// lower half of the existing branch's first-parent chain. Ordering by name
+    /// used to let `aaa` (created at F1, inside `feature`) claim F1..base and split
+    /// `feature`'s colour in two, drawing a spurious line back to an earlier dot.
+    /// Now the branch with the newer tip (`feature`, tip F2) owns the whole line
+    /// and `aaa` is a stub.
+    #[test]
+    fn a_branch_at_an_interior_commit_is_a_stub_not_a_stolen_line() {
+        // main: D -> C -> B -> A ; feature: F2 -> F1 -> B ; aaa points at F1.
+        // Rows are newest-first (row 0 at top).
+        let commits = vec![
+            commit("D", &["C"]),  // 0  main tip
+            commit("F2", &["F1"]), // 1  feature tip
+            commit("C", &["B"]),  // 2
+            commit("F1", &["B"]), // 3  aaa points here (interior of feature)
+            commit("B", &["A"]),  // 4  fork point
+            commit("A", &[]),     // 5
+        ];
+        let refs = vec![
+            gitref("HEAD", RefKind::Head, "D"),
+            gitref("main", RefKind::Branch, "D"),
+            gitref("feature", RefKind::Branch, "F2"),
+            gitref("aaa", RefKind::Branch, "F1"),
+        ];
+        let g = layout_with_refs(commits, refs, Some("main"));
+
+        // `feature` keeps ONE colour down its whole line (F2 and F1 match), and
+        // it's distinct from main's trunk colour.
+        assert_eq!(
+            color_of(&g, "F2"),
+            color_of(&g, "F1"),
+            "feature must not be split in two by aaa stealing F1"
+        );
+        assert_ne!(color_of(&g, "F1"), color_of(&g, "D"), "feature isn't the trunk");
+        assert_eq!(color_of(&g, "D"), 0, "main (checked out) owns the trunk colour");
+
+        // `aaa` owns nothing → it's a stub anchored at F1, not a badge, not a line.
+        assert_eq!(g.stubs.len(), 1);
+        assert_eq!(g.stubs[0].name, "aaa");
+        assert_eq!(g.stubs[0].anchor_row, 3, "stub forks off F1's dot");
+        assert!(!ref_names(&g, "F1").contains(&"aaa".to_string()));
+        // `feature` stays a real line: it's badged on its tip, not a stub.
+        assert!(g.stubs.iter().all(|s| s.name != "feature"));
+        assert!(ref_names(&g, "F2").contains(&"feature".to_string()));
     }
 
     fn commit(id: &str, parents: &[&str]) -> CommitSummary {
