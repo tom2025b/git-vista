@@ -29,7 +29,7 @@ pub mod history;
 pub mod refs;
 
 pub use github::github_web_base;
-pub use history::{read_remote_commits, walk_history};
+pub use history::{read_commit, read_remote_commits, walk_history};
 pub use refs::{read_head_branch, read_refs};
 
 #[derive(Debug, Error)]
@@ -38,4 +38,6 @@ pub enum RepoError {
     Open { path: PathBuf, message: String },
     #[error("failed to read history: {0}")]
     Walk(String),
+    #[error("no such commit: {0}")]
+    CommitNotFound(String),
 }

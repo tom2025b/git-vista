@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::response::IntoResponse;
 use axum::{
+    extract::Path as AxumPath,
     http::{header, HeaderValue, StatusCode},
     routing::{get, post},
     Json, Router,
@@ -28,7 +29,7 @@ use git_vista_core::model::{
     validate_clone_url, BranchRequest, CloneRequest, CommitSummary, CreateBranchRequest,
     CreateCommitRequest, GitRef, RefKind,
 };
-use git_vista_git::{read_refs, walk_history};
+use git_vista_git::{read_commit, read_refs, walk_history, RepoError};
 use tower::Layer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -135,6 +136,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/commits", get(commits))
+        // Phase 10: full detail for one commit, read on demand for the side panel.
+        .route("/api/commit/{id}", get(commit_detail))
         // Phase 12: clone a public URL into a temp dir and view it read-only.
         .route("/api/clone", post(clone_repo))
         // Issue #18: create a branch at a commit (shells out to `git branch`).
@@ -249,6 +252,25 @@ async fn commits() -> Result<impl IntoResponse, (StatusCode, String)> {
     }
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
     Ok((no_store, Json(graph)))
+}
+
+/// Full detail for one commit (Phase 10 — the detail panel): the whole message
+/// body plus the author and committer signatures, looked up by hex id in the
+/// current repo. A read, so it works on read-only clones too. A bad or unknown id
+/// is a `404`; any other read failure a `500`. Sent `no-store` like the graph.
+async fn commit_detail(
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = current().0;
+    let detail = read_commit(&repo, &id).map_err(|e| match e {
+        RepoError::CommitNotFound(_) => (StatusCode::NOT_FOUND, "No such commit.".to_string()),
+        other => {
+            eprintln!("git-vista: /api/commit/{id} failed: {other}");
+            (StatusCode::INTERNAL_SERVER_ERROR, other.to_string())
+        }
+    })?;
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(detail)))
 }
 
 /// Guard for the write endpoints (Phase 12): when the current repo is a read-only
