@@ -2,6 +2,7 @@
 target = "index.html"
 
 [serve]
-# Match the port Tauri expects in tauri.conf.json (build.devUrl).
+# Frontend-only dev server (no API/real data). The full app is normally run via
+# the `gv` launcher, which serves the built bundle + the API on :8080.
 port = 1420
 open = false
