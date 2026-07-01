@@ -1,11 +1,11 @@
 //! `git-vista-core` — pure, UI-independent logic for git-vista.
 //!
-//! Nothing in this crate knows about Tauri, Leptos, rendering — or even how to
+//! Nothing in this crate knows about HTTP, Leptos, rendering — or even how to
 //! read a git repository. It's **pure logic with no platform dependencies**, so
 //! it compiles cleanly for both native and wasm and is shared, as-is, by the
 //! browser frontend and the native backend. Two small layers, each testable:
 //!
-//! - [`model`]  — serializable data types shared across the IPC/HTTP boundary.
+//! - [`model`]  — serializable data types shared across the HTTP/JSON boundary.
 //! - [`layout`] — assigns commits to lanes for the vertical graph.
 //!
 //! Reading real history (which needs `gix` and a filesystem, and so can't run in

@@ -28,18 +28,17 @@ that a fresh session can resume with no other context.
 ## Snapshot (current)
 - **Architecture:** browser-first. `git-vista-server` (axum) serves the wasm SPA +
   `/api/*` on `0.0.0.0:8080`; the Leptos (`0.6.15`, CSR) frontend `fetch`es it.
-  The Tauri v2 shell (`crates/git-vista/src-tauri`) is **legacy** — kept in the
-  workspace but not the path we run; a browser can't reach a Tauri command, which
-  is why the server exists (see Phase 4).
+  The legacy Tauri v2 shell was **removed in Phase 13** (it was a Phase-4 stub that
+  never read real data; a browser can't reach a Tauri command, which is why the
+  server exists — see Phase 4). Its history is preserved in git.
 - **Toolchain:** cargo `1.96.0`, Trunk `0.21.14`, wasm-bindgen `0.2.126`, wasm32
   target installed. `gix` pinned to `=0.84.0` (see `git-vista-git/Cargo.toml` for
   why 0.85 breaks), axum `0.8`.
-- **Workspace (4 crates + legacy shell):**
+- **Workspace (4 crates):**
   - `crates/git-vista-core` — pure logic (`model`, `layout`); wasm-safe, no gix.
   - `crates/git-vista-git` — native gix reader (`history`, `refs`, `github`).
   - `crates/git-vista-server` — the axum HTTP backend (`main.rs`).
   - `crates/git-vista` — the Leptos wasm UI (bin `git-vista-ui`).
-  - `crates/git-vista/src-tauri` — legacy Tauri shell (pkg `git-vista-tauri`).
 - **Git repo:** on `main`; each phase ships on its own `phaseN-*` branch via PR.
   **Never delete branches** (standing user rule) — leave every branch in place.
 
@@ -51,7 +50,7 @@ cargo test -p git-vista                      # ~39 host tests (geometry/color/�
 cargo clippy -p git-vista-core -p git-vista-git -p git-vista-server            # native clippy
 cargo clippy -p git-vista --target wasm32-unknown-unknown                      # frontend clippy
 ( cd crates/git-vista && trunk build )       # frontend → wasm in dist/
-cargo build --workspace                      # server + frontend + legacy shell compile
+cargo build --workspace                      # core + git + server + frontend compile
 ```
 
 ## Running the app — the `gv` launcher & choosing which repo to view
@@ -1318,6 +1317,15 @@ where it differs (e.g. a GitHub-merged commit).
     `.exists()`). `gv` SIGKILLs the previous server, so its last Phase 12 clone never
     got cleaned up and piled up under the temp dir across runs. Nothing is served
     from there yet at startup, so wiping it is safe; the next clone recreates it.
+- **Removed the legacy Tauri desktop shell** (`crates/git-vista/src-tauri`, pkg
+  `git-vista-tauri`). It was a Phase-4 stub — its one command `list_commits`
+  returned an empty graph and nothing used it — yet it cost a whole CI job plus
+  WebKitGTK/GTK/appindicator/librsvg system deps and a 5th workspace member. Gone:
+  the `src-tauri/` tree, the workspace member, the CI `tauri` job, the
+  `src-tauri/gen` gitignore line, and every Tauri mention in docs/comments (the
+  data types now describe the HTTP/JSON boundary, not "Tauri IPC"). History is
+  preserved in git; the branch `phase10-commit-detail-panel` and all others are
+  left in place (standing "never delete branches" rule).
 
 **Decisions.**
 - Floating reset button lives in `graph_canvas` (where `camera` is), not the topbar
@@ -1345,6 +1353,5 @@ cargo clippy -p git-vista --target wasm32-unknown-unknown    # clean
 ( cd crates/git-vista && trunk build )                       # bundle builds; favicon in dist/index.html
 ```
 
-**Next:** finish Phase 13 (perf pass; consider removing the legacy Tauri shell — it's
-a Phase-4 stub that still costs a whole CI job + WebKitGTK deps), then Phase 11 —
-Search & filter.
+**Next:** finish Phase 13 (an optional perf pass — e.g. open the gix repo once per
+`/api/commits` instead of ~5×), then Phase 11 — Search & filter.
