@@ -824,3 +824,125 @@ opened nothing. **Real-iPad tap check still owed** (headless simulates touch).
 
 **Next:** Phase 8 — Viewport virtualization (only render commits visible in the
 viewport for performance).
+
+
+## Issue #33 — Commit directly from the graph, with an iPad-safe modal (2026-07-01)
+**Status:** done (merged to `main` via PR #34, commit `009327a`). Touches all layers.
+
+### ⚠️ THE BIG LESSON: a void `<input>` breaks Leptos CSR rendering on iOS WebKit
+**This is the most important thing to carry forward.** The commit modal worked
+perfectly on desktop Linux but **silently never mounted on the iPad** — no modal,
+no error, the menu just closed. It took ~15 rebuilds to find because the symptom
+mimicked cache, reactivity, and CSS bugs. Root cause:
+
+- Leptos **0.6.15 with the `csr` feature** renders static markup by building an
+  HTML **`<template>`**, then *walking the parsed DOM nodes at compile-time-fixed
+  positions* (firstChild/nextSibling) to attach dynamic bits + event listeners.
+- **`<input>` is a void element**, and **iOS WebKit's HTML parser handles void
+  elements differently than desktop Blink/Gecko**. The parsed node tree didn't
+  match what Leptos' compile-time walk expected, so the walk landed on the wrong
+  node and **panicked the entire `view!`** — taking the whole modal (even its
+  full-screen backdrop) down with it. Desktop parsed it the expected way, so it
+  worked there. Classic "works on my machine, dead on the device."
+
+**The fix: use a non-void `<textarea>` for the commit-message field, not `<input>`.**
+A `<textarea>` has a real closing tag, so there's no void-parsing ambiguity — and
+it's perfectly good for a commit message (multi-line is fine). **Rule going
+forward: avoid void HTML elements (`<input>`, `<br>`, `<img>`, `<hr>`) inside a
+Leptos `view!` in this project — prefer a non-void equivalent, or build the node
+via `web_sys`.** (Also recorded in Claude auto-memory as `leptos-csr-void-input-webkit`.)
+
+### How it was finally diagnosed (reusable technique)
+The iPad's console isn't readable from the Linux box, and the user runs it in
+**Firefox Private on iOS** (still WebKit) closing the tab between tests (so no
+cache). What cracked it: a **temporary on-screen debug bar** rendered as a
+`position:fixed` element, showing a hardcoded **`BUILD-XXX` marker** (bumped every
+build, so you can confirm from the device which bundle is live vs. a stale one)
+plus a **"TEST MODAL" button** that opened the modal directly (bypassing the menu
+path). Then the modal's contents were **bisected**: minimal magenta `<div>` (✓
+mounts) → +flex/nesting/title (✓) → +`<input>` (✗ whole modal dies) → bare
+`<input>` (✗) → `<textarea>` (✓). When you can't see a device's console, put the
+diagnostics **on the screen** and bisect.
+
+**What changed (feature itself):**
+- **`git-vista-core::model`**: new shared `CreateCommitRequest { message: String,
+  allow_empty: bool }` (mirrors `CreateBranchRequest` from Issue #18).
+- **`git-vista-server`**: new route **`POST /api/commit`** → `create_commit()`
+  shells out to `git -C <repo> commit [-m <msg>] [--allow-empty]`, argv-separated
+  (no shell injection), rejects an empty message. Surfaces git's own error text;
+  note **"nothing to commit" goes to git's *stdout* (not stderr) with a non-zero
+  exit**, so the handler prefers stderr, then falls back to stdout, then a generic
+  line. (Same B3 "let git validate + report" posture as `/api/branch`.)
+- **Frontend `app.rs`**:
+  - Context menu (on a commit dot) gained **"Commit staged changes"**
+    (`allow_empty:false`) and **"Create empty commit"** (`allow_empty:true`),
+    enabled **only on the current HEAD tip** — computed as
+    `gr.refs.iter().any(|r| r.kind == RefKind::Head)` — and rendered as a disabled
+    greyed `<span>` elsewhere (only there can a commit land without moving HEAD).
+    `MenuData` gained `is_head: bool` (a branch stub is always `false`).
+  - **The modal** (`commit_dialog_view`): a `commit_dialog: RwSignal<Option<bool>>`
+    (Some(allow_empty) = open) + `commit_msg: RwSignal<String>`. Prompts for the
+    message because **`window.prompt()` is blocked/flashed inside the webview**
+    (its unreliability was the whole reason for a custom modal). On confirm it
+    POSTs `/api/commit`, refreshes the graph (bumps `reload`), and shows git's
+    error via `alert()` on failure. Commit button is `prop:disabled` until the
+    message is non-blank.
+  - `create_commit_request(message, allow_empty)` helper (mirrors
+    `create_branch_request`).
+
+**Modal structure details worth knowing (all deliberate, don't "clean up" naïvely):**
+- **`<textarea>`, never `<input>`** (see the big lesson above).
+- **Inline styles + viewport-unit sizing** (`position:fixed; width:100vw;
+  height:100vh`), NOT CSS classes and NOT the `inset:0` shorthand. Viewport units
+  proved to render reliably on iOS; `inset` is unsupported on older iOS Safari
+  (<14.5) and would collapse the backdrop. The old `.modal-*` CSS classes were
+  removed — the modal is styled inline in `app.rs` on purpose.
+- **Single reactive overlay block.** The menu and modal render from ONE
+  `move || { let menu = menu_view(); let modal = commit_dialog_view(); view!{{menu}{modal}} }`
+  block (they're mutually exclusive — opening the modal closes the menu). This was
+  originally a workaround for a suspected "second adjacent reactive block fails to
+  mount on WebKit" theory that turned out to be **wrong** (the real culprit was the
+  `<input>`); the single block is kept because it's confirmed-working and harmless,
+  but two separate blocks would also work now.
+- **Ghost-click guard.** `dialog_opened_at` (a `store_value(f64)`) records
+  `js_sys::Date::now()` when the modal opens (in `on_commit`); the backdrop's
+  click-to-close ignores a dismiss within **`DIALOG_GUARD_MS` (400 ms)** of
+  opening. Rationale: iOS synthesizes a `click` a few ms after a tap; opening the
+  modal puts its full-screen backdrop under that tap point, so without the guard
+  the synthesized "ghost click" could hit the backdrop and instantly close the
+  modal. (Added defensively; never proven to be the failure — the `<input>` kept
+  the modal from mounting at all — but it's correct and cheap, so it stays.)
+- The `on_commit` handler sets `commit_dialog`/`commit_msg` **before**
+  `menu.set(None)`, because `menu.set(None)` synchronously disposes the handler's
+  own reactive owner and any signal write after it is unreliable.
+
+**Gotchas:**
+- **Test frontend changes on the actual iPad, not just Linux** — WebKit vs
+  Blink/Gecko rendering differences are real and silent (this whole saga). A
+  headless desktop browser won't catch them either.
+- `gv` builds the wasm but a stale bundle can persist on a device; Firefox Private
+  + closing the tab guarantees a fresh load. A `BUILD-XXX` marker is the fastest
+  way to confirm which bundle a device is running.
+- The `git-vista-test` repo (`~/projects/git-vista-test`, github
+  `tom2025b/git-vista-test`) is a **target repo you visualize**, not a copy of the
+  source — it has **no `crates/git-vista/` and no frontend**. Running bare
+  `trunk build` inside it gives *"Unable to find any Trunk configuration"*. Always
+  build via `gv` (it cd's into the real source's `crates/git-vista`).
+
+**Verify:**
+```sh
+cargo test --workspace                        # 58 pass
+( cd crates/git-vista && trunk build )        # wasm bundle builds, no warnings
+( cd crates/git-vista && cargo check --target wasm32-unknown-unknown )   # clean
+```
+Real-device check (the one that matters): `gv`, open on the iPad, stage a change
+in the visualized repo, tap the HEAD-tip dot → "Commit staged changes" → the dark
+modal appears → type a message → Commit → the graph refreshes with the new commit.
+Confirmed working end-to-end on an iPad on 2026-07-01.
+
+**Next (remaining Issue #33 actions, not yet done):** "Merge this branch into
+main", "Push this branch", "Delete this branch (with confirmation)", and
+"Export/Print view". Each maps onto the same pattern: shared request struct in
+`git-vista-core::model` → a `POST /api/…` route in `git-vista-server` that shells
+out to git → a menu item + handler in `app.rs`. Reuse `CreateBranchRequest` /
+`CreateCommitRequest` as the template.
