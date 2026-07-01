@@ -96,21 +96,45 @@ pub fn layout_with_refs(
     // distinct stub lines instead of a second badge on the shared commit.
     let (stub_seeds, used_slots) = assign_branch_colors(&mut graph, &refs, head_branch);
 
-    // Give each stub its own lane (right of the commit lanes) and its own colour
-    // slot (continuing past the ones the real branch lines used, so it's distinct).
-    let mut next_lane = graph.lane_count;
-    let mut stubs = Vec::with_capacity(stub_seeds.len());
+    // Lay the stubs out as *cascades*: all stubs that point at the same commit
+    // stack into a staircase, each forking off the previous one's tip rather than
+    // every one fanning back to the shared commit. So creating another branch at a
+    // commit that already has a stub adds a new hollow dot off the last dot — a
+    // visible fork from the stub you branched from, not another dot on the commit.
+    // Grouping preserves first-appearance order (seed order = branch name), which
+    // is the only deterministic order available (git records no "from which stub").
+    let mut groups: Vec<(usize, Vec<String>)> = Vec::new();
     let mut stub_names = HashSet::new();
-    for (i, (name, anchor_row)) in stub_seeds.into_iter().enumerate() {
+    for (name, anchor_row) in stub_seeds {
         stub_names.insert(name.clone());
-        stubs.push(BranchStub {
-            name,
-            anchor_row,
-            anchor_lane: graph.rows[anchor_row].lane,
-            lane: next_lane,
-            color: used_slots + i,
-        });
-        next_lane += 1;
+        match groups.iter_mut().find(|(row, _)| *row == anchor_row) {
+            Some((_, names)) => names.push(name),
+            None => groups.push((anchor_row, vec![name])),
+        }
+    }
+    // Each cascade gets its own block of consecutive lanes (right of the commit
+    // lanes) so stub `depth` maps to lane `base + depth` — the connector for a
+    // deeper stub starts one lane left, at the previous stub's dot. Colour slots
+    // continue past the real branch lines' so every stub stays distinct.
+    let mut next_lane = graph.lane_count;
+    let mut stubs = Vec::new();
+    let mut slot = used_slots;
+    for (anchor_row, names) in groups {
+        let base = next_lane;
+        for (depth, name) in names.into_iter().enumerate() {
+            stubs.push(BranchStub {
+                name,
+                anchor_row,
+                anchor_lane: graph.rows[anchor_row].lane,
+                lane: base + depth,
+                color: slot,
+                depth,
+            });
+            slot += 1;
+            // The cascade occupies lanes base..=base+depth; keep the next cascade
+            // clear of it.
+            next_lane = base + depth + 1;
+        }
     }
     // Widen the lane count to include the stub columns so the label column sits
     // to the right of them (and the gutter is wide enough to draw the stubs).
@@ -256,11 +280,15 @@ fn assign_branch_colors(
     let index: HashMap<&Oid, usize> = graph.rows.iter().map(|r| (&r.commit.id, r.row)).collect();
 
     // Branch refs, in colouring priority. The order decides who *owns* a shared
-    // first-parent chain and who is demoted to a stub, so it matters a lot:
+    // first-parent chain (and so who takes the trunk colour and who is demoted to a
+    // stub), so it matters a lot:
     //
-    //  1. The checked-out branch first — it owns the trunk colour (slot 0) and,
-    //     by claiming its tip before anyone else, is never demoted to a stub even
-    //     when a sibling branch sits on the very same commit (exactly what happens
+    //  1. **The trunk first**, so it owns colour slot 0 — the one blue line. That
+    //     is `main` (then `master`) whenever a local one exists, so `main` is
+    //     *always* blue regardless of which branch happens to be checked out
+    //     (Issue #30). Only if neither exists do we fall back to the checked-out
+    //     branch. Claiming its tip before anyone else also keeps the trunk off the
+    //     stub list even when a sibling branch sits on its very tip (what happens
     //     right after you branch from it).
     //  2. Local before remote — so a local branch's tip is never pre-claimed by a
     //     remote-tracking ref; remotes like `origin/main` stay ordinary badges.
@@ -276,12 +304,21 @@ fn assign_branch_colors(
     //  4. Name — a final, deterministic tiebreak (e.g. two branches on one commit).
     let mut seeds: Vec<&GitRef> = refs.iter().filter(|r| r.is_branch()).collect();
     seeds.sort_by_key(|r| {
-        let is_checked_out = head_branch == Some(r.name.as_str())
-            && matches!(r.kind, crate::model::RefKind::Branch);
+        let is_local = matches!(r.kind, crate::model::RefKind::Branch);
+        // Which branch owns the trunk (slot 0, blue): prefer local `main`, then
+        // local `master`, then the checked-out branch — smaller rank wins.
+        let trunk_rank = if is_local && r.name == "main" {
+            0
+        } else if is_local && r.name == "master" {
+            1
+        } else if is_local && head_branch == Some(r.name.as_str()) {
+            2
+        } else {
+            3
+        };
         let is_remote = matches!(r.kind, crate::model::RefKind::RemoteBranch);
         let tip_row = index.get(&r.target).copied().unwrap_or(usize::MAX);
-        // false < true, so negate the one we want first.
-        (!is_checked_out, is_remote, tip_row, r.name.clone())
+        (trunk_rank, is_remote, tip_row, r.name.clone())
     });
 
     // commit row -> colour slot, and branch key -> slot so the same branch reuses
@@ -350,6 +387,34 @@ fn assign_branch_colors(
         }
         let key = format!("~{}", graph.rows[row].commit.id.short());
         claim(Some(row), key, &mut color_of, &mut slot_of_key);
+    }
+
+    // Keep the whole trunk *line* one colour — Issue #30. `main` colours its
+    // first-parent chain from its tip downward (the trunk slot, 0), but a branch
+    // sitting ABOVE that tip on the same lane — e.g. a working branch that's ahead
+    // of main and not merged back yet — occupies the very same vertical line, so
+    // the trunk would turn from blue to that branch's colour as it climbs. Extend
+    // the trunk colour upward along that lane: from the trunk tip, follow
+    // first-parent *children* that stay in the trunk's lane, recolouring each to
+    // the trunk slot so the mainline reads as one unbroken blue line top to bottom.
+    // Side branches (which sit in other lanes) keep their own distinct colours.
+    if let Some(mut cur) = color_of
+        .iter()
+        .filter(|&(_, &c)| c == 0)
+        .map(|(&r, _)| r)
+        .min()
+    {
+        let lane = graph.rows[cur].lane;
+        // The child (if any) that continues this lane is the one whose *first*
+        // parent is the current commit and which the layout kept in the same lane.
+        while let Some(child) = graph.rows.iter().find(|r| {
+            r.lane == lane
+                && r.commit.parents.first().and_then(|p| index.get(p).copied()) == Some(cur)
+        }) {
+            let child_row = child.row;
+            color_of.insert(child_row, 0);
+            cur = child_row;
+        }
     }
 
     for row in &mut graph.rows {
@@ -444,6 +509,90 @@ mod tests {
         // The lane count was widened to include the stub lane (so the label
         // column sits to the right of it).
         assert!(g.lane_count > stub.lane);
+    }
+
+    /// Issue #30: a stub has its own identity and the *correct* tip commit. The
+    /// stub's anchor row must be the exact commit its branch points at — that hash
+    /// is what the UI's menu shows and what "branch from the stub" forks off, so if
+    /// it drifted to some other commit, the hollow dot would misrepresent the
+    /// branch and branching would target the wrong commit.
+    #[test]
+    fn a_stub_anchor_is_its_branchs_own_tip_commit() {
+        // A coloured side branch `feature` (tip F2), plus a brand-new branch `fork`
+        // created at feature's *tip* F2 — so `fork` owns nothing and is a stub.
+        //   D  main tip
+        //   F2 feature tip  <- `fork` also points here
+        //   C
+        //   F1
+        //   B  fork point
+        //   A
+        let commits = vec![
+            commit("D", &["C"]),
+            commit("F2", &["F1"]),
+            commit("C", &["B"]),
+            commit("F1", &["B"]),
+            commit("B", &["A"]),
+            commit("A", &[]),
+        ];
+        let refs = vec![
+            gitref("HEAD", RefKind::Head, "D"),
+            gitref("main", RefKind::Branch, "D"),
+            gitref("feature", RefKind::Branch, "F2"),
+            gitref("fork", RefKind::Branch, "F2"),
+        ];
+        let g = layout_with_refs(commits, refs, Some("main"));
+
+        // `feature` is the real line; `fork` (created at its tip) is the stub.
+        let stub = g.stubs.iter().find(|s| s.name == "fork").expect("fork is a stub");
+        assert!(g.stubs.iter().all(|s| s.name != "feature"), "feature is a real line");
+        // The stub's tip is exactly F2 — feature's own tip, the commit `fork`
+        // points at — so branching from the stub forks off F2, not some parent.
+        assert_eq!(
+            g.rows[stub.anchor_row].commit.id.0, "F2",
+            "the stub's tip must be its branch's own commit"
+        );
+        // And its colour slot is distinct from the branch it forked off.
+        assert_ne!(stub.color, color_of(&g, "F2"), "a new branch differs from its parent");
+    }
+
+    /// Issue #30: several branches created at the *same* commit cascade — each is
+    /// its own stub, stacked so a deeper one forks off the previous stub's tip (one
+    /// lane to the right) rather than every stub fanning back to the shared commit.
+    /// This is what makes "create a branch from a hollow dot" draw a new dot off
+    /// the dot you clicked.
+    #[test]
+    fn stubs_sharing_a_commit_cascade_off_one_another() {
+        // main at c2; `aaa` and `bbb` both freshly created at c2 (own nothing).
+        let commits = vec![
+            commit("c2", &["c1"]),
+            commit("c1", &["c0"]),
+            commit("c0", &[]),
+        ];
+        let refs = vec![
+            gitref("HEAD", RefKind::Head, "c2"),
+            gitref("main", RefKind::Branch, "c2"),
+            gitref("aaa", RefKind::Branch, "c2"),
+            gitref("bbb", RefKind::Branch, "c2"),
+        ];
+        let g = layout_with_refs(commits, refs, Some("main"));
+
+        assert_eq!(g.stubs.len(), 2, "both new branches are stubs");
+        // Ordered deterministically by name: aaa is the base of the cascade, bbb
+        // stacks above it.
+        let aaa = g.stubs.iter().find(|s| s.name == "aaa").unwrap();
+        let bbb = g.stubs.iter().find(|s| s.name == "bbb").unwrap();
+        // Both anchor at the same commit (c2, row 0).
+        assert_eq!(aaa.anchor_row, 0);
+        assert_eq!(bbb.anchor_row, 0);
+        // First forks off the commit; second forks off the first (one deeper, one
+        // lane further right — that's how the connector finds the previous tip).
+        assert_eq!(aaa.depth, 0, "first stub forks off the commit");
+        assert_eq!(bbb.depth, 1, "second stub forks off the first stub's tip");
+        assert_eq!(bbb.lane, aaa.lane + 1, "the deeper stub sits one lane right");
+        // Distinct colours, and neither is the trunk slot.
+        assert_ne!(aaa.color, bbb.color);
+        assert_ne!(aaa.color, 0);
+        assert_ne!(bbb.color, 0);
     }
 
     /// Issue #28: a branch created at an *interior* commit of an existing branch's
@@ -870,6 +1019,74 @@ mod tests {
             g.rows.iter().all(|r| r.color == 0),
             "one branch, one colour"
         );
+    }
+
+    /// Issue #30: `main` owns the trunk colour (slot 0, the one blue line) even
+    /// when a *different* branch is checked out. Here HEAD is on `feature`, yet
+    /// `main`'s line must still be blue and `feature` a distinct non-trunk colour.
+    #[test]
+    fn main_owns_the_trunk_colour_even_when_not_checked_out() {
+        let g = layout_with_refs(
+            vec![
+                commit("M", &["C", "D"]),
+                commit("C", &["B"]),
+                commit("D", &["B"]),
+                commit("B", &["A"]),
+                commit("A", &[]),
+            ],
+            vec![
+                gitref("HEAD", RefKind::Head, "D"),
+                gitref("main", RefKind::Branch, "M"),
+                gitref("feature", RefKind::Branch, "D"),
+            ],
+            // Checked out on `feature`, not `main`.
+            Some("feature"),
+        );
+        assert_eq!(color_of(&g, "M"), 0, "main is the trunk (slot 0) regardless of HEAD");
+        assert_ne!(color_of(&g, "D"), 0, "the checked-out feature is not the trunk");
+        assert!(g.stubs.is_empty(), "both branches own commits — neither is a stub");
+    }
+
+    /// Issue #30 follow-up: a branch ahead of `main` that hasn't been merged back
+    /// sits in the trunk lane, directly above main's tip, so it *is* the visible
+    /// continuation of the trunk line. The whole line must stay the trunk colour
+    /// top to bottom — not turn to the ahead-branch's colour going up — while a
+    /// genuine side branch (in another lane) keeps its own distinct colour.
+    #[test]
+    fn the_trunk_line_stays_one_colour_when_a_branch_is_ahead_of_main() {
+        // E,D (feature, ahead) -> C (main tip) -> B -> A, all lane 0; S is a side
+        // branch off B in its own lane.
+        //   E   feature tip (lane 0)
+        //   D   feature      (lane 0)
+        //   | S side tip     (lane 1)
+        //   C   main tip     (lane 0)
+        //   |/
+        //   B
+        //   A
+        let commits = vec![
+            commit("E", &["D"]),
+            commit("D", &["C"]),
+            commit("S", &["B"]),
+            commit("C", &["B"]),
+            commit("B", &["A"]),
+            commit("A", &[]),
+        ];
+        let refs = vec![
+            gitref("HEAD", RefKind::Head, "E"),
+            gitref("main", RefKind::Branch, "C"),
+            gitref("feature", RefKind::Branch, "E"),
+            gitref("side", RefKind::Branch, "S"),
+        ];
+        // Checked out on `feature`, which is ahead of `main`.
+        let g = layout_with_refs(commits, refs, Some("feature"));
+
+        // The entire trunk line is the trunk colour, including the un-merged
+        // feature commits that sit above main's tip on the same lane.
+        for c in ["E", "D", "C", "B", "A"] {
+            assert_eq!(color_of(&g, c), 0, "{c} is on the trunk line and must be blue");
+        }
+        // The genuine side branch (different lane) keeps its own, non-trunk colour.
+        assert_ne!(color_of(&g, "S"), 0, "a real side branch is not the trunk colour");
     }
 
     #[test]

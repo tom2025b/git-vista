@@ -143,6 +143,14 @@ pub struct BranchStub {
     pub lane: usize,
     /// The stub's own colour slot — distinct from the branch it forked off.
     pub color: usize,
+    /// Position in the cascade of stubs that share this anchor commit: 0 forks
+    /// straight off the commit; 1 forks off stub 0's tip; 2 off stub 1's tip; …
+    /// So creating another branch at a commit that already has one draws a *new*
+    /// hollow dot forking off the previous stub's dot, rather than every stub
+    /// fanning back to the shared commit. (Git records no "created from which
+    /// stub" link, so the cascade is ordered deterministically by branch name.)
+    #[serde(default)]
+    pub depth: usize,
 }
 
 /// Body of a `POST /api/branch` request (Issue #18): create a branch named

@@ -102,20 +102,29 @@ pub fn edge_path(e: &Edge) -> String {
     }
 }
 
-/// Centre y of a branch stub's tip node: half a row above its anchor commit, so
-/// the stub reads as a short fork sitting just above the commit it points at,
-/// clear of that commit's own label lines.
-pub fn stub_node_cy(anchor_row: usize) -> i32 {
-    node_cy(anchor_row) - ROW_HEIGHT / 2
+/// Centre y of a branch stub's tip node. Stubs sharing a commit cascade upward:
+/// `depth` 0 sits half a row above the commit (a short fork just above it), and
+/// each deeper stub steps another half-row higher, so a stack of branches at one
+/// commit reads as a staircase of hollow dots rather than a pile on the commit.
+pub fn stub_node_cy(anchor_row: usize, depth: usize) -> i32 {
+    node_cy(anchor_row) - (depth as i32 + 1) * (ROW_HEIGHT / 2)
 }
 
-/// SVG path from an anchor commit's node up-and-out to a branch stub's tip node —
-/// a smooth S-curve, like a branch edge, so the stub flows out of the commit
-/// rather than cutting straight to it.
+/// SVG path up-and-out to a branch stub's tip node — a smooth S-curve, like a
+/// branch edge, so the stub flows out of its source rather than cutting to it. The
+/// source is the anchor commit for the first stub in a cascade (`depth` 0), or the
+/// previous stub's tip (one lane left, one half-row down) for a deeper stub — so
+/// the cascade visibly forks each new branch off the one before it.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn stub_path(anchor_lane: usize, anchor_row: usize, stub_lane: usize) -> String {
-    let (ax, ay) = (node_cx(anchor_lane), node_cy(anchor_row));
-    let (sx, sy) = (node_cx(stub_lane), stub_node_cy(anchor_row));
+pub fn stub_path(anchor_lane: usize, anchor_row: usize, stub_lane: usize, depth: usize) -> String {
+    let (sx, sy) = (node_cx(stub_lane), stub_node_cy(anchor_row, depth));
+    let (ax, ay) = if depth == 0 {
+        // Fork straight off the commit dot.
+        (node_cx(anchor_lane), node_cy(anchor_row))
+    } else {
+        // Fork off the previous stub's tip (the lane immediately to the left).
+        (node_cx(stub_lane - 1), stub_node_cy(anchor_row, depth - 1))
+    };
     let ym = (ay + sy) / 2;
     format!("M {ax} {ay} C {ax} {ym}, {sx} {ym}, {sx} {sy}")
 }
@@ -151,6 +160,29 @@ mod tests {
         // Pills sit on the top label line, above the hash·author line.
         assert!(badge_top_y(2) < label_top_y(2));
         assert!(badge_text_y(2) < label_bottom_y(2));
+    }
+
+    #[test]
+    fn stub_cascade_steps_up_and_forks_off_the_previous_tip() {
+        // Each deeper stub sits a further half-row above the commit.
+        assert_eq!(stub_node_cy(4, 0), node_cy(4) - ROW_HEIGHT / 2);
+        assert_eq!(stub_node_cy(4, 1), node_cy(4) - ROW_HEIGHT);
+        assert!(stub_node_cy(4, 1) < stub_node_cy(4, 0), "deeper is higher up");
+
+        // The first stub in a cascade forks off the commit dot itself.
+        let d0 = stub_path(0, 4, 3, 0);
+        assert!(
+            d0.starts_with(&format!("M {} {}", node_cx(0), node_cy(4))),
+            "depth-0 stub starts at the commit dot: {d0}"
+        );
+        // A deeper stub forks off the previous stub's tip (one lane left, one
+        // half-row down), NOT off the commit — that's the visible fork-from-a-dot.
+        let d1 = stub_path(0, 4, 4, 1);
+        assert!(
+            d1.starts_with(&format!("M {} {}", node_cx(3), stub_node_cy(4, 0))),
+            "depth-1 stub starts at the previous stub's tip: {d1}"
+        );
+        assert!(d1.contains(" C "), "still a smooth curve");
     }
 
     #[test]
