@@ -487,6 +487,50 @@ mod tests {
         assert!(g.lane_count > stub.lane);
     }
 
+    /// Issue #30: a stub has its own identity and the *correct* tip commit. The
+    /// stub's anchor row must be the exact commit its branch points at — that hash
+    /// is what the UI's menu shows and what "branch from the stub" forks off, so if
+    /// it drifted to some other commit, the hollow dot would misrepresent the
+    /// branch and branching would target the wrong commit.
+    #[test]
+    fn a_stub_anchor_is_its_branchs_own_tip_commit() {
+        // A coloured side branch `feature` (tip F2), plus a brand-new branch `fork`
+        // created at feature's *tip* F2 — so `fork` owns nothing and is a stub.
+        //   D  main tip
+        //   F2 feature tip  <- `fork` also points here
+        //   C
+        //   F1
+        //   B  fork point
+        //   A
+        let commits = vec![
+            commit("D", &["C"]),
+            commit("F2", &["F1"]),
+            commit("C", &["B"]),
+            commit("F1", &["B"]),
+            commit("B", &["A"]),
+            commit("A", &[]),
+        ];
+        let refs = vec![
+            gitref("HEAD", RefKind::Head, "D"),
+            gitref("main", RefKind::Branch, "D"),
+            gitref("feature", RefKind::Branch, "F2"),
+            gitref("fork", RefKind::Branch, "F2"),
+        ];
+        let g = layout_with_refs(commits, refs, Some("main"));
+
+        // `feature` is the real line; `fork` (created at its tip) is the stub.
+        let stub = g.stubs.iter().find(|s| s.name == "fork").expect("fork is a stub");
+        assert!(g.stubs.iter().all(|s| s.name != "feature"), "feature is a real line");
+        // The stub's tip is exactly F2 — feature's own tip, the commit `fork`
+        // points at — so branching from the stub forks off F2, not some parent.
+        assert_eq!(
+            g.rows[stub.anchor_row].commit.id.0, "F2",
+            "the stub's tip must be its branch's own commit"
+        );
+        // And its colour slot is distinct from the branch it forked off.
+        assert_ne!(stub.color, color_of(&g, "F2"), "a new branch differs from its parent");
+    }
+
     /// Issue #28: a branch created at an *interior* commit of an existing branch's
     /// line must become a stub forking off that commit — it must NOT claim the
     /// lower half of the existing branch's first-parent chain. Ordering by name

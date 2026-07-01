@@ -58,6 +58,24 @@ pub fn branch_color(slot: usize) -> &'static str {
     }
 }
 
+// Used only by the wasm-only `app` view.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+/// The colour for branch slot `slot`, but guaranteed to *differ* from the colour
+/// of `avoid`. Because the palette collapses many slots onto few colours, a slot
+/// can otherwise land on the same colour as an unrelated branch; this steps to the
+/// next slot until the colour differs. Used so a freshly-created branch never
+/// shares the colour of the branch it forked off (Issue #30).
+pub fn branch_color_distinct_from(slot: usize, avoid: usize) -> &'static str {
+    let avoid = branch_color(avoid);
+    // Non-trunk slots (>= 1) cycle through BRANCH_COLORS, so stepping at most
+    // `len` times always reaches a different colour. `slot` for a stub is always
+    // >= 1, so we never step onto (or off) the reserved trunk blue.
+    (slot..)
+        .map(branch_color)
+        .find(|&c| c != avoid)
+        .unwrap_or_else(|| branch_color(slot))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +106,78 @@ mod tests {
         assert_eq!(branch_color(1), BRANCH_COLORS[0]);
         assert_eq!(branch_color(BRANCH_COLORS.len()), BRANCH_COLORS[BRANCH_COLORS.len() - 1]);
         assert_eq!(branch_color(1), branch_color(1 + BRANCH_COLORS.len()));
+    }
+
+    #[test]
+    fn distinct_from_never_matches_the_avoided_colour() {
+        // A stub whose raw slot collides with its parent's colour gets bumped to a
+        // different colour; a non-colliding slot is returned unchanged.
+        for slot in 1..30 {
+            for avoid in 0..30 {
+                let c = branch_color_distinct_from(slot, avoid);
+                assert_ne!(c, branch_color(avoid), "slot {slot} vs avoid {avoid}");
+                assert_ne!(c, TRUNK_COLOR, "a stub colour is never the trunk blue");
+            }
+        }
+        // No collision => unchanged (slot 1 is green, avoiding blue leaves it green).
+        assert_eq!(branch_color_distinct_from(1, 0), branch_color(1));
+    }
+
+    /// End-to-end (real layout + the exact colour call the view makes): a branch
+    /// created off an existing coloured branch renders in a *different* colour
+    /// from that parent branch. This is the Issue #30 report — a new branch
+    /// reusing its parent's colour — pinned so it can't regress.
+    #[test]
+    fn a_new_branch_renders_a_different_colour_from_its_parent() {
+        use git_vista_core::layout::layout_with_refs;
+        use git_vista_core::model::{CommitSummary, GitRef, Oid, RefKind};
+
+        let c = |id: &str, parents: &[&str]| CommitSummary {
+            id: Oid(id.into()),
+            parents: parents.iter().map(|p| Oid((*p).into())).collect(),
+            summary: id.into(),
+            author: "t".into(),
+            time: 0,
+        };
+        let r = |name: &str, kind: RefKind, target: &str| GitRef {
+            name: name.into(),
+            kind,
+            target: Oid(target.into()),
+        };
+        // main line with a feature side branch (its own colour); `fork` is a fresh
+        // branch created at feature's tip F, so it's a stub anchored on feature.
+        //   M  merge[C, F]
+        //   C  F   (F = feature tip, `fork` also points here)
+        //   B
+        //   A
+        let g = layout_with_refs(
+            vec![
+                c("M", &["C", "F"]),
+                c("C", &["B"]),
+                c("F", &["B"]),
+                c("B", &["A"]),
+                c("A", &[]),
+            ],
+            vec![
+                r("HEAD", RefKind::Head, "M"),
+                r("main", RefKind::Branch, "M"),
+                r("feature", RefKind::Branch, "F"),
+                r("fork", RefKind::Branch, "F"),
+            ],
+            Some("main"),
+        );
+
+        let stub = g.stubs.iter().find(|s| s.name == "fork").expect("fork is a stub");
+        // Exactly the computation the view performs for a stub's colour.
+        let anchor_slot = g.rows[stub.anchor_row].color;
+        let rendered = branch_color_distinct_from(stub.color, anchor_slot);
+        assert_ne!(
+            rendered,
+            branch_color(anchor_slot),
+            "the new branch must not share the colour of the branch it forked off"
+        );
+        // The parent branch here is a real coloured (non-trunk) line, so this is a
+        // meaningful check, not a trivial trunk-vs-branch difference.
+        assert_ne!(branch_color(anchor_slot), TRUNK_COLOR);
     }
 }

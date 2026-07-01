@@ -21,7 +21,9 @@ use gloo_net::http::Request;
 use git_vista_core::model::{CreateBranchRequest, Graph, RefKind};
 
 use crate::camera::{Camera, ZOOM_STEP};
-use crate::color::{branch_color, BADGE_DARK, HEAD_BADGE, MERGE_FILL, TAG_BADGE};
+use crate::color::{
+    branch_color, branch_color_distinct_from, BADGE_DARK, HEAD_BADGE, MERGE_FILL, TAG_BADGE,
+};
 use crate::datetime::local_timestamp;
 use crate::geometry::{
     badge_text_dx, badge_text_y, badge_top_y, badge_width, edge_path, label_bottom_y, label_top_y,
@@ -39,17 +41,25 @@ const MAX_SUMMARY_CHARS: usize = 60;
 /// part of the pan/zoomed SVG), and the commit's GitHub URL when it has one.
 #[derive(Clone)]
 struct MenuData {
-    /// Full commit hash — what "Create branch" targets.
+    /// Full commit hash — what "Create branch" targets. For a branch stub this is
+    /// its tip's commit (the branch owns no commit of its own), so branching from
+    /// the stub forks off that commit.
     commit: String,
-    /// Short hash, shown as the menu's header.
-    short: String,
+    /// The menu's header: a commit's short hash, or a stub's branch name — so a
+    /// stub reads as the branch it is, not the commit it happens to sit on
+    /// (Issue #30).
+    header: String,
     /// Viewport x/y of the click, used to position the overlay.
     x: f64,
     y: f64,
-    /// GitHub commit URL, `Some` only when this repo has a github.com origin *and*
-    /// the commit is pushed (otherwise the page would 404). Drives whether the
-    /// "Open on GitHub" item is a live link or a disabled entry.
+    /// GitHub URL for the "Open on GitHub" item — a commit page for a commit dot,
+    /// or the branch's tree page for a stub. `Some` only when this repo has a
+    /// github.com origin *and* the target is pushed (otherwise it would 404);
+    /// `None` renders the item disabled.
     github_url: Option<String>,
+    /// Label for the "Open on GitHub" item, so a stub says "branch" and a commit
+    /// says "commit".
+    github_label: &'static str,
 }
 
 /// Pointer travel (CSS px) past which a press becomes a pan/drag rather than a
@@ -251,10 +261,11 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 ev.stop_propagation();
                 menu.set(Some(MenuData {
                     commit: commit_id.clone(),
-                    short: short.clone(),
+                    header: short.clone(),
                     x: ev.client_x() as f64,
                     y: ev.client_y() as f64,
                     github_url: github_url.clone(),
+                    github_label: "Open commit on GitHub",
                 }));
             };
 
@@ -452,7 +463,12 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
         .stubs
         .iter()
         .map(|s| {
-            let color = branch_color(s.color);
+            // A new branch must never share the colour of the branch it forked off
+            // (Issue #30): the palette collapses many slots onto few colours, so a
+            // stub's raw slot can collide with its anchor branch's colour. Bump it
+            // until it differs from the anchor commit's colour.
+            let anchor_slot = graph.rows[s.anchor_row].color;
+            let color = branch_color_distinct_from(s.color, anchor_slot);
             let d = stub_path(s.anchor_lane, s.anchor_row, s.lane);
             let sx = node_cx(s.lane);
             let sy = stub_node_cy(s.anchor_row);
@@ -461,16 +477,21 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             let w = badge_width(&s.name);
             let name = s.name.clone();
 
-            // The stub's tip *is* its anchor commit (the branch owns no commits of
-            // its own yet), so tapping the tip opens the same context menu as that
-            // commit — letting you fork a further branch straight off this one
-            // (Issue #24). We therefore target the anchor commit's id/hash.
+            // The stub is a *branch*, not the commit it happens to sit on, so its
+            // menu takes the branch's identity (Issue #30): the header is the
+            // branch name and "Open on GitHub" goes to the branch's tree page (only
+            // when a remote branch of the same name exists, so it never 404s) — the
+            // same rule the branch badges use. "Create branch" still targets the
+            // stub's tip commit, so forking from the stub forks off that commit
+            // (Issue #24).
             let anchor = &graph.rows[s.anchor_row].commit;
             let commit_id = anchor.id.0.clone();
-            let short = anchor.id.short().to_string();
-            let github_url = repo_url
-                .as_ref()
-                .and_then(|base| remote_set.contains(&commit_id).then(|| format!("{base}/commit/{commit_id}")));
+            let header = s.name.clone();
+            let github_url = repo_url.as_ref().and_then(|base| {
+                remote_branches
+                    .contains(&s.name)
+                    .then(|| format!("{base}/tree/{}", s.name))
+            });
             let open_menu = move |ev: web_sys::MouseEvent| {
                 // Ignore the click that ends a pan; a real tap opens the menu.
                 if moved.get_value() {
@@ -479,10 +500,11 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 ev.stop_propagation();
                 menu.set(Some(MenuData {
                     commit: commit_id.clone(),
-                    short: short.clone(),
+                    header: header.clone(),
                     x: ev.client_x() as f64,
                     y: ev.client_y() as f64,
                     github_url: github_url.clone(),
+                    github_label: "Open branch on GitHub",
                 }));
             };
             view! {
@@ -675,6 +697,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
     // click, rendered outside the SVG so it never pans/zooms and isn't clipped.
     let menu_view = move || {
         menu.get().map(|m| {
+            let label = m.github_label;
             let open_github = match m.github_url.clone() {
                 // Live link: a real anchor, opening GitHub in a new tab. Tapping it
                 // also closes the menu.
@@ -686,18 +709,18 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                         rel="noopener"
                         on:click=move |_| menu.set(None)
                     >
-                        "Open on GitHub"
+                        {label}
                     </a>
                 }
                 .into_view(),
-                // No GitHub page for this commit (no github remote, or unpushed):
+                // No GitHub page for this target (no github remote, or unpushed):
                 // show the option but disabled, with a reason on hover.
                 None => view! {
                     <span
                         class="ctx-item disabled"
-                        title="This commit has no GitHub page (no github.com remote, or it isn't pushed)"
+                        title="No GitHub page (no github.com remote, or it isn't pushed)"
                     >
-                        "Open on GitHub"
+                        {label}
                     </span>
                 }
                 .into_view(),
@@ -732,7 +755,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             };
             view! {
                 <div class="ctx-menu" style=format!("left: {}px; top: {}px;", m.x, m.y)>
-                    <div class="ctx-menu-header">{m.short.clone()}</div>
+                    <div class="ctx-menu-header">{m.header.clone()}</div>
                     {open_github}
                     <button class="ctx-item" on:click=on_branch>
                         "Create branch from this commit"
