@@ -23,7 +23,7 @@ use axum::{
 };
 use git_vista_core::layout;
 use git_vista_core::model::{
-    CommitSummary, CreateBranchRequest, CreateCommitRequest, GitRef, RefKind,
+    BranchRequest, CommitSummary, CreateBranchRequest, CreateCommitRequest, GitRef, RefKind,
 };
 use git_vista_git::{read_refs, walk_history};
 use tower::Layer;
@@ -90,6 +90,13 @@ async fn main() {
         .route("/api/branch", post(create_branch))
         // Issue #33: create a commit on top of HEAD (shells out to `git commit`).
         .route("/api/commit", post(create_commit))
+        // Issue #33 follow-up: the live checked-out branch, resolved fresh on every
+        // request so the merge dialog shows the true target even without a Refresh.
+        .route("/api/head-branch", get(head_branch))
+        // Issue #33 follow-up: branch operations, each shelling out to git.
+        .route("/api/merge", post(merge_branch))
+        .route("/api/push", post(push_branch))
+        .route("/api/delete-branch", post(delete_branch))
         // Anything that isn't the API is served from the built SPA bundle.
         .fallback_service(spa);
 
@@ -303,6 +310,114 @@ async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (StatusCode, Str
             }
         };
         eprintln!("git-vista: /api/commit failed: {msg}");
+        (StatusCode::BAD_REQUEST, msg)
+    }
+}
+
+/// The currently checked-out branch, resolved fresh (Issue #33 follow-up). The
+/// merge dialog fetches this the moment the user clicks "Merge", so it names the
+/// real target even if the graph on screen is a stale snapshot from before a branch
+/// switch. `null` => detached HEAD. Sent `no-store` so it's never served from cache.
+async fn head_branch() -> impl IntoResponse {
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    (no_store, Json(git_vista_git::read_head_branch(repo_path())))
+}
+
+/// Merge a branch into the currently checked-out branch (Issue #33 follow-up):
+/// `git merge --no-edit <branch>`. `--no-edit` takes git's default merge message
+/// (the server has no editor). A merge lands in whatever HEAD points at, so the UI
+/// labels this with the current branch and never switches branches itself.
+async fn merge_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
+    run_branch_op(
+        "/api/merge",
+        &req.branch,
+        &["merge", "--no-edit"],
+        format!("merged '{}' into HEAD", req.branch.trim()),
+    )
+    .await
+}
+
+/// Push a branch to `origin` (Issue #33 follow-up): `git push origin <branch>`.
+/// A non-origin remote (or none) makes git error; that text is forwarded to the UI.
+async fn push_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
+    run_branch_op(
+        "/api/push",
+        &req.branch,
+        &["push", "origin"],
+        format!("pushed '{}' to origin", req.branch.trim()),
+    )
+    .await
+}
+
+/// Delete a branch (Issue #33 follow-up): `git branch -d <branch>`. The lowercase
+/// `-d` is the *safe* delete — git refuses to drop a branch whose commits aren't
+/// merged, forwarding "not fully merged" to the UI. The UI also confirms first, so
+/// deletion takes both a click-through and a merged branch.
+async fn delete_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
+    run_branch_op(
+        "/api/delete-branch",
+        &req.branch,
+        &["branch", "-d"],
+        format!("deleted branch '{}'", req.branch.trim()),
+    )
+    .await
+}
+
+/// Shared runner for the branch-operation endpoints (merge/push/delete). Validates
+/// `branch` (non-empty, not an option), then runs `git -C <repo> <args…> <branch>`
+/// with the branch as its own final argv entry — so a crafted name is a git
+/// argument, never a shell command. On failure it forwards git's own stderr
+/// (falling back to stdout, then a generic line), matching `create_commit`'s posture.
+async fn run_branch_op(
+    endpoint: &str,
+    branch: &str,
+    args: &[&str],
+    ok_msg: String,
+) -> (StatusCode, String) {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Branch name can't be empty.".to_string());
+    }
+    if branch.starts_with('-') {
+        return (StatusCode::BAD_REQUEST, "Branch name can't start with '-'.".to_string());
+    }
+
+    let output = match tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path())
+        .args(args)
+        .arg(branch)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("git-vista: {endpoint} couldn't run git: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Couldn't run git: {e}"),
+            );
+        }
+    };
+
+    if output.status.success() {
+        println!("[{endpoint}] {ok_msg}");
+        (StatusCode::OK, ok_msg)
+    } else {
+        // git explains most failures on stderr, but some (e.g. an up-to-date merge)
+        // print to stdout with a non-zero exit — so prefer stderr, fall back to stdout.
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if !stderr.is_empty() {
+            stderr
+        } else {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if stdout.is_empty() {
+                "git command failed.".to_string()
+            } else {
+                stdout
+            }
+        };
+        eprintln!("git-vista: {endpoint} failed: {msg}");
         (StatusCode::BAD_REQUEST, msg)
     }
 }
