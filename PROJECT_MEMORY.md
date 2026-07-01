@@ -1108,3 +1108,76 @@ should all still work.
 
 **Next:** Phase 10 — Commit detail panel (clicking a commit opens a side panel with
 full details), or Phase 11 — Search & filter.
+
+---
+
+## Phase 12 — Open repository UX ("Open URL", read-only) (2026-07-01)
+**Status:** done (skipped Phase 10/11 at the user's request). Ships on branch
+`phase12-open-url`.
+
+**Scope was deliberately cut.** The DESIGN framing was "open any local repository",
+but the user's real need is: *"look at a complex public git history in this app a
+few times to learn git better"* — read-only, occasional, public URLs. So this phase
+is NOT a local-filesystem picker. It's "paste a public URL → clone → view read-only".
+Explicitly NOT built: allowed-roots/local-path picker, directory browser, recents
+persistence, auto-discovery, private-repo auth, any write path on a clone. (A local
+picker could reuse the mutable-repo foundation below if ever wanted.)
+
+**How it works.**
+- **Mutable current repo.** The server's repo was a fixed `OnceLock<PathBuf>`;
+  now it's `OnceLock<RwLock<Current { path, read_only }>>` in
+  `git-vista-server/src/main.rs`. `current() -> (PathBuf, bool)` snapshots + clones
+  out of the lock so no guard is ever held across an `.await`; `set_current()`
+  swaps it. Startup seeds it from the CLI arg with `read_only:false` (your own repo
+  is writable). All existing handlers read `current().0` instead of the old
+  `repo_path()`.
+- **`POST /api/clone { url }`** (new). Validates the URL with the pure, unit-tested
+  `git_vista_core::model::validate_clone_url` (accepts only `https://`/`http://`/
+  `git://`; rejects `git@…` SSH, `file://`, local paths, leading `-`, and embedded
+  spaces — so a paste can't trigger an SSH key prompt or smuggle a git option),
+  then `git clone -- <url> <dest>`. Full clone (history bounded downstream by
+  `HISTORY_LIMIT=5000`) — user chose full over `--depth`.
+- **Temp dirs + cleanup.** Clones go under `std::env::temp_dir()/git-vista-clones/
+  clone-<nanos>-<counter>`. On a successful clone the *previous* clone is deleted,
+  so disk holds at most one. `cleanup_clone()` refuses to `rm` anything not under
+  `clones_root()` — a bug can never delete a real repo. No shutdown cleanup (temp
+  dir, low stakes); the "delete previous on next open" bound is what matters.
+- **Read-only enforcement, two layers.** `/api/commits` sets the new
+  `Graph.read_only` field (`git-vista-core::model`) from the current repo's flag.
+  Frontend (`app.rs` `graph_canvas`) hides ALL write items in the context menu
+  when `read_only` (create branch / commit / merge / push / delete) — only the
+  header + GitHub link remain. The server ALSO refuses every write endpoint with
+  `403` via `reject_if_read_only()` (defense in depth; the UI hiding them is just
+  honesty).
+- **Frontend UX.** New "Open URL…" button in the `.topbar` next to Refresh opens a
+  modal (App component in `app.rs`). On success it bumps the existing `reload`
+  signal — the same refresh path used everywhere — so the cloned graph loads with
+  no new plumbing. Modal reuses the commit modal's iPad-proven inline-styled
+  overlay and a **`<textarea>` (NOT a void `<input>`** — void inputs panic the
+  Leptos CSR node-walk on iOS WebKit; long-standing gotcha) for the URL field. The
+  Open button shows "Cloning…" and is disabled while git runs.
+
+**Gotchas / caveats.**
+- **Single shared current repo:** switching the clone affects ALL connected
+  browsers (one global `RwLock`). Fine for this single-user tool; documented, not a
+  bug. A per-client repo would mean threading the repo through every request.
+- **Couldn't live-test the HTTP round-trip here.** This sandbox blocks binding a
+  listening socket (the exit-144 note above; even sandbox-disabled the server won't
+  stay up). Verified instead: 23 core tests pass incl. the two new
+  `validate_clone_url` cases; `cargo build --workspace` + `trunk build` clean;
+  clippy clean; and a manual `git clone <local repo> <temp>` → `git log` /
+  `for-each-ref` → `rm -rf` proving the clone read path (identical to the proven
+  `/api/commits`) and the cleanup. **Owed:** real run — `gv`, click "Open URL…",
+  paste e.g. a small public GitHub repo, confirm the graph loads read-only (no
+  write items in the dot menu) and that opening a second URL replaces it.
+
+**Verify:**
+```sh
+cargo test -p git-vista-core   # 23 pass (+2 validate_clone_url)
+cargo build --workspace        # server + tauri + frontend compile
+cargo clippy -p git-vista-server -p git-vista   # clean
+( cd crates/git-vista && trunk build )          # wasm bundle builds
+```
+
+**Next:** Phase 10 — Commit detail panel, or Phase 11 — Search & filter, or
+Phase 13 — Packaging & polish.
