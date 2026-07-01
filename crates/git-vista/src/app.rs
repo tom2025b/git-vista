@@ -60,6 +60,9 @@ struct MenuData {
     /// Label for the "Open on GitHub" item, so a stub says "branch" and a commit
     /// says "commit".
     github_label: &'static str,
+    /// Label for the "Create branch…" item, so a stub (which represents a branch)
+    /// reads "from this branch" while a commit dot reads "from this commit".
+    create_label: &'static str,
 }
 
 /// Pointer travel (CSS px) past which a press becomes a pan/drag rather than a
@@ -266,6 +269,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     y: ev.client_y() as f64,
                     github_url: github_url.clone(),
                     github_label: "Open commit on GitHub",
+                    create_label: "Create branch from this commit",
                 }));
             };
 
@@ -469,9 +473,9 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             // until it differs from the anchor commit's colour.
             let anchor_slot = graph.rows[s.anchor_row].color;
             let color = branch_color_distinct_from(s.color, anchor_slot);
-            let d = stub_path(s.anchor_lane, s.anchor_row, s.lane);
+            let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.depth);
             let sx = node_cx(s.lane);
-            let sy = stub_node_cy(s.anchor_row);
+            let sy = stub_node_cy(s.anchor_row, s.depth);
             // Badge sits just right of the fork tip, vertically centred on it.
             let bx = sx + NODE_RADIUS + BADGE_GAP;
             let w = badge_width(&s.name);
@@ -505,6 +509,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     y: ev.client_y() as f64,
                     github_url: github_url.clone(),
                     github_label: "Open branch on GitHub",
+                    create_label: "Create branch from this branch",
                 }));
             };
             view! {
@@ -753,12 +758,13 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     }
                 });
             };
+            let create_label = m.create_label;
             view! {
                 <div class="ctx-menu" style=format!("left: {}px; top: {}px;", m.x, m.y)>
                     <div class="ctx-menu-header">{m.header.clone()}</div>
                     {open_github}
                     <button class="ctx-item" on:click=on_branch>
-                        "Create branch from this commit"
+                        {create_label}
                     </button>
                 </div>
             }
