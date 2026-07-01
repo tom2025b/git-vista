@@ -7,8 +7,13 @@
 //! palette entry, so a branch keeps one colour wherever it appears — independent
 //! of the lane it happens to sit in.
 
-const BRANCH_COLORS: [&str; 6] = [
-    "#2f81f7", // blue   (trunk / HEAD's branch)
+/// The trunk colour — reserved exclusively for `main` (colour slot 0). No other
+/// branch is ever painted blue, so blue always means "the mainline".
+const TRUNK_COLOR: &str = "#2f81f7"; // blue
+
+/// Colours for every *non*-trunk branch. Slots 1, 2, 3, … cycle through these in
+/// order, so a side branch is always one of these five and never the trunk blue.
+const BRANCH_COLORS: [&str; 5] = [
     "#3fb950", // green
     "#d29922", // amber
     "#db61a2", // pink
@@ -39,11 +44,18 @@ pub const HEAD_BADGE: &str = "#e6edf3";
 /// Fill for tag badges — a consistent tag colour, regardless of branch.
 pub const TAG_BADGE: &str = "#d29922";
 
-/// Colour for the given branch slot, wrapping around the palette. The backend's
-/// per-branch `color` index feeds straight in, so the same branch always lands on
-/// the same colour.
+/// Colour for the given branch slot. Slot 0 is always the trunk blue (`main`);
+/// every other slot cycles through the non-trunk palette, so blue is unique to
+/// the mainline and no side branch is ever painted blue. The backend's per-branch
+/// `color` index feeds straight in, so the same branch always lands on the same
+/// colour.
 pub fn branch_color(slot: usize) -> &'static str {
-    BRANCH_COLORS[slot % BRANCH_COLORS.len()]
+    match slot {
+        0 => TRUNK_COLOR,
+        // Map slots 1, 2, 3, … onto the non-trunk palette (0, 1, 2, … of it),
+        // wrapping once it's exhausted — but never back onto the trunk blue.
+        n => BRANCH_COLORS[(n - 1) % BRANCH_COLORS.len()],
+    }
 }
 
 #[cfg(test)]
@@ -51,13 +63,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn branch_color_wraps_around_the_palette() {
-        assert_eq!(branch_color(0), branch_color(BRANCH_COLORS.len()));
-        assert_eq!(branch_color(1), branch_color(BRANCH_COLORS.len() + 1));
+    fn slot_zero_is_the_trunk_blue() {
+        assert_eq!(branch_color(0), TRUNK_COLOR);
+        assert_eq!(branch_color(0), "#2f81f7");
     }
 
     #[test]
-    fn slot_zero_is_the_trunk_blue() {
-        assert_eq!(branch_color(0), "#2f81f7");
+    fn non_trunk_slots_are_never_blue() {
+        // Whatever the slot, only the trunk (slot 0) is ever blue — side branches
+        // cycle through the non-trunk palette and never wrap back onto blue.
+        for slot in 1..100 {
+            assert_ne!(
+                branch_color(slot),
+                TRUNK_COLOR,
+                "slot {slot} must not be the trunk blue"
+            );
+        }
+    }
+
+    #[test]
+    fn non_trunk_slots_cycle_through_the_palette() {
+        // Slot 1 is the first non-trunk colour; the cycle wraps after five, still
+        // skipping blue.
+        assert_eq!(branch_color(1), BRANCH_COLORS[0]);
+        assert_eq!(branch_color(BRANCH_COLORS.len()), BRANCH_COLORS[BRANCH_COLORS.len() - 1]);
+        assert_eq!(branch_color(1), branch_color(1 + BRANCH_COLORS.len()));
     }
 }

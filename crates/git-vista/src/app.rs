@@ -226,11 +226,12 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             let cx = node_cx(gr.lane);
             let cy = node_cy(gr.row);
             let color = branch_color(gr.color);
-            // Draw merge commits as a hollow ring so they stand out from the
-            // ordinary filled dots.
-            let merge = gr.commit.is_merge();
-            let fill = if merge { MERGE_FILL } else { color };
-            let stroke_width = if merge { "3" } else { "2" };
+            // Every real commit — merges included — is a filled dot in its branch
+            // colour. A hollow ring is reserved for branch stubs (a new branch with
+            // no commits of its own): it means "nothing committed here yet", so a
+            // merge, which has real content, must never read as empty (Issue #30).
+            let fill = color;
+            let stroke_width = "2";
 
             // Issue #18: tapping a dot opens a context menu. Gather this commit's
             // menu data now; the click handler clones it in (it may fire repeatedly).
