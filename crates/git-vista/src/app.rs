@@ -20,7 +20,8 @@ use wasm_bindgen::JsCast;
 use gloo_net::http::Request;
 
 use git_vista_core::model::{
-    BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, Graph, RefKind,
+    BranchRequest, CloneRequest, CommitDetail, CreateBranchRequest, CreateCommitRequest, Graph,
+    RefKind,
 };
 
 use crate::camera::{Camera, ZOOM_STEP};
@@ -174,6 +175,23 @@ async fn fetch_graph() -> Result<Graph, String> {
         .json::<Graph>()
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Fetch one commit's full detail for the side panel (Phase 10,
+/// `GET /api/commit/<id>`). Same-origin relative URL, cache-busted like the graph
+/// fetch. A non-2xx body is the server's reason (e.g. "No such commit."),
+/// returned as `Err` for the panel to show.
+async fn fetch_commit_detail(id: &str) -> Result<CommitDetail, String> {
+    let url = format!("/api/commit/{id}?t={}", js_sys::Date::now());
+    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    if resp.ok() {
+        resp.json::<CommitDetail>().await.map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
 }
 
 /// Ask the backend to clone a public URL and switch to viewing it read-only
@@ -486,6 +504,21 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
     // `Some` => the confirm modal is showing; confirming runs the op then refreshes.
     // Mutually exclusive with the commit dialog (only one overlay is ever open).
     let confirm_op = create_rw_signal(None::<PendingOp>);
+    // The commit whose detail panel is open (Phase 10), by full hash. `None` => no
+    // panel. Set from the context menu's "View details" item; cleared by the
+    // panel's close button. A `Resource` keyed on it fetches the full commit lazily
+    // — so the graph payload stays lean and the panel shows the whole message body
+    // and both signatures, which the row summary doesn't carry.
+    let detail_id = create_rw_signal(None::<String>);
+    let detail = create_local_resource(
+        move || detail_id.get(),
+        |id| async move {
+            match id {
+                Some(id) => Some(fetch_commit_detail(&id).await),
+                None => None,
+            }
+        },
+    );
     // When the commit modal was opened (ms). iOS synthesizes a `click` a few ms
     // after a tap; opening the modal puts its full-screen backdrop under that tap
     // point, so the ghost click hits the backdrop and closes the modal instantly.
@@ -1082,6 +1115,17 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 }
                 .into_view(),
             };
+            // "View details" (Phase 10): open the side panel for this commit. A
+            // read, so it's shown for read-only clones too. Set `detail_id` before
+            // closing the menu — `menu.set(None)` disposes this handler's reactive
+            // owner, after which a signal write is unreliable (same caveat as below).
+            let detail_commit = m.commit.clone();
+            let on_details = move |_| {
+                detail_id.set(Some(detail_commit.clone()));
+                menu.set(None);
+            };
+            let details_item =
+                view! { <button class="ctx-item" on:click=on_details>"View details"</button> };
             // "Create branch from this commit": prompt for a name, POST it, then
             // refresh the graph on success or show git's error on failure (B3).
             let commit = m.commit.clone();
@@ -1227,6 +1271,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             view! {
                 <div class="ctx-menu" style=format!("left: {}px; top: {}px;", m.x, m.y)>
                     <div class="ctx-menu-header">{m.header.clone()}</div>
+                    {details_item}
                     {open_github}
                     {write_items}
                 </div>
@@ -1460,6 +1505,134 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
         })
     };
 
+    // The commit detail panel (Phase 10). Docked to the right, it shows one
+    // commit's full detail — the whole message body and both the author and
+    // committer signatures — fetched lazily by hash. The chrome (title + close)
+    // shows the instant a commit is picked; the body reacts to the fetch: a
+    // "Loading…" line, git's error, or the detail once it lands. Clicking a parent
+    // hash re-points the panel at that parent, so you can walk up the history.
+    let detail_panel_view = move || {
+        detail_id.get().map(|open_id| {
+            let body = move || {
+                // While the fetch is in flight `get()` is `None`; a stale value from
+                // the previously-viewed commit is also treated as loading, so the
+                // panel never shows one commit's chrome over another's detail.
+                match detail.get().flatten() {
+                    None => view! { <p class="detail-status">"Loading…"</p> }.into_view(),
+                    Some(Err(e)) => view! {
+                        <p class="detail-status detail-error">{format!("Couldn't load commit: {e}")}</p>
+                    }
+                    .into_view(),
+                    Some(Ok(d)) if d.id.0 != open_id => {
+                        view! { <p class="detail-status">"Loading…"</p> }.into_view()
+                    }
+                    Some(Ok(d)) => {
+                        // Link to the commit on GitHub when the repo has a github.com
+                        // origin *and* this commit is pushed — same rule the labels
+                        // and menu use, so the link never 404s.
+                        let github = ctx.with_value(|c| {
+                            c.repo_url.as_ref().and_then(|base| {
+                                c.remote_set
+                                    .contains(&d.id.0)
+                                    .then(|| format!("{base}/commit/{}", d.id.0))
+                            })
+                        });
+                        // Author and committer lines. Show the committer only when it
+                        // differs from the author (name/email or time) — for most
+                        // commits they're identical and a second identical line is noise.
+                        let committer_differs = d.committer_name != d.author_name
+                            || d.committer_email != d.author_email
+                            || d.commit_time != d.author_time;
+                        let committer_row = committer_differs.then(|| {
+                            view! {
+                                <div class="detail-field">
+                                    <span class="detail-key">"Committer"</span>
+                                    <span class="detail-val">
+                                        {format!("{} <{}>", d.committer_name, d.committer_email)}
+                                        <span class="detail-date">
+                                            {format!(" · {}", local_timestamp(d.commit_time))}
+                                        </span>
+                                    </span>
+                                </div>
+                            }
+                        });
+                        // Parents: each short hash re-points the panel at that parent,
+                        // so you can walk up the history from within the panel.
+                        let parents = if d.parents.is_empty() {
+                            view! { <span class="detail-val detail-muted">"none (root commit)"</span> }
+                                .into_view()
+                        } else {
+                            d.parents
+                                .iter()
+                                .map(|p| {
+                                    let full = p.0.clone();
+                                    let short = p.short().to_string();
+                                    view! {
+                                        <button
+                                            class="detail-parent"
+                                            on:click=move |_| detail_id.set(Some(full.clone()))
+                                            title="View this parent"
+                                        >
+                                            {short}
+                                        </button>
+                                    }
+                                    .into_view()
+                                })
+                                .collect_view()
+                        };
+                        let github_row = match github {
+                            Some(url) => view! {
+                                <a class="detail-github" href=url target="_blank" rel="noopener">
+                                    "Open on GitHub"
+                                </a>
+                            }
+                            .into_view(),
+                            None => ().into_view(),
+                        };
+                        view! {
+                            <div class="detail-field">
+                                <span class="detail-key">"Commit"</span>
+                                <span class="detail-val detail-hash">{d.id.0.clone()}</span>
+                            </div>
+                            <div class="detail-field">
+                                <span class="detail-key">"Author"</span>
+                                <span class="detail-val">
+                                    {format!("{} <{}>", d.author_name, d.author_email)}
+                                    <span class="detail-date">
+                                        {format!(" · {}", local_timestamp(d.author_time))}
+                                    </span>
+                                </span>
+                            </div>
+                            {committer_row}
+                            <div class="detail-field">
+                                <span class="detail-key">"Parents"</span>
+                                <span class="detail-parents">{parents}</span>
+                            </div>
+                            {github_row}
+                            <pre class="detail-msg">{d.message.clone()}</pre>
+                        }
+                        .into_view()
+                    }
+                }
+            };
+            view! {
+                <aside class="detail-panel">
+                    <div class="detail-head">
+                        <span class="detail-title">"Commit details"</span>
+                        <button
+                            class="detail-close"
+                            title="Close"
+                            on:click=move |_| detail_id.set(None)
+                        >
+                            "×"
+                        </button>
+                    </div>
+                    <div class="detail-body">{body}</div>
+                </aside>
+            }
+        })
+    };
+
     view! {
         <svg
             class="graph-svg"
@@ -1519,7 +1692,8 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 let menu = menu_view();
                 let modal = commit_dialog_view();
                 let confirm = confirm_modal_view();
-                view! { {menu} {modal} {confirm} }
+                let panel = detail_panel_view();
+                view! { {menu} {modal} {confirm} {panel} }
             }}
         </div>
     }
