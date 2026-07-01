@@ -5,12 +5,10 @@
 #   - git-vista-git     native git reader via gix; has tests (uses the git binary)
 #   - git-vista-server  native axum backend: serves the SPA + /api/commits
 #   - git-vista         Leptos frontend, built to WASM by Trunk (crates/git-vista)
-#   - git-vista-tauri   native desktop shell (crates/git-vista/src-tauri)
 #
-# Three jobs run in parallel, each mapped to a concrete check:
+# Two jobs run in parallel, each mapped to a concrete check:
 #   1. core      test + check the pure-logic, git-reading, and server crates
-#   2. tauri     check that the native shell compiles
-#   3. frontend  build the real WASM bundle with Trunk
+#   2. frontend  build the real WASM bundle with Trunk
 name: CI
 
 on:
@@ -59,41 +57,7 @@ jobs:
         run: cargo test -p git-vista-core -p git-vista-git -p git-vista
 
   # ---------------------------------------------------------------------------
-  # 2. Tauri shell: build check.
-  #
-  # The shell links against system WebKitGTK/GTK, so those libraries must be
-  # installed before cargo can compile it. We only `check` here — a successful
-  # type/link check is enough to catch breakage without a full release build.
-  # ---------------------------------------------------------------------------
-  tauri:
-    name: Tauri shell (check)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # Tauri v2 Linux build dependencies.
-      - name: Install Tauri system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libxdo-dev \
-            libssl-dev \
-            patchelf
-
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Check Tauri shell builds
-        run: cargo check -p git-vista-tauri
-
-  # ---------------------------------------------------------------------------
-  # 3. Frontend: build the WASM bundle with Trunk.
+  # 2. Frontend: build the WASM bundle with Trunk.
   #
   # This is the closest CI gets to "the real app builds" — Trunk compiles the
   # Leptos frontend to wasm32 and emits the dist/ bundle the shell loads.

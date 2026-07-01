@@ -11,7 +11,7 @@ than driven through a native shell (a browser can't read a git repo itself).
 
 ## Workspace layout
 
-Four crates (plus a legacy Tauri shell), each with one job:
+Four crates, each with one job:
 
 ```
 git-vista/
@@ -33,8 +33,7 @@ git-vista/
     └── git-vista/                # the Leptos wasm UI (bin: git-vista-ui)
         ├── index.html            # Trunk entry point
         ├── styles.css
-        ├── src/                  # app.rs (view), camera, geometry, color, …
-        └── src-tauri/            # legacy native desktop shell (Tauri v2)
+        └── src/                  # app.rs (view), camera, geometry, color, …
 ```
 
 `git-vista-git` is kept **separate** from `git-vista-core` on purpose: gix reads a
@@ -93,10 +92,7 @@ cargo install trunk
 ```
 
 A working `git` on `PATH` (the server shells out to it for writes and clones); the
-history read itself uses `gix`'s pure-Rust reader. The legacy Tauri shell
-additionally needs `cargo install tauri-cli --version "^2.0"` and the system
-webview libs (`webkit2gtk-4.1`, `librsvg2`, …) — not required for normal
-browser-first use.
+history read itself uses `gix`'s pure-Rust reader.
 
 ## Running
 

@@ -1,6 +1,6 @@
 [package]
 name = "git-vista"
-description = "git-vista Leptos frontend — renders the vertical git graph inside the Tauri webview."
+description = "git-vista Leptos frontend — renders the vertical git graph in the browser (built to wasm by Trunk)."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
