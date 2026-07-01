@@ -32,12 +32,14 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. Core + git + server crates: build check + tests.
+  # 1. Core + git + server + frontend crates: build check + tests.
   #
   # git-vista-core is pure logic; git-vista-git reads real repos via gix (its
   # tests shell out to the `git` binary, preinstalled on the runner);
-  # git-vista-server is the axum backend. None need GTK/WebKit, so this job needs
-  # nothing beyond stable Rust. Together they carry the project's test suite.
+  # git-vista-server is the axum backend; git-vista is the Leptos frontend, whose
+  # host-side unit tests (colour/geometry/text/…) run natively because its
+  # wasm-only view module is `#[cfg]`-gated out. None need GTK/WebKit, so this job
+  # needs nothing beyond stable Rust. Together they carry the project's test suite.
   # ---------------------------------------------------------------------------
   core:
     name: Core (check + test)
@@ -53,8 +55,8 @@ jobs:
       - name: Check core + git + server crates build
         run: cargo check -p git-vista-core -p git-vista-git -p git-vista-server
 
-      - name: Test core + git crates
-        run: cargo test -p git-vista-core -p git-vista-git
+      - name: Test core + git + frontend crates
+        run: cargo test -p git-vista-core -p git-vista-git -p git-vista
 
   # ---------------------------------------------------------------------------
   # 2. Tauri shell: build check.
