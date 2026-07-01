@@ -40,6 +40,6 @@ fn main() {
 fn main() {
     eprintln!(
         "git-vista's frontend is a WebAssembly app built with Trunk.\n\
-         Run `trunk serve` (browser) or `cargo tauri dev` (desktop) instead."
+         Run it via the `gv` launcher, or `trunk serve` for frontend-only iteration."
     );
 }
