@@ -14,6 +14,7 @@
 //! the backend by `git-vista-core`.
 
 use leptos::*;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use gloo_net::http::Request;
@@ -34,6 +35,7 @@ use crate::geometry::{
 };
 use crate::lod::detail_for;
 use crate::text::truncate;
+use crate::viewport::visible_row_range;
 
 /// Commit messages longer than this are truncated with an ellipsis in the label
 /// (the full text stays available via the node/label hover tooltip).
@@ -102,6 +104,59 @@ const DRAG_THRESHOLD: f64 = 4.0;
 /// How long (ms) after the commit modal opens to ignore a backdrop dismiss, so
 /// iOS's synthesized post-tap "ghost click" can't close the modal it just opened.
 const DIALOG_GUARD_MS: f64 = 400.0;
+
+/// Everything the per-row / per-edge view builders need, bundled behind a
+/// `StoredValue` so the reactive `<For>` closures (Phase 8 viewport
+/// virtualization) can reach the graph and its derived lookups cheaply — without
+/// cloning the graph into each closure or rebuilding these tables per row.
+struct RenderCtx {
+    graph: Graph,
+    /// Per-row branch-colour slot (row index → palette slot), so an edge can pick
+    /// up the coloured line of the row it belongs to.
+    row_color: Vec<usize>,
+    /// Commit ids present on the remote, for the "is this pushed?" link gating.
+    remote_set: std::collections::HashSet<String>,
+    /// Remote branch short-names, for gating local-branch links.
+    remote_branches: std::collections::HashSet<String>,
+    /// GitHub web base (e.g. "https://github.com/owner/repo"), when this repo has
+    /// a github.com origin; `None` => labels stay plain text.
+    repo_url: Option<String>,
+    /// Left edge (x) of the aligned label column.
+    text_x: i32,
+}
+
+/// Extra rows rendered above and below the visible window so a fast pan doesn't
+/// flash a blank strip before the row `Memo` catches up (Phase 8).
+const OVERSCAN_ROWS: usize = 6;
+
+/// Current browser window inner height in CSS px, or a sane default when it can't
+/// be read. The window is always at least as tall as the SVG (the topbar sits
+/// above it), so this is a safe *upper* bound on the viewport height — the
+/// virtualizer may draw a few extra rows just past the bottom, never too few.
+fn window_inner_height() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.inner_height().ok())
+        .and_then(|v| v.as_f64())
+        .unwrap_or(800.0)
+}
+
+/// Indices of edges whose row span intersects the visible row window `[start,
+/// end)`. An edge is kept whenever any part of it could cross the viewport — even
+/// when both endpoints are off-screen (a long merge line passing through) — so an
+/// edge never visibly disappears at the window's edge. Edges always run downward
+/// (`from_row` < `to_row`), so the span is `[from_row, to_row]`.
+fn visible_edges(ctx: StoredValue<RenderCtx>, range: (usize, usize)) -> Vec<usize> {
+    let (start, end) = range;
+    ctx.with_value(|c| {
+        c.graph
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.from_row < end && e.to_row >= start)
+            .map(|(i, _)| i)
+            .collect()
+    })
+}
 
 /// Fetch the laid-out graph from the backend. Relative URL → same origin as the
 /// served SPA, so no CORS and no hardcoded host.
@@ -320,42 +375,57 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
         }
     };
 
-    // Edges first so the nodes paint on top of them.
-    let edges = graph
-        .edges
-        .iter()
-        .map(|e| {
+    // Phase 8 (viewport virtualization): bundle the graph and its derived lookups
+    // behind a `StoredValue` so the reactive per-row `<For>` closures below can
+    // reach them cheaply — without cloning the graph into each closure or
+    // rebuilding these tables per row. The graph moves in here; everything
+    // downstream reads it back out of `ctx`.
+    let text_x = label_x(graph.lane_count);
+    let ctx = store_value(RenderCtx {
+        graph,
+        row_color,
+        remote_set,
+        remote_branches,
+        repo_url,
+        text_x,
+    });
+
+    // Per-edge view builder — invoked by a `<For>` only for edges whose row span
+    // intersects the viewport. Colour a link by the branch *line* it belongs to,
+    // so it matches the dots it connects:
+    //  * a first-parent link is part of the child's own branch — a side branch
+    //    forking off main is drawn in the side branch's colour all the way down to
+    //    its fork point, not main's blue;
+    //  * a merge link (any non-first parent) is part of the merged-in branch, so
+    //    it takes that parent's colour as it curves in.
+    // Only main (colour slot 0) ever stays blue this way.
+    let build_edge = move |ei: usize| -> View {
+        ctx.with_value(|c| {
+            let e = &c.graph.edges[ei];
             let d = edge_path(e);
-            // Colour a link by the branch *line* it belongs to, so it matches the
-            // dots it connects:
-            //  * a first-parent link is part of the child's own branch — a side
-            //    branch forking off main is drawn in the side branch's colour all
-            //    the way down to its fork point, not main's blue;
-            //  * a merge link (any non-first parent) is part of the merged-in
-            //    branch, so it takes that parent's colour as it curves in.
-            // Only main (colour slot 0) ever stays blue this way.
-            let child = &graph.rows[e.from_row].commit;
-            let parent_oid = &graph.rows[e.to_row].commit.id;
+            let child = &c.graph.rows[e.from_row].commit;
+            let parent_oid = &c.graph.rows[e.to_row].commit.id;
             let is_first_parent = child.parents.first() == Some(parent_oid);
             let color_row = if is_first_parent { e.from_row } else { e.to_row };
-            let color = branch_color(row_color[color_row]);
+            let color = branch_color(c.row_color[color_row]);
             view! {
                 <path d=d fill="none" stroke=color stroke-width="2" stroke-linecap="round" />
             }
+            .into_view()
         })
-        .collect_view();
+    };
 
-    let nodes = graph
-        .rows
-        .iter()
-        .map(|gr| {
+    // Per-commit node builder — a filled dot in the branch colour plus a larger
+    // invisible hit target, built by a `<For>` only for rows in the viewport.
+    // Every real commit (merges included) is a filled dot; a hollow ring is
+    // reserved for branch stubs (a new branch with no commits of its own), so a
+    // merge, which has real content, never reads as empty (Issue #30).
+    let build_node = move |i: usize| -> View {
+        ctx.with_value(|c| {
+            let gr = &c.graph.rows[i];
             let cx = node_cx(gr.lane);
             let cy = node_cy(gr.row);
             let color = branch_color(gr.color);
-            // Every real commit — merges included — is a filled dot in its branch
-            // colour. A hollow ring is reserved for branch stubs (a new branch with
-            // no commits of its own): it means "nothing committed here yet", so a
-            // merge, which has real content, must never read as empty (Issue #30).
             let fill = color;
             let stroke_width = "2";
 
@@ -363,6 +433,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             // menu data now; the click handler clones it in (it may fire repeatedly).
             let commit_id = gr.commit.id.0.clone();
             let short = gr.commit.id.short().to_string();
+            let title = format!("{} — {}", gr.commit.id.short(), gr.commit.summary);
             // Only the commit HEAD points at can take a new commit without moving
             // HEAD, so the "Commit …" items are enabled only here (Issue #33).
             let is_head = gr.refs.iter().any(|r| r.kind == RefKind::Head);
@@ -376,9 +447,9 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 .collect();
             // Link target only when the repo is on GitHub *and* this commit is
             // pushed — same rule the labels use, so the menu never offers a 404.
-            let github_url = repo_url
-                .as_ref()
-                .and_then(|base| remote_set.contains(&commit_id).then(|| format!("{base}/commit/{commit_id}")));
+            let github_url = c.repo_url.as_ref().and_then(|base| {
+                c.remote_set.contains(&commit_id).then(|| format!("{base}/commit/{commit_id}"))
+            });
             let open_menu = move |ev: web_sys::MouseEvent| {
                 // Ignore the click that ends a pan; a real tap opens the menu where
                 // the pointer is (viewport coords for the fixed-position overlay).
@@ -409,7 +480,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                         stroke=color
                         stroke-width=stroke_width
                     >
-                        <title>{format!("{} — {}", gr.commit.id.short(), gr.commit.summary)}</title>
+                        <title>{title}</title>
                     </circle>
                     // A larger, invisible hit target on top so the small dot is easy
                     // to tap (especially on the iPad). `transparent` (not `none`) so
@@ -424,29 +495,29 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     />
                 </g>
             }
+            .into_view()
         })
-        .collect_view();
+    };
 
     // Commit labels: a fixed text column to the right of the lanes, two lines per
     // row — any ref badges then the (truncated) message on top, the short hash and
     // author dimmed below. The full message stays available on hover.
     //
-    // Phase 9 (level of detail): the two lines are collected into *separate*
-    // groups so the view can hide each independently as the graph is zoomed out —
-    // the message tier (badges + message) and the dimmed meta tier (hash · author
-    // · date). Both are gated reactively off the camera scale in the final view.
-    let text_x = label_x(graph.lane_count);
-    let (label_msgs, label_metas): (Vec<_>, Vec<_>) = graph
-        .rows
-        .iter()
-        .map(|gr| {
-            // Lay any ref badges out left-to-right from the start of the label
-            // column; the message then starts just past them (or at the column
-            // edge when there are none).
-            let mut bx = text_x;
+    // Phase 9 (level of detail) + Phase 8 (virtualization): the two lines are two
+    // independent builders — the message tier (badges + message) and the dimmed
+    // meta tier (hash · author · date) — so the view can hide each at a different
+    // zoom (LOD) and a `<For>` can build each only for the rows on screen. They're
+    // independent because the meta line doesn't depend on the badge layout.
+    //
+    // Message tier: any ref badges laid out left-to-right from the label column,
+    // then the (truncated, linkable) commit message just past them.
+    let build_msg = move |i: usize| -> View {
+        ctx.with_value(|c| {
+            let gr = &c.graph.rows[i];
+            let mut bx = c.text_x;
             // Is this row's commit on the remote? Drives whether its message, HEAD
             // badge and tag badges link out (an unpushed commit would 404).
-            let commit_on_remote = remote_set.contains(&gr.commit.id.0);
+            let commit_on_remote = c.remote_set.contains(&gr.commit.id.0);
             let badges = gr
                 .refs
                 .iter()
@@ -473,11 +544,12 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     //    the same name exists.
                     //  * remote branch -> its tree page (it's on the remote by
                     //    definition); its leading "<remote>/" is stripped.
-                    let badge_url = repo_url.as_ref().and_then(|base| match r.kind {
+                    let badge_url = c.repo_url.as_ref().and_then(|base| match r.kind {
                         RefKind::Head | RefKind::Tag => {
                             commit_on_remote.then(|| format!("{base}/commit/{}", gr.commit.id.0))
                         }
-                        RefKind::Branch => remote_branches
+                        RefKind::Branch => c
+                            .remote_branches
                             .contains(&r.name)
                             .then(|| format!("{base}/tree/{}", r.name)),
                         RefKind::RemoteBranch => {
@@ -488,7 +560,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     let clickable = badge_url.is_some();
                     // A GitHub repo where this ref simply isn't pushed: show it, but
                     // dimmed and unlinked, so it's clear it has no GitHub page yet.
-                    let unpushed = repo_url.is_some() && badge_url.is_none();
+                    let unpushed = c.repo_url.is_some() && badge_url.is_none();
                     let pill = view! {
                         <rect
                             x=x
@@ -534,21 +606,14 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             let msg_x = bx; // past the last badge, or text_x when there were none
 
             let msg = truncate(&gr.commit.summary, MAX_SUMMARY_CHARS);
-            // hash · author · local date+time, so the timeline is visible per row.
-            let meta = format!(
-                "{} · {} · {}",
-                gr.commit.id.short(),
-                gr.commit.author,
-                local_timestamp(gr.commit.time),
-            );
             // The message links to the commit page on GitHub (Issue #12), but only
             // when the commit is on the remote — otherwise it's dimmed and the
             // tooltip says why, rather than linking to a page that would 404.
-            let msg_url = repo_url
-                .as_ref()
-                .and_then(|base| commit_on_remote.then(|| format!("{base}/commit/{}", gr.commit.id.0)));
+            let msg_url = c.repo_url.as_ref().and_then(|base| {
+                commit_on_remote.then(|| format!("{base}/commit/{}", gr.commit.id.0))
+            });
             let msg_clickable = msg_url.is_some();
-            let msg_unpushed = repo_url.is_some() && msg_url.is_none();
+            let msg_unpushed = c.repo_url.is_some() && msg_url.is_none();
             let title = if msg_unpushed {
                 format!("{} — not pushed to GitHub", gr.commit.summary)
             } else {
@@ -579,30 +644,45 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 .into_view(),
                 None => msg_text.into_view(),
             };
-            // Message tier (badges + message) and meta tier (hash · author · date)
-            // as two separate views, so the render can show/hide them at different
-            // zoom levels (Phase 9).
-            let message_tier = view! {
+            view! {
                 {badges}
                 {msg_view}
             }
-            .into_view();
-            let meta_tier = view! {
-                <text x=text_x y=label_bottom_y(gr.row) class="label-meta">
+            .into_view()
+        })
+    };
+
+    // Meta tier: the dimmed `hash · author · local date+time` line, so the
+    // timeline is visible per row. Independent of the badge layout, so it doesn't
+    // recompute the badges.
+    let build_meta = move |i: usize| -> View {
+        ctx.with_value(|c| {
+            let gr = &c.graph.rows[i];
+            let meta = format!(
+                "{} · {} · {}",
+                gr.commit.id.short(),
+                gr.commit.author,
+                local_timestamp(gr.commit.time),
+            );
+            view! {
+                <text x=c.text_x y=label_bottom_y(gr.row) class="label-meta">
                     {meta}
                 </text>
             }
-            .into_view();
-            (message_tier, meta_tier)
+            .into_view()
         })
-        .unzip();
+    };
 
     // Branch stubs: a local branch with no commits of its own (e.g. one just
     // created from an existing commit) is drawn GitHub-network-graph style — a
     // short, uniquely-coloured line forking off its commit into its own lane,
     // with the branch badge on the fork tip, instead of a second badge crowding
     // the shared commit.
-    let stubs = graph
+    // Branch stubs (Phase 8: kept eager and always rendered). There are only a
+    // handful — one per commit-less new branch — and their cascade fans *upward*
+    // off the anchor commit, so they don't map onto the row window as cleanly as
+    // nodes/edges/labels; rendering them all is cheap and avoids that edge case.
+    let stubs = ctx.with_value(|c| c.graph
         .stubs
         .iter()
         .map(|s| {
@@ -610,7 +690,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             // (Issue #30): the palette collapses many slots onto few colours, so a
             // stub's raw slot can collide with its anchor branch's colour. Bump it
             // until it differs from the anchor commit's colour.
-            let anchor_slot = graph.rows[s.anchor_row].color;
+            let anchor_slot = c.graph.rows[s.anchor_row].color;
             let color = branch_color_distinct_from(s.color, anchor_slot);
             let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.depth);
             let sx = node_cx(s.lane);
@@ -624,12 +704,12 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             // same rule the branch badges use. "Create branch" still targets the
             // stub's tip commit, so forking from the stub forks off that commit
             // (Issue #24).
-            let anchor = &graph.rows[s.anchor_row].commit;
+            let anchor = &c.graph.rows[s.anchor_row].commit;
             let commit_id = anchor.id.0.clone();
             let header = s.name.clone();
             let branch_name = s.name.clone();
-            let github_url = repo_url.as_ref().and_then(|base| {
-                remote_branches
+            let github_url = c.repo_url.as_ref().and_then(|base| {
+                c.remote_branches
                     .contains(&s.name)
                     .then(|| format!("{base}/tree/{}", s.name))
             });
@@ -680,12 +760,30 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 />
             }
         })
-        .collect_view();
+        .collect_view());
 
     // Camera (pan/zoom) state.
     let camera = create_rw_signal(Camera::default());
     // Whether any pointer is currently pressed (drives the grab/grabbing cursor).
     let dragging = create_rw_signal(false);
+
+    // Phase 8 — viewport virtualization. Track the viewport height and derive the
+    // window of rows currently on screen; the `<For>`s in the view render only
+    // those (plus a small overscan margin). Using a `Memo` means a sub-row pan
+    // doesn't rebuild anything — the row set changes only when a row actually
+    // enters or leaves the viewport, and the keyed `<For>` then adds/removes just
+    // that row's DOM rather than re-rendering the screenful.
+    let row_count = ctx.with_value(|c| c.graph.rows.len());
+    let vp_h = create_rw_signal(window_inner_height());
+    // Refresh the viewport height on window resize (rotate the iPad, resize the
+    // desktop window). `forget()` keeps the callback alive for the app's lifetime.
+    if let Some(win) = web_sys::window() {
+        let cb = Closure::<dyn FnMut()>::new(move || vp_h.set(window_inner_height()));
+        let _ = win.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+    let visible =
+        create_memo(move |_| visible_row_range(camera.get(), vp_h.get(), row_count, OVERSCAN_ROWS));
 
     // --- Gesture tracking on Pointer Events ---------------------------------
     // Pointer Events unify mouse, pen and touch — crucially they fire for touch
@@ -1238,8 +1336,22 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             on:wheel=on_wheel
         >
             <g transform=move || camera.get().transform()>
-                {edges}
-                {nodes}
+                // Phase 8 (viewport virtualization): only the rows — and the edges —
+                // currently on screen are rendered. `visible` is the row window as a
+                // `Memo`, so panning within a row doesn't churn the DOM; each keyed
+                // `<For>` adds/removes only the rows that actually cross the viewport
+                // edge. Order matters for painting: edges first, then nodes on top,
+                // then the label tiers, then stubs (unchanged from before).
+                <For
+                    each=move || visible_edges(ctx, visible.get())
+                    key=|ei| *ei
+                    children=move |ei| build_edge(ei)
+                />
+                <For
+                    each=move || { let (s, e) = visible.get(); (s..e).collect::<Vec<usize>>() }
+                    key=|i| *i
+                    children=move |i| build_node(i)
+                />
                 // Phase 9 (level of detail): the two label tiers, each hidden as the
                 // graph is zoomed out. The message tier (badges + message) drops
                 // below MESSAGE_SCALE; the dimmed meta line drops below FULL_SCALE,
@@ -1247,10 +1359,18 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 // (display:none), keeping the node/edge structure readable when the
                 // text would just be an unreadable smear.
                 <g class:lod-hidden=move || !detail_for(camera.get().scale).shows_message()>
-                    {label_msgs}
+                    <For
+                        each=move || { let (s, e) = visible.get(); (s..e).collect::<Vec<usize>>() }
+                        key=|i| *i
+                        children=move |i| build_msg(i)
+                    />
                 </g>
                 <g class:lod-hidden=move || !detail_for(camera.get().scale).shows_meta()>
-                    {label_metas}
+                    <For
+                        each=move || { let (s, e) = visible.get(); (s..e).collect::<Vec<usize>>() }
+                        key=|i| *i
+                        children=move |i| build_meta(i)
+                    />
                 </g>
                 {stubs}
             </g>

@@ -19,6 +19,8 @@ mod geometry;
 mod lod;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod text;
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+mod viewport;
 // Hardcoded demo history. No longer used in the render path (the frontend now
 // fetches real history from the backend), but kept for tests/fixtures.
 #[cfg(test)]

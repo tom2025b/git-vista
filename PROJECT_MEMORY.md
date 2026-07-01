@@ -1011,3 +1011,100 @@ coloured dots, edges and stub lines; zooming back in restores each tier.
 
 **Next:** Phase 8 — Viewport virtualization (still open; skipped to do Phase 9),
 or Phase 10 — Commit detail panel.
+
+
+## Phase 8 — Viewport virtualization (2026-07-01)
+**Status:** done (frontend-only). Done *after* Phase 9 at the user's request;
+Phase 9 (PR #39) was merged to `main` first, then this on its own branch.
+**What changed:**
+- `crates/git-vista/src/viewport.rs` (new, pure/host-tested): `visible_row_range(
+  cam, viewport_h, row_count, overscan) -> (start, end)` — the half-open window of
+  row indices whose nodes fall inside a `viewport_h`-tall viewport under the camera.
+  It maps the visible screen band `[0, viewport_h]` back to a world-y interval
+  (`(y - ty)/scale`), inverts `geometry::node_cy` (`row = (y - PAD_Y)/ROW_HEIGHT`)
+  with `floor`/`ceil` so partially-visible rows count, pads by `overscan` rows each
+  side, and clamps to `0..row_count` (always ordered). 6 unit tests (empty, default
+  starts at top, pan scrolls the top off, zoom-out widens, clamp/order, overscan
+  grows both sides).
+- `crates/git-vista/src/app.rs`: `graph_canvas` no longer builds every row eagerly.
+  The graph + its derived lookups (`row_color`, `remote_set`, `remote_branches`,
+  `repo_url`, `text_x`) are moved into a `RenderCtx` behind `store_value` so the
+  reactive closures can reach them cheaply. The old eager `edges`/`nodes`/label
+  `.map().collect_view()` blocks became **per-item builder closures** `build_edge`
+  / `build_node` / `build_msg` / `build_meta` (each `ctx.with_value(|c| … )` →
+  `View`). The render uses keyed `<For>`s over the visible window: nodes + both
+  label tiers iterate `(start..end)` keyed by row index; edges iterate
+  `visible_edges(ctx, range)` (edge indices whose `[from_row, to_row]` span
+  intersects `[start, end)`) keyed by edge index. A `visible` **`Memo`** of the row
+  range is derived from `camera` + a `vp_h` signal; `vp_h` starts at
+  `window_inner_height()` and is refreshed by a `resize` listener (a `web_sys`
+  `Closure` that's `.forget()`-leaked for the app's lifetime). Stubs stay **eager**
+  (kept inside one `ctx.with_value(...)`).
+- `crates/git-vista/src/main.rs`: `mod viewport;` (same dead-code gating).
+- `crates/git-vista/Cargo.toml`: unchanged — the web-sys `Window` + `EventTarget`
+  features (present since earlier phases) already cover `inner_height` and
+  `add_event_listener_with_callback`.
+
+**Decisions:**
+- **Keyed `<For>`, not show/hide.** Real virtualization must not create the
+  off-screen DOM (hiding with `display:none` still builds thousands of nodes). A
+  keyed `<For>` (key = row index / edge index) adds/removes only the rows crossing
+  the viewport edge and keeps the DOM for rows that stay — so a pan is a cheap
+  delta, not a full re-render.
+- **Range is a `Memo`.** `visible_row_range` reads `camera` (which changes every
+  pointer move), but the `Memo`'s `PartialEq` on `(usize, usize)` means the `<For>`
+  `each` closures only re-run when the row window actually changes — a sub-row pan
+  is a no-op for the DOM.
+- **Window height as a safe over-estimate.** The virtualizer needs an *upper* bound
+  on the SVG viewport height; the browser window is always ≥ the SVG (the topbar
+  sits above it), so `window.inner_height()` is used directly instead of measuring
+  the SVG with a `NodeRef`/`ResizeObserver`. Worst case we render a few extra rows
+  just past the bottom — never too few (which would leave a blank strip).
+- **Overscan of 6 rows** each side so a fast flick doesn't flash a blank edge before
+  the `Memo` recomputes; it also absorbs the small vertical extent of a row's badges
+  (above the node) and meta line (below).
+- **Edges by span-intersection, not endpoint-in-window.** An edge is drawn whenever
+  `from_row < end && to_row >= start`, so a long merge line whose *both* endpoints
+  are off-screen but which crosses the viewport still renders. (Edges always run
+  downward, `from_row` < `to_row`.)
+- **Stubs kept eager.** There are only a handful (one per commit-less new branch)
+  and their cascade fans *upward* off the anchor commit, which doesn't map onto the
+  row window as cleanly as nodes/edges; rendering them all is cheap and dodges that
+  edge case.
+- **`RenderCtx` behind `store_value`.** The builder closures need the graph +
+  derived tables; `StoredValue` is `Copy`, so every closure captures it for free
+  (no per-row clone), and the derived sets are built once, not per row.
+
+**Gotchas:**
+- The builder closures are only `Copy` (hence reusable in `<For children>`) because
+  everything they capture is `Copy` — `ctx` (`StoredValue`), `menu` (`RwSignal`),
+  `moved` (`StoredValue`), and `suppress` (a closure capturing only the `Copy`
+  `moved`). Keep it that way; capturing a non-`Copy` value would break the `<For>`.
+- `app.rs` is **wasm-only** (`#[cfg(target_arch = "wasm32")] mod app`), so the host
+  `cargo test` never compiles it — the `<For>`/closure changes are only checked by
+  `cargo clippy --target wasm32-unknown-unknown` and `trunk build`. Run those, not
+  just `cargo test`.
+- The `resize` `Closure` is `.forget()`-leaked deliberately (it must outlive the
+  function scope). That's fine for a single top-level app component; don't "fix" it.
+- **Couldn't do a live browser/iPad check in this sandbox** (it kills any process
+  binding a listening socket — the documented exit-144 constraint). Verified the
+  pure `viewport` logic via its 6 unit tests, plus clean `clippy` + `trunk build`.
+  **Real-device check still owed:** on a large repo, scroll a long history and
+  confirm it stays smooth, labels/dots appear/disappear correctly at the viewport
+  edges (no blank strips, no missing edges), and pan/zoom/tap still behave.
+- Don't `cargo fmt` this crate — only `git-vista-core` is kept stock-rustfmt-clean
+  (Phase 7 gotcha); match the compact hand style here.
+
+**Verify:**
+```sh
+cargo test -p git-vista        # 39 pass (+6 viewport)
+cargo clippy -p git-vista --target wasm32-unknown-unknown   # clean
+( cd crates/git-vista && trunk build )                      # wasm bundle builds
+```
+Real-device (owed): `gv <big-repo>`, open on the iPad, fling-scroll the history —
+it should stay responsive with only the on-screen rows in the DOM; rows and edges
+should fill in at the edges without blanks, and tapping a dot / pinch-zoom / LOD
+should all still work.
+
+**Next:** Phase 10 — Commit detail panel (clicking a commit opens a side panel with
+full details), or Phase 11 — Search & filter.
