@@ -111,6 +111,38 @@ pub struct Graph {
     /// no remote. Set by the backend after layout, alongside `repo_url`.
     #[serde(default)]
     pub remote_commits: Vec<String>,
+    /// Local branches that have no commits of their own — their tip is a commit
+    /// another branch already owns (e.g. a branch just created from an existing
+    /// commit). Rather than crowd that commit with another badge, the UI draws
+    /// each as its own short, distinctly-coloured line forking off the commit.
+    /// Set by the layout pass.
+    #[serde(default)]
+    pub stubs: Vec<BranchStub>,
+    /// Filesystem path of the repository this graph was read from, as the server
+    /// resolved it (e.g. `/home/tom/projects/git-vista-test`). Surfaced in the UI
+    /// header so it's always unambiguous *which* repo a given page is showing —
+    /// the fastest way to catch a browser that's pointed at a stale server/tab.
+    /// Set by the backend; `None` => the UI shows nothing extra.
+    #[serde(default)]
+    pub repo_label: Option<String>,
+}
+
+/// A local branch with no commits of its own, drawn as a short fork off the
+/// commit it points at (its `anchor`). Carries its own `lane` and `color` so the
+/// UI renders it as a distinct line+badge rather than a second badge on the
+/// shared commit. See [`Graph::stubs`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchStub {
+    /// Branch name — the badge text, e.g. `"feature/ui-dark-mode"`.
+    pub name: String,
+    /// Row of the commit this branch forks from (its tip is that commit).
+    pub anchor_row: usize,
+    /// Lane of the commit it forks from, so the connector can curve out of it.
+    pub anchor_lane: usize,
+    /// The stub's own lane (column), to the right of the commit lanes.
+    pub lane: usize,
+    /// The stub's own colour slot — distinct from the branch it forked off.
+    pub color: usize,
 }
 
 /// Body of a `POST /api/branch` request (Issue #18): create a branch named

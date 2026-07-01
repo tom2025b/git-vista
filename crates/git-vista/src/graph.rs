@@ -111,6 +111,8 @@ pub fn fake_graph() -> Graph {
         lane_count,
         repo_url: None,
         remote_commits: Vec::new(),
+        stubs: Vec::new(),
+        repo_label: None,
     }
 }
 

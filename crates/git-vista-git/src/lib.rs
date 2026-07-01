@@ -196,6 +196,21 @@ pub fn read_remote_commits(path: &Path, limit: usize) -> Result<HashSet<String>,
     Ok(ids)
 }
 
+/// The short name of the branch currently checked out (HEAD's symbolic referent),
+/// e.g. `"main"` or `"feature/ui"`. `None` when HEAD is detached or unreadable.
+///
+/// Used to colour the graph: the checked-out branch owns its line (and so a branch
+/// freshly created from its tip is the one drawn as a new stub, not the trunk).
+/// Several branches can sit on the same commit, so the commit alone can't say
+/// which is "the" branch — the symbolic HEAD can.
+pub fn read_head_branch(path: &Path) -> Option<String> {
+    let repo = gix::open_opts(path, gix::open::Options::isolated()).ok()?;
+    // `head_name()` is `Some` only when HEAD is symbolic (on a branch); `None`
+    // when detached. Shorten `refs/heads/feature/ui` to `feature/ui`.
+    let name = repo.head_name().ok()??;
+    Some(name.shorten().to_string())
+}
+
 /// Read the repository's refs — HEAD, local & remote branches, and tags — each
 /// peeled to the commit it ultimately points at, for badging and per-branch
 /// colouring in the UI.
