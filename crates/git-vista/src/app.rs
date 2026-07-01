@@ -25,7 +25,8 @@ use crate::color::{branch_color, BADGE_DARK, HEAD_BADGE, MERGE_FILL, TAG_BADGE};
 use crate::datetime::local_timestamp;
 use crate::geometry::{
     badge_text_dx, badge_text_y, badge_top_y, badge_width, edge_path, label_bottom_y, label_top_y,
-    label_x, node_cx, node_cy, BADGE_GAP, BADGE_HEIGHT, BADGE_RADIUS, NODE_RADIUS,
+    label_x, node_cx, node_cy, stub_node_cy, stub_path, BADGE_GAP, BADGE_HEIGHT, BADGE_RADIUS,
+    NODE_RADIUS,
 };
 use crate::text::truncate;
 
@@ -130,7 +131,19 @@ pub fn App() -> impl IntoView {
                         <p class="status error">{format!("Failed to load history: {e}")}</p>
                     }
                     .into_view(),
-                    Some(Ok(g)) => graph_canvas(g, reload).into_view(),
+                    Some(Ok(g)) => {
+                        // Show which repo this page is actually displaying, straight
+                        // from the API response. If it disagrees with the terminal,
+                        // the browser is pointed at a stale server/tab — now visible.
+                        let repo = g.repo_label.clone();
+                        view! {
+                            {repo.map(|r| view! {
+                                <p class="status repo">{format!("repository: {r}")}</p>
+                            })}
+                            {graph_canvas(g, reload)}
+                        }
+                        .into_view()
+                    }
                 }}
             </section>
         </main>
@@ -187,10 +200,19 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
         .iter()
         .map(|e| {
             let d = edge_path(e);
-            // Colour a link by the branch of its parent (the lower endpoint): a
-            // first-parent link keeps the branch colour, a merge link takes the
-            // merged-in branch's colour — consistent with its commits.
-            let color = branch_color(row_color[e.to_row]);
+            // Colour a link by the branch *line* it belongs to, so it matches the
+            // dots it connects:
+            //  * a first-parent link is part of the child's own branch — a side
+            //    branch forking off main is drawn in the side branch's colour all
+            //    the way down to its fork point, not main's blue;
+            //  * a merge link (any non-first parent) is part of the merged-in
+            //    branch, so it takes that parent's colour as it curves in.
+            // Only main (colour slot 0) ever stays blue this way.
+            let child = &graph.rows[e.from_row].commit;
+            let parent_oid = &graph.rows[e.to_row].commit.id;
+            let is_first_parent = child.parents.first() == Some(parent_oid);
+            let color_row = if is_first_parent { e.from_row } else { e.to_row };
+            let color = branch_color(row_color[color_row]);
             view! {
                 <path d=d fill="none" stroke=color stroke-width="2" stroke-linecap="round" />
             }
@@ -415,6 +437,89 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 {msg_view}
                 <text x=text_x y=label_bottom_y(gr.row) class="label-meta">
                     {meta}
+                </text>
+            }
+        })
+        .collect_view();
+
+    // Branch stubs: a local branch with no commits of its own (e.g. one just
+    // created from an existing commit) is drawn GitHub-network-graph style — a
+    // short, uniquely-coloured line forking off its commit into its own lane,
+    // with the branch badge on the fork tip, instead of a second badge crowding
+    // the shared commit.
+    let stubs = graph
+        .stubs
+        .iter()
+        .map(|s| {
+            let color = branch_color(s.color);
+            let d = stub_path(s.anchor_lane, s.anchor_row, s.lane);
+            let sx = node_cx(s.lane);
+            let sy = stub_node_cy(s.anchor_row);
+            // Badge sits just right of the fork tip, vertically centred on it.
+            let bx = sx + NODE_RADIUS + BADGE_GAP;
+            let w = badge_width(&s.name);
+            let name = s.name.clone();
+
+            // The stub's tip *is* its anchor commit (the branch owns no commits of
+            // its own yet), so tapping the tip opens the same context menu as that
+            // commit — letting you fork a further branch straight off this one
+            // (Issue #24). We therefore target the anchor commit's id/hash.
+            let anchor = &graph.rows[s.anchor_row].commit;
+            let commit_id = anchor.id.0.clone();
+            let short = anchor.id.short().to_string();
+            let github_url = repo_url
+                .as_ref()
+                .and_then(|base| remote_set.contains(&commit_id).then(|| format!("{base}/commit/{commit_id}")));
+            let open_menu = move |ev: web_sys::MouseEvent| {
+                // Ignore the click that ends a pan; a real tap opens the menu.
+                if moved.get_value() {
+                    return;
+                }
+                ev.stop_propagation();
+                menu.set(Some(MenuData {
+                    commit: commit_id.clone(),
+                    short: short.clone(),
+                    x: ev.client_x() as f64,
+                    y: ev.client_y() as f64,
+                    github_url: github_url.clone(),
+                }));
+            };
+            view! {
+                <path
+                    d=d
+                    fill="none"
+                    stroke=color
+                    stroke-width="2"
+                    stroke-linecap="round"
+                />
+                // Filled, clickable dot (Issue #24) — matching the commit nodes, so
+                // every node in the graph reads as a tappable dot.
+                <circle cx=sx cy=sy r=NODE_RADIUS fill=color stroke=color stroke-width="2">
+                    <title>{format!("{name} — new branch (no commits yet); tap to branch from here")}</title>
+                </circle>
+                // A larger, invisible hit target on top so the tip is easy to tap,
+                // exactly like the commit dots.
+                <circle
+                    cx=sx
+                    cy=sy
+                    r=NODE_RADIUS + 8
+                    fill="transparent"
+                    class="node-hit"
+                    on:click=open_menu
+                />
+                <rect
+                    x=bx
+                    y=sy - BADGE_HEIGHT / 2
+                    width=w
+                    height=BADGE_HEIGHT
+                    rx=BADGE_RADIUS
+                    ry=BADGE_RADIUS
+                    fill=color
+                    stroke=color
+                    stroke-width="1"
+                />
+                <text x=bx + badge_text_dx() y=sy + 4 class="badge-text" fill=BADGE_DARK>
+                    {name}
                 </text>
             }
         })
@@ -648,6 +753,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 {edges}
                 {nodes}
                 {labels}
+                {stubs}
             </g>
         </svg>
         {menu_view}

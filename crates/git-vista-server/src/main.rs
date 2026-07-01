@@ -163,7 +163,14 @@ async fn commits() -> Result<impl IntoResponse, (StatusCode, String)> {
     // fine and the browser is showing a cached copy; if it's missing here, the
     // problem is the repo being served (wrong path) or a ref the walk couldn't read.
     log_commits_summary(repo, &history, &refs);
-    let mut graph = layout::layout_with_refs(history, refs);
+    // The checked-out branch owns its line, so a branch just created from its tip
+    // is the one drawn as a new stub line (not the trunk). See `layout_with_refs`.
+    let head_branch = git_vista_git::read_head_branch(repo);
+    let mut graph = layout::layout_with_refs(history, refs, head_branch.as_deref());
+    // Tell the UI exactly which repo path this graph came from, so the header can
+    // show it. If the page ever displays a different repo than the terminal is
+    // serving, this makes the mismatch visible instead of a mystery.
+    graph.repo_label = Some(repo.display().to_string());
     // Attach the GitHub web base (if this repo has a github.com origin) so the UI
     // can link commits and refs. None => the frontend renders plain-text labels.
     graph.repo_url = git_vista_git::github_web_base(repo);

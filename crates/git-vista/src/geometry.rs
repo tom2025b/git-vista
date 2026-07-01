@@ -102,6 +102,24 @@ pub fn edge_path(e: &Edge) -> String {
     }
 }
 
+/// Centre y of a branch stub's tip node: half a row above its anchor commit, so
+/// the stub reads as a short fork sitting just above the commit it points at,
+/// clear of that commit's own label lines.
+pub fn stub_node_cy(anchor_row: usize) -> i32 {
+    node_cy(anchor_row) - ROW_HEIGHT / 2
+}
+
+/// SVG path from an anchor commit's node up-and-out to a branch stub's tip node —
+/// a smooth S-curve, like a branch edge, so the stub flows out of the commit
+/// rather than cutting straight to it.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn stub_path(anchor_lane: usize, anchor_row: usize, stub_lane: usize) -> String {
+    let (ax, ay) = (node_cx(anchor_lane), node_cy(anchor_row));
+    let (sx, sy) = (node_cx(stub_lane), stub_node_cy(anchor_row));
+    let ym = (ay + sy) / 2;
+    format!("M {ax} {ay} C {ax} {ym}, {sx} {ym}, {sx} {sy}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
