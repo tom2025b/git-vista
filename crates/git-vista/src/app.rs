@@ -476,9 +476,6 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.depth);
             let sx = node_cx(s.lane);
             let sy = stub_node_cy(s.anchor_row, s.depth);
-            // Badge sits just right of the fork tip, vertically centred on it.
-            let bx = sx + NODE_RADIUS + BADGE_GAP;
-            let w = badge_width(&s.name);
             let name = s.name.clone();
 
             // The stub is a *branch*, not the commit it happens to sit on, so its
@@ -537,20 +534,6 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     class="node-hit"
                     on:click=open_menu
                 />
-                <rect
-                    x=bx
-                    y=sy - BADGE_HEIGHT / 2
-                    width=w
-                    height=BADGE_HEIGHT
-                    rx=BADGE_RADIUS
-                    ry=BADGE_RADIUS
-                    fill=color
-                    stroke=color
-                    stroke-width="1"
-                />
-                <text x=bx + badge_text_dx() y=sy + 4 class="badge-text" fill=BADGE_DARK>
-                    {name}
-                </text>
             }
         })
         .collect_view();
