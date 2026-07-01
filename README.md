@@ -1,90 +1,136 @@
 # git-vista
 
-A desktop application that visualizes git history as a clean, zoomable **vertical**
-graph. Built in Rust with **Tauri** (native desktop shell) + **Leptos**
-(Rust to WebAssembly UI), on top of a pure-logic core crate.
+A **browser-first** app that visualizes git history as a clean, zoomable
+**vertical** graph — branches in stable colours, HEAD/branch/tag badges, commit
+labels, and a per-commit detail panel. Built in Rust: a pure-logic core, a native
+git reader (gix), a small HTTP server, and a **Leptos → WebAssembly** UI.
+
+It's designed to be run on a machine and opened from a browser — including
+**Safari on an iPad over the LAN**, which is why the UI is served over HTTP rather
+than driven through a native shell (a browser can't read a git repo itself).
 
 ## Workspace layout
+
+Four crates (plus a legacy Tauri shell), each with one job:
 
 ```
 git-vista/
 ├── Cargo.toml                    # workspace root
 ├── rust-toolchain.toml           # stable toolchain + wasm32 target
+├── gv                            # launcher: rebuild the SPA + serve a repo
 └── crates/
-    ├── git-vista-core/           # pure logic — NO UI dependencies
+    ├── git-vista-core/           # pure logic — NO UI, NO filesystem, wasm-safe
     │   └── src/
-    │       ├── lib.rs            # crate root, module wiring
-    │       ├── model.rs          # serializable data types (cross IPC)
-    │       ├── repo.rs           # git history reader (stub)
-    │       └── layout.rs         # vertical lane-assignment (stub)
-    └── git-vista/                # the GUI application
-        ├── index.html           # Trunk entry point
-        ├── Trunk.toml           # frontend build/serve config
+    │       ├── model.rs          # serializable data types (server ⇄ UI)
+    │       └── layout.rs         # vertical lane assignment + per-branch colour
+    ├── git-vista-git/            # native git reading via gix (native-only)
+    │   └── src/
+    │       ├── history.rs        # walk_history, read_commit, read_remote_commits
+    │       ├── refs.rs           # HEAD, branches, tags, checked-out branch
+    │       └── github.rs         # origin URL → GitHub web base
+    ├── git-vista-server/         # axum HTTP backend
+    │   └── src/main.rs           # serves the SPA + the /api/* endpoints
+    └── git-vista/                # the Leptos wasm UI (bin: git-vista-ui)
+        ├── index.html            # Trunk entry point
         ├── styles.css
-        ├── src/
-        │   ├── main.rs          # Leptos wasm entry (mounts App)
-        │   └── app.rs           # Leptos components
-        └── src-tauri/           # native desktop shell (Tauri v2)
-            ├── Cargo.toml
-            ├── build.rs
-            ├── tauri.conf.json
-            ├── capabilities/default.json
-            └── src/
-                ├── main.rs      # desktop binary entry
-                ├── lib.rs       # Tauri builder + IPC handlers
-                └── commands.rs  # #[tauri::command] functions
+        ├── src/                  # app.rs (view), camera, geometry, color, …
+        └── src-tauri/            # legacy native desktop shell (Tauri v2)
 ```
 
-## Why three packages for "two crates"?
+`git-vista-git` is kept **separate** from `git-vista-core` on purpose: gix reads a
+filesystem repo and can't compile for wasm, so keeping it out of `core` lets the
+browser frontend depend on a clean, wasm-safe core. Both the server and the UI
+share `git-vista-core`'s types, so the same structs flow from the git walker
+through JSON into the UI with no duplication.
 
-Conceptually there are two crates: **git-vista-core** (logic) and **git-vista**
-(the GUI). But Tauri requires its native shell to be a *separate* cargo package,
-because the frontend and the desktop binary compile for **different targets** and
-never link together:
+## Architecture
 
-- The Leptos frontend (`crates/git-vista`) compiles to **wasm32** and is built by
-  **Trunk** into `dist/`.
-- The Tauri shell (`crates/git-vista/src-tauri`) compiles to a **native** binary
-  that opens a webview and loads those `dist/` assets.
+```
+  browser (SPA, wasm)                    git-vista-server (native)
+  ────────────────────      HTTP         ─────────────────────────
+  fetch /api/commits   ───────────────▶  walk_history + layout  ─┐
+  fetch /api/commit/id ───────────────▶  read_commit            ─┤ gix reads
+  POST  /api/branch    ───────────────▶  git branch  (shell)    ─┤ the repo on
+  POST  /api/commit    ───────────────▶  git commit  (shell)    ─┤ the filesystem
+  POST  /api/merge|push|delete-branch ▶  git … (shell)          ─┤
+  POST  /api/clone     ───────────────▶  git clone → temp dir   ─┘
+```
 
-Both depend on `git-vista-core` for shared data models, so the same types flow
-from the git walker through the IPC boundary into the UI with no duplication.
+Everything is same-origin, so there's no CORS and no hardcoded host — the server
+serves both the wasm bundle and the API on `:8080`.
+
+## Features (through Phase 12)
+
+- Vertical commit graph with robust lane assignment (branches, merges, octopus).
+- Pan & zoom via **Pointer Events** — drag to pan, wheel to zoom on desktop,
+  one-finger drag + two-finger pinch on iPad/Safari.
+- Stable **per-branch colours**, and HEAD / branch / tag badges beside commits.
+- Commit labels (message · short hash · author · local date), with **level of
+  detail** (text hidden when zoomed out) and **viewport virtualization** (only
+  on-screen rows are rendered, for large histories).
+- **GitHub links** on commits/refs when the repo has a `github.com` origin — only
+  for pushed objects, so a link never 404s.
+- Write actions from the graph's context menu: create branch, commit, merge, push,
+  delete branch (each confirmed in an iPad-safe in-app modal).
+- **Commit detail panel** (Phase 10): "View details" opens a side panel with the
+  full message body and both author & committer signatures; parent hashes are
+  clickable to walk up the history.
+- **Open URL** (Phase 12): paste a public `https://`/`http://`/`git://` URL to
+  clone and view any repo **read-only** (all write actions hidden + refused).
+
+See `DESIGN.md` for the phased roadmap and `PROJECT_MEMORY.md` for the running
+per-phase handoff notes.
 
 ## Prerequisites
 
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install trunk
-cargo install tauri-cli --version "^2.0"
 ```
 
-On Linux (Mint), Tauri also needs system webview libraries — `webkit2gtk-4.1`,
-`librsvg2`, `libayatana-appindicator3`, etc. See the Tauri v2 prerequisites docs.
-
-> Dependency versions in the Cargo.toml files (leptos, tauri, gix) are pinned to
-> known-good majors — bump them to the latest releases before the first build.
+A working `git` on `PATH` (the server shells out to it for writes and clones); the
+history read itself uses `gix`'s pure-Rust reader. The legacy Tauri shell
+additionally needs `cargo install tauri-cli --version "^2.0"` and the system
+webview libs (`webkit2gtk-4.1`, `librsvg2`, …) — not required for normal
+browser-first use.
 
 ## Running
 
-```sh
-# Dev: launches a native window with the hot-reloading Leptos frontend.
-cargo tauri dev
+The normal path is the `gv` launcher: it does a clean rebuild of the wasm SPA,
+then starts the server pointed at a repo.
 
-# Frontend only, in a browser (no native shell):
-cd crates/git-vista && trunk serve
+```sh
+./gv                  # visualise the CURRENT directory's repo
+./gv ~/code/myproj    # visualise another repo by path
 ```
 
-`cargo tauri dev` runs `trunk serve` first (see `beforeDevCommand` in
-`tauri.conf.json`), then opens the Tauri window pointed at it.
+Then open the URL it prints:
+
+- on this machine: `http://localhost:8080/`
+- from an iPad on the same Wi-Fi: `http://<this-machine-LAN-IP>:8080/`
+
+Under the hood that's just:
+
+```sh
+( cd crates/git-vista && trunk build )        # build the wasm bundle into dist/
+cargo run -p git-vista-server -- <repo-path>  # serve SPA + API on :8080
+```
+
+Frontend-only iteration (no API, no real data) still works with
+`cd crates/git-vista && trunk serve`.
 
 ## Tests
 
 ```sh
-cargo test -p git-vista-core
+cargo test -p git-vista-core     # layout, model
+cargo test -p git-vista-git      # history/refs/github readers against fixtures
 ```
+
+The core and git crates are headlessly unit-tested against fixture repositories;
+the frontend is view-assembly over those tested pieces.
 
 ## Status
 
-Scaffold. The `repo` (git walking) and `layout` (lane assignment) modules are
-documented stubs — see their module docs for the planned implementation and the
-companion lesson in the teacher repo.
+Working browser-first git visualizer, complete through **Phase 12** (and the
+Phase 10 commit detail panel). Remaining open phases: **Phase 11** — search &
+filter, and **Phase 13** — packaging & polish. See `DESIGN.md`.
