@@ -6,8 +6,8 @@
 //! rather than a module in `git-vista-core`: gix reads a filesystem repo and
 //! can't compile for wasm, so keeping it out of `core` lets the browser frontend
 //! depend on a clean, wasm-compatible core without any `#[cfg]` gating. The
-//! native backend (the Tauri shell today) depends on this crate; the frontend
-//! never does.
+//! native backend (`git-vista-server`) depends on this crate; the frontend never
+//! does.
 //!
 //! It's UI-independent and headlessly unit-testable against fixture repositories.
 //!

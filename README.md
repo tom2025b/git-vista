@@ -11,7 +11,7 @@ than driven through a native shell (a browser can't read a git repo itself).
 
 ## Workspace layout
 
-Four crates (plus a legacy Tauri shell), each with one job:
+Four crates, each with one job:
 
 ```
 git-vista/
@@ -33,8 +33,7 @@ git-vista/
     └── git-vista/                # the Leptos wasm UI (bin: git-vista-ui)
         ├── index.html            # Trunk entry point
         ├── styles.css
-        ├── src/                  # app.rs (view), camera, geometry, color, …
-        └── src-tauri/            # legacy native desktop shell (Tauri v2)
+        └── src/                  # app.rs (view), camera, geometry, color, …
 ```
 
 `git-vista-git` is kept **separate** from `git-vista-core` on purpose: gix reads a
@@ -77,6 +76,10 @@ serves both the wasm bundle and the API on `:8080`.
   clickable to walk up the history.
 - **Open URL** (Phase 12): paste a public `https://`/`http://`/`git://` URL to
   clone and view any repo **read-only** (all write actions hidden + refused).
+- **Controls & shortcuts** (Phase 13): drag/one-finger to pan, wheel/pinch to zoom,
+  plus keyboard shortcuts on desktop and the iPad Magic Keyboard — `+`/`-` zoom, `0`
+  resets the view, `r` refreshes, `Esc` closes the open menu/panel. A **Reset view**
+  button recenters the camera for pure touch/trackpad use (no keyboard needed).
 
 See `DESIGN.md` for the phased roadmap and `PROJECT_MEMORY.md` for the running
 per-phase handoff notes.
@@ -89,10 +92,7 @@ cargo install trunk
 ```
 
 A working `git` on `PATH` (the server shells out to it for writes and clones); the
-history read itself uses `gix`'s pure-Rust reader. The legacy Tauri shell
-additionally needs `cargo install tauri-cli --version "^2.0"` and the system
-webview libs (`webkit2gtk-4.1`, `librsvg2`, …) — not required for normal
-browser-first use.
+history read itself uses `gix`'s pure-Rust reader.
 
 ## Running
 
@@ -132,5 +132,6 @@ the frontend is view-assembly over those tested pieces.
 ## Status
 
 Working browser-first git visualizer, complete through **Phase 12** (and the
-Phase 10 commit detail panel). Remaining open phases: **Phase 11** — search &
-filter, and **Phase 13** — packaging & polish. See `DESIGN.md`.
+Phase 10 commit detail panel). **Phase 13** — packaging & polish is **in progress**
+(icons, keyboard shortcuts, reset-view, shippable server defaults). Remaining:
+**Phase 11** — search & filter, and the rest of Phase 13. See `DESIGN.md`.

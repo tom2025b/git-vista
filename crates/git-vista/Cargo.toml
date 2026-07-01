@@ -1,6 +1,6 @@
 [package]
 name = "git-vista"
-description = "git-vista Leptos frontend — renders the vertical git graph inside the Tauri webview."
+description = "git-vista Leptos frontend — renders the vertical git graph in the browser (built to wasm by Trunk)."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -34,6 +34,8 @@ web-sys = { version = "0.3", features = [
     "Element",
     "Event",
     "EventTarget",
+    # Phase 13: keyboard shortcuts (Esc / +/-/0 / r) via a window keydown listener.
+    "KeyboardEvent",
     "MouseEvent",
     "PointerEvent",
     "WheelEvent",

@@ -144,6 +144,29 @@ html, body {
    template walk on iOS WebKit) and inline viewport-sized styles that render
    reliably there. Nothing to add here. */
 
+/* Phase 13: floating "Reset view" control. Bottom-left so it clears the
+   right-docked detail panel; semi-transparent until hovered so it doesn't fight
+   the graph, but always tappable to recenter the camera. */
+.reset-view {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  z-index: 15;
+  padding: 0.4rem 0.8rem;
+  font: inherit;
+  font-size: 0.8rem;
+  color: var(--fg);
+  background: rgba(33, 38, 45, 0.82);
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0.75;
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+}
+.reset-view:hover { opacity: 1; border-color: var(--accent); }
+.reset-view:active { background: #30363d; }
+
 /* Issue #12: commit messages and ref badges that link to GitHub. */
 .clickable { cursor: pointer; }
 /* Commits/refs that aren't on the remote yet — shown but not linked (their

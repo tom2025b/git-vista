@@ -35,10 +35,12 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 // Which repository to visualise *initially*. Taken from the first CLI argument
-// (`git-vista-server <path>`), falling back to this checkout when none is given.
-// The `gv` launcher passes the directory you run it from. This is only the
-// starting repo — Phase 12 lets the user switch to a cloned URL at runtime.
-const DEFAULT_REPO: &str = "/home/tom/projects/git-vista";
+// (`git-vista-server <path>`), falling back to the current working directory (`.`,
+// canonicalised at startup) when none is given. The `gv` launcher always passes
+// the directory you run it from, so this default only bites when the server is run
+// directly with no argument. This is only the starting repo — Phase 12 lets the
+// user switch to a cloned URL at runtime.
+const DEFAULT_REPO: &str = ".";
 
 /// The repository the server is currently serving. Mutable at runtime (Phase 12):
 /// starts at the CLI-arg repo (`read_only: false`, the user's own working repo),
@@ -115,6 +117,18 @@ async fn main() {
     }
     // The CLI-arg repo is the user's own working repo, so it's writable.
     set_current(repo, false);
+
+    // Phase 13: clear any throwaway clones left behind by a previous run. The `gv`
+    // launcher SIGKILLs the old server on restart, so its last Phase 12 clone was
+    // never cleaned up and would otherwise pile up under the temp dir across runs.
+    // Nothing is being served from there yet at startup, so removing the whole
+    // clones root is safe; the next clone recreates it.
+    let clones = clones_root();
+    if clones.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&clones) {
+            eprintln!("git-vista: couldn't clear old clones at {}: {e}", clones.display());
+        }
+    }
 
     // Warn early if the SPA hasn't been built — otherwise every page is a 404
     // and it looks like the server is broken.

@@ -1,6 +1,7 @@
 # git-vista — Design & Development Roadmap
 
-A clean, zoomable vertical git history visualizer built with Tauri + Leptos.
+A clean, zoomable vertical git history visualizer — browser-first, built in Rust
+with a Leptos → WebAssembly UI served over HTTP.
 
 ## Principles
 
@@ -100,8 +101,27 @@ picker, discovery, recents, or auth. `gv <path>` still sets the writable startin
 repo. The mutable current-repo (`OnceLock` → `RwLock`) is the reusable foundation
 if a local-path picker is ever wanted.
 
-### Phase 13 — Packaging & polish
+### Phase 13 — Packaging & polish (in progress)
 Icons, performance tuning, keyboard shortcuts, build process, and final cleanup.
+
+Done so far:
+- **Icons:** an inline SVG favicon (a small vertical branch graph) plus mobile meta
+  (`theme-color`, `apple-mobile-web-app-*`, `viewport-fit=cover`) in `index.html`.
+- **Keyboard shortcuts:** a window keydown listener — `Esc` backs out of the open
+  overlay (menu → modal → detail panel), `+`/`-` zoom, `0` resets the camera, `r`
+  refreshes. `Esc` is only a bonus: every overlay also closes via its Cancel button
+  or a backdrop tap, since some iPad Magic Keyboards have no physical `Esc` key.
+- **Reset view:** a floating button recenters pan/zoom, so a touch/trackpad user who
+  pans the graph off-screen has a one-tap way back (no keyboard needed).
+- **Build / packaging:** the server now defaults to the current working directory
+  (was a hardcoded absolute path), and clears any throwaway clones left by a prior
+  run on startup (the launcher SIGKILLs the old server, so its last clone leaked).
+- **Final cleanup:** removed the legacy Tauri desktop shell — a Phase-4 stub that
+  never read real data yet cost a whole CI job plus WebKitGTK/GTK system deps. The
+  workspace is now four crates; the app is purely browser-first.
+
+Still open: an optional performance pass (e.g. open the gix repo once per
+`/api/commits` rather than ~5×).
 
 ## Backlog
 - Dark/light theme toggle
