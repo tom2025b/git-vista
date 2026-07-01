@@ -11,7 +11,7 @@ use gix::refs::Category;
 use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
 
-use git_vista_core::model::{CommitSummary, Oid};
+use git_vista_core::model::{CommitDetail, CommitSummary, Oid};
 
 use crate::RepoError;
 
@@ -112,6 +112,52 @@ pub fn walk_history(path: &Path, limit: usize) -> Result<Vec<CommitSummary>, Rep
     }
 
     Ok(commits)
+}
+
+/// Read one commit in full, by its hex id (Phase 10 — the detail panel).
+///
+/// Unlike [`walk_history`], which flattens each commit to the summary a row needs,
+/// this loads everything the panel shows: the whole message body and both the
+/// author and committer signatures (name, email, and their own times). Looked up
+/// directly by id rather than walked, so it's cheap regardless of history size.
+///
+/// A malformed id, or one that isn't a commit in this repo, is a
+/// [`RepoError::CommitNotFound`] (the caller maps it to a 404), not a read error.
+pub fn read_commit(path: &Path, id: &str) -> Result<CommitDetail, RepoError> {
+    let repo = gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+
+    let oid = gix::ObjectId::from_hex(id.as_bytes())
+        .map_err(|e| RepoError::CommitNotFound(format!("{id}: {e}")))?;
+    let commit = repo
+        .find_commit(oid)
+        .map_err(|e| RepoError::CommitNotFound(format!("{id}: {e}")))?;
+
+    let author = commit.author().map_err(|e| RepoError::Walk(e.to_string()))?;
+    let committer = commit.committer().map_err(|e| RepoError::Walk(e.to_string()))?;
+    let message = commit
+        .message_raw()
+        .map_err(|e| RepoError::Walk(e.to_string()))?
+        .to_string();
+    let parents = commit.parent_ids().map(|p| Oid(p.detach().to_string())).collect();
+
+    // The signature time is parsed leniently; a malformed one falls back to the
+    // epoch rather than failing the whole read (the panel just shows a stale date).
+    let seconds = |s: &gix::actor::SignatureRef| s.time().map(|t| t.seconds).unwrap_or(0);
+
+    Ok(CommitDetail {
+        id: Oid(commit.id.to_string()),
+        parents,
+        author_name: author.name.to_string().trim().to_string(),
+        author_email: author.email.to_string().trim().to_string(),
+        author_time: seconds(&author),
+        committer_name: committer.name.to_string().trim().to_string(),
+        committer_email: committer.email.to_string().trim().to_string(),
+        commit_time: seconds(&committer),
+        message,
+    })
 }
 
 /// The set of commit ids (hex) reachable from the repository's remote-tracking
@@ -298,6 +344,38 @@ pub(crate) mod tests {
                 assert!(ids.contains(p.0.as_str()), "parent {} should be walked", p.0);
             }
         }
+    }
+
+    #[test]
+    fn read_commit_returns_full_detail() {
+        let dir = fixture();
+        let p = dir.path();
+        // Grab the merge commit E's id from the walk, then read it in full.
+        let history = walk_history(p, 100).unwrap();
+        let e = history.iter().find(|c| c.summary == "E merge feature").unwrap();
+
+        let detail = read_commit(p, &e.id.0).unwrap();
+        assert_eq!(detail.id, e.id);
+        assert_eq!(detail.author_name, "Ada Lovelace");
+        assert_eq!(detail.author_email, "ada@example.com");
+        assert_eq!(detail.committer_name, "Ada Lovelace");
+        // The fixture pins both times to @6, so author and commit time agree.
+        assert_eq!(detail.author_time, 6);
+        assert_eq!(detail.commit_time, 6);
+        // A merge has two parents, both present in the walk.
+        assert_eq!(detail.parents.len(), 2);
+        // The full message starts with the summary line.
+        assert!(detail.message.starts_with("E merge feature"));
+    }
+
+    #[test]
+    fn read_commit_rejects_unknown_or_malformed_ids() {
+        let dir = fixture();
+        let p = dir.path();
+        // Well-formed but absent id, and a non-hex string: both are "not found".
+        let absent = "0".repeat(40);
+        assert!(matches!(read_commit(p, &absent), Err(RepoError::CommitNotFound(_))));
+        assert!(matches!(read_commit(p, "not-a-hash"), Err(RepoError::CommitNotFound(_))));
     }
 
     #[test]
