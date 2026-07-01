@@ -37,9 +37,9 @@
 //! wired in a second pass so they connect each commit to its parent's final lane
 //! even when sibling lanes collapsed left at a merge.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::model::{CommitSummary, Edge, GitRef, Graph, GraphRow, Oid};
+use crate::model::{BranchStub, CommitSummary, Edge, GitRef, Graph, GraphRow, Oid};
 
 /// Leftmost free (`None`) lane, growing the lane set only if none is free.
 /// Used for branch tips, which have no incoming edge and so can safely take any
@@ -74,18 +74,52 @@ fn leftmost_free_right_of(lanes: &mut Vec<Option<Oid>>, after: usize) -> usize {
 /// [`color`]: GraphRow::color
 pub fn layout(commits: Vec<CommitSummary>) -> Graph {
     let mut graph = layout_topology(commits);
-    assign_branch_colors(&mut graph, &[]);
+    assign_branch_colors(&mut graph, &[], None);
     graph
 }
 
 /// Lay commits out and decorate the graph with `refs`: attach each ref as a badge
 /// on the commit it points at, and colour each branch consistently across the
-/// whole graph (branch tips seed the colouring; HEAD's branch is preferred for
-/// the trunk). `commits` must be newest-first.
-pub fn layout_with_refs(commits: Vec<CommitSummary>, refs: Vec<GitRef>) -> Graph {
+/// whole graph (branch tips seed the colouring; `head_branch` — the checked-out
+/// branch — is preferred for the trunk). A local branch that ends up with no
+/// commits of its own (e.g. one just created from an existing commit) is drawn as
+/// a distinct stub line via [`Graph::stubs`] rather than a second badge.
+/// `commits` must be newest-first.
+pub fn layout_with_refs(
+    commits: Vec<CommitSummary>,
+    refs: Vec<GitRef>,
+    head_branch: Option<&str>,
+) -> Graph {
     let mut graph = layout_topology(commits);
-    assign_branch_colors(&mut graph, &refs);
-    attach_ref_badges(&mut graph, refs);
+    // Colouring also tells us which local branches own no commits of their own
+    // (their tip was already claimed by a higher-priority branch) — those become
+    // distinct stub lines instead of a second badge on the shared commit.
+    let (stub_seeds, used_slots) = assign_branch_colors(&mut graph, &refs, head_branch);
+
+    // Give each stub its own lane (right of the commit lanes) and its own colour
+    // slot (continuing past the ones the real branch lines used, so it's distinct).
+    let mut next_lane = graph.lane_count;
+    let mut stubs = Vec::with_capacity(stub_seeds.len());
+    let mut stub_names = HashSet::new();
+    for (i, (name, anchor_row)) in stub_seeds.into_iter().enumerate() {
+        stub_names.insert(name.clone());
+        stubs.push(BranchStub {
+            name,
+            anchor_row,
+            anchor_lane: graph.rows[anchor_row].lane,
+            lane: next_lane,
+            color: used_slots + i,
+        });
+        next_lane += 1;
+    }
+    // Widen the lane count to include the stub columns so the label column sits
+    // to the right of them (and the gutter is wide enough to draw the stubs).
+    graph.lane_count = graph.lane_count.max(next_lane);
+    graph.stubs = stubs;
+
+    // Badge the remaining refs on their commits — but not the stub branches, which
+    // are drawn as their own lines (the whole point of this feature).
+    attach_ref_badges(&mut graph, refs, &stub_names);
     graph
 }
 
@@ -184,6 +218,8 @@ fn layout_topology(commits: Vec<CommitSummary>) -> Graph {
         lane_count,
         repo_url: None,
         remote_commits: Vec::new(),
+        stubs: Vec::new(),
+        repo_label: None,
     }
 }
 
@@ -196,8 +232,9 @@ fn layout_topology(commits: Vec<CommitSummary>) -> Graph {
 /// everywhere the branch appears — independent of which lane it sits in (lanes
 /// get reused; colours don't).
 ///
-/// Branch tips (from `refs`) seed the colouring in priority order: HEAD's branch
-/// first (so the trunk takes colour 0), then local branches, then remote ones,
+/// Branch tips (from `refs`) seed the colouring in priority order: the checked-out
+/// branch (`head_branch`) first (so the trunk takes colour 0 and never becomes a
+/// stub), then the branch on HEAD's commit, then local branches, then remote ones,
 /// each group by name. Any commit still unclaimed afterwards (e.g. commits of a
 /// deleted branch, reachable only as a merge's second parent) starts its own
 /// synthetic line, walked the same way, so **every** commit ends up coloured.
@@ -205,7 +242,17 @@ fn layout_topology(commits: Vec<CommitSummary>) -> Graph {
 /// Colour slots are handed out in order of first appearance, so the same branch
 /// always maps to the same slot for a given graph; the UI wraps the slot onto its
 /// palette.
-fn assign_branch_colors(graph: &mut Graph, refs: &[GitRef]) {
+///
+/// Returns `(stub_seeds, used_slots)`: `stub_seeds` are the local branches that
+/// owned no commits of their own — their tip was already claimed by a
+/// higher-priority branch (e.g. a branch just created from an existing commit) —
+/// each as `(name, anchor_row)`; `used_slots` is how many colour slots the real
+/// branch lines consumed, so the caller can give stubs fresh, distinct colours.
+fn assign_branch_colors(
+    graph: &mut Graph,
+    refs: &[GitRef],
+    head_branch: Option<&str>,
+) -> (Vec<(String, usize)>, usize) {
     let index: HashMap<&Oid, usize> = graph.rows.iter().map(|r| (&r.commit.id, r.row)).collect();
 
     // Branch refs, in colouring priority: HEAD's branch first, then local before
@@ -216,10 +263,16 @@ fn assign_branch_colors(graph: &mut Graph, refs: &[GitRef]) {
         .map(|r| &r.target);
     let mut seeds: Vec<&GitRef> = refs.iter().filter(|r| r.is_branch()).collect();
     seeds.sort_by_key(|r| {
+        // The checked-out branch wins outright: it owns the trunk colour and, by
+        // claiming its tip first, is never demoted to a stub even when a sibling
+        // branch sits on the very same commit (which is exactly what happens right
+        // after you branch from it).
+        let is_checked_out = head_branch == Some(r.name.as_str())
+            && matches!(r.kind, crate::model::RefKind::Branch);
         let is_head = head_target == Some(&r.target);
         let is_remote = matches!(r.kind, crate::model::RefKind::RemoteBranch);
         // false < true, so negate the ones we want first.
-        (!is_head, is_remote, r.name.clone())
+        (!is_checked_out, !is_head, is_remote, r.name.clone())
     });
 
     // commit row -> colour slot, and branch key -> slot so the same branch reuses
@@ -260,9 +313,25 @@ fn assign_branch_colors(graph: &mut Graph, refs: &[GitRef]) {
         }
     };
 
+    // Local branches that turn out to own no commits become stub lines (collected
+    // here as (name, anchor_row)). A stub is a local branch whose tip is already
+    // coloured by the time we reach it — i.e. a higher-priority branch claimed it
+    // first (it shares that branch's tip, or sits on an interior commit of it).
+    // We only do this for *local* branches: priority puts locals before remotes,
+    // so a local's tip is never pre-claimed by a remote, and remotes like
+    // `origin/main` keep showing as ordinary badges on the shared commit.
+    let mut stub_seeds: Vec<(String, usize)> = Vec::new();
     for seed in seeds {
         let tip = index.get(&seed.target).copied();
-        claim(tip, seed.name.clone(), &mut color_of, &mut slot_of_key);
+        let is_local = matches!(seed.kind, crate::model::RefKind::Branch);
+        match tip {
+            Some(row) if is_local && color_of.contains_key(&row) => {
+                // Owns nothing of its own → draw it as a distinct stub line, not a
+                // second badge. Don't claim (it has no chain to colour anyway).
+                stub_seeds.push((seed.name.clone(), row));
+            }
+            _ => claim(tip, seed.name.clone(), &mut color_of, &mut slot_of_key),
+        }
     }
     // Synthetic fallback: any commit still unowned, top-to-bottom, starts a line
     // keyed by its own short hash so the slot is stable.
@@ -277,17 +346,26 @@ fn assign_branch_colors(graph: &mut Graph, refs: &[GitRef]) {
     for row in &mut graph.rows {
         row.color = color_of.get(&row.row).copied().unwrap_or(0);
     }
+
+    // All slots consumed by real lines (branch + synthetic); stubs get colours
+    // numbered from here so they don't collide with any line's colour.
+    (stub_seeds, slot_of_key.len())
 }
 
 /// Attach each ref to the row of the commit it points at, so the UI can badge it.
 /// Refs whose target is outside the walked window are dropped (nothing to badge).
-fn attach_ref_badges(graph: &mut Graph, refs: Vec<GitRef>) {
+/// Local branches named in `skip` are *not* badged: they're drawn as stub lines
+/// instead (see [`Graph::stubs`]), so badging them too would double them up.
+fn attach_ref_badges(graph: &mut Graph, refs: Vec<GitRef>, skip: &HashSet<String>) {
     let index: HashMap<Oid, usize> = graph
         .rows
         .iter()
         .map(|r| (r.commit.id.clone(), r.row))
         .collect();
     for r in refs {
+        if matches!(r.kind, crate::model::RefKind::Branch) && skip.contains(&r.name) {
+            continue; // drawn as a stub line, not a badge
+        }
         if let Some(&row) = index.get(&r.target) {
             graph.rows[row].refs.push(r);
         }
@@ -320,6 +398,43 @@ mod tests {
             .iter()
             .map(|r| r.name.clone())
             .collect()
+    }
+
+    /// A branch created from an existing commit (its tip already owned by another
+    /// branch) is drawn as a distinct stub line, not a second badge: it owns no
+    /// commits, gets its own lane and a colour distinct from the branch it forked
+    /// off, and its name is removed from the shared commit's badges.
+    #[test]
+    fn branch_with_no_own_commits_becomes_a_distinct_stub() {
+        // c2 <- c1 <- c0 ; `main` and a freshly-created `feature` both at c2.
+        let commits = vec![
+            commit("c2", &["c1"]),
+            commit("c1", &["c0"]),
+            commit("c0", &[]),
+        ];
+        let refs = vec![
+            gitref("HEAD", RefKind::Head, "c2"),
+            gitref("main", RefKind::Branch, "c2"),
+            gitref("feature", RefKind::Branch, "c2"),
+        ];
+        // We're on `main` (HEAD) and just created `feature` from its tip.
+        let g = layout_with_refs(commits, refs, Some("main"));
+
+        // `feature` owns nothing, so it's a stub — not a badge on c2.
+        assert!(!ref_names(&g, "c2").contains(&"feature".to_string()));
+        assert!(ref_names(&g, "c2").contains(&"main".to_string()));
+
+        assert_eq!(g.stubs.len(), 1);
+        let stub = &g.stubs[0];
+        assert_eq!(stub.name, "feature");
+        // Anchored to c2's row, in its own lane to the right, distinct colour.
+        assert_eq!(stub.anchor_row, 0);
+        assert_eq!(stub.anchor_lane, lane_of(&g, "c2"));
+        assert!(stub.lane >= g.rows.iter().map(|r| r.lane).max().unwrap());
+        assert_ne!(stub.color, color_of(&g, "c2"));
+        // The lane count was widened to include the stub lane (so the label
+        // column sits to the right of it).
+        assert!(g.lane_count > stub.lane);
     }
 
     fn commit(id: &str, parents: &[&str]) -> CommitSummary {
@@ -726,6 +841,7 @@ mod tests {
                 gitref("main", RefKind::Branch, "M"),
                 gitref("feature", RefKind::Branch, "D"),
             ],
+            Some("main"),
         );
 
         // The whole mainline (incl. the shared base B/A) is HEAD's branch colour.
@@ -749,6 +865,7 @@ mod tests {
                 // Points outside the walked window — must be dropped, not panic.
                 gitref("old", RefKind::Branch, "zzz"),
             ],
+            Some("main"),
         );
         assert_eq!(ref_names(&g, "b"), vec!["HEAD", "main"]);
         assert_eq!(ref_names(&g, "a"), vec!["v1"]);
@@ -783,6 +900,7 @@ mod tests {
                 gitref("main", RefKind::Branch, "M"),
                 gitref("v2", RefKind::Tag, "S"),
             ],
+            Some("main"),
         );
         assert_eq!(ref_names(&g, "S"), vec!["v2"], "the tag still badges S");
         assert_ne!(
