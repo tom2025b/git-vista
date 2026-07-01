@@ -65,6 +65,12 @@ html, body {
 }
 .graph-svg.grabbing { cursor: grabbing; }
 
+/* Phase 9 (level of detail): a label tier the current zoom is too far out to
+   render legibly. Toggled reactively on its <g> off the camera scale (see lod.rs)
+   so the graph structure stays readable when the text would be an unreadable
+   smear. `display:none` removes it from paint and hit-testing entirely. */
+.lod-hidden { display: none; }
+
 /* Phase 5: commit labels — a text column right of the lanes, two lines per row. */
 .label-msg {
   fill: var(--fg);
