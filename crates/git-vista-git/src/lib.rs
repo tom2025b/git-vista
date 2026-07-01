@@ -556,6 +556,59 @@ mod tests {
         assert_eq!(full_version.target, tip.id, "full-version must point at its tip Y");
     }
 
+    /// Issue #28, end-to-end through gix: a branch created at an interior commit
+    /// of an existing branch (`git branch aaa feature~1`) must render as a stub
+    /// forking off that commit, not steal the lower half of `feature`'s line. This
+    /// exercises the real ref/HEAD reading + layout, not just a hand-built graph.
+    #[test]
+    fn a_branch_created_at_an_interior_commit_renders_as_a_stub() {
+        use git_vista_core::layout::layout_with_refs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        commit(p, "A root", 1);
+        commit(p, "B second", 2);
+        git(p, &["checkout", "-q", "-b", "feature", "HEAD"]); // feature off B
+        commit(p, "F1 on feature", 3);
+        commit(p, "F2 on feature", 4);
+        git(p, &["checkout", "-q", "main"]);
+        commit(p, "C on main", 5);
+        commit(p, "D on main", 6); // main tip is the newest commit
+        // Create `aaa` at feature's interior commit F1 (feature~1), without
+        // switching to it — HEAD stays on main.
+        git(p, &["branch", "aaa", "feature~1"]);
+
+        let commits = walk_history(p, 100).unwrap();
+        let refs = read_refs(p).unwrap();
+        let head_branch = read_head_branch(p);
+        assert_eq!(head_branch.as_deref(), Some("main"));
+
+        let g = layout_with_refs(commits, refs, head_branch.as_deref());
+
+        let color = |summary: &str| {
+            g.rows
+                .iter()
+                .find(|r| r.commit.summary == summary)
+                .unwrap_or_else(|| panic!("commit {summary:?} missing"))
+                .color
+        };
+
+        // `aaa` owns nothing of its own → it's a stub, not a real line or a badge.
+        assert!(g.stubs.iter().any(|s| s.name == "aaa"), "aaa should be a stub");
+        assert!(g.stubs.iter().all(|s| s.name != "feature"), "feature is a real line");
+        // `feature` keeps ONE colour down its whole line (F1 and F2 match) — it was
+        // not split by aaa claiming F1.
+        assert_eq!(
+            color("F1 on feature"),
+            color("F2 on feature"),
+            "feature's colour must not be split by the interior branch"
+        );
+        // The checked-out branch (main) owns the trunk colour.
+        assert_eq!(color("D on main"), 0, "main owns the trunk colour");
+        assert_ne!(color("F2 on feature"), 0, "feature is distinct from the trunk");
+    }
+
     #[test]
     fn parses_github_remote_urls_to_a_web_base() {
         let want = Some("https://github.com/owner/repo".to_string());
