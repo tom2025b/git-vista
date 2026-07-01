@@ -84,8 +84,15 @@ Clicking a commit opens a side panel with full details.
 ### Phase 11 — Search & filter
 Search commits by message, author, or hash.
 
-### Phase 12 — Open repository UX
-Add a proper way to open any local repository.
+### Phase 12 — Open repository UX ✅ (done)
+"Open URL": paste a public `https://`/`http://`/`git://` URL, the server clones it
+into a throwaway temp dir and switches to viewing it **read-only** (all write
+actions hidden in the UI and refused server-side with 403). At most one clone is
+kept — opening another deletes the previous. Scoped down at the user's request to
+"look at a complex public history a few times to learn git", so no local-path
+picker, discovery, recents, or auth. `gv <path>` still sets the writable starting
+repo. The mutable current-repo (`OnceLock` → `RwLock`) is the reusable foundation
+if a local-path picker is ever wanted.
 
 ### Phase 13 — Packaging & polish
 Icons, performance tuning, keyboard shortcuts, build process, and final cleanup.
