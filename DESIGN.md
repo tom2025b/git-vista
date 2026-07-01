@@ -63,8 +63,12 @@ colours nodes/edges by branch.)
 ### Phase 8 — Viewport virtualization
 Only render commits currently visible in the viewport for performance.
 
-### Phase 9 — Level of detail
+### Phase 9 — Level of detail ✅ (done)
 Change level of detail based on zoom level (hide text when zoomed out, etc.).
+(Done: a pure `lod::detail_for(scale)` maps the camera zoom to a `Detail` level;
+the view hides the message tier below 0.5× and the dimmed meta line below 0.8×,
+so a zoomed-out graph reads as structure, not a smear. Phase 8 — viewport
+virtualization — was skipped for now and is still open.)
 
 ### Phase 10 — Commit detail panel
 Clicking a commit opens a side panel with full details.

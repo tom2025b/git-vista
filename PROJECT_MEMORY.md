@@ -946,3 +946,68 @@ main", "Push this branch", "Delete this branch (with confirmation)", and
 `git-vista-core::model` → a `POST /api/…` route in `git-vista-server` that shells
 out to git → a menu item + handler in `app.rs`. Reuse `CreateBranchRequest` /
 `CreateCommitRequest` as the template.
+
+
+## Phase 9 — Level of detail (2026-07-01)
+**Status:** done (frontend-only). **NB: Phase 8 (viewport virtualization) was
+skipped** — done out of order at the user's request ("Do Phase 9 now"); Phase 8
+is still open. Phase 9 doesn't depend on it (it hides text, doesn't cull nodes).
+**What changed:**
+- `crates/git-vista/src/lod.rs` (new, pure/host-tested): `detail_for(scale) ->
+  Detail` maps the camera zoom to a `Detail` enum — `GraphOnly` (structure only)
+  / `Message` (ref badges + commit message) / `Full` (+ the dimmed `hash · author
+  · date` meta line). `Detail::shows_message()` / `shows_meta()` are the two gates
+  the view reads. Thresholds `MESSAGE_SCALE = 0.5`, `FULL_SCALE = 0.8` (chosen
+  against the camera's `[0.2, 5.0]` range so the default unzoomed `scale = 1.0`
+  view is `Full`). 5 tests (each boundary, default-is-full, monotonic-in-zoom).
+- `crates/git-vista/src/app.rs`: the per-row label build now returns a **tuple**
+  `(message_tier, meta_tier)` and the rows `.unzip()` into two `Vec<View>`
+  (`label_msgs`, `label_metas`) instead of one combined `collect_view()`. In the
+  render each tier is its own `<g class:lod-hidden=move || !detail_for(camera.get()
+  .scale).shows_…()>` inside the existing pan/zoom `<g>`, so visibility is reactive
+  to the camera signal. Added `use crate::lod::detail_for;`.
+- `crates/git-vista/src/main.rs`: `mod lod;` with the same dead-code gating as the
+  other pure modules.
+- `crates/git-vista/styles.css`: `.lod-hidden { display: none; }`.
+
+**Decisions:**
+- **LOD is a pure `scale -> Detail` function in its own module**, matching the
+  project's camera/geometry/text/datetime split (DOM-free, host-tested); the view
+  just reads it reactively. Kept the palette/geometry split intact.
+- **Hide via a CSS class toggle (`display:none`) on a per-tier `<g>`**, not by
+  rebuilding the view. The label views are built once (static `Vec<View>`); only
+  the class flips as you zoom, so there's no per-frame re-render of the labels.
+  `display:none` also drops them from hit-testing, so hidden links aren't tappable.
+- **Two tiers, not one on/off.** Badges + message go together (they share the
+  left-to-right `bx` layout, so they're built in one `view!`); the smaller meta
+  line is a separate tier that drops one zoom-step earlier. Three levels total.
+- **Boundaries belong to the finer level** (`<` comparisons): text appears the
+  instant you reach a threshold, not one notch late.
+- **Stubs stay always visible** — a branch stub draws only a line + hollow ring
+  (its name is a `<title>` hover, not on-canvas text), so it's structure, not a
+  label tier.
+
+**Gotchas:**
+- **Couldn't do a live browser/iPad check in this sandbox** — it kills any process
+  that binds a listening socket, so `git-vista-server` exits immediately with no
+  output (the documented exit-144 constraint). Verified the pure logic via the
+  `lod` unit tests + a clean `cargo clippy --target wasm32-unknown-unknown` and
+  `trunk build`. **Real-device visual check still owed**: on the iPad, zoom out and
+  confirm the meta line drops first, then all label text, leaving dots/edges/stubs.
+- Don't `cargo fmt` this crate — only `git-vista-core` is kept stock-rustfmt-clean
+  (Phase 7 gotcha); match the compact hand style here.
+- `.unzip()` needs the target annotation `(Vec<_>, Vec<_>)` and each tier
+  `.into_view()`'d so both tuple positions are the same `View` type.
+
+**Verify:**
+```sh
+cargo test -p git-vista        # 33 pass (+5 lod)
+cargo clippy -p git-vista --target wasm32-unknown-unknown   # clean
+( cd crates/git-vista && trunk build )                      # wasm bundle builds
+```
+Real-device (owed): `gv`, open on the iPad, pinch-zoom out — the dimmed meta line
+disappears first (~0.8×), then the badges + message (~0.5×), leaving just the
+coloured dots, edges and stub lines; zooming back in restores each tier.
+
+**Next:** Phase 8 — Viewport virtualization (still open; skipped to do Phase 9),
+or Phase 10 — Commit detail panel.

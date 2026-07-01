@@ -32,6 +32,7 @@ use crate::geometry::{
     label_x, node_cx, node_cy, stub_node_cy, stub_path, BADGE_GAP, BADGE_HEIGHT, BADGE_RADIUS,
     NODE_RADIUS,
 };
+use crate::lod::detail_for;
 use crate::text::truncate;
 
 /// Commit messages longer than this are truncated with an ellipsis in the label
@@ -429,8 +430,13 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
     // Commit labels: a fixed text column to the right of the lanes, two lines per
     // row — any ref badges then the (truncated) message on top, the short hash and
     // author dimmed below. The full message stays available on hover.
+    //
+    // Phase 9 (level of detail): the two lines are collected into *separate*
+    // groups so the view can hide each independently as the graph is zoomed out —
+    // the message tier (badges + message) and the dimmed meta tier (hash · author
+    // · date). Both are gated reactively off the camera scale in the final view.
     let text_x = label_x(graph.lane_count);
-    let labels = graph
+    let (label_msgs, label_metas): (Vec<_>, Vec<_>) = graph
         .rows
         .iter()
         .map(|gr| {
@@ -573,15 +579,23 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 .into_view(),
                 None => msg_text.into_view(),
             };
-            view! {
+            // Message tier (badges + message) and meta tier (hash · author · date)
+            // as two separate views, so the render can show/hide them at different
+            // zoom levels (Phase 9).
+            let message_tier = view! {
                 {badges}
                 {msg_view}
+            }
+            .into_view();
+            let meta_tier = view! {
                 <text x=text_x y=label_bottom_y(gr.row) class="label-meta">
                     {meta}
                 </text>
             }
+            .into_view();
+            (message_tier, meta_tier)
         })
-        .collect_view();
+        .unzip();
 
     // Branch stubs: a local branch with no commits of its own (e.g. one just
     // created from an existing commit) is drawn GitHub-network-graph style — a
@@ -1226,7 +1240,18 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             <g transform=move || camera.get().transform()>
                 {edges}
                 {nodes}
-                {labels}
+                // Phase 9 (level of detail): the two label tiers, each hidden as the
+                // graph is zoomed out. The message tier (badges + message) drops
+                // below MESSAGE_SCALE; the dimmed meta line drops below FULL_SCALE,
+                // so it's shown only at the closest zoom. Hidden via `.lod-hidden`
+                // (display:none), keeping the node/edge structure readable when the
+                // text would just be an unreadable smear.
+                <g class:lod-hidden=move || !detail_for(camera.get().scale).shows_message()>
+                    {label_msgs}
+                </g>
+                <g class:lod-hidden=move || !detail_for(camera.get().scale).shows_meta()>
+                    {label_metas}
+                </g>
                 {stubs}
             </g>
         </svg>
