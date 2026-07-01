@@ -18,7 +18,7 @@ use wasm_bindgen::JsCast;
 
 use gloo_net::http::Request;
 
-use git_vista_core::model::{CreateBranchRequest, Graph, RefKind};
+use git_vista_core::model::{CreateBranchRequest, CreateCommitRequest, Graph, RefKind};
 
 use crate::camera::{Camera, ZOOM_STEP};
 use crate::color::{
@@ -63,11 +63,19 @@ struct MenuData {
     /// Label for the "Create branch…" item, so a stub (which represents a branch)
     /// reads "from this branch" while a commit dot reads "from this commit".
     create_label: &'static str,
+    /// True when this target is the current HEAD tip — the only place a new commit
+    /// can land without moving HEAD, so the "Commit …" items are enabled only here
+    /// (Issue #33). A branch stub is never the HEAD tip, so it's always false.
+    is_head: bool,
 }
 
 /// Pointer travel (CSS px) past which a press becomes a pan/drag rather than a
 /// tap. Keeps a tap-to-open-link from being eaten by the pan handler.
 const DRAG_THRESHOLD: f64 = 4.0;
+
+/// How long (ms) after the commit modal opens to ignore a backdrop dismiss, so
+/// iOS's synthesized post-tap "ghost click" can't close the modal it just opened.
+const DIALOG_GUARD_MS: f64 = 400.0;
 
 /// Fetch the laid-out graph from the backend. Relative URL → same origin as the
 /// served SPA, so no CORS and no hardcoded host.
@@ -96,6 +104,31 @@ async fn create_branch_request(name: &str, commit: &str) -> Result<(), String> {
         commit: commit.to_string(),
     };
     let resp = Request::post("/api/branch")
+        .json(&body)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
+/// Ask the backend to create a commit on top of HEAD (Issue #33,
+/// `POST /api/commit`). `allow_empty` picks `git commit --allow-empty` (empty
+/// commit) vs a plain `git commit` (staged changes). As with the branch request,
+/// a non-2xx body is git's own error text, returned as `Err`.
+async fn create_commit_request(message: &str, allow_empty: bool) -> Result<(), String> {
+    let body = CreateCommitRequest {
+        message: message.to_string(),
+        allow_empty,
+    };
+    let resp = Request::post("/api/commit")
         .json(&body)
         .map_err(|e| e.to_string())?
         .send()
@@ -196,6 +229,17 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
     // The open context menu, if any (Issue #18). `None` => no menu. Set when a dot
     // is tapped (below), cleared on a pan/tap-elsewhere (the SVG pointerdown).
     let menu = create_rw_signal(None::<MenuData>);
+    // The open commit-message dialog, if any (Issue #33). `Some(allow_empty)` =>
+    // the modal is showing; the bool picks `--allow-empty` vs a staged commit.
+    // A real in-app modal, not `window.prompt()`, which webviews block/flash.
+    let commit_dialog = create_rw_signal(None::<bool>);
+    // The text currently typed into that dialog's message box.
+    let commit_msg = create_rw_signal(String::new());
+    // When the commit modal was opened (ms). iOS synthesizes a `click` a few ms
+    // after a tap; opening the modal puts its full-screen backdrop under that tap
+    // point, so the ghost click hits the backdrop and closes the modal instantly.
+    // The backdrop ignores a dismiss that lands within `DIALOG_GUARD_MS` of opening.
+    let dialog_opened_at = store_value(0.0_f64);
     // Links are real SVG `<a target="_blank">` anchors (built below), so a tap is
     // native link navigation. That works on iOS WebKit — which every iPad browser
     // (Safari, Chrome, DuckDuckGo) runs on, and which silently blocks the scripted
@@ -250,6 +294,9 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             // menu data now; the click handler clones it in (it may fire repeatedly).
             let commit_id = gr.commit.id.0.clone();
             let short = gr.commit.id.short().to_string();
+            // Only the commit HEAD points at can take a new commit without moving
+            // HEAD, so the "Commit …" items are enabled only here (Issue #33).
+            let is_head = gr.refs.iter().any(|r| r.kind == RefKind::Head);
             // Link target only when the repo is on GitHub *and* this commit is
             // pushed — same rule the labels use, so the menu never offers a 404.
             let github_url = repo_url
@@ -270,6 +317,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     github_url: github_url.clone(),
                     github_label: "Open commit on GitHub",
                     create_label: "Create branch from this commit",
+                    is_head,
                 }));
             };
 
@@ -507,6 +555,8 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     github_url: github_url.clone(),
                     github_label: "Open branch on GitHub",
                     create_label: "Create branch from this branch",
+                    // A stub is a new empty branch, never the HEAD tip.
+                    is_head: false,
                 }));
             };
             view! {
@@ -742,6 +792,37 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 });
             };
             let create_label = m.create_label;
+            // The two "Commit …" items (Issue #33). Clicking one closes the menu
+            // and opens the commit-message modal (below); the actual POST + refresh
+            // happens when the user confirms there. They're enabled only on the
+            // HEAD tip (the only place a commit can land without moving HEAD);
+            // elsewhere they render disabled with a reason.
+            let is_head = m.is_head;
+            let make_commit_item = move |label: &'static str, allow_empty: bool| {
+                if !is_head {
+                    return view! {
+                        <span
+                            class="ctx-item disabled"
+                            title="Only available on the current HEAD commit"
+                        >
+                            {label}
+                        </span>
+                    }
+                    .into_view();
+                }
+                let on_commit = move |_| {
+                    // Open the dialog *before* closing the menu: `menu.set(None)`
+                    // synchronously disposes this handler's own reactive owner, so
+                    // any signal write after it is unreliable. Set the dialog first.
+                    commit_msg.set(String::new());
+                    dialog_opened_at.set_value(js_sys::Date::now());
+                    commit_dialog.set(Some(allow_empty));
+                    menu.set(None);
+                };
+                view! { <button class="ctx-item" on:click=on_commit>{label}</button> }.into_view()
+            };
+            let commit_staged = make_commit_item("Commit staged changes", false);
+            let commit_empty = make_commit_item("Create empty commit", true);
             view! {
                 <div class="ctx-menu" style=format!("left: {}px; top: {}px;", m.x, m.y)>
                     <div class="ctx-menu-header">{m.header.clone()}</div>
@@ -749,6 +830,99 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     <button class="ctx-item" on:click=on_branch>
                         {create_label}
                     </button>
+                    {commit_staged}
+                    {commit_empty}
+                </div>
+            }
+        })
+    };
+
+    // The commit-message modal (Issue #33). Shown while `commit_dialog` is `Some`;
+    // a real overlay with a focused text box, so it prompts reliably where a native
+    // `window.prompt()` gets blocked/flashed by the webview. Confirming POSTs the
+    // commit and refreshes the graph; cancelling just closes it.
+    let submit_commit = move || {
+        let Some(allow_empty) = commit_dialog.get_untracked() else {
+            return;
+        };
+        let message = commit_msg.get_untracked().trim().to_string();
+        if message.is_empty() {
+            return; // Keep the dialog open; the Commit button is disabled anyway.
+        }
+        commit_dialog.set(None);
+        spawn_local(async move {
+            match create_commit_request(&message, allow_empty).await {
+                Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+                Err(e) => {
+                    if let Some(w) = web_sys::window() {
+                        let _ = w.alert_with_message(&format!("Couldn't create commit:\n{e}"));
+                    }
+                }
+            }
+        });
+    };
+    let commit_dialog_view = move || {
+        commit_dialog.get().map(|allow_empty| {
+            let title = if allow_empty { "Create empty commit" } else { "Commit staged changes" };
+            // The message field is a <textarea>, NOT an <input>: the void <input>
+            // element breaks Leptos' CSR <template> node-walk on iOS WebKit (which
+            // parses void elements differently than Blink/Gecko), panicking the whole
+            // view so the modal never mounts on iPad. A textarea is non-void — and is
+            // fine for a commit message. Styles are inline and viewport-sized
+            // (100vw/100vh) since that's what proved to render reliably on iOS.
+            view! {
+                <div
+                    style="position:fixed; top:0; left:0; width:100vw; height:100vh; \
+                           z-index:30; display:flex; align-items:center; \
+                           justify-content:center; background:rgba(1,4,9,0.6);"
+                    on:click=move |_| {
+                        // Ignore the iOS ghost click that fires just after opening.
+                        if js_sys::Date::now() - dialog_opened_at.get_value()
+                            > DIALOG_GUARD_MS
+                        {
+                            commit_dialog.set(None);
+                        }
+                    }
+                >
+                    <div
+                        style="min-width:300px; max-width:90vw; padding:16px; \
+                               background:#161b22; border:1px solid #30363d; \
+                               border-radius:10px; color:var(--fg); \
+                               box-shadow:0 12px 32px rgba(0,0,0,0.6);"
+                        on:click=move |ev| ev.stop_propagation()
+                    >
+                        <div style="font-weight:600; margin-bottom:12px;">{title}</div>
+                        <textarea
+                            style="width:100%; box-sizing:border-box; padding:10px; \
+                                   font:inherit; color:var(--fg); background:#0d1117; \
+                                   border:1px solid #30363d; border-radius:6px; \
+                                   resize:none;"
+                            rows="2"
+                            placeholder="Commit message"
+                            prop:value=move || commit_msg.get()
+                            on:input=move |ev| commit_msg.set(event_target_value(&ev))
+                        ></textarea>
+                        <div style="display:flex; gap:8px; justify-content:flex-end; \
+                                    margin-top:14px;">
+                            <button
+                                style="padding:6px 14px; font:inherit; color:var(--fg); \
+                                       background:#21262d; border:1px solid #30363d; \
+                                       border-radius:6px;"
+                                on:click=move |_| commit_dialog.set(None)
+                            >
+                                "Cancel"
+                            </button>
+                            <button
+                                style="padding:6px 14px; font:inherit; color:#fff; \
+                                       background:#238636; border:1px solid #2ea043; \
+                                       border-radius:6px;"
+                                prop:disabled=move || commit_msg.get().trim().is_empty()
+                                on:click=move |_| submit_commit()
+                            >
+                                "Commit"
+                            </button>
+                        </div>
+                    </div>
                 </div>
             }
         })
@@ -771,6 +945,16 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 {stubs}
             </g>
         </svg>
-        {menu_view}
+        // The context menu and the commit modal are the two overlays. They're
+        // mutually exclusive (opening the modal closes the menu), so a single
+        // reactive block renders whichever is active — the overlays are
+        // `position: fixed`, so this wrapper adds no layout.
+        <div class="overlays">
+            {move || {
+                let menu = menu_view();
+                let modal = commit_dialog_view();
+                view! { {menu} {modal} }
+            }}
+        </div>
     }
 }

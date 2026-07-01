@@ -162,6 +162,17 @@ pub struct CreateBranchRequest {
     pub commit: String,
 }
 
+/// Body of a `POST /api/commit` request (Issue #33): create a commit on top of
+/// the current HEAD with the message `message`. When `allow_empty` is true the
+/// commit is made even with nothing staged (`git commit --allow-empty`);
+/// otherwise git commits the staged changes and fails if there are none. The UI
+/// only offers this on the HEAD tip, so the backend never needs to move HEAD.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateCommitRequest {
+    pub message: String,
+    pub allow_empty: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
