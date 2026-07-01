@@ -13,7 +13,9 @@
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::response::IntoResponse;
 use axum::{
@@ -23,23 +25,69 @@ use axum::{
 };
 use git_vista_core::layout;
 use git_vista_core::model::{
-    BranchRequest, CommitSummary, CreateBranchRequest, CreateCommitRequest, GitRef, RefKind,
+    validate_clone_url, BranchRequest, CloneRequest, CommitSummary, CreateBranchRequest,
+    CreateCommitRequest, GitRef, RefKind,
 };
 use git_vista_git::{read_refs, walk_history};
 use tower::Layer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-// Which repository to visualise. Taken from the first CLI argument
+// Which repository to visualise *initially*. Taken from the first CLI argument
 // (`git-vista-server <path>`), falling back to this checkout when none is given.
-// The `gv` launcher passes the directory you run it from. Set once at startup.
+// The `gv` launcher passes the directory you run it from. This is only the
+// starting repo — Phase 12 lets the user switch to a cloned URL at runtime.
 const DEFAULT_REPO: &str = "/home/tom/projects/git-vista";
-static REPO: OnceLock<PathBuf> = OnceLock::new();
 
-/// The repository being served, resolved at startup. Panics only if called before
-/// `main` sets it.
-fn repo_path() -> &'static Path {
-    REPO.get().expect("REPO is set at startup").as_path()
+/// The repository the server is currently serving. Mutable at runtime (Phase 12):
+/// starts at the CLI-arg repo (`read_only: false`, the user's own working repo),
+/// and `POST /api/clone` swaps it for a throwaway clone (`read_only: true`).
+struct Current {
+    path: PathBuf,
+    /// True for a cloned URL: a view-only snapshot, so the write endpoints refuse.
+    read_only: bool,
+}
+
+static CURRENT: OnceLock<RwLock<Current>> = OnceLock::new();
+
+/// Snapshot the current repo path and its read-only flag. Clones out of the lock
+/// immediately so no guard is ever held across an `.await`.
+fn current() -> (PathBuf, bool) {
+    let g = CURRENT
+        .get()
+        .expect("CURRENT is set at startup")
+        .read()
+        .expect("CURRENT lock not poisoned");
+    (g.path.clone(), g.read_only)
+}
+
+/// Point the server at a new repository (startup, or after a clone).
+fn set_current(path: PathBuf, read_only: bool) {
+    if let Some(lock) = CURRENT.get() {
+        *lock.write().expect("CURRENT lock not poisoned") = Current { path, read_only };
+    } else {
+        CURRENT
+            .set(RwLock::new(Current { path, read_only }))
+            .unwrap_or_else(|_| unreachable!("CURRENT set once at startup"));
+    }
+}
+
+/// Parent directory that holds every throwaway clone, under the OS temp dir. A
+/// clone's temp dir is created here, and cleanup refuses to delete anything that
+/// isn't under this root — so a bug can never `rm` a real repository.
+fn clones_root() -> PathBuf {
+    std::env::temp_dir().join("git-vista-clones")
+}
+
+/// Delete a previous clone's directory, best-effort. Guarded: only ever removes a
+/// path under [`clones_root`], so it can't touch the user's own repo even if state
+/// were somehow wrong.
+fn cleanup_clone(path: &Path) {
+    if path.starts_with(clones_root()) {
+        if let Err(e) = std::fs::remove_dir_all(path) {
+            eprintln!("git-vista: couldn't remove old clone {}: {e}", path.display());
+        }
+    }
 }
 // Upper bound on how much history to walk; plenty for now.
 const HISTORY_LIMIT: usize = 5_000;
@@ -64,7 +112,8 @@ async fn main() {
         eprintln!("warning: {} doesn't look like a git repository (no .git).", repo.display());
         eprintln!("         /api/commits will error until it points at a real repo.\n");
     }
-    REPO.set(repo).expect("REPO set once");
+    // The CLI-arg repo is the user's own working repo, so it's writable.
+    set_current(repo, false);
 
     // Warn early if the SPA hasn't been built — otherwise every page is a 404
     // and it looks like the server is broken.
@@ -86,6 +135,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/commits", get(commits))
+        // Phase 12: clone a public URL into a temp dir and view it read-only.
+        .route("/api/clone", post(clone_repo))
         // Issue #18: create a branch at a commit (shells out to `git branch`).
         .route("/api/branch", post(create_branch))
         // Issue #33: create a commit on top of HEAD (shells out to `git commit`).
@@ -123,7 +174,7 @@ async fn main() {
 /// Print where to open the app and how to fix the common "works locally but the
 /// iPad can't reach it" situation.
 fn print_startup_banner() {
-    println!("git-vista server — serving {}", repo_path().display());
+    println!("git-vista server — serving {}", current().0.display());
     println!("  • on this machine: http://localhost:{PORT}/");
     match lan_ip() {
         Some(ip) => println!("  • from the iPad:   http://{ip}:{PORT}/   (must be on the same Wi-Fi)"),
@@ -159,7 +210,8 @@ fn lan_ip() -> Option<IpAddr> {
 /// and iOS Safari's on-disk cache otherwise persists a stale graph across app —
 /// and even device — restarts, making freshly created branches never appear.
 async fn commits() -> Result<impl IntoResponse, (StatusCode, String)> {
-    let repo = repo_path();
+    let (repo, read_only) = current();
+    let repo = repo.as_path();
     let history = walk_history(repo, HISTORY_LIMIT).map_err(|e| {
         eprintln!("git-vista: /api/commits failed reading history: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -182,6 +234,8 @@ async fn commits() -> Result<impl IntoResponse, (StatusCode, String)> {
     // show it. If the page ever displays a different repo than the terminal is
     // serving, this makes the mismatch visible instead of a mystery.
     graph.repo_label = Some(repo.display().to_string());
+    // A cloned URL is view-only: tell the UI to hide every write action.
+    graph.read_only = read_only;
     // Attach the GitHub web base (if this repo has a github.com origin) so the UI
     // can link commits and refs. None => the frontend renders plain-text labels.
     graph.repo_url = git_vista_git::github_web_base(repo);
@@ -197,6 +251,86 @@ async fn commits() -> Result<impl IntoResponse, (StatusCode, String)> {
     Ok((no_store, Json(graph)))
 }
 
+/// Guard for the write endpoints (Phase 12): when the current repo is a read-only
+/// clone, refuse the operation with `403` and a clear reason, since any change
+/// would be thrown away with the clone. Returns `None` when writes are allowed.
+fn reject_if_read_only() -> Option<(StatusCode, String)> {
+    if current().1 {
+        Some((
+            StatusCode::FORBIDDEN,
+            "This repository is a read-only clone opened from a URL. Open your own \
+             repo to make changes."
+                .to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Clone a public repository from a pasted URL into a throwaway temp directory and
+/// switch the server to viewing it, read-only (Phase 12).
+///
+/// Same B3 posture as the other git handlers: shell out to `git clone` and forward
+/// git's own error text (bad host, repo not found, …) verbatim. The URL is
+/// validated by [`validate_clone_url`] — only `http(s)://`/`git://`, so a pasted
+/// SSH URL can't trigger a key prompt — and is passed as its own argv entry, never
+/// a shell line. A full clone is made (history is bounded downstream by
+/// `HISTORY_LIMIT`); the previous clone, if any, is deleted so at most one is kept.
+async fn clone_repo(Json(req): Json<CloneRequest>) -> (StatusCode, String) {
+    let url = match validate_clone_url(&req.url) {
+        Ok(u) => u,
+        Err(e) => return (StatusCode::BAD_REQUEST, e),
+    };
+
+    let root = clones_root();
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        eprintln!("git-vista: /api/clone couldn't create {}: {e}", root.display());
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't prepare temp dir: {e}"));
+    }
+    // Unique per-clone dir: monotonic counter + a timestamp, so concurrent or
+    // rapid clones never collide.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let dest = root.join(format!("clone-{stamp}-{n}"));
+
+    println!("[/api/clone] cloning {url} → {}", dest.display());
+    let output = match tokio::process::Command::new("git")
+        .arg("clone")
+        // `--` so the URL is never read as an option, even past validation.
+        .arg("--")
+        .arg(&url)
+        .arg(&dest)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("git-vista: /api/clone couldn't run git: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"));
+        }
+    };
+
+    if !output.status.success() {
+        // git printed why (host down, repo not found, auth needed…) on stderr.
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if msg.is_empty() { "git clone failed.".to_string() } else { msg };
+        cleanup_clone(&dest); // remove the empty/partial dir git may have left
+        eprintln!("git-vista: /api/clone failed: {msg}");
+        return (StatusCode::BAD_REQUEST, msg);
+    }
+
+    // Switch to the fresh clone (read-only), then delete the previous one, if it
+    // was itself a clone — so disk holds at most one clone at a time.
+    let (old_path, old_read_only) = current();
+    set_current(dest.clone(), true);
+    if old_read_only {
+        cleanup_clone(&old_path);
+    }
+    println!("[/api/clone] now viewing {}", dest.display());
+    (StatusCode::OK, format!("Cloned {url}"))
+}
+
 /// Create a branch in the served repository at a given commit (Issue #18).
 ///
 /// B3 from the design discussion: shell out to `git branch <name> <commit>` rather
@@ -208,6 +342,9 @@ async fn commits() -> Result<impl IntoResponse, (StatusCode, String)> {
 /// name/commit can't inject a command. We additionally reject an empty name and
 /// one starting with `-` so it can't be read as a git option.
 async fn create_branch(Json(req): Json<CreateBranchRequest>) -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
     let name = req.name.trim();
     let commit = req.commit.trim();
     if name.is_empty() {
@@ -219,7 +356,7 @@ async fn create_branch(Json(req): Json<CreateBranchRequest>) -> (StatusCode, Str
 
     let output = match tokio::process::Command::new("git")
         .arg("-C")
-        .arg(repo_path())
+        .arg(current().0)
         .arg("branch")
         .arg(name)
         .arg(commit)
@@ -265,6 +402,9 @@ async fn create_branch(Json(req): Json<CreateBranchRequest>) -> (StatusCode, Str
 /// (never a shell line); the message is the value of `-m`, so even a message
 /// starting with `-` can't be read as an option. An empty message is rejected.
 async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
     let message = req.message.trim();
     if message.is_empty() {
         return (
@@ -274,7 +414,7 @@ async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (StatusCode, Str
     }
 
     let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C").arg(repo_path()).arg("commit");
+    cmd.arg("-C").arg(current().0).arg("commit");
     if req.allow_empty {
         cmd.arg("--allow-empty");
     }
@@ -320,7 +460,7 @@ async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (StatusCode, Str
 /// switch. `null` => detached HEAD. Sent `no-store` so it's never served from cache.
 async fn head_branch() -> impl IntoResponse {
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
-    (no_store, Json(git_vista_git::read_head_branch(repo_path())))
+    (no_store, Json(git_vista_git::read_head_branch(&current().0)))
 }
 
 /// Merge a branch into the currently checked-out branch (Issue #33 follow-up):
@@ -374,6 +514,9 @@ async fn run_branch_op(
     args: &[&str],
     ok_msg: String,
 ) -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
     let branch = branch.trim();
     if branch.is_empty() {
         return (StatusCode::BAD_REQUEST, "Branch name can't be empty.".to_string());
@@ -384,7 +527,7 @@ async fn run_branch_op(
 
     let output = match tokio::process::Command::new("git")
         .arg("-C")
-        .arg(repo_path())
+        .arg(current().0)
         .args(args)
         .arg(branch)
         .output()

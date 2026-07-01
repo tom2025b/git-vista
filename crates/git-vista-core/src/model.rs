@@ -125,6 +125,12 @@ pub struct Graph {
     /// Set by the backend; `None` => the UI shows nothing extra.
     #[serde(default)]
     pub repo_label: Option<String>,
+    /// True when this graph came from a throwaway clone the server made from a
+    /// pasted URL (Phase 12). Such repos are for *viewing only*: the UI hides all
+    /// write actions (branch/commit/merge/push/delete) since any change would be
+    /// discarded when the clone is deleted. `false` for the user's own local repo.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// A local branch with no commits of its own, drawn as a short fork off the
@@ -182,6 +188,44 @@ pub struct BranchRequest {
     pub branch: String,
 }
 
+/// Body of a `POST /api/clone` request (Phase 12): clone the public repository at
+/// `url` into a throwaway temp directory and switch the server to viewing it,
+/// read-only. `url` is a git-cloneable URL (typically `https://…`); the backend
+/// validates its scheme and forwards git's own error text on failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneRequest {
+    pub url: String,
+}
+
+/// Validate a URL a user pasted to clone, before the server hands it to
+/// `git clone` (Phase 12). This is a *gate*, not a parser: it accepts only the
+/// public, read-oriented transports (`https://`, `http://`, `git://`) and rejects
+/// everything else, so the pasted string can't be an SSH URL that would prompt for
+/// keys, a local filesystem path, or an option smuggled in with a leading `-`.
+/// git itself does the real URL parsing and reports a clear error if the host or
+/// repo is wrong. Returns the trimmed URL on success, or a user-facing reason.
+pub fn validate_clone_url(url: &str) -> Result<String, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("Enter a repository URL.".to_string());
+    }
+    // Belt-and-braces even though the URL is passed as its own argv entry: a value
+    // starting with '-' could still be read by git as an option.
+    if url.starts_with('-') {
+        return Err("URL can't start with '-'.".to_string());
+    }
+    const ALLOWED: [&str; 3] = ["https://", "http://", "git://"];
+    if !ALLOWED.iter().any(|scheme| url.starts_with(scheme)) {
+        return Err("Only https://, http:// or git:// URLs are supported.".to_string());
+    }
+    // Reject whitespace inside the URL — a single field should hold one URL, and it
+    // keeps a space-separated second token from ever reaching git as an extra arg.
+    if url.split_whitespace().count() != 1 {
+        return Err("URL can't contain spaces.".to_string());
+    }
+    Ok(url.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +251,27 @@ mod tests {
             time: 0,
         };
         assert!(two_parents.is_merge());
+    }
+
+    #[test]
+    fn clone_url_accepts_public_transports_and_trims() {
+        assert_eq!(
+            validate_clone_url("  https://github.com/rust-lang/rust.git "),
+            Ok("https://github.com/rust-lang/rust.git".to_string())
+        );
+        assert!(validate_clone_url("http://example.com/r.git").is_ok());
+        assert!(validate_clone_url("git://example.com/r.git").is_ok());
+    }
+
+    #[test]
+    fn clone_url_rejects_unsafe_or_unsupported() {
+        // SSH URL (would prompt for keys), local path, empty, option-like, spaces.
+        assert!(validate_clone_url("git@github.com:owner/repo.git").is_err());
+        assert!(validate_clone_url("/home/tom/secret").is_err());
+        assert!(validate_clone_url("file:///etc").is_err());
+        assert!(validate_clone_url("").is_err());
+        assert!(validate_clone_url("   ").is_err());
+        assert!(validate_clone_url("--upload-pack=evil").is_err());
+        assert!(validate_clone_url("https://a.com/r.git --extra").is_err());
     }
 }
