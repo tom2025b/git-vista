@@ -1,12 +1,12 @@
-//! Data types shared between the core, the Tauri shell, and the Leptos UI.
+//! Data types shared between the core, the server, and the Leptos UI.
 //!
 //! Everything here derives `Serialize`/`Deserialize` so the exact same structs
-//! cross the Tauri IPC boundary (Rust → JSON → wasm) without a second set of
-//! frontend types.
+//! cross the HTTP/JSON boundary (server → JSON → wasm frontend) without a second
+//! set of frontend types.
 
 use serde::{Deserialize, Serialize};
 
-/// A git object id (commit hash), kept as a hex string so it crosses the IPC
+/// A git object id (commit hash), kept as a hex string so it crosses the JSON
 /// boundary with no custom (de)serialization.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Oid(pub String);

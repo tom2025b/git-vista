@@ -1,6 +1,7 @@
 # git-vista — Design & Development Roadmap
 
-A clean, zoomable vertical git history visualizer built with Tauri + Leptos.
+A clean, zoomable vertical git history visualizer — browser-first, built in Rust
+with a Leptos → WebAssembly UI served over HTTP.
 
 ## Principles
 
@@ -115,8 +116,12 @@ Done so far:
 - **Build / packaging:** the server now defaults to the current working directory
   (was a hardcoded absolute path), and clears any throwaway clones left by a prior
   run on startup (the launcher SIGKILLs the old server, so its last clone leaked).
+- **Final cleanup:** removed the legacy Tauri desktop shell — a Phase-4 stub that
+  never read real data yet cost a whole CI job plus WebKitGTK/GTK system deps. The
+  workspace is now four crates; the app is purely browser-first.
 
-Still open: performance tuning, removing the legacy Tauri shell, other final cleanup.
+Still open: an optional performance pass (e.g. open the gix repo once per
+`/api/commits` rather than ~5×).
 
 ## Backlog
 - Dark/light theme toggle
