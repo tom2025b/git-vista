@@ -26,19 +26,32 @@ that a fresh session can resume with no other context.
 ---
 
 ## Snapshot (current)
-- **Stack:** Tauri v2 (`2.11.3`) + Leptos (`0.6.15`, CSR) + `git-vista-core`.
-- **Toolchain:** cargo `1.96.0`, Trunk `0.21.14`, wasm-bindgen `0.2.126`,
-  wasm32 target installed. `tauri-cli` NOT installed yet (needed for `cargo tauri dev`).
-- **Workspace:** `crates/git-vista-core`, `crates/git-vista` (frontend, bin
-  `git-vista-ui`), `crates/git-vista/src-tauri` (pkg `git-vista-tauri`, bin `git-vista`).
-- **Git repo:** initialised; work for this phase lives on branch `phase1-vertical-graph` (off `main`).
+- **Architecture:** browser-first. `git-vista-server` (axum) serves the wasm SPA +
+  `/api/*` on `0.0.0.0:8080`; the Leptos (`0.6.15`, CSR) frontend `fetch`es it.
+  The Tauri v2 shell (`crates/git-vista/src-tauri`) is **legacy** — kept in the
+  workspace but not the path we run; a browser can't reach a Tauri command, which
+  is why the server exists (see Phase 4).
+- **Toolchain:** cargo `1.96.0`, Trunk `0.21.14`, wasm-bindgen `0.2.126`, wasm32
+  target installed. `gix` pinned to `=0.84.0` (see `git-vista-git/Cargo.toml` for
+  why 0.85 breaks), axum `0.8`.
+- **Workspace (4 crates + legacy shell):**
+  - `crates/git-vista-core` — pure logic (`model`, `layout`); wasm-safe, no gix.
+  - `crates/git-vista-git` — native gix reader (`history`, `refs`, `github`).
+  - `crates/git-vista-server` — the axum HTTP backend (`main.rs`).
+  - `crates/git-vista` — the Leptos wasm UI (bin `git-vista-ui`).
+  - `crates/git-vista/src-tauri` — legacy Tauri shell (pkg `git-vista-tauri`).
+- **Git repo:** on `main`; each phase ships on its own `phaseN-*` branch via PR.
+  **Never delete branches** (standing user rule) — leave every branch in place.
 
 ## Verify the whole build
 ```sh
-cargo test -p git-vista-core                 # 6 tests pass
-cargo test -p git-vista                      # 6 frontend (geometry/color/graph) tests pass
-cargo build -p git-vista-tauri               # native shell compiles
+cargo test -p git-vista-core                 # 23 tests pass
+cargo test -p git-vista-git                  # 11 tests pass (fixture repos)
+cargo test -p git-vista                      # ~39 host tests (geometry/color/…)
+cargo clippy -p git-vista-core -p git-vista-git -p git-vista-server            # native clippy
+cargo clippy -p git-vista --target wasm32-unknown-unknown                      # frontend clippy
 ( cd crates/git-vista && trunk build )       # frontend → wasm in dist/
+cargo build --workspace                      # server + frontend + legacy shell compile
 ```
 
 ## Running the app — the `gv` launcher & choosing which repo to view
@@ -53,8 +66,11 @@ then runs the server for a repo:
 ```sh
 gv                  # visualise the CURRENT directory's repo
 gv ~/code/myproj    # visualise another repo by path
-gv --no-build       # skip the wasm rebuild (fast restart); path arg optional too
 ```
+`gv` **always does a clean wasm rebuild** (`trunk clean && trunk build`) before
+serving, so a stale bundle can never be served while developing — there is no
+`--no-build` fast path anymore (the script rejects any `-…` option with exit 2; a
+`--no-build`/`--fast` path can be reintroduced when shipping to other people).
 `gv` validates the target is a git repo, resolves it to an absolute path, and
 passes it to the server. It finds the git-vista checkout via `readlink -f` on its
 own path, so it works through the PATH symlink from any directory.
@@ -1181,3 +1197,78 @@ cargo clippy -p git-vista-server -p git-vista   # clean
 
 **Next:** Phase 10 — Commit detail panel, or Phase 11 — Search & filter, or
 Phase 13 — Packaging & polish.
+
+---
+
+## Phase 10 — Commit detail panel (2026-07-01)
+**Status:** done. Ships on branch `phase10-commit-detail-panel`.
+
+**What changed.**
+- **New lazy detail read, not a fatter graph.** The graph's `CommitSummary` still
+  carries only what a row needs (first line, author name, commit time). A new
+  `git_vista_core::model::CommitDetail` carries everything the panel shows — full
+  message body, and *both* the author and committer signatures (name, email, and
+  each one's own time). It's fetched per-commit on demand rather than bloating
+  every one of up to 5000 rows.
+- **Backend.** `git_vista_git::read_commit(path, id)` (in `history.rs`) opens the
+  repo isolated (same as the walk), parses the hex id with
+  `gix::ObjectId::from_hex`, `repo.find_commit`, and pulls `author()`/`committer()`
+  /`message_raw()`/`parent_ids()`. Signature seconds via `SignatureRef::time()`
+  (lenient; malformed → epoch, never fails the read). A malformed/absent id is a
+  new `RepoError::CommitNotFound` (→ 404), distinct from a read error (→ 500).
+  Two unit tests: full-detail read of the merge fixture, and the not-found cases.
+- **Server.** `GET /api/commit/{id}` → `commit_detail` handler (axum **0.8**, so the
+  path param is `{id}` not `:id`). Reads the *current* repo (works on read-only
+  clones — it's a read), maps `CommitNotFound` → 404 / else → 500, `no-store` like
+  the graph. Note the pre-existing `POST /api/commit` (create) is a different
+  method+path, no conflict.
+- **Frontend (`app.rs`).** A `detail_id: RwSignal<Option<String>>` (the selected
+  full hash) drives a `create_local_resource` that calls `fetch_commit_detail`.
+  The context menu (shared by commit dots *and* stubs) gained a **"View details"**
+  item — shown even on read-only clones, since it's a read — that sets `detail_id`
+  (before `menu.set(None)`, per the existing owner-disposal caveat). A new
+  `detail_panel_view` renders a right-docked `<aside class="detail-panel">`: title +
+  close (×), full hash, author line, committer line **only when it differs** from
+  the author, parent hashes as clickable chips that re-point the panel at that
+  parent (walk up history), an "Open on GitHub" link gated on repo_url + the commit
+  being in `remote_set` (same 404-avoidance rule as labels/menu), and the full
+  message in a `<pre class="detail-msg">` (`white-space: pre-wrap`). Dates via the
+  existing `datetime::local_timestamp`.
+- **CSS.** `.detail-panel` and friends appended to `styles.css` — fixed to the
+  right edge, `width: min(420px, 100vw)` so it goes full-width on iPad portrait,
+  scrollable body. Same overlay posture as the context menu (outside the SVG, so it
+  never pans/zooms or clips).
+
+**Decisions.**
+- Lazy per-commit endpoint over fattening the graph: keeps the (up to 5000-row)
+  `/api/commits` payload lean; the body + emails + committer are only ever wanted
+  for the one commit you're looking at.
+- Entry point is a menu item, not a bare dot-tap: the dot already opens the context
+  menu (Issue #18), so "View details" joins that menu rather than fighting it.
+- Stale-guard in the panel body: if the loaded detail's id ≠ the currently-open
+  `detail_id` (e.g. mid-navigation between parents), it shows "Loading…" rather than
+  one commit's chrome over another's data.
+
+**Gotchas.**
+- axum 0.8 path syntax is `{id}` (0.7 was `:id`) — wrong syntax panics at route
+  registration.
+- `menu.set(None)` disposes the menu handler's reactive owner; set `detail_id`
+  *before* it (matches the commit/branch items' existing ordering note).
+- `CommitDetail`'s field is `commit_time`, not `committer_time` (compile caught it).
+
+**Verify:**
+```sh
+cargo test -p git-vista-core -p git-vista-git   # incl. 2 new read_commit tests
+cargo clippy -p git-vista-server -p git-vista   # clean (frontend: --target wasm32…)
+( cd crates/git-vista && trunk build )          # wasm bundle builds
+# Live round-trip (done here): run the server, then
+curl -s localhost:8080/api/commit/$(git rev-parse HEAD)   # → full JSON, 200
+curl -s -o/dev/null -w '%{http_code}' localhost:8080/api/commit/000…0  # → 404
+```
+Live-tested the endpoint (200 with full detail incl. differing author/committer on
+a merge; 404 for bad/unknown ids). **Owed:** eyeball the panel itself in a browser
+(no browser in this sandbox) — open the app, tap a dot → "View details", confirm
+the panel, parent-chip navigation, and the committer row appearing only on commits
+where it differs (e.g. a GitHub-merged commit).
+
+**Next:** Phase 11 — Search & filter, or Phase 13 — Packaging & polish.

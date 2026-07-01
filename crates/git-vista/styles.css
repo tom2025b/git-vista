@@ -149,3 +149,97 @@ html, body {
 /* Commits/refs that aren't on the remote yet — shown but not linked (their
    GitHub page doesn't exist), dimmed so it's clear they're local-only. */
 .unpushed { opacity: 0.45; }
+
+/* Phase 10: the commit detail panel — an HTML overlay docked to the right edge,
+   outside the SVG so it doesn't pan/zoom or get clipped (same posture as the
+   context menu). Shows one commit's full detail; the close button and a parent
+   hash re-point or dismiss it. On a narrow screen (iPad portrait) it spans the
+   full width so the content stays readable. */
+.detail-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 20;
+  width: min(420px, 100vw);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: #161b22;
+  border-left: 1px solid #30363d;
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
+  font-size: 0.85rem;
+}
+.detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid #21262d;
+}
+.detail-title { color: var(--fg); font-weight: 600; }
+.detail-close {
+  font: inherit;
+  font-size: 1.2rem;
+  line-height: 1;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.detail-close:hover { background: #21262d; color: var(--fg); }
+.detail-body {
+  padding: 14px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.detail-field { margin-bottom: 12px; }
+.detail-key {
+  display: block;
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 3px;
+}
+.detail-val { color: var(--fg); word-break: break-word; }
+.detail-hash { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.detail-date { color: var(--muted); }
+.detail-muted { color: var(--muted); }
+/* Parent hashes: clickable chips that re-point the panel at that parent. */
+.detail-parents { display: flex; flex-wrap: wrap; gap: 6px; }
+.detail-parent {
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--accent);
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.detail-parent:hover { border-color: var(--accent); }
+.detail-github {
+  display: inline-block;
+  margin-bottom: 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+.detail-github:hover { text-decoration: underline; }
+/* The full commit message, verbatim — wrap long lines, keep the author's own
+   line breaks. */
+.detail-msg {
+  margin: 4px 0 0;
+  padding: 12px;
+  background: var(--bg);
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.detail-status { color: var(--muted); }
+.detail-error { color: #f85149; white-space: pre-wrap; }
