@@ -936,11 +936,84 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
     let row_count = ctx.with_value(|c| c.graph.rows.len());
     let vp_h = create_rw_signal(window_inner_height());
     // Refresh the viewport height on window resize (rotate the iPad, resize the
-    // desktop window). `forget()` keeps the callback alive for the app's lifetime.
+    // desktop window). Removed on cleanup so a graph reload — which reruns this
+    // function with fresh signals — doesn't stack a second live listener writing
+    // to the disposed `vp_h`.
     if let Some(win) = web_sys::window() {
         let cb = Closure::<dyn FnMut()>::new(move || vp_h.set(window_inner_height()));
         let _ = win.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
-        cb.forget();
+        let win2 = win.clone();
+        on_cleanup(move || {
+            let _ = win2.remove_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+        });
+    }
+
+    // Phase 13 — keyboard shortcuts (a window keydown listener):
+    //   * Esc backs out of whatever overlay is open — the menu first, then a modal,
+    //     then the detail panel. It's only a shortcut: every overlay also closes via
+    //     its Cancel button or a backdrop tap, since some iPad Magic Keyboards have
+    //     no physical Esc key.
+    //   * +/= zoom in, -/_ zoom out (anchored at the viewport centre, as there's no
+    //     cursor for a key press), 0 resets pan & zoom.
+    //   * r re-reads the repository (same as the Refresh button).
+    // Non-Esc keys are ignored while a text field is focused (the commit / URL
+    // boxes) and when a modifier is held, so typing an "r" — or the browser's own
+    // Cmd/Ctrl-R reload — is left untouched. Removed on cleanup, like the resize
+    // listener above, so a reload doesn't leave duplicate handlers behind.
+    if let Some(win) = web_sys::window() {
+        let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
+            move |ev: web_sys::KeyboardEvent| {
+                if ev.key() == "Escape" {
+                    if menu.get_untracked().is_some() {
+                        menu.set(None);
+                    } else if commit_dialog.get_untracked().is_some() {
+                        commit_dialog.set(None);
+                    } else if confirm_op.get_untracked().is_some() {
+                        confirm_op.set(None);
+                    } else if detail_id.get_untracked().is_some() {
+                        detail_id.set(None);
+                    }
+                    return;
+                }
+                // Leave keys alone while typing in a field, or when a modifier is held.
+                let typing = ev
+                    .target()
+                    .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                    .map(|el| {
+                        let tag = el.tag_name();
+                        tag.eq_ignore_ascii_case("textarea") || tag.eq_ignore_ascii_case("input")
+                    })
+                    .unwrap_or(false);
+                if typing || ev.ctrl_key() || ev.meta_key() || ev.alt_key() {
+                    return;
+                }
+                let centre = || {
+                    let vw = web_sys::window()
+                        .and_then(|w| w.inner_width().ok())
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1200.0);
+                    (vw / 2.0, window_inner_height() / 2.0)
+                };
+                match ev.key().as_str() {
+                    "+" | "=" => {
+                        let (cx, cy) = centre();
+                        camera.update(|c| *c = c.zoomed_at(ZOOM_STEP, cx, cy));
+                    }
+                    "-" | "_" => {
+                        let (cx, cy) = centre();
+                        camera.update(|c| *c = c.zoomed_at(1.0 / ZOOM_STEP, cx, cy));
+                    }
+                    "0" => camera.set(Camera::default()),
+                    "r" | "R" => reload.update(|n| *n = n.wrapping_add(1)),
+                    _ => {}
+                }
+            },
+        );
+        let _ = win.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
+        let win2 = win.clone();
+        on_cleanup(move || {
+            let _ = win2.remove_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
+        });
     }
     let visible =
         create_memo(move |_| visible_row_range(camera.get(), vp_h.get(), row_count, OVERSCAN_ROWS));
@@ -1683,6 +1756,17 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 {stubs}
             </g>
         </svg>
+        // Phase 13: a floating "Reset view" control. Pan/zoom can carry the graph
+        // off-screen with no obvious way back — easy to do with the iPad trackpad or
+        // a pinch — so this recenters the camera (same as the `0` key) with one tap,
+        // which is the only way back for anyone driving purely by touch/trackpad.
+        <button
+            class="reset-view"
+            title="Reset pan & zoom (keyboard: 0)"
+            on:click=move |_| camera.set(Camera::default())
+        >
+            "Reset view"
+        </button>
         // The overlays: the context menu, the commit modal, and the branch-op
         // confirm modal. They're mutually exclusive (opening either modal closes the
         // menu), so one reactive block renders whichever is active — all are
