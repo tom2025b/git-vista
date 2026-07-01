@@ -492,9 +492,11 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     stroke-width="2"
                     stroke-linecap="round"
                 />
-                // Filled, clickable dot (Issue #24) — matching the commit nodes, so
-                // every node in the graph reads as a tappable dot.
-                <circle cx=sx cy=sy r=NODE_RADIUS fill=color stroke=color stroke-width="2">
+                // Hollow, clickable ring (Issue #28) — a stub branch owns no
+                // commits of its own yet, so it reads as an empty ring in the
+                // branch's colour rather than a filled dot, signalling "nothing
+                // committed here yet" at a glance. Still tappable to branch from.
+                <circle cx=sx cy=sy r=NODE_RADIUS fill=MERGE_FILL stroke=color stroke-width="2">
                     <title>{format!("{name} — new branch (no commits yet); tap to branch from here")}</title>
                 </circle>
                 // A larger, invisible hit target on top so the tip is easy to tap,
