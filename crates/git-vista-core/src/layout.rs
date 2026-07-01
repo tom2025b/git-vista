@@ -365,6 +365,34 @@ fn assign_branch_colors(
         claim(Some(row), key, &mut color_of, &mut slot_of_key);
     }
 
+    // Keep the whole trunk *line* one colour — Issue #30. `main` colours its
+    // first-parent chain from its tip downward (the trunk slot, 0), but a branch
+    // sitting ABOVE that tip on the same lane — e.g. a working branch that's ahead
+    // of main and not merged back yet — occupies the very same vertical line, so
+    // the trunk would turn from blue to that branch's colour as it climbs. Extend
+    // the trunk colour upward along that lane: from the trunk tip, follow
+    // first-parent *children* that stay in the trunk's lane, recolouring each to
+    // the trunk slot so the mainline reads as one unbroken blue line top to bottom.
+    // Side branches (which sit in other lanes) keep their own distinct colours.
+    if let Some(mut cur) = color_of
+        .iter()
+        .filter(|&(_, &c)| c == 0)
+        .map(|(&r, _)| r)
+        .min()
+    {
+        let lane = graph.rows[cur].lane;
+        // The child (if any) that continues this lane is the one whose *first*
+        // parent is the current commit and which the layout kept in the same lane.
+        while let Some(child) = graph.rows.iter().find(|r| {
+            r.lane == lane
+                && r.commit.parents.first().and_then(|p| index.get(p).copied()) == Some(cur)
+        }) {
+            let child_row = child.row;
+            color_of.insert(child_row, 0);
+            cur = child_row;
+        }
+    }
+
     for row in &mut graph.rows {
         row.color = color_of.get(&row.row).copied().unwrap_or(0);
     }
@@ -909,6 +937,48 @@ mod tests {
         assert_eq!(color_of(&g, "M"), 0, "main is the trunk (slot 0) regardless of HEAD");
         assert_ne!(color_of(&g, "D"), 0, "the checked-out feature is not the trunk");
         assert!(g.stubs.is_empty(), "both branches own commits — neither is a stub");
+    }
+
+    /// Issue #30 follow-up: a branch ahead of `main` that hasn't been merged back
+    /// sits in the trunk lane, directly above main's tip, so it *is* the visible
+    /// continuation of the trunk line. The whole line must stay the trunk colour
+    /// top to bottom — not turn to the ahead-branch's colour going up — while a
+    /// genuine side branch (in another lane) keeps its own distinct colour.
+    #[test]
+    fn the_trunk_line_stays_one_colour_when_a_branch_is_ahead_of_main() {
+        // E,D (feature, ahead) -> C (main tip) -> B -> A, all lane 0; S is a side
+        // branch off B in its own lane.
+        //   E   feature tip (lane 0)
+        //   D   feature      (lane 0)
+        //   | S side tip     (lane 1)
+        //   C   main tip     (lane 0)
+        //   |/
+        //   B
+        //   A
+        let commits = vec![
+            commit("E", &["D"]),
+            commit("D", &["C"]),
+            commit("S", &["B"]),
+            commit("C", &["B"]),
+            commit("B", &["A"]),
+            commit("A", &[]),
+        ];
+        let refs = vec![
+            gitref("HEAD", RefKind::Head, "E"),
+            gitref("main", RefKind::Branch, "C"),
+            gitref("feature", RefKind::Branch, "E"),
+            gitref("side", RefKind::Branch, "S"),
+        ];
+        // Checked out on `feature`, which is ahead of `main`.
+        let g = layout_with_refs(commits, refs, Some("feature"));
+
+        // The entire trunk line is the trunk colour, including the un-merged
+        // feature commits that sit above main's tip on the same lane.
+        for c in ["E", "D", "C", "B", "A"] {
+            assert_eq!(color_of(&g, c), 0, "{c} is on the trunk line and must be blue");
+        }
+        // The genuine side branch (different lane) keeps its own, non-trunk colour.
+        assert_ne!(color_of(&g, "S"), 0, "a real side branch is not the trunk colour");
     }
 
     #[test]
