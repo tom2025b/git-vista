@@ -17,6 +17,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// The activity feed (journal + reflogs + snapshots) — the server-side half of
+// the Activity Log / Contextual Undo feature. `journal` owns the on-disk state
+// under `.git/git-vista/`; `activity` owns `GET /api/activity`.
+mod activity;
+mod journal;
+
 use axum::response::IntoResponse;
 use axum::{
     extract::Path as AxumPath,
@@ -25,6 +31,7 @@ use axum::{
     Json, Router,
 };
 use git_vista_core::layout;
+use git_vista_core::activity::{ActivityEvent, ActivityKind, ActivitySource};
 use git_vista_core::model::{
     validate_clone_url, BranchRequest, CloneRequest, CommitSummary, CreateBranchRequest,
     CreateCommitRequest, GitRef, RefKind,
@@ -169,6 +176,9 @@ async fn main() {
         // behind, and the staged/unstaged/untracked/conflicted file lists —
         // resolved fresh per request, like `head_branch`.
         .route("/api/status", get(worktree_status))
+        // Activity/Undo feature, step 3: the chronological event feed —
+        // journal + reflogs + snapshot diffs, folded and attributed.
+        .route("/api/activity", get(activity::activity_feed))
         // Issue #33 follow-up: branch operations, each shelling out to git.
         .route("/api/merge", post(merge_branch))
         .route("/api/push", post(push_branch))
@@ -539,6 +549,18 @@ async fn create_branch(Json(req): Json<CreateBranchRequest>) -> (StatusCode, Str
 
     if output.status.success() {
         println!("[/api/branch] created branch '{name}' at {commit}");
+        // Journal the creation with the resolved tip (the user may have given
+        // an abbreviated or symbolic start point).
+        let repo = current().0;
+        let tip = rev_parse(&repo, name).await;
+        journal_app_event(
+            &repo,
+            ActivityKind::BranchCreated,
+            Some(name.to_string()),
+            None,
+            tip,
+            format!("created branch ‘{name}’"),
+        );
         (StatusCode::OK, format!("Created branch '{name}'."))
     } else {
         // git already explains the failure (name exists, bad name, unknown commit,
@@ -577,8 +599,14 @@ async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (StatusCode, Str
         );
     }
 
+    // The pre-commit tip, captured for the journal before git moves anything.
+    // `None` on an unborn HEAD (first commit) — journaled as a creation-like
+    // event with no old state, which is exactly what it is.
+    let repo = current().0;
+    let old = rev_parse(&repo, "HEAD").await;
+
     let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C").arg(current().0).arg("commit");
+    cmd.arg("-C").arg(&repo).arg("commit");
     if req.allow_empty {
         cmd.arg("--allow-empty");
     }
@@ -597,6 +625,11 @@ async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (StatusCode, Str
 
     if output.status.success() {
         println!("[/api/commit] created commit (allow_empty={})", req.allow_empty);
+        let new = rev_parse(&repo, "HEAD").await;
+        // The branch the commit landed on; "HEAD" when detached.
+        let branch = git_vista_git::read_head_branch(&repo).unwrap_or_else(|| "HEAD".into());
+        let summary = message.lines().next().unwrap_or(message).to_string();
+        journal_app_event(&repo, ActivityKind::Commit, Some(branch), old, new, summary);
         (StatusCode::OK, "Created commit.".to_string())
     } else {
         // git explains the failure, but "nothing to commit, working tree clean"
@@ -664,25 +697,56 @@ async fn worktree_status() -> Result<impl IntoResponse, (StatusCode, String)> {
 /// (the server has no editor). A merge lands in whatever HEAD points at, so the UI
 /// labels this with the current branch and never switches branches itself.
 async fn merge_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
-    run_branch_op(
+    // Pre-merge tip, captured for the journal: it's the "undo merge" target.
+    let repo = current().0;
+    let old = rev_parse(&repo, "HEAD").await;
+    let resp = run_branch_op(
         "/api/merge",
         &req.branch,
         &["merge", "--no-edit"],
         format!("merged '{}' into HEAD", req.branch.trim()),
     )
-    .await
+    .await;
+    if resp.0 == StatusCode::OK {
+        let branch = req.branch.trim();
+        let new = rev_parse(&repo, "HEAD").await;
+        let into = git_vista_git::read_head_branch(&repo).unwrap_or_else(|| "HEAD".into());
+        journal_app_event(
+            &repo,
+            ActivityKind::Merge,
+            Some(into.clone()),
+            old,
+            new,
+            format!("merged ‘{branch}’ into ‘{into}’"),
+        );
+    }
+    resp
 }
 
 /// Push a branch to `origin` (Issue #33 follow-up): `git push origin <branch>`.
 /// A non-origin remote (or none) makes git error; that text is forwarded to the UI.
 async fn push_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
-    run_branch_op(
+    let resp = run_branch_op(
         "/api/push",
         &req.branch,
         &["push", "origin"],
         format!("pushed '{}' to origin", req.branch.trim()),
     )
-    .await
+    .await;
+    if resp.0 == StatusCode::OK {
+        let repo = current().0;
+        let branch = req.branch.trim();
+        let tip = rev_parse(&repo, branch).await;
+        journal_app_event(
+            &repo,
+            ActivityKind::Push,
+            Some(branch.to_string()),
+            None,
+            tip,
+            format!("pushed ‘{branch}’ to origin"),
+        );
+    }
+    resp
 }
 
 /// Delete a branch (Issue #33 follow-up): `git branch -d <branch>`. The lowercase
@@ -690,13 +754,33 @@ async fn push_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
 /// merged, forwarding "not fully merged" to the UI. The UI also confirms first, so
 /// deletion takes both a click-through and a merged branch.
 async fn delete_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
-    run_branch_op(
+    // The tip must be captured BEFORE the delete: git removes the branch's
+    // reflog with the branch, so afterwards nobody knows where it pointed —
+    // and this journaled oid is precisely what "Restore branch" replays.
+    let repo = current().0;
+    let tip = rev_parse(&repo, req.branch.trim()).await;
+    let resp = run_branch_op(
         "/api/delete-branch",
         &req.branch,
         &["branch", "-d"],
         format!("deleted branch '{}'", req.branch.trim()),
     )
-    .await
+    .await;
+    if resp.0 == StatusCode::OK {
+        let branch = req.branch.trim();
+        journal_app_event(
+            &repo,
+            ActivityKind::BranchDeleted,
+            Some(branch.to_string()),
+            tip,
+            None,
+            format!("deleted branch ‘{branch}’"),
+        );
+        // Drop it from the snapshot now, so the feed's snapshot diff can't
+        // also report this app deletion as an external one.
+        journal::remove_from_snapshot(&repo, branch);
+    }
+    resp
 }
 
 /// Force-delete a branch (Issue #33 follow-up): `git branch -D <branch>`. The
@@ -705,13 +789,31 @@ async fn delete_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
 /// (see [`delete_branch`]) was refused for "not fully merged" and the user
 /// confirmed the override, so this deliberately skips git's merge safety check.
 async fn force_delete_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
-    run_branch_op(
+    // Same pre-delete tip capture as `delete_branch` — even more load-bearing
+    // here, since a force-delete may discard commits nothing else reaches:
+    // the journaled tip is then the ONLY path back to them (until gc).
+    let repo = current().0;
+    let tip = rev_parse(&repo, req.branch.trim()).await;
+    let resp = run_branch_op(
         "/api/force-delete-branch",
         &req.branch,
         &["branch", "-D"],
         format!("force-deleted branch '{}'", req.branch.trim()),
     )
-    .await
+    .await;
+    if resp.0 == StatusCode::OK {
+        let branch = req.branch.trim();
+        journal_app_event(
+            &repo,
+            ActivityKind::BranchDeleted,
+            Some(branch.to_string()),
+            tip,
+            None,
+            format!("force-deleted branch ‘{branch}’"),
+        );
+        journal::remove_from_snapshot(&repo, branch);
+    }
+    resp
 }
 
 /// Rebase the checked-out branch onto main (Issue #33 follow-up): `git rebase
@@ -728,6 +830,8 @@ async fn rebase() -> (StatusCode, String) {
         return rejected;
     }
     let repo = current().0;
+    // Pre-rebase tip, for the journal: it's the "undo rebase" target.
+    let old = rev_parse(&repo, "HEAD").await;
     let base = if git_ref_exists(&repo, "refs/remotes/origin/main").await {
         "origin/main"
     } else {
@@ -754,6 +858,16 @@ async fn rebase() -> (StatusCode, String) {
 
     if output.status.success() {
         println!("[/api/rebase] rebased HEAD onto {base}");
+        let new = rev_parse(&repo, "HEAD").await;
+        let branch = git_vista_git::read_head_branch(&repo).unwrap_or_else(|| "HEAD".into());
+        journal_app_event(
+            &repo,
+            ActivityKind::Rebase,
+            Some(branch.clone()),
+            old,
+            new,
+            format!("rebased ‘{branch}’ onto {base}"),
+        );
         (StatusCode::OK, format!("Rebased onto {base}."))
     } else {
         // git explains conflicts on stderr (some notices go to stdout); prefer
@@ -781,6 +895,54 @@ async fn rebase() -> (StatusCode, String) {
         eprintln!("git-vista: /api/rebase failed (aborted): {msg}");
         (StatusCode::BAD_REQUEST, msg)
     }
+}
+
+/// Resolve `rev` to a full commit id in `repo`, or `None` if it doesn't
+/// resolve. Used by the journal hooks to capture a ref's tip before/after an
+/// operation — e.g. a branch's tip *before* deleting it, which is the one
+/// piece of state git itself throws away (the branch's reflog dies with it)
+/// and exactly what "Restore branch" later needs.
+async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{rev}^{{commit}}"))
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+/// Record one successful app operation in the journal (source: App). The
+/// activity feed matches the operation's own reflog echo against this entry
+/// and shows a single event labelled "via git-vista". Best-effort by design:
+/// the git operation already succeeded, so journal trouble is only logged.
+fn journal_app_event(
+    repo: &Path,
+    kind: ActivityKind,
+    ref_name: Option<String>,
+    old_oid: Option<String>,
+    new_oid: Option<String>,
+    summary: String,
+) {
+    journal::append(
+        repo,
+        &ActivityEvent {
+            time: activity::now_secs(),
+            kind,
+            ref_name,
+            summary,
+            old_oid,
+            new_oid,
+            source: ActivitySource::App,
+            undo: None,
+        },
+    );
 }
 
 /// Whether `refname` resolves in `repo` (`git rev-parse --verify --quiet`): exit 0
