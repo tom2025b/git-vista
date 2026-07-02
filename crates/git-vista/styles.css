@@ -76,6 +76,45 @@ html, body {
 .status-chip.dirty { color: #d29922; border-color: #9e6a03; }
 .status-chip.conflict { color: #f85149; border-color: #da3633; }
 
+/* The detail panel's Changes section (Activity/Undo step 2): the per-file
+   stat rows and the unified patch. Diff colours follow the GitHub-dark
+   palette used everywhere else: green additions, red deletions, blue hunk
+   headers, muted file metadata. */
+.detail-section-title {
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid #21262d;
+  font-weight: 600;
+}
+.detail-file {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  padding: 0.15rem 0;
+  font-size: 0.85rem;
+}
+.detail-file-path { flex: 1; word-break: break-all; }
+.detail-file-counts { white-space: nowrap; }
+.file-added { color: #3fb950; }
+.file-modified { color: #d29922; }
+.file-deleted { color: #f85149; }
+.file-renamed { color: #2f81f7; }
+.detail-diff {
+  margin: 0.75rem 0 0;
+  padding: 0.6rem;
+  background: #010409;
+  border: 1px solid #21262d;
+  border-radius: 6px;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  overflow-x: auto;
+  white-space: pre;
+}
+.diff-add { color: #3fb950; }
+.diff-del { color: #f85149; }
+.diff-hunk { color: #2f81f7; }
+.diff-meta { color: var(--muted); }
+
 .graph { flex: 1; overflow: hidden; }
 .placeholder { color: var(--muted); }
 
