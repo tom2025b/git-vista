@@ -120,6 +120,11 @@ pub struct Overlays {
     pub confirm_op: RwSignal<Option<PendingOp>>,
     /// The commit whose detail panel is open (Phase 10), by full hash.
     pub detail_id: RwSignal<Option<String>>,
+    /// Whether the Activity panel is open (Activity/Undo feature). Created in
+    /// `App` — the topbar owns its button — and threaded through here so the
+    /// panel, the menu and the detail panel can keep each other exclusive
+    /// (both are right-docked; stacking them would just hide one).
+    pub activity_open: RwSignal<bool>,
     /// One-shot flag set by the menu's "Show diff" item: when the panel's
     /// Changes section next finishes rendering, scroll it into view, then
     /// clear the flag. A `StoredValue` (not a signal) on purpose — it's an
