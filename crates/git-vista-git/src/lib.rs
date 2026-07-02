@@ -16,6 +16,7 @@
 //!
 //! - [`history`] — walking commit history and finding commits present on a remote.
 //! - [`refs`]    — reading HEAD, branches and tags, and the checked-out branch.
+//! - [`reflog`]  — reading every ref's reflog, for the activity feed.
 //! - [`github`]  — turning the `origin` remote URL into a GitHub web base URL.
 //!
 //! [`CommitSummary`]: git_vista_core::model::CommitSummary
@@ -26,10 +27,12 @@ use thiserror::Error;
 
 pub mod github;
 pub mod history;
+pub mod reflog;
 pub mod refs;
 
 pub use github::github_web_base;
 pub use history::{read_commit, read_remote_commits, walk_history};
+pub use reflog::read_reflogs;
 pub use refs::{read_head_branch, read_refs};
 
 #[derive(Debug, Error)]
