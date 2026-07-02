@@ -11,6 +11,7 @@
 
 use gloo_net::http::Request;
 
+use git_vista_core::diff::CommitDiff;
 use git_vista_core::model::{
     BranchRequest, CloneRequest, CommitDetail, CreateBranchRequest, CreateCommitRequest, Graph,
 };
@@ -134,6 +135,23 @@ pub async fn fetch_head_branch() -> Result<Option<String>, String> {
         .json::<Option<String>>()
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Fetch one commit's diff — file list + unified patch — for the detail
+/// panel's Changes section (`GET /api/diff/{id}`). Fetched lazily alongside
+/// the commit detail, cache-busted the same way. A non-2xx body is the
+/// server's reason, returned as `Err` for the panel to show.
+pub async fn fetch_diff(id: &str) -> Result<CommitDiff, String> {
+    let url = format!("/api/diff/{id}?t={}", js_sys::Date::now());
+    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    if resp.ok() {
+        resp.json::<CommitDiff>().await.map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
 }
 
 /// Fetch the live working-tree status (`GET /api/status`) — branch, ahead/

@@ -30,6 +30,9 @@ js-sys = "0.3"
 # Event types used by the pan/zoom handlers. Leptos pulls web-sys in already;
 # we list the exact features we call so the build doesn't rely on its defaults.
 web-sys = { version = "0.3", features = [
+    # Activity/Undo step 2: get_element_by_id, so "Show diff" can scroll the
+    # detail panel's Changes section into view once it renders.
+    "Document",
     "DomRect",
     "Element",
     "Event",

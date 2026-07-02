@@ -311,6 +311,9 @@ fn graph_canvas(
     // point, so the ghost click hits the backdrop and closes the modal instantly.
     // The backdrop ignores a dismiss that lands within `DIALOG_GUARD_MS` of opening.
     let dialog_opened_at = store_value(0.0_f64);
+    // One-shot "scroll the Changes section into view" instruction, set by the
+    // menu's "Show diff" item and consumed by the detail panel's next render.
+    let scroll_diff = store_value(false);
 
     // Phase 8 (viewport virtualization): bundle the graph and its derived lookups
     // behind a `StoredValue` so the reactive per-row `<For>` closures below can
@@ -336,6 +339,7 @@ fn graph_canvas(
         commit_msg,
         confirm_op,
         detail_id,
+        scroll_diff,
         dialog_opened_at,
         reload,
     };

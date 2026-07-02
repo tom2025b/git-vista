@@ -120,6 +120,11 @@ pub struct Overlays {
     pub confirm_op: RwSignal<Option<PendingOp>>,
     /// The commit whose detail panel is open (Phase 10), by full hash.
     pub detail_id: RwSignal<Option<String>>,
+    /// One-shot flag set by the menu's "Show diff" item: when the panel's
+    /// Changes section next finishes rendering, scroll it into view, then
+    /// clear the flag. A `StoredValue` (not a signal) on purpose — it's an
+    /// instruction consumed by the next render, not state the UI reflects.
+    pub scroll_diff: StoredValue<bool>,
     /// When the current modal was opened (ms) — the iOS ghost-click guard.
     pub dialog_opened_at: StoredValue<f64>,
     /// The App's fetch counter; bumped to re-read the repo after a write.

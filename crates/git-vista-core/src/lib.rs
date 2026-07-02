@@ -8,11 +8,13 @@
 //! - [`model`]  — serializable data types shared across the HTTP/JSON boundary.
 //! - [`layout`] — assigns commits to lanes for the vertical graph.
 //! - [`status`] — working-tree status types + the porcelain-v2 parser.
+//! - [`diff`]   — commit-diff types + the name-status/numstat parsers.
 //!
 //! Reading real history (which needs `gix` and a filesystem, and so can't run in
 //! a browser) lives in the separate native-only `git-vista-git` crate. Keeping
 //! it out of here is what lets this crate stay clean and browser-compatible.
 
+pub mod diff;
 pub mod layout;
 pub mod model;
 pub mod status;
