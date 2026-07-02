@@ -12,8 +12,24 @@
 
 use leptos::*;
 
-use crate::api::{branch_op_request, clone_request, create_commit_request};
+use crate::api::{branch_op_request, clone_request, create_commit_request, rebase_request};
 use crate::state::{Overlays, PendingOp, DIALOG_GUARD_MS};
+
+/// Pop a native alert with `msg` (there's always a window in the running SPA).
+fn alert(msg: &str) {
+    if let Some(w) = web_sys::window() {
+        let _ = w.alert_with_message(msg);
+    }
+}
+
+/// Resolve a git op's result: bump `reload` so the graph re-reads on success, or
+/// surface git's own error text ("Couldn't {what}:\n<git stderr>") on failure.
+fn report(result: Result<(), String>, what: &str, reload: RwSignal<u32>) {
+    match result {
+        Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+        Err(e) => alert(&format!("Couldn't {what}:\n{e}")),
+    }
+}
 
 /// The commit-message modal (Issue #33). Shown while `commit_dialog` is `Some`;
 /// a real overlay with a focused text box, so it prompts reliably where a native
@@ -120,21 +136,43 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
             return;
         };
         confirm_op.set(None);
-        let (path, branch, verb) = match op {
-            PendingOp::Merge { branch, .. } => ("/api/merge", branch, "merge"),
-            PendingOp::Push { branch } => ("/api/push", branch, "push"),
-            PendingOp::Delete { branch, .. } => ("/api/delete-branch", branch, "delete"),
-        };
-        spawn_local(async move {
-            match branch_op_request(path, &branch).await {
-                Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
-                Err(e) => {
-                    if let Some(w) = web_sys::window() {
-                        let _ = w.alert_with_message(&format!("Couldn't {verb} ‘{branch}’:\n{e}"));
+        // Each arm runs its git op and then either bumps `reload` (re-read the graph)
+        // or surfaces git's own error. Two arms are special: Rebase hits a bodyless
+        // endpoint (it acts on HEAD, not a named branch), and Delete upgrades git's
+        // "not fully merged" refusal into a Force-Delete confirmation rather than a
+        // dead-end alert.
+        match op {
+            PendingOp::Merge { branch, .. } => spawn_local(async move {
+                report(branch_op_request("/api/merge", &branch).await, &format!("merge ‘{branch}’"), reload);
+            }),
+            PendingOp::Push { branch } => spawn_local(async move {
+                report(branch_op_request("/api/push", &branch).await, &format!("push ‘{branch}’"), reload);
+            }),
+            PendingOp::ForceDelete { branch } => spawn_local(async move {
+                report(
+                    branch_op_request("/api/force-delete-branch", &branch).await,
+                    &format!("force-delete ‘{branch}’"),
+                    reload,
+                );
+            }),
+            PendingOp::Rebase { .. } => spawn_local(async move {
+                report(rebase_request().await, "rebase onto main", reload);
+            }),
+            PendingOp::Delete { branch, .. } => spawn_local(async move {
+                match branch_op_request("/api/delete-branch", &branch).await {
+                    Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+                    // git's safe `-d` refuses an unmerged branch with "not fully
+                    // merged". Rather than dead-end on that error, re-open the modal
+                    // offering a force delete (`-D`). Reset the ghost-click guard as
+                    // the modal re-opens, exactly as when it's first shown.
+                    Err(e) if e.contains("not fully merged") => {
+                        dialog_opened_at.set_value(js_sys::Date::now());
+                        confirm_op.set(Some(PendingOp::ForceDelete { branch }));
                     }
+                    Err(e) => alert(&format!("Couldn't delete ‘{branch}’:\n{e}")),
                 }
-            }
-        });
+            }),
+        }
     };
     move || {
         confirm_op.get().map(|op| {
@@ -186,6 +224,31 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
                         "Delete",
                         true,
                         true,
+                    ),
+                },
+                // Reached only after a safe delete was refused for "not fully merged"
+                // (see `run_confirmed`): offer the override, spelling out the risk.
+                PendingOp::ForceDelete { branch } => (
+                    "Force delete branch",
+                    format!("‘{branch}’ isn't fully merged — force-deleting it discards any commits it holds that aren't on another branch. This can't be undone. Force delete it anyway?"),
+                    "Force Delete",
+                    true,
+                    true,
+                ),
+                PendingOp::Rebase { current } => match current {
+                    Some(branch) => (
+                        "Rebase onto main",
+                        format!("Rebase ‘{branch}’ onto main? This replays ‘{branch}’’s commits on top of the latest main and rewrites its history."),
+                        "Rebase",
+                        false,
+                        true,
+                    ),
+                    None => (
+                        "Rebase onto main",
+                        "HEAD is detached, so there's no branch to rebase. Check out a branch first.".to_string(),
+                        "Rebase",
+                        false,
+                        false,
                     ),
                 },
             };
