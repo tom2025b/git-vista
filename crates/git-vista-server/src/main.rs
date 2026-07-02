@@ -165,6 +165,11 @@ async fn main() {
         .route("/api/merge", post(merge_branch))
         .route("/api/push", post(push_branch))
         .route("/api/delete-branch", post(delete_branch))
+        // Issue #33 follow-up: force-delete an unmerged branch (`git branch -D`),
+        // offered only after the safe `-d` above is refused; and rebase the
+        // checked-out branch onto main (`git rebase`).
+        .route("/api/force-delete-branch", post(force_delete_branch))
+        .route("/api/rebase", post(rebase))
         // Anything that isn't the API is served from the built SPA bundle.
         .fallback_service(spa);
 
@@ -537,6 +542,107 @@ async fn delete_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
         format!("deleted branch '{}'", req.branch.trim()),
     )
     .await
+}
+
+/// Force-delete a branch (Issue #33 follow-up): `git branch -D <branch>`. The
+/// uppercase `-D` drops a branch even when its commits aren't merged, discarding
+/// any it alone holds. The UI only reaches here after the safe `git branch -d`
+/// (see [`delete_branch`]) was refused for "not fully merged" and the user
+/// confirmed the override, so this deliberately skips git's merge safety check.
+async fn force_delete_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
+    run_branch_op(
+        "/api/force-delete-branch",
+        &req.branch,
+        &["branch", "-D"],
+        format!("force-deleted branch '{}'", req.branch.trim()),
+    )
+    .await
+}
+
+/// Rebase the checked-out branch onto main (Issue #33 follow-up): `git rebase
+/// <base>`. `<base>` is `origin/main` when that remote-tracking ref exists — the
+/// usual feature-branch target, so you rebase onto the freshest pushed main — and
+/// the local `main` otherwise. It acts on HEAD, so it takes no request body.
+///
+/// A failed rebase (almost always conflicts) would leave the repo mid-rebase,
+/// which a browser-only user with no shell can't resolve — so on failure it runs
+/// `git rebase --abort` to restore the pre-rebase state, then forwards git's own
+/// error text so the UI can explain why it couldn't complete.
+async fn rebase() -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    let repo = current().0;
+    let base = if git_ref_exists(&repo, "refs/remotes/origin/main").await {
+        "origin/main"
+    } else {
+        "main"
+    };
+
+    let output = match tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .arg("rebase")
+        .arg(base)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("git-vista: /api/rebase couldn't run git: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Couldn't run git: {e}"),
+            );
+        }
+    };
+
+    if output.status.success() {
+        println!("[/api/rebase] rebased HEAD onto {base}");
+        (StatusCode::OK, format!("Rebased onto {base}."))
+    } else {
+        // git explains conflicts on stderr (some notices go to stdout); prefer
+        // stderr, fall back to stdout, then a generic line — matching the others.
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if !stderr.is_empty() {
+            stderr
+        } else {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if stdout.is_empty() {
+                "git rebase failed.".to_string()
+            } else {
+                stdout
+            }
+        };
+        // Best-effort: back out of the half-applied rebase so the working tree isn't
+        // stuck mid-rebase. Harmless (exits non-zero, ignored) when none is running.
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("rebase")
+            .arg("--abort")
+            .output()
+            .await;
+        eprintln!("git-vista: /api/rebase failed (aborted): {msg}");
+        (StatusCode::BAD_REQUEST, msg)
+    }
+}
+
+/// Whether `refname` resolves in `repo` (`git rev-parse --verify --quiet`): exit 0
+/// when the ref exists, non-zero otherwise. Used to prefer `origin/main` over the
+/// local `main` as a rebase base only when the remote-tracking ref is actually there.
+async fn git_ref_exists(repo: &Path, refname: &str) -> bool {
+    tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(refname)
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Shared runner for the branch-operation endpoints (merge/push/delete). Validates
