@@ -59,6 +59,62 @@ html, body {
 .refresh:hover { border-color: var(--accent); }
 .refresh:active { background: #30363d; }
 
+/* The live working-tree status chip (Activity/Undo step 1): a small pill by
+   the subtitle — green check when clean, yellow with a change count when
+   dirty, red when conflicted — plus ↑ahead ↓behind vs the upstream. Refreshed
+   with the graph via the shared reload counter; hidden entirely if the status
+   probe fails. */
+.status-chip {
+  align-self: center;
+  padding: 0.15rem 0.6rem;
+  font-size: 0.8rem;
+  border: 1px solid #30363d;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.status-chip.clean { color: #3fb950; border-color: #238636; }
+.status-chip.dirty { color: #d29922; border-color: #9e6a03; }
+.status-chip.conflict { color: #f85149; border-color: #da3633; }
+
+/* The detail panel's Changes section (Activity/Undo step 2): the per-file
+   stat rows and the unified patch. Diff colours follow the GitHub-dark
+   palette used everywhere else: green additions, red deletions, blue hunk
+   headers, muted file metadata. */
+.detail-section-title {
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid #21262d;
+  font-weight: 600;
+}
+.detail-file {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  padding: 0.15rem 0;
+  font-size: 0.85rem;
+}
+.detail-file-path { flex: 1; word-break: break-all; }
+.detail-file-counts { white-space: nowrap; }
+.file-added { color: #3fb950; }
+.file-modified { color: #d29922; }
+.file-deleted { color: #f85149; }
+.file-renamed { color: #2f81f7; }
+.detail-diff {
+  margin: 0.75rem 0 0;
+  padding: 0.6rem;
+  background: #010409;
+  border: 1px solid #21262d;
+  border-radius: 6px;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  overflow-x: auto;
+  white-space: pre;
+}
+.diff-add { color: #3fb950; }
+.diff-del { color: #f85149; }
+.diff-hunk { color: #2f81f7; }
+.diff-meta { color: var(--muted); }
+
 .graph { flex: 1; overflow: hidden; }
 .placeholder { color: var(--muted); }
 
@@ -329,3 +385,116 @@ html, body {
 }
 .detail-status { color: var(--muted); }
 .detail-error { color: #f85149; white-space: pre-wrap; }
+
+/* Activity/Undo step 4: the Activity panel. It wears .detail-panel for the
+   frame (fixed right dock, head/body split), so everything here is just the
+   panel's own content: the working-tree status block on top, then the event
+   feed. Colours reuse the status-chip triple (green/yellow/red) and the
+   GitHub-dark palette used everywhere else. */
+.activity-panel { width: min(440px, 100vw); }
+.act-head-buttons { display: flex; align-items: center; gap: 6px; }
+/* Same recipe as the topbar .refresh, scaled down to fit the panel head. */
+.act-refresh {
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.25rem 0.7rem;
+  color: var(--fg);
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.act-refresh:hover { border-color: var(--accent); }
+.act-refresh:active { background: #30363d; }
+
+/* The status headline: one line, coloured like the topbar chip. */
+.act-status {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+.act-status.clean { color: #3fb950; }
+.act-status.dirty { color: #d29922; }
+.act-status.conflict { color: #f85149; }
+
+/* One dirty file per row, capped in activity.rs so the feed stays the star. */
+.act-file {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  padding: 0.1rem 0;
+  font-size: 0.8rem;
+}
+.act-file-path { flex: 1; word-break: break-all; }
+
+/* Small label pills: the file's stage tag, an event's ref name, and the
+   app/terminal attribution. app = accent (done through git-vista),
+   terminal = muted (done outside it). */
+.act-pill {
+  padding: 0 0.45em;
+  font-size: 0.72rem;
+  color: var(--muted);
+  border: 1px solid #30363d;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.act-pill.act-app { color: var(--accent); border-color: var(--accent); }
+.act-pill.act-terminal { color: var(--muted); }
+.act-pill.act-ref { color: #3fb950; border-color: #238636; }
+
+.act-feed-title { margin-bottom: 4px; }
+
+/* One feed row. Also a <button> when the event references a commit (it opens
+   the shared context menu), so flatten the button chrome away and keep the
+   tap target comfortable (iPad). Static rows share the layout minus the
+   pointer affordances. */
+.act-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 7px 8px;
+  text-align: left;
+  font: inherit;
+  font-size: 0.82rem;
+  color: var(--fg);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.act-row:hover { background: #21262d; }
+.act-row.act-row-static { cursor: default; }
+.act-row.act-row-static:hover { background: transparent; }
+.act-glyph { flex: none; padding-top: 1px; }
+.act-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+
+/* Step 5: the direct Undo control on a feed row whose event is still
+   undoable. Right-aligned in the row, accent-outlined so it reads as the
+   row's one action; the destructive part is confirmed in the modal, so the
+   button itself stays calm. */
+.act-undo {
+  margin-left: auto;
+  flex: none;
+  align-self: center;
+  padding: 0.2rem 0.6rem;
+  font: inherit;
+  font-size: 0.75rem;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.act-undo:hover { background: #21262d; }
+.act-summary { word-break: break-word; }
+.act-meta {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.act-when { color: var(--muted); font-size: 0.75rem; }

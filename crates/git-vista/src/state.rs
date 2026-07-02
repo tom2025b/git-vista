@@ -12,6 +12,7 @@
 
 use leptos::{Resource, RwSignal, StoredValue};
 
+use git_vista_core::activity::Undoable;
 use git_vista_core::model::CommitDetail;
 
 /// State for the per-commit context menu (Issue #18): which commit was tapped,
@@ -61,6 +62,20 @@ pub struct MenuData {
     pub repo_url: Option<String>,
 }
 
+/// What the commit-message dialog (Issue #33) is collecting a message for:
+/// which kind of commit, and where it should land.
+#[derive(Clone)]
+pub struct CommitDialog {
+    /// `git commit --allow-empty` (an empty commit) vs a staged-changes commit.
+    pub allow_empty: bool,
+    /// Branch the commit should land on. `None` => the checked-out branch (a
+    /// plain `git commit` on HEAD — every commit item on a commit dot). `Some`
+    /// => a branch stub's own name: the server writes the commit object and
+    /// moves just that ref, so an empty branch can take its first commit
+    /// without a checkout. Only ever `Some` together with `allow_empty`.
+    pub branch: Option<String>,
+}
+
 /// A branch operation awaiting confirmation in the modal (Issue #33 follow-up).
 /// Merge and delete change history/refs and push reaches the network, so each is
 /// confirmed before it runs — reusing the same in-app modal the commit dialog uses
@@ -87,6 +102,12 @@ pub enum PendingOp {
     /// live HEAD branch, fetched on click, purely to name it in the dialog; `None` =>
     /// detached HEAD (the confirm button is disabled — there's no branch to rebase).
     Rebase { current: Option<String> },
+    /// Execute one undo action (Activity/Undo step 5, `POST /api/undo`). Carries the
+    /// whole [`Undoable`] — the action plus its server-built label and `warn_pushed`
+    /// flag — so the dialog can name exactly what it's about to do and warn when the
+    /// discarded state is already on the remote. Offered from the graph menu's undo
+    /// section (`/api/undoables`) and straight from Activity feed rows.
+    Undo(Undoable),
 }
 
 /// How long (ms) after the commit modal opens to ignore a backdrop dismiss, so
@@ -112,14 +133,24 @@ pub struct Settings {
 pub struct Overlays {
     /// The open context menu, if any (Issue #18). `None` => no menu.
     pub menu: RwSignal<Option<MenuData>>,
-    /// The open commit-message dialog, if any (Issue #33). `Some(allow_empty)`.
-    pub commit_dialog: RwSignal<Option<bool>>,
+    /// The open commit-message dialog, if any (Issue #33).
+    pub commit_dialog: RwSignal<Option<CommitDialog>>,
     /// The text currently typed into that dialog's message box.
     pub commit_msg: RwSignal<String>,
     /// The branch operation awaiting confirmation, if any (Issue #33 follow-up).
     pub confirm_op: RwSignal<Option<PendingOp>>,
     /// The commit whose detail panel is open (Phase 10), by full hash.
     pub detail_id: RwSignal<Option<String>>,
+    /// Whether the Activity panel is open (Activity/Undo feature). Created in
+    /// `App` — the topbar owns its button — and threaded through here so the
+    /// panel, the menu and the detail panel can keep each other exclusive
+    /// (both are right-docked; stacking them would just hide one).
+    pub activity_open: RwSignal<bool>,
+    /// One-shot flag set by the menu's "Show diff" item: when the panel's
+    /// Changes section next finishes rendering, scroll it into view, then
+    /// clear the flag. A `StoredValue` (not a signal) on purpose — it's an
+    /// instruction consumed by the next render, not state the UI reflects.
+    pub scroll_diff: StoredValue<bool>,
     /// When the current modal was opened (ms) — the iOS ghost-click guard.
     pub dialog_opened_at: StoredValue<f64>,
     /// The App's fetch counter; bumped to re-read the repo after a write.

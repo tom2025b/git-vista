@@ -11,9 +11,12 @@
 
 use gloo_net::http::Request;
 
+use git_vista_core::activity::{ActivityEvent, UndoAction, Undoable};
+use git_vista_core::diff::CommitDiff;
 use git_vista_core::model::{
     BranchRequest, CloneRequest, CommitDetail, CreateBranchRequest, CreateCommitRequest, Graph,
 };
+use git_vista_core::status::RepoStatus;
 
 /// Fetch the laid-out graph from the backend. Relative URL → same origin as the
 /// served SPA, so no CORS and no hardcoded host.
@@ -95,14 +98,21 @@ pub async fn create_branch_request(name: &str, commit: &str) -> Result<(), Strin
     }
 }
 
-/// Ask the backend to create a commit on top of HEAD (Issue #33,
-/// `POST /api/commit`). `allow_empty` picks `git commit --allow-empty` (empty
-/// commit) vs a plain `git commit` (staged changes). As with the branch request,
-/// a non-2xx body is git's own error text, returned as `Err`.
-pub async fn create_commit_request(message: &str, allow_empty: bool) -> Result<(), String> {
+/// Ask the backend to create a commit (Issue #33, `POST /api/commit`).
+/// `allow_empty` picks `git commit --allow-empty` (empty commit) vs a plain
+/// `git commit` (staged changes). `branch` targets a branch other than the
+/// checked-out one — the branch-stub path, empty commits only; `None` commits
+/// on HEAD as before. As with the branch request, a non-2xx body is git's own
+/// error text, returned as `Err`.
+pub async fn create_commit_request(
+    message: &str,
+    allow_empty: bool,
+    branch: Option<&str>,
+) -> Result<(), String> {
     let body = CreateCommitRequest {
         message: message.to_string(),
         allow_empty,
+        branch: branch.map(str::to_string),
     };
     let resp = Request::post("/api/commit")
         .json(&body)
@@ -135,6 +145,97 @@ pub async fn fetch_head_branch() -> Result<Option<String>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Fetch the activity feed (`GET /api/activity`): the chronological list of
+/// repo events — commits, merges, rebases, branch creations/deletions,
+/// pushes… — each attributed app-vs-terminal and carrying an undo hint when
+/// the event is still undoable. Fetched fresh every time the panel opens,
+/// cache-busted like the other live reads.
+pub async fn fetch_activity(limit: usize) -> Result<Vec<ActivityEvent>, String> {
+    let url = format!("/api/activity?limit={limit}&t={}", js_sys::Date::now());
+    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    if resp.ok() {
+        resp.json::<Vec<ActivityEvent>>().await.map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
+/// Fetch the undo actions that apply to one commit (`GET /api/undoables/{id}`,
+/// Activity/Undo step 5), computed live server-side — so the context menu's
+/// undo section reflects the repo *now*, not the possibly-stale graph. Empty
+/// on a read-only clone. Cache-busted like the other live reads.
+pub async fn fetch_undoables(commit: &str) -> Result<Vec<Undoable>, String> {
+    let url = format!("/api/undoables/{commit}?t={}", js_sys::Date::now());
+    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    if resp.ok() {
+        resp.json::<Vec<Undoable>>().await.map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
+/// Ask the backend to execute one undo action (`POST /api/undo`, Activity/Undo
+/// step 5). The body is the tagged [`UndoAction`] exactly as the server handed
+/// it out. A non-2xx body is the server's reason — including the 409s for a
+/// moved branch (compare-and-swap) or a dirty working tree — returned as `Err`
+/// for the confirm flow to show.
+pub async fn undo_request(action: &UndoAction) -> Result<(), String> {
+    let resp = Request::post("/api/undo")
+        .json(action)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
+/// Fetch one commit's diff — file list + unified patch — for the detail
+/// panel's Changes section (`GET /api/diff/{id}`). Fetched lazily alongside
+/// the commit detail, cache-busted the same way. A non-2xx body is the
+/// server's reason, returned as `Err` for the panel to show.
+pub async fn fetch_diff(id: &str) -> Result<CommitDiff, String> {
+    let url = format!("/api/diff/{id}?t={}", js_sys::Date::now());
+    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    if resp.ok() {
+        resp.json::<CommitDiff>().await.map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
+/// Fetch the live working-tree status (`GET /api/status`) — branch, ahead/
+/// behind, and the dirty-file lists — for the topbar chip and the Activity
+/// panel's status section. Resolved fresh server-side per request and cache-
+/// busted like the other live reads, since it changes with every edit.
+pub async fn fetch_status() -> Result<RepoStatus, String> {
+    let url = format!("/api/status?t={}", js_sys::Date::now());
+    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    if resp.ok() {
+        resp.json::<RepoStatus>().await.map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
 /// Ask the backend to rebase the checked-out branch onto main (`POST /api/rebase`).
 /// Unlike the branch ops it carries no body — it always acts on the current HEAD,
 /// and the server picks `origin/main` vs `main` as the base. A non-2xx body is
@@ -158,7 +259,9 @@ pub async fn rebase_request() -> Result<(), String> {
 /// `path` is the endpoint — `/api/merge`, `/api/push`, `/api/delete-branch`, or
 /// `/api/force-delete-branch` — all of which take the same `{ branch }` body. As with the other requests, a
 /// non-2xx body is git's own error text, returned as `Err` for the caller to show.
-pub async fn branch_op_request(path: &str, branch: &str) -> Result<(), String> {
+/// `Ok` carries the server's success line — most callers ignore it, but the merge
+/// flow reads it to tell a real merge from git's "Already up to date" no-op.
+pub async fn branch_op_request(path: &str, branch: &str) -> Result<String, String> {
     let body = BranchRequest {
         branch: branch.to_string(),
     };
@@ -169,7 +272,7 @@ pub async fn branch_op_request(path: &str, branch: &str) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     if resp.ok() {
-        Ok(())
+        Ok(resp.text().await.unwrap_or_default())
     } else {
         Err(resp
             .text()

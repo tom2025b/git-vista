@@ -192,15 +192,25 @@ pub struct CreateBranchRequest {
     pub commit: String,
 }
 
-/// Body of a `POST /api/commit` request (Issue #33): create a commit on top of
-/// the current HEAD with the message `message`. When `allow_empty` is true the
-/// commit is made even with nothing staged (`git commit --allow-empty`);
-/// otherwise git commits the staged changes and fails if there are none. The UI
-/// only offers this on the HEAD tip, so the backend never needs to move HEAD.
+/// Body of a `POST /api/commit` request (Issue #33): create a commit with the
+/// message `message`. When `allow_empty` is true the commit is made even with
+/// nothing staged (`git commit --allow-empty`); otherwise git commits the
+/// staged changes and fails if there are none.
+///
+/// `branch` names the branch the commit should land on. `None` — and any name
+/// that turns out to be the checked-out branch — means a plain `git commit` on
+/// HEAD, exactly as before this field existed. A *different* branch is allowed
+/// only for empty commits (there's no meaning to committing HEAD's staged tree
+/// onto another branch): the backend writes the commit with `git commit-tree`
+/// and advances the ref with a compare-and-swap `git update-ref`, never
+/// touching HEAD or the working tree. This is how a branch stub — a new branch
+/// with no commits of its own — takes its first (empty) commit from the UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateCommitRequest {
     pub message: String,
     pub allow_empty: bool,
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 /// Body of the three branch-operation requests (Issue #33 follow-up): merge

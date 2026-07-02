@@ -20,9 +20,9 @@ use leptos::*;
 
 use git_vista_core::model::{Graph, RefKind};
 
-use crate::api::{fetch_commit_detail, fetch_graph, fetch_head_branch};
+use crate::api::{fetch_commit_detail, fetch_graph, fetch_head_branch, fetch_status};
 use crate::camera::Camera;
-use crate::geometry::label_x;
+use crate::geometry::{label_x, stub_headroom};
 use crate::gestures::{self, GestureState};
 use crate::icons::icon_set;
 use crate::lod::detail_for;
@@ -30,9 +30,9 @@ use crate::prefs::{
     load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref,
 };
 use crate::render::{self, RenderCtx};
-use crate::state::{MenuData, Overlays, PendingOp, Settings};
+use crate::state::{CommitDialog, MenuData, Overlays, PendingOp, Settings};
 use crate::viewport::visible_row_range;
-use crate::{detail, dialogs, menu};
+use crate::{activity, detail, dialogs, menu};
 
 /// Extra rows rendered above and below the visible window so a fast pan doesn't
 /// flash a blank strip before the row `Memo` catches up (Phase 8).
@@ -62,6 +62,17 @@ pub fn App() -> impl IntoView {
         |_| async { fetch_head_branch().await.unwrap_or(None) },
     );
 
+    // The live working-tree status behind the topbar chip (Activity/Undo
+    // step 1): clean/dirty/conflicted at a glance, plus ahead/behind vs the
+    // upstream. Keyed on `reload` so Refresh — and every post-operation
+    // reload — re-reads it alongside the graph. A fetch failure resolves to
+    // `None`, which simply hides the chip: a broken status probe shouldn't
+    // take the topbar down with it.
+    let status = create_local_resource(
+        move || reload.get(),
+        |_| async { fetch_status().await.ok() },
+    );
+
     // Icon style (icons.rs): Nerd Font glyphs vs the plain-text fallback. A
     // signal so every icon in the app switches live when toggled; persisted in
     // localStorage so a device without a Nerd Font stays on text across loads.
@@ -81,6 +92,12 @@ pub fn App() -> impl IntoView {
         show_node_icons.set(on);
         store_node_icons_pref(on);
     };
+
+    // Whether the Activity panel is open (Activity/Undo feature). Lives here —
+    // not in graph_canvas — because its button sits in the topbar, which
+    // exists even while the graph is still loading; threaded into the
+    // overlays bundle inside graph_canvas.
+    let activity_open = create_rw_signal(false);
 
     // Phase 12 — "Open URL": clone a public repo and view it read-only. `open_url`
     // toggles the modal; `clone_url` holds the field; `cloning` disables the button
@@ -102,6 +119,41 @@ pub fn App() -> impl IntoView {
                     "git-vista"
                 </h1>
                 <span class="subtitle">"vertical git history — drag to pan, pinch or scroll to zoom"</span>
+                // The working-tree status chip: conflicts trump dirt trumps
+                // clean, so the chip always shows the most urgent truth about
+                // the tree. Ahead/behind use plain unicode arrows (not Nerd
+                // glyphs) so they render identically in both icon modes; the
+                // hover title carries the full breakdown.
+                {move || status.get().flatten().map(|s| {
+                    let ic = icon_set(nerd_icons.get());
+                    let (class, icon, label) = if !s.conflicted.is_empty() {
+                        ("status-chip conflict", ic.conflict,
+                         format!("{} conflicted", s.conflicted.len()))
+                    } else if !s.is_clean() {
+                        let n = s.change_count();
+                        ("status-chip dirty", ic.dirty,
+                         format!("{n} change{}", if n == 1 { "" } else { "s" }))
+                    } else {
+                        ("status-chip clean", ic.clean, "clean".to_string())
+                    };
+                    let mut sync = String::new();
+                    if s.ahead > 0 { sync.push_str(&format!(" ↑{}", s.ahead)); }
+                    if s.behind > 0 { sync.push_str(&format!(" ↓{}", s.behind)); }
+                    let title = format!(
+                        "{} staged · {} unstaged · {} untracked · {} conflicted{}",
+                        s.staged.len(), s.unstaged.len(), s.untracked.len(),
+                        s.conflicted.len(),
+                        s.upstream.as_deref()
+                            .map(|u| format!(" · vs {u}"))
+                            .unwrap_or_default(),
+                    );
+                    view! {
+                        <span class=class title=title>
+                            <span class="nf">{icon}</span>
+                            {format!(" {label}{sync}")}
+                        </span>
+                    }
+                })}
                 <button
                     class="refresh"
                     on:click=toggle_icons
@@ -127,6 +179,15 @@ pub fn App() -> impl IntoView {
                     title="Clone a public repository from a URL and view its history (read-only)"
                 >
                     "Open URL…"
+                </button>
+                <button
+                    class="refresh"
+                    on:click=move |_| activity_open.update(|open| *open = !*open)
+                    title="Everything that happened in this repo — commits, merges, \
+                           branch operations — with what was done through the app \
+                           marked, and undo where possible"
+                >
+                    "Activity"
                 </button>
                 <button
                     class="refresh"
@@ -174,7 +235,7 @@ pub fn App() -> impl IntoView {
                                         })}
                                     </p>
                                 })}
-                                {graph_canvas(g, reload, nerd_icons, show_node_icons)}
+                                {graph_canvas(g, reload, nerd_icons, show_node_icons, activity_open)}
                             }
                             .into_view()
                         }
@@ -200,6 +261,7 @@ fn graph_canvas(
     reload: RwSignal<u32>,
     nerd_icons: RwSignal<bool>,
     show_node_icons: RwSignal<bool>,
+    activity_open: RwSignal<bool>,
 ) -> impl IntoView {
     // Per-branch colour slot for each row, indexed by row number (rows are stored
     // in row order), so an edge can pick up its parent's branch colour.
@@ -235,10 +297,10 @@ fn graph_canvas(
     // The open context menu, if any (Issue #18). `None` => no menu. Set when a dot
     // is tapped (render::build_node), cleared on a pan/tap-elsewhere (pointerdown).
     let menu = create_rw_signal(None::<MenuData>);
-    // The open commit-message dialog, if any (Issue #33). `Some(allow_empty)` =>
-    // the modal is showing; the bool picks `--allow-empty` vs a staged commit.
+    // The open commit-message dialog, if any (Issue #33): which kind of commit
+    // (empty vs staged) and, for a branch stub, which branch it lands on.
     // A real in-app modal, not `window.prompt()`, which webviews block/flash.
-    let commit_dialog = create_rw_signal(None::<bool>);
+    let commit_dialog = create_rw_signal(None::<CommitDialog>);
     // The text currently typed into that dialog's message box.
     let commit_msg = create_rw_signal(String::new());
     // The branch operation awaiting confirmation, if any (Issue #33 follow-up).
@@ -265,6 +327,9 @@ fn graph_canvas(
     // point, so the ghost click hits the backdrop and closes the modal instantly.
     // The backdrop ignores a dismiss that lands within `DIALOG_GUARD_MS` of opening.
     let dialog_opened_at = store_value(0.0_f64);
+    // One-shot "scroll the Changes section into view" instruction, set by the
+    // menu's "Show diff" item and consumed by the detail panel's next render.
+    let scroll_diff = store_value(false);
 
     // Phase 8 (viewport virtualization): bundle the graph and its derived lookups
     // behind a `StoredValue` so the reactive per-row `<For>` closures below can
@@ -290,12 +355,18 @@ fn graph_canvas(
         commit_msg,
         confirm_op,
         detail_id,
+        activity_open,
+        scroll_diff,
         dialog_opened_at,
         reload,
     };
 
-    // Camera (pan/zoom) state.
-    let camera = create_rw_signal(Camera::default());
+    // Camera (pan/zoom) state. Its home position leaves headroom for any stub
+    // cascade overshooting the top of the canvas (a branch created on the
+    // newest commit tips *above* row 0), so new branches aren't born
+    // half-clipped and unreachable until the user thinks to pan up.
+    let home = Camera::home(ctx.with_value(|c| stub_headroom(&c.graph.stubs)));
+    let camera = create_rw_signal(home);
     // Whether any pointer is currently pressed (drives the grab/grabbing cursor).
     let dragging = create_rw_signal(false);
 
@@ -310,7 +381,7 @@ fn graph_canvas(
     // Window listeners (resize → viewport height; keydown → shortcuts), each
     // removed on cleanup so a graph reload doesn't stack duplicate handlers.
     gestures::install_resize_listener(vp_h);
-    gestures::install_key_listener(camera, reload, overlays);
+    gestures::install_key_listener(camera, home, reload, overlays);
     let visible =
         create_memo(move |_| visible_row_range(camera.get(), vp_h.get(), row_count, OVERSCAN_ROWS));
 
@@ -415,7 +486,7 @@ fn graph_canvas(
         <button
             class="reset-view"
             title="Reset pan & zoom (keyboard: 0)"
-            on:click=move |_| camera.set(Camera::default())
+            on:click=move |_| camera.set(home)
         >
             "Reset view"
         </button>
@@ -428,6 +499,7 @@ fn graph_canvas(
             {dialogs::commit_dialog_view(overlays)}
             {dialogs::confirm_modal_view(overlays)}
             {detail::detail_panel_view(overlays, settings, detail, ctx)}
+            {activity::activity_panel_view(overlays, settings)}
         </div>
     }
 }
