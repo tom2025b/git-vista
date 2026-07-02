@@ -34,6 +34,7 @@ use crate::geometry::{
     label_x, node_cx, node_cy, stub_node_cy, stub_path, BADGE_GAP, BADGE_HEIGHT, BADGE_RADIUS,
     NODE_RADIUS,
 };
+use crate::icons::icon_set;
 use crate::lod::detail_for;
 use crate::text::truncate;
 use crate::viewport::visible_row_range;
@@ -78,6 +79,10 @@ struct MenuData {
     /// (Issue #33 follow-up). Empty => the target carries no branch, so no branch
     /// operations are shown.
     branches: Vec<String>,
+    /// True when the menu belongs to a branch stub rather than a commit dot —
+    /// picks the branch icon (vs the commit icon) for the menu header, so the
+    /// header's glyph matches what the header names.
+    is_branch: bool,
 }
 
 /// A branch operation awaiting confirmation in the modal (Issue #33 follow-up).
@@ -139,6 +144,46 @@ fn window_inner_height() -> f64 {
         .and_then(|w| w.inner_height().ok())
         .and_then(|v| v.as_f64())
         .unwrap_or(800.0)
+}
+
+/// localStorage key for the icon-style preference: "nerd" (glyphs) or "text".
+const ICON_PREF_KEY: &str = "git-vista.icons";
+
+/// Load the persisted icon preference. Defaults to Nerd Font glyphs; "text"
+/// selects the plain-text fallback (crate::icons::TEXT_ICONS) for devices with
+/// no Nerd Font installed — e.g. an iPad, where only system fonts exist and a
+/// PUA glyph renders as tofu.
+fn load_icon_pref() -> bool {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(ICON_PREF_KEY).ok().flatten())
+        .map_or(true, |v| v != "text")
+}
+
+/// Persist the icon preference. Best-effort: private browsing may refuse the
+/// write, in which case the toggle still works for this session.
+fn store_icon_pref(nerd: bool) {
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = s.set_item(ICON_PREF_KEY, if nerd { "nerd" } else { "text" });
+    }
+}
+
+/// localStorage key for the per-node icons preference: "on" (default) or "off".
+const NODE_ICONS_KEY: &str = "git-vista.node-icons";
+
+/// Load the persisted "icons beside the commit dots" preference (default on).
+fn load_node_icons_pref() -> bool {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(NODE_ICONS_KEY).ok().flatten())
+        .map_or(true, |v| v != "off")
+}
+
+/// Persist the per-node icons preference. Best-effort, like the icon style.
+fn store_node_icons_pref(on: bool) {
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = s.set_item(NODE_ICONS_KEY, if on { "on" } else { "off" });
+    }
 }
 
 /// Indices of edges whose row span intersects the visible row window `[start,
@@ -316,6 +361,37 @@ pub fn App() -> impl IntoView {
     let graph = create_local_resource(move || reload.get(), |_| fetch_graph());
     let refresh = move |_| reload.update(|n| *n = n.wrapping_add(1));
 
+    // The checked-out branch, shown next to the repo name in the status line.
+    // Fetched from the same endpoint the merge/delete confirmations use — not
+    // inferred from the graph's badges, where several branches on the HEAD
+    // commit would make "which one is checked out?" a guess. Keyed on `reload`
+    // so Refresh (or any post-operation reload) re-reads it too. `None`/pending
+    // => the branch chip is simply omitted (detached HEAD, or still loading).
+    let head_branch = create_local_resource(
+        move || reload.get(),
+        |_| async { fetch_head_branch().await.unwrap_or(None) },
+    );
+
+    // Icon style (icons.rs): Nerd Font glyphs vs the plain-text fallback. A
+    // signal so every icon in the app switches live when toggled; persisted in
+    // localStorage so a device without a Nerd Font stays on text across loads.
+    let nerd_icons = create_rw_signal(load_icon_pref());
+    let toggle_icons = move |_| {
+        let nerd = !nerd_icons.get_untracked();
+        nerd_icons.set(nerd);
+        store_icon_pref(nerd);
+    };
+
+    // Whether the per-node icons (the glyph beside each commit dot) are shown.
+    // Always-on by default; the topbar toggle hides them for anyone who prefers
+    // bare dots. Persisted like the icon style.
+    let show_node_icons = create_rw_signal(load_node_icons_pref());
+    let toggle_node_icons = move |_| {
+        let on = !show_node_icons.get_untracked();
+        show_node_icons.set(on);
+        store_node_icons_pref(on);
+    };
+
     // Phase 12 — "Open URL": clone a public repo and view it read-only. `open_url`
     // toggles the modal; `clone_url` holds the field; `cloning` disables the button
     // while git works so a slow clone can't be fired twice. `open_opened_at` guards
@@ -352,8 +428,28 @@ pub fn App() -> impl IntoView {
     view! {
         <main class="app">
             <header class="topbar">
-                <h1>"git-vista"</h1>
+                // The git mark brands the title (icons.rs). Reactive so the
+                // topbar switches with the icon-style toggle like everything else.
+                <h1>
+                    <span class="nf app-icon">{move || icon_set(nerd_icons.get()).git}</span>
+                    "git-vista"
+                </h1>
                 <span class="subtitle">"vertical git history — drag to pan, pinch or scroll to zoom"</span>
+                <button
+                    class="refresh"
+                    on:click=toggle_icons
+                    title="Switch between Nerd Font glyph icons and plain-text icons \
+                           (use text on devices without a Nerd Font installed)"
+                >
+                    {move || if nerd_icons.get() { "Icons: glyphs" } else { "Icons: text" }}
+                </button>
+                <button
+                    class="refresh"
+                    on:click=toggle_node_icons
+                    title="Show or hide the small icons beside each commit dot"
+                >
+                    {move || if show_node_icons.get() { "Dot icons: on" } else { "Dot icons: off" }}
+                </button>
                 <button
                     class="refresh"
                     on:click=move |_| {
@@ -431,24 +527,45 @@ pub fn App() -> impl IntoView {
                 </div>
             })}
             <section class="graph">
-                {move || match graph.get() {
-                    None => view! { <p class="status">"Loading history…"</p> }.into_view(),
-                    Some(Err(e)) => view! {
-                        <p class="status error">{format!("Failed to load history: {e}")}</p>
-                    }
-                    .into_view(),
-                    Some(Ok(g)) => {
-                        // Show which repo this page is actually displaying, straight
-                        // from the API response. If it disagrees with the terminal,
-                        // the browser is pointed at a stale server/tab — now visible.
-                        let repo = g.repo_label.clone();
-                        view! {
-                            {repo.map(|r| view! {
-                                <p class="status repo">{format!("repository: {r}")}</p>
-                            })}
-                            {graph_canvas(g, reload)}
+                {move || {
+                    // Read the icon set here, inside the reactive block, so the
+                    // status lines re-render when the icon style is toggled.
+                    let ic = icon_set(nerd_icons.get());
+                    match graph.get() {
+                        None => view! { <p class="status">"Loading history…"</p> }.into_view(),
+                        // The conflict/warning glyph flags the failure at a glance.
+                        Some(Err(e)) => view! {
+                            <p class="status error">
+                                <span class="nf">{ic.conflict}</span>
+                                {format!(" Failed to load history: {e}")}
+                            </p>
                         }
-                        .into_view()
+                        .into_view(),
+                        Some(Ok(g)) => {
+                            // Show which repo this page is actually displaying, straight
+                            // from the API response. If it disagrees with the terminal,
+                            // the browser is pointed at a stale server/tab — now visible.
+                            let repo = g.repo_label.clone();
+                            view! {
+                                // Repo glyph + name, then branch glyph + checked-out
+                                // branch — the icons carry what the old "repository:"
+                                // prefix used to spell out.
+                                {repo.map(|r| view! {
+                                    <p class="status repo">
+                                        <span class="nf ic-repo">{ic.repository}</span>
+                                        {format!(" {r}")}
+                                        {head_branch.get().flatten().map(|b| view! {
+                                            <span class="repo-branch">
+                                                <span class="nf ic-branch">{ic.branch}</span>
+                                                {format!(" {b}")}
+                                            </span>
+                                        })}
+                                    </p>
+                                })}
+                                {graph_canvas(g, reload, nerd_icons, show_node_icons)}
+                            }
+                            .into_view()
+                        }
                     }
                 }}
             </section>
@@ -459,7 +576,14 @@ pub fn App() -> impl IntoView {
 /// Render a loaded [`Graph`] as a pan/zoomable SVG canvas. `reload` is the App's
 /// fetch counter, bumped after a successful branch creation so the new branch
 /// shows without a full reload (Issue #18, reusing the Issue #16 refresh path).
-fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
+/// `nerd_icons` picks the icon set (icons.rs) for the badges, labels and menus;
+/// `show_node_icons` shows/hides the glyph beside each commit dot.
+fn graph_canvas(
+    graph: Graph,
+    reload: RwSignal<u32>,
+    nerd_icons: RwSignal<bool>,
+    show_node_icons: RwSignal<bool>,
+) -> impl IntoView {
     // Per-branch colour slot for each row, indexed by row number (rows are stored
     // in row order), so an edge can pick up its parent's branch colour.
     let row_color: Vec<usize> = graph.rows.iter().map(|gr| gr.color).collect();
@@ -627,6 +751,8 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     create_label: "Create branch from this commit",
                     is_head,
                     branches: branches.clone(),
+                    // A commit dot: the menu header shows the commit glyph.
+                    is_branch: false,
                 }));
             };
 
@@ -659,6 +785,62 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
         })
     };
 
+    // Per-node icons: a small glyph just left of each commit dot, in the dot's
+    // own branch colour — the merge glyph for merges, the commit glyph
+    // otherwise. A separate builder (not part of build_node) so the icons live
+    // in their own <g>, shown/hidden as one layer by the "Dot icons" toggle
+    // without touching the dots themselves.
+    let build_node_icon = move |i: usize| -> View {
+        ctx.with_value(|c| {
+            // Untracked read, same as the other builders: the <For> keys carry
+            // the icon mode, so a toggle rebuilds the rows.
+            let ic = icon_set(nerd_icons.get_untracked());
+            let gr = &c.graph.rows[i];
+            let icon = if gr.commit.parents.len() > 1 { ic.merge } else { ic.commit };
+            view! {
+                <text
+                    x=node_cx(gr.lane) - NODE_RADIUS - 5
+                    y=node_cy(gr.row) + 4
+                    text-anchor="end"
+                    class="nf node-icon"
+                    fill=branch_color(gr.color)
+                >
+                    {icon}
+                </text>
+            }
+            .into_view()
+        })
+    };
+
+    // Stub tips get the branch glyph beside their hollow ring, in the same
+    // toggleable layer. Stubs are few and eager (see `stubs` below), so this is
+    // a plain reactive closure — reading the icon signal re-renders on toggle.
+    let stub_icons = move || {
+        let ic = icon_set(nerd_icons.get());
+        ctx.with_value(|c| {
+            c.graph
+                .stubs
+                .iter()
+                .map(|s| {
+                    // Same colour rule as the stub's own line/ring (Issue #30).
+                    let anchor_slot = c.graph.rows[s.anchor_row].color;
+                    let color = branch_color_distinct_from(s.color, anchor_slot);
+                    view! {
+                        <text
+                            x=node_cx(s.lane) - NODE_RADIUS - 5
+                            y=stub_node_cy(s.anchor_row, s.depth) + 4
+                            text-anchor="end"
+                            class="nf node-icon"
+                            fill=color
+                        >
+                            {ic.branch}
+                        </text>
+                    }
+                })
+                .collect_view()
+        })
+    };
+
     // Commit labels: a fixed text column to the right of the lanes, two lines per
     // row — any ref badges then the (truncated) message on top, the short hash and
     // author dimmed below. The full message stays available on hover.
@@ -673,8 +855,14 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
     // then the (truncated, linkable) commit message just past them.
     let build_msg = move |i: usize| -> View {
         ctx.with_value(|c| {
+            // Untracked read, same as build_node: the <For> keys carry the icon
+            // mode, so a toggle rebuilds the rows.
+            let ic = icon_set(nerd_icons.get_untracked());
             let gr = &c.graph.rows[i];
             let mut bx = c.text_x;
+            // The row's branch colour — the label column takes the colour of the
+            // dot it describes, so a row reads as one unit across the canvas.
+            let row_color = branch_color(gr.color);
             // Is this row's commit on the remote? Drives whether its message, HEAD
             // badge and tag badges link out (an unpushed commit would 404).
             let commit_on_remote = c.remote_set.contains(&gr.commit.id.0);
@@ -682,7 +870,19 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 .refs
                 .iter()
                 .map(|r| {
-                    let w = badge_width(&r.name);
+                    // Each badge leads with its kind's glyph (icons.rs): local
+                    // branches get the branch icon, remote branches the alternate
+                    // one — so local vs remote pills differ at a glance even
+                    // before reading the name — tags the tag icon, and HEAD the
+                    // commit icon (it marks the commit you're on). The glyph
+                    // counts into the pill's width like any other monospace char.
+                    let icon = match r.kind {
+                        RefKind::Head => ic.commit,
+                        RefKind::Tag => ic.tag,
+                        RefKind::Branch => ic.branch,
+                        RefKind::RemoteBranch => ic.branch_alt,
+                    };
+                    let w = badge_width(&format!("{icon} {}", r.name));
                     let x = bx;
                     bx += w + BADGE_GAP;
                     // Branch badges take their branch's colour (filled for local,
@@ -743,7 +943,11 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                             class:unpushed=unpushed
                             fill=text_fill
                         >
-                            {name}
+                            // The kind glyph, then the name. The tspan only swaps
+                            // the font stack (.nf); it inherits the pill's text fill,
+                            // so the icon never fights the badge colour.
+                            <tspan class="nf">{icon}</tspan>
+                            {format!(" {name}")}
                         </text>
                     };
                     // Wrap in a real SVG anchor when this repo has a GitHub base.
@@ -786,6 +990,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     class="label-msg"
                     class:clickable=msg_clickable
                     class:unpushed=msg_unpushed
+                    fill=row_color
                 >
                     {msg}
                     <title>{title}</title>
@@ -817,15 +1022,28 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
     // recompute the badges.
     let build_meta = move |i: usize| -> View {
         ctx.with_value(|c| {
+            // Untracked read, same as build_node: the <For> keys carry the icon
+            // mode, so a toggle rebuilds the rows.
+            let ic = icon_set(nerd_icons.get_untracked());
             let gr = &c.graph.rows[i];
             let meta = format!(
-                "{} · {} · {}",
+                " {} · {} · {}",
                 gr.commit.id.short(),
                 gr.commit.author,
                 local_timestamp(gr.commit.time),
             );
             view! {
-                <text x=c.text_x y=label_bottom_y(gr.row) class="label-meta">
+                // The commit glyph leads the meta line, marking each entry of the
+                // "commit list" tier. Like the message, the line takes its row's
+                // branch colour (the glyph inherits it), faded to stay secondary
+                // (see .label-meta's opacity).
+                <text
+                    x=c.text_x
+                    y=label_bottom_y(gr.row)
+                    class="label-meta"
+                    fill=branch_color(gr.color)
+                >
+                    <tspan class="nf">{ic.commit}</tspan>
                     {meta}
                 </text>
             }
@@ -891,6 +1109,8 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     is_head: false,
                     // The stub *is* one branch, so its ops act on that single name.
                     branches: vec![branch_name.clone()],
+                    // …and its menu header shows the branch glyph, not the commit's.
+                    is_branch: true,
                 }));
             };
             view! {
@@ -1160,6 +1380,9 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
     // click, rendered outside the SVG so it never pans/zooms and isn't clipped.
     let menu_view = move || {
         menu.get().map(|m| {
+            // Tracked read: the menu lives inside the overlays' reactive block,
+            // so it re-renders live if the icon style is toggled while open.
+            let ic = icon_set(nerd_icons.get());
             let label = m.github_label;
             let open_github = match m.github_url.clone() {
                 // Live link: a real anchor, opening GitHub in a new tab. Tapping it
@@ -1172,6 +1395,8 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                         rel="noopener"
                         on:click=move |_| menu.set(None)
                     >
+                        // The GitHub mark flags the one item that leaves the app.
+                        <span class="nf ctx-icon">{ic.github}</span>
                         {label}
                     </a>
                 }
@@ -1183,6 +1408,7 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                         class="ctx-item disabled"
                         title="No GitHub page (no github.com remote, or it isn't pushed)"
                     >
+                        <span class="nf ctx-icon">{ic.github}</span>
                         {label}
                     </span>
                 }
@@ -1197,8 +1423,13 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 detail_id.set(Some(detail_commit.clone()));
                 menu.set(None);
             };
-            let details_item =
-                view! { <button class="ctx-item" on:click=on_details>"View details"</button> };
+            // "View details" opens a commit's detail panel — the commit glyph.
+            let details_item = view! {
+                <button class="ctx-item" on:click=on_details>
+                    <span class="nf ctx-icon">{ic.commit}</span>
+                    "View details"
+                </button>
+            };
             // "Create branch from this commit": prompt for a name, POST it, then
             // refresh the graph on success or show git's error on failure (B3).
             let commit = m.commit.clone();
@@ -1234,13 +1465,19 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             // HEAD tip (the only place a commit can land without moving HEAD);
             // elsewhere they render disabled with a reason.
             let is_head = m.is_head;
-            let make_commit_item = move |label: &'static str, allow_empty: bool| {
+            // `icon` distinguishes the two variants: the staged-changes commit
+            // gets the diff-added glyph (it records staged additions), the empty
+            // commit the plain commit glyph.
+            let make_commit_item = move |icon: &'static str,
+                                         label: &'static str,
+                                         allow_empty: bool| {
                 if !is_head {
                     return view! {
                         <span
                             class="ctx-item disabled"
                             title="Only available on the current HEAD commit"
                         >
+                            <span class="nf ctx-icon">{icon}</span>
                             {label}
                         </span>
                     }
@@ -1255,10 +1492,16 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                     commit_dialog.set(Some(allow_empty));
                     menu.set(None);
                 };
-                view! { <button class="ctx-item" on:click=on_commit>{label}</button> }.into_view()
+                view! {
+                    <button class="ctx-item" on:click=on_commit>
+                        <span class="nf ctx-icon">{icon}</span>
+                        {label}
+                    </button>
+                }
+                .into_view()
             };
-            let commit_staged = make_commit_item("Commit staged changes", false);
-            let commit_empty = make_commit_item("Create empty commit", true);
+            let commit_staged = make_commit_item(ic.added, "Commit staged changes", false);
+            let commit_empty = make_commit_item(ic.commit, "Create empty commit", true);
             // The branch operations (Issue #33 follow-up): merge / push / delete, one
             // set per local branch living at this target. Each opens the confirm modal
             // rather than acting immediately — the actual POST + refresh happens there.
@@ -1288,6 +1531,8 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                         };
                         view! {
                             <button class="ctx-item" on:click=on>
+                                // The merge glyph, matching the merge-dot marker.
+                                <span class="nf ctx-icon">{ic.merge}</span>
                                 {format!("Merge ‘{b}’ into current branch")}
                             </button>
                         }
@@ -1301,8 +1546,14 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                             confirm_op.set(Some(PendingOp::Push { branch: branch.clone() }));
                             menu.set(None);
                         };
-                        view! { <button class="ctx-item" on:click=on>{format!("Push ‘{b}’")}</button> }
-                            .into_view()
+                        view! {
+                            <button class="ctx-item" on:click=on>
+                                // Push updates the *remote* branch — its glyph.
+                                <span class="nf ctx-icon">{ic.branch_alt}</span>
+                                {format!("Push ‘{b}’")}
+                            </button>
+                        }
+                        .into_view()
                     };
                     // Delete: like merge, the "is this the checked-out branch?" test is
                     // resolved live on click, not from the possibly-stale graph. The
@@ -1321,7 +1572,11 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                             });
                         };
                         view! {
-                            <button class="ctx-item danger" on:click=on>{format!("Delete ‘{b}’")}</button>
+                            <button class="ctx-item danger" on:click=on>
+                                // The diff-removed glyph, inheriting the item's red.
+                                <span class="nf ctx-icon">{ic.deleted}</span>
+                                {format!("Delete ‘{b}’")}
+                            </button>
                         }
                         .into_view()
                     };
@@ -1334,6 +1589,8 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             let write_items = (!read_only).then(|| {
                 view! {
                     <button class="ctx-item" on:click=on_branch>
+                        // Creating a branch — the branch glyph.
+                        <span class="nf ctx-icon">{ic.branch}</span>
                         {create_label}
                     </button>
                     {commit_staged}
@@ -1343,7 +1600,14 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             });
             view! {
                 <div class="ctx-menu" style=format!("left: {}px; top: {}px;", m.x, m.y)>
-                    <div class="ctx-menu-header">{m.header.clone()}</div>
+                    // Header glyph matches what the header names: a branch for a
+                    // stub, a commit hash for a dot.
+                    <div class="ctx-menu-header">
+                        <span class="nf ctx-icon">
+                            {if m.is_branch { ic.branch } else { ic.commit }}
+                        </span>
+                        {m.header.clone()}
+                    </div>
                     {details_item}
                     {open_github}
                     {write_items}
@@ -1586,6 +1850,9 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
     // hash re-points the panel at that parent, so you can walk up the history.
     let detail_panel_view = move || {
         detail_id.get().map(|open_id| {
+            // Tracked read, like the menu: the panel re-renders live if the icon
+            // style is toggled while it's open.
+            let ic = icon_set(nerd_icons.get());
             let body = move || {
                 // While the fetch is in flight `get()` is `None`; a stale value from
                 // the previously-viewed commit is also treated as loading, so the
@@ -1656,6 +1923,8 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                         let github_row = match github {
                             Some(url) => view! {
                                 <a class="detail-github" href=url target="_blank" rel="noopener">
+                                    // Same GitHub mark as the menu's external link.
+                                    <span class="nf ctx-icon">{ic.github}</span>
                                     "Open on GitHub"
                                 </a>
                             }
@@ -1691,7 +1960,11 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
             view! {
                 <aside class="detail-panel">
                     <div class="detail-head">
-                        <span class="detail-title">"Commit details"</span>
+                        // The commit glyph titles the panel — it's one commit's view.
+                        <span class="detail-title">
+                            <span class="nf ctx-icon">{ic.commit}</span>
+                            "Commit details"
+                        </span>
                         <button
                             class="detail-close"
                             title="Close"
@@ -1741,17 +2014,42 @@ fn graph_canvas(graph: Graph, reload: RwSignal<u32>) -> impl IntoView {
                 // text would just be an unreadable smear.
                 <g class:lod-hidden=move || !detail_for(camera.get().scale).shows_message()>
                     <For
-                        each=move || { let (s, e) = visible.get(); (s..e).collect::<Vec<usize>>() }
-                        key=|i| *i
-                        children=move |i| build_msg(i)
+                        each=move || {
+                            let (s, e) = visible.get();
+                            let nerd = nerd_icons.get();
+                            (s..e).map(|i| (i, nerd)).collect::<Vec<_>>()
+                        }
+                        key=|k| *k
+                        children=move |(i, _)| build_msg(i)
                     />
                 </g>
                 <g class:lod-hidden=move || !detail_for(camera.get().scale).shows_meta()>
                     <For
-                        each=move || { let (s, e) = visible.get(); (s..e).collect::<Vec<usize>>() }
-                        key=|i| *i
-                        children=move |i| build_meta(i)
+                        each=move || {
+                            let (s, e) = visible.get();
+                            let nerd = nerd_icons.get();
+                            (s..e).map(|i| (i, nerd)).collect::<Vec<_>>()
+                        }
+                        key=|k| *k
+                        children=move |(i, _)| build_meta(i)
                     />
+                </g>
+                // The per-node icons: one layer holding the glyph beside every
+                // dot and stub ring, always on unless the user hides it via the
+                // topbar "Dot icons" toggle (unlike the label tiers above, this
+                // is a preference, not a zoom level). Same virtualization and
+                // keying as the label tiers.
+                <g class:lod-hidden=move || !show_node_icons.get()>
+                    <For
+                        each=move || {
+                            let (s, e) = visible.get();
+                            let nerd = nerd_icons.get();
+                            (s..e).map(|i| (i, nerd)).collect::<Vec<_>>()
+                        }
+                        key=|k| *k
+                        children=move |(i, _)| build_node_icon(i)
+                    />
+                    {stub_icons}
                 </g>
                 {stubs}
             </g>

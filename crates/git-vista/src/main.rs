@@ -16,6 +16,8 @@ mod datetime;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod geometry;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+mod icons;
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod lod;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod text;
