@@ -14,7 +14,7 @@ use git_vista_core::activity::UndoAction;
 
 use crate::api::{create_branch_request, fetch_head_branch, fetch_undoables};
 use crate::icons::icon_set;
-use crate::state::{Overlays, PendingOp, Settings};
+use crate::state::{CommitDialog, Overlays, PendingOp, Settings};
 
 /// The context menu overlay (Issue #18): a plain HTML pop-up positioned at the
 /// click, rendered outside the SVG so it never pans/zooms and isn't clipped.
@@ -39,8 +39,11 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
     // closed menu → no fetch. Arrives async: the menu renders immediately and
     // grows an undo section when (and only when) actions exist. Errors are
     // deliberately swallowed — a menu that can't offer undo is still a menu.
+    // Not fetched for a branch stub: its `commit` is the anchor commit the
+    // empty branch merely points at, so the anchor's undo actions ("reset
+    // ‘main’ …") belong to other branches, not the one that was tapped.
     let undoables = create_local_resource(
-        move || (menu.get().map(|m| m.commit), reload.get()),
+        move || (menu.get().filter(|m| !m.is_branch).map(|m| m.commit), reload.get()),
         |(commit, _)| async move {
             match commit {
                 Some(c) => fetch_undoables(&c).await.unwrap_or_default(),
@@ -157,22 +160,36 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             let create_label = m.create_label;
             // The two "Commit …" items (Issue #33). Clicking one closes the menu
             // and opens the commit-message modal (below); the actual POST + refresh
-            // happens when the user confirms there. They're enabled only on the
-            // HEAD tip (the only place a commit can land without moving HEAD);
-            // elsewhere they render disabled with a reason.
+            // happens when the user confirms there.
+            //
+            // On a commit dot they're enabled only on the HEAD tip — the one place
+            // a plain `git commit` lands where the user clicked. On a branch stub,
+            // "Create empty commit" is enabled too and targets the stub's own
+            // branch (the server writes the commit object and moves just that ref,
+            // no checkout needed) — it's exactly how an empty new branch takes its
+            // first commit. Staged changes belong to the checked-out branch's
+            // index, so that item stays HEAD-only everywhere. Anything else
+            // renders disabled with the reason in its hover title.
             let is_head = m.is_head;
+            let is_stub = m.is_branch;
+            // A stub carries exactly its own branch name (see `MenuData::branches`).
+            let stub_branch = is_stub.then(|| m.branches.first().cloned()).flatten();
             // `icon` distinguishes the two variants: the staged-changes commit
             // gets the diff-added glyph (it records staged additions), the empty
             // commit the plain commit glyph.
             let make_commit_item = move |icon: &'static str,
                                          label: &'static str,
                                          allow_empty: bool| {
-                if !is_head {
+                let stub_branch = stub_branch.clone();
+                let enabled = is_head || (allow_empty && stub_branch.is_some());
+                if !enabled {
+                    let reason = if is_stub {
+                        "Staged changes can only be committed on the checked-out branch"
+                    } else {
+                        "Only available on the current HEAD commit"
+                    };
                     return view! {
-                        <span
-                            class="ctx-item disabled"
-                            title="Only available on the current HEAD commit"
-                        >
+                        <span class="ctx-item disabled" title=reason>
                             <span class="nf ctx-icon">{icon}</span>
                             {label}
                         </span>
@@ -185,7 +202,10 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     // any signal write after it is unreliable. Set the dialog first.
                     commit_msg.set(String::new());
                     dialog_opened_at.set_value(js_sys::Date::now());
-                    commit_dialog.set(Some(allow_empty));
+                    commit_dialog.set(Some(CommitDialog {
+                        allow_empty,
+                        branch: stub_branch.clone(),
+                    }));
                     menu.set(None);
                 };
                 view! {
@@ -312,7 +332,10 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             // on click, then open the confirm modal, which decides whether it's
             // actionable (a detached HEAD has no branch to rebase). Set `confirm_op`
             // before the menu closes — same reactive-owner ordering caveat as above.
-            let rebase_item = {
+            // Omitted on a branch stub: a zero-commit branch has nothing to replay,
+            // and the item would silently target the checked-out branch instead
+            // ("Rebase ‘main’ onto main?" from the stub's own menu).
+            let rebase_item = (!m.is_branch).then(|| {
                 let on = move |_| {
                     menu.set(None);
                     spawn_local(async move {
@@ -328,7 +351,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         "Rebase onto main"
                     </button>
                 }
-            };
+            });
             // The undo section (step 5): one item per action `/api/undoables`
             // returned for this commit — reset-style undos when its result is
             // still a branch tip, a restore when it's a deleted branch's lost

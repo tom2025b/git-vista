@@ -8,7 +8,7 @@
 //!
 //! All values are whole numbers so the emitted SVG attributes stay clean.
 
-use git_vista_core::model::Edge;
+use git_vista_core::model::{BranchStub, Edge};
 
 // Geometry of the graph, in SVG user units (px).
 pub const ROW_HEIGHT: i32 = 56; // vertical gap between commits
@@ -110,6 +110,25 @@ pub fn stub_node_cy(anchor_row: usize, depth: usize) -> i32 {
     node_cy(anchor_row) - (depth as i32 + 1) * (ROW_HEIGHT / 2)
 }
 
+/// Extra vertical margin kept above the highest stub ring at the home view, so
+/// the ring doesn't kiss the canvas edge.
+const STUB_TOP_MARGIN: i32 = 6;
+
+/// How far (world px) the home camera must shift the graph down so every stub
+/// ring is fully visible. Stubs cascade *upward* off their anchor commit, so a
+/// branch created on the newest commit (row 0) tips above `y = 0` — born
+/// half-clipped at the default view, invisible until the user pans. Returns the
+/// overshoot of the highest ring past the top edge (plus a small margin), or
+/// zero when nothing reaches above the canvas.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn stub_headroom(stubs: &[BranchStub]) -> f64 {
+    stubs
+        .iter()
+        .map(|s| stub_node_cy(s.anchor_row, s.depth) - NODE_RADIUS - STUB_TOP_MARGIN)
+        .min()
+        .map_or(0.0, |top| (-top).max(0) as f64)
+}
+
 /// SVG path up-and-out to a branch stub's tip node — a smooth S-curve, like a
 /// branch edge, so the stub flows out of its source rather than cutting to it. The
 /// source is the anchor commit for the first stub in a cascade (`depth` 0), or the
@@ -160,6 +179,28 @@ mod tests {
         // Pills sit on the top label line, above the hash·author line.
         assert!(badge_top_y(2) < label_top_y(2));
         assert!(badge_text_y(2) < label_bottom_y(2));
+    }
+
+    #[test]
+    fn headroom_covers_only_stubs_that_overshoot_the_top() {
+        let stub = |anchor_row: usize, depth: usize| BranchStub {
+            name: String::new(),
+            anchor_row,
+            anchor_lane: 0,
+            lane: 3,
+            color: 3,
+            depth,
+        };
+        // No stubs — no headroom.
+        assert_eq!(stub_headroom(&[]), 0.0);
+        // A stub deep in the graph stays fully on canvas: still none.
+        assert_eq!(stub_headroom(&[stub(10, 0)]), 0.0);
+        // A depth-1 stub on row 0 tips at y = PAD_Y - ROW_HEIGHT = -28; the home
+        // view must shift down past its ring top (tip - radius - margin = -41).
+        let need = stub_headroom(&[stub(0, 0), stub(0, 1)]);
+        assert_eq!(need, (ROW_HEIGHT - PAD_Y + NODE_RADIUS + 6) as f64);
+        // The deepest overshoot wins when cascades mix.
+        assert_eq!(stub_headroom(&[stub(10, 0), stub(0, 1)]), need);
     }
 
     #[test]
