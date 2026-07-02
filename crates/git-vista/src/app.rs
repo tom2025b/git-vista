@@ -20,7 +20,7 @@ use leptos::*;
 
 use git_vista_core::model::{Graph, RefKind};
 
-use crate::api::{fetch_commit_detail, fetch_graph, fetch_head_branch};
+use crate::api::{fetch_commit_detail, fetch_graph, fetch_head_branch, fetch_status};
 use crate::camera::Camera;
 use crate::geometry::label_x;
 use crate::gestures::{self, GestureState};
@@ -60,6 +60,17 @@ pub fn App() -> impl IntoView {
     let head_branch = create_local_resource(
         move || reload.get(),
         |_| async { fetch_head_branch().await.unwrap_or(None) },
+    );
+
+    // The live working-tree status behind the topbar chip (Activity/Undo
+    // step 1): clean/dirty/conflicted at a glance, plus ahead/behind vs the
+    // upstream. Keyed on `reload` so Refresh — and every post-operation
+    // reload — re-reads it alongside the graph. A fetch failure resolves to
+    // `None`, which simply hides the chip: a broken status probe shouldn't
+    // take the topbar down with it.
+    let status = create_local_resource(
+        move || reload.get(),
+        |_| async { fetch_status().await.ok() },
     );
 
     // Icon style (icons.rs): Nerd Font glyphs vs the plain-text fallback. A
@@ -102,6 +113,41 @@ pub fn App() -> impl IntoView {
                     "git-vista"
                 </h1>
                 <span class="subtitle">"vertical git history — drag to pan, pinch or scroll to zoom"</span>
+                // The working-tree status chip: conflicts trump dirt trumps
+                // clean, so the chip always shows the most urgent truth about
+                // the tree. Ahead/behind use plain unicode arrows (not Nerd
+                // glyphs) so they render identically in both icon modes; the
+                // hover title carries the full breakdown.
+                {move || status.get().flatten().map(|s| {
+                    let ic = icon_set(nerd_icons.get());
+                    let (class, icon, label) = if !s.conflicted.is_empty() {
+                        ("status-chip conflict", ic.conflict,
+                         format!("{} conflicted", s.conflicted.len()))
+                    } else if !s.is_clean() {
+                        let n = s.change_count();
+                        ("status-chip dirty", ic.dirty,
+                         format!("{n} change{}", if n == 1 { "" } else { "s" }))
+                    } else {
+                        ("status-chip clean", ic.clean, "clean".to_string())
+                    };
+                    let mut sync = String::new();
+                    if s.ahead > 0 { sync.push_str(&format!(" ↑{}", s.ahead)); }
+                    if s.behind > 0 { sync.push_str(&format!(" ↓{}", s.behind)); }
+                    let title = format!(
+                        "{} staged · {} unstaged · {} untracked · {} conflicted{}",
+                        s.staged.len(), s.unstaged.len(), s.untracked.len(),
+                        s.conflicted.len(),
+                        s.upstream.as_deref()
+                            .map(|u| format!(" · vs {u}"))
+                            .unwrap_or_default(),
+                    );
+                    view! {
+                        <span class=class title=title>
+                            <span class="nf">{icon}</span>
+                            {format!(" {label}{sync}")}
+                        </span>
+                    }
+                })}
                 <button
                     class="refresh"
                     on:click=toggle_icons

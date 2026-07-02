@@ -59,6 +59,23 @@ html, body {
 .refresh:hover { border-color: var(--accent); }
 .refresh:active { background: #30363d; }
 
+/* The live working-tree status chip (Activity/Undo step 1): a small pill by
+   the subtitle — green check when clean, yellow with a change count when
+   dirty, red when conflicted — plus ↑ahead ↓behind vs the upstream. Refreshed
+   with the graph via the shared reload counter; hidden entirely if the status
+   probe fails. */
+.status-chip {
+  align-self: center;
+  padding: 0.15rem 0.6rem;
+  font-size: 0.8rem;
+  border: 1px solid #30363d;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.status-chip.clean { color: #3fb950; border-color: #238636; }
+.status-chip.dirty { color: #d29922; border-color: #9e6a03; }
+.status-chip.conflict { color: #f85149; border-color: #da3633; }
+
 .graph { flex: 1; overflow: hidden; }
 .placeholder { color: var(--muted); }
 
