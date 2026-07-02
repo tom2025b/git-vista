@@ -179,6 +179,10 @@ async fn main() {
         // Activity/Undo feature, step 3: the chronological event feed —
         // journal + reflogs + snapshot diffs, folded and attributed.
         .route("/api/activity", get(activity::activity_feed))
+        // Activity/Undo feature, step 5: the undo actions for one commit,
+        // computed live; and the endpoint that executes one of them.
+        .route("/api/undoables/{id}", get(activity::undoables))
+        .route("/api/undo", post(activity::undo))
         // Issue #33 follow-up: branch operations, each shelling out to git.
         .route("/api/merge", post(merge_branch))
         .route("/api/push", post(push_branch))

@@ -12,7 +12,11 @@
 
 use leptos::*;
 
-use crate::api::{branch_op_request, clone_request, create_commit_request, rebase_request};
+use git_vista_core::activity::UndoAction;
+
+use crate::api::{
+    branch_op_request, clone_request, create_commit_request, rebase_request, undo_request,
+};
 use crate::state::{Overlays, PendingOp, DIALOG_GUARD_MS};
 
 /// Pop a native alert with `msg` (there's always a window in the running SPA).
@@ -158,6 +162,13 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
             PendingOp::Rebase { .. } => spawn_local(async move {
                 report(rebase_request().await, "rebase onto main", reload);
             }),
+            // The undo itself (step 5). The server re-checks everything that
+            // matters — compare-and-swap on the branch tip, clean-tree guard,
+            // revert auto-abort — so failure here surfaces its reason verbatim
+            // (e.g. "‘main’ has moved since this undo was offered").
+            PendingOp::Undo(u) => spawn_local(async move {
+                report(undo_request(&u.action).await, "undo", reload);
+            }),
             PendingOp::Delete { branch, .. } => spawn_local(async move {
                 match branch_op_request("/api/delete-branch", &branch).await {
                     Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
@@ -235,6 +246,54 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
                     true,
                     true,
                 ),
+                // The undo confirmation (step 5). The server-built label already
+                // says exactly what will happen ("Undo merge — reset ‘main’ to
+                // abc1234"); the body adds what that means for history, and the
+                // pushed warning when the discarded state is on the remote.
+                PendingOp::Undo(u) => {
+                    let warn = if u.warn_pushed {
+                        " The discarded state is already pushed: origin keeps it \
+                         (git-vista never force-pushes), so the branch will show \
+                         as behind until it's pushed again."
+                    } else {
+                        ""
+                    };
+                    match &u.action {
+                        UndoAction::ResetBranch { .. } => (
+                            "Undo — move branch back",
+                            format!(
+                                "{}? The discarded commits leave the graph but stay \
+                                 in the reflog.{warn}",
+                                u.label
+                            ),
+                            "Undo",
+                            true,
+                            true,
+                        ),
+                        UndoAction::RestoreBranch { .. } => (
+                            "Restore branch",
+                            format!(
+                                "{}? This re-creates the branch exactly where it \
+                                 last pointed — nothing else changes.",
+                                u.label
+                            ),
+                            "Restore",
+                            false,
+                            true,
+                        ),
+                        UndoAction::RevertCommit { .. } => (
+                            "Revert commit",
+                            format!(
+                                "{}? This adds a new commit that reverses it — \
+                                 history is kept, so it's safe even when pushed.",
+                                u.label
+                            ),
+                            "Revert",
+                            false,
+                            true,
+                        ),
+                    }
+                }
                 PendingOp::Rebase { current } => match current {
                     Some(branch) => (
                         "Rebase onto main",
