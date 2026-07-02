@@ -1,3 +1,16 @@
+/* The bundled Nerd Font symbols (copied to the dist root by Trunk — see
+   index.html). Self-hosting the font means the `.nf` glyph icons render on
+   devices where no Nerd Font can be installed (the iPad). `font-display:
+   swap` keeps first paint unblocked: the fallback font shows for an instant,
+   then the glyphs land. */
+@font-face {
+  font-family: "Symbols Nerd Font Mono";
+  src: url("/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --bg: #0d1117;
   --fg: #e6edf3;
@@ -49,6 +62,53 @@ html, body {
 .graph { flex: 1; overflow: hidden; }
 .placeholder { color: var(--muted); }
 
+/* Icon system (icons.rs). `.nf` marks a span/tspan holding an icon glyph: the
+   Nerd Font families lead its stack so the glyph set (crate::icons::ICONS)
+   resolves wherever one is installed; without one, the stack falls back to the
+   regular monospace fonts — which is fine, because the topbar "Icons" toggle
+   then swaps in the plain-text set (TEXT_ICONS) that any font renders (the
+   sane choice on iPad/Safari, where only system fonts exist). Works for HTML
+   spans and SVG <tspan>/<text> alike. */
+.nf {
+  font-family:
+    "Symbols Nerd Font Mono", "Symbols Nerd Font",
+    "JetBrainsMono Nerd Font", "FiraCode Nerd Font", "Hack Nerd Font",
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-style: normal;
+  font-weight: 400;
+}
+
+/* The git mark branding the topbar title — git's own brand orange, slightly
+   smaller than the title text so it decorates rather than dominates. */
+.app-icon { color: #f0883e; font-size: 0.95em; margin-right: 0.45em; }
+
+/* The repo status line: repo glyph in the app accent, then — set off by a
+   gap — the checked-out branch with the branch glyph in branch green. */
+.ic-repo { color: var(--accent); }
+.repo-branch { margin-left: 1.1em; }
+.ic-branch { color: #3fb950; }
+
+/* Icons inside menu items / panel headers: a fixed-width slot so the labels
+   align in a column, slightly faded so the label stays the focus. `inherit`
+   keeps the red of a .danger item and the muted tone of a disabled one. */
+.ctx-icon {
+  display: inline-block;
+  width: 1.5em;
+  color: inherit;
+  opacity: 0.8;
+}
+
+/* The per-node icon beside each dot / stub ring — always on, hidden as one
+   layer by the topbar "Dot icons" toggle (via .lod-hidden on its <g>).
+   Slightly faded so the dots stay the primary mark; non-interactive so it
+   never steals a tap from the node's hit circle. */
+.node-icon {
+  font-size: 10px;
+  opacity: 0.85;
+  pointer-events: none;
+  user-select: none;
+}
+
 /* Phase 4: loading / error states while the history is fetched. */
 .status { color: var(--muted); padding: 1rem; }
 .status.error { color: #f78166; }
@@ -71,14 +131,17 @@ html, body {
    smear. `display:none` removes it from paint and hit-testing entirely. */
 .lod-hidden { display: none; }
 
-/* Phase 5: commit labels — a text column right of the lanes, two lines per row. */
+/* Phase 5: commit labels — a text column right of the lanes, two lines per row.
+   No `fill` here: each row's text is filled per-row (an SVG attribute in
+   app.rs) with its branch colour, so the list matches the dot it describes —
+   a CSS fill would override that attribute. The meta line is faded via
+   opacity instead, keeping it secondary in any branch colour. */
 .label-msg {
-  fill: var(--fg);
   font-size: 13px;
 }
 .label-meta {
-  fill: var(--muted);
   font-size: 11px;
+  opacity: 0.62;
 }
 
 /* Phase 7: ref badges — branch / tag / HEAD pills drawn at their commit. The

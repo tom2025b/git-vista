@@ -42,5 +42,8 @@ web-sys = { version = "0.3", features = [
     # Issue #18: `window()` plus the native prompt()/alert() dialogs used to ask
     # for a branch name and report a failure.
     "Window",
+    # Icon system: the Nerd-Font-vs-plain-text preference persists in
+    # localStorage so it survives reloads.
+    "Storage",
 ] }
 gloo-net = { version = "0.7.0", default-features = false, features = ["http", "json"] }

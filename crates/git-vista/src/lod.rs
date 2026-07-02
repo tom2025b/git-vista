@@ -7,6 +7,9 @@
 //! a [`Detail`] level and the view drops the least-important text first. Pure
 //! and host-testable, like [`crate::camera`] and [`crate::geometry`]; the view
 //! layer just reads the level reactively off the camera signal.
+//!
+//! (The per-node icons beside the dots are *not* LOD-driven: they're always on,
+//! behind their own user toggle — see `show_node_icons` in `app.rs`.)
 
 /// How much label text to render at the current zoom. Ordered coarse → fine:
 /// each finer level is a superset of the text the coarser one shows.
