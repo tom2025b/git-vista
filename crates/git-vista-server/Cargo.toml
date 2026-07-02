@@ -15,6 +15,10 @@ path = "src/main.rs"
 axum = "0.8.9"
 git-vista-core = { workspace = true }
 git-vista-git = { workspace = true }
+# The activity feed's journal is JSONL on disk, and its query params derive
+# Deserialize — the same serde the shared models already use.
+serde = { workspace = true }
+serde_json = { workspace = true }
 # `process` lets the /api/branch endpoint shell out to `git branch` without
 # blocking the async runtime (Issue #18).
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "process"] }
@@ -22,3 +26,7 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "p
 # layer; `set-header` is the tower-http layer that applies it.
 tower = "0.5"
 tower-http = { version = "0.7.0", features = ["fs", "set-header"] }
+
+[dev-dependencies]
+# Throwaway repos for the journal/snapshot round-trip tests.
+tempfile = "3"
