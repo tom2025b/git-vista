@@ -11,9 +11,11 @@ Log / Journal view** and **Contextual Undo**, plus **commit diffs** and a
 - Branch: `feature/activity-log-undo` (pushed to origin).
 - Safety net: `v1-stable` (= `main` @ `a0715e0`, pushed) — the known-good
   fallback. Untouched by any of this work.
-- **Steps 1–5 are complete, tested, and green** (113 tests; native + wasm
+- **Steps 1–5 are complete, tested, and green** (114 tests; native + wasm
   builds clean; steps 4 and 5 verified live + headless-CDP). Only Step 6
   (final verify pass + docs + PR) remains.
+- On top of Step 5: a **stub-branch fix batch** (`035c75d`) — see "Post-Step-5
+  fix batch" below.
 
 ## Commit history on the branch
 
@@ -21,6 +23,7 @@ Newest first:
 
 | Commit    | State        | What |
 |-----------|--------------|------|
+| `035c75d` | ✅ green      | Post-Step-5 fix batch — lane-0 trunk reservation, empty commit on stubs, menu-on-stub fixes, merge no-op message, stub z-order, camera headroom |
 | `170c5e3` | ✅ green      | Step 5 — contextual undo: `/api/undoables/{id}`, `POST /api/undo`, menu undo section, row Undo buttons, confirm-modal arm |
 | `a8af52a` | ✅ green      | Step 4 finish — `mod activity;` wiring + the `.act-*` panel CSS |
 | `175e948` | WIP (broken) | Step 4 Activity panel UI checkpoint — superseded by `a8af52a` |
@@ -166,6 +169,35 @@ inside the existing detail panel; all parsing lives in `git-vista-core`
 - Verified live on a throwaway repo (all three actions, both reset paths,
   CAS + dirty-tree 409s, absorption) and headless via CDP (row button, menu
   section, modal, confirmed undo refreshing the feed in place).
+
+---
+
+### Post-Step-5 fix batch (`035c75d`)
+
+The "commit on a fresh branch stub made the branch disappear" investigation,
+plus everything found alongside it:
+
+- **layout.rs** — lane 0 is now *reserved* for the trunk's tip (or the
+  checked-out branch's tip when its first-parent chain runs through the trunk
+  tip). Previously the newest commit always took lane 0, so a side branch's
+  new commit glued itself onto the trunk (same lane, then recoloured
+  trunk-blue) — the branch looked like it had vanished into main. Regression
+  test: `a_commit_on_a_side_branch_forks_out_instead_of_absorbing_the_trunk`.
+- **Empty commit on a branch stub** — `POST /api/commit` takes an optional
+  `branch`. A branch that isn't checked out gets `git commit-tree` + a
+  compare-and-swap `git update-ref` (empty commits only; HEAD, index and
+  worktree untouched; journaled; 409 when the branch moved). The menu enables
+  "Create empty commit" on stubs; the dialog title names the target branch.
+- **Menu on stubs** — no undoables fetch (the anchor commit's undo actions
+  belong to other branches), no "Rebase onto main" item (nothing to replay;
+  it would silently target the checked-out branch).
+- **Merge no-op** — "Already up to date." is surfaced verbatim instead of
+  journaling a phantom merge event; frontend alerts it and still reloads.
+- **render.rs** — stub connector paths draw in a pass under all rings with
+  `pointer-events: none`, so a cascade's path can't swallow taps on a ring.
+- **Camera headroom** — the home view (initial, "Reset view", the `0` key)
+  shifts down by `stub_headroom(...)` so a branch created on the newest
+  commit isn't born clipped above the canvas. Recomputed per graph load.
 
 ---
 
