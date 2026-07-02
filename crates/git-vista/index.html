@@ -27,6 +27,12 @@
     <!-- Build this crate's `git-vista-ui` binary to wasm. -->
     <link data-trunk rel="rust" data-bin="git-vista-ui" />
     <link data-trunk rel="css" href="styles.css" />
+    <!-- The bundled Nerd Font symbols (icons.rs / the .nf class in styles.css).
+         Shipping the font means the glyph icons render on every device — an
+         iPad has no way to install fonts — instead of only where a Nerd Font
+         happens to be installed. Symbols-only build, SIL OFL licensed (see
+         assets/NERD-FONTS-LICENSE). -->
+    <link data-trunk rel="copy-file" href="assets/SymbolsNerdFontMono-Regular.ttf" />
   </head>
   <body></body>
 </html>
