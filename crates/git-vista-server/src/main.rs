@@ -153,6 +153,9 @@ async fn main() {
         .route("/api/commits", get(commits))
         // Phase 10: full detail for one commit, read on demand for the side panel.
         .route("/api/commit/{id}", get(commit_detail))
+        // Activity/Undo feature, step 2: one commit's diff (file list + patch),
+        // read on demand when the detail panel opens.
+        .route("/api/diff/{id}", get(commit_diff))
         // Phase 12: clone a public URL into a temp dir and view it read-only.
         .route("/api/clone", post(clone_repo))
         // Issue #18: create a branch at a commit (shells out to `git branch`).
@@ -295,6 +298,121 @@ async fn commit_detail(
     })?;
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
     Ok((no_store, Json(detail)))
+}
+
+/// Upper bound on the patch text returned by `/api/diff/{id}`. A huge commit
+/// (vendored deps, generated files) can carry a multi-megabyte patch that would
+/// choke the iPad both in transfer and in rendering; past this, the patch is
+/// cut at a line boundary and flagged `truncated` so the panel says so.
+const DIFF_PATCH_CAP: usize = 200_000;
+
+/// One commit's diff (Activity/Undo feature, step 2): the per-file change list
+/// and the unified patch, for the detail panel's Changes section.
+///
+/// The commit is first resolved via gix ([`read_commit`]) — validating the id
+/// and yielding the parent count — then git itself produces the diff (same B3
+/// posture as everywhere: git's diff engine handles renames, binaries and
+/// merges; we only parse its machine-readable listings, in core, where that's
+/// unit-tested). Three reads of the same diff:
+///
+///   * `--name-status -z` — the file list (order + change kinds),
+///   * `--numstat -z`     — per-file added/deleted counts folded into it,
+///   * `--patch`          — the unified text, capped at [`DIFF_PATCH_CAP`].
+///
+/// An ordinary commit uses `git show` (its diff vs the parent; a root commit
+/// diffs against the empty tree). A merge commit is diffed against its *first
+/// parent* instead — `git show` on a merge prints the usually-empty combined
+/// diff, while "what did this merge bring in?" is exactly the first-parent
+/// diff — and the response says so (`against_first_parent`).
+async fn commit_diff(
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = current().0;
+    // Belt-and-braces before the id goes anywhere near argv: real ids are hex.
+    if id.len() < 4 || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string()));
+    }
+    let detail = read_commit(&repo, &id).map_err(|e| match e {
+        RepoError::CommitNotFound(_) => (StatusCode::NOT_FOUND, "No such commit.".to_string()),
+        other => {
+            eprintln!("git-vista: /api/diff/{id} failed: {other}");
+            (StatusCode::INTERNAL_SERVER_ERROR, other.to_string())
+        }
+    })?;
+    let against_first_parent = detail.parents.len() >= 2;
+
+    // The base args for the three reads: `show <id>` for ordinary commits,
+    // `diff <id>^1 <id>` for merges. `--format=` silences show's commit header
+    // so only the diff comes back; harmless on `diff`... which doesn't take it,
+    // so the merge arm simply omits it.
+    let first_parent = format!("{id}^1");
+    let base: Vec<&str> = if against_first_parent {
+        vec!["diff", first_parent.as_str(), id.as_str()]
+    } else {
+        vec!["show", "--format=", id.as_str()]
+    };
+    let with = |extra: &[&str]| -> Vec<String> {
+        // Diff options go *before* the revisions so git never reads a
+        // revision as an option's value.
+        let mut args = vec![base[0].to_string()];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args.extend(base[1..].iter().map(|s| s.to_string()));
+        args
+    };
+
+    let name_status = git_stdout(&repo, &with(&["--name-status", "-z"]), "/api/diff").await?;
+    let numstat = git_stdout(&repo, &with(&["--numstat", "-z"]), "/api/diff").await?;
+    let patch_bytes =
+        git_stdout(&repo, &with(&["--patch", "--no-color"]), "/api/diff").await?;
+
+    let mut files = git_vista_core::diff::parse_name_status_z(&name_status);
+    git_vista_core::diff::fold_numstat_z(&numstat, &mut files);
+
+    // Cap the patch at a line boundary so the panel never gets half a line.
+    let mut patch = String::from_utf8_lossy(&patch_bytes).into_owned();
+    let truncated = patch.len() > DIFF_PATCH_CAP;
+    if truncated {
+        let cut = patch[..DIFF_PATCH_CAP].rfind('\n').unwrap_or(DIFF_PATCH_CAP);
+        patch.truncate(cut);
+    }
+
+    let diff = git_vista_core::diff::CommitDiff {
+        id: detail.id.0,
+        files,
+        patch,
+        truncated,
+        against_first_parent,
+    };
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(diff)))
+}
+
+/// Run `git -C <repo> <args…>` and return its stdout bytes, mapping both spawn
+/// failures and non-zero exits to a 500 with git's own stderr as the reason.
+/// Shared by the diff reads; deliberately bytes, not String — paths in `-z`
+/// listings aren't guaranteed UTF-8, and the parsers handle that themselves.
+async fn git_stdout(
+    repo: &Path,
+    args: &[String],
+    endpoint: &str,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| {
+            eprintln!("git-vista: {endpoint} couldn't run git: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"))
+        })?;
+    if !output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if msg.is_empty() { "git failed.".to_string() } else { msg };
+        eprintln!("git-vista: {endpoint} failed: {msg}");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
+    }
+    Ok(output.stdout)
 }
 
 /// Guard for the write endpoints (Phase 12): when the current repo is a read-only

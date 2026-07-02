@@ -24,6 +24,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
         commit_msg,
         confirm_op,
         detail_id,
+        scroll_diff,
         dialog_opened_at,
         reload,
     } = overlays;
@@ -70,6 +71,9 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             // owner, after which a signal write is unreliable (same caveat as below).
             let detail_commit = m.commit.clone();
             let on_details = move |_| {
+                // Plain details: make sure a leftover "scroll to diff" wish
+                // from an earlier "Show diff" doesn't fire on this open.
+                scroll_diff.set_value(false);
                 detail_id.set(Some(detail_commit.clone()));
                 menu.set(None);
             };
@@ -78,6 +82,24 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                 <button class="ctx-item" on:click=on_details>
                     <span class="nf ctx-icon">{ic.commit}</span>
                     "View details"
+                </button>
+            };
+            // "Show diff": the same detail panel, but with the Changes section
+            // scrolled into view once the diff lands — so the tap answers
+            // "what did this commit change?" directly. The scroll wish rides
+            // in a one-shot StoredValue the panel consumes; `detail_id` is set
+            // before the menu closes (the reactive-owner ordering rule).
+            let diff_commit = m.commit.clone();
+            let on_diff = move |_| {
+                scroll_diff.set_value(true);
+                detail_id.set(Some(diff_commit.clone()));
+                menu.set(None);
+            };
+            let diff_item = view! {
+                <button class="ctx-item" on:click=on_diff>
+                    // The diff-modified glyph — this item is about changed files.
+                    <span class="nf ctx-icon">{ic.modified}</span>
+                    "Show diff"
                 </button>
             };
             // "Create branch from this commit": prompt for a name, POST it, then
@@ -310,6 +332,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         {m.header.clone()}
                     </div>
                     {details_item}
+                    {diff_item}
                     {open_github}
                     {write_items}
                 </div>
