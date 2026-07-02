@@ -98,14 +98,21 @@ pub async fn create_branch_request(name: &str, commit: &str) -> Result<(), Strin
     }
 }
 
-/// Ask the backend to create a commit on top of HEAD (Issue #33,
-/// `POST /api/commit`). `allow_empty` picks `git commit --allow-empty` (empty
-/// commit) vs a plain `git commit` (staged changes). As with the branch request,
-/// a non-2xx body is git's own error text, returned as `Err`.
-pub async fn create_commit_request(message: &str, allow_empty: bool) -> Result<(), String> {
+/// Ask the backend to create a commit (Issue #33, `POST /api/commit`).
+/// `allow_empty` picks `git commit --allow-empty` (empty commit) vs a plain
+/// `git commit` (staged changes). `branch` targets a branch other than the
+/// checked-out one — the branch-stub path, empty commits only; `None` commits
+/// on HEAD as before. As with the branch request, a non-2xx body is git's own
+/// error text, returned as `Err`.
+pub async fn create_commit_request(
+    message: &str,
+    allow_empty: bool,
+    branch: Option<&str>,
+) -> Result<(), String> {
     let body = CreateCommitRequest {
         message: message.to_string(),
         allow_empty,
+        branch: branch.map(str::to_string),
     };
     let resp = Request::post("/api/commit")
         .json(&body)
@@ -252,7 +259,9 @@ pub async fn rebase_request() -> Result<(), String> {
 /// `path` is the endpoint — `/api/merge`, `/api/push`, `/api/delete-branch`, or
 /// `/api/force-delete-branch` — all of which take the same `{ branch }` body. As with the other requests, a
 /// non-2xx body is git's own error text, returned as `Err` for the caller to show.
-pub async fn branch_op_request(path: &str, branch: &str) -> Result<(), String> {
+/// `Ok` carries the server's success line — most callers ignore it, but the merge
+/// flow reads it to tell a real merge from git's "Already up to date" no-op.
+pub async fn branch_op_request(path: &str, branch: &str) -> Result<String, String> {
     let body = BranchRequest {
         branch: branch.to_string(),
     };
@@ -263,7 +272,7 @@ pub async fn branch_op_request(path: &str, branch: &str) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     if resp.ok() {
-        Ok(())
+        Ok(resp.text().await.unwrap_or_default())
     } else {
         Err(resp
             .text()

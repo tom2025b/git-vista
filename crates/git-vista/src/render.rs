@@ -483,7 +483,32 @@ pub fn stubs(
     menu: RwSignal<Option<MenuData>>,
     moved: StoredValue<bool>,
 ) -> View {
-    ctx.with_value(|c| c.graph
+    // Two passes: every connector path first, then every ring + hit target. A
+    // cascade's deeper connector starts exactly at the previous tip's centre
+    // (and the first at the anchor commit's), so drawn interleaved it would
+    // paint over the ring below it — and, worse, sit on top of that ring's hit
+    // circle, swallowing taps aimed dead-centre. The paths are decorative, so
+    // they also get pointer-events:none; belt and braces with the ordering.
+    let paths = ctx.with_value(|c| c.graph
+        .stubs
+        .iter()
+        .map(|s| {
+            let anchor_slot = c.graph.rows[s.anchor_row].color;
+            let color = branch_color_distinct_from(s.color, anchor_slot);
+            let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.depth);
+            view! {
+                <path
+                    d=d
+                    fill="none"
+                    stroke=color
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    pointer-events="none"
+                />
+            }
+        })
+        .collect_view());
+    let tips = ctx.with_value(|c| c.graph
         .stubs
         .iter()
         .map(|s| {
@@ -493,7 +518,6 @@ pub fn stubs(
             // until it differs from the anchor commit's colour.
             let anchor_slot = c.graph.rows[s.anchor_row].color;
             let color = branch_color_distinct_from(s.color, anchor_slot);
-            let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.depth);
             let sx = node_cx(s.lane);
             let sy = stub_node_cy(s.anchor_row, s.depth);
             let name = s.name.clone();
@@ -540,13 +564,6 @@ pub fn stubs(
                 }));
             };
             view! {
-                <path
-                    d=d
-                    fill="none"
-                    stroke=color
-                    stroke-width="2"
-                    stroke-linecap="round"
-                />
                 // Hollow, clickable ring (Issue #28) — a stub branch owns no
                 // commits of its own yet, so it reads as an empty ring in the
                 // branch's colour rather than a filled dot, signalling "nothing
@@ -566,5 +583,6 @@ pub fn stubs(
                 />
             }
         })
-        .collect_view())
+        .collect_view());
+    view! { {paths} {tips} }.into_view()
 }

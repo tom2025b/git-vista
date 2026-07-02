@@ -22,7 +22,7 @@ use git_vista_core::model::{Graph, RefKind};
 
 use crate::api::{fetch_commit_detail, fetch_graph, fetch_head_branch, fetch_status};
 use crate::camera::Camera;
-use crate::geometry::label_x;
+use crate::geometry::{label_x, stub_headroom};
 use crate::gestures::{self, GestureState};
 use crate::icons::icon_set;
 use crate::lod::detail_for;
@@ -30,7 +30,7 @@ use crate::prefs::{
     load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref,
 };
 use crate::render::{self, RenderCtx};
-use crate::state::{MenuData, Overlays, PendingOp, Settings};
+use crate::state::{CommitDialog, MenuData, Overlays, PendingOp, Settings};
 use crate::viewport::visible_row_range;
 use crate::{activity, detail, dialogs, menu};
 
@@ -297,10 +297,10 @@ fn graph_canvas(
     // The open context menu, if any (Issue #18). `None` => no menu. Set when a dot
     // is tapped (render::build_node), cleared on a pan/tap-elsewhere (pointerdown).
     let menu = create_rw_signal(None::<MenuData>);
-    // The open commit-message dialog, if any (Issue #33). `Some(allow_empty)` =>
-    // the modal is showing; the bool picks `--allow-empty` vs a staged commit.
+    // The open commit-message dialog, if any (Issue #33): which kind of commit
+    // (empty vs staged) and, for a branch stub, which branch it lands on.
     // A real in-app modal, not `window.prompt()`, which webviews block/flash.
-    let commit_dialog = create_rw_signal(None::<bool>);
+    let commit_dialog = create_rw_signal(None::<CommitDialog>);
     // The text currently typed into that dialog's message box.
     let commit_msg = create_rw_signal(String::new());
     // The branch operation awaiting confirmation, if any (Issue #33 follow-up).
@@ -361,8 +361,12 @@ fn graph_canvas(
         reload,
     };
 
-    // Camera (pan/zoom) state.
-    let camera = create_rw_signal(Camera::default());
+    // Camera (pan/zoom) state. Its home position leaves headroom for any stub
+    // cascade overshooting the top of the canvas (a branch created on the
+    // newest commit tips *above* row 0), so new branches aren't born
+    // half-clipped and unreachable until the user thinks to pan up.
+    let home = Camera::home(ctx.with_value(|c| stub_headroom(&c.graph.stubs)));
+    let camera = create_rw_signal(home);
     // Whether any pointer is currently pressed (drives the grab/grabbing cursor).
     let dragging = create_rw_signal(false);
 
@@ -377,7 +381,7 @@ fn graph_canvas(
     // Window listeners (resize → viewport height; keydown → shortcuts), each
     // removed on cleanup so a graph reload doesn't stack duplicate handlers.
     gestures::install_resize_listener(vp_h);
-    gestures::install_key_listener(camera, reload, overlays);
+    gestures::install_key_listener(camera, home, reload, overlays);
     let visible =
         create_memo(move |_| visible_row_range(camera.get(), vp_h.get(), row_count, OVERSCAN_ROWS));
 
@@ -482,7 +486,7 @@ fn graph_canvas(
         <button
             class="reset-view"
             title="Reset pan & zoom (keyboard: 0)"
-            on:click=move |_| camera.set(Camera::default())
+            on:click=move |_| camera.set(home)
         >
             "Reset view"
         </button>
