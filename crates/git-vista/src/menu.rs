@@ -10,7 +10,9 @@
 
 use leptos::*;
 
-use crate::api::{create_branch_request, fetch_head_branch};
+use git_vista_core::activity::UndoAction;
+
+use crate::api::{create_branch_request, fetch_head_branch, fetch_undoables};
 use crate::icons::icon_set;
 use crate::state::{Overlays, PendingOp, Settings};
 
@@ -30,6 +32,22 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
         reload,
     } = overlays;
     let nerd_icons = settings.nerd_icons;
+    // The undo actions for the menu's commit (step 5), fetched the moment the
+    // menu opens — computed live server-side, so the section reflects the repo
+    // *now*, not the possibly-stale graph. Keyed on (commit, reload) so
+    // reopening on the same commit reuses the answer until something changes;
+    // closed menu → no fetch. Arrives async: the menu renders immediately and
+    // grows an undo section when (and only when) actions exist. Errors are
+    // deliberately swallowed — a menu that can't offer undo is still a menu.
+    let undoables = create_local_resource(
+        move || (menu.get().map(|m| m.commit), reload.get()),
+        |(commit, _)| async move {
+            match commit {
+                Some(c) => fetch_undoables(&c).await.unwrap_or_default(),
+                None => Vec::new(),
+            }
+        },
+    );
     move || {
         menu.get().map(|m| {
             // Tracked read: the menu lives inside the overlays' reactive block,
@@ -311,11 +329,45 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     </button>
                 }
             };
+            // The undo section (step 5): one item per action `/api/undoables`
+            // returned for this commit — reset-style undos when its result is
+            // still a branch tip, a restore when it's a deleted branch's lost
+            // tip, a revert for any non-merge commit. The tracked read means
+            // the menu re-renders when the fetch lands; until then (or with
+            // nothing to offer) the section simply isn't there. Each item opens
+            // the shared confirm modal — `confirm_op` is set BEFORE the menu
+            // closes (the reactive-owner ordering rule above).
+            let undo_items = undoables
+                .get()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|u| {
+                    // A reset discards commits from the graph — red like the
+                    // delete item; restore/revert only add, so they stay plain.
+                    let class = match u.action {
+                        UndoAction::ResetBranch { .. } => "ctx-item danger",
+                        _ => "ctx-item",
+                    };
+                    let label = u.label.clone();
+                    let on = move |_| {
+                        dialog_opened_at.set_value(js_sys::Date::now());
+                        confirm_op.set(Some(PendingOp::Undo(u.clone())));
+                        menu.set(None);
+                    };
+                    view! {
+                        <button class=class on:click=on>
+                            <span class="nf ctx-icon">{ic.undo}</span>
+                            {label}
+                        </button>
+                    }
+                })
+                .collect_view();
             // On a read-only clone (Phase 12) the menu is just the header + the
-            // GitHub link: no branch/commit/merge/push/delete. Otherwise show the
-            // full set of write actions.
+            // GitHub link: no branch/commit/merge/push/delete/undo. Otherwise
+            // show the full set of write actions.
             let write_items = (!read_only).then(|| {
                 view! {
+                    {undo_items}
                     <button class="ctx-item" on:click=on_branch>
                         // Creating a branch — the branch glyph.
                         <span class="nf ctx-icon">{ic.branch}</span>
