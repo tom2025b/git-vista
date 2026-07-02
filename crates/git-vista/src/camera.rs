@@ -38,6 +38,17 @@ impl Default for Camera {
 }
 
 impl Camera {
+    /// The graph's *home* view: unzoomed, shifted down by `headroom` px so
+    /// content above `y = 0` — the stub cascades that fan upward off the top
+    /// row — starts on screen instead of clipped above the canvas. This is the
+    /// initial camera and what "Reset view" / the `0` key return to; with no
+    /// overshooting stubs it's the identity.
+    // Consumed only by the wasm-only `app` view (like ZOOM_STEP above).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub fn home(headroom: f64) -> Self {
+        Self { ty: headroom, ..Self::default() }
+    }
+
     /// The SVG group transform that realises this camera. Applied as
     /// `translate(...) scale(...)`, i.e. content is scaled first, then shifted.
     pub fn transform(&self) -> String {
@@ -81,6 +92,13 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_is_identity_shifted_down_by_the_headroom() {
+        assert_eq!(Camera::home(0.0), Camera::default());
+        let c = Camera::home(41.0);
+        assert_eq!((c.tx, c.ty, c.scale), (0.0, 41.0, 1.0));
+    }
 
     #[test]
     fn transform_string_is_svg_ready() {
