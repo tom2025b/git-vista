@@ -24,6 +24,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
         commit_msg,
         confirm_op,
         detail_id,
+        activity_open,
         scroll_diff,
         dialog_opened_at,
         reload,
@@ -74,6 +75,10 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                 // Plain details: make sure a leftover "scroll to diff" wish
                 // from an earlier "Show diff" doesn't fire on this open.
                 scroll_diff.set_value(false);
+                // The detail and Activity panels share the right edge — the
+                // one being opened replaces the other (this menu may itself
+                // have been opened from an Activity row).
+                activity_open.set(false);
                 detail_id.set(Some(detail_commit.clone()));
                 menu.set(None);
             };
@@ -92,6 +97,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             let diff_commit = m.commit.clone();
             let on_diff = move |_| {
                 scroll_diff.set_value(true);
+                activity_open.set(false); // same right-edge exclusivity as details
                 detail_id.set(Some(diff_commit.clone()));
                 menu.set(None);
             };

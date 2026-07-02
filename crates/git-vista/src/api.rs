@@ -11,6 +11,7 @@
 
 use gloo_net::http::Request;
 
+use git_vista_core::activity::ActivityEvent;
 use git_vista_core::diff::CommitDiff;
 use git_vista_core::model::{
     BranchRequest, CloneRequest, CommitDetail, CreateBranchRequest, CreateCommitRequest, Graph,
@@ -135,6 +136,24 @@ pub async fn fetch_head_branch() -> Result<Option<String>, String> {
         .json::<Option<String>>()
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Fetch the activity feed (`GET /api/activity`): the chronological list of
+/// repo events — commits, merges, rebases, branch creations/deletions,
+/// pushes… — each attributed app-vs-terminal and carrying an undo hint when
+/// the event is still undoable. Fetched fresh every time the panel opens,
+/// cache-busted like the other live reads.
+pub async fn fetch_activity(limit: usize) -> Result<Vec<ActivityEvent>, String> {
+    let url = format!("/api/activity?limit={limit}&t={}", js_sys::Date::now());
+    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    if resp.ok() {
+        resp.json::<Vec<ActivityEvent>>().await.map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
 }
 
 /// Fetch one commit's diff — file list + unified patch — for the detail
