@@ -28,8 +28,28 @@ mod viewport;
 #[cfg(test)]
 mod graph;
 
+// The frontend, split out of the former monolithic `app.rs`. Every one of these
+// pulls in Leptos / web-sys (wasm-only deps), so — like `app` — they compile only
+// for the wasm target; a host `cargo build --workspace` builds the native stub
+// below and skips them entirely.
+#[cfg(target_arch = "wasm32")]
+mod api;
 #[cfg(target_arch = "wasm32")]
 mod app;
+#[cfg(target_arch = "wasm32")]
+mod detail;
+#[cfg(target_arch = "wasm32")]
+mod dialogs;
+#[cfg(target_arch = "wasm32")]
+mod gestures;
+#[cfg(target_arch = "wasm32")]
+mod menu;
+#[cfg(target_arch = "wasm32")]
+mod prefs;
+#[cfg(target_arch = "wasm32")]
+mod render;
+#[cfg(target_arch = "wasm32")]
+mod state;
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
