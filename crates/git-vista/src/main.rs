@@ -33,6 +33,8 @@ mod graph;
 // for the wasm target; a host `cargo build --workspace` builds the native stub
 // below and skips them entirely.
 #[cfg(target_arch = "wasm32")]
+mod activity;
+#[cfg(target_arch = "wasm32")]
 mod api;
 #[cfg(target_arch = "wasm32")]
 mod app;
