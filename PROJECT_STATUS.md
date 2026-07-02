@@ -11,10 +11,9 @@ Log / Journal view** and **Contextual Undo**, plus **commit diffs** and a
 - Branch: `feature/activity-log-undo` (pushed to origin).
 - Safety net: `v1-stable` (= `main` @ `a0715e0`, pushed) — the known-good
   fallback. Untouched by any of this work.
-- **The branch tip does NOT compile right now.** The last commit is an
-  intentional WIP checkpoint. One missing line + CSS + a build pass finish it.
-- Steps 1–3 are complete, tested, and green. Step 4 is ~80% done. Steps 5–6
-  not started.
+- **Steps 1–5 are complete, tested, and green** (113 tests; native + wasm
+  builds clean; steps 4 and 5 verified live + headless-CDP). Only Step 6
+  (final verify pass + docs + PR) remains.
 
 ## Commit history on the branch
 
@@ -22,14 +21,12 @@ Newest first:
 
 | Commit    | State        | What |
 |-----------|--------------|------|
-| `175e948` | **WIP, broken** | Step 4 Activity panel UI — does not compile (see below) |
+| `170c5e3` | ✅ green      | Step 5 — contextual undo: `/api/undoables/{id}`, `POST /api/undo`, menu undo section, row Undo buttons, confirm-modal arm |
+| `a8af52a` | ✅ green      | Step 4 finish — `mod activity;` wiring + the `.act-*` panel CSS |
+| `175e948` | WIP (broken) | Step 4 Activity panel UI checkpoint — superseded by `a8af52a` |
 | `c421faf` | ✅ green      | Step 3 — activity backend: journal, reflog reader, `/api/activity` |
 | `aa0bbdb` | ✅ green      | Step 2 — commit diffs: `/api/diff/{id}`, Changes section, "Show diff" menu item |
 | `1cbb03e` | ✅ green      | Step 1 — working-tree status: parser, `/api/status`, topbar chip |
-
-Everything through `c421faf` builds clean (native + wasm) and passes the full
-test suite (109 tests). To get back to a compiling tree at any point:
-`git checkout c421faf` (or reset the branch there if you want to redo Step 4).
 
 ## The overall plan (6 steps)
 
@@ -38,10 +35,10 @@ test suite (109 tests). To get back to a compiling tree at any point:
    diff" menu item.
 3. ✅ **Activity backend** — app journal + gix reflog reader + snapshot diffing
    + `/api/activity` (merge/dedupe/coalesce/attribute).
-4. 🚧 **Activity panel UI** — topbar button + right-docked panel (status on
+4. ✅ **Activity panel UI** — topbar button + right-docked panel (status on
    top, feed below); tapping a row opens the shared context menu.
-5. ⬜ **Contextual undo** — `/api/undoables` + `POST /api/undo` +
-   `PendingOp::Undo` confirm arm + wiring into the graph menu AND activity rows.
+5. ✅ **Contextual undo** — `/api/undoables/{id}` + `POST /api/undo` +
+   `PendingOp::Undo` confirm arm, wired into the graph menu AND activity rows.
 6. ⬜ **Verify + docs** — end-to-end test pass, PROJECT_MEMORY/README updates.
 
 Architecture principle throughout: **maximum reuse**. The context menu
@@ -130,77 +127,49 @@ inside the existing detail panel; all parsing lives in `git-vista-core`
 
 ---
 
-## What's IN FLIGHT (Step 4 — the reason it doesn't compile)
-
-Commit `175e948`. The Activity panel is written but **not wired in**.
-
-### Written in this commit
-- `crates/git-vista/src/icons.rs` — `history` / `undo` / `push` / `checkout`
-  glyphs added to both icon sets and the exhaustive test list.
-- `crates/git-vista/src/datetime.rs` — `ago_label` (pure, tested: just now /
-  Nm / Nh / Nd / None past a week) + `time_ago` wasm wrapper.
-- `crates/git-vista/src/api.rs` — `fetch_activity(limit)`.
-- `crates/git-vista/src/state.rs` — `Overlays.activity_open: RwSignal<bool>`.
-- `crates/git-vista/src/app.rs` — `activity_open` signal created in `App`;
-  topbar **"Activity"** button toggles it; `graph_canvas` takes it as a param
-  and threads it into the `Overlays` bundle; panel mounted in the overlays
-  wrapper via `activity::activity_panel_view(...)`; `use crate::{activity, …}`.
-- `crates/git-vista/src/menu.rs` — destructures `activity_open`; "View
-  details" and "Show diff" now close the Activity panel (right-edge
-  exclusivity, since both panels dock right).
-- `crates/git-vista/src/activity.rs` — **new**, the panel itself: status
-  section on top (headline + capped dirty-file list), event feed below
+### Step 4 — Activity panel UI (`175e948` + `a8af52a`)
+- `crates/git-vista/src/activity.rs` — **new.** The right-docked panel:
+  status section on top (headline + capped dirty-file list), event feed below
   (per-kind glyph, summary, ref pill, app/terminal pill, relative time).
   Tapping a row builds the SAME `MenuData` the graph dots use and opens
-  `menu.rs`'s menu at the tap point (clamped to stay on-screen near the right
-  edge). Reuses the `.detail-panel` CSS family; explicit ✕ close (no Esc
-  dependency — iPad rule); both fetches re-fire on open and on `reload`.
+  `menu.rs`'s menu at the tap point (clamped near the right edge). Explicit ✕
+  close (iPad rule); both fetches re-fire on open and on `reload`.
+- Supporting pieces: `icons.rs` glyphs (history/undo/push/checkout),
+  `datetime.rs` `ago_label`/`time_ago`, `api.rs` `fetch_activity`,
+  `state.rs` `Overlays.activity_open`, topbar button in `app.rs`, right-edge
+  exclusivity with the detail panel in `menu.rs`, the `.act-*` CSS family,
+  and the `mod activity;` (wasm cfg) declaration in `main.rs`.
+- Verified headless via CDP: status + feed render, a row tap opens the shared
+  context menu.
 
-### ⛔ Why it doesn't compile — the exact remaining wiring
-1. **`crates/git-vista/src/main.rs` is missing the module declaration.**
-   `activity.rs` exists but is never declared, so `crate::activity` (referenced
-   from `app.rs`) doesn't resolve. Add, in the wasm-cfg module block (next to
-   `mod app;` etc.):
-   ```rust
-   #[cfg(target_arch = "wasm32")]
-   mod activity;
-   ```
-   (It's the frontend `activity.rs`; unrelated to the server module of the
-   same name.)
-2. **Panel CSS not written.** `activity.rs` uses these classes, none styled
-   yet: `.activity-panel`, `.act-head-buttons`, `.act-refresh`, `.act-status`
-   (+ `.clean/.dirty/.conflict`), `.act-file`, `.act-file-path`, `.act-pill`
-   (+ `.act-app`, `.act-terminal`, `.act-ref`), `.act-feed-title`, `.act-row`,
-   `.act-row-static`, `.act-glyph`, `.act-main`, `.act-summary`, `.act-meta`,
-   `.act-when`. Add to `crates/git-vista/styles.css`. (It reuses `.detail-panel`
-   for the frame, so it renders even without these — just unstyled.)
-
-### Not started for Step 4
-- `cargo check` (native + wasm) after the two fixes above.
-- Build (`trunk build`) + a headless-CDP render check of the panel
-  (see the "Headless UI verification" note in memory).
+### Step 5 — Contextual undo (`170c5e3`)
+- `crates/git-vista-server/src/activity.rs` — `GET /api/undoables/{id}`:
+  undo actions for one commit, computed live (same fold as the feed, minus
+  snapshot upkeep — that invariant stays single-writer) + a revert offer for
+  any non-merge commit. `POST /api/undo` executes an `UndoAction`:
+  - `RestoreBranch` → `git branch <name> <tip>`;
+  - `ResetBranch` → checked-out branch: `git reset --hard` only after a
+    clean-tree check (`git status --porcelain` empty — even an untracked file
+    could be overwritten if the target commit tracks that path); other
+    branches: `git branch -f`. CAS `expected_tip` honoured (409 when moved);
+  - `RevertCommit` → `git revert --no-edit`, auto-abort on conflict.
+  Every undo is journaled (App-attributed in the feed; a reset gets its own
+  undo hint, so undo-the-undo works). Read-only clones: 403 on undo, empty
+  undoables, hints stripped from `/api/activity`.
+- `git-vista-core` — reflog `"branch: Reset to …"` parses as `Reset`, so a
+  `git branch -f` undo's echo folds into its journal entry (+2 tests).
+- Frontend — `PendingOp::Undo(Undoable)` arm in the shared confirm modal
+  (incl. `warn_pushed` text); the context menu grows an async undo section
+  (`fetch_undoables`, keyed on commit + reload); Activity rows show a direct
+  Undo button (rows are `<div>`s now — no button-in-button). Undoing a
+  branch creation stays the existing Delete flow, as planned.
+- Verified live on a throwaway repo (all three actions, both reset paths,
+  CAS + dirty-tree 409s, absorption) and headless via CDP (row button, menu
+  section, modal, confirmed undo refreshing the feed in place).
 
 ---
 
 ## Remaining steps (not started)
-
-### Step 5 — Contextual undo
-- Server: `GET /api/undoables` (undo actions for a tapped commit/branch,
-  computed live) + `POST /api/undo` executing `UndoAction`:
-  - `RestoreBranch` → `git branch <name> <tip>`.
-  - `ResetBranch` → checked-out branch: `git reset --hard` **only after**
-    `git status --porcelain` confirms a clean tree (never eat uncommitted
-    work); other branches: `git branch -f`. Honour the CAS `expected_tip`.
-  - `RevertCommit` → `git revert --no-edit` (auto-abort on conflict, like
-    rebase does).
-  - Every undo is itself journaled. Read-only clones: 403 + hidden in UI.
-- Frontend: one new `PendingOp::Undo(UndoAction)` arm in `state.rs` +
-  `dialogs.rs` (reuse the confirm modal wholesale, incl. `warn_pushed` text).
-  Graph menu fetches `/api/undoables` async and shows an undo section when it
-  lands. Activity rows already carry `event.undo` from `/api/activity` — surface
-  it directly on the row / in its menu.
-- "Undo a branch creation" = reuse the existing Delete flow (`PendingOp::Delete`
-  → ForceDelete path) verbatim.
 
 ### Step 6 — Verify + docs
 - Full `cargo test` + `trunk build` + headless render pass exercising
@@ -231,8 +200,9 @@ Commit `175e948`. The Activity panel is written but **not wired in**.
 ## How to resume
 ```bash
 git checkout feature/activity-log-undo   # already the current branch
-# finish Step 4: add `mod activity;` (wasm cfg) to crates/git-vista/src/main.rs,
-# write the .act-* CSS in crates/git-vista/styles.css, then:
+# Steps 1–5 are done and green. Only Step 6 remains: the final end-to-end
+# verify pass on a throwaway repo, PROJECT_MEMORY.md + README.md updates,
+# and the PR to main (push the branch; NEVER delete any branch).
 cargo test --workspace
 cargo check -p git-vista --target wasm32-unknown-unknown
 ```
