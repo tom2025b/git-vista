@@ -14,6 +14,7 @@ use gloo_net::http::Request;
 use git_vista_core::model::{
     BranchRequest, CloneRequest, CommitDetail, CreateBranchRequest, CreateCommitRequest, Graph,
 };
+use git_vista_core::status::RepoStatus;
 
 /// Fetch the laid-out graph from the backend. Relative URL → same origin as the
 /// served SPA, so no CORS and no hardcoded host.
@@ -133,6 +134,23 @@ pub async fn fetch_head_branch() -> Result<Option<String>, String> {
         .json::<Option<String>>()
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Fetch the live working-tree status (`GET /api/status`) — branch, ahead/
+/// behind, and the dirty-file lists — for the topbar chip and the Activity
+/// panel's status section. Resolved fresh server-side per request and cache-
+/// busted like the other live reads, since it changes with every edit.
+pub async fn fetch_status() -> Result<RepoStatus, String> {
+    let url = format!("/api/status?t={}", js_sys::Date::now());
+    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    if resp.ok() {
+        resp.json::<RepoStatus>().await.map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
 }
 
 /// Ask the backend to rebase the checked-out branch onto main (`POST /api/rebase`).

@@ -29,6 +29,7 @@ use git_vista_core::model::{
     validate_clone_url, BranchRequest, CloneRequest, CommitSummary, CreateBranchRequest,
     CreateCommitRequest, GitRef, RefKind,
 };
+use git_vista_core::status::parse_porcelain_v2;
 use git_vista_git::{read_commit, read_refs, walk_history, RepoError};
 use tower::Layer;
 use tower_http::services::ServeDir;
@@ -161,6 +162,10 @@ async fn main() {
         // Issue #33 follow-up: the live checked-out branch, resolved fresh on every
         // request so the merge dialog shows the true target even without a Refresh.
         .route("/api/head-branch", get(head_branch))
+        // Working-tree status (Activity/Undo feature, step 1): branch, ahead/
+        // behind, and the staged/unstaged/untracked/conflicted file lists —
+        // resolved fresh per request, like `head_branch`.
+        .route("/api/status", get(worktree_status))
         // Issue #33 follow-up: branch operations, each shelling out to git.
         .route("/api/merge", post(merge_branch))
         .route("/api/push", post(push_branch))
@@ -502,6 +507,38 @@ async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (StatusCode, Str
 async fn head_branch() -> impl IntoResponse {
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
     (no_store, Json(git_vista_git::read_head_branch(&current().0)))
+}
+
+/// The working-tree status (Activity/Undo feature, step 1): the parsed output
+/// of `git status --porcelain=v2 --branch`, resolved fresh on every request.
+///
+/// Shelling out to `git status` rather than assembling this from gix keeps the
+/// B3 posture of the write endpoints — git itself decides what's staged /
+/// modified / conflicted, including every corner case (renames, type changes,
+/// sparse checkouts) — and the pure parser lives in core where it's unit-
+/// tested. A read, so it works on read-only clones too. Sent `no-store` like
+/// the other live reads: the answer changes with every edit in the worktree.
+async fn worktree_status() -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = current().0;
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["status", "--porcelain=v2", "--branch"])
+        .output()
+        .await
+        .map_err(|e| {
+            eprintln!("git-vista: /api/status couldn't run git: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"))
+        })?;
+    if !output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if msg.is_empty() { "git status failed.".to_string() } else { msg };
+        eprintln!("git-vista: /api/status failed: {msg}");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
+    }
+    let parsed = parse_porcelain_v2(&String::from_utf8_lossy(&output.stdout));
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(parsed)))
 }
 
 /// Merge a branch into the currently checked-out branch (Issue #33 follow-up):

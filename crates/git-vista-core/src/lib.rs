@@ -7,6 +7,7 @@
 //!
 //! - [`model`]  — serializable data types shared across the HTTP/JSON boundary.
 //! - [`layout`] — assigns commits to lanes for the vertical graph.
+//! - [`status`] — working-tree status types + the porcelain-v2 parser.
 //!
 //! Reading real history (which needs `gix` and a filesystem, and so can't run in
 //! a browser) lives in the separate native-only `git-vista-git` crate. Keeping
@@ -14,3 +15,4 @@
 
 pub mod layout;
 pub mod model;
+pub mod status;
