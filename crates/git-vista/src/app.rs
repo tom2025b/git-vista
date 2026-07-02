@@ -32,7 +32,7 @@ use crate::prefs::{
 use crate::render::{self, RenderCtx};
 use crate::state::{MenuData, Overlays, PendingOp, Settings};
 use crate::viewport::visible_row_range;
-use crate::{detail, dialogs, menu};
+use crate::{activity, detail, dialogs, menu};
 
 /// Extra rows rendered above and below the visible window so a fast pan doesn't
 /// flash a blank strip before the row `Memo` catches up (Phase 8).
@@ -92,6 +92,12 @@ pub fn App() -> impl IntoView {
         show_node_icons.set(on);
         store_node_icons_pref(on);
     };
+
+    // Whether the Activity panel is open (Activity/Undo feature). Lives here —
+    // not in graph_canvas — because its button sits in the topbar, which
+    // exists even while the graph is still loading; threaded into the
+    // overlays bundle inside graph_canvas.
+    let activity_open = create_rw_signal(false);
 
     // Phase 12 — "Open URL": clone a public repo and view it read-only. `open_url`
     // toggles the modal; `clone_url` holds the field; `cloning` disables the button
@@ -176,6 +182,15 @@ pub fn App() -> impl IntoView {
                 </button>
                 <button
                     class="refresh"
+                    on:click=move |_| activity_open.update(|open| *open = !*open)
+                    title="Everything that happened in this repo — commits, merges, \
+                           branch operations — with what was done through the app \
+                           marked, and undo where possible"
+                >
+                    "Activity"
+                </button>
+                <button
+                    class="refresh"
                     on:click=refresh
                     title="Re-read the repository — shows branches and commits created since the page loaded"
                 >
@@ -220,7 +235,7 @@ pub fn App() -> impl IntoView {
                                         })}
                                     </p>
                                 })}
-                                {graph_canvas(g, reload, nerd_icons, show_node_icons)}
+                                {graph_canvas(g, reload, nerd_icons, show_node_icons, activity_open)}
                             }
                             .into_view()
                         }
@@ -246,6 +261,7 @@ fn graph_canvas(
     reload: RwSignal<u32>,
     nerd_icons: RwSignal<bool>,
     show_node_icons: RwSignal<bool>,
+    activity_open: RwSignal<bool>,
 ) -> impl IntoView {
     // Per-branch colour slot for each row, indexed by row number (rows are stored
     // in row order), so an edge can pick up its parent's branch colour.
@@ -339,6 +355,7 @@ fn graph_canvas(
         commit_msg,
         confirm_op,
         detail_id,
+        activity_open,
         scroll_diff,
         dialog_opened_at,
         reload,
@@ -478,6 +495,7 @@ fn graph_canvas(
             {dialogs::commit_dialog_view(overlays)}
             {dialogs::confirm_modal_view(overlays)}
             {detail::detail_panel_view(overlays, settings, detail, ctx)}
+            {activity::activity_panel_view(overlays, settings)}
         </div>
     }
 }

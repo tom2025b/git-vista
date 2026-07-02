@@ -77,6 +77,16 @@ pub struct GitIcons {
     pub dirty: &'static str,
     /// Stashed changes.
     pub stash: &'static str,
+
+    // -- Activity feed (Activity/Undo feature) --------------------------------
+    /// The activity log itself — the topbar button and the panel title.
+    pub history: &'static str,
+    /// Undo — contextual undo menu items, and reset/revert feed events.
+    pub undo: &'static str,
+    /// A push to a remote.
+    pub push: &'static str,
+    /// A branch switch (checkout) — HEAD moving between branches.
+    pub checkout: &'static str,
 }
 
 /// The Nerd Font set. Codepoints are from the Nerd Fonts cheat sheet; most sit
@@ -102,6 +112,10 @@ pub const ICONS: GitIcons = GitIcons {
     clean: "\u{F058}",        // nf-fa-check_circle
     dirty: "\u{25CF}",        // ● black circle (not PUA, but themed with the set)
     stash: "\u{F187}",        // nf-fa-archive
+    history: "\u{F1DA}",      // nf-fa-history
+    undo: "\u{F0E2}",         // nf-fa-undo
+    push: "\u{F0EE}",         // nf-fa-cloud_upload
+    checkout: "\u{F0EC}",     // nf-fa-exchange
 };
 
 /// The plain-text fallback set: every value renders in any font (ASCII, or a
@@ -127,6 +141,10 @@ pub const TEXT_ICONS: GitIcons = GitIcons {
     clean: "\u{2713}", // ✓
     dirty: "*",        // `__git_ps1` marks a dirty tree with *
     stash: "$",        // `__git_ps1` marks a stash with $
+    history: "\u{2261}",  // ≡ — stacked lines, a log
+    undo: "\u{21A9}",     // ↩ — turn back
+    push: "\u{2191}",     // ↑ — up to the remote (matches the chip's arrows)
+    checkout: "\u{21C4}", // ⇄ — switching between branches
 };
 
 /// The set to render with: Nerd Font glyphs when `nerd` is on (the default),
@@ -166,6 +184,10 @@ mod tests {
             ("clean", set.clean),
             ("dirty", set.dirty),
             ("stash", set.stash),
+            ("history", set.history),
+            ("undo", set.undo),
+            ("push", set.push),
+            ("checkout", set.checkout),
         ]
     }
 

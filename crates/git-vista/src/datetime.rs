@@ -41,6 +41,31 @@ pub fn format_label(
     }
 }
 
+/// Relative-time label for the activity feed: `"just now"`, `"5m ago"`,
+/// `"3h ago"`, `"2d ago"` — or `None` past a week, where a relative label
+/// stops being more readable than the date (the caller falls back to
+/// [`local_timestamp`]). A negative delta (clock skew between the server's
+/// stamps and the browser) reads as "just now" rather than a nonsense future.
+/// Pure and host-testable, like [`format_label`].
+pub fn ago_label(delta_secs: i64) -> Option<String> {
+    match delta_secs {
+        d if d < 60 => Some("just now".to_string()),
+        d if d < 3_600 => Some(format!("{}m ago", d / 60)),
+        d if d < 86_400 => Some(format!("{}h ago", d / 3_600)),
+        d if d < 7 * 86_400 => Some(format!("{}d ago", d / 86_400)),
+        _ => None,
+    }
+}
+
+/// Feed-row timestamp: relative while recent ("5m ago"), the usual local
+/// date label once it's over a week old. wasm-only for the same reason as
+/// [`local_timestamp`]; the interesting logic is the pure [`ago_label`].
+#[cfg(target_arch = "wasm32")]
+pub fn time_ago(epoch_secs: i64) -> String {
+    let now = (js_sys::Date::now() / 1000.0) as i64;
+    ago_label(now - epoch_secs).unwrap_or_else(|| local_timestamp(epoch_secs))
+}
+
 /// Compact local-timezone label for a Unix timestamp (seconds), e.g.
 /// `"Jun 29 14:32"`. wasm-only: it uses the JS `Date`, which resolves the
 /// browser's timezone (and DST) for the commit's own instant, and the current
@@ -89,5 +114,17 @@ mod tests {
     #[test]
     fn late_evening_is_pm() {
         assert_eq!(format_label(2026, 7, 1, 23, 5, 2026), "Jul 1 11:05 PM");
+    }
+
+    #[test]
+    fn ago_labels_scale_with_the_delta() {
+        assert_eq!(ago_label(-30).as_deref(), Some("just now"), "clock skew");
+        assert_eq!(ago_label(5).as_deref(), Some("just now"));
+        assert_eq!(ago_label(59).as_deref(), Some("just now"));
+        assert_eq!(ago_label(60).as_deref(), Some("1m ago"));
+        assert_eq!(ago_label(59 * 60).as_deref(), Some("59m ago"));
+        assert_eq!(ago_label(3 * 3_600 + 5).as_deref(), Some("3h ago"));
+        assert_eq!(ago_label(2 * 86_400).as_deref(), Some("2d ago"));
+        assert_eq!(ago_label(8 * 86_400), None, "past a week: fall back to the date");
     }
 }
