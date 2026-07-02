@@ -54,6 +54,11 @@ pub struct MenuData {
     /// picks the branch icon (vs the commit icon) for the menu header, so the
     /// header's glyph matches what the header names.
     pub is_branch: bool,
+    /// GitHub web base for this repo (e.g. "https://github.com/owner/repo"), when
+    /// it has a github.com origin. Used to build the "Create Pull Request" item's
+    /// compare URL (`<base>/compare/main...<branch>`); `None` => no GitHub repo, so
+    /// that item is omitted.
+    pub repo_url: Option<String>,
 }
 
 /// A branch operation awaiting confirmation in the modal (Issue #33 follow-up).
@@ -72,6 +77,16 @@ pub enum PendingOp {
     /// fetched on click; when it equals `branch` the confirm button is disabled (git
     /// refuses to delete the checked-out branch). `None` => detached HEAD (deletable).
     Delete { branch: String, current: Option<String> },
+    /// Force-delete `branch` (`git branch -D <branch>`), discarding unmerged commits.
+    /// Only reached after the safe [`PendingOp::Delete`] is refused with "not fully
+    /// merged": the modal re-opens as this so the user can override rather than hit a
+    /// dead-end error.
+    ForceDelete { branch: String },
+    /// Rebase the checked-out branch onto main (`git rebase main`, or `origin/main`
+    /// when that remote-tracking ref exists — resolved server-side). `current` is the
+    /// live HEAD branch, fetched on click, purely to name it in the dialog; `None` =>
+    /// detached HEAD (the confirm button is disabled — there's no branch to rebase).
+    Rebase { current: Option<String> },
 }
 
 /// How long (ms) after the commit modal opens to ignore a backdrop dismiss, so

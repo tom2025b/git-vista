@@ -144,6 +144,9 @@ pub fn build_node(
         let github_url = c.repo_url.as_ref().and_then(|base| {
             c.remote_set.contains(&commit_id).then(|| format!("{base}/commit/{commit_id}"))
         });
+        // The repo's GitHub base, carried into the menu for the "Create Pull
+        // Request" compare link (independent of whether this commit is pushed).
+        let repo_url = c.repo_url.clone();
         let open_menu = move |ev: web_sys::MouseEvent| {
             // Ignore the click that ends a pan; a real tap opens the menu where
             // the pointer is (viewport coords for the fixed-position overlay).
@@ -163,6 +166,7 @@ pub fn build_node(
                 branches: branches.clone(),
                 // A commit dot: the menu header shows the commit glyph.
                 is_branch: false,
+                repo_url: repo_url.clone(),
             }));
         };
 
@@ -510,6 +514,8 @@ pub fn stubs(
                     .contains(&s.name)
                     .then(|| format!("{base}/tree/{}", s.name))
             });
+            // The repo's GitHub base, for the menu's "Create Pull Request" link.
+            let repo_url = c.repo_url.clone();
             let open_menu = move |ev: web_sys::MouseEvent| {
                 // Ignore the click that ends a pan; a real tap opens the menu.
                 if moved.get_value() {
@@ -530,6 +536,7 @@ pub fn stubs(
                     branches: vec![branch_name.clone()],
                     // …and its menu header shows the branch glyph, not the commit's.
                     is_branch: true,
+                    repo_url: repo_url.clone(),
                 }));
             };
             view! {

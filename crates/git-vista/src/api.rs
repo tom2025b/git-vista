@@ -135,9 +135,28 @@ pub async fn fetch_head_branch() -> Result<Option<String>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Ask the backend to rebase the checked-out branch onto main (`POST /api/rebase`).
+/// Unlike the branch ops it carries no body — it always acts on the current HEAD,
+/// and the server picks `origin/main` vs `main` as the base. A non-2xx body is
+/// git's own error text (conflicts, detached HEAD, …), returned as `Err`.
+pub async fn rebase_request() -> Result<(), String> {
+    let resp = Request::post("/api/rebase")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
 /// Ask the backend to run a branch operation on `branch` (Issue #33 follow-up).
-/// `path` is the endpoint — `/api/merge`, `/api/push`, or `/api/delete-branch` —
-/// all of which take the same `{ branch }` body. As with the other requests, a
+/// `path` is the endpoint — `/api/merge`, `/api/push`, `/api/delete-branch`, or
+/// `/api/force-delete-branch` — all of which take the same `{ branch }` body. As with the other requests, a
 /// non-2xx body is git's own error text, returned as `Err` for the caller to show.
 pub async fn branch_op_request(path: &str, branch: &str) -> Result<(), String> {
     let body = BranchRequest {

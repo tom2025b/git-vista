@@ -230,9 +230,59 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         }
                         .into_view()
                     };
-                    [merge_item, push_item, delete_item]
+                    // "Create Pull Request": a real anchor to GitHub's compare page
+                    // (`…/compare/main...<branch>`), opening in a new tab — a live
+                    // link, not a scripted `window.open`, which iOS WebKit blocks
+                    // (same reason as "Open on GitHub"). Shown only on a GitHub repo;
+                    // omitted otherwise, since there's no compare page to point at.
+                    let mut items = vec![merge_item, push_item];
+                    if let Some(base) = m.repo_url.as_ref() {
+                        let branch = b.clone();
+                        let url = format!("{base}/compare/main...{branch}");
+                        items.push(
+                            view! {
+                                <a
+                                    class="ctx-item"
+                                    href=url
+                                    target="_blank"
+                                    rel="noopener"
+                                    on:click=move |_| menu.set(None)
+                                >
+                                    // The pull-request glyph flags this GitHub action.
+                                    <span class="nf ctx-icon">{ic.pull_request}</span>
+                                    {format!("Create Pull Request for ‘{branch}’")}
+                                </a>
+                            }
+                            .into_view(),
+                        );
+                    }
+                    items.push(delete_item);
+                    items
                 })
                 .collect_view();
+            // "Rebase onto main" (Issue #33 follow-up). Rebase acts on the *checked-
+            // out* branch, not the clicked target — like the "Commit …" items — so
+            // it's a single entry, not one per branch. Resolve the live HEAD branch
+            // on click, then open the confirm modal, which decides whether it's
+            // actionable (a detached HEAD has no branch to rebase). Set `confirm_op`
+            // before the menu closes — same reactive-owner ordering caveat as above.
+            let rebase_item = {
+                let on = move |_| {
+                    menu.set(None);
+                    spawn_local(async move {
+                        let current = fetch_head_branch().await.unwrap_or(None);
+                        dialog_opened_at.set_value(js_sys::Date::now());
+                        confirm_op.set(Some(PendingOp::Rebase { current }));
+                    });
+                };
+                view! {
+                    <button class="ctx-item" on:click=on>
+                        // The merge glyph — rebase reintegrates onto another base.
+                        <span class="nf ctx-icon">{ic.merge}</span>
+                        "Rebase onto main"
+                    </button>
+                }
+            };
             // On a read-only clone (Phase 12) the menu is just the header + the
             // GitHub link: no branch/commit/merge/push/delete. Otherwise show the
             // full set of write actions.
@@ -246,6 +296,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     {commit_staged}
                     {commit_empty}
                     {branch_items}
+                    {rebase_item}
                 }
             });
             view! {
