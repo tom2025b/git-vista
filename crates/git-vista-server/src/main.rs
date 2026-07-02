@@ -17,6 +17,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// The activity feed (journal + reflogs + snapshots) — the server-side half of
+// the Activity Log / Contextual Undo feature. `journal` owns the on-disk state
+// under `.git/git-vista/`; `activity` owns `GET /api/activity`.
+mod activity;
+mod journal;
+
 use axum::response::IntoResponse;
 use axum::{
     extract::Path as AxumPath,
@@ -25,10 +31,12 @@ use axum::{
     Json, Router,
 };
 use git_vista_core::layout;
+use git_vista_core::activity::{ActivityEvent, ActivityKind, ActivitySource};
 use git_vista_core::model::{
     validate_clone_url, BranchRequest, CloneRequest, CommitSummary, CreateBranchRequest,
     CreateCommitRequest, GitRef, RefKind,
 };
+use git_vista_core::status::parse_porcelain_v2;
 use git_vista_git::{read_commit, read_refs, walk_history, RepoError};
 use tower::Layer;
 use tower_http::services::ServeDir;
@@ -152,6 +160,9 @@ async fn main() {
         .route("/api/commits", get(commits))
         // Phase 10: full detail for one commit, read on demand for the side panel.
         .route("/api/commit/{id}", get(commit_detail))
+        // Activity/Undo feature, step 2: one commit's diff (file list + patch),
+        // read on demand when the detail panel opens.
+        .route("/api/diff/{id}", get(commit_diff))
         // Phase 12: clone a public URL into a temp dir and view it read-only.
         .route("/api/clone", post(clone_repo))
         // Issue #18: create a branch at a commit (shells out to `git branch`).
@@ -161,6 +172,17 @@ async fn main() {
         // Issue #33 follow-up: the live checked-out branch, resolved fresh on every
         // request so the merge dialog shows the true target even without a Refresh.
         .route("/api/head-branch", get(head_branch))
+        // Working-tree status (Activity/Undo feature, step 1): branch, ahead/
+        // behind, and the staged/unstaged/untracked/conflicted file lists —
+        // resolved fresh per request, like `head_branch`.
+        .route("/api/status", get(worktree_status))
+        // Activity/Undo feature, step 3: the chronological event feed —
+        // journal + reflogs + snapshot diffs, folded and attributed.
+        .route("/api/activity", get(activity::activity_feed))
+        // Activity/Undo feature, step 5: the undo actions for one commit,
+        // computed live; and the endpoint that executes one of them.
+        .route("/api/undoables/{id}", get(activity::undoables))
+        .route("/api/undo", post(activity::undo))
         // Issue #33 follow-up: branch operations, each shelling out to git.
         .route("/api/merge", post(merge_branch))
         .route("/api/push", post(push_branch))
@@ -292,6 +314,121 @@ async fn commit_detail(
     Ok((no_store, Json(detail)))
 }
 
+/// Upper bound on the patch text returned by `/api/diff/{id}`. A huge commit
+/// (vendored deps, generated files) can carry a multi-megabyte patch that would
+/// choke the iPad both in transfer and in rendering; past this, the patch is
+/// cut at a line boundary and flagged `truncated` so the panel says so.
+const DIFF_PATCH_CAP: usize = 200_000;
+
+/// One commit's diff (Activity/Undo feature, step 2): the per-file change list
+/// and the unified patch, for the detail panel's Changes section.
+///
+/// The commit is first resolved via gix ([`read_commit`]) — validating the id
+/// and yielding the parent count — then git itself produces the diff (same B3
+/// posture as everywhere: git's diff engine handles renames, binaries and
+/// merges; we only parse its machine-readable listings, in core, where that's
+/// unit-tested). Three reads of the same diff:
+///
+///   * `--name-status -z` — the file list (order + change kinds),
+///   * `--numstat -z`     — per-file added/deleted counts folded into it,
+///   * `--patch`          — the unified text, capped at [`DIFF_PATCH_CAP`].
+///
+/// An ordinary commit uses `git show` (its diff vs the parent; a root commit
+/// diffs against the empty tree). A merge commit is diffed against its *first
+/// parent* instead — `git show` on a merge prints the usually-empty combined
+/// diff, while "what did this merge bring in?" is exactly the first-parent
+/// diff — and the response says so (`against_first_parent`).
+async fn commit_diff(
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = current().0;
+    // Belt-and-braces before the id goes anywhere near argv: real ids are hex.
+    if id.len() < 4 || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string()));
+    }
+    let detail = read_commit(&repo, &id).map_err(|e| match e {
+        RepoError::CommitNotFound(_) => (StatusCode::NOT_FOUND, "No such commit.".to_string()),
+        other => {
+            eprintln!("git-vista: /api/diff/{id} failed: {other}");
+            (StatusCode::INTERNAL_SERVER_ERROR, other.to_string())
+        }
+    })?;
+    let against_first_parent = detail.parents.len() >= 2;
+
+    // The base args for the three reads: `show <id>` for ordinary commits,
+    // `diff <id>^1 <id>` for merges. `--format=` silences show's commit header
+    // so only the diff comes back; harmless on `diff`... which doesn't take it,
+    // so the merge arm simply omits it.
+    let first_parent = format!("{id}^1");
+    let base: Vec<&str> = if against_first_parent {
+        vec!["diff", first_parent.as_str(), id.as_str()]
+    } else {
+        vec!["show", "--format=", id.as_str()]
+    };
+    let with = |extra: &[&str]| -> Vec<String> {
+        // Diff options go *before* the revisions so git never reads a
+        // revision as an option's value.
+        let mut args = vec![base[0].to_string()];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args.extend(base[1..].iter().map(|s| s.to_string()));
+        args
+    };
+
+    let name_status = git_stdout(&repo, &with(&["--name-status", "-z"]), "/api/diff").await?;
+    let numstat = git_stdout(&repo, &with(&["--numstat", "-z"]), "/api/diff").await?;
+    let patch_bytes =
+        git_stdout(&repo, &with(&["--patch", "--no-color"]), "/api/diff").await?;
+
+    let mut files = git_vista_core::diff::parse_name_status_z(&name_status);
+    git_vista_core::diff::fold_numstat_z(&numstat, &mut files);
+
+    // Cap the patch at a line boundary so the panel never gets half a line.
+    let mut patch = String::from_utf8_lossy(&patch_bytes).into_owned();
+    let truncated = patch.len() > DIFF_PATCH_CAP;
+    if truncated {
+        let cut = patch[..DIFF_PATCH_CAP].rfind('\n').unwrap_or(DIFF_PATCH_CAP);
+        patch.truncate(cut);
+    }
+
+    let diff = git_vista_core::diff::CommitDiff {
+        id: detail.id.0,
+        files,
+        patch,
+        truncated,
+        against_first_parent,
+    };
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(diff)))
+}
+
+/// Run `git -C <repo> <args…>` and return its stdout bytes, mapping both spawn
+/// failures and non-zero exits to a 500 with git's own stderr as the reason.
+/// Shared by the diff reads; deliberately bytes, not String — paths in `-z`
+/// listings aren't guaranteed UTF-8, and the parsers handle that themselves.
+async fn git_stdout(
+    repo: &Path,
+    args: &[String],
+    endpoint: &str,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| {
+            eprintln!("git-vista: {endpoint} couldn't run git: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"))
+        })?;
+    if !output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if msg.is_empty() { "git failed.".to_string() } else { msg };
+        eprintln!("git-vista: {endpoint} failed: {msg}");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
+    }
+    Ok(output.stdout)
+}
+
 /// Guard for the write endpoints (Phase 12): when the current repo is a read-only
 /// clone, refuse the operation with `403` and a clear reason, since any change
 /// would be thrown away with the clone. Returns `None` when writes are allowed.
@@ -416,6 +553,18 @@ async fn create_branch(Json(req): Json<CreateBranchRequest>) -> (StatusCode, Str
 
     if output.status.success() {
         println!("[/api/branch] created branch '{name}' at {commit}");
+        // Journal the creation with the resolved tip (the user may have given
+        // an abbreviated or symbolic start point).
+        let repo = current().0;
+        let tip = rev_parse(&repo, name).await;
+        journal_app_event(
+            &repo,
+            ActivityKind::BranchCreated,
+            Some(name.to_string()),
+            None,
+            tip,
+            format!("created branch ‘{name}’"),
+        );
         (StatusCode::OK, format!("Created branch '{name}'."))
     } else {
         // git already explains the failure (name exists, bad name, unknown commit,
@@ -431,17 +580,22 @@ async fn create_branch(Json(req): Json<CreateBranchRequest>) -> (StatusCode, Str
     }
 }
 
-/// Create a commit on top of the current HEAD in the served repository (Issue #33).
+/// Create a commit in the served repository (Issue #33).
 ///
 /// Same B3 posture as [`create_branch`]: shell out to `git commit` rather than
 /// build the commit ourselves. git validates the tree state, refuses an empty
 /// commit unless `--allow-empty` is passed, and reports a clear message on stderr
 /// (e.g. "nothing to commit") which we forward verbatim to the UI on failure.
 ///
-/// The UI only offers this on the HEAD tip, so a plain `git commit` lands exactly
-/// where the user clicked — no ref moving here. Args are separate argv entries
-/// (never a shell line); the message is the value of `-m`, so even a message
-/// starting with `-` can't be read as an option. An empty message is rejected.
+/// With no `branch` in the request — or one that turns out to be the checked-out
+/// branch — this is a plain `git commit` on HEAD, which lands exactly where the
+/// UI offered it (the HEAD tip). A *different* branch (the UI offers this on
+/// branch stubs, for empty commits only) takes [`commit_empty_on_branch`]
+/// instead: `git commit` can only ever commit on HEAD, so that path writes the
+/// commit object directly and moves just the named ref. Args are separate argv
+/// entries (never a shell line); the message is the value of `-m`, so even a
+/// message starting with `-` can't be read as an option. An empty message is
+/// rejected.
 async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (StatusCode, String) {
     if let Some(rejected) = reject_if_read_only() {
         return rejected;
@@ -454,8 +608,24 @@ async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (StatusCode, Str
         );
     }
 
+    let repo = current().0;
+
+    // A named target that isn't the checked-out branch takes the ref-write
+    // path. The checked-out branch itself falls through to the plain
+    // `git commit` below — same result, plus HEAD's own reflog entry.
+    if let Some(branch) = req.branch.as_deref().map(str::trim) {
+        if git_vista_git::read_head_branch(&repo).as_deref() != Some(branch) {
+            return commit_empty_on_branch(&repo, branch, message, req.allow_empty).await;
+        }
+    }
+
+    // The pre-commit tip, captured for the journal before git moves anything.
+    // `None` on an unborn HEAD (first commit) — journaled as a creation-like
+    // event with no old state, which is exactly what it is.
+    let old = rev_parse(&repo, "HEAD").await;
+
     let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C").arg(current().0).arg("commit");
+    cmd.arg("-C").arg(&repo).arg("commit");
     if req.allow_empty {
         cmd.arg("--allow-empty");
     }
@@ -474,6 +644,11 @@ async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (StatusCode, Str
 
     if output.status.success() {
         println!("[/api/commit] created commit (allow_empty={})", req.allow_empty);
+        let new = rev_parse(&repo, "HEAD").await;
+        // The branch the commit landed on; "HEAD" when detached.
+        let branch = git_vista_git::read_head_branch(&repo).unwrap_or_else(|| "HEAD".into());
+        let summary = message.lines().next().unwrap_or(message).to_string();
+        journal_app_event(&repo, ActivityKind::Commit, Some(branch), old, new, summary);
         (StatusCode::OK, "Created commit.".to_string())
     } else {
         // git explains the failure, but "nothing to commit, working tree clean"
@@ -495,6 +670,125 @@ async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (StatusCode, Str
     }
 }
 
+/// Create an empty commit on a branch that is *not* checked out — the branch-stub
+/// path of [`create_commit`], how a new zero-commit branch takes its first commit
+/// from the UI without a checkout.
+///
+/// `git commit` can only commit on HEAD, so this writes the commit object
+/// directly: `git commit-tree <tip>^{tree} -p <tip>` reuses the parent's tree
+/// (an empty commit by construction), then `git update-ref <ref> <new> <tip>`
+/// advances the branch. Passing the expected old value makes the update a
+/// compare-and-swap — if the branch moved since the menu was opened, git
+/// refuses rather than clobbering it (the same stale-graph posture as undo).
+/// HEAD, the index and the working tree are untouched throughout.
+///
+/// Only empty commits are meaningful here: staged changes live in the
+/// checked-out branch's index, so a staged commit aimed at another branch is
+/// rejected — the UI keeps that item disabled on stubs, this is belt and braces.
+async fn commit_empty_on_branch(
+    repo: &Path,
+    branch: &str,
+    message: &str,
+    allow_empty: bool,
+) -> (StatusCode, String) {
+    if branch.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Branch name can't be empty.".to_string());
+    }
+    if branch.starts_with('-') {
+        return (StatusCode::BAD_REQUEST, "Branch name can't start with '-'.".to_string());
+    }
+    if !allow_empty {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Staged changes can only be committed on the checked-out branch, \
+                 not ‘{branch}’. Check it out first, or create an empty commit."
+            ),
+        );
+    }
+    // Resolve the branch's tip — also confirms a local branch by that name
+    // exists (the graph the menu came from may be stale).
+    let refname = format!("refs/heads/{branch}");
+    let Some(tip) = rev_parse(repo, &refname).await else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("No local branch named ‘{branch}’ — refresh and try again."),
+        );
+    };
+
+    // Write the commit object: the parent's own tree, so nothing changes.
+    let output = match tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("commit-tree")
+        .arg(format!("{tip}^{{tree}}"))
+        .args(["-p", &tip, "-m"])
+        .arg(message)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("git-vista: /api/commit couldn't run git commit-tree: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"));
+        }
+    };
+    if !output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if msg.is_empty() { "git commit-tree failed.".to_string() } else { msg };
+        eprintln!("git-vista: /api/commit (on ‘{branch}’) failed: {msg}");
+        return (StatusCode::BAD_REQUEST, msg);
+    }
+    let new = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if new.is_empty() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "git commit-tree returned no commit id.".to_string(),
+        );
+    }
+
+    // Advance the ref — compare-and-swap on the tip resolved above, with a
+    // reflog line in git's own "commit (empty): …" shape so the activity feed
+    // reads it like any other commit.
+    let summary = message.lines().next().unwrap_or(message).to_string();
+    let output = match tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["update-ref", "-m"])
+        .arg(format!("commit (empty): {summary}"))
+        .args([refname.as_str(), new.as_str(), tip.as_str()])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("git-vista: /api/commit couldn't run git update-ref: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"));
+        }
+    };
+    if !output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if msg.is_empty() {
+            format!("‘{branch}’ has moved since this was offered — refresh and try again.")
+        } else {
+            msg
+        };
+        eprintln!("git-vista: /api/commit (on ‘{branch}’) failed: {msg}");
+        return (StatusCode::CONFLICT, msg);
+    }
+
+    println!("[/api/commit] created empty commit on '{branch}' ({new})");
+    journal_app_event(
+        repo,
+        ActivityKind::Commit,
+        Some(branch.to_string()),
+        Some(tip),
+        Some(new),
+        summary,
+    );
+    (StatusCode::OK, "Created commit.".to_string())
+}
+
 /// The currently checked-out branch, resolved fresh (Issue #33 follow-up). The
 /// merge dialog fetches this the moment the user clicks "Merge", so it names the
 /// real target even if the graph on screen is a stale snapshot from before a branch
@@ -504,30 +798,104 @@ async fn head_branch() -> impl IntoResponse {
     (no_store, Json(git_vista_git::read_head_branch(&current().0)))
 }
 
+/// The working-tree status (Activity/Undo feature, step 1): the parsed output
+/// of `git status --porcelain=v2 --branch`, resolved fresh on every request.
+///
+/// Shelling out to `git status` rather than assembling this from gix keeps the
+/// B3 posture of the write endpoints — git itself decides what's staged /
+/// modified / conflicted, including every corner case (renames, type changes,
+/// sparse checkouts) — and the pure parser lives in core where it's unit-
+/// tested. A read, so it works on read-only clones too. Sent `no-store` like
+/// the other live reads: the answer changes with every edit in the worktree.
+async fn worktree_status() -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = current().0;
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["status", "--porcelain=v2", "--branch"])
+        .output()
+        .await
+        .map_err(|e| {
+            eprintln!("git-vista: /api/status couldn't run git: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"))
+        })?;
+    if !output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if msg.is_empty() { "git status failed.".to_string() } else { msg };
+        eprintln!("git-vista: /api/status failed: {msg}");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
+    }
+    let parsed = parse_porcelain_v2(&String::from_utf8_lossy(&output.stdout));
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(parsed)))
+}
+
 /// Merge a branch into the currently checked-out branch (Issue #33 follow-up):
 /// `git merge --no-edit <branch>`. `--no-edit` takes git's default merge message
 /// (the server has no editor). A merge lands in whatever HEAD points at, so the UI
 /// labels this with the current branch and never switches branches itself.
 async fn merge_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
-    run_branch_op(
+    // Pre-merge tip, captured for the journal: it's the "undo merge" target.
+    let repo = current().0;
+    let old = rev_parse(&repo, "HEAD").await;
+    let resp = run_branch_op(
         "/api/merge",
         &req.branch,
         &["merge", "--no-edit"],
         format!("merged '{}' into HEAD", req.branch.trim()),
     )
-    .await
+    .await;
+    if resp.0 == StatusCode::OK {
+        let branch = req.branch.trim();
+        let new = rev_parse(&repo, "HEAD").await;
+        // git exits 0 with "Already up to date." when the branch brings nothing
+        // in — HEAD hasn't moved. That's no merge: journalling one would put an
+        // event in the Activity feed that never happened (with nothing to undo),
+        // and a silent OK reads in the UI like a refresh failure. Say what
+        // happened instead; the frontend surfaces this body verbatim.
+        if new == old {
+            return (
+                StatusCode::OK,
+                format!("Already up to date — ‘{branch}’ has no commits the current branch doesn’t already have."),
+            );
+        }
+        let into = git_vista_git::read_head_branch(&repo).unwrap_or_else(|| "HEAD".into());
+        journal_app_event(
+            &repo,
+            ActivityKind::Merge,
+            Some(into.clone()),
+            old,
+            new,
+            format!("merged ‘{branch}’ into ‘{into}’"),
+        );
+    }
+    resp
 }
 
 /// Push a branch to `origin` (Issue #33 follow-up): `git push origin <branch>`.
 /// A non-origin remote (or none) makes git error; that text is forwarded to the UI.
 async fn push_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
-    run_branch_op(
+    let resp = run_branch_op(
         "/api/push",
         &req.branch,
         &["push", "origin"],
         format!("pushed '{}' to origin", req.branch.trim()),
     )
-    .await
+    .await;
+    if resp.0 == StatusCode::OK {
+        let repo = current().0;
+        let branch = req.branch.trim();
+        let tip = rev_parse(&repo, branch).await;
+        journal_app_event(
+            &repo,
+            ActivityKind::Push,
+            Some(branch.to_string()),
+            None,
+            tip,
+            format!("pushed ‘{branch}’ to origin"),
+        );
+    }
+    resp
 }
 
 /// Delete a branch (Issue #33 follow-up): `git branch -d <branch>`. The lowercase
@@ -535,13 +903,33 @@ async fn push_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
 /// merged, forwarding "not fully merged" to the UI. The UI also confirms first, so
 /// deletion takes both a click-through and a merged branch.
 async fn delete_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
-    run_branch_op(
+    // The tip must be captured BEFORE the delete: git removes the branch's
+    // reflog with the branch, so afterwards nobody knows where it pointed —
+    // and this journaled oid is precisely what "Restore branch" replays.
+    let repo = current().0;
+    let tip = rev_parse(&repo, req.branch.trim()).await;
+    let resp = run_branch_op(
         "/api/delete-branch",
         &req.branch,
         &["branch", "-d"],
         format!("deleted branch '{}'", req.branch.trim()),
     )
-    .await
+    .await;
+    if resp.0 == StatusCode::OK {
+        let branch = req.branch.trim();
+        journal_app_event(
+            &repo,
+            ActivityKind::BranchDeleted,
+            Some(branch.to_string()),
+            tip,
+            None,
+            format!("deleted branch ‘{branch}’"),
+        );
+        // Drop it from the snapshot now, so the feed's snapshot diff can't
+        // also report this app deletion as an external one.
+        journal::remove_from_snapshot(&repo, branch);
+    }
+    resp
 }
 
 /// Force-delete a branch (Issue #33 follow-up): `git branch -D <branch>`. The
@@ -550,13 +938,31 @@ async fn delete_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
 /// (see [`delete_branch`]) was refused for "not fully merged" and the user
 /// confirmed the override, so this deliberately skips git's merge safety check.
 async fn force_delete_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
-    run_branch_op(
+    // Same pre-delete tip capture as `delete_branch` — even more load-bearing
+    // here, since a force-delete may discard commits nothing else reaches:
+    // the journaled tip is then the ONLY path back to them (until gc).
+    let repo = current().0;
+    let tip = rev_parse(&repo, req.branch.trim()).await;
+    let resp = run_branch_op(
         "/api/force-delete-branch",
         &req.branch,
         &["branch", "-D"],
         format!("force-deleted branch '{}'", req.branch.trim()),
     )
-    .await
+    .await;
+    if resp.0 == StatusCode::OK {
+        let branch = req.branch.trim();
+        journal_app_event(
+            &repo,
+            ActivityKind::BranchDeleted,
+            Some(branch.to_string()),
+            tip,
+            None,
+            format!("force-deleted branch ‘{branch}’"),
+        );
+        journal::remove_from_snapshot(&repo, branch);
+    }
+    resp
 }
 
 /// Rebase the checked-out branch onto main (Issue #33 follow-up): `git rebase
@@ -573,6 +979,8 @@ async fn rebase() -> (StatusCode, String) {
         return rejected;
     }
     let repo = current().0;
+    // Pre-rebase tip, for the journal: it's the "undo rebase" target.
+    let old = rev_parse(&repo, "HEAD").await;
     let base = if git_ref_exists(&repo, "refs/remotes/origin/main").await {
         "origin/main"
     } else {
@@ -599,6 +1007,16 @@ async fn rebase() -> (StatusCode, String) {
 
     if output.status.success() {
         println!("[/api/rebase] rebased HEAD onto {base}");
+        let new = rev_parse(&repo, "HEAD").await;
+        let branch = git_vista_git::read_head_branch(&repo).unwrap_or_else(|| "HEAD".into());
+        journal_app_event(
+            &repo,
+            ActivityKind::Rebase,
+            Some(branch.clone()),
+            old,
+            new,
+            format!("rebased ‘{branch}’ onto {base}"),
+        );
         (StatusCode::OK, format!("Rebased onto {base}."))
     } else {
         // git explains conflicts on stderr (some notices go to stdout); prefer
@@ -626,6 +1044,54 @@ async fn rebase() -> (StatusCode, String) {
         eprintln!("git-vista: /api/rebase failed (aborted): {msg}");
         (StatusCode::BAD_REQUEST, msg)
     }
+}
+
+/// Resolve `rev` to a full commit id in `repo`, or `None` if it doesn't
+/// resolve. Used by the journal hooks to capture a ref's tip before/after an
+/// operation — e.g. a branch's tip *before* deleting it, which is the one
+/// piece of state git itself throws away (the branch's reflog dies with it)
+/// and exactly what "Restore branch" later needs.
+async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{rev}^{{commit}}"))
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+/// Record one successful app operation in the journal (source: App). The
+/// activity feed matches the operation's own reflog echo against this entry
+/// and shows a single event labelled "via git-vista". Best-effort by design:
+/// the git operation already succeeded, so journal trouble is only logged.
+fn journal_app_event(
+    repo: &Path,
+    kind: ActivityKind,
+    ref_name: Option<String>,
+    old_oid: Option<String>,
+    new_oid: Option<String>,
+    summary: String,
+) {
+    journal::append(
+        repo,
+        &ActivityEvent {
+            time: activity::now_secs(),
+            kind,
+            ref_name,
+            summary,
+            old_oid,
+            new_oid,
+            source: ActivitySource::App,
+            undo: None,
+        },
+    );
 }
 
 /// Whether `refname` resolves in `repo` (`git rev-parse --verify --quiet`): exit 0

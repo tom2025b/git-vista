@@ -19,7 +19,10 @@
 //!    children reserved them), it takes the **leftmost** of those; the rest are
 //!    **freed** — those sibling branch lines have converged here. If no lane
 //!    expects it (a branch tip / the newest commit), it takes the **leftmost
-//!    free lane**, only widening the graph when nothing is free.
+//!    free lane**, only widening the graph when nothing is free. (When refs are
+//!    known, lane 0 starts out reserved for the trunk's tip — see
+//!    [`trunk_reserve_tip`] — so a side branch's newer commit can't capture the
+//!    trunk's column.)
 //! 2. **Continue its first parent in the same lane**, so a branch keeps a stable
 //!    column for its whole life (the mainline stays in lane 0). If the first
 //!    parent is out of window the lane is freed.
@@ -73,7 +76,7 @@ fn leftmost_free_right_of(lanes: &mut Vec<Option<Oid>>, after: usize) -> usize {
 ///
 /// [`color`]: GraphRow::color
 pub fn layout(commits: Vec<CommitSummary>) -> Graph {
-    let mut graph = layout_topology(commits);
+    let mut graph = layout_topology(commits, None);
     assign_branch_colors(&mut graph, &[], None);
     graph
 }
@@ -90,7 +93,8 @@ pub fn layout_with_refs(
     refs: Vec<GitRef>,
     head_branch: Option<&str>,
 ) -> Graph {
-    let mut graph = layout_topology(commits);
+    let trunk_tip = trunk_reserve_tip(&commits, &refs, head_branch);
+    let mut graph = layout_topology(commits, trunk_tip.as_ref());
     // Colouring also tells us which local branches own no commits of their own
     // (their tip was already claimed by a higher-priority branch) — those become
     // distinct stub lines instead of a second badge on the shared commit.
@@ -147,9 +151,58 @@ pub fn layout_with_refs(
     graph
 }
 
+/// The commit whose line lane 0 is held for — the trunk's tip, or the
+/// checked-out branch's tip when its first-parent chain runs *through* the
+/// trunk tip (work ahead of `main`, which reads as the trunk's continuation —
+/// Issue #30). `None` when there's no trunk to protect (no branch refs at all).
+///
+/// Why this exists: the lane walk hands the newest commit "the leftmost free
+/// lane", which at row 0 is always lane 0 — even when that commit belongs to a
+/// side branch. Its first-parent then continues the same lane, so the side
+/// branch visually glues itself on top of the trunk as one unbroken vertical
+/// line (and the trunk recolour pass paints it trunk-blue). Committing on a
+/// fresh branch stub made the branch "disappear" into main this way. Reserving
+/// lane 0 for the trunk's own tip forces such a side tip into lane 1+, where it
+/// forks off the trunk like any other branch.
+fn trunk_reserve_tip(
+    commits: &[CommitSummary],
+    refs: &[GitRef],
+    head_branch: Option<&str>,
+) -> Option<Oid> {
+    let local = |name: &str| {
+        refs.iter()
+            .find(|r| matches!(r.kind, crate::model::RefKind::Branch) && r.name == name)
+            .map(|r| r.target.clone())
+    };
+    // Same priority the colour seeding gives the trunk: local `main`, then local
+    // `master`, then the checked-out branch — so lane 0 and colour slot 0 always
+    // describe the same line.
+    let trunk = local("main")
+        .or_else(|| local("master"))
+        .or_else(|| head_branch.and_then(&local))?;
+    // If the checked-out branch sits ahead of (or exactly on) the trunk tip
+    // along first parents, its chain *is* the trunk line's visible continuation
+    // — reserve its tip instead, so that chain keeps lane 0 (Issue #30's
+    // one-unbroken-trunk rendering).
+    if let Some(head_tip) = head_branch.and_then(&local) {
+        let index: HashMap<&Oid, usize> =
+            commits.iter().enumerate().map(|(row, c)| (&c.id, row)).collect();
+        let mut cur = index.get(&head_tip).copied();
+        while let Some(row) = cur {
+            if commits[row].id == trunk {
+                return Some(head_tip);
+            }
+            cur = commits[row].parents.first().and_then(|p| index.get(p).copied());
+        }
+    }
+    Some(trunk)
+}
+
 /// The pure topology pass: assign each commit a lane and wire edges. Leaves every
 /// row's `refs` empty and `color` at 0 — [`assign_branch_colors`] fills those.
-fn layout_topology(commits: Vec<CommitSummary>) -> Graph {
+/// `trunk_tip` (if given and in-window) holds lane 0 for the trunk's line — see
+/// [`trunk_reserve_tip`] for why.
+fn layout_topology(commits: Vec<CommitSummary>, trunk_tip: Option<&Oid>) -> Graph {
     // Row index per commit id, so an edge can find its parent's row, and so we
     // can tell in-window parents from dangling ones.
     let index: HashMap<Oid, usize> = commits
@@ -161,6 +214,13 @@ fn layout_topology(commits: Vec<CommitSummary>) -> Graph {
     // Active lanes: `lanes[i] = Some(id)` means lane i currently expects commit
     // `id` next; `None` means the lane is free and reusable.
     let mut lanes: Vec<Option<Oid>> = Vec::new();
+    // Hold lane 0 for the trunk before any tip can claim it. When the trunk tip
+    // is itself the newest commit this is a no-op (it just collects its
+    // reservation); when a side branch's commit is newer, that tip now starts in
+    // lane 1+ and forks off the trunk instead of absorbing it.
+    if let Some(tip) = trunk_tip.filter(|t| index.contains_key(t)) {
+        lanes.push(Some(tip.clone()));
+    }
     // Each commit's final lane, decided as we walk newest -> oldest.
     let mut lane_of: HashMap<Oid, usize> = HashMap::new();
     let mut rows = Vec::with_capacity(commits.len());
@@ -641,6 +701,43 @@ mod tests {
         // `feature` stays a real line: it's badged on its tip, not a stub.
         assert!(g.stubs.iter().all(|s| s.name != "feature"));
         assert!(ref_names(&g, "F2").contains(&"feature".to_string()));
+    }
+
+    /// The "commit on a fresh branch stub" bug: a commit created on a side
+    /// branch (without checking it out) is the newest commit, so the lane walk
+    /// used to hand it lane 0 — gluing it on top of the trunk as one vertical
+    /// line — and the trunk recolour pass then painted it blue. The branch
+    /// looked like it had vanished into main. It must fork right into its own
+    /// lane with its own colour, badge on the new commit.
+    #[test]
+    fn a_commit_on_a_side_branch_forks_out_instead_of_absorbing_the_trunk() {
+        //   X   igdj's first commit (newest; must fork right)
+        //   T   main tip, checked out
+        //   B
+        let commits = vec![
+            commit("X", &["T"]),
+            commit("T", &["B"]),
+            commit("B", &[]),
+        ];
+        let refs = vec![
+            gitref("HEAD", RefKind::Head, "T"),
+            gitref("main", RefKind::Branch, "T"),
+            gitref("igdj", RefKind::Branch, "X"),
+        ];
+        let g = layout_with_refs(commits, refs, Some("main"));
+        assert_well_formed(&g);
+
+        // The trunk keeps lane 0 top to bottom; the side commit forks right.
+        assert_eq!(lane_of(&g, "T"), 0, "main's tip stays in the trunk lane");
+        assert_eq!(lane_of(&g, "B"), 0);
+        assert_eq!(lane_of(&g, "X"), 1, "the side-branch commit must not take the trunk lane");
+        // …and keeps its own colour: the trunk recolour pass is lane-gated, so
+        // it can no longer absorb it.
+        assert_eq!(color_of(&g, "T"), 0);
+        assert_ne!(color_of(&g, "X"), 0, "the side branch keeps a distinct colour");
+        // igdj is a real line now (badged on its commit), not a stub.
+        assert!(g.stubs.is_empty(), "a branch with a commit of its own is no stub");
+        assert!(ref_names(&g, "X").contains(&"igdj".to_string()));
     }
 
     fn commit(id: &str, parents: &[&str]) -> CommitSummary {

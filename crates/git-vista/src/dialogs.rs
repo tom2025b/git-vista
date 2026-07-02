@@ -12,8 +12,12 @@
 
 use leptos::*;
 
-use crate::api::{branch_op_request, clone_request, create_commit_request, rebase_request};
-use crate::state::{Overlays, PendingOp, DIALOG_GUARD_MS};
+use git_vista_core::activity::UndoAction;
+
+use crate::api::{
+    branch_op_request, clone_request, create_commit_request, rebase_request, undo_request,
+};
+use crate::state::{CommitDialog, Overlays, PendingOp, DIALOG_GUARD_MS};
 
 /// Pop a native alert with `msg` (there's always a window in the running SPA).
 fn alert(msg: &str) {
@@ -24,9 +28,11 @@ fn alert(msg: &str) {
 
 /// Resolve a git op's result: bump `reload` so the graph re-reads on success, or
 /// surface git's own error text ("Couldn't {what}:\n<git stderr>") on failure.
-fn report(result: Result<(), String>, what: &str, reload: RwSignal<u32>) {
+/// Generic over the success payload — some requests return `()`, the branch ops
+/// return the server's success line — since either way it's dropped here.
+fn report<T>(result: Result<T, String>, what: &str, reload: RwSignal<u32>) {
     match result {
-        Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+        Ok(_) => reload.update(|n| *n = n.wrapping_add(1)),
         Err(e) => alert(&format!("Couldn't {what}:\n{e}")),
     }
 }
@@ -38,7 +44,7 @@ fn report(result: Result<(), String>, what: &str, reload: RwSignal<u32>) {
 pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
     let Overlays { commit_dialog, commit_msg, dialog_opened_at, reload, .. } = overlays;
     let submit_commit = move || {
-        let Some(allow_empty) = commit_dialog.get_untracked() else {
+        let Some(CommitDialog { allow_empty, branch }) = commit_dialog.get_untracked() else {
             return;
         };
         let message = commit_msg.get_untracked().trim().to_string();
@@ -47,7 +53,7 @@ pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
         }
         commit_dialog.set(None);
         spawn_local(async move {
-            match create_commit_request(&message, allow_empty).await {
+            match create_commit_request(&message, allow_empty, branch.as_deref()).await {
                 Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
                 Err(e) => {
                     if let Some(w) = web_sys::window() {
@@ -58,8 +64,15 @@ pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
         });
     };
     move || {
-        commit_dialog.get().map(|allow_empty| {
-            let title = if allow_empty { "Create empty commit" } else { "Commit staged changes" };
+        commit_dialog.get().map(|CommitDialog { allow_empty, branch }| {
+            // Name the branch a stub-targeted empty commit will land on — it is
+            // *not* the checked-out branch, which is what anyone would otherwise
+            // assume a commit dialog acts on.
+            let title = match branch {
+                Some(b) => format!("Create empty commit on ‘{b}’"),
+                None if allow_empty => "Create empty commit".to_string(),
+                None => "Commit staged changes".to_string(),
+            };
             // The message field is a <textarea>, NOT an <input>: the void <input>
             // element breaks Leptos' CSR <template> node-walk on iOS WebKit (which
             // parses void elements differently than Blink/Gecko), panicking the whole
@@ -143,7 +156,18 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
         // dead-end alert.
         match op {
             PendingOp::Merge { branch, .. } => spawn_local(async move {
-                report(branch_op_request("/api/merge", &branch).await, &format!("merge ‘{branch}’"), reload);
+                match branch_op_request("/api/merge", &branch).await {
+                    // git's no-op: the branch brought nothing in and HEAD didn't
+                    // move. The graph won't visibly change, which reads as a
+                    // refresh failure — so say what (didn't) happen. Still bump
+                    // `reload`: the repo may have changed under us since the
+                    // graph was drawn, and a re-read after any op is cheap.
+                    Ok(msg) if msg.starts_with("Already up to date") => {
+                        alert(&msg);
+                        reload.update(|n| *n = n.wrapping_add(1));
+                    }
+                    other => report(other, &format!("merge ‘{branch}’"), reload),
+                }
             }),
             PendingOp::Push { branch } => spawn_local(async move {
                 report(branch_op_request("/api/push", &branch).await, &format!("push ‘{branch}’"), reload);
@@ -158,9 +182,16 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
             PendingOp::Rebase { .. } => spawn_local(async move {
                 report(rebase_request().await, "rebase onto main", reload);
             }),
+            // The undo itself (step 5). The server re-checks everything that
+            // matters — compare-and-swap on the branch tip, clean-tree guard,
+            // revert auto-abort — so failure here surfaces its reason verbatim
+            // (e.g. "‘main’ has moved since this undo was offered").
+            PendingOp::Undo(u) => spawn_local(async move {
+                report(undo_request(&u.action).await, "undo", reload);
+            }),
             PendingOp::Delete { branch, .. } => spawn_local(async move {
                 match branch_op_request("/api/delete-branch", &branch).await {
-                    Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+                    Ok(_) => reload.update(|n| *n = n.wrapping_add(1)),
                     // git's safe `-d` refuses an unmerged branch with "not fully
                     // merged". Rather than dead-end on that error, re-open the modal
                     // offering a force delete (`-D`). Reset the ghost-click guard as
@@ -235,6 +266,54 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
                     true,
                     true,
                 ),
+                // The undo confirmation (step 5). The server-built label already
+                // says exactly what will happen ("Undo merge — reset ‘main’ to
+                // abc1234"); the body adds what that means for history, and the
+                // pushed warning when the discarded state is on the remote.
+                PendingOp::Undo(u) => {
+                    let warn = if u.warn_pushed {
+                        " The discarded state is already pushed: origin keeps it \
+                         (git-vista never force-pushes), so the branch will show \
+                         as behind until it's pushed again."
+                    } else {
+                        ""
+                    };
+                    match &u.action {
+                        UndoAction::ResetBranch { .. } => (
+                            "Undo — move branch back",
+                            format!(
+                                "{}? The discarded commits leave the graph but stay \
+                                 in the reflog.{warn}",
+                                u.label
+                            ),
+                            "Undo",
+                            true,
+                            true,
+                        ),
+                        UndoAction::RestoreBranch { .. } => (
+                            "Restore branch",
+                            format!(
+                                "{}? This re-creates the branch exactly where it \
+                                 last pointed — nothing else changes.",
+                                u.label
+                            ),
+                            "Restore",
+                            false,
+                            true,
+                        ),
+                        UndoAction::RevertCommit { .. } => (
+                            "Revert commit",
+                            format!(
+                                "{}? This adds a new commit that reverses it — \
+                                 history is kept, so it's safe even when pushed.",
+                                u.label
+                            ),
+                            "Revert",
+                            false,
+                            true,
+                        ),
+                    }
+                }
                 PendingOp::Rebase { current } => match current {
                     Some(branch) => (
                         "Rebase onto main",
