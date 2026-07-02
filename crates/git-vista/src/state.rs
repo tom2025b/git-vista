@@ -62,6 +62,20 @@ pub struct MenuData {
     pub repo_url: Option<String>,
 }
 
+/// What the commit-message dialog (Issue #33) is collecting a message for:
+/// which kind of commit, and where it should land.
+#[derive(Clone)]
+pub struct CommitDialog {
+    /// `git commit --allow-empty` (an empty commit) vs a staged-changes commit.
+    pub allow_empty: bool,
+    /// Branch the commit should land on. `None` => the checked-out branch (a
+    /// plain `git commit` on HEAD — every commit item on a commit dot). `Some`
+    /// => a branch stub's own name: the server writes the commit object and
+    /// moves just that ref, so an empty branch can take its first commit
+    /// without a checkout. Only ever `Some` together with `allow_empty`.
+    pub branch: Option<String>,
+}
+
 /// A branch operation awaiting confirmation in the modal (Issue #33 follow-up).
 /// Merge and delete change history/refs and push reaches the network, so each is
 /// confirmed before it runs — reusing the same in-app modal the commit dialog uses
@@ -119,8 +133,8 @@ pub struct Settings {
 pub struct Overlays {
     /// The open context menu, if any (Issue #18). `None` => no menu.
     pub menu: RwSignal<Option<MenuData>>,
-    /// The open commit-message dialog, if any (Issue #33). `Some(allow_empty)`.
-    pub commit_dialog: RwSignal<Option<bool>>,
+    /// The open commit-message dialog, if any (Issue #33).
+    pub commit_dialog: RwSignal<Option<CommitDialog>>,
     /// The text currently typed into that dialog's message box.
     pub commit_msg: RwSignal<String>,
     /// The branch operation awaiting confirmation, if any (Issue #33 follow-up).

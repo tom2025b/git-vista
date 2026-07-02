@@ -197,7 +197,12 @@ pub fn install_resize_listener(vp_h: RwSignal<f64>) {
 /// boxes) and when a modifier is held, so typing an "r" — or the browser's own
 /// Cmd/Ctrl-R reload — is left untouched. Removed on cleanup, like the resize
 /// listener above, so a reload doesn't leave duplicate handlers behind.
-pub fn install_key_listener(camera: RwSignal<Camera>, reload: RwSignal<u32>, overlays: Overlays) {
+pub fn install_key_listener(
+    camera: RwSignal<Camera>,
+    home: Camera,
+    reload: RwSignal<u32>,
+    overlays: Overlays,
+) {
     let Overlays { menu, commit_dialog, confirm_op, detail_id, .. } = overlays;
     if let Some(win) = web_sys::window() {
         let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
@@ -242,7 +247,10 @@ pub fn install_key_listener(camera: RwSignal<Camera>, reload: RwSignal<u32>, ove
                         let (cx, cy) = centre();
                         camera.update(|c| *c = c.zoomed_at(1.0 / ZOOM_STEP, cx, cy));
                     }
-                    "0" => camera.set(Camera::default()),
+                    // The graph's home view — not the raw identity, so a repo
+                    // whose stub cascades overshoot the top edge resets to a
+                    // view that actually shows them (see `Camera::home`).
+                    "0" => camera.set(home),
                     "r" | "R" => reload.update(|n| *n = n.wrapping_add(1)),
                     _ => {}
                 }
