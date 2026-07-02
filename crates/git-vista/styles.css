@@ -470,6 +470,26 @@ html, body {
 .act-row.act-row-static:hover { background: transparent; }
 .act-glyph { flex: none; padding-top: 1px; }
 .act-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+
+/* Step 5: the direct Undo control on a feed row whose event is still
+   undoable. Right-aligned in the row, accent-outlined so it reads as the
+   row's one action; the destructive part is confirmed in the modal, so the
+   button itself stays calm. */
+.act-undo {
+  margin-left: auto;
+  flex: none;
+  align-self: center;
+  padding: 0.2rem 0.6rem;
+  font: inherit;
+  font-size: 0.75rem;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.act-undo:hover { background: #21262d; }
 .act-summary { word-break: break-word; }
 .act-meta {
   display: flex;

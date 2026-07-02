@@ -12,6 +12,7 @@
 
 use leptos::{Resource, RwSignal, StoredValue};
 
+use git_vista_core::activity::Undoable;
 use git_vista_core::model::CommitDetail;
 
 /// State for the per-commit context menu (Issue #18): which commit was tapped,
@@ -87,6 +88,12 @@ pub enum PendingOp {
     /// live HEAD branch, fetched on click, purely to name it in the dialog; `None` =>
     /// detached HEAD (the confirm button is disabled — there's no branch to rebase).
     Rebase { current: Option<String> },
+    /// Execute one undo action (Activity/Undo step 5, `POST /api/undo`). Carries the
+    /// whole [`Undoable`] — the action plus its server-built label and `warn_pushed`
+    /// flag — so the dialog can name exactly what it's about to do and warn when the
+    /// discarded state is already on the remote. Offered from the graph menu's undo
+    /// section (`/api/undoables`) and straight from Activity feed rows.
+    Undo(Undoable),
 }
 
 /// How long (ms) after the commit modal opens to ignore a backdrop dismiss, so

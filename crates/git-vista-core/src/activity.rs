@@ -171,6 +171,12 @@ pub fn parse_reflog_message(message: &str) -> (ActivityKind, String) {
     if msg.starts_with("branch: Created") {
         return (ActivityKind::BranchCreated, msg.to_string());
     }
+    if msg.starts_with("branch: Reset") {
+        // `git branch -f <name> <target>` — how the undo endpoint moves a
+        // branch that isn't checked out. Classing it Reset lets the journal's
+        // Reset entry absorb this reflog echo like any other app op.
+        return (ActivityKind::Reset, msg.to_string());
+    }
     if msg.starts_with("merge ") {
         return (ActivityKind::Merge, msg.to_string());
     }
@@ -402,6 +408,7 @@ mod tests {
              "rebase (finish): returning to refs/heads/f"),
             ("reset: moving to HEAD~1", ActivityKind::Reset, "reset: moving to HEAD~1"),
             ("branch: Created from main", ActivityKind::BranchCreated, "branch: Created from main"),
+            ("branch: Reset to abc1234", ActivityKind::Reset, "branch: Reset to abc1234"),
             ("cherry-pick: pick me", ActivityKind::CherryPick, "pick me"),
             ("revert: Revert \"oops\"", ActivityKind::Revert, "Revert \"oops\""),
             ("pull: Fast-forward", ActivityKind::Pull, "pull: Fast-forward"),
@@ -473,6 +480,27 @@ mod tests {
         assert_eq!(feed.len(), 1, "one event for one merge: {feed:#?}");
         assert_eq!(feed[0].source, ActivitySource::App);
         assert_eq!(feed[0].summary, "merged ‘feature’ into ‘main’");
+    }
+
+    #[test]
+    fn an_undo_reset_journal_absorbs_its_branch_reset_echo() {
+        // The undo endpoint moves a non-checked-out branch with `git branch
+        // -f`, whose reflog echo is "branch: Reset to <target>" — same Reset
+        // kind as the journal entry, so the App-attributed copy wins.
+        let journal = vec![ActivityEvent {
+            time: 100,
+            kind: ActivityKind::Reset,
+            ref_name: Some("feature".into()),
+            summary: "reset ‘feature’ to abc1234".into(),
+            old_oid: Some("m".into()),
+            new_oid: Some("a".into()),
+            source: ActivitySource::App,
+            undo: None,
+        }];
+        let reflog = vec![entry("feature", 100, "m", "a", "branch: Reset to a")];
+        let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 10);
+        assert_eq!(feed.len(), 1, "one event for one undo: {feed:#?}");
+        assert_eq!(feed[0].source, ActivitySource::App);
     }
 
     #[test]

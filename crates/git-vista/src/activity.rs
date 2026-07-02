@@ -23,7 +23,7 @@ use git_vista_core::activity::{ActivityEvent, ActivityKind, ActivitySource};
 use crate::api::{fetch_activity, fetch_status};
 use crate::datetime::time_ago;
 use crate::icons::{icon_set, GitIcons};
-use crate::state::{MenuData, Overlays, Settings};
+use crate::state::{MenuData, Overlays, PendingOp, Settings};
 
 /// How many events to request. The panel is a scrollable feed, not an
 /// archive; the backend caps harder anyway.
@@ -82,7 +82,7 @@ fn clamp_menu_x(x: f64) -> f64 {
 /// Build the Activity panel view. Rendered inside the overlays wrapper, so it
 /// shares the reactive context the menu and modals use.
 pub fn activity_panel_view(overlays: Overlays, settings: Settings) -> impl IntoView {
-    let Overlays { menu, detail_id, activity_open, reload, .. } = overlays;
+    let Overlays { detail_id, activity_open, reload, .. } = overlays;
     let nerd_icons = settings.nerd_icons;
 
     // Both fetches key on (open, reload): opening the panel fetches fresh,
@@ -211,7 +211,7 @@ pub fn activity_panel_view(overlays: Overlays, settings: Settings) -> impl IntoV
                 .into_view(),
                 Some(Ok(events)) => events
                     .into_iter()
-                    .map(|e| activity_row(e, nerd_icons, menu))
+                    .map(|e| activity_row(e, nerd_icons, overlays))
                     .collect_view(),
             };
 
@@ -254,12 +254,20 @@ pub fn activity_panel_view(overlays: Overlays, settings: Settings) -> impl IntoV
 
 /// One feed row. Tapping it opens the shared context menu on the commit the
 /// event references (its result, or — for a deletion — the tip that died).
-/// Events that reference no commit render as plain, non-tappable rows.
+/// Events that reference no commit render as plain, non-tappable rows. An
+/// event still carrying an undo hint (step 5) gets a direct Undo button that
+/// opens the shared confirm modal — the same `PendingOp::Undo` flow the graph
+/// menu's undo section uses.
+///
+/// The row is a `<div>` with a click handler, not a `<button>`: the Undo
+/// button lives inside it, and a button nested in a button is invalid HTML
+/// that browsers un-nest unpredictably.
 fn activity_row(
     event: ActivityEvent,
     nerd_icons: RwSignal<bool>,
-    menu: RwSignal<Option<MenuData>>,
+    overlays: Overlays,
 ) -> impl IntoView {
+    let Overlays { menu, confirm_op, dialog_opened_at, .. } = overlays;
     let ic = icon_set(nerd_icons.get_untracked());
     let glyph = kind_glyph(ic, event.kind);
     let when = time_ago(event.time);
@@ -289,6 +297,28 @@ fn activity_row(
         kind_label(event.kind),
         event.ref_name.as_deref().map(|r| format!(" · {r}")).unwrap_or_default()
     );
+    // The direct Undo control (step 5): shown only while the server still
+    // says this event is undoable — `event.undo` is recomputed on every feed
+    // read, so a hint can't outlive its validity by more than one refresh
+    // (and the server's compare-and-swap catches even that window). Opens the
+    // shared confirm modal; the panel stays open, and the confirmed undo's
+    // `reload` bump refreshes this very feed in place.
+    let undo_btn = event.undo.clone().map(|u| {
+        let title = u.label.clone();
+        let on = move |ev: web_sys::MouseEvent| {
+            // The row underneath opens the context menu — this tap shouldn't.
+            ev.stop_propagation();
+            dialog_opened_at.set_value(js_sys::Date::now());
+            confirm_op.set(Some(PendingOp::Undo(u.clone())));
+        };
+        view! {
+            <button class="act-undo" title=title on:click=on>
+                <span class="nf">{ic.undo}</span>
+                " Undo"
+            </button>
+        }
+    });
+
     let row_body = view! {
         <span class="nf ctx-icon act-glyph">{glyph}</span>
         <span class="act-main">
@@ -299,6 +329,7 @@ fn activity_row(
                 <span class="act-when">{when}</span>
             </span>
         </span>
+        {undo_btn}
     };
 
     match commit {
@@ -323,9 +354,9 @@ fn activity_row(
                 }));
             };
             view! {
-                <button class="act-row" on:click=on_tap>
+                <div class="act-row" on:click=on_tap>
                     {row_body}
-                </button>
+                </div>
             }
             .into_view()
         }
