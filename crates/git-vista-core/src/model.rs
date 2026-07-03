@@ -155,6 +155,11 @@ pub struct Graph {
     /// discarded when the clone is deleted. `false` for the user's own local repo.
     #[serde(default)]
     pub read_only: bool,
+    /// True when this repo carries a recorded test-repo seed (`gv --seed`), so
+    /// the UI may offer "Reset Test Repo" — restore the seeded branches/HEAD/
+    /// worktree, discarding everything since. Never true on a read-only clone.
+    #[serde(default)]
+    pub resettable: bool,
 }
 
 /// A local branch with no commits of its own, drawn as a short fork off the
@@ -211,6 +216,24 @@ pub struct CreateCommitRequest {
     pub allow_empty: bool,
     #[serde(default)]
     pub branch: Option<String>,
+}
+
+/// Response of `GET /api/rebase-status`: whether "Rebase onto main" would do
+/// anything right now, resolved live server-side — the same freshness posture
+/// as `/api/head-branch`, so the menu can disable the item instead of offering
+/// a rebase that no-ops (or the nonsense "rebase ‘main’ onto main").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebaseStatus {
+    /// The checked-out branch; `None` => detached HEAD (nothing to rebase).
+    pub branch: Option<String>,
+    /// What the server would rebase onto: `origin/main` when that
+    /// remote-tracking ref exists, else the local `main`.
+    pub base: String,
+    /// False when `base` doesn't resolve at all (a repo with no `main`).
+    pub base_exists: bool,
+    /// True when HEAD already contains the base tip — the branch is already
+    /// based on the latest `base`, so a rebase would change nothing.
+    pub up_to_date: bool,
 }
 
 /// Body of the three branch-operation requests (Issue #33 follow-up): merge
@@ -285,6 +308,18 @@ mod tests {
             time: 0,
         };
         assert!(two_parents.is_merge());
+    }
+
+    #[test]
+    fn rebase_status_roundtrips_through_json() {
+        let status = RebaseStatus {
+            branch: Some("feature".into()),
+            base: "origin/main".into(),
+            base_exists: true,
+            up_to_date: false,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(serde_json::from_str::<RebaseStatus>(&json).unwrap(), status);
     }
 
     #[test]

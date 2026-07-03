@@ -8,14 +8,68 @@ Building two big features on top of the existing branch-ops app: an **Activity
 Log / Journal view** and **Contextual Undo**, plus **commit diffs** and a
 **working-tree status** chip along the way.
 
-- Branch: `feature/activity-log-undo` (pushed to origin).
+- **MERGED**: the whole feature landed in `main` via PR #47 (2026-07-02,
+  merge `3da597a`). The `feature/activity-log-undo` branch stays in place
+  (never delete branches).
 - Safety net: `v1-stable` (= `main` @ `a0715e0`, pushed) — the known-good
   fallback. Untouched by any of this work.
-- **Steps 1–5 are complete, tested, and green** (114 tests; native + wasm
-  builds clean; steps 4 and 5 verified live + headless-CDP). Only Step 6
-  (final verify pass + docs + PR) remains.
-- On top of Step 5: a **stub-branch fix batch** (`035c75d`) — see "Post-Step-5
-  fix batch" below.
+- **Current work**: the **iPad test-report fix batch** on
+  `feature/ipad-test-fixes` (PR #48) — see the section right below. All seven
+  report tasks are done and green (129 tests); what's left is Tom's real-iPad
+  tap-through of the checklist.
+
+## iPad test-report fix batch (2026-07-03, branch `feature/ipad-test-fixes`)
+
+Fixes for Tom's 2026-07-02 iPad testing report:
+
+1. **Stable lanes + colours** (`layout.rs`, `color.rs`, `render.rs`) — commits
+   get a deterministic topo order (time desc, id asc on ties) so equal-time
+   tips can't reshuffle the layout; branch colours come from an FNV-1a hash of
+   the branch *name* (`stable_color_slot`, 6-slot palette), so no operation
+   recolours anything; the trunk is always slot 0 (blue) regardless of what's
+   checked out; a stub keeps its colour when its first commit arrives.
+   Trade-off: two branches may share a colour — stability beats distinctness.
+2. **Rebase gating** (`/api/rebase-status`, menu) — "Rebase onto main" is
+   disabled with the reason when the branch is already based on the base /
+   HEAD is detached / no main; the label names the true base (`origin/main`
+   vs `main`); a raced no-op answers "Already up to date" and journals no
+   phantom event.
+3. **Checkout from the menu** (`/api/checkout`, menu, dialogs) — every local
+   branch on the tapped target gets "Checkout ‘X’" (first item); confirm
+   dialog blocks checking out the current branch; journaled as an app event
+   (the reflog echo dedupes); same-branch checkouts ("main → main") are
+   dropped from the feed as noise.
+4. **"Load failed" hardening** (`gv`, `api.rs`, core `net.rs`, server) — root
+   cause: gv's foreground server died with its terminal/SSH session. gv now
+   runs the server **detached** (setsid) with a log at
+   `~/.local/state/git-vista/server.log`, health-checks before claiming
+   success, and gains `gv --stop` (Ctrl-C no longer stops the server!).
+   Every network-level fetch failure shows an actionable message instead of
+   Safari's raw "TypeError: Load failed"; create-branch retries once
+   automatically; the server gets CatchPanicLayer + `GIT_TERMINAL_PROMPT=0`.
+5. **Context-menu clamp** (`geometry.rs::menu_placement`, `gestures.rs`,
+   `styles.css`) — a tap in the lower half flips the menu above the finger;
+   max-height = the room actually available; overflow scrolls, never clips;
+   clamped against iOS Safari's *visual* viewport; width capped at 320px;
+   the Activity panel's private x-clamp is deleted (one shared path).
+
+6. **Gated "Reset Test Repo"** (`gv --seed`, core `seed.rs`,
+   `POST /api/reset-test-repo`, topbar button) — a repo opted in with
+   `gv --seed <path>` records its branches/HEAD/objects under
+   `.git/git-vista/`; the graph then carries `resettable: true` and the
+   topbar shows a red button. Reset = unbundle objects, verify every seeded
+   tip (corrupt seed refuses — never half-restores), move refs back, forced
+   checkout of the seeded HEAD, hard reset + clean, delete post-seed
+   branches (THE ONLY PLACE git-vista deletes branches), wipe the journal.
+   `~/projects/git-vista-test` is seeded (9 branches, HEAD `main`).
+7. **Stub labels** (`render.rs`, `.stub-label`) — every hollow stub ring now
+   draws its branch name beside it in the branch's own colour, truncated at
+   24 chars; sits at half-row heights so it can't collide with commit text.
+
+Verified: 129 workspace tests, wasm check clean, zero warnings, live server
+checks per fix (incl. a full seed → mess → reset → exact-restore cycle on the
+test repo), headless-CDP probes of the menu flip, the Reset button/modal and
+the stub labels. Remaining: Tom's tap-by-tap pass on the real iPad.
 
 ## Commit history on the branch
 
@@ -231,10 +285,11 @@ plus everything found alongside it:
 
 ## How to resume
 ```bash
-git checkout feature/activity-log-undo   # already the current branch
-# Steps 1–5 are done and green. Only Step 6 remains: the final end-to-end
-# verify pass on a throwaway repo, PROJECT_MEMORY.md + README.md updates,
-# and the PR to main (push the branch; NEVER delete any branch).
+git checkout feature/ipad-test-fixes
+# The Activity/Undo feature is MERGED (PR #47). Current work: the iPad
+# test-report fix batch — tasks 1–5 committed here; tasks 6 (gated "Reset
+# Test Repo"), 7 (label branch stubs) and 8 (batch verify + iPad checklist)
+# remain. NEVER delete any branch.
 cargo test --workspace
 cargo check -p git-vista --target wasm32-unknown-unknown
 ```

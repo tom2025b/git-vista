@@ -68,17 +68,6 @@ fn kind_label(kind: ActivityKind) -> &'static str {
     }
 }
 
-/// Keep the context menu on screen when opened near the right edge (the
-/// panel is right-docked, so every row tap is near it). Mirrors the menu's
-/// own width plus margin; clamping beats teaching the menu to re-anchor.
-fn clamp_menu_x(x: f64) -> f64 {
-    let width = web_sys::window()
-        .and_then(|w| w.inner_width().ok())
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1024.0);
-    x.min((width - 280.0).max(8.0))
-}
-
 /// Build the Activity panel view. Rendered inside the overlays wrapper, so it
 /// shares the reactive context the menu and modals use.
 pub fn activity_panel_view(overlays: Overlays, settings: Settings) -> impl IntoView {
@@ -338,11 +327,13 @@ fn activity_row(
                 // The same MenuData the graph's dots build — one menu, two
                 // entry points. No GitHub link from here (the panel doesn't
                 // carry the pushed-commit set, and a wrong link that 404s is
-                // worse than a disabled item).
+                // worse than a disabled item). Raw tap coords: the menu view
+                // itself clamps every entry point (geometry.rs::menu_placement),
+                // which replaced the right-edge clamp that used to live here.
                 menu.set(Some(MenuData {
                     commit: commit.clone(),
                     header: header.clone(),
-                    x: clamp_menu_x(ev.client_x() as f64),
+                    x: ev.client_x() as f64,
                     y: ev.client_y() as f64,
                     github_url: None,
                     github_label: "Open on GitHub",

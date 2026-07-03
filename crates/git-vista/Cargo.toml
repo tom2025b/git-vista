@@ -48,5 +48,9 @@ web-sys = { version = "0.3", features = [
     # Icon system: the Nerd-Font-vs-plain-text preference persists in
     # localStorage so it survives reloads.
     "Storage",
+    # Context-menu placement: iOS Safari's *visual* viewport (inner_height
+    # over-reports while the URL bar is expanded), so the menu is clamped
+    # against what's actually visible.
+    "VisualViewport",
 ] }
 gloo-net = { version = "0.7.0", default-features = false, features = ["http", "json"] }

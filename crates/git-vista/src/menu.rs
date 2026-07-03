@@ -12,7 +12,9 @@ use leptos::*;
 
 use git_vista_core::activity::UndoAction;
 
-use crate::api::{create_branch_request, fetch_head_branch, fetch_undoables};
+use crate::api::{create_branch_request, fetch_head_branch, fetch_rebase_status, fetch_undoables};
+use crate::geometry::menu_placement;
+use crate::gestures::viewport_size;
 use crate::icons::icon_set;
 use crate::state::{CommitDialog, Overlays, PendingOp, Settings};
 
@@ -49,6 +51,17 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                 Some(c) => fetch_undoables(&c).await.unwrap_or_default(),
                 None => Vec::new(),
             }
+        },
+    );
+    // Whether "Rebase onto main" would do anything (step: menu gating) — fetched
+    // live like `undoables`, and keyed the same way, so the item can be disabled
+    // with the reason ("already based on origin/main", detached HEAD, no main)
+    // instead of offering a rebase that no-ops. `None` (still loading, or the
+    // fetch failed) leaves the item enabled — the server no-ops safely anyway.
+    let rebase_status = create_local_resource(
+        move || (menu.get().filter(|m| !m.is_branch).is_some(), reload.get()),
+        |(open, _)| async move {
+            if open { fetch_rebase_status().await.ok() } else { None }
         },
     );
     move || {
@@ -228,6 +241,31 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                 .iter()
                 .flat_map(|b| {
                     let b = b.clone();
+                    // Checkout: switch HEAD (and the working tree) to this branch.
+                    // Like merge/delete, the "already on it?" test resolves *live*
+                    // on click, not from the possibly-stale graph — the confirm
+                    // dialog disables itself when this is the checked-out branch.
+                    let checkout_item = {
+                        let branch = b.clone();
+                        let on = move |_| {
+                            let branch = branch.clone();
+                            menu.set(None);
+                            spawn_local(async move {
+                                let current = fetch_head_branch().await.unwrap_or(None);
+                                // Start the ghost-click guard when the modal opens.
+                                dialog_opened_at.set_value(js_sys::Date::now());
+                                confirm_op.set(Some(PendingOp::Checkout { branch, current }));
+                            });
+                        };
+                        view! {
+                            <button class="ctx-item" on:click=on>
+                                // The branch-switch glyph — HEAD moving between branches.
+                                <span class="nf ctx-icon">{ic.checkout}</span>
+                                {format!("Checkout ‘{b}’")}
+                            </button>
+                        }
+                        .into_view()
+                    };
                     // Merge into the checked-out branch. The target is resolved *live*
                     // on click (not from the possibly-stale graph), so the item stays
                     // generic — "into current branch" — and the confirm dialog names
@@ -301,7 +339,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     // link, not a scripted `window.open`, which iOS WebKit blocks
                     // (same reason as "Open on GitHub"). Shown only on a GitHub repo;
                     // omitted otherwise, since there's no compare page to point at.
-                    let mut items = vec![merge_item, push_item];
+                    let mut items = vec![checkout_item, merge_item, push_item];
                     if let Some(base) = m.repo_url.as_ref() {
                         let branch = b.clone();
                         let url = format!("{base}/compare/main...{branch}");
@@ -328,29 +366,61 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                 .collect_view();
             // "Rebase onto main" (Issue #33 follow-up). Rebase acts on the *checked-
             // out* branch, not the clicked target — like the "Commit …" items — so
-            // it's a single entry, not one per branch. Resolve the live HEAD branch
-            // on click, then open the confirm modal, which decides whether it's
-            // actionable (a detached HEAD has no branch to rebase). Set `confirm_op`
-            // before the menu closes — same reactive-owner ordering caveat as above.
-            // Omitted on a branch stub: a zero-commit branch has nothing to replay,
-            // and the item would silently target the checked-out branch instead
-            // ("Rebase ‘main’ onto main?" from the stub's own menu).
+            // it's a single entry, not one per branch. Gated on the live
+            // `/api/rebase-status`: disabled (with the reason) when the branch is
+            // already based on the base, HEAD is detached, or there's no main —
+            // a rebase that would do nothing shouldn't look available. While the
+            // status is still loading the item stays enabled; the server answers
+            // a raced no-op with "Already up to date" rather than a phantom
+            // rebase. Resolve the live HEAD branch on click, then open the
+            // confirm modal. Omitted on a branch stub: a zero-commit branch has
+            // nothing to replay, and the item would silently target the checked-
+            // out branch instead ("Rebase ‘main’ onto main?" from the stub's own
+            // menu).
             let rebase_item = (!m.is_branch).then(|| {
+                let status = rebase_status.get().flatten();
+                let base = status
+                    .as_ref()
+                    .map_or_else(|| "main".to_string(), |s| s.base.clone());
+                let label = format!("Rebase onto {base}");
+                let reason = status.as_ref().and_then(|s| {
+                    if s.branch.is_none() {
+                        Some("HEAD is detached — no branch to rebase".to_string())
+                    } else if !s.base_exists {
+                        Some(format!("No ‘{}’ branch to rebase onto", s.base))
+                    } else if s.up_to_date {
+                        let b = s.branch.as_deref().unwrap_or("HEAD");
+                        Some(format!("‘{b}’ is already based on {} — nothing to rebase", s.base))
+                    } else {
+                        None
+                    }
+                });
+                if let Some(reason) = reason {
+                    return view! {
+                        <span class="ctx-item disabled" title=reason>
+                            <span class="nf ctx-icon">{ic.merge}</span>
+                            {label}
+                        </span>
+                    }
+                    .into_view();
+                }
                 let on = move |_| {
+                    let base = base.clone();
                     menu.set(None);
                     spawn_local(async move {
                         let current = fetch_head_branch().await.unwrap_or(None);
                         dialog_opened_at.set_value(js_sys::Date::now());
-                        confirm_op.set(Some(PendingOp::Rebase { current }));
+                        confirm_op.set(Some(PendingOp::Rebase { current, base }));
                     });
                 };
                 view! {
                     <button class="ctx-item" on:click=on>
                         // The merge glyph — rebase reintegrates onto another base.
                         <span class="nf ctx-icon">{ic.merge}</span>
-                        "Rebase onto main"
+                        {label}
                     </button>
                 }
+                .into_view()
             });
             // The undo section (step 5): one item per action `/api/undoables`
             // returned for this commit — reset-style undos when its result is
@@ -402,8 +472,15 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     {rebase_item}
                 }
             });
+            // Clamp the menu inside the *visual* viewport (iPad fix): a tap in
+            // the lower half flips it above the finger, and its max-height is
+            // the room actually available — anything past that scrolls
+            // (.ctx-menu's overflow-y) instead of hanging offscreen where no
+            // finger can reach it.
+            let (vw, vh) = viewport_size();
+            let placement = menu_placement(m.x, m.y, vw, vh);
             view! {
-                <div class="ctx-menu" style=format!("left: {}px; top: {}px;", m.x, m.y)>
+                <div class="ctx-menu" style=placement.style()>
                     // Header glyph matches what the header names: a branch for a
                     // stub, a commit hash for a dot.
                     <div class="ctx-menu-header">

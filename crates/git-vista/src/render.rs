@@ -14,9 +14,7 @@ use leptos::*;
 
 use git_vista_core::model::{Graph, RefKind};
 
-use crate::color::{
-    branch_color, branch_color_distinct_from, BADGE_DARK, HEAD_BADGE, MERGE_FILL, TAG_BADGE,
-};
+use crate::color::{branch_color, BADGE_DARK, HEAD_BADGE, MERGE_FILL, TAG_BADGE};
 use crate::datetime::local_timestamp;
 use crate::geometry::{
     badge_text_dx, badge_text_y, badge_top_y, badge_width, edge_path, label_bottom_y, label_top_y,
@@ -29,6 +27,11 @@ use crate::text::truncate;
 /// Commit messages longer than this are truncated with an ellipsis in the label
 /// (the full text stays available via the node/label hover tooltip).
 const MAX_SUMMARY_CHARS: usize = 60;
+
+/// A stub's branch-name label is truncated past this (the full name stays in
+/// the ring's hover tooltip and the menu header). Short enough that a deep
+/// cascade's label can't reach far across the message column.
+const MAX_STUB_NAME_CHARS: usize = 24;
 
 /// Everything the per-row / per-edge view builders need, bundled behind a
 /// `StoredValue` so the reactive `<For>` closures (Phase 8 viewport
@@ -237,9 +240,9 @@ pub fn stub_icons(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>) -> im
                 .stubs
                 .iter()
                 .map(|s| {
-                    // Same colour rule as the stub's own line/ring (Issue #30).
-                    let anchor_slot = c.graph.rows[s.anchor_row].color;
-                    let color = branch_color_distinct_from(s.color, anchor_slot);
+                    // Same colour rule as the stub's own line/ring: the branch
+                    // name's stable colour.
+                    let color = branch_color(s.color);
                     view! {
                         <text
                             x=node_cx(s.lane) - NODE_RADIUS - 5
@@ -493,8 +496,7 @@ pub fn stubs(
         .stubs
         .iter()
         .map(|s| {
-            let anchor_slot = c.graph.rows[s.anchor_row].color;
-            let color = branch_color_distinct_from(s.color, anchor_slot);
+            let color = branch_color(s.color);
             let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.depth);
             view! {
                 <path
@@ -512,12 +514,10 @@ pub fn stubs(
         .stubs
         .iter()
         .map(|s| {
-            // A new branch must never share the colour of the branch it forked off
-            // (Issue #30): the palette collapses many slots onto few colours, so a
-            // stub's raw slot can collide with its anchor branch's colour. Bump it
-            // until it differs from the anchor commit's colour.
-            let anchor_slot = c.graph.rows[s.anchor_row].color;
-            let color = branch_color_distinct_from(s.color, anchor_slot);
+            // The branch name's stable colour — the same colour this branch's
+            // line will wear once it owns commits, so committing on the stub
+            // reads as the stub growing into its line.
+            let color = branch_color(s.color);
             let sx = node_cx(s.lane);
             let sy = stub_node_cy(s.anchor_row, s.depth);
             let name = s.name.clone();
@@ -571,6 +571,21 @@ pub fn stubs(
                 <circle cx=sx cy=sy r=NODE_RADIUS fill=MERGE_FILL stroke=color stroke-width="2">
                     <title>{format!("{name} — new branch (no commits yet); tap to branch from here")}</title>
                 </circle>
+                // The branch NAME beside the ring (iPad-testing follow-up: a bare
+                // hollow ring was unidentifiable without tapping it). Same colour
+                // as the ring/line so name and geometry read as one thing;
+                // truncated so a long name can't sprawl across the canvas. Sits
+                // at a half-row y, so it clears the commit labels' text lines;
+                // pointer-events:none keeps the ring's hit circle the tap target.
+                <text
+                    x=sx + NODE_RADIUS + 6
+                    y=sy + 4
+                    class="stub-label"
+                    fill=color
+                    pointer-events="none"
+                >
+                    {truncate(&s.name, MAX_STUB_NAME_CHARS)}
+                </text>
                 // A larger, invisible hit target on top so the tip is easy to tap,
                 // exactly like the commit dots.
                 <circle
