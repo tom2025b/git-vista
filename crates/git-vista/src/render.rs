@@ -14,9 +14,7 @@ use leptos::*;
 
 use git_vista_core::model::{Graph, RefKind};
 
-use crate::color::{
-    branch_color, branch_color_distinct_from, BADGE_DARK, HEAD_BADGE, MERGE_FILL, TAG_BADGE,
-};
+use crate::color::{branch_color, BADGE_DARK, HEAD_BADGE, MERGE_FILL, TAG_BADGE};
 use crate::datetime::local_timestamp;
 use crate::geometry::{
     badge_text_dx, badge_text_y, badge_top_y, badge_width, edge_path, label_bottom_y, label_top_y,
@@ -237,9 +235,9 @@ pub fn stub_icons(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>) -> im
                 .stubs
                 .iter()
                 .map(|s| {
-                    // Same colour rule as the stub's own line/ring (Issue #30).
-                    let anchor_slot = c.graph.rows[s.anchor_row].color;
-                    let color = branch_color_distinct_from(s.color, anchor_slot);
+                    // Same colour rule as the stub's own line/ring: the branch
+                    // name's stable colour.
+                    let color = branch_color(s.color);
                     view! {
                         <text
                             x=node_cx(s.lane) - NODE_RADIUS - 5
@@ -493,8 +491,7 @@ pub fn stubs(
         .stubs
         .iter()
         .map(|s| {
-            let anchor_slot = c.graph.rows[s.anchor_row].color;
-            let color = branch_color_distinct_from(s.color, anchor_slot);
+            let color = branch_color(s.color);
             let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.depth);
             view! {
                 <path
@@ -512,12 +509,10 @@ pub fn stubs(
         .stubs
         .iter()
         .map(|s| {
-            // A new branch must never share the colour of the branch it forked off
-            // (Issue #30): the palette collapses many slots onto few colours, so a
-            // stub's raw slot can collide with its anchor branch's colour. Bump it
-            // until it differs from the anchor commit's colour.
-            let anchor_slot = c.graph.rows[s.anchor_row].color;
-            let color = branch_color_distinct_from(s.color, anchor_slot);
+            // The branch name's stable colour — the same colour this branch's
+            // line will wear once it owns commits, so committing on the stub
+            // reads as the stub growing into its line.
+            let color = branch_color(s.color);
             let sx = node_cx(s.lane);
             let sy = stub_node_cy(s.anchor_row, s.depth);
             let name = s.name.clone();

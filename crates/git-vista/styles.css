@@ -217,6 +217,18 @@ html, body {
   position: fixed;
   z-index: 10;
   min-width: 230px;
+  /* iPad fix: the menu must always fit the viewport. Width is capped (long
+     branch names wrap) so the left clamp in geometry.rs::menu_placement can
+     rely on one number; height overflow SCROLLS instead of clipping — the
+     per-open inline max-height (same fn) wins over the static backstop here
+     (the dvh line replaces the vh one on iOS 16.4+, tracking the real visible
+     box under Safari's collapsing URL bar). */
+  max-width: 320px;
+  max-height: calc(100vh - 16px);
+  max-height: calc(100dvh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   padding: 4px;
   background: #161b22;
   border: 1px solid #30363d;

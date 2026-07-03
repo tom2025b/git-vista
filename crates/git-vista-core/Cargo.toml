@@ -11,3 +11,6 @@ repository.workspace = true
 # is shared by the browser frontend. Git reading (gix) lives in `git-vista-git`.
 [dependencies]
 serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
