@@ -298,6 +298,27 @@ pub async fn rebase_request() -> Result<String, String> {
     }
 }
 
+/// Ask the backend to reset a seeded *test repo* to its recorded state
+/// (`POST /api/reset-test-repo`). Only offered when the graph said
+/// `resettable` (the repo was opted in with `gv --seed`). `Ok` carries the
+/// server's summary line ("… 2 branches restored, 1 deleted, HEAD → ‘main’");
+/// a non-2xx body is the server's reason (not a test repo, corrupt seed, or
+/// the exact git step that refused), returned as `Err` for the dialog to show.
+pub async fn reset_test_repo_request() -> Result<String, String> {
+    let resp = Request::post("/api/reset-test-repo")
+        .send()
+        .await
+        .map_err(network_error)?;
+    if resp.ok() {
+        Ok(resp.text().await.unwrap_or_default())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
 /// Ask the backend to run a branch operation on `branch` (Issue #33 follow-up).
 /// `path` is the endpoint — `/api/merge`, `/api/push`, `/api/delete-branch`, or
 /// `/api/force-delete-branch` — all of which take the same `{ branch }` body. As with the other requests, a
