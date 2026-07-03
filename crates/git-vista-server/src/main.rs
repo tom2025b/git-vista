@@ -34,11 +34,12 @@ use git_vista_core::layout;
 use git_vista_core::activity::{ActivityEvent, ActivityKind, ActivitySource};
 use git_vista_core::model::{
     validate_clone_url, BranchRequest, CloneRequest, CommitSummary, CreateBranchRequest,
-    CreateCommitRequest, GitRef, RefKind,
+    CreateCommitRequest, GitRef, RebaseStatus, RefKind,
 };
 use git_vista_core::status::parse_porcelain_v2;
 use git_vista_git::{read_commit, read_refs, walk_history, RepoError};
 use tower::Layer;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -111,6 +112,15 @@ const ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT
 
 #[tokio::main]
 async fn main() {
+    // No git child may ever sit waiting on input this headless server can't
+    // provide: these are inherited by every `git` the handlers spawn, making
+    // git fail fast instead of hanging a request forever on a credential
+    // prompt (push/clone against a private remote) or an editor. A request
+    // that never completes surfaces on the iPad as the same opaque
+    // "Load failed" a dead server does.
+    std::env::set_var("GIT_TERMINAL_PROMPT", "0");
+    std::env::set_var("GIT_EDITOR", "true");
+
     // Resolve which repo to serve: first CLI arg, else the default checkout.
     // Canonicalise so relative paths (e.g. `.`) and the banner are absolute; if
     // that fails (path missing) keep the raw value so the error is reported.
@@ -187,13 +197,35 @@ async fn main() {
         .route("/api/merge", post(merge_branch))
         .route("/api/push", post(push_branch))
         .route("/api/delete-branch", post(delete_branch))
+        // iPad-testing follow-up: switch HEAD to a branch (`git checkout`).
+        .route("/api/checkout", post(checkout_branch))
         // Issue #33 follow-up: force-delete an unmerged branch (`git branch -D`),
         // offered only after the safe `-d` above is refused; and rebase the
         // checked-out branch onto main (`git rebase`).
         .route("/api/force-delete-branch", post(force_delete_branch))
         .route("/api/rebase", post(rebase))
+        // Whether "Rebase onto main" would do anything right now — the menu
+        // disables the item (with the reason) when it wouldn't.
+        .route("/api/rebase-status", get(rebase_status))
         // Anything that isn't the API is served from the built SPA bundle.
-        .fallback_service(spa);
+        .fallback_service(spa)
+        // A handler panic becomes a 500 with the panic text instead of a reset
+        // connection: the frontend then shows a real error, and the process —
+        // which axum keeps alive either way — never leaves the browser with
+        // the unexplained "Load failed" a torn-down connection produces.
+        .layer(CatchPanicLayer::custom(|panic: Box<dyn std::any::Any + Send>| {
+            let msg = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("(no panic message)");
+            eprintln!("git-vista: handler panicked: {msg}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("git-vista server bug — a handler panicked: {msg}"),
+            )
+                .into_response()
+        }));
 
     let listener = match tokio::net::TcpListener::bind(ADDR).await {
         Ok(l) => l,
@@ -830,6 +862,49 @@ async fn worktree_status() -> Result<impl IntoResponse, (StatusCode, String)> {
     Ok((no_store, Json(parsed)))
 }
 
+/// Check out a branch (iPad-testing follow-up): `git checkout <branch>`, moving
+/// HEAD and the working tree to it. Git itself refuses when local changes would
+/// be overwritten; that error is forwarded verbatim. Asking for the branch
+/// already checked out is a no-op — git exits 0 (and logs a "moving from X to X"
+/// reflog line the feed drops as noise), so journalling it would put an event in
+/// the Activity feed that changed nothing (the same phantom-event trap the
+/// merge/rebase no-ops guard against). A real switch *is* journaled: git also
+/// logs it on the HEAD reflog, but the feed's dedup collapses that copy into
+/// this one, which knows it came from the app.
+async fn checkout_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
+    let repo = current().0;
+    // Pre-checkout branch and tip, read before the switch: the branch is the
+    // no-op test above, the tip is the journaled "moved from" oid.
+    let before = git_vista_git::read_head_branch(&repo);
+    let old = rev_parse(&repo, "HEAD").await;
+    let resp = run_branch_op(
+        "/api/checkout",
+        &req.branch,
+        &["checkout"],
+        format!("checked out '{}'", req.branch.trim()),
+    )
+    .await;
+    if resp.0 == StatusCode::OK {
+        let branch = req.branch.trim();
+        if before.as_deref() == Some(branch) {
+            return (
+                StatusCode::OK,
+                format!("Already on ‘{branch}’ — it's the checked-out branch."),
+            );
+        }
+        let new = rev_parse(&repo, "HEAD").await;
+        journal_app_event(
+            &repo,
+            ActivityKind::Checkout,
+            Some(branch.to_string()),
+            old,
+            new,
+            format!("checked out ‘{branch}’"),
+        );
+    }
+    resp
+}
+
 /// Merge a branch into the currently checked-out branch (Issue #33 follow-up):
 /// `git merge --no-edit <branch>`. `--no-edit` takes git's default merge message
 /// (the server has no editor). A merge lands in whatever HEAD points at, so the UI
@@ -981,11 +1056,7 @@ async fn rebase() -> (StatusCode, String) {
     let repo = current().0;
     // Pre-rebase tip, for the journal: it's the "undo rebase" target.
     let old = rev_parse(&repo, "HEAD").await;
-    let base = if git_ref_exists(&repo, "refs/remotes/origin/main").await {
-        "origin/main"
-    } else {
-        "main"
-    };
+    let base = rebase_base(&repo).await;
 
     let output = match tokio::process::Command::new("git")
         .arg("-C")
@@ -1006,9 +1077,20 @@ async fn rebase() -> (StatusCode, String) {
     };
 
     if output.status.success() {
-        println!("[/api/rebase] rebased HEAD onto {base}");
         let new = rev_parse(&repo, "HEAD").await;
         let branch = git_vista_git::read_head_branch(&repo).unwrap_or_else(|| "HEAD".into());
+        // git exits 0 without moving HEAD when the branch is already based on
+        // the base ("Current branch … is up to date"). That's no rebase:
+        // journalling one puts a phantom "rebased ‘main’ onto main" event in
+        // the Activity feed with nothing to undo, and "Rebased onto …" in the
+        // UI claims something happened. Say what (didn't) happen instead.
+        if new == old {
+            return (
+                StatusCode::OK,
+                format!("Already up to date — ‘{branch}’ is already based on {base}."),
+            );
+        }
+        println!("[/api/rebase] rebased HEAD onto {base}");
         journal_app_event(
             &repo,
             ActivityKind::Rebase,
@@ -1092,6 +1174,49 @@ fn journal_app_event(
             undo: None,
         },
     );
+}
+
+/// The base "Rebase onto main" rebases onto: `origin/main` when that
+/// remote-tracking ref exists — the usual feature-branch target, so you rebase
+/// onto the freshest pushed main — and the local `main` otherwise. Shared by
+/// the rebase handler and `/api/rebase-status`, so the menu's gate always
+/// describes exactly what the rebase would do.
+async fn rebase_base(repo: &Path) -> &'static str {
+    if git_ref_exists(repo, "refs/remotes/origin/main").await {
+        "origin/main"
+    } else {
+        "main"
+    }
+}
+
+/// Whether `ancestor` is an ancestor of (or equal to) `rev` — `git merge-base
+/// --is-ancestor` exits 0 exactly then. "HEAD already contains the base tip" is
+/// the definition of "a rebase onto that base would change nothing".
+async fn is_ancestor(repo: &Path, ancestor: &str, rev: &str) -> bool {
+    tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, rev])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Whether "Rebase onto main" would do anything right now (see [`RebaseStatus`]),
+/// resolved fresh per request like `/api/head-branch` — the graph on screen may
+/// predate a rebase or a branch switch. Sent `no-store` like the other live reads.
+async fn rebase_status() -> impl IntoResponse {
+    let repo = current().0;
+    let branch = git_vista_git::read_head_branch(&repo);
+    let base = rebase_base(&repo).await;
+    let base_exists = rev_parse(&repo, base).await.is_some();
+    let up_to_date = base_exists && is_ancestor(&repo, base, "HEAD").await;
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    (
+        no_store,
+        Json(RebaseStatus { branch, base: base.to_string(), base_exists, up_to_date }),
+    )
 }
 
 /// Whether `refname` resolves in `repo` (`git rev-parse --verify --quiet`): exit 0

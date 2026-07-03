@@ -15,8 +15,20 @@ use git_vista_core::activity::{ActivityEvent, UndoAction, Undoable};
 use git_vista_core::diff::CommitDiff;
 use git_vista_core::model::{
     BranchRequest, CloneRequest, CommitDetail, CreateBranchRequest, CreateCommitRequest, Graph,
+    RebaseStatus,
 };
+use git_vista_core::net::network_error_text;
 use git_vista_core::status::RepoStatus;
+
+/// Map a `send()`-level failure — the request never completed — to the
+/// actionable message built in core, instead of Safari's bare "TypeError:
+/// Load failed" (the server stopped, the Wi-Fi changed, or iOS suspended the
+/// tab and Safari re-used a dead pooled socket). Only the network hop gets
+/// this treatment: body-serialization and response-parse errors stay verbatim,
+/// since those mean a bug, not an unreachable server.
+fn network_error(e: gloo_net::Error) -> String {
+    network_error_text(&e.to_string())
+}
 
 /// Fetch the laid-out graph from the backend. Relative URL → same origin as the
 /// served SPA, so no CORS and no hardcoded host.
@@ -30,7 +42,7 @@ pub async fn fetch_graph() -> Result<Graph, String> {
     Request::get(&url)
         .send()
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(network_error)?
         .json::<Graph>()
         .await
         .map_err(|e| e.to_string())
@@ -42,7 +54,7 @@ pub async fn fetch_graph() -> Result<Graph, String> {
 /// returned as `Err` for the panel to show.
 pub async fn fetch_commit_detail(id: &str) -> Result<CommitDetail, String> {
     let url = format!("/api/commit/{id}?t={}", js_sys::Date::now());
-    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    let resp = Request::get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<CommitDetail>().await.map_err(|e| e.to_string())
     } else {
@@ -63,7 +75,7 @@ pub async fn clone_request(url: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(network_error)?;
     if resp.ok() {
         Ok(())
     } else {
@@ -77,17 +89,30 @@ pub async fn clone_request(url: &str) -> Result<(), String> {
 /// Ask the backend to create `name` at `commit` (Issue #18, `POST /api/branch`).
 /// On a non-2xx response the body is git's own error text, returned as `Err` so
 /// the caller can show the real reason (branch exists, bad name, …).
+///
+/// A network-level send failure gets ONE automatic retry: the classic iPad
+/// cause is Safari re-using a pooled TCP socket that silently died while the
+/// tab was suspended — the failed attempt evicts that socket, so the second
+/// attempt goes out on a fresh connection (no delay needed). The retry is safe
+/// for *this* endpoint because a duplicated `git branch` is harmless: if the
+/// first request did land, the retry just returns git's own "already exists".
 pub async fn create_branch_request(name: &str, commit: &str) -> Result<(), String> {
     let body = CreateBranchRequest {
         name: name.to_string(),
         commit: commit.to_string(),
     };
-    let resp = Request::post("/api/branch")
-        .json(&body)
-        .map_err(|e| e.to_string())?
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let send = || async {
+        Request::post("/api/branch")
+            .json(&body)
+            .map_err(|e| e.to_string())?
+            .send()
+            .await
+            .map_err(network_error)
+    };
+    let resp = match send().await {
+        Ok(resp) => resp,
+        Err(_) => send().await?,
+    };
     if resp.ok() {
         Ok(())
     } else {
@@ -119,7 +144,7 @@ pub async fn create_commit_request(
         .map_err(|e| e.to_string())?
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(network_error)?;
     if resp.ok() {
         Ok(())
     } else {
@@ -139,7 +164,7 @@ pub async fn fetch_head_branch() -> Result<Option<String>, String> {
     Request::get(&url)
         .send()
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(network_error)?
         .json::<Option<String>>()
         .await
         .map_err(|e| e.to_string())
@@ -152,7 +177,7 @@ pub async fn fetch_head_branch() -> Result<Option<String>, String> {
 /// cache-busted like the other live reads.
 pub async fn fetch_activity(limit: usize) -> Result<Vec<ActivityEvent>, String> {
     let url = format!("/api/activity?limit={limit}&t={}", js_sys::Date::now());
-    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    let resp = Request::get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<Vec<ActivityEvent>>().await.map_err(|e| e.to_string())
     } else {
@@ -169,7 +194,7 @@ pub async fn fetch_activity(limit: usize) -> Result<Vec<ActivityEvent>, String> 
 /// on a read-only clone. Cache-busted like the other live reads.
 pub async fn fetch_undoables(commit: &str) -> Result<Vec<Undoable>, String> {
     let url = format!("/api/undoables/{commit}?t={}", js_sys::Date::now());
-    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    let resp = Request::get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<Vec<Undoable>>().await.map_err(|e| e.to_string())
     } else {
@@ -191,7 +216,7 @@ pub async fn undo_request(action: &UndoAction) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(network_error)?;
     if resp.ok() {
         Ok(())
     } else {
@@ -208,7 +233,7 @@ pub async fn undo_request(action: &UndoAction) -> Result<(), String> {
 /// server's reason, returned as `Err` for the panel to show.
 pub async fn fetch_diff(id: &str) -> Result<CommitDiff, String> {
     let url = format!("/api/diff/{id}?t={}", js_sys::Date::now());
-    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    let resp = Request::get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<CommitDiff>().await.map_err(|e| e.to_string())
     } else {
@@ -225,7 +250,7 @@ pub async fn fetch_diff(id: &str) -> Result<CommitDiff, String> {
 /// busted like the other live reads, since it changes with every edit.
 pub async fn fetch_status() -> Result<RepoStatus, String> {
     let url = format!("/api/status?t={}", js_sys::Date::now());
-    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    let resp = Request::get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<RepoStatus>().await.map_err(|e| e.to_string())
     } else {
@@ -236,17 +261,35 @@ pub async fn fetch_status() -> Result<RepoStatus, String> {
     }
 }
 
+/// Fetch whether "Rebase onto main" would do anything right now
+/// (`GET /api/rebase-status`): the checked-out branch, the base the server
+/// would use (`origin/main` vs `main`), and whether HEAD is already based on
+/// it. Fetched live when the menu opens — like `fetch_undoables` — so the
+/// item's enabled state reflects the repo *now*, not the possibly-stale graph.
+pub async fn fetch_rebase_status() -> Result<RebaseStatus, String> {
+    let url = format!("/api/rebase-status?t={}", js_sys::Date::now());
+    Request::get(&url)
+        .send()
+        .await
+        .map_err(network_error)?
+        .json::<RebaseStatus>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Ask the backend to rebase the checked-out branch onto main (`POST /api/rebase`).
 /// Unlike the branch ops it carries no body — it always acts on the current HEAD,
-/// and the server picks `origin/main` vs `main` as the base. A non-2xx body is
-/// git's own error text (conflicts, detached HEAD, …), returned as `Err`.
-pub async fn rebase_request() -> Result<(), String> {
+/// and the server picks `origin/main` vs `main` as the base. `Ok` carries the
+/// server's success line so the caller can tell a real rebase from the
+/// "Already up to date" no-op (a raced click from a stale menu). A non-2xx body
+/// is git's own error text (conflicts, detached HEAD, …), returned as `Err`.
+pub async fn rebase_request() -> Result<String, String> {
     let resp = Request::post("/api/rebase")
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(network_error)?;
     if resp.ok() {
-        Ok(())
+        Ok(resp.text().await.unwrap_or_default())
     } else {
         Err(resp
             .text()
@@ -270,7 +313,7 @@ pub async fn branch_op_request(path: &str, branch: &str) -> Result<String, Strin
         .map_err(|e| e.to_string())?
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(network_error)?;
     if resp.ok() {
         Ok(resp.text().await.unwrap_or_default())
     } else {

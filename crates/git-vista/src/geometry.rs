@@ -148,9 +148,102 @@ pub fn stub_path(anchor_lane: usize, anchor_row: usize, stub_lane: usize, depth:
     format!("M {ax} {ay} C {ax} {ym}, {sx} {ym}, {sx} {sy}")
 }
 
+// Context-menu placement (iPad fix: the menu used to open at the raw tap point
+// and run off the bottom of the screen, its clipped items unreachable). The
+// menu's CSS caps its width at MENU_MAX_WIDTH, so the left clamp below only
+// needs that one number; EDGE_PAD keeps a sliver of backdrop visible past the
+// menu so tap-outside-to-close always has somewhere to land.
+const MENU_MAX_WIDTH: f64 = 320.0;
+const EDGE_PAD: f64 = 8.0;
+// Never squeeze the menu shorter than this, even on an absurdly small
+// viewport — a few rows plus scrolling beats a sliver.
+const MENU_MIN_HEIGHT: f64 = 120.0;
+
+/// Which vertical edge of the context menu sits at the tap point: `Top` pins
+/// its top there (menu grows downward), `Bottom` pins its bottom (grows up).
+/// Values are the CSS `top:`/`bottom:` px for a `position: fixed` element.
+#[derive(Debug, PartialEq)]
+pub enum VAnchor {
+    Top(f64),
+    Bottom(f64),
+}
+
+/// Where the context menu goes: clamped `left`, vertical anchor, `max-height`.
+pub struct MenuPlacement {
+    pub left: f64,
+    pub anchor: VAnchor,
+    pub max_height: f64,
+}
+
+/// Place the context menu for a tap at `(x, y)` in a `vw`×`vh` viewport (CSS
+/// px). Like a native context menu, a tap in the lower half flips the menu
+/// ABOVE the finger — the anchored edge stays at the tap point and the menu
+/// grows toward the farther screen edge, so it always has at least half the
+/// viewport of room. `max_height` is the space actually available on that
+/// side; whatever doesn't fit scrolls (`.ctx-menu`'s `overflow-y`) instead of
+/// clipping. That also covers the undo section arriving async after placement:
+/// a menu that grows late starts scrolling, it never pushes items offscreen.
+pub fn menu_placement(x: f64, y: f64, vw: f64, vh: f64) -> MenuPlacement {
+    let left = x.min((vw - MENU_MAX_WIDTH - EDGE_PAD).max(EDGE_PAD));
+    let (anchor, room) = if y > vh / 2.0 {
+        (VAnchor::Bottom(vh - y), y - EDGE_PAD)
+    } else {
+        (VAnchor::Top(y), vh - y - EDGE_PAD)
+    };
+    MenuPlacement { left, anchor, max_height: room.max(MENU_MIN_HEIGHT) }
+}
+
+impl MenuPlacement {
+    /// The inline `style` for the `.ctx-menu` div. Emits `top:` or `bottom:`
+    /// per the anchor; the per-open `max-height` overrides the stylesheet's
+    /// static viewport-sized backstop.
+    pub fn style(&self) -> String {
+        let v = match self.anchor {
+            VAnchor::Top(t) => format!("top: {t}px;"),
+            VAnchor::Bottom(b) => format!("bottom: {b}px;"),
+        };
+        format!("left: {}px; {v} max-height: {}px;", self.left, self.max_height)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_top_half_tap_opens_downward_with_room_to_the_bottom_edge() {
+        let p = menu_placement(100.0, 200.0, 1024.0, 800.0);
+        assert_eq!(p.anchor, VAnchor::Top(200.0));
+        assert_eq!(p.max_height, 800.0 - 200.0 - 8.0);
+        assert_eq!(p.left, 100.0);
+        assert_eq!(p.style(), "left: 100px; top: 200px; max-height: 592px;");
+    }
+
+    #[test]
+    fn a_bottom_half_tap_flips_the_menu_above_the_finger() {
+        // Tap at y=700 of 800: bottom edge pinned 100px up from the viewport
+        // bottom, growing upward, capped by the space above the tap.
+        let p = menu_placement(100.0, 700.0, 1024.0, 800.0);
+        assert_eq!(p.anchor, VAnchor::Bottom(100.0));
+        assert_eq!(p.max_height, 700.0 - 8.0);
+        assert!(p.style().contains("bottom: 100px;"), "{}", p.style());
+    }
+
+    #[test]
+    fn a_tap_near_the_right_edge_pulls_the_menu_back_on_screen() {
+        let p = menu_placement(1000.0, 200.0, 1024.0, 800.0);
+        assert_eq!(p.left, 1024.0 - 320.0 - 8.0);
+    }
+
+    #[test]
+    fn a_tiny_viewport_still_leaves_a_usable_scrollable_menu() {
+        // Tap at the very top of a 100px-tall viewport: available room (92px)
+        // is under the floor, so the menu keeps its minimum and scrolls.
+        let p = menu_placement(5.0, 0.0, 200.0, 100.0);
+        assert_eq!(p.max_height, 120.0);
+        // And the left clamp never goes negative on a narrow screen.
+        assert_eq!(menu_placement(150.0, 0.0, 200.0, 100.0).left, 8.0);
+    }
 
     #[test]
     fn node_centres_step_by_the_configured_gaps() {

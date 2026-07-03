@@ -10,6 +10,7 @@
 //! - [`status`]   — working-tree status types + the porcelain-v2 parser.
 //! - [`diff`]     — commit-diff types + the name-status/numstat parsers.
 //! - [`activity`] — activity-feed types, reflog-message parsing, feed assembly.
+//! - [`net`]      — user-facing wording for network-level fetch failures.
 //!
 //! Reading real history (which needs `gix` and a filesystem, and so can't run in
 //! a browser) lives in the separate native-only `git-vista-git` crate. Keeping
@@ -19,4 +20,5 @@ pub mod activity;
 pub mod diff;
 pub mod layout;
 pub mod model;
+pub mod net;
 pub mod status;
