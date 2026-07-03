@@ -58,6 +58,11 @@ html, body {
 }
 .refresh:hover { border-color: var(--accent); }
 .refresh:active { background: #30363d; }
+/* The gated "Reset Test Repo" button (only on a gv --seed repo): reads as the
+   hazard it is, like the menu's delete item. The first .refresh takes the
+   margin-left:auto gap, so later buttons need it off to stay adjacent. */
+.refresh.danger { margin-left: 0.5rem; color: #f85149; }
+.refresh.danger:hover { border-color: #f85149; }
 
 /* The live working-tree status chip (Activity/Undo step 1): a small pill by
    the subtitle — green check when clean, yellow with a change count when
@@ -200,6 +205,15 @@ html, body {
   opacity: 0.62;
 }
 
+/* iPad fix: the branch name beside a stub's hollow ring, so an empty branch is
+   identifiable without tapping it. Filled per-stub (SVG attribute) with the
+   branch's colour, like the labels above; weighted like a badge since it names
+   a branch, not a commit. */
+.stub-label {
+  font-size: 11px;
+  font-weight: 600;
+}
+
 /* Phase 7: ref badges — branch / tag / HEAD pills drawn at their commit. The
    monospace fill matches the badge-width math in geometry.rs. */
 .badge-text {
@@ -217,6 +231,18 @@ html, body {
   position: fixed;
   z-index: 10;
   min-width: 230px;
+  /* iPad fix: the menu must always fit the viewport. Width is capped (long
+     branch names wrap) so the left clamp in geometry.rs::menu_placement can
+     rely on one number; height overflow SCROLLS instead of clipping — the
+     per-open inline max-height (same fn) wins over the static backstop here
+     (the dvh line replaces the vh one on iOS 16.4+, tracking the real visible
+     box under Safari's collapsing URL bar). */
+  max-width: 320px;
+  max-height: calc(100vh - 16px);
+  max-height: calc(100dvh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   padding: 4px;
   background: #161b22;
   border: 1px solid #30363d;
