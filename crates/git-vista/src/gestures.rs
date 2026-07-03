@@ -31,6 +31,27 @@ pub fn window_inner_height() -> f64 {
         .unwrap_or(800.0)
 }
 
+/// The *visual* viewport size in CSS px — what's actually on screen right now.
+/// On iOS Safari `inner_height` over-reports while the URL bar / toolbars are
+/// expanded, so a menu clamped to it can still hang past the visible bottom;
+/// `visualViewport` tracks the true visible box. Falls back to the window
+/// inner size (then a sane default) where the API is missing. Used to place
+/// the context menu, so it's clamped against what the user can really see.
+pub fn viewport_size() -> (f64, f64) {
+    let win = web_sys::window();
+    if let Some(vv) = win.as_ref().and_then(|w| w.visual_viewport()) {
+        let (w, h) = (vv.width(), vv.height());
+        if w > 0.0 && h > 0.0 {
+            return (w, h);
+        }
+    }
+    let width = win
+        .and_then(|w| w.inner_width().ok())
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1024.0);
+    (width, window_inner_height())
+}
+
 /// The live gesture state, held in `store_value` cells (plain mutable state, no
 /// reactivity needed) plus the camera/dragging signals the handlers drive. A
 /// `Copy` bundle so the `<svg>` event closures each take one handle.

@@ -109,6 +109,13 @@ pub fn App() -> impl IntoView {
     let cloning = create_rw_signal(false);
     let open_opened_at = store_value(0f64);
 
+    // "Reset Test Repo" (iPad-testing follow-up): the button appears only when
+    // the graph says this repo carries a seed (`gv --seed`); the confirm modal
+    // lives in `dialogs::reset_repo_view`, owned here like the Open-URL one
+    // because its button sits in the topbar, not the graph canvas.
+    let reset_open = create_rw_signal(false);
+    let reset_opened_at = store_value(0f64);
+
     view! {
         <main class="app">
             <header class="topbar">
@@ -196,9 +203,33 @@ pub fn App() -> impl IntoView {
                 >
                     "Refresh"
                 </button>
+                // Only a repo explicitly seeded as a test repo (`gv --seed`)
+                // gets this; everything since the seed is discarded on reset,
+                // so it's confirmed in its own modal and styled as a hazard.
+                {move || graph
+                    .get()
+                    .and_then(|r| r.ok())
+                    .filter(|g| g.resettable)
+                    .map(|_| view! {
+                        <button
+                            class="refresh danger"
+                            on:click=move |_| {
+                                reset_opened_at.set_value(js_sys::Date::now());
+                                reset_open.set(true);
+                            }
+                            title="Restore this test repo to its recorded seed state — \
+                                   discards every commit, branch and change made since \
+                                   (recorded with gv --seed)"
+                        >
+                            "Reset Test Repo"
+                        </button>
+                    })}
             </header>
             // The "Open URL" modal (Phase 12), factored into `dialogs`.
             {dialogs::open_url_view(open_url, clone_url, cloning, open_opened_at, reload)}
+            // The "Reset Test Repo" confirmation (only reachable via the gated
+            // topbar button above).
+            {dialogs::reset_repo_view(reset_open, reset_opened_at, reload)}
             <section class="graph">
                 {move || {
                     // Read the icon set here, inside the reactive block, so the

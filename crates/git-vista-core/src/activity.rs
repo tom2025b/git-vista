@@ -195,6 +195,19 @@ pub fn parse_reflog_message(message: &str) -> (ActivityKind, String) {
     (ActivityKind::Other, msg.to_string())
 }
 
+/// True for a `checkout: moving from X to X` reflog message — a same-branch
+/// checkout that moved nothing. git logs it anyway (exit 0, "Already on 'X'"),
+/// but a "main → main" row is noise to a reader whoever ran it, so the feed
+/// skips these. Same last-` to `-split as [`parse_reflog_message`]: ref names
+/// can't contain spaces.
+fn is_self_checkout(message: &str) -> bool {
+    message
+        .trim()
+        .strip_prefix("checkout: moving from ")
+        .and_then(|rest| rest.rsplit_once(" to "))
+        .is_some_and(|(from, to)| from == to)
+}
+
 /// How close (seconds) a reflog entry must be to a journal entry with the same
 /// kind and new oid to count as *the same event*. Reflog timestamps have
 /// one-second granularity and the journal stamps its own clock right after
@@ -227,6 +240,11 @@ pub fn assemble_feed(
     while i < reflog.len() {
         let entry = &reflog[i];
         let (kind, summary) = parse_reflog_message(&entry.message);
+        // Same-branch checkouts moved nothing — drop them as noise.
+        if kind == ActivityKind::Checkout && is_self_checkout(&entry.message) {
+            i += 1;
+            continue;
+        }
         if kind == ActivityKind::Rebase {
             let mut span = i;
             while span + 1 < reflog.len() {
@@ -458,6 +476,22 @@ mod tests {
         assert_eq!(commits[0].ref_name.as_deref(), Some("main"), "branch copy wins");
         // The checkout (HEAD-only) survives.
         assert!(feed.iter().any(|e| e.kind == ActivityKind::Checkout));
+    }
+
+    #[test]
+    fn a_same_branch_checkout_is_dropped_as_noise() {
+        // `git checkout main` while on main: exit 0, "Already on 'main'", yet
+        // git still logs "moving from main to main" — nothing moved, so the
+        // feed drops it. A real switch right next to it survives.
+        let reflog = vec![
+            entry("HEAD", 100, "b", "b", "checkout: moving from main to main"),
+            entry("HEAD", 90, "a", "b", "checkout: moving from feature to main"),
+        ];
+        let feed = assemble_feed(vec![], reflog, &HashMap::new(), &HashSet::new(), 10);
+        let checkouts: Vec<_> =
+            feed.iter().filter(|e| e.kind == ActivityKind::Checkout).collect();
+        assert_eq!(checkouts.len(), 1, "self-checkout dropped: {feed:#?}");
+        assert_eq!(checkouts[0].summary, "feature → main");
     }
 
     #[test]

@@ -34,11 +34,13 @@ use git_vista_core::layout;
 use git_vista_core::activity::{ActivityEvent, ActivityKind, ActivitySource};
 use git_vista_core::model::{
     validate_clone_url, BranchRequest, CloneRequest, CommitSummary, CreateBranchRequest,
-    CreateCommitRequest, GitRef, RefKind,
+    CreateCommitRequest, GitRef, RebaseStatus, RefKind,
 };
+use git_vista_core::seed::{parse_seed, reset_plan, Seed};
 use git_vista_core::status::parse_porcelain_v2;
 use git_vista_git::{read_commit, read_refs, walk_history, RepoError};
 use tower::Layer;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -111,6 +113,15 @@ const ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT
 
 #[tokio::main]
 async fn main() {
+    // No git child may ever sit waiting on input this headless server can't
+    // provide: these are inherited by every `git` the handlers spawn, making
+    // git fail fast instead of hanging a request forever on a credential
+    // prompt (push/clone against a private remote) or an editor. A request
+    // that never completes surfaces on the iPad as the same opaque
+    // "Load failed" a dead server does.
+    std::env::set_var("GIT_TERMINAL_PROMPT", "0");
+    std::env::set_var("GIT_EDITOR", "true");
+
     // Resolve which repo to serve: first CLI arg, else the default checkout.
     // Canonicalise so relative paths (e.g. `.`) and the banner are absolute; if
     // that fails (path missing) keep the raw value so the error is reported.
@@ -187,13 +198,38 @@ async fn main() {
         .route("/api/merge", post(merge_branch))
         .route("/api/push", post(push_branch))
         .route("/api/delete-branch", post(delete_branch))
+        // iPad-testing follow-up: switch HEAD to a branch (`git checkout`).
+        .route("/api/checkout", post(checkout_branch))
         // Issue #33 follow-up: force-delete an unmerged branch (`git branch -D`),
         // offered only after the safe `-d` above is refused; and rebase the
         // checked-out branch onto main (`git rebase`).
         .route("/api/force-delete-branch", post(force_delete_branch))
         .route("/api/rebase", post(rebase))
+        // Whether "Rebase onto main" would do anything right now — the menu
+        // disables the item (with the reason) when it wouldn't.
+        .route("/api/rebase-status", get(rebase_status))
+        // iPad-testing follow-up: restore a seeded *test repo* to its recorded
+        // state (gated on the seed files `gv --seed` writes).
+        .route("/api/reset-test-repo", post(reset_test_repo))
         // Anything that isn't the API is served from the built SPA bundle.
-        .fallback_service(spa);
+        .fallback_service(spa)
+        // A handler panic becomes a 500 with the panic text instead of a reset
+        // connection: the frontend then shows a real error, and the process —
+        // which axum keeps alive either way — never leaves the browser with
+        // the unexplained "Load failed" a torn-down connection produces.
+        .layer(CatchPanicLayer::custom(|panic: Box<dyn std::any::Any + Send>| {
+            let msg = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("(no panic message)");
+            eprintln!("git-vista: handler panicked: {msg}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("git-vista server bug — a handler panicked: {msg}"),
+            )
+                .into_response()
+        }));
 
     let listener = match tokio::net::TcpListener::bind(ADDR).await {
         Ok(l) => l,
@@ -280,6 +316,9 @@ async fn commits() -> Result<impl IntoResponse, (StatusCode, String)> {
     graph.repo_label = Some(repo.display().to_string());
     // A cloned URL is view-only: tell the UI to hide every write action.
     graph.read_only = read_only;
+    // Offer "Reset Test Repo" only for a repo explicitly opted in with
+    // `gv --seed` (the seed files exist) — and never on a read-only clone.
+    graph.resettable = !read_only && has_seed(repo);
     // Attach the GitHub web base (if this repo has a github.com origin) so the UI
     // can link commits and refs. None => the frontend renders plain-text labels.
     graph.repo_url = git_vista_git::github_web_base(repo);
@@ -830,6 +869,49 @@ async fn worktree_status() -> Result<impl IntoResponse, (StatusCode, String)> {
     Ok((no_store, Json(parsed)))
 }
 
+/// Check out a branch (iPad-testing follow-up): `git checkout <branch>`, moving
+/// HEAD and the working tree to it. Git itself refuses when local changes would
+/// be overwritten; that error is forwarded verbatim. Asking for the branch
+/// already checked out is a no-op — git exits 0 (and logs a "moving from X to X"
+/// reflog line the feed drops as noise), so journalling it would put an event in
+/// the Activity feed that changed nothing (the same phantom-event trap the
+/// merge/rebase no-ops guard against). A real switch *is* journaled: git also
+/// logs it on the HEAD reflog, but the feed's dedup collapses that copy into
+/// this one, which knows it came from the app.
+async fn checkout_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
+    let repo = current().0;
+    // Pre-checkout branch and tip, read before the switch: the branch is the
+    // no-op test above, the tip is the journaled "moved from" oid.
+    let before = git_vista_git::read_head_branch(&repo);
+    let old = rev_parse(&repo, "HEAD").await;
+    let resp = run_branch_op(
+        "/api/checkout",
+        &req.branch,
+        &["checkout"],
+        format!("checked out '{}'", req.branch.trim()),
+    )
+    .await;
+    if resp.0 == StatusCode::OK {
+        let branch = req.branch.trim();
+        if before.as_deref() == Some(branch) {
+            return (
+                StatusCode::OK,
+                format!("Already on ‘{branch}’ — it's the checked-out branch."),
+            );
+        }
+        let new = rev_parse(&repo, "HEAD").await;
+        journal_app_event(
+            &repo,
+            ActivityKind::Checkout,
+            Some(branch.to_string()),
+            old,
+            new,
+            format!("checked out ‘{branch}’"),
+        );
+    }
+    resp
+}
+
 /// Merge a branch into the currently checked-out branch (Issue #33 follow-up):
 /// `git merge --no-edit <branch>`. `--no-edit` takes git's default merge message
 /// (the server has no editor). A merge lands in whatever HEAD points at, so the UI
@@ -981,11 +1063,7 @@ async fn rebase() -> (StatusCode, String) {
     let repo = current().0;
     // Pre-rebase tip, for the journal: it's the "undo rebase" target.
     let old = rev_parse(&repo, "HEAD").await;
-    let base = if git_ref_exists(&repo, "refs/remotes/origin/main").await {
-        "origin/main"
-    } else {
-        "main"
-    };
+    let base = rebase_base(&repo).await;
 
     let output = match tokio::process::Command::new("git")
         .arg("-C")
@@ -1006,9 +1084,20 @@ async fn rebase() -> (StatusCode, String) {
     };
 
     if output.status.success() {
-        println!("[/api/rebase] rebased HEAD onto {base}");
         let new = rev_parse(&repo, "HEAD").await;
         let branch = git_vista_git::read_head_branch(&repo).unwrap_or_else(|| "HEAD".into());
+        // git exits 0 without moving HEAD when the branch is already based on
+        // the base ("Current branch … is up to date"). That's no rebase:
+        // journalling one puts a phantom "rebased ‘main’ onto main" event in
+        // the Activity feed with nothing to undo, and "Rebased onto …" in the
+        // UI claims something happened. Say what (didn't) happen instead.
+        if new == old {
+            return (
+                StatusCode::OK,
+                format!("Already up to date — ‘{branch}’ is already based on {base}."),
+            );
+        }
+        println!("[/api/rebase] rebased HEAD onto {base}");
         journal_app_event(
             &repo,
             ActivityKind::Rebase,
@@ -1092,6 +1181,209 @@ fn journal_app_event(
             undo: None,
         },
     );
+}
+
+/// The base "Rebase onto main" rebases onto: `origin/main` when that
+/// remote-tracking ref exists — the usual feature-branch target, so you rebase
+/// onto the freshest pushed main — and the local `main` otherwise. Shared by
+/// the rebase handler and `/api/rebase-status`, so the menu's gate always
+/// describes exactly what the rebase would do.
+async fn rebase_base(repo: &Path) -> &'static str {
+    if git_ref_exists(repo, "refs/remotes/origin/main").await {
+        "origin/main"
+    } else {
+        "main"
+    }
+}
+
+/// Whether `ancestor` is an ancestor of (or equal to) `rev` — `git merge-base
+/// --is-ancestor` exits 0 exactly then. "HEAD already contains the base tip" is
+/// the definition of "a rebase onto that base would change nothing".
+async fn is_ancestor(repo: &Path, ancestor: &str, rev: &str) -> bool {
+    tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, rev])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Whether "Rebase onto main" would do anything right now (see [`RebaseStatus`]),
+/// resolved fresh per request like `/api/head-branch` — the graph on screen may
+/// predate a rebase or a branch switch. Sent `no-store` like the other live reads.
+async fn rebase_status() -> impl IntoResponse {
+    let repo = current().0;
+    let branch = git_vista_git::read_head_branch(&repo);
+    let base = rebase_base(&repo).await;
+    let base_exists = rev_parse(&repo, base).await.is_some();
+    let up_to_date = base_exists && is_ancestor(&repo, base, "HEAD").await;
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    (
+        no_store,
+        Json(RebaseStatus { branch, base: base.to_string(), base_exists, up_to_date }),
+    )
+}
+
+/// Whether this repo carries a recorded test-repo seed (`gv --seed`) — the gate
+/// for offering "Reset Test Repo" at all.
+fn has_seed(repo: &Path) -> bool {
+    journal::state_dir(repo)
+        .is_some_and(|d| d.join("seed-refs").exists() && d.join("seed-head").exists())
+}
+
+/// The parsed seed, if this repo has one. `None` => not a test repo;
+/// `Some(Err)` => the seed files exist but are corrupt (refuse to reset).
+fn read_seed(repo: &Path) -> Option<Result<Seed, String>> {
+    let dir = journal::state_dir(repo)?;
+    let refs = std::fs::read_to_string(dir.join("seed-refs")).ok()?;
+    let head = std::fs::read_to_string(dir.join("seed-head")).ok()?;
+    Some(parse_seed(&refs, &head))
+}
+
+/// Run one `git -C <repo> <args…>` for the reset, mapping any failure to git's
+/// own stderr so the response can say which exact step refused and why.
+async fn git_ok(repo: &Path, args: &[&str]) -> Result<(), String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("couldn't run git: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() { format!("`git {}` failed", args.join(" ")) } else { stderr })
+}
+
+/// Reset a *test repo* to its recorded seed (iPad-testing follow-up): move
+/// every seeded branch back to its recorded tip, check out the seeded HEAD
+/// branch, force the worktree clean, DELETE branches the seed doesn't know —
+/// allowed nowhere else in git-vista — and wipe the app journal (its events
+/// describe history that no longer exists). Hard-gated: only a repo explicitly
+/// opted in with `gv --seed <path>` has seed files, and a read-only clone is
+/// refused outright. The seed's object bundle is unbundled first so seeded
+/// commits exist even if git gc pruned them after they became unreachable.
+async fn reset_test_repo() -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    let repo = current().0;
+    let seed = match read_seed(&repo) {
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                "This repo has no recorded seed — it isn't marked as a test repo. \
+                 Run `gv --seed <path>` once on the server machine to record its reset point."
+                    .to_string(),
+            )
+        }
+        Some(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("The recorded seed is corrupt ({e}) — re-record it with `gv --seed`."),
+            )
+        }
+        Some(Ok(seed)) => seed,
+    };
+
+    // Objects first, verification second: unbundle is best-effort (idempotent,
+    // cheap), then every seeded tip must resolve or the reset refuses to start —
+    // never a half-restore.
+    if let Some(dir) = journal::state_dir(&repo) {
+        let bundle = dir.join("seed.bundle");
+        if bundle.exists() {
+            let _ = git_ok(&repo, &["bundle", "unbundle", &bundle.display().to_string()]).await;
+        }
+    }
+    for r in &seed.refs {
+        if rev_parse(&repo, &format!("{}^{{commit}}", r.oid)).await.is_none() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Seed commit {} for ‘{}’ no longer exists in this repo — \
+                     re-record the seed with `gv --seed`.",
+                    &r.oid[..7],
+                    r.name
+                ),
+            );
+        }
+    }
+
+    // What the repo looks like NOW, then the pure plan of moves + deletions.
+    let current_refs = match tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["for-each-ref", "refs/heads", "--format=%(objectname) %(refname:short)"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| l.split_once(' ').map(|(oid, name)| (name.to_string(), oid.to_string())))
+            .collect::<Vec<_>>(),
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Couldn't list the repo's current branches.".to_string(),
+            )
+        }
+    };
+    let plan = reset_plan(&seed, &current_refs);
+
+    // Apply, in an order where each step makes the next valid: refs back first
+    // (so the seed HEAD branch exists at the right tip), then a forced checkout
+    // + hard reset + clean (so HEAD is off any branch about to be deleted and
+    // the worktree matches the seed exactly), then the deletions.
+    for r in &plan.update {
+        if let Err(e) = git_ok(&repo, &["update-ref", &format!("refs/heads/{}", r.name), &r.oid]).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Reset stopped while restoring ‘{}’: {e}", r.name),
+            );
+        }
+    }
+    for step in [
+        &["checkout", "-f", seed.head.as_str()] as &[&str],
+        &["reset", "--hard"],
+        &["clean", "-fd"],
+    ] {
+        if let Err(e) = git_ok(&repo, step).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Reset stopped at `git {}`: {e}", step.join(" ")),
+            );
+        }
+    }
+    let mut deleted = 0;
+    for name in &plan.delete {
+        // The ONLY place git-vista deletes a branch: a seeded test repo, inside
+        // an explicit reset, for branches created after the seed was recorded.
+        match git_ok(&repo, &["branch", "-D", name]).await {
+            Ok(()) => deleted += 1,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Reset stopped deleting test branch ‘{name}’: {e}"),
+                )
+            }
+        }
+    }
+    // The journal now describes history that no longer exists (dead undo
+    // targets included) — wipe it with the snapshot; both regenerate.
+    journal::clear(&repo);
+
+    let msg = format!(
+        "Reset to seed: {} branch(es) restored, {} deleted, HEAD → ‘{}’, working tree clean.",
+        plan.update.len(),
+        deleted,
+        seed.head
+    );
+    println!("[/api/reset-test-repo] {msg}");
+    (StatusCode::OK, msg)
 }
 
 /// Whether `refname` resolves in `repo` (`git rev-parse --verify --quiet`): exit 0
