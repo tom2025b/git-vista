@@ -28,6 +28,11 @@ use crate::text::truncate;
 /// (the full text stays available via the node/label hover tooltip).
 const MAX_SUMMARY_CHARS: usize = 60;
 
+/// A stub's branch-name label is truncated past this (the full name stays in
+/// the ring's hover tooltip and the menu header). Short enough that a deep
+/// cascade's label can't reach far across the message column.
+const MAX_STUB_NAME_CHARS: usize = 24;
+
 /// Everything the per-row / per-edge view builders need, bundled behind a
 /// `StoredValue` so the reactive `<For>` closures (Phase 8 viewport
 /// virtualization) can reach the graph and its derived lookups cheaply — without
@@ -566,6 +571,21 @@ pub fn stubs(
                 <circle cx=sx cy=sy r=NODE_RADIUS fill=MERGE_FILL stroke=color stroke-width="2">
                     <title>{format!("{name} — new branch (no commits yet); tap to branch from here")}</title>
                 </circle>
+                // The branch NAME beside the ring (iPad-testing follow-up: a bare
+                // hollow ring was unidentifiable without tapping it). Same colour
+                // as the ring/line so name and geometry read as one thing;
+                // truncated so a long name can't sprawl across the canvas. Sits
+                // at a half-row y, so it clears the commit labels' text lines;
+                // pointer-events:none keeps the ring's hit circle the tap target.
+                <text
+                    x=sx + NODE_RADIUS + 6
+                    y=sy + 4
+                    class="stub-label"
+                    fill=color
+                    pointer-events="none"
+                >
+                    {truncate(&s.name, MAX_STUB_NAME_CHARS)}
+                </text>
                 // A larger, invisible hit target on top so the tip is easy to tap,
                 // exactly like the commit dots.
                 <circle

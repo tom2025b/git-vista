@@ -382,6 +382,7 @@ fn layout_topology(commits: Vec<CommitSummary>, trunk_tip: Option<&Oid>) -> Grap
         stubs: Vec::new(),
         repo_label: None,
         read_only: false,
+        resettable: false,
     }
 }
 
