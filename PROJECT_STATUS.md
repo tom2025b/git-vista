@@ -14,13 +14,13 @@ Log / Journal view** and **Contextual Undo**, plus **commit diffs** and a
 - Safety net: `v1-stable` (= `main` @ `a0715e0`, pushed) — the known-good
   fallback. Untouched by any of this work.
 - **Current work**: the **iPad test-report fix batch** on
-  `feature/ipad-test-fixes` — see the section right below. Tasks 1–5 of the
-  report are done and green (125 tests); tasks 6 (gated "Reset Test Repo")
-  and 7 (label branch stubs) remain, then the final verify pass (task 8).
+  `feature/ipad-test-fixes` (PR #48) — see the section right below. All seven
+  report tasks are done and green (129 tests); what's left is Tom's real-iPad
+  tap-through of the checklist.
 
 ## iPad test-report fix batch (2026-07-03, branch `feature/ipad-test-fixes`)
 
-Fixes for Tom's 2026-07-02 iPad testing report, one commit, five fixes:
+Fixes for Tom's 2026-07-02 iPad testing report:
 
 1. **Stable lanes + colours** (`layout.rs`, `color.rs`, `render.rs`) — commits
    get a deterministic topo order (time desc, id asc on ties) so equal-time
@@ -53,10 +53,23 @@ Fixes for Tom's 2026-07-02 iPad testing report, one commit, five fixes:
    clamped against iOS Safari's *visual* viewport; width capped at 320px;
    the Activity panel's private x-clamp is deleted (one shared path).
 
-Verified: 125 workspace tests, wasm check clean, live server checks per fix,
-headless-CDP probe of the menu flip (bottom tap → `bottom:`-anchored, fully
-on-screen). Remaining from the report: task 6 (gated "Reset Test Repo"
-button), task 7 (label branch stubs), task 8 (batch verify + iPad checklist).
+6. **Gated "Reset Test Repo"** (`gv --seed`, core `seed.rs`,
+   `POST /api/reset-test-repo`, topbar button) — a repo opted in with
+   `gv --seed <path>` records its branches/HEAD/objects under
+   `.git/git-vista/`; the graph then carries `resettable: true` and the
+   topbar shows a red button. Reset = unbundle objects, verify every seeded
+   tip (corrupt seed refuses — never half-restores), move refs back, forced
+   checkout of the seeded HEAD, hard reset + clean, delete post-seed
+   branches (THE ONLY PLACE git-vista deletes branches), wipe the journal.
+   `~/projects/git-vista-test` is seeded (9 branches, HEAD `main`).
+7. **Stub labels** (`render.rs`, `.stub-label`) — every hollow stub ring now
+   draws its branch name beside it in the branch's own colour, truncated at
+   24 chars; sits at half-row heights so it can't collide with commit text.
+
+Verified: 129 workspace tests, wasm check clean, zero warnings, live server
+checks per fix (incl. a full seed → mess → reset → exact-restore cycle on the
+test repo), headless-CDP probes of the menu flip, the Reset button/modal and
+the stub labels. Remaining: Tom's tap-by-tap pass on the real iPad.
 
 ## Commit history on the branch
 
