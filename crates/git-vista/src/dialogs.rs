@@ -172,6 +172,17 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
             PendingOp::Push { branch } => spawn_local(async move {
                 report(branch_op_request("/api/push", &branch).await, &format!("push ‘{branch}’"), reload);
             }),
+            PendingOp::Checkout { branch, .. } => spawn_local(async move {
+                match branch_op_request("/api/checkout", &branch).await {
+                    // The already-on-it no-op (raced from a stale menu): say what
+                    // (didn't) happen, mirroring the merge arm's up-to-date case.
+                    Ok(msg) if msg.starts_with("Already on") => {
+                        alert(&msg);
+                        reload.update(|n| *n = n.wrapping_add(1));
+                    }
+                    other => report(other, &format!("check out ‘{branch}’"), reload),
+                }
+            }),
             PendingOp::ForceDelete { branch } => spawn_local(async move {
                 report(
                     branch_op_request("/api/force-delete-branch", &branch).await,
@@ -179,8 +190,16 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
                     reload,
                 );
             }),
-            PendingOp::Rebase { .. } => spawn_local(async move {
-                report(rebase_request().await, "rebase onto main", reload);
+            PendingOp::Rebase { base, .. } => spawn_local(async move {
+                match rebase_request().await {
+                    // The already-based no-op (raced from a stale menu): say what
+                    // (didn't) happen, mirroring the merge arm's up-to-date case.
+                    Ok(msg) if msg.starts_with("Already up to date") => {
+                        alert(&msg);
+                        reload.update(|n| *n = n.wrapping_add(1));
+                    }
+                    other => report(other, &format!("rebase onto {base}"), reload),
+                }
             }),
             // The undo itself (step 5). The server re-checks everything that
             // matters — compare-and-swap on the branch tip, clean-tree guard,
@@ -240,6 +259,23 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
                     false,
                     true,
                 ),
+                PendingOp::Checkout { branch, current } => match current {
+                    Some(current) if current == branch => (
+                        "Checkout branch",
+                        format!("‘{branch}’ is already the branch you're on — nothing to switch."),
+                        "Checkout",
+                        false,
+                        false,
+                    ),
+                    // A different branch, or detached HEAD (which a checkout re-attaches).
+                    _ => (
+                        "Checkout branch",
+                        format!("Check out ‘{branch}’? This switches the working tree and HEAD to ‘{branch}’."),
+                        "Checkout",
+                        false,
+                        true,
+                    ),
+                },
                 PendingOp::Delete { branch, current } => match current {
                     Some(current) if current == branch => (
                         "Delete branch",
@@ -314,16 +350,16 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
                         ),
                     }
                 }
-                PendingOp::Rebase { current } => match current {
+                PendingOp::Rebase { current, base } => match current {
                     Some(branch) => (
-                        "Rebase onto main",
-                        format!("Rebase ‘{branch}’ onto main? This replays ‘{branch}’’s commits on top of the latest main and rewrites its history."),
+                        "Rebase branch",
+                        format!("Rebase ‘{branch}’ onto {base}? This replays ‘{branch}’’s commits on top of the latest {base} and rewrites its history."),
                         "Rebase",
                         false,
                         true,
                     ),
                     None => (
-                        "Rebase onto main",
+                        "Rebase branch",
                         "HEAD is detached, so there's no branch to rebase. Check out a branch first.".to_string(),
                         "Rebase",
                         false,

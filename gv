@@ -7,6 +7,13 @@
 #
 #   gv                  visualise the CURRENT directory's repo
 #   gv ~/code/myproj    visualise another repo by path
+#   gv --stop           stop the running server
+#
+# The server runs DETACHED (its own session, logging to a file), so closing the
+# terminal or losing the SSH session that launched gv no longer kills it — which
+# used to surface on the iPad, minutes later, as "Type error. Load failed" on
+# the next write. Ctrl-C is no longer how you stop it: use `gv --stop`, or just
+# run gv again (a restart always replaces the old server).
 #
 # While actively developing, gv ALWAYS does a CLEAN rebuild of the wasm frontend
 # (trunk clean + trunk build) before starting the server, so a stale/cached bundle
@@ -17,11 +24,24 @@ set -euo pipefail
 # Where you ran gv from (the repo to visualise defaults to this).
 START_DIR="$PWD"
 
-# Parse args: an optional path to the repo to visualise. (No --no-build while
-# developing — we always rebuild from scratch; see the header.)
+# The detached server's log — the server's banner (with the firewall tips) and
+# everything it prints land here. Kept under XDG state, out of any repo.
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/git-vista"
+LOG="$LOG_DIR/server.log"
+
+# Parse args: an optional path to the repo to visualise, or --stop. (No
+# --no-build while developing — we always rebuild from scratch; see the header.)
 TARGET=""
 for arg in "$@"; do
   case "$arg" in
+    --stop)
+      if pkill -9 -f '[g]it-vista-server' 2>/dev/null; then
+        echo "gv: server stopped"
+      else
+        echo "gv: no server was running"
+      fi
+      exit 0
+      ;;
     -*) echo "gv: unknown option: $arg" >&2; exit 2 ;;
     *)  TARGET="$arg" ;;
   esac
@@ -55,6 +75,28 @@ pkill -9 -f '[g]it-vista-server' 2>/dev/null || true
 # the recurring "my new code isn't loading" trap during development.
 ( cd crates/git-vista && trunk clean && trunk build )
 
-# Hand off to the server (exec so Ctrl-C stops it cleanly). It prints the LAN URL.
+# Build the server in the FOREGROUND so compile errors land in this terminal…
+cargo build -p git-vista-server
+
+# …then run the built binary DETACHED: `setsid` gives it its own session with no
+# controlling terminal, so a closed terminal / dropped SSH session can't SIGHUP
+# it. Its output (including the LAN-URL banner and firewall tips) goes to $LOG.
+mkdir -p "$LOG_DIR"
+echo "=== gv start $(date '+%F %T') — visualising $TARGET" >>"$LOG"
+setsid "$REPO/target/debug/git-vista-server" "$TARGET" >>"$LOG" 2>&1 </dev/null &
+
+# Don't claim success until it actually serves: catches an immediate crash or a
+# port clash, with the log's last lines as the explanation.
 echo "gv: visualising $TARGET"
-exec cargo run -p git-vista-server -- "$TARGET"
+for _ in $(seq 1 40); do
+  if curl -sf -m 1 "http://localhost:8080/api/head-branch" >/dev/null 2>&1; then
+    LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "gv: server up — http://${LAN_IP:-<this-machine-LAN-IP>}:8080/"
+    echo "gv: log: $LOG    stop: gv --stop"
+    exit 0
+  fi
+  sleep 0.25
+done
+echo "gv: server didn't come up within 10s — last log lines:" >&2
+tail -n 20 "$LOG" >&2
+exit 1

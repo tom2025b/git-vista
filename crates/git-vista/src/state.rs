@@ -92,6 +92,11 @@ pub enum PendingOp {
     /// fetched on click; when it equals `branch` the confirm button is disabled (git
     /// refuses to delete the checked-out branch). `None` => detached HEAD (deletable).
     Delete { branch: String, current: Option<String> },
+    /// Check out `branch` (`git checkout <branch>`), moving HEAD and the working
+    /// tree to it. `current` is the live HEAD branch, fetched on click; when it
+    /// equals `branch` the confirm button is disabled (nothing to switch to).
+    /// `None` => detached HEAD — checkout is *allowed* there, it re-attaches HEAD.
+    Checkout { branch: String, current: Option<String> },
     /// Force-delete `branch` (`git branch -D <branch>`), discarding unmerged commits.
     /// Only reached after the safe [`PendingOp::Delete`] is refused with "not fully
     /// merged": the modal re-opens as this so the user can override rather than hit a
@@ -101,7 +106,9 @@ pub enum PendingOp {
     /// when that remote-tracking ref exists — resolved server-side). `current` is the
     /// live HEAD branch, fetched on click, purely to name it in the dialog; `None` =>
     /// detached HEAD (the confirm button is disabled — there's no branch to rebase).
-    Rebase { current: Option<String> },
+    /// `base` names the server's actual rebase target (from `/api/rebase-status`),
+    /// so the dialog says exactly what the branch will be replayed onto.
+    Rebase { current: Option<String>, base: String },
     /// Execute one undo action (Activity/Undo step 5, `POST /api/undo`). Carries the
     /// whole [`Undoable`] — the action plus its server-built label and `warn_pushed`
     /// flag — so the dialog can name exactly what it's about to do and warn when the

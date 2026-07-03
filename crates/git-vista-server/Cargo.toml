@@ -25,7 +25,9 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "p
 # `tower::Layer` lets us wrap the static file service with a cache-control header
 # layer; `set-header` is the tower-http layer that applies it.
 tower = "0.5"
-tower-http = { version = "0.7.0", features = ["fs", "set-header"] }
+# `catch-panic` turns any handler panic into a 500 response instead of a reset
+# connection (which iPad Safari would report as an opaque "Load failed").
+tower-http = { version = "0.7.0", features = ["fs", "set-header", "catch-panic"] }
 
 [dev-dependencies]
 # Throwaway repos for the journal/snapshot round-trip tests.
