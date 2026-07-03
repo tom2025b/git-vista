@@ -114,6 +114,7 @@ pub fn fake_graph() -> Graph {
         stubs: Vec::new(),
         repo_label: None,
         read_only: false,
+        resettable: false,
     }
 }
 

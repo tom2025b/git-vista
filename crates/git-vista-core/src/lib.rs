@@ -11,6 +11,7 @@
 //! - [`diff`]     — commit-diff types + the name-status/numstat parsers.
 //! - [`activity`] — activity-feed types, reflog-message parsing, feed assembly.
 //! - [`net`]      — user-facing wording for network-level fetch failures.
+//! - [`seed`]     — test-repo seed parsing + reset planning ("Reset Test Repo").
 //!
 //! Reading real history (which needs `gix` and a filesystem, and so can't run in
 //! a browser) lives in the separate native-only `git-vista-git` crate. Keeping
@@ -21,4 +22,5 @@ pub mod diff;
 pub mod layout;
 pub mod model;
 pub mod net;
+pub mod seed;
 pub mod status;

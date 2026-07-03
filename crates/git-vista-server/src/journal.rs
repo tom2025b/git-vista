@@ -20,6 +20,7 @@
 //! the feed's attribution, which must never break the git operation itself.
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -31,8 +32,10 @@ const JOURNAL_READ_CAP: usize = 1_000;
 
 /// The state directory, `.git/git-vista/`, if this repo has a real `.git`
 /// *directory*. (A linked worktree's `.git` is a file; journaling is quietly
-/// skipped there rather than guessed at.)
-fn state_dir(repo: &Path) -> Option<PathBuf> {
+/// skipped there rather than guessed at.) Public because the test-repo seed
+/// files (`seed-refs` / `seed-head` / `seed.bundle`, written by `gv --seed`)
+/// live in the same directory.
+pub fn state_dir(repo: &Path) -> Option<PathBuf> {
     let git = repo.join(".git");
     git.is_dir().then(|| git.join("git-vista"))
 }
@@ -118,6 +121,21 @@ pub fn remove_from_snapshot(repo: &Path, branch: &str) {
     if let Some(mut snapshot) = read_snapshot(repo) {
         if snapshot.remove(branch).is_some() {
             write_snapshot(repo, &snapshot);
+        }
+    }
+}
+
+/// Wipe the journal and the branch snapshot. Used by the test-repo reset: its
+/// whole point is that the recorded history no longer describes the repo, and
+/// keeping it would resurface undone events (with dead undo targets) in the
+/// feed. Both files regenerate naturally — the journal on the next app write,
+/// the snapshot on the next feed read. Best-effort, like the other writers.
+pub fn clear(repo: &Path) {
+    for path in [journal_path(repo), snapshot_path(repo)].into_iter().flatten() {
+        if path.exists() {
+            if let Err(e) = fs::remove_file(&path) {
+                eprintln!("git-vista: couldn't clear {}: {e}", path.display());
+            }
         }
     }
 }

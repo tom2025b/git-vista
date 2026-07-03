@@ -155,6 +155,11 @@ pub struct Graph {
     /// discarded when the clone is deleted. `false` for the user's own local repo.
     #[serde(default)]
     pub read_only: bool,
+    /// True when this repo carries a recorded test-repo seed (`gv --seed`), so
+    /// the UI may offer "Reset Test Repo" — restore the seeded branches/HEAD/
+    /// worktree, discarding everything since. Never true on a read-only clone.
+    #[serde(default)]
+    pub resettable: bool,
 }
 
 /// A local branch with no commits of its own, drawn as a short fork off the

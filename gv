@@ -8,6 +8,9 @@
 #   gv                  visualise the CURRENT directory's repo
 #   gv ~/code/myproj    visualise another repo by path
 #   gv --stop           stop the running server
+#   gv --seed [path]    mark a repo as a TEST repo: record its current branches,
+#                       HEAD and objects as the reset point the app's
+#                       "Reset Test Repo" button restores (rerun to re-record)
 #
 # The server runs DETACHED (its own session, logging to a file), so closing the
 # terminal or losing the SSH session that launched gv no longer kills it — which
@@ -29,11 +32,13 @@ START_DIR="$PWD"
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/git-vista"
 LOG="$LOG_DIR/server.log"
 
-# Parse args: an optional path to the repo to visualise, or --stop. (No
+# Parse args: an optional path to the repo to visualise, --stop, or --seed. (No
 # --no-build while developing — we always rebuild from scratch; see the header.)
 TARGET=""
+SEED=0
 for arg in "$@"; do
   case "$arg" in
+    --seed) SEED=1 ;;
     --stop)
       if pkill -9 -f '[g]it-vista-server' 2>/dev/null; then
         echo "gv: server stopped"
@@ -54,6 +59,25 @@ TARGET="$(cd "$TARGET" 2>/dev/null && pwd)" || { echo "gv: no such directory: $T
 if ! git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
   echo "gv: '$TARGET' is not a git repository" >&2
   exit 1
+fi
+
+# --seed: record this repo's current state as the "Reset Test Repo" point and
+# exit (no build, no server). Written where the server looks for it
+# (.git/git-vista/): the branch list with tips, the checked-out branch, and a
+# bundle of the objects those tips need (so a reset works even after git gc).
+if [[ $SEED -eq 1 ]]; then
+  GIT_DIR="$(git -C "$TARGET" rev-parse --absolute-git-dir)"
+  HEAD_BRANCH="$(git -C "$TARGET" symbolic-ref --short HEAD 2>/dev/null)" || {
+    echo "gv: --seed needs a checked-out branch (HEAD is detached)" >&2; exit 1;
+  }
+  mkdir -p "$GIT_DIR/git-vista"
+  git -C "$TARGET" bundle create "$GIT_DIR/git-vista/seed.bundle" --branches 2>/dev/null
+  git -C "$TARGET" for-each-ref refs/heads \
+    --format='%(objectname) %(refname:short)' > "$GIT_DIR/git-vista/seed-refs"
+  printf '%s\n' "$HEAD_BRANCH" > "$GIT_DIR/git-vista/seed-head"
+  echo "gv: seed recorded for $TARGET — $(wc -l < "$GIT_DIR/git-vista/seed-refs") branch(es), HEAD ‘$HEAD_BRANCH’"
+  echo "gv: the app now offers 'Reset Test Repo' when viewing this repo"
+  exit 0
 fi
 
 # git-vista repo = the directory this script lives in. `readlink -f` resolves any
