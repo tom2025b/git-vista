@@ -60,7 +60,7 @@ pub fn now_secs() -> i64 {
 pub async fn activity_feed(
     Query(params): Query<ActivityParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (repo, read_only) = crate::current();
+    let (repo, read_only) = crate::state::current();
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
 
     // The current local branch → tip map: the baseline for undo hints and for
@@ -112,7 +112,7 @@ pub async fn activity_feed(
     // reset-style undo hints. Best-effort: no remote (or a failed walk) just
     // means no warnings.
     let remote: HashSet<String> =
-        read_remote_commits(&repo, crate::HISTORY_LIMIT).unwrap_or_default();
+        read_remote_commits(&repo, crate::state::HISTORY_LIMIT).unwrap_or_default();
 
     let mut feed = assemble_feed(journal_events, reflog, &branches, &remote, limit);
     // A read-only clone can't undo anything (`/api/undo` would 403), so its
@@ -192,7 +192,7 @@ pub async fn undoables(
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
-    let (repo, read_only) = crate::current();
+    let (repo, read_only) = crate::state::current();
     if !is_hex_id(&id) {
         return Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string()));
     }
@@ -223,7 +223,7 @@ pub async fn undoables(
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
     let remote: HashSet<String> =
-        read_remote_commits(&repo, crate::HISTORY_LIMIT).unwrap_or_default();
+        read_remote_commits(&repo, crate::state::HISTORY_LIMIT).unwrap_or_default();
 
     let feed = assemble_feed(journal_events, reflog, &branches, &remote, MAX_LIMIT);
     let mut out: Vec<Undoable> = Vec::new();
@@ -273,10 +273,10 @@ pub async fn undoables(
 /// other, shows up in the feed attributed to the app, and (for a reset) gets
 /// its own undo hint, which is what makes "undo the undo" fall out for free.
 pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
-    if let Some(rejected) = crate::reject_if_read_only() {
+    if let Some(rejected) = crate::state::reject_if_read_only() {
         return rejected;
     }
-    let repo = crate::current().0;
+    let repo = crate::state::current().0;
     match action {
         UndoAction::RestoreBranch { name, tip } => {
             let name = name.trim();
@@ -291,7 +291,7 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
             match git(&repo, &["branch", name, &tip]).await {
                 Ok(()) => {
                     println!("[/api/undo] restored branch '{name}' at {}", short(&tip));
-                    crate::journal_app_event(
+                    crate::handlers::journal_app_event(
                         &repo,
                         ActivityKind::BranchCreated,
                         Some(name.to_string()),
@@ -318,7 +318,7 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
             // Compare-and-swap: the hint was computed against `expected_tip`;
             // if the branch has moved since, this undo would discard newer
             // work the user never saw in the dialog — refuse instead.
-            let actual = crate::rev_parse(&repo, branch).await;
+            let actual = crate::git_cmd::rev_parse(&repo, branch).await;
             if actual.as_deref() != Some(expected_tip.as_str()) {
                 return (
                     StatusCode::CONFLICT,
@@ -351,7 +351,7 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
             match result {
                 Ok(()) => {
                     println!("[/api/undo] reset branch '{branch}' to {}", short(&to));
-                    crate::journal_app_event(
+                    crate::handlers::journal_app_event(
                         &repo,
                         ActivityKind::Reset,
                         Some(branch.to_string()),
@@ -371,14 +371,14 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
             if !is_hex_id(&commit) {
                 return (StatusCode::BAD_REQUEST, "Not a commit id.".to_string());
             }
-            let old = crate::rev_parse(&repo, "HEAD").await;
+            let old = crate::git_cmd::rev_parse(&repo, "HEAD").await;
             match git(&repo, &["revert", "--no-edit", &commit]).await {
                 Ok(()) => {
                     println!("[/api/undo] reverted {}", short(&commit));
-                    let new = crate::rev_parse(&repo, "HEAD").await;
+                    let new = crate::git_cmd::rev_parse(&repo, "HEAD").await;
                     let branch = git_vista_git::read_head_branch(&repo)
                         .unwrap_or_else(|| "HEAD".into());
-                    crate::journal_app_event(
+                    crate::handlers::journal_app_event(
                         &repo,
                         ActivityKind::Revert,
                         Some(branch),

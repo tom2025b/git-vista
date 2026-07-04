@@ -4,7 +4,7 @@
 //! — onto concrete SVG user units, with no Leptos/DOM dependency. Splitting it
 //! out of the [`crate::app`] component keeps that file about *view assembly* and
 //! lets the spatial math be reasoned about (and unit-tested) on its own. Colours
-//! live separately in [`crate::color`].
+//! live separately in [`git_vista_core::color`].
 //!
 //! All values are whole numbers so the emitted SVG attributes stay clean.
 

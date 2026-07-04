@@ -6,6 +6,8 @@
 //! browser frontend and the native backend. Two small layers, each testable:
 //!
 //! - [`model`]    — serializable data types shared across the HTTP/JSON boundary.
+//! - [`color`]    — the single source of truth for branch colours (palette,
+//!                  slots, hex values), shared by the layout engine and the UI.
 //! - [`layout`]   — assigns commits to lanes for the vertical graph.
 //! - [`status`]   — working-tree status types + the porcelain-v2 parser.
 //! - [`diff`]     — commit-diff types + the name-status/numstat parsers.
@@ -18,6 +20,7 @@
 //! it out of here is what lets this crate stay clean and browser-compatible.
 
 pub mod activity;
+pub mod color;
 pub mod diff;
 pub mod layout;
 pub mod model;
