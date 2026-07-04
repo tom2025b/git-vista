@@ -12,7 +12,7 @@
 use gloo_net::http::Request;
 
 use git_vista_core::activity::{ActivityEvent, UndoAction, Undoable};
-use git_vista_core::diff::CommitDiff;
+use git_vista_core::diff::{CommitDiff, FileContent};
 use git_vista_core::model::{
     BranchRequest, CloneRequest, CommitDetail, CreateBranchRequest, CreateCommitRequest, Graph,
     RebaseStatus,
@@ -174,6 +174,25 @@ pub async fn stage_request() -> Result<(), String> {
     }
 }
 
+/// Ask the backend to unstage everything (`POST /api/unstage`) — a plain
+/// `git reset HEAD`, the exact inverse of [`stage_request`]: the index goes
+/// back to HEAD, the working tree keeps every edit. Same bodyless shape and
+/// error posture as staging.
+pub async fn unstage_request() -> Result<(), String> {
+    let resp = Request::post("/api/unstage")
+        .send()
+        .await
+        .map_err(network_error)?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
 /// Fetch the live checked-out branch (Issue #33 follow-up), used to name the merge
 /// target the moment the user clicks "Merge" — so it's correct even if the graph on
 /// screen predates a branch switch. `Ok(None)` => detached HEAD. Cache-busted like
@@ -255,6 +274,42 @@ pub async fn fetch_diff(id: &str) -> Result<CommitDiff, String> {
     let resp = Request::get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<CommitDiff>().await.map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
+/// Fetch one commit's diff with the patch cap lifted (`GET /api/diff/{id}?full=1`)
+/// for the full-screen viewer — the panel's capped fetch is [`fetch_diff`].
+pub async fn fetch_diff_full(id: &str) -> Result<CommitDiff, String> {
+    let url = format!("/api/diff/{id}?full=1&t={}", js_sys::Date::now());
+    let resp = Request::get(&url).send().await.map_err(network_error)?;
+    if resp.ok() {
+        resp.json::<CommitDiff>().await.map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
+/// Fetch one file's full content at one commit (`GET /api/file/{id}/{path}`)
+/// for the full file viewer. The path rides in the URL path (encoded per
+/// segment so `#`/`?` in a filename can't cut the request short); slashes stay
+/// literal — the server's wildcard route consumes them.
+pub async fn fetch_file(id: &str, path: &str) -> Result<FileContent, String> {
+    let encoded: Vec<String> = path
+        .split('/')
+        .map(|seg| js_sys::encode_uri_component(seg).as_string().unwrap_or_default())
+        .collect();
+    let url = format!("/api/file/{id}/{}?t={}", encoded.join("/"), js_sys::Date::now());
+    let resp = Request::get(&url).send().await.map_err(network_error)?;
+    if resp.ok() {
+        resp.json::<FileContent>().await.map_err(|e| e.to_string())
     } else {
         Err(resp
             .text()
