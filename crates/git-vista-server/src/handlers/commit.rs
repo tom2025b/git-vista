@@ -105,6 +105,40 @@ pub(crate) async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (Stat
     }
 }
 
+/// Stage all working-tree changes (`POST /api/stage`): a plain `git add -A`, so
+/// the user can stage from the UI and then commit. Same read-only gate and
+/// git-error-forwarding posture as [`create_commit`]; `-A` stages modified, new
+/// and deleted paths (honouring `.gitignore`) — what a "Stage Changes" button is
+/// expected to do.
+pub(crate) async fn stage_all() -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    let repo = current().0;
+    let output = match tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["add", "-A"])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("git-vista: /api/stage couldn't run git: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"));
+        }
+    };
+    if output.status.success() {
+        println!("[/api/stage] staged all changes (git add -A)");
+        (StatusCode::OK, "Staged changes.".to_string())
+    } else {
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if msg.is_empty() { "git add failed.".to_string() } else { msg };
+        eprintln!("git-vista: /api/stage failed: {msg}");
+        (StatusCode::BAD_REQUEST, msg)
+    }
+}
+
 /// Create an empty commit on a branch that is *not* checked out — the branch-stub
 /// path of [`create_commit`], how a new zero-commit branch takes its first commit
 /// from the UI without a checkout.
