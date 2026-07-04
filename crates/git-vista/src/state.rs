@@ -121,6 +121,17 @@ pub enum PendingOp {
 /// iOS's synthesized post-tap "ghost click" can't close the modal it just opened.
 pub const DIALOG_GUARD_MS: f64 = 400.0;
 
+/// What the full-screen viewer (viewer.rs) is showing: a commit's whole diff
+/// (the detail panel's "Expand Full Diff"), or one file's full content at a
+/// commit (tapping a file in the diff list). Both get Print / Save-as-PDF.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ViewerDoc {
+    /// The full (uncapped) diff of one commit, by full hash.
+    Diff { id: String },
+    /// One file's content at one commit.
+    File { id: String, path: String },
+}
+
 /// The persisted display settings, shared into every icon-drawing view so a
 /// single toggle re-renders the whole app. Both are booleans behind signals:
 /// `nerd_icons` picks the icon set (icons.rs); `show_node_icons` shows/hides the
@@ -148,6 +159,9 @@ pub struct Overlays {
     pub confirm_op: RwSignal<Option<PendingOp>>,
     /// The commit whose detail panel is open (Phase 10), by full hash.
     pub detail_id: RwSignal<Option<String>>,
+    /// The full-screen viewer's document (full diff / full file), if open.
+    /// Sits on top of the detail panel it was opened from.
+    pub viewer: RwSignal<Option<ViewerDoc>>,
     /// Whether the Activity panel is open (Activity/Undo feature). Created in
     /// `App` — the topbar owns its button — and threaded through here so the
     /// panel, the menu and the detail panel can keep each other exclusive

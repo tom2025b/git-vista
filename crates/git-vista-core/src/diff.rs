@@ -63,6 +63,26 @@ impl CommitDiff {
     }
 }
 
+/// One file's full content at one commit — the payload of
+/// `GET /api/file/{id}/{path}`, behind the full file viewer (tapping a file
+/// name in the diff list). The commit and path are echoed back so the viewer
+/// can ignore a stale response after the user switches files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileContent {
+    /// Full hex id of the commit the content was read at.
+    pub id: String,
+    /// Repo-relative path, exactly as requested.
+    pub path: String,
+    /// The file's text. Empty when `binary` is set.
+    pub content: String,
+    /// True when the content was cut at the server's size cap — the viewer
+    /// says so instead of silently showing a partial file.
+    pub truncated: bool,
+    /// True when the blob isn't text (NUL bytes near the start) — the viewer
+    /// shows a note instead of garbage.
+    pub binary: bool,
+}
+
 /// Map a `--name-status` letter to the UI's [`ChangeKind`]. Same folding as
 /// the status parser: `T` (type change) reads as modified, `C` (copy) as a
 /// rename. Unknown letters read as modified rather than dropping the file.

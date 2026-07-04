@@ -8,7 +8,7 @@
 //!
 //! All values are whole numbers so the emitted SVG attributes stay clean.
 
-use git_vista_core::model::{BranchStub, Edge};
+use git_vista_core::model::{BranchStub, Edge, Graph};
 
 // Geometry of the graph, in SVG user units (px).
 pub const ROW_HEIGHT: i32 = 56; // vertical gap between commits
@@ -48,9 +48,67 @@ pub fn node_cy(row: usize) -> i32 {
 
 /// Left edge (x) of the commit-label column: a fixed column just to the right of
 /// the widest lane, so every row's text is aligned regardless of its own lane.
+/// Superseded in the views by [`label_x_per_row`] (labels hug the graph now);
+/// kept as the documented old behaviour, pinned by its test below.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn label_x(lane_count: usize) -> i32 {
     // `lane_count` lanes occupy indices 0..lane_count; sit past the last one.
     node_cx(lane_count.saturating_sub(1)) + LABEL_GAP
+}
+
+/// Per-row left edge (x) of the label text, hugging the graph: each row's label
+/// starts just right of the rightmost thing actually drawn *at that row* — its
+/// own dot, any edge passing vertically through, and any stub ring hovering
+/// there — instead of one global column past the widest lane ([`label_x`]).
+///
+/// The old global column made label distance depend on the whole repo: every
+/// commit-less branch stub takes its own lane, so a repo with many branches
+/// pushed all labels far right of the trunk dots, while a freshly cloned repo
+/// (no local stubs) had them snug against the graph. Hugging per row gives every
+/// repo the snug version.
+///
+/// Edge occupancy is the safe over-approximation of the S-curve
+/// ([`edge_path`]): at its two endpoint rows the curve is still within a lane
+/// of the endpoint (the bulge allowance below), and on rows strictly between it
+/// can be anywhere between the lanes, so those take the outer lane.
+pub fn label_x_per_row(graph: &Graph) -> Vec<i32> {
+    // Every row is at least as wide as its own dot.
+    let mut occ: Vec<usize> = graph.rows.iter().map(|r| r.lane).collect();
+    if occ.is_empty() {
+        return Vec::new();
+    }
+    let last = occ.len() - 1;
+    for e in &graph.edges {
+        let (top, bot) = if e.from_row <= e.to_row {
+            (e.from_row, e.to_row)
+        } else {
+            (e.to_row, e.from_row)
+        };
+        let hi = e.from_lane.max(e.to_lane);
+        for r in top.min(last)..=bot.min(last) {
+            // Endpoint rows: the curve has left its lane by less than one lane
+            // within the label's text band, so allow one lane of bulge (capped
+            // at the outer lane). Middle rows: anywhere between — take `hi`.
+            let lane = if r == e.from_row {
+                (e.from_lane + 1).min(hi)
+            } else if r == e.to_row {
+                (e.to_lane + 1).min(hi)
+            } else {
+                hi
+            };
+            occ[r] = occ[r].max(lane);
+        }
+    }
+    for s in &graph.stubs {
+        // A stub's ring sits (depth+1) half-rows above its anchor, so it hangs
+        // over the anchor row and ⌈(depth+1)/2⌉ rows above it.
+        let up = (s.depth + 2) / 2;
+        let top = s.anchor_row.saturating_sub(up);
+        for r in top..=s.anchor_row.min(last) {
+            occ[r] = occ[r].max(s.lane);
+        }
+    }
+    occ.into_iter().map(|lane| node_cx(lane) + LABEL_GAP).collect()
 }
 
 /// Baseline y of a row's first (message) label line — just above the node's
@@ -261,6 +319,60 @@ mod tests {
         // The two text baselines bracket the node centre.
         assert!(label_top_y(2) < node_cy(2));
         assert!(label_bottom_y(2) > node_cy(2));
+    }
+
+    #[test]
+    fn per_row_labels_hug_the_graph() {
+        use git_vista_core::model::{CommitSummary, GraphRow, Oid};
+        let commit = |id: &str| CommitSummary {
+            id: Oid(id.into()),
+            parents: vec![],
+            summary: id.into(),
+            author: "t".into(),
+            time: 0,
+        };
+        let row = |r: usize, lane: usize| GraphRow {
+            commit: commit(&r.to_string()),
+            row: r,
+            lane,
+            refs: vec![],
+            color: 0,
+        };
+        let mut g = Graph {
+            rows: vec![row(0, 0), row(1, 2), row(2, 0), row(3, 0)],
+            lane_count: 8, // inflated by stub lanes — must NOT matter per-row
+            ..Default::default()
+        };
+        let xs = label_x_per_row(&g);
+        // A bare row hugs its own dot, not the global widest lane.
+        assert_eq!(xs[3], node_cx(0) + LABEL_GAP);
+        assert_eq!(xs[1], node_cx(2) + LABEL_GAP);
+
+        // An edge fanning from lane 2 (row 1) to lane 0 (row 3) pushes the rows
+        // it passes through: the middle row takes the outer lane, the endpoint
+        // rows stay within a lane of their own end.
+        g.edges = vec![Edge { from_row: 1, from_lane: 2, to_row: 3, to_lane: 0 }];
+        let xs = label_x_per_row(&g);
+        assert_eq!(xs[2], node_cx(2) + LABEL_GAP, "middle row clears the curve");
+        assert_eq!(xs[3], node_cx(1) + LABEL_GAP, "endpoint allows one lane of bulge");
+        assert_eq!(xs[0], node_cx(0) + LABEL_GAP, "rows off the edge are untouched");
+
+        // A stub ring hovering over rows 0..=1 pushes them past its lane.
+        g.stubs = vec![BranchStub {
+            name: "s".into(),
+            anchor_row: 1,
+            anchor_lane: 2,
+            lane: 5,
+            color: 3,
+            depth: 0,
+        }];
+        let xs = label_x_per_row(&g);
+        assert_eq!(xs[1], node_cx(5) + LABEL_GAP);
+        assert_eq!(xs[0], node_cx(5) + LABEL_GAP, "ring tips over the row above");
+        assert_eq!(xs[2], node_cx(2) + LABEL_GAP, "rows below the anchor are untouched");
+
+        // Empty graph: no rows, no panic.
+        assert!(label_x_per_row(&Graph::default()).is_empty());
     }
 
     #[test]
