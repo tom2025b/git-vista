@@ -9,8 +9,9 @@
 // targeted allows.
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod camera;
-#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
-mod color;
+// Branch colours live in the crate-wide `git_vista_core::color` "Color God" — the
+// single source of truth shared with the layout engine — so there's no local
+// colour module here; the render code imports from core directly.
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod datetime;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
