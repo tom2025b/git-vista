@@ -155,6 +155,25 @@ pub async fn create_commit_request(
     }
 }
 
+/// Ask the backend to stage all working-tree changes (`POST /api/stage`) — a
+/// plain `git add -A`, so modified/new/deleted files move into the index and can
+/// then be committed. Bodyless, like the rebase request; a non-2xx body is git's
+/// own error text, returned as `Err` for the caller to show.
+pub async fn stage_request() -> Result<(), String> {
+    let resp = Request::post("/api/stage")
+        .send()
+        .await
+        .map_err(network_error)?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
 /// Fetch the live checked-out branch (Issue #33 follow-up), used to name the merge
 /// target the moment the user clicks "Merge" — so it's correct even if the graph on
 /// screen predates a branch switch. `Ok(None)` => detached HEAD. Cache-busted like

@@ -12,7 +12,9 @@ use leptos::*;
 
 use git_vista_core::activity::UndoAction;
 
-use crate::api::{create_branch_request, fetch_head_branch, fetch_rebase_status, fetch_undoables};
+use crate::api::{
+    create_branch_request, fetch_head_branch, fetch_rebase_status, fetch_undoables, stage_request,
+};
 use crate::geometry::menu_placement;
 use crate::gestures::viewport_size;
 use crate::icons::icon_set;
@@ -187,9 +189,8 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             let is_stub = m.is_branch;
             // A stub carries exactly its own branch name (see `MenuData::branches`).
             let stub_branch = is_stub.then(|| m.branches.first().cloned()).flatten();
-            // `icon` distinguishes the two variants: the staged-changes commit
-            // gets the diff-added glyph (it records staged additions), the empty
-            // commit the plain commit glyph.
+            // `icon` is the glyph beside the item — the commit glyph for both
+            // commit variants ("Stage Changes" below uses the diff-added glyph).
             let make_commit_item = move |icon: &'static str,
                                          label: &'static str,
                                          allow_empty: bool| {
@@ -229,8 +230,51 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                 }
                 .into_view()
             };
-            let commit_staged = make_commit_item(ic.added, "Commit staged changes", false);
+            let commit_changes = make_commit_item(ic.commit, "Commit Changes", false);
             let commit_empty = make_commit_item(ic.commit, "Create empty commit", true);
+            // "Stage Changes" (git add -A): move the working-tree changes into the
+            // index so they can be committed. Like committing, it acts on the
+            // checked-out branch, so it's offered on the HEAD commit and disabled
+            // elsewhere (and on a stub) with the reason. Immediate — no dialog —
+            // then a reload, so the status chip flips to "staged" and "Commit
+            // Changes" has something to commit.
+            let stage_changes = if is_head {
+                let on_stage = move |_| {
+                    menu.set(None);
+                    spawn_local(async move {
+                        match stage_request().await {
+                            Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+                            Err(e) => {
+                                if let Some(w) = web_sys::window() {
+                                    let _ = w.alert_with_message(&format!(
+                                        "Couldn't stage changes:\n{e}"
+                                    ));
+                                }
+                            }
+                        }
+                    });
+                };
+                view! {
+                    <button class="ctx-item" on:click=on_stage>
+                        <span class="nf ctx-icon">{ic.added}</span>
+                        "Stage Changes"
+                    </button>
+                }
+                .into_view()
+            } else {
+                let reason = if is_stub {
+                    "Staging applies to the checked-out branch, not a stub"
+                } else {
+                    "Only available on the current HEAD commit"
+                };
+                view! {
+                    <span class="ctx-item disabled" title=reason>
+                        <span class="nf ctx-icon">{ic.added}</span>
+                        "Stage Changes"
+                    </span>
+                }
+                .into_view()
+            };
             // The branch operations (Issue #33 follow-up): merge / push / delete, one
             // set per local branch living at this target. Each opens the confirm modal
             // rather than acting immediately — the actual POST + refresh happens there.
@@ -466,7 +510,8 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         <span class="nf ctx-icon">{ic.branch}</span>
                         {create_label}
                     </button>
-                    {commit_staged}
+                    {stage_changes}
+                    {commit_changes}
                     {commit_empty}
                     {branch_items}
                     {rebase_item}
