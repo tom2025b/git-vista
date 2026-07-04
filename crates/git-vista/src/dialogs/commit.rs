@@ -39,7 +39,7 @@ pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
             let title = match branch {
                 Some(b) => format!("Create empty commit on ‘{b}’"),
                 None if allow_empty => "Create empty commit".to_string(),
-                None => "Commit staged changes".to_string(),
+                None => "Commit Changes".to_string(),
             };
             // The message field is a <textarea>, NOT an <input>: the void <input>
             // element breaks Leptos' CSR <template> node-walk on iOS WebKit (which

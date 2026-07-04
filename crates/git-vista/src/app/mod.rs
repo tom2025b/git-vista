@@ -131,9 +131,17 @@ pub fn App() -> impl IntoView {
                         ("status-chip conflict", ic.conflict,
                          format!("{} conflicted", s.conflicted.len()))
                     } else if !s.is_clean() {
-                        let n = s.change_count();
-                        ("status-chip dirty", ic.dirty,
-                         format!("{n} change{}", if n == 1 { "" } else { "s" }))
+                        // Split into staged vs the rest, so clicking "Stage
+                        // Changes" visibly flips the chip ("2 changes" → "2
+                        // staged"), then to "clean" once committed.
+                        let staged = s.staged.len();
+                        let unstaged = s.unstaged.len() + s.untracked.len();
+                        let label = match (staged, unstaged) {
+                            (st, 0) => format!("{st} staged"),
+                            (0, un) => format!("{un} change{}", if un == 1 { "" } else { "s" }),
+                            (st, un) => format!("{st} staged · {un} unstaged"),
+                        };
+                        ("status-chip dirty", ic.dirty, label)
                     } else {
                         ("status-chip clean", ic.clean, "clean".to_string())
                     };

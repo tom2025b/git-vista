@@ -54,7 +54,7 @@ use handlers::branch::{
     checkout_branch, create_branch, delete_branch, force_delete_branch, merge_branch, push_branch,
 };
 use handlers::clone::clone_repo;
-use handlers::commit::create_commit;
+use handlers::commit::{create_commit, stage_all};
 use handlers::read::{commit_detail, commit_diff, commits, head_branch, worktree_status};
 use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
@@ -129,6 +129,8 @@ async fn main() {
         .route("/api/branch", post(create_branch))
         // Issue #33: create a commit on top of HEAD (shells out to `git commit`).
         .route("/api/commit", post(create_commit))
+        // Stage the working tree (`git add -A`) so the UI can stage, then commit.
+        .route("/api/stage", post(stage_all))
         // Issue #33 follow-up: the live checked-out branch, resolved fresh on every
         // request so the merge dialog shows the true target even without a Refresh.
         .route("/api/head-branch", get(head_branch))

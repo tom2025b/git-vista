@@ -45,9 +45,14 @@ pub fn build_msg(
         let ic = icon_set(nerd_icons.get_untracked());
         let gr = &c.graph.rows[i];
         let mut bx = c.text_x;
-        // The row's branch colour — the label column takes the colour of the
-        // dot it describes, so a row reads as one unit across the canvas.
-        let row_color = branch_color(gr.color);
+        // The row's label colour. Normally the commit's own branch colour, so the
+        // label matches the dot it describes. But when an open-circle stub — a
+        // branch with no commits of its own — forks off this row, the label follows
+        // that branch's colour instead, faded, so the empty-branch row reads as its
+        // hollow ring rather than the line it happens to sit on.
+        let stub_slot = c.graph.stubs.iter().find(|s| s.anchor_row == gr.row).map(|s| s.color);
+        let row_color = branch_color(stub_slot.unwrap_or(gr.color));
+        let faded = stub_slot.is_some();
         // Is this row's commit on the remote? Drives whether its message, HEAD
         // badge and tag badges link out (an unpushed commit would 404).
         let commit_on_remote = c.remote_set.contains(&gr.commit.id.0);
@@ -70,9 +75,9 @@ pub fn build_msg(
                 let w = badge_width(&format!("{icon} {}", r.name));
                 let x = bx;
                 bx += w + BADGE_GAP;
-                // Branch badges take their branch's colour (filled for local,
+                // Branch badges take the row's label colour (filled for local,
                 // outlined for remote); HEAD and tags get fixed colours.
-                let branch = branch_color(gr.color);
+                let branch = row_color;
                 let (fill, stroke, text_fill) = match r.kind {
                     RefKind::Head => (HEAD_BADGE, HEAD_BADGE, BADGE_DARK),
                     RefKind::Tag => (TAG_BADGE, TAG_BADGE, BADGE_DARK),
@@ -175,6 +180,7 @@ pub fn build_msg(
                 class="label-msg"
                 class:clickable=msg_clickable
                 class:unpushed=msg_unpushed
+                class:faded=faded
                 fill=row_color
             >
                 {msg}
@@ -211,6 +217,10 @@ pub fn build_meta(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>, i: us
         // mode, so a toggle rebuilds the rows.
         let ic = icon_set(nerd_icons.get_untracked());
         let gr = &c.graph.rows[i];
+        // Same open-circle rule as build_msg: a stub's anchor row takes the stub's
+        // branch colour instead of the line it sits on (the meta line's own opacity
+        // already gives it the faded, secondary look).
+        let stub_slot = c.graph.stubs.iter().find(|s| s.anchor_row == gr.row).map(|s| s.color);
         let meta = format!(
             " {} · {} · {}",
             gr.commit.id.short(),
@@ -226,7 +236,7 @@ pub fn build_meta(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>, i: us
                 x=c.text_x
                 y=label_bottom_y(gr.row)
                 class="label-meta"
-                fill=branch_color(gr.color)
+                fill=branch_color(stub_slot.unwrap_or(gr.color))
             >
                 <tspan class="nf">{ic.commit}</tspan>
                 {meta}

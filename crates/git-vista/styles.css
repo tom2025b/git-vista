@@ -317,6 +317,10 @@ html, body {
 /* Commits/refs that aren't on the remote yet — shown but not linked (their
    GitHub page doesn't exist), dimmed so it's clear they're local-only. */
 .unpushed { opacity: 0.45; }
+/* An open-circle stub's anchor row: the label uses the stub's real branch colour
+   (render/labels.rs) but muted, so an empty, commit-less branch reads as
+   "inactive" — matching its hollow ring rather than the mainline it sits on. */
+.faded { opacity: 0.65; }
 
 /* Phase 10: the commit detail panel — an HTML overlay docked to the right edge,
    outside the SVG so it doesn't pan/zoom or get clipped (same posture as the
