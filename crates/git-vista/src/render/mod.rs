@@ -53,8 +53,9 @@ pub struct RenderCtx {
     /// GitHub web base (e.g. "https://github.com/owner/repo"), when this repo has
     /// a github.com origin; `None` => labels stay plain text.
     pub repo_url: Option<String>,
-    /// Left edge (x) of the aligned label column.
-    pub text_x: i32,
+    /// Per-row left edge (x) of the label text, hugging the graph — indexed by
+    /// row number (see [`crate::geometry::label_x_per_row`]).
+    pub text_x: Vec<i32>,
 }
 
 /// Cancel a link's navigation only when the "click" is actually the tail of a
