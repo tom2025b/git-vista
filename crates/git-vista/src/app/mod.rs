@@ -24,6 +24,7 @@ use leptos::*;
 use crate::api::{fetch_graph, fetch_head_branch, fetch_status};
 use crate::dialogs;
 use crate::icons::icon_set;
+use crate::print::print_graph_view;
 use crate::prefs::{
     load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref,
 };
@@ -109,6 +110,10 @@ pub fn App() -> impl IntoView {
     // because its button sits in the topbar, not the graph canvas.
     let reset_open = create_rw_signal(false);
     let reset_opened_at = store_value(0f64);
+
+    // "Print Graph": the full static print view of the whole graph
+    // (crate::print), opened from the topbar, with Print / Save as PDF.
+    let print_graph_open = create_rw_signal(false);
 
     view! {
         <main class="app">
@@ -205,6 +210,19 @@ pub fn App() -> impl IntoView {
                 >
                     "Refresh"
                 </button>
+                // "Print Graph" appears once the graph is loaded — it opens
+                // the full static print view (every row, light background)
+                // with Print / Save-as-PDF controls.
+                {move || graph.get().and_then(|r| r.ok()).map(|_| view! {
+                    <button
+                        class="refresh"
+                        on:click=move |_| print_graph_open.set(true)
+                        title="A clean, printable view of the whole graph — \
+                               print it or save it as a PDF"
+                    >
+                        "Print Graph"
+                    </button>
+                })}
                 // Only a repo explicitly seeded as a test repo (`gv --seed`)
                 // gets this; everything since the seed is discarded on reset,
                 // so it's confirmed in its own modal and styled as a hazard.
@@ -268,6 +286,7 @@ pub fn App() -> impl IntoView {
                                         })}
                                     </p>
                                 })}
+                                {print_graph_view(g.clone(), print_graph_open, nerd_icons)}
                                 {graph_canvas(g, reload, nerd_icons, show_node_icons, activity_open)}
                             }
                             .into_view()

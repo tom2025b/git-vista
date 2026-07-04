@@ -224,12 +224,18 @@ pub fn install_key_listener(
     reload: RwSignal<u32>,
     overlays: Overlays,
 ) {
-    let Overlays { menu, commit_dialog, confirm_op, detail_id, .. } = overlays;
+    let Overlays { menu, commit_dialog, confirm_op, detail_id, viewer, .. } = overlays;
     if let Some(win) = web_sys::window() {
         let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
             move |ev: web_sys::KeyboardEvent| {
                 if ev.key() == "Escape" {
-                    if menu.get_untracked().is_some() {
+                    // Topmost first: the full-screen viewer sits over the panel
+                    // it was opened from. (Esc is a desktop convenience only —
+                    // every overlay keeps a visible close control, since the
+                    // iPad Magic Keyboard has no Esc key.)
+                    if viewer.get_untracked().is_some() {
+                        viewer.set(None);
+                    } else if menu.get_untracked().is_some() {
                         menu.set(None);
                     } else if commit_dialog.get_untracked().is_some() {
                         commit_dialog.set(None);
