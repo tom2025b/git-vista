@@ -139,6 +139,40 @@ pub(crate) async fn stage_all() -> (StatusCode, String) {
     }
 }
 
+/// Unstage everything (`POST /api/unstage`): a plain `git reset -q HEAD`, the
+/// exact inverse of [`stage_all`] — the index goes back to HEAD while the
+/// working tree keeps every edit, so nothing is lost. Same read-only gate and
+/// git-error-forwarding posture; the UI offers it only while something is
+/// staged, but running it with a clean index is a harmless no-op anyway.
+pub(crate) async fn unstage_all() -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    let repo = current().0;
+    let output = match tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["reset", "-q", "HEAD"])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("git-vista: /api/unstage couldn't run git: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"));
+        }
+    };
+    if output.status.success() {
+        println!("[/api/unstage] unstaged all changes (git reset -q HEAD)");
+        (StatusCode::OK, "Unstaged changes.".to_string())
+    } else {
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if msg.is_empty() { "git reset failed.".to_string() } else { msg };
+        eprintln!("git-vista: /api/unstage failed: {msg}");
+        (StatusCode::BAD_REQUEST, msg)
+    }
+}
+
 /// Create an empty commit on a branch that is *not* checked out — the branch-stub
 /// path of [`create_commit`], how a new zero-commit branch takes its first commit
 /// from the UI without a checkout.

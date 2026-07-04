@@ -54,8 +54,10 @@ use handlers::branch::{
     checkout_branch, create_branch, delete_branch, force_delete_branch, merge_branch, push_branch,
 };
 use handlers::clone::clone_repo;
-use handlers::commit::{create_commit, stage_all};
-use handlers::read::{commit_detail, commit_diff, commits, head_branch, worktree_status};
+use handlers::commit::{create_commit, stage_all, unstage_all};
+use handlers::read::{
+    commit_detail, commit_diff, commits, file_at_commit, head_branch, worktree_status,
+};
 use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
 use state::{clones_root, current, set_current, ADDR, DEFAULT_REPO, DIST_DIR, PORT};
@@ -121,8 +123,12 @@ async fn main() {
         // Phase 10: full detail for one commit, read on demand for the side panel.
         .route("/api/commit/{id}", get(commit_detail))
         // Activity/Undo feature, step 2: one commit's diff (file list + patch),
-        // read on demand when the detail panel opens.
+        // read on demand when the detail panel opens. `?full=1` lifts the patch
+        // cap for the full-screen diff viewer.
         .route("/api/diff/{id}", get(commit_diff))
+        // Full file viewer: one file's whole content at one commit (`git show
+        // <id>:<path>`), read on demand when a file in the diff list is tapped.
+        .route("/api/file/{id}/{*path}", get(file_at_commit))
         // Phase 12: clone a public URL into a temp dir and view it read-only.
         .route("/api/clone", post(clone_repo))
         // Issue #18: create a branch at a commit (shells out to `git branch`).
@@ -131,6 +137,9 @@ async fn main() {
         .route("/api/commit", post(create_commit))
         // Stage the working tree (`git add -A`) so the UI can stage, then commit.
         .route("/api/stage", post(stage_all))
+        // …and unstage it again (`git reset HEAD`) — the exact inverse, offered
+        // by the menu while anything is staged.
+        .route("/api/unstage", post(unstage_all))
         // Issue #33 follow-up: the live checked-out branch, resolved fresh on every
         // request so the merge dialog shows the true target even without a Refresh.
         .route("/api/head-branch", get(head_branch))

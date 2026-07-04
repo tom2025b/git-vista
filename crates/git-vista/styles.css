@@ -528,3 +528,193 @@ html, body {
   gap: 0.4rem;
 }
 .act-when { color: var(--muted); font-size: 0.75rem; }
+
+/* The detail panel's file rows are now buttons (they open the full file
+   viewer), so flatten the button chrome back to the row layout they had as
+   divs, and add the tap affordance. */
+button.detail-file {
+  width: 100%;
+  font: inherit;
+  color: var(--fg);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  text-align: left;
+  cursor: pointer;
+}
+button.detail-file:hover { background: #21262d; }
+button.detail-file:hover .detail-file-path { color: var(--accent); }
+
+/* "Expand Full Diff" in the Changes header — small, right-aligned, styled
+   like the panel's other secondary buttons (.act-refresh). */
+.detail-expand {
+  float: right;
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 400;
+  padding: 0.2rem 0.6rem;
+  color: var(--fg);
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.detail-expand:hover { border-color: var(--accent); }
+
+/* ---------------------------------------------------------------------------
+   The full-screen viewer (viewer.rs): the whole diff or one file's content,
+   with Print / Save as PDF / Close. Also worn (head/body/buttons) by the
+   Print Graph overlay (print.rs). Fixed full-viewport, above everything. */
+.viewer-modal,
+.print-graph-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh; /* iOS 16.4+: track the real visible box under Safari's bars */
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.viewer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid #21262d;
+  flex: none;
+}
+.viewer-title {
+  font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.viewer-actions { display: flex; gap: 8px; flex: none; }
+.viewer-btn {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.9rem;
+  color: var(--fg);
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.viewer-btn:hover { border-color: var(--accent); }
+.viewer-btn:active { background: #30363d; }
+.viewer-close { color: var(--muted); }
+.viewer-body {
+  flex: 1;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 14px;
+}
+.viewer-doc-head {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+/* The viewer's <pre> wraps long lines so nothing is lost off the right edge
+   of a page — unlike the panel's, which scrolls horizontally instead. */
+.viewer-pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: visible;
+}
+
+/* The Print Graph preview: a white sheet (what the paper will look like)
+   holding the full static graph SVG at page width. */
+.print-sheet {
+  background: #ffffff;
+  color: #1f2328;
+  border-radius: 8px;
+  padding: 18px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+.print-sheet-head {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: #57606a;
+  margin-bottom: 10px;
+}
+.print-graph-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+/* Dark-on-white text tiers of the print sheet (the SVG's own classes). */
+.pg-msg { fill: #1f2328; }
+.pg-meta { fill: #57606a; opacity: 1; }
+
+/* ---------------------------------------------------------------------------
+   Print / Save as PDF. While a print surface is open, viewer.rs / print.rs
+   stamp `data-print` on <html>; these rules then print ONLY that surface —
+   light-themed, position-static, flowing across pages — instead of the dark
+   app shell. Without the attribute a plain browser print is untouched. */
+@media print {
+  html[data-print] .topbar,
+  html[data-print] .status,
+  html[data-print] .graph-svg,
+  html[data-print] .reset-view,
+  html[data-print] .ctx-menu,
+  html[data-print] .detail-panel { display: none !important; }
+  /* Un-trap the surface from the app's fixed/overflow layout: everything on
+     its ancestor path must be static and unclipped or pages past the first
+     come out blank. */
+  html[data-print], html[data-print] body {
+    height: auto;
+    overflow: visible;
+    background: #fff;
+  }
+  html[data-print] .app,
+  html[data-print] .graph {
+    display: block;
+    height: auto;
+    overflow: visible;
+  }
+  html[data-print] .print-surface {
+    position: static !important;
+    width: auto;
+    height: auto;
+    display: block;
+    background: #fff;
+    color: #1f2328;
+  }
+  html[data-print] .viewer-head { display: none !important; }
+  html[data-print] .viewer-body {
+    overflow: visible;
+    height: auto;
+    padding: 0;
+  }
+  /* Paper-legible content colours (GitHub light palette). */
+  html[data-print] .viewer-doc-head { color: #1f2328; }
+  html[data-print] .detail-diff {
+    background: #fff;
+    border: none;
+    color: #1f2328;
+    overflow: visible;
+  }
+  html[data-print] .detail-file { color: #1f2328; }
+  html[data-print] .detail-file-path { color: #1f2328; }
+  html[data-print] .detail-status { color: #57606a; }
+  html[data-print] .detail-muted { color: #57606a; }
+  html[data-print] .diff-add { color: #116329; }
+  html[data-print] .diff-del { color: #a40e26; }
+  html[data-print] .diff-hunk { color: #0550ae; }
+  html[data-print] .diff-meta { color: #57606a; }
+  html[data-print] .file-added { color: #116329; }
+  html[data-print] .file-modified { color: #7d4e00; }
+  html[data-print] .file-deleted { color: #a40e26; }
+  html[data-print] .file-renamed { color: #0550ae; }
+  /* The graph sheet loses its screen-preview chrome and fills the page. */
+  html[data-print] .print-sheet {
+    border-radius: 0;
+    padding: 0;
+    max-width: none;
+    margin: 0;
+  }
+}

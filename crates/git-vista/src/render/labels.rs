@@ -44,7 +44,7 @@ pub fn build_msg(
         // mode, so a toggle rebuilds the rows.
         let ic = icon_set(nerd_icons.get_untracked());
         let gr = &c.graph.rows[i];
-        let mut bx = c.text_x;
+        let mut bx = c.text_x[gr.row];
         // The row's label colour. Normally the commit's own branch colour, so the
         // label matches the dot it describes. But when an open-circle stub — a
         // branch with no commits of its own — forks off this row, the label follows
@@ -233,7 +233,7 @@ pub fn build_meta(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>, i: us
             // branch colour (the glyph inherits it), faded to stay secondary
             // (see .label-meta's opacity).
             <text
-                x=c.text_x
+                x=c.text_x[gr.row]
                 y=label_bottom_y(gr.row)
                 class="label-meta"
                 fill=branch_color(stub_slot.unwrap_or(gr.color))

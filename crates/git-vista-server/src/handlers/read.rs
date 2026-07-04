@@ -4,10 +4,11 @@
 
 use std::path::Path;
 
-use axum::extract::Path as AxumPath;
+use axum::extract::{Path as AxumPath, Query};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
+use serde::Deserialize;
 
 use git_vista_core::layout;
 use git_vista_core::model::{CommitSummary, GitRef, RefKind};
@@ -96,6 +97,19 @@ pub(crate) async fn commit_detail(
 /// cut at a line boundary and flagged `truncated` so the panel says so.
 const DIFF_PATCH_CAP: usize = 200_000;
 
+/// The cap when `?full=1` is passed — the full-screen diff viewer asks for the
+/// whole patch (it exists to escape the panel's cap), but a hard ceiling still
+/// protects the iPad's tab from a truly pathological multi-hundred-MB diff.
+const DIFF_PATCH_CAP_FULL: usize = 5_000_000;
+
+/// Query of `GET /api/diff/{id}`: `full=1` lifts the patch cap to
+/// [`DIFF_PATCH_CAP_FULL`] for the full-screen viewer.
+#[derive(Deserialize)]
+pub(crate) struct DiffQuery {
+    #[serde(default)]
+    full: Option<u8>,
+}
+
 /// One commit's diff (Activity/Undo feature, step 2): the per-file change list
 /// and the unified patch, for the detail panel's Changes section.
 ///
@@ -116,6 +130,7 @@ const DIFF_PATCH_CAP: usize = 200_000;
 /// diff — and the response says so (`against_first_parent`).
 pub(crate) async fn commit_diff(
     AxumPath(id): AxumPath<String>,
+    Query(query): Query<DiffQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let repo = current().0;
     // Belt-and-braces before the id goes anywhere near argv: real ids are hex.
@@ -159,11 +174,12 @@ pub(crate) async fn commit_diff(
     git_vista_core::diff::fold_numstat_z(&numstat, &mut files);
 
     // Cap the patch at a line boundary so the panel never gets half a line.
+    // The full-screen viewer (`?full=1`) gets the much higher ceiling.
+    let cap = if query.full == Some(1) { DIFF_PATCH_CAP_FULL } else { DIFF_PATCH_CAP };
     let mut patch = String::from_utf8_lossy(&patch_bytes).into_owned();
-    let truncated = patch.len() > DIFF_PATCH_CAP;
+    let truncated = patch.len() > cap;
     if truncated {
-        let cut = patch[..DIFF_PATCH_CAP].rfind('\n').unwrap_or(DIFF_PATCH_CAP);
-        patch.truncate(cut);
+        truncate_at_line(&mut patch, cap);
     }
 
     let diff = git_vista_core::diff::CommitDiff {
@@ -175,6 +191,72 @@ pub(crate) async fn commit_diff(
     };
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
     Ok((no_store, Json(diff)))
+}
+
+/// Cut `text` down to at most `cap` bytes, at the last full line before the
+/// cap. The cap is first walked back to a char boundary so a multi-byte
+/// character straddling it can't panic the slice.
+fn truncate_at_line(text: &mut String, cap: usize) {
+    let mut end = cap.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = text[..end].rfind('\n').unwrap_or(end);
+    text.truncate(cut);
+}
+
+/// Upper bound on the text returned by `/api/file/{id}/{path}` — same iPad
+/// protection as the diff caps; past this the content is cut at a line
+/// boundary and flagged `truncated`.
+const FILE_CONTENT_CAP: usize = 2_000_000;
+
+/// One file's full content at one commit (`GET /api/file/{id}/{*path}`), for
+/// the full file viewer opened from the diff's file list.
+///
+/// `git show <id>:<path>` does the reading — the same B3 posture as the diff:
+/// git resolves the path inside the tree and reports a clear error when it
+/// isn't there. A path deleted *by* this commit doesn't exist in its tree, so
+/// on failure the first parent (`<id>^:<path>`) is tried before giving up —
+/// tapping a deleted file then shows what was deleted rather than an error.
+/// Binary blobs (NUL bytes near the start) come back flagged, not as garbage.
+pub(crate) async fn file_at_commit(
+    AxumPath((id, path)): AxumPath<(String, String)>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = current().0;
+    // Same belt-and-braces as the diff: real ids are hex, and the id leads the
+    // `<id>:<path>` argument, so neither half can ever read as an option.
+    if id.len() < 4 || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string()));
+    }
+    let show = |spec: String| {
+        let repo = repo.clone();
+        async move {
+            git_stdout(&repo, &["show".to_string(), spec], "/api/file").await
+        }
+    };
+    let bytes = match show(format!("{id}:{path}")).await {
+        Ok(bytes) => bytes,
+        // Not in this commit's tree — a file this commit deleted. Show the
+        // version it deleted (from the first parent) instead of a dead end.
+        Err(first) => show(format!("{id}^:{path}")).await.map_err(|_| first)?,
+    };
+
+    // Binary sniff, the way git itself does it: a NUL in the first 8000 bytes.
+    let binary = bytes.iter().take(8000).any(|&b| b == 0);
+    let (content, truncated) = if binary {
+        (String::new(), false)
+    } else {
+        let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        let truncated = text.len() > FILE_CONTENT_CAP;
+        if truncated {
+            truncate_at_line(&mut text, FILE_CONTENT_CAP);
+        }
+        (text, truncated)
+    };
+
+    let file = git_vista_core::diff::FileContent { id, path, content, truncated, binary };
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(file)))
 }
 
 /// The currently checked-out branch, resolved fresh (Issue #33 follow-up). The

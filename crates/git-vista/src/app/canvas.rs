@@ -14,13 +14,13 @@ use git_vista_core::model::{Graph, RefKind};
 
 use crate::api::fetch_commit_detail;
 use crate::camera::Camera;
-use crate::geometry::{label_x, stub_headroom};
+use crate::geometry::{label_x_per_row, stub_headroom};
 use crate::gestures::{self, GestureState};
 use crate::lod::detail_for;
 use crate::render::{self, RenderCtx};
-use crate::state::{CommitDialog, MenuData, Overlays, PendingOp, Settings};
+use crate::state::{CommitDialog, MenuData, Overlays, PendingOp, Settings, ViewerDoc};
 use crate::viewport::visible_row_range;
-use crate::{activity, detail, dialogs, menu};
+use crate::{activity, detail, dialogs, menu, viewer};
 
 /// Extra rows rendered above and below the visible window so a fast pan doesn't
 /// flash a blank strip before the row `Memo` catches up (Phase 8).
@@ -93,6 +93,9 @@ pub(super) fn graph_canvas(
     // — so the graph payload stays lean and the panel shows the whole message body
     // and both signatures, which the row summary doesn't carry.
     let detail_id = create_rw_signal(None::<String>);
+    // The full-screen viewer's document (viewer.rs): the full diff or one
+    // file's content, opened from the detail panel, with Print / Save as PDF.
+    let viewer_doc = create_rw_signal(None::<ViewerDoc>);
     let detail = create_local_resource(
         move || detail_id.get(),
         |id| async move {
@@ -116,7 +119,10 @@ pub(super) fn graph_canvas(
     // reach them cheaply — without cloning the graph into each closure or
     // rebuilding these tables per row. The graph moves in here; everything
     // downstream reads it back out of `ctx`.
-    let text_x = label_x(graph.lane_count);
+    // Per-row label x, hugging the graph (see label_x_per_row): each row's text
+    // sits just right of what's actually drawn at that row, so labels stay
+    // snug against the dots however many stub lanes the repo has grown.
+    let text_x = label_x_per_row(&graph);
     let ctx = store_value(RenderCtx {
         graph,
         row_color,
@@ -135,6 +141,7 @@ pub(super) fn graph_canvas(
         commit_msg,
         confirm_op,
         detail_id,
+        viewer: viewer_doc,
         activity_open,
         scroll_diff,
         dialog_opened_at,
@@ -280,6 +287,7 @@ pub(super) fn graph_canvas(
             {dialogs::confirm_modal_view(overlays)}
             {detail::detail_panel_view(overlays, settings, detail, ctx)}
             {activity::activity_panel_view(overlays, settings)}
+            {viewer::viewer_view(overlays, settings)}
         </div>
     }
 }
