@@ -4,7 +4,7 @@
 //! scale — that is applied to the graph as a single SVG `<g transform>`. Keeping
 //! it here, free of any Leptos/DOM dependency, means the (slightly fiddly)
 //! anchored-zoom arithmetic can be reasoned about and unit-tested on the host,
-//! exactly like [`crate::geometry`] and [`crate::color`].
+//! exactly like [`crate::geometry`] and [`git_vista_core::color`].
 //!
 //! Coordinate model: the SVG has no `viewBox`, so one user unit equals one CSS
 //! pixel and pointer coordinates (`offset_x`/`movement_x`) map straight onto the
