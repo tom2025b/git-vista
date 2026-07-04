@@ -18,12 +18,13 @@ use crate::api::fetch_diff;
 use crate::datetime::local_timestamp;
 use crate::icons::{icon_set, GitIcons};
 use crate::render::RenderCtx;
-use crate::state::{DetailResource, Overlays, Settings};
+use crate::state::{DetailResource, Overlays, Settings, ViewerDoc};
 
 /// CSS class for one line of the unified patch, keyed off its prefix. The
 /// file/hunk headers are checked *before* the bare +/- so `+++`/`---` read as
-/// metadata, not as a one-character change.
-fn diff_line_class(line: &str) -> &'static str {
+/// metadata, not as a one-character change. Shared with the full-screen
+/// viewer (viewer.rs), which colours the same patch text.
+pub(crate) fn diff_line_class(line: &str) -> &'static str {
     if line.starts_with("diff --git")
         || line.starts_with("index ")
         || line.starts_with("--- ")
@@ -52,7 +53,8 @@ fn diff_line_class(line: &str) -> &'static str {
 /// Glyph + colour class for one changed file's kind, from the icon fields
 /// defined for exactly this view (see icons.rs — added/modified/deleted/
 /// renamed have waited for a diff surface since the icon system landed).
-fn file_change_marker(ic: &GitIcons, kind: ChangeKind) -> (&'static str, &'static str) {
+/// Shared with the full-screen viewer (viewer.rs).
+pub(crate) fn file_change_marker(ic: &GitIcons, kind: ChangeKind) -> (&'static str, &'static str) {
     match kind {
         ChangeKind::Added => (ic.added, "file-added"),
         ChangeKind::Modified => (ic.modified, "file-modified"),
@@ -72,6 +74,7 @@ pub fn detail_panel_view(
 ) -> impl IntoView {
     let detail_id = overlays.detail_id;
     let scroll_diff = overlays.scroll_diff;
+    let viewer = overlays.viewer;
     let nerd_icons = settings.nerd_icons;
     // The commit's diff (file list + patch), fetched lazily alongside the
     // detail and keyed on the same open hash — so walking to a parent
@@ -219,7 +222,9 @@ pub fn detail_panel_view(
                         let (adds, dels) = d.totals();
                         // One row per changed file: kind glyph, path (renames
                         // show "old → new"), then its +/− counts ("binary"
-                        // when git couldn't count lines).
+                        // when git couldn't count lines). The row is a button:
+                        // tapping it opens that file's full content at this
+                        // commit in the full-screen viewer (viewer.rs).
                         let files = d
                             .files
                             .iter()
@@ -240,14 +245,26 @@ pub fn detail_panel_view(
                                     }
                                     .into_view(),
                                 };
+                                let file_id = d.id.clone();
+                                let file_path = f.path.clone();
+                                let open_file = move |_| {
+                                    viewer.set(Some(ViewerDoc::File {
+                                        id: file_id.clone(),
+                                        path: file_path.clone(),
+                                    }));
+                                };
                                 view! {
-                                    <div class="detail-file">
+                                    <button
+                                        class="detail-file"
+                                        title="View this file's full content (with Print / Save as PDF)"
+                                        on:click=open_file
+                                    >
                                         <span class=format!("nf ctx-icon {kind_class}")>
                                             {glyph}
                                         </span>
                                         <span class="detail-file-path">{label}</span>
                                         <span class="detail-file-counts">{counts}</span>
-                                    </div>
+                                    </button>
                                 }
                             })
                             .collect_view();
@@ -290,6 +307,23 @@ pub fn detail_panel_view(
                                 }
                             });
                         }
+                        // "Expand Full Diff": the same diff, full-screen and
+                        // uncapped (`?full=1`), with Print / Save as PDF.
+                        let expand_id = d.id.clone();
+                        let expand = view! {
+                            <button
+                                class="detail-expand"
+                                title="Open the whole diff full-screen, uncapped, \
+                                       with Print / Save as PDF"
+                                on:click=move |_| {
+                                    viewer.set(Some(ViewerDoc::Diff {
+                                        id: expand_id.clone(),
+                                    }));
+                                }
+                            >
+                                "Expand Full Diff"
+                            </button>
+                        };
                         view! {
                             <div class="detail-section-title" id="detail-changes">
                                 <span class="nf ctx-icon">{ic.modified}</span>
@@ -298,6 +332,7 @@ pub fn detail_panel_view(
                                 <span class="diff-add">{format!(" +{adds}")}</span>
                                 <span class="diff-del">{format!(" −{dels}")}</span>
                                 {merge_note}
+                                {expand}
                             </div>
                             {files}
                             {truncated_note}

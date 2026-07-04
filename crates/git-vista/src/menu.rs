@@ -13,7 +13,8 @@ use leptos::*;
 use git_vista_core::activity::UndoAction;
 
 use crate::api::{
-    create_branch_request, fetch_head_branch, fetch_rebase_status, fetch_undoables, stage_request,
+    create_branch_request, fetch_head_branch, fetch_rebase_status, fetch_status,
+    fetch_undoables, stage_request, unstage_request,
 };
 use crate::geometry::menu_placement;
 use crate::gestures::viewport_size;
@@ -34,6 +35,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
         scroll_diff,
         dialog_opened_at,
         reload,
+        ..
     } = overlays;
     let nerd_icons = settings.nerd_icons;
     // The undo actions for the menu's commit (step 5), fetched the moment the
@@ -64,6 +66,21 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
         move || (menu.get().filter(|m| !m.is_branch).is_some(), reload.get()),
         |(open, _)| async move {
             if open { fetch_rebase_status().await.ok() } else { None }
+        },
+    );
+    // How many files are currently staged — fetched live when the menu opens
+    // on the HEAD commit (the only place staging items appear), keyed like
+    // `rebase_status`. Drives the "Unstage Changes" item: it appears only
+    // while something is actually staged, so the menu reflects the repo *now*,
+    // not the possibly-stale graph. Fetch failure => 0 => the item is absent.
+    let staged_count = create_local_resource(
+        move || (menu.get().map_or(false, |m| m.is_head && !m.is_branch), reload.get()),
+        |(open, _)| async move {
+            if open {
+                fetch_status().await.map(|s| s.staged.len()).unwrap_or(0)
+            } else {
+                0
+            }
         },
     );
     move || {
@@ -275,6 +292,36 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                 }
                 .into_view()
             };
+            // "Unstage Changes" (git reset HEAD): the exact inverse of "Stage
+            // Changes" — the index goes back to HEAD, the working tree keeps
+            // every edit. Appears only while something is actually staged
+            // (live `/api/status`, tracked read so the item pops in when the
+            // fetch lands) and only on the HEAD commit, like staging.
+            let unstage_changes = (is_head && staged_count.get().unwrap_or(0) > 0)
+                .then(|| {
+                    let on_unstage = move |_| {
+                        menu.set(None);
+                        spawn_local(async move {
+                            match unstage_request().await {
+                                Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+                                Err(e) => {
+                                    if let Some(w) = web_sys::window() {
+                                        let _ = w.alert_with_message(&format!(
+                                            "Couldn't unstage changes:\n{e}"
+                                        ));
+                                    }
+                                }
+                            }
+                        });
+                    };
+                    view! {
+                        <button class="ctx-item" on:click=on_unstage>
+                            // The undo glyph — staging, taken back.
+                            <span class="nf ctx-icon">{ic.undo}</span>
+                            "Unstage Changes"
+                        </button>
+                    }
+                });
             // The branch operations (Issue #33 follow-up): merge / push / delete, one
             // set per local branch living at this target. Each opens the confirm modal
             // rather than acting immediately — the actual POST + refresh happens there.
@@ -511,6 +558,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         {create_label}
                     </button>
                     {stage_changes}
+                    {unstage_changes}
                     {commit_changes}
                     {commit_empty}
                     {branch_items}

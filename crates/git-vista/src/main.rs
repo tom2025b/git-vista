@@ -50,9 +50,13 @@ mod menu;
 #[cfg(target_arch = "wasm32")]
 mod prefs;
 #[cfg(target_arch = "wasm32")]
+mod print;
+#[cfg(target_arch = "wasm32")]
 mod render;
 #[cfg(target_arch = "wasm32")]
 mod state;
+#[cfg(target_arch = "wasm32")]
+mod viewer;
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
