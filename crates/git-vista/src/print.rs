@@ -4,9 +4,9 @@
 //! rows exist in the DOM), pan/zoomed by a camera transform, and dark-themed.
 //! So this module builds a separate, static SVG of the entire graph — every
 //! row, edge, badge, label and stub, no virtualization, no camera — on a white
-//! sheet with dark text, and shows it in a full-screen overlay with Print /
-//! Save-as-PDF buttons (the same `window.print()` flow as viewer.rs; on iPad
-//! the print sheet's share button saves the PDF).
+//! sheet with dark text, and shows it in a full-screen overlay with a size
+//! picker and one Print / Save PDF button (the same `window.print()` flow as
+//! viewer.rs; on iPad the print sheet's share button saves the PDF).
 //!
 //! While open it stamps `data-print` on `<html>` so the `@media print` rules
 //! print only the sheet, scaled to the page width and flowing across pages.
@@ -43,8 +43,54 @@ fn set_print_attr(on: bool) {
     }
 }
 
+/// How big the printed graph is drawn before it goes to paper/PDF. It scales
+/// the *rendered* SVG (as a % of the page-width sheet) — the graph's own
+/// geometry is never touched — so it only ever affects the printout, never the
+/// interactive canvas. `Large`/`ExtraLarge` make every dot, line, badge and
+/// label proportionally bigger and let the graph flow across more pages.
+#[derive(Clone, Copy, PartialEq)]
+enum PrintScale {
+    Normal,
+    Large,
+    ExtraLarge,
+}
+
+impl PrintScale {
+    /// Rendered width of the graph as a percentage of the page-width sheet.
+    fn pct(self) -> u32 {
+        match self {
+            Self::Normal => 100,
+            Self::Large => 150,
+            Self::ExtraLarge => 200,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Large => "Large",
+            Self::ExtraLarge => "Extra Large",
+        }
+    }
+}
+
+/// One button of the Normal / Large / Extra Large size picker: selects `this`
+/// and lights up while it is the chosen size.
+fn scale_button(scale: RwSignal<PrintScale>, this: PrintScale) -> impl IntoView {
+    view! {
+        <button
+            class="scale-btn"
+            class:active=move || scale.get() == this
+            on:click=move |_| scale.set(this)
+        >
+            {this.label()}
+        </button>
+    }
+}
+
 /// The "Print Graph" overlay: a white preview sheet holding the full static
-/// graph SVG, plus Print / Save-as-PDF / Close. Rendered while `open` is true.
+/// graph SVG, a Normal/Large/Extra-Large size picker, and one Print / Save PDF
+/// button (plus Close). Rendered while `open` is true.
 pub fn print_graph_view(
     graph: Graph,
     open: RwSignal<bool>,
@@ -53,6 +99,10 @@ pub fn print_graph_view(
     // The graph parks in a StoredValue so the reactive closure below can read
     // it per open without cloning it into every render.
     let graph = store_value(graph);
+    // Print magnification. Read only by the sheet wrapper's reactive width
+    // below, so toggling it re-styles that one wrapper without rebuilding the
+    // SVG — and never touches the interactive canvas.
+    let scale = create_rw_signal(PrintScale::Normal);
     move || {
         let is_open = open.get();
         set_print_attr(is_open);
@@ -64,15 +114,12 @@ pub fn print_graph_view(
                     <div class="viewer-head">
                         <span class="viewer-title">"Print Graph"</span>
                         <span class="viewer-actions">
-                            <button
-                                class="viewer-btn"
-                                title="Print the whole graph"
-                                on:click=move |_| {
-                                    if let Some(w) = web_sys::window() { let _ = w.print(); }
-                                }
-                            >
-                                "Print"
-                            </button>
+                            <span class="print-scale" role="group" aria-label="Print size">
+                                <span class="print-scale-label">"Size"</span>
+                                {scale_button(scale, PrintScale::Normal)}
+                                {scale_button(scale, PrintScale::Large)}
+                                {scale_button(scale, PrintScale::ExtraLarge)}
+                            </span>
                             <button
                                 class="viewer-btn"
                                 title="Opens the print sheet — on iPad choose the \
@@ -82,7 +129,7 @@ pub fn print_graph_view(
                                     if let Some(w) = web_sys::window() { let _ = w.print(); }
                                 }
                             >
-                                "Save as PDF"
+                                "Print / Save PDF"
                             </button>
                             <button
                                 class="viewer-btn viewer-close"
@@ -96,7 +143,15 @@ pub fn print_graph_view(
                     <div class="viewer-body">
                         <div class="print-sheet">
                             <div class="print-sheet-head">{repo}</div>
-                            {sheet}
+                            // The size picker scales the printout by rendering
+                            // the SVG at a % of the sheet width; the SVG keeps
+                            // its own geometry, so the live graph is unaffected.
+                            <div
+                                class="print-scale-box"
+                                style:width=move || format!("{}%", scale.get().pct())
+                            >
+                                {sheet}
+                            </div>
                         </div>
                     </div>
                 </div>

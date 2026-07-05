@@ -1,8 +1,8 @@
 //! The full-screen viewer: one commit's whole diff ("Expand Full Diff" in the
 //! detail panel) or one file's full content (tapping a file in the diff list),
-//! with Print and Save-as-PDF controls.
+//! with a single Print / Save PDF control.
 //!
-//! Both buttons drive the browser's print flow (`window.print()`): that is the
+//! That button drives the browser's print flow (`window.print()`): that is the
 //! one path that reliably produces a PDF on iPad Safari — the print sheet's
 //! share button (or a pinch-out on the preview) offers "Save to Files"/share as
 //! PDF. While the viewer is open it stamps `data-print` on `<html>`; the
@@ -36,7 +36,7 @@ fn set_print_attr(on: bool) {
 }
 
 /// Open the browser's print flow. On iPad Safari the resulting sheet is also
-/// the "Save as PDF" path (share → Save to Files, or pinch out the preview).
+/// the "Save PDF" path (share → Save to Files, or pinch out the preview).
 fn print_now() {
     if let Some(w) = web_sys::window() {
         let _ = w.print();
@@ -111,19 +111,12 @@ pub fn viewer_view(overlays: Overlays, settings: Settings) -> impl IntoView {
                         <span class="viewer-actions">
                             <button
                                 class="viewer-btn"
-                                title="Print this document"
-                                on:click=move |_| print_now()
-                            >
-                                "Print"
-                            </button>
-                            <button
-                                class="viewer-btn"
                                 title="Opens the print sheet — on iPad choose the \
                                        share icon (or pinch the preview open) and \
                                        ‘Save to Files’ to keep it as a PDF"
                                 on:click=move |_| print_now()
                             >
-                                "Save as PDF"
+                                "Print / Save PDF"
                             </button>
                             <button
                                 class="viewer-btn viewer-close"
