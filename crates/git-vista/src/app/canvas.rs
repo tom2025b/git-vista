@@ -94,7 +94,7 @@ pub(super) fn graph_canvas(
     // and both signatures, which the row summary doesn't carry.
     let detail_id = create_rw_signal(None::<String>);
     // The full-screen viewer's document (viewer.rs): the full diff or one
-    // file's content, opened from the detail panel, with Print / Save as PDF.
+    // file's content, opened from the detail panel, with Print / Save PDF.
     let viewer_doc = create_rw_signal(None::<ViewerDoc>);
     let detail = create_local_resource(
         move || detail_id.get(),

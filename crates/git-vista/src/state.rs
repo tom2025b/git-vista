@@ -123,7 +123,7 @@ pub const DIALOG_GUARD_MS: f64 = 400.0;
 
 /// What the full-screen viewer (viewer.rs) is showing: a commit's whole diff
 /// (the detail panel's "Expand Full Diff"), or one file's full content at a
-/// commit (tapping a file in the diff list). Both get Print / Save-as-PDF.
+/// commit (tapping a file in the diff list). Both get one Print / Save PDF.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ViewerDoc {
     /// The full (uncapped) diff of one commit, by full hash.
