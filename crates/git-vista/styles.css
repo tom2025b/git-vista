@@ -650,6 +650,36 @@ button.detail-file:hover .detail-file-path { color: var(--accent); }
 .pg-msg { fill: #1f2328; }
 .pg-meta { fill: #57606a; opacity: 1; }
 
+/* Normal / Large / Extra Large size picker in the Print Graph head. It only
+   sets the wrapper's rendered width below — the SVG (and the live graph's
+   geometry) is never touched, so "bigger" means the same graph drawn larger,
+   flowing across more pages. Lives in .viewer-head, which is display:none in
+   print, so the picker never appears on paper. */
+.print-scale { display: flex; align-items: center; gap: 4px; }
+.print-scale-label { color: var(--muted); font-size: 0.8rem; margin-right: 2px; }
+.scale-btn {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 0.35rem 0.7rem;
+  color: var(--fg);
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.scale-btn:hover { border-color: var(--accent); }
+.scale-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+/* The scaled wrapper: its width is set inline by the picker (100/150/200%);
+   the SVG inside fills it, so the whole graph magnifies uniformly. At >100% it
+   overruns the sheet and the viewer body scrolls to it (on paper the print
+   sheet is full page-width, so the graph prints larger, across more pages). */
+.print-scale-box { width: 100%; }
+
 /* ---------------------------------------------------------------------------
    Print / Save as PDF. While a print surface is open, viewer.rs / print.rs
    stamp `data-print` on <html>; these rules then print ONLY that surface —
