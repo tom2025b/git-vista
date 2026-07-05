@@ -256,7 +256,7 @@ pub fn detail_panel_view(
                                 view! {
                                     <button
                                         class="detail-file"
-                                        title="View this file's full content (with Print / Save as PDF)"
+                                        title="View this file's full content (with Print / Save PDF)"
                                         on:click=open_file
                                     >
                                         <span class=format!("nf ctx-icon {kind_class}")>
@@ -308,13 +308,13 @@ pub fn detail_panel_view(
                             });
                         }
                         // "Expand Full Diff": the same diff, full-screen and
-                        // uncapped (`?full=1`), with Print / Save as PDF.
+                        // uncapped (`?full=1`), with Print / Save PDF.
                         let expand_id = d.id.clone();
                         let expand = view! {
                             <button
                                 class="detail-expand"
                                 title="Open the whole diff full-screen, uncapped, \
-                                       with Print / Save as PDF"
+                                       with Print / Save PDF"
                                 on:click=move |_| {
                                     viewer.set(Some(ViewerDoc::Diff {
                                         id: expand_id.clone(),
