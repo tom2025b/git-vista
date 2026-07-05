@@ -112,7 +112,7 @@ pub fn App() -> impl IntoView {
     let reset_opened_at = store_value(0f64);
 
     // "Print Graph": the full static print view of the whole graph
-    // (crate::print), opened from the topbar, with Print / Save as PDF.
+    // (crate::print), opened from the topbar, with Print / Save PDF.
     let print_graph_open = create_rw_signal(false);
 
     view! {
@@ -212,7 +212,7 @@ pub fn App() -> impl IntoView {
                 </button>
                 // "Print Graph" appears once the graph is loaded — it opens
                 // the full static print view (every row, light background)
-                // with Print / Save-as-PDF controls.
+                // with Print / Save PDF controls.
                 {move || graph.get().and_then(|r| r.ok()).map(|_| view! {
                     <button
                         class="refresh"
