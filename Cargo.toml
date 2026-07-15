@@ -1,17 +1,22 @@
 # Workspace root for git-vista.
 #
 # Four crates, each with one job:
-#   - git-vista-core   : pure logic (graph layout + data models). No platform or UI
-#                        deps, so it compiles for wasm and is shared by the frontend.
-#   - git-vista-git    : native-only git reading via gix. Kept apart from core so
-#                        gix never reaches the wasm/browser build.
-#   - git-vista-server : the axum HTTP backend — serves the SPA + the /api/* routes.
-#   - git-vista        : the Leptos frontend GUI, built to wasm by Trunk (the app
-#                        you interact with in the browser).
+#   - git-vista-core     : pure logic (graph layout + data models). No platform or UI
+#                          deps, so it compiles for wasm and is shared by the frontend.
+#   - git-vista-protocol : the versioned HTTP transport contract — protocol version
+#                          negotiation, the API error envelope, request-id, and the
+#                          shared request/response DTOs. Pure/wasm-safe; depended on
+#                          by the server and the frontend, independent of core.
+#   - git-vista-git      : native-only git reading via gix. Kept apart from core so
+#                          gix never reaches the wasm/browser build.
+#   - git-vista-server   : the axum HTTP backend — serves the SPA + the /api/* routes.
+#   - git-vista          : the Leptos frontend GUI, built to wasm by Trunk (the app
+#                          you interact with in the browser).
 [workspace]
 resolver = "2"
 members = [
     "crates/git-vista-core",
+    "crates/git-vista-protocol",
     "crates/git-vista-git",
     "crates/git-vista-server",
     "crates/git-vista",
@@ -28,6 +33,7 @@ repository = "https://github.com/tom2025b/git-vista"
 # `serde = { workspace = true }` so versions stay in lock-step.
 [workspace.dependencies]
 git-vista-core = { path = "crates/git-vista-core" }
+git-vista-protocol = { path = "crates/git-vista-protocol" }
 git-vista-git = { path = "crates/git-vista-git" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
