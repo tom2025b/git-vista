@@ -32,10 +32,16 @@ pub(crate) async fn create_branch(Json(req): Json<CreateBranchRequest>) -> (Stat
     let name = req.name.trim();
     let commit = req.commit.trim();
     if name.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Branch name can't be empty.".to_string());
+        return (
+            StatusCode::BAD_REQUEST,
+            "Branch name can't be empty.".to_string(),
+        );
     }
     if name.starts_with('-') {
-        return (StatusCode::BAD_REQUEST, "Branch name can't start with '-'.".to_string());
+        return (
+            StatusCode::BAD_REQUEST,
+            "Branch name can't start with '-'.".to_string(),
+        );
     }
 
     let output = match tokio::process::Command::new("git")
@@ -280,10 +286,16 @@ async fn run_branch_op(
     }
     let branch = branch.trim();
     if branch.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Branch name can't be empty.".to_string());
+        return (
+            StatusCode::BAD_REQUEST,
+            "Branch name can't be empty.".to_string(),
+        );
     }
     if branch.starts_with('-') {
-        return (StatusCode::BAD_REQUEST, "Branch name can't start with '-'.".to_string());
+        return (
+            StatusCode::BAD_REQUEST,
+            "Branch name can't start with '-'.".to_string(),
+        );
     }
 
     let output = match tokio::process::Command::new("git")

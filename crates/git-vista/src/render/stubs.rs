@@ -7,11 +7,11 @@
 
 use leptos::*;
 
-use git_vista_core::color::{branch_color, MERGE_FILL};
 use crate::geometry::{node_cx, stub_node_cy, stub_path, NODE_RADIUS};
 use crate::icons::icon_set;
 use crate::state::MenuData;
 use crate::text::truncate;
+use git_vista_core::color::{branch_color, MERGE_FILL};
 
 use super::RenderCtx;
 
@@ -72,24 +72,26 @@ pub fn stubs(
     // paint over the ring below it — and, worse, sit on top of that ring's hit
     // circle, swallowing taps aimed dead-centre. The paths are decorative, so
     // they also get pointer-events:none; belt and braces with the ordering.
-    let paths = ctx.with_value(|c| c.graph
-        .stubs
-        .iter()
-        .map(|s| {
-            let color = branch_color(s.color);
-            let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.depth);
-            view! {
-                <path
-                    d=d
-                    fill="none"
-                    stroke=color
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    pointer-events="none"
-                />
-            }
-        })
-        .collect_view());
+    let paths = ctx.with_value(|c| {
+        c.graph
+            .stubs
+            .iter()
+            .map(|s| {
+                let color = branch_color(s.color);
+                let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.depth);
+                view! {
+                    <path
+                        d=d
+                        fill="none"
+                        stroke=color
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        pointer-events="none"
+                    />
+                }
+            })
+            .collect_view()
+    });
     let tips = ctx.with_value(|c| c.graph
         .stubs
         .iter()

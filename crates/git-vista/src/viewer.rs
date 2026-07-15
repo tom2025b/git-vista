@@ -57,9 +57,7 @@ pub fn viewer_view(overlays: Overlays, settings: Settings) -> impl IntoView {
         |doc| async move {
             match doc {
                 None => None,
-                Some(ViewerDoc::Diff { id }) => {
-                    Some(DocResult::Diff(fetch_diff_full(&id).await))
-                }
+                Some(ViewerDoc::Diff { id }) => Some(DocResult::Diff(fetch_diff_full(&id).await)),
                 Some(ViewerDoc::File { id, path }) => {
                     Some(DocResult::File(fetch_file(&id, &path).await))
                 }

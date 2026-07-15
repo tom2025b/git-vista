@@ -112,7 +112,10 @@ mod tests {
         let mut s = 0.2;
         while s <= 5.0 {
             let d = detail_for(s);
-            assert!(d.shows_message() >= prev_msg, "message flag regressed at {s}");
+            assert!(
+                d.shows_message() >= prev_msg,
+                "message flag regressed at {s}"
+            );
             assert!(d.shows_meta() >= prev_meta, "meta flag regressed at {s}");
             prev_msg = d.shows_message();
             prev_meta = d.shows_meta();

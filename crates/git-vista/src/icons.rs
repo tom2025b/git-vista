@@ -123,24 +123,24 @@ pub const ICONS: GitIcons = GitIcons {
 /// Font — e.g. an iPad, where only the system fonts exist. Values reuse git's
 /// own textual conventions where one exists.
 pub const TEXT_ICONS: GitIcons = GitIcons {
-    git: "\u{B1}",     // ± — the classic git symbol in shell prompts
+    git: "\u{B1}", // ± — the classic git symbol in shell prompts
     github: "GH",
     repository: "\u{25C6}", // ◆
-    branch: "\u{BB}",  // » — "forked off to…"
-    branch_alt: ">>",  // remote branch: same idea, visibly different
-    commit: "*",       // the commit marker in `git log --graph`
+    branch: "\u{BB}",       // » — "forked off to…"
+    branch_alt: ">>",       // remote branch: same idea, visibly different
+    commit: "*",            // the commit marker in `git log --graph`
     pull_request: "PR",
-    merge: "><",       // two lines joining
-    tag: "#",          // a label
-    added: "+",        // diff-style
+    merge: "><", // two lines joining
+    tag: "#",    // a label
+    added: "+",  // diff-style
     modified: "~",
     deleted: "-",
     renamed: "\u{2192}", // →
-    untracked: "?",    // `git status --short` shows untracked as ??
+    untracked: "?",      // `git status --short` shows untracked as ??
     conflict: "!",
-    clean: "\u{2713}", // ✓
-    dirty: "*",        // `__git_ps1` marks a dirty tree with *
-    stash: "$",        // `__git_ps1` marks a stash with $
+    clean: "\u{2713}",    // ✓
+    dirty: "*",           // `__git_ps1` marks a dirty tree with *
+    stash: "$",           // `__git_ps1` marks a stash with $
     history: "\u{2261}",  // ≡ — stacked lines, a log
     undo: "\u{21A9}",     // ↩ — turn back
     push: "\u{2191}",     // ↑ — up to the remote (matches the chip's arrows)

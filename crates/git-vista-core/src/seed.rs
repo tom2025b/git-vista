@@ -47,15 +47,23 @@ pub fn parse_seed(refs: &str, head: &str) -> Result<Seed, String> {
         if name.is_empty() {
             return Err(format!("empty branch name in seed-refs line: {line:?}"));
         }
-        parsed.push(SeedRef { name: name.to_string(), oid: oid.to_lowercase() });
+        parsed.push(SeedRef {
+            name: name.to_string(),
+            oid: oid.to_lowercase(),
+        });
     }
     if parsed.is_empty() {
         return Err("seed-refs lists no branches".to_string());
     }
     if !parsed.iter().any(|r| r.name == head) {
-        return Err(format!("seed-head ‘{head}’ isn't among the seeded branches"));
+        return Err(format!(
+            "seed-head ‘{head}’ isn't among the seeded branches"
+        ));
     }
-    Ok(Seed { head: head.to_string(), refs: parsed })
+    Ok(Seed {
+        head: head.to_string(),
+        refs: parsed,
+    })
 }
 
 /// What a reset must do to the branch refs, given the repo's *current*
@@ -102,7 +110,13 @@ mod tests {
         let s = seed();
         assert_eq!(s.head, "main");
         assert_eq!(s.refs.len(), 2);
-        assert_eq!(s.refs[1], SeedRef { name: "feature/x".into(), oid: B.into() });
+        assert_eq!(
+            s.refs[1],
+            SeedRef {
+                name: "feature/x".into(),
+                oid: B.into()
+            }
+        );
     }
 
     #[test]
@@ -127,8 +141,14 @@ mod tests {
         assert_eq!(
             plan.update,
             vec![
-                SeedRef { name: "feature/x".into(), oid: B.into() },
-                SeedRef { name: "main".into(), oid: A.into() },
+                SeedRef {
+                    name: "feature/x".into(),
+                    oid: B.into()
+                },
+                SeedRef {
+                    name: "main".into(),
+                    oid: A.into()
+                },
             ]
         );
         assert_eq!(plan.delete, vec!["extra/y".to_string()]);

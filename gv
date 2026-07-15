@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # gv — build the git-vista frontend and start the server for a git repo.
 #
-# Serves the SPA + /api/commits on http://0.0.0.0:8080 (reachable from the iPad
-# over the LAN). Run it from anywhere; it locates the git-vista repo from its own
-# path and visualises whichever repo you point it at.
+# Serves the SPA + API on http://127.0.0.1:8080 by default. Use an SSH local port
+# forward from the iPad, or opt into the unauthenticated legacy LAN mode with
+# --lan. Run it from anywhere; it locates the git-vista repo from its own path and
+# visualises whichever repo you point it at.
 #
 #   gv                  visualise the CURRENT directory's repo
 #   gv ~/code/myproj    visualise another repo by path
+#   gv --lan [path]     bind all interfaces for a trusted personal LAN
 #   gv --stop           stop the running server
 #   gv --seed [path]    mark a repo as a TEST repo: record its current branches,
 #                       HEAD and objects as the reset point the app's
@@ -36,9 +38,11 @@ LOG="$LOG_DIR/server.log"
 # --no-build while developing — we always rebuild from scratch; see the header.)
 TARGET=""
 SEED=0
+LAN=0
 for arg in "$@"; do
   case "$arg" in
     --seed) SEED=1 ;;
+    --lan) LAN=1 ;;
     --stop)
       if pkill -9 -f '[g]it-vista-server' 2>/dev/null; then
         echo "gv: server stopped"
@@ -104,9 +108,14 @@ cargo build -p git-vista-server
 
 # …then run the built binary DETACHED: `setsid` gives it its own session with no
 # controlling terminal, so a closed terminal / dropped SSH session can't SIGHUP
-# it. Its output (including the LAN-URL banner and firewall tips) goes to $LOG.
+# it. Its output (including connection guidance) goes to $LOG.
 mkdir -p "$LOG_DIR"
 echo "=== gv start $(date '+%F %T') — visualising $TARGET" >>"$LOG"
+unset GIT_VISTA_BIND_ADDR
+if [[ $LAN -eq 1 ]]; then
+  export GIT_VISTA_BIND_ADDR="0.0.0.0:8080"
+  echo "gv: WARNING: --lan exposes unauthenticated Git write endpoints to your LAN" >&2
+fi
 setsid "$REPO/target/debug/git-vista-server" "$TARGET" >>"$LOG" 2>&1 </dev/null &
 
 # Don't claim success until it actually serves: catches an immediate crash or a
@@ -114,8 +123,15 @@ setsid "$REPO/target/debug/git-vista-server" "$TARGET" >>"$LOG" 2>&1 </dev/null 
 echo "gv: visualising $TARGET"
 for _ in $(seq 1 40); do
   if curl -sf -m 1 "http://localhost:8080/api/head-branch" >/dev/null 2>&1; then
-    LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    echo "gv: server up — http://${LAN_IP:-<this-machine-LAN-IP>}:8080/"
+    if [[ $LAN -eq 1 ]]; then
+      LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+      echo "gv: server up in LAN mode — http://${LAN_IP:-<this-machine-LAN-IP>}:8080/"
+    else
+      echo "gv: server up — http://127.0.0.1:8080/"
+      echo "gv: 127.0.0.1 works only on this Linux host"
+      echo "gv: iPad via SSH: forward local port 8080 to 127.0.0.1:8080"
+      echo "gv: iPad via trusted Wi-Fi without SSH: restart with gv --lan"
+    fi
     echo "gv: log: $LOG    stop: gv --stop"
     exit 0
   fi

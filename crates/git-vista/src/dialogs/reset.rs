@@ -36,51 +36,55 @@ pub fn reset_repo_view(
             }
         });
     };
-    move || reset_open.get().then(|| view! {
-        <div
-            style="position:fixed; top:0; left:0; width:100vw; height:100vh; \
-                   z-index:30; display:flex; align-items:center; \
-                   justify-content:center; background:rgba(1,4,9,0.6);"
-            on:click=move |_| {
-                // Ignore the iOS ghost click that fires just after opening.
-                if js_sys::Date::now() - reset_opened_at.get_value() > DIALOG_GUARD_MS {
-                    reset_open.set(false);
-                }
+    move || {
+        reset_open.get().then(|| {
+            view! {
+                <div
+                    style="position:fixed; top:0; left:0; width:100vw; height:100vh; \
+                           z-index:30; display:flex; align-items:center; \
+                           justify-content:center; background:rgba(1,4,9,0.6);"
+                    on:click=move |_| {
+                        // Ignore the iOS ghost click that fires just after opening.
+                        if js_sys::Date::now() - reset_opened_at.get_value() > DIALOG_GUARD_MS {
+                            reset_open.set(false);
+                        }
+                    }
+                >
+                    <div
+                        style="min-width:300px; max-width:90vw; padding:16px; \
+                               background:#161b22; border:1px solid #30363d; \
+                               border-radius:10px; color:var(--fg); \
+                               box-shadow:0 12px 32px rgba(0,0,0,0.6);"
+                        on:click=move |ev| ev.stop_propagation()
+                    >
+                        <div style="font-weight:600; margin-bottom:12px;">"Reset Test Repo"</div>
+                        <div style="margin-bottom:14px; line-height:1.4;">
+                            "Restore this repo to its recorded seed state? Every commit, \
+                             branch and uncommitted change made since the seed is \
+                             DISCARDED — including deleting branches created during \
+                             testing. This can't be undone."
+                        </div>
+                        <div style="display:flex; gap:8px; justify-content:flex-end;">
+                            <button
+                                style="padding:6px 14px; font:inherit; color:var(--fg); \
+                                       background:#21262d; border:1px solid #30363d; \
+                                       border-radius:6px;"
+                                on:click=move |_| reset_open.set(false)
+                            >
+                                "Cancel"
+                            </button>
+                            <button
+                                style="padding:6px 14px; font:inherit; color:#fff; \
+                                       background:#da3633; border:1px solid #f85149; \
+                                       border-radius:6px;"
+                                on:click=move |_| run_reset()
+                            >
+                                "Reset"
+                            </button>
+                        </div>
+                    </div>
+                </div>
             }
-        >
-            <div
-                style="min-width:300px; max-width:90vw; padding:16px; \
-                       background:#161b22; border:1px solid #30363d; \
-                       border-radius:10px; color:var(--fg); \
-                       box-shadow:0 12px 32px rgba(0,0,0,0.6);"
-                on:click=move |ev| ev.stop_propagation()
-            >
-                <div style="font-weight:600; margin-bottom:12px;">"Reset Test Repo"</div>
-                <div style="margin-bottom:14px; line-height:1.4;">
-                    "Restore this repo to its recorded seed state? Every commit, \
-                     branch and uncommitted change made since the seed is \
-                     DISCARDED — including deleting branches created during \
-                     testing. This can't be undone."
-                </div>
-                <div style="display:flex; gap:8px; justify-content:flex-end;">
-                    <button
-                        style="padding:6px 14px; font:inherit; color:var(--fg); \
-                               background:#21262d; border:1px solid #30363d; \
-                               border-radius:6px;"
-                        on:click=move |_| reset_open.set(false)
-                    >
-                        "Cancel"
-                    </button>
-                    <button
-                        style="padding:6px 14px; font:inherit; color:#fff; \
-                               background:#da3633; border:1px solid #f85149; \
-                               border-radius:6px;"
-                        on:click=move |_| run_reset()
-                    >
-                        "Reset"
-                    </button>
-                </div>
-            </div>
-        </div>
-    })
+        })
+    }
 }

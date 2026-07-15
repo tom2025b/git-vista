@@ -96,7 +96,10 @@ mod tests {
 
     #[test]
     fn other_year_shows_the_year() {
-        assert_eq!(format_label(2024, 6, 29, 14, 32, 2026), "Jun 29 2024 2:32 PM");
+        assert_eq!(
+            format_label(2024, 6, 29, 14, 32, 2026),
+            "Jun 29 2024 2:32 PM"
+        );
     }
 
     #[test]
@@ -125,6 +128,10 @@ mod tests {
         assert_eq!(ago_label(59 * 60).as_deref(), Some("59m ago"));
         assert_eq!(ago_label(3 * 3_600 + 5).as_deref(), Some("3h ago"));
         assert_eq!(ago_label(2 * 86_400).as_deref(), Some("2d ago"));
-        assert_eq!(ago_label(8 * 86_400), None, "past a week: fall back to the date");
+        assert_eq!(
+            ago_label(8 * 86_400),
+            None,
+            "past a week: fall back to the date"
+        );
     }
 }
