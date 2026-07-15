@@ -15,8 +15,22 @@ lost.** So, on anything non-trivial:
 - Keep **`handoff.md`** current as you go (gitignored, repo root): the goal, a
   `[ ]`/`[x]` checklist, and an explicit **"next step."** This is the human-readable
   map; the git commits are the durable bytes.
-- Resume with **`./dev resume`** — shows the branch, the WIP commits not yet on
-  main, uncommitted changes, and `handoff.md`.
+- Resume with **`./dev resume`** — shows the branch, WIP commits not yet on main,
+  uncommitted changes, **open PRs and unmerged branches** (catches "did it all but
+  never merged"), and `handoff.md`.
+
+### Resuming a session that ran out of tokens
+
+1. **`claude --continue`** (or `--resume`) reloads the dead session's own context —
+   including its last command and the command it was mid-way through when it
+   stopped. That's *intent*. (Only works as the same OS user; the transcripts live
+   under `~/.claude/projects/…` mode 0600.)
+2. **`./dev resume` + `git log`** tells you what *actually landed* — git is ground
+   truth. A transcript can show `git commit`/`dev wip` was the interrupted command;
+   only `git log`/`gh pr list` says whether it committed, pushed, or merged.
+3. **Committed ≠ done.** If `./dev resume` shows an open PR or an unmerged branch,
+   the task isn't finished — merge it and close the issue. That's what bit us
+   before: work sat complete-but-unmerged and the next session didn't know.
 
 ## The `./dev` commands (bash, no install needed)
 
