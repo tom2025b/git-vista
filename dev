@@ -92,11 +92,26 @@ cmd_wip() {
 
 cmd_resume() {
   local branch; branch="$(git rev-parse --abbrev-ref HEAD)"
+  git fetch -q origin 2>/dev/null || true
   echo "=== branch: $branch ==="
   echo "=== commits on this branch (not yet on main) ==="
   git log --oneline --format='  %h %an %s' main.."$branch" 2>/dev/null || echo "  (none / branch is main)"
   echo "=== uncommitted changes (would be lost on token-out — 'dev wip' them!) ==="
   git status --short || true
+  # The "did it all but never merged" catch: work can be complete on a branch /
+  # in an open PR while you're sitting on a clean main and think nothing's pending.
+  echo "=== OPEN PRs (done-but-unmerged? merge + close the issue!) ==="
+  if command -v gh >/dev/null; then
+    gh pr list --state open --json number,title,headRefName \
+      --jq '.[] | "  #\(.number)  \(.title)  [\(.headRefName)]"' 2>/dev/null || echo "  (gh error)"
+  else
+    echo "  (gh not available)"
+  fi
+  echo "=== local branches with commits not on main (unfinished work?) ==="
+  git for-each-ref --format='%(refname:short)' refs/heads | grep -vx main | while read -r b; do
+    n="$(git rev-list --count "main..$b" 2>/dev/null || echo 0)"
+    [[ "$n" -gt 0 ]] && echo "  $b (+$n ahead of main)"
+  done
   echo "=== handoff.md ==="
   if [[ -f handoff.md ]]; then cat handoff.md; else echo "  (no handoff.md — create one with the plan + checklist)"; fi
 }
