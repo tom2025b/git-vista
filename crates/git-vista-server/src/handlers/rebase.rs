@@ -10,7 +10,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 
 use git_vista_core::activity::ActivityKind;
-use git_vista_core::model::RebaseStatus;
+use git_vista_protocol::RebaseStatus;
 
 use crate::git_cmd::{git_ref_exists, is_ancestor, rev_parse};
 use crate::state::{current, reject_if_read_only};

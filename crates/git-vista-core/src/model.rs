@@ -188,100 +188,12 @@ pub struct BranchStub {
     pub depth: usize,
 }
 
-/// Body of a `POST /api/branch` request (Issue #18): create a branch named
-/// `name` pointing at the commit `commit` (full hex id). Shared so the frontend
-/// serialises exactly what the backend deserialises.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreateBranchRequest {
-    pub name: String,
-    pub commit: String,
-}
-
-/// Body of a `POST /api/commit` request (Issue #33): create a commit with the
-/// message `message`. When `allow_empty` is true the commit is made even with
-/// nothing staged (`git commit --allow-empty`); otherwise git commits the
-/// staged changes and fails if there are none.
-///
-/// `branch` names the branch the commit should land on. `None` — and any name
-/// that turns out to be the checked-out branch — means a plain `git commit` on
-/// HEAD, exactly as before this field existed. A *different* branch is allowed
-/// only for empty commits (there's no meaning to committing HEAD's staged tree
-/// onto another branch): the backend writes the commit with `git commit-tree`
-/// and advances the ref with a compare-and-swap `git update-ref`, never
-/// touching HEAD or the working tree. This is how a branch stub — a new branch
-/// with no commits of its own — takes its first (empty) commit from the UI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreateCommitRequest {
-    pub message: String,
-    pub allow_empty: bool,
-    #[serde(default)]
-    pub branch: Option<String>,
-}
-
-/// Response of `GET /api/rebase-status`: whether "Rebase onto main" would do
-/// anything right now, resolved live server-side — the same freshness posture
-/// as `/api/head-branch`, so the menu can disable the item instead of offering
-/// a rebase that no-ops (or the nonsense "rebase ‘main’ onto main").
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RebaseStatus {
-    /// The checked-out branch; `None` => detached HEAD (nothing to rebase).
-    pub branch: Option<String>,
-    /// What the server would rebase onto: `origin/main` when that
-    /// remote-tracking ref exists, else the local `main`.
-    pub base: String,
-    /// False when `base` doesn't resolve at all (a repo with no `main`).
-    pub base_exists: bool,
-    /// True when HEAD already contains the base tip — the branch is already
-    /// based on the latest `base`, so a rebase would change nothing.
-    pub up_to_date: bool,
-}
-
-/// Body of the three branch-operation requests (Issue #33 follow-up): merge
-/// (`POST /api/merge`), push (`POST /api/push`), and delete (`POST /api/delete-branch`).
-/// All three act on a single named branch, so they share one shape. `branch` is a
-/// local branch name; the backend validates it and forwards git's own error text.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BranchRequest {
-    pub branch: String,
-}
-
-/// Body of a `POST /api/clone` request (Phase 12): clone the public repository at
-/// `url` into a throwaway temp directory and switch the server to viewing it,
-/// read-only. `url` is a git-cloneable URL (typically `https://…`); the backend
-/// validates its scheme and forwards git's own error text on failure.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloneRequest {
-    pub url: String,
-}
-
-/// Validate a URL a user pasted to clone, before the server hands it to
-/// `git clone` (Phase 12). This is a *gate*, not a parser: it accepts only the
-/// public, read-oriented transports (`https://`, `http://`, `git://`) and rejects
-/// everything else, so the pasted string can't be an SSH URL that would prompt for
-/// keys, a local filesystem path, or an option smuggled in with a leading `-`.
-/// git itself does the real URL parsing and reports a clear error if the host or
-/// repo is wrong. Returns the trimmed URL on success, or a user-facing reason.
-pub fn validate_clone_url(url: &str) -> Result<String, String> {
-    let url = url.trim();
-    if url.is_empty() {
-        return Err("Enter a repository URL.".to_string());
-    }
-    // Belt-and-braces even though the URL is passed as its own argv entry: a value
-    // starting with '-' could still be read by git as an option.
-    if url.starts_with('-') {
-        return Err("URL can't start with '-'.".to_string());
-    }
-    const ALLOWED: [&str; 3] = ["https://", "http://", "git://"];
-    if !ALLOWED.iter().any(|scheme| url.starts_with(scheme)) {
-        return Err("Only https://, http:// or git:// URLs are supported.".to_string());
-    }
-    // Reject whitespace inside the URL — a single field should hold one URL, and it
-    // keeps a space-separated second token from ever reaching git as an extra arg.
-    if url.split_whitespace().count() != 1 {
-        return Err("URL can't contain spaces.".to_string());
-    }
-    Ok(url.to_string())
-}
+// The request/response transport DTOs that used to live here — `CreateBranchRequest`,
+// `CreateCommitRequest`, `BranchRequest`, `CloneRequest`, `RebaseStatus`, and the
+// `validate_clone_url` gate — moved to the `git-vista-protocol` crate (M1.02, #102):
+// they are the wire contract, versioned independently of this domain model. Core no
+// longer knows about transport. The graph/commit types above stay here — they are the
+// repository domain, produced by this crate's own layout engine.
 
 #[cfg(test)]
 mod tests {
@@ -308,39 +220,5 @@ mod tests {
             time: 0,
         };
         assert!(two_parents.is_merge());
-    }
-
-    #[test]
-    fn rebase_status_roundtrips_through_json() {
-        let status = RebaseStatus {
-            branch: Some("feature".into()),
-            base: "origin/main".into(),
-            base_exists: true,
-            up_to_date: false,
-        };
-        let json = serde_json::to_string(&status).unwrap();
-        assert_eq!(serde_json::from_str::<RebaseStatus>(&json).unwrap(), status);
-    }
-
-    #[test]
-    fn clone_url_accepts_public_transports_and_trims() {
-        assert_eq!(
-            validate_clone_url("  https://github.com/rust-lang/rust.git "),
-            Ok("https://github.com/rust-lang/rust.git".to_string())
-        );
-        assert!(validate_clone_url("http://example.com/r.git").is_ok());
-        assert!(validate_clone_url("git://example.com/r.git").is_ok());
-    }
-
-    #[test]
-    fn clone_url_rejects_unsafe_or_unsupported() {
-        // SSH URL (would prompt for keys), local path, empty, option-like, spaces.
-        assert!(validate_clone_url("git@github.com:owner/repo.git").is_err());
-        assert!(validate_clone_url("/home/tom/secret").is_err());
-        assert!(validate_clone_url("file:///etc").is_err());
-        assert!(validate_clone_url("").is_err());
-        assert!(validate_clone_url("   ").is_err());
-        assert!(validate_clone_url("--upload-pack=evil").is_err());
-        assert!(validate_clone_url("https://a.com/r.git --extra").is_err());
     }
 }
