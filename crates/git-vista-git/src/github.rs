@@ -56,10 +56,16 @@ mod tests {
         assert_eq!(web_base_from_remote("git@github.com:owner/repo.git"), want);
         assert_eq!(web_base_from_remote("git@github.com:owner/repo"), want);
         // HTTPS, with .git / trailing slash
-        assert_eq!(web_base_from_remote("https://github.com/owner/repo.git"), want);
+        assert_eq!(
+            web_base_from_remote("https://github.com/owner/repo.git"),
+            want
+        );
         assert_eq!(web_base_from_remote("https://github.com/owner/repo/"), want);
         // ssh:// URL form
-        assert_eq!(web_base_from_remote("ssh://git@github.com/owner/repo.git"), want);
+        assert_eq!(
+            web_base_from_remote("ssh://git@github.com/owner/repo.git"),
+            want
+        );
         // Case-insensitive host.
         assert_eq!(web_base_from_remote("git@GitHub.com:owner/repo.git"), want);
     }
@@ -67,7 +73,10 @@ mod tests {
     #[test]
     fn rejects_non_github_or_malformed_remotes() {
         assert_eq!(web_base_from_remote("git@gitlab.com:owner/repo.git"), None);
-        assert_eq!(web_base_from_remote("https://example.com/owner/repo.git"), None);
+        assert_eq!(
+            web_base_from_remote("https://example.com/owner/repo.git"),
+            None
+        );
         assert_eq!(web_base_from_remote("/local/path/repo.git"), None);
         assert_eq!(web_base_from_remote("git@github.com:owner.git"), None); // no repo
         assert_eq!(web_base_from_remote(""), None);

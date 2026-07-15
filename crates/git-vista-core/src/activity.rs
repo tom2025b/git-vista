@@ -70,7 +70,11 @@ pub enum UndoAction {
     /// result still sits at the branch tip. `expected_tip` is compare-and-swap:
     /// the server refuses if the branch no longer points there, so a stale
     /// menu can never reset away work that happened after it was shown.
-    ResetBranch { branch: String, to: String, expected_tip: String },
+    ResetBranch {
+        branch: String,
+        to: String,
+        expected_tip: String,
+    },
     /// `git revert --no-edit <commit>` — the history-preserving undo for a
     /// commit that's already shared.
     RevertCommit { commit: String },
@@ -263,7 +267,11 @@ pub fn assemble_feed(
                 time: entry.time,
                 kind: ActivityKind::Rebase,
                 ref_name: Some(entry.ref_name.clone()),
-                summary: if steps > 1 { format!("rebase ({steps} steps)") } else { summary },
+                summary: if steps > 1 {
+                    format!("rebase ({steps} steps)")
+                } else {
+                    summary
+                },
                 old_oid: Some(reflog[span].old_oid.clone()),
                 new_oid: Some(entry.new_oid.clone()),
                 source: ActivitySource::External,
@@ -298,7 +306,9 @@ pub fn assemble_feed(
         if e.ref_name.as_deref() != Some("HEAD") {
             return true;
         }
-        let Some(new_oid) = &e.new_oid else { return true };
+        let Some(new_oid) = &e.new_oid else {
+            return true;
+        };
         !branch_moves.iter().any(|(kind, oid, time)| {
             *kind == e.kind && oid == new_oid && (e.time - time).abs() <= HEAD_MATCH_SLACK
         })
@@ -309,7 +319,9 @@ pub fn assemble_feed(
     // entry — keep the journal copy, which knows the source and has the
     // richer summary.
     events.retain(|e| {
-        let Some(new_oid) = &e.new_oid else { return true };
+        let Some(new_oid) = &e.new_oid else {
+            return true;
+        };
         !journal.iter().any(|j| {
             j.kind == e.kind
                 && j.new_oid.as_deref() == Some(new_oid)
@@ -420,21 +432,63 @@ mod tests {
             ("commit: fix the bug", ActivityKind::Commit, "fix the bug"),
             ("commit (initial): root", ActivityKind::Commit, "root"),
             ("commit (amend): better", ActivityKind::Amend, "better"),
-            ("checkout: moving from main to feature", ActivityKind::Checkout, "main → feature"),
-            ("merge feature: Fast-forward", ActivityKind::Merge, "merge feature: Fast-forward"),
-            ("rebase (finish): returning to refs/heads/f", ActivityKind::Rebase,
-             "rebase (finish): returning to refs/heads/f"),
-            ("reset: moving to HEAD~1", ActivityKind::Reset, "reset: moving to HEAD~1"),
-            ("branch: Created from main", ActivityKind::BranchCreated, "branch: Created from main"),
-            ("branch: Reset to abc1234", ActivityKind::Reset, "branch: Reset to abc1234"),
+            (
+                "checkout: moving from main to feature",
+                ActivityKind::Checkout,
+                "main → feature",
+            ),
+            (
+                "merge feature: Fast-forward",
+                ActivityKind::Merge,
+                "merge feature: Fast-forward",
+            ),
+            (
+                "rebase (finish): returning to refs/heads/f",
+                ActivityKind::Rebase,
+                "rebase (finish): returning to refs/heads/f",
+            ),
+            (
+                "reset: moving to HEAD~1",
+                ActivityKind::Reset,
+                "reset: moving to HEAD~1",
+            ),
+            (
+                "branch: Created from main",
+                ActivityKind::BranchCreated,
+                "branch: Created from main",
+            ),
+            (
+                "branch: Reset to abc1234",
+                ActivityKind::Reset,
+                "branch: Reset to abc1234",
+            ),
             ("cherry-pick: pick me", ActivityKind::CherryPick, "pick me"),
-            ("revert: Revert \"oops\"", ActivityKind::Revert, "Revert \"oops\""),
-            ("pull: Fast-forward", ActivityKind::Pull, "pull: Fast-forward"),
-            ("clone: from https://example.com/r.git", ActivityKind::Clone,
-             "clone: from https://example.com/r.git"),
+            (
+                "revert: Revert \"oops\"",
+                ActivityKind::Revert,
+                "Revert \"oops\"",
+            ),
+            (
+                "pull: Fast-forward",
+                ActivityKind::Pull,
+                "pull: Fast-forward",
+            ),
+            (
+                "clone: from https://example.com/r.git",
+                ActivityKind::Clone,
+                "clone: from https://example.com/r.git",
+            ),
             ("update by push", ActivityKind::Push, "update by push"),
-            ("fetch: fast-forward", ActivityKind::Fetch, "fetch: fast-forward"),
-            ("frobnicate: unknown", ActivityKind::Other, "frobnicate: unknown"),
+            (
+                "fetch: fast-forward",
+                ActivityKind::Fetch,
+                "fetch: fast-forward",
+            ),
+            (
+                "frobnicate: unknown",
+                ActivityKind::Other,
+                "frobnicate: unknown",
+            ),
         ];
         for (msg, kind, summary) in cases {
             let (k, s) = parse_reflog_message(msg);
@@ -447,16 +501,29 @@ mod tests {
     fn rebase_burst_coalesces_to_one_event() {
         // Newest-first on one ref: finish, two picks, start — one rebase.
         let reflog = vec![
-            entry("feature", 100, "c3", "c4", "rebase (finish): returning to refs/heads/feature"),
+            entry(
+                "feature",
+                100,
+                "c3",
+                "c4",
+                "rebase (finish): returning to refs/heads/feature",
+            ),
             entry("feature", 100, "c2", "c3", "rebase (pick): two"),
             entry("feature", 99, "c1", "c2", "rebase (pick): one"),
             entry("feature", 99, "c0", "c1", "rebase (start): checkout main"),
             entry("feature", 50, "c9", "c0", "commit: before"),
         ];
         let feed = assemble_feed(vec![], reflog, &HashMap::new(), &HashSet::new(), 10);
-        let rebases: Vec<_> = feed.iter().filter(|e| e.kind == ActivityKind::Rebase).collect();
+        let rebases: Vec<_> = feed
+            .iter()
+            .filter(|e| e.kind == ActivityKind::Rebase)
+            .collect();
         assert_eq!(rebases.len(), 1, "one coalesced rebase, got {feed:#?}");
-        assert_eq!(rebases[0].old_oid.as_deref(), Some("c0"), "pre-rebase state");
+        assert_eq!(
+            rebases[0].old_oid.as_deref(),
+            Some("c0"),
+            "pre-rebase state"
+        );
         assert_eq!(rebases[0].new_oid.as_deref(), Some("c4"), "post-rebase tip");
         assert_eq!(rebases[0].summary, "rebase (4 steps)");
         // The plain commit below the burst survives untouched.
@@ -471,9 +538,16 @@ mod tests {
             entry("HEAD", 90, "x", "a", "checkout: moving from f to main"),
         ];
         let feed = assemble_feed(vec![], reflog, &HashMap::new(), &HashSet::new(), 10);
-        let commits: Vec<_> = feed.iter().filter(|e| e.kind == ActivityKind::Commit).collect();
+        let commits: Vec<_> = feed
+            .iter()
+            .filter(|e| e.kind == ActivityKind::Commit)
+            .collect();
         assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0].ref_name.as_deref(), Some("main"), "branch copy wins");
+        assert_eq!(
+            commits[0].ref_name.as_deref(),
+            Some("main"),
+            "branch copy wins"
+        );
         // The checkout (HEAD-only) survives.
         assert!(feed.iter().any(|e| e.kind == ActivityKind::Checkout));
     }
@@ -485,11 +559,19 @@ mod tests {
         // feed drops it. A real switch right next to it survives.
         let reflog = vec![
             entry("HEAD", 100, "b", "b", "checkout: moving from main to main"),
-            entry("HEAD", 90, "a", "b", "checkout: moving from feature to main"),
+            entry(
+                "HEAD",
+                90,
+                "a",
+                "b",
+                "checkout: moving from feature to main",
+            ),
         ];
         let feed = assemble_feed(vec![], reflog, &HashMap::new(), &HashSet::new(), 10);
-        let checkouts: Vec<_> =
-            feed.iter().filter(|e| e.kind == ActivityKind::Checkout).collect();
+        let checkouts: Vec<_> = feed
+            .iter()
+            .filter(|e| e.kind == ActivityKind::Checkout)
+            .collect();
         assert_eq!(checkouts.len(), 1, "self-checkout dropped: {feed:#?}");
         assert_eq!(checkouts[0].summary, "feature → main");
     }
@@ -579,7 +661,10 @@ mod tests {
         let undo = feed[0].undo.as_ref().expect("restore hint");
         assert_eq!(
             undo.action,
-            UndoAction::RestoreBranch { name: "old-work".into(), tip: "abc1234567".into() }
+            UndoAction::RestoreBranch {
+                name: "old-work".into(),
+                tip: "abc1234567".into()
+            }
         );
         assert!(undo.label.contains("Restore branch ‘old-work’"));
 
@@ -610,7 +695,10 @@ mod tests {
         );
         assert!(undo.warn_pushed, "discarded tip is on the remote");
         // The older commit is no longer the tip: no hint on it.
-        let older = feed.iter().find(|e| e.kind == ActivityKind::Commit).unwrap();
+        let older = feed
+            .iter()
+            .find(|e| e.kind == ActivityKind::Commit)
+            .unwrap();
         assert!(older.undo.is_none());
     }
 

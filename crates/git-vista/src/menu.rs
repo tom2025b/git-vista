@@ -13,8 +13,8 @@ use leptos::*;
 use git_vista_core::activity::UndoAction;
 
 use crate::api::{
-    create_branch_request, fetch_head_branch, fetch_rebase_status, fetch_status,
-    fetch_undoables, stage_request, unstage_request,
+    create_branch_request, fetch_head_branch, fetch_rebase_status, fetch_status, fetch_undoables,
+    stage_request, unstage_request,
 };
 use crate::geometry::menu_placement;
 use crate::gestures::viewport_size;
@@ -49,7 +49,12 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
     // empty branch merely points at, so the anchor's undo actions ("reset
     // ‘main’ …") belong to other branches, not the one that was tapped.
     let undoables = create_local_resource(
-        move || (menu.get().filter(|m| !m.is_branch).map(|m| m.commit), reload.get()),
+        move || {
+            (
+                menu.get().filter(|m| !m.is_branch).map(|m| m.commit),
+                reload.get(),
+            )
+        },
         |(commit, _)| async move {
             match commit {
                 Some(c) => fetch_undoables(&c).await.unwrap_or_default(),
@@ -65,7 +70,11 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
     let rebase_status = create_local_resource(
         move || (menu.get().filter(|m| !m.is_branch).is_some(), reload.get()),
         |(open, _)| async move {
-            if open { fetch_rebase_status().await.ok() } else { None }
+            if open {
+                fetch_rebase_status().await.ok()
+            } else {
+                None
+            }
         },
     );
     // How many files are currently staged — fetched live when the menu opens
@@ -74,7 +83,12 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
     // while something is actually staged, so the menu reflects the repo *now*,
     // not the possibly-stale graph. Fetch failure => 0 => the item is absent.
     let staged_count = create_local_resource(
-        move || (menu.get().map_or(false, |m| m.is_head && !m.is_branch), reload.get()),
+        move || {
+            (
+                menu.get().is_some_and(|m| m.is_head && !m.is_branch),
+                reload.get(),
+            )
+        },
         |(open, _)| async move {
             if open {
                 fetch_status().await.map(|s| s.staged.len()).unwrap_or(0)
@@ -183,7 +197,8 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
                         Err(e) => {
                             if let Some(w) = web_sys::window() {
-                                let _ = w.alert_with_message(&format!("Couldn't create branch:\n{e}"));
+                                let _ =
+                                    w.alert_with_message(&format!("Couldn't create branch:\n{e}"));
                             }
                         }
                     }
@@ -208,45 +223,44 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             let stub_branch = is_stub.then(|| m.branches.first().cloned()).flatten();
             // `icon` is the glyph beside the item — the commit glyph for both
             // commit variants ("Stage Changes" below uses the diff-added glyph).
-            let make_commit_item = move |icon: &'static str,
-                                         label: &'static str,
-                                         allow_empty: bool| {
-                let stub_branch = stub_branch.clone();
-                let enabled = is_head || (allow_empty && stub_branch.is_some());
-                if !enabled {
-                    let reason = if is_stub {
-                        "Staged changes can only be committed on the checked-out branch"
-                    } else {
-                        "Only available on the current HEAD commit"
+            let make_commit_item =
+                move |icon: &'static str, label: &'static str, allow_empty: bool| {
+                    let stub_branch = stub_branch.clone();
+                    let enabled = is_head || (allow_empty && stub_branch.is_some());
+                    if !enabled {
+                        let reason = if is_stub {
+                            "Staged changes can only be committed on the checked-out branch"
+                        } else {
+                            "Only available on the current HEAD commit"
+                        };
+                        return view! {
+                            <span class="ctx-item disabled" title=reason>
+                                <span class="nf ctx-icon">{icon}</span>
+                                {label}
+                            </span>
+                        }
+                        .into_view();
+                    }
+                    let on_commit = move |_| {
+                        // Open the dialog *before* closing the menu: `menu.set(None)`
+                        // synchronously disposes this handler's own reactive owner, so
+                        // any signal write after it is unreliable. Set the dialog first.
+                        commit_msg.set(String::new());
+                        dialog_opened_at.set_value(js_sys::Date::now());
+                        commit_dialog.set(Some(CommitDialog {
+                            allow_empty,
+                            branch: stub_branch.clone(),
+                        }));
+                        menu.set(None);
                     };
-                    return view! {
-                        <span class="ctx-item disabled" title=reason>
+                    view! {
+                        <button class="ctx-item" on:click=on_commit>
                             <span class="nf ctx-icon">{icon}</span>
                             {label}
-                        </span>
+                        </button>
                     }
-                    .into_view();
-                }
-                let on_commit = move |_| {
-                    // Open the dialog *before* closing the menu: `menu.set(None)`
-                    // synchronously disposes this handler's own reactive owner, so
-                    // any signal write after it is unreliable. Set the dialog first.
-                    commit_msg.set(String::new());
-                    dialog_opened_at.set_value(js_sys::Date::now());
-                    commit_dialog.set(Some(CommitDialog {
-                        allow_empty,
-                        branch: stub_branch.clone(),
-                    }));
-                    menu.set(None);
+                    .into_view()
                 };
-                view! {
-                    <button class="ctx-item" on:click=on_commit>
-                        <span class="nf ctx-icon">{icon}</span>
-                        {label}
-                    </button>
-                }
-                .into_view()
-            };
             let commit_changes = make_commit_item(ic.commit, "Commit Changes", false);
             let commit_empty = make_commit_item(ic.commit, "Create empty commit", true);
             // "Stage Changes" (git add -A): move the working-tree changes into the
@@ -297,31 +311,30 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             // every edit. Appears only while something is actually staged
             // (live `/api/status`, tracked read so the item pops in when the
             // fetch lands) and only on the HEAD commit, like staging.
-            let unstage_changes = (is_head && staged_count.get().unwrap_or(0) > 0)
-                .then(|| {
-                    let on_unstage = move |_| {
-                        menu.set(None);
-                        spawn_local(async move {
-                            match unstage_request().await {
-                                Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
-                                Err(e) => {
-                                    if let Some(w) = web_sys::window() {
-                                        let _ = w.alert_with_message(&format!(
-                                            "Couldn't unstage changes:\n{e}"
-                                        ));
-                                    }
+            let unstage_changes = (is_head && staged_count.get().unwrap_or(0) > 0).then(|| {
+                let on_unstage = move |_| {
+                    menu.set(None);
+                    spawn_local(async move {
+                        match unstage_request().await {
+                            Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+                            Err(e) => {
+                                if let Some(w) = web_sys::window() {
+                                    let _ = w.alert_with_message(&format!(
+                                        "Couldn't unstage changes:\n{e}"
+                                    ));
                                 }
                             }
-                        });
-                    };
-                    view! {
-                        <button class="ctx-item" on:click=on_unstage>
-                            // The undo glyph — staging, taken back.
-                            <span class="nf ctx-icon">{ic.undo}</span>
-                            "Unstage Changes"
-                        </button>
-                    }
-                });
+                        }
+                    });
+                };
+                view! {
+                    <button class="ctx-item" on:click=on_unstage>
+                        // The undo glyph — staging, taken back.
+                        <span class="nf ctx-icon">{ic.undo}</span>
+                        "Unstage Changes"
+                    </button>
+                }
+            });
             // The branch operations (Issue #33 follow-up): merge / push / delete, one
             // set per local branch living at this target. Each opens the confirm modal
             // rather than acting immediately — the actual POST + refresh happens there.
@@ -388,7 +401,9 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         let branch = b.clone();
                         let on = move |_| {
                             dialog_opened_at.set_value(js_sys::Date::now());
-                            confirm_op.set(Some(PendingOp::Push { branch: branch.clone() }));
+                            confirm_op.set(Some(PendingOp::Push {
+                                branch: branch.clone(),
+                            }));
                             menu.set(None);
                         };
                         view! {
@@ -481,7 +496,10 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         Some(format!("No ‘{}’ branch to rebase onto", s.base))
                     } else if s.up_to_date {
                         let b = s.branch.as_deref().unwrap_or("HEAD");
-                        Some(format!("‘{b}’ is already based on {} — nothing to rebase", s.base))
+                        Some(format!(
+                            "‘{b}’ is already based on {} — nothing to rebase",
+                            s.base
+                        ))
                     } else {
                         None
                     }

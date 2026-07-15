@@ -7,7 +7,7 @@
 //!
 //! - [`model`]    — serializable data types shared across the HTTP/JSON boundary.
 //! - [`color`]    — the single source of truth for branch colours (palette,
-//!                  slots, hex values), shared by the layout engine and the UI.
+//!   slots, hex values), shared by the layout engine and the UI.
 //! - [`layout`]   — assigns commits to lanes for the vertical graph.
 //! - [`status`]   — working-tree status types + the porcelain-v2 parser.
 //! - [`diff`]     — commit-diff types + the name-status/numstat parsers.

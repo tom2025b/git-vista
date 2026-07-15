@@ -33,24 +33,132 @@ struct FakeCommit {
 ///   (main)      (side)      (side)
 /// ```
 const HISTORY: &[FakeCommit] = &[
-    FakeCommit { id: "c18", lane: 0, parents: &["c17"],        summary: "Polish vertical graph styling",   author: "Ada Lovelace" },
-    FakeCommit { id: "c17", lane: 0, parents: &["c15", "c16"], summary: "Merge branch 'release' into main", author: "Grace Hopper" },
-    FakeCommit { id: "c16", lane: 1, parents: &["c13"],        summary: "Write 1.0 release notes",          author: "Alan Turing" },
-    FakeCommit { id: "c15", lane: 0, parents: &["c14", "c11"], summary: "Merge branch 'topic' into main",   author: "Ada Lovelace" },
-    FakeCommit { id: "c14", lane: 0, parents: &["c12"],        summary: "Speed up the initial paint",       author: "Grace Hopper" },
-    FakeCommit { id: "c13", lane: 1, parents: &["c12"],        summary: "Bump version to 1.0.0-rc",         author: "Alan Turing" },
-    FakeCommit { id: "c12", lane: 0, parents: &["c09"],        summary: "Tidy up the module layout",        author: "Ada Lovelace" },
-    FakeCommit { id: "c11", lane: 2, parents: &["c10"],        summary: "Add edge curve rendering",         author: "Grace Hopper" },
-    FakeCommit { id: "c10", lane: 2, parents: &["c09"],        summary: "Sketch the topic experiment",      author: "Alan Turing" },
-    FakeCommit { id: "c09", lane: 0, parents: &["c08"],        summary: "Wire fake data into the view",     author: "Ada Lovelace" },
-    FakeCommit { id: "c08", lane: 0, parents: &["c07", "c05"], summary: "Merge branch 'feature' into main", author: "Grace Hopper" },
-    FakeCommit { id: "c07", lane: 0, parents: &["c06"],        summary: "Document the SVG layout",          author: "Alan Turing" },
-    FakeCommit { id: "c06", lane: 0, parents: &["c03"],        summary: "Set up the SVG canvas",            author: "Ada Lovelace" },
-    FakeCommit { id: "c05", lane: 1, parents: &["c04"],        summary: "Tune node spacing",                author: "Grace Hopper" },
-    FakeCommit { id: "c04", lane: 1, parents: &["c03"],        summary: "Draft the commit node component",  author: "Alan Turing" },
-    FakeCommit { id: "c03", lane: 0, parents: &["c02"],        summary: "Add the core graph model",         author: "Ada Lovelace" },
-    FakeCommit { id: "c02", lane: 0, parents: &["c01"],        summary: "Scaffold the Leptos app",          author: "Grace Hopper" },
-    FakeCommit { id: "c01", lane: 0, parents: &[],             summary: "Initial commit",                   author: "Alan Turing" },
+    FakeCommit {
+        id: "c18",
+        lane: 0,
+        parents: &["c17"],
+        summary: "Polish vertical graph styling",
+        author: "Ada Lovelace",
+    },
+    FakeCommit {
+        id: "c17",
+        lane: 0,
+        parents: &["c15", "c16"],
+        summary: "Merge branch 'release' into main",
+        author: "Grace Hopper",
+    },
+    FakeCommit {
+        id: "c16",
+        lane: 1,
+        parents: &["c13"],
+        summary: "Write 1.0 release notes",
+        author: "Alan Turing",
+    },
+    FakeCommit {
+        id: "c15",
+        lane: 0,
+        parents: &["c14", "c11"],
+        summary: "Merge branch 'topic' into main",
+        author: "Ada Lovelace",
+    },
+    FakeCommit {
+        id: "c14",
+        lane: 0,
+        parents: &["c12"],
+        summary: "Speed up the initial paint",
+        author: "Grace Hopper",
+    },
+    FakeCommit {
+        id: "c13",
+        lane: 1,
+        parents: &["c12"],
+        summary: "Bump version to 1.0.0-rc",
+        author: "Alan Turing",
+    },
+    FakeCommit {
+        id: "c12",
+        lane: 0,
+        parents: &["c09"],
+        summary: "Tidy up the module layout",
+        author: "Ada Lovelace",
+    },
+    FakeCommit {
+        id: "c11",
+        lane: 2,
+        parents: &["c10"],
+        summary: "Add edge curve rendering",
+        author: "Grace Hopper",
+    },
+    FakeCommit {
+        id: "c10",
+        lane: 2,
+        parents: &["c09"],
+        summary: "Sketch the topic experiment",
+        author: "Alan Turing",
+    },
+    FakeCommit {
+        id: "c09",
+        lane: 0,
+        parents: &["c08"],
+        summary: "Wire fake data into the view",
+        author: "Ada Lovelace",
+    },
+    FakeCommit {
+        id: "c08",
+        lane: 0,
+        parents: &["c07", "c05"],
+        summary: "Merge branch 'feature' into main",
+        author: "Grace Hopper",
+    },
+    FakeCommit {
+        id: "c07",
+        lane: 0,
+        parents: &["c06"],
+        summary: "Document the SVG layout",
+        author: "Alan Turing",
+    },
+    FakeCommit {
+        id: "c06",
+        lane: 0,
+        parents: &["c03"],
+        summary: "Set up the SVG canvas",
+        author: "Ada Lovelace",
+    },
+    FakeCommit {
+        id: "c05",
+        lane: 1,
+        parents: &["c04"],
+        summary: "Tune node spacing",
+        author: "Grace Hopper",
+    },
+    FakeCommit {
+        id: "c04",
+        lane: 1,
+        parents: &["c03"],
+        summary: "Draft the commit node component",
+        author: "Alan Turing",
+    },
+    FakeCommit {
+        id: "c03",
+        lane: 0,
+        parents: &["c02"],
+        summary: "Add the core graph model",
+        author: "Ada Lovelace",
+    },
+    FakeCommit {
+        id: "c02",
+        lane: 0,
+        parents: &["c01"],
+        summary: "Scaffold the Leptos app",
+        author: "Grace Hopper",
+    },
+    FakeCommit {
+        id: "c01",
+        lane: 0,
+        parents: &[],
+        summary: "Initial commit",
+        author: "Alan Turing",
+    },
 ];
 
 /// Build the static demo [`Graph`] from [`HISTORY`].
@@ -142,7 +250,10 @@ mod tests {
         let g = fake_graph();
         let n = g.rows.len();
         for e in &g.edges {
-            assert!(e.from_row < n && e.to_row < n, "edge endpoints are in range");
+            assert!(
+                e.from_row < n && e.to_row < n,
+                "edge endpoints are in range"
+            );
             // Parents are older, so they sit further down the graph.
             assert!(e.to_row > e.from_row, "child sits above its parent");
             assert!(e.from_lane < g.lane_count && e.to_lane < g.lane_count);

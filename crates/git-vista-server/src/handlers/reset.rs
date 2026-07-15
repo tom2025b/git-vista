@@ -67,11 +67,18 @@ pub(crate) async fn reset_test_repo() -> (StatusCode, String) {
     if let Some(dir) = journal::state_dir(&repo) {
         let bundle = dir.join("seed.bundle");
         if bundle.exists() {
-            let _ = git_ok(&repo, &["bundle", "unbundle", &bundle.display().to_string()]).await;
+            let _ = git_ok(
+                &repo,
+                &["bundle", "unbundle", &bundle.display().to_string()],
+            )
+            .await;
         }
     }
     for r in &seed.refs {
-        if rev_parse(&repo, &format!("{}^{{commit}}", r.oid)).await.is_none() {
+        if rev_parse(&repo, &format!("{}^{{commit}}", r.oid))
+            .await
+            .is_none()
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!(
@@ -88,13 +95,20 @@ pub(crate) async fn reset_test_repo() -> (StatusCode, String) {
     let current_refs = match tokio::process::Command::new("git")
         .arg("-C")
         .arg(&repo)
-        .args(["for-each-ref", "refs/heads", "--format=%(objectname) %(refname:short)"])
+        .args([
+            "for-each-ref",
+            "refs/heads",
+            "--format=%(objectname) %(refname:short)",
+        ])
         .output()
         .await
     {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
-            .filter_map(|l| l.split_once(' ').map(|(oid, name)| (name.to_string(), oid.to_string())))
+            .filter_map(|l| {
+                l.split_once(' ')
+                    .map(|(oid, name)| (name.to_string(), oid.to_string()))
+            })
             .collect::<Vec<_>>(),
         _ => {
             return (
@@ -110,7 +124,12 @@ pub(crate) async fn reset_test_repo() -> (StatusCode, String) {
     // + hard reset + clean (so HEAD is off any branch about to be deleted and
     // the worktree matches the seed exactly), then the deletions.
     for r in &plan.update {
-        if let Err(e) = git_ok(&repo, &["update-ref", &format!("refs/heads/{}", r.name), &r.oid]).await {
+        if let Err(e) = git_ok(
+            &repo,
+            &["update-ref", &format!("refs/heads/{}", r.name), &r.oid],
+        )
+        .await
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Reset stopped while restoring ‘{}’: {e}", r.name),

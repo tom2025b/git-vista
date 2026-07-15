@@ -10,7 +10,6 @@ use leptos::*;
 
 use git_vista_core::model::RefKind;
 
-use git_vista_core::color::{branch_color, BADGE_DARK, HEAD_BADGE, TAG_BADGE};
 use crate::datetime::local_timestamp;
 use crate::geometry::{
     badge_text_dx, badge_text_y, badge_top_y, badge_width, label_bottom_y, label_top_y, BADGE_GAP,
@@ -18,6 +17,7 @@ use crate::geometry::{
 };
 use crate::icons::icon_set;
 use crate::text::truncate;
+use git_vista_core::color::{branch_color, BADGE_DARK, HEAD_BADGE, TAG_BADGE};
 
 use super::{suppress, RenderCtx};
 
@@ -220,7 +220,12 @@ pub fn build_meta(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>, i: us
         // Same open-circle rule as build_msg: a stub's anchor row takes the stub's
         // branch colour instead of the line it sits on (the meta line's own opacity
         // already gives it the faded, secondary look).
-        let stub_slot = c.graph.stubs.iter().find(|s| s.anchor_row == gr.row).map(|s| s.color);
+        let stub_slot = c
+            .graph
+            .stubs
+            .iter()
+            .find(|s| s.anchor_row == gr.row)
+            .map(|s| s.color);
         let meta = format!(
             " {} · {} · {}",
             gr.commit.id.short(),

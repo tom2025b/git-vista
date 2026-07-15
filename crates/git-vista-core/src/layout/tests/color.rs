@@ -75,8 +75,15 @@ fn a_stub_anchor_is_its_branchs_own_tip_commit() {
     let g = layout_with_refs(commits, refs, Some("main"));
 
     // `feature` is the real line; `fork` (created at its tip) is the stub.
-    let stub = g.stubs.iter().find(|s| s.name == "fork").expect("fork is a stub");
-    assert!(g.stubs.iter().all(|s| s.name != "feature"), "feature is a real line");
+    let stub = g
+        .stubs
+        .iter()
+        .find(|s| s.name == "fork")
+        .expect("fork is a stub");
+    assert!(
+        g.stubs.iter().all(|s| s.name != "feature"),
+        "feature is a real line"
+    );
     // The stub's tip is exactly F2 — feature's own tip, the commit `fork`
     // points at — so branching from the stub forks off F2, not some parent.
     assert_eq!(
@@ -84,7 +91,11 @@ fn a_stub_anchor_is_its_branchs_own_tip_commit() {
         "the stub's tip must be its branch's own commit"
     );
     // And its colour slot is distinct from the branch it forked off.
-    assert_ne!(stub.color, color_of(&g, "F2"), "a new branch differs from its parent");
+    assert_ne!(
+        stub.color,
+        color_of(&g, "F2"),
+        "a new branch differs from its parent"
+    );
 }
 
 /// Issue #30: several branches created at the *same* commit cascade — each is
@@ -120,7 +131,11 @@ fn stubs_sharing_a_commit_cascade_off_one_another() {
     // lane further right — that's how the connector finds the previous tip).
     assert_eq!(aaa.depth, 0, "first stub forks off the commit");
     assert_eq!(bbb.depth, 1, "second stub forks off the first stub's tip");
-    assert_eq!(bbb.lane, aaa.lane + 1, "the deeper stub sits one lane right");
+    assert_eq!(
+        bbb.lane,
+        aaa.lane + 1,
+        "the deeper stub sits one lane right"
+    );
     // Distinct colours, and neither is the trunk slot.
     assert_ne!(aaa.color, bbb.color);
     assert_ne!(aaa.color, 0);
@@ -139,12 +154,12 @@ fn a_branch_at_an_interior_commit_is_a_stub_not_a_stolen_line() {
     // main: D -> C -> B -> A ; feature: F2 -> F1 -> B ; aaa points at F1.
     // Rows are newest-first (row 0 at top).
     let commits = vec![
-        commit("D", &["C"]),  // 0  main tip
+        commit("D", &["C"]),   // 0  main tip
         commit("F2", &["F1"]), // 1  feature tip
-        commit("C", &["B"]),  // 2
-        commit("F1", &["B"]), // 3  aaa points here (interior of feature)
-        commit("B", &["A"]),  // 4  fork point
-        commit("A", &[]),     // 5
+        commit("C", &["B"]),   // 2
+        commit("F1", &["B"]),  // 3  aaa points here (interior of feature)
+        commit("B", &["A"]),   // 4  fork point
+        commit("A", &[]),      // 5
     ];
     let refs = vec![
         gitref("HEAD", RefKind::Head, "D"),
@@ -161,8 +176,16 @@ fn a_branch_at_an_interior_commit_is_a_stub_not_a_stolen_line() {
         color_of(&g, "F1"),
         "feature must not be split in two by aaa stealing F1"
     );
-    assert_ne!(color_of(&g, "F1"), color_of(&g, "D"), "feature isn't the trunk");
-    assert_eq!(color_of(&g, "D"), 0, "main (checked out) owns the trunk colour");
+    assert_ne!(
+        color_of(&g, "F1"),
+        color_of(&g, "D"),
+        "feature isn't the trunk"
+    );
+    assert_eq!(
+        color_of(&g, "D"),
+        0,
+        "main (checked out) owns the trunk colour"
+    );
 
     // `aaa` owns nothing → it's a stub anchored at F1, not a badge, not a line.
     assert_eq!(g.stubs.len(), 1);
@@ -185,11 +208,7 @@ fn a_commit_on_a_side_branch_forks_out_instead_of_absorbing_the_trunk() {
     //   X   igdj's first commit (newest; must fork right)
     //   T   main tip, checked out
     //   B
-    let commits = vec![
-        commit("X", &["T"]),
-        commit("T", &["B"]),
-        commit("B", &[]),
-    ];
+    let commits = vec![commit("X", &["T"]), commit("T", &["B"]), commit("B", &[])];
     let refs = vec![
         gitref("HEAD", RefKind::Head, "T"),
         gitref("main", RefKind::Branch, "T"),
@@ -201,13 +220,24 @@ fn a_commit_on_a_side_branch_forks_out_instead_of_absorbing_the_trunk() {
     // The trunk keeps lane 0 top to bottom; the side commit forks right.
     assert_eq!(lane_of(&g, "T"), 0, "main's tip stays in the trunk lane");
     assert_eq!(lane_of(&g, "B"), 0);
-    assert_eq!(lane_of(&g, "X"), 1, "the side-branch commit must not take the trunk lane");
+    assert_eq!(
+        lane_of(&g, "X"),
+        1,
+        "the side-branch commit must not take the trunk lane"
+    );
     // …and keeps its own colour: the trunk recolour pass is lane-gated, so
     // it can no longer absorb it.
     assert_eq!(color_of(&g, "T"), 0);
-    assert_ne!(color_of(&g, "X"), 0, "the side branch keeps a distinct colour");
+    assert_ne!(
+        color_of(&g, "X"),
+        0,
+        "the side branch keeps a distinct colour"
+    );
     // igdj is a real line now (badged on its commit), not a stub.
-    assert!(g.stubs.is_empty(), "a branch with a commit of its own is no stub");
+    assert!(
+        g.stubs.is_empty(),
+        "a branch with a commit of its own is no stub"
+    );
     assert!(ref_names(&g, "X").contains(&"igdj".to_string()));
 }
 
@@ -244,7 +274,11 @@ fn a_stub_keeps_its_colour_when_its_first_commit_arrives() {
         ],
         Some("main"),
     );
-    let stub = before.stubs.iter().find(|s| s.name == "topic").expect("topic is a stub");
+    let stub = before
+        .stubs
+        .iter()
+        .find(|s| s.name == "topic")
+        .expect("topic is a stub");
     let stub_color = stub.color;
 
     // After: `topic` takes its first (empty) commit X.
@@ -291,9 +325,20 @@ fn main_owns_the_trunk_colour_even_when_not_checked_out() {
         // Checked out on `feature`, not `main`.
         Some("feature"),
     );
-    assert_eq!(color_of(&g, "M"), 0, "main is the trunk (slot 0) regardless of HEAD");
-    assert_ne!(color_of(&g, "D"), 0, "the checked-out feature is not the trunk");
-    assert!(g.stubs.is_empty(), "both branches own commits — neither is a stub");
+    assert_eq!(
+        color_of(&g, "M"),
+        0,
+        "main is the trunk (slot 0) regardless of HEAD"
+    );
+    assert_ne!(
+        color_of(&g, "D"),
+        0,
+        "the checked-out feature is not the trunk"
+    );
+    assert!(
+        g.stubs.is_empty(),
+        "both branches own commits — neither is a stub"
+    );
 }
 
 /// A branch ahead of `main` (its first-parent chain runs through main's tip)
@@ -365,7 +410,11 @@ fn a_branch_ahead_of_main_forks_off_the_trunk_tip_instead_of_extending_it() {
             .map(|r| (r.commit.id.0.clone(), r.lane, r.color))
             .collect::<Vec<_>>()
     };
-    assert_eq!(shape(&g), shape(&g2), "checkout state must not change lanes or colours");
+    assert_eq!(
+        shape(&g),
+        shape(&g2),
+        "checkout state must not change lanes or colours"
+    );
 }
 
 #[test]
