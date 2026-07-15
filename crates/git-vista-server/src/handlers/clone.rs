@@ -9,7 +9,9 @@ use axum::Json;
 
 use git_vista_protocol::{validate_clone_url, CloneRequest};
 
-use crate::state::{cleanup_clone, clones_root, current, set_current};
+use crate::state::{
+    allow_repo_root, cleanup_clone, clones_root, current, path_is_allowed, set_current,
+};
 
 /// Clone a public repository from a pasted URL into a throwaway temp directory and
 /// switch the server to viewing it, read-only (Phase 12).
@@ -37,6 +39,10 @@ pub(crate) async fn clone_repo(Json(req): Json<CloneRequest>) -> (StatusCode, St
             format!("Couldn't prepare temp dir: {e}"),
         );
     }
+    // The clones root is an allowed root (M1.03): every clone registers under it,
+    // and nothing outside it can be served. Adding it here (rather than only at
+    // startup) also covers the case where a previous run's root was cleared.
+    allow_repo_root(&root);
     // Unique per-clone dir: monotonic counter + a timestamp, so concurrent or
     // rapid clones never collide.
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -80,10 +86,26 @@ pub(crate) async fn clone_repo(Json(req): Json<CloneRequest>) -> (StatusCode, St
         return (StatusCode::BAD_REQUEST, msg);
     }
 
+    // Defence in depth (M1.03): the destination is built under the clones root by
+    // construction, but confirm its canonical path really is within an allowed
+    // root before serving it — a clone must never escape the clones directory.
+    let canonical = std::fs::canonicalize(&dest).unwrap_or_else(|_| dest.clone());
+    if !path_is_allowed(&canonical) {
+        cleanup_clone(&dest);
+        eprintln!(
+            "git-vista: /api/clone destination escaped the clones root: {}",
+            dest.display()
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Clone destination was rejected.".to_string(),
+        );
+    }
+
     // Switch to the fresh clone (read-only), then delete the previous one, if it
     // was itself a clone — so disk holds at most one clone at a time.
     let (old_path, old_read_only) = current();
-    set_current(dest.clone(), true);
+    set_current(&dest, true);
     if old_read_only {
         cleanup_clone(&old_path);
     }
