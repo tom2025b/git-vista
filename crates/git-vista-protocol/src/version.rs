@@ -47,6 +47,13 @@ pub const PROTOCOL_HEADER: &str = "x-git-vista-protocol";
 /// quote it when reporting a failure.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
+/// Request header the client echoes its session's CSRF token in on every
+/// state-changing `/api/*` call (M1.04). Named here — in the shared transport
+/// contract — so the server's check and the frontend's send can never drift.
+/// A custom header a cross-origin HTML form cannot set, so its mere presence
+/// (validated server-side against the session) is a CSRF control.
+pub const CSRF_HEADER: &str = "x-git-vista-csrf";
+
 /// Parse the value of the [`PROTOCOL_HEADER`] a client sent. Returns `None` when
 /// it is absent-shaped (empty) or not a base-10 `u32`; the server maps `None` to
 /// a structured `invalid`/`missing` protocol error. Centralised (and tested)
