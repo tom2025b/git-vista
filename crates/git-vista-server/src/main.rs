@@ -40,7 +40,14 @@ mod journal;
 // The versioned-API-contract layer (M1.02, #102): protocol negotiation, the
 // request id, the structured error envelope, and the contract response headers.
 mod middleware;
+// The loopback session + request-protection layer (M1.04, #57): Origin/Host/CSRF/
+// content-type/method enforcement, the browser hardening headers, and the
+// bootstrap-token → session-cookie exchange.
+mod security;
+mod session;
 mod state;
+
+use std::sync::Arc;
 
 use axum::response::IntoResponse;
 use axum::{
@@ -64,7 +71,13 @@ use handlers::read::{
 };
 use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
-use state::{bind_addr, clones_root, current, set_current, DEFAULT_REPO, DIST_DIR, PORT};
+use handlers::session::{create_session, revoke_session, session_status};
+use security::{AuthState, HostPolicy};
+use session::SessionManager;
+use state::{
+    bind_addr, bootstrap_token_path, clones_root, current, set_current, DEFAULT_REPO, DIST_DIR,
+    PORT,
+};
 
 #[tokio::main]
 async fn main() {
@@ -130,6 +143,26 @@ async fn main() {
     )
     .layer(ServeDir::new(DIST_DIR).append_index_html_on_directories(true));
 
+    // Resolve the bind address first: the M1.04 Host/Origin policy is derived from
+    // it (loopback → loopback-only, defeating DNS rebinding), and the socket is
+    // bound to it below.
+    let addr = match bind_addr() {
+        Ok(addr) => addr,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    // M1.04: mint the one-time bootstrap token (written 0600 for `gv` to read) and
+    // build the shared session store. The auth layer and the session handlers both
+    // hold this `Arc`; the Host/Origin policy comes from the bind above.
+    let sessions = Arc::new(SessionManager::new(Some(bootstrap_token_path())));
+    let auth_state = AuthState {
+        manager: sessions.clone(),
+        hosts: HostPolicy::from_bind(addr),
+    };
+
     // Every `/api/*` route lives on this sub-router so the M1.02 contract layer
     // (protocol negotiation, request id, structured errors, response headers)
     // wraps them all — and only them, never the static SPA below.
@@ -138,6 +171,15 @@ async fn main() {
         // before it can be required to speak it (so it's exempt from the header
         // check inside the contract layer).
         .route("/api/protocol", get(protocol_info))
+        // M1.04: establish (POST, bootstrap→cookie), check (GET), or revoke
+        // (DELETE) a session. GET/POST are exempt from the session gate — they are
+        // how a session comes to exist — but never from the Host/Origin checks.
+        .route(
+            "/api/session",
+            get(session_status)
+                .post(create_session)
+                .delete(revoke_session),
+        )
         .route("/api/commits", get(commits))
         // Phase 10: full detail for one commit, read on demand for the side panel.
         .route("/api/commit/{id}", get(commit_detail))
@@ -190,13 +232,23 @@ async fn main() {
         // iPad-testing follow-up: restore a seeded *test repo* to its recorded
         // state (gated on the seed files `gv --seed` writes).
         .route("/api/reset-test-repo", post(reset_test_repo))
-        // Inner: a panicking handler becomes a 500 with the panic text (not a
-        // reset connection) *before* the contract layer sees it, so that 500 is
+        // Innermost: a panicking handler becomes a 500 with the panic text (not a
+        // reset connection) *before* the layers above see it, so that 500 is
         // rewrapped into the structured error envelope like any other failure.
         .layer(CatchPanicLayer::custom(panic_to_response))
-        // Outer: the M1.02 versioned-API contract — protocol negotiation, request
-        // id, the consistent error envelope, and the response headers.
-        .layer(axum::middleware::from_fn(middleware::api_contract));
+        // Middle: the M1.04 auth gate — Origin/Host/CSRF/content-type/method and a
+        // valid session. Inside the contract layer, so its refusals become the same
+        // structured envelope; outside the panic catch, so a panic is still caught.
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            security::require_auth,
+        ))
+        // Outermost: the M1.02 versioned-API contract — protocol negotiation,
+        // request id, the consistent error envelope, and the response headers.
+        .layer(axum::middleware::from_fn(middleware::api_contract))
+        // The session store the session handlers (and the auth layer) resolve
+        // against. Erases the router's state type back to `()`.
+        .with_state(sessions);
 
     let app = Router::new()
         .merge(api)
@@ -206,15 +258,12 @@ async fn main() {
         // own inner catch above (so API panics are already enveloped); this keeps
         // any panic outside it from tearing down the connection — which iPad
         // Safari would report as the unexplained "Load failed".
-        .layer(CatchPanicLayer::custom(panic_to_response));
-
-    let addr = match bind_addr() {
-        Ok(addr) => addr,
-        Err(error) => {
-            eprintln!("error: {error}");
-            std::process::exit(2);
-        }
-    };
+        .layer(CatchPanicLayer::custom(panic_to_response))
+        // M1.04: the browser hardening headers (CSP, COOP/CORP, nosniff, …) on
+        // *every* response — the SPA shell as well as the API — so framing,
+        // cross-origin embedding, and off-origin script/connect are denied
+        // everywhere the app is served.
+        .layer(axum::middleware::from_fn(security::security_headers));
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -230,7 +279,7 @@ async fn main() {
         }
     };
 
-    print_startup_banner(addr);
+    print_startup_banner(addr, &bootstrap_token_path());
 
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("error: server stopped: {e}");
@@ -258,7 +307,7 @@ fn panic_to_response(panic: Box<dyn std::any::Any + Send>) -> axum::response::Re
 
 /// Print the local/SSH path by default and isolate the legacy LAN guidance to an
 /// explicit non-loopback bind.
-fn print_startup_banner(addr: std::net::SocketAddr) {
+fn print_startup_banner(addr: std::net::SocketAddr, token_path: &Path) {
     println!("git-vista server — serving {}", current().0.display());
     println!("  • on this machine: http://localhost:{PORT}/");
     if addr.ip().is_loopback() {
@@ -270,10 +319,18 @@ fn print_startup_banner(addr: std::net::SocketAddr) {
             .unwrap_or_else(|| "<this-machine-LAN-IP>".to_string());
         println!("  • from the iPad: http://{display_ip}:{PORT}/");
         println!();
-        println!("WARNING: LAN mode has no authentication or HTTPS.");
-        println!("Anyone or any webpage that can reach this port may invoke Git operations.");
-        println!("Use only on a trusted personal LAN; prefer the default SSH-tunnel mode.");
+        println!("WARNING: LAN mode has no HTTPS, and its DNS-rebinding protection is");
+        println!("weaker than loopback (the Host allowlist can't be pinned on 0.0.0.0).");
+        println!("A session is still required, but prefer the default SSH-tunnel mode.");
     }
+    // M1.04: the app needs a one-time session first. The bootstrap token is *not*
+    // printed here (it must never land in a log) — `gv` reads the 0600 file and
+    // builds the setup URL, or the operator can read it by hand.
+    println!("  • sign in: open the setup link `gv` printed (or `gv --token`).");
+    println!(
+        "    the one-time token lives, 0600, at {}",
+        token_path.display()
+    );
     println!();
 }
 

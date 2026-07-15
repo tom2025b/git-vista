@@ -43,6 +43,9 @@ web-sys = { version = "0.3", features = [
     # M1.02 "Update Required" screen: window.location().reload() when the client's
     # protocol is incompatible with the server's.
     "Location",
+    # M1.04 session bootstrap: window.history().replace_state_with_url(…) to strip
+    # the one-time `#s=<token>` from the URL the moment it's exchanged.
+    "History",
     # Phase 13: keyboard shortcuts (Esc / +/-/0 / r) via a window keydown listener.
     "KeyboardEvent",
     "MouseEvent",
