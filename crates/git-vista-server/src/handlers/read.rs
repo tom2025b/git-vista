@@ -167,15 +167,18 @@ pub(crate) async fn commit_diff(
 
     let name_status = git_stdout(&repo, &with(&["--name-status", "-z"]), "/api/diff").await?;
     let numstat = git_stdout(&repo, &with(&["--numstat", "-z"]), "/api/diff").await?;
-    let patch_bytes =
-        git_stdout(&repo, &with(&["--patch", "--no-color"]), "/api/diff").await?;
+    let patch_bytes = git_stdout(&repo, &with(&["--patch", "--no-color"]), "/api/diff").await?;
 
     let mut files = git_vista_core::diff::parse_name_status_z(&name_status);
     git_vista_core::diff::fold_numstat_z(&numstat, &mut files);
 
     // Cap the patch at a line boundary so the panel never gets half a line.
     // The full-screen viewer (`?full=1`) gets the much higher ceiling.
-    let cap = if query.full == Some(1) { DIFF_PATCH_CAP_FULL } else { DIFF_PATCH_CAP };
+    let cap = if query.full == Some(1) {
+        DIFF_PATCH_CAP_FULL
+    } else {
+        DIFF_PATCH_CAP
+    };
     let mut patch = String::from_utf8_lossy(&patch_bytes).into_owned();
     let truncated = patch.len() > cap;
     if truncated {
@@ -230,9 +233,7 @@ pub(crate) async fn file_at_commit(
     }
     let show = |spec: String| {
         let repo = repo.clone();
-        async move {
-            git_stdout(&repo, &["show".to_string(), spec], "/api/file").await
-        }
+        async move { git_stdout(&repo, &["show".to_string(), spec], "/api/file").await }
     };
     let bytes = match show(format!("{id}:{path}")).await {
         Ok(bytes) => bytes,
@@ -254,7 +255,13 @@ pub(crate) async fn file_at_commit(
         (text, truncated)
     };
 
-    let file = git_vista_core::diff::FileContent { id, path, content, truncated, binary };
+    let file = git_vista_core::diff::FileContent {
+        id,
+        path,
+        content,
+        truncated,
+        binary,
+    };
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
     Ok((no_store, Json(file)))
 }
@@ -265,7 +272,10 @@ pub(crate) async fn file_at_commit(
 /// switch. `null` => detached HEAD. Sent `no-store` so it's never served from cache.
 pub(crate) async fn head_branch() -> impl IntoResponse {
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
-    (no_store, Json(git_vista_git::read_head_branch(&current().0)))
+    (
+        no_store,
+        Json(git_vista_git::read_head_branch(&current().0)),
+    )
 }
 
 /// The working-tree status (Activity/Undo feature, step 1): the parsed output
@@ -287,11 +297,18 @@ pub(crate) async fn worktree_status() -> Result<impl IntoResponse, (StatusCode, 
         .await
         .map_err(|e| {
             eprintln!("git-vista: /api/status couldn't run git: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Couldn't run git: {e}"),
+            )
         })?;
     if !output.status.success() {
         let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let msg = if msg.is_empty() { "git status failed.".to_string() } else { msg };
+        let msg = if msg.is_empty() {
+            "git status failed.".to_string()
+        } else {
+            msg
+        };
         eprintln!("git-vista: /api/status failed: {msg}");
         return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
     }

@@ -33,7 +33,11 @@ pub struct Camera {
 impl Default for Camera {
     /// Identity: no pan, no zoom — the graph sits at its natural position.
     fn default() -> Self {
-        Self { tx: 0.0, ty: 0.0, scale: 1.0 }
+        Self {
+            tx: 0.0,
+            ty: 0.0,
+            scale: 1.0,
+        }
     }
 }
 
@@ -46,7 +50,10 @@ impl Camera {
     // Consumed only by the wasm-only `app` view (like ZOOM_STEP above).
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub fn home(headroom: f64) -> Self {
-        Self { ty: headroom, ..Self::default() }
+        Self {
+            ty: headroom,
+            ..Self::default()
+        }
     }
 
     /// The SVG group transform that realises this camera. Applied as
@@ -58,7 +65,11 @@ impl Camera {
     /// Translate the view by a screen-space delta — e.g. the per-event movement
     /// of a pointer drag. Independent of zoom, so a drag tracks the cursor 1:1.
     pub fn panned(self, dx: f64, dy: f64) -> Self {
-        Self { tx: self.tx + dx, ty: self.ty + dy, ..self }
+        Self {
+            tx: self.tx + dx,
+            ty: self.ty + dy,
+            ..self
+        }
     }
 
     /// Zoom by `factor` while pinning the content point currently under the
@@ -102,7 +113,11 @@ mod tests {
 
     #[test]
     fn transform_string_is_svg_ready() {
-        let c = Camera { tx: 2.0, ty: 3.0, scale: 2.0 };
+        let c = Camera {
+            tx: 2.0,
+            ty: 3.0,
+            scale: 2.0,
+        };
         assert_eq!(c.transform(), "translate(2 3) scale(2)");
     }
 
@@ -114,7 +129,11 @@ mod tests {
 
     #[test]
     fn zoom_keeps_the_cursor_point_anchored() {
-        let c = Camera { tx: 3.0, ty: 7.0, scale: 1.5 };
+        let c = Camera {
+            tx: 3.0,
+            ty: 7.0,
+            scale: 1.5,
+        };
         let (sx, sy) = (40.0, 25.0);
         let cx = (sx - c.tx) / c.scale; // content point under the cursor
         let cy = (sy - c.ty) / c.scale;
@@ -127,8 +146,14 @@ mod tests {
 
     #[test]
     fn zoom_clamps_to_the_limits() {
-        assert_eq!(Camera::default().zoomed_at(1000.0, 0.0, 0.0).scale, MAX_ZOOM);
-        assert_eq!(Camera::default().zoomed_at(0.0001, 0.0, 0.0).scale, MIN_ZOOM);
+        assert_eq!(
+            Camera::default().zoomed_at(1000.0, 0.0, 0.0).scale,
+            MAX_ZOOM
+        );
+        assert_eq!(
+            Camera::default().zoomed_at(0.0001, 0.0, 0.0).scale,
+            MIN_ZOOM
+        );
     }
 
     #[test]
@@ -137,20 +162,32 @@ mod tests {
         let c = Camera::default().pinched(100.0, 200.0, 0.0, 0.0);
         assert!((c.scale - 2.0).abs() < 1e-9);
         // Pinching closed (200 -> 100) halves it.
-        let c = Camera { scale: 2.0, ..Camera::default() }.pinched(200.0, 100.0, 0.0, 0.0);
+        let c = Camera {
+            scale: 2.0,
+            ..Camera::default()
+        }
+        .pinched(200.0, 100.0, 0.0, 0.0);
         assert!((c.scale - 1.0).abs() < 1e-9);
     }
 
     #[test]
     fn pinch_with_no_baseline_is_a_noop() {
         // The first move of a pinch has no previous distance yet.
-        let c = Camera { tx: 5.0, ty: 6.0, scale: 1.5 };
+        let c = Camera {
+            tx: 5.0,
+            ty: 6.0,
+            scale: 1.5,
+        };
         assert_eq!(c.pinched(0.0, 120.0, 10.0, 10.0), c);
     }
 
     #[test]
     fn pinch_keeps_the_midpoint_anchored() {
-        let c = Camera { tx: 3.0, ty: 7.0, scale: 1.0 };
+        let c = Camera {
+            tx: 3.0,
+            ty: 7.0,
+            scale: 1.0,
+        };
         let (mx, my) = (50.0, 30.0);
         let cx = (mx - c.tx) / c.scale; // content point under the midpoint
         let cy = (my - c.ty) / c.scale;

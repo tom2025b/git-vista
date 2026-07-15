@@ -17,11 +17,11 @@
 //! was split out of what was a single large `main.rs`, by concern:
 //!
 //!   * [`state`]    — the process-wide "which repo, and is it writable?" state,
-//!                    the config constants, and the read-only write guard.
+//!     the config constants, and the read-only write guard.
 //!   * [`git_cmd`]  — the thin `git -C <repo> …` command wrappers the handlers share.
 //!   * [`handlers`] — the `/api/*` route handlers, one submodule per concern.
 //!   * [`activity`] / [`journal`] — the Activity Log / Contextual Undo backend
-//!                    (`GET /api/activity` and the on-disk journal it reads).
+//!     (`GET /api/activity` and the on-disk journal it reads).
 //!
 //! The split is move-only: every handler and helper kept its behaviour, and the
 //! router below reads exactly as it did when all of this lived in one file.
@@ -60,7 +60,7 @@ use handlers::read::{
 };
 use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
-use state::{clones_root, current, set_current, ADDR, DEFAULT_REPO, DIST_DIR, PORT};
+use state::{bind_addr, clones_root, current, set_current, DEFAULT_REPO, DIST_DIR, PORT};
 
 #[tokio::main]
 async fn main() {
@@ -82,7 +82,10 @@ async fn main() {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_REPO));
     let repo = raw.canonicalize().unwrap_or(raw);
     if !repo.join(".git").exists() {
-        eprintln!("warning: {} doesn't look like a git repository (no .git).", repo.display());
+        eprintln!(
+            "warning: {} doesn't look like a git repository (no .git).",
+            repo.display()
+        );
         eprintln!("         /api/commits will error until it points at a real repo.\n");
     }
     // The CLI-arg repo is the user's own working repo, so it's writable.
@@ -96,7 +99,10 @@ async fn main() {
     let clones = clones_root();
     if clones.exists() {
         if let Err(e) = std::fs::remove_dir_all(&clones) {
-            eprintln!("git-vista: couldn't clear old clones at {}: {e}", clones.display());
+            eprintln!(
+                "git-vista: couldn't clear old clones at {}: {e}",
+                clones.display()
+            );
         }
     }
 
@@ -104,7 +110,9 @@ async fn main() {
     // and it looks like the server is broken.
     if !Path::new(DIST_DIR).exists() {
         eprintln!("warning: the web bundle isn't built yet ({DIST_DIR} is missing).");
-        eprintln!("         run `(cd crates/git-vista && trunk build)` first, or pages will 404.\n");
+        eprintln!(
+            "         run `(cd crates/git-vista && trunk build)` first, or pages will 404.\n"
+        );
     }
 
     // Serve the SPA bundle with `Cache-Control: no-cache` so the browser always
@@ -177,33 +185,45 @@ async fn main() {
         // connection: the frontend then shows a real error, and the process —
         // which axum keeps alive either way — never leaves the browser with
         // the unexplained "Load failed" a torn-down connection produces.
-        .layer(CatchPanicLayer::custom(|panic: Box<dyn std::any::Any + Send>| {
-            let msg = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("(no panic message)");
-            eprintln!("git-vista: handler panicked: {msg}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("git-vista server bug — a handler panicked: {msg}"),
-            )
-                .into_response()
-        }));
+        .layer(CatchPanicLayer::custom(
+            |panic: Box<dyn std::any::Any + Send>| {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("(no panic message)");
+                eprintln!("git-vista: handler panicked: {msg}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("git-vista server bug — a handler panicked: {msg}"),
+                )
+                    .into_response()
+            },
+        ));
 
-    let listener = match tokio::net::TcpListener::bind(ADDR).await {
+    let addr = match bind_addr() {
+        Ok(addr) => addr,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("error: could not bind {ADDR}: {e}");
+            eprintln!("error: could not bind {addr}: {e}");
             if e.kind() == ErrorKind::AddrInUse {
-                eprintln!("  Port {PORT} is already in use — another git-vista-server may be running.");
+                eprintln!(
+                    "  Port {PORT} is already in use — another git-vista-server may be running."
+                );
                 eprintln!("  Stop it (e.g. `pkill -f git-vista-server`) and try again.");
             }
             std::process::exit(1);
         }
     };
 
-    print_startup_banner();
+    print_startup_banner(addr);
 
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("error: server stopped: {e}");
@@ -211,24 +231,24 @@ async fn main() {
     }
 }
 
-/// Print where to open the app and how to fix the common "works locally but the
-/// iPad can't reach it" situation.
-fn print_startup_banner() {
+/// Print the local/SSH path by default and isolate the legacy LAN guidance to an
+/// explicit non-loopback bind.
+fn print_startup_banner(addr: std::net::SocketAddr) {
     println!("git-vista server — serving {}", current().0.display());
     println!("  • on this machine: http://localhost:{PORT}/");
-    match lan_ip() {
-        Some(ip) => println!("  • from the iPad:   http://{ip}:{PORT}/   (must be on the same Wi-Fi)"),
-        None => println!(
-            "  • from the iPad:   http://<this-machine-LAN-IP>:{PORT}/   (find it with `hostname -I`)"
-        ),
+    if addr.ip().is_loopback() {
+        println!("  • from the iPad: use an SSH local port forward to 127.0.0.1:{PORT}");
+        println!("    example: ssh -N -L {PORT}:127.0.0.1:{PORT} <linux-host>");
+    } else {
+        let display_ip = lan_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "<this-machine-LAN-IP>".to_string());
+        println!("  • from the iPad: http://{display_ip}:{PORT}/");
+        println!();
+        println!("WARNING: LAN mode has no authentication or HTTPS.");
+        println!("Anyone or any webpage that can reach this port may invoke Git operations.");
+        println!("Use only on a trusted personal LAN; prefer the default SSH-tunnel mode.");
     }
-    println!();
-    println!("Reaches localhost but NOT the iPad? It's almost always one of these:");
-    println!("  1. Firewall (most common): the OS is blocking inbound :{PORT}. Allow it, e.g.");
-    println!("       sudo ufw allow {PORT}/tcp        # or: sudo ufw status  to check");
-    println!("  2. Different network: the iPad's Wi-Fi must share this machine's subnet");
-    println!("     (the LAN IP above). Guest Wi-Fi or a separate AP won't reach it.");
-    println!("  3. Router 'AP/client isolation' blocks device-to-device traffic — disable it.");
     println!();
 }
 

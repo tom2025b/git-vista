@@ -43,8 +43,8 @@
 //! ## Determinism
 //!
 //! Input order is normalised first by [`stable_topo_order`](topology::stable_topo_order)
-//! — a date-ordered topological sort — so the layout is a pure function of the DAG
-//! + refs. The git walk upstream sorts by commit time alone, and same-second
+//! — a date-ordered topological sort — so the layout is a pure function of the DAG +
+//! refs. The git walk upstream sorts by commit time alone, and same-second
 //! commits (every burst of test commits, every rebase) land in whatever order the
 //! walker's queue happened to produce, which reshuffled lanes wholesale after
 //! unrelated operations. Colours are likewise a pure function of the branch *name*

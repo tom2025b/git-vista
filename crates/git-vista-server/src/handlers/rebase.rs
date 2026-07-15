@@ -130,6 +130,11 @@ pub(crate) async fn rebase_status() -> impl IntoResponse {
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
     (
         no_store,
-        Json(RebaseStatus { branch, base: base.to_string(), base_exists, up_to_date }),
+        Json(RebaseStatus {
+            branch,
+            base: base.to_string(),
+            base_exists,
+            up_to_date,
+        }),
     )
 }

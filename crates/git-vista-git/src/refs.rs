@@ -19,10 +19,11 @@ use crate::RepoError;
 /// commit (an unborn HEAD, a broken ref) are skipped. Notes and worktree-private
 /// refs are ignored.
 pub fn read_refs(path: &Path) -> Result<Vec<GitRef>, RepoError> {
-    let repo = gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
+    let repo =
+        gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
 
     let mut refs = Vec::new();
 
@@ -78,7 +79,9 @@ pub fn read_refs(path: &Path) -> Result<Vec<GitRef>, RepoError> {
                 kind,
                 target: Oid(id.detach().to_string()),
             }),
-            Err(e) => eprintln!("git-vista: ref {name:?} won't resolve to a commit ({e}); not badged"),
+            Err(e) => {
+                eprintln!("git-vista: ref {name:?} won't resolve to a commit ({e}); not badged")
+            }
         }
     }
 

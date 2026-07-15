@@ -78,7 +78,10 @@ pub(crate) async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (Stat
     };
 
     if output.status.success() {
-        println!("[/api/commit] created commit (allow_empty={})", req.allow_empty);
+        println!(
+            "[/api/commit] created commit (allow_empty={})",
+            req.allow_empty
+        );
         let new = rev_parse(&repo, "HEAD").await;
         // The branch the commit landed on; "HEAD" when detached.
         let branch = git_vista_git::read_head_branch(&repo).unwrap_or_else(|| "HEAD".into());
@@ -125,7 +128,10 @@ pub(crate) async fn stage_all() -> (StatusCode, String) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("git-vista: /api/stage couldn't run git: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Couldn't run git: {e}"),
+            );
         }
     };
     if output.status.success() {
@@ -133,7 +139,11 @@ pub(crate) async fn stage_all() -> (StatusCode, String) {
         (StatusCode::OK, "Staged changes.".to_string())
     } else {
         let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let msg = if msg.is_empty() { "git add failed.".to_string() } else { msg };
+        let msg = if msg.is_empty() {
+            "git add failed.".to_string()
+        } else {
+            msg
+        };
         eprintln!("git-vista: /api/stage failed: {msg}");
         (StatusCode::BAD_REQUEST, msg)
     }
@@ -159,7 +169,10 @@ pub(crate) async fn unstage_all() -> (StatusCode, String) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("git-vista: /api/unstage couldn't run git: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Couldn't run git: {e}"),
+            );
         }
     };
     if output.status.success() {
@@ -167,7 +180,11 @@ pub(crate) async fn unstage_all() -> (StatusCode, String) {
         (StatusCode::OK, "Unstaged changes.".to_string())
     } else {
         let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let msg = if msg.is_empty() { "git reset failed.".to_string() } else { msg };
+        let msg = if msg.is_empty() {
+            "git reset failed.".to_string()
+        } else {
+            msg
+        };
         eprintln!("git-vista: /api/unstage failed: {msg}");
         (StatusCode::BAD_REQUEST, msg)
     }
@@ -195,10 +212,16 @@ async fn commit_empty_on_branch(
     allow_empty: bool,
 ) -> (StatusCode, String) {
     if branch.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Branch name can't be empty.".to_string());
+        return (
+            StatusCode::BAD_REQUEST,
+            "Branch name can't be empty.".to_string(),
+        );
     }
     if branch.starts_with('-') {
-        return (StatusCode::BAD_REQUEST, "Branch name can't start with '-'.".to_string());
+        return (
+            StatusCode::BAD_REQUEST,
+            "Branch name can't start with '-'.".to_string(),
+        );
     }
     if !allow_empty {
         return (
@@ -233,12 +256,19 @@ async fn commit_empty_on_branch(
         Ok(o) => o,
         Err(e) => {
             eprintln!("git-vista: /api/commit couldn't run git commit-tree: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Couldn't run git: {e}"),
+            );
         }
     };
     if !output.status.success() {
         let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let msg = if msg.is_empty() { "git commit-tree failed.".to_string() } else { msg };
+        let msg = if msg.is_empty() {
+            "git commit-tree failed.".to_string()
+        } else {
+            msg
+        };
         eprintln!("git-vista: /api/commit (on ‘{branch}’) failed: {msg}");
         return (StatusCode::BAD_REQUEST, msg);
     }
@@ -266,7 +296,10 @@ async fn commit_empty_on_branch(
         Ok(o) => o,
         Err(e) => {
             eprintln!("git-vista: /api/commit couldn't run git update-ref: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Couldn't run git: {e}"),
+            );
         }
     };
     if !output.status.success() {

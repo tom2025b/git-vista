@@ -15,7 +15,11 @@
 /// error stays diagnosable; an empty `raw` just omits it.
 pub fn network_error_text(raw: &str) -> String {
     let raw = raw.trim();
-    let detail = if raw.is_empty() { String::new() } else { format!(" ({raw})") };
+    let detail = if raw.is_empty() {
+        String::new()
+    } else {
+        format!(" ({raw})")
+    };
     format!(
         "Couldn't reach the git-vista server{detail}.\n\
          Check that `gv` is still running and that this device is on the same \
@@ -33,13 +37,19 @@ mod tests {
         assert!(msg.contains("Couldn't reach the git-vista server"), "{msg}");
         assert!(msg.contains("(TypeError: Load failed)"), "{msg}");
         assert!(msg.contains("gv"), "actionable: names the launcher — {msg}");
-        assert!(msg.contains("try again"), "actionable: suggests a retry — {msg}");
+        assert!(
+            msg.contains("try again"),
+            "actionable: suggests a retry — {msg}"
+        );
     }
 
     #[test]
     fn an_empty_raw_error_leaves_no_dangling_parentheses() {
         let msg = network_error_text("  ");
         assert!(!msg.contains('('), "{msg}");
-        assert!(msg.starts_with("Couldn't reach the git-vista server."), "{msg}");
+        assert!(
+            msg.starts_with("Couldn't reach the git-vista server."),
+            "{msg}"
+        );
     }
 }

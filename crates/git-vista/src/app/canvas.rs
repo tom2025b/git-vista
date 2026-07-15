@@ -134,7 +134,10 @@ pub(super) fn graph_canvas(
 
     // The signal bundles the split view modules take (see `crate::state`): one
     // `Copy` handle each instead of a fistful of separate signals.
-    let settings = Settings { nerd_icons, show_node_icons };
+    let settings = Settings {
+        nerd_icons,
+        show_node_icons,
+    };
     let overlays = Overlays {
         menu,
         commit_dialog,

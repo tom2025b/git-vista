@@ -30,6 +30,39 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # 0. Lint: formatting + strict Clippy, the exact commands contributors run
+  #    locally (see README "Tests"). Split from the build/test jobs so a
+  #    formatting or lint regression is reported as its own red check.
+  #
+  # Clippy runs twice: once for the native host (the whole workspace) and once
+  # for the configured wasm32 target, scoped to the frontend crate. The wasm
+  # pass is frontend-only because git-vista-git (gix) and git-vista-server
+  # (axum/tokio) are native-only and don't compile for wasm32.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + rustfmt + clippy + wasm32)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting is clean
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (native, strict)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy (wasm32 frontend, strict)
+        run: cargo clippy -p git-vista --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------------
   # 1. Core + git + server + frontend crates: build check + tests.
   #
   # git-vista-core is pure logic; git-vista-git reads real repos via gix (its

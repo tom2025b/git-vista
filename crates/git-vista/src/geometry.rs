@@ -13,7 +13,7 @@ use git_vista_core::model::{BranchStub, Edge, Graph};
 // Geometry of the graph, in SVG user units (px).
 pub const ROW_HEIGHT: i32 = 56; // vertical gap between commits
 pub const LANE_WIDTH: i32 = 34; // horizontal gap between lanes
-// Used only by the wasm-only `app` view, so it reads as dead on host/test builds.
+                                // Used only by the wasm-only `app` view, so it reads as dead on host/test builds.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub const NODE_RADIUS: i32 = 7;
 pub const PAD_X: i32 = 28;
@@ -85,7 +85,12 @@ pub fn label_x_per_row(graph: &Graph) -> Vec<i32> {
             (e.to_row, e.from_row)
         };
         let hi = e.from_lane.max(e.to_lane);
-        for r in top.min(last)..=bot.min(last) {
+        for (r, occ_r) in occ
+            .iter_mut()
+            .enumerate()
+            .take(bot.min(last) + 1)
+            .skip(top.min(last))
+        {
             // Endpoint rows: the curve has left its lane by less than one lane
             // within the label's text band, so allow one lane of bulge (capped
             // at the outer lane). Middle rows: anywhere between — take `hi`.
@@ -96,7 +101,7 @@ pub fn label_x_per_row(graph: &Graph) -> Vec<i32> {
             } else {
                 hi
             };
-            occ[r] = occ[r].max(lane);
+            *occ_r = (*occ_r).max(lane);
         }
     }
     for s in &graph.stubs {
@@ -104,11 +109,13 @@ pub fn label_x_per_row(graph: &Graph) -> Vec<i32> {
         // over the anchor row and ⌈(depth+1)/2⌉ rows above it.
         let up = (s.depth + 2) / 2;
         let top = s.anchor_row.saturating_sub(up);
-        for r in top..=s.anchor_row.min(last) {
-            occ[r] = occ[r].max(s.lane);
+        for occ_r in occ.iter_mut().take(s.anchor_row.min(last) + 1).skip(top) {
+            *occ_r = (*occ_r).max(s.lane);
         }
     }
-    occ.into_iter().map(|lane| node_cx(lane) + LABEL_GAP).collect()
+    occ.into_iter()
+        .map(|lane| node_cx(lane) + LABEL_GAP)
+        .collect()
 }
 
 /// Baseline y of a row's first (message) label line — just above the node's
@@ -248,7 +255,11 @@ pub fn menu_placement(x: f64, y: f64, vw: f64, vh: f64) -> MenuPlacement {
     } else {
         (VAnchor::Top(y), vh - y - EDGE_PAD)
     };
-    MenuPlacement { left, anchor, max_height: room.max(MENU_MIN_HEIGHT) }
+    MenuPlacement {
+        left,
+        anchor,
+        max_height: room.max(MENU_MIN_HEIGHT),
+    }
 }
 
 impl MenuPlacement {
@@ -260,7 +271,10 @@ impl MenuPlacement {
             VAnchor::Top(t) => format!("top: {t}px;"),
             VAnchor::Bottom(b) => format!("bottom: {b}px;"),
         };
-        format!("left: {}px; {v} max-height: {}px;", self.left, self.max_height)
+        format!(
+            "left: {}px; {v} max-height: {}px;",
+            self.left, self.max_height
+        )
     }
 }
 
@@ -351,11 +365,24 @@ mod tests {
         // An edge fanning from lane 2 (row 1) to lane 0 (row 3) pushes the rows
         // it passes through: the middle row takes the outer lane, the endpoint
         // rows stay within a lane of their own end.
-        g.edges = vec![Edge { from_row: 1, from_lane: 2, to_row: 3, to_lane: 0 }];
+        g.edges = vec![Edge {
+            from_row: 1,
+            from_lane: 2,
+            to_row: 3,
+            to_lane: 0,
+        }];
         let xs = label_x_per_row(&g);
         assert_eq!(xs[2], node_cx(2) + LABEL_GAP, "middle row clears the curve");
-        assert_eq!(xs[3], node_cx(1) + LABEL_GAP, "endpoint allows one lane of bulge");
-        assert_eq!(xs[0], node_cx(0) + LABEL_GAP, "rows off the edge are untouched");
+        assert_eq!(
+            xs[3],
+            node_cx(1) + LABEL_GAP,
+            "endpoint allows one lane of bulge"
+        );
+        assert_eq!(
+            xs[0],
+            node_cx(0) + LABEL_GAP,
+            "rows off the edge are untouched"
+        );
 
         // A stub ring hovering over rows 0..=1 pushes them past its lane.
         g.stubs = vec![BranchStub {
@@ -368,8 +395,16 @@ mod tests {
         }];
         let xs = label_x_per_row(&g);
         assert_eq!(xs[1], node_cx(5) + LABEL_GAP);
-        assert_eq!(xs[0], node_cx(5) + LABEL_GAP, "ring tips over the row above");
-        assert_eq!(xs[2], node_cx(2) + LABEL_GAP, "rows below the anchor are untouched");
+        assert_eq!(
+            xs[0],
+            node_cx(5) + LABEL_GAP,
+            "ring tips over the row above"
+        );
+        assert_eq!(
+            xs[2],
+            node_cx(2) + LABEL_GAP,
+            "rows below the anchor are untouched"
+        );
 
         // Empty graph: no rows, no panic.
         assert!(label_x_per_row(&Graph::default()).is_empty());
@@ -413,7 +448,10 @@ mod tests {
         // Each deeper stub sits a further half-row above the commit.
         assert_eq!(stub_node_cy(4, 0), node_cy(4) - ROW_HEIGHT / 2);
         assert_eq!(stub_node_cy(4, 1), node_cy(4) - ROW_HEIGHT);
-        assert!(stub_node_cy(4, 1) < stub_node_cy(4, 0), "deeper is higher up");
+        assert!(
+            stub_node_cy(4, 1) < stub_node_cy(4, 0),
+            "deeper is higher up"
+        );
 
         // The first stub in a cascade forks off the commit dot itself.
         let d0 = stub_path(0, 4, 3, 0);
@@ -433,13 +471,29 @@ mod tests {
 
     #[test]
     fn same_lane_edges_are_straight_others_curve() {
-        let straight = Edge { from_row: 0, from_lane: 0, to_row: 1, to_lane: 0 };
+        let straight = Edge {
+            from_row: 0,
+            from_lane: 0,
+            to_row: 1,
+            to_lane: 0,
+        };
         assert_eq!(
             edge_path(&straight),
-            format!("M {} {} L {} {}", node_cx(0), node_cy(0), node_cx(0), node_cy(1))
+            format!(
+                "M {} {} L {} {}",
+                node_cx(0),
+                node_cy(0),
+                node_cx(0),
+                node_cy(1)
+            )
         );
 
-        let curved = Edge { from_row: 0, from_lane: 0, to_row: 1, to_lane: 1 };
+        let curved = Edge {
+            from_row: 0,
+            from_lane: 0,
+            to_row: 1,
+            to_lane: 1,
+        };
         let d = edge_path(&curved);
         assert!(d.starts_with('M'), "starts with a move");
         assert!(d.contains(" C "), "lane-changing edge is a cubic curve");
