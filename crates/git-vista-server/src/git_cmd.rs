@@ -27,11 +27,18 @@ pub(crate) async fn git_stdout(
         .await
         .map_err(|e| {
             eprintln!("git-vista: {endpoint} couldn't run git: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Couldn't run git: {e}"),
+            )
         })?;
     if !output.status.success() {
         let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let msg = if msg.is_empty() { "git failed.".to_string() } else { msg };
+        let msg = if msg.is_empty() {
+            "git failed.".to_string()
+        } else {
+            msg
+        };
         eprintln!("git-vista: {endpoint} failed: {msg}");
         return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
     }
@@ -87,7 +94,11 @@ pub(crate) async fn git_ok(repo: &Path, args: &[&str]) -> Result<(), String> {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Err(if stderr.is_empty() { format!("`git {}` failed", args.join(" ")) } else { stderr })
+    Err(if stderr.is_empty() {
+        format!("`git {}` failed", args.join(" "))
+    } else {
+        stderr
+    })
 }
 
 /// Whether `refname` resolves in `repo` (`git rev-parse --verify --quiet`): exit 0

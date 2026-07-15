@@ -6,11 +6,11 @@
 //! only caller); helpers used by only one file stay private to it.
 //!
 //!   * [`read`]   — the read endpoints: history graph, one commit's detail/diff,
-//!                  the live head-branch / working-tree reads.
+//!     the live head-branch / working-tree reads.
 //!   * [`clone`]  — clone a public URL into a throwaway dir, view it read-only.
 //!   * [`commit`] — create a commit (on HEAD, or an empty one on a named branch).
 //!   * [`branch`] — create a branch and the branch operations (checkout / merge /
-//!                  push / delete / force-delete) that share one runner.
+//!     push / delete / force-delete) that share one runner.
 //!   * [`rebase`] — rebase the checked-out branch onto main, and its live gate.
 //!   * [`reset`]  — restore a seeded test repo to its recorded state.
 //!

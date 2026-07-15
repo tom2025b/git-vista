@@ -371,6 +371,9 @@ fn a_time_skewed_child_is_still_laid_out_above_its_parent() {
     c.time = 50;
     let g = layout(vec![p, c]);
     assert_well_formed(&g);
-    assert_eq!(g.rows[0].commit.id.0, "C", "the child draws above its parent");
+    assert_eq!(
+        g.rows[0].commit.id.0, "C",
+        "the child draws above its parent"
+    );
     assert_eq!(g.rows[1].commit.id.0, "P");
 }

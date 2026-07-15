@@ -28,14 +28,23 @@ pub(crate) async fn clone_repo(Json(req): Json<CloneRequest>) -> (StatusCode, St
 
     let root = clones_root();
     if let Err(e) = std::fs::create_dir_all(&root) {
-        eprintln!("git-vista: /api/clone couldn't create {}: {e}", root.display());
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't prepare temp dir: {e}"));
+        eprintln!(
+            "git-vista: /api/clone couldn't create {}: {e}",
+            root.display()
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Couldn't prepare temp dir: {e}"),
+        );
     }
     // Unique per-clone dir: monotonic counter + a timestamp, so concurrent or
     // rapid clones never collide.
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let dest = root.join(format!("clone-{stamp}-{n}"));
 
     println!("[/api/clone] cloning {url} → {}", dest.display());
@@ -51,14 +60,21 @@ pub(crate) async fn clone_repo(Json(req): Json<CloneRequest>) -> (StatusCode, St
         Ok(o) => o,
         Err(e) => {
             eprintln!("git-vista: /api/clone couldn't run git: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't run git: {e}"));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Couldn't run git: {e}"),
+            );
         }
     };
 
     if !output.status.success() {
         // git printed why (host down, repo not found, auth needed…) on stderr.
         let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let msg = if msg.is_empty() { "git clone failed.".to_string() } else { msg };
+        let msg = if msg.is_empty() {
+            "git clone failed.".to_string()
+        } else {
+            msg
+        };
         cleanup_clone(&dest); // remove the empty/partial dir git may have left
         eprintln!("git-vista: /api/clone failed: {msg}");
         return (StatusCode::BAD_REQUEST, msg);

@@ -26,10 +26,11 @@ pub fn walk_history(path: &Path, limit: usize) -> Result<Vec<CommitSummary>, Rep
     // user's global/system git config or environment. We only ever read history,
     // so external config is irrelevant, and ignoring it keeps the walk robust to
     // a malformed global config on the host.
-    let repo = gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
+    let repo =
+        gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
 
     // Seed the walk from HEAD and every ref tip, de-duplicated so a tip that is
     // both HEAD and a branch isn't queued twice.
@@ -124,10 +125,11 @@ pub fn walk_history(path: &Path, limit: usize) -> Result<Vec<CommitSummary>, Rep
 /// A malformed id, or one that isn't a commit in this repo, is a
 /// [`RepoError::CommitNotFound`] (the caller maps it to a 404), not a read error.
 pub fn read_commit(path: &Path, id: &str) -> Result<CommitDetail, RepoError> {
-    let repo = gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
+    let repo =
+        gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
 
     let oid = gix::ObjectId::from_hex(id.as_bytes())
         .map_err(|e| RepoError::CommitNotFound(format!("{id}: {e}")))?;
@@ -135,13 +137,20 @@ pub fn read_commit(path: &Path, id: &str) -> Result<CommitDetail, RepoError> {
         .find_commit(oid)
         .map_err(|e| RepoError::CommitNotFound(format!("{id}: {e}")))?;
 
-    let author = commit.author().map_err(|e| RepoError::Walk(e.to_string()))?;
-    let committer = commit.committer().map_err(|e| RepoError::Walk(e.to_string()))?;
+    let author = commit
+        .author()
+        .map_err(|e| RepoError::Walk(e.to_string()))?;
+    let committer = commit
+        .committer()
+        .map_err(|e| RepoError::Walk(e.to_string()))?;
     let message = commit
         .message_raw()
         .map_err(|e| RepoError::Walk(e.to_string()))?
         .to_string();
-    let parents = commit.parent_ids().map(|p| Oid(p.detach().to_string())).collect();
+    let parents = commit
+        .parent_ids()
+        .map(|p| Oid(p.detach().to_string()))
+        .collect();
 
     // The signature time is parsed leniently; a malformed one falls back to the
     // epoch rather than failing the whole read (the panel just shows a stale date).
@@ -171,10 +180,11 @@ pub fn read_commit(path: &Path, id: &str) -> Result<CommitDetail, RepoError> {
 /// commits, so any displayed (newest-`limit`) commit that is on a remote falls
 /// within the newest `limit` remote commits too. Empty when there's no remote.
 pub fn read_remote_commits(path: &Path, limit: usize) -> Result<HashSet<String>, RepoError> {
-    let repo = gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
+    let repo =
+        gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
 
     let mut seen = HashSet::new();
     let mut tips: Vec<gix::ObjectId> = Vec::new();
@@ -341,7 +351,11 @@ pub(crate) mod tests {
         let ids: HashSet<&str> = history.iter().map(|c| c.id.0.as_str()).collect();
         for c in &history {
             for p in &c.parents {
-                assert!(ids.contains(p.0.as_str()), "parent {} should be walked", p.0);
+                assert!(
+                    ids.contains(p.0.as_str()),
+                    "parent {} should be walked",
+                    p.0
+                );
             }
         }
     }
@@ -352,7 +366,10 @@ pub(crate) mod tests {
         let p = dir.path();
         // Grab the merge commit E's id from the walk, then read it in full.
         let history = walk_history(p, 100).unwrap();
-        let e = history.iter().find(|c| c.summary == "E merge feature").unwrap();
+        let e = history
+            .iter()
+            .find(|c| c.summary == "E merge feature")
+            .unwrap();
 
         let detail = read_commit(p, &e.id.0).unwrap();
         assert_eq!(detail.id, e.id);
@@ -374,8 +391,14 @@ pub(crate) mod tests {
         let p = dir.path();
         // Well-formed but absent id, and a non-hex string: both are "not found".
         let absent = "0".repeat(40);
-        assert!(matches!(read_commit(p, &absent), Err(RepoError::CommitNotFound(_))));
-        assert!(matches!(read_commit(p, "not-a-hash"), Err(RepoError::CommitNotFound(_))));
+        assert!(matches!(
+            read_commit(p, &absent),
+            Err(RepoError::CommitNotFound(_))
+        ));
+        assert!(matches!(
+            read_commit(p, "not-a-hash"),
+            Err(RepoError::CommitNotFound(_))
+        ));
     }
 
     #[test]
@@ -442,8 +465,14 @@ pub(crate) mod tests {
         // The walk reaches the side branch's commits even though HEAD can't.
         let history = walk_history(p, 100).unwrap();
         let summaries: HashSet<&str> = history.iter().map(|c| c.summary.as_str()).collect();
-        assert!(summaries.contains("X on full-version"), "side-branch commit X missing");
-        assert!(summaries.contains("Y on full-version"), "side-branch tip Y missing");
+        assert!(
+            summaries.contains("X on full-version"),
+            "side-branch commit X missing"
+        );
+        assert!(
+            summaries.contains("Y on full-version"),
+            "side-branch tip Y missing"
+        );
         assert!(summaries.contains("B on main"));
 
         // ...and the branch itself is reported, tip resolving to Y.
@@ -455,9 +484,15 @@ pub(crate) mod tests {
             .collect();
         branches.sort();
         assert_eq!(branches, vec!["full-version", "main"]);
-        let tip = history.iter().find(|c| c.summary == "Y on full-version").unwrap();
+        let tip = history
+            .iter()
+            .find(|c| c.summary == "Y on full-version")
+            .unwrap();
         let full_version = refs.iter().find(|r| r.name == "full-version").unwrap();
-        assert_eq!(full_version.target, tip.id, "full-version must point at its tip Y");
+        assert_eq!(
+            full_version.target, tip.id,
+            "full-version must point at its tip Y"
+        );
     }
 
     /// Issue #28, end-to-end through gix: a branch created at an interior commit
@@ -479,8 +514,8 @@ pub(crate) mod tests {
         git(p, &["checkout", "-q", "main"]);
         commit(p, "C on main", 5);
         commit(p, "D on main", 6); // main tip is the newest commit
-        // Create `aaa` at feature's interior commit F1 (feature~1), without
-        // switching to it — HEAD stays on main.
+                                   // Create `aaa` at feature's interior commit F1 (feature~1), without
+                                   // switching to it — HEAD stays on main.
         git(p, &["branch", "aaa", "feature~1"]);
 
         let commits = walk_history(p, 100).unwrap();
@@ -499,8 +534,14 @@ pub(crate) mod tests {
         };
 
         // `aaa` owns nothing of its own → it's a stub, not a real line or a badge.
-        assert!(g.stubs.iter().any(|s| s.name == "aaa"), "aaa should be a stub");
-        assert!(g.stubs.iter().all(|s| s.name != "feature"), "feature is a real line");
+        assert!(
+            g.stubs.iter().any(|s| s.name == "aaa"),
+            "aaa should be a stub"
+        );
+        assert!(
+            g.stubs.iter().all(|s| s.name != "feature"),
+            "feature is a real line"
+        );
         // `feature` keeps ONE colour down its whole line (F1 and F2 match) — it was
         // not split by aaa claiming F1.
         assert_eq!(
@@ -510,6 +551,10 @@ pub(crate) mod tests {
         );
         // The checked-out branch (main) owns the trunk colour.
         assert_eq!(color("D on main"), 0, "main owns the trunk colour");
-        assert_ne!(color("F2 on feature"), 0, "feature is distinct from the trunk");
+        assert_ne!(
+            color("F2 on feature"),
+            0,
+            "feature is distinct from the trunk"
+        );
     }
 }

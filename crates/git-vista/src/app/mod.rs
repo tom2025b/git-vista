@@ -24,10 +24,8 @@ use leptos::*;
 use crate::api::{fetch_graph, fetch_head_branch, fetch_status};
 use crate::dialogs;
 use crate::icons::icon_set;
+use crate::prefs::{load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref};
 use crate::print::print_graph_view;
-use crate::prefs::{
-    load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref,
-};
 
 mod canvas;
 

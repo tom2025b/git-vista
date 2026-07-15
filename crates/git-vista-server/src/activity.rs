@@ -97,7 +97,9 @@ pub async fn activity_feed(
                         undo: None,
                     },
                 );
-                println!("[/api/activity] noticed external deletion of branch '{name}' (was {tip})");
+                println!(
+                    "[/api/activity] noticed external deletion of branch '{name}' (was {tip})"
+                );
             }
         }
     }
@@ -122,7 +124,10 @@ pub async fn activity_feed(
             event.undo = None;
         }
     }
-    let app_count = feed.iter().filter(|e| e.source == ActivitySource::App).count();
+    let app_count = feed
+        .iter()
+        .filter(|e| e.source == ActivitySource::App)
+        .count();
     println!(
         "[/api/activity] {} — {} event(s) ({app_count} via app), {} undoable",
         repo.display(),
@@ -170,7 +175,11 @@ async fn git(repo: &Path, args: &[&str]) -> Result<(), String> {
         return Err(stderr);
     }
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Err(if stdout.is_empty() { "git failed.".to_string() } else { stdout })
+    Err(if stdout.is_empty() {
+        "git failed.".to_string()
+    } else {
+        stdout
+    })
 }
 
 /// `GET /api/undoables/{id}` — every undo action that applies to one commit,
@@ -242,12 +251,18 @@ pub async fn undoables(
     }
     if detail.parents.len() <= 1 {
         out.push(Undoable {
-            action: UndoAction::RevertCommit { commit: full.clone() },
+            action: UndoAction::RevertCommit {
+                commit: full.clone(),
+            },
             label: format!("Revert {} (adds an inverse commit)", short(&full)),
             warn_pushed: false,
         });
     }
-    println!("[/api/undoables] {} → {} action(s)", short(&full), out.len());
+    println!(
+        "[/api/undoables] {} → {} action(s)",
+        short(&full),
+        out.len()
+    );
     Ok((no_store, Json(out)))
 }
 
@@ -307,7 +322,11 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
                 }
             }
         }
-        UndoAction::ResetBranch { branch, to, expected_tip } => {
+        UndoAction::ResetBranch {
+            branch,
+            to,
+            expected_tip,
+        } => {
             let branch = branch.trim();
             if !is_safe_branch_name(branch) {
                 return (StatusCode::BAD_REQUEST, "Bad branch name.".to_string());
@@ -327,8 +346,7 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
                     ),
                 );
             }
-            let checked_out =
-                git_vista_git::read_head_branch(&repo).as_deref() == Some(branch);
+            let checked_out = git_vista_git::read_head_branch(&repo).as_deref() == Some(branch);
             let result = if checked_out {
                 // `git reset --hard` rewrites the working tree, so it runs
                 // only against a fully clean one — never eat uncommitted work.
@@ -359,7 +377,10 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
                         Some(to.clone()),
                         format!("undid — reset ‘{branch}’ to {}", short(&to)),
                     );
-                    (StatusCode::OK, format!("Reset ‘{branch}’ to {}.", short(&to)))
+                    (
+                        StatusCode::OK,
+                        format!("Reset ‘{branch}’ to {}.", short(&to)),
+                    )
                 }
                 Err(msg) => {
                     eprintln!("git-vista: /api/undo reset failed: {msg}");
@@ -376,8 +397,8 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
                 Ok(()) => {
                     println!("[/api/undo] reverted {}", short(&commit));
                     let new = crate::git_cmd::rev_parse(&repo, "HEAD").await;
-                    let branch = git_vista_git::read_head_branch(&repo)
-                        .unwrap_or_else(|| "HEAD".into());
+                    let branch =
+                        git_vista_git::read_head_branch(&repo).unwrap_or_else(|| "HEAD".into());
                     crate::handlers::journal_app_event(
                         &repo,
                         ActivityKind::Revert,
@@ -414,7 +435,11 @@ async fn worktree_dirty(repo: &Path) -> Result<bool, String> {
         .map_err(|e| format!("Couldn't run git: {e}"))?;
     if !output.status.success() {
         let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if msg.is_empty() { "git status failed.".to_string() } else { msg });
+        return Err(if msg.is_empty() {
+            "git status failed.".to_string()
+        } else {
+            msg
+        });
     }
     Ok(!output.stdout.is_empty())
 }

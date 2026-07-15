@@ -4,6 +4,11 @@ _Date: 2026-07-01 · Scope: full workspace at the Phase 10 tip, reviewed while
 preparing Phase 13. Items marked **FIXED** were addressed in the Phase 13
 packaging-&-polish change set; the rest are recorded for later._
 
+> **Superseded product and security scope:** this is a historical review of an
+> earlier trusted-LAN visualizer. Its security conclusion is not acceptable for
+> the professional, SSH-first Git client. See `docs/V2_ARCHITECTURE.md` and
+> `docs/SECURITY_MODEL.md` for the current assessment and target controls.
+
 ## Overall assessment
 
 This is a strong, mature codebase. The four-crate split is clean and principled
@@ -50,7 +55,7 @@ object ids are always hex ASCII (one byte per char), so `[..7]` can never split 
 codepoint. Worth a comment or a `char`-based slice if `Oid` ever holds non-hex
 text. _File:_ `crates/git-vista-core/src/model.rs`.
 
-## Security posture (acceptable under the documented threat model)
+## Security posture (historical trusted-LAN assessment; superseded)
 
 The stated model is "a personal viewer on a trusted home LAN." Under that model
 these are fine; they'd matter on an untrusted network.

@@ -71,7 +71,12 @@ fn kind_label(kind: ActivityKind) -> &'static str {
 /// Build the Activity panel view. Rendered inside the overlays wrapper, so it
 /// shares the reactive context the menu and modals use.
 pub fn activity_panel_view(overlays: Overlays, settings: Settings) -> impl IntoView {
-    let Overlays { detail_id, activity_open, reload, .. } = overlays;
+    let Overlays {
+        detail_id,
+        activity_open,
+        reload,
+        ..
+    } = overlays;
     let nerd_icons = settings.nerd_icons;
 
     // Both fetches key on (open, reload): opening the panel fetches fresh,
@@ -118,20 +123,36 @@ pub fn activity_panel_view(overlays: Overlays, settings: Settings) -> impl IntoV
                 status.get().flatten().map(|s| {
                     let ic = icon_set(nerd_icons.get());
                     let (glyph, class, headline) = if !s.conflicted.is_empty() {
-                        (ic.conflict, "act-status conflict",
-                         format!("{} conflicted file(s)", s.conflicted.len()))
+                        (
+                            ic.conflict,
+                            "act-status conflict",
+                            format!("{} conflicted file(s)", s.conflicted.len()),
+                        )
                     } else if !s.is_clean() {
                         let n = s.change_count();
-                        (ic.dirty, "act-status dirty",
-                         format!("{n} uncommitted change{}", if n == 1 { "" } else { "s" }))
+                        (
+                            ic.dirty,
+                            "act-status dirty",
+                            format!("{n} uncommitted change{}", if n == 1 { "" } else { "s" }),
+                        )
                     } else {
-                        (ic.clean, "act-status clean", "working tree clean".to_string())
+                        (
+                            ic.clean,
+                            "act-status clean",
+                            "working tree clean".to_string(),
+                        )
                     };
                     let sync = (s.ahead > 0 || s.behind > 0).then(|| {
                         let mut t = String::new();
-                        if s.ahead > 0 { t.push_str(&format!(" ↑{}", s.ahead)); }
-                        if s.behind > 0 { t.push_str(&format!(" ↓{}", s.behind)); }
-                        s.upstream.as_deref().map(|u| t.push_str(&format!(" vs {u}")));
+                        if s.ahead > 0 {
+                            t.push_str(&format!(" ↑{}", s.ahead));
+                        }
+                        if s.behind > 0 {
+                            t.push_str(&format!(" ↓{}", s.behind));
+                        }
+                        if let Some(u) = s.upstream.as_deref() {
+                            t.push_str(&format!(" vs {u}"));
+                        }
                         view! { <span class="detail-muted">{t}</span> }
                     });
                     // The dirty files, one compact row each, capped so a huge
@@ -256,7 +277,12 @@ fn activity_row(
     nerd_icons: RwSignal<bool>,
     overlays: Overlays,
 ) -> impl IntoView {
-    let Overlays { menu, confirm_op, dialog_opened_at, .. } = overlays;
+    let Overlays {
+        menu,
+        confirm_op,
+        dialog_opened_at,
+        ..
+    } = overlays;
     let ic = icon_set(nerd_icons.get_untracked());
     let glyph = kind_glyph(ic, event.kind);
     let when = time_ago(event.time);
@@ -279,12 +305,21 @@ fn activity_row(
         .new_oid
         .clone()
         .filter(|oid| !oid.bytes().all(|b| b == b'0'))
-        .or_else(|| event.old_oid.clone().filter(|oid| !oid.bytes().all(|b| b == b'0')));
+        .or_else(|| {
+            event
+                .old_oid
+                .clone()
+                .filter(|oid| !oid.bytes().all(|b| b == b'0'))
+        });
 
     let header = format!(
         "{}{}",
         kind_label(event.kind),
-        event.ref_name.as_deref().map(|r| format!(" · {r}")).unwrap_or_default()
+        event
+            .ref_name
+            .as_deref()
+            .map(|r| format!(" · {r}"))
+            .unwrap_or_default()
     );
     // The direct Undo control (step 5): shown only while the server still
     // says this event is undoable — `event.undo` is recomputed on every feed

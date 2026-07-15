@@ -52,8 +52,12 @@ fn snapshot_path(repo: &Path) -> Option<PathBuf> {
 /// Best-effort: failure is logged to the terminal and swallowed — the git
 /// operation this records already succeeded, and must stay succeeded.
 pub fn append(repo: &Path, event: &ActivityEvent) {
-    let Some(path) = journal_path(repo) else { return };
-    let Ok(line) = serde_json::to_string(event) else { return };
+    let Some(path) = journal_path(repo) else {
+        return;
+    };
+    let Ok(line) = serde_json::to_string(event) else {
+        return;
+    };
     let result = path
         .parent()
         .map(std::fs::create_dir_all)
@@ -66,7 +70,10 @@ pub fn append(repo: &Path, event: &ActivityEvent) {
         })
         .and_then(|mut f| writeln!(f, "{line}"));
     if let Err(e) = result {
-        eprintln!("git-vista: couldn't append to the journal at {}: {e}", path.display());
+        eprintln!(
+            "git-vista: couldn't append to the journal at {}: {e}",
+            path.display()
+        );
     }
 }
 
@@ -74,8 +81,12 @@ pub fn append(repo: &Path, event: &ActivityEvent) {
 /// first — is preserved within the returned slice). Unparsable lines are
 /// skipped loudly: one corrupt line must not hide the rest of the history.
 pub fn read_all(repo: &Path) -> Vec<ActivityEvent> {
-    let Some(path) = journal_path(repo) else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Some(path) = journal_path(repo) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(JOURNAL_READ_CAP);
     lines[start..]
@@ -101,15 +112,22 @@ pub fn read_snapshot(repo: &Path) -> Option<HashMap<String, String>> {
 
 /// Overwrite the snapshot with the repo's current branch → tip map.
 pub fn write_snapshot(repo: &Path, branches: &HashMap<String, String>) {
-    let Some(path) = snapshot_path(repo) else { return };
-    let Ok(json) = serde_json::to_string_pretty(branches) else { return };
+    let Some(path) = snapshot_path(repo) else {
+        return;
+    };
+    let Ok(json) = serde_json::to_string_pretty(branches) else {
+        return;
+    };
     let result = path
         .parent()
         .map(std::fs::create_dir_all)
         .unwrap_or(Ok(()))
         .and_then(|()| std::fs::write(&path, json));
     if let Err(e) = result {
-        eprintln!("git-vista: couldn't write the ref snapshot at {}: {e}", path.display());
+        eprintln!(
+            "git-vista: couldn't write the ref snapshot at {}: {e}",
+            path.display()
+        );
     }
 }
 
@@ -131,7 +149,10 @@ pub fn remove_from_snapshot(repo: &Path, branch: &str) {
 /// feed. Both files regenerate naturally — the journal on the next app write,
 /// the snapshot on the next feed read. Best-effort, like the other writers.
 pub fn clear(repo: &Path) {
-    for path in [journal_path(repo), snapshot_path(repo)].into_iter().flatten() {
+    for path in [journal_path(repo), snapshot_path(repo)]
+        .into_iter()
+        .flatten()
+    {
         if path.exists() {
             if let Err(e) = fs::remove_file(&path) {
                 eprintln!("git-vista: couldn't clear {}: {e}", path.display());
@@ -203,9 +224,10 @@ mod tests {
     fn snapshot_round_trips_and_removes() {
         let dir = repo();
         assert!(read_snapshot(dir.path()).is_none(), "no baseline yet");
-        let branches =
-            HashMap::from([("main".to_string(), "aaa".to_string()),
-                           ("feat".to_string(), "bbb".to_string())]);
+        let branches = HashMap::from([
+            ("main".to_string(), "aaa".to_string()),
+            ("feat".to_string(), "bbb".to_string()),
+        ]);
         write_snapshot(dir.path(), &branches);
         assert_eq!(read_snapshot(dir.path()).unwrap(), branches);
 

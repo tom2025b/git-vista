@@ -18,9 +18,9 @@ use git_vista_core::model::{Graph, RefKind};
 
 use crate::datetime::local_timestamp;
 use crate::geometry::{
-    badge_text_dx, badge_text_y, badge_top_y, badge_width, edge_path, label_bottom_y,
-    label_top_y, label_x_per_row, node_cx, node_cy, stub_headroom, stub_node_cy, stub_path,
-    BADGE_GAP, BADGE_HEIGHT, BADGE_RADIUS, NODE_RADIUS, PAD_Y, ROW_HEIGHT,
+    badge_text_dx, badge_text_y, badge_top_y, badge_width, edge_path, label_bottom_y, label_top_y,
+    label_x_per_row, node_cx, node_cy, stub_headroom, stub_node_cy, stub_path, BADGE_GAP,
+    BADGE_HEIGHT, BADGE_RADIUS, NODE_RADIUS, PAD_Y, ROW_HEIGHT,
 };
 use crate::icons::icon_set;
 use crate::text::truncate;
@@ -108,7 +108,9 @@ pub fn print_graph_view(
         set_print_attr(is_open);
         is_open.then(|| {
             let sheet = graph.with_value(|g| graph_sheet(g, nerd_icons.get()));
-            let repo = graph.with_value(|g| g.repo_label.clone()).unwrap_or_default();
+            let repo = graph
+                .with_value(|g| g.repo_label.clone())
+                .unwrap_or_default();
             view! {
                 <div class="print-graph-modal print-surface">
                     <div class="viewer-head">
@@ -180,11 +182,13 @@ fn graph_sheet(g: &Graph, nerd: bool) -> View {
                 .refs
                 .iter()
                 .map(|r| {
-                    let icon = ref_icon(&ic, &r.kind);
+                    let icon = ref_icon(ic, &r.kind);
                     badge_width(&format!("{icon} {}", r.name)) + BADGE_GAP
                 })
                 .sum();
-            let msg = truncate(&gr.commit.summary, MAX_SUMMARY_CHARS).chars().count() as i32;
+            let msg = truncate(&gr.commit.summary, MAX_SUMMARY_CHARS)
+                .chars()
+                .count() as i32;
             let meta = format!(
                 "  {} · {} · {}",
                 gr.commit.id.short(),
@@ -209,7 +213,11 @@ fn graph_sheet(g: &Graph, nerd: bool) -> View {
             let child = &g.rows[e.from_row].commit;
             let parent_oid = &g.rows[e.to_row].commit.id;
             let is_first_parent = child.parents.first() == Some(parent_oid);
-            let color_row = if is_first_parent { e.from_row } else { e.to_row };
+            let color_row = if is_first_parent {
+                e.from_row
+            } else {
+                e.to_row
+            };
             let color = branch_color(row_color[color_row]);
             view! {
                 <path d=d fill="none" stroke=color stroke-width="2" stroke-linecap="round" />
@@ -254,7 +262,11 @@ fn graph_sheet(g: &Graph, nerd: bool) -> View {
             let cx = node_cx(gr.lane);
             let cy = node_cy(gr.row);
             let color = branch_color(gr.color);
-            let icon = if gr.commit.parents.len() > 1 { ic.merge } else { ic.commit };
+            let icon = if gr.commit.parents.len() > 1 {
+                ic.merge
+            } else {
+                ic.commit
+            };
             view! {
                 <circle cx=cx cy=cy r=NODE_RADIUS fill=color stroke=color stroke-width="2" />
                 <text
@@ -282,7 +294,7 @@ fn graph_sheet(g: &Graph, nerd: bool) -> View {
                 .refs
                 .iter()
                 .map(|r| {
-                    let icon = ref_icon(&ic, &r.kind);
+                    let icon = ref_icon(ic, &r.kind);
                     let w = badge_width(&format!("{icon} {}", r.name));
                     let x = bx;
                     bx += w + BADGE_GAP;

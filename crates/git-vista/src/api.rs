@@ -69,7 +69,9 @@ pub async fn fetch_commit_detail(id: &str) -> Result<CommitDetail, String> {
 /// (Phase 12, `POST /api/clone`). On a non-2xx response the body is the server's /
 /// git's own error text (bad URL, repo not found, …), returned as `Err`.
 pub async fn clone_request(url: &str) -> Result<(), String> {
-    let body = CloneRequest { url: url.to_string() };
+    let body = CloneRequest {
+        url: url.to_string(),
+    };
     let resp = Request::post("/api/clone")
         .json(&body)
         .map_err(|e| e.to_string())?
@@ -217,7 +219,9 @@ pub async fn fetch_activity(limit: usize) -> Result<Vec<ActivityEvent>, String> 
     let url = format!("/api/activity?limit={limit}&t={}", js_sys::Date::now());
     let resp = Request::get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
-        resp.json::<Vec<ActivityEvent>>().await.map_err(|e| e.to_string())
+        resp.json::<Vec<ActivityEvent>>()
+            .await
+            .map_err(|e| e.to_string())
     } else {
         Err(resp
             .text()
@@ -234,7 +238,9 @@ pub async fn fetch_undoables(commit: &str) -> Result<Vec<Undoable>, String> {
     let url = format!("/api/undoables/{commit}?t={}", js_sys::Date::now());
     let resp = Request::get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
-        resp.json::<Vec<Undoable>>().await.map_err(|e| e.to_string())
+        resp.json::<Vec<Undoable>>()
+            .await
+            .map_err(|e| e.to_string())
     } else {
         Err(resp
             .text()
@@ -304,9 +310,17 @@ pub async fn fetch_diff_full(id: &str) -> Result<CommitDiff, String> {
 pub async fn fetch_file(id: &str, path: &str) -> Result<FileContent, String> {
     let encoded: Vec<String> = path
         .split('/')
-        .map(|seg| js_sys::encode_uri_component(seg).as_string().unwrap_or_default())
+        .map(|seg| {
+            js_sys::encode_uri_component(seg)
+                .as_string()
+                .unwrap_or_default()
+        })
         .collect();
-    let url = format!("/api/file/{id}/{}?t={}", encoded.join("/"), js_sys::Date::now());
+    let url = format!(
+        "/api/file/{id}/{}?t={}",
+        encoded.join("/"),
+        js_sys::Date::now()
+    );
     let resp = Request::get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<FileContent>().await.map_err(|e| e.to_string())

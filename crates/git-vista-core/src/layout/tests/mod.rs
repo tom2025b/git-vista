@@ -8,7 +8,7 @@
 //!
 //!   * [`topology`] — lane assignment, edge wiring, ordering, determinism.
 //!   * [`color`]    — per-branch colouring, the trunk slot, and branch stubs
-//!                    (which the colouring pass produces).
+//!     (which the colouring pass produces).
 //!   * [`badges`]   — attaching refs to their commits.
 
 use crate::model::{CommitSummary, Edge, GitRef, Graph, Oid, RefKind};

@@ -27,10 +27,11 @@ use crate::RepoError;
 /// simply contribute nothing — a sparse feed, not an error. The remote's
 /// symbolic `…/HEAD` pointer is skipped like everywhere else.
 pub fn read_reflogs(path: &Path, per_ref_limit: usize) -> Result<Vec<ReflogEntry>, RepoError> {
-    let repo = gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
+    let repo =
+        gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
 
     let mut entries = Vec::new();
 
@@ -144,7 +145,10 @@ mod tests {
 
         // HEAD saw the two checkouts (to feature and back to main).
         let head = kinds_of(&entries, "HEAD");
-        let checkouts = head.iter().filter(|(k, _)| *k == ActivityKind::Checkout).count();
+        let checkouts = head
+            .iter()
+            .filter(|(k, _)| *k == ActivityKind::Checkout)
+            .count();
         assert_eq!(checkouts, 2, "HEAD: {head:?}");
     }
 
@@ -179,7 +183,16 @@ mod tests {
         // Simulate a push: update-ref writes the remote-tracking ref with a
         // reflog line when logging is forced on for it.
         git(p, &["config", "core.logAllRefUpdates", "always"]);
-        git(p, &["update-ref", "-m", "update by push", "refs/remotes/origin/main", "main"]);
+        git(
+            p,
+            &[
+                "update-ref",
+                "-m",
+                "update by push",
+                "refs/remotes/origin/main",
+                "main",
+            ],
+        );
         commit(p, "F after push", 7);
 
         let entries = read_reflogs(p, 100).unwrap();

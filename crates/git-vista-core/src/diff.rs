@@ -122,7 +122,13 @@ pub fn parse_name_status_z(bytes: &[u8]) -> Vec<DiffFile> {
                 None => break,
             }
         };
-        files.push(DiffFile { path, old_path, kind, additions: None, deletions: None });
+        files.push(DiffFile {
+            path,
+            old_path,
+            kind,
+            additions: None,
+            deletions: None,
+        });
     }
     files
 }
@@ -192,7 +198,7 @@ mod tests {
     #[test]
     fn numstat_counts_fold_in_by_path() {
         let mut files = parse_name_status_z(b"M\0a.rs\0M\0b.rs\0");
-        fold_numstat_z(b"10\t2\ta.rs\05\t0\tb.rs\0", &mut files);
+        fold_numstat_z(b"10\t2\ta.rs\x005\t0\tb.rs\0", &mut files);
         assert_eq!(files[0].additions, Some(10));
         assert_eq!(files[0].deletions, Some(2));
         assert_eq!(files[1].additions, Some(5));
@@ -218,7 +224,10 @@ mod tests {
     fn totals_sum_across_files_skipping_binary() {
         let mut files = parse_name_status_z(b"M\0a.rs\0M\0logo.png\0");
         fold_numstat_z(b"10\t2\ta.rs\0-\t-\tlogo.png\0", &mut files);
-        let diff = CommitDiff { files, ..Default::default() };
+        let diff = CommitDiff {
+            files,
+            ..Default::default()
+        };
         assert_eq!(diff.totals(), (10, 2));
     }
 

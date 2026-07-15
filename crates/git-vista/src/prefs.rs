@@ -18,7 +18,7 @@ pub fn load_icon_pref() -> bool {
     web_sys::window()
         .and_then(|w| w.local_storage().ok().flatten())
         .and_then(|s| s.get_item(ICON_PREF_KEY).ok().flatten())
-        .map_or(true, |v| v != "text")
+        .is_none_or(|v| v != "text")
 }
 
 /// Persist the icon preference. Best-effort: private browsing may refuse the
@@ -37,7 +37,7 @@ pub fn load_node_icons_pref() -> bool {
     web_sys::window()
         .and_then(|w| w.local_storage().ok().flatten())
         .and_then(|s| s.get_item(NODE_ICONS_KEY).ok().flatten())
-        .map_or(true, |v| v != "off")
+        .is_none_or(|v| v != "off")
 }
 
 /// Persist the per-node icons preference. Best-effort, like the icon style.

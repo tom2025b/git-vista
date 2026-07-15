@@ -115,7 +115,10 @@ mod tests {
         // Slot 1 is the first non-trunk colour; the cycle wraps after the last,
         // still skipping blue.
         assert_eq!(branch_color(1), BRANCH_COLORS[0]);
-        assert_eq!(branch_color(BRANCH_COLORS.len()), BRANCH_COLORS[BRANCH_COLORS.len() - 1]);
+        assert_eq!(
+            branch_color(BRANCH_COLORS.len()),
+            BRANCH_COLORS[BRANCH_COLORS.len() - 1]
+        );
         assert_eq!(branch_color(1), branch_color(1 + BRANCH_COLORS.len()));
     }
 
@@ -123,10 +126,19 @@ mod tests {
     /// non-trunk slot range `1..=BRANCH_PALETTE` — the layout adds the trunk's 0.
     #[test]
     fn stable_color_slot_is_deterministic_and_in_range() {
-        for name in ["main", "feature", "origin/x", "a-really-long-branch-name", ""] {
+        for name in [
+            "main",
+            "feature",
+            "origin/x",
+            "a-really-long-branch-name",
+            "",
+        ] {
             let s = stable_color_slot(name);
             assert_eq!(s, stable_color_slot(name), "same name, same slot");
-            assert!((1..=BRANCH_PALETTE).contains(&s), "slot {s} in 1..=BRANCH_PALETTE");
+            assert!(
+                (1..=BRANCH_PALETTE).contains(&s),
+                "slot {s} in 1..=BRANCH_PALETTE"
+            );
         }
     }
 
@@ -178,10 +190,17 @@ mod tests {
             ],
             Some("main"),
         );
-        let stub = g.stubs.iter().find(|s| s.name == "fork").expect("fork is a stub");
+        let stub = g
+            .stubs
+            .iter()
+            .find(|s| s.name == "fork")
+            .expect("fork is a stub");
         // The view colours a stub with plain `branch_color(stub.color)`; that
         // must equal the colour of a future line owned by the same branch name.
-        assert_eq!(branch_color(stub.color), branch_color(stable_color_slot("fork")));
+        assert_eq!(
+            branch_color(stub.color),
+            branch_color(stable_color_slot("fork"))
+        );
         assert_ne!(branch_color(stub.color), TRUNK_COLOR);
     }
 }

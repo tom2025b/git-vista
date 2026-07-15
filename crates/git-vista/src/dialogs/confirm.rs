@@ -14,7 +14,12 @@ use super::{alert, report};
 /// `<input>` to trip the WebKit CSR bug). Confirming runs the pending op and
 /// refreshes; cancelling or a backdrop tap closes it.
 pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
-    let Overlays { confirm_op, dialog_opened_at, reload, .. } = overlays;
+    let Overlays {
+        confirm_op,
+        dialog_opened_at,
+        reload,
+        ..
+    } = overlays;
     let run_confirmed = move || {
         let Some(op) = confirm_op.get_untracked() else {
             return;
@@ -41,7 +46,11 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
                 }
             }),
             PendingOp::Push { branch } => spawn_local(async move {
-                report(branch_op_request("/api/push", &branch).await, &format!("push ‘{branch}’"), reload);
+                report(
+                    branch_op_request("/api/push", &branch).await,
+                    &format!("push ‘{branch}’"),
+                    reload,
+                );
             }),
             PendingOp::Checkout { branch, .. } => spawn_local(async move {
                 match branch_op_request("/api/checkout", &branch).await {
