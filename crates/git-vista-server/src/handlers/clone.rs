@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::http::StatusCode;
 use axum::Json;
 
-use git_vista_core::model::{validate_clone_url, CloneRequest};
+use git_vista_protocol::{validate_clone_url, CloneRequest};
 
 use crate::state::{cleanup_clone, clones_root, current, set_current};
 

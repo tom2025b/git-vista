@@ -14,6 +14,9 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.8.9"
 git-vista-core = { workspace = true }
+# The versioned HTTP transport contract: protocol negotiation, the API error
+# envelope, request-id, and the shared request/response DTOs the router deserialises.
+git-vista-protocol = { workspace = true }
 git-vista-git = { workspace = true }
 # The activity feed's journal is JSONL on disk, and its query params derive
 # Deserialize — the same serde the shared models already use.
@@ -32,3 +35,7 @@ tower-http = { version = "0.7.0", features = ["fs", "set-header", "catch-panic"]
 [dev-dependencies]
 # Throwaway repos for the journal/snapshot round-trip tests.
 tempfile = "3"
+# `ServiceExt::oneshot` drives the router in the contract-layer tests (protocol
+# negotiation, the error envelope, the no-path-based-selection guard) without a
+# live socket. Test-only: the release binary never pulls tower's `util` feature.
+tower = { version = "0.5", features = ["util"] }

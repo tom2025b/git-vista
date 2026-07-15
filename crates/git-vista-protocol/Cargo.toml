@@ -1,0 +1,18 @@
+[package]
+name = "git-vista-protocol"
+description = "Versioned HTTP transport contract for git-vista: protocol version negotiation, the structured API error envelope, request-id, and the shared request/response DTOs. Pure and wasm-safe; depended on by both the server and the frontend, and independent of the repository/graph domain (git-vista-core)."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The only dependency: serde derive for the wire types. No Axum, Leptos, tokio,
+# gix, or filesystem — so this crate compiles for both native and wasm32 and can
+# be shared, unchanged, by the server and the browser frontend.
+serde = { workspace = true }
+
+[dev-dependencies]
+# Round-trip (serialize → JSON → deserialize) tests for every wire type.
+serde_json = { workspace = true }

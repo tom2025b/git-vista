@@ -623,6 +623,7 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "git-vista-core",
+ "git-vista-protocol",
  "gloo-net 0.7.0",
  "js-sys",
  "leptos",
@@ -652,12 +653,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-vista-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "git-vista-server"
 version = "0.1.0"
 dependencies = [
  "axum",
  "git-vista-core",
  "git-vista-git",
+ "git-vista-protocol",
  "serde",
  "serde_json",
  "tempfile",

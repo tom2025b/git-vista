@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use axum::Json;
 
 use git_vista_core::activity::ActivityKind;
-use git_vista_core::model::CreateCommitRequest;
+use git_vista_protocol::CreateCommitRequest;
 
 use crate::git_cmd::rev_parse;
 use crate::state::{current, reject_if_read_only};
