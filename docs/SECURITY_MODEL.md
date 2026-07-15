@@ -106,14 +106,31 @@ These concerns are intentionally outside the V2 local-first implementation.
 
 ## Repository Isolation
 
-- Configure one or more allowlisted repository roots.
-- Canonicalize discovered paths and reject escapes through symlinks.
+Implemented by the server-owned catalog (M1.03, `git-vista-server::catalog`;
+ADR 0003). The catalog is the only path→id resolver and fails closed on anything
+it did not itself register.
+
+- Configure one or more allowlisted repository roots. *(Catalog `AllowedRoots`;
+  the clones root is always allowed, and a server-launched repo allows its own
+  root.)*
+- Canonicalize discovered paths and reject escapes through symlinks. *(Registration
+  canonicalises the repository root and checks component-wise containment, so a
+  `../` traversal or a symlink escaping an allowed root is rejected.)*
 - Give the browser opaque repository IDs, not arbitrary filesystem paths.
+  *(Requests select a worktree by `WorktreeId`; `GET /api/catalog` reports
+  capabilities by id. A malformed id is a `400`, an unknown id a `404`.)*
 - Resolve git-dir and common-dir through Git/gix for normal, bare, and linked
-  worktree repositories.
-- Never follow a browser-provided path to open a file or repository.
+  worktree repositories. *(`git_vista_git::read_repo_facts` classifies each as
+  bare / main / linked and derives the canonical root.)*
+- Never follow a browser-provided path to open a file or repository. *(No endpoint
+  accepts a path; ids resolve only against the registered set.)*
+- Report capabilities without exposing absolute paths by default. *(Descriptors
+  and the graph label carry only a base name unless `GIT_VISTA_EXPOSE_PATHS` is
+  set.)*
 - Scope operation stores and recovery refs to the canonical repository identity.
+  *(Deferred to M1.09.)*
 - Treat submodules as separate repositories with explicit opt-in traversal.
+  *(Deferred.)*
 - Never serve `.git` internals as static files.
 
 ## Command Execution

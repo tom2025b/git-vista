@@ -85,6 +85,62 @@ pub struct RebaseStatus {
     pub up_to_date: bool,
 }
 
+/// How a servable repository entry relates to git's on-disk layout (M1.03). The
+/// catalog classifies every registered repository so the API — and eventually the
+/// UI — can treat a bare repository or a linked worktree explicitly instead of
+/// assuming one working tree per clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryKind {
+    /// A bare repository: a git directory with no working tree. Reads work; the
+    /// working-tree/status reads and every mutation are meaningless and refused.
+    Bare,
+    /// The main working tree of a repository (its git dir *is* the common dir).
+    MainWorktree,
+    /// A linked worktree (`git worktree add`): its own working tree and git dir
+    /// under `…/worktrees/<name>`, sharing the repository's common dir — so it
+    /// shares the [`repository`](RepositoryDescriptor::repository) id but carries
+    /// a distinct [`worktree`](RepositoryDescriptor::worktree) id.
+    LinkedWorktree,
+}
+
+/// One entry in the server-owned repository catalog (M1.03), as reported to the
+/// client. This is the *capability* view: it addresses a repository by opaque
+/// ids, never by a filesystem path, so the browser selects what to act on with a
+/// [`worktree`](Self::worktree) id it cannot forge into a path.
+///
+/// The id fields are the opaque string forms of `git-vista-core`'s
+/// `RepositoryId`/`WorktreeId`. They are kept as plain strings here to hold the
+/// transport/domain boundary this crate exists to enforce: the client treats them
+/// as meaningless handles and echoes them back, and only the native backend maps
+/// an id to a path — through the catalog, which fails closed on anything it did
+/// not itself register.
+///
+/// `path` is `None` by default. Absolute paths are server-filesystem detail and
+/// are omitted unless the operator opts in (the `GIT_VISTA_EXPOSE_PATHS`
+/// diagnostic), so the capability report never leaks the layout of the machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryDescriptor {
+    /// Opaque id of the shared repository (its common git directory). Every
+    /// worktree of one clone reports the same value here.
+    pub repository: String,
+    /// Opaque id of this specific worktree — the handle the client sends back to
+    /// address this entry. Distinct per worktree even within one repository.
+    pub worktree: String,
+    /// A short, non-path display label (the directory's base name), safe to show
+    /// in the UI without revealing where on disk the repository lives.
+    pub name: String,
+    /// Whether this entry is a bare repo, the main worktree, or a linked worktree.
+    pub kind: RepositoryKind,
+    /// True when the entry is view-only (e.g. a clone opened from a URL): every
+    /// mutation is refused, mirroring the graph's `read_only`.
+    pub read_only: bool,
+    /// The absolute filesystem path — omitted (`None`) unless the operator opted
+    /// into path exposure. Never sent by default; the client must not depend on it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub path: Option<String>,
+}
+
 /// Validate a URL a user pasted to clone, before the server hands it to
 /// `git clone` (Phase 12). This is a *gate*, not a parser: it accepts only the
 /// public, read-oriented transports (`https://`, `http://`, `git://`) and rejects
@@ -196,6 +252,47 @@ mod tests {
         };
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(serde_json::from_str::<RebaseStatus>(&json).unwrap(), status);
+    }
+
+    #[test]
+    fn repository_descriptor_roundtrips_and_omits_path_by_default() {
+        let d = RepositoryDescriptor {
+            repository: "11111111-1111-5111-8111-111111111111".into(),
+            worktree: "22222222-2222-5222-8222-222222222222".into(),
+            name: "my-repo".into(),
+            kind: RepositoryKind::MainWorktree,
+            read_only: false,
+            path: None,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        // A `None` path is skipped entirely — the wire form never carries the key,
+        // so the capability report can't leak the server's filesystem by default.
+        assert!(
+            !json.contains("path"),
+            "path must be omitted when None: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<RepositoryDescriptor>(&json).unwrap(),
+            d
+        );
+    }
+
+    #[test]
+    fn repository_kind_uses_stable_snake_case_wire_names() {
+        // The wire names are part of the contract; pin them so a rename is a
+        // deliberate, visible protocol change rather than an accident.
+        assert_eq!(
+            serde_json::to_string(&RepositoryKind::Bare).unwrap(),
+            "\"bare\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RepositoryKind::MainWorktree).unwrap(),
+            "\"main_worktree\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RepositoryKind::LinkedWorktree).unwrap(),
+            "\"linked_worktree\""
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! commit's detail and diff, and the two live "state" reads (checked-out branch,
 //! working-tree status). Reads, so they work on read-only clones too.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use axum::extract::{Path as AxumPath, Query};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -10,6 +10,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
 
+use git_vista_core::identity::{RepositoryHandle, WorktreeId};
 use git_vista_core::layout;
 use git_vista_core::model::{CommitSummary, GitRef, RefKind};
 use git_vista_core::status::parse_porcelain_v2;
@@ -17,7 +18,41 @@ use git_vista_git::{read_commit, read_refs, walk_history, RepoError};
 
 use crate::git_cmd::git_stdout;
 use crate::handlers::reset::has_seed;
-use crate::state::{current, HISTORY_LIMIT};
+use crate::state::{current, current_handle, repo_label, resolve_worktree, HISTORY_LIMIT};
+
+/// The optional opaque repository selector shared by the read endpoints (M1.03):
+/// `?repo=<worktree-id>` addresses one servable worktree by its opaque id. When
+/// absent, the endpoint acts on the server's current default selection — the
+/// backward-compatible behaviour the existing single-repo frontend relies on
+/// until it adopts ids (M1.11).
+#[derive(Deserialize)]
+pub(crate) struct RepoQuery {
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+/// Resolve the `?repo=` selector to a concrete repository, failing closed. A
+/// malformed id is a `400`; an id the catalog does not hold is a `404` — the
+/// server only ever resolves an id it itself registered, never a path from the
+/// request. An absent selector falls back to the current default selection.
+fn resolve_repo(
+    repo: Option<&str>,
+) -> Result<(PathBuf, bool, Option<RepositoryHandle>), (StatusCode, String)> {
+    match repo {
+        None => {
+            let (path, read_only) = current();
+            Ok((path, read_only, current_handle()))
+        }
+        Some(id) => {
+            let worktree: WorktreeId = id
+                .parse()
+                .map_err(|_| (StatusCode::BAD_REQUEST, "Not a repository id.".to_string()))?;
+            let (path, read_only, handle) = resolve_worktree(worktree)
+                .ok_or((StatusCode::NOT_FOUND, "No such repository.".to_string()))?;
+            Ok((path, read_only, Some(handle)))
+        }
+    }
+}
 
 /// Walk the configured repository (see [`repo_path`]) and return its laid-out
 /// graph as JSON, with branch/tag/HEAD refs attached for badging and per-branch
@@ -27,8 +62,10 @@ use crate::state::{current, HISTORY_LIMIT};
 /// changes underneath us (new commits, new/switched branches) between launches,
 /// and iOS Safari's on-disk cache otherwise persists a stale graph across app —
 /// and even device — restarts, making freshly created branches never appear.
-pub(crate) async fn commits() -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (repo, read_only) = current();
+pub(crate) async fn commits(
+    Query(q): Query<RepoQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let (repo, read_only, handle) = resolve_repo(q.repo.as_deref())?;
     let repo = repo.as_path();
     let history = walk_history(repo, HISTORY_LIMIT).map_err(|e| {
         eprintln!("git-vista: /api/commits failed reading history: {e}");
@@ -48,10 +85,16 @@ pub(crate) async fn commits() -> Result<impl IntoResponse, (StatusCode, String)>
     // is the one drawn as a new stub line (not the trunk). See `layout_with_refs`.
     let head_branch = git_vista_git::read_head_branch(repo);
     let mut graph = layout::layout_with_refs(history, refs, head_branch.as_deref());
-    // Tell the UI exactly which repo path this graph came from, so the header can
-    // show it. If the page ever displays a different repo than the terminal is
-    // serving, this makes the mismatch visible instead of a mystery.
-    graph.repo_label = Some(repo.display().to_string());
+    // Tell the UI which repo this graph came from, as a short non-path label so
+    // the header can show *which* repo without leaking the server's filesystem
+    // (M1.03; the full path only when the operator opts into `GIT_VISTA_EXPOSE_PATHS`).
+    graph.repo_label = Some(repo_label(repo));
+    // Stamp the opaque ids the client addresses this repo by (M1.03), so a later
+    // request can select this exact worktree with `?repo=`. Absent in degraded mode.
+    if let Some(handle) = handle {
+        graph.repo_id = Some(handle.repository.to_string());
+        graph.worktree_id = Some(handle.worktree.to_string());
+    }
     // A cloned URL is view-only: tell the UI to hide every write action.
     graph.read_only = read_only;
     // Offer "Reset Test Repo" only for a repo explicitly opted in with
@@ -78,8 +121,9 @@ pub(crate) async fn commits() -> Result<impl IntoResponse, (StatusCode, String)>
 /// is a `404`; any other read failure a `500`. Sent `no-store` like the graph.
 pub(crate) async fn commit_detail(
     AxumPath(id): AxumPath<String>,
+    Query(q): Query<RepoQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let repo = current().0;
+    let repo = resolve_repo(q.repo.as_deref())?.0;
     let detail = read_commit(&repo, &id).map_err(|e| match e {
         RepoError::CommitNotFound(_) => (StatusCode::NOT_FOUND, "No such commit.".to_string()),
         other => {
@@ -108,6 +152,9 @@ const DIFF_PATCH_CAP_FULL: usize = 5_000_000;
 pub(crate) struct DiffQuery {
     #[serde(default)]
     full: Option<u8>,
+    /// Opaque repository selector (M1.03), same meaning as [`RepoQuery::repo`].
+    #[serde(default)]
+    repo: Option<String>,
 }
 
 /// One commit's diff (Activity/Undo feature, step 2): the per-file change list
@@ -132,7 +179,7 @@ pub(crate) async fn commit_diff(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<DiffQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let repo = current().0;
+    let repo = resolve_repo(query.repo.as_deref())?.0;
     // Belt-and-braces before the id goes anywhere near argv: real ids are hex.
     if id.len() < 4 || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string()));
@@ -224,8 +271,9 @@ const FILE_CONTENT_CAP: usize = 2_000_000;
 /// Binary blobs (NUL bytes near the start) come back flagged, not as garbage.
 pub(crate) async fn file_at_commit(
     AxumPath((id, path)): AxumPath<(String, String)>,
+    Query(q): Query<RepoQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let repo = current().0;
+    let repo = resolve_repo(q.repo.as_deref())?.0;
     // Same belt-and-braces as the diff: real ids are hex, and the id leads the
     // `<id>:<path>` argument, so neither half can ever read as an option.
     if id.len() < 4 || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -270,12 +318,12 @@ pub(crate) async fn file_at_commit(
 /// merge dialog fetches this the moment the user clicks "Merge", so it names the
 /// real target even if the graph on screen is a stale snapshot from before a branch
 /// switch. `null` => detached HEAD. Sent `no-store` so it's never served from cache.
-pub(crate) async fn head_branch() -> impl IntoResponse {
+pub(crate) async fn head_branch(
+    Query(q): Query<RepoQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = resolve_repo(q.repo.as_deref())?.0;
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
-    (
-        no_store,
-        Json(git_vista_git::read_head_branch(&current().0)),
-    )
+    Ok((no_store, Json(git_vista_git::read_head_branch(&repo))))
 }
 
 /// The working-tree status (Activity/Undo feature, step 1): the parsed output
@@ -287,8 +335,10 @@ pub(crate) async fn head_branch() -> impl IntoResponse {
 /// sparse checkouts) — and the pure parser lives in core where it's unit-
 /// tested. A read, so it works on read-only clones too. Sent `no-store` like
 /// the other live reads: the answer changes with every edit in the worktree.
-pub(crate) async fn worktree_status() -> Result<impl IntoResponse, (StatusCode, String)> {
-    let repo = current().0;
+pub(crate) async fn worktree_status(
+    Query(q): Query<RepoQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = resolve_repo(q.repo.as_deref())?.0;
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(&repo)
@@ -342,4 +392,55 @@ fn log_commits_summary(repo: &Path, history: &[CommitSummary], refs: &[GitRef]) 
         local.join(", "),
         if has_head { "; HEAD" } else { "" },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::get;
+    use axum::Router;
+    use git_vista_protocol::RepositoryDescriptor;
+    use tower::ServiceExt;
+
+    async fn status_of(app: Router, uri: &str) -> StatusCode {
+        let req = axum::http::Request::get(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn repo_selector_rejects_a_malformed_id_as_bad_request() {
+        // A `?repo=` that isn't even a valid id never reaches path resolution.
+        let app = Router::new().route("/api/head-branch", get(head_branch));
+        let status = status_of(app, "/api/head-branch?repo=not-an-id").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn repo_selector_fails_closed_on_an_unknown_id() {
+        // A well-formed id the catalog never registered resolves to nothing — the
+        // request is refused with a 404 rather than falling back to any path.
+        let unknown = WorktreeId::from_git_dir("/no/such/repo/.git").to_string();
+        let app = Router::new().route("/api/head-branch", get(head_branch));
+        let status = status_of(app, &format!("/api/head-branch?repo={unknown}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn catalog_endpoint_lists_entries_without_leaking_paths() {
+        // The capability report is valid JSON and, by default, carries no paths.
+        let app = Router::new().route("/api/catalog", get(crate::handlers::catalog::catalog_list));
+        let req = axum::http::Request::get("/api/catalog")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        // Deserialises as the descriptor list, and no descriptor carries a path.
+        let list: Vec<RepositoryDescriptor> = serde_json::from_slice(&bytes).unwrap();
+        assert!(list.iter().all(|d| d.path.is_none()));
+    }
 }
