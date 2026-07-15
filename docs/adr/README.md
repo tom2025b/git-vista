@@ -13,3 +13,4 @@ it, and note the link in both.
 | ADR | Title | Status |
 | --- | --- | --- |
 | [0001](0001-repository-generation.md) | Repository identity and the repository-generation algorithm | Accepted |
+| [0002](0002-versioned-api-contract.md) | A versioned API contract: protocol negotiation, structured errors, and a transport crate | Accepted |

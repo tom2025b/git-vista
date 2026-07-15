@@ -15,6 +15,9 @@ path = "src/main.rs"
 [dependencies]
 # Shared data models (compiles for wasm too — pure logic, no UI deps).
 git-vista-core = { workspace = true }
+# The versioned HTTP transport contract (M1.02): protocol version + negotiation,
+# the API error envelope, and the shared request/response DTOs. Pure/wasm-safe.
+git-vista-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
@@ -37,6 +40,9 @@ web-sys = { version = "0.3", features = [
     "Element",
     "Event",
     "EventTarget",
+    # M1.02 "Update Required" screen: window.location().reload() when the client's
+    # protocol is incompatible with the server's.
+    "Location",
     # Phase 13: keyboard shortcuts (Esc / +/-/0 / r) via a window keydown listener.
     "KeyboardEvent",
     "MouseEvent",

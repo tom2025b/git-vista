@@ -9,16 +9,47 @@
 //! failure, so the UI can show the real reason. Pure data plumbing — no UI —
 //! so this stays testable on its own away from the view code.
 
-use gloo_net::http::Request;
+use gloo_net::http::{Request, RequestBuilder};
 
 use git_vista_core::activity::{ActivityEvent, UndoAction, Undoable};
 use git_vista_core::diff::{CommitDiff, FileContent};
-use git_vista_core::model::{
-    BranchRequest, CloneRequest, CommitDetail, CreateBranchRequest, CreateCommitRequest, Graph,
-    RebaseStatus,
-};
+use git_vista_core::model::{CommitDetail, Graph};
 use git_vista_core::net::network_error_text;
 use git_vista_core::status::RepoStatus;
+use git_vista_protocol::{
+    BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, ProtocolInfo,
+    RebaseStatus, PROTOCOL_HEADER, PROTOCOL_VERSION,
+};
+
+/// Start a GET carrying the protocol header every `/api/*` request must send
+/// (M1.02): the server refuses a call without it, so every read goes through
+/// here rather than `Request::get` directly.
+fn req_get(url: &str) -> RequestBuilder {
+    Request::get(url).header(PROTOCOL_HEADER, &PROTOCOL_VERSION.to_string())
+}
+
+/// Start a POST carrying the protocol header (see [`req_get`]).
+fn req_post(url: &str) -> RequestBuilder {
+    Request::post(url).header(PROTOCOL_HEADER, &PROTOCOL_VERSION.to_string())
+}
+
+/// Fetch the server's protocol contract (`GET /api/protocol`, M1.02): the
+/// current protocol version and the `[min, max]` client-version window it
+/// accepts. Hit at startup — and on every reload — so the app can raise an
+/// "Update Required" screen instead of silently talking to an incompatible
+/// server. This endpoint needs no protocol header; sending it is harmless.
+pub async fn fetch_protocol() -> Result<ProtocolInfo, String> {
+    let url = format!("/api/protocol?t={}", js_sys::Date::now());
+    let resp = req_get(&url).send().await.map_err(network_error)?;
+    if resp.ok() {
+        resp.json::<ProtocolInfo>().await.map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
 
 /// Map a `send()`-level failure — the request never completed — to the
 /// actionable message built in core, instead of Safari's bare "TypeError:
@@ -39,7 +70,7 @@ fn network_error(e: gloo_net::Error) -> String {
 /// created since the last launch never shows). The backend ignores the param.
 pub async fn fetch_graph() -> Result<Graph, String> {
     let url = format!("/api/commits?t={}", js_sys::Date::now());
-    Request::get(&url)
+    req_get(&url)
         .send()
         .await
         .map_err(network_error)?
@@ -54,7 +85,7 @@ pub async fn fetch_graph() -> Result<Graph, String> {
 /// returned as `Err` for the panel to show.
 pub async fn fetch_commit_detail(id: &str) -> Result<CommitDetail, String> {
     let url = format!("/api/commit/{id}?t={}", js_sys::Date::now());
-    let resp = Request::get(&url).send().await.map_err(network_error)?;
+    let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<CommitDetail>().await.map_err(|e| e.to_string())
     } else {
@@ -72,7 +103,7 @@ pub async fn clone_request(url: &str) -> Result<(), String> {
     let body = CloneRequest {
         url: url.to_string(),
     };
-    let resp = Request::post("/api/clone")
+    let resp = req_post("/api/clone")
         .json(&body)
         .map_err(|e| e.to_string())?
         .send()
@@ -104,7 +135,7 @@ pub async fn create_branch_request(name: &str, commit: &str) -> Result<(), Strin
         commit: commit.to_string(),
     };
     let send = || async {
-        Request::post("/api/branch")
+        req_post("/api/branch")
             .json(&body)
             .map_err(|e| e.to_string())?
             .send()
@@ -141,7 +172,7 @@ pub async fn create_commit_request(
         allow_empty,
         branch: branch.map(str::to_string),
     };
-    let resp = Request::post("/api/commit")
+    let resp = req_post("/api/commit")
         .json(&body)
         .map_err(|e| e.to_string())?
         .send()
@@ -162,10 +193,7 @@ pub async fn create_commit_request(
 /// then be committed. Bodyless, like the rebase request; a non-2xx body is git's
 /// own error text, returned as `Err` for the caller to show.
 pub async fn stage_request() -> Result<(), String> {
-    let resp = Request::post("/api/stage")
-        .send()
-        .await
-        .map_err(network_error)?;
+    let resp = req_post("/api/stage").send().await.map_err(network_error)?;
     if resp.ok() {
         Ok(())
     } else {
@@ -181,7 +209,7 @@ pub async fn stage_request() -> Result<(), String> {
 /// back to HEAD, the working tree keeps every edit. Same bodyless shape and
 /// error posture as staging.
 pub async fn unstage_request() -> Result<(), String> {
-    let resp = Request::post("/api/unstage")
+    let resp = req_post("/api/unstage")
         .send()
         .await
         .map_err(network_error)?;
@@ -201,7 +229,7 @@ pub async fn unstage_request() -> Result<(), String> {
 /// the graph fetch, since the answer changes as branches are switched.
 pub async fn fetch_head_branch() -> Result<Option<String>, String> {
     let url = format!("/api/head-branch?t={}", js_sys::Date::now());
-    Request::get(&url)
+    req_get(&url)
         .send()
         .await
         .map_err(network_error)?
@@ -217,7 +245,7 @@ pub async fn fetch_head_branch() -> Result<Option<String>, String> {
 /// cache-busted like the other live reads.
 pub async fn fetch_activity(limit: usize) -> Result<Vec<ActivityEvent>, String> {
     let url = format!("/api/activity?limit={limit}&t={}", js_sys::Date::now());
-    let resp = Request::get(&url).send().await.map_err(network_error)?;
+    let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<Vec<ActivityEvent>>()
             .await
@@ -236,7 +264,7 @@ pub async fn fetch_activity(limit: usize) -> Result<Vec<ActivityEvent>, String> 
 /// on a read-only clone. Cache-busted like the other live reads.
 pub async fn fetch_undoables(commit: &str) -> Result<Vec<Undoable>, String> {
     let url = format!("/api/undoables/{commit}?t={}", js_sys::Date::now());
-    let resp = Request::get(&url).send().await.map_err(network_error)?;
+    let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<Vec<Undoable>>()
             .await
@@ -255,7 +283,7 @@ pub async fn fetch_undoables(commit: &str) -> Result<Vec<Undoable>, String> {
 /// moved branch (compare-and-swap) or a dirty working tree — returned as `Err`
 /// for the confirm flow to show.
 pub async fn undo_request(action: &UndoAction) -> Result<(), String> {
-    let resp = Request::post("/api/undo")
+    let resp = req_post("/api/undo")
         .json(action)
         .map_err(|e| e.to_string())?
         .send()
@@ -277,7 +305,7 @@ pub async fn undo_request(action: &UndoAction) -> Result<(), String> {
 /// server's reason, returned as `Err` for the panel to show.
 pub async fn fetch_diff(id: &str) -> Result<CommitDiff, String> {
     let url = format!("/api/diff/{id}?t={}", js_sys::Date::now());
-    let resp = Request::get(&url).send().await.map_err(network_error)?;
+    let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<CommitDiff>().await.map_err(|e| e.to_string())
     } else {
@@ -292,7 +320,7 @@ pub async fn fetch_diff(id: &str) -> Result<CommitDiff, String> {
 /// for the full-screen viewer — the panel's capped fetch is [`fetch_diff`].
 pub async fn fetch_diff_full(id: &str) -> Result<CommitDiff, String> {
     let url = format!("/api/diff/{id}?full=1&t={}", js_sys::Date::now());
-    let resp = Request::get(&url).send().await.map_err(network_error)?;
+    let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<CommitDiff>().await.map_err(|e| e.to_string())
     } else {
@@ -321,7 +349,7 @@ pub async fn fetch_file(id: &str, path: &str) -> Result<FileContent, String> {
         encoded.join("/"),
         js_sys::Date::now()
     );
-    let resp = Request::get(&url).send().await.map_err(network_error)?;
+    let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<FileContent>().await.map_err(|e| e.to_string())
     } else {
@@ -338,7 +366,7 @@ pub async fn fetch_file(id: &str, path: &str) -> Result<FileContent, String> {
 /// busted like the other live reads, since it changes with every edit.
 pub async fn fetch_status() -> Result<RepoStatus, String> {
     let url = format!("/api/status?t={}", js_sys::Date::now());
-    let resp = Request::get(&url).send().await.map_err(network_error)?;
+    let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<RepoStatus>().await.map_err(|e| e.to_string())
     } else {
@@ -356,7 +384,7 @@ pub async fn fetch_status() -> Result<RepoStatus, String> {
 /// item's enabled state reflects the repo *now*, not the possibly-stale graph.
 pub async fn fetch_rebase_status() -> Result<RebaseStatus, String> {
     let url = format!("/api/rebase-status?t={}", js_sys::Date::now());
-    Request::get(&url)
+    req_get(&url)
         .send()
         .await
         .map_err(network_error)?
@@ -372,7 +400,7 @@ pub async fn fetch_rebase_status() -> Result<RebaseStatus, String> {
 /// "Already up to date" no-op (a raced click from a stale menu). A non-2xx body
 /// is git's own error text (conflicts, detached HEAD, …), returned as `Err`.
 pub async fn rebase_request() -> Result<String, String> {
-    let resp = Request::post("/api/rebase")
+    let resp = req_post("/api/rebase")
         .send()
         .await
         .map_err(network_error)?;
@@ -393,7 +421,7 @@ pub async fn rebase_request() -> Result<String, String> {
 /// a non-2xx body is the server's reason (not a test repo, corrupt seed, or
 /// the exact git step that refused), returned as `Err` for the dialog to show.
 pub async fn reset_test_repo_request() -> Result<String, String> {
-    let resp = Request::post("/api/reset-test-repo")
+    let resp = req_post("/api/reset-test-repo")
         .send()
         .await
         .map_err(network_error)?;
@@ -417,7 +445,7 @@ pub async fn branch_op_request(path: &str, branch: &str) -> Result<String, Strin
     let body = BranchRequest {
         branch: branch.to_string(),
     };
-    let resp = Request::post(path)
+    let resp = req_post(path)
         .json(&body)
         .map_err(|e| e.to_string())?
         .send()
