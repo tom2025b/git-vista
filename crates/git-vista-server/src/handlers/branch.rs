@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::Json;
 
 use git_vista_core::activity::ActivityKind;
-use git_vista_core::model::{BranchRequest, CreateBranchRequest};
+use git_vista_protocol::{BranchRequest, CreateBranchRequest};
 
 use crate::git_cmd::rev_parse;
 use crate::journal;

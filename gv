@@ -119,10 +119,14 @@ fi
 setsid "$REPO/target/debug/git-vista-server" "$TARGET" >>"$LOG" 2>&1 </dev/null &
 
 # Don't claim success until it actually serves: catches an immediate crash or a
-# port clash, with the log's last lines as the explanation.
+# port clash, with the log's last lines as the explanation. Probe /api/protocol —
+# the one endpoint exempt from the M1.02 protocol-header requirement (every other
+# /api/* now answers 426 without an `X-Git-Vista-Protocol` header, which `curl -f`
+# would read as "down"). It's also the natural health check: it needs no repo read
+# and returns 200 the moment the server is serving.
 echo "gv: visualising $TARGET"
 for _ in $(seq 1 40); do
-  if curl -sf -m 1 "http://localhost:8080/api/head-branch" >/dev/null 2>&1; then
+  if curl -sf -m 1 "http://localhost:8080/api/protocol" >/dev/null 2>&1; then
     if [[ $LAN -eq 1 ]]; then
       LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
       echo "gv: server up in LAN mode — http://${LAN_IP:-<this-machine-LAN-IP>}:8080/"

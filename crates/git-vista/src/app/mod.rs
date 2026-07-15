@@ -21,11 +21,14 @@
 
 use leptos::*;
 
-use crate::api::{fetch_graph, fetch_head_branch, fetch_status};
+use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
+
+use crate::api::{fetch_graph, fetch_head_branch, fetch_protocol, fetch_status};
 use crate::dialogs;
 use crate::icons::icon_set;
 use crate::prefs::{load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref};
 use crate::print::print_graph_view;
+use crate::update_required::update_required_view;
 
 mod canvas;
 
@@ -43,6 +46,27 @@ pub fn App() -> impl IntoView {
     let reload = create_rw_signal(0u32);
     let graph = create_local_resource(move || reload.get(), |_| fetch_graph());
     let refresh = move |_| reload.update(|n| *n = n.wrapping_add(1));
+
+    // M1.02 (#102): negotiate the protocol before trusting the rest of the API.
+    // Keyed on `reload` so every Refresh (and every post-operation reload)
+    // re-checks — if the server is redeployed on an incompatible protocol while
+    // this tab stays open, the next reload catches it. `protocol_gate` yields the
+    // negotiation payload + verdict only when the client is *out* of the server's
+    // accepted window; that drives the blocking "Update Required" overlay below.
+    let protocol = create_local_resource(move || reload.get(), |_| fetch_protocol());
+    let protocol_gate = move || match protocol.get() {
+        Some(Ok(info)) => {
+            let verdict = check_compatibility(
+                PROTOCOL_VERSION,
+                info.min_client_protocol,
+                info.max_client_protocol,
+            );
+            (!verdict.is_compatible()).then_some((info, verdict))
+        }
+        // Pending, or the negotiation call itself failed (unreachable server):
+        // no overlay — the normal load-error path handles an unreachable server.
+        _ => None,
+    };
 
     // The checked-out branch, shown next to the repo name in the status line.
     // Fetched from the same endpoint the merge/delete confirmations use — not
@@ -115,6 +139,9 @@ pub fn App() -> impl IntoView {
 
     view! {
         <main class="app">
+            // M1.02: the blocking "Update Required" screen, shown (over everything
+            // else) only when this client's protocol is incompatible with the server.
+            {move || protocol_gate().map(|(info, verdict)| update_required_view(info, verdict))}
             <header class="topbar">
                 // The git mark brands the title (icons.rs). Reactive so the
                 // topbar switches with the icon-style toggle like everything else.
