@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# dev — shared developer commands for git-vista, so both Claude accounts (and Tom)
+# run the project's rituals identically and can always resume half-finished work.
+#
+# The point of this script is durability: sessions run out of tokens mid-milestone,
+# so the rule is COMMIT WORK-IN-PROGRESS OFTEN (`dev wip`) — every push is a
+# checkpoint on GitHub that any later session, on either account, can resume from
+# (`dev resume`). Uncommitted work is the only work that gets lost.
+#
+#   dev gate              run the full CI gate (fmt, clippy x2, test, trunk build)
+#   dev roadmap           print milestones + open issues, grouped by M-band
+#   dev start <issue#>    branch off fresh main for an issue (feature/mX.YY-slug)
+#   dev wip [message]     checkpoint: add + commit (as claude_2010) + push
+#   dev resume [issue#]   show branch state, WIP commits, and handoff.md
+#   dev signin            reprint the sign-in link(s) for the running server
+#   dev serve [--lan] [p] start the server for a repo (delegates to ./gv)
+#   dev handoff           open/print handoff.md (the running "what's done / next" note)
+#
+# handoff.md is gitignored on purpose (local working note); the DURABLE record is
+# the WIP git commits. Keep handoff.md current as you work so a fresh session — or
+# the other account — can pick up exactly where you left off.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+cd "$REPO"
+
+# Author identity for commits this script makes: name distinguishes Claude's
+# commits from Tom's in `git log`; the noreply email dodges GitHub's GH007.
+GIT_AS=(-c user.name=claude_2010 -c user.email=262510778+tom2025b@users.noreply.github.com)
+
+die() { echo "dev: $*" >&2; exit 1; }
+
+cmd_gate() {
+  echo "dev: running the CI gate (fmt → clippy → wasm-clippy → test → trunk build)…"
+  echo "── fmt ─────────────────────────────────────────────"
+  cargo fmt --all -- --check
+  echo "── clippy (native) ─────────────────────────────────"
+  cargo clippy --workspace --all-targets -- -D warnings
+  echo "── clippy (wasm32) ─────────────────────────────────"
+  cargo clippy -p git-vista --target wasm32-unknown-unknown --all-targets -- -D warnings
+  echo "── test ────────────────────────────────────────────"
+  cargo test --workspace
+  echo "── trunk build ─────────────────────────────────────"
+  ( cd crates/git-vista && trunk build )
+  echo "dev: ✅ gate green"
+}
+
+cmd_roadmap() {
+  command -v gh >/dev/null || die "gh CLI not found"
+  echo "=== Milestones (progress) ==="
+  gh api "repos/{owner}/{repo}/milestones?state=all&per_page=50" \
+    --jq 'sort_by(.title) | .[] | "  \(.title)  —  \(.closed_issues) done / \(.open_issues) open"'
+  echo
+  echo "=== Open issues (next up first) ==="
+  gh api "repos/{owner}/{repo}/issues?state=open&per_page=100" \
+    --jq 'map(select(.pull_request == null)) | sort_by(.number) | .[] | "  #\(.number)  \(.title)"' \
+    | head -20
+}
+
+cmd_start() {
+  local issue="${1:-}"
+  [[ -n "$issue" ]] || die "usage: dev start <issue#>"
+  command -v gh >/dev/null || die "gh CLI not found"
+  local title mnum rest slug branch
+  title="$(gh issue view "$issue" --json title --jq .title)" || die "no issue #$issue"
+  mnum="$(grep -oiE 'M[0-9]+\.[0-9]+' <<<"$title" | head -1 | tr 'A-Z' 'a-z')"
+  rest="$(sed -E 's/^M[0-9]+\.[0-9]+ *//I' <<<"$title")"
+  slug="$(tr 'A-Z' 'a-z' <<<"$rest" | tr -cs 'a-z0-9' '-' | sed 's/^-//; s/-$//' | cut -c1-40 | sed 's/-$//')"
+  branch="feature/${mnum:-issue-$issue}-${slug}"
+  echo "dev: issue #$issue — $title"
+  echo "dev: branching $branch off fresh main…"
+  git checkout main -q
+  git pull --ff-only origin main -q
+  git checkout -b "$branch"
+  echo "dev: on $branch. First thing: seed handoff.md and 'dev wip' early + often."
+}
+
+cmd_wip() {
+  local msg="${*:-}"
+  [[ -n "$msg" ]] || msg="wip: checkpoint $(git rev-parse --abbrev-ref HEAD)"
+  local branch; branch="$(git rev-parse --abbrev-ref HEAD)"
+  [[ "$branch" != "main" ]] || die "refuse to WIP-commit on main — 'dev start <issue#>' first"
+  if git diff --quiet && git diff --cached --quiet; then
+    echo "dev: nothing to commit; pushing branch to be safe…"
+  else
+    git add -A
+    git "${GIT_AS[@]}" commit --no-verify -m "$msg"
+  fi
+  git push -u origin "$branch"
+  echo "dev: ✅ checkpoint pushed — this session's work is now safe to resume."
+}
+
+cmd_resume() {
+  local branch; branch="$(git rev-parse --abbrev-ref HEAD)"
+  echo "=== branch: $branch ==="
+  echo "=== commits on this branch (not yet on main) ==="
+  git log --oneline --format='  %h %an %s' main.."$branch" 2>/dev/null || echo "  (none / branch is main)"
+  echo "=== uncommitted changes (would be lost on token-out — 'dev wip' them!) ==="
+  git status --short || true
+  echo "=== handoff.md ==="
+  if [[ -f handoff.md ]]; then cat handoff.md; else echo "  (no handoff.md — create one with the plan + checklist)"; fi
+}
+
+cmd_signin() { ./gv --token; }
+cmd_serve()  { ./gv "$@"; }
+cmd_handoff() {
+  [[ -f handoff.md ]] && { cat handoff.md; exit 0; }
+  echo "dev: no handoff.md yet. Create it with: the goal, a [ ]/[x] checklist, and 'next step'."
+}
+
+case "${1:-}" in
+  gate)    shift; cmd_gate "$@" ;;
+  roadmap) shift; cmd_roadmap "$@" ;;
+  start)   shift; cmd_start "$@" ;;
+  wip)     shift; cmd_wip "$@" ;;
+  resume)  shift; cmd_resume "$@" ;;
+  signin)  shift; cmd_signin "$@" ;;
+  serve)   shift; cmd_serve "$@" ;;
+  handoff) shift; cmd_handoff "$@" ;;
+  ""|-h|--help|help)
+    sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    ;;
+  *) die "unknown command: $1 (try: dev help)" ;;
+esac
