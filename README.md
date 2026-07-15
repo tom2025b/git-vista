@@ -141,17 +141,36 @@ then starts the server pointed at a repo.
 ./gv ~/code/myproj    # visualise another repo by path
 ```
 
-Then open the URL it prints:
+Then open the **sign-in link** it prints (M1.04):
 
-- on this machine: `http://localhost:8080/`
-- from an iPad: forward local port `8080` through SSH to
-  `127.0.0.1:8080` on the Linux host.
+```
+gv: sign in on the iPad/browser by opening this one-time link:
+gv:   http://localhost:8080/#s=<token>
+```
+
+- on this machine: open that link in the browser.
+- from an iPad: forward local port `8080` through SSH to `127.0.0.1:8080` on the
+  Linux host, then open the link (the tunnel makes `localhost:8080` on the iPad the
+  server).
+
+The link carries a one-time token in the URL *fragment* — it never reaches the
+server or any log. Opening it exchanges the token for an HttpOnly, `SameSite=Strict`
+session cookie; the app then works normally. The token is **single-use** and
+expires; `./gv --token` reprints a fresh link for the running server (e.g. for a
+second device), and restarting the server mints a new one. Until a browser signs
+in, the app shows a "Connect to git-vista" screen and the API answers `401`.
+
+Every mutating request additionally carries a per-session CSRF token, and the
+server validates `Origin`/`Host` (loopback-only, defeating DNS rebinding) and
+content type on top of the session — see [ADR 0004](docs/adr/0004-loopback-sessions.md)
+and [the security model](docs/SECURITY_MODEL.md).
 
 Opening `http://127.0.0.1:8080/` directly in Safari without a tunnel will not
 work: on the iPad, `127.0.0.1` means the iPad itself.
 
 For temporary direct access on a trusted personal LAN, run `./gv --lan [path]`.
-This binds all interfaces without authentication or HTTPS. See
+This binds all interfaces over plain HTTP (no TLS); a session is still required,
+but DNS-rebinding protection is weaker than loopback, so prefer the SSH tunnel. See
 [Remote Linux Architecture](docs/REMOTE_ARCHITECTURE.md) for the target session
 and tunnel design.
 

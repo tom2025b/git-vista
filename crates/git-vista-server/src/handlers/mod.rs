@@ -32,6 +32,8 @@ pub(crate) mod protocol;
 pub(crate) mod read;
 pub(crate) mod rebase;
 pub(crate) mod reset;
+// M1.04 (#57): establish / check / revoke a loopback session.
+pub(crate) mod session;
 
 /// Record one successful app operation in the journal (source: App). The
 /// activity feed matches the operation's own reflog echo against this entry

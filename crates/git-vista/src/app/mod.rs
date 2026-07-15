@@ -28,6 +28,7 @@ use crate::dialogs;
 use crate::icons::icon_set;
 use crate::prefs::{load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref};
 use crate::print::print_graph_view;
+use crate::session::{establish_session, not_connected_view};
 use crate::update_required::update_required_view;
 
 mod canvas;
@@ -46,6 +47,22 @@ pub fn App() -> impl IntoView {
     let reload = create_rw_signal(0u32);
     let graph = create_local_resource(move || reload.get(), |_| fetch_graph());
     let refresh = move |_| reload.update(|n| *n = n.wrapping_add(1));
+
+    // M1.04 (#57): establish the loopback session before the API is usable. Run
+    // once on load (source `|| ()`, not keyed on `reload`, so re-reads don't
+    // re-bootstrap): it exchanges a `#s=<token>` fragment for a session cookie, or
+    // checks an existing one. `Some(Ok(false))` — no session and nothing to make
+    // one from — drives the blocking sign-in overlay; a network `Err` falls through
+    // to the normal load-error path (an unreachable server isn't a sign-in problem).
+    let session = create_local_resource(|| (), |_| establish_session());
+    let needs_sign_in = move || matches!(session.get(), Some(Ok(false)));
+    // The graph/status/head-branch reads fired at load without a cookie and 401'd;
+    // once the session lands, bump `reload` once so they refetch authenticated.
+    create_effect(move |_| {
+        if matches!(session.get(), Some(Ok(true))) {
+            reload.update(|n| *n = n.wrapping_add(1));
+        }
+    });
 
     // M1.02 (#102): negotiate the protocol before trusting the rest of the API.
     // Keyed on `reload` so every Refresh (and every post-operation reload)
@@ -142,6 +159,9 @@ pub fn App() -> impl IntoView {
             // M1.02: the blocking "Update Required" screen, shown (over everything
             // else) only when this client's protocol is incompatible with the server.
             {move || protocol_gate().map(|(info, verdict)| update_required_view(info, verdict))}
+            // M1.04: the blocking sign-in screen, shown when there's no session and
+            // no bootstrap token to make one — the operator must open `gv`'s link.
+            {move || needs_sign_in().then(not_connected_view)}
             <header class="topbar">
                 // The git mark brands the title (icons.rs). Reactive so the
                 // topbar switches with the icon-style toggle like everything else.
