@@ -11,6 +11,9 @@ repository.workspace = true
 # is shared by the browser frontend. Git reading (gix) lives in `git-vista-git`.
 [dependencies]
 serde = { workspace = true }
+# Opaque repository/worktree identity. Name-based (`v5`) only — deterministic and
+# randomness-free, so this crate stays pure and wasm-compatible. See `identity`.
+uuid = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

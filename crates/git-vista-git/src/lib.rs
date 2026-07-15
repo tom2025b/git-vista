@@ -14,10 +14,11 @@
 //! The work is split into focused modules, all re-exported at the crate root so
 //! callers use a flat API (`git_vista_git::walk_history`, etc.):
 //!
-//! - [`history`] — walking commit history and finding commits present on a remote.
-//! - [`refs`]    — reading HEAD, branches and tags, and the checked-out branch.
-//! - [`reflog`]  — reading every ref's reflog, for the activity feed.
-//! - [`github`]  — turning the `origin` remote URL into a GitHub web base URL.
+//! - [`history`]  — walking commit history and finding commits present on a remote.
+//! - [`identity`] — deriving stable repository/worktree ids and generations.
+//! - [`refs`]     — reading HEAD, branches and tags, and the checked-out branch.
+//! - [`reflog`]   — reading every ref's reflog, for the activity feed.
+//! - [`github`]   — turning the `origin` remote URL into a GitHub web base URL.
 //!
 //! [`CommitSummary`]: git_vista_core::model::CommitSummary
 
@@ -27,11 +28,13 @@ use thiserror::Error;
 
 pub mod github;
 pub mod history;
+pub mod identity;
 pub mod reflog;
 pub mod refs;
 
 pub use github::github_web_base;
 pub use history::{read_commit, read_remote_commits, walk_history};
+pub use identity::{read_generation, read_generation_inputs, read_handle};
 pub use reflog::read_reflogs;
 pub use refs::{read_head_branch, read_refs};
 
