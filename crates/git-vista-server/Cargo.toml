@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8.9"
+# CSPRNG for the M1.04 session/bootstrap/CSRF secrets — the OS entropy source
+# directly, no `rand` wrapper. Native-server only; never reaches the wasm build.
+getrandom = "0.2"
 git-vista-core = { workspace = true }
 # The versioned HTTP transport contract: protocol negotiation, the API error
 # envelope, request-id, and the shared request/response DTOs the router deserialises.
