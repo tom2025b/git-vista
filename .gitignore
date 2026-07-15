@@ -6,3 +6,12 @@
 
 # Claude Code local settings (machine-specific permissions)
 .claude/settings.local.json
+
+# Local Codex architecture review and continuation handoff
+/codex-code-review.md
+/codex-code-review.pdf
+/codex-code-review-handoff.md
+/codex-code-review-handoff.pdf
+
+# Personal GitHub issue staging list
+/issues.md

@@ -6,8 +6,8 @@
 
 use leptos::*;
 
-use git_vista_core::color::branch_color;
 use crate::geometry::edge_path;
+use git_vista_core::color::branch_color;
 
 use super::RenderCtx;
 
@@ -37,6 +37,7 @@ pub fn visible_edges(ctx: StoredValue<RenderCtx>, range: (usize, usize)) -> Vec<
 ///    its fork point, not main's blue;
 ///  * a merge link (any non-first parent) is part of the merged-in branch, so
 ///    it takes that parent's colour as it curves in.
+///
 /// Only main (colour slot 0) ever stays blue this way.
 pub fn build_edge(ctx: StoredValue<RenderCtx>, ei: usize) -> View {
     ctx.with_value(|c| {
@@ -45,7 +46,11 @@ pub fn build_edge(ctx: StoredValue<RenderCtx>, ei: usize) -> View {
         let child = &c.graph.rows[e.from_row].commit;
         let parent_oid = &c.graph.rows[e.to_row].commit.id;
         let is_first_parent = child.parents.first() == Some(parent_oid);
-        let color_row = if is_first_parent { e.from_row } else { e.to_row };
+        let color_row = if is_first_parent {
+            e.from_row
+        } else {
+            e.to_row
+        };
         let color = branch_color(c.row_color[color_row]);
         view! {
             <path d=d fill="none" stroke=color stroke-width="2" stroke-linecap="round" />

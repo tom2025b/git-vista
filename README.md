@@ -1,17 +1,50 @@
-# git-vista
+# Git-Vista
 
-A **browser-first** app that visualizes git history as a clean, zoomable
-**vertical** graph — branches in stable colours, HEAD/branch/tag badges, commit
-labels, and a per-commit detail panel. Built in Rust: a pure-logic core, a native
-git reader (gix), a small HTTP server, and a **Leptos → WebAssembly** UI.
+Git-Vista is becoming a professional, touch-first visual Git client for one
+developer using an iPad to work with real repositories on Linux. The browser is
+the portable UI platform; Rust, Axum, `gix`, System Git, Leptos, and WebAssembly
+provide the native repository service and adaptive client.
 
-It's designed to be run on a machine and opened from a browser — including
-**Safari on an iPad over the LAN**, which is why the UI is served over HTTP rather
-than driven through a native shell (a browser can't read a git repo itself).
+The current implementation is a working prototype centered on a clean, zoomable
+vertical commit graph. The proposed V2 direction adds a safe daily-driver Git
+workflow, SSH-first remote access, worktrees, stash, history editing, conflicts,
+forge integration, PWA behavior, and teaching built on professional semantics.
+
+> **Current security warning:** the prototype now binds `127.0.0.1:8080` by
+> default, but its write endpoints do not yet authenticate requests. Session,
+> origin/CSRF, and repository-isolation controls remain V1 architecture work.
+> `gv --lan` is an explicit unauthenticated compatibility mode for a trusted
+> personal LAN, not the target secure remote mode.
+
+## Product Direction
+
+- Professional Git client first; teaching is a major layer, not the base product.
+- iPad, finger, and Apple Pencil as primary design inputs.
+- Local-first and single-user, with no required Git-Vista cloud account.
+- Git-Vista runs beside repositories on Linux; an SSH tunnel is the target remote
+  access path.
+- One frontend for iPad, Linux, macOS, Windows, touchscreens, and large displays.
+- Standard Git remains authoritative and interoperable with terminal workflows.
+
+## Documentation
+
+- [Future vision](docs/FUTURE_VISION.md)
+- [V2 architecture](docs/V2_ARCHITECTURE.md)
+- [Git client roadmap](docs/GIT_CLIENT_ROADMAP.md)
+- [iPad interaction design](docs/IPAD_DESIGN.md)
+- [Remote Linux architecture](docs/REMOTE_ARCHITECTURE.md)
+- [Security model](docs/SECURITY_MODEL.md)
+- [Feature and competitive matrix](docs/FEATURE_MATRIX.md)
+- [Reusable architecture review prompt](docs/prompts/ARCHITECT_REVIEW.md)
+- [Agent handoff prompt](docs/prompts/HANDOFF.md)
+
+`DESIGN.md` and `PROJECT_MEMORY.md` preserve the prototype's phased implementation
+history. The documents under `docs/` are proposed architecture, not claims about
+the current code.
 
 ## Workspace layout
 
-Four crates, each with one job:
+The current prototype has four crates:
 
 ```
 git-vista/
@@ -19,28 +52,23 @@ git-vista/
 ├── rust-toolchain.toml           # stable toolchain + wasm32 target
 ├── gv                            # launcher: rebuild the SPA + serve a repo
 └── crates/
-    ├── git-vista-core/           # pure logic — NO UI, NO filesystem, wasm-safe
-    │   └── src/
-    │       ├── model.rs          # serializable data types (server ⇄ UI)
-    │       └── layout.rs         # vertical lane assignment + per-branch colour
+    ├── git-vista-core/           # wasm-safe models and pure shared logic
     ├── git-vista-git/            # native git reading via gix (native-only)
-    │   └── src/
-    │       ├── history.rs        # walk_history, read_commit, read_remote_commits
-    │       ├── refs.rs           # HEAD, branches, tags, checked-out branch
-    │       └── github.rs         # origin URL → GitHub web base
     ├── git-vista-server/         # axum HTTP backend
-    │   └── src/main.rs           # serves the SPA + the /api/* endpoints
+    │   └── src/                  # routes, Git commands, state, journal/activity
     └── git-vista/                # the Leptos wasm UI (bin: git-vista-ui)
         ├── index.html            # Trunk entry point
         ├── styles.css
-        └── src/                  # app.rs (view), camera, geometry, color, …
+        └── src/                  # feature, rendering, gesture, and state modules
 ```
 
 `git-vista-git` is kept **separate** from `git-vista-core` on purpose: gix reads a
 filesystem repo and can't compile for wasm, so keeping it out of `core` lets the
 browser frontend depend on a clean, wasm-safe core. Both the server and the UI
 share `git-vista-core`'s types, so the same structs flow from the git walker
-through JSON into the UI with no duplication.
+through JSON into the UI with no duplication. V2 will split pure domain,
+versioned protocol, graph, repository application, and forge concerns as those
+boundaries earn their own crates.
 
 ## Architecture
 
@@ -55,10 +83,11 @@ through JSON into the UI with no duplication.
   POST  /api/clone     ───────────────▶  git clone → temp dir   ─┘
 ```
 
-Everything is same-origin, so there's no CORS and no hardcoded host — the server
-serves both the wasm bundle and the API on `:8080`.
+The server serves both the WASM bundle and same-origin API on `:8080`. Same-origin
+delivery reduces frontend configuration; it does not authenticate the current
+write endpoints.
 
-## Features (through Phase 12)
+## Current Prototype Features
 
 - Vertical commit graph with robust lane assignment (branches, merges, octopus).
 - Pan & zoom via **Pointer Events** — drag to pan, wheel to zoom on desktop,
@@ -80,9 +109,10 @@ serves both the wasm bundle and the API on `:8080`.
   plus keyboard shortcuts on desktop and the iPad Magic Keyboard — `+`/`-` zoom, `0`
   resets the view, `r` refreshes, `Esc` closes the open menu/panel. A **Reset view**
   button recenters the camera for pure touch/trackpad use (no keyboard needed).
+- Working-tree summary, stage-all/unstage-all, commit diffs, file viewing, branch
+  checkout, rebase gating, activity history, contextual undo, and graph printing.
 
-See `DESIGN.md` for the phased roadmap and `PROJECT_MEMORY.md` for the running
-per-phase handoff notes.
+See the [feature matrix](docs/FEATURE_MATRIX.md) for an honest current/target split.
 
 ## Prerequisites
 
@@ -107,7 +137,16 @@ then starts the server pointed at a repo.
 Then open the URL it prints:
 
 - on this machine: `http://localhost:8080/`
-- from an iPad on the same Wi-Fi: `http://<this-machine-LAN-IP>:8080/`
+- from an iPad: forward local port `8080` through SSH to
+  `127.0.0.1:8080` on the Linux host.
+
+Opening `http://127.0.0.1:8080/` directly in Safari without a tunnel will not
+work: on the iPad, `127.0.0.1` means the iPad itself.
+
+For temporary direct access on a trusted personal LAN, run `./gv --lan [path]`.
+This binds all interfaces without authentication or HTTPS. See
+[Remote Linux Architecture](docs/REMOTE_ARCHITECTURE.md) for the target session
+and tunnel design.
 
 Under the hood that's just:
 
@@ -121,17 +160,38 @@ Frontend-only iteration (no API, no real data) still works with
 
 ## Tests
 
+These are the exact commands CI runs, in the order it runs them:
+
 ```sh
-cargo test -p git-vista-core     # layout, model
-cargo test -p git-vista-git      # history/refs/github readers against fixtures
+cargo fmt --all -- --check                                # formatting is clean
+cargo clippy --workspace --all-targets -- -D warnings     # strict clippy (native)
+cargo clippy -p git-vista --target wasm32-unknown-unknown --all-targets -- -D warnings
+cargo test --workspace                                    # headless test suite
+cd crates/git-vista && trunk build                        # the real wasm bundle
 ```
 
-The core and git crates are headlessly unit-tested against fixture repositories;
-the frontend is view-assembly over those tested pieces.
+The core and Git crates include headless tests and repository fixtures. V2 requires
+additional route-policy, operation-state, crash-recovery, browser, and real-device
+coverage described in the architecture documents.
+
+### Toolchain and terminal colour
+
+The toolchain is pinned by [`rust-toolchain.toml`](rust-toolchain.toml): stable
+Rust plus the `wasm32-unknown-unknown` target, so `rustup` selects the right
+compiler automatically. The strict clippy pass runs twice — once for the native
+host across the whole workspace, and once for the configured wasm32 target scoped
+to the frontend crate, because `git-vista-git` (gix) and `git-vista-server`
+(axum/tokio) are native-only and don't compile for wasm.
+
+Diagnostic colour follows the standard `NO_COLOR` / `CARGO_TERM_COLOR`
+conventions. CI pins `CARGO_TERM_COLOR=always` so logs keep colour; set
+`NO_COLOR=1` (or `CARGO_TERM_COLOR=never`) locally for plain output when capturing
+a `--check` diff or a lint log into a file.
 
 ## Status
 
-Working browser-first git visualizer, complete through **Phase 12** (and the
-Phase 10 commit detail panel). **Phase 13** — packaging & polish is **in progress**
-(icons, keyboard shortcuts, reset-view, shippable server defaults). Remaining:
-**Phase 11** — search & filter, and the rest of Phase 13. See `DESIGN.md`.
+The visualizer prototype is functional and has continued beyond its original
+Phase 12/13 plan. It is not yet a secure professional daily-driver client. The V2
+roadmap begins with repository identity, protocol versioning, session security,
+typed operation planning, mutation serialization, and recovery evidence before
+expanding Git feature breadth.

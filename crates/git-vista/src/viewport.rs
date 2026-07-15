@@ -73,7 +73,11 @@ mod tests {
     fn panning_up_scrolls_the_top_rows_out_of_the_window() {
         // Content shifted up by 1000px (ty negative) pushes the first rows above
         // the viewport, so the range should start well past row 0.
-        let cam = Camera { tx: 0.0, ty: -1000.0, scale: 1.0 };
+        let cam = Camera {
+            tx: 0.0,
+            ty: -1000.0,
+            scale: 1.0,
+        };
         let (start, end) = visible_row_range(cam, 800.0, ROWS, 6);
         assert!(start > 0, "top rows scrolled off, start = {start}");
         assert!(end > start);
@@ -84,7 +88,15 @@ mod tests {
     fn zooming_out_widens_the_row_window() {
         let vh = 800.0;
         let full = visible_row_range(Camera::default(), vh, ROWS, 6);
-        let out = visible_row_range(Camera { scale: 0.3, ..Camera::default() }, vh, ROWS, 6);
+        let out = visible_row_range(
+            Camera {
+                scale: 0.3,
+                ..Camera::default()
+            },
+            vh,
+            ROWS,
+            6,
+        );
         let span = |(s, e): (usize, usize)| e - s;
         assert!(
             span(out) > span(full),
@@ -98,7 +110,11 @@ mod tests {
     fn the_range_is_always_clamped_and_ordered() {
         // Panned far past the end of the graph: nothing is visible, but the range
         // stays in bounds and ordered rather than going negative or past the end.
-        let cam = Camera { tx: 0.0, ty: -1.0e6, scale: 1.0 };
+        let cam = Camera {
+            tx: 0.0,
+            ty: -1.0e6,
+            scale: 1.0,
+        };
         let (start, end) = visible_row_range(cam, 800.0, ROWS, 6);
         assert!(start <= end);
         assert!(end <= ROWS);
@@ -108,10 +124,18 @@ mod tests {
     #[test]
     fn overscan_grows_the_window_on_both_sides() {
         // Mid-graph so both edges have room to expand (not clamped at 0).
-        let cam = Camera { tx: 0.0, ty: -1000.0, scale: 1.0 };
+        let cam = Camera {
+            tx: 0.0,
+            ty: -1000.0,
+            scale: 1.0,
+        };
         let (s0, e0) = visible_row_range(cam, 800.0, ROWS, 0);
         let (s6, e6) = visible_row_range(cam, 800.0, ROWS, 6);
         assert_eq!(s0 - s6, 6, "overscan extends the top by exactly its size");
-        assert_eq!(e6 - e0, 6, "overscan extends the bottom by exactly its size");
+        assert_eq!(
+            e6 - e0,
+            6,
+            "overscan extends the bottom by exactly its size"
+        );
     }
 }
