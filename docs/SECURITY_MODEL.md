@@ -65,18 +65,38 @@ has different startup checks and refuses to start when required controls are abs
 
 ## Local and SSH Session Design
 
+Implemented by the session + request-protection layer (M1.04,
+`git-vista-server::{session,security}`; ADR 0004). The bootstrap token is written
+`0600` and delivered via the `gv` setup link's URL *fragment* (never the server,
+never a log); everything below is enforced by the `require_auth` layer.
+
 - Generate a high-entropy session secret at every service start unless a durable
-  paired-device session is explicitly configured.
+  paired-device session is explicitly configured. *(256-bit `getrandom` token per
+  start; the in-memory store means a restart is a full revocation. Durable paired
+  sessions deferred to the LAN/paired milestone.)*
 - Print/open a bootstrap URL whose one-time secret is exchanged for an HttpOnly,
   SameSite=Strict session cookie. Remove secrets from the visible URL immediately.
-- Require a separate CSRF token on every state-changing request.
+  *(`gv` prints `…/#s=<token>`; the SPA `POST`s it and strips the fragment with
+  `history.replaceState`. The token is single-use — redeeming it rotates a fresh
+  one — and expires.)*
+- Require a separate CSRF token on every state-changing request. *(Per-session
+  token echoed in `x-git-vista-csrf`, compared constant-time; missing/invalid on a
+  live session is a `403`.)*
 - Validate `Origin`, `Host`, and content type. Reject `Origin: null` mutations.
+  *(Host must be a loopback literal — the anti-DNS-rebinding check; `Origin`, when
+  present, must be same-origin and non-`null`; a present content type on a write
+  must be JSON, blocking form-encoded CSRF.)*
 - Set a strict Content Security Policy and deny framing with `frame-ancestors 'none'`.
-- Bind only to loopback in Local and SSH modes.
+  *(See "Browser Security Headers" — stamped on every response by
+  `security_headers`.)*
+- Bind only to loopback in Local and SSH modes. *(Default bind is `127.0.0.1`; the
+  Host/Origin policy is derived from the bind address.)*
 - Treat localhost as vulnerable to malicious webpages and DNS rebinding; binding
-  loopback is necessary but not sufficient.
+  loopback is necessary but not sufficient. *(The reason the Host allowlist and
+  session gate exist at all.)*
 - Expire operation approval tokens quickly and bind them to session, repository,
-  worktree, operation hash, and repository generation.
+  worktree, operation hash, and repository generation. *(Session/bootstrap expiry
+  landed here; per-operation approval tokens are a later milestone.)*
 
 ## LAN Mode
 
@@ -200,6 +220,15 @@ Cache-Control: no-store                 # authenticated API responses
 
 Static fingerprinted assets may be immutable. Do not apply `no-store` blindly to
 the PWA shell and destroy offline startup.
+
+Implemented by `security_headers` (M1.04; ADR 0004), stamped on every response. Two
+deviations from the baseline above, both documented in ADR 0004: the CSP's
+`script-src` adds `'wasm-unsafe-eval'` (required by the WebAssembly runtime) and
+`'unsafe-inline'` (Trunk boots the wasm with an inline module script whose hash
+changes each build, and the server sets a static header), and `img-src`/`font-src`
+are widened to `'self' data:` / `'self'` for the inline SVG favicon and the bundled
+Nerd Font. `Cache-Control: no-store` is applied to API responses only; the SPA
+shell keeps `no-cache` so offline startup (a later PWA milestone) survives.
 
 ## Data at Rest
 

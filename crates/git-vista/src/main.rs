@@ -53,6 +53,10 @@ mod prefs;
 mod print;
 #[cfg(target_arch = "wasm32")]
 mod render;
+// M1.04 (#57): the loopback session bootstrap flow — exchange the one-time
+// `#s=<token>` fragment for a session cookie, and the blocking sign-in screen.
+#[cfg(target_arch = "wasm32")]
+mod session;
 #[cfg(target_arch = "wasm32")]
 mod state;
 // M1.02 (#102): the blocking "Update Required" screen shown when the client's
