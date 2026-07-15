@@ -62,6 +62,13 @@ pub enum ErrorCode {
     ProtocolIncompatible,
     /// The request was malformed (bad path param, or an unexpected/invalid body).
     BadRequest,
+    /// No valid session (M1.04): the request carried no session cookie, or one the
+    /// server no longer holds (expired, revoked, or a fresh server). The frontend
+    /// keys its "open the bootstrap URL from `gv`" screen on this code — the one
+    /// auth failure a normal client recovers from, by exchanging a bootstrap token
+    /// for a new session. Origin/Host/CSRF failures are [`Forbidden`](Self::Forbidden)
+    /// instead: they are "this should not happen" states, not a re-auth prompt.
+    Unauthenticated,
     /// The addressed thing (commit, file, …) does not exist.
     NotFound,
     /// The operation is not permitted in the current state.
@@ -86,6 +93,7 @@ impl ErrorCode {
             | ErrorCode::InvalidProtocolHeader
             | ErrorCode::ProtocolIncompatible => 426,
             ErrorCode::BadRequest => 400,
+            ErrorCode::Unauthenticated => 401,
             ErrorCode::NotFound => 404,
             ErrorCode::Forbidden | ErrorCode::ReadOnly => 403,
             ErrorCode::GitFailed | ErrorCode::Internal => 500,
@@ -98,6 +106,7 @@ impl ErrorCode {
     /// falls back to [`Internal`](ErrorCode::Internal).
     pub fn from_status(status: u16) -> Self {
         match status {
+            401 => ErrorCode::Unauthenticated,
             403 => ErrorCode::Forbidden,
             404 => ErrorCode::NotFound,
             426 => ErrorCode::ProtocolIncompatible,
@@ -185,6 +194,10 @@ mod tests {
             serde_json::to_string(&ErrorCode::GitFailed).unwrap(),
             "\"git_failed\""
         );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::Unauthenticated).unwrap(),
+            "\"unauthenticated\""
+        );
     }
 
     #[test]
@@ -192,6 +205,7 @@ mod tests {
         assert_eq!(ErrorCode::ProtocolIncompatible.http_status(), 426);
         assert_eq!(ErrorCode::MissingProtocolHeader.http_status(), 426);
         assert_eq!(ErrorCode::BadRequest.http_status(), 400);
+        assert_eq!(ErrorCode::Unauthenticated.http_status(), 401);
         assert_eq!(ErrorCode::NotFound.http_status(), 404);
         assert_eq!(ErrorCode::Forbidden.http_status(), 403);
         assert_eq!(ErrorCode::ReadOnly.http_status(), 403);
@@ -202,6 +216,7 @@ mod tests {
     #[test]
     fn from_status_classifies_the_handler_statuses() {
         assert_eq!(ErrorCode::from_status(400), ErrorCode::BadRequest);
+        assert_eq!(ErrorCode::from_status(401), ErrorCode::Unauthenticated);
         assert_eq!(ErrorCode::from_status(403), ErrorCode::Forbidden);
         assert_eq!(ErrorCode::from_status(404), ErrorCode::NotFound);
         assert_eq!(ErrorCode::from_status(426), ErrorCode::ProtocolIncompatible);

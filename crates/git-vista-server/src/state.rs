@@ -89,6 +89,25 @@ pub(crate) fn clones_root() -> PathBuf {
     std::env::temp_dir().join("git-vista-clones")
 }
 
+/// This user's git-vista state directory — `$XDG_STATE_HOME/git-vista`, or
+/// `~/.local/state/git-vista` when that isn't set. Matches the `gv` launcher's
+/// `LOG_DIR`, so the server and `gv` agree on where the bootstrap token lives.
+fn state_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(|| std::env::temp_dir().join("git-vista-state"));
+    base.join("git-vista")
+}
+
+/// Where the one-time session bootstrap token (M1.04) is written `0600` at
+/// startup. `gv` reads this exact path to build the `#s=<token>` setup URL it
+/// prints; nothing else — and no request — ever reads it.
+pub(crate) fn bootstrap_token_path() -> PathBuf {
+    state_dir().join("bootstrap.token")
+}
+
 /// Delete a previous clone's directory, best-effort. Guarded: only ever removes a
 /// path under [`clones_root`], so it can't touch the user's own repo even if state
 /// were somehow wrong.
