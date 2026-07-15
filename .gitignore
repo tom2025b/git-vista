@@ -15,5 +15,9 @@
 /codex-code-review-handoff.md
 /codex-code-review-handoff.pdf
 
+# Local session handoff / resume note (see `./dev resume`). Local working state,
+# not repo history — the durable record is the WIP git commits `./dev wip` pushes.
+/handoff.md
+
 # Personal GitHub issue staging list
 /issues.md
