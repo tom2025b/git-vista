@@ -6,6 +6,8 @@
 //! browser frontend and the native backend. Two small layers, each testable:
 //!
 //! - [`model`]    — serializable data types shared across the HTTP/JSON boundary.
+//! - [`identity`] — stable, opaque, path-independent repository/worktree ids,
+//!   validated object ids, and repository generation tokens.
 //! - [`color`]    — the single source of truth for branch colours (palette,
 //!   slots, hex values), shared by the layout engine and the UI.
 //! - [`layout`]   — assigns commits to lanes for the vertical graph.
@@ -22,6 +24,7 @@
 pub mod activity;
 pub mod color;
 pub mod diff;
+pub mod identity;
 pub mod layout;
 pub mod model;
 pub mod net;

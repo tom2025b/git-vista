@@ -32,6 +32,11 @@ git-vista-git = { path = "crates/git-vista-git" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
+# Opaque, path-independent repository/worktree identity (git-vista-core::identity).
+# Only the name-based `v5` constructor is enabled: it is deterministic (SHA-1 over a
+# namespace + name) and pulls no randomness, so `core` stays pure and wasm-safe —
+# unlike `v4`, which would drag in `getrandom`. `serde` gives string (de)serialization.
+uuid = { version = "1", default-features = false, features = ["v5", "serde", "std"] }
 
 # Smaller, faster release binary for the server.
 [profile.release]
