@@ -37,6 +37,9 @@ mod activity;
 mod git_cmd;
 mod handlers;
 mod journal;
+// The versioned-API-contract layer (M1.02, #102): protocol negotiation, the
+// request id, the structured error envelope, and the contract response headers.
+mod middleware;
 mod state;
 
 use axum::response::IntoResponse;
@@ -55,6 +58,7 @@ use handlers::branch::{
 };
 use handlers::clone::clone_repo;
 use handlers::commit::{create_commit, stage_all, unstage_all};
+use handlers::protocol::protocol_info;
 use handlers::read::{
     commit_detail, commit_diff, commits, file_at_commit, head_branch, worktree_status,
 };
@@ -126,7 +130,14 @@ async fn main() {
     )
     .layer(ServeDir::new(DIST_DIR).append_index_html_on_directories(true));
 
-    let app = Router::new()
+    // Every `/api/*` route lives on this sub-router so the M1.02 contract layer
+    // (protocol negotiation, request id, structured errors, response headers)
+    // wraps them all — and only them, never the static SPA below.
+    let api = Router::new()
+        // The one unversioned endpoint: a client hits it to learn the protocol
+        // before it can be required to speak it (so it's exempt from the header
+        // check inside the contract layer).
+        .route("/api/protocol", get(protocol_info))
         .route("/api/commits", get(commits))
         // Phase 10: full detail for one commit, read on demand for the side panel.
         .route("/api/commit/{id}", get(commit_detail))
@@ -179,27 +190,23 @@ async fn main() {
         // iPad-testing follow-up: restore a seeded *test repo* to its recorded
         // state (gated on the seed files `gv --seed` writes).
         .route("/api/reset-test-repo", post(reset_test_repo))
+        // Inner: a panicking handler becomes a 500 with the panic text (not a
+        // reset connection) *before* the contract layer sees it, so that 500 is
+        // rewrapped into the structured error envelope like any other failure.
+        .layer(CatchPanicLayer::custom(panic_to_response))
+        // Outer: the M1.02 versioned-API contract — protocol negotiation, request
+        // id, the consistent error envelope, and the response headers.
+        .layer(axum::middleware::from_fn(middleware::api_contract));
+
+    let app = Router::new()
+        .merge(api)
         // Anything that isn't the API is served from the built SPA bundle.
         .fallback_service(spa)
-        // A handler panic becomes a 500 with the panic text instead of a reset
-        // connection: the frontend then shows a real error, and the process —
-        // which axum keeps alive either way — never leaves the browser with
-        // the unexplained "Load failed" a torn-down connection produces.
-        .layer(CatchPanicLayer::custom(
-            |panic: Box<dyn std::any::Any + Send>| {
-                let msg = panic
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap_or("(no panic message)");
-                eprintln!("git-vista: handler panicked: {msg}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("git-vista server bug — a handler panicked: {msg}"),
-                )
-                    .into_response()
-            },
-        ));
+        // Global backstop for the static SPA / fallback. The `/api` space has its
+        // own inner catch above (so API panics are already enveloped); this keeps
+        // any panic outside it from tearing down the connection — which iPad
+        // Safari would report as the unexplained "Load failed".
+        .layer(CatchPanicLayer::custom(panic_to_response));
 
     let addr = match bind_addr() {
         Ok(addr) => addr,
@@ -229,6 +236,24 @@ async fn main() {
         eprintln!("error: server stopped: {e}");
         std::process::exit(1);
     }
+}
+
+/// Turn a caught handler panic into a `500` carrying the panic text, instead of a
+/// reset connection (which iPad Safari reports as an opaque "Load failed"). Used
+/// by both `CatchPanicLayer`s; on the `/api` router the contract layer then
+/// rewraps this into the structured error envelope like any other failure.
+fn panic_to_response(panic: Box<dyn std::any::Any + Send>) -> axum::response::Response {
+    let msg = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("(no panic message)");
+    eprintln!("git-vista: handler panicked: {msg}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("git-vista server bug — a handler panicked: {msg}"),
+    )
+        .into_response()
 }
 
 /// Print the local/SSH path by default and isolate the legacy LAN guidance to an

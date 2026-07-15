@@ -44,7 +44,7 @@ the current code.
 
 ## Workspace layout
 
-The current prototype has four crates:
+The current prototype has five crates:
 
 ```
 git-vista/
@@ -52,15 +52,22 @@ git-vista/
 ├── rust-toolchain.toml           # stable toolchain + wasm32 target
 ├── gv                            # launcher: rebuild the SPA + serve a repo
 └── crates/
-    ├── git-vista-core/           # wasm-safe models and pure shared logic
+    ├── git-vista-core/           # wasm-safe domain model + pure shared logic
+    ├── git-vista-protocol/       # versioned HTTP contract: protocol negotiation,
+    │                             #   API error envelope, request-id, wire DTOs
     ├── git-vista-git/            # native git reading via gix (native-only)
     ├── git-vista-server/         # axum HTTP backend
-    │   └── src/                  # routes, Git commands, state, journal/activity
+    │   └── src/                  # routes, contract middleware, Git commands, state
     └── git-vista/                # the Leptos wasm UI (bin: git-vista-ui)
         ├── index.html            # Trunk entry point
         ├── styles.css
         └── src/                  # feature, rendering, gesture, and state modules
 ```
+
+`git-vista-protocol` is the **transport contract**, separated from the domain
+model so the wire format versions independently: the server and the wasm frontend
+both depend on it, while `git-vista-core` stays free of transport concerns. See
+[ADR 0002](docs/adr/0002-versioned-api-contract.md).
 
 `git-vista-git` is kept **separate** from `git-vista-core` on purpose: gix reads a
 filesystem repo and can't compile for wasm, so keeping it out of `core` lets the

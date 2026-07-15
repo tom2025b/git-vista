@@ -55,6 +55,10 @@ mod print;
 mod render;
 #[cfg(target_arch = "wasm32")]
 mod state;
+// M1.02 (#102): the blocking "Update Required" screen shown when the client's
+// protocol version is incompatible with the server's.
+#[cfg(target_arch = "wasm32")]
+mod update_required;
 #[cfg(target_arch = "wasm32")]
 mod viewer;
 

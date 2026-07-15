@@ -5,6 +5,7 @@
 //! before. The handlers are `pub(crate)` (the router in the crate root is their
 //! only caller); helpers used by only one file stay private to it.
 //!
+//!   * [`protocol`] — `GET /api/protocol`, the unversioned negotiation endpoint.
 //!   * [`read`]   — the read endpoints: history graph, one commit's detail/diff,
 //!     the live head-branch / working-tree reads.
 //!   * [`clone`]  — clone a public URL into a throwaway dir, view it read-only.
@@ -27,6 +28,7 @@ use crate::{activity, journal};
 pub(crate) mod branch;
 pub(crate) mod clone;
 pub(crate) mod commit;
+pub(crate) mod protocol;
 pub(crate) mod read;
 pub(crate) mod rebase;
 pub(crate) mod reset;
