@@ -1,0 +1,15 @@
+# Architecture Decision Records
+
+Short, dated records of decisions that shape Git-Vista's architecture — the kind
+of thing that is expensive to reverse and easy to forget the *why* of. Each ADR
+captures the context, the decision, the alternatives weighed, and the
+consequences, so a later reader (or a later us) can see not just what was chosen
+but what it was chosen over.
+
+One file per decision, numbered in order: `NNNN-short-slug.md`. ADRs are
+append-only history — supersede an old one with a new one rather than rewriting
+it, and note the link in both.
+
+| ADR | Title | Status |
+| --- | --- | --- |
+| [0001](0001-repository-generation.md) | Repository identity and the repository-generation algorithm | Accepted |
