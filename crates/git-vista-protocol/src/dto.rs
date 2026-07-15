@@ -67,6 +67,28 @@ pub struct CloneRequest {
     pub url: String,
 }
 
+/// Body of a `POST /api/session` request (M1.04, #57): the one-time bootstrap
+/// `token` the SPA read from the `#s=<token>` URL fragment, exchanged for an
+/// HttpOnly session cookie. The only `/api` write body that legitimately carries
+/// a secret — which is why it travels in the JSON body (never a query string, so
+/// it can't land in a server log) and the endpoint is served over loopback only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRequest {
+    pub token: String,
+}
+
+/// Response of `GET`/`POST /api/session` (M1.04): whether the caller now has a
+/// live session and, when it does, the CSRF token to echo in the
+/// [`CSRF_HEADER`](crate::CSRF_HEADER) on every state-changing request. `csrf` is
+/// `None` exactly when `authenticated` is false, so the SPA can branch on either.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub authenticated: bool,
+    #[serde(default)]
+    pub csrf: Option<String>,
+}
+
 /// Response of `GET /api/rebase-status`: whether "Rebase onto main" would do
 /// anything right now, resolved live server-side — the same freshness posture
 /// as `/api/head-branch`, so the menu can disable the item instead of offering
@@ -240,6 +262,27 @@ mod tests {
             r#"{"message":"m","allow_empty":false,"cwd":"/x"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn session_dtos_roundtrip_and_reject_unknown_fields() {
+        let req = SessionRequest {
+            token: "deadbeef".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(serde_json::from_str::<SessionRequest>(&json).unwrap(), req);
+        // A stray field on the bootstrap body is a hard error, like every other.
+        assert!(serde_json::from_str::<SessionRequest>(r#"{"token":"x","extra":1}"#).is_err());
+
+        let info = SessionInfo {
+            authenticated: true,
+            csrf: Some("csrf-token".into()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert_eq!(serde_json::from_str::<SessionInfo>(&json).unwrap(), info);
+        // csrf defaults to None when absent (the unauthenticated response omits it).
+        let back: SessionInfo = serde_json::from_str(r#"{"authenticated":false}"#).unwrap();
+        assert_eq!(back.csrf, None);
     }
 
     #[test]

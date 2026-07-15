@@ -39,10 +39,10 @@ pub mod version;
 
 pub use dto::{
     validate_clone_url, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
-    RebaseStatus, RepositoryDescriptor, RepositoryKind,
+    RebaseStatus, RepositoryDescriptor, RepositoryKind, SessionInfo, SessionRequest,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use version::{
-    check_compatibility, parse_protocol_header, Compatibility, ProtocolInfo, MAX_CLIENT_PROTOCOL,
-    MIN_CLIENT_PROTOCOL, PROTOCOL_HEADER, PROTOCOL_VERSION, REQUEST_ID_HEADER,
+    check_compatibility, parse_protocol_header, Compatibility, ProtocolInfo, CSRF_HEADER,
+    MAX_CLIENT_PROTOCOL, MIN_CLIENT_PROTOCOL, PROTOCOL_HEADER, PROTOCOL_VERSION, REQUEST_ID_HEADER,
 };

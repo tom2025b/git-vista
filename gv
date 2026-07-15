@@ -10,9 +10,18 @@
 #   gv ~/code/myproj    visualise another repo by path
 #   gv --lan [path]     bind all interfaces for a trusted personal LAN
 #   gv --stop           stop the running server
+#   gv --token          reprint the one-time sign-in link for the running server
 #   gv --seed [path]    mark a repo as a TEST repo: record its current branches,
 #                       HEAD and objects as the reset point the app's
 #                       "Reset Test Repo" button restores (rerun to re-record)
+#
+# Sign-in (M1.04): the server needs a one-time session before it will answer the
+# API. gv prints a setup link — http://localhost:8080/#s=<token> — after it starts;
+# open it once in the browser to sign that browser in. The token rides in the URL
+# *fragment* (never sent to the server, never logged); the server writes it 0600 to
+# $XDG_STATE_HOME/git-vista/bootstrap.token, which is the only thing gv reads to
+# build the link. It's single-use: opening the link rotates in a fresh token, so a
+# second device can `gv --token` for a new link. A server restart mints a new one.
 #
 # The server runs DETACHED (its own session, logging to a file), so closing the
 # terminal or losing the SSH session that launched gv no longer kills it — which
@@ -33,6 +42,23 @@ START_DIR="$PWD"
 # everything it prints land here. Kept under XDG state, out of any repo.
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/git-vista"
 LOG="$LOG_DIR/server.log"
+# The one-time session bootstrap token (M1.04), written 0600 by the server. This
+# path must match the server's `state::bootstrap_token_path()`. Only gv reads it.
+TOKEN_FILE="$LOG_DIR/bootstrap.token"
+
+# Print the browser sign-in link for `host` (default localhost) by folding the
+# current bootstrap token into a URL fragment. The fragment never reaches the
+# server, so the token stays out of access logs. Silent (returns 1) if the token
+# file isn't there yet — the caller decides whether that's worth a warning.
+print_setup_url() {
+  local host="${1:-localhost:8080}"
+  local token
+  token="$(tr -d '[:space:]' <"$TOKEN_FILE" 2>/dev/null)" || return 1
+  [[ -n "$token" ]] || return 1
+  echo "gv: sign in on the iPad/browser by opening this one-time link:"
+  echo "gv:   http://${host}/#s=${token}"
+  return 0
+}
 
 # Parse args: an optional path to the repo to visualise, --stop, or --seed. (No
 # --no-build while developing — we always rebuild from scratch; see the header.)
@@ -43,6 +69,25 @@ for arg in "$@"; do
   case "$arg" in
     --seed) SEED=1 ;;
     --lan) LAN=1 ;;
+    --token)
+      # Reprint the sign-in link(s) for the already-running server, no rebuild.
+      # Print BOTH the loopback/SSH-tunnel link and the LAN-IP link, since which
+      # one is right depends on how the server was started (plain vs --lan) and
+      # how the device reaches it — the token is the same for either.
+      TOKEN="$(tr -d '[:space:]' <"$TOKEN_FILE" 2>/dev/null)" || TOKEN=""
+      if [[ -n "$TOKEN" ]]; then
+        echo "gv: one-time sign-in link — open it in the browser:"
+        echo "gv:   this machine / SSH tunnel:   http://localhost:8080/#s=${TOKEN}"
+        LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+        [[ -n "$LAN_IP" ]] && \
+          echo "gv:   over the LAN (gv --lan mode):  http://${LAN_IP}:8080/#s=${TOKEN}"
+        exit 0
+      else
+        echo "gv: no bootstrap token found at $TOKEN_FILE" >&2
+        echo "gv: is the server running? start it with 'gv' first." >&2
+        exit 1
+      fi
+      ;;
     --stop)
       if pkill -9 -f '[g]it-vista-server' 2>/dev/null; then
         echo "gv: server stopped"
@@ -114,7 +159,9 @@ echo "=== gv start $(date '+%F %T') — visualising $TARGET" >>"$LOG"
 unset GIT_VISTA_BIND_ADDR
 if [[ $LAN -eq 1 ]]; then
   export GIT_VISTA_BIND_ADDR="0.0.0.0:8080"
-  echo "gv: WARNING: --lan exposes unauthenticated Git write endpoints to your LAN" >&2
+  echo "gv: WARNING: --lan serves git-vista over plain HTTP (no TLS) to your LAN." >&2
+  echo "gv: A session is still required, but DNS-rebinding protection is weaker" >&2
+  echo "gv: than loopback. Prefer the default SSH-tunnel mode." >&2
 fi
 setsid "$REPO/target/debug/git-vista-server" "$TARGET" >>"$LOG" 2>&1 </dev/null &
 
@@ -130,13 +177,17 @@ for _ in $(seq 1 40); do
     if [[ $LAN -eq 1 ]]; then
       LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
       echo "gv: server up in LAN mode — http://${LAN_IP:-<this-machine-LAN-IP>}:8080/"
+      print_setup_url "${LAN_IP:-<this-machine-LAN-IP>}:8080" || \
+        echo "gv: (couldn't read the sign-in token yet — try 'gv --token')" >&2
     else
       echo "gv: server up — http://127.0.0.1:8080/"
       echo "gv: 127.0.0.1 works only on this Linux host"
       echo "gv: iPad via SSH: forward local port 8080 to 127.0.0.1:8080"
       echo "gv: iPad via trusted Wi-Fi without SSH: restart with gv --lan"
+      print_setup_url "localhost:8080" || \
+        echo "gv: (couldn't read the sign-in token yet — try 'gv --token')" >&2
     fi
-    echo "gv: log: $LOG    stop: gv --stop"
+    echo "gv: log: $LOG    stop: gv --stop    sign-in link: gv --token"
     exit 0
   fi
   sleep 0.25
