@@ -321,11 +321,17 @@ impl<'de> Deserialize<'de> for ObjectId {
 /// records the generation it reviewed, and a mutation is allowed only while the
 /// current generation still equals it.
 ///
-/// It is a *content digest*, not a monotonic counter — equal means "same state",
-/// differ means "state changed" — and it carries no ordering. See the ADR for
-/// why that suffices and why a counter was not chosen. Build one with
-/// [`GenerationInputs`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// It is an **equality token, not a sequence number**: a *content digest*, not a
+/// monotonic counter. `==` means "same state" and `!=` means "state changed", and
+/// that is the *only* defined comparison. The inner `u64` is a hash — it can move
+/// up, down, or back to a prior value when state is reverted — so callers must
+/// never infer newer/older, sort by it, or treat a larger value as "ahead". That
+/// contract is enforced here by *not* deriving `PartialOrd`/`Ord`: the type
+/// supports equality and hashing (so it can key a map) but not ordering. See the
+/// ADR (`docs/adr/0001-repository-generation.md`) for why equality suffices, why a
+/// counter was rejected, and how the algorithm may be versioned later. Build one
+/// with [`GenerationInputs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RepositoryGeneration(u64);
 
