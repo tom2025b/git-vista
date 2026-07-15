@@ -4,8 +4,10 @@
 # Trunk build output for the Leptos frontend
 /crates/git-vista/dist
 
-# Claude Code local settings (machine-specific permissions)
+# Claude Code local settings (machine-specific permissions), including the
+# transient `*.tmp.<pid>.<hash>` files it writes while updating them.
 .claude/settings.local.json
+.claude/settings.local.json.tmp.*
 
 # Local Codex architecture review and continuation handoff
 /codex-code-review.md
