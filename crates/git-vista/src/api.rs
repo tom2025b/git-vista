@@ -9,6 +9,8 @@
 //! failure, so the UI can show the real reason. Pure data plumbing — no UI —
 //! so this stays testable on its own away from the view code.
 
+use std::cell::RefCell;
+
 use gloo_net::http::{Request, RequestBuilder};
 
 use git_vista_core::activity::{ActivityEvent, UndoAction, Undoable};
@@ -18,19 +20,84 @@ use git_vista_core::net::network_error_text;
 use git_vista_core::status::RepoStatus;
 use git_vista_protocol::{
     BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, ProtocolInfo,
-    RebaseStatus, PROTOCOL_HEADER, PROTOCOL_VERSION,
+    RebaseStatus, SessionInfo, SessionRequest, CSRF_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
+
+// The current session's CSRF token (M1.04). Set once the session is established
+// (`POST`/`GET /api/session`), then echoed in the [`CSRF_HEADER`] on every write —
+// the server refuses a state-changing request without it. A `thread_local` is all
+// we need: wasm is single-threaded, and the token is per-tab, not persisted.
+thread_local! {
+    static CSRF_TOKEN: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Record (or clear) the session's CSRF token — called by [`crate::session`] after
+/// establishing or checking the session. `None` clears it (logged out / no session).
+pub fn set_csrf_token(token: Option<String>) {
+    CSRF_TOKEN.with(|c| *c.borrow_mut() = token);
+}
+
+fn csrf_token() -> Option<String> {
+    CSRF_TOKEN.with(|c| c.borrow().clone())
+}
 
 /// Start a GET carrying the protocol header every `/api/*` request must send
 /// (M1.02): the server refuses a call without it, so every read goes through
-/// here rather than `Request::get` directly.
+/// here rather than `Request::get` directly. The session cookie rides along
+/// automatically — same-origin `fetch` sends it — so reads need no extra header.
 fn req_get(url: &str) -> RequestBuilder {
     Request::get(url).header(PROTOCOL_HEADER, &PROTOCOL_VERSION.to_string())
 }
 
-/// Start a POST carrying the protocol header (see [`req_get`]).
+/// Start a POST carrying the protocol header (see [`req_get`]) and, when a session
+/// is established, the CSRF token (M1.04): the server refuses a state-changing
+/// request whose CSRF header doesn't match the session, so every write goes
+/// through here. The session cookie is sent automatically (same-origin).
 fn req_post(url: &str) -> RequestBuilder {
-    Request::post(url).header(PROTOCOL_HEADER, &PROTOCOL_VERSION.to_string())
+    let builder = Request::post(url).header(PROTOCOL_HEADER, &PROTOCOL_VERSION.to_string());
+    match csrf_token() {
+        Some(token) => builder.header(CSRF_HEADER, &token),
+        None => builder,
+    }
+}
+
+/// Exchange a one-time bootstrap token for a session (`POST /api/session`, M1.04).
+/// On success the server sets the HttpOnly session cookie and returns the CSRF
+/// token; a `401` means the token was wrong or expired. The token travels in the
+/// JSON body, never the URL, so it can't land in a server log.
+pub async fn post_session(token: &str) -> Result<SessionInfo, String> {
+    let body = SessionRequest {
+        token: token.to_string(),
+    };
+    let resp = req_post("/api/session")
+        .json(&body)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(network_error)?;
+    if resp.ok() {
+        resp.json::<SessionInfo>().await.map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
+/// Report the current session state (`GET /api/session`, M1.04): whether the
+/// browser's cookie still names a live session, and its CSRF token if so. Hit on
+/// load (and after a failed bootstrap) so a reload recovers the session — and the
+/// CSRF token writes need — without re-exchanging a token.
+pub async fn get_session() -> Result<SessionInfo, String> {
+    let url = format!("/api/session?t={}", js_sys::Date::now());
+    req_get(&url)
+        .send()
+        .await
+        .map_err(network_error)?
+        .json::<SessionInfo>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Fetch the server's protocol contract (`GET /api/protocol`, M1.02): the
