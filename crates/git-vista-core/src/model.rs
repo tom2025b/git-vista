@@ -142,13 +142,26 @@ pub struct Graph {
     /// Set by the layout pass.
     #[serde(default)]
     pub stubs: Vec<BranchStub>,
-    /// Filesystem path of the repository this graph was read from, as the server
-    /// resolved it (e.g. `/home/tom/projects/git-vista-test`). Surfaced in the UI
-    /// header so it's always unambiguous *which* repo a given page is showing —
-    /// the fastest way to catch a browser that's pointed at a stale server/tab.
-    /// Set by the backend; `None` => the UI shows nothing extra.
+    /// A short, non-path label for the repository this graph was read from (its
+    /// directory base name, e.g. `git-vista-test`). Surfaced in the UI header so
+    /// it's always unambiguous *which* repo a given page is showing — the fastest
+    /// way to catch a browser pointed at a stale server/tab. Deliberately *not*
+    /// the absolute path by default (M1.03): the server's filesystem layout is not
+    /// exposed to the browser unless the operator opts in (`GIT_VISTA_EXPOSE_PATHS`),
+    /// in which case the full path is shown here instead. `None` => nothing extra.
     #[serde(default)]
     pub repo_label: Option<String>,
+    /// Opaque id of the shared repository this graph came from (M1.03), as an
+    /// otherwise-meaningless string handle. `None` on a repo the server is serving
+    /// in degraded mode (couldn't classify it). The UI treats it as opaque and may
+    /// echo it back to address later requests at the same repository.
+    #[serde(default)]
+    pub repo_id: Option<String>,
+    /// Opaque id of the specific worktree this graph came from (M1.03) — the
+    /// handle a request uses to select this exact worktree. Distinct per worktree
+    /// even within one repository; `None` in degraded mode.
+    #[serde(default)]
+    pub worktree_id: Option<String>,
     /// True when this graph came from a throwaway clone the server made from a
     /// pasted URL (Phase 12). Such repos are for *viewing only*: the UI hides all
     /// write actions (branch/commit/merge/push/delete) since any change would be

@@ -221,6 +221,8 @@ pub fn fake_graph() -> Graph {
         remote_commits: Vec::new(),
         stubs: Vec::new(),
         repo_label: None,
+        repo_id: None,
+        worktree_id: None,
         read_only: false,
         resettable: false,
     }
