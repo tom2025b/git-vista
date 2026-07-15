@@ -62,6 +62,90 @@ pub fn read_handle(path: &Path) -> Result<RepositoryHandle, RepoError> {
     Ok(RepositoryHandle::new(repository, worktree))
 }
 
+/// How a repository relates to git's on-disk layout, classified from the
+/// directories `gix` resolves. The server catalog (M1.03) needs this to handle
+/// bare repositories and linked worktrees explicitly rather than assuming one
+/// working tree per clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeKind {
+    /// A bare repository — a git directory with no working tree.
+    Bare,
+    /// The main working tree (its git dir *is* the common dir).
+    Main,
+    /// A linked worktree (`git worktree add`) whose git dir lives under
+    /// `…/worktrees/<name>` while its common dir is the main `.git`.
+    Linked,
+}
+
+/// Everything the server catalog needs to admit a repository by an opaque id,
+/// resolved from a real path via `gix` — the one place that maps a path to
+/// identity. Nothing above the backend ever sees the [`root`](Self::root) path.
+#[derive(Debug, Clone)]
+pub struct RepoFacts {
+    /// The opaque repository + worktree ids this path is addressed by.
+    pub handle: RepositoryHandle,
+    /// Bare / main / linked classification.
+    pub kind: WorktreeKind,
+    /// The canonical (symlink-resolved) directory used for the allowed-root
+    /// check: the working tree for a normal or linked worktree, the git dir for
+    /// a bare repository. Canonical so a symlink escaping an allowed root fails
+    /// the containment check closed.
+    pub root: std::path::PathBuf,
+    /// A short, non-path display label: the base name of [`root`](Self::root).
+    pub name: String,
+}
+
+/// Canonicalise a directory to an absolute, symlink-resolved [`PathBuf`], or
+/// return the path unchanged if canonicalisation fails (missing, permissions).
+/// The catalog treats a non-canonicalisable path as outside every allowed root,
+/// so a failure here fails closed rather than admitting an unresolved path.
+fn canonical_pathbuf(dir: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// Resolve `path` to the [`RepoFacts`] the server catalog admits it by: its
+/// opaque handle, its bare/main/linked classification, and the canonical root
+/// directory the allowed-root check is performed against.
+///
+/// A bare repository is recognised by having no working tree; a linked worktree
+/// by its git dir differing from its common dir (see [`WorktreeKind`]). The
+/// [`root`](RepoFacts::root) is canonicalised so that a symlink pointing outside
+/// an allowed root resolves — and is then rejected — rather than slipping through.
+pub fn read_repo_facts(path: &Path) -> Result<RepoFacts, RepoError> {
+    let repo = open(path)?;
+    let handle = RepositoryHandle::new(
+        RepositoryId::from_common_dir(&canonical_dir(repo.common_dir())),
+        WorktreeId::from_git_dir(&canonical_dir(repo.git_dir())),
+    );
+
+    // Bare iff there is no working tree. Otherwise it's linked when this
+    // worktree's git dir differs from the shared common dir.
+    let (kind, root) = match repo.workdir() {
+        None => (WorktreeKind::Bare, canonical_pathbuf(repo.git_dir())),
+        Some(work_dir) => {
+            let linked = canonical_pathbuf(repo.git_dir()) != canonical_pathbuf(repo.common_dir());
+            let kind = if linked {
+                WorktreeKind::Linked
+            } else {
+                WorktreeKind::Main
+            };
+            (kind, canonical_pathbuf(work_dir))
+        }
+    };
+
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned());
+
+    Ok(RepoFacts {
+        handle,
+        kind,
+        root,
+        name,
+    })
+}
+
 /// Read the observable state `gix` can see — HEAD, every ref, and the index —
 /// into a [`GenerationInputs`] the caller finishes and folds into a generation.
 ///
@@ -209,6 +293,53 @@ mod tests {
             main_handle.worktree, linked_handle.worktree,
             "a linked worktree has its own worktree id"
         );
+    }
+
+    #[test]
+    fn facts_classify_a_normal_repo_as_the_main_worktree() {
+        let dir = fixture();
+        let facts = read_repo_facts(dir.path()).unwrap();
+        assert_eq!(facts.kind, WorktreeKind::Main);
+        // The root is the working tree, and the handle matches read_handle.
+        assert_eq!(facts.handle, read_handle(dir.path()).unwrap());
+        // Canonical root, so the name is the working tree's directory base name.
+        let expected = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(facts.root, expected);
+    }
+
+    #[test]
+    fn facts_classify_a_linked_worktree_explicitly() {
+        let dir = fixture();
+        let wt = tempfile::tempdir().unwrap();
+        let wt_path = wt.path().join("linked");
+        git(
+            dir.path(),
+            &["worktree", "add", wt_path.to_str().unwrap(), "feature"],
+        );
+
+        let main = read_repo_facts(dir.path()).unwrap();
+        let linked = read_repo_facts(&wt_path).unwrap();
+        assert_eq!(main.kind, WorktreeKind::Main);
+        assert_eq!(linked.kind, WorktreeKind::Linked);
+        // Shared repository, distinct worktrees.
+        assert_eq!(main.handle.repository, linked.handle.repository);
+        assert_ne!(main.handle.worktree, linked.handle.worktree);
+    }
+
+    #[test]
+    fn facts_classify_a_bare_repo_explicitly() {
+        let dir = fixture();
+        let bare_parent = tempfile::tempdir().unwrap();
+        let bare = bare_parent.path().join("mirror.git");
+        git(
+            dir.path(),
+            &["clone", "--bare", ".", bare.to_str().unwrap()],
+        );
+
+        let facts = read_repo_facts(&bare).unwrap();
+        assert_eq!(facts.kind, WorktreeKind::Bare);
+        // A bare repo's root is its git directory, canonicalised.
+        assert_eq!(facts.root, std::fs::canonicalize(&bare).unwrap());
     }
 
     #[test]

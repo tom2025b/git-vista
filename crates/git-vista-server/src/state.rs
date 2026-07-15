@@ -12,6 +12,11 @@ use std::sync::{OnceLock, RwLock};
 
 use axum::http::StatusCode;
 
+use git_vista_core::identity::{RepositoryHandle, WorktreeId};
+use git_vista_protocol::RepositoryDescriptor;
+
+use crate::catalog::Catalog;
+
 // Which repository to visualise *initially*. Taken from the first CLI argument
 // (`git-vista-server <path>`), falling back to the current working directory (`.`,
 // canonicalised at startup) when none is given. The `gv` launcher always passes
@@ -49,16 +54,110 @@ fn parse_bind_addr(value: Option<&str>) -> Result<SocketAddr, String> {
 // read (`handlers::read`) and the activity feed's remote-commit lookup.
 pub(crate) const HISTORY_LIMIT: usize = 5_000;
 
-/// The repository the server is currently serving. Mutable at runtime (Phase 12):
+/// Environment variable that opts the operator into exposing absolute filesystem
+/// paths to the browser (the graph's `repo_label` and the catalog descriptors).
+/// Off by default (M1.03): the server's layout is not the browser's business, so
+/// only a short base-name label is sent unless this is set to a truthy value.
+const EXPOSE_PATHS_ENV: &str = "GIT_VISTA_EXPOSE_PATHS";
+
+/// Whether the operator opted into exposing absolute paths (see
+/// [`EXPOSE_PATHS_ENV`]). Any value other than empty/`0`/`false` counts as on.
+pub(crate) fn expose_paths() -> bool {
+    match std::env::var(EXPOSE_PATHS_ENV) {
+        Ok(v) => !matches!(v.trim(), "" | "0" | "false" | "no" | "off"),
+        Err(_) => false,
+    }
+}
+
+/// A short, non-path label for `path` — its directory base name — unless the
+/// operator opted into path exposure, in which case the full path is used. This
+/// is what the UI header shows; it never leaks the server's layout by default.
+pub(crate) fn repo_label(path: &Path) -> String {
+    if expose_paths() {
+        return path.display().to_string();
+    }
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// The process-wide catalog of servable repositories (M1.03). Every path→id
+/// mapping and every allowed root lives here; it is the only thing that turns an
+/// opaque request id back into a filesystem path, and it fails closed on anything
+/// it did not itself register. See [`crate::catalog`].
+static CATALOG: OnceLock<RwLock<Catalog>> = OnceLock::new();
+
+fn catalog() -> &'static RwLock<Catalog> {
+    CATALOG.get_or_init(|| RwLock::new(Catalog::new()))
+}
+
+/// Permit repositories under `dir` to be registered in the catalog. Used for the
+/// clones root at startup; server-initiated selections ([`set_current`]) also
+/// allow their own root automatically.
+pub(crate) fn allow_repo_root(dir: &Path) {
+    catalog().write().expect("catalog lock").allow_root(dir);
+}
+
+/// Whether `canonical` (already canonicalised by the caller) lies within an
+/// allowed root. The clone handler uses this to confirm a destination stays
+/// inside the clones root before serving it.
+pub(crate) fn path_is_allowed(canonical: &Path) -> bool {
+    catalog()
+        .read()
+        .expect("catalog lock")
+        .contains_path(canonical)
+}
+
+/// Resolve an opaque worktree id to `(canonical path, read_only, handle)`, or
+/// `None` for any id the catalog does not hold — the fail-closed path a request
+/// for an unknown or forged id takes. Clones the small result out of the lock at
+/// once so no guard is held across an `.await`.
+pub(crate) fn resolve_worktree(worktree: WorktreeId) -> Option<(PathBuf, bool, RepositoryHandle)> {
+    let c = catalog().read().expect("catalog lock");
+    c.resolve(worktree)
+        .map(|e| (e.path.clone(), e.read_only, e.handle))
+}
+
+/// The capability view of the catalog for `GET /api/catalog`: the servable
+/// repositories addressed by opaque id, with absolute paths included only when
+/// the operator opted in ([`expose_paths`]).
+pub(crate) fn catalog_descriptors() -> Vec<RepositoryDescriptor> {
+    catalog()
+        .read()
+        .expect("catalog lock")
+        .descriptors(expose_paths())
+}
+
+/// The repository the server is currently serving *by default* — the selection a
+/// request with no explicit `?repo=` id acts on. Mutable at runtime (Phase 12):
 /// starts at the CLI-arg repo (`read_only: false`, the user's own working repo),
 /// and `POST /api/clone` swaps it for a throwaway clone (`read_only: true`).
 struct Current {
     path: PathBuf,
     /// True for a cloned URL: a view-only snapshot, so the write endpoints refuse.
     read_only: bool,
+    /// The opaque handle for this selection, when it registered in the catalog.
+    /// `None` only in degraded mode (the path wouldn't classify as a repo), where
+    /// the reads still run and surface git's own error.
+    handle: Option<RepositoryHandle>,
 }
 
 static CURRENT: OnceLock<RwLock<Current>> = OnceLock::new();
+
+fn set_current_resolved(path: PathBuf, read_only: bool, handle: Option<RepositoryHandle>) {
+    let value = Current {
+        path,
+        read_only,
+        handle,
+    };
+    if let Some(lock) = CURRENT.get() {
+        *lock.write().expect("CURRENT lock not poisoned") = value;
+    } else {
+        CURRENT
+            .set(RwLock::new(value))
+            .unwrap_or_else(|_| unreachable!("CURRENT set once at startup"));
+    }
+}
 
 /// Snapshot the current repo path and its read-only flag. Clones out of the lock
 /// immediately so no guard is ever held across an `.await`.
@@ -71,14 +170,57 @@ pub(crate) fn current() -> (PathBuf, bool) {
     (g.path.clone(), g.read_only)
 }
 
-/// Point the server at a new repository (startup, or after a clone).
-pub(crate) fn set_current(path: PathBuf, read_only: bool) {
-    if let Some(lock) = CURRENT.get() {
-        *lock.write().expect("CURRENT lock not poisoned") = Current { path, read_only };
-    } else {
-        CURRENT
-            .set(RwLock::new(Current { path, read_only }))
-            .unwrap_or_else(|_| unreachable!("CURRENT set once at startup"));
+/// The opaque handle for the current default selection, or `None` in degraded
+/// mode. Used to stamp the graph with the ids the client addresses it by.
+pub(crate) fn current_handle() -> Option<RepositoryHandle> {
+    CURRENT
+        .get()
+        .expect("CURRENT is set at startup")
+        .read()
+        .expect("CURRENT lock not poisoned")
+        .handle
+}
+
+/// Point the server at a new repository (startup, or after a clone), registering
+/// it in the catalog and making it the default selection.
+///
+/// This is the **trusted, server-initiated** path — the operator launched this
+/// repo, or the server itself cloned it — so it allows the repository's own
+/// canonical root before registering. That is what lets you launch `gv` inside
+/// any repo; it does *not* widen what a *request* can reach, since requests never
+/// call this and resolve ids only against what is already registered.
+///
+/// If the path won't classify as a git repository, the server drops to degraded
+/// mode: the selection is still set (so the reads run and surface git's own
+/// error, as before this module), but with no catalog entry and no handle.
+pub(crate) fn set_current(path: &Path, read_only: bool) {
+    let registered = {
+        let mut c = catalog().write().expect("catalog lock");
+        // Trusted selection: allow its own root so a repo launched from anywhere
+        // (or a fresh clone under the clones root) can register.
+        if let Ok(facts) = git_vista_git::read_repo_facts(path) {
+            c.allow_root(&facts.root);
+        }
+        c.register(path, read_only)
+    };
+    match registered {
+        Ok(handle) => {
+            // Use the catalog's canonical path for the selection, so `current()`
+            // and an explicit `?repo=<this id>` resolve to the very same path.
+            let (path, read_only) = match resolve_worktree(handle.worktree) {
+                Some((canonical, ro, _)) => (canonical, ro),
+                None => (path.to_path_buf(), read_only),
+            };
+            set_current_resolved(path, read_only, Some(handle));
+        }
+        Err(e) => {
+            eprintln!(
+                "git-vista: serving {} in degraded mode ({e}); \
+                 /api/* reads will surface git's own error",
+                path.display()
+            );
+            set_current_resolved(path.to_path_buf(), read_only, None);
+        }
     }
 }
 

@@ -34,6 +34,9 @@ use std::path::{Path, PathBuf};
 // the Activity Log / Contextual Undo feature. `journal` owns the on-disk state
 // under `.git/git-vista/`; `activity` owns `GET /api/activity`.
 mod activity;
+// The server-owned repository catalog (M1.03): opaque repository/worktree ids,
+// allowed-root enforcement, and the only path→id resolution in the server.
+mod catalog;
 mod git_cmd;
 mod handlers;
 mod journal;
@@ -92,8 +95,9 @@ async fn main() {
         );
         eprintln!("         /api/commits will error until it points at a real repo.\n");
     }
-    // The CLI-arg repo is the user's own working repo, so it's writable.
-    set_current(repo, false);
+    // The CLI-arg repo is the user's own working repo, so it's writable. This
+    // registers it in the catalog (M1.03) and makes it the default selection.
+    set_current(&repo, false);
 
     // Phase 13: clear any throwaway clones left behind by a previous run. The `gv`
     // launcher SIGKILLs the old server on restart, so its last Phase 12 clone was
@@ -138,6 +142,9 @@ async fn main() {
         // before it can be required to speak it (so it's exempt from the header
         // check inside the contract layer).
         .route("/api/protocol", get(protocol_info))
+        // M1.03: the capability report — which repositories are servable, each
+        // addressed by an opaque id, with no filesystem paths by default.
+        .route("/api/catalog", get(handlers::catalog::catalog_list))
         .route("/api/commits", get(commits))
         // Phase 10: full detail for one commit, read on demand for the side panel.
         .route("/api/commit/{id}", get(commit_detail))
