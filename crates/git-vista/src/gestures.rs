@@ -89,7 +89,14 @@ fn svg_origin(ev: &web_sys::PointerEvent) -> (f64, f64) {
 /// drag yet — that waits until the pointer actually moves (see [`on_pointer_move`]),
 /// so a plain tap stays a tap and its click reaches the link underneath.
 pub fn on_pointer_down(g: GestureState, ev: web_sys::PointerEvent) {
-    let GestureState { menu, moved, pointers, pinch_dist, down_xy, .. } = g;
+    let GestureState {
+        menu,
+        moved,
+        pointers,
+        pinch_dist,
+        down_xy,
+        ..
+    } = g;
     // Any press on the canvas dismisses an open menu. A tap on a dot reopens it
     // on the click that follows (pointerdown fires before click), so this just
     // handles "tap empty space / start panning to close".
@@ -112,7 +119,15 @@ pub fn on_pointer_down(g: GestureState, ev: web_sys::PointerEvent) {
 
 /// Move: update this pointer's position, then pan or pinch by how it changed.
 pub fn on_pointer_move(g: GestureState, ev: web_sys::PointerEvent) {
-    let GestureState { camera, dragging, moved, pointers, pinch_dist, down_xy, .. } = g;
+    let GestureState {
+        camera,
+        dragging,
+        moved,
+        pointers,
+        pinch_dist,
+        down_xy,
+        ..
+    } = g;
     let id = ev.pointer_id();
     let (x, y) = (ev.client_x() as f64, ev.client_y() as f64);
     let (ox, oy) = svg_origin(&ev);
@@ -173,7 +188,12 @@ pub fn on_pointer_move(g: GestureState, ev: web_sys::PointerEvent) {
 /// the pinch baseline so lifting one of two fingers doesn't make the next move
 /// jump. `moved` is left for the click that may follow, and reset on next press.
 pub fn on_pointer_up(g: GestureState, ev: web_sys::PointerEvent) {
-    let GestureState { dragging, pointers, pinch_dist, .. } = g;
+    let GestureState {
+        dragging,
+        pointers,
+        pinch_dist,
+        ..
+    } = g;
     let id = ev.pointer_id();
     pointers.update_value(|ps| ps.retain(|p| p.0 != id));
     pinch_dist.set_value(None);
@@ -186,7 +206,11 @@ pub fn on_pointer_up(g: GestureState, ev: web_sys::PointerEvent) {
 /// in, down/toward zooms out. Touch pinch is handled above, not here.
 pub fn on_wheel(camera: RwSignal<Camera>, ev: web_sys::WheelEvent) {
     ev.prevent_default(); // don't let the page scroll
-    let factor = if ev.delta_y() < 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
+    let factor = if ev.delta_y() < 0.0 {
+        ZOOM_STEP
+    } else {
+        1.0 / ZOOM_STEP
+    };
     let (sx, sy) = (ev.offset_x() as f64, ev.offset_y() as f64);
     camera.update(|c| *c = c.zoomed_at(factor, sx, sy));
 }
@@ -214,6 +238,7 @@ pub fn install_resize_listener(vp_h: RwSignal<f64>) {
 ///   * +/= zoom in, -/_ zoom out (anchored at the viewport centre, as there's no
 ///     cursor for a key press), 0 resets pan & zoom.
 ///   * r re-reads the repository (same as the Refresh button).
+///
 /// Non-Esc keys are ignored while a text field is focused (the commit / URL
 /// boxes) and when a modifier is held, so typing an "r" — or the browser's own
 /// Cmd/Ctrl-R reload — is left untouched. Removed on cleanup, like the resize
@@ -224,10 +249,17 @@ pub fn install_key_listener(
     reload: RwSignal<u32>,
     overlays: Overlays,
 ) {
-    let Overlays { menu, commit_dialog, confirm_op, detail_id, viewer, .. } = overlays;
+    let Overlays {
+        menu,
+        commit_dialog,
+        confirm_op,
+        detail_id,
+        viewer,
+        ..
+    } = overlays;
     if let Some(win) = web_sys::window() {
-        let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
-            move |ev: web_sys::KeyboardEvent| {
+        let cb =
+            Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
                 if ev.key() == "Escape" {
                     // Topmost first: the full-screen viewer sits over the panel
                     // it was opened from. (Esc is a desktop convenience only —
@@ -281,12 +313,12 @@ pub fn install_key_listener(
                     "r" | "R" => reload.update(|n| *n = n.wrapping_add(1)),
                     _ => {}
                 }
-            },
-        );
+            });
         let _ = win.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
         let win2 = win.clone();
         on_cleanup(move || {
-            let _ = win2.remove_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
+            let _ =
+                win2.remove_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
         });
     }
 }

@@ -24,8 +24,26 @@ pub(crate) const DEFAULT_REPO: &str = ".";
 // time relative to this crate so the server runs from any working directory.
 pub(crate) const DIST_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../git-vista/dist");
 pub(crate) const PORT: u16 = 8080;
-// Bound on all interfaces so the iPad can reach it over the LAN.
-pub(crate) const ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT);
+pub(crate) const LOOPBACK_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), PORT);
+
+/// Loopback is the safe default. The launcher sets an explicit address only for
+/// its opt-in, unauthenticated personal-LAN compatibility mode.
+pub(crate) fn bind_addr() -> Result<SocketAddr, String> {
+    match std::env::var("GIT_VISTA_BIND_ADDR") {
+        Ok(value) => parse_bind_addr(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_bind_addr(None),
+        Err(error) => Err(format!("could not read GIT_VISTA_BIND_ADDR: {error}")),
+    }
+}
+
+fn parse_bind_addr(value: Option<&str>) -> Result<SocketAddr, String> {
+    match value {
+        Some(value) => value
+            .parse()
+            .map_err(|error| format!("invalid GIT_VISTA_BIND_ADDR '{value}': {error}")),
+        None => Ok(LOOPBACK_ADDR),
+    }
+}
 
 // Upper bound on how much history to walk; plenty for now. Shared by the graph
 // read (`handlers::read`) and the activity feed's remote-commit lookup.
@@ -77,7 +95,10 @@ pub(crate) fn clones_root() -> PathBuf {
 pub(crate) fn cleanup_clone(path: &Path) {
     if path.starts_with(clones_root()) {
         if let Err(e) = std::fs::remove_dir_all(path) {
-            eprintln!("git-vista: couldn't remove old clone {}: {e}", path.display());
+            eprintln!(
+                "git-vista: couldn't remove old clone {}: {e}",
+                path.display()
+            );
         }
     }
 }
@@ -95,5 +116,29 @@ pub(crate) fn reject_if_read_only() -> Option<(StatusCode, String)> {
         ))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_bind_addr, LOOPBACK_ADDR};
+
+    #[test]
+    fn bind_address_defaults_to_loopback() {
+        assert_eq!(parse_bind_addr(None).unwrap(), LOOPBACK_ADDR);
+    }
+
+    #[test]
+    fn bind_address_accepts_an_explicit_lan_listener() {
+        assert_eq!(
+            parse_bind_addr(Some("0.0.0.0:8080")).unwrap(),
+            "0.0.0.0:8080".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn bind_address_rejects_invalid_configuration() {
+        let error = parse_bind_addr(Some("not-an-address")).unwrap_err();
+        assert!(error.contains("invalid GIT_VISTA_BIND_ADDR"));
     }
 }

@@ -42,7 +42,8 @@ pub fn open_url_view(
             }
         });
     };
-    move || open_url.get().then(|| view! {
+    move || {
+        open_url.get().then(|| view! {
         <div
             style="position:fixed; top:0; left:0; width:100vw; height:100vh; \
                    z-index:30; display:flex; align-items:center; \
@@ -96,4 +97,5 @@ pub fn open_url_view(
             </div>
         </div>
     })
+    }
 }

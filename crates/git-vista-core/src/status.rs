@@ -184,7 +184,10 @@ fn push_sides(xy: &str, path: String, status: &mut RepoStatus) {
         return;
     }
     if let Some(kind) = ChangeKind::from_letter(bytes[0]) {
-        status.staged.push(FileChange { path: path.clone(), kind });
+        status.staged.push(FileChange {
+            path: path.clone(),
+            kind,
+        });
     }
     if let Some(kind) = ChangeKind::from_letter(bytes[1]) {
         status.unstaged.push(FileChange { path, kind });
@@ -298,15 +301,27 @@ mod tests {
         assert_eq!(
             s.staged,
             vec![
-                FileChange { path: "new.rs".into(), kind: ChangeKind::Added },
-                FileChange { path: "both.rs".into(), kind: ChangeKind::Modified },
+                FileChange {
+                    path: "new.rs".into(),
+                    kind: ChangeKind::Added
+                },
+                FileChange {
+                    path: "both.rs".into(),
+                    kind: ChangeKind::Modified
+                },
             ]
         );
         assert_eq!(
             s.unstaged,
             vec![
-                FileChange { path: "edited.rs".into(), kind: ChangeKind::Modified },
-                FileChange { path: "both.rs".into(), kind: ChangeKind::Modified },
+                FileChange {
+                    path: "edited.rs".into(),
+                    kind: ChangeKind::Modified
+                },
+                FileChange {
+                    path: "both.rs".into(),
+                    kind: ChangeKind::Modified
+                },
             ]
         );
         assert_eq!(s.change_count(), 4); // both.rs counts once per side
@@ -325,7 +340,10 @@ mod tests {
         let s = parse_porcelain_v2(text);
         assert_eq!(
             s.staged,
-            vec![FileChange { path: "new/name.rs".into(), kind: ChangeKind::Renamed }]
+            vec![FileChange {
+                path: "new/name.rs".into(),
+                kind: ChangeKind::Renamed
+            }]
         );
         assert!(s.unstaged.is_empty());
     }

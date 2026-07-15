@@ -2,6 +2,10 @@
 
 Status as of this checkpoint. Read this first when resuming.
 
+> **Historical feature checkpoint:** verify the live branch before using the
+> status below. For current product direction and a reusable session handoff, read
+> `docs/prompts/HANDOFF.md`. The V2 proposal is not implemented by this log.
+
 ## TL;DR
 
 Building two big features on top of the existing branch-ops app: an **Activity

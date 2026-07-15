@@ -3,6 +3,12 @@
 A clean, zoomable vertical git history visualizer — browser-first, built in Rust
 with a Leptos → WebAssembly UI served over HTTP.
 
+> **Historical implementation plan:** this file records the prototype phases and
+> remains useful for understanding why the current code exists. It is not the
+> professional-client roadmap. The V2 direction is defined by
+> `docs/FUTURE_VISION.md`, `docs/V2_ARCHITECTURE.md`, and
+> `docs/GIT_CLIENT_ROADMAP.md`.
+
 ## Principles
 
 - Show something on screen as early as possible

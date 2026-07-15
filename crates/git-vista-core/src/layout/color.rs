@@ -112,7 +112,11 @@ pub(super) fn assign_branch_colors(
     // The slot is a pure function of the key (trunk => 0, else its stable hash),
     // never of how many lines came before.
     let claim = |tip: Option<usize>, key: &str, color_of: &mut HashMap<usize, usize>| {
-        let slot = if Some(key) == trunk_name { 0 } else { stable_color_slot(key) };
+        let slot = if Some(key) == trunk_name {
+            0
+        } else {
+            stable_color_slot(key)
+        };
         let mut cur = tip;
         while let Some(row) = cur {
             if color_of.contains_key(&row) {

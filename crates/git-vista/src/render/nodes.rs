@@ -9,10 +9,10 @@ use leptos::*;
 
 use git_vista_core::model::RefKind;
 
-use git_vista_core::color::branch_color;
 use crate::geometry::{node_cx, node_cy, NODE_RADIUS};
 use crate::icons::icon_set;
 use crate::state::MenuData;
+use git_vista_core::color::branch_color;
 
 use super::RenderCtx;
 
@@ -54,7 +54,9 @@ pub fn build_node(
         // Link target only when the repo is on GitHub *and* this commit is
         // pushed — same rule the labels use, so the menu never offers a 404.
         let github_url = c.repo_url.as_ref().and_then(|base| {
-            c.remote_set.contains(&commit_id).then(|| format!("{base}/commit/{commit_id}"))
+            c.remote_set
+                .contains(&commit_id)
+                .then(|| format!("{base}/commit/{commit_id}"))
         });
         // The repo's GitHub base, carried into the menu for the "Create Pull
         // Request" compare link (independent of whether this commit is pushed).
@@ -122,7 +124,11 @@ pub fn build_node_icon(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>, 
         // the icon mode, so a toggle rebuilds the rows.
         let ic = icon_set(nerd_icons.get_untracked());
         let gr = &c.graph.rows[i];
-        let icon = if gr.commit.parents.len() > 1 { ic.merge } else { ic.commit };
+        let icon = if gr.commit.parents.len() > 1 {
+            ic.merge
+        } else {
+            ic.commit
+        };
         view! {
             <text
                 x=node_cx(gr.lane) - NODE_RADIUS - 5
