@@ -6,9 +6,10 @@
 #   - git-vista-server  native axum backend: serves the SPA + /api/commits
 #   - git-vista         Leptos frontend, built to WASM by Trunk (crates/git-vista)
 #
-# Two jobs run in parallel, each mapped to a concrete check:
-#   1. core      test + check the pure-logic, git-reading, and server crates
-#   2. frontend  build the real WASM bundle with Trunk
+# Three jobs run in parallel, each mapped to a concrete check:
+#   1. lint      format + strict native/WASM Clippy + shell syntax
+#   2. core      test + check the pure-logic, git-reading, server, and UI crates
+#   3. frontend  build the real WASM bundle with Trunk
 name: CI
 
 on:
@@ -62,6 +63,9 @@ jobs:
       - name: Clippy (wasm32 frontend, strict)
         run: cargo clippy -p git-vista --target wasm32-unknown-unknown --all-targets -- -D warnings
 
+      - name: Shell launchers parse
+        run: bash -n gv dev
+
   # ---------------------------------------------------------------------------
   # 1. Core + git + server + frontend crates: build check + tests.
   #
@@ -86,8 +90,8 @@ jobs:
       - name: Check core + git + server crates build
         run: cargo check -p git-vista-core -p git-vista-git -p git-vista-server
 
-      - name: Test core + git + frontend crates
-        run: cargo test -p git-vista-core -p git-vista-git -p git-vista
+      - name: Test core + git + server + frontend crates
+        run: cargo test -p git-vista-core -p git-vista-git -p git-vista-server -p git-vista
 
   # ---------------------------------------------------------------------------
   # 2. Frontend: build the WASM bundle with Trunk.
