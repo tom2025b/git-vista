@@ -21,3 +21,17 @@
 
 # Personal GitHub issue staging list
 /issues.md
+
+# Agent-session instructions and running memory. These files are useful in a
+# local checkout but are not product documentation or a durable project record.
+# Existing copies are intentionally preserved in the worktree; remove them
+# from the index separately if this repository is being cleaned up.
+/CLAUDE.md
+/PROJECT_MEMORY.md
+/PROJECT_STATUS.md
+/docs/prompts/
+
+# Local print/archive outputs generated from the documentation set
+/ALL_DOCUMENTATION.md
+/DOCUMENTATION_ASSESSMENT.md
+/codex-m1-future-code-review.md
