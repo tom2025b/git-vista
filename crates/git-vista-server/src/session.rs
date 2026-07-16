@@ -46,6 +46,14 @@ pub(crate) const CSRF_HEADER: &str = git_vista_protocol::CSRF_HEADER;
 /// forever live. A server restart mints a fresh one regardless.
 const BOOTSTRAP_TTL: Duration = Duration::from_secs(60 * 60);
 
+/// Rotate the bootstrap token before it enters its final validity window. The
+/// old token still expires within the ADR's one-hour limit, while the token file
+/// read by `gv --token` always points at a link with ample time left to open.
+const BOOTSTRAP_REFRESH_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// How often the server checks whether the bootstrap token needs refreshing.
+pub(crate) const BOOTSTRAP_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Idle lifetime of a session in seconds, refreshed on every validated request. A
 /// tab left open keeps working; one abandoned for this long must re-bootstrap.
 /// Also the cookie's `Max-Age`, so the browser drops the cookie in step with the
@@ -164,16 +172,7 @@ impl SessionManager {
                 return None;
             }
             // Single-use: rotate the token the moment it's spent.
-            boot.token = mint_secret();
-            boot.expires_at = Instant::now() + BOOTSTRAP_TTL;
-            if let Some(path) = &self.token_file {
-                if let Err(e) = write_token_file(path, &boot.token) {
-                    eprintln!(
-                        "git-vista: couldn't rotate the bootstrap token file {}: {e}",
-                        path.display()
-                    );
-                }
-            }
+            self.rotate_bootstrap(&mut boot);
         }
         let id = mint_secret();
         let csrf = mint_secret();
@@ -185,6 +184,32 @@ impl SessionManager {
             },
         );
         Some(NewSession { id, csrf })
+    }
+
+    /// Refresh a token approaching expiry so `gv --token` never advertises an
+    /// already-dead link on a long-running server. Returns whether it rotated;
+    /// callers need no token value and must never log one.
+    pub(crate) fn refresh_bootstrap_if_expiring(&self) -> bool {
+        let mut boot = self.bootstrap.lock().expect("bootstrap lock");
+        let remaining = boot.expires_at.saturating_duration_since(Instant::now());
+        if remaining > BOOTSTRAP_REFRESH_WINDOW {
+            return false;
+        }
+        self.rotate_bootstrap(&mut boot);
+        true
+    }
+
+    fn rotate_bootstrap(&self, boot: &mut Bootstrap) {
+        boot.token = mint_secret();
+        boot.expires_at = Instant::now() + BOOTSTRAP_TTL;
+        if let Some(path) = &self.token_file {
+            if let Err(e) = write_token_file(path, &boot.token) {
+                eprintln!(
+                    "git-vista: couldn't rotate the bootstrap token file {}: {e}",
+                    path.display()
+                );
+            }
+        }
     }
 
     /// Validate a session id (the cookie value), returning its CSRF token when the
@@ -238,21 +263,62 @@ fn write_token_file(path: &Path, token: &str) -> std::io::Result<()> {
 fn write_token_file_inner(path: &Path, token: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    // Create-or-truncate with mode 0600 from the start, so the secret is never
-    // briefly world-readable between create and chmod.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    // An existing file created before this run may have looser perms than the
-    // create mode grants; tighten it explicitly.
-    let mut perms = file.metadata()?.permissions();
-    use std::os::unix::fs::PermissionsExt;
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)?;
-    writeln!(file, "{token}")
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Publish through a fresh file in the same directory. Readers then observe
+    // either the complete old token or the complete new one — never the empty or
+    // partial contents exposed by truncating the live file during rotation.
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bootstrap token path has no file name",
+        )
+    })?;
+
+    // create_new plus the process/counter suffix avoids two server generations
+    // sharing a temporary file. The final rename is atomic because both paths
+    // live in the same directory.
+    for _ in 0..32 {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{}.tmp.{}.{}",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            id
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+
+        let write_result = writeln!(file, "{token}").and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&temp_path, path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        return Ok(());
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "couldn't allocate a unique bootstrap-token temporary file",
+    ))
 }
 
 #[cfg(not(unix))]
@@ -325,6 +391,27 @@ mod tests {
     }
 
     #[test]
+    fn an_expiring_bootstrap_token_rotates_before_it_dies() {
+        let m = manager();
+        let old = m.current_bootstrap();
+        m.bootstrap.lock().unwrap().expires_at = Instant::now() + BOOTSTRAP_REFRESH_WINDOW;
+
+        assert!(m.refresh_bootstrap_if_expiring());
+        let fresh = m.current_bootstrap();
+        assert_ne!(fresh, old);
+        assert!(m.exchange(&old).is_none());
+        assert!(m.exchange(&fresh).is_some());
+    }
+
+    #[test]
+    fn a_fresh_bootstrap_token_is_not_rotated_early() {
+        let m = manager();
+        let token = m.current_bootstrap();
+        assert!(!m.refresh_bootstrap_if_expiring());
+        assert_eq!(m.current_bootstrap(), token);
+    }
+
+    #[test]
     fn a_session_carries_a_csrf_token_matched_constant_time() {
         let m = manager();
         let token = m.current_bootstrap();
@@ -377,5 +464,35 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "token file must be owner-only");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_rotation_atomically_replaces_the_published_file() {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bootstrap.token");
+        write_token_file(&path, "old-token").unwrap();
+
+        // A handle opened before an atomic rename keeps seeing the complete old
+        // inode. Truncate-in-place would instead change this handle's contents.
+        let mut old_handle = std::fs::File::open(&path).unwrap();
+        let old_inode = old_handle.metadata().unwrap().ino();
+
+        write_token_file(&path, "new-token").unwrap();
+
+        let new_metadata = std::fs::metadata(&path).unwrap();
+        assert_ne!(old_inode, new_metadata.ino());
+        assert_eq!(new_metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new-token\n");
+
+        let mut old_contents = String::new();
+        old_handle.read_to_string(&mut old_contents).unwrap();
+        assert_eq!(old_contents, "old-token\n");
+
+        let published_files = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(published_files, 1, "temporary token file was left behind");
     }
 }
