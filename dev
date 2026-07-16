@@ -30,6 +30,17 @@ GIT_AS=(-c user.name=claude_2010 -c user.email=262510778+tom2025b@users.noreply.
 
 die() { echo "dev: $*" >&2; exit 1; }
 
+# Trunk 0.21 treats NO_COLOR as a boolean flag but rejects the conventional
+# NO_COLOR=1 value. Keep no-colour behavior while passing Trunk an explicit,
+# accepted option; this mirrors the production `gv` launcher.
+trunk_build() {
+  if [[ ${NO_COLOR+x} ]]; then
+    ( cd crates/git-vista && env -u NO_COLOR trunk build --color never )
+  else
+    ( cd crates/git-vista && trunk build )
+  fi
+}
+
 cmd_gate() {
   echo "dev: running the CI gate (fmt → clippy → wasm-clippy → test → trunk build)…"
   echo "── fmt ─────────────────────────────────────────────"
@@ -41,7 +52,7 @@ cmd_gate() {
   echo "── test ────────────────────────────────────────────"
   cargo test --workspace
   echo "── trunk build ─────────────────────────────────────"
-  ( cd crates/git-vista && trunk build )
+  trunk_build
   echo "dev: ✅ gate green"
 }
 

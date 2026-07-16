@@ -57,7 +57,30 @@ print_setup_url() {
   [[ -n "$token" ]] || return 1
   echo "gv: sign in on the iPad/browser by opening this one-time link:"
   echo "gv:   http://${host}/#s=${token}"
+  echo "gv: open the entire URL — the token is not a password to paste into the app."
   return 0
+}
+
+# The server deliberately expires an unused bootstrap token after one hour. New
+# servers refresh the token file before then, but this check also diagnoses an
+# older/stuck server instead of reprinting a link that can only answer 401.
+token_file_is_stale() {
+  local modified now
+  modified="$(stat -c '%Y' "$TOKEN_FILE" 2>/dev/null)" || return 1
+  now="$(date +%s)"
+  (( now - modified >= 60 * 60 ))
+}
+
+# Trunk 0.21 exposes NO_COLOR as a boolean flag but rejects the conventional
+# NO_COLOR=1 value used by many shells/CI runners. Preserve the user's no-colour
+# intent through Trunk's explicit colour option while removing the incompatible
+# environment value from that child process only.
+build_frontend() {
+  if [[ ${NO_COLOR+x} ]]; then
+    ( cd crates/git-vista && env -u NO_COLOR trunk build --color never )
+  else
+    ( cd crates/git-vista && trunk build )
+  fi
 }
 
 # Parse args: an optional path to the repo to visualise, --stop, or --seed. (No
@@ -75,12 +98,21 @@ for arg in "$@"; do
       # one is right depends on how the server was started (plain vs --lan) and
       # how the device reaches it — the token is the same for either.
       TOKEN="$(tr -d '[:space:]' <"$TOKEN_FILE" 2>/dev/null)" || TOKEN=""
-      if [[ -n "$TOKEN" ]]; then
+      if ! curl -sf -m 1 "http://localhost:8080/api/protocol" >/dev/null 2>&1; then
+        echo "gv: the token file exists, but no git-vista server answers on port 8080." >&2
+        echo "gv: start it with 'gv' (or 'gv --lan' for trusted-LAN access)." >&2
+        exit 1
+      elif token_file_is_stale; then
+        echo "gv: the saved one-time token has expired; this server needs restarting." >&2
+        echo "gv: restart with 'gv' (or 'gv --lan' for trusted-LAN access)." >&2
+        exit 1
+      elif [[ -n "$TOKEN" ]]; then
         echo "gv: one-time sign-in link — open it in the browser:"
         echo "gv:   this machine / SSH tunnel:   http://localhost:8080/#s=${TOKEN}"
         LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
         [[ -n "$LAN_IP" ]] && \
           echo "gv:   over the LAN (gv --lan mode):  http://${LAN_IP}:8080/#s=${TOKEN}"
+        echo "gv: open the entire URL — the token is not a password to paste into the app."
         exit 0
       else
         echo "gv: no bootstrap token found at $TOKEN_FILE" >&2
@@ -134,24 +166,20 @@ fi
 REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 cd "$REPO"
 
-# Avoid the "exit 144 / port 8080 already in use" trap: a stale server from a
-# previous run holds the port and the new one gets killed on bind. NOTES:
-#   * plain `pkill git-vista-server` matches NOTHING — the process name (comm) is
-#     truncated to 15 chars ("git-vista-serve"), so the 16-char pattern misses;
-#   * so we match the full command line with `-f`, and use the `[g]...` bracket
-#     trick so the pattern doesn't match this script's own command line.
-pkill -9 -f '[g]it-vista-server' 2>/dev/null || true
-
-# Always rebuild the wasm SPA from scratch: `trunk clean` wipes dist/ and trunk's
-# build cache, then `trunk build` regenerates it. This guarantees the server
-# (which serves crates/git-vista/dist/) never hands out a stale frontend bundle —
-# the recurring "my new code isn't loading" trap during development.
-( cd crates/git-vista && trunk clean && trunk build )
-
-# Build the server in the FOREGROUND so compile errors land in this terminal…
+# Build both halves before touching the running process. Trunk applies a completed
+# distribution at the end of a successful build, and the server build writes a
+# separate target artifact; if either build fails, the last working server stays
+# alive instead of `gv` turning a build/configuration error into an outage.
+build_frontend
 cargo build -p git-vista-server
 
-# …then run the built binary DETACHED: `setsid` gives it its own session with no
+# Avoid the "port 8080 already in use" trap only after both builds succeed. Plain
+# `pkill git-vista-server` misses because Linux truncates the process name to 15
+# chars, so match the full command line; `[g]` keeps this script from matching
+# itself.
+pkill -9 -f '[g]it-vista-server' 2>/dev/null || true
+
+# Run the built binary DETACHED: `setsid` gives it its own session with no
 # controlling terminal, so a closed terminal / dropped SSH session can't SIGHUP
 # it. Its output (including connection guidance) goes to $LOG.
 mkdir -p "$LOG_DIR"

@@ -76,7 +76,7 @@ use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
 use handlers::session::{create_session, revoke_session, session_status};
 use security::{AuthState, HostPolicy};
-use session::SessionManager;
+use session::{SessionManager, BOOTSTRAP_REFRESH_INTERVAL};
 use state::{
     bind_addr, bootstrap_token_path, clones_root, current, set_current, DEFAULT_REPO, DIST_DIR,
     PORT,
@@ -162,6 +162,18 @@ async fn main() {
     // build the shared session store. The auth layer and the session handlers both
     // hold this `Arc`; the Host/Origin policy comes from the bind above.
     let sessions = Arc::new(SessionManager::new(Some(bootstrap_token_path())));
+    // Keep the launcher-visible one-time link usable on a long-running server.
+    // Each individual token still expires within one hour; this task replaces it
+    // before that deadline and never exposes or logs the secret.
+    let bootstrap_refresher = sessions.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(BOOTSTRAP_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            bootstrap_refresher.refresh_bootstrap_if_expiring();
+        }
+    });
     let auth_state = AuthState {
         manager: sessions.clone(),
         hosts: HostPolicy::from_bind(addr),
