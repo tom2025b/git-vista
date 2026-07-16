@@ -114,4 +114,4 @@ overlay — Esc bonus-only, since the target iPad Magic Keyboard has no Esc key)
 floating **Reset view** button for touch/trackpad use, an inline SVG favicon plus
 mobile meta tags, the shippable server default and startup clone cleanup (items 2
 and 3), the listener-leak fix (item 1), and removal of the legacy Tauri shell.
-See `DESIGN.md` and the Phase 13 entry in `PROJECT_MEMORY.md`.
+See `DESIGN.md` and the merged Phase 13 Git history.
