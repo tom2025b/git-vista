@@ -1,69 +1,89 @@
 #!/usr/bin/env bash
-# gv — build the git-vista frontend and start the server for a git repo.
+# gv — build the Git-Vista frontend and start the server for a Git repository.
 #
-# Serves the SPA + API on http://127.0.0.1:8080 by default. Use an SSH local port
-# forward from the iPad, or opt into the unauthenticated legacy LAN mode with
-# --lan. Run it from anywhere; it locates the git-vista repo from its own path and
-# visualises whichever repo you point it at.
+# The secure default serves loopback only. An iPad reaches that listener through
+# an SSH local-port forward. `--lan` is an explicit trusted-network compatibility
+# mode: it still requires a Git-Vista session, but uses plain HTTP and has weaker
+# DNS-rebinding protection than loopback.
 #
-#   gv                  visualise the CURRENT directory's repo
-#   gv ~/code/myproj    visualise another repo by path
-#   gv --lan [path]     bind all interfaces for a trusted personal LAN
-#   gv --stop           stop the running server
-#   gv --token          reprint the one-time sign-in link for the running server
-#   gv --seed [path]    mark a repo as a TEST repo: record its current branches,
-#                       HEAD and objects as the reset point the app's
-#                       "Reset Test Repo" button restores (rerun to re-record)
+#   gv                  visualise the current directory's repository
+#   gv ~/code/myproj    visualise another repository
+#   gv --lan [path]     bind every interface for a trusted personal LAN
+#   gv doctor           diagnose listener/session/tunnel state without secrets
+#   gv --token          print a fresh one-time sign-in link for the current mode
+#   gv --stop           stop the server owned by this checkout
+#   gv --seed [path]    record a TEST repository reset point
 #
-# Sign-in (M1.04): the server needs a one-time session before it will answer the
-# API. gv prints a setup link — http://localhost:8080/#s=<token> — after it starts;
-# open it once in the browser to sign that browser in. The token rides in the URL
-# *fragment* (never sent to the server, never logged); the server writes it 0600 to
-# $XDG_STATE_HOME/git-vista/bootstrap.token, which is the only thing gv reads to
-# build the link. It's single-use: opening the link rotates in a fresh token, so a
-# second device can `gv --token` for a new link. A server restart mints a new one.
-#
-# The server runs DETACHED (its own session, logging to a file), so closing the
-# terminal or losing the SSH session that launched gv no longer kills it — which
-# used to surface on the iPad, minutes later, as "Type error. Load failed" on
-# the next write. Ctrl-C is no longer how you stop it: use `gv --stop`, or just
-# run gv again (a restart always replaces the old server).
-#
-# While actively developing, gv ALWAYS does a CLEAN rebuild of the wasm frontend
-# (trunk clean + trunk build) before starting the server, so a stale/cached bundle
-# can never be served. (We can reintroduce an incremental/--no-build fast path when
-# we're ready to ship to other people.)
+# A setup token lives only in a URL fragment (`#s=...`), is single-use, and is
+# exchanged for an HttpOnly session cookie. Run `gv --token` again for each new
+# browser/device. Never paste the token as a password or reuse one link twice.
 set -euo pipefail
 
-# Where you ran gv from (the repo to visualise defaults to this).
+PORT=8080
 START_DIR="$PWD"
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SERVER_BIN="$REPO/target/debug/git-vista-server"
 
-# The detached server's log — the server's banner (with the firewall tips) and
-# everything it prints land here. Kept under XDG state, out of any repo.
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/git-vista"
 LOG="$LOG_DIR/server.log"
-# The one-time session bootstrap token (M1.04), written 0600 by the server. This
-# path must match the server's `state::bootstrap_token_path()`. Only gv reads it.
 TOKEN_FILE="$LOG_DIR/bootstrap.token"
+PID_FILE="$LOG_DIR/server.pid"
+MODE_FILE="$LOG_DIR/server.mode"
+TARGET_FILE="$LOG_DIR/server.target"
 
-# Print the browser sign-in link for `host` (default localhost) by folding the
-# current bootstrap token into a URL fragment. The fragment never reaches the
-# server, so the token stays out of access logs. Silent (returns 1) if the token
-# file isn't there yet — the caller decides whether that's worth a warning.
-print_setup_url() {
-  local host="${1:-localhost:8080}"
-  local token
-  token="$(tr -d '[:space:]' <"$TOKEN_FILE" 2>/dev/null)" || return 1
-  [[ -n "$token" ]] || return 1
-  echo "gv: sign in on the iPad/browser by opening this one-time link:"
-  echo "gv:   http://${host}/#s=${token}"
-  echo "gv: open the entire URL — the token is not a password to paste into the app."
-  return 0
+server_health() {
+  local host="${1:-localhost}"
+  curl -sf -m 2 "http://${host}:${PORT}/api/protocol" >/dev/null 2>&1
 }
 
-# The server deliberately expires an unused bootstrap token after one hour. New
-# servers refresh the token file before then, but this check also diagnoses an
-# older/stuck server instead of reprinting a link that can only answer 401.
+lan_ip() {
+  hostname -I 2>/dev/null \
+    | tr ' ' '\n' \
+    | awk 'NF && $0 !~ /^127\./ && $0 !~ /:/ { print; exit }'
+}
+
+listener_address() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltn "sport = :${PORT}" 2>/dev/null | awk 'NR == 1 { print $4 }'
+  fi
+}
+
+listener_pid() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltnp "sport = :${PORT}" 2>/dev/null \
+      | sed -nE 's/.*pid=([0-9]+).*/\1/p' \
+      | head -n 1
+  fi
+}
+
+listener_mode() {
+  local address
+  address="$(listener_address)"
+  case "$address" in
+    127.0.0.1:*|'[::1]':*) printf '%s\n' loopback ;;
+    0.0.0.0:*|'[::]':*) printf '%s\n' lan ;;
+    '')
+      if server_health localhost; then
+        local ip
+        ip="$(lan_ip)"
+        if [[ -n "$ip" ]] && server_health "$ip"; then
+          printf '%s\n' lan
+        else
+          printf '%s\n' loopback
+        fi
+      else
+        printf '%s\n' down
+      fi
+      ;;
+    *) printf '%s\n' lan ;;
+  esac
+}
+
+ufw_is_active() {
+  command -v systemctl >/dev/null 2>&1 \
+    && systemctl is-active --quiet ufw 2>/dev/null
+}
+
 token_file_is_stale() {
   local modified now
   modified="$(stat -c '%Y' "$TOKEN_FILE" 2>/dev/null)" || return 1
@@ -71,20 +91,210 @@ token_file_is_stale() {
   (( now - modified >= 60 * 60 ))
 }
 
-# Trunk 0.21 exposes NO_COLOR as a boolean flag but rejects the conventional
-# NO_COLOR=1 value used by many shells/CI runners. Preserve the user's no-colour
-# intent through Trunk's explicit colour option while removing the incompatible
-# environment value from that child process only.
+read_token() {
+  local token
+  token="$(tr -d '[:space:]' <"$TOKEN_FILE" 2>/dev/null)" || return 1
+  [[ $token =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$token"
+}
+
+print_setup_url() {
+  local host="${1:-localhost:${PORT}}" token
+  token="$(read_token)" || return 1
+  echo "gv: sign in by opening this complete one-time link:"
+  echo "gv:   http://${host}/#s=${token}"
+  echo "gv: the #s= part is required; it is not a password. Use a fresh link per device."
+}
+
+print_token_links() {
+  local token mode ip
+  if ! server_health localhost; then
+    echo "gv: no Git-Vista server answers on localhost:${PORT}." >&2
+    echo "gv: start it with 'gv' (or 'gv --lan' for temporary trusted-LAN access)." >&2
+    return 1
+  fi
+  if token_file_is_stale; then
+    echo "gv: the saved setup token is stale; restart the server to recover." >&2
+    return 1
+  fi
+  token="$(read_token)" || {
+    echo "gv: no valid bootstrap token found at $TOKEN_FILE" >&2
+    return 1
+  }
+
+  mode="$(listener_mode)"
+  echo "gv: one-time sign-in link — open the entire URL:"
+  echo "gv:   Linux / SSH tunnel:  http://localhost:${PORT}/#s=${token}"
+  if [[ $mode == lan ]]; then
+    ip="$(lan_ip)"
+    if [[ -n "$ip" ]]; then
+      echo "gv:   iPad over LAN:       http://${ip}:${PORT}/#s=${token}"
+    else
+      echo "gv: LAN listener is active, but no non-loopback IPv4 address was found." >&2
+    fi
+    if ufw_is_active; then
+      echo "gv: WARNING: UFW is active; it may block iPad access to TCP ${PORT}." >&2
+      echo "gv: inspect with 'sudo ufw status numbered' or use the SSH tunnel." >&2
+    fi
+  else
+    echo "gv: current listener is loopback-only; a direct 192.168.x.x iPad URL will fail."
+    echo "gv: iPad: forward local ${PORT} to Linux 127.0.0.1:${PORT}, then open the localhost link."
+    echo "gv: temporary trusted-LAN alternative: restart with 'gv --lan'."
+  fi
+  echo "gv: this link is single-use; run 'gv --token' again for the next device."
+}
+
+write_private_file() {
+  local path="$1" value="$2" temp="${1}.tmp.$$"
+  mkdir -p "$(dirname "$path")"
+  ( umask 077; printf '%s\n' "$value" >"$temp" )
+  mv -f "$temp" "$path"
+}
+
+repo_server_pids() {
+  local proc pid argv0
+  for proc in /proc/[0-9]*; do
+    [[ -r "$proc/cmdline" ]] || continue
+    pid="${proc##*/}"
+    argv0="$(tr '\0' '\n' 2>/dev/null <"$proc/cmdline" | head -n 1)" || continue
+    [[ $argv0 == "$SERVER_BIN" ]] && printf '%s\n' "$pid"
+  done
+  return 0
+}
+
+stop_pid() {
+  local pid="$1"
+  kill "$pid" 2>/dev/null || return 0
+  for _ in $(seq 1 30); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -9 "$pid" 2>/dev/null || true
+}
+
+stop_repo_servers() {
+  local pid found=1
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    stop_pid "$pid"
+    found=0
+  done < <(repo_server_pids)
+  rm -f "$PID_FILE" "$MODE_FILE" "$TARGET_FILE"
+  return "$found"
+}
+
+record_runtime_state() {
+  local pid="$1" mode="$2" target="$3"
+  write_private_file "$PID_FILE" "$pid"
+  write_private_file "$MODE_FILE" "$mode"
+  write_private_file "$TARGET_FILE" "$target"
+}
+
+doctor() {
+  local result=0 address mode recorded_mode protocol pid target token_mode modified now age ip
+  echo "Git-Vista doctor (no secrets printed)"
+  echo "  checkout: $REPO"
+  echo "  Git: $(git --version 2>&1 || echo unavailable)"
+
+  address="$(listener_address)"
+  mode="$(listener_mode)"
+  echo "  bind: ${address:-not detected} (${mode})"
+  recorded_mode=""
+  [[ -r "$MODE_FILE" ]] && recorded_mode="$(cat "$MODE_FILE")"
+  if [[ -n "$recorded_mode" && $recorded_mode != "$mode" ]]; then
+    echo "  WARNING: recorded launch mode '$recorded_mode' disagrees with live mode '$mode'."
+    result=1
+  fi
+  if server_health localhost; then
+    protocol="$(curl -sf -m 2 "http://localhost:${PORT}/api/protocol")"
+    echo "  health: healthy — HTTP 200"
+    echo "  protocol: $protocol"
+  else
+    echo "  health: DOWN — no response on localhost:${PORT}"
+    result=1
+  fi
+
+  pid="$(repo_server_pids | head -n 1)"
+  if [[ -n "$pid" ]]; then
+    echo "  process: PID $pid (owned by this checkout)"
+  else
+    pid="$(listener_pid)"
+    if [[ -n "$pid" ]]; then
+      echo "  process: PID $pid (listener not owned by this checkout)"
+    else
+      echo "  process: not detected"
+    fi
+  fi
+  target=""
+  [[ -r "$TARGET_FILE" ]] && target="$(cat "$TARGET_FILE")"
+  if [[ -z "$target" && -n "$pid" && -r "/proc/$pid/cmdline" ]]; then
+    target="$(tr '\0' '\n' 2>/dev/null <"/proc/$pid/cmdline" | sed -n '2p')" || target=""
+  fi
+  echo "  catalog root (launch repository): ${target:-unknown}"
+  echo "  catalog root (managed clones): ${TMPDIR:-/tmp}/git-vista-clones"
+
+  if [[ -r "$TOKEN_FILE" ]]; then
+    token_mode="$(stat -c '%a' "$TOKEN_FILE" 2>/dev/null || echo unknown)"
+    modified="$(stat -c '%Y' "$TOKEN_FILE" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+    age=$(( now - modified ))
+    if read_token >/dev/null && ! token_file_is_stale; then
+      echo "  bootstrap token: present, mode ${token_mode}, age ${age}s (value hidden)"
+    else
+      echo "  bootstrap token: INVALID OR STALE, mode ${token_mode}, age ${age}s"
+      result=1
+    fi
+    if [[ $token_mode != 600 ]]; then
+      echo "  WARNING: bootstrap token permissions should be 600."
+      result=1
+    fi
+  else
+    echo "  bootstrap token: missing"
+    result=1
+  fi
+
+  if ufw_is_active; then
+    echo "  firewall: UFW active (rules need 'sudo ufw status numbered')"
+  else
+    echo "  firewall: UFW inactive or unavailable"
+  fi
+
+  echo "  tunnel: on the iPad SSH client, forward local ${PORT}"
+  echo "          to 127.0.0.1:${PORT} on this Linux host."
+  echo "          Then run 'gv --token' and open its localhost link on the iPad."
+  if [[ $mode == lan ]]; then
+    ip="$(lan_ip)"
+    echo "  LAN: direct HTTP is active at http://${ip:-<LAN-IP>}:${PORT}/ (not TLS)."
+    echo "       Prefer a plain 'gv' restart plus the SSH tunnel for normal use."
+  else
+    echo "  LAN: direct LAN access is off; this is the secure default."
+  fi
+  return "$result"
+}
+
 build_frontend() {
   if [[ ${NO_COLOR+x} ]]; then
-    ( cd crates/git-vista && env -u NO_COLOR trunk build --color never )
+    ( cd "$REPO/crates/git-vista" && env -u NO_COLOR trunk build --color never )
   else
-    ( cd crates/git-vista && trunk build )
+    ( cd "$REPO/crates/git-vista" && trunk build )
   fi
 }
 
-# Parse args: an optional path to the repo to visualise, --stop, or --seed. (No
-# --no-build while developing — we always rebuild from scratch; see the header.)
+usage() {
+  sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+if [[ ${1:-} == help ]]; then
+  usage
+  exit 0
+fi
+
+if [[ ${1:-} == doctor ]]; then
+  [[ $# -eq 1 ]] || { echo "gv: 'doctor' takes no other arguments" >&2; exit 2; }
+  doctor
+  exit $?
+fi
+
 TARGET=""
 SEED=0
 LAN=0
@@ -92,134 +302,117 @@ for arg in "$@"; do
   case "$arg" in
     --seed) SEED=1 ;;
     --lan) LAN=1 ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --doctor)
+      doctor
+      exit $?
+      ;;
     --token)
-      # Reprint the sign-in link(s) for the already-running server, no rebuild.
-      # Print BOTH the loopback/SSH-tunnel link and the LAN-IP link, since which
-      # one is right depends on how the server was started (plain vs --lan) and
-      # how the device reaches it — the token is the same for either.
-      TOKEN="$(tr -d '[:space:]' <"$TOKEN_FILE" 2>/dev/null)" || TOKEN=""
-      if ! curl -sf -m 1 "http://localhost:8080/api/protocol" >/dev/null 2>&1; then
-        echo "gv: the token file exists, but no git-vista server answers on port 8080." >&2
-        echo "gv: start it with 'gv' (or 'gv --lan' for trusted-LAN access)." >&2
-        exit 1
-      elif token_file_is_stale; then
-        echo "gv: the saved one-time token has expired; this server needs restarting." >&2
-        echo "gv: restart with 'gv' (or 'gv --lan' for trusted-LAN access)." >&2
-        exit 1
-      elif [[ -n "$TOKEN" ]]; then
-        echo "gv: one-time sign-in link — open it in the browser:"
-        echo "gv:   this machine / SSH tunnel:   http://localhost:8080/#s=${TOKEN}"
-        LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-        [[ -n "$LAN_IP" ]] && \
-          echo "gv:   over the LAN (gv --lan mode):  http://${LAN_IP}:8080/#s=${TOKEN}"
-        echo "gv: open the entire URL — the token is not a password to paste into the app."
-        exit 0
-      else
-        echo "gv: no bootstrap token found at $TOKEN_FILE" >&2
-        echo "gv: is the server running? start it with 'gv' first." >&2
-        exit 1
-      fi
+      print_token_links
+      exit $?
       ;;
     --stop)
-      if pkill -9 -f '[g]it-vista-server' 2>/dev/null; then
-        echo "gv: server stopped"
+      if stop_repo_servers; then
+        echo "gv: server owned by $REPO stopped"
+      elif server_health localhost; then
+        echo "gv: a server answers on ${PORT}, but it is not owned by this checkout; refusing to kill it." >&2
+        exit 1
       else
-        echo "gv: no server was running"
+        echo "gv: no server owned by this checkout is running"
       fi
       exit 0
       ;;
     -*) echo "gv: unknown option: $arg" >&2; exit 2 ;;
-    *)  TARGET="$arg" ;;
+    *) TARGET="$arg" ;;
   esac
 done
 TARGET="${TARGET:-$START_DIR}"
 
-# Resolve the target to an absolute path and confirm it's a git repo, so the
-# server doesn't just serve an empty graph for a non-repo.
-TARGET="$(cd "$TARGET" 2>/dev/null && pwd)" || { echo "gv: no such directory: $TARGET" >&2; exit 1; }
+TARGET="$(cd "$TARGET" 2>/dev/null && pwd)" || {
+  echo "gv: no such directory: $TARGET" >&2
+  exit 1
+}
 if ! git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
-  echo "gv: '$TARGET' is not a git repository" >&2
+  echo "gv: '$TARGET' is not a Git repository" >&2
   exit 1
 fi
 
-# --seed: record this repo's current state as the "Reset Test Repo" point and
-# exit (no build, no server). Written where the server looks for it
-# (.git/git-vista/): the branch list with tips, the checked-out branch, and a
-# bundle of the objects those tips need (so a reset works even after git gc).
 if [[ $SEED -eq 1 ]]; then
   GIT_DIR="$(git -C "$TARGET" rev-parse --absolute-git-dir)"
   HEAD_BRANCH="$(git -C "$TARGET" symbolic-ref --short HEAD 2>/dev/null)" || {
-    echo "gv: --seed needs a checked-out branch (HEAD is detached)" >&2; exit 1;
+    echo "gv: --seed needs a checked-out branch (HEAD is detached)" >&2
+    exit 1
   }
   mkdir -p "$GIT_DIR/git-vista"
   git -C "$TARGET" bundle create "$GIT_DIR/git-vista/seed.bundle" --branches 2>/dev/null
   git -C "$TARGET" for-each-ref refs/heads \
-    --format='%(objectname) %(refname:short)' > "$GIT_DIR/git-vista/seed-refs"
-  printf '%s\n' "$HEAD_BRANCH" > "$GIT_DIR/git-vista/seed-head"
-  echo "gv: seed recorded for $TARGET — $(wc -l < "$GIT_DIR/git-vista/seed-refs") branch(es), HEAD ‘$HEAD_BRANCH’"
-  echo "gv: the app now offers 'Reset Test Repo' when viewing this repo"
+    --format='%(objectname) %(refname:short)' >"$GIT_DIR/git-vista/seed-refs"
+  printf '%s\n' "$HEAD_BRANCH" >"$GIT_DIR/git-vista/seed-head"
+  echo "gv: seed recorded for $TARGET — $(wc -l <"$GIT_DIR/git-vista/seed-refs") branch(es), HEAD '$HEAD_BRANCH'"
+  echo "gv: the app now offers 'Reset Test Repo' when viewing this repository"
   exit 0
 fi
 
-# git-vista repo = the directory this script lives in. `readlink -f` resolves any
-# symlinks first (e.g. a `gv` symlink on PATH) back to the real file in the repo.
-REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 cd "$REPO"
 
-# Build both halves before touching the running process. Trunk applies a completed
-# distribution at the end of a successful build, and the server build writes a
-# separate target artifact; if either build fails, the last working server stays
-# alive instead of `gv` turning a build/configuration error into an outage.
+# Build both halves before touching the live process. A failed build leaves the
+# last working server intact.
 build_frontend
 cargo build -p git-vista-server
 
-# Avoid the "port 8080 already in use" trap only after both builds succeed. Plain
-# `pkill git-vista-server` misses because Linux truncates the process name to 15
-# chars, so match the full command line; `[g]` keeps this script from matching
-# itself.
-pkill -9 -f '[g]it-vista-server' 2>/dev/null || true
+# Stop only a process whose argv[0] is this checkout's server binary. This safely
+# adopts pre-PID-file launcher generations without killing another checkout.
+stop_repo_servers || true
+if server_health localhost; then
+  echo "gv: port ${PORT} is occupied by a server not owned by $REPO; refusing to kill it." >&2
+  exit 1
+fi
 
-# Run the built binary DETACHED: `setsid` gives it its own session with no
-# controlling terminal, so a closed terminal / dropped SSH session can't SIGHUP
-# it. Its output (including connection guidance) goes to $LOG.
 mkdir -p "$LOG_DIR"
 echo "=== gv start $(date '+%F %T') — visualising $TARGET" >>"$LOG"
 unset GIT_VISTA_BIND_ADDR
+MODE=loopback
 if [[ $LAN -eq 1 ]]; then
-  export GIT_VISTA_BIND_ADDR="0.0.0.0:8080"
-  echo "gv: WARNING: --lan serves git-vista over plain HTTP (no TLS) to your LAN." >&2
-  echo "gv: A session is still required, but DNS-rebinding protection is weaker" >&2
-  echo "gv: than loopback. Prefer the default SSH-tunnel mode." >&2
+  MODE=lan
+  export GIT_VISTA_BIND_ADDR="0.0.0.0:${PORT}"
+  echo "gv: WARNING: --lan serves Git-Vista over plain HTTP (no TLS) to your LAN." >&2
+  echo "gv: a session is required, but DNS-rebinding protection is weaker than loopback." >&2
+  if ufw_is_active; then
+    echo "gv: WARNING: UFW is active and may block inbound TCP ${PORT}." >&2
+    echo "gv: inspect 'sudo ufw status numbered'; prefer the SSH tunnel." >&2
+  fi
 fi
-setsid "$REPO/target/debug/git-vista-server" "$TARGET" >>"$LOG" 2>&1 </dev/null &
 
-# Don't claim success until it actually serves: catches an immediate crash or a
-# port clash, with the log's last lines as the explanation. Probe /api/protocol —
-# the one endpoint exempt from the M1.02 protocol-header requirement (every other
-# /api/* now answers 426 without an `X-Git-Vista-Protocol` header, which `curl -f`
-# would read as "down"). It's also the natural health check: it needs no repo read
-# and returns 200 the moment the server is serving.
+setsid "$SERVER_BIN" "$TARGET" >>"$LOG" 2>&1 </dev/null &
+SERVER_PID=$!
+record_runtime_state "$SERVER_PID" "$MODE" "$TARGET"
+
 echo "gv: visualising $TARGET"
 for _ in $(seq 1 40); do
-  if curl -sf -m 1 "http://localhost:8080/api/protocol" >/dev/null 2>&1; then
+  if server_health localhost; then
     if [[ $LAN -eq 1 ]]; then
-      LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-      echo "gv: server up in LAN mode — http://${LAN_IP:-<this-machine-LAN-IP>}:8080/"
-      print_setup_url "${LAN_IP:-<this-machine-LAN-IP>}:8080" || \
-        echo "gv: (couldn't read the sign-in token yet — try 'gv --token')" >&2
+      LAN_IP="$(lan_ip)"
+      echo "gv: server up in LAN mode — http://${LAN_IP:-<this-machine-LAN-IP>}:${PORT}/"
+      print_setup_url "${LAN_IP:-<this-machine-LAN-IP>}:${PORT}" || \
+        echo "gv: couldn't read the sign-in token yet; try 'gv --token'" >&2
     else
-      echo "gv: server up — http://127.0.0.1:8080/"
-      echo "gv: 127.0.0.1 works only on this Linux host"
-      echo "gv: iPad via SSH: forward local port 8080 to 127.0.0.1:8080"
-      echo "gv: iPad via trusted Wi-Fi without SSH: restart with gv --lan"
-      print_setup_url "localhost:8080" || \
-        echo "gv: (couldn't read the sign-in token yet — try 'gv --token')" >&2
+      echo "gv: server up in loopback/SSH mode — http://127.0.0.1:${PORT}/"
+      echo "gv: iPad SSH forward: local ${PORT} -> Linux 127.0.0.1:${PORT}"
+      print_setup_url "localhost:${PORT}" || \
+        echo "gv: couldn't read the sign-in token yet; try 'gv --token'" >&2
     fi
-    echo "gv: log: $LOG    stop: gv --stop    sign-in link: gv --token"
+    echo "gv: log: $LOG    diagnose: gv doctor    stop: gv --stop"
     exit 0
   fi
+  kill -0 "$SERVER_PID" 2>/dev/null || break
   sleep 0.25
 done
-echo "gv: server didn't come up within 10s — last log lines:" >&2
+
+echo "gv: server did not come up — last log lines:" >&2
 tail -n 20 "$LOG" >&2
+stop_pid "$SERVER_PID"
+rm -f "$PID_FILE" "$MODE_FILE" "$TARGET_FILE"
 exit 1
