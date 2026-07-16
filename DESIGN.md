@@ -14,7 +14,8 @@ with a Leptos → WebAssembly UI served over HTTP.
 - Show something on screen as early as possible
 - Small, shippable phases with clear completion criteria
 - Keep core logic separate from UI code
-- Document decisions in `PROJECT_MEMORY.md` after each phase
+- Preserve durable architectural decisions as ADRs and completed work in Git
+  history/issues
 
 ## Phases
 

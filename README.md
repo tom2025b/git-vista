@@ -35,12 +35,11 @@ forge integration, PWA behavior, and teaching built on professional semantics.
 - [Remote Linux architecture](docs/REMOTE_ARCHITECTURE.md)
 - [Security model](docs/SECURITY_MODEL.md)
 - [Feature and competitive matrix](docs/FEATURE_MATRIX.md)
-- [Reusable architecture review prompt](docs/prompts/ARCHITECT_REVIEW.md)
-- [Agent handoff prompt](docs/prompts/HANDOFF.md)
 
-`DESIGN.md` and `PROJECT_MEMORY.md` preserve the prototype's phased implementation
-history. The documents under `docs/` are proposed architecture, not claims about
-the current code.
+`DESIGN.md` preserves the prototype's phased implementation history. The
+documents under `docs/` are proposed architecture, not claims about the current
+code. Agent prompts, session handoffs, and running project memory are local
+working material and are intentionally excluded from the public repository.
 
 ## Workspace layout
 
