@@ -1,0 +1,26 @@
+# Git-Vista systemd user-service example.
+#
+# Copy to ~/.config/systemd/user/git-vista.service, then edit both paths below:
+#   * WorkingDirectory / the binary's source checkout
+#   * the final ExecStart argument / repository Git-Vista should initially serve
+#
+# Build and install first:
+#   cargo build --release -p git-vista-server
+#   install -Dm755 target/release/git-vista-server ~/.local/bin/git-vista-server
+
+[Unit]
+Description=Git-Vista loopback repository service
+Documentation=https://github.com/tom2025b/git-vista
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/Git-Vista
+Environment=GIT_VISTA_BIND_ADDR=127.0.0.1:8080
+ExecStart=%h/.local/bin/git-vista-server %h/projects/Git-Vista
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+
+[Install]
+WantedBy=default.target

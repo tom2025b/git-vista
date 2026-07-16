@@ -32,7 +32,7 @@ pub(crate) const PORT: u16 = 8080;
 pub(crate) const LOOPBACK_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), PORT);
 
 /// Loopback is the safe default. The launcher sets an explicit address only for
-/// its opt-in, unauthenticated personal-LAN compatibility mode.
+/// its opt-in, session-protected personal-LAN compatibility mode.
 pub(crate) fn bind_addr() -> Result<SocketAddr, String> {
     match std::env::var("GIT_VISTA_BIND_ADDR") {
         Ok(value) => parse_bind_addr(Some(&value)),

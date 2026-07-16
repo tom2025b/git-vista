@@ -112,9 +112,9 @@ async fn main() {
     // registers it in the catalog (M1.03) and makes it the default selection.
     set_current(&repo, false);
 
-    // Phase 13: clear any throwaway clones left behind by a previous run. The `gv`
-    // launcher SIGKILLs the old server on restart, so its last Phase 12 clone was
-    // never cleaned up and would otherwise pile up under the temp dir across runs.
+    // Phase 13: clear any throwaway clones left behind by a previous run. A prior
+    // launcher/process interruption may not have cleaned its last Phase 12 clone,
+    // which would otherwise pile up under the temp dir across runs.
     // Nothing is being served from there yet at startup, so removing the whole
     // clones root is safe; the next clone recreates it.
     let clones = clones_root();
@@ -292,7 +292,7 @@ async fn main() {
                 eprintln!(
                     "  Port {PORT} is already in use — another git-vista-server may be running."
                 );
-                eprintln!("  Stop it (e.g. `pkill -f git-vista-server`) and try again.");
+                eprintln!("  Run `gv doctor`, then stop it with its owning launcher/service.");
             }
             std::process::exit(1);
         }
