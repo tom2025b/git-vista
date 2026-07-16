@@ -544,6 +544,58 @@ mod wire_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// An SSH local forward is only a transport: dropping and recreating it must
+    /// not revoke the browser's Git-Vista session. Model that boundary by ending
+    /// one request/response completely, then reconnecting with the same cookie
+    /// through a fresh service call and finally reading the graph again.
+    #[tokio::test]
+    async fn a_session_survives_tunnel_disconnect_and_reconnect() {
+        let (router, sessions) = app();
+        let (cookie, _csrf) = bootstrap(&router, &sessions).await;
+
+        let before_disconnect = router
+            .clone()
+            .oneshot(
+                req("GET", "/api/commits")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(before_disconnect.status(), StatusCode::OK);
+        drop(before_disconnect);
+
+        // No server-side connection object is retained. A new request carrying
+        // the browser cookie recovers the session and its in-memory CSRF token.
+        let reconnected = router
+            .clone()
+            .oneshot(
+                req("GET", "/api/session")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reconnected.status(), StatusCode::OK);
+        let bytes = to_bytes(reconnected.into_body(), 64 * 1024).await.unwrap();
+        let info: SessionInfo = serde_json::from_slice(&bytes).unwrap();
+        assert!(info.authenticated);
+        assert!(info.csrf.is_some());
+
+        let graph_after_reconnect = router
+            .oneshot(
+                req("GET", "/api/commits")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(graph_after_reconnect.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn a_write_needs_both_session_and_csrf() {
         let (router, sessions) = app();

@@ -10,11 +10,12 @@ vertical commit graph. The proposed V2 direction adds a safe daily-driver Git
 workflow, SSH-first remote access, worktrees, stash, history editing, conflicts,
 forge integration, PWA behavior, and teaching built on professional semantics.
 
-> **Current security warning:** the prototype now binds `127.0.0.1:8080` by
-> default, but its write endpoints do not yet authenticate requests. Session,
-> origin/CSRF, and repository-isolation controls remain V1 architecture work.
-> `gv --lan` is an explicit unauthenticated compatibility mode for a trusted
-> personal LAN, not the target secure remote mode.
+> **Current security boundary:** the prototype binds `127.0.0.1:8080` by
+> default and requires a single-use bootstrap, HttpOnly session, CSRF, and
+> Host/Origin checks. `gv --lan` is an explicit session-protected compatibility
+> mode over plain HTTP for a trusted personal LAN; it is not the target secure
+> remote mode. Mutation serialization, bounded Git execution, and durable
+> recovery remain M1 work before professional daily-driver use.
 
 ## Product Direction
 
@@ -132,8 +133,8 @@ history read itself uses `gix`'s pure-Rust reader.
 
 ## Running
 
-The normal path is the `gv` launcher: it does a clean rebuild of the wasm SPA,
-then starts the server pointed at a repo.
+The normal path is the `gv` launcher: it builds the WASM SPA and server before
+replacing the previous process, then points the server at a repository.
 
 ```sh
 ./gv                  # visualise the CURRENT directory's repo
@@ -147,7 +148,7 @@ gv: sign in on the iPad/browser by opening this one-time link:
 gv:   http://localhost:8080/#s=<token>
 ```
 
-- on this machine: open that link in the browser.
+- on this machine: open that complete link in the browser.
 - from an iPad: forward local port `8080` through SSH to `127.0.0.1:8080` on the
   Linux host, then open the link (the tunnel makes `localhost:8080` on the iPad the
   server).
@@ -155,23 +156,76 @@ gv:   http://localhost:8080/#s=<token>
 The link carries a one-time token in the URL *fragment* — it never reaches the
 server or any log. Opening it exchanges the token for an HttpOnly, `SameSite=Strict`
 session cookie; the app then works normally. The token is **single-use** and
-expires; `./gv --token` reprints a fresh link for the running server (e.g. for a
-second device), and restarting the server mints a new one. Until a browser signs
-in, the app shows a "Connect to git-vista" screen and the API answers `401`.
+expires; `./gv --token` prints a mode-aware fresh link for the running server.
+Each browser/device needs a newly printed link because a successful exchange
+consumes it. The complete `#s=...` fragment is required; the token is not a
+password to paste into the app. Until a browser signs in, the app shows a
+"Connect to git-vista" screen and the API answers `401`.
 
 Every mutating request additionally carries a per-session CSRF token, and the
-server validates `Origin`/`Host` (loopback-only, defeating DNS rebinding) and
-content type on top of the session — see [ADR 0004](docs/adr/0004-loopback-sessions.md)
-and [the security model](docs/SECURITY_MODEL.md).
+server validates `Origin`/`Host` (strict in loopback/SSH mode) and content type
+on top of the session — see [ADR 0004](docs/adr/0004-loopback-sessions.md) and
+[the security model](docs/SECURITY_MODEL.md).
 
 Opening `http://127.0.0.1:8080/` directly in Safari without a tunnel will not
 work: on the iPad, `127.0.0.1` means the iPad itself.
 
 For temporary direct access on a trusted personal LAN, run `./gv --lan [path]`.
 This binds all interfaces over plain HTTP (no TLS); a session is still required,
-but DNS-rebinding protection is weaker than loopback, so prefer the SSH tunnel. See
-[Remote Linux Architecture](docs/REMOTE_ARCHITECTURE.md) for the target session
-and tunnel design.
+but DNS-rebinding protection is weaker than loopback, so prefer the SSH tunnel.
+An active UFW policy may also block inbound TCP 8080; `gv doctor` reports that
+condition without changing firewall rules.
+
+### SSH tunnel workflow and diagnostics
+
+Start Git-Vista normally on Linux so it remains loopback-only:
+
+```sh
+./gv /absolute/path/to/repository
+./gv doctor
+```
+
+In the iPad SSH client, configure a **local** forward from iPad port `8080` to
+Linux `127.0.0.1:8080`. The command-line equivalent on another client is:
+
+```sh
+ssh -N -L 8080:127.0.0.1:8080 linux-user@linux-host
+```
+
+With the tunnel connected, run `./gv --token` on Linux and open its complete
+`http://localhost:8080/#s=...` link on the iPad. Here `localhost` deliberately
+means the iPad end of the forward. If the tunnel drops, reconnect the same
+forward and reload: the Git-Vista session cookie remains valid until its own
+idle expiry. Generate a new link only if the browser session itself is gone.
+
+`./gv doctor` prints the actual bind address, health and protocol versions,
+launch/catalog roots, token age and permissions, UFW state, process ownership,
+and safe tunnel recipe. It never prints the token, cookies, or CSRF value. The
+launcher likewise inspects the actual listener: it will not advertise a direct
+LAN link while the server is loopback-only.
+
+### Optional systemd user service
+
+For a server that survives terminal and SSH-client closure under the user's
+service manager, build/install the binary and adapt the supplied example:
+
+```sh
+cargo build --release -p git-vista-server
+install -Dm755 target/release/git-vista-server ~/.local/bin/git-vista-server
+mkdir -p ~/.config/systemd/user
+cp contrib/systemd/git-vista.service ~/.config/systemd/user/
+# Edit WorkingDirectory and the final repository argument in ExecStart.
+systemctl --user daemon-reload
+systemctl --user enable --now git-vista.service
+systemctl --user status git-vista.service
+```
+
+The example remains loopback-only. Use `systemctl --user restart/stop
+git-vista.service` for a supervised process; `gv` deliberately refuses to kill a
+port occupant it does not own. `gv --token` and `gv doctor` still work because
+the service and launcher share the same per-user state directory. See [Remote
+Linux Architecture](docs/REMOTE_ARCHITECTURE.md) for the target session and
+tunnel design.
 
 Under the hood that's just:
 
@@ -216,7 +270,7 @@ a `--check` diff or a lint log into a file.
 ## Status
 
 The visualizer prototype is functional and has continued beyond its original
-Phase 12/13 plan. It is not yet a secure professional daily-driver client. The V2
-roadmap begins with repository identity, protocol versioning, session security,
-typed operation planning, mutation serialization, and recovery evidence before
-expanding Git feature breadth.
+Phase 12/13 plan. Repository identity, protocol negotiation, catalog isolation,
+and loopback sessions have landed. It is not yet a professional daily-driver
+client: typed operation planning, mutation serialization, bounded Git process
+policy, and durable recovery evidence still precede broader Git feature work.

@@ -64,7 +64,9 @@ jobs:
         run: cargo clippy -p git-vista --target wasm32-unknown-unknown --all-targets -- -D warnings
 
       - name: Shell launchers parse
-        run: bash -n gv dev
+        run: |
+          bash -n gv dev
+          ./gv help >/dev/null
 
   # ---------------------------------------------------------------------------
   # 1. Core + git + server + frontend crates: build check + tests.
