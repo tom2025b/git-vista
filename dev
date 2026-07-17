@@ -14,7 +14,7 @@
 #   dev resume [issue#]   show branch state, WIP commits, and handoff.md
 #   dev signin            reprint the sign-in link(s) for the running server
 #   dev doctor            diagnose listener/session/tunnel state without secrets
-#   dev serve [--lan] [p] start the server for a repo (delegates to ./gv)
+#   dev serve [path]      start the loopback-only server (delegates to ./gv)
 #   dev handoff           open/print handoff.md (the running "what's done / next" note)
 #
 # handoff.md is gitignored on purpose (local working note); the DURABLE record is

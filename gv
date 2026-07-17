@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # gv — build the Git-Vista frontend and start the server for a Git repository.
 #
-# The secure default serves loopback only. An iPad reaches that listener through
-# an SSH local-port forward. `--lan` is an explicit trusted-network compatibility
-# mode: it still requires a Git-Vista session, but uses plain HTTP and has weaker
-# DNS-rebinding protection than loopback.
+# Git-Vista serves only IPv4 loopback. An iPad reaches that listener through an
+# SSH local-port forward; direct LAN serving is deliberately unsupported because
+# it would expose a plain-HTTP Git control surface beyond this machine.
 #
 #   gv                  visualise the current directory's repository
 #   gv ~/code/myproj    visualise another repository
-#   gv --lan [path]     bind every interface for a trusted personal LAN
 #   gv doctor           diagnose listener/session/tunnel state without secrets
-#   gv --token          print a fresh one-time sign-in link for the current mode
+#   gv --token          print a fresh one-time localhost sign-in link
 #   gv --stop           stop the server owned by this checkout
 #   gv --seed [path]    record a TEST repository reset point
 #
@@ -36,12 +34,6 @@ server_health() {
   curl -sf -m 2 "http://${host}:${PORT}/api/protocol" >/dev/null 2>&1
 }
 
-lan_ip() {
-  hostname -I 2>/dev/null \
-    | tr ' ' '\n' \
-    | awk 'NF && $0 !~ /^127\./ && $0 !~ /:/ { print; exit }'
-}
-
 listener_address() {
   if command -v ss >/dev/null 2>&1; then
     ss -H -ltn "sport = :${PORT}" 2>/dev/null | awk 'NR == 1 { print $4 }'
@@ -60,28 +52,16 @@ listener_mode() {
   local address
   address="$(listener_address)"
   case "$address" in
-    127.0.0.1:*|'[::1]':*) printf '%s\n' loopback ;;
-    0.0.0.0:*|'[::]':*) printf '%s\n' lan ;;
+    127.0.0.1:*) printf '%s\n' loopback ;;
     '')
       if server_health localhost; then
-        local ip
-        ip="$(lan_ip)"
-        if [[ -n "$ip" ]] && server_health "$ip"; then
-          printf '%s\n' lan
-        else
-          printf '%s\n' loopback
-        fi
+        printf '%s\n' unknown
       else
         printf '%s\n' down
       fi
       ;;
-    *) printf '%s\n' lan ;;
+    *) printf '%s\n' exposed ;;
   esac
-}
-
-ufw_is_active() {
-  command -v systemctl >/dev/null 2>&1 \
-    && systemctl is-active --quiet ufw 2>/dev/null
 }
 
 token_file_is_stale() {
@@ -107,10 +87,10 @@ print_setup_url() {
 }
 
 print_token_links() {
-  local token mode ip
+  local token mode
   if ! server_health localhost; then
     echo "gv: no Git-Vista server answers on localhost:${PORT}." >&2
-    echo "gv: start it with 'gv' (or 'gv --lan' for temporary trusted-LAN access)." >&2
+    echo "gv: start it with 'gv'." >&2
     return 1
   fi
   if token_file_is_stale; then
@@ -123,24 +103,18 @@ print_token_links() {
   }
 
   mode="$(listener_mode)"
+  if [[ $mode == exposed ]]; then
+    echo "gv: refusing to print a sign-in token for a non-loopback listener." >&2
+    echo "gv: restart it with 'gv' to restore 127.0.0.1:${PORT}." >&2
+    return 1
+  fi
   echo "gv: one-time sign-in link — open the entire URL:"
   echo "gv:   Linux / SSH tunnel:  http://localhost:${PORT}/#s=${token}"
-  if [[ $mode == lan ]]; then
-    ip="$(lan_ip)"
-    if [[ -n "$ip" ]]; then
-      echo "gv:   iPad over LAN:       http://${ip}:${PORT}/#s=${token}"
-    else
-      echo "gv: LAN listener is active, but no non-loopback IPv4 address was found." >&2
-    fi
-    if ufw_is_active; then
-      echo "gv: WARNING: UFW is active; it may block iPad access to TCP ${PORT}." >&2
-      echo "gv: inspect with 'sudo ufw status numbered' or use the SSH tunnel." >&2
-    fi
-  else
-    echo "gv: current listener is loopback-only; a direct 192.168.x.x iPad URL will fail."
-    echo "gv: iPad: forward local ${PORT} to Linux 127.0.0.1:${PORT}, then open the localhost link."
-    echo "gv: temporary trusted-LAN alternative: restart with 'gv --lan'."
+  if [[ $mode == unknown ]]; then
+    echo "gv: WARNING: listener address could not be inspected; install 'ss' (iproute2) to verify it." >&2
   fi
+  echo "gv: iPad: forward local ${PORT} to Linux 127.0.0.1:${PORT}, then open this localhost link."
+  echo "gv: direct 192.168.x.x access is intentionally disabled."
   echo "gv: this link is single-use; run 'gv --token' again for the next device."
 }
 
@@ -191,7 +165,7 @@ record_runtime_state() {
 }
 
 doctor() {
-  local result=0 address mode recorded_mode protocol pid target token_mode modified now age ip
+  local result=0 address mode recorded_mode protocol pid target token_mode modified now age
   echo "Git-Vista doctor (no secrets printed)"
   echo "  checkout: $REPO"
   echo "  Git: $(git --version 2>&1 || echo unavailable)"
@@ -199,6 +173,13 @@ doctor() {
   address="$(listener_address)"
   mode="$(listener_mode)"
   echo "  bind: ${address:-not detected} (${mode})"
+  if [[ $mode == exposed ]]; then
+    echo "  SECURITY ERROR: port ${PORT} is reachable on a non-loopback interface."
+    result=1
+  elif [[ $mode == unknown ]]; then
+    echo "  WARNING: listener address could not be verified (the 'ss' command is required)."
+    result=1
+  fi
   recorded_mode=""
   [[ -r "$MODE_FILE" ]] && recorded_mode="$(cat "$MODE_FILE")"
   if [[ -n "$recorded_mode" && $recorded_mode != "$mode" ]]; then
@@ -253,22 +234,10 @@ doctor() {
     result=1
   fi
 
-  if ufw_is_active; then
-    echo "  firewall: UFW active (rules need 'sudo ufw status numbered')"
-  else
-    echo "  firewall: UFW inactive or unavailable"
-  fi
-
   echo "  tunnel: on the iPad SSH client, forward local ${PORT}"
   echo "          to 127.0.0.1:${PORT} on this Linux host."
   echo "          Then run 'gv --token' and open its localhost link on the iPad."
-  if [[ $mode == lan ]]; then
-    ip="$(lan_ip)"
-    echo "  LAN: direct HTTP is active at http://${ip:-<LAN-IP>}:${PORT}/ (not TLS)."
-    echo "       Prefer a plain 'gv' restart plus the SSH tunnel for normal use."
-  else
-    echo "  LAN: direct LAN access is off; this is the secure default."
-  fi
+  echo "  LAN: direct LAN access is disabled; only the SSH tunnel is supported."
   return "$result"
 }
 
@@ -281,7 +250,8 @@ build_frontend() {
 }
 
 usage() {
-  sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^set -euo pipefail$/p' "${BASH_SOURCE[0]}" \
+    | sed '$d; s/^# \{0,1\}//'
 }
 
 if [[ ${1:-} == help ]]; then
@@ -297,11 +267,14 @@ fi
 
 TARGET=""
 SEED=0
-LAN=0
 for arg in "$@"; do
   case "$arg" in
     --seed) SEED=1 ;;
-    --lan) LAN=1 ;;
+    --lan)
+      echo "gv: --lan is disabled; Git-Vista only listens on 127.0.0.1:${PORT}." >&2
+      echo "gv: use an SSH local-port forward for iPad access." >&2
+      exit 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -373,37 +346,26 @@ fi
 
 mkdir -p "$LOG_DIR"
 echo "=== gv start $(date '+%F %T') — visualising $TARGET" >>"$LOG"
-unset GIT_VISTA_BIND_ADDR
-MODE=loopback
-if [[ $LAN -eq 1 ]]; then
-  MODE=lan
-  export GIT_VISTA_BIND_ADDR="0.0.0.0:${PORT}"
-  echo "gv: WARNING: --lan serves Git-Vista over plain HTTP (no TLS) to your LAN." >&2
-  echo "gv: a session is required, but DNS-rebinding protection is weaker than loopback." >&2
-  if ufw_is_active; then
-    echo "gv: WARNING: UFW is active and may block inbound TCP ${PORT}." >&2
-    echo "gv: inspect 'sudo ufw status numbered'; prefer the SSH tunnel." >&2
-  fi
-fi
+export GIT_VISTA_BIND_ADDR="127.0.0.1:${PORT}"
 
 setsid "$SERVER_BIN" "$TARGET" >>"$LOG" 2>&1 </dev/null &
 SERVER_PID=$!
-record_runtime_state "$SERVER_PID" "$MODE" "$TARGET"
+record_runtime_state "$SERVER_PID" loopback "$TARGET"
 
 echo "gv: visualising $TARGET"
 for _ in $(seq 1 40); do
   if server_health localhost; then
-    if [[ $LAN -eq 1 ]]; then
-      LAN_IP="$(lan_ip)"
-      echo "gv: server up in LAN mode — http://${LAN_IP:-<this-machine-LAN-IP>}:${PORT}/"
-      print_setup_url "${LAN_IP:-<this-machine-LAN-IP>}:${PORT}" || \
-        echo "gv: couldn't read the sign-in token yet; try 'gv --token'" >&2
-    else
-      echo "gv: server up in loopback/SSH mode — http://127.0.0.1:${PORT}/"
-      echo "gv: iPad SSH forward: local ${PORT} -> Linux 127.0.0.1:${PORT}"
-      print_setup_url "localhost:${PORT}" || \
-        echo "gv: couldn't read the sign-in token yet; try 'gv --token'" >&2
+    LIVE_MODE="$(listener_mode)"
+    if [[ $LIVE_MODE == exposed ]]; then
+      echo "gv: SECURITY ERROR: server opened a non-loopback listener; stopping it." >&2
+      stop_pid "$SERVER_PID"
+      rm -f "$PID_FILE" "$MODE_FILE" "$TARGET_FILE"
+      exit 1
     fi
+    echo "gv: server up in loopback/SSH mode — http://127.0.0.1:${PORT}/"
+    echo "gv: iPad SSH forward: local ${PORT} -> Linux 127.0.0.1:${PORT}"
+    print_setup_url "localhost:${PORT}" || \
+      echo "gv: couldn't read the sign-in token yet; try 'gv --token'" >&2
     echo "gv: log: $LOG    diagnose: gv doctor    stop: gv --stop"
     exit 0
   fi

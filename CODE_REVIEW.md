@@ -7,7 +7,9 @@ packaging-&-polish change set; the rest are recorded for later._
 > **Superseded product and security scope:** this is a historical review of an
 > earlier trusted-LAN visualizer. Its security conclusion is not acceptable for
 > the professional, SSH-first Git client. See `docs/V2_ARCHITECTURE.md` and
-> `docs/SECURITY_MODEL.md` for the current assessment and target controls.
+> `docs/SECURITY_MODEL.md` for the current assessment and target controls. The
+> all-interface behavior described below has since been removed; the current
+> server refuses every bind except `127.0.0.1:8080`.
 
 ## Overall assessment
 
