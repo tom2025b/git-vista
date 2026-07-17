@@ -51,8 +51,9 @@ ssh -N -L 8080:127.0.0.1:8080 linux-host
 Current M1.05 support uses `gv` as that companion CLI: plain `gv` keeps the
 Linux listener on loopback, `gv --token` prints a single-use localhost-fragment
 link for the forwarded browser, and `gv doctor` reports the real listener,
-health/protocol, launch/catalog roots, token metadata, UFW state, and tunnel
-recipe without printing a secret. The browser session survives a dropped tunnel;
+health/protocol, launch/catalog roots, token metadata, and tunnel recipe without
+printing a secret. The server refuses non-loopback bind overrides and the
+launcher rejects `--lan`. The browser session survives a dropped tunnel;
 reconnect the same local forward and reload. `contrib/systemd/git-vista.service`
 is the editable user-service example for supervised startup.
 

@@ -49,9 +49,9 @@ that horizon, and `Later` intentionally deferred.
 
 | Capability | Current | V1 foundation | V2 professional | Later |
 | --- | --- | --- | --- | --- |
-| Loopback personal mode | Default bind; no session auth | Add session protections | Supported | - |
-| SSH-tunnel remote Linux | Manual | First-class docs/session | First-class UX | Managed helper |
-| Paired HTTPS LAN mode | Explicit insecure `--lan` compatibility | Design only | Optional | Device management |
+| Loopback personal mode | Enforced bind; session/CSRF/Host protections | Harden | Supported | - |
+| SSH-tunnel remote Linux | Documented launcher/session workflow | Harden | First-class UX | Managed helper |
+| Paired HTTPS LAN mode | No; insecure HTTP LAN mode removed | Design only | Optional | Device management |
 | Multi-user mode | No | Explicitly excluded | Explicitly excluded | Separate architecture |
 | Touch graph navigation | Yes | Harden | Full app touch UX | Pencil refinements |
 | Portrait/split-screen shell | Partial | Target | Refine | - |

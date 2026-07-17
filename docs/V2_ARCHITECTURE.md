@@ -90,7 +90,7 @@ abstractions today.
 
 | Severity | Risk | Required response |
 | --- | --- | --- |
-| High | Current write endpoints remain unauthenticated; explicit `--lan` mode exposes them beyond loopback | Implement session/origin/CSRF controls and retire unauthenticated LAN writes before broader client claims |
+| High | A future remote mode could weaken the current loopback/session boundary | Keep non-loopback binds refused until paired HTTPS has an accepted threat model and tests |
 | High | Endpoint-specific writes can race across tabs or external Git clients | Add repository generations, typed plans, idempotency, and per-worktree serialization |
 | High | Contextual undo can overstate safety as operation breadth grows | Replace generic undo with checked recovery classes and durable evidence |
 | High | Unbounded history/diff/process output can exhaust server or WASM memory | Page history, stream bounded content, virtualize, cancel, and enforce limits |

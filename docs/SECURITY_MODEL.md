@@ -100,7 +100,9 @@ never a log); everything below is enforced by the `require_auth` layer.
 
 ## LAN Mode
 
-LAN mode is opt-in and must not be the default convenience path.
+No current LAN mode exists: the server is hard-limited to `127.0.0.1:8080`, and
+the earlier plain-HTTP `--lan` compatibility path was removed. Any future LAN
+mode is a separate paired-HTTPS profile, not a convenience switch, and must:
 
 - Require HTTPS so service workers, credentials, and browser security semantics
   operate on a secure origin.
@@ -295,4 +297,3 @@ No release should claim safe remote or LAN write access until:
 - Child processes have time/output limits and credential redaction.
 - Recovery behavior is documented for each destructive operation.
 - A `SECURITY.md` vulnerability-reporting policy exists.
-
