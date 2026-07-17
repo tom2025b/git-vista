@@ -10,12 +10,12 @@ vertical commit graph. The proposed V2 direction adds a safe daily-driver Git
 workflow, SSH-first remote access, worktrees, stash, history editing, conflicts,
 forge integration, PWA behavior, and teaching built on professional semantics.
 
-> **Current security boundary:** the prototype binds `127.0.0.1:8080` by
-> default and requires a single-use bootstrap, HttpOnly session, CSRF, and
-> Host/Origin checks. `gv --lan` is an explicit session-protected compatibility
-> mode over plain HTTP for a trusted personal LAN; it is not the target secure
-> remote mode. Mutation serialization, bounded Git execution, and durable
-> recovery remain M1 work before professional daily-driver use.
+> **Current security boundary:** the prototype is hard-limited to
+> `127.0.0.1:8080` and requires a single-use bootstrap, HttpOnly session, CSRF,
+> and strict Host/Origin checks. Non-loopback bind overrides are refused; an SSH
+> local-port forward is the only supported iPad access path. Mutation
+> serialization, bounded Git execution, and durable recovery remain M1 work
+> before professional daily-driver use.
 
 ## Product Direction
 
@@ -156,25 +156,23 @@ gv:   http://localhost:8080/#s=<token>
 The link carries a one-time token in the URL *fragment* — it never reaches the
 server or any log. Opening it exchanges the token for an HttpOnly, `SameSite=Strict`
 session cookie; the app then works normally. The token is **single-use** and
-expires; `./gv --token` prints a mode-aware fresh link for the running server.
+expires; `./gv --token` prints a fresh localhost link for the running server.
 Each browser/device needs a newly printed link because a successful exchange
 consumes it. The complete `#s=...` fragment is required; the token is not a
 password to paste into the app. Until a browser signs in, the app shows a
 "Connect to git-vista" screen and the API answers `401`.
 
 Every mutating request additionally carries a per-session CSRF token, and the
-server validates `Origin`/`Host` (strict in loopback/SSH mode) and content type
-on top of the session — see [ADR 0004](docs/adr/0004-loopback-sessions.md) and
+server validates `Origin`/`Host` against loopback plus the content type on top of
+the session — see [ADR 0004](docs/adr/0004-loopback-sessions.md) and
 [the security model](docs/SECURITY_MODEL.md).
 
 Opening `http://127.0.0.1:8080/` directly in Safari without a tunnel will not
 work: on the iPad, `127.0.0.1` means the iPad itself.
 
-For temporary direct access on a trusted personal LAN, run `./gv --lan [path]`.
-This binds all interfaces over plain HTTP (no TLS); a session is still required,
-but DNS-rebinding protection is weaker than loopback, so prefer the SSH tunnel.
-An active UFW policy may also block inbound TCP 8080; `gv doctor` reports that
-condition without changing firewall rules.
+Direct LAN access is deliberately disabled. `./gv --lan` is rejected, and the
+server also refuses a non-loopback `GIT_VISTA_BIND_ADDR` override. This keeps the
+plain-HTTP Git control surface off Wi-Fi, VPN, container, and public interfaces.
 
 ### SSH tunnel workflow and diagnostics
 
@@ -199,10 +197,9 @@ forward and reload: the Git-Vista session cookie remains valid until its own
 idle expiry. Generate a new link only if the browser session itself is gone.
 
 `./gv doctor` prints the actual bind address, health and protocol versions,
-launch/catalog roots, token age and permissions, UFW state, process ownership,
-and safe tunnel recipe. It never prints the token, cookies, or CSRF value. The
-launcher likewise inspects the actual listener: it will not advertise a direct
-LAN link while the server is loopback-only.
+launch/catalog roots, token age and permissions, process ownership, and the safe
+tunnel recipe. It never prints the token, cookies, or CSRF value. It reports a
+security error if port 8080 is ever observed on a non-loopback listener.
 
 ### Optional systemd user service
 
