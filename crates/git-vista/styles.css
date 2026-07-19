@@ -26,9 +26,22 @@ html, body {
   background: var(--bg);
   color: var(--fg);
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  /* The page itself must never scroll (issue #117): on iOS Safari 100vh is
+     the LARGE viewport, so with the URL bar visible the shell overflows and
+     Safari restores that scroll across reloads — parking the topbar above
+     the visible area. All real scrolling lives in inner overflow containers
+     (.detail-body, .ctx-menu, .viewer-body); print mode restores overflow
+     via html[data-print]. */
+  overflow: hidden;
+  overscroll-behavior: none;
 }
 
-.app { display: flex; flex-direction: column; height: 100vh; }
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh; /* iOS 16.4+: track the real visible box under Safari's bars */
+}
 
 .topbar {
   display: flex;
