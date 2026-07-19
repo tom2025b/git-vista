@@ -31,8 +31,9 @@ pub(crate) const DIST_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../git-v
 pub(crate) const PORT: u16 = 8080;
 pub(crate) const LOOPBACK_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), PORT);
 
-/// Loopback is the safe default. The launcher sets an explicit address only for
-/// its opt-in, unauthenticated personal-LAN compatibility mode.
+/// Git-Vista is intentionally loopback-only. An explicit environment value is
+/// accepted for service files only when it repeats the exact safe address; this
+/// prevents a stale launcher or service override from exposing the server.
 pub(crate) fn bind_addr() -> Result<SocketAddr, String> {
     match std::env::var("GIT_VISTA_BIND_ADDR") {
         Ok(value) => parse_bind_addr(Some(&value)),
@@ -43,9 +44,17 @@ pub(crate) fn bind_addr() -> Result<SocketAddr, String> {
 
 fn parse_bind_addr(value: Option<&str>) -> Result<SocketAddr, String> {
     match value {
-        Some(value) => value
-            .parse()
-            .map_err(|error| format!("invalid GIT_VISTA_BIND_ADDR '{value}': {error}")),
+        Some(value) => {
+            let addr: SocketAddr = value
+                .parse()
+                .map_err(|error| format!("invalid GIT_VISTA_BIND_ADDR '{value}': {error}"))?;
+            if addr != LOOPBACK_ADDR {
+                return Err(format!(
+                    "refusing GIT_VISTA_BIND_ADDR '{value}': Git-Vista only listens on {LOOPBACK_ADDR}; use an SSH local-port forward for remote access"
+                ));
+            }
+            Ok(addr)
+        }
         None => Ok(LOOPBACK_ADDR),
     }
 }
@@ -290,11 +299,23 @@ mod tests {
     }
 
     #[test]
-    fn bind_address_accepts_an_explicit_lan_listener() {
+    fn bind_address_accepts_the_explicit_loopback_service_value() {
         assert_eq!(
-            parse_bind_addr(Some("0.0.0.0:8080")).unwrap(),
-            "0.0.0.0:8080".parse().unwrap()
+            parse_bind_addr(Some("127.0.0.1:8080")).unwrap(),
+            LOOPBACK_ADDR
         );
+    }
+
+    #[test]
+    fn bind_address_rejects_an_all_interface_listener() {
+        let error = parse_bind_addr(Some("0.0.0.0:8080")).unwrap_err();
+        assert!(error.contains("only listens on 127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn bind_address_rejects_a_lan_interface() {
+        let error = parse_bind_addr(Some("192.168.1.5:8080")).unwrap_err();
+        assert!(error.contains("only listens on 127.0.0.1:8080"));
     }
 
     #[test]

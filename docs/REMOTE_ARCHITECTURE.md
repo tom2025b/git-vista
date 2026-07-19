@@ -48,6 +48,15 @@ ssh -N -L 8080:127.0.0.1:8080 linux-host
 - A companion CLI may print a QR/pairing URL after the tunnel is established, but
   it must not expose a reusable bearer token in logs or shell history.
 
+Current M1.05 support uses `gv` as that companion CLI: plain `gv` keeps the
+Linux listener on loopback, `gv --token` prints a single-use localhost-fragment
+link for the forwarded browser, and `gv doctor` reports the real listener,
+health/protocol, launch/catalog roots, token metadata, and tunnel recipe without
+printing a secret. The server refuses non-loopback bind overrides and the
+launcher rejects `--lan`. The browser session survives a dropped tunnel;
+reconnect the same local forward and reload. `contrib/systemd/git-vista.service`
+is the editable user-service example for supervised startup.
+
 ### LAN paired mode
 
 ```text
@@ -225,4 +234,3 @@ provider and catalog policy without changing typed Git operations.
 The critical future change is workspace isolation: two users should not share one
 writable worktree. Team mode must allocate linked worktrees or disposable clones per
 user/task and coordinate shared refs explicitly.
-

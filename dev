@@ -13,7 +13,8 @@
 #   dev wip [message]     checkpoint: add + commit (as claude_2010) + push
 #   dev resume [issue#]   show branch state, WIP commits, and handoff.md
 #   dev signin            reprint the sign-in link(s) for the running server
-#   dev serve [--lan] [p] start the server for a repo (delegates to ./gv)
+#   dev doctor            diagnose listener/session/tunnel state without secrets
+#   dev serve [path]      start the loopback-only server (delegates to ./gv)
 #   dev handoff           open/print handoff.md (the running "what's done / next" note)
 #
 # handoff.md is gitignored on purpose (local working note); the DURABLE record is
@@ -74,9 +75,9 @@ cmd_start() {
   command -v gh >/dev/null || die "gh CLI not found"
   local title mnum rest slug branch
   title="$(gh issue view "$issue" --json title --jq .title)" || die "no issue #$issue"
-  mnum="$(grep -oiE 'M[0-9]+\.[0-9]+' <<<"$title" | head -1 | tr 'A-Z' 'a-z')"
+  mnum="$(grep -oiE 'M[0-9]+\.[0-9]+' <<<"$title" | head -1 | tr '[:upper:]' '[:lower:]')"
   rest="$(sed -E 's/^M[0-9]+\.[0-9]+ *//I' <<<"$title")"
-  slug="$(tr 'A-Z' 'a-z' <<<"$rest" | tr -cs 'a-z0-9' '-' | sed 's/^-//; s/-$//' | cut -c1-40 | sed 's/-$//')"
+  slug="$(tr '[:upper:]' '[:lower:]' <<<"$rest" | tr -cs '[:lower:]0-9' '-' | sed 's/^-//; s/-$//' | cut -c1-40 | sed 's/-$//')"
   branch="feature/${mnum:-issue-$issue}-${slug}"
   echo "dev: issue #$issue — $title"
   echo "dev: branching $branch off fresh main…"
@@ -131,6 +132,7 @@ cmd_resume() {
 }
 
 cmd_signin() { ./gv --token; }
+cmd_doctor() { ./gv doctor; }
 cmd_serve()  { ./gv "$@"; }
 cmd_handoff() {
   [[ -f handoff.md ]] && { cat handoff.md; exit 0; }
@@ -144,6 +146,7 @@ case "${1:-}" in
   wip)     shift; cmd_wip "$@" ;;
   resume)  shift; cmd_resume "$@" ;;
   signin)  shift; cmd_signin "$@" ;;
+  doctor)  shift; cmd_doctor "$@" ;;
   serve)   shift; cmd_serve "$@" ;;
   handoff) shift; cmd_handoff "$@" ;;
   ""|-h|--help|help)

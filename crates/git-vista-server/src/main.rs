@@ -27,7 +27,6 @@
 //! router below reads exactly as it did when all of this lived in one file.
 
 use std::io::ErrorKind;
-use std::net::{IpAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 
 // The activity feed (journal + reflogs + snapshots) — the server-side half of
@@ -112,9 +111,9 @@ async fn main() {
     // registers it in the catalog (M1.03) and makes it the default selection.
     set_current(&repo, false);
 
-    // Phase 13: clear any throwaway clones left behind by a previous run. The `gv`
-    // launcher SIGKILLs the old server on restart, so its last Phase 12 clone was
-    // never cleaned up and would otherwise pile up under the temp dir across runs.
+    // Phase 13: clear any throwaway clones left behind by a previous run. A prior
+    // launcher/process interruption may not have cleaned its last Phase 12 clone,
+    // which would otherwise pile up under the temp dir across runs.
     // Nothing is being served from there yet at startup, so removing the whole
     // clones root is safe; the next clone recreates it.
     let clones = clones_root();
@@ -147,9 +146,9 @@ async fn main() {
     )
     .layer(ServeDir::new(DIST_DIR).append_index_html_on_directories(true));
 
-    // Resolve the bind address first: the M1.04 Host/Origin policy is derived from
-    // it (loopback → loopback-only, defeating DNS rebinding), and the socket is
-    // bound to it below.
+    // Resolve the fixed loopback address first. `bind_addr` rejects every
+    // non-loopback override so neither a stale launcher nor a service file can
+    // expose this plain-HTTP control surface.
     let addr = match bind_addr() {
         Ok(addr) => addr,
         Err(error) => {
@@ -158,9 +157,28 @@ async fn main() {
         }
     };
 
+    // Reserve the port before creating the session manager. SessionManager
+    // publishes a new bootstrap token as part of construction; doing that first
+    // meant a second server that later failed with AddrInUse could overwrite the
+    // token file belonging to the healthy live server. The operator would then
+    // receive links that could only answer 401 until the live server restarted.
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("error: could not bind {addr}: {error}");
+            if error.kind() == ErrorKind::AddrInUse {
+                eprintln!(
+                    "  Port {PORT} is already in use — another git-vista-server may be running."
+                );
+                eprintln!("  Run `gv doctor`, then stop it with its owning launcher/service.");
+            }
+            std::process::exit(1);
+        }
+    };
+
     // M1.04: mint the one-time bootstrap token (written 0600 for `gv` to read) and
     // build the shared session store. The auth layer and the session handlers both
-    // hold this `Arc`; the Host/Origin policy comes from the bind above.
+    // hold this `Arc`; the Host/Origin policy is strict loopback-only.
     let sessions = Arc::new(SessionManager::new(Some(bootstrap_token_path())));
     // Keep the launcher-visible one-time link usable on a long-running server.
     // Each individual token still expires within one hour; this task replaces it
@@ -176,7 +194,7 @@ async fn main() {
     });
     let auth_state = AuthState {
         manager: sessions.clone(),
-        hosts: HostPolicy::from_bind(addr),
+        hosts: HostPolicy::loopback(PORT),
     };
 
     // Every `/api/*` route lives on this sub-router so the M1.02 contract layer
@@ -284,21 +302,7 @@ async fn main() {
         // everywhere the app is served.
         .layer(axum::middleware::from_fn(security::security_headers));
 
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("error: could not bind {addr}: {e}");
-            if e.kind() == ErrorKind::AddrInUse {
-                eprintln!(
-                    "  Port {PORT} is already in use — another git-vista-server may be running."
-                );
-                eprintln!("  Stop it (e.g. `pkill -f git-vista-server`) and try again.");
-            }
-            std::process::exit(1);
-        }
-    };
-
-    print_startup_banner(addr, &bootstrap_token_path());
+    print_startup_banner(&bootstrap_token_path());
 
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("error: server stopped: {e}");
@@ -324,24 +328,14 @@ fn panic_to_response(panic: Box<dyn std::any::Any + Send>) -> axum::response::Re
         .into_response()
 }
 
-/// Print the local/SSH path by default and isolate the legacy LAN guidance to an
-/// explicit non-loopback bind.
-fn print_startup_banner(addr: std::net::SocketAddr, token_path: &Path) {
+/// Print the only supported access paths: local loopback or an SSH tunnel whose
+/// remote endpoint is that same loopback listener.
+fn print_startup_banner(token_path: &Path) {
     println!("git-vista server — serving {}", current().0.display());
     println!("  • on this machine: http://localhost:{PORT}/");
-    if addr.ip().is_loopback() {
-        println!("  • from the iPad: use an SSH local port forward to 127.0.0.1:{PORT}");
-        println!("    example: ssh -N -L {PORT}:127.0.0.1:{PORT} <linux-host>");
-    } else {
-        let display_ip = lan_ip()
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "<this-machine-LAN-IP>".to_string());
-        println!("  • from the iPad: http://{display_ip}:{PORT}/");
-        println!();
-        println!("WARNING: LAN mode has no HTTPS, and its DNS-rebinding protection is");
-        println!("weaker than loopback (the Host allowlist can't be pinned on 0.0.0.0).");
-        println!("A session is still required, but prefer the default SSH-tunnel mode.");
-    }
+    println!("  • from the iPad: use an SSH local port forward to 127.0.0.1:{PORT}");
+    println!("    example: ssh -N -L {PORT}:127.0.0.1:{PORT} <linux-host>");
+    println!("  • direct LAN access is disabled");
     // M1.04: the app needs a one-time session first. The bootstrap token is *not*
     // printed here (it must never land in a log) — `gv` reads the 0600 file and
     // builds the setup URL, or the operator can read it by hand.
@@ -351,13 +345,4 @@ fn print_startup_banner(addr: std::net::SocketAddr, token_path: &Path) {
         token_path.display()
     );
     println!();
-}
-
-/// Best-effort: this machine's primary LAN IPv4. Connecting a UDP socket sends no
-/// packets; it just makes the OS pick the outbound interface, whose local address
-/// is the IP other devices on the LAN use to reach us. Returns `None` if offline.
-fn lan_ip() -> Option<IpAddr> {
-    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect("8.8.8.8:80").ok()?;
-    sock.local_addr().ok().map(|addr| addr.ip())
 }
