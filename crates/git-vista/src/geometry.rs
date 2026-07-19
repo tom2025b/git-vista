@@ -36,6 +36,19 @@ pub const BADGE_GAP: i32 = 5;
 const BADGE_CHAR_W: i32 = 7;
 const BADGE_PAD_X: i32 = 6;
 
+/// Pointer travel (CSS px) past which a press becomes a pan/drag rather than a
+/// tap. Touch gets a wider allowance: a natural finger tap wobbles 5-10 px on
+/// an iPad, and the strict mouse value silently ate node taps (issue #115).
+/// Mouse/pen (and anything unknown) stay precise so a tiny deliberate drag
+/// still pans.
+pub fn drag_threshold(pointer_type: &str) -> f64 {
+    if pointer_type == "touch" {
+        12.0
+    } else {
+        4.0
+    }
+}
+
 /// Centre x of a node in the given lane.
 pub fn node_cx(lane: usize) -> i32 {
     PAD_X + lane as i32 * LANE_WIDTH
@@ -281,6 +294,18 @@ impl MenuPlacement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_touch_tap_tolerates_finger_wobble_a_mouse_click_stays_precise() {
+        // A natural finger tap wobbles 5-10 CSS px on an iPad; a mouse doesn't.
+        // Touch must tolerate more travel before a press becomes a pan, or node
+        // taps are silently eaten (issue #115).
+        assert!(drag_threshold("touch") >= 10.0);
+        assert_eq!(drag_threshold("mouse"), 4.0);
+        assert_eq!(drag_threshold("pen"), 4.0);
+        // Unknown/empty pointer types keep the strict default.
+        assert_eq!(drag_threshold(""), 4.0);
+    }
 
     #[test]
     fn a_top_half_tap_opens_downward_with_room_to_the_bottom_edge() {
