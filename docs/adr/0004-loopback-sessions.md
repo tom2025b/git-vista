@@ -56,10 +56,10 @@ bootstrap; 12 h idle session, refreshed on use). Sessions are revocable
 
 1. **Method** allowlist — `GET/HEAD/POST/PUT/PATCH/DELETE`; anything else (incl.
    `OPTIONS`, since we serve no CORS) is `405`.
-2. **Host** — must be a loopback literal (`localhost`, `127.0.0.1`, `::1`), or the
-   explicit LAN bind IP. This is the anti-DNS-rebinding control: a rebinding
-   attacker's `Host: evil.example` is refused. A `0.0.0.0` bind can't enumerate
-   its hostnames, so host-pinning relaxes there (documented, warned at startup).
+2. **Host** — must be a loopback literal (`localhost`, `127.0.0.1`, `::1`). This
+   is the anti-DNS-rebinding control: a rebinding attacker's `Host: evil.example`
+   is refused. M1.05 subsequently made the listener itself loopback-only and
+   removed the old plain-HTTP LAN exception.
 3. **Origin** — when present it must be same-origin; `Origin: null` is always
    refused. Absent Origin (same-origin GETs often omit it) is allowed, with CSRF +
    `SameSite=Strict` carrying the load on writes.
@@ -113,9 +113,9 @@ nonce if the SPA shell is served dynamically.
 - The frontend must hold a session before any `/api/*` call succeeds; the SPA gains
   a one-shot bootstrap and a blocking "Connect to git-vista" screen keyed on the
   `unauthenticated` error code (added to the protocol crate).
-- `gv` gains `--token` and prints the setup link after startup; its `--lan` warning
-  is corrected (a session is now required; only TLS and strict host-pinning are the
-  LAN gaps).
+- `gv` gains `--token` and prints the setup link after startup. The M1.05
+  follow-up removed `--lan`; both launcher and server now enforce
+  `127.0.0.1:8080`, with SSH forwarding as the supported remote path.
 - A new `getrandom` dependency on the **server** crate only (never the wasm build).
 - Sessions are per-process and in-memory by design: a restart is a full revocation.
   Durable/paired-device sessions and an HTTPS LAN mode are explicitly out of scope
