@@ -20,7 +20,6 @@
 //! `GET`/`POST /api/session`, which is how a client checks or establishes a
 //! session in the first place. Everything else needs one.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
@@ -37,60 +36,32 @@ const NEGOTIATION_PATH: &str = "/api/protocol";
 /// The session endpoint: `GET` checks, `POST` establishes — both pre-session.
 const SESSION_PATH: &str = "/api/session";
 
-/// State threaded into [`require_auth`]: the session store plus the Host/Origin
-/// policy derived from the bind address. Cheap to clone (two `Arc`s / small copy).
+/// State threaded into [`require_auth`]: the session store plus the loopback-only
+/// Host/Origin policy. Cheap to clone (two `Arc`s / a port number).
 #[derive(Clone)]
 pub(crate) struct AuthState {
     pub manager: Arc<SessionManager>,
     pub hosts: HostPolicy,
 }
 
-/// Which `Host`/`Origin` values this bind accepts. In the default loopback and
-/// SSH-tunnel modes only loopback names pass, which is what makes a DNS-rebinding
-/// attack (whose `Host` is the attacker's domain) fail closed.
+/// Which `Host`/`Origin` values the loopback listener accepts. Only loopback
+/// names pass, which makes a DNS-rebinding attack (whose `Host` is the attacker's
+/// domain) fail closed.
 #[derive(Clone)]
 pub(crate) struct HostPolicy {
     /// The port the service is bound to; a `Host`/`Origin` naming a different port
     /// is rejected.
     port: u16,
-    /// A non-loopback literal to also accept (the explicit LAN bind IP), if any.
-    extra_host: Option<String>,
-    /// Whether to enforce the host allowlist at all. False only for a `0.0.0.0`
-    /// bind, where the reachable hostnames can't be enumerated; the operator is
-    /// warned at startup that DNS-rebinding protection then relies on the network.
-    strict: bool,
 }
 
 impl HostPolicy {
-    /// Derive the policy from the socket the server actually bound. Loopback →
-    /// strict loopback-only. A specific LAN IP → loopback plus that IP. `0.0.0.0`
-    /// / `::` (any interface) → non-strict (can't pin a host), documented as such.
-    pub(crate) fn from_bind(addr: SocketAddr) -> Self {
-        let ip = addr.ip();
-        if ip.is_loopback() {
-            Self {
-                port: addr.port(),
-                extra_host: None,
-                strict: true,
-            }
-        } else if ip.is_unspecified() {
-            Self {
-                port: addr.port(),
-                extra_host: None,
-                strict: false,
-            }
-        } else {
-            Self {
-                port: addr.port(),
-                extra_host: Some(ip.to_string()),
-                strict: true,
-            }
-        }
+    /// Create the strict loopback policy for the listener's fixed port.
+    pub(crate) fn loopback(port: u16) -> Self {
+        Self { port }
     }
 
-    /// Whether a raw `Host` header value is acceptable. When strict, the host must
-    /// be a loopback literal (or the configured LAN IP) and any port must match the
-    /// bind port. When non-strict, only the port (if given) is checked.
+    /// Whether a raw `Host` header value is acceptable. The host must be a
+    /// loopback literal and any supplied port must match the bind port.
     fn host_allowed(&self, host: &str) -> bool {
         let (name, port) = split_host_port(host);
         if let Some(port) = port {
@@ -98,10 +69,7 @@ impl HostPolicy {
                 return false;
             }
         }
-        if !self.strict {
-            return true;
-        }
-        is_loopback_name(name) || self.extra_host.as_deref() == Some(name)
+        is_loopback_name(name)
     }
 
     /// Whether an `Origin` header value is acceptable: a same-origin `http`/`https`
@@ -356,7 +324,7 @@ mod tests {
     use super::*;
 
     fn loopback() -> HostPolicy {
-        HostPolicy::from_bind("127.0.0.1:8080".parse().unwrap())
+        HostPolicy::loopback(8080)
     }
 
     #[test]
@@ -389,22 +357,6 @@ mod tests {
         assert!(!p.origin_allowed("https://evil.example.com"));
         assert!(!p.origin_allowed("http://localhost:9999"));
         assert!(!p.origin_allowed("ftp://localhost:8080"));
-    }
-
-    #[test]
-    fn a_lan_bind_allows_its_own_ip_and_loopback() {
-        let p = HostPolicy::from_bind("192.168.1.5:8080".parse().unwrap());
-        assert!(p.host_allowed("192.168.1.5:8080"));
-        assert!(p.host_allowed("localhost:8080"));
-        assert!(!p.host_allowed("10.0.0.9:8080"));
-    }
-
-    #[test]
-    fn an_any_interface_bind_is_non_strict_on_host() {
-        let p = HostPolicy::from_bind("0.0.0.0:8080".parse().unwrap());
-        // Can't pin a host, so any host name passes — but the port still must match.
-        assert!(p.host_allowed("whatever.example:8080"));
-        assert!(!p.host_allowed("whatever.example:9999"));
     }
 
     #[test]
@@ -458,7 +410,7 @@ mod wire_tests {
         let sessions = Arc::new(SessionManager::new(None));
         let auth_state = AuthState {
             manager: sessions.clone(),
-            hosts: HostPolicy::from_bind("127.0.0.1:8080".parse().unwrap()),
+            hosts: HostPolicy::loopback(8080),
         };
         let router = Router::new()
             .route(
@@ -542,6 +494,58 @@ mod wire_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// An SSH local forward is only a transport: dropping and recreating it must
+    /// not revoke the browser's Git-Vista session. Model that boundary by ending
+    /// one request/response completely, then reconnecting with the same cookie
+    /// through a fresh service call and finally reading the graph again.
+    #[tokio::test]
+    async fn a_session_survives_tunnel_disconnect_and_reconnect() {
+        let (router, sessions) = app();
+        let (cookie, _csrf) = bootstrap(&router, &sessions).await;
+
+        let before_disconnect = router
+            .clone()
+            .oneshot(
+                req("GET", "/api/commits")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(before_disconnect.status(), StatusCode::OK);
+        drop(before_disconnect);
+
+        // No server-side connection object is retained. A new request carrying
+        // the browser cookie recovers the session and its in-memory CSRF token.
+        let reconnected = router
+            .clone()
+            .oneshot(
+                req("GET", "/api/session")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reconnected.status(), StatusCode::OK);
+        let bytes = to_bytes(reconnected.into_body(), 64 * 1024).await.unwrap();
+        let info: SessionInfo = serde_json::from_slice(&bytes).unwrap();
+        assert!(info.authenticated);
+        assert!(info.csrf.is_some());
+
+        let graph_after_reconnect = router
+            .oneshot(
+                req("GET", "/api/commits")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(graph_after_reconnect.status(), StatusCode::OK);
     }
 
     #[tokio::test]

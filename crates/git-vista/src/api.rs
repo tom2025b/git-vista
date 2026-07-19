@@ -19,7 +19,7 @@ use git_vista_core::model::{CommitDetail, Graph};
 use git_vista_core::net::network_error_text;
 use git_vista_core::status::RepoStatus;
 use git_vista_protocol::{
-    BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, ProtocolInfo,
+    ApiError, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, ProtocolInfo,
     RebaseStatus, SessionInfo, SessionRequest, CSRF_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
@@ -128,6 +128,20 @@ fn network_error(e: gloo_net::Error) -> String {
     network_error_text(&e.to_string())
 }
 
+/// Turn the versioned server error envelope into the message the UI should show.
+/// Falling back to the raw body preserves useful errors from an older server.
+async fn response_error(resp: gloo_net::http::Response) -> String {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if let Ok(error) = serde_json::from_str::<ApiError>(&body) {
+        format!("{} (request {})", error.error.message, error.request_id)
+    } else if body.trim().is_empty() {
+        format!("HTTP {status}")
+    } else {
+        body
+    }
+}
+
 /// Fetch the laid-out graph from the backend. Relative URL → same origin as the
 /// served SPA, so no CORS and no hardcoded host.
 ///
@@ -137,13 +151,12 @@ fn network_error(e: gloo_net::Error) -> String {
 /// created since the last launch never shows). The backend ignores the param.
 pub async fn fetch_graph() -> Result<Graph, String> {
     let url = format!("/api/commits?t={}", js_sys::Date::now());
-    req_get(&url)
-        .send()
-        .await
-        .map_err(network_error)?
-        .json::<Graph>()
-        .await
-        .map_err(|e| e.to_string())
+    let resp = req_get(&url).send().await.map_err(network_error)?;
+    if resp.ok() {
+        resp.json::<Graph>().await.map_err(|e| e.to_string())
+    } else {
+        Err(response_error(resp).await)
+    }
 }
 
 /// Fetch one commit's full detail for the side panel (Phase 10,
