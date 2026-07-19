@@ -14,11 +14,8 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::camera::{Camera, ZOOM_STEP};
+use crate::geometry::drag_threshold;
 use crate::state::{MenuData, Overlays};
-
-/// Pointer travel (CSS px) past which a press becomes a pan/drag rather than a
-/// tap. Keeps a tap-to-open-link from being eaten by the pan handler.
-const DRAG_THRESHOLD: f64 = 4.0;
 
 /// Current browser window inner height in CSS px, or a sane default when it can't
 /// be read. The window is always at least as tall as the SVG (the topbar sits
@@ -168,9 +165,11 @@ pub fn on_pointer_move(g: GestureState, ev: web_sys::PointerEvent) {
         // Single pointer: only treat it as a drag once it crosses the
         // threshold from where it started; below that it's still a tap.
         if !moved.get_value() {
-            let far = down_xy.get_value().is_some_and(|(sx, sy)| {
-                ((x - sx).powi(2) + (y - sy).powi(2)).sqrt() > DRAG_THRESHOLD
-            });
+            // Per-pointer-type slop: a finger wobbles, a mouse doesn't (issue #115).
+            let threshold = drag_threshold(&ev.pointer_type());
+            let far = down_xy
+                .get_value()
+                .is_some_and(|(sx, sy)| ((x - sx).powi(2) + (y - sy).powi(2)).sqrt() > threshold);
             if far {
                 moved.set_value(true);
                 dragging.set(true);
