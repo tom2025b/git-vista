@@ -234,8 +234,7 @@ mod tests {
     fn graph_remote_web_url_defaults_when_absent_from_wire() {
         // M1.02 contract rule: a new optional field must not break an older
         // server's payload — absent on the wire deserializes to None.
-        let g: Graph =
-            serde_json::from_str(r#"{"rows":[],"edges":[],"lane_count":0}"#).unwrap();
+        let g: Graph = serde_json::from_str(r#"{"rows":[],"edges":[],"lane_count":0}"#).unwrap();
         assert_eq!(g.remote_web_url, None);
     }
 

@@ -195,10 +195,7 @@ impl Catalog {
         let entries = match std::fs::read_dir(root) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!(
-                    "git-vista: repo root {} not scanned: {e}",
-                    root.display()
-                );
+                eprintln!("git-vista: repo root {} not scanned: {e}", root.display());
                 return (0, 0);
             }
         };
