@@ -144,8 +144,25 @@ pub(crate) fn scan_repo_root() -> Option<(usize, usize)> {
         catalog()
             .write()
             .expect("catalog lock")
-            .scan_direct_children(&root),
+            .scan_direct_children(&root, false),
     )
+}
+
+/// Scan the clones root (ADR 0008) into the catalog, marking every entry as a
+/// clone (`read_only: true` — the descriptor flag the picker keys Delete on).
+/// Called at startup and by `POST /api/rescan`; a missing clones root is a soft
+/// zero, not an error.
+pub(crate) fn scan_clones_root() -> (usize, usize) {
+    let root = clones_root();
+    // Create it if this is a fresh install (no clone yet): scan_direct_children
+    // logs a "not scanned" warning on a missing directory, worded for the
+    // configured repo root, not the not-yet-created clones store — make sure
+    // it exists rather than let that warning fire every startup/rescan.
+    let _ = std::fs::create_dir_all(&root);
+    catalog()
+        .write()
+        .expect("catalog lock")
+        .scan_direct_children(&root, true)
 }
 
 /// The capability view of the catalog for `GET /api/catalog`: the servable

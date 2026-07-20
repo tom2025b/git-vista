@@ -116,6 +116,13 @@ async fn main() {
         println!("git-vista: repo root scan: {registered} registered, {skipped} skipped");
     }
 
+    // ADR 0008: clones persist across runs. Re-register every clone surviving
+    // under the clones root so the picker keeps offering it after a restart.
+    let (clones_registered, _) = state::scan_clones_root();
+    if clones_registered > 0 {
+        println!("git-vista: {clones_registered} persistent clone(s) re-registered");
+    }
+
     // Warn early if the SPA hasn't been built — otherwise every page is a 404
     // and it looks like the server is broken.
     if !Path::new(DIST_DIR).exists() {
