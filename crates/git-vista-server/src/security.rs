@@ -20,6 +20,7 @@
 //! `GET`/`POST /api/session`, which is how a client checks or establishes a
 //! session in the first place. Everything else needs one.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::{
@@ -44,24 +45,37 @@ pub(crate) struct AuthState {
     pub hosts: HostPolicy,
 }
 
-/// Which `Host`/`Origin` values the loopback listener accepts. Only loopback
-/// names pass, which makes a DNS-rebinding attack (whose `Host` is the attacker's
-/// domain) fail closed.
+/// Which `Host`/`Origin` values a listener accepts. Only the listener's own
+/// identity passes, which makes a DNS-rebinding attack (whose `Host` is the
+/// attacker's domain) fail closed.
 #[derive(Clone)]
 pub(crate) struct HostPolicy {
     /// The port the service is bound to; a `Host`/`Origin` naming a different port
     /// is rejected.
     port: u16,
+    /// `None` (loopback listener): only the loopback name literals pass.
+    /// `Some(ip)` (LAN listener, ADR 0005): only that exact IP literal passes —
+    /// not `localhost`, not any other address the machine might also answer on.
+    pinned_ip: Option<IpAddr>,
 }
 
 impl HostPolicy {
     /// Create the strict loopback policy for the listener's fixed port.
     pub(crate) fn loopback(port: u16) -> Self {
-        Self { port }
+        Self { port, pinned_ip: None }
     }
 
-    /// Whether a raw `Host` header value is acceptable. The host must be a
-    /// loopback literal and any supplied port must match the bind port.
+    /// Create the policy for the LAN listener (ADR 0005): only the one
+    /// sanctioned LAN IP at the fixed port is an acceptable Host. Narrower than
+    /// [`Self::loopback`] on purpose — nothing routes to this listener except a
+    /// request that already knows the exact sanctioned socket.
+    pub(crate) fn lan(ip: IpAddr, port: u16) -> Self {
+        Self { port, pinned_ip: Some(ip) }
+    }
+
+    /// Whether a raw `Host` header value is acceptable. The host must match
+    /// this policy's identity (loopback literal, or the one pinned LAN IP) and
+    /// any supplied port must match the bind port.
     fn host_allowed(&self, host: &str) -> bool {
         let (name, port) = split_host_port(host);
         if let Some(port) = port {
@@ -69,7 +83,10 @@ impl HostPolicy {
                 return false;
             }
         }
-        is_loopback_name(name)
+        match self.pinned_ip {
+            Some(ip) => name.parse::<IpAddr>().map(|parsed| parsed == ip).unwrap_or(false),
+            None => is_loopback_name(name),
+        }
     }
 
     /// Whether an `Origin` header value is acceptable: a same-origin `http`/`https`
@@ -357,6 +374,25 @@ mod tests {
         assert!(!p.origin_allowed("https://evil.example.com"));
         assert!(!p.origin_allowed("http://localhost:9999"));
         assert!(!p.origin_allowed("ftp://localhost:8080"));
+    }
+
+    #[test]
+    fn lan_host_pins_to_the_exact_ip_and_port() {
+        let p = HostPolicy::lan("192.168.1.42".parse().unwrap(), 8080);
+        assert!(p.host_allowed("192.168.1.42:8080"));
+        assert!(!p.host_allowed("192.168.1.42:9999")); // wrong port
+        assert!(!p.host_allowed("192.168.1.99:8080")); // different LAN ip
+        assert!(!p.host_allowed("localhost:8080")); // loopback names refused here
+        assert!(!p.host_allowed("127.0.0.1:8080"));
+        assert!(!p.host_allowed("evil.example.com"));
+    }
+
+    #[test]
+    fn lan_origin_must_match_the_pinned_ip_and_not_be_null() {
+        let p = HostPolicy::lan("192.168.1.42".parse().unwrap(), 8080);
+        assert!(p.origin_allowed("http://192.168.1.42:8080"));
+        assert!(!p.origin_allowed("null"));
+        assert!(!p.origin_allowed("http://localhost:8080"));
     }
 
     #[test]
