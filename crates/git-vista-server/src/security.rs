@@ -20,6 +20,7 @@
 //! `GET`/`POST /api/session`, which is how a client checks or establishes a
 //! session in the first place. Everything else needs one.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::{
@@ -44,24 +45,43 @@ pub(crate) struct AuthState {
     pub hosts: HostPolicy,
 }
 
-/// Which `Host`/`Origin` values the loopback listener accepts. Only loopback
-/// names pass, which makes a DNS-rebinding attack (whose `Host` is the attacker's
-/// domain) fail closed.
+/// Which `Host`/`Origin` values a listener accepts. Only the listener's own
+/// identity passes, which makes a DNS-rebinding attack (whose `Host` is the
+/// attacker's domain) fail closed.
 #[derive(Clone)]
 pub(crate) struct HostPolicy {
     /// The port the service is bound to; a `Host`/`Origin` naming a different port
     /// is rejected.
     port: u16,
+    /// `None` (loopback listener): only the loopback name literals pass.
+    /// `Some(ip)` (LAN listener, ADR 0005): only that exact IP literal passes —
+    /// not `localhost`, not any other address the machine might also answer on.
+    pinned_ip: Option<IpAddr>,
 }
 
 impl HostPolicy {
     /// Create the strict loopback policy for the listener's fixed port.
     pub(crate) fn loopback(port: u16) -> Self {
-        Self { port }
+        Self {
+            port,
+            pinned_ip: None,
+        }
     }
 
-    /// Whether a raw `Host` header value is acceptable. The host must be a
-    /// loopback literal and any supplied port must match the bind port.
+    /// Create the policy for the LAN listener (ADR 0005): only the one
+    /// sanctioned LAN IP at the fixed port is an acceptable Host. Narrower than
+    /// [`Self::loopback`] on purpose — nothing routes to this listener except a
+    /// request that already knows the exact sanctioned socket.
+    pub(crate) fn lan(ip: IpAddr, port: u16) -> Self {
+        Self {
+            port,
+            pinned_ip: Some(ip),
+        }
+    }
+
+    /// Whether a raw `Host` header value is acceptable. The host must match
+    /// this policy's identity (loopback literal, or the one pinned LAN IP) and
+    /// any supplied port must match the bind port.
     fn host_allowed(&self, host: &str) -> bool {
         let (name, port) = split_host_port(host);
         if let Some(port) = port {
@@ -69,7 +89,13 @@ impl HostPolicy {
                 return false;
             }
         }
-        is_loopback_name(name)
+        match self.pinned_ip {
+            Some(ip) => name
+                .parse::<IpAddr>()
+                .map(|parsed| parsed == ip)
+                .unwrap_or(false),
+            None => is_loopback_name(name),
+        }
     }
 
     /// Whether an `Origin` header value is acceptable: a same-origin `http`/`https`
@@ -360,6 +386,25 @@ mod tests {
     }
 
     #[test]
+    fn lan_host_pins_to_the_exact_ip_and_port() {
+        let p = HostPolicy::lan("192.168.1.42".parse().unwrap(), 8080);
+        assert!(p.host_allowed("192.168.1.42:8080"));
+        assert!(!p.host_allowed("192.168.1.42:9999")); // wrong port
+        assert!(!p.host_allowed("192.168.1.99:8080")); // different LAN ip
+        assert!(!p.host_allowed("localhost:8080")); // loopback names refused here
+        assert!(!p.host_allowed("127.0.0.1:8080"));
+        assert!(!p.host_allowed("evil.example.com"));
+    }
+
+    #[test]
+    fn lan_origin_must_match_the_pinned_ip_and_not_be_null() {
+        let p = HostPolicy::lan("192.168.1.42".parse().unwrap(), 8080);
+        assert!(p.origin_allowed("http://192.168.1.42:8080"));
+        assert!(!p.origin_allowed("null"));
+        assert!(!p.origin_allowed("http://localhost:8080"));
+    }
+
+    #[test]
     fn content_type_rule_blocks_forms_but_allows_bodyless_and_json() {
         let mut h = header::HeaderMap::new();
         assert!(content_type_ok_for_write(&h)); // bodyless write: no content type
@@ -407,7 +452,20 @@ mod wire_tests {
     /// The wired router plus the session store it shares, so a test can read the
     /// current bootstrap token to establish a session.
     fn app() -> (Router, Arc<SessionManager>) {
+        app_with_limiter(None)
+    }
+
+    /// Same as `app()`, but lets a test install a rate limiter (the LAN
+    /// router's shape) — used by the LAN sign-in rate-limit test below.
+    fn app_with_limiter(
+        rate_limiter: Option<Arc<crate::ratelimit::SignInLimiter>>,
+    ) -> (Router, Arc<SessionManager>) {
         let sessions = Arc::new(SessionManager::new(None));
+        let session_state = crate::handlers::session::SessionState {
+            manager: sessions.clone(),
+            via_lan: rate_limiter.is_some(),
+            rate_limiter,
+        };
         let auth_state = AuthState {
             manager: sessions.clone(),
             hosts: HostPolicy::loopback(8080),
@@ -425,16 +483,23 @@ mod wire_tests {
                 auth_state,
                 require_auth,
             ))
-            .with_state(sessions.clone());
+            .with_state(session_state);
         (router, sessions)
     }
 
-    /// A request builder pre-loaded with a valid loopback `Host`.
+    /// A request builder pre-loaded with a valid loopback `Host` and connect
+    /// info — `create_session` extracts `ConnectInfo<SocketAddr>` now that
+    /// sign-in can be rate-limited, and `oneshot()` skips the real listener
+    /// that would normally supply it in production.
     fn req(method: &str, path: &str) -> axum::http::request::Builder {
         Request::builder()
             .method(method)
             .uri(path)
             .header(header::HOST, "localhost:8080")
+            .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                55000,
+            ))))
     }
 
     /// Bootstrap a session, returning `(cookie value for the Cookie header, csrf)`.
@@ -695,5 +760,70 @@ mod wire_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn lan_sign_in_is_rate_limited_but_loopback_is_not() {
+        let limiter = Arc::new(crate::ratelimit::SignInLimiter::new());
+        let (router, sessions) = app_with_limiter(Some(limiter));
+        let token = sessions.current_bootstrap();
+        // The manager only holds one outstanding bootstrap token, and a
+        // successful exchange rotates it -- so drive the limiter with wrong
+        // tokens (still counted, still 401) until the 6th attempt is 429.
+        for _ in 0..5 {
+            let resp = router
+                .clone()
+                .oneshot(
+                    req("POST", "/api/session")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"token":"wrong"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+        let sixth = router
+            .clone()
+            .oneshot(
+                req("POST", "/api/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"token":"{token}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sixth.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // A router with no limiter (the loopback shape) is unaffected by volume.
+        let (loopback_router, loopback_sessions) = app();
+        let loopback_token = loopback_sessions.current_bootstrap();
+        for _ in 0..7 {
+            let resp = loopback_router
+                .clone()
+                .oneshot(
+                    req("POST", "/api/session")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"token":"wrong"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+        let resp = loopback_router
+            .oneshot(
+                req("POST", "/api/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"token":"{loopback_token}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "loopback sign-in has no rate limit"
+        );
     }
 }

@@ -16,7 +16,7 @@ it, and note the link in both.
 | [0002](0002-versioned-api-contract.md) | A versioned API contract: protocol negotiation, structured errors, and a transport crate | Accepted |
 | [0003](0003-repository-catalog.md) | A server-owned, allowlisted repository catalog addressed by opaque id | Accepted |
 | [0004](0004-loopback-sessions.md) | Protecting loopback sessions and mutating requests | Accepted |
-| [0005](0005-lan-view-profile.md) | LAN view profile: a read-only second listener | Accepted — implementation pending |
+| [0005](0005-lan-view-profile.md) | LAN view profile: a read-only second listener | Accepted — implemented |
 | [0006](0006-ask-every-time-mode-picker.md) | Visualize / Active is chosen per open, every time | Accepted — implementation pending |
 | [0007](0007-selection-scoped-mode.md) | Mode rides the current-repo selection (`POST /api/select`) | Accepted — implementation pending |
 | [0008](0008-persistent-clones-xdg.md) | Persistent, multiple clones under the XDG data dir | Accepted |
