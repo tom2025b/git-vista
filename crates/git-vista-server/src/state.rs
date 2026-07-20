@@ -377,6 +377,58 @@ pub(crate) fn cleanup_clone(path: &Path) {
     }
 }
 
+/// Outcome of a delete-clone attempt (ADR 0008); the handler maps each to an
+/// HTTP status. Every refusal names why, so the picker can show the reason.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeleteCloneOutcome {
+    /// Unknown/forged id — fail closed, the same contract as the reads (404).
+    NotFound,
+    /// The id resolves, but its path does not canonicalize inside the clones
+    /// root: not a clone, never deletable through this endpoint (400).
+    NotAClone,
+    /// The clone is the current selection — deleting the repo being served
+    /// would break every read. Open another repo first (409).
+    CurrentlyOpen,
+    /// Removed from disk and catalog (200).
+    Deleted,
+    /// Guards passed but `remove_dir_all` failed (500); carries the OS error.
+    DeleteFailed(String),
+}
+
+/// Delete the clone addressed by `worktree` (ADR 0008): resolve fail-closed,
+/// refuse anything that does not canonicalize inside `clones_root` (the delete
+/// guard), refuse the current selection, then remove the directory and the
+/// catalog entry — in that order, so a failed removal stays visible and
+/// retryable. `clones_root` is a parameter so tests never touch process env.
+pub(crate) fn delete_clone(worktree: WorktreeId, clones_root: &Path) -> DeleteCloneOutcome {
+    let Some((path, _, _)) = resolve_worktree(worktree) else {
+        return DeleteCloneOutcome::NotFound;
+    };
+    // A root that can't canonicalize (missing dir) can't contain anything:
+    // fail closed. Re-canonicalize the entry's path fresh too, rather than
+    // trusting the catalog's registration-time value — if the directory was
+    // swapped out from under us since registration, the guard must see that.
+    let root = match std::fs::canonicalize(clones_root) {
+        Ok(root) => root,
+        Err(_) => return DeleteCloneOutcome::NotAClone,
+    };
+    let path = match std::fs::canonicalize(&path) {
+        Ok(path) => path,
+        Err(_) => return DeleteCloneOutcome::NotFound,
+    };
+    if path == root || !path.starts_with(&root) {
+        return DeleteCloneOutcome::NotAClone;
+    }
+    if current().0 == path {
+        return DeleteCloneOutcome::CurrentlyOpen;
+    }
+    if let Err(e) = std::fs::remove_dir_all(&path) {
+        return DeleteCloneOutcome::DeleteFailed(e.to_string());
+    }
+    catalog().write().expect("catalog lock").remove(worktree);
+    DeleteCloneOutcome::Deleted
+}
+
 /// Guard for the write endpoints: in Visualize mode (ADR 0006/0007) the current
 /// selection is look-only, so every mutation is refused with `403` and a clear
 /// reason. Returns `None` when writes are allowed (Active mode).
@@ -431,6 +483,36 @@ mod tests {
             git_vista_core::identity::WorktreeId::from_git_dir("/nowhere/.git/worktrees/ghost");
         assert!(!select_registered(stranger, RepoMode::Active));
         assert_eq!(current_mode(), RepoMode::Visualize);
+
+        // --- delete-clone (ADR 0008) ------------------------------------
+        // A fake clones root holding one "clone"; the project repo above is
+        // the guard's negative case (a real repo, not a clone).
+        let clones = root.path().join("clones");
+        let clone_dir = clones.join("octocat");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&clone_dir)
+            .status()
+            .unwrap()
+            .success());
+        set_current(&clone_dir, RepoMode::Visualize); // registers, like /api/clone
+        let clone_wt = current_handle().expect("clone registered").worktree;
+
+        // The currently open clone is not deletable (the server would be
+        // serving a removed directory).
+        assert_eq!(
+            delete_clone(clone_wt, &clones),
+            DeleteCloneOutcome::CurrentlyOpen
+        );
+        // Move the selection off the clone; the project repo is outside the
+        // clones root, so IT is refused as NotAClone…
+        assert!(select_registered(wt, RepoMode::Active));
+        assert_eq!(delete_clone(wt, &clones), DeleteCloneOutcome::NotAClone);
+        // …and the clone itself now deletes: directory gone, id fails closed.
+        assert_eq!(delete_clone(clone_wt, &clones), DeleteCloneOutcome::Deleted);
+        assert!(!clone_dir.exists(), "the clone directory was removed");
+        assert_eq!(delete_clone(clone_wt, &clones), DeleteCloneOutcome::NotFound);
     }
 
     #[test]

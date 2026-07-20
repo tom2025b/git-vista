@@ -186,6 +186,12 @@ impl Catalog {
         self.entries.get(&worktree)
     }
 
+    /// Drop the entry for `worktree`, returning it (`None` when not held). The
+    /// allowed root it lived under stays — other clones share it.
+    pub(crate) fn remove(&mut self, worktree: WorktreeId) -> Option<RepoEntry> {
+        self.entries.remove(&worktree)
+    }
+
     /// Scan `root`'s DIRECT children (ADR 0009: one deliberate root, no
     /// recursion) and register every valid git repository, allowing `root`
     /// first. `read_only` marks every registered child as a URL clone (the
@@ -456,6 +462,20 @@ mod tests {
 
         let stranger = WorktreeId::from_git_dir("/nowhere/.git/worktrees/ghost");
         assert!(catalog.descriptor_of(stranger, false).is_none());
+    }
+
+    #[test]
+    fn remove_drops_the_entry_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("project");
+        init_repo(&repo);
+        let mut catalog = Catalog::new();
+        catalog.allow_root(root.path());
+        let handle = catalog.register(&repo, true).unwrap();
+
+        assert!(catalog.remove(handle.worktree).is_some());
+        assert!(catalog.resolve(handle.worktree).is_none(), "gone after remove");
+        assert!(catalog.remove(handle.worktree).is_none(), "second remove is a no-op");
     }
 
     // --- descriptors: no path by default -----------------------------------
