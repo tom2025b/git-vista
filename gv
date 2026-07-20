@@ -159,7 +159,12 @@ print_token_links() {
     echo "gv: WARNING: listener address could not be inspected; install 'ss' (iproute2) to verify it." >&2
   fi
   echo "gv: iPad: forward local ${PORT} to Linux 127.0.0.1:${PORT}, then open this localhost link."
-  echo "gv: direct 192.168.x.x access is intentionally disabled."
+  if [[ $mode == lan_view ]]; then
+    echo "gv: the LAN view link works directly from any device on this network — no tunnel needed."
+    echo "gv: plain HTTP: trusted home LAN only, never a guest or shared network."
+  else
+    echo "gv: direct 192.168.x.x access is intentionally disabled; use --lan-view to enable a read-only backup."
+  fi
   echo "gv: this link is single-use; run 'gv --token' again for the next device."
 }
 
