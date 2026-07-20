@@ -352,7 +352,7 @@ pub fn App() -> impl IntoView {
                     })}
             </header>
             // The "Open URL" modal (Phase 12), factored into `dialogs`.
-            {dialogs::open_url_view(open_url, clone_url, cloning, open_opened_at, reload)}
+            {dialogs::open_url_view(open_url, clone_url, cloning, open_opened_at, reload, mode_for)}
             // The "Reset Test Repo" confirmation (only reachable via the gated
             // topbar button above).
             {dialogs::reset_repo_view(reset_open, reset_opened_at, reload)}

@@ -2,6 +2,8 @@
 
 use leptos::*;
 
+use git_vista_protocol::RepositoryDescriptor;
+
 use crate::api::clone_request;
 use crate::state::DIALOG_GUARD_MS;
 
@@ -17,6 +19,7 @@ pub fn open_url_view(
     cloning: RwSignal<bool>,
     open_opened_at: StoredValue<f64>,
     reload: RwSignal<u32>,
+    mode_for: RwSignal<Option<RepositoryDescriptor>>,
 ) -> impl IntoView {
     let submit_clone = move || {
         let url = clone_url.get_untracked().trim().to_string();
@@ -26,12 +29,14 @@ pub fn open_url_view(
         cloning.set(true);
         spawn_local(async move {
             match clone_request(&url).await {
-                Ok(()) => {
+                Ok(descriptor) => {
                     cloning.set(false);
                     open_url.set(false);
                     clone_url.set(String::new());
-                    // Re-read via the shared fetch counter so the cloned graph loads.
+                    // The server opened the clone look-only; the reload shows
+                    // it, and the mode screen asks Visualize/Active (ADR 0008).
                     reload.update(|n| *n = n.wrapping_add(1));
+                    mode_for.set(Some(descriptor));
                 }
                 Err(e) => {
                     cloning.set(false);
@@ -73,7 +78,7 @@ pub fn open_url_view(
                     on:input=move |ev| clone_url.set(event_target_value(&ev))
                 ></textarea>
                 <div style="font-size:0.85em; color:var(--muted, #8b949e); margin-top:8px;">
-                    "Public https:// URLs only. Cloned repos are read-only."
+                    "Public https:// URLs only. Clones persist until you delete them from the picker."
                 </div>
                 <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:14px;">
                     <button

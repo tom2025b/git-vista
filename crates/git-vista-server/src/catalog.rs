@@ -456,7 +456,9 @@ mod tests {
         catalog.allow_root(root.path());
         let handle = catalog.register(&repo, true).unwrap();
 
-        let d = catalog.descriptor_of(handle.worktree, false).expect("known id");
+        let d = catalog
+            .descriptor_of(handle.worktree, false)
+            .expect("known id");
         assert_eq!(d, catalog.descriptors(false)[0]);
         assert!(d.read_only);
 
@@ -474,8 +476,14 @@ mod tests {
         let handle = catalog.register(&repo, true).unwrap();
 
         assert!(catalog.remove(handle.worktree).is_some());
-        assert!(catalog.resolve(handle.worktree).is_none(), "gone after remove");
-        assert!(catalog.remove(handle.worktree).is_none(), "second remove is a no-op");
+        assert!(
+            catalog.resolve(handle.worktree).is_none(),
+            "gone after remove"
+        );
+        assert!(
+            catalog.remove(handle.worktree).is_none(),
+            "second remove is a no-op"
+        );
     }
 
     // --- descriptors: no path by default -----------------------------------
