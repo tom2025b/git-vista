@@ -24,3 +24,4 @@ it, and note the link in both.
 | [0010](0010-visualizer-forge-links.md) | Visualizer = existing read-only views plus forge deep links | Accepted — implementation pending |
 | [0011](0011-pointer-type-gesture-slop.md) | Gesture slop is pointer-type-aware (touch 12px, mouse/pen 4px) | Accepted |
 | [0012](0012-unscrollable-app-shell.md) | The app shell never scrolls; all scrolling is internal | Accepted |
+| [0013](0013-clone-descriptor-protocol-bump.md) | Protocol v2 for the clone response; `set_current` returns its own handle | Accepted — implementation pending |

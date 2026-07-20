@@ -56,8 +56,9 @@ pub struct BranchRequest {
 }
 
 /// Body of a `POST /api/clone` request (Phase 12): clone the public repository at
-/// `url` into a throwaway temp directory and switch the server to viewing it,
-/// read-only. `url` is a git-cloneable URL (typically `https://…`); the backend
+/// `url` into the persistent clones store (ADR 0008) and open it look-only
+/// pending the operator's mode choice. `url` is a git-cloneable URL (typically
+/// `https://…`); the backend
 /// validates its scheme with [`validate_clone_url`] and forwards git's own error
 /// text on failure. There is deliberately no destination field — the server picks
 /// the clone directory, so a request can never point the server at a path.
