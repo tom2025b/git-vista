@@ -61,6 +61,8 @@ pub fn build_node(
         // The repo's GitHub base, carried into the menu for the "Create Pull
         // Request" compare link (independent of whether this commit is pushed).
         let repo_url = c.repo_url.clone();
+        // The any-host forge base (ADR 0010), for the non-GitHub branch links.
+        let remote_web_url = c.graph.remote_web_url.clone();
         let open_menu = move |ev: web_sys::MouseEvent| {
             // Ignore the click that ends a pan; a real tap opens the menu where
             // the pointer is (viewport coords for the fixed-position overlay).
@@ -81,6 +83,7 @@ pub fn build_node(
                 // A commit dot: the menu header shows the commit glyph.
                 is_branch: false,
                 repo_url: repo_url.clone(),
+                remote_web_url: remote_web_url.clone(),
             }));
         };
 
