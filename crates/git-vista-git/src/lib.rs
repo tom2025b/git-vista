@@ -32,7 +32,7 @@ pub mod identity;
 pub mod reflog;
 pub mod refs;
 
-pub use github::github_web_base;
+pub use github::{github_web_base, remote_web_base};
 pub use history::{read_commit, read_remote_commits, walk_history};
 pub use identity::{
     read_generation, read_generation_inputs, read_handle, read_repo_facts, RepoFacts, WorktreeKind,
