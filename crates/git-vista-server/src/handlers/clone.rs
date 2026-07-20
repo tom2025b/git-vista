@@ -10,10 +10,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::http::StatusCode;
 use axum::Json;
 
-use git_vista_protocol::{validate_clone_url, CloneRequest, RepositoryDescriptor};
+use git_vista_core::identity::WorktreeId;
+use git_vista_protocol::{validate_clone_url, CloneRequest, DeleteCloneRequest, RepositoryDescriptor};
 
 use crate::state::{
-    allow_repo_root, cleanup_clone, clones_root, descriptor_for, path_is_allowed, set_current,
+    allow_repo_root, cleanup_clone, clones_root, delete_clone, descriptor_for, path_is_allowed,
+    set_current, DeleteCloneOutcome,
 };
 
 /// A human-recognisable directory name for a clone of `url` — the URL's last
@@ -173,6 +175,38 @@ pub(crate) async fn clone_repo(
     }
 }
 
+/// `POST /api/delete-clone` (ADR 0008): remove a clone — catalog entry and
+/// directory — addressed by opaque id. Malformed id → 400; unknown id → 404
+/// (fail closed, like the reads); a repo that isn't a clone → 400; the
+/// currently open repo → 409. The guard is [`crate::state::delete_clone`]:
+/// nothing outside the canonical clones root is ever removed.
+pub(crate) async fn delete_clone_repo(
+    Json(req): Json<DeleteCloneRequest>,
+) -> (StatusCode, String) {
+    let worktree: WorktreeId = match req.worktree.parse() {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Not a repository id.".to_string()),
+    };
+    match delete_clone(worktree, &clones_root()) {
+        DeleteCloneOutcome::NotFound => {
+            (StatusCode::NOT_FOUND, "No such repository.".to_string())
+        }
+        DeleteCloneOutcome::NotAClone => (
+            StatusCode::BAD_REQUEST,
+            "Not a clone — only cloned repositories can be deleted.".to_string(),
+        ),
+        DeleteCloneOutcome::CurrentlyOpen => (
+            StatusCode::CONFLICT,
+            "This repository is open right now. Open another repository first.".to_string(),
+        ),
+        DeleteCloneOutcome::DeleteFailed(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Couldn't delete the clone: {e}"),
+        ),
+        DeleteCloneOutcome::Deleted => (StatusCode::OK, "Clone deleted.".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +251,22 @@ mod tests {
         assert_eq!(unique_dest(root.path(), "repo"), root.path().join("repo-2"));
         std::fs::create_dir_all(root.path().join("repo-2")).unwrap();
         assert_eq!(unique_dest(root.path(), "repo"), root.path().join("repo-3"));
+    }
+
+    #[tokio::test]
+    async fn delete_clone_refuses_a_malformed_and_an_unknown_id() {
+        let (status, _) = delete_clone_repo(axum::Json(DeleteCloneRequest {
+            worktree: "not-an-id".into(),
+        }))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, msg) = delete_clone_repo(axum::Json(DeleteCloneRequest {
+            // Valid id shape, never registered → fail-closed 404.
+            worktree: "99999999-9999-5999-8999-999999999999".into(),
+        }))
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(msg, "No such repository.");
     }
 }

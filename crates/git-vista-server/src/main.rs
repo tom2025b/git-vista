@@ -66,7 +66,7 @@ use git_vista_protocol::RepoMode;
 use handlers::branch::{
     checkout_branch, create_branch, delete_branch, force_delete_branch, merge_branch, push_branch,
 };
-use handlers::clone::clone_repo;
+use handlers::clone::{clone_repo, delete_clone_repo};
 use handlers::commit::{create_commit, stage_all, unstage_all};
 use handlers::protocol::protocol_info;
 use handlers::read::{
@@ -226,6 +226,9 @@ async fn main() {
         .route("/api/file/{id}/{*path}", get(file_at_commit))
         // Phase 12: clone a public URL into a temp dir and view it read-only.
         .route("/api/clone", post(clone_repo))
+        // ADR 0008: delete a persistent clone (catalog entry + directory),
+        // guarded to paths that canonicalize inside the clones root.
+        .route("/api/delete-clone", post(delete_clone_repo))
         // ADR 0007: pick the current repository + Visualize/Active mode by id.
         .route("/api/select", post(select_repo))
         // ADR 0009: re-scan the configured repo root without a restart.

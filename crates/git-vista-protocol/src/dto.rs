@@ -88,6 +88,17 @@ pub struct SelectRequest {
     pub mode: RepoMode,
 }
 
+/// Body of `POST /api/delete-clone` (ADR 0008): delete the *clone* addressed by
+/// the opaque `worktree` id — its catalog entry and its directory. The server
+/// refuses any id whose path does not canonicalize inside the clones root, so
+/// this can only ever remove server-made clones, never a user repository; it
+/// also refuses the currently open repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteCloneRequest {
+    pub worktree: String,
+}
+
 /// Body of a `POST /api/session` request (M1.04, #57): the one-time bootstrap
 /// `token` the SPA read from the `#s=<token>` URL fragment, exchanged for an
 /// HttpOnly session cookie. The only `/api` write body that legitimately carries
@@ -301,6 +312,20 @@ mod tests {
         // No path smuggling on the select body either.
         assert!(serde_json::from_str::<SelectRequest>(
             r#"{"worktree":"w","mode":"active","path":"/etc"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn delete_clone_request_round_trips_and_rejects_unknown_fields() {
+        let req = DeleteCloneRequest {
+            worktree: "11111111-2222-5333-8444-555555555555".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(serde_json::from_str::<DeleteCloneRequest>(&json).unwrap(), req);
+
+        assert!(serde_json::from_str::<DeleteCloneRequest>(
+            r#"{"worktree":"x","path":"/etc"}"#
         )
         .is_err());
     }
