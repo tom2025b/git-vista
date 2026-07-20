@@ -114,6 +114,9 @@ pub(crate) struct RepoEntry {
     pub(crate) kind: WorktreeKind,
     /// View-only (a clone opened from a URL): every mutation is refused.
     pub(crate) read_only: bool,
+    /// Normalized web base of the repo's origin remote (ADR 0010), read once at
+    /// registration. `None` = no usable remote.
+    pub(crate) remote_web_url: Option<String>,
 }
 
 /// The registry mapping opaque [`WorktreeId`]s to the repositories the server may
@@ -161,6 +164,7 @@ impl Catalog {
             return Err(CatalogError::OutsideAllowedRoots);
         }
         let handle = facts.handle;
+        let remote_web_url = git_vista_git::remote_web_base(&facts.root);
         self.entries.insert(
             handle.worktree,
             RepoEntry {
@@ -169,6 +173,7 @@ impl Catalog {
                 name: facts.name,
                 kind: facts.kind,
                 read_only,
+                remote_web_url,
             },
         );
         Ok(handle)
@@ -196,9 +201,7 @@ impl Catalog {
                 kind: kind_to_protocol(e.kind),
                 read_only: e.read_only,
                 path: expose_paths.then(|| e.path.display().to_string()),
-                // Populated with the real origin web base by the repo-picker
-                // work's catalog change; None until an entry records one.
-                remote_web_url: None,
+                remote_web_url: e.remote_web_url.clone(),
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name).then(a.worktree.cmp(&b.worktree)));
