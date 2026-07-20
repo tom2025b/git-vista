@@ -88,7 +88,10 @@ pub(crate) async fn create_session(
 }
 
 /// `GET /api/session`: report the current session state (always `200`).
-pub(crate) async fn session_status(State(state): State<SessionState>, headers: HeaderMap) -> Response {
+pub(crate) async fn session_status(
+    State(state): State<SessionState>,
+    headers: HeaderMap,
+) -> Response {
     let csrf = cookie_value(&headers, SESSION_COOKIE).and_then(|id| state.manager.validate(id));
     Json(SessionInfo {
         authenticated: csrf.is_some(),
@@ -102,7 +105,10 @@ pub(crate) async fn session_status(State(state): State<SessionState>, headers: H
 /// the auth gate (needs a live session + CSRF), so it only ever revokes the
 /// caller's own session. Clearing the cookie is unconditional, so a
 /// double-logout still leaves the browser clean.
-pub(crate) async fn revoke_session(State(state): State<SessionState>, headers: HeaderMap) -> Response {
+pub(crate) async fn revoke_session(
+    State(state): State<SessionState>,
+    headers: HeaderMap,
+) -> Response {
     if let Some(id) = cookie_value(&headers, SESSION_COOKIE) {
         state.manager.revoke(id);
     }

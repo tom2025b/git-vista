@@ -62,7 +62,10 @@ pub(crate) struct HostPolicy {
 impl HostPolicy {
     /// Create the strict loopback policy for the listener's fixed port.
     pub(crate) fn loopback(port: u16) -> Self {
-        Self { port, pinned_ip: None }
+        Self {
+            port,
+            pinned_ip: None,
+        }
     }
 
     /// Create the policy for the LAN listener (ADR 0005): only the one
@@ -70,7 +73,10 @@ impl HostPolicy {
     /// [`Self::loopback`] on purpose — nothing routes to this listener except a
     /// request that already knows the exact sanctioned socket.
     pub(crate) fn lan(ip: IpAddr, port: u16) -> Self {
-        Self { port, pinned_ip: Some(ip) }
+        Self {
+            port,
+            pinned_ip: Some(ip),
+        }
     }
 
     /// Whether a raw `Host` header value is acceptable. The host must match
@@ -84,7 +90,10 @@ impl HostPolicy {
             }
         }
         match self.pinned_ip {
-            Some(ip) => name.parse::<IpAddr>().map(|parsed| parsed == ip).unwrap_or(false),
+            Some(ip) => name
+                .parse::<IpAddr>()
+                .map(|parsed| parsed == ip)
+                .unwrap_or(false),
             None => is_loopback_name(name),
         }
     }
