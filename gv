@@ -13,6 +13,14 @@
 #   gv --seed [path]    record a TEST repository reset point
 #   gv --root <dir>     also serve every repo directly under <dir> (the in-app
 #                       picker lists them; e.g. --root ~/projects)
+#   gv --lan-view [path]  also bind a second, read-only LAN listener (ADR
+#                       0005): a backup path to the iPad when the SSH tunnel
+#                       is unavailable. Auto-detects the LAN IP when the
+#                       machine has exactly one candidate; otherwise pass
+#                       --lan-ip. Plain HTTP — trusted home LAN only, never a
+#                       guest/shared network.
+#   gv --lan-ip <addr>  the explicit LAN IP for --lan-view, when auto-detect
+#                       can't pick a single candidate.
 #
 # A setup token lives only in a URL fragment (`#s=...`), is single-use, and is
 # exchanged for an HttpOnly session cookie. Run `gv --token` again for each new
@@ -30,6 +38,7 @@ TOKEN_FILE="$LOG_DIR/bootstrap.token"
 PID_FILE="$LOG_DIR/server.pid"
 MODE_FILE="$LOG_DIR/server.mode"
 TARGET_FILE="$LOG_DIR/server.target"
+LAN_FILE="$LOG_DIR/server.lan"
 
 server_health() {
   local host="${1:-localhost}"
@@ -42,6 +51,15 @@ listener_address() {
   fi
 }
 
+# Every socket currently listening on $PORT, one per line — plural counterpart
+# to listener_address() above, needed once --lan-view can put two sockets
+# (loopback + the sanctioned LAN ip) on the same port.
+listener_addresses() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltn "sport = :${PORT}" 2>/dev/null | awk '{print $4}' | sort -u
+  fi
+}
+
 listener_pid() {
   if command -v ss >/dev/null 2>&1; then
     ss -H -ltnp "sport = :${PORT}" 2>/dev/null \
@@ -50,20 +68,47 @@ listener_pid() {
   fi
 }
 
+# Classify what's actually listening on $PORT against what's sanctioned:
+# loopback alone (no --lan-view), or loopback plus the one LAN ip recorded in
+# $LAN_FILE at launch (--lan-view). Anything else present -- an extra
+# interface, a missing loopback, or a LAN ip that doesn't match what was
+# recorded -- is `exposed`, the same SECURITY ERROR classification as before
+# this feature landed.
 listener_mode() {
-  local address
-  address="$(listener_address)"
-  case "$address" in
-    127.0.0.1:*) printf '%s\n' loopback ;;
-    '')
-      if server_health localhost; then
-        printf '%s\n' unknown
-      else
-        printf '%s\n' down
-      fi
-      ;;
-    *) printf '%s\n' exposed ;;
-  esac
+  local addresses expected_lan address unexpected=0 saw_loopback=0 saw_lan=0
+  addresses="$(listener_addresses)"
+  if [[ -z $addresses ]]; then
+    if server_health localhost; then
+      printf '%s\n' unknown
+    else
+      printf '%s\n' down
+    fi
+    return
+  fi
+  expected_lan=""
+  if [[ -r "$LAN_FILE" ]]; then
+    expected_lan="$(cat "$LAN_FILE"):${PORT}"
+  fi
+  while IFS= read -r address; do
+    if [[ $address == "127.0.0.1:${PORT}" ]]; then
+      saw_loopback=1
+    elif [[ -n $expected_lan && $address == "$expected_lan" ]]; then
+      saw_lan=1
+    else
+      unexpected=1
+    fi
+  done <<<"$addresses"
+  if [[ $unexpected -eq 1 || $saw_loopback -eq 0 ]]; then
+    printf '%s\n' exposed
+  elif [[ -n $expected_lan && $saw_lan -eq 0 ]]; then
+    # --lan-view was requested but the sanctioned socket isn't actually up --
+    # a mismatch worth flagging, not a silent downgrade to "just loopback".
+    printf '%s\n' exposed
+  elif [[ -n $expected_lan ]]; then
+    printf '%s\n' lan_view
+  else
+    printf '%s\n' loopback
+  fi
 }
 
 token_file_is_stale() {
@@ -112,12 +157,32 @@ print_token_links() {
   fi
   echo "gv: one-time sign-in link — open the entire URL:"
   echo "gv:   Linux / SSH tunnel:  http://localhost:${PORT}/#s=${token}"
+  if [[ $mode == lan_view && -r "$LAN_FILE" ]]; then
+    echo "gv:   LAN view (read-only, this network only):  http://$(cat "$LAN_FILE"):${PORT}/#s=${token}"
+  fi
   if [[ $mode == unknown ]]; then
     echo "gv: WARNING: listener address could not be inspected; install 'ss' (iproute2) to verify it." >&2
   fi
   echo "gv: iPad: forward local ${PORT} to Linux 127.0.0.1:${PORT}, then open this localhost link."
   echo "gv: direct 192.168.x.x access is intentionally disabled."
   echo "gv: this link is single-use; run 'gv --token' again for the next device."
+}
+
+list_lan_ips() {
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+  fi
+}
+
+detect_lan_ip() {
+  local candidates count
+  candidates="$(list_lan_ips)"
+  count="$(printf '%s\n' "$candidates" | grep -c .)"
+  if [[ $count -eq 1 ]]; then
+    printf '%s\n' "$candidates"
+    return 0
+  fi
+  return 1
 }
 
 write_private_file() {
@@ -155,15 +220,20 @@ stop_repo_servers() {
     stop_pid "$pid"
     found=0
   done < <(repo_server_pids)
-  rm -f "$PID_FILE" "$MODE_FILE" "$TARGET_FILE"
+  rm -f "$PID_FILE" "$MODE_FILE" "$TARGET_FILE" "$LAN_FILE"
   return "$found"
 }
 
 record_runtime_state() {
-  local pid="$1" mode="$2" target="$3"
+  local pid="$1" mode="$2" target="$3" lan_ip="${4:-}"
   write_private_file "$PID_FILE" "$pid"
   write_private_file "$MODE_FILE" "$mode"
   write_private_file "$TARGET_FILE" "$target"
+  if [[ -n $lan_ip ]]; then
+    write_private_file "$LAN_FILE" "$lan_ip"
+  else
+    rm -f "$LAN_FILE"
+  fi
 }
 
 doctor() {
@@ -239,7 +309,11 @@ doctor() {
   echo "  tunnel: on the iPad SSH client, forward local ${PORT}"
   echo "          to 127.0.0.1:${PORT} on this Linux host."
   echo "          Then run 'gv --token' and open its localhost link on the iPad."
-  echo "  LAN: direct LAN access is disabled; only the SSH tunnel is supported."
+  if [[ -r "$LAN_FILE" ]]; then
+    echo "  LAN view (ADR 0005): $(cat "$LAN_FILE"):${PORT} — read-only, plain HTTP, trusted-LAN only"
+  else
+    echo "  LAN: direct LAN access is disabled; only the SSH tunnel is supported."
+  fi
   return "$result"
 }
 
@@ -271,10 +345,18 @@ TARGET=""
 SEED=0
 REPO_ROOT=""
 NEXT_IS_ROOT=0
+LAN_VIEW=0
+LAN_IP=""
+NEXT_IS_LAN_IP=0
 for arg in "$@"; do
   if [[ $NEXT_IS_ROOT -eq 1 ]]; then
     REPO_ROOT="$arg"
     NEXT_IS_ROOT=0
+    continue
+  fi
+  if [[ $NEXT_IS_LAN_IP -eq 1 ]]; then
+    LAN_IP="$arg"
+    NEXT_IS_LAN_IP=0
     continue
   fi
   case "$arg" in
@@ -282,9 +364,13 @@ for arg in "$@"; do
     # ADR 0009: one deliberate repos root; the server scans its direct children.
     --root) NEXT_IS_ROOT=1 ;;
     --root=*) REPO_ROOT="${arg#--root=}" ;;
+    # ADR 0005: opt-in second, read-only LAN listener.
+    --lan-view) LAN_VIEW=1 ;;
+    --lan-ip) NEXT_IS_LAN_IP=1 ;;
+    --lan-ip=*) LAN_IP="${arg#--lan-ip=}" ;;
     --lan)
       echo "gv: --lan is disabled; Git-Vista only listens on 127.0.0.1:${PORT}." >&2
-      echo "gv: use an SSH local-port forward for iPad access." >&2
+      echo "gv: use an SSH local-port forward for iPad access, or 'gv --lan-view' for a read-only LAN backup." >&2
       exit 2
       ;;
     -h|--help)
@@ -321,6 +407,29 @@ fi
 if [[ -n $REPO_ROOT && ! -d $REPO_ROOT ]]; then
   echo "gv: --root: no such directory: $REPO_ROOT" >&2
   exit 2
+fi
+if [[ $NEXT_IS_LAN_IP -eq 1 ]]; then
+  echo "gv: --lan-ip needs an address" >&2
+  exit 2
+fi
+if [[ $LAN_VIEW -eq 1 && -z $LAN_IP ]]; then
+  LAN_IP="$(detect_lan_ip)" || {
+    echo "gv: --lan-view needs --lan-ip <addr> — couldn't auto-detect a single LAN address" >&2
+    echo "gv: candidates found:" >&2
+    list_lan_ips >&2
+    exit 2
+  }
+elif [[ $LAN_VIEW -eq 0 && -n $LAN_IP ]]; then
+  echo "gv: --lan-ip only applies with --lan-view" >&2
+  exit 2
+fi
+if [[ -n $LAN_IP ]]; then
+  case "$LAN_IP" in
+    127.*|0.0.0.0)
+      echo "gv: --lan-ip must be a real LAN interface address, not loopback or 0.0.0.0" >&2
+      exit 2
+      ;;
+  esac
 fi
 TARGET="${TARGET:-$START_DIR}"
 
@@ -371,10 +480,14 @@ export GIT_VISTA_BIND_ADDR="127.0.0.1:${PORT}"
 if [[ -n $REPO_ROOT ]]; then
   export GIT_VISTA_REPO_ROOT="$REPO_ROOT"
 fi
+# ADR 0005: opt-in second, read-only LAN listener.
+if [[ $LAN_VIEW -eq 1 ]]; then
+  export GIT_VISTA_LAN_IP="$LAN_IP"
+fi
 
 setsid "$SERVER_BIN" "$TARGET" >>"$LOG" 2>&1 </dev/null &
 SERVER_PID=$!
-record_runtime_state "$SERVER_PID" loopback "$TARGET"
+record_runtime_state "$SERVER_PID" loopback "$TARGET" "$LAN_IP"
 
 echo "gv: visualising $TARGET"
 for _ in $(seq 1 40); do
@@ -388,6 +501,9 @@ for _ in $(seq 1 40); do
     fi
     echo "gv: server up in loopback/SSH mode — http://127.0.0.1:${PORT}/"
     echo "gv: iPad SSH forward: local ${PORT} -> Linux 127.0.0.1:${PORT}"
+    if [[ -n $LAN_IP ]]; then
+      echo "gv: LAN view up — http://${LAN_IP}:${PORT}/ (read-only, plain HTTP, trusted LAN only)"
+    fi
     print_setup_url "localhost:${PORT}" || \
       echo "gv: couldn't read the sign-in token yet; try 'gv --token'" >&2
     echo "gv: log: $LOG    diagnose: gv doctor    stop: gv --stop"
