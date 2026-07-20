@@ -228,6 +228,7 @@ pub(super) fn layout_topology(commits: Vec<CommitSummary>, trunk_tip: Option<&Oi
         edges,
         lane_count,
         repo_url: None,
+        remote_web_url: None,
         remote_commits: Vec::new(),
         stubs: Vec::new(),
         repo_label: None,

@@ -39,7 +39,8 @@ pub mod version;
 
 pub use dto::{
     validate_clone_url, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
-    RebaseStatus, RepositoryDescriptor, RepositoryKind, SessionInfo, SessionRequest,
+    RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo,
+    SessionRequest,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use version::{

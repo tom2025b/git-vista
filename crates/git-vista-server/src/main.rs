@@ -62,6 +62,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
+use git_vista_protocol::RepoMode;
 use handlers::branch::{
     checkout_branch, create_branch, delete_branch, force_delete_branch, merge_branch, push_branch,
 };
@@ -73,6 +74,7 @@ use handlers::read::{
 };
 use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
+use handlers::select::{rescan, select_repo};
 use handlers::session::{create_session, revoke_session, session_status};
 use security::{AuthState, HostPolicy};
 use session::{SessionManager, BOOTSTRAP_REFRESH_INTERVAL};
@@ -107,9 +109,15 @@ async fn main() {
         );
         eprintln!("         /api/commits will error until it points at a real repo.\n");
     }
-    // The CLI-arg repo is the user's own working repo, so it's writable. This
+    // The CLI-arg repo is the user's own working repo, so it opens Active. This
     // registers it in the catalog (M1.03) and makes it the default selection.
-    set_current(&repo, false);
+    set_current(&repo, RepoMode::Active);
+
+    // ADR 0009: register every direct-child repo of the configured root, so the
+    // picker can offer them. No root configured → exactly the old behavior.
+    if let Some((registered, skipped)) = state::scan_repo_root() {
+        println!("git-vista: repo root scan: {registered} registered, {skipped} skipped");
+    }
 
     // Phase 13: clear any throwaway clones left behind by a previous run. A prior
     // launcher/process interruption may not have cleaned its last Phase 12 clone,
@@ -229,6 +237,10 @@ async fn main() {
         .route("/api/file/{id}/{*path}", get(file_at_commit))
         // Phase 12: clone a public URL into a temp dir and view it read-only.
         .route("/api/clone", post(clone_repo))
+        // ADR 0007: pick the current repository + Visualize/Active mode by id.
+        .route("/api/select", post(select_repo))
+        // ADR 0009: re-scan the configured repo root without a restart.
+        .route("/api/rescan", post(rescan))
         // Issue #18: create a branch at a commit (shells out to `git branch`).
         .route("/api/branch", post(create_branch))
         // Issue #33: create a commit on top of HEAD (shells out to `git commit`).

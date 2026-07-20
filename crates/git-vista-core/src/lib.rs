@@ -24,6 +24,7 @@
 pub mod activity;
 pub mod color;
 pub mod diff;
+pub mod forge;
 pub mod identity;
 pub mod layout;
 pub mod model;

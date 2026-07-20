@@ -69,8 +69,14 @@ fn kind_label(kind: ActivityKind) -> &'static str {
 }
 
 /// Build the Activity panel view. Rendered inside the overlays wrapper, so it
-/// shares the reactive context the menu and modals use.
-pub fn activity_panel_view(overlays: Overlays, settings: Settings) -> impl IntoView {
+/// shares the reactive context the menu and modals use. `read_only` (Visualize
+/// mode, ADR 0006/0007) hides the rows' Undo buttons — the feed itself is a
+/// read and stays available.
+pub fn activity_panel_view(
+    overlays: Overlays,
+    settings: Settings,
+    read_only: bool,
+) -> impl IntoView {
     let Overlays {
         detail_id,
         activity_open,
@@ -221,7 +227,7 @@ pub fn activity_panel_view(overlays: Overlays, settings: Settings) -> impl IntoV
                 .into_view(),
                 Some(Ok(events)) => events
                     .into_iter()
-                    .map(|e| activity_row(e, nerd_icons, overlays))
+                    .map(|e| activity_row(e, nerd_icons, overlays, read_only))
                     .collect_view(),
             };
 
@@ -276,6 +282,7 @@ fn activity_row(
     event: ActivityEvent,
     nerd_icons: RwSignal<bool>,
     overlays: Overlays,
+    read_only: bool,
 ) -> impl IntoView {
     let Overlays {
         menu,
@@ -327,7 +334,9 @@ fn activity_row(
     // (and the server's compare-and-swap catches even that window). Opens the
     // shared confirm modal; the panel stays open, and the confirmed undo's
     // `reload` bump refreshes this very feed in place.
-    let undo_btn = event.undo.clone().map(|u| {
+    // In Visualize mode the button is absent entirely (ADR 0007 gating audit):
+    // the api.rs chokepoint and the server 403 back this up in depth.
+    let undo_btn = (!read_only).then(|| event.undo.clone()).flatten().map(|u| {
         let title = u.label.clone();
         let on = move |ev: web_sys::MouseEvent| {
             // The row underneath opens the context menu — this tap shouldn't.
@@ -377,6 +386,7 @@ fn activity_row(
                     branches: Vec::new(),
                     is_branch: false,
                     repo_url: None,
+                    remote_web_url: None,
                 }));
             };
             view! {
