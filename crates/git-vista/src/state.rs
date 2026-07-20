@@ -60,6 +60,10 @@ pub struct MenuData {
     /// compare URL (`<base>/compare/main...<branch>`); `None` => no GitHub repo, so
     /// that item is omitted.
     pub repo_url: Option<String>,
+    /// Any-host forge web base (ADR 0010), for the non-GitHub branch link items —
+    /// shown only when [`repo_url`](Self::repo_url) is `None`, so it never
+    /// duplicates the GitHub items. `None` => no usable remote.
+    pub remote_web_url: Option<String>,
 }
 
 /// What the commit-message dialog (Issue #33) is collecting a message for:

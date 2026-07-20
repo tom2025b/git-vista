@@ -386,6 +386,7 @@ fn activity_row(
                     branches: Vec::new(),
                     is_branch: false,
                     repo_url: None,
+                    remote_web_url: None,
                 }));
             };
             view! {

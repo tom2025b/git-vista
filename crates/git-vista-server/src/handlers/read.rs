@@ -107,9 +107,10 @@ pub(crate) async fn commits(
     // stays GitHub-only for the existing pushed-commit link behavior.
     graph.remote_web_url = git_vista_git::remote_web_base(repo);
     // Mark which commits are on the remote, so the UI only links pushed objects —
-    // an unpushed commit/ref would 404 on GitHub. Only worth computing when we
-    // have a web base to link to; on failure we leave it empty (nothing linked).
-    if graph.repo_url.is_some() {
+    // an unpushed commit/ref would 404 on the forge. Only worth computing when we
+    // have a web base to link to (either the GitHub-only base or the any-host
+    // one); on failure we leave it empty (nothing linked).
+    if graph.repo_url.is_some() || graph.remote_web_url.is_some() {
         if let Ok(remote) = git_vista_git::read_remote_commits(repo, HISTORY_LIMIT) {
             graph.remote_commits = remote.into_iter().collect();
         }
