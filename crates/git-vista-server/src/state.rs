@@ -59,6 +59,39 @@ fn parse_bind_addr(value: Option<&str>) -> Result<SocketAddr, String> {
     }
 }
 
+/// The optional second, LAN-facing listener (ADR 0005, `gv --lan-view`). `None`
+/// means the feature isn't requested — the server then behaves exactly as
+/// before this feature landed. `gv` is responsible for auto-detecting the LAN
+/// IP or requiring `--lan-ip` before it ever sets this variable, so a parse
+/// failure here means the launcher passed something bad — still handled as a
+/// clean startup error, never a panic.
+pub(crate) fn lan_bind_addr() -> Option<Result<SocketAddr, String>> {
+    parse_lan_ip_env(std::env::var("GIT_VISTA_LAN_IP").ok().as_deref())
+}
+
+/// The pure resolution behind [`lan_bind_addr`], parameterised so tests never
+/// read or write process env — the same pattern as `parse_bind_addr`. An empty
+/// value counts as unset, matching `resolve_clones_root`'s convention (a
+/// systemd unit with `Environment=X=` must not silently enable the feature).
+fn parse_lan_ip_env(value: Option<&str>) -> Option<Result<SocketAddr, String>> {
+    let value = value.filter(|v| !v.trim().is_empty())?;
+    let ip: IpAddr = match value.trim().parse() {
+        Ok(ip) => ip,
+        Err(error) => return Some(Err(format!("invalid GIT_VISTA_LAN_IP '{value}': {error}"))),
+    };
+    if ip.is_loopback() {
+        return Some(Err(format!(
+            "refusing GIT_VISTA_LAN_IP '{value}': that is a loopback address, not a LAN interface"
+        )));
+    }
+    if ip.is_unspecified() {
+        return Some(Err(format!(
+            "refusing GIT_VISTA_LAN_IP '{value}': 0.0.0.0 is never accepted — pass one explicit interface address"
+        )));
+    }
+    Some(Ok(SocketAddr::new(ip, PORT)))
+}
+
 // Upper bound on how much history to walk; plenty for now. Shared by the graph
 // read (`handlers::read`) and the activity feed's remote-commit lookup.
 pub(crate) const HISTORY_LIMIT: usize = 5_000;
@@ -547,6 +580,44 @@ mod tests {
     fn bind_address_rejects_invalid_configuration() {
         let error = parse_bind_addr(Some("not-an-address")).unwrap_err();
         assert!(error.contains("invalid GIT_VISTA_BIND_ADDR"));
+    }
+
+    // --- LAN listener address resolution (ADR 0005) -------------------------
+
+    #[test]
+    fn lan_ip_is_none_when_unset() {
+        assert!(parse_lan_ip_env(None).is_none());
+    }
+
+    #[test]
+    fn lan_ip_is_none_when_empty() {
+        assert!(parse_lan_ip_env(Some("")).is_none());
+    }
+
+    #[test]
+    fn lan_ip_accepts_an_explicit_lan_address() {
+        let addr = parse_lan_ip_env(Some("192.168.1.42")).unwrap().unwrap();
+        assert_eq!(addr, SocketAddr::new("192.168.1.42".parse().unwrap(), PORT));
+    }
+
+    #[test]
+    fn lan_ip_rejects_loopback() {
+        let error = parse_lan_ip_env(Some("127.0.0.1")).unwrap().unwrap_err();
+        assert!(error.contains("loopback"));
+    }
+
+    #[test]
+    fn lan_ip_rejects_unspecified() {
+        let error = parse_lan_ip_env(Some("0.0.0.0")).unwrap().unwrap_err();
+        assert!(error.contains("0.0.0.0"));
+    }
+
+    #[test]
+    fn lan_ip_rejects_invalid_input() {
+        let error = parse_lan_ip_env(Some("not-an-address"))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("invalid GIT_VISTA_LAN_IP"));
     }
 
     // --- clones root resolution (ADR 0008) ---------------------------------

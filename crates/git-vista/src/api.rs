@@ -55,6 +55,25 @@ pub fn set_ui_mode(mode: Option<RepoMode>) {
     UI_MODE.with(|m| *m.borrow_mut() = mode);
 }
 
+// Whether the current session came through the LAN listener (ADR 0005) —
+// mirrored from the session-establish/-check response. Purely a UI signal: it
+// drives hiding the Active option on the mode screen. The server's own route
+// absence on the LAN listener is the actual write boundary.
+thread_local! {
+    static VIA_LAN: RefCell<bool> = const { RefCell::new(false) };
+}
+
+/// Record whether the current session is LAN-scoped — called by
+/// [`crate::session`] after establishing or checking the session.
+pub fn set_via_lan(via_lan: bool) {
+    VIA_LAN.with(|v| *v.borrow_mut() = via_lan);
+}
+
+/// Whether the current session came through the LAN listener (ADR 0005).
+pub fn is_lan_session() -> bool {
+    VIA_LAN.with(|v| *v.borrow())
+}
+
 /// The ADR 0007 client-side write chokepoint: every repo-write function refuses
 /// up front in Visualize mode, so a gating gap in the UI can't even attempt a
 /// mutation. The server's own 403 remains the actual boundary.
