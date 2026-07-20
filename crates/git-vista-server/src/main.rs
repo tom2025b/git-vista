@@ -112,6 +112,12 @@ async fn main() {
     // registers it in the catalog (M1.03) and makes it the default selection.
     set_current(&repo, RepoMode::Active);
 
+    // ADR 0009: register every direct-child repo of the configured root, so the
+    // picker can offer them. No root configured → exactly the old behavior.
+    if let Some((registered, skipped)) = state::scan_repo_root() {
+        println!("git-vista: repo root scan: {registered} registered, {skipped} skipped");
+    }
+
     // Phase 13: clear any throwaway clones left behind by a previous run. A prior
     // launcher/process interruption may not have cleaned its last Phase 12 clone,
     // which would otherwise pile up under the temp dir across runs.
