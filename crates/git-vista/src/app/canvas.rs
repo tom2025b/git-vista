@@ -289,7 +289,7 @@ pub(super) fn graph_canvas(
             {dialogs::commit_dialog_view(overlays)}
             {dialogs::confirm_modal_view(overlays)}
             {detail::detail_panel_view(overlays, settings, detail, ctx)}
-            {activity::activity_panel_view(overlays, settings)}
+            {activity::activity_panel_view(overlays, settings, read_only)}
             {viewer::viewer_view(overlays, settings)}
         </div>
     }
