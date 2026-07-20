@@ -42,6 +42,8 @@ mod journal;
 // The versioned-API-contract layer (M1.02, #102): protocol negotiation, the
 // request id, the structured error envelope, and the contract response headers.
 mod middleware;
+// Per-source-IP sign-in rate limiting for the LAN listener (ADR 0005, #122).
+mod ratelimit;
 // The loopback session + request-protection layer (M1.04, #57): Origin/Host/CSRF/
 // content-type/method enforcement, the browser hardening headers, and the
 // bootstrap-token → session-cookie exchange.
@@ -75,7 +77,7 @@ use handlers::read::{
 use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
 use handlers::select::{rescan, select_repo};
-use handlers::session::{create_session, revoke_session, session_status};
+use handlers::session::{create_session, revoke_session, session_status, SessionState};
 use security::{AuthState, HostPolicy};
 use session::{SessionManager, BOOTSTRAP_REFRESH_INTERVAL};
 use state::{bind_addr, bootstrap_token_path, current, set_current, DEFAULT_REPO, DIST_DIR, PORT};
@@ -288,8 +290,15 @@ async fn main() {
         // request id, the consistent error envelope, and the response headers.
         .layer(axum::middleware::from_fn(middleware::api_contract))
         // The session store the session handlers (and the auth layer) resolve
-        // against. Erases the router's state type back to `()`.
-        .with_state(sessions);
+        // against, plus this listener's LAN/rate-limit flags (ADR 0005) —
+        // `false`/`None` here since this is still the single loopback router;
+        // Task 4 splits this into a dedicated loopback + LAN router pair.
+        // Erases the router's state type back to `()`.
+        .with_state(SessionState {
+            manager: sessions,
+            via_lan: false,
+            rate_limiter: None,
+        });
 
     let app = Router::new()
         .merge(api)

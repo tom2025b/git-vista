@@ -119,6 +119,13 @@ pub struct SessionInfo {
     pub authenticated: bool,
     #[serde(default)]
     pub csrf: Option<String>,
+    /// Whether this session was established through the LAN listener (ADR
+    /// 0005). Additive field (M1.02 rule: new fields are `#[serde(default)]`,
+    /// no protocol bump) — an older client ignores it. Purely a UI signal: the
+    /// LAN listener's write routes are structurally absent regardless of what
+    /// a client does with this flag.
+    #[serde(default)]
+    pub via_lan: bool,
 }
 
 /// Response of `GET /api/rebase-status`: whether "Rebase onto main" would do
@@ -360,6 +367,7 @@ mod tests {
         let info = SessionInfo {
             authenticated: true,
             csrf: Some("csrf-token".into()),
+            via_lan: false,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert_eq!(serde_json::from_str::<SessionInfo>(&json).unwrap(), info);
