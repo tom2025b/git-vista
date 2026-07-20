@@ -1,6 +1,6 @@
 # ADR 0005 — LAN view profile: a read-only second listener
 
-- **Status:** Accepted — implementation pending (`feature/lan-view-mode`)
+- **Status:** Accepted — implemented 2026-07-20 (`feature/lan-view-mode`, #122)
 - **Date:** 2026-07-19
 - **Milestone / issue:** Post-M1.05 feature set; design spec
   `docs/superpowers/specs/2026-07-19-repo-modes-lan-visualizer-design.md`

@@ -614,7 +614,9 @@ mod tests {
 
     #[test]
     fn lan_ip_rejects_invalid_input() {
-        let error = parse_lan_ip_env(Some("not-an-address")).unwrap().unwrap_err();
+        let error = parse_lan_ip_env(Some("not-an-address"))
+            .unwrap()
+            .unwrap_err();
         assert!(error.contains("invalid GIT_VISTA_LAN_IP"));
     }
 

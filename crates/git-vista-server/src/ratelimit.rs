@@ -54,7 +54,12 @@ impl SignInLimiter {
     /// `session.rs`'s tests use on `Bootstrap::expires_at`.
     #[cfg(test)]
     fn force_window_start(&self, addr: IpAddr, when: Instant) {
-        self.buckets.lock().unwrap().get_mut(&addr).unwrap().window_started = when;
+        self.buckets
+            .lock()
+            .unwrap()
+            .get_mut(&addr)
+            .unwrap()
+            .window_started = when;
     }
 }
 
@@ -93,7 +98,10 @@ mod tests {
         assert!(l.check(ip()));
         l.force_window_start(ip(), Instant::now() - WINDOW - Duration::from_secs(1));
         for _ in 0..MAX_ATTEMPTS {
-            assert!(l.check(ip()), "a fresh window allows a fresh batch of attempts");
+            assert!(
+                l.check(ip()),
+                "a fresh window allows a fresh batch of attempts"
+            );
         }
     }
 }
