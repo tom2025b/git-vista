@@ -20,7 +20,8 @@ use git_vista_core::net::network_error_text;
 use git_vista_core::status::RepoStatus;
 use git_vista_protocol::{
     ApiError, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, ProtocolInfo,
-    RebaseStatus, SessionInfo, SessionRequest, CSRF_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
+    RebaseStatus, RepoMode, RepositoryDescriptor, SelectRequest, SessionInfo, SessionRequest,
+    CSRF_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
 // The current session's CSRF token (M1.04). Set once the session is established
@@ -39,6 +40,31 @@ pub fn set_csrf_token(token: Option<String>) {
 
 fn csrf_token() -> Option<String> {
     CSRF_TOKEN.with(|c| c.borrow().clone())
+}
+
+// The mode the current repo is open in (ADR 0006/0007), mirrored from the last
+// graph load / selection. Purely defense in depth: in Visualize the write fns
+// below refuse before any network call; the server's 403 is the real boundary.
+thread_local! {
+    static UI_MODE: RefCell<Option<RepoMode>> = const { RefCell::new(None) };
+}
+
+/// Record the current repo's mode — set when a graph lands and when a selection
+/// is made. `None` clears it (unknown, e.g. before the first load).
+pub fn set_ui_mode(mode: Option<RepoMode>) {
+    UI_MODE.with(|m| *m.borrow_mut() = mode);
+}
+
+/// The ADR 0007 client-side write chokepoint: every repo-write function refuses
+/// up front in Visualize mode, so a gating gap in the UI can't even attempt a
+/// mutation. The server's own 403 remains the actual boundary.
+fn refuse_if_visualize() -> Result<(), String> {
+    let visualize = UI_MODE.with(|m| *m.borrow() == Some(RepoMode::Visualize));
+    if visualize {
+        Err("This repository is open in Visualize mode — look-only.".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 /// Start a GET carrying the protocol header every `/api/*` request must send
@@ -210,6 +236,7 @@ pub async fn clone_request(url: &str) -> Result<(), String> {
 /// for *this* endpoint because a duplicated `git branch` is harmless: if the
 /// first request did land, the retry just returns git's own "already exists".
 pub async fn create_branch_request(name: &str, commit: &str) -> Result<(), String> {
+    refuse_if_visualize()?;
     let body = CreateBranchRequest {
         name: name.to_string(),
         commit: commit.to_string(),
@@ -247,6 +274,7 @@ pub async fn create_commit_request(
     allow_empty: bool,
     branch: Option<&str>,
 ) -> Result<(), String> {
+    refuse_if_visualize()?;
     let body = CreateCommitRequest {
         message: message.to_string(),
         allow_empty,
@@ -273,6 +301,7 @@ pub async fn create_commit_request(
 /// then be committed. Bodyless, like the rebase request; a non-2xx body is git's
 /// own error text, returned as `Err` for the caller to show.
 pub async fn stage_request() -> Result<(), String> {
+    refuse_if_visualize()?;
     let resp = req_post("/api/stage").send().await.map_err(network_error)?;
     if resp.ok() {
         Ok(())
@@ -289,6 +318,7 @@ pub async fn stage_request() -> Result<(), String> {
 /// back to HEAD, the working tree keeps every edit. Same bodyless shape and
 /// error posture as staging.
 pub async fn unstage_request() -> Result<(), String> {
+    refuse_if_visualize()?;
     let resp = req_post("/api/unstage")
         .send()
         .await
@@ -363,6 +393,7 @@ pub async fn fetch_undoables(commit: &str) -> Result<Vec<Undoable>, String> {
 /// moved branch (compare-and-swap) or a dirty working tree — returned as `Err`
 /// for the confirm flow to show.
 pub async fn undo_request(action: &UndoAction) -> Result<(), String> {
+    refuse_if_visualize()?;
     let resp = req_post("/api/undo")
         .json(action)
         .map_err(|e| e.to_string())?
@@ -480,6 +511,7 @@ pub async fn fetch_rebase_status() -> Result<RebaseStatus, String> {
 /// "Already up to date" no-op (a raced click from a stale menu). A non-2xx body
 /// is git's own error text (conflicts, detached HEAD, …), returned as `Err`.
 pub async fn rebase_request() -> Result<String, String> {
+    refuse_if_visualize()?;
     let resp = req_post("/api/rebase")
         .send()
         .await
@@ -501,6 +533,7 @@ pub async fn rebase_request() -> Result<String, String> {
 /// a non-2xx body is the server's reason (not a test repo, corrupt seed, or
 /// the exact git step that refused), returned as `Err` for the dialog to show.
 pub async fn reset_test_repo_request() -> Result<String, String> {
+    refuse_if_visualize()?;
     let resp = req_post("/api/reset-test-repo")
         .send()
         .await
@@ -522,6 +555,7 @@ pub async fn reset_test_repo_request() -> Result<String, String> {
 /// `Ok` carries the server's success line — most callers ignore it, but the merge
 /// flow reads it to tell a real merge from git's "Already up to date" no-op.
 pub async fn branch_op_request(path: &str, branch: &str) -> Result<String, String> {
+    refuse_if_visualize()?;
     let body = BranchRequest {
         branch: branch.to_string(),
     };
@@ -538,5 +572,52 @@ pub async fn branch_op_request(path: &str, branch: &str) -> Result<String, Strin
             .text()
             .await
             .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
+/// The servable repositories (`GET /api/catalog`) — M1.03 built the endpoint,
+/// the repo picker finally consumes it. Cache-busted like every live read: the
+/// catalog changes at runtime (clones, rescans).
+pub async fn fetch_catalog() -> Result<Vec<RepositoryDescriptor>, String> {
+    let url = format!("/api/catalog?t={}", js_sys::Date::now());
+    let resp = req_get(&url).send().await.map_err(network_error)?;
+    if resp.ok() {
+        resp.json::<Vec<RepositoryDescriptor>>()
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        Err(response_error(resp).await)
+    }
+}
+
+/// Make `worktree` the current repo in `mode` (`POST /api/select`, ADR 0007).
+/// A forged/unknown id comes back 404 from the fail-closed catalog; the picker
+/// shows the server's reason.
+pub async fn select_request(worktree: &str, mode: RepoMode) -> Result<(), String> {
+    let body = SelectRequest {
+        worktree: worktree.to_string(),
+        mode,
+    };
+    let resp = req_post("/api/select")
+        .json(&body)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(network_error)?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(response_error(resp).await)
+    }
+}
+
+/// Re-scan the configured repo root (`POST /api/rescan`, ADR 0009). `Ok` carries
+/// the server's one-line summary for the picker to show.
+pub async fn rescan_request() -> Result<String, String> {
+    let resp = req_post("/api/rescan").send().await.map_err(network_error)?;
+    if resp.ok() {
+        Ok(resp.text().await.unwrap_or_default())
+    } else {
+        Err(response_error(resp).await)
     }
 }
