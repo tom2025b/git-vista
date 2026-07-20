@@ -19,9 +19,9 @@ use git_vista_core::model::{CommitDetail, Graph};
 use git_vista_core::net::network_error_text;
 use git_vista_core::status::RepoStatus;
 use git_vista_protocol::{
-    ApiError, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, ProtocolInfo,
-    RebaseStatus, RepoMode, RepositoryDescriptor, SelectRequest, SessionInfo, SessionRequest,
-    CSRF_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
+    ApiError, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
+    DeleteCloneRequest, ProtocolInfo, RebaseStatus, RepoMode, RepositoryDescriptor, SelectRequest,
+    SessionInfo, SessionRequest, CSRF_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
 // The current session's CSRF token (M1.04). Set once the session is established
@@ -202,10 +202,12 @@ pub async fn fetch_commit_detail(id: &str) -> Result<CommitDetail, String> {
     }
 }
 
-/// Ask the backend to clone a public URL and switch to viewing it read-only
-/// (Phase 12, `POST /api/clone`). On a non-2xx response the body is the server's /
-/// git's own error text (bad URL, repo not found, …), returned as `Err`.
-pub async fn clone_request(url: &str) -> Result<(), String> {
+/// Ask the backend to clone a public URL into the persistent clones store
+/// (`POST /api/clone`, ADR 0008). `Ok` carries the fresh clone's descriptor so
+/// the caller can jump straight to the Visualize/Active mode screen for it. On
+/// a non-2xx response the body is the server's / git's own error text (bad
+/// URL, repo not found, …), returned as `Err`.
+pub async fn clone_request(url: &str) -> Result<RepositoryDescriptor, String> {
     let body = CloneRequest {
         url: url.to_string(),
     };
@@ -216,7 +218,9 @@ pub async fn clone_request(url: &str) -> Result<(), String> {
         .await
         .map_err(network_error)?;
     if resp.ok() {
-        Ok(())
+        resp.json::<RepositoryDescriptor>()
+            .await
+            .map_err(|e| e.to_string())
     } else {
         Err(resp
             .text()
@@ -615,6 +619,26 @@ pub async fn select_request(worktree: &str, mode: RepoMode) -> Result<(), String
 /// the server's one-line summary for the picker to show.
 pub async fn rescan_request() -> Result<String, String> {
     let resp = req_post("/api/rescan")
+        .send()
+        .await
+        .map_err(network_error)?;
+    if resp.ok() {
+        Ok(resp.text().await.unwrap_or_default())
+    } else {
+        Err(response_error(resp).await)
+    }
+}
+
+/// Delete a persistent clone by id (`POST /api/delete-clone`, ADR 0008). `Ok`
+/// carries the server's confirmation line for the picker; refusals (not a
+/// clone, currently open, unknown id) come back as `Err` with the reason.
+pub async fn delete_clone_request(worktree: &str) -> Result<String, String> {
+    let body = DeleteCloneRequest {
+        worktree: worktree.to_string(),
+    };
+    let resp = req_post("/api/delete-clone")
+        .json(&body)
+        .map_err(|e| e.to_string())?
         .send()
         .await
         .map_err(network_error)?;

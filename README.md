@@ -87,7 +87,8 @@ boundaries earn their own crates.
   POST  /api/branch    ───────────────▶  git branch  (shell)    ─┤ the repo on
   POST  /api/commit    ───────────────▶  git commit  (shell)    ─┤ the filesystem
   POST  /api/merge|push|delete-branch ▶  git … (shell)          ─┤
-  POST  /api/clone     ───────────────▶  git clone → temp dir   ─┘
+  POST  /api/clone     ───────────────▶  git clone → clones dir ─┤
+  POST  /api/delete-clone             ▶  rm clone (guarded)      ─┘
 ```
 
 The server serves both the WASM bundle and same-origin API on `:8080`. Same-origin
@@ -110,8 +111,10 @@ write endpoints.
 - **Commit detail panel** (Phase 10): "View details" opens a side panel with the
   full message body and both author & committer signatures; parent hashes are
   clickable to walk up the history.
-- **Open URL** (Phase 12): paste a public `https://`/`http://`/`git://` URL to
-  clone and view any repo **read-only** (all write actions hidden + refused).
+- **Open URL** (Phase 12, persisted by ADR 0008): paste a public
+  `https://`/`http://`/`git://` URL to clone it into the persistent clones
+  store, then choose Visualize (read-only) or Active mode. Clones survive a
+  restart and stay listed in the picker until deleted.
 - **Controls & shortcuts** (Phase 13): drag/one-finger to pan, wheel/pinch to zoom,
   plus keyboard shortcuts on desktop and the iPad Magic Keyboard — `+`/`-` zoom, `0`
   resets the view, `r` refreshes, `Esc` closes the open menu/panel. A **Reset view**

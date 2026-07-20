@@ -219,7 +219,12 @@ operation. Touch gestures may select or open a plan; final confirmation is expli
   arbitrary URL cloning is exposed beyond local mode, unless explicitly allowlisted.
 - Apply clone size/time quotas and stream progress without buffering complete output.
 - Store temporary clones under a managed root with ownership metadata and expiry.
+  *(Implemented: ADR 0008, #121 — clones persist under `$XDG_DATA_HOME/git-vista/
+  clones`, not a wiped-at-startup temp dir; deletion is explicit via
+  `POST /api/delete-clone`, guarded to paths that canonicalize inside that root.)*
 - Never delete a clone while an active repository handle references it.
+  *(Implemented: ADR 0008, #121 — `delete_clone` refuses the currently open
+  selection with `409`.)*
 - Treat remote URLs as secrets because they can contain credentials.
 
 ## Browser Security Headers
