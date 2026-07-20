@@ -228,18 +228,36 @@ impl Catalog {
         let mut out: Vec<RepositoryDescriptor> = self
             .entries
             .values()
-            .map(|e| RepositoryDescriptor {
-                repository: e.handle.repository.to_string(),
-                worktree: e.handle.worktree.to_string(),
-                name: e.name.clone(),
-                kind: kind_to_protocol(e.kind),
-                read_only: e.read_only,
-                path: expose_paths.then(|| e.path.display().to_string()),
-                remote_web_url: e.remote_web_url.clone(),
-            })
+            .map(|e| Self::descriptor(e, expose_paths))
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name).then(a.worktree.cmp(&b.worktree)));
         out
+    }
+
+    /// The descriptor for one entry, or `None` when the catalog doesn't hold
+    /// the id — the same capability view as [`descriptors`](Self::descriptors),
+    /// for the single entry a fresh clone just registered (ADR 0008).
+    pub(crate) fn descriptor_of(
+        &self,
+        worktree: WorktreeId,
+        expose_paths: bool,
+    ) -> Option<RepositoryDescriptor> {
+        self.entries
+            .get(&worktree)
+            .map(|e| Self::descriptor(e, expose_paths))
+    }
+
+    /// One entry's wire form — shared by the list and single-entry views.
+    fn descriptor(e: &RepoEntry, expose_paths: bool) -> RepositoryDescriptor {
+        RepositoryDescriptor {
+            repository: e.handle.repository.to_string(),
+            worktree: e.handle.worktree.to_string(),
+            name: e.name.clone(),
+            kind: kind_to_protocol(e.kind),
+            read_only: e.read_only,
+            path: expose_paths.then(|| e.path.display().to_string()),
+            remote_web_url: e.remote_web_url.clone(),
+        }
     }
 }
 
@@ -421,6 +439,23 @@ mod tests {
         let d = catalog.descriptors(false);
         assert_eq!(d[0].name, "octocat");
         assert!(d[0].read_only, "re-registered clones keep the clone marker");
+    }
+
+    #[test]
+    fn descriptor_of_reports_one_entry_and_fails_closed_on_unknown_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("project");
+        init_repo(&repo);
+        let mut catalog = Catalog::new();
+        catalog.allow_root(root.path());
+        let handle = catalog.register(&repo, true).unwrap();
+
+        let d = catalog.descriptor_of(handle.worktree, false).expect("known id");
+        assert_eq!(d, catalog.descriptors(false)[0]);
+        assert!(d.read_only);
+
+        let stranger = WorktreeId::from_git_dir("/nowhere/.git/worktrees/ghost");
+        assert!(catalog.descriptor_of(stranger, false).is_none());
     }
 
     // --- descriptors: no path by default -----------------------------------
