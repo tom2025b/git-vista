@@ -45,15 +45,10 @@ server_health() {
   curl -sf -m 2 "http://${host}:${PORT}/api/protocol" >/dev/null 2>&1
 }
 
-listener_address() {
-  if command -v ss >/dev/null 2>&1; then
-    ss -H -ltn "sport = :${PORT}" 2>/dev/null | awk 'NR == 1 { print $4 }'
-  fi
-}
-
-# Every socket currently listening on $PORT, one per line — plural counterpart
-# to listener_address() above, needed once --lan-view can put two sockets
-# (loopback + the sanctioned LAN ip) on the same port.
+# Every socket currently listening on $PORT, one per line — plural because
+# --lan-view can put two sockets (loopback + the sanctioned LAN ip) on the
+# same port; doctor's "bind:" line and listener_mode() below both need every
+# one, not just the first `ss` happens to report.
 listener_addresses() {
   if command -v ss >/dev/null 2>&1; then
     ss -H -ltn "sport = :${PORT}" 2>/dev/null | awk '{print $4}' | sort -u
@@ -237,14 +232,14 @@ record_runtime_state() {
 }
 
 doctor() {
-  local result=0 address mode recorded_mode protocol pid target token_mode modified now age
+  local result=0 addresses mode recorded_mode protocol pid target token_mode modified now age
   echo "Git-Vista doctor (no secrets printed)"
   echo "  checkout: $REPO"
   echo "  Git: $(git --version 2>&1 || echo unavailable)"
 
-  address="$(listener_address)"
+  addresses="$(listener_addresses | paste -sd, -)"
   mode="$(listener_mode)"
-  echo "  bind: ${address:-not detected} (${mode})"
+  echo "  bind: ${addresses:-not detected} (${mode})"
   if [[ $mode == exposed ]]; then
     echo "  SECURITY ERROR: port ${PORT} is reachable on a non-loopback interface."
     result=1
@@ -487,7 +482,11 @@ fi
 
 setsid "$SERVER_BIN" "$TARGET" >>"$LOG" 2>&1 </dev/null &
 SERVER_PID=$!
-record_runtime_state "$SERVER_PID" loopback "$TARGET" "$LAN_IP"
+LAUNCH_MODE=loopback
+if [[ $LAN_VIEW -eq 1 ]]; then
+  LAUNCH_MODE=lan_view
+fi
+record_runtime_state "$SERVER_PID" "$LAUNCH_MODE" "$TARGET" "$LAN_IP"
 
 echo "gv: visualising $TARGET"
 for _ in $(seq 1 40); do
@@ -496,7 +495,7 @@ for _ in $(seq 1 40); do
     if [[ $LIVE_MODE == exposed ]]; then
       echo "gv: SECURITY ERROR: server opened a non-loopback listener; stopping it." >&2
       stop_pid "$SERVER_PID"
-      rm -f "$PID_FILE" "$MODE_FILE" "$TARGET_FILE"
+      rm -f "$PID_FILE" "$MODE_FILE" "$TARGET_FILE" "$LAN_FILE"
       exit 1
     fi
     echo "gv: server up in loopback/SSH mode — http://127.0.0.1:${PORT}/"
@@ -516,5 +515,5 @@ done
 echo "gv: server did not come up — last log lines:" >&2
 tail -n 20 "$LOG" >&2
 stop_pid "$SERVER_PID"
-rm -f "$PID_FILE" "$MODE_FILE" "$TARGET_FILE"
+rm -f "$PID_FILE" "$MODE_FILE" "$TARGET_FILE" "$LAN_FILE"
 exit 1
