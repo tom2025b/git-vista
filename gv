@@ -11,6 +11,8 @@
 #   gv --token          print a fresh one-time localhost sign-in link
 #   gv --stop           stop the server owned by this checkout
 #   gv --seed [path]    record a TEST repository reset point
+#   gv --root <dir>     also serve every repo directly under <dir> (the in-app
+#                       picker lists them; e.g. --root ~/projects)
 #
 # A setup token lives only in a URL fragment (`#s=...`), is single-use, and is
 # exchanged for an HttpOnly session cookie. Run `gv --token` again for each new
@@ -267,9 +269,19 @@ fi
 
 TARGET=""
 SEED=0
+REPO_ROOT=""
+NEXT_IS_ROOT=0
 for arg in "$@"; do
+  if [[ $NEXT_IS_ROOT -eq 1 ]]; then
+    REPO_ROOT="$arg"
+    NEXT_IS_ROOT=0
+    continue
+  fi
   case "$arg" in
     --seed) SEED=1 ;;
+    # ADR 0009: one deliberate repos root; the server scans its direct children.
+    --root) NEXT_IS_ROOT=1 ;;
+    --root=*) REPO_ROOT="${arg#--root=}" ;;
     --lan)
       echo "gv: --lan is disabled; Git-Vista only listens on 127.0.0.1:${PORT}." >&2
       echo "gv: use an SSH local-port forward for iPad access." >&2
@@ -302,6 +314,14 @@ for arg in "$@"; do
     *) TARGET="$arg" ;;
   esac
 done
+if [[ $NEXT_IS_ROOT -eq 1 ]]; then
+  echo "gv: --root needs a directory" >&2
+  exit 2
+fi
+if [[ -n $REPO_ROOT && ! -d $REPO_ROOT ]]; then
+  echo "gv: --root: no such directory: $REPO_ROOT" >&2
+  exit 2
+fi
 TARGET="${TARGET:-$START_DIR}"
 
 TARGET="$(cd "$TARGET" 2>/dev/null && pwd)" || {
@@ -347,6 +367,10 @@ fi
 mkdir -p "$LOG_DIR"
 echo "=== gv start $(date '+%F %T') — visualising $TARGET" >>"$LOG"
 export GIT_VISTA_BIND_ADDR="127.0.0.1:${PORT}"
+# ADR 0009: env form so systemd units can set the same root without the flag.
+if [[ -n $REPO_ROOT ]]; then
+  export GIT_VISTA_REPO_ROOT="$REPO_ROOT"
+fi
 
 setsid "$SERVER_BIN" "$TARGET" >>"$LOG" 2>&1 </dev/null &
 SERVER_PID=$!
