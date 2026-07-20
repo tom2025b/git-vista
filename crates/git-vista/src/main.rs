@@ -47,6 +47,9 @@ mod dialogs;
 mod gestures;
 #[cfg(target_arch = "wasm32")]
 mod menu;
+// The repo picker + Visualize/Active mode screens (ADR 0006/0009).
+#[cfg(target_arch = "wasm32")]
+mod picker;
 #[cfg(target_arch = "wasm32")]
 mod prefs;
 #[cfg(target_arch = "wasm32")]
