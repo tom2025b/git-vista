@@ -196,6 +196,9 @@ impl Catalog {
                 kind: kind_to_protocol(e.kind),
                 read_only: e.read_only,
                 path: expose_paths.then(|| e.path.display().to_string()),
+                // Populated with the real origin web base by the repo-picker
+                // work's catalog change; None until an entry records one.
+                remote_web_url: None,
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name).then(a.worktree.cmp(&b.worktree)));
