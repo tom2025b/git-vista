@@ -512,7 +512,10 @@ mod tests {
         // …and the clone itself now deletes: directory gone, id fails closed.
         assert_eq!(delete_clone(clone_wt, &clones), DeleteCloneOutcome::Deleted);
         assert!(!clone_dir.exists(), "the clone directory was removed");
-        assert_eq!(delete_clone(clone_wt, &clones), DeleteCloneOutcome::NotFound);
+        assert_eq!(
+            delete_clone(clone_wt, &clones),
+            DeleteCloneOutcome::NotFound
+        );
     }
 
     #[test]
@@ -563,7 +566,11 @@ mod tests {
     #[test]
     fn clones_root_uses_xdg_data_home_when_set() {
         assert_eq!(
-            resolve_clones_root(None, Some(PathBuf::from("/xdg")), Some(PathBuf::from("/home/u"))),
+            resolve_clones_root(
+                None,
+                Some(PathBuf::from("/xdg")),
+                Some(PathBuf::from("/home/u"))
+            ),
             PathBuf::from("/xdg/git-vista/clones")
         );
     }

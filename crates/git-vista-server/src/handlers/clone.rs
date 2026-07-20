@@ -11,7 +11,9 @@ use axum::http::StatusCode;
 use axum::Json;
 
 use git_vista_core::identity::WorktreeId;
-use git_vista_protocol::{validate_clone_url, CloneRequest, DeleteCloneRequest, RepositoryDescriptor};
+use git_vista_protocol::{
+    validate_clone_url, CloneRequest, DeleteCloneRequest, RepositoryDescriptor,
+};
 
 use crate::state::{
     allow_repo_root, cleanup_clone, clones_root, delete_clone, descriptor_for, path_is_allowed,
@@ -180,17 +182,13 @@ pub(crate) async fn clone_repo(
 /// (fail closed, like the reads); a repo that isn't a clone → 400; the
 /// currently open repo → 409. The guard is [`crate::state::delete_clone`]:
 /// nothing outside the canonical clones root is ever removed.
-pub(crate) async fn delete_clone_repo(
-    Json(req): Json<DeleteCloneRequest>,
-) -> (StatusCode, String) {
+pub(crate) async fn delete_clone_repo(Json(req): Json<DeleteCloneRequest>) -> (StatusCode, String) {
     let worktree: WorktreeId = match req.worktree.parse() {
         Ok(id) => id,
         Err(_) => return (StatusCode::BAD_REQUEST, "Not a repository id.".to_string()),
     };
     match delete_clone(worktree, &clones_root()) {
-        DeleteCloneOutcome::NotFound => {
-            (StatusCode::NOT_FOUND, "No such repository.".to_string())
-        }
+        DeleteCloneOutcome::NotFound => (StatusCode::NOT_FOUND, "No such repository.".to_string()),
         DeleteCloneOutcome::NotAClone => (
             StatusCode::BAD_REQUEST,
             "Not a clone — only cloned repositories can be deleted.".to_string(),
@@ -233,7 +231,10 @@ mod tests {
             clone_dir_name("https://host/repo.git?ref=main#frag"),
             Some("repo".to_string())
         );
-        assert_eq!(clone_dir_name("https://host/we ird$name"), Some("weirdname".to_string()));
+        assert_eq!(
+            clone_dir_name("https://host/we ird$name"),
+            Some("weirdname".to_string())
+        );
     }
 
     #[test]
