@@ -394,6 +394,23 @@ pub fn App() -> impl IntoView {
                                                 {format!(" {b}")}
                                             </span>
                                         })}
+                                        // Forge repo link (ADR 0010): out to wherever
+                                        // this repo's origin lives, any host.
+                                        {g.remote_web_url.clone().map(|base| {
+                                            let host =
+                                                git_vista_core::forge::host_label(&base);
+                                            view! {
+                                                <a
+                                                    class="repo-link"
+                                                    href=base
+                                                    target="_blank"
+                                                    rel="noopener"
+                                                    style="margin-left:8px; font-size:0.85em;"
+                                                >
+                                                    {format!("view on {host} ↗")}
+                                                </a>
+                                            }
+                                        })}
                                     </p>
                                 })}
                                 {print_graph_view(g.clone(), print_graph_open, nerd_icons)}
