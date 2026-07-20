@@ -23,13 +23,17 @@ pub fn picker_view(
     open_url: RwSignal<bool>,
     clone_url: RwSignal<String>,
     open_opened_at: StoredValue<f64>,
+    reload: RwSignal<u32>,
 ) -> impl IntoView {
     // Refetch every time the picker opens (and after a rescan) — the catalog
     // changes at runtime (clones, rescans), so a cached list would mislead.
+    // Also keyed on `reload`: the picker opens on load BEFORE the session
+    // lands, so its first fetch 401s; the session effect's reload bump retries
+    // it (the same recovery the graph/status reads use).
     let bump = create_rw_signal(0u32);
     let catalog = create_local_resource(
-        move || (open.get(), bump.get()),
-        |(is_open, _)| async move {
+        move || (open.get(), bump.get(), reload.get()),
+        |(is_open, _, _)| async move {
             if is_open {
                 Some(fetch_catalog().await)
             } else {
