@@ -614,7 +614,10 @@ pub async fn select_request(worktree: &str, mode: RepoMode) -> Result<(), String
 /// Re-scan the configured repo root (`POST /api/rescan`, ADR 0009). `Ok` carries
 /// the server's one-line summary for the picker to show.
 pub async fn rescan_request() -> Result<String, String> {
-    let resp = req_post("/api/rescan").send().await.map_err(network_error)?;
+    let resp = req_post("/api/rescan")
+        .send()
+        .await
+        .map_err(network_error)?;
     if resp.ok() {
         Ok(resp.text().await.unwrap_or_default())
     } else {

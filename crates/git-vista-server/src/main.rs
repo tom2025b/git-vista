@@ -62,6 +62,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
+use git_vista_protocol::RepoMode;
 use handlers::branch::{
     checkout_branch, create_branch, delete_branch, force_delete_branch, merge_branch, push_branch,
 };
@@ -77,7 +78,6 @@ use handlers::select::{rescan, select_repo};
 use handlers::session::{create_session, revoke_session, session_status};
 use security::{AuthState, HostPolicy};
 use session::{SessionManager, BOOTSTRAP_REFRESH_INTERVAL};
-use git_vista_protocol::RepoMode;
 use state::{
     bind_addr, bootstrap_token_path, clones_root, current, set_current, DEFAULT_REPO, DIST_DIR,
     PORT,

@@ -359,10 +359,7 @@ mod tests {
 
         set_current(&repo, RepoMode::Active);
         assert_eq!(current_mode(), RepoMode::Active);
-        assert!(
-            reject_if_read_only().is_none(),
-            "active mode allows writes"
-        );
+        assert!(reject_if_read_only().is_none(), "active mode allows writes");
         assert!(!current().1);
 
         let wt = current_handle().expect("registered").worktree;
