@@ -16,7 +16,7 @@
 
 use leptos::*;
 
-use crate::api::{get_session, post_session, set_csrf_token};
+use crate::api::{get_session, post_session, set_csrf_token, set_via_lan};
 
 /// Establish the session on load. Returns `Ok(true)` when authenticated (cookie is
 /// live and the CSRF token is recorded), `Ok(false)` when the app needs the
@@ -27,6 +27,7 @@ pub async fn establish_session() -> Result<bool, String> {
     if let Some(token) = take_bootstrap_token() {
         if let Ok(info) = post_session(&token).await {
             set_csrf_token(info.csrf.clone());
+            set_via_lan(info.via_lan);
             return Ok(info.authenticated);
         }
         // The token was invalid or already spent — fall through to see whether a
@@ -34,6 +35,7 @@ pub async fn establish_session() -> Result<bool, String> {
     }
     let info = get_session().await?;
     set_csrf_token(info.csrf.clone());
+    set_via_lan(info.via_lan);
     Ok(info.authenticated)
 }
 

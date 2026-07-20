@@ -251,16 +251,18 @@ pub fn mode_view(
                         >
                             "Visualize — look only, with links out"
                         </button>
-                        <button
-                            style="display:block; width:100%; padding:16px; margin:8px 0; \
-                                   font:inherit; font-size:1.05em; color:#fff; \
-                                   background:#238636; border:1px solid #2ea043; \
-                                   border-radius:8px;"
-                            disabled=move || busy.get()
-                            on:click=choose(RepoMode::Active)
-                        >
-                            "Active — full git operations"
-                        </button>
+                        {(!crate::api::is_lan_session()).then(|| view! {
+                            <button
+                                style="display:block; width:100%; padding:16px; margin:8px 0; \
+                                       font:inherit; font-size:1.05em; color:#fff; \
+                                       background:#238636; border:1px solid #2ea043; \
+                                       border-radius:8px;"
+                                disabled=move || busy.get()
+                                on:click=choose(RepoMode::Active)
+                            >
+                                "Active — full git operations"
+                            </button>
+                        })}
                         {move || {
                             (!err.get().is_empty()).then(|| {
                                 view! {
