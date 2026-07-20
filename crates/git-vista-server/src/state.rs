@@ -175,6 +175,15 @@ pub(crate) fn catalog_descriptors() -> Vec<RepositoryDescriptor> {
         .descriptors(expose_paths())
 }
 
+/// The capability descriptor for one registered worktree — the clone handler's
+/// success body (ADR 0008) — or `None` for an id the catalog does not hold.
+pub(crate) fn descriptor_for(worktree: WorktreeId) -> Option<RepositoryDescriptor> {
+    catalog()
+        .read()
+        .expect("catalog lock")
+        .descriptor_of(worktree, expose_paths())
+}
+
 /// The repository the server is currently serving *by default* — the selection a
 /// request with no explicit `?repo=` id acts on. Mutable at runtime: starts at
 /// the CLI-arg repo (Active — the user's own working repo), `POST /api/clone`
@@ -251,7 +260,7 @@ pub(crate) fn current_handle() -> Option<RepositoryHandle> {
 /// If the path won't classify as a git repository, the server drops to degraded
 /// mode: the selection is still set (so the reads run and surface git's own
 /// error, as before this module), but with no catalog entry and no handle.
-pub(crate) fn set_current(path: &Path, mode: RepoMode) {
+pub(crate) fn set_current(path: &Path, mode: RepoMode) -> Option<RepositoryHandle> {
     let registered = {
         let mut c = catalog().write().expect("catalog lock");
         // Trusted selection: allow its own root so a repo launched from anywhere
@@ -272,6 +281,7 @@ pub(crate) fn set_current(path: &Path, mode: RepoMode) {
                 None => path.to_path_buf(),
             };
             set_current_resolved(path, mode, Some(handle));
+            Some(handle)
         }
         Err(e) => {
             eprintln!(
@@ -280,6 +290,7 @@ pub(crate) fn set_current(path: &Path, mode: RepoMode) {
                 path.display()
             );
             set_current_resolved(path.to_path_buf(), mode, None);
+            None
         }
     }
 }
