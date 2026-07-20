@@ -281,11 +281,39 @@ pub(crate) fn select_registered(worktree: WorktreeId, mode: RepoMode) -> bool {
     }
 }
 
-/// Parent directory that holds every throwaway clone, under the OS temp dir. A
-/// clone's temp dir is created here, and cleanup refuses to delete anything that
-/// isn't under this root — so a bug can never `rm` a real repository.
+/// Parent directory that holds every persistent clone (ADR 0008):
+/// `GIT_VISTA_CLONES_ROOT` override, else `$XDG_DATA_HOME/git-vista/clones`,
+/// else `~/.local/share/git-vista/clones`. Clones live here across restarts;
+/// deletion refuses anything that doesn't canonicalize inside this root — so a
+/// bug can never `rm` a real repository.
 pub(crate) fn clones_root() -> PathBuf {
-    std::env::temp_dir().join("git-vista-clones")
+    resolve_clones_root(
+        std::env::var_os("GIT_VISTA_CLONES_ROOT").map(PathBuf::from),
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// The pure resolution behind [`clones_root`], parameterised so tests never
+/// read or write process env — the same pattern as `parse_bind_addr`. Empty
+/// values count as unset (a systemd unit with `Environment=X=` must not send
+/// clones to `/git-vista/clones`).
+fn resolve_clones_root(
+    override_root: Option<PathBuf>,
+    xdg_data_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(root) = override_root.filter(|p| !p.as_os_str().is_empty()) {
+        return root;
+    }
+    let base = xdg_data_home
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            home.filter(|p| !p.as_os_str().is_empty())
+                .map(|h| h.join(".local/share"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("git-vista-data"));
+    base.join("git-vista").join("clones")
 }
 
 /// This user's git-vista state directory — `$XDG_STATE_HOME/git-vista`, or
@@ -406,5 +434,47 @@ mod tests {
     fn bind_address_rejects_invalid_configuration() {
         let error = parse_bind_addr(Some("not-an-address")).unwrap_err();
         assert!(error.contains("invalid GIT_VISTA_BIND_ADDR"));
+    }
+
+    // --- clones root resolution (ADR 0008) ---------------------------------
+
+    #[test]
+    fn clones_root_prefers_the_explicit_override() {
+        assert_eq!(
+            resolve_clones_root(
+                Some(PathBuf::from("/custom/clones")),
+                Some(PathBuf::from("/xdg")),
+                Some(PathBuf::from("/home/u")),
+            ),
+            PathBuf::from("/custom/clones")
+        );
+    }
+
+    #[test]
+    fn clones_root_uses_xdg_data_home_when_set() {
+        assert_eq!(
+            resolve_clones_root(None, Some(PathBuf::from("/xdg")), Some(PathBuf::from("/home/u"))),
+            PathBuf::from("/xdg/git-vista/clones")
+        );
+    }
+
+    #[test]
+    fn clones_root_falls_back_to_dot_local_share() {
+        assert_eq!(
+            resolve_clones_root(None, None, Some(PathBuf::from("/home/u"))),
+            PathBuf::from("/home/u/.local/share/git-vista/clones")
+        );
+    }
+
+    #[test]
+    fn clones_root_treats_empty_values_as_unset() {
+        assert_eq!(
+            resolve_clones_root(
+                Some(PathBuf::from("")),
+                Some(PathBuf::from("")),
+                Some(PathBuf::from("/home/u")),
+            ),
+            PathBuf::from("/home/u/.local/share/git-vista/clones")
+        );
     }
 }

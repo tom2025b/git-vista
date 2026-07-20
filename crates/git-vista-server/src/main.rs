@@ -78,10 +78,7 @@ use handlers::select::{rescan, select_repo};
 use handlers::session::{create_session, revoke_session, session_status};
 use security::{AuthState, HostPolicy};
 use session::{SessionManager, BOOTSTRAP_REFRESH_INTERVAL};
-use state::{
-    bind_addr, bootstrap_token_path, clones_root, current, set_current, DEFAULT_REPO, DIST_DIR,
-    PORT,
-};
+use state::{bind_addr, bootstrap_token_path, current, set_current, DEFAULT_REPO, DIST_DIR, PORT};
 
 #[tokio::main]
 async fn main() {
@@ -117,21 +114,6 @@ async fn main() {
     // picker can offer them. No root configured → exactly the old behavior.
     if let Some((registered, skipped)) = state::scan_repo_root() {
         println!("git-vista: repo root scan: {registered} registered, {skipped} skipped");
-    }
-
-    // Phase 13: clear any throwaway clones left behind by a previous run. A prior
-    // launcher/process interruption may not have cleaned its last Phase 12 clone,
-    // which would otherwise pile up under the temp dir across runs.
-    // Nothing is being served from there yet at startup, so removing the whole
-    // clones root is safe; the next clone recreates it.
-    let clones = clones_root();
-    if clones.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&clones) {
-            eprintln!(
-                "git-vista: couldn't clear old clones at {}: {e}",
-                clones.display()
-            );
-        }
     }
 
     // Warn early if the SPA hasn't been built — otherwise every page is a 404
