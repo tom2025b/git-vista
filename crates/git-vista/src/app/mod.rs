@@ -358,7 +358,7 @@ pub fn App() -> impl IntoView {
             {dialogs::reset_repo_view(reset_open, reset_opened_at, reload)}
             // The repo picker + mode screens (ADR 0006): blocking overlays under
             // the sign-in/protocol screens, over everything else.
-            {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, open_opened_at)}
+            {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, open_opened_at, reload)}
             {crate::picker::mode_view(mode_for, picker_open, reload)}
             <section class="graph">
                 {move || {
