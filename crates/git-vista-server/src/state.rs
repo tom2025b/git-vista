@@ -127,6 +127,27 @@ pub(crate) fn resolve_worktree(worktree: WorktreeId) -> Option<(PathBuf, bool, R
         .map(|e| (e.path.clone(), e.read_only, e.handle))
 }
 
+/// The operator-configured repos root (ADR 0009): `GIT_VISTA_REPO_ROOT`, set by
+/// `gv --root <dir>` (env form so systemd units can set it too). None = the
+/// feature is off and only the launch repo + clones are served.
+pub(crate) fn repo_root() -> Option<PathBuf> {
+    std::env::var_os("GIT_VISTA_REPO_ROOT")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Scan the configured root into the catalog (startup and `POST /api/rescan`).
+/// `None` = no root configured; `Some((registered, skipped))` otherwise.
+pub(crate) fn scan_repo_root() -> Option<(usize, usize)> {
+    let root = repo_root()?;
+    Some(
+        catalog()
+            .write()
+            .expect("catalog lock")
+            .scan_direct_children(&root),
+    )
+}
+
 /// The capability view of the catalog for `GET /api/catalog`: the servable
 /// repositories addressed by opaque id, with absolute paths included only when
 /// the operator opted in ([`expose_paths`]).
