@@ -62,8 +62,16 @@ loopback server **plus a second listener** with these properties:
 - Two listeners with different capability sets; the session response tells
   the client which listener served it, and the client's mode screen offers
   Visualize only on LAN.
-- New wire tests: write route on the LAN listener → 404; wrong Host → 403;
-  repeated LAN sign-ins hit the rate limit.
+- New wire tests: write route on the LAN listener never reaches a handler
+  (proven directly against the route table: `main.rs::the_lan_router_has_no_write_routes`);
+  wrong Host → 403; repeated LAN sign-ins hit the rate limit.
+- **Implementation note (live-verified 2026-07-20):** hitting an absent write
+  path through the real server (not the bare route table) surfaces as `405
+  Method Not Allowed` for a `POST`, not `404` — the request falls through to
+  the static SPA fallback (`ServeDir`), which rejects non-GET/HEAD methods
+  before it would even 404 on a missing file. The security property is
+  identical either way (no handler runs, nothing mutates); only the exact
+  status code differs from what this ADR originally predicted.
 - The startup banner must display bound interfaces (model requirement).
 - Loopback behavior without `--lan-view` is exactly M1.05's: nothing changes
   for existing users.
