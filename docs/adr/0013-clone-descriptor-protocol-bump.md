@@ -1,6 +1,6 @@
 # ADR 0013 — Protocol v2 for the clone response; `set_current` returns its own handle
 
-- **Status:** Accepted — implementation pending (`feature/persistent-clones`)
+- **Status:** Accepted — implemented 2026-07-19 (`feature/persistent-clones`, #121)
 - **Date:** 2026-07-20
 - **Milestone / issue:** #121 persistent-clones — surfaced during adversarial
   review of the implementation plan
