@@ -172,6 +172,32 @@ pub fn detail_panel_view(
                             .into_view(),
                             None => ().into_view(),
                         };
+                        // Non-GitHub forge link (ADR 0010): same pushed-commit
+                        // gating, shown only when there's no GitHub base so it
+                        // never doubles the row above.
+                        let forge_row = ctx.with_value(|c| {
+                            if c.repo_url.is_some() {
+                                return None;
+                            }
+                            c.graph.remote_web_url.as_ref().and_then(|base| {
+                                c.remote_set.contains(&d.id.0).then(|| {
+                                    let url =
+                                        git_vista_core::forge::commit_url(base, &d.id.0);
+                                    let host = git_vista_core::forge::host_label(base);
+                                    view! {
+                                        <a
+                                            class="detail-github"
+                                            href=url
+                                            target="_blank"
+                                            rel="noopener"
+                                        >
+                                            <span class="nf ctx-icon">{ic.github}</span>
+                                            {format!("View commit on {host}")}
+                                        </a>
+                                    }
+                                })
+                            })
+                        });
                         view! {
                             <div class="detail-field">
                                 <span class="detail-key">"Commit"</span>
@@ -192,6 +218,7 @@ pub fn detail_panel_view(
                                 <span class="detail-parents">{parents}</span>
                             </div>
                             {github_row}
+                            {forge_row}
                             <pre class="detail-msg">{d.message.clone()}</pre>
                         }
                         .into_view()

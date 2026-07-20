@@ -102,10 +102,11 @@ pub(crate) async fn clone_repo(Json(req): Json<CloneRequest>) -> (StatusCode, St
         );
     }
 
-    // Switch to the fresh clone (read-only), then delete the previous one, if it
-    // was itself a clone — so disk holds at most one clone at a time.
+    // Switch to the fresh clone (Visualize — look-only until the operator picks
+    // a mode for it), then delete the previous one, if it was itself a clone —
+    // so disk holds at most one clone at a time.
     let (old_path, old_read_only) = current();
-    set_current(&dest, true);
+    set_current(&dest, git_vista_protocol::RepoMode::Visualize);
     if old_read_only {
         cleanup_clone(&old_path);
     }

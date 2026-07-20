@@ -114,6 +114,9 @@ pub(crate) struct RepoEntry {
     pub(crate) kind: WorktreeKind,
     /// View-only (a clone opened from a URL): every mutation is refused.
     pub(crate) read_only: bool,
+    /// Normalized web base of the repo's origin remote (ADR 0010), read once at
+    /// registration. `None` = no usable remote.
+    pub(crate) remote_web_url: Option<String>,
 }
 
 /// The registry mapping opaque [`WorktreeId`]s to the repositories the server may
@@ -161,6 +164,7 @@ impl Catalog {
             return Err(CatalogError::OutsideAllowedRoots);
         }
         let handle = facts.handle;
+        let remote_web_url = git_vista_git::remote_web_base(&facts.root);
         self.entries.insert(
             handle.worktree,
             RepoEntry {
@@ -169,6 +173,7 @@ impl Catalog {
                 name: facts.name,
                 kind: facts.kind,
                 read_only,
+                remote_web_url,
             },
         );
         Ok(handle)
@@ -179,6 +184,38 @@ impl Catalog {
     /// forged id takes.
     pub(crate) fn resolve(&self, worktree: WorktreeId) -> Option<&RepoEntry> {
         self.entries.get(&worktree)
+    }
+
+    /// Scan `root`'s DIRECT children (ADR 0009: one deliberate root, no
+    /// recursion) and register every valid git repository, allowing `root`
+    /// first. Junk children are skipped and logged; a missing/unreadable root
+    /// is a warning and an empty scan — the server stays healthy rather than
+    /// failing startup over a config typo. Returns (registered, skipped dirs).
+    pub(crate) fn scan_direct_children(&mut self, root: &Path) -> (usize, usize) {
+        let entries = match std::fs::read_dir(root) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("git-vista: repo root {} not scanned: {e}", root.display());
+                return (0, 0);
+            }
+        };
+        self.allow_root(root);
+        let (mut registered, mut skipped) = (0, 0);
+        let mut children: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_dir())
+            .collect();
+        children.sort(); // stable scan/log order
+        for child in children {
+            match self.register(&child, false) {
+                Ok(_) => registered += 1,
+                Err(e) => {
+                    skipped += 1;
+                    eprintln!("git-vista: skipping {} ({e})", child.display());
+                }
+            }
+        }
+        (registered, skipped)
     }
 
     /// The capability view of the catalog: one [`RepositoryDescriptor`] per entry,
@@ -196,6 +233,7 @@ impl Catalog {
                 kind: kind_to_protocol(e.kind),
                 read_only: e.read_only,
                 path: expose_paths.then(|| e.path.display().to_string()),
+                remote_web_url: e.remote_web_url.clone(),
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name).then(a.worktree.cmp(&b.worktree)));
@@ -333,6 +371,37 @@ mod tests {
         // An id for a repository the catalog never registered resolves to nothing.
         let stranger = WorktreeId::from_git_dir("/nowhere/.git/worktrees/ghost");
         assert!(catalog.resolve(stranger).is_none());
+    }
+
+    // --- root scan (ADR 0009) ----------------------------------------------
+
+    #[test]
+    fn scan_registers_direct_child_repos_and_skips_junk() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(&root.path().join("repo-a"));
+        init_repo(&root.path().join("repo-b"));
+        std::fs::create_dir_all(root.path().join("not-a-repo")).unwrap();
+        std::fs::write(root.path().join("stray-file.txt"), "x").unwrap();
+        // A repo one level deeper must NOT register (direct children only).
+        init_repo(&root.path().join("not-a-repo/nested"));
+
+        let mut catalog = Catalog::new();
+        let (registered, skipped) = catalog.scan_direct_children(root.path());
+        assert_eq!(registered, 2);
+        assert_eq!(skipped, 1, "the non-repo dir is skipped; files don't count");
+        let names: Vec<String> = catalog
+            .descriptors(false)
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert_eq!(names, vec!["repo-a", "repo-b"]);
+    }
+
+    #[test]
+    fn scan_of_a_missing_root_is_a_soft_zero_not_a_panic() {
+        let mut catalog = Catalog::new();
+        let (registered, skipped) = catalog.scan_direct_children(Path::new("/no/such/dir"));
+        assert_eq!((registered, skipped), (0, 0));
     }
 
     // --- descriptors: no path by default -----------------------------------

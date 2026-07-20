@@ -13,7 +13,7 @@ use std::sync::{OnceLock, RwLock};
 use axum::http::StatusCode;
 
 use git_vista_core::identity::{RepositoryHandle, WorktreeId};
-use git_vista_protocol::RepositoryDescriptor;
+use git_vista_protocol::{RepoMode, RepositoryDescriptor};
 
 use crate::catalog::Catalog;
 
@@ -127,6 +127,27 @@ pub(crate) fn resolve_worktree(worktree: WorktreeId) -> Option<(PathBuf, bool, R
         .map(|e| (e.path.clone(), e.read_only, e.handle))
 }
 
+/// The operator-configured repos root (ADR 0009): `GIT_VISTA_REPO_ROOT`, set by
+/// `gv --root <dir>` (env form so systemd units can set it too). None = the
+/// feature is off and only the launch repo + clones are served.
+pub(crate) fn repo_root() -> Option<PathBuf> {
+    std::env::var_os("GIT_VISTA_REPO_ROOT")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Scan the configured root into the catalog (startup and `POST /api/rescan`).
+/// `None` = no root configured; `Some((registered, skipped))` otherwise.
+pub(crate) fn scan_repo_root() -> Option<(usize, usize)> {
+    let root = repo_root()?;
+    Some(
+        catalog()
+            .write()
+            .expect("catalog lock")
+            .scan_direct_children(&root),
+    )
+}
+
 /// The capability view of the catalog for `GET /api/catalog`: the servable
 /// repositories addressed by opaque id, with absolute paths included only when
 /// the operator opted in ([`expose_paths`]).
@@ -138,13 +159,15 @@ pub(crate) fn catalog_descriptors() -> Vec<RepositoryDescriptor> {
 }
 
 /// The repository the server is currently serving *by default* — the selection a
-/// request with no explicit `?repo=` id acts on. Mutable at runtime (Phase 12):
-/// starts at the CLI-arg repo (`read_only: false`, the user's own working repo),
-/// and `POST /api/clone` swaps it for a throwaway clone (`read_only: true`).
+/// request with no explicit `?repo=` id acts on. Mutable at runtime: starts at
+/// the CLI-arg repo (Active — the user's own working repo), `POST /api/clone`
+/// swaps it for a clone (Visualize), and `POST /api/select` moves it to any
+/// catalog entry in the mode the operator chose (ADR 0007).
 struct Current {
     path: PathBuf,
-    /// True for a cloned URL: a view-only snapshot, so the write endpoints refuse.
-    read_only: bool,
+    /// Visualize = look-only: every write handler refuses (ADR 0007). This
+    /// supersedes the old per-selection `read_only: bool` (Phase-12 clones).
+    mode: RepoMode,
     /// The opaque handle for this selection, when it registered in the catalog.
     /// `None` only in degraded mode (the path wouldn't classify as a repo), where
     /// the reads still run and surface git's own error.
@@ -153,12 +176,8 @@ struct Current {
 
 static CURRENT: OnceLock<RwLock<Current>> = OnceLock::new();
 
-fn set_current_resolved(path: PathBuf, read_only: bool, handle: Option<RepositoryHandle>) {
-    let value = Current {
-        path,
-        read_only,
-        handle,
-    };
+fn set_current_resolved(path: PathBuf, mode: RepoMode, handle: Option<RepositoryHandle>) {
+    let value = Current { path, mode, handle };
     if let Some(lock) = CURRENT.get() {
         *lock.write().expect("CURRENT lock not poisoned") = value;
     } else {
@@ -168,15 +187,28 @@ fn set_current_resolved(path: PathBuf, read_only: bool, handle: Option<Repositor
     }
 }
 
-/// Snapshot the current repo path and its read-only flag. Clones out of the lock
-/// immediately so no guard is ever held across an `.await`.
+/// Snapshot the current repo path and whether it is look-only. The bool keeps
+/// the old `read_only` meaning (`mode == Visualize`) so the many read-handler
+/// call sites stay untouched; write gating goes through [`current_mode`]/
+/// [`reject_if_read_only`]. Clones out of the lock immediately so no guard is
+/// ever held across an `.await`.
 pub(crate) fn current() -> (PathBuf, bool) {
     let g = CURRENT
         .get()
         .expect("CURRENT is set at startup")
         .read()
         .expect("CURRENT lock not poisoned");
-    (g.path.clone(), g.read_only)
+    (g.path.clone(), g.mode == RepoMode::Visualize)
+}
+
+/// The mode the current selection is open in (ADR 0006/0007).
+pub(crate) fn current_mode() -> RepoMode {
+    CURRENT
+        .get()
+        .expect("CURRENT is set at startup")
+        .read()
+        .expect("CURRENT lock not poisoned")
+        .mode
 }
 
 /// The opaque handle for the current default selection, or `None` in degraded
@@ -202,7 +234,7 @@ pub(crate) fn current_handle() -> Option<RepositoryHandle> {
 /// If the path won't classify as a git repository, the server drops to degraded
 /// mode: the selection is still set (so the reads run and surface git's own
 /// error, as before this module), but with no catalog entry and no handle.
-pub(crate) fn set_current(path: &Path, read_only: bool) {
+pub(crate) fn set_current(path: &Path, mode: RepoMode) {
     let registered = {
         let mut c = catalog().write().expect("catalog lock");
         // Trusted selection: allow its own root so a repo launched from anywhere
@@ -210,17 +242,19 @@ pub(crate) fn set_current(path: &Path, read_only: bool) {
         if let Ok(facts) = git_vista_git::read_repo_facts(path) {
             c.allow_root(&facts.root);
         }
-        c.register(path, read_only)
+        // The entry's read_only flag records "opened look-only" for the catalog
+        // report; the live write gate is the selection's mode (ADR 0007).
+        c.register(path, mode == RepoMode::Visualize)
     };
     match registered {
         Ok(handle) => {
             // Use the catalog's canonical path for the selection, so `current()`
             // and an explicit `?repo=<this id>` resolve to the very same path.
-            let (path, read_only) = match resolve_worktree(handle.worktree) {
-                Some((canonical, ro, _)) => (canonical, ro),
-                None => (path.to_path_buf(), read_only),
+            let path = match resolve_worktree(handle.worktree) {
+                Some((canonical, _, _)) => canonical,
+                None => path.to_path_buf(),
             };
-            set_current_resolved(path, read_only, Some(handle));
+            set_current_resolved(path, mode, Some(handle));
         }
         Err(e) => {
             eprintln!(
@@ -228,8 +262,22 @@ pub(crate) fn set_current(path: &Path, read_only: bool) {
                  /api/* reads will surface git's own error",
                 path.display()
             );
-            set_current_resolved(path.to_path_buf(), read_only, None);
+            set_current_resolved(path.to_path_buf(), mode, None);
         }
+    }
+}
+
+/// `POST /api/select` (ADR 0007): move the current selection to an id the
+/// catalog already holds, in `mode`. Returns false — and changes nothing — for
+/// an unknown or forged id: the handler turns that into a 404, the same
+/// fail-closed contract as the reads.
+pub(crate) fn select_registered(worktree: WorktreeId, mode: RepoMode) -> bool {
+    match resolve_worktree(worktree) {
+        Some((path, _, handle)) => {
+            set_current_resolved(path, mode, Some(handle));
+            true
+        }
+        None => false,
     }
 }
 
@@ -273,15 +321,15 @@ pub(crate) fn cleanup_clone(path: &Path) {
     }
 }
 
-/// Guard for the write endpoints (Phase 12): when the current repo is a read-only
-/// clone, refuse the operation with `403` and a clear reason, since any change
-/// would be thrown away with the clone. Returns `None` when writes are allowed.
+/// Guard for the write endpoints: in Visualize mode (ADR 0006/0007) the current
+/// selection is look-only, so every mutation is refused with `403` and a clear
+/// reason. Returns `None` when writes are allowed (Active mode).
 pub(crate) fn reject_if_read_only() -> Option<(StatusCode, String)> {
-    if current().1 {
+    if current_mode() == RepoMode::Visualize {
         Some((
             StatusCode::FORBIDDEN,
-            "This repository is a read-only clone opened from a URL. Open your own \
-             repo to make changes."
+            "This repository is open in Visualize mode — look-only. Reopen it in \
+             Active mode to make changes."
                 .to_string(),
         ))
     } else {
@@ -291,7 +339,43 @@ pub(crate) fn reject_if_read_only() -> Option<(StatusCode, String)> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::{parse_bind_addr, LOOPBACK_ADDR};
+
+    /// One test fn drives the CURRENT/CATALOG globals end-to-end — keeping every
+    /// global mutation in a single test means parallel test threads never fight
+    /// over the process-wide selection (no other test touches it).
+    #[test]
+    fn selection_flow_carries_mode_and_gates_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("project");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+
+        set_current(&repo, RepoMode::Active);
+        assert_eq!(current_mode(), RepoMode::Active);
+        assert!(reject_if_read_only().is_none(), "active mode allows writes");
+        assert!(!current().1);
+
+        let wt = current_handle().expect("registered").worktree;
+        assert!(select_registered(wt, RepoMode::Visualize));
+        assert_eq!(current_mode(), RepoMode::Visualize);
+        let (status, msg) = reject_if_read_only().expect("visualize refuses writes");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(msg.contains("Visualize"));
+        assert!(current().1, "compat bool mirrors visualize");
+
+        // A forged id changes nothing and reports failure (the 404 path).
+        let stranger =
+            git_vista_core::identity::WorktreeId::from_git_dir("/nowhere/.git/worktrees/ghost");
+        assert!(!select_registered(stranger, RepoMode::Active));
+        assert_eq!(current_mode(), RepoMode::Visualize);
+    }
 
     #[test]
     fn bind_address_defaults_to_loopback() {

@@ -122,6 +122,7 @@ pub fn stubs(
             });
             // The repo's GitHub base, for the menu's "Create Pull Request" link.
             let repo_url = c.repo_url.clone();
+            let remote_web_url = c.graph.remote_web_url.clone();
             let open_menu = move |ev: web_sys::MouseEvent| {
                 // Ignore the click that ends a pan; a real tap opens the menu.
                 if moved.get_value() {
@@ -143,6 +144,7 @@ pub fn stubs(
                     // …and its menu header shows the branch glyph, not the commit's.
                     is_branch: true,
                     repo_url: repo_url.clone(),
+                    remote_web_url: remote_web_url.clone(),
                 }));
             };
             view! {

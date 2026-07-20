@@ -128,6 +128,13 @@ pub struct Graph {
     /// after layout (the pure layout doesn't know about remotes).
     #[serde(default)]
     pub repo_url: Option<String>,
+    /// The origin remote normalized to a browsable https base for ANY forge host
+    /// (ADR 0010) — GitHub, GitLab, Codeberg, or a best-effort unknown host.
+    /// Unlike [`repo_url`](Self::repo_url) (GitHub-only, drives the pushed-commit
+    /// dot links) this powers the general "view on <host>" links. `None` => no
+    /// usable remote; those links are simply absent.
+    #[serde(default)]
+    pub remote_web_url: Option<String>,
     /// Commit ids (hex) reachable from a remote-tracking ref — i.e. the commits
     /// actually on the remote (GitHub). The UI links a commit/ref only when its
     /// commit is in this set, so links never point at unpushed objects that would
@@ -221,6 +228,14 @@ mod tests {
     #[test]
     fn short_hash_handles_tiny_ids() {
         assert_eq!(Oid("abc".into()).short(), "abc");
+    }
+
+    #[test]
+    fn graph_remote_web_url_defaults_when_absent_from_wire() {
+        // M1.02 contract rule: a new optional field must not break an older
+        // server's payload — absent on the wire deserializes to None.
+        let g: Graph = serde_json::from_str(r#"{"rows":[],"edges":[],"lane_count":0}"#).unwrap();
+        assert_eq!(g.remote_web_url, None);
     }
 
     #[test]

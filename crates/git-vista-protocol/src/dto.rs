@@ -67,6 +67,26 @@ pub struct CloneRequest {
     pub url: String,
 }
 
+/// Which experience a repository is opened in (ADR 0006/0007). `Visualize` is
+/// look-only: the server refuses every mutation while it is the current mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoMode {
+    Visualize,
+    Active,
+}
+
+/// Body of `POST /api/select` (ADR 0007): make the repository addressed by the
+/// opaque `worktree` id the current selection, opened in `mode`. The id resolves
+/// only through the server-owned catalog — an unknown/forged id is a 404, and
+/// like every request body this cannot carry a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectRequest {
+    pub worktree: String,
+    pub mode: RepoMode,
+}
+
 /// Body of a `POST /api/session` request (M1.04, #57): the one-time bootstrap
 /// `token` the SPA read from the `#s=<token>` URL fragment, exchanged for an
 /// HttpOnly session cookie. The only `/api` write body that legitimately carries
@@ -161,6 +181,11 @@ pub struct RepositoryDescriptor {
     /// into path exposure. Never sent by default; the client must not depend on it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub path: Option<String>,
+    /// The repo's `origin` remote normalized to a browsable https base URL
+    /// (ADR 0010), e.g. `"https://github.com/owner/repo"`. `None` when there is
+    /// no usable remote. Optional on the wire (M1.02 contract rule).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub remote_web_url: Option<String>,
 }
 
 /// Validate a URL a user pasted to clone, before the server hands it to
@@ -265,6 +290,35 @@ mod tests {
     }
 
     #[test]
+    fn select_request_roundtrips_and_rejects_unknown_fields() {
+        let req = SelectRequest {
+            worktree: "22222222-2222-5222-8222-222222222222".into(),
+            mode: RepoMode::Visualize,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(serde_json::from_str::<SelectRequest>(&json).unwrap(), req);
+        // No path smuggling on the select body either.
+        assert!(serde_json::from_str::<SelectRequest>(
+            r#"{"worktree":"w","mode":"active","path":"/etc"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn repo_mode_uses_stable_snake_case_wire_names() {
+        // Wire names are contract (like RepositoryKind's): pin them so a rename
+        // is a deliberate protocol change, never an accident.
+        assert_eq!(
+            serde_json::to_string(&RepoMode::Visualize).unwrap(),
+            "\"visualize\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RepoMode::Active).unwrap(),
+            "\"active\""
+        );
+    }
+
+    #[test]
     fn session_dtos_roundtrip_and_reject_unknown_fields() {
         let req = SessionRequest {
             token: "deadbeef".into(),
@@ -306,6 +360,7 @@ mod tests {
             kind: RepositoryKind::MainWorktree,
             read_only: false,
             path: None,
+            remote_web_url: None,
         };
         let json = serde_json::to_string(&d).unwrap();
         // A `None` path is skipped entirely — the wire form never carries the key,
@@ -313,6 +368,11 @@ mod tests {
         assert!(
             !json.contains("path"),
             "path must be omitted when None: {json}"
+        );
+        // Same for the optional forge base (ADR 0010 + M1.02 contract rule).
+        assert!(
+            !json.contains("remote_web_url"),
+            "remote_web_url must be omitted when None: {json}"
         );
         assert_eq!(
             serde_json::from_str::<RepositoryDescriptor>(&json).unwrap(),

@@ -446,6 +446,30 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     // (same reason as "Open on GitHub"). Shown only on a GitHub repo;
                     // omitted otherwise, since there's no compare page to point at.
                     let mut items = vec![checkout_item, merge_item, push_item];
+                    // Non-GitHub forge branch link (ADR 0010): only when there is
+                    // no GitHub base, so it never duplicates the GitHub items.
+                    if m.repo_url.is_none() {
+                        if let Some(base) = m.remote_web_url.as_ref() {
+                            let url = git_vista_core::forge::branch_url(base, &b);
+                            let host = git_vista_core::forge::host_label(base);
+                            let branch = b.clone();
+                            items.push(
+                                view! {
+                                    <a
+                                        class="ctx-item"
+                                        href=url
+                                        target="_blank"
+                                        rel="noopener"
+                                        on:click=move |_| menu.set(None)
+                                    >
+                                        <span class="nf ctx-icon">{ic.github}</span>
+                                        {format!("View ‘{branch}’ on {host}")}
+                                    </a>
+                                }
+                                .into_view(),
+                            );
+                        }
+                    }
                     if let Some(base) = m.repo_url.as_ref() {
                         let branch = b.clone();
                         let url = format!("{base}/compare/main...{branch}");
