@@ -76,6 +76,7 @@ use handlers::reset::reset_test_repo;
 use handlers::session::{create_session, revoke_session, session_status};
 use security::{AuthState, HostPolicy};
 use session::{SessionManager, BOOTSTRAP_REFRESH_INTERVAL};
+use git_vista_protocol::RepoMode;
 use state::{
     bind_addr, bootstrap_token_path, clones_root, current, set_current, DEFAULT_REPO, DIST_DIR,
     PORT,
@@ -107,9 +108,9 @@ async fn main() {
         );
         eprintln!("         /api/commits will error until it points at a real repo.\n");
     }
-    // The CLI-arg repo is the user's own working repo, so it's writable. This
+    // The CLI-arg repo is the user's own working repo, so it opens Active. This
     // registers it in the catalog (M1.03) and makes it the default selection.
-    set_current(&repo, false);
+    set_current(&repo, RepoMode::Active);
 
     // Phase 13: clear any throwaway clones left behind by a previous run. A prior
     // launcher/process interruption may not have cleaned its last Phase 12 clone,
