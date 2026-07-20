@@ -12,7 +12,10 @@ use crate::state::DIALOG_GUARD_MS;
 /// (NOT a void `<input>`, which panics the Leptos CSR node-walk on iOS WebKit)
 /// for the URL field. `cloning` disables the button while git works so a slow
 /// clone can't be fired twice; `open_opened_at` guards the backdrop against the
-/// iOS ghost-click, same trick as the commit modal.
+/// iOS ghost-click, same trick as the commit modal. Unlike the other `dialogs/*`
+/// modals (z-index 30), this one is also reachable from inside the open picker
+/// (ADR 0006's "Clone URL…" button, which doesn't close the picker) — its
+/// z-index must beat the picker's 900 or the picker intercepts every click.
 pub fn open_url_view(
     open_url: RwSignal<bool>,
     clone_url: RwSignal<String>,
@@ -51,7 +54,7 @@ pub fn open_url_view(
         open_url.get().then(|| view! {
         <div
             style="position:fixed; top:0; left:0; width:100vw; height:100vh; \
-                   z-index:30; display:flex; align-items:center; \
+                   z-index:910; display:flex; align-items:center; \
                    justify-content:center; background:rgba(1,4,9,0.6);"
             on:click=move |_| {
                 if js_sys::Date::now() - open_opened_at.get_value() > DIALOG_GUARD_MS {
