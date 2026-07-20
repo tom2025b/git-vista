@@ -57,7 +57,8 @@ checks, operation planning, and the per-worktree queue.
 |---|---|---|---|---|
 | Local | `127.0.0.1` | HTTP localhost | Launch/session secret + same-origin | Browser on the Linux/macOS/Windows host |
 | SSH tunnel | `127.0.0.1` on Linux | SSH encrypted forwarding | SSH plus Git-Vista session | Primary iPad-to-Linux workflow |
-| LAN paired | Explicit interface | HTTPS | One-time pairing and device session | Trusted private network without SSH tunnel |
+| LAN view | One explicit interface | Plain HTTP | Single-use bootstrap token, view-scoped read-only routes, rate-limited sign-in | Backup path when the SSH tunnel is unavailable, trusted home LAN only (ADR 0005) |
+| LAN paired, future | Explicit interface | HTTPS | One-time pairing and device session | Trusted private network without SSH tunnel, full read/write |
 | Team, future | Reverse proxy/private network | HTTPS | OIDC/passkeys plus RBAC | Explicit multi-user deployment, not V2 default |
 
 Modes are configuration profiles, not a boolean `--public` switch. Each profile
@@ -98,11 +99,48 @@ never a log); everything below is enforced by the `require_auth` layer.
   worktree, operation hash, and repository generation. *(Session/bootstrap expiry
   landed here; per-operation approval tokens are a later milestone.)*
 
-## LAN Mode
+## LAN View Profile (implemented, ADR 0005)
 
-No current LAN mode exists: the server is hard-limited to `127.0.0.1:8080`, and
-the earlier plain-HTTP `--lan` compatibility path was removed. Any future LAN
-mode is a separate paired-HTTPS profile, not a convenience switch, and must:
+`gv --lan-view [path]` starts the existing loopback server plus a second
+listener, bound to one explicit, operator-confirmed LAN IP:
+
+- The second listener serves a structurally reduced router: GET read routes
+  plus `POST`/`DELETE /api/session` only. Every write, `/api/select`,
+  `/api/rescan`, `/api/clone`, and `/api/delete-clone` route is never
+  registered on it — absence, not a runtime check (`crates/git-vista-server/
+  src/main.rs::api_router`).
+- `Host`/`Origin` on this listener are pinned to the one sanctioned LAN
+  IP:port (`security::HostPolicy::lan`); neither `localhost` nor any other
+  address the machine answers on is accepted, so a DNS-rebinding attempt
+  against the LAN listener fails closed the same way the loopback listener's
+  Host check does.
+- Sign-in (`POST /api/session`) on this listener is rate-limited per source
+  IP (`crates/git-vista-server/src/ratelimit.rs`); the loopback listener's
+  sign-in is unaffected.
+- Auth is otherwise the same single-use bootstrap-token flow as loopback,
+  sharing one in-memory session store; a session established via either
+  listener carries a `via_lan` flag purely so the UI can hide the Active
+  option — the actual write boundary is the LAN router's absent routes.
+- Accepted, documented risk: plain HTTP means repo contents and the session
+  cookie are readable by anyone on the same network. Suitable for a trusted
+  home LAN, never a guest or shared network — the startup banner and `gv
+  doctor` say so explicitly.
+- `gv doctor` and the launch-time exposed-listener kill-check learn the
+  sanctioned second socket: with `--lan-view`, exactly {loopback, the
+  recorded LAN ip} on port 8080 is healthy; anything else is still a
+  SECURITY ERROR that stops the server. Without the flag, behavior is
+  unchanged from M1.05.
+
+## LAN Mode (future, paired HTTPS — write-capable)
+
+The read-only LAN view profile above (ADR 0005) is what's implemented today;
+this section covers the *different*, still-future write-capable LAN mode —
+the "LAN paired" row in the Operating Modes table.
+
+No current *write-capable* LAN mode exists: the server is hard-limited to
+`127.0.0.1:8080` plus the read-only LAN view listener above, and the earlier
+plain-HTTP `--lan` compatibility path was removed. This future mode is a
+separate paired-HTTPS profile, not a convenience switch, and must:
 
 - Require HTTPS so service workers, credentials, and browser security semantics
   operate on a secure origin.
