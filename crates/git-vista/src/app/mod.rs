@@ -154,6 +154,25 @@ pub fn App() -> impl IntoView {
     // (crate::print), opened from the topbar, with Print / Save PDF.
     let print_graph_open = create_rw_signal(false);
 
+    // ADR 0006: ask every time — the repo picker opens on load (the sign-in and
+    // protocol overlays sit above it when they apply) and from the topbar
+    // "Repos" button. `mode_for` holds the repo awaiting a Visualize/Active
+    // choice; the mode screen renders whenever it's Some.
+    let picker_open = create_rw_signal(true);
+    let mode_for = create_rw_signal(None::<git_vista_protocol::RepositoryDescriptor>);
+
+    // Defense in depth (ADR 0007): mirror the loaded graph's mode into api.rs so
+    // write calls refuse client-side too. The server's 403 remains the boundary.
+    create_effect(move |_| {
+        if let Some(Ok(g)) = graph.get() {
+            crate::api::set_ui_mode(Some(if g.read_only {
+                git_vista_protocol::RepoMode::Visualize
+            } else {
+                git_vista_protocol::RepoMode::Active
+            }));
+        }
+    });
+
     view! {
         <main class="app">
             // M1.02: the blocking "Update Required" screen, shown (over everything
@@ -230,6 +249,48 @@ pub fn App() -> impl IntoView {
                 </button>
                 <button
                     class="refresh"
+                    on:click=move |_| picker_open.set(true)
+                    title="Open another repository — the launch repo, a repo from \
+                           the configured root, or a clone"
+                >
+                    "Repos"
+                </button>
+                // The mode badge (ADR 0006): which experience the current repo is
+                // open in; tapping it re-opens the mode screen for this repo.
+                {move || graph.get().and_then(|r| r.ok()).map(|g| {
+                    let (label, class) = if g.read_only {
+                        ("Visualize", "refresh mode-badge visualize")
+                    } else {
+                        ("Active", "refresh mode-badge active")
+                    };
+                    view! {
+                        <button
+                            class=class
+                            title="This repo's mode — tap to change it"
+                            on:click=move |_| {
+                                // Re-open the mode screen for the current repo by
+                                // synthesizing its descriptor from the graph stamp.
+                                // Absent ids (degraded mode) => no mode screen.
+                                if let Some(worktree) = g.worktree_id.clone() {
+                                    mode_for.set(Some(git_vista_protocol::RepositoryDescriptor {
+                                        repository: g.repo_id.clone().unwrap_or_default(),
+                                        worktree,
+                                        name: g.repo_label.clone()
+                                            .unwrap_or_else(|| "repository".into()),
+                                        kind: git_vista_protocol::RepositoryKind::MainWorktree,
+                                        read_only: g.read_only,
+                                        path: None,
+                                        remote_web_url: g.remote_web_url.clone(),
+                                    }));
+                                }
+                            }
+                        >
+                            {label}
+                        </button>
+                    }
+                })}
+                <button
+                    class="refresh"
                     on:click=move |_| {
                         clone_url.set(String::new());
                         open_opened_at.set_value(js_sys::Date::now());
@@ -295,6 +356,10 @@ pub fn App() -> impl IntoView {
             // The "Reset Test Repo" confirmation (only reachable via the gated
             // topbar button above).
             {dialogs::reset_repo_view(reset_open, reset_opened_at, reload)}
+            // The repo picker + mode screens (ADR 0006): blocking overlays under
+            // the sign-in/protocol screens, over everything else.
+            {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, open_opened_at)}
+            {crate::picker::mode_view(mode_for, picker_open, reload)}
             <section class="graph">
                 {move || {
                     // Read the icon set here, inside the reactive block, so the

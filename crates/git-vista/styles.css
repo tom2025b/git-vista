@@ -52,6 +52,11 @@ html, body {
 }
 
 .topbar h1 { margin: 0; font-size: 1.1rem; color: var(--accent); }
+
+/* The mode badge (ADR 0006): the current repo's Visualize/Active state, worn
+   like a .refresh button so it sits naturally in the topbar row. */
+.mode-badge.visualize { color: #58a6ff; }
+.mode-badge.active { color: #3fb950; }
 .subtitle { color: var(--muted); font-size: 0.85rem; }
 
 /* Issue #16: pull the current repo state (new branches/commits) without a full
