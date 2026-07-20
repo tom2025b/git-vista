@@ -2,17 +2,20 @@
 //!
 //! Both are blocking full-screen overlays in the iPad-proven inline-style
 //! pattern of `session::not_connected_view`. The picker lists what the server's
-//! catalog offers — launch repo, root-scanned repos, clones — as opaque
-//! descriptors (never paths); picking one opens the mode screen; choosing a mode
-//! POSTs `/api/select` and bumps `reload` so the graph re-reads. The picker sits
-//! at z-index 900, the mode screen at 901, both *below* the sign-in and
-//! protocol overlays (1000) so authentication always wins the stack.
+//! catalog offers — launch repo, root-scanned repos, persistent clones
+//! (deletable in place, ADR 0008) — as opaque descriptors (never paths);
+//! picking one opens the mode screen; choosing a mode POSTs `/api/select` and
+//! bumps `reload` so the graph re-reads. The picker sits at z-index 900, the
+//! mode screen at 901, both *below* the sign-in and protocol overlays (1000)
+//! so authentication always wins the stack.
 
 use leptos::*;
 
 use git_vista_protocol::{RepoMode, RepositoryDescriptor, RepositoryKind};
 
-use crate::api::{fetch_catalog, rescan_request, select_request, set_ui_mode};
+use crate::api::{
+    delete_clone_request, fetch_catalog, rescan_request, select_request, set_ui_mode,
+};
 
 /// The blocking repo list. `open` shows/hides it; picking a repo hands its
 /// descriptor to `mode_for` (the mode screen); "Clone URL…" opens the existing
@@ -64,25 +67,72 @@ pub fn picker_view(
                             Some(Ok(entries)) => entries
                                 .into_iter()
                                 .map(|d| {
+                                    let is_clone = d.read_only;
                                     let label = match d.kind {
                                         RepositoryKind::Bare => format!("{} (bare)", d.name),
                                         RepositoryKind::LinkedWorktree => {
                                             format!("{} (worktree)", d.name)
                                         }
+                                        RepositoryKind::MainWorktree if is_clone => {
+                                            format!("{} (clone)", d.name)
+                                        }
                                         RepositoryKind::MainWorktree => d.name.clone(),
                                     };
+                                    let worktree = d.worktree.clone();
+                                    let name = d.name.clone();
                                     let pick = move |_| mode_for.set(Some(d.clone()));
+                                    // Delete a persistent clone (ADR 0008): native
+                                    // confirm, then the guarded endpoint; feedback
+                                    // reuses the status line under the buttons.
+                                    let del = move |_| {
+                                        let confirmed = web_sys::window()
+                                            .map(|w| {
+                                                w.confirm_with_message(&format!(
+                                                    "Delete the clone \u{2018}{name}\u{2019} from disk?"
+                                                ))
+                                                .unwrap_or(false)
+                                            })
+                                            .unwrap_or(false);
+                                        if !confirmed {
+                                            return;
+                                        }
+                                        let worktree = worktree.clone();
+                                        spawn_local(async move {
+                                            match delete_clone_request(&worktree).await {
+                                                Ok(msg) => {
+                                                    rescan_msg.set(msg);
+                                                    bump.update(|n| *n = n.wrapping_add(1));
+                                                }
+                                                Err(e) => rescan_msg.set(e),
+                                            }
+                                        });
+                                    };
                                     view! {
-                                        // A big touch row per repo: tap → mode screen.
-                                        <button
-                                            style="display:block; width:100%; text-align:left; \
-                                                   padding:12px; margin:4px 0; font:inherit; \
-                                                   color:var(--fg); background:#0d1117; \
-                                                   border:1px solid #30363d; border-radius:6px;"
-                                            on:click=pick
-                                        >
-                                            {label}
-                                        </button>
+                                        // A big touch row per repo: tap → mode
+                                        // screen; clones carry a Delete beside.
+                                        <div style="display:flex; gap:4px; margin:4px 0;">
+                                            <button
+                                                style="flex:1; text-align:left; \
+                                                       padding:12px; font:inherit; \
+                                                       color:var(--fg); background:#0d1117; \
+                                                       border:1px solid #30363d; \
+                                                       border-radius:6px;"
+                                                on:click=pick
+                                            >
+                                                {label}
+                                            </button>
+                                            {is_clone.then(|| view! {
+                                                <button
+                                                    style="padding:12px; font:inherit; \
+                                                           color:#f85149; background:#0d1117; \
+                                                           border:1px solid #30363d; \
+                                                           border-radius:6px;"
+                                                    on:click=del
+                                                >
+                                                    "Delete"
+                                                </button>
+                                            })}
+                                        </div>
                                     }
                                 })
                                 .collect_view(),

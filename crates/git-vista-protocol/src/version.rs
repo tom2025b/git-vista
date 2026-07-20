@@ -22,19 +22,19 @@ use serde::{Deserialize, Serialize};
 /// server advertises it as its "current" version, and the client sends it in the
 /// [`PROTOCOL_HEADER`] on every request. Bump this only when the request/response
 /// contract changes in a way an older peer would misread.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The oldest client protocol version this server build still accepts. Together
 /// with [`MAX_CLIENT_PROTOCOL`] it is the compatibility window a client's version
 /// must fall inside. Equal to [`PROTOCOL_VERSION`] until a compatible-but-older
 /// contract must be supported.
-pub const MIN_CLIENT_PROTOCOL: u32 = 1;
+pub const MIN_CLIENT_PROTOCOL: u32 = 2;
 
 /// The newest client protocol version this server build can accept. A client
 /// reporting a version above this is *ahead* of the server (the server was
 /// downgraded, or the client cache is from a newer deploy) and is refused the
 /// same way as one that is too old.
-pub const MAX_CLIENT_PROTOCOL: u32 = 1;
+pub const MAX_CLIENT_PROTOCOL: u32 = 2;
 
 /// Request header a client must send on every `/api/*` call **except**
 /// `GET /api/protocol`, carrying the [`PROTOCOL_VERSION`] it was built against.

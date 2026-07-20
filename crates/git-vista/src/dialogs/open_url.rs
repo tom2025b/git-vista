@@ -2,6 +2,8 @@
 
 use leptos::*;
 
+use git_vista_protocol::RepositoryDescriptor;
+
 use crate::api::clone_request;
 use crate::state::DIALOG_GUARD_MS;
 
@@ -10,13 +12,17 @@ use crate::state::DIALOG_GUARD_MS;
 /// (NOT a void `<input>`, which panics the Leptos CSR node-walk on iOS WebKit)
 /// for the URL field. `cloning` disables the button while git works so a slow
 /// clone can't be fired twice; `open_opened_at` guards the backdrop against the
-/// iOS ghost-click, same trick as the commit modal.
+/// iOS ghost-click, same trick as the commit modal. Unlike the other `dialogs/*`
+/// modals (z-index 30), this one is also reachable from inside the open picker
+/// (ADR 0006's "Clone URL…" button, which doesn't close the picker) — its
+/// z-index must beat the picker's 900 or the picker intercepts every click.
 pub fn open_url_view(
     open_url: RwSignal<bool>,
     clone_url: RwSignal<String>,
     cloning: RwSignal<bool>,
     open_opened_at: StoredValue<f64>,
     reload: RwSignal<u32>,
+    mode_for: RwSignal<Option<RepositoryDescriptor>>,
 ) -> impl IntoView {
     let submit_clone = move || {
         let url = clone_url.get_untracked().trim().to_string();
@@ -26,12 +32,14 @@ pub fn open_url_view(
         cloning.set(true);
         spawn_local(async move {
             match clone_request(&url).await {
-                Ok(()) => {
+                Ok(descriptor) => {
                     cloning.set(false);
                     open_url.set(false);
                     clone_url.set(String::new());
-                    // Re-read via the shared fetch counter so the cloned graph loads.
+                    // The server opened the clone look-only; the reload shows
+                    // it, and the mode screen asks Visualize/Active (ADR 0008).
                     reload.update(|n| *n = n.wrapping_add(1));
+                    mode_for.set(Some(descriptor));
                 }
                 Err(e) => {
                     cloning.set(false);
@@ -46,7 +54,7 @@ pub fn open_url_view(
         open_url.get().then(|| view! {
         <div
             style="position:fixed; top:0; left:0; width:100vw; height:100vh; \
-                   z-index:30; display:flex; align-items:center; \
+                   z-index:910; display:flex; align-items:center; \
                    justify-content:center; background:rgba(1,4,9,0.6);"
             on:click=move |_| {
                 if js_sys::Date::now() - open_opened_at.get_value() > DIALOG_GUARD_MS {
@@ -73,7 +81,7 @@ pub fn open_url_view(
                     on:input=move |ev| clone_url.set(event_target_value(&ev))
                 ></textarea>
                 <div style="font-size:0.85em; color:var(--muted, #8b949e); margin-top:8px;">
-                    "Public https:// URLs only. Cloned repos are read-only."
+                    "Public https:// URLs only. Clones persist until you delete them from the picker."
                 </div>
                 <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:14px;">
                     <button

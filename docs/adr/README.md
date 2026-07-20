@@ -19,8 +19,9 @@ it, and note the link in both.
 | [0005](0005-lan-view-profile.md) | LAN view profile: a read-only second listener | Accepted — implementation pending |
 | [0006](0006-ask-every-time-mode-picker.md) | Visualize / Active is chosen per open, every time | Accepted — implementation pending |
 | [0007](0007-selection-scoped-mode.md) | Mode rides the current-repo selection (`POST /api/select`) | Accepted — implementation pending |
-| [0008](0008-persistent-clones-xdg.md) | Persistent, multiple clones under the XDG data dir | Accepted — implementation pending |
+| [0008](0008-persistent-clones-xdg.md) | Persistent, multiple clones under the XDG data dir | Accepted |
 | [0009](0009-configured-root-repo-discovery.md) | Local repos discovered from one configured root, direct children only | Accepted — implementation pending |
 | [0010](0010-visualizer-forge-links.md) | Visualizer = existing read-only views plus forge deep links | Accepted — implementation pending |
 | [0011](0011-pointer-type-gesture-slop.md) | Gesture slop is pointer-type-aware (touch 12px, mouse/pen 4px) | Accepted |
 | [0012](0012-unscrollable-app-shell.md) | The app shell never scrolls; all scrolling is internal | Accepted |
+| [0013](0013-clone-descriptor-protocol-bump.md) | Protocol v2 for the clone response; `set_current` returns its own handle | Accepted |

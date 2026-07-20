@@ -13,7 +13,7 @@ use axum::Json;
 use git_vista_core::identity::WorktreeId;
 use git_vista_protocol::SelectRequest;
 
-use crate::state::{scan_repo_root, select_registered};
+use crate::state::{scan_clones_root, scan_repo_root, select_registered};
 
 /// Make the repository addressed by `worktree` the current selection, in the
 /// requested mode. Unknown/forged id → 404, the same fail-closed contract as
@@ -30,15 +30,21 @@ pub(crate) async fn select_repo(Json(req): Json<SelectRequest>) -> (StatusCode, 
     }
 }
 
-/// Re-scan the configured repo root (ADR 0009). Bodyless POST, like `rebase`.
-/// Registered clones and the current selection are untouched; this only adds/
-/// refreshes entries under the configured root.
+/// Re-scan the configured repo root and the clones root (ADR 0009/0008).
+/// Bodyless POST, like `rebase`. Registered entries and the current selection
+/// are untouched; this only adds/refreshes entries.
 pub(crate) async fn rescan() -> (StatusCode, String) {
-    let summary = match scan_repo_root() {
-        Some((registered, skipped)) => {
-            format!("Rescanned: {registered} repos registered, {skipped} skipped.")
-        }
-        None => "No repo root configured; nothing to rescan.".to_string(),
+    // Repo-root scan first, clones-root scan second — same order as startup,
+    // so the clones-root scan wins any path both roots would register
+    // (keeping the `read_only` clone marker accurate) on a rescan too.
+    let repo_result = scan_repo_root();
+    let (clones_registered, _) = scan_clones_root();
+    let summary = match repo_result {
+        Some((registered, skipped)) => format!(
+            "Rescanned: {registered} repos registered, {skipped} skipped; \
+             {clones_registered} clone(s) re-registered."
+        ),
+        None => format!("No repo root configured; {clones_registered} clone(s) re-registered."),
     };
     (StatusCode::OK, summary)
 }

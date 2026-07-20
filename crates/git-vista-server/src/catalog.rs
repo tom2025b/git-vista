@@ -186,12 +186,20 @@ impl Catalog {
         self.entries.get(&worktree)
     }
 
+    /// Drop the entry for `worktree`, returning it (`None` when not held). The
+    /// allowed root it lived under stays — other clones share it.
+    pub(crate) fn remove(&mut self, worktree: WorktreeId) -> Option<RepoEntry> {
+        self.entries.remove(&worktree)
+    }
+
     /// Scan `root`'s DIRECT children (ADR 0009: one deliberate root, no
     /// recursion) and register every valid git repository, allowing `root`
-    /// first. Junk children are skipped and logged; a missing/unreadable root
-    /// is a warning and an empty scan — the server stays healthy rather than
+    /// first. `read_only` marks every registered child as a URL clone (the
+    /// clones-root scan) or a normal repo (the configured repo root). Junk
+    /// children are skipped and logged; a missing/unreadable root is a
+    /// warning and an empty scan — the server stays healthy rather than
     /// failing startup over a config typo. Returns (registered, skipped dirs).
-    pub(crate) fn scan_direct_children(&mut self, root: &Path) -> (usize, usize) {
+    pub(crate) fn scan_direct_children(&mut self, root: &Path, read_only: bool) -> (usize, usize) {
         let entries = match std::fs::read_dir(root) {
             Ok(e) => e,
             Err(e) => {
@@ -207,7 +215,7 @@ impl Catalog {
             .collect();
         children.sort(); // stable scan/log order
         for child in children {
-            match self.register(&child, false) {
+            match self.register(&child, read_only) {
                 Ok(_) => registered += 1,
                 Err(e) => {
                     skipped += 1;
@@ -226,18 +234,36 @@ impl Catalog {
         let mut out: Vec<RepositoryDescriptor> = self
             .entries
             .values()
-            .map(|e| RepositoryDescriptor {
-                repository: e.handle.repository.to_string(),
-                worktree: e.handle.worktree.to_string(),
-                name: e.name.clone(),
-                kind: kind_to_protocol(e.kind),
-                read_only: e.read_only,
-                path: expose_paths.then(|| e.path.display().to_string()),
-                remote_web_url: e.remote_web_url.clone(),
-            })
+            .map(|e| Self::descriptor(e, expose_paths))
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name).then(a.worktree.cmp(&b.worktree)));
         out
+    }
+
+    /// The descriptor for one entry, or `None` when the catalog doesn't hold
+    /// the id — the same capability view as [`descriptors`](Self::descriptors),
+    /// for the single entry a fresh clone just registered (ADR 0008).
+    pub(crate) fn descriptor_of(
+        &self,
+        worktree: WorktreeId,
+        expose_paths: bool,
+    ) -> Option<RepositoryDescriptor> {
+        self.entries
+            .get(&worktree)
+            .map(|e| Self::descriptor(e, expose_paths))
+    }
+
+    /// One entry's wire form — shared by the list and single-entry views.
+    fn descriptor(e: &RepoEntry, expose_paths: bool) -> RepositoryDescriptor {
+        RepositoryDescriptor {
+            repository: e.handle.repository.to_string(),
+            worktree: e.handle.worktree.to_string(),
+            name: e.name.clone(),
+            kind: kind_to_protocol(e.kind),
+            read_only: e.read_only,
+            path: expose_paths.then(|| e.path.display().to_string()),
+            remote_web_url: e.remote_web_url.clone(),
+        }
     }
 }
 
@@ -386,7 +412,7 @@ mod tests {
         init_repo(&root.path().join("not-a-repo/nested"));
 
         let mut catalog = Catalog::new();
-        let (registered, skipped) = catalog.scan_direct_children(root.path());
+        let (registered, skipped) = catalog.scan_direct_children(root.path(), false);
         assert_eq!(registered, 2);
         assert_eq!(skipped, 1, "the non-repo dir is skipped; files don't count");
         let names: Vec<String> = catalog
@@ -400,8 +426,64 @@ mod tests {
     #[test]
     fn scan_of_a_missing_root_is_a_soft_zero_not_a_panic() {
         let mut catalog = Catalog::new();
-        let (registered, skipped) = catalog.scan_direct_children(Path::new("/no/such/dir"));
+        let (registered, skipped) = catalog.scan_direct_children(Path::new("/no/such/dir"), false);
         assert_eq!((registered, skipped), (0, 0));
+    }
+
+    #[test]
+    fn a_clone_survives_a_simulated_restart_scan() {
+        // ADR 0008: a fresh process re-scans the clones root and re-registers
+        // surviving clones, keeping the clone marker (`read_only`) the picker
+        // uses to offer Delete.
+        let clones = tempfile::tempdir().unwrap();
+        init_repo(&clones.path().join("octocat"));
+
+        // "Restart" = a brand-new catalog scanning the same directory.
+        let mut catalog = Catalog::new();
+        let (registered, skipped) = catalog.scan_direct_children(clones.path(), true);
+        assert_eq!((registered, skipped), (1, 0));
+        let d = catalog.descriptors(false);
+        assert_eq!(d[0].name, "octocat");
+        assert!(d[0].read_only, "re-registered clones keep the clone marker");
+    }
+
+    #[test]
+    fn descriptor_of_reports_one_entry_and_fails_closed_on_unknown_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("project");
+        init_repo(&repo);
+        let mut catalog = Catalog::new();
+        catalog.allow_root(root.path());
+        let handle = catalog.register(&repo, true).unwrap();
+
+        let d = catalog
+            .descriptor_of(handle.worktree, false)
+            .expect("known id");
+        assert_eq!(d, catalog.descriptors(false)[0]);
+        assert!(d.read_only);
+
+        let stranger = WorktreeId::from_git_dir("/nowhere/.git/worktrees/ghost");
+        assert!(catalog.descriptor_of(stranger, false).is_none());
+    }
+
+    #[test]
+    fn remove_drops_the_entry_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("project");
+        init_repo(&repo);
+        let mut catalog = Catalog::new();
+        catalog.allow_root(root.path());
+        let handle = catalog.register(&repo, true).unwrap();
+
+        assert!(catalog.remove(handle.worktree).is_some());
+        assert!(
+            catalog.resolve(handle.worktree).is_none(),
+            "gone after remove"
+        );
+        assert!(
+            catalog.remove(handle.worktree).is_none(),
+            "second remove is a no-op"
+        );
     }
 
     // --- descriptors: no path by default -----------------------------------
