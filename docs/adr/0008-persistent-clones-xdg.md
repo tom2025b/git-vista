@@ -1,6 +1,6 @@
 # ADR 0008 — Persistent, multiple clones under the XDG data dir
 
-- **Status:** Accepted — implementation pending (`feature/persistent-clones`)
+- **Status:** Accepted — implemented 2026-07-19 (`feature/persistent-clones`, #121)
 - **Date:** 2026-07-19
 - **Milestone / issue:** Post-M1.05 feature set; design spec
   `docs/superpowers/specs/2026-07-19-repo-modes-lan-visualizer-design.md`

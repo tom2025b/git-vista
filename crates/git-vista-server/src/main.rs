@@ -66,7 +66,7 @@ use git_vista_protocol::RepoMode;
 use handlers::branch::{
     checkout_branch, create_branch, delete_branch, force_delete_branch, merge_branch, push_branch,
 };
-use handlers::clone::clone_repo;
+use handlers::clone::{clone_repo, delete_clone_repo};
 use handlers::commit::{create_commit, stage_all, unstage_all};
 use handlers::protocol::protocol_info;
 use handlers::read::{
@@ -78,10 +78,7 @@ use handlers::select::{rescan, select_repo};
 use handlers::session::{create_session, revoke_session, session_status};
 use security::{AuthState, HostPolicy};
 use session::{SessionManager, BOOTSTRAP_REFRESH_INTERVAL};
-use state::{
-    bind_addr, bootstrap_token_path, clones_root, current, set_current, DEFAULT_REPO, DIST_DIR,
-    PORT,
-};
+use state::{bind_addr, bootstrap_token_path, current, set_current, DEFAULT_REPO, DIST_DIR, PORT};
 
 #[tokio::main]
 async fn main() {
@@ -119,19 +116,11 @@ async fn main() {
         println!("git-vista: repo root scan: {registered} registered, {skipped} skipped");
     }
 
-    // Phase 13: clear any throwaway clones left behind by a previous run. A prior
-    // launcher/process interruption may not have cleaned its last Phase 12 clone,
-    // which would otherwise pile up under the temp dir across runs.
-    // Nothing is being served from there yet at startup, so removing the whole
-    // clones root is safe; the next clone recreates it.
-    let clones = clones_root();
-    if clones.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&clones) {
-            eprintln!(
-                "git-vista: couldn't clear old clones at {}: {e}",
-                clones.display()
-            );
-        }
+    // ADR 0008: clones persist across runs. Re-register every clone surviving
+    // under the clones root so the picker keeps offering it after a restart.
+    let (clones_registered, _) = state::scan_clones_root();
+    if clones_registered > 0 {
+        println!("git-vista: {clones_registered} persistent clone(s) re-registered");
     }
 
     // Warn early if the SPA hasn't been built — otherwise every page is a 404
@@ -237,6 +226,9 @@ async fn main() {
         .route("/api/file/{id}/{*path}", get(file_at_commit))
         // Phase 12: clone a public URL into a temp dir and view it read-only.
         .route("/api/clone", post(clone_repo))
+        // ADR 0008: delete a persistent clone (catalog entry + directory),
+        // guarded to paths that canonicalize inside the clones root.
+        .route("/api/delete-clone", post(delete_clone_repo))
         // ADR 0007: pick the current repository + Visualize/Active mode by id.
         .route("/api/select", post(select_repo))
         // ADR 0009: re-scan the configured repo root without a restart.

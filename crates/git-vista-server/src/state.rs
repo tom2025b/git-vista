@@ -144,8 +144,25 @@ pub(crate) fn scan_repo_root() -> Option<(usize, usize)> {
         catalog()
             .write()
             .expect("catalog lock")
-            .scan_direct_children(&root),
+            .scan_direct_children(&root, false),
     )
+}
+
+/// Scan the clones root (ADR 0008) into the catalog, marking every entry as a
+/// clone (`read_only: true` — the descriptor flag the picker keys Delete on).
+/// Called at startup and by `POST /api/rescan`; a missing clones root is a soft
+/// zero, not an error.
+pub(crate) fn scan_clones_root() -> (usize, usize) {
+    let root = clones_root();
+    // Create it if this is a fresh install (no clone yet): scan_direct_children
+    // logs a "not scanned" warning on a missing directory, worded for the
+    // configured repo root, not the not-yet-created clones store — make sure
+    // it exists rather than let that warning fire every startup/rescan.
+    let _ = std::fs::create_dir_all(&root);
+    catalog()
+        .write()
+        .expect("catalog lock")
+        .scan_direct_children(&root, true)
 }
 
 /// The capability view of the catalog for `GET /api/catalog`: the servable
@@ -156,6 +173,15 @@ pub(crate) fn catalog_descriptors() -> Vec<RepositoryDescriptor> {
         .read()
         .expect("catalog lock")
         .descriptors(expose_paths())
+}
+
+/// The capability descriptor for one registered worktree — the clone handler's
+/// success body (ADR 0008) — or `None` for an id the catalog does not hold.
+pub(crate) fn descriptor_for(worktree: WorktreeId) -> Option<RepositoryDescriptor> {
+    catalog()
+        .read()
+        .expect("catalog lock")
+        .descriptor_of(worktree, expose_paths())
 }
 
 /// The repository the server is currently serving *by default* — the selection a
@@ -234,7 +260,7 @@ pub(crate) fn current_handle() -> Option<RepositoryHandle> {
 /// If the path won't classify as a git repository, the server drops to degraded
 /// mode: the selection is still set (so the reads run and surface git's own
 /// error, as before this module), but with no catalog entry and no handle.
-pub(crate) fn set_current(path: &Path, mode: RepoMode) {
+pub(crate) fn set_current(path: &Path, mode: RepoMode) -> Option<RepositoryHandle> {
     let registered = {
         let mut c = catalog().write().expect("catalog lock");
         // Trusted selection: allow its own root so a repo launched from anywhere
@@ -255,6 +281,7 @@ pub(crate) fn set_current(path: &Path, mode: RepoMode) {
                 None => path.to_path_buf(),
             };
             set_current_resolved(path, mode, Some(handle));
+            Some(handle)
         }
         Err(e) => {
             eprintln!(
@@ -263,6 +290,7 @@ pub(crate) fn set_current(path: &Path, mode: RepoMode) {
                 path.display()
             );
             set_current_resolved(path.to_path_buf(), mode, None);
+            None
         }
     }
 }
@@ -281,11 +309,39 @@ pub(crate) fn select_registered(worktree: WorktreeId, mode: RepoMode) -> bool {
     }
 }
 
-/// Parent directory that holds every throwaway clone, under the OS temp dir. A
-/// clone's temp dir is created here, and cleanup refuses to delete anything that
-/// isn't under this root — so a bug can never `rm` a real repository.
+/// Parent directory that holds every persistent clone (ADR 0008):
+/// `GIT_VISTA_CLONES_ROOT` override, else `$XDG_DATA_HOME/git-vista/clones`,
+/// else `~/.local/share/git-vista/clones`. Clones live here across restarts;
+/// deletion refuses anything that doesn't canonicalize inside this root — so a
+/// bug can never `rm` a real repository.
 pub(crate) fn clones_root() -> PathBuf {
-    std::env::temp_dir().join("git-vista-clones")
+    resolve_clones_root(
+        std::env::var_os("GIT_VISTA_CLONES_ROOT").map(PathBuf::from),
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// The pure resolution behind [`clones_root`], parameterised so tests never
+/// read or write process env — the same pattern as `parse_bind_addr`. Empty
+/// values count as unset (a systemd unit with `Environment=X=` must not send
+/// clones to `/git-vista/clones`).
+fn resolve_clones_root(
+    override_root: Option<PathBuf>,
+    xdg_data_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(root) = override_root.filter(|p| !p.as_os_str().is_empty()) {
+        return root;
+    }
+    let base = xdg_data_home
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            home.filter(|p| !p.as_os_str().is_empty())
+                .map(|h| h.join(".local/share"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("git-vista-data"));
+    base.join("git-vista").join("clones")
 }
 
 /// This user's git-vista state directory — `$XDG_STATE_HOME/git-vista`, or
@@ -319,6 +375,58 @@ pub(crate) fn cleanup_clone(path: &Path) {
             );
         }
     }
+}
+
+/// Outcome of a delete-clone attempt (ADR 0008); the handler maps each to an
+/// HTTP status. Every refusal names why, so the picker can show the reason.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeleteCloneOutcome {
+    /// Unknown/forged id — fail closed, the same contract as the reads (404).
+    NotFound,
+    /// The id resolves, but its path does not canonicalize inside the clones
+    /// root: not a clone, never deletable through this endpoint (400).
+    NotAClone,
+    /// The clone is the current selection — deleting the repo being served
+    /// would break every read. Open another repo first (409).
+    CurrentlyOpen,
+    /// Removed from disk and catalog (200).
+    Deleted,
+    /// Guards passed but `remove_dir_all` failed (500); carries the OS error.
+    DeleteFailed(String),
+}
+
+/// Delete the clone addressed by `worktree` (ADR 0008): resolve fail-closed,
+/// refuse anything that does not canonicalize inside `clones_root` (the delete
+/// guard), refuse the current selection, then remove the directory and the
+/// catalog entry — in that order, so a failed removal stays visible and
+/// retryable. `clones_root` is a parameter so tests never touch process env.
+pub(crate) fn delete_clone(worktree: WorktreeId, clones_root: &Path) -> DeleteCloneOutcome {
+    let Some((path, _, _)) = resolve_worktree(worktree) else {
+        return DeleteCloneOutcome::NotFound;
+    };
+    // A root that can't canonicalize (missing dir) can't contain anything:
+    // fail closed. Re-canonicalize the entry's path fresh too, rather than
+    // trusting the catalog's registration-time value — if the directory was
+    // swapped out from under us since registration, the guard must see that.
+    let root = match std::fs::canonicalize(clones_root) {
+        Ok(root) => root,
+        Err(_) => return DeleteCloneOutcome::NotAClone,
+    };
+    let path = match std::fs::canonicalize(&path) {
+        Ok(path) => path,
+        Err(_) => return DeleteCloneOutcome::NotFound,
+    };
+    if path == root || !path.starts_with(&root) {
+        return DeleteCloneOutcome::NotAClone;
+    }
+    if current().0 == path {
+        return DeleteCloneOutcome::CurrentlyOpen;
+    }
+    if let Err(e) = std::fs::remove_dir_all(&path) {
+        return DeleteCloneOutcome::DeleteFailed(e.to_string());
+    }
+    catalog().write().expect("catalog lock").remove(worktree);
+    DeleteCloneOutcome::Deleted
 }
 
 /// Guard for the write endpoints: in Visualize mode (ADR 0006/0007) the current
@@ -375,6 +483,39 @@ mod tests {
             git_vista_core::identity::WorktreeId::from_git_dir("/nowhere/.git/worktrees/ghost");
         assert!(!select_registered(stranger, RepoMode::Active));
         assert_eq!(current_mode(), RepoMode::Visualize);
+
+        // --- delete-clone (ADR 0008) ------------------------------------
+        // A fake clones root holding one "clone"; the project repo above is
+        // the guard's negative case (a real repo, not a clone).
+        let clones = root.path().join("clones");
+        let clone_dir = clones.join("octocat");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&clone_dir)
+            .status()
+            .unwrap()
+            .success());
+        set_current(&clone_dir, RepoMode::Visualize); // registers, like /api/clone
+        let clone_wt = current_handle().expect("clone registered").worktree;
+
+        // The currently open clone is not deletable (the server would be
+        // serving a removed directory).
+        assert_eq!(
+            delete_clone(clone_wt, &clones),
+            DeleteCloneOutcome::CurrentlyOpen
+        );
+        // Move the selection off the clone; the project repo is outside the
+        // clones root, so IT is refused as NotAClone…
+        assert!(select_registered(wt, RepoMode::Active));
+        assert_eq!(delete_clone(wt, &clones), DeleteCloneOutcome::NotAClone);
+        // …and the clone itself now deletes: directory gone, id fails closed.
+        assert_eq!(delete_clone(clone_wt, &clones), DeleteCloneOutcome::Deleted);
+        assert!(!clone_dir.exists(), "the clone directory was removed");
+        assert_eq!(
+            delete_clone(clone_wt, &clones),
+            DeleteCloneOutcome::NotFound
+        );
     }
 
     #[test]
@@ -406,5 +547,51 @@ mod tests {
     fn bind_address_rejects_invalid_configuration() {
         let error = parse_bind_addr(Some("not-an-address")).unwrap_err();
         assert!(error.contains("invalid GIT_VISTA_BIND_ADDR"));
+    }
+
+    // --- clones root resolution (ADR 0008) ---------------------------------
+
+    #[test]
+    fn clones_root_prefers_the_explicit_override() {
+        assert_eq!(
+            resolve_clones_root(
+                Some(PathBuf::from("/custom/clones")),
+                Some(PathBuf::from("/xdg")),
+                Some(PathBuf::from("/home/u")),
+            ),
+            PathBuf::from("/custom/clones")
+        );
+    }
+
+    #[test]
+    fn clones_root_uses_xdg_data_home_when_set() {
+        assert_eq!(
+            resolve_clones_root(
+                None,
+                Some(PathBuf::from("/xdg")),
+                Some(PathBuf::from("/home/u"))
+            ),
+            PathBuf::from("/xdg/git-vista/clones")
+        );
+    }
+
+    #[test]
+    fn clones_root_falls_back_to_dot_local_share() {
+        assert_eq!(
+            resolve_clones_root(None, None, Some(PathBuf::from("/home/u"))),
+            PathBuf::from("/home/u/.local/share/git-vista/clones")
+        );
+    }
+
+    #[test]
+    fn clones_root_treats_empty_values_as_unset() {
+        assert_eq!(
+            resolve_clones_root(
+                Some(PathBuf::from("")),
+                Some(PathBuf::from("")),
+                Some(PathBuf::from("/home/u")),
+            ),
+            PathBuf::from("/home/u/.local/share/git-vista/clones")
+        );
     }
 }

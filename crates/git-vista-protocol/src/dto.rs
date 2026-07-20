@@ -56,8 +56,9 @@ pub struct BranchRequest {
 }
 
 /// Body of a `POST /api/clone` request (Phase 12): clone the public repository at
-/// `url` into a throwaway temp directory and switch the server to viewing it,
-/// read-only. `url` is a git-cloneable URL (typically `https://…`); the backend
+/// `url` into the persistent clones store (ADR 0008) and open it look-only
+/// pending the operator's mode choice. `url` is a git-cloneable URL (typically
+/// `https://…`); the backend
 /// validates its scheme with [`validate_clone_url`] and forwards git's own error
 /// text on failure. There is deliberately no destination field — the server picks
 /// the clone directory, so a request can never point the server at a path.
@@ -85,6 +86,17 @@ pub enum RepoMode {
 pub struct SelectRequest {
     pub worktree: String,
     pub mode: RepoMode,
+}
+
+/// Body of `POST /api/delete-clone` (ADR 0008): delete the *clone* addressed by
+/// the opaque `worktree` id — its catalog entry and its directory. The server
+/// refuses any id whose path does not canonicalize inside the clones root, so
+/// this can only ever remove server-made clones, never a user repository; it
+/// also refuses the currently open repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteCloneRequest {
+    pub worktree: String,
 }
 
 /// Body of a `POST /api/session` request (M1.04, #57): the one-time bootstrap
@@ -302,6 +314,23 @@ mod tests {
             r#"{"worktree":"w","mode":"active","path":"/etc"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn delete_clone_request_round_trips_and_rejects_unknown_fields() {
+        let req = DeleteCloneRequest {
+            worktree: "11111111-2222-5333-8444-555555555555".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DeleteCloneRequest>(&json).unwrap(),
+            req
+        );
+
+        assert!(
+            serde_json::from_str::<DeleteCloneRequest>(r#"{"worktree":"x","path":"/etc"}"#)
+                .is_err()
+        );
     }
 
     #[test]
