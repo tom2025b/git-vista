@@ -322,12 +322,15 @@ mod tests {
             worktree: "11111111-2222-5333-8444-555555555555".into(),
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert_eq!(serde_json::from_str::<DeleteCloneRequest>(&json).unwrap(), req);
+        assert_eq!(
+            serde_json::from_str::<DeleteCloneRequest>(&json).unwrap(),
+            req
+        );
 
-        assert!(serde_json::from_str::<DeleteCloneRequest>(
-            r#"{"worktree":"x","path":"/etc"}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<DeleteCloneRequest>(r#"{"worktree":"x","path":"/etc"}"#)
+                .is_err()
+        );
     }
 
     #[test]
