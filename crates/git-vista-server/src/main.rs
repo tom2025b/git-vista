@@ -51,6 +51,7 @@ mod security;
 mod session;
 mod state;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::response::IntoResponse;
@@ -78,9 +79,13 @@ use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
 use handlers::select::{rescan, select_repo};
 use handlers::session::{create_session, revoke_session, session_status, SessionState};
+use ratelimit::SignInLimiter;
 use security::{AuthState, HostPolicy};
 use session::{SessionManager, BOOTSTRAP_REFRESH_INTERVAL};
-use state::{bind_addr, bootstrap_token_path, current, set_current, DEFAULT_REPO, DIST_DIR, PORT};
+use state::{
+    bind_addr, bootstrap_token_path, current, lan_bind_addr, set_current, DEFAULT_REPO, DIST_DIR,
+    PORT,
+};
 
 #[tokio::main]
 async fn main() {
@@ -134,17 +139,6 @@ async fn main() {
         );
     }
 
-    // Serve the SPA bundle with `Cache-Control: no-cache` so the browser always
-    // revalidates index.html (and thus picks up a freshly built wasm hash) instead
-    // of running a stale, cached frontend — the cache layered on top of the live
-    // git data we already keep uncacheable below. The layer wraps only the static
-    // fallback, so it never overrides the API's stronger `no-store`.
-    let spa = SetResponseHeaderLayer::overriding(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache"),
-    )
-    .layer(ServeDir::new(DIST_DIR).append_index_html_on_directories(true));
-
     // Resolve the fixed loopback address first. `bind_addr` rejects every
     // non-loopback override so neither a stale launcher nor a service file can
     // expose this plain-HTTP control surface.
@@ -175,6 +169,29 @@ async fn main() {
         }
     };
 
+    // ADR 0005: resolve the optional second, LAN-facing listener. `gv` is
+    // responsible for auto-detecting the LAN IP or requiring --lan-ip before
+    // ever setting GIT_VISTA_LAN_IP, so a rejection here is a clean startup
+    // error, matching the loopback bind_addr() error path above.
+    let lan_addr = match lan_bind_addr() {
+        None => None,
+        Some(Ok(addr)) => Some(addr),
+        Some(Err(error)) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+    let lan_listener = match lan_addr {
+        Some(addr) => match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                eprintln!("error: could not bind LAN listener {addr}: {error}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     // M1.04: mint the one-time bootstrap token (written 0600 for `gv` to read) and
     // build the shared session store. The auth layer and the session handlers both
     // hold this `Arc`; the Host/Origin policy is strict loopback-only.
@@ -191,15 +208,70 @@ async fn main() {
             bootstrap_refresher.refresh_bootstrap_if_expiring();
         }
     });
-    let auth_state = AuthState {
+    let loopback_session_state = SessionState {
         manager: sessions.clone(),
-        hosts: HostPolicy::loopback(PORT),
+        via_lan: false,
+        rate_limiter: None,
+    };
+    let loopback_app = build_app(loopback_session_state, HostPolicy::loopback(PORT), true);
+
+    print_startup_banner(&bootstrap_token_path(), lan_addr);
+
+    match lan_listener {
+        Some(lan_listener) => {
+            let lan_ip = lan_addr.expect("lan_listener implies lan_addr").ip();
+            // ADR 0005: sign-in on the LAN listener is rate-limited per source
+            // IP; the loopback listener above stays unlimited.
+            let lan_session_state = SessionState {
+                manager: sessions.clone(),
+                via_lan: true,
+                rate_limiter: Some(Arc::new(SignInLimiter::new())),
+            };
+            let lan_app = build_app(lan_session_state, HostPolicy::lan(lan_ip, PORT), false);
+            let loopback_serve = axum::serve(
+                listener,
+                loopback_app.into_make_service_with_connect_info::<SocketAddr>(),
+            );
+            let lan_serve = axum::serve(
+                lan_listener,
+                lan_app.into_make_service_with_connect_info::<SocketAddr>(),
+            );
+            if let Err(e) = tokio::try_join!(loopback_serve, lan_serve) {
+                eprintln!("error: server stopped: {e}");
+                std::process::exit(1);
+            }
+        }
+        None => {
+            if let Err(e) = axum::serve(
+                listener,
+                loopback_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                eprintln!("error: server stopped: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// The `/api/*` route table plus its auth/contract layers, for one listener.
+/// `full_routes` selects whether the write/select/rescan/clone endpoints are
+/// registered at all: `true` for the loopback listener, `false` for the LAN
+/// listener (ADR 0005) — those routes are never *built* on the LAN router, not
+/// merely gated, so a mode-check regression can't reopen them. Kept separate
+/// from [`build_app`] so a test can exercise route registration directly,
+/// without the static-file fallback (and its `DIST_DIR` dependency) in the way.
+fn api_router(session_state: SessionState, hosts: HostPolicy, full_routes: bool) -> Router {
+    let auth_state = AuthState {
+        manager: session_state.manager.clone(),
+        hosts,
     };
 
     // Every `/api/*` route lives on this sub-router so the M1.02 contract layer
     // (protocol negotiation, request id, structured errors, response headers)
-    // wraps them all — and only them, never the static SPA below.
-    let api = Router::new()
+    // wraps them all — and only them, never the static SPA served alongside it.
+    let mut api = Router::new()
         // The one unversioned endpoint: a client hits it to learn the protocol
         // before it can be required to speak it (so it's exempt from the header
         // check inside the contract layer).
@@ -226,24 +298,6 @@ async fn main() {
         // Full file viewer: one file's whole content at one commit (`git show
         // <id>:<path>`), read on demand when a file in the diff list is tapped.
         .route("/api/file/{id}/{*path}", get(file_at_commit))
-        // Phase 12: clone a public URL into a temp dir and view it read-only.
-        .route("/api/clone", post(clone_repo))
-        // ADR 0008: delete a persistent clone (catalog entry + directory),
-        // guarded to paths that canonicalize inside the clones root.
-        .route("/api/delete-clone", post(delete_clone_repo))
-        // ADR 0007: pick the current repository + Visualize/Active mode by id.
-        .route("/api/select", post(select_repo))
-        // ADR 0009: re-scan the configured repo root without a restart.
-        .route("/api/rescan", post(rescan))
-        // Issue #18: create a branch at a commit (shells out to `git branch`).
-        .route("/api/branch", post(create_branch))
-        // Issue #33: create a commit on top of HEAD (shells out to `git commit`).
-        .route("/api/commit", post(create_commit))
-        // Stage the working tree (`git add -A`) so the UI can stage, then commit.
-        .route("/api/stage", post(stage_all))
-        // …and unstage it again (`git reset HEAD`) — the exact inverse, offered
-        // by the menu while anything is staged.
-        .route("/api/unstage", post(unstage_all))
         // Issue #33 follow-up: the live checked-out branch, resolved fresh on every
         // request so the merge dialog shows the true target even without a Refresh.
         .route("/api/head-branch", get(head_branch))
@@ -254,27 +308,53 @@ async fn main() {
         // Activity/Undo feature, step 3: the chronological event feed —
         // journal + reflogs + snapshot diffs, folded and attributed.
         .route("/api/activity", get(activity::activity_feed))
-        // Activity/Undo feature, step 5: the undo actions for one commit,
-        // computed live; and the endpoint that executes one of them.
+        // Activity/Undo feature, step 5: the undo actions for one commit, computed live.
         .route("/api/undoables/{id}", get(activity::undoables))
-        .route("/api/undo", post(activity::undo))
-        // Issue #33 follow-up: branch operations, each shelling out to git.
-        .route("/api/merge", post(merge_branch))
-        .route("/api/push", post(push_branch))
-        .route("/api/delete-branch", post(delete_branch))
-        // iPad-testing follow-up: switch HEAD to a branch (`git checkout`).
-        .route("/api/checkout", post(checkout_branch))
-        // Issue #33 follow-up: force-delete an unmerged branch (`git branch -D`),
-        // offered only after the safe `-d` above is refused; and rebase the
-        // checked-out branch onto main (`git rebase`).
-        .route("/api/force-delete-branch", post(force_delete_branch))
-        .route("/api/rebase", post(rebase))
         // Whether "Rebase onto main" would do anything right now — the menu
         // disables the item (with the reason) when it wouldn't.
-        .route("/api/rebase-status", get(rebase_status))
-        // iPad-testing follow-up: restore a seeded *test repo* to its recorded
-        // state (gated on the seed files `gv --seed` writes).
-        .route("/api/reset-test-repo", post(reset_test_repo))
+        .route("/api/rebase-status", get(rebase_status));
+
+    // ADR 0005: every write / repo-selection / clone endpoint is registered
+    // only when full_routes is set — the LAN router never sees these routes
+    // exist at all.
+    if full_routes {
+        api = api
+            // Phase 12: clone a public URL into a temp dir and view it read-only.
+            .route("/api/clone", post(clone_repo))
+            // ADR 0008: delete a persistent clone (catalog entry + directory),
+            // guarded to paths that canonicalize inside the clones root.
+            .route("/api/delete-clone", post(delete_clone_repo))
+            // ADR 0007: pick the current repository + Visualize/Active mode by id.
+            .route("/api/select", post(select_repo))
+            // ADR 0009: re-scan the configured repo root without a restart.
+            .route("/api/rescan", post(rescan))
+            // Issue #18: create a branch at a commit (shells out to `git branch`).
+            .route("/api/branch", post(create_branch))
+            // Issue #33: create a commit on top of HEAD (shells out to `git commit`).
+            .route("/api/commit", post(create_commit))
+            // Stage the working tree (`git add -A`) so the UI can stage, then commit.
+            .route("/api/stage", post(stage_all))
+            // …and unstage it again (`git reset HEAD`) — the exact inverse, offered
+            // by the menu while anything is staged.
+            .route("/api/unstage", post(unstage_all))
+            .route("/api/undo", post(activity::undo))
+            // Issue #33 follow-up: branch operations, each shelling out to git.
+            .route("/api/merge", post(merge_branch))
+            .route("/api/push", post(push_branch))
+            .route("/api/delete-branch", post(delete_branch))
+            // iPad-testing follow-up: switch HEAD to a branch (`git checkout`).
+            .route("/api/checkout", post(checkout_branch))
+            // Issue #33 follow-up: force-delete an unmerged branch (`git branch -D`),
+            // offered only after the safe `-d` above is refused; and rebase the
+            // checked-out branch onto main (`git rebase`).
+            .route("/api/force-delete-branch", post(force_delete_branch))
+            .route("/api/rebase", post(rebase))
+            // iPad-testing follow-up: restore a seeded *test repo* to its recorded
+            // state (gated on the seed files `gv --seed` writes).
+            .route("/api/reset-test-repo", post(reset_test_repo));
+    }
+
+    api
         // Innermost: a panicking handler becomes a 500 with the panic text (not a
         // reset connection) *before* the layers above see it, so that 500 is
         // rewrapped into the structured error envelope like any other failure.
@@ -290,18 +370,26 @@ async fn main() {
         // request id, the consistent error envelope, and the response headers.
         .layer(axum::middleware::from_fn(middleware::api_contract))
         // The session store the session handlers (and the auth layer) resolve
-        // against, plus this listener's LAN/rate-limit flags (ADR 0005) —
-        // `false`/`None` here since this is still the single loopback router;
-        // Task 4 splits this into a dedicated loopback + LAN router pair.
-        // Erases the router's state type back to `()`.
-        .with_state(SessionState {
-            manager: sessions,
-            via_lan: false,
-            rate_limiter: None,
-        });
+        // against. Erases the router's state type back to `()`.
+        .with_state(session_state)
+}
 
-    let app = Router::new()
-        .merge(api)
+/// Assemble one full application — [`api_router`] plus the static SPA fallback
+/// and the two outer layers — for one listener.
+fn build_app(session_state: SessionState, hosts: HostPolicy, full_routes: bool) -> Router {
+    // Serve the SPA bundle with `Cache-Control: no-cache` so the browser always
+    // revalidates index.html (and thus picks up a freshly built wasm hash) instead
+    // of running a stale, cached frontend — the cache layered on top of the live
+    // git data we already keep uncacheable below. The layer wraps only the static
+    // fallback, so it never overrides the API's stronger `no-store`.
+    let spa = SetResponseHeaderLayer::overriding(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    )
+    .layer(ServeDir::new(DIST_DIR).append_index_html_on_directories(true));
+
+    Router::new()
+        .merge(api_router(session_state, hosts, full_routes))
         // Anything that isn't the API is served from the built SPA bundle.
         .fallback_service(spa)
         // Global backstop for the static SPA / fallback. The `/api` space has its
@@ -313,14 +401,7 @@ async fn main() {
         // *every* response — the SPA shell as well as the API — so framing,
         // cross-origin embedding, and off-origin script/connect are denied
         // everywhere the app is served.
-        .layer(axum::middleware::from_fn(security::security_headers));
-
-    print_startup_banner(&bootstrap_token_path());
-
-    if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("error: server stopped: {e}");
-        std::process::exit(1);
-    }
+        .layer(axum::middleware::from_fn(security::security_headers))
 }
 
 /// Turn a caught handler panic into a `500` carrying the panic text, instead of a
@@ -341,14 +422,23 @@ fn panic_to_response(panic: Box<dyn std::any::Any + Send>) -> axum::response::Re
         .into_response()
 }
 
-/// Print the only supported access paths: local loopback or an SSH tunnel whose
-/// remote endpoint is that same loopback listener.
-fn print_startup_banner(token_path: &Path) {
+/// Print the supported access paths: local loopback, an SSH tunnel whose remote
+/// endpoint is that same loopback listener, and — only when `lan_addr` is
+/// `Some` — the LAN view profile's plain-HTTP address and its documented risk.
+fn print_startup_banner(token_path: &Path, lan_addr: Option<SocketAddr>) {
     println!("git-vista server — serving {}", current().0.display());
     println!("  • on this machine: http://localhost:{PORT}/");
     println!("  • from the iPad: use an SSH local port forward to 127.0.0.1:{PORT}");
     println!("    example: ssh -N -L {PORT}:127.0.0.1:{PORT} <linux-host>");
-    println!("  • direct LAN access is disabled");
+    match lan_addr {
+        Some(addr) => {
+            println!("  • LAN view (ADR 0005, read-only): http://{addr}/");
+            println!("    WARNING: plain HTTP — repo contents and the session cookie are");
+            println!("    readable by anyone on this network. Trusted home LAN only,");
+            println!("    never a guest or shared network.");
+        }
+        None => println!("  • direct LAN access is disabled"),
+    }
     // M1.04: the app needs a one-time session first. The bootstrap token is *not*
     // printed here (it must never land in a log) — `gv` reads the 0600 file and
     // builds the setup URL, or the operator can read it by hand.
@@ -358,4 +448,117 @@ fn print_startup_banner(token_path: &Path) {
         token_path.display()
     );
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::extract::ConnectInfo;
+    use axum::http::Request;
+    use git_vista_protocol::{SessionInfo, PROTOCOL_HEADER, PROTOCOL_VERSION};
+    use tower::ServiceExt;
+
+    /// Establish a session against `router` (whichever host it expects) and
+    /// return just the `Cookie` header value. Only exercises the session
+    /// store (`SessionManager`, process-local to this test) — never touches
+    /// the `state::CURRENT`/`CATALOG` globals other tests in this binary
+    /// share, so it's safe to run alongside them in any order.
+    async fn bootstrap_cookie(router: Router, host: &str, token: &str) -> String {
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/session")
+                    .header(header::HOST, host)
+                    .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 55000))))
+                    .body(Body::from(format!(r#"{{"token":"{token}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "bootstrap should succeed");
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let cookie = set_cookie.split(';').next().unwrap().to_string();
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let info: SessionInfo = serde_json::from_slice(&bytes).unwrap();
+        assert!(info.authenticated);
+        cookie
+    }
+
+    /// Proves the spec's required case directly against the real route table:
+    /// a GET to a write-only path passes the session gate (needs only a live
+    /// session, not CSRF) and reaches axum's own routing — distinguishing
+    /// "path never registered" (404, LAN) from "path registered, wrong
+    /// method" (405, loopback) without ever invoking the write handler
+    /// itself (which reads the process-global `CURRENT` selection other
+    /// tests in this binary also touch).
+    #[tokio::test]
+    async fn the_lan_router_has_no_write_routes() {
+        let sessions = Arc::new(SessionManager::new(None));
+        let token = sessions.current_bootstrap();
+        let session_state = SessionState {
+            manager: sessions,
+            via_lan: true,
+            rate_limiter: None,
+        };
+        let router = api_router(
+            session_state,
+            HostPolicy::lan("192.168.1.42".parse().unwrap(), PORT),
+            false,
+        );
+        let cookie = bootstrap_cookie(router.clone(), "192.168.1.42:8080", &token).await;
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/commit")
+                    .header(header::HOST, "192.168.1.42:8080")
+                    .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_loopback_router_still_has_write_routes_registered() {
+        let sessions = Arc::new(SessionManager::new(None));
+        let token = sessions.current_bootstrap();
+        let session_state = SessionState {
+            manager: sessions,
+            via_lan: false,
+            rate_limiter: None,
+        };
+        let router = api_router(session_state, HostPolicy::loopback(PORT), true);
+        let cookie = bootstrap_cookie(router.clone(), "localhost:8080", &token).await;
+        // /api/commit is registered POST-only; a GET reaches real routing and
+        // gets axum's own 405 -- proving the path exists, in contrast to the
+        // LAN router's 404 above.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/commit")
+                    .header(header::HOST, "localhost:8080")
+                    .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
 }
