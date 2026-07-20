@@ -188,10 +188,12 @@ impl Catalog {
 
     /// Scan `root`'s DIRECT children (ADR 0009: one deliberate root, no
     /// recursion) and register every valid git repository, allowing `root`
-    /// first. Junk children are skipped and logged; a missing/unreadable root
-    /// is a warning and an empty scan — the server stays healthy rather than
+    /// first. `read_only` marks every registered child as a URL clone (the
+    /// clones-root scan) or a normal repo (the configured repo root). Junk
+    /// children are skipped and logged; a missing/unreadable root is a
+    /// warning and an empty scan — the server stays healthy rather than
     /// failing startup over a config typo. Returns (registered, skipped dirs).
-    pub(crate) fn scan_direct_children(&mut self, root: &Path) -> (usize, usize) {
+    pub(crate) fn scan_direct_children(&mut self, root: &Path, read_only: bool) -> (usize, usize) {
         let entries = match std::fs::read_dir(root) {
             Ok(e) => e,
             Err(e) => {
@@ -207,7 +209,7 @@ impl Catalog {
             .collect();
         children.sort(); // stable scan/log order
         for child in children {
-            match self.register(&child, false) {
+            match self.register(&child, read_only) {
                 Ok(_) => registered += 1,
                 Err(e) => {
                     skipped += 1;
@@ -386,7 +388,7 @@ mod tests {
         init_repo(&root.path().join("not-a-repo/nested"));
 
         let mut catalog = Catalog::new();
-        let (registered, skipped) = catalog.scan_direct_children(root.path());
+        let (registered, skipped) = catalog.scan_direct_children(root.path(), false);
         assert_eq!(registered, 2);
         assert_eq!(skipped, 1, "the non-repo dir is skipped; files don't count");
         let names: Vec<String> = catalog
@@ -400,8 +402,25 @@ mod tests {
     #[test]
     fn scan_of_a_missing_root_is_a_soft_zero_not_a_panic() {
         let mut catalog = Catalog::new();
-        let (registered, skipped) = catalog.scan_direct_children(Path::new("/no/such/dir"));
+        let (registered, skipped) = catalog.scan_direct_children(Path::new("/no/such/dir"), false);
         assert_eq!((registered, skipped), (0, 0));
+    }
+
+    #[test]
+    fn a_clone_survives_a_simulated_restart_scan() {
+        // ADR 0008: a fresh process re-scans the clones root and re-registers
+        // surviving clones, keeping the clone marker (`read_only`) the picker
+        // uses to offer Delete.
+        let clones = tempfile::tempdir().unwrap();
+        init_repo(&clones.path().join("octocat"));
+
+        // "Restart" = a brand-new catalog scanning the same directory.
+        let mut catalog = Catalog::new();
+        let (registered, skipped) = catalog.scan_direct_children(clones.path(), true);
+        assert_eq!((registered, skipped), (1, 0));
+        let d = catalog.descriptors(false);
+        assert_eq!(d[0].name, "octocat");
+        assert!(d[0].read_only, "re-registered clones keep the clone marker");
     }
 
     // --- descriptors: no path by default -----------------------------------
