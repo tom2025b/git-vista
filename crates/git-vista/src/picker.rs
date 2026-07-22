@@ -51,13 +51,18 @@ pub fn picker_view(
                 <div style="position:fixed; top:0; left:0; width:100vw; height:100vh; \
                             z-index:900; display:flex; align-items:center; \
                             justify-content:center; background:rgba(1,4,9,0.85);">
+                    // Flex column with the repo list as the only scrolling region,
+                    // so the Cancel/actions row below stays visible however long
+                    // the list gets (a 20-repo root buried it off-screen on iPad).
                     <div style="min-width:320px; max-width:90vw; max-height:85vh; \
-                                overflow-y:auto; -webkit-overflow-scrolling:touch; \
+                                display:flex; flex-direction:column; \
                                 padding:24px; background:#161b22; border:1px solid #30363d; \
                                 border-radius:10px; color:var(--fg);">
                         <div style="font-weight:600; font-size:1.2em; margin-bottom:12px;">
                             "Open a repository"
                         </div>
+                        <div style="overflow-y:auto; -webkit-overflow-scrolling:touch; \
+                                    flex:1 1 auto; min-height:0;">
                         {move || match catalog.get().flatten() {
                             None => view! { <p>"Loading repositories…"</p> }.into_view(),
                             Some(Err(e)) => view! {
@@ -80,7 +85,13 @@ pub fn picker_view(
                                     };
                                     let worktree = d.worktree.clone();
                                     let name = d.name.clone();
-                                    let pick = move |_| mode_for.set(Some(d.clone()));
+                                    // ADR 0005: a LAN-view session can't select —
+                                    // the row stays as a label, not a dead-end.
+                                    let pick = move |_| {
+                                        if !crate::api::is_lan_session() {
+                                            mode_for.set(Some(d.clone()));
+                                        }
+                                    };
                                     // Delete a persistent clone (ADR 0008): native
                                     // confirm, then the guarded endpoint; feedback
                                     // reuses the status line under the buttons.
@@ -121,7 +132,13 @@ pub fn picker_view(
                                             >
                                                 {label}
                                             </button>
-                                            {is_clone.then(|| view! {
+                                            // ADR 0005: no Delete on a LAN-view
+                                            // session — the route doesn't even
+                                            // exist on the LAN listener. Rows
+                                            // re-render post-session (catalog is
+                                            // keyed on `reload`), so the flag is
+                                            // settled by the time it's read.
+                                            {(is_clone && !crate::api::is_lan_session()).then(|| view! {
                                                 <button
                                                     style="padding:12px; font:inherit; \
                                                            color:#f85149; background:#0d1117; \
@@ -137,37 +154,48 @@ pub fn picker_view(
                                 })
                                 .collect_view(),
                         }}
+                        </div>
                         <div style="display:flex; gap:8px; margin-top:16px;">
-                            <button
-                                style="padding:8px 16px; font:inherit; color:var(--fg); \
-                                       background:#21262d; border:1px solid #30363d; \
-                                       border-radius:6px;"
-                                on:click=move |_| {
-                                    clone_url.set(String::new());
-                                    open_opened_at.set_value(js_sys::Date::now());
-                                    open_url.set(true);
-                                }
-                            >
-                                "Clone URL…"
-                            </button>
-                            <button
-                                style="padding:8px 16px; font:inherit; color:var(--fg); \
-                                       background:#21262d; border:1px solid #30363d; \
-                                       border-radius:6px;"
-                                on:click=move |_| {
-                                    spawn_local(async move {
-                                        match rescan_request().await {
-                                            Ok(msg) => {
-                                                rescan_msg.set(msg);
-                                                bump.update(|n| *n = n.wrapping_add(1));
-                                            }
-                                            Err(e) => rescan_msg.set(e),
+                            // ADR 0005: Clone URL…/Rescan hit routes the LAN
+                            // listener never registers — hide them there. Keyed
+                            // on `reload` so the buttons re-evaluate once the
+                            // session (and its via_lan flag) lands, the same
+                            // recovery the catalog fetch above uses.
+                            {move || {
+                                reload.get();
+                                (!crate::api::is_lan_session()).then(|| view! {
+                                    <button
+                                        style="padding:8px 16px; font:inherit; color:var(--fg); \
+                                               background:#21262d; border:1px solid #30363d; \
+                                               border-radius:6px;"
+                                        on:click=move |_| {
+                                            clone_url.set(String::new());
+                                            open_opened_at.set_value(js_sys::Date::now());
+                                            open_url.set(true);
                                         }
-                                    });
-                                }
-                            >
-                                "Rescan"
-                            </button>
+                                    >
+                                        "Clone URL…"
+                                    </button>
+                                    <button
+                                        style="padding:8px 16px; font:inherit; color:var(--fg); \
+                                               background:#21262d; border:1px solid #30363d; \
+                                               border-radius:6px;"
+                                        on:click=move |_| {
+                                            spawn_local(async move {
+                                                match rescan_request().await {
+                                                    Ok(msg) => {
+                                                        rescan_msg.set(msg);
+                                                        bump.update(|n| *n = n.wrapping_add(1));
+                                                    }
+                                                    Err(e) => rescan_msg.set(e),
+                                                }
+                                            });
+                                        }
+                                    >
+                                        "Rescan"
+                                    </button>
+                                })
+                            }}
                             // The picker blocks the app, so it must always be
                             // dismissable: Cancel keeps the current repo/mode.
                             <button
