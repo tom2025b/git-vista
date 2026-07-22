@@ -121,7 +121,13 @@ pub fn picker_view(
                                             >
                                                 {label}
                                             </button>
-                                            {is_clone.then(|| view! {
+                                            // ADR 0005: no Delete on a LAN-view
+                                            // session — the route doesn't even
+                                            // exist on the LAN listener. Rows
+                                            // re-render post-session (catalog is
+                                            // keyed on `reload`), so the flag is
+                                            // settled by the time it's read.
+                                            {(is_clone && !crate::api::is_lan_session()).then(|| view! {
                                                 <button
                                                     style="padding:12px; font:inherit; \
                                                            color:#f85149; background:#0d1117; \
@@ -138,36 +144,46 @@ pub fn picker_view(
                                 .collect_view(),
                         }}
                         <div style="display:flex; gap:8px; margin-top:16px;">
-                            <button
-                                style="padding:8px 16px; font:inherit; color:var(--fg); \
-                                       background:#21262d; border:1px solid #30363d; \
-                                       border-radius:6px;"
-                                on:click=move |_| {
-                                    clone_url.set(String::new());
-                                    open_opened_at.set_value(js_sys::Date::now());
-                                    open_url.set(true);
-                                }
-                            >
-                                "Clone URL…"
-                            </button>
-                            <button
-                                style="padding:8px 16px; font:inherit; color:var(--fg); \
-                                       background:#21262d; border:1px solid #30363d; \
-                                       border-radius:6px;"
-                                on:click=move |_| {
-                                    spawn_local(async move {
-                                        match rescan_request().await {
-                                            Ok(msg) => {
-                                                rescan_msg.set(msg);
-                                                bump.update(|n| *n = n.wrapping_add(1));
-                                            }
-                                            Err(e) => rescan_msg.set(e),
+                            // ADR 0005: Clone URL…/Rescan hit routes the LAN
+                            // listener never registers — hide them there. Keyed
+                            // on `reload` so the buttons re-evaluate once the
+                            // session (and its via_lan flag) lands, the same
+                            // recovery the catalog fetch above uses.
+                            {move || {
+                                reload.get();
+                                (!crate::api::is_lan_session()).then(|| view! {
+                                    <button
+                                        style="padding:8px 16px; font:inherit; color:var(--fg); \
+                                               background:#21262d; border:1px solid #30363d; \
+                                               border-radius:6px;"
+                                        on:click=move |_| {
+                                            clone_url.set(String::new());
+                                            open_opened_at.set_value(js_sys::Date::now());
+                                            open_url.set(true);
                                         }
-                                    });
-                                }
-                            >
-                                "Rescan"
-                            </button>
+                                    >
+                                        "Clone URL…"
+                                    </button>
+                                    <button
+                                        style="padding:8px 16px; font:inherit; color:var(--fg); \
+                                               background:#21262d; border:1px solid #30363d; \
+                                               border-radius:6px;"
+                                        on:click=move |_| {
+                                            spawn_local(async move {
+                                                match rescan_request().await {
+                                                    Ok(msg) => {
+                                                        rescan_msg.set(msg);
+                                                        bump.update(|n| *n = n.wrapping_add(1));
+                                                    }
+                                                    Err(e) => rescan_msg.set(e),
+                                                }
+                                            });
+                                        }
+                                    >
+                                        "Rescan"
+                                    </button>
+                                })
+                            }}
                             // The picker blocks the app, so it must always be
                             // dismissable: Cancel keeps the current repo/mode.
                             <button
