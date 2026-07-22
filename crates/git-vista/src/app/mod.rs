@@ -289,17 +289,26 @@ pub fn App() -> impl IntoView {
                         </button>
                     }
                 })}
-                <button
-                    class="refresh"
-                    on:click=move |_| {
-                        clone_url.set(String::new());
-                        open_opened_at.set_value(js_sys::Date::now());
-                        open_url.set(true);
-                    }
-                    title="Clone a public repository from a URL and view its history (read-only)"
-                >
-                    "Open URL…"
-                </button>
+                // ADR 0005: no Open URL… on a LAN-view session — `/api/clone`
+                // doesn't exist on the LAN listener. Keyed on the session
+                // resource so the button re-evaluates once `establish_session`
+                // lands (it records via_lan before resolving).
+                {move || {
+                    session.get();
+                    (!crate::api::is_lan_session()).then(|| view! {
+                        <button
+                            class="refresh"
+                            on:click=move |_| {
+                                clone_url.set(String::new());
+                                open_opened_at.set_value(js_sys::Date::now());
+                                open_url.set(true);
+                            }
+                            title="Clone a public repository from a URL and view its history (read-only)"
+                        >
+                            "Open URL…"
+                        </button>
+                    })
+                }}
                 <button
                     class="refresh"
                     on:click=move |_| activity_open.update(|open| *open = !*open)
