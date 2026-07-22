@@ -160,6 +160,14 @@ pub fn App() -> impl IntoView {
     // choice; the mode screen renders whenever it's Some.
     let picker_open = create_rw_signal(true);
     let mode_for = create_rw_signal(None::<git_vista_protocol::RepositoryDescriptor>);
+    // ADR 0005: a LAN-view session can't select a repo or mode, so the
+    // ask-every-time picker would only dead-end there — close it once the
+    // session lands and show the served repo's graph straight away.
+    create_effect(move |_| {
+        if matches!(session.get(), Some(Ok(true))) && crate::api::is_lan_session() {
+            picker_open.set(false);
+        }
+    });
 
     // Defense in depth (ADR 0007): mirror the loaded graph's mode into api.rs so
     // write calls refuse client-side too. The server's 403 remains the boundary.
