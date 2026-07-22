@@ -74,6 +74,21 @@ pub fn is_lan_session() -> bool {
     VIA_LAN.with(|v| *v.borrow())
 }
 
+/// The ADR 0005 client-side counterpart of the LAN listener's structural
+/// read-only-ness: clone/select/rescan/delete refuse up front on a LAN-view
+/// session with a clear reason, instead of surfacing the bare `405` the
+/// route-less LAN listener answers with. The absent server route remains the
+/// actual boundary.
+fn refuse_if_lan_view() -> Result<(), String> {
+    if is_lan_session() {
+        Err("This is a read-only LAN view session — open the localhost \
+             (SSH-tunnel) link to clone, rescan, or switch repositories."
+            .to_string())
+    } else {
+        Ok(())
+    }
+}
+
 /// The ADR 0007 client-side write chokepoint: every repo-write function refuses
 /// up front in Visualize mode, so a gating gap in the UI can't even attempt a
 /// mutation. The server's own 403 remains the actual boundary.
@@ -227,6 +242,7 @@ pub async fn fetch_commit_detail(id: &str) -> Result<CommitDetail, String> {
 /// a non-2xx response the body is the server's / git's own error text (bad
 /// URL, repo not found, …), returned as `Err`.
 pub async fn clone_request(url: &str) -> Result<RepositoryDescriptor, String> {
+    refuse_if_lan_view()?;
     let body = CloneRequest {
         url: url.to_string(),
     };
@@ -241,10 +257,9 @@ pub async fn clone_request(url: &str) -> Result<RepositoryDescriptor, String> {
             .await
             .map_err(|e| e.to_string())
     } else {
-        Err(resp
-            .text()
-            .await
-            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+        // `response_error` (not raw body text): an empty error body — the
+        // LAN listener's bare 405, say — must still say *something*.
+        Err(response_error(resp).await)
     }
 }
 
@@ -617,6 +632,7 @@ pub async fn fetch_catalog() -> Result<Vec<RepositoryDescriptor>, String> {
 /// A forged/unknown id comes back 404 from the fail-closed catalog; the picker
 /// shows the server's reason.
 pub async fn select_request(worktree: &str, mode: RepoMode) -> Result<(), String> {
+    refuse_if_lan_view()?;
     let body = SelectRequest {
         worktree: worktree.to_string(),
         mode,
@@ -637,6 +653,7 @@ pub async fn select_request(worktree: &str, mode: RepoMode) -> Result<(), String
 /// Re-scan the configured repo root (`POST /api/rescan`, ADR 0009). `Ok` carries
 /// the server's one-line summary for the picker to show.
 pub async fn rescan_request() -> Result<String, String> {
+    refuse_if_lan_view()?;
     let resp = req_post("/api/rescan")
         .send()
         .await
@@ -652,6 +669,7 @@ pub async fn rescan_request() -> Result<String, String> {
 /// carries the server's confirmation line for the picker; refusals (not a
 /// clone, currently open, unknown id) come back as `Err` with the reason.
 pub async fn delete_clone_request(worktree: &str) -> Result<String, String> {
+    refuse_if_lan_view()?;
     let body = DeleteCloneRequest {
         worktree: worktree.to_string(),
     };
