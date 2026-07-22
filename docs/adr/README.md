@@ -25,3 +25,4 @@ it, and note the link in both.
 | [0011](0011-pointer-type-gesture-slop.md) | Gesture slop is pointer-type-aware (touch 12px, mouse/pen 4px) | Accepted |
 | [0012](0012-unscrollable-app-shell.md) | The app shell never scrolls; all scrolling is internal | Accepted |
 | [0013](0013-clone-descriptor-protocol-bump.md) | Protocol v2 for the clone response; `set_current` returns its own handle | Accepted |
+| [0014](0014-lan-view-read-only-affordances.md) | LAN-view sessions present read-only affordances only | Accepted |
