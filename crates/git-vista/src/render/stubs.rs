@@ -123,12 +123,13 @@ pub fn stubs(
             // The repo's GitHub base, for the menu's "Create Pull Request" link.
             let repo_url = c.repo_url.clone();
             let remote_web_url = c.graph.remote_web_url.clone();
-            let open_menu = move |ev: web_sys::MouseEvent| {
-                // Ignore the click that ends a pan; a real tap opens the menu.
+            // Issue #139: pointerup, not click — same reasoning as the commit
+            // dots in nodes.rs (iPad DuckDuckGo click synthesis). Propagation
+            // stays live for the svg's gesture cleanup.
+            let open_menu = move |ev: web_sys::PointerEvent| {
                 if moved.get_value() {
                     return;
                 }
-                ev.stop_propagation();
                 menu.set(Some(MenuData {
                     commit: commit_id.clone(),
                     header: header.clone(),
@@ -178,7 +179,7 @@ pub fn stubs(
                     r=NODE_RADIUS + 8
                     fill="transparent"
                     class="node-hit"
-                    on:click=open_menu
+                    on:pointerup=open_menu
                 />
             }
         })

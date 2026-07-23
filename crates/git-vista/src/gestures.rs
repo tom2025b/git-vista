@@ -185,10 +185,20 @@ pub fn on_pointer_move(g: GestureState, ev: web_sys::PointerEvent) {
 
 /// Release / cancel: drop the pointer; end the drag once none remain. Reset
 /// the pinch baseline so lifting one of two fingers doesn't make the next move
-/// jump. `moved` is left for the click that may follow, and reset on next press.
+/// jump.
+///
+/// `moved` (issue #139): the node/stub hit targets open their menu on
+/// *pointerup*, and a target's handler runs before this ancestor handler in
+/// the bubble — the pan gate is still set when they read it. The label links,
+/// though, suppress on the *click* that follows this event, so the flag can't
+/// be cleared synchronously here or a pan ending on a link would open it.
+/// Clearing on the next animation frame keeps both consumers correct while
+/// making sure a lost/interrupted gesture can never leave a stale
+/// `moved=true` swallowing every later tap (the pre-#139 failure mode).
 pub fn on_pointer_up(g: GestureState, ev: web_sys::PointerEvent) {
     let GestureState {
         dragging,
+        moved,
         pointers,
         pinch_dist,
         ..
@@ -198,6 +208,7 @@ pub fn on_pointer_up(g: GestureState, ev: web_sys::PointerEvent) {
     pinch_dist.set_value(None);
     if pointers.with_value(|ps| ps.is_empty()) {
         dragging.set(false);
+        request_animation_frame(move || moved.set_value(false));
     }
 }
 
