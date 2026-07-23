@@ -63,13 +63,15 @@ pub fn build_node(
         let repo_url = c.repo_url.clone();
         // The any-host forge base (ADR 0010), for the non-GitHub branch links.
         let remote_web_url = c.graph.remote_web_url.clone();
-        let open_menu = move |ev: web_sys::MouseEvent| {
-            // Ignore the click that ends a pan; a real tap opens the menu where
-            // the pointer is (viewport coords for the fixed-position overlay).
+        // Issue #139: opened on pointerup, not click — iPad DuckDuckGo doesn't
+        // reliably synthesize a click from a touch on these SVG circles, so the
+        // menu depends only on raw pointer events. The `moved` gate still
+        // swallows the pointerup that ends a pan. Propagation must NOT be
+        // stopped: the svg's own pointerup (gesture cleanup) runs after this.
+        let open_menu = move |ev: web_sys::PointerEvent| {
             if moved.get_value() {
                 return;
             }
-            ev.stop_propagation();
             menu.set(Some(MenuData {
                 commit: commit_id.clone(),
                 header: short.clone(),
@@ -108,7 +110,7 @@ pub fn build_node(
                     r=NODE_RADIUS + 8
                     fill="transparent"
                     class="node-hit"
-                    on:click=open_menu
+                    on:pointerup=open_menu
                 />
             </g>
         }
