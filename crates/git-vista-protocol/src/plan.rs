@@ -556,9 +556,7 @@ mod tests {
         // An unknown `op` tag must fail to deserialize — the vocabulary is
         // closed, with no generic escape hatch.
         assert!(serde_json::from_str::<GitOperation>(r#"{"op":"run_arbitrary_git"}"#).is_err());
-        assert!(
-            serde_json::from_str::<GitOperation>(r#"{"op":"generic","argv":["gc"]}"#).is_err()
-        );
+        assert!(serde_json::from_str::<GitOperation>(r#"{"op":"generic","argv":["gc"]}"#).is_err());
     }
 
     #[test]
@@ -573,7 +571,10 @@ mod tests {
         );
         let at = RefState::At(oid('a'));
         let json = serde_json::to_string(&at).unwrap();
-        assert_eq!(json, format!(r#"{{"kind":"at","value":"{}"}}"#, "a".repeat(40)));
+        assert_eq!(
+            json,
+            format!(r#"{{"kind":"at","value":"{}"}}"#, "a".repeat(40))
+        );
         assert_eq!(serde_json::from_str::<RefState>(&json).unwrap(), at);
         let sym = RefState::Symbolic(RefName::new("refs/heads/main").unwrap());
         let json = serde_json::to_string(&sym).unwrap();
