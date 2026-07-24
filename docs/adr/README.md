@@ -26,3 +26,4 @@ it, and note the link in both.
 | [0012](0012-unscrollable-app-shell.md) | The app shell never scrolls; all scrolling is internal | Accepted |
 | [0013](0013-clone-descriptor-protocol-bump.md) | Protocol v2 for the clone response; `set_current` returns its own handle | Accepted |
 | [0014](0014-lan-view-read-only-affordances.md) | LAN-view sessions present read-only affordances only | Accepted |
+| [0015](0015-typed-operation-vocabulary-and-plan-schema.md) | A closed Git-operation vocabulary and the reviewable Plan schema | Accepted |
