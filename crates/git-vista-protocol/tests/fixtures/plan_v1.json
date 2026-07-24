@@ -1,0 +1,530 @@
+[
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "create_branch",
+      "name": "feature/idea",
+      "at": "1111111111111111111111111111111111111111"
+    },
+    "operation_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "reversible",
+    "preconditions": [
+      {
+        "check": "ref_absent",
+        "ref_name": "refs/heads/feature/idea"
+      }
+    ],
+    "expected_ref_changes": [
+      {
+        "ref_name": "refs/heads/feature/idea",
+        "before": {
+          "kind": "absent"
+        },
+        "after": {
+          "kind": "at",
+          "value": "1111111111111111111111111111111111111111"
+        }
+      }
+    ],
+    "recovery": {
+      "strategy": "delete_created_branch",
+      "name": "feature/idea"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "commit_on_head",
+      "message": "feat: land the thing",
+      "allow_empty": false
+    },
+    "operation_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "reversible",
+    "preconditions": [
+      {
+        "check": "branch_checked_out",
+        "branch": "main"
+      }
+    ],
+    "expected_ref_changes": [
+      {
+        "ref_name": "refs/heads/main",
+        "before": {
+          "kind": "at",
+          "value": "2222222222222222222222222222222222222222"
+        },
+        "after": {
+          "kind": "computed"
+        }
+      }
+    ],
+    "recovery": {
+      "strategy": "reset_ref",
+      "ref_name": "refs/heads/main",
+      "to": "2222222222222222222222222222222222222222"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "empty_commit_on_branch",
+      "branch": "feature/stub",
+      "message": "chore: first (empty) commit",
+      "expected_tip": "3333333333333333333333333333333333333333"
+    },
+    "operation_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "reversible",
+    "preconditions": [
+      {
+        "check": "branch_not_checked_out",
+        "branch": "feature/stub"
+      },
+      {
+        "check": "ref_at",
+        "ref_name": "refs/heads/feature/stub",
+        "oid": "3333333333333333333333333333333333333333"
+      }
+    ],
+    "expected_ref_changes": [
+      {
+        "ref_name": "refs/heads/feature/stub",
+        "before": {
+          "kind": "at",
+          "value": "3333333333333333333333333333333333333333"
+        },
+        "after": {
+          "kind": "computed"
+        }
+      }
+    ],
+    "recovery": {
+      "strategy": "reset_ref",
+      "ref_name": "refs/heads/feature/stub",
+      "to": "3333333333333333333333333333333333333333"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "stage_all"
+    },
+    "operation_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "safe",
+    "preconditions": [],
+    "expected_ref_changes": [],
+    "recovery": {
+      "strategy": "not_needed"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "unstage_all"
+    },
+    "operation_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "safe",
+    "preconditions": [],
+    "expected_ref_changes": [],
+    "recovery": {
+      "strategy": "not_needed"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "checkout_branch",
+      "branch": "feature/idea"
+    },
+    "operation_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "safe",
+    "preconditions": [
+      {
+        "check": "ref_exists",
+        "ref_name": "refs/heads/feature/idea"
+      }
+    ],
+    "expected_ref_changes": [
+      {
+        "ref_name": "HEAD",
+        "before": {
+          "kind": "symbolic",
+          "value": "refs/heads/main"
+        },
+        "after": {
+          "kind": "symbolic",
+          "value": "refs/heads/feature/idea"
+        }
+      }
+    ],
+    "recovery": {
+      "strategy": "checkout_previous",
+      "branch": "main"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "merge_branch",
+      "branch": "feature/idea"
+    },
+    "operation_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "reversible",
+    "preconditions": [
+      {
+        "check": "branch_checked_out",
+        "branch": "main"
+      },
+      {
+        "check": "ref_at",
+        "ref_name": "refs/heads/main",
+        "oid": "2222222222222222222222222222222222222222"
+      }
+    ],
+    "expected_ref_changes": [
+      {
+        "ref_name": "refs/heads/main",
+        "before": {
+          "kind": "at",
+          "value": "2222222222222222222222222222222222222222"
+        },
+        "after": {
+          "kind": "computed"
+        }
+      }
+    ],
+    "recovery": {
+      "strategy": "reset_ref",
+      "ref_name": "refs/heads/main",
+      "to": "2222222222222222222222222222222222222222"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "push_branch",
+      "branch": "main",
+      "remote": "origin"
+    },
+    "operation_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "remote",
+    "preconditions": [
+      {
+        "check": "remote_configured",
+        "remote": "origin"
+      },
+      {
+        "check": "ref_exists",
+        "ref_name": "refs/heads/main"
+      }
+    ],
+    "expected_ref_changes": [
+      {
+        "ref_name": "refs/remotes/origin/main",
+        "before": {
+          "kind": "at",
+          "value": "4444444444444444444444444444444444444444"
+        },
+        "after": {
+          "kind": "at",
+          "value": "2222222222222222222222222222222222222222"
+        }
+      }
+    ],
+    "recovery": {
+      "strategy": "irrecoverable"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "delete_branch",
+      "branch": "feature/done"
+    },
+    "operation_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "reversible",
+    "preconditions": [
+      {
+        "check": "ref_at",
+        "ref_name": "refs/heads/feature/done",
+        "oid": "5555555555555555555555555555555555555555"
+      }
+    ],
+    "expected_ref_changes": [
+      {
+        "ref_name": "refs/heads/feature/done",
+        "before": {
+          "kind": "at",
+          "value": "5555555555555555555555555555555555555555"
+        },
+        "after": {
+          "kind": "absent"
+        }
+      }
+    ],
+    "recovery": {
+      "strategy": "recreate_branch",
+      "name": "feature/done",
+      "at": "5555555555555555555555555555555555555555"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "force_delete_branch",
+      "branch": "feature/abandoned"
+    },
+    "operation_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "destructive",
+    "preconditions": [
+      {
+        "check": "ref_at",
+        "ref_name": "refs/heads/feature/abandoned",
+        "oid": "6666666666666666666666666666666666666666"
+      }
+    ],
+    "expected_ref_changes": [
+      {
+        "ref_name": "refs/heads/feature/abandoned",
+        "before": {
+          "kind": "at",
+          "value": "6666666666666666666666666666666666666666"
+        },
+        "after": {
+          "kind": "absent"
+        }
+      }
+    ],
+    "recovery": {
+      "strategy": "recreate_branch",
+      "name": "feature/abandoned",
+      "at": "6666666666666666666666666666666666666666"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "rebase_onto_base",
+      "base": "origin/main"
+    },
+    "operation_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "reversible",
+    "preconditions": [
+      {
+        "check": "branch_checked_out",
+        "branch": "feature/idea"
+      },
+      {
+        "check": "ref_exists",
+        "ref_name": "refs/remotes/origin/main"
+      }
+    ],
+    "expected_ref_changes": [
+      {
+        "ref_name": "refs/heads/feature/idea",
+        "before": {
+          "kind": "at",
+          "value": "1111111111111111111111111111111111111111"
+        },
+        "after": {
+          "kind": "computed"
+        }
+      }
+    ],
+    "recovery": {
+      "strategy": "reset_ref",
+      "ref_name": "refs/heads/feature/idea",
+      "to": "1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "restore_branch",
+      "name": "feature/done",
+      "tip": "5555555555555555555555555555555555555555"
+    },
+    "operation_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "reversible",
+    "preconditions": [
+      {
+        "check": "ref_absent",
+        "ref_name": "refs/heads/feature/done"
+      }
+    ],
+    "expected_ref_changes": [
+      {
+        "ref_name": "refs/heads/feature/done",
+        "before": {
+          "kind": "absent"
+        },
+        "after": {
+          "kind": "at",
+          "value": "5555555555555555555555555555555555555555"
+        }
+      }
+    ],
+    "recovery": {
+      "strategy": "delete_created_branch",
+      "name": "feature/done"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "reset_branch",
+      "branch": "main",
+      "to": "2222222222222222222222222222222222222222",
+      "expected_tip": "7777777777777777777777777777777777777777"
+    },
+    "operation_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "destructive",
+    "preconditions": [
+      {
+        "check": "ref_at",
+        "ref_name": "refs/heads/main",
+        "oid": "7777777777777777777777777777777777777777"
+      },
+      {
+        "check": "clean_worktree"
+      }
+    ],
+    "expected_ref_changes": [
+      {
+        "ref_name": "refs/heads/main",
+        "before": {
+          "kind": "at",
+          "value": "7777777777777777777777777777777777777777"
+        },
+        "after": {
+          "kind": "at",
+          "value": "2222222222222222222222222222222222222222"
+        }
+      }
+    ],
+    "recovery": {
+      "strategy": "reset_ref",
+      "ref_name": "refs/heads/main",
+      "to": "7777777777777777777777777777777777777777"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "revert_commit",
+      "commit": "8888888888888888888888888888888888888888"
+    },
+    "operation_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "reversible",
+    "preconditions": [
+      {
+        "check": "branch_checked_out",
+        "branch": "main"
+      }
+    ],
+    "expected_ref_changes": [
+      {
+        "ref_name": "refs/heads/main",
+        "before": {
+          "kind": "at",
+          "value": "2222222222222222222222222222222222222222"
+        },
+        "after": {
+          "kind": "computed"
+        }
+      }
+    ],
+    "recovery": {
+      "strategy": "revert_commit",
+      "commit": "8888888888888888888888888888888888888888"
+    }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "reset_test_repo"
+    },
+    "operation_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "destructive",
+    "preconditions": [
+      {
+        "check": "seed_recorded"
+      }
+    ],
+    "expected_ref_changes": [
+      {
+        "ref_name": "refs/heads/main",
+        "before": {
+          "kind": "at",
+          "value": "7777777777777777777777777777777777777777"
+        },
+        "after": {
+          "kind": "at",
+          "value": "9999999999999999999999999999999999999999"
+        }
+      }
+    ],
+    "recovery": {
+      "strategy": "irrecoverable"
+    }
+  }
+]
