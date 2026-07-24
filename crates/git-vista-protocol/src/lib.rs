@@ -11,6 +11,9 @@
 //!   its machine-readable [`ErrorCode`], and the [`RequestId`] correlation token.
 //! - [`dto`]     — the shared request/response DTOs (branch/commit/clone bodies,
 //!   rebase-status) the server and frontend exchange.
+//! - [`plan`]    — the closed, typed [`GitOperation`] vocabulary (every mutation
+//!   the server can perform) and the reviewable [`Plan`] previewing one before
+//!   execution (M1.06a, #142; enforcement lands with #145).
 //!
 //! ## Why a separate crate
 //!
@@ -35,6 +38,7 @@
 
 pub mod dto;
 pub mod error;
+pub mod plan;
 pub mod version;
 
 pub use dto::{
@@ -43,6 +47,11 @@ pub use dto::{
     SelectRequest, SessionInfo, SessionRequest,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
+pub use plan::{
+    BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, OperationHash, Plan,
+    PlanFieldError, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
+    RepositoryToken, RiskLevel, UnixSeconds, WorktreeToken,
+};
 pub use version::{
     check_compatibility, parse_protocol_header, Compatibility, ProtocolInfo, CSRF_HEADER,
     MAX_CLIENT_PROTOCOL, MIN_CLIENT_PROTOCOL, PROTOCOL_HEADER, PROTOCOL_VERSION, REQUEST_ID_HEADER,
