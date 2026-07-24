@@ -30,6 +30,7 @@ use git_vista_core::activity::{
 };
 use git_vista_core::model::RefKind;
 use git_vista_git::{read_commit, read_reflogs, read_refs, read_remote_commits, RepoError};
+use git_vista_protocol::{BranchName, CommitOid, GitOperation};
 
 use crate::journal;
 
@@ -156,32 +157,6 @@ fn is_safe_branch_name(name: &str) -> bool {
     !name.is_empty() && !name.starts_with('-')
 }
 
-/// Run `git -C <repo> <args…>`, mapping failure to git's own explanation
-/// (stderr, falling back to stdout, then a generic line — the same posture as
-/// every other write handler).
-async fn git(repo: &Path, args: &[&str]) -> Result<(), String> {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| format!("Couldn't run git: {e}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !stderr.is_empty() {
-        return Err(stderr);
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Err(if stdout.is_empty() {
-        "git failed.".to_string()
-    } else {
-        stdout
-    })
-}
-
 /// `GET /api/undoables/{id}` — every undo action that applies to one commit,
 /// computed live (step 5). The graph menu fetches this when it opens, so the
 /// undo section always reflects the repo *now*, not the possibly-stale graph.
@@ -269,18 +244,18 @@ pub async fn undoables(
 /// `POST /api/undo` — execute one [`UndoAction`] (step 5). The body is the
 /// tagged action exactly as `/api/activity` / `/api/undoables` handed it out.
 ///
-/// Safety posture, in order:
+/// Since M1.06b (#143) the handler validates the action's fields (same
+/// wording), builds the matching [`GitOperation`], and hands it to the shared
+/// planner; the execution safety posture is unchanged, now inside the
+/// planner's executor:
 ///  * read-only clones are refused outright (403);
 ///  * ids and branch names are validated before they go near argv;
 ///  * `ResetBranch` is compare-and-swap — the branch must still point at
 ///    `expected_tip`, so a hint from a stale menu can never reset away work
 ///    that happened after it was shown (409 when it has moved);
-///  * resetting the *checked-out* branch requires a clean working tree
-///    (`git status --porcelain` empty) — `git reset --hard` must never eat
-///    uncommitted work, and a fully-clean tree is the one state where it
-///    can't (even an untracked file could be overwritten if the target
-///    commit tracks that path). A branch that isn't checked out moves with
-///    `git branch -f`, which touches no worktree at all;
+///  * resetting the *checked-out* branch requires a clean working tree —
+///    `git reset --hard` must never eat uncommitted work. A branch that isn't
+///    checked out moves with `git branch -f`, which touches no worktree;
 ///  * a conflicted `git revert` is auto-aborted (like `/api/rebase`), so a
 ///    browser-only user is never left mid-revert with no shell to fix it.
 ///
@@ -292,7 +267,7 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
         return rejected;
     }
     let repo = crate::state::current().0;
-    match action {
+    let op = match action {
         UndoAction::RestoreBranch { name, tip } => {
             let name = name.trim();
             if !is_safe_branch_name(name) {
@@ -301,26 +276,14 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
             if !is_hex_id(&tip) {
                 return (StatusCode::BAD_REQUEST, "Not a commit id.".to_string());
             }
-            // The safe undo: `git branch` creates, never destroys, and fails
-            // by itself if the name came back into use since the hint.
-            match git(&repo, &["branch", name, &tip]).await {
-                Ok(()) => {
-                    println!("[/api/undo] restored branch '{name}' at {}", short(&tip));
-                    crate::handlers::journal_app_event(
-                        &repo,
-                        ActivityKind::BranchCreated,
-                        Some(name.to_string()),
-                        None,
-                        Some(tip.clone()),
-                        format!("restored branch ‘{name}’ at {}", short(&tip)),
-                    );
-                    (StatusCode::OK, format!("Restored branch ‘{name}’."))
-                }
-                Err(msg) => {
-                    eprintln!("git-vista: /api/undo restore failed: {msg}");
-                    (StatusCode::BAD_REQUEST, msg)
-                }
-            }
+            let Ok(name) = BranchName::new(name) else {
+                return (StatusCode::BAD_REQUEST, "Bad branch name.".to_string());
+            };
+            let tip = match undo_commit_oid(&repo, &tip).await {
+                Ok(tip) => tip,
+                Err(refused) => return refused,
+            };
+            GitOperation::RestoreBranch { name, tip }
         }
         UndoAction::ResetBranch {
             branch,
@@ -334,112 +297,59 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
             if !is_hex_id(&to) || !is_hex_id(&expected_tip) {
                 return (StatusCode::BAD_REQUEST, "Not a commit id.".to_string());
             }
-            // Compare-and-swap: the hint was computed against `expected_tip`;
-            // if the branch has moved since, this undo would discard newer
-            // work the user never saw in the dialog — refuse instead.
-            let actual = crate::git_cmd::rev_parse(&repo, branch).await;
-            if actual.as_deref() != Some(expected_tip.as_str()) {
+            let Ok(branch) = BranchName::new(branch) else {
+                return (StatusCode::BAD_REQUEST, "Bad branch name.".to_string());
+            };
+            // The hint's compare-and-swap tip must be exact — the feed only
+            // ever hands out full ids, so anything else is a hand-crafted
+            // request whose CAS could never have matched the live tip anyway.
+            let Ok(expected_tip) = CommitOid::new(expected_tip) else {
                 return (
                     StatusCode::CONFLICT,
                     format!(
                         "‘{branch}’ has moved since this undo was offered — refresh and try again."
                     ),
                 );
-            }
-            let checked_out = git_vista_git::read_head_branch(&repo).as_deref() == Some(branch);
-            let result = if checked_out {
-                // `git reset --hard` rewrites the working tree, so it runs
-                // only against a fully clean one — never eat uncommitted work.
-                match worktree_dirty(&repo).await {
-                    Err(msg) => Err(msg),
-                    Ok(true) => {
-                        return (
-                            StatusCode::CONFLICT,
-                            "The working tree has uncommitted changes — commit them first \
-                             so the undo can't destroy them."
-                                .to_string(),
-                        );
-                    }
-                    Ok(false) => git(&repo, &["reset", "--hard", &to]).await,
-                }
-            } else {
-                // Not checked out: move the ref alone, no worktree involved.
-                git(&repo, &["branch", "-f", branch, &to]).await
             };
-            match result {
-                Ok(()) => {
-                    println!("[/api/undo] reset branch '{branch}' to {}", short(&to));
-                    crate::handlers::journal_app_event(
-                        &repo,
-                        ActivityKind::Reset,
-                        Some(branch.to_string()),
-                        Some(expected_tip.clone()),
-                        Some(to.clone()),
-                        format!("undid — reset ‘{branch}’ to {}", short(&to)),
-                    );
-                    (
-                        StatusCode::OK,
-                        format!("Reset ‘{branch}’ to {}.", short(&to)),
-                    )
-                }
-                Err(msg) => {
-                    eprintln!("git-vista: /api/undo reset failed: {msg}");
-                    (StatusCode::BAD_REQUEST, msg)
-                }
+            let to = match undo_commit_oid(&repo, &to).await {
+                Ok(to) => to,
+                Err(refused) => return refused,
+            };
+            GitOperation::ResetBranch {
+                branch,
+                to,
+                expected_tip,
             }
         }
         UndoAction::RevertCommit { commit } => {
             if !is_hex_id(&commit) {
                 return (StatusCode::BAD_REQUEST, "Not a commit id.".to_string());
             }
-            let old = crate::git_cmd::rev_parse(&repo, "HEAD").await;
-            match git(&repo, &["revert", "--no-edit", &commit]).await {
-                Ok(()) => {
-                    println!("[/api/undo] reverted {}", short(&commit));
-                    let new = crate::git_cmd::rev_parse(&repo, "HEAD").await;
-                    let branch =
-                        git_vista_git::read_head_branch(&repo).unwrap_or_else(|| "HEAD".into());
-                    crate::handlers::journal_app_event(
-                        &repo,
-                        ActivityKind::Revert,
-                        Some(branch),
-                        old,
-                        new,
-                        format!("reverted {}", short(&commit)),
-                    );
-                    (StatusCode::OK, format!("Reverted {}.", short(&commit)))
-                }
-                Err(msg) => {
-                    // Back out of a conflicted half-applied revert so the tree
-                    // isn't stuck (same posture as /api/rebase). Harmless when
-                    // no revert is in progress.
-                    let _ = git(&repo, &["revert", "--abort"]).await;
-                    eprintln!("git-vista: /api/undo revert failed (aborted): {msg}");
-                    (StatusCode::BAD_REQUEST, msg)
-                }
-            }
+            let commit = match undo_commit_oid(&repo, &commit).await {
+                Ok(commit) => commit,
+                Err(refused) => return refused,
+            };
+            GitOperation::RevertCommit { commit }
         }
-    }
+    };
+    crate::planner::plan_and_execute(op).await
 }
 
-/// Whether the working tree has any change at all (`git status --porcelain`
-/// non-empty): staged, unstaged, untracked or conflicted — any of them makes
-/// a hard reset unsafe.
-async fn worktree_dirty(repo: &Path) -> Result<bool, String> {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["status", "--porcelain"])
-        .output()
-        .await
-        .map_err(|e| format!("Couldn't run git: {e}"))?;
-    if !output.status.success() {
-        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if msg.is_empty() {
-            "git status failed.".to_string()
-        } else {
-            msg
-        });
+/// An undo id as an exact [`CommitOid`]: the feed's full 40/64-hex ids are
+/// taken as-is; an abbreviated (hand-crafted) id is resolved through
+/// `git rev-parse` — the commands the old handler passed short ids straight
+/// to accepted them the same way.
+async fn undo_commit_oid(repo: &Path, given: &str) -> Result<CommitOid, (StatusCode, String)> {
+    if let Ok(oid) = CommitOid::new(given) {
+        return Ok(oid);
     }
-    Ok(!output.stdout.is_empty())
+    match crate::git_cmd::rev_parse(repo, given).await {
+        Some(full) => CommitOid::new(full).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "git rev-parse returned an unusable id.".to_string(),
+            )
+        }),
+        None => Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string())),
+    }
 }
