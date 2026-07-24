@@ -590,9 +590,7 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         GitOperation::CheckoutBranch { branch } => exec_checkout(repo, &branch, &observed).await,
         GitOperation::MergeBranch { branch } => exec_merge(repo, &branch, &observed).await,
         GitOperation::PushBranch { branch, remote } => exec_push(repo, &branch, &remote).await,
-        GitOperation::DeleteBranch { branch } => {
-            exec_delete(repo, &branch, &observed, false).await
-        }
+        GitOperation::DeleteBranch { branch } => exec_delete(repo, &branch, &observed, false).await,
         GitOperation::ForceDeleteBranch { branch } => {
             exec_delete(repo, &branch, &observed, true).await
         }
@@ -692,7 +690,11 @@ fn short(oid: &str) -> &str {
 
 /// `git branch <name> <at>` (`/api/branch`). B3 posture: git validates the
 /// name, refuses a duplicate, and its stderr is forwarded verbatim on failure.
-async fn exec_create_branch(repo: &Path, name: &BranchName, at: &CommitOid) -> (StatusCode, String) {
+async fn exec_create_branch(
+    repo: &Path,
+    name: &BranchName,
+    at: &CommitOid,
+) -> (StatusCode, String) {
     let output = match run_git(repo, &["branch", name.as_str(), at.as_str()]).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/branch", &e),
@@ -1106,7 +1108,11 @@ async fn exec_rebase(repo: &Path, base: &RefName, observed: &Observed) -> (Statu
 /// `git branch <name> <tip>` — re-create a deleted branch at its journaled tip
 /// (`/api/undo`). The safe undo: `git branch` creates, never destroys, and
 /// fails by itself if the name came back into use since the hint.
-async fn exec_restore_branch(repo: &Path, name: &BranchName, tip: &CommitOid) -> (StatusCode, String) {
+async fn exec_restore_branch(
+    repo: &Path,
+    name: &BranchName,
+    tip: &CommitOid,
+) -> (StatusCode, String) {
     match git(repo, &["branch", name.as_str(), tip.as_str()]).await {
         Ok(()) => {
             println!(
@@ -1266,11 +1272,7 @@ async fn exec_reset_test_repo(repo: &Path) -> (StatusCode, String) {
     if let Some(dir) = journal::state_dir(repo) {
         let bundle = dir.join("seed.bundle");
         if bundle.exists() {
-            let _ = git_ok(
-                repo,
-                &["bundle", "unbundle", &bundle.display().to_string()],
-            )
-            .await;
+            let _ = git_ok(repo, &["bundle", "unbundle", &bundle.display().to_string()]).await;
         }
     }
     for r in &seed.refs {
