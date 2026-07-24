@@ -196,10 +196,15 @@ it did not itself register.
 ## Command Execution
 
 - Use direct argv execution; never invoke a shell.
+  *(Enforced by a tripwire test: ADR 0017, #144 —
+  `git-vista-server::argv_boundary` scans both native crates and fails on any
+  process-spawn site that is not allowlisted or does not name `git` literally.)*
 - Build argv only from typed operation planners and validated domain values.
   *(Implemented for every served-repository mutation: ADR 0015/0016, #142/#143 —
   write handlers build a typed `GitOperation`, and `git-vista-server::planner`
-  is the only place a mutating git argv is constructed.)*
+  is the only place a mutating git argv is constructed. Proven at the API
+  boundary by adversarial fixtures: ADR 0017, #144 — no route deserializes a
+  raw command string or argv array, and hostile bodies die at the extractor.)*
 - Pass `--` where Git supports it and validate full refnames with Git.
 - Clear or explicitly set child environment variables. Disable terminal prompts,
   editors, pagers, and hooks where the operation semantics permit.
