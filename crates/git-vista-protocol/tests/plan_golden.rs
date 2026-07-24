@@ -20,10 +20,7 @@ use git_vista_protocol::{
 };
 
 const FIXTURE: &str = include_str!("fixtures/plan_v1.json");
-const FIXTURE_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/plan_v1.json"
-);
+const FIXTURE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/plan_v1.json");
 
 fn oid(byte: char) -> CommitOid {
     CommitOid::new(byte.to_string().repeat(40)).unwrap()
