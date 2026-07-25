@@ -11,9 +11,13 @@
 //!   * [`clone`]  — clone a public URL into a throwaway dir, view it read-only.
 //!   * [`commit`] — create a commit (on HEAD, or an empty one on a named branch).
 //!   * [`branch`] — create a branch and the branch operations (checkout / merge /
-//!     push / delete / force-delete) that share one runner.
+//!     push / delete / force-delete).
 //!   * [`rebase`] — rebase the checked-out branch onto main, and its live gate.
 //!   * [`reset`]  — restore a seeded test repo to its recorded state.
+//!
+//! Since M1.06b (#143) the write handlers don't run git themselves: each
+//! validates its request, builds one typed `GitOperation` (#142), and hands it
+//! to [`crate::planner`], which builds/validates/executes the reviewable Plan.
 //!
 //! [`journal_app_event`] lives here because the write handlers across several of
 //! those submodules all record their successful operation the same way; the undo
