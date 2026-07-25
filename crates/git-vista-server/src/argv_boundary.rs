@@ -27,14 +27,15 @@ use std::path::{Path, PathBuf};
 /// are read-only helpers or `#[cfg(test)]` fixture setup.
 const ALLOWED_SPAWN_SITES: &[&str] = &[
     // git-vista-server
-    "src/planner.rs",        // the executor — the one mutating-argv site
-    "src/git_cmd.rs",        // shared read-only git helpers
-    "src/handlers/clone.rs", // `git clone` with a validated URL as its own argv entry
-    "src/handlers/read.rs",  // `git status --porcelain=v2` (static args)
-    "src/catalog.rs",        // static-arg read at registration
-    "src/journal.rs",        // #[cfg(test)] fixture setup
-    "src/state.rs",          // #[cfg(test)] fixture setup
-    "src/argv_boundary.rs",  // this file (the scan reads its own source)
+    "src/planner.rs",                // the executor — the one mutating-argv site
+    "src/git_cmd.rs",                // shared read-only git helpers
+    "src/handlers/clone.rs",         // `git clone` with a validated URL as its own argv entry
+    "src/handlers/read.rs",          // `git status --porcelain=v2` (static args)
+    "src/catalog.rs",                // static-arg read at registration
+    "src/journal.rs",                // #[cfg(test)] fixture setup
+    "src/planner/contract_suite.rs", // #[cfg(test)] git fixtures for the #146 pipeline suite
+    "src/state.rs",                  // #[cfg(test)] fixture setup
+    "src/argv_boundary.rs",          // this file (the scan reads its own source)
     // git-vista-git
     "src/history.rs", // read-side reflog/stash reads, static args
 ];
