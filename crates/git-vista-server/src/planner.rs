@@ -1557,8 +1557,13 @@ async fn exec_reset_test_repo(repo: &Path) -> (StatusCode, String) {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — the #145 staleness contract, on a real throwaway repository
+// Tests — the #145 staleness contract, on a real throwaway repository, and
+// the #146 end-to-end contract suite (build → validate → execute for every
+// operation kind; the single-funnel proof; refusals that protect).
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod contract_suite;
 
 #[cfg(test)]
 mod tests {
