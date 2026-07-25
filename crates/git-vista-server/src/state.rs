@@ -396,6 +396,19 @@ pub(crate) fn bootstrap_token_path() -> PathBuf {
     state_dir().join("bootstrap.token")
 }
 
+/// Where the durable operation journal's SQLite file lives (M1.09, #62).
+/// Process-wide rather than per-repository: the operation registry already
+/// addresses repositories by opaque token, not path, and one file keeps
+/// startup recovery a single open instead of a scan of every served repo.
+///
+/// Only [`crate::durable::db_path`] calls this, and only outside `#[cfg(test)]`
+/// (tests point at a throwaway file instead, see that function's docs) — so a
+/// test build never references it, which `dead_code` would otherwise flag.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn operations_db_path() -> PathBuf {
+    state_dir().join("operations.sqlite3")
+}
+
 /// Delete a previous clone's directory, best-effort. Guarded: only ever removes a
 /// path under [`clones_root`], so it can't touch the user's own repo even if state
 /// were somehow wrong.
