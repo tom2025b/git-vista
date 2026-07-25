@@ -129,19 +129,43 @@ async fn plan_and_execute_tracked(
 
     crate::operations::note_minted(&record.id());
 
+    let durable_key = key;
+    let durable_record = record.clone();
     // Detached on purpose: this task owns the operation from here, and nothing
     // the client does to its connection can cancel it. `handle`'s Drop is the
     // backstop — a panic in the pipeline still terminalises the record, so the
     // waiter below can never hang.
+    //
+    // **No `.await` may sit between `admit()` above and this `tokio::spawn`
+    // call.** `handle` lives in this function's own frame until the moment it
+    // is moved into the spawned task below; an await point in between would
+    // give a client disconnect (which aborts *this* task, per axum) a window
+    // to drop `handle` — via its own Drop impl — before the pipeline ever
+    // started, which fails the operation the same way a lost connection used
+    // to before M1.08 existed. The durable-journal write for admission
+    // therefore happens *inside* the detached task, not before it's spawned,
+    // even though that means the `Accepted` row lands a beat later than the
+    // in-memory state does.
     tokio::spawn(crate::operations::with_progress(
         record.clone(),
         async move {
+            crate::durable::persist(durable_key.clone(), durable_record.status()).await;
+
             let (status, message) = plan_and_execute_in(&repo, repo_id, tokens, op).await;
             // The generation *after* execution: the datum a reconnecting client
             // uses to decide whether its cached graph is stale, without re-reading
             // the repository. Best-effort, like every other observation here.
             let generation = Some(generation_token(&repo, &observe_live(&repo).await).await);
             handle.finish(status, message, generation);
+
+            // M1.09: the terminal record and its recovery ref. Both run after
+            // `finish` has already published the terminal snapshot, so neither
+            // adds latency to what `wait_terminal` below is waiting on.
+            let terminal = durable_record.status();
+            crate::durable::persist(durable_key, terminal.clone()).await;
+            if let Some(recovery) = &terminal.recovery {
+                crate::durable::write_recovery_ref(&repo, &terminal.id, recovery).await;
+            }
         },
     ));
 
