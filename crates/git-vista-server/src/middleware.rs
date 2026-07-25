@@ -16,6 +16,7 @@
 //!    every response, success or error.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::{
     body::to_bytes,
@@ -27,8 +28,9 @@ use axum::{
 };
 
 use git_vista_protocol::{
-    check_compatibility, parse_protocol_header, ApiError, ErrorCode, RequestId,
-    MAX_CLIENT_PROTOCOL, MIN_CLIENT_PROTOCOL, PROTOCOL_HEADER, PROTOCOL_VERSION, REQUEST_ID_HEADER,
+    check_compatibility, parse_protocol_header, ApiError, ErrorCode, IdempotencyKey, OperationId,
+    RequestId, IDEMPOTENCY_HEADER, MAX_CLIENT_PROTOCOL, MIN_CLIENT_PROTOCOL, OPERATION_HEADER,
+    PROTOCOL_HEADER, PROTOCOL_QUERY, PROTOCOL_VERSION, REQUEST_ID_HEADER,
 };
 
 /// The one path exempt from the protocol-header requirement: a client hits it
@@ -80,18 +82,36 @@ pub(crate) async fn api_contract(request: Request, next: Next) -> Response {
 /// Validate the inbound protocol header, returning the error code + message to
 /// send when it's absent, malformed, or outside the accepted `[min, max]` window.
 fn check_protocol(request: &Request) -> Result<(), (ErrorCode, String)> {
-    let raw = request.headers().get(PROTOCOL_HEADER).ok_or_else(|| {
-        (
-            ErrorCode::MissingProtocolHeader,
-            format!("This request needs the {PROTOCOL_HEADER} header. Reload the app to update."),
-        )
-    })?;
-    let raw = raw.to_str().map_err(|_| {
-        (
-            ErrorCode::InvalidProtocolHeader,
-            format!("The {PROTOCOL_HEADER} header isn't valid text."),
-        )
-    })?;
+    let raw = match request.headers().get(PROTOCOL_HEADER) {
+        Some(raw) => raw.to_str().map_err(|_| {
+            (
+                ErrorCode::InvalidProtocolHeader,
+                format!("The {PROTOCOL_HEADER} header isn't valid text."),
+            )
+        })?,
+        // The documented exception (M1.08): a progress stream is opened by
+        // `EventSource`, which cannot set request headers at all, so that one
+        // path may carry its version in the query string instead. Same parse,
+        // same window check, same refusal — only the place it's read differs.
+        None if accepts_protocol_query(request.uri().path()) => &protocol_query_value(request)
+            .ok_or_else(|| {
+                (
+                    ErrorCode::MissingProtocolHeader,
+                    format!(
+                        "This stream needs a ?{PROTOCOL_QUERY}= parameter naming the \
+                         protocol version. Reload the app to update."
+                    ),
+                )
+            })?,
+        None => {
+            return Err((
+                ErrorCode::MissingProtocolHeader,
+                format!(
+                    "This request needs the {PROTOCOL_HEADER} header. Reload the app to update."
+                ),
+            ))
+        }
+    };
     let client = parse_protocol_header(raw).ok_or_else(|| {
         (
             ErrorCode::InvalidProtocolHeader,
@@ -110,6 +130,72 @@ fn check_protocol(request: &Request) -> Result<(), (ErrorCode, String)> {
             ),
         ))
     }
+}
+
+/// Whether `path` is the one route allowed to name its protocol version in the
+/// query string — `GET /api/operations/{id}/events`, the SSE stream.
+///
+/// Matched structurally rather than by a wildcard so the exception cannot widen
+/// by accident: a new `/api/operations/...` route does not inherit it.
+fn accepts_protocol_query(path: &str) -> bool {
+    path.starts_with("/api/operations/")
+        && path.ends_with("/events")
+        && path.matches('/').count() == 4
+}
+
+/// The `protocol=` query parameter's value, if the request carries one.
+/// A hand-rolled scan rather than a query-string parser: one parameter, read in
+/// one place, and nothing here is worth a dependency.
+fn protocol_query_value(request: &Request) -> Option<String> {
+    request.uri().query().and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            (name == PROTOCOL_QUERY).then(|| value.to_string())
+        })
+    })
+}
+
+/// Put the client's idempotency key in scope for the request, and stamp the
+/// operation id the planner minted onto the response (M1.08, #61).
+///
+/// This layer only *carries* the key. Whether a request needs one is decided at
+/// the planner — the single place a mutation can begin — because a route list
+/// here would drift the first time someone adds an endpoint, and the chokepoint
+/// cannot. A malformed key is refused here, though: it is a wire error, and the
+/// planner should never see a value that failed validation.
+pub(crate) async fn idempotency(request: Request, next: Next) -> Response {
+    let raw = request
+        .headers()
+        .get(IDEMPOTENCY_HEADER)
+        .map(|value| value.to_str().unwrap_or_default().to_string());
+
+    let Some(raw) = raw else {
+        return next.run(request).await;
+    };
+    let key = match IdempotencyKey::new(raw) {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("The {IDEMPOTENCY_HEADER} header isn't usable: {e}."),
+            )
+                .into_response()
+        }
+    };
+
+    let minted: Arc<Mutex<Option<OperationId>>> = Arc::new(Mutex::new(None));
+    let mut response =
+        crate::operations::with_key(key, Arc::clone(&minted), next.run(request)).await;
+
+    // The id exists only if this request actually reached the planner — a read,
+    // or a write refused before admission, mints nothing and stamps nothing.
+    let minted = minted.lock().ok().and_then(|slot| slot.clone());
+    if let Some(id) = minted {
+        if let Ok(value) = HeaderValue::from_str(id.as_str()) {
+            response.headers_mut().insert(OPERATION_HEADER, value);
+        }
+    }
+    response
 }
 
 /// Build a structured error response, its HTTP status taken from the code.
@@ -197,6 +283,21 @@ mod tests {
                 get(|| async { (StatusCode::NOT_FOUND, "No such commit.") }),
             )
             .route("/api/branch", post(crate::handlers::branch::create_branch))
+            // The M1.08 stream route: the one path that may negotiate through
+            // the query string, and the one whose id echoes the key in scope.
+            .route(
+                "/api/operations/{id}/events",
+                get(|| async { "stream-would-start-here" }),
+            )
+            .route(
+                "/api/operations/{id}",
+                get(|| async {
+                    crate::operations::current_key()
+                        .map(|key| key.as_str().to_string())
+                        .unwrap_or_else(|| "no-key".to_string())
+                }),
+            )
+            .layer(axum::middleware::from_fn(idempotency))
             .layer(axum::middleware::from_fn(api_contract))
     }
 
@@ -311,5 +412,104 @@ mod tests {
             "message should name the rejected field: {}",
             err.error.message
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M1.08 — the stream's query-string negotiation, and the idempotency scope
+    // -----------------------------------------------------------------------
+
+    /// `EventSource` cannot set headers, so the stream route — and only it —
+    /// may name its protocol version in the query string.
+    #[tokio::test]
+    async fn the_stream_route_negotiates_through_the_query_string() {
+        let path = format!("/api/operations/abc/events?{PROTOCOL_QUERY}={PROTOCOL_VERSION}");
+        let resp = app().oneshot(get_req(&path, None)).await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    /// The exception is narrow: it buys the stream nothing but a different
+    /// *place* to read the version from. An out-of-window value in the query
+    /// string is refused exactly like an out-of-window header.
+    #[tokio::test]
+    async fn an_out_of_window_query_version_is_refused_like_a_header() {
+        let path = format!("/api/operations/abc/events?{PROTOCOL_QUERY}=999999");
+        let resp = app().oneshot(get_req(&path, None)).await.unwrap();
+        assert_eq!(resp.status(), 426);
+        let err: ApiError = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(err.error.code, ErrorCode::ProtocolIncompatible);
+    }
+
+    /// A stream opened with no version at all is still refused — the route is
+    /// exempt from the *header*, never from negotiation.
+    #[tokio::test]
+    async fn a_stream_with_no_version_anywhere_is_refused() {
+        let resp = app()
+            .oneshot(get_req("/api/operations/abc/events", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 426);
+        let err: ApiError = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(err.error.code, ErrorCode::MissingProtocolHeader);
+    }
+
+    /// And no *other* path inherits the exception, including its siblings under
+    /// `/api/operations/`.
+    #[tokio::test]
+    async fn no_other_route_may_negotiate_through_the_query_string() {
+        let path = format!("/api/operations/abc?{PROTOCOL_QUERY}={PROTOCOL_VERSION}");
+        let resp = app().oneshot(get_req(&path, None)).await.unwrap();
+        assert_eq!(resp.status(), 426);
+        assert!(!accepts_protocol_query("/api/operations/abc"));
+        assert!(!accepts_protocol_query("/api/operations/abc/events/extra"));
+        assert!(!accepts_protocol_query("/api/commits"));
+        assert!(accepts_protocol_query("/api/operations/abc/events"));
+    }
+
+    /// A valid key reaches the handler through the task-local scope — which is
+    /// how fifteen write handlers get it without naming it.
+    #[tokio::test]
+    async fn a_valid_idempotency_key_is_in_scope_for_the_handler() {
+        let req = HttpRequest::get("/api/operations/abc")
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+            .header(IDEMPOTENCY_HEADER, "gv-abc-123")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_string(resp).await, "gv-abc-123");
+    }
+
+    /// A malformed key is a wire error, refused before any handler sees it —
+    /// the planner must never be handed a value that failed validation.
+    #[tokio::test]
+    async fn a_malformed_idempotency_key_is_refused_at_the_wire() {
+        let req = HttpRequest::get("/api/operations/abc")
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+            .header(IDEMPOTENCY_HEADER, "not a token")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+        let err: ApiError = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(
+            err.error.message.contains(IDEMPOTENCY_HEADER),
+            "the refusal should name the header: {}",
+            err.error.message
+        );
+    }
+
+    /// A request with no key at all passes through — reads need none, and
+    /// whether a *write* needs one is the planner's call, not this layer's.
+    #[tokio::test]
+    async fn a_request_without_a_key_passes_through() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/operations/abc",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_string(resp).await, "no-key");
     }
 }

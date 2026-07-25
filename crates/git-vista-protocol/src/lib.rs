@@ -14,6 +14,11 @@
 //! - [`plan`]    — the closed, typed [`GitOperation`] vocabulary (every mutation
 //!   the server can perform) and the reviewable [`Plan`] previewing one before
 //!   execution (M1.06a, #142; enforcement lands with #145).
+//! - [`operation`] — operation identity and lifecycle (M1.08, #61): the client's
+//!   [`IdempotencyKey`], the server's [`OperationId`], the [`OperationState`]
+//!   machine, the replayable [`OperationStatus`] record, and [`ProgressEvent`].
+//! - [`newtype`] — the validating-newtype machinery the three above share, so
+//!   every string-shaped wire value is checked in exactly one place.
 //!
 //! ## Why a separate crate
 //!
@@ -36,8 +41,14 @@
 //! (de)serialize identically on both sides. `git-vista-core` does *not* depend on
 //! it, keeping the domain model free of transport concerns.
 
+// `newtype` first, and `#[macro_use]`: it defines `validated_string!`, and a
+// `macro_rules!` macro is only in scope for items declared *after* it.
+#[macro_use]
+pub mod newtype;
+
 pub mod dto;
 pub mod error;
+pub mod operation;
 pub mod plan;
 pub mod version;
 
@@ -47,6 +58,10 @@ pub use dto::{
     SelectRequest, SessionInfo, SessionRequest,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
+pub use operation::{
+    IdempotencyKey, OperationId, OperationStage, OperationState, OperationStatus, ProgressEvent,
+    MAX_IDEMPOTENCY_KEY_LEN, MAX_OPERATION_ID_LEN, PROGRESS_EVENT, RESULT_EVENT,
+};
 pub use plan::{
     BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, OperationHash, Plan,
     PlanFieldError, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
@@ -54,5 +69,6 @@ pub use plan::{
 };
 pub use version::{
     check_compatibility, parse_protocol_header, Compatibility, ProtocolInfo, CSRF_HEADER,
-    MAX_CLIENT_PROTOCOL, MIN_CLIENT_PROTOCOL, PROTOCOL_HEADER, PROTOCOL_VERSION, REQUEST_ID_HEADER,
+    IDEMPOTENCY_HEADER, MAX_CLIENT_PROTOCOL, MIN_CLIENT_PROTOCOL, OPERATION_HEADER,
+    PROTOCOL_HEADER, PROTOCOL_QUERY, PROTOCOL_VERSION, REQUEST_ID_HEADER,
 };
