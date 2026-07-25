@@ -105,12 +105,15 @@ fn message(s: &str) -> CommitMessage {
     CommitMessage::new(s).unwrap()
 }
 
-/// The full planner pipeline as `plan_and_execute` composes it, minus the
-/// process-global selection read: build → validate → staleness gate →
-/// execute. What every test in layer 1 and 3 drives.
+/// The full planner pipeline, driven through the real entry point with the
+/// process-global selection injected: guard → busy check → build → validate →
+/// staleness gate → execute. What every test in layer 1 and 3 drives.
+///
+/// Since #60 this calls [`plan_and_execute_in`] rather than re-composing the
+/// stages, so these tests exercise the production composition — mutation guard
+/// included — instead of a copy of it that could drift.
 async fn pipeline(repo: &Path, op: GitOperation) -> (StatusCode, String) {
-    let (plan, observed) = build_plan(repo, op, tokens()).await;
-    run_prebuilt(repo, plan, observed).await
+    plan_and_execute_in(repo, None, tokens(), op).await
 }
 
 /// The pipeline from `validate` on, for tests that tamper with a built plan
@@ -837,20 +840,49 @@ fn every_git_write_route_reaches_the_planner() {
 /// process-global selection is set-once per process, owned by `state`'s own
 /// test); this pin guarantees the entry point requests actually take composes
 /// exactly the stages those tests prove.
+/// The guard's position is pinned too, and it is load-bearing (#60) — but the
+/// *other way round* from the obvious guess: the plan is built BEFORE the guard
+/// so a queued duplicate carries the pre-mutation generation into
+/// `enforce_fresh` and is refused there. Guarding the observation as well would
+/// let a double-clicked Commit observe fresh state and commit twice. See
+/// `plan_and_execute_in`'s own docs and ADR 0019.
 #[test]
 fn the_production_entry_point_composes_the_tested_stages_in_order() {
     let src = source("src/planner.rs");
-    let body = fn_body(&src, "plan_and_execute");
+    let body = fn_body(&src, "plan_and_execute_in");
     let mut from = 0;
-    for stage in ["build_plan(", "validate(", "enforce_fresh(", "execute("] {
+    for stage in [
+        "build_plan(",
+        "coordinator::lock(",
+        "coordinator::refuse_if_git_busy(",
+        "validate(",
+        "enforce_fresh(",
+        "execute(",
+    ] {
         match body[from..].find(stage) {
             Some(at) => from += at + stage.len(),
             None => panic!(
-                "plan_and_execute no longer calls {stage} after the previous stage — \
-                 the build → validate → enforce_fresh → execute composition is broken"
+                "plan_and_execute_in no longer calls {stage} after the previous stage — \
+                 the guard → build → validate → enforce_fresh → execute composition is broken"
             ),
         }
     }
+}
+
+/// The outer entry point still applies the write gate and delegates: the
+/// handlers' single funnel is unchanged by the #60 split.
+#[test]
+fn the_global_entry_point_delegates_to_the_guarded_pipeline() {
+    let src = source("src/planner.rs");
+    let body = fn_body(&src, "plan_and_execute");
+    assert!(
+        body.contains("reject_if_read_only()"),
+        "the write gate must stay on the global entry point"
+    );
+    assert!(
+        body.contains("plan_and_execute_in("),
+        "the global entry point must delegate to the guarded pipeline"
+    );
 }
 
 // ---------------------------------------------------------------------------
