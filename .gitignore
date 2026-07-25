@@ -18,6 +18,7 @@
 # Local session handoff / resume note (see `./dev resume`). Local working state,
 # not repo history — the durable record is the WIP git commits `./dev wip` pushes.
 /handoff.md
+/handoff.pdf
 
 # Personal GitHub issue staging list
 /issues.md
@@ -27,9 +28,24 @@
 # Existing copies are intentionally preserved in the worktree; remove them
 # from the index separately if this repository is being cleaned up.
 /CLAUDE.md
+/AGENTS.md
 /PROJECT_MEMORY.md
 /PROJECT_STATUS.md
 /docs/prompts/
+
+# Per-repo journal note staging (rendered into ~/Documents/journals by the
+# printpdf MCP server). Local record of sessions, not project history.
+/.journal/
+
+# Browser-automation scratch output from driving the app during verification:
+# page snapshots, console dumps, and the screenshots taken alongside them.
+/.playwright-mcp/
+/*.png
+/Test/
+
+# ADR PDFs are rendered twins of the tracked Markdown, kept for local reading
+# only. The `.md` under docs/adr/ is the durable, reviewable record.
+/docs/adr/*.pdf
 
 # Local print/archive outputs generated from the documentation set
 /ALL_DOCUMENTATION.md

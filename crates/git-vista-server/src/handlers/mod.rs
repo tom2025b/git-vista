@@ -14,6 +14,7 @@
 //!     push / delete / force-delete).
 //!   * [`rebase`] — rebase the checked-out branch onto main, and its live gate.
 //!   * [`reset`]  — restore a seeded test repo to its recorded state.
+//!   * [`operations`] — one write's recorded lifecycle, and its progress stream.
 //!
 //! Since M1.06b (#143) the write handlers don't run git themselves: each
 //! validates its request, builds one typed `GitOperation` (#142), and hands it
@@ -33,6 +34,8 @@ pub(crate) mod branch;
 pub(crate) mod catalog;
 pub(crate) mod clone;
 pub(crate) mod commit;
+// M1.08 (#61): what happened to an operation, and watching one happen.
+pub(crate) mod operations;
 pub(crate) mod protocol;
 pub(crate) mod read;
 pub(crate) mod rebase;

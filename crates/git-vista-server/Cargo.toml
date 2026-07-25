@@ -12,6 +12,10 @@ name = "git-vista-server"
 path = "src/main.rs"
 
 [dependencies]
+# `stream!` builds the M1.08 progress stream (#61) as the select-loop it actually
+# is — watch change, lifetime cap — instead of a hand-rolled `Stream` impl.
+# Pure Rust, one small dependency (futures-core), server-side only.
+async-stream = "0.3"
 axum = "0.8.9"
 # CSPRNG for the M1.04 session/bootstrap/CSRF secrets — the OS entropy source
 # directly, no `rand` wrapper. Native-server only; never reaches the wasm build.
