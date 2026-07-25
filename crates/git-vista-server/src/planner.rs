@@ -40,7 +40,6 @@ use git_vista_protocol::{
 };
 
 use crate::git_cmd::{git_ok, rev_parse};
-use crate::handlers::journal_app_event;
 use crate::journal;
 use crate::state::{current, current_handle, reject_if_read_only};
 
@@ -188,7 +187,7 @@ async fn build_plan(
     operation: GitOperation,
     tokens: (RepositoryToken, WorktreeToken),
 ) -> (Plan, Observed) {
-    let head_branch = git_vista_git::read_head_branch(repo);
+    let head_branch = read_head_branch_blocking(repo).await;
     let head_tip = rev_parse(repo, "HEAD").await;
     let branch_tip = match &operation {
         GitOperation::DeleteBranch { branch }
@@ -219,7 +218,7 @@ async fn build_plan(
 
     let (repository, worktree) = tokens;
     let operation_hash = operation_hash(&operation);
-    let generation = generation_token(repo, &observed);
+    let generation = generation_token(repo, &observed).await;
     let now = crate::activity::now_secs();
 
     let plan = Plan {
@@ -262,7 +261,9 @@ fn selection_tokens() -> (RepositoryToken, WorktreeToken) {
 /// of them moving means the repository the plan described no longer exists.
 /// The token is opaque and compared only for equality, so deepening its
 /// inputs further later is not a wire change.
-fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
+/// Async since #60: the ref read below is synchronous filesystem work and now
+/// runs on a blocking thread instead of an async worker.
+async fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
     let mut inputs = GenerationInputs::new();
     inputs.field(
         "head",
@@ -272,14 +273,85 @@ fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
             observed.head_tip.as_deref().unwrap_or("")
         ),
     );
-    if let Ok(refs) = git_vista_git::read_refs(repo) {
-        for r in &refs {
-            inputs.field(format!("ref:{:?}:{}", r.kind, r.name), r.target.0.clone());
-        }
+    for (name, target) in refs_digest_input(repo).await {
+        inputs.field(name, target);
     }
     inputs.field("status", observed.status.clone().unwrap_or_default());
     GenerationToken::new(inputs.generation().to_string())
         .expect("a RepositoryGeneration displays as non-empty decimal")
+}
+
+// --- blocking-work offload (#60, acceptance 4) ------------------------------
+//
+// Every git invocation on this path already goes through
+// `tokio::process::Command`, which never occupies a worker thread. These three
+// helpers cover what was left: synchronous filesystem reads and the JSONL
+// journal append, which on an async worker block that worker for their whole
+// duration — long enough to matter on a cold cache or a slow disk.
+//
+// Scope is deliberately **the planner path only**. The read handlers were not
+// swept as part of #60; see ADR 0019 so a later session doesn't read this as
+// "done everywhere".
+
+/// [`git_vista_git::read_head_branch`] off the async workers.
+async fn read_head_branch_blocking(repo: &Path) -> Option<String> {
+    let repo = repo.to_path_buf();
+    tokio::task::spawn_blocking(move || git_vista_git::read_head_branch(&repo))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Every ref as `(digest field name, target oid)`, read off the async workers.
+/// Shaped for [`generation_token`]'s digest so the blocking read happens once,
+/// in one place, rather than a `Refs` value being held across an await.
+async fn refs_digest_input(repo: &Path) -> Vec<(String, String)> {
+    let repo = repo.to_path_buf();
+    tokio::task::spawn_blocking(move || match git_vista_git::read_refs(&repo) {
+        Ok(refs) => refs
+            .iter()
+            .map(|r| (format!("ref:{:?}:{}", r.kind, r.name), r.target.0.clone()))
+            .collect(),
+        Err(_) => Vec::new(),
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Record one successful app operation in the journal, off the async workers.
+///
+/// Shadows [`crate::handlers::journal_app_event`] inside this module on
+/// purpose: every executor calls it by the same name it always did, and gets
+/// the blocking-thread version. Best-effort exactly as before — the git
+/// operation has already succeeded, so a failed join is dropped rather than
+/// turned into a failed response.
+async fn journal_app_event(
+    repo: &Path,
+    kind: ActivityKind,
+    ref_name: Option<String>,
+    old_oid: Option<String>,
+    new_oid: Option<String>,
+    summary: String,
+) {
+    let repo = repo.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::handlers::journal_app_event(&repo, kind, ref_name, old_oid, new_oid, summary)
+    })
+    .await;
+}
+
+/// [`journal::remove_from_snapshot`] off the async workers.
+async fn remove_from_snapshot_blocking(repo: &Path, branch: &str) {
+    let repo = repo.to_path_buf();
+    let branch = branch.to_string();
+    let _ =
+        tokio::task::spawn_blocking(move || journal::remove_from_snapshot(&repo, &branch)).await;
+}
+
+/// [`journal::clear`] off the async workers.
+async fn journal_clear_blocking(repo: &Path) {
+    let repo = repo.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || journal::clear(&repo)).await;
 }
 
 /// `git status --porcelain=v2` at this instant; `None` when git couldn't run
@@ -295,7 +367,7 @@ async fn worktree_status(repo: &Path) -> Option<String> {
 /// plan-building, minus the per-operation `branch_tip`.
 async fn observe_live(repo: &Path) -> Observed {
     Observed {
-        head_branch: git_vista_git::read_head_branch(repo),
+        head_branch: read_head_branch_blocking(repo).await,
         head_tip: rev_parse(repo, "HEAD").await,
         branch_tip: None,
         status: worktree_status(repo).await,
@@ -318,7 +390,7 @@ async fn enforce_fresh(
     observed: &Observed,
 ) -> Result<(), (StatusCode, String)> {
     let live = observe_live(repo).await;
-    if generation_token(repo, &live).as_str() != plan.generation.as_str() {
+    if generation_token(repo, &live).await.as_str() != plan.generation.as_str() {
         return Err((
             StatusCode::CONFLICT,
             "The repository changed while this plan was pending — refresh and try again."
@@ -934,7 +1006,8 @@ async fn exec_create_branch(
             None,
             tip,
             format!("created branch ‘{name}’"),
-        );
+        )
+        .await;
         (StatusCode::OK, format!("Created branch '{name}'."))
     } else {
         let msg = stderr_or(&output, "git branch failed.");
@@ -970,14 +1043,16 @@ async fn exec_commit_on_head(
         println!("[/api/commit] created commit (allow_empty={allow_empty})");
         let new = rev_parse(repo, "HEAD").await;
         // The branch the commit landed on; "HEAD" when detached.
-        let branch = git_vista_git::read_head_branch(repo).unwrap_or_else(|| "HEAD".into());
+        let branch = read_head_branch_blocking(repo)
+            .await
+            .unwrap_or_else(|| "HEAD".into());
         let summary = message
             .as_str()
             .lines()
             .next()
             .unwrap_or(message.as_str())
             .to_string();
-        journal_app_event(repo, ActivityKind::Commit, Some(branch), old, new, summary);
+        journal_app_event(repo, ActivityKind::Commit, Some(branch), old, new, summary).await;
         (StatusCode::OK, "Created commit.".to_string())
     } else {
         // "nothing to commit, working tree clean" goes to *stdout* with a
@@ -1087,7 +1162,8 @@ async fn exec_empty_commit_on_branch(
         Some(tip.to_string()),
         Some(new),
         summary,
-    );
+    )
+    .await;
     (StatusCode::OK, "Created commit.".to_string())
 }
 
@@ -1181,7 +1257,8 @@ async fn exec_checkout(
             observed.head_tip.clone(),
             new,
             format!("checked out ‘{branch}’"),
-        );
+        )
+        .await;
     }
     resp
 }
@@ -1207,7 +1284,9 @@ async fn exec_merge(repo: &Path, branch: &BranchName, observed: &Observed) -> (S
                 format!("Already up to date — ‘{branch}’ has no commits the current branch doesn’t already have."),
             );
         }
-        let into = git_vista_git::read_head_branch(repo).unwrap_or_else(|| "HEAD".into());
+        let into = read_head_branch_blocking(repo)
+            .await
+            .unwrap_or_else(|| "HEAD".into());
         journal_app_event(
             repo,
             ActivityKind::Merge,
@@ -1215,7 +1294,8 @@ async fn exec_merge(repo: &Path, branch: &BranchName, observed: &Observed) -> (S
             observed.head_tip.clone(),
             new,
             format!("merged ‘{branch}’ into ‘{into}’"),
-        );
+        )
+        .await;
     }
     resp
 }
@@ -1239,7 +1319,8 @@ async fn exec_push(repo: &Path, branch: &BranchName, remote: &RemoteName) -> (St
             None,
             tip,
             format!("pushed ‘{branch}’ to {remote}"),
-        );
+        )
+        .await;
     }
     resp
 }
@@ -1276,10 +1357,11 @@ async fn exec_delete(
             observed.branch_tip.clone(),
             None,
             format!("{verb} branch ‘{branch}’"),
-        );
+        )
+        .await;
         // Drop it from the snapshot now, so the feed's snapshot diff can't
         // also report this app deletion as an external one.
-        journal::remove_from_snapshot(repo, branch.as_str());
+        remove_from_snapshot_blocking(repo, branch.as_str()).await;
     }
     resp
 }
@@ -1297,7 +1379,9 @@ async fn exec_rebase(repo: &Path, base: &RefName, observed: &Observed) -> (Statu
     };
     if output.status.success() {
         let new = rev_parse(repo, "HEAD").await;
-        let branch = git_vista_git::read_head_branch(repo).unwrap_or_else(|| "HEAD".into());
+        let branch = read_head_branch_blocking(repo)
+            .await
+            .unwrap_or_else(|| "HEAD".into());
         // git exits 0 without moving HEAD when the branch is already based on
         // the base — that's no rebase, and journalling one would put a phantom
         // event in the Activity feed. Say what (didn't) happen instead.
@@ -1315,7 +1399,8 @@ async fn exec_rebase(repo: &Path, base: &RefName, observed: &Observed) -> (Statu
             old,
             new,
             format!("rebased ‘{branch}’ onto {base}"),
-        );
+        )
+        .await;
         (StatusCode::OK, format!("Rebased onto {base}."))
     } else {
         let msg = stderr_stdout_or(&output, "git rebase failed.");
@@ -1349,7 +1434,8 @@ async fn exec_restore_branch(
                 None,
                 Some(tip.as_str().to_string()),
                 format!("restored branch ‘{name}’ at {}", short(tip.as_str())),
-            );
+            )
+            .await;
             (StatusCode::OK, format!("Restored branch ‘{name}’."))
         }
         Err(msg) => {
@@ -1412,7 +1498,8 @@ async fn exec_reset_branch(
                 Some(expected_tip.as_str().to_string()),
                 Some(to.as_str().to_string()),
                 format!("undid — reset ‘{branch}’ to {}", short(to.as_str())),
-            );
+            )
+            .await;
             (
                 StatusCode::OK,
                 format!("Reset ‘{branch}’ to {}.", short(to.as_str())),
@@ -1434,7 +1521,9 @@ async fn exec_revert(repo: &Path, commit: &CommitOid, observed: &Observed) -> (S
         Ok(()) => {
             println!("[/api/undo] reverted {}", short(commit));
             let new = rev_parse(repo, "HEAD").await;
-            let branch = git_vista_git::read_head_branch(repo).unwrap_or_else(|| "HEAD".into());
+            let branch = read_head_branch_blocking(repo)
+                .await
+                .unwrap_or_else(|| "HEAD".into());
             journal_app_event(
                 repo,
                 ActivityKind::Revert,
@@ -1442,7 +1531,8 @@ async fn exec_revert(repo: &Path, commit: &CommitOid, observed: &Observed) -> (S
                 observed.head_tip.clone(),
                 new,
                 format!("reverted {}", short(commit)),
-            );
+            )
+            .await;
             (StatusCode::OK, format!("Reverted {}.", short(commit)))
         }
         Err(msg) => {
@@ -1587,7 +1677,7 @@ async fn exec_reset_test_repo(repo: &Path) -> (StatusCode, String) {
     }
     // The journal now describes history that no longer exists (dead undo
     // targets included) — wipe it with the snapshot; both regenerate.
-    journal::clear(repo);
+    journal_clear_blocking(repo).await;
 
     let msg = format!(
         "Reset to seed: {} branch(es) restored, {} deleted, HEAD → ‘{}’, working tree clean.",
