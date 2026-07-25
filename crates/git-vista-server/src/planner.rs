@@ -1792,6 +1792,11 @@ mod contract_suite;
 #[cfg(test)]
 mod coordination_suite;
 
+// The #61 lifecycle suite: identity, replay under one key, and survival of a
+// disconnected client.
+#[cfg(test)]
+mod lifecycle_suite;
+
 #[cfg(test)]
 mod tests {
     use super::*;
