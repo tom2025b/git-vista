@@ -38,6 +38,9 @@ mod activity;
 #[cfg(test)]
 mod argv_boundary;
 mod catalog;
+// M1.07 (#60): the per-repository guard every app mutation acquires, plus the
+// external-git busy check. Serialization lives here and nowhere else.
+mod coordinator;
 mod git_cmd;
 mod handlers;
 mod journal;
