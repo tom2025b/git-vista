@@ -23,22 +23,28 @@ use std::path::{Path, PathBuf};
 
 /// Files allowed to construct a process `Command`, relative to their crate
 /// root. Everything else is a regression. Keep the list short and deliberate:
-/// the planner's executor is the only *mutating* argv site (#143); the rest
-/// are read-only helpers or `#[cfg(test)]` fixture setup.
+/// the planner's executor is where every *client-requested* mutation's argv is
+/// built (#143); `durable.rs`'s `update-ref` (#62) is the one other mutating
+/// site, and it is narrow by construction rather than by review alone — fixed
+/// subcommand, a ref name built only from the server-minted `OperationId`
+/// (token-shaped, never client free text) under a fixed app-owned prefix, and
+/// an oid that only ever comes from an already-validated `CommitOid`. Every
+/// other entry here is a read-only helper or `#[cfg(test)]` fixture setup.
 const ALLOWED_SPAWN_SITES: &[&str] = &[
     // git-vista-server
-    "src/planner.rs",                    // the executor — the one mutating-argv site
-    "src/git_cmd.rs",                    // shared read-only git helpers
-    "src/handlers/clone.rs",             // `git clone` with a validated URL as its own argv entry
-    "src/handlers/read.rs",              // `git status --porcelain=v2` (static args)
-    "src/catalog.rs",                    // static-arg read at registration
-    "src/journal.rs",                    // #[cfg(test)] fixture setup
-    "src/coordinator.rs", // `git rev-parse --absolute-git-dir` (static args, read-only)
+    "src/planner.rs",        // the executor — every client-requested mutation's argv
+    "src/durable.rs",        // `git update-ref` for recovery refs (#62) — see above
+    "src/git_cmd.rs",        // shared read-only git helpers
+    "src/handlers/clone.rs", // `git clone` with a validated URL as its own argv entry
+    "src/handlers/read.rs",  // `git status --porcelain=v2` (static args)
+    "src/catalog.rs",        // static-arg read at registration
+    "src/journal.rs",        // #[cfg(test)] fixture setup
+    "src/coordinator.rs",    // `git rev-parse --absolute-git-dir` (static args, read-only)
     "src/planner/contract_suite.rs", // #[cfg(test)] git fixtures for the #146 pipeline suite
     "src/planner/coordination_suite.rs", // #[cfg(test)] git fixtures for the #60 coordination suite
     "src/planner/lifecycle_suite.rs", // #[cfg(test)] git fixtures for the #61 lifecycle suite
-    "src/state.rs",       // #[cfg(test)] fixture setup
-    "src/argv_boundary.rs", // this file (the scan reads its own source)
+    "src/state.rs",          // #[cfg(test)] fixture setup
+    "src/argv_boundary.rs",  // this file (the scan reads its own source)
     // git-vista-git
     "src/history.rs", // read-side reflog/stash reads, static args
 ];
