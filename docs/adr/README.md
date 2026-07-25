@@ -30,3 +30,4 @@ it, and note the link in both.
 | [0016](0016-shared-write-planner.md) | Every write action executes through one shared planner | Accepted |
 | [0017](0017-no-arbitrary-argv-from-the-browser.md) | No arbitrary argv from the browser, held closed by a tripwire | Accepted |
 | [0018](0018-plan-staleness-enforcement.md) | Stale, tampered or expired plans never execute | Accepted |
+| [0019](0019-serialized-mutations-per-repository.md) | One mutation at a time per shared repository | Accepted |
