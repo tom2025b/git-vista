@@ -9,9 +9,9 @@
 //!     live generation, the operation's SHA-256 hash, an expiry window, and the
 //!     per-operation risk / preconditions / expected ref changes / recovery
 //!     (the shapes ADR 0015 pinned in the golden fixture);
-//!  2. **validates** it — today the structural checks (hash equality, expiry)
-//!     that #145 extends into full staleness/generation/precondition
-//!     enforcement for client-reviewed plans;
+//!  2. **validates** it — the structural checks (hash equality, expiry), then
+//!     the execution-time staleness gate (#145): generation equality and live
+//!     re-verification of every build-time-held precondition, fail-closed;
 //!  3. **executes** it — the *only* place in the server where a mutating git
 //!     argv is constructed. The per-operation execution is the write handlers'
 //!     old code moved here verbatim: same git commands, same journaling, same
@@ -44,9 +44,10 @@ use crate::handlers::journal_app_event;
 use crate::journal;
 use crate::state::{current, current_handle, reject_if_read_only};
 
-/// How long a freshly issued plan stays executable. Irrelevant while plans are
-/// executed in the same request they're built in; the moment a client-review
-/// roundtrip exists (#145), this is the staleness window it enforces.
+/// How long a freshly issued plan stays executable. Enforced by [`validate`]
+/// (#145); unreachable in practice while plans execute in the same request
+/// they're built in, and the staleness window the moment a client-review
+/// roundtrip exists.
 const PLAN_TTL_SECS: i64 = 300;
 
 // ---------------------------------------------------------------------------
@@ -63,8 +64,15 @@ pub(crate) async fn plan_and_execute(op: GitOperation) -> (StatusCode, String) {
         return rejected;
     }
     let repo = current().0;
-    let (plan, observed) = build_plan(&repo, op).await;
+    let (plan, observed) = build_plan(&repo, op, selection_tokens()).await;
     if let Err(refused) = validate(&plan) {
+        return refused;
+    }
+    // #145: a plan may only mutate the repository it still describes. Recheck
+    // the generation and every build-time-verified precondition against the
+    // live repository immediately before execution — the TOCTOU gap between
+    // observation and mutation fails closed instead of proceeding stale.
+    if let Err(refused) = enforce_fresh(&repo, &plan, &observed).await {
         return refused;
     }
     execute(&repo, plan, observed).await
@@ -113,6 +121,16 @@ struct Observed {
     /// The tip of the branch the operation names, for the operations that need
     /// it before executing (delete's journaled restore point, reset's CAS).
     branch_tip: Option<String>,
+    /// `git status --porcelain=v2` at observation time — a generation input
+    /// (#145) so uncommitted-work changes count as the repository moving, and
+    /// the live check behind [`Precondition::CleanWorktree`].
+    status: Option<String>,
+    /// Which of the plan's preconditions actually *held* when it was built,
+    /// index-aligned with `Plan::preconditions`. [`enforce_fresh`] re-verifies
+    /// exactly these before executing: one that failed at build time flows on
+    /// to the executor's own legacy guard (same refusal text as ever), while
+    /// one that held and then broke is a race — refused, fail-closed (#145).
+    held_at_build: Vec<bool>,
 }
 
 /// Build the reviewable [`Plan`] for `operation` against the live repository.
@@ -122,7 +140,11 @@ struct Observed {
 /// plan's preconditions/ref-changes rather than refusing the operation —
 /// execution then surfaces git's own error exactly as it always has. #145 is
 /// where preconditions become load-bearing checks.
-async fn build_plan(repo: &Path, operation: GitOperation) -> (Plan, Observed) {
+async fn build_plan(
+    repo: &Path,
+    operation: GitOperation,
+    tokens: (RepositoryToken, WorktreeToken),
+) -> (Plan, Observed) {
     let head_branch = git_vista_git::read_head_branch(repo);
     let head_tip = rev_parse(repo, "HEAD").await;
     let branch_tip = match &operation {
@@ -131,16 +153,28 @@ async fn build_plan(repo: &Path, operation: GitOperation) -> (Plan, Observed) {
         | GitOperation::ResetBranch { branch, .. } => rev_parse(repo, branch.as_str()).await,
         _ => None,
     };
-    let observed = Observed {
+    let mut observed = Observed {
         head_branch,
         head_tip,
         branch_tip,
+        status: worktree_status(repo).await,
+        held_at_build: Vec::new(),
     };
 
     let (risk, preconditions, expected_ref_changes, recovery) =
         shape(repo, &operation, &observed).await;
 
-    let (repository, worktree) = selection_tokens();
+    // Record which preconditions hold right now (#145): enforce_fresh only
+    // re-verifies these, so a precondition that was already unmet reaches the
+    // executor's legacy guard unchanged.
+    for precondition in &preconditions {
+        let held = verify_precondition(repo, precondition, &observed)
+            .await
+            .is_ok();
+        observed.held_at_build.push(held);
+    }
+
+    let (repository, worktree) = tokens;
     let operation_hash = operation_hash(&operation);
     let generation = generation_token(repo, &observed);
     let now = crate::activity::now_secs();
@@ -181,10 +215,10 @@ fn selection_tokens() -> (RepositoryToken, WorktreeToken) {
 }
 
 /// The live repository generation as the plan's opaque token (ADR 0001).
-/// Computed from HEAD and every ref; the index/worktree digests join in #145
-/// when generation equality becomes an enforced execution-time check — the
-/// token is opaque and compared only for equality, so deepening its inputs
-/// later is not a wire change.
+/// Computed from HEAD, every ref, and the worktree/index status (#145) — any
+/// of them moving means the repository the plan described no longer exists.
+/// The token is opaque and compared only for equality, so deepening its
+/// inputs further later is not a wire change.
 fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
     let mut inputs = GenerationInputs::new();
     inputs.field(
@@ -200,8 +234,154 @@ fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
             inputs.field(format!("ref:{:?}:{}", r.kind, r.name), r.target.0.clone());
         }
     }
+    inputs.field("status", observed.status.clone().unwrap_or_default());
     GenerationToken::new(inputs.generation().to_string())
         .expect("a RepositoryGeneration displays as non-empty decimal")
+}
+
+/// `git status --porcelain=v2` at this instant; `None` when git couldn't run
+/// or the path isn't a working tree — best-effort, like every observation.
+async fn worktree_status(repo: &Path) -> Option<String> {
+    let out = run_git(repo, &["status", "--porcelain=v2"]).await.ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Fresh observations for the execution-time check (#145): same reads as
+/// plan-building, minus the per-operation `branch_tip`.
+async fn observe_live(repo: &Path) -> Observed {
+    Observed {
+        head_branch: git_vista_git::read_head_branch(repo),
+        head_tip: rev_parse(repo, "HEAD").await,
+        branch_tip: None,
+        status: worktree_status(repo).await,
+        held_at_build: Vec::new(),
+    }
+}
+
+/// The execution-time staleness gate (#145). Refuses — fail-closed, 409 —
+/// when the live repository no longer matches the plan:
+///
+///  1. **Generation**: recomputed from live HEAD/refs/status; any drift since
+///     the plan was built refuses execution.
+///  2. **Preconditions**: every precondition that *held* at build time is
+///     re-verified against the live repository. One that already failed at
+///     build time is skipped here — the executor's own legacy guard refuses
+///     it with the exact wording it always had.
+async fn enforce_fresh(
+    repo: &Path,
+    plan: &Plan,
+    observed: &Observed,
+) -> Result<(), (StatusCode, String)> {
+    let live = observe_live(repo).await;
+    if generation_token(repo, &live).as_str() != plan.generation.as_str() {
+        return Err((
+            StatusCode::CONFLICT,
+            "The repository changed while this plan was pending — refresh and try again."
+                .to_string(),
+        ));
+    }
+    for (i, precondition) in plan.preconditions.iter().enumerate() {
+        if observed.held_at_build.get(i).copied().unwrap_or(false) {
+            verify_precondition(repo, precondition, &live).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Check one [`Precondition`] against the live repository. `live` supplies the
+/// already-read HEAD and status; ref lookups go to git directly. Refusals are
+/// 409s that say what moved.
+async fn verify_precondition(
+    repo: &Path,
+    precondition: &Precondition,
+    live: &Observed,
+) -> Result<(), (StatusCode, String)> {
+    let refuse = |why: String| Err((StatusCode::CONFLICT, why));
+    match precondition {
+        Precondition::RefAt { ref_name, oid } => match rev_parse(repo, ref_name.as_str()).await {
+            Some(at) if at == oid.as_str() => Ok(()),
+            Some(_) => refuse(format!(
+                "‘{}’ moved while this plan was pending — refresh and try again.",
+                ref_name.as_str()
+            )),
+            None => refuse(format!(
+                "‘{}’ disappeared while this plan was pending — refresh and try again.",
+                ref_name.as_str()
+            )),
+        },
+        Precondition::RefExists { ref_name } => {
+            if rev_parse(repo, ref_name.as_str()).await.is_some() {
+                Ok(())
+            } else {
+                refuse(format!(
+                    "‘{}’ disappeared while this plan was pending — refresh and try again.",
+                    ref_name.as_str()
+                ))
+            }
+        }
+        Precondition::RefAbsent { ref_name } => {
+            if rev_parse(repo, ref_name.as_str()).await.is_none() {
+                Ok(())
+            } else {
+                refuse(format!(
+                    "‘{}’ appeared while this plan was pending — refresh and try again.",
+                    ref_name.as_str()
+                ))
+            }
+        }
+        Precondition::BranchCheckedOut { branch } => {
+            if live.head_branch.as_deref() == Some(branch.as_str()) {
+                Ok(())
+            } else {
+                refuse(format!(
+                    "‘{}’ is no longer the checked-out branch — refresh and try again.",
+                    branch.as_str()
+                ))
+            }
+        }
+        Precondition::BranchNotCheckedOut { branch } => {
+            if live.head_branch.as_deref() != Some(branch.as_str()) {
+                Ok(())
+            } else {
+                refuse(format!(
+                    "‘{}’ became the checked-out branch — refresh and try again.",
+                    branch.as_str()
+                ))
+            }
+        }
+        Precondition::CleanWorktree => match live.status.as_deref() {
+            Some("") => Ok(()),
+            Some(_) => refuse(
+                "The working tree picked up uncommitted changes while this plan was \
+                 pending — refresh and try again."
+                    .to_string(),
+            ),
+            // Unreadable state on a plan that requires a clean tree: refuse
+            // rather than guess (fail-closed).
+            None => refuse(
+                "Couldn't verify the working tree is clean — refusing to execute.".to_string(),
+            ),
+        },
+        Precondition::RemoteConfigured { remote } => {
+            if git_ok(repo, &["remote", "get-url", remote.as_str()])
+                .await
+                .is_ok()
+            {
+                Ok(())
+            } else {
+                refuse(format!(
+                    "Remote ‘{}’ is no longer configured — refresh and try again.",
+                    remote.as_str()
+                ))
+            }
+        }
+        Precondition::SeedRecorded => match read_seed(repo) {
+            Some(Ok(_)) => Ok(()),
+            _ => refuse("The recorded seed is gone or unreadable — refusing to reset.".to_string()),
+        },
+    }
 }
 
 /// SHA-256 (lowercase hex) of the operation's canonical JSON — the digest the
@@ -1374,4 +1554,137 @@ async fn exec_reset_test_repo(repo: &Path) -> (StatusCode, String) {
     );
     println!("[/api/reset-test-repo] {msg}");
     (StatusCode::OK, msg)
+}
+
+// ---------------------------------------------------------------------------
+// Tests — the #145 staleness contract, on a real throwaway repository
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tokens() -> (RepositoryToken, WorktreeToken) {
+        (
+            RepositoryToken::new("test-repo").unwrap(),
+            WorktreeToken::new("test-worktree").unwrap(),
+        )
+    }
+
+    fn run(repo: &Path, args: &[&str]) {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?} failed in {repo:?}"
+        );
+    }
+
+    /// A fresh repository on branch `main` with one committed file and a
+    /// clean working tree.
+    fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@example.invalid"]);
+        run(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        run(&repo, &["add", "a.txt"]);
+        run(&repo, &["commit", "-q", "-m", "seed"]);
+        (dir, repo)
+    }
+
+    /// #145 acceptance 1 + 4 (the race): a plan built against generation N is
+    /// refused once anything moves — a new commit, or even just the working
+    /// tree picking up an untracked file — and a fresh plan passes.
+    #[tokio::test]
+    async fn a_generation_move_refuses_execution() {
+        let (_dir, repo) = seeded_repo();
+        let (plan, observed) = build_plan(&repo, GitOperation::StageAll, tokens()).await;
+
+        // Fresh plan against an untouched repository: allowed.
+        assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+
+        // Worktree-only drift (no ref moved): still a generation move.
+        std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+        let (status, why) = enforce_fresh(&repo, &plan, &observed).await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(why.contains("changed while this plan was pending"), "{why}");
+
+        // Ref drift (a new commit) on a *fresh* plan built after the file
+        // appeared: build, then commit, then try to execute.
+        let (plan, observed) = build_plan(&repo, GitOperation::StageAll, tokens()).await;
+        run(&repo, &["add", "b.txt"]);
+        run(&repo, &["commit", "-q", "-m", "moved"]);
+        let (status, why) = enforce_fresh(&repo, &plan, &observed).await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(why.contains("changed while this plan was pending"), "{why}");
+    }
+
+    /// #145 acceptance 2: a plan whose operation no longer matches its
+    /// declared hash is refused (tamper detection).
+    #[tokio::test]
+    async fn a_tampered_operation_is_refused() {
+        let (_dir, repo) = seeded_repo();
+        let (mut plan, _observed) = build_plan(&repo, GitOperation::StageAll, tokens()).await;
+        plan.operation = GitOperation::UnstageAll; // no longer what the hash approves
+        let (status, why) = validate(&plan).unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(why.contains("doesn't match"), "{why}");
+    }
+
+    /// #145 acceptance 3: an expired plan is refused with a reason the client
+    /// can show.
+    #[tokio::test]
+    async fn an_expired_plan_is_refused() {
+        let (_dir, repo) = seeded_repo();
+        let (mut plan, _observed) = build_plan(&repo, GitOperation::StageAll, tokens()).await;
+        plan.expires_at = UnixSeconds(crate::activity::now_secs() - 1);
+        let (status, why) = validate(&plan).unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(why.contains("expired"), "{why}");
+    }
+
+    /// #145 acceptance 4, precondition flavor: a precondition that *held* at
+    /// build time and broke before execution refuses — here the push remote
+    /// disappears, which moves no ref and so slips past the generation check.
+    #[tokio::test]
+    async fn a_broken_precondition_refuses_execution() {
+        let (_dir, repo) = seeded_repo();
+        run(&repo, &["remote", "add", "origin", "/nowhere/upstream.git"]);
+        let op = GitOperation::PushBranch {
+            branch: BranchName::new("main").unwrap(),
+            remote: RemoteName::new("origin").unwrap(),
+        };
+        let (plan, observed) = build_plan(&repo, op, tokens()).await;
+        assert!(
+            observed.held_at_build.iter().any(|&h| h),
+            "remote precondition should hold"
+        );
+        assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+
+        run(&repo, &["remote", "remove", "origin"]);
+        let (status, why) = enforce_fresh(&repo, &plan, &observed).await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(why.contains("no longer configured"), "{why}");
+    }
+
+    /// A precondition that already failed at build time is *not* enforced here:
+    /// it flows to the executor's legacy guard so refusal texts stay exactly
+    /// what they always were.
+    #[tokio::test]
+    async fn a_precondition_unmet_at_build_time_is_left_to_the_executor() {
+        let (_dir, repo) = seeded_repo();
+        let op = GitOperation::PushBranch {
+            branch: BranchName::new("main").unwrap(),
+            remote: RemoteName::new("origin").unwrap(), // never configured
+        };
+        let (plan, observed) = build_plan(&repo, op, tokens()).await;
+        assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+    }
 }
