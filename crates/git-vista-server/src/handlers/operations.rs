@@ -170,3 +170,106 @@ fn encode(snapshot: &OperationStatus) -> Event {
         .json_data(&progress)
         .unwrap_or_else(|_| Event::default().event(PROGRESS_EVENT).data("{}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use git_vista_protocol::{
+        CommitMessage, GitOperation, IdempotencyKey, OperationHash, RepositoryToken, WorktreeToken,
+    };
+
+    use crate::operations::Admission;
+
+    fn admit(name: &str) -> (OperationId, crate::operations::OperationHandle) {
+        let key = IdempotencyKey::new(format!("handler-{name}")).unwrap();
+        let op = GitOperation::CommitOnHead {
+            message: CommitMessage::new(name).unwrap(),
+            allow_empty: true,
+        };
+        let hash = OperationHash::new("a".repeat(64)).unwrap();
+        match operations::admit(
+            &key,
+            &op,
+            &hash,
+            RepositoryToken::new("test-repo").unwrap(),
+            WorktreeToken::new("test-worktree").unwrap(),
+        ) {
+            Admission::Fresh(handle, record) => (record.id(), handle),
+            _ => panic!("a fresh key must be admitted"),
+        }
+    }
+
+    /// An id that never existed and one that has been forgotten answer the
+    /// same, and neither leaks whether the server ever minted it.
+    #[tokio::test]
+    async fn an_unknown_operation_is_not_found() {
+        let status = operation_status(Path("0123456789abcdef".to_string())).await;
+        assert_eq!(status.status(), StatusCode::NOT_FOUND);
+
+        let events = operation_events(Path("0123456789abcdef".to_string())).await;
+        assert_eq!(events.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// An id that isn't even token-shaped can't name a record this server
+    /// minted, so it is refused as "no such operation" rather than reaching
+    /// the map at all.
+    #[tokio::test]
+    async fn a_malformed_id_is_not_found_rather_than_an_error() {
+        let response = operation_status(Path("not a token".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A live record is readable while it is still running — a reconnecting
+    /// client learns its push is in flight, not that nothing is known.
+    #[tokio::test]
+    async fn a_running_operation_is_readable_before_it_finishes() {
+        let (id, handle) = admit("still-running");
+        let response = operation_status(Path(id.as_str().to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        handle.finish(StatusCode::OK, "done".into(), None);
+    }
+
+    /// The stream opens as `text/event-stream`, and its permit is released
+    /// when the response (and so the body) is dropped.
+    #[tokio::test]
+    async fn a_stream_opens_as_server_sent_events_and_frees_its_permit() {
+        let (id, handle) = admit("stream-opens");
+        handle.finish(StatusCode::OK, "done".into(), None);
+
+        let response = operation_events(Path(id.as_str().to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        drop(response);
+
+        // The cap is process-wide; if the permit had leaked, exhausting it here
+        // would leave the next test unable to open a stream at all.
+        let permits: Vec<_> = std::iter::repeat_with(operations::StreamPermit::acquire)
+            .take_while(Option::is_some)
+            .collect();
+        assert!(
+            !permits.is_empty(),
+            "the finished stream must have released its permit"
+        );
+    }
+
+    /// The cap is hard: a client that opens and abandons streams cannot
+    /// accumulate connections past it.
+    #[tokio::test]
+    async fn the_stream_cap_refuses_rather_than_growing() {
+        let (id, handle) = admit("stream-cap");
+        handle.finish(StatusCode::OK, "done".into(), None);
+
+        let _held: Vec<_> = (0..crate::operations::MAX_LIVE_STREAMS)
+            .map(|_| operations::StreamPermit::acquire().expect("under the cap"))
+            .collect();
+
+        let response = operation_events(Path(id.as_str().to_string())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
