@@ -42,6 +42,10 @@ mod journal;
 // The versioned-API-contract layer (M1.02, #102): protocol negotiation, the
 // request id, the structured error envelope, and the contract response headers.
 mod middleware;
+// The shared write planner (M1.06b, #143): every write handler builds a typed
+// GitOperation and this module builds/validates/executes its reviewable Plan —
+// the only place a mutating git argv is constructed.
+mod planner;
 // Per-source-IP sign-in rate limiting for the LAN listener (ADR 0005, #122).
 mod ratelimit;
 // The loopback session + request-protection layer (M1.04, #57): Origin/Host/CSRF/

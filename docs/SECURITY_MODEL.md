@@ -197,6 +197,9 @@ it did not itself register.
 
 - Use direct argv execution; never invoke a shell.
 - Build argv only from typed operation planners and validated domain values.
+  *(Implemented for every served-repository mutation: ADR 0015/0016, #142/#143 —
+  write handlers build a typed `GitOperation`, and `git-vista-server::planner`
+  is the only place a mutating git argv is constructed.)*
 - Pass `--` where Git supports it and validate full refnames with Git.
 - Clear or explicitly set child environment variables. Disable terminal prompts,
   editors, pagers, and hooks where the operation semantics permit.
