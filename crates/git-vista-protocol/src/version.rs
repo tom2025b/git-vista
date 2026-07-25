@@ -22,19 +22,24 @@ use serde::{Deserialize, Serialize};
 /// server advertises it as its "current" version, and the client sends it in the
 /// [`PROTOCOL_HEADER`] on every request. Bump this only when the request/response
 /// contract changes in a way an older peer would misread.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// **v3 (M1.08, #61)** — every write carries an [`IDEMPOTENCY_HEADER`] and gets
+/// back an [`OPERATION_HEADER`]; `/api/operations/*` exists. A v2 client would
+/// send no key, so its writes would silently lose the replay guarantee this
+/// version exists to give — hence a hard window move rather than a tolerated
+/// omission.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The oldest client protocol version this server build still accepts. Together
 /// with [`MAX_CLIENT_PROTOCOL`] it is the compatibility window a client's version
 /// must fall inside. Equal to [`PROTOCOL_VERSION`] until a compatible-but-older
 /// contract must be supported.
-pub const MIN_CLIENT_PROTOCOL: u32 = 2;
+pub const MIN_CLIENT_PROTOCOL: u32 = 3;
 
 /// The newest client protocol version this server build can accept. A client
 /// reporting a version above this is *ahead* of the server (the server was
 /// downgraded, or the client cache is from a newer deploy) and is refused the
 /// same way as one that is too old.
-pub const MAX_CLIENT_PROTOCOL: u32 = 2;
+pub const MAX_CLIENT_PROTOCOL: u32 = 3;
 
 /// Request header a client must send on every `/api/*` call **except**
 /// `GET /api/protocol`, carrying the [`PROTOCOL_VERSION`] it was built against.
@@ -53,6 +58,33 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 /// A custom header a cross-origin HTML form cannot set, so its mere presence
 /// (validated server-side against the session) is a CSRF control.
 pub const CSRF_HEADER: &str = "x-git-vista-csrf";
+
+/// Request header carrying the client's [`IdempotencyKey`](crate::IdempotencyKey)
+/// on every state-changing `/api/*` call (M1.08, protocol 3). A header rather
+/// than a body field so it applies uniformly to every write shape, and so a
+/// retry is provably *the same* request byte-for-byte in its body.
+///
+/// The key is required: a write without one is refused, because the whole point
+/// of the version bump is that no write can silently lose its replay guarantee.
+pub const IDEMPOTENCY_HEADER: &str = "x-git-vista-idempotency-key";
+
+/// Response header the server sets on every accepted write, naming the
+/// [`OperationId`](crate::OperationId) the lifecycle was recorded under. A
+/// client that loses the response body (or the connection) still learns the id
+/// from a replayed request and can poll `/api/operations/{id}` or subscribe to
+/// its event stream.
+pub const OPERATION_HEADER: &str = "x-git-vista-operation";
+
+/// Query parameter carrying the client's protocol version on the SSE progress
+/// endpoint, and *only* there.
+///
+/// The browser's `EventSource` cannot set request headers, so a stream client
+/// physically cannot send [`PROTOCOL_HEADER`]. Rather than exempt the route
+/// from negotiation, it accepts the same number in the query string and runs it
+/// through the same [`check_compatibility`]. Nothing else may use this — a
+/// version in a URL is cacheable and log-visible in a way a header is not, so
+/// the exception stays as narrow as the limitation that forced it.
+pub const PROTOCOL_QUERY: &str = "protocol";
 
 /// Parse the value of the [`PROTOCOL_HEADER`] a client sent. Returns `None` when
 /// it is absent-shaped (empty) or not a base-10 `u32`; the server maps `None` to
@@ -182,6 +214,37 @@ mod tests {
             info.compatibility(MAX_CLIENT_PROTOCOL + 1),
             Compatibility::ClientTooNew
         );
+    }
+
+    #[test]
+    fn this_builds_own_version_is_inside_the_window_it_advertises() {
+        // A server that refuses its own client is a shipping-blocker, and the
+        // window is edited by hand on every bump — so pin it.
+        assert!(MIN_CLIENT_PROTOCOL <= MAX_CLIENT_PROTOCOL);
+        assert_eq!(
+            check_compatibility(PROTOCOL_VERSION, MIN_CLIENT_PROTOCOL, MAX_CLIENT_PROTOCOL),
+            Compatibility::Compatible
+        );
+    }
+
+    #[test]
+    fn header_names_are_lowercase_and_distinct() {
+        let names = [
+            PROTOCOL_HEADER,
+            REQUEST_ID_HEADER,
+            CSRF_HEADER,
+            IDEMPOTENCY_HEADER,
+            OPERATION_HEADER,
+        ];
+        for name in names {
+            assert_eq!(name, name.to_ascii_lowercase(), "{name} must be lowercase");
+        }
+        // Two headers sharing a name would silently make one clobber the other.
+        for (i, a) in names.iter().enumerate() {
+            for b in &names[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 
     #[test]
