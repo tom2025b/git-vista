@@ -244,6 +244,14 @@ Every mutation request contains:
 The server records idempotency results for a bounded period. A retried mobile
 request returns the original result rather than performing the action twice.
 
+*(Generation, hash and expiry are enforced at execution time: ADR 0018, #145 —
+`planner::validate` refuses a tampered operation hash and an expired plan, and
+`planner::enforce_fresh` recomputes the repository generation (HEAD, all refs,
+worktree status) and re-verifies every build-time-held precondition against
+the live repository immediately before execution. Any drift refuses with a 409
+and a client-facing reason — the TOCTOU gap fails closed. Client-supplied
+generation/idempotency fields arrive with the review roundtrip, M2+.)*
+
 ## Operation Risk Classes
 
 | Class | Examples | Required control |
