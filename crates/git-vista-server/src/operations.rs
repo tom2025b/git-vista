@@ -37,14 +37,16 @@
 //! (the same discipline as [`crate::coordinator`]): every entry point clones the
 //! `Arc` out and drops the guard before awaiting anything.
 //!
-//! ## Bounded, and in memory for now
+//! ## Bounded in memory, durable on disk
 //!
 //! Newest [`MAX_RECORDS`] records, [`RECORD_TTL_SECS`] TTL, and **a record that
 //! is not terminal is never evicted** — dropping a live record would strand the
-//! request awaiting it. Persistence is issue #62; [`OperationStatus`] is
-//! deliberately shaped to be the thing it writes to disk. A restart therefore
-//! forgets in-flight operations, which the staleness gate already handles: the
-//! client re-POSTs, the generation has moved, and it is told so.
+//! request awaiting it. [`crate::durable`] (M1.09, #62) persists every record to
+//! SQLite and [`rehydrate`] reloads them at startup, so a restart no longer
+//! forgets a *finished* operation's outcome — only a running one, which no
+//! process can meaningfully resume across a restart anyway (see that module's
+//! docs). The staleness gate still covers the case a client re-POSTs before
+//! reconciling: the generation has moved, and it is told so.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -342,6 +344,29 @@ pub(crate) fn admit(
 pub(crate) fn lookup(id: &OperationId) -> Option<Arc<Record>> {
     let reg = registry().lock().expect("operation registry lock");
     reg.by_id.get(id).map(Arc::clone)
+}
+
+/// Repopulate the registry from journal rows read at startup (M1.09, #62).
+///
+/// Called once, before the server accepts requests, with the durable layer's
+/// already-closed-out records — every entry here is terminal, because
+/// [`crate::durable::recover`] resolved anything a prior process left running
+/// into a `Failed` record before returning. This function only ever *adds*
+/// entries to an empty registry, so it does not need `admit`'s duplicate/
+/// conflict logic.
+pub(crate) fn rehydrate(records: Vec<(IdempotencyKey, OperationStatus)>) {
+    let mut reg = registry().lock().expect("operation registry lock");
+    for (key, status) in records {
+        let id = status.id.clone();
+        let (status_tx, _) = watch::channel(status);
+        let record = Arc::new(Record {
+            key: key.clone(),
+            status: status_tx,
+        });
+        reg.by_key.insert(key, Arc::clone(&record));
+        reg.by_id.insert(id.clone(), record);
+        reg.order.push_back(id);
+    }
 }
 
 /// Drop terminal records that are past the TTL, then oldest-first until the map

@@ -41,6 +41,9 @@ mod catalog;
 // M1.07 (#60): the per-repository guard every app mutation acquires, plus the
 // external-git busy check. Serialization lives here and nowhere else.
 mod coordinator;
+// M1.09 (#62): the SQLite operation journal (survives a restart) and the
+// private git recovery refs a completed mutation's recovery strategy pins.
+mod durable;
 mod git_cmd;
 mod handlers;
 mod journal;
@@ -142,6 +145,20 @@ async fn main() {
     if clones_registered > 0 {
         println!("git-vista: {clones_registered} persistent clone(s) re-registered");
     }
+
+    // M1.09 (#62): reload the durable operation journal. Anything left
+    // non-terminal by a prior process is closed out as interrupted here (see
+    // `durable`'s module docs for why that's the correct answer) before the
+    // registry is repopulated, so `GET /api/operations/{id}` and idempotency
+    // replay both keep working for operations admitted before this restart.
+    let recovered = durable::recover().await;
+    if !recovered.is_empty() {
+        println!(
+            "git-vista: {} operation(s) reloaded from the journal",
+            recovered.len()
+        );
+    }
+    operations::rehydrate(recovered);
 
     // Warn early if the SPA hasn't been built — otherwise every page is a 404
     // and it looks like the server is broken.
