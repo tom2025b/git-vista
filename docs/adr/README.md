@@ -28,3 +28,4 @@ it, and note the link in both.
 | [0014](0014-lan-view-read-only-affordances.md) | LAN-view sessions present read-only affordances only | Accepted |
 | [0015](0015-typed-operation-vocabulary-and-plan-schema.md) | A closed Git-operation vocabulary and the reviewable Plan schema | Accepted |
 | [0016](0016-shared-write-planner.md) | Every write action executes through one shared planner | Accepted |
+| [0017](0017-no-arbitrary-argv-from-the-browser.md) | No arbitrary argv from the browser, held closed by a tripwire | Accepted |
