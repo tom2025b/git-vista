@@ -35,6 +35,8 @@ use std::path::{Path, PathBuf};
 mod activity;
 // The server-owned repository catalog (M1.03): opaque repository/worktree ids,
 // allowed-root enforcement, and the only path→id resolution in the server.
+#[cfg(test)]
+mod argv_boundary;
 mod catalog;
 mod git_cmd;
 mod handlers;
