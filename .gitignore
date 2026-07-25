@@ -47,6 +47,10 @@
 # only. The `.md` under docs/adr/ is the durable, reviewable record.
 /docs/adr/*.pdf
 
+# Same rule for the tracked design/decision documents: the `.md` is the record,
+# any rendered PDF beside it is a local reading copy.
+/docs/superpowers/**/*.pdf
+
 # Local print/archive outputs generated from the documentation set
 /ALL_DOCUMENTATION.md
 /DOCUMENTATION_ASSESSMENT.md
