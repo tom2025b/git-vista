@@ -283,6 +283,21 @@ mod tests {
                 get(|| async { (StatusCode::NOT_FOUND, "No such commit.") }),
             )
             .route("/api/branch", post(crate::handlers::branch::create_branch))
+            // The M1.08 stream route: the one path that may negotiate through
+            // the query string, and the one whose id echoes the key in scope.
+            .route(
+                "/api/operations/{id}/events",
+                get(|| async { "stream-would-start-here" }),
+            )
+            .route(
+                "/api/operations/{id}",
+                get(|| async {
+                    crate::operations::current_key()
+                        .map(|key| key.as_str().to_string())
+                        .unwrap_or_else(|| "no-key".to_string())
+                }),
+            )
+            .layer(axum::middleware::from_fn(idempotency))
             .layer(axum::middleware::from_fn(api_contract))
     }
 
@@ -397,5 +412,104 @@ mod tests {
             "message should name the rejected field: {}",
             err.error.message
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M1.08 — the stream's query-string negotiation, and the idempotency scope
+    // -----------------------------------------------------------------------
+
+    /// `EventSource` cannot set headers, so the stream route — and only it —
+    /// may name its protocol version in the query string.
+    #[tokio::test]
+    async fn the_stream_route_negotiates_through_the_query_string() {
+        let path = format!("/api/operations/abc/events?{PROTOCOL_QUERY}={PROTOCOL_VERSION}");
+        let resp = app().oneshot(get_req(&path, None)).await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    /// The exception is narrow: it buys the stream nothing but a different
+    /// *place* to read the version from. An out-of-window value in the query
+    /// string is refused exactly like an out-of-window header.
+    #[tokio::test]
+    async fn an_out_of_window_query_version_is_refused_like_a_header() {
+        let path = format!("/api/operations/abc/events?{PROTOCOL_QUERY}=999999");
+        let resp = app().oneshot(get_req(&path, None)).await.unwrap();
+        assert_eq!(resp.status(), 426);
+        let err: ApiError = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(err.error.code, ErrorCode::ProtocolIncompatible);
+    }
+
+    /// A stream opened with no version at all is still refused — the route is
+    /// exempt from the *header*, never from negotiation.
+    #[tokio::test]
+    async fn a_stream_with_no_version_anywhere_is_refused() {
+        let resp = app()
+            .oneshot(get_req("/api/operations/abc/events", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 426);
+        let err: ApiError = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(err.error.code, ErrorCode::MissingProtocolHeader);
+    }
+
+    /// And no *other* path inherits the exception, including its siblings under
+    /// `/api/operations/`.
+    #[tokio::test]
+    async fn no_other_route_may_negotiate_through_the_query_string() {
+        let path = format!("/api/operations/abc?{PROTOCOL_QUERY}={PROTOCOL_VERSION}");
+        let resp = app().oneshot(get_req(&path, None)).await.unwrap();
+        assert_eq!(resp.status(), 426);
+        assert!(!accepts_protocol_query("/api/operations/abc"));
+        assert!(!accepts_protocol_query("/api/operations/abc/events/extra"));
+        assert!(!accepts_protocol_query("/api/commits"));
+        assert!(accepts_protocol_query("/api/operations/abc/events"));
+    }
+
+    /// A valid key reaches the handler through the task-local scope — which is
+    /// how fifteen write handlers get it without naming it.
+    #[tokio::test]
+    async fn a_valid_idempotency_key_is_in_scope_for_the_handler() {
+        let req = HttpRequest::get("/api/operations/abc")
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+            .header(IDEMPOTENCY_HEADER, "gv-abc-123")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_string(resp).await, "gv-abc-123");
+    }
+
+    /// A malformed key is a wire error, refused before any handler sees it —
+    /// the planner must never be handed a value that failed validation.
+    #[tokio::test]
+    async fn a_malformed_idempotency_key_is_refused_at_the_wire() {
+        let req = HttpRequest::get("/api/operations/abc")
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+            .header(IDEMPOTENCY_HEADER, "not a token")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+        let err: ApiError = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(
+            err.error.message.contains(IDEMPOTENCY_HEADER),
+            "the refusal should name the header: {}",
+            err.error.message
+        );
+    }
+
+    /// A request with no key at all passes through — reads need none, and
+    /// whether a *write* needs one is the planner's call, not this layer's.
+    #[tokio::test]
+    async fn a_request_without_a_key_passes_through() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/operations/abc",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_string(resp).await, "no-key");
     }
 }

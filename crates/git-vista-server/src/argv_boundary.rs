@@ -36,6 +36,7 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     "src/coordinator.rs", // `git rev-parse --absolute-git-dir` (static args, read-only)
     "src/planner/contract_suite.rs", // #[cfg(test)] git fixtures for the #146 pipeline suite
     "src/planner/coordination_suite.rs", // #[cfg(test)] git fixtures for the #60 coordination suite
+    "src/planner/lifecycle_suite.rs", // #[cfg(test)] git fixtures for the #61 lifecycle suite
     "src/state.rs",       // #[cfg(test)] fixture setup
     "src/argv_boundary.rs", // this file (the scan reads its own source)
     // git-vista-git
