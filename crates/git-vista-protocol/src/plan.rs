@@ -43,117 +43,15 @@
 //! generation and preconditions are defined over. ADR 0015 records this scope
 //! decision.
 
-use std::fmt;
-
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Field validation
-// ---------------------------------------------------------------------------
+use crate::newtype::{require_git_safe, require_hex, require_non_empty};
 
-/// Why a plan field failed validation, typed (used as the serde error message
-/// when a malformed value arrives on the wire).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlanFieldError {
-    /// The field is empty (or whitespace-only) where a value is required.
-    Empty(&'static str),
-    /// The value starts with `-`, so git could read it as an option.
-    OptionShaped(&'static str),
-    /// The value is not the required lowercase-hex shape.
-    NotHex {
-        field: &'static str,
-        expected: &'static str,
-    },
-}
-
-impl fmt::Display for PlanFieldError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PlanFieldError::Empty(field) => write!(f, "{field} can't be empty"),
-            PlanFieldError::OptionShaped(field) => write!(f, "{field} can't start with '-'"),
-            PlanFieldError::NotHex { field, expected } => {
-                write!(f, "{field} must be {expected} lowercase hex characters")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PlanFieldError {}
-
-/// Non-empty after trimming — the same test every write handler applies.
-fn require_non_empty(value: &str, field: &'static str) -> Result<(), PlanFieldError> {
-    if value.trim().is_empty() {
-        return Err(PlanFieldError::Empty(field));
-    }
-    Ok(())
-}
-
-/// Non-empty and not option-shaped — the belt-and-braces check the handlers
-/// run before a name goes anywhere near a git argv.
-fn require_git_safe(value: &str, field: &'static str) -> Result<(), PlanFieldError> {
-    require_non_empty(value, field)?;
-    if value.starts_with('-') {
-        return Err(PlanFieldError::OptionShaped(field));
-    }
-    Ok(())
-}
-
-fn require_hex(
-    value: &str,
-    lens: &[usize],
-    field: &'static str,
-    expected: &'static str,
-) -> Result<(), PlanFieldError> {
-    let hex_ok = lens.contains(&value.len())
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if hex_ok {
-        Ok(())
-    } else {
-        Err(PlanFieldError::NotHex { field, expected })
-    }
-}
-
-/// Declare a validated, string-backed newtype: serializes as a bare JSON
-/// string, and `Deserialize` runs the same validator as [`Self::new`] so a
-/// malformed value is a hard wire error, never a smuggled payload.
-macro_rules! validated_string {
-    ($(#[$doc:meta])* $name:ident, $validate:expr) => {
-        $(#[$doc])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-        #[serde(transparent)]
-        pub struct $name(String);
-
-        impl $name {
-            /// Validate and wrap a raw value.
-            pub fn new(value: impl Into<String>) -> Result<Self, PlanFieldError> {
-                let value = value.into();
-                let validate: fn(&str) -> Result<(), PlanFieldError> = $validate;
-                validate(&value)?;
-                Ok(Self(value))
-            }
-
-            /// The raw wire value.
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let raw = String::deserialize(deserializer)?;
-                Self::new(raw).map_err(serde::de::Error::custom)
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&self.0)
-            }
-        }
-    };
-}
+/// Why a plan field failed validation — see
+/// [`newtype::PlanFieldError`](crate::newtype::PlanFieldError), re-exported
+/// here because this is the module it was introduced with and the path every
+/// caller already uses.
+pub use crate::newtype::PlanFieldError;
 
 validated_string!(
     /// Opaque id of the shared repository a plan targets — the string form of
