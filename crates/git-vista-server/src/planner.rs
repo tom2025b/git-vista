@@ -31,7 +31,7 @@ use axum::http::StatusCode;
 use sha2::{Digest, Sha256};
 
 use git_vista_core::activity::ActivityKind;
-use git_vista_core::identity::GenerationInputs;
+use git_vista_core::identity::{GenerationInputs, RepositoryId};
 use git_vista_core::seed::{parse_seed, reset_plan, Seed};
 use git_vista_protocol::{
     BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, OperationHash, Plan,
@@ -64,7 +64,49 @@ pub(crate) async fn plan_and_execute(op: GitOperation) -> (StatusCode, String) {
         return rejected;
     }
     let repo = current().0;
-    let (plan, observed) = build_plan(&repo, op, selection_tokens()).await;
+    let repo_id = current_handle().map(|handle| handle.repository);
+    plan_and_execute_in(&repo, repo_id, selection_tokens(), op).await
+}
+
+/// The guarded pipeline, with the selection injected rather than read from the
+/// process-global state — which is what lets the coordination and contract
+/// suites drive the real entry point against a throwaway repository.
+///
+/// **The plan is built before the guard is taken, and deliberately so.** The
+/// obvious arrangement — guard first, then observe — serializes correctly but
+/// silently defeats the point: a double-clicked Commit would queue, wait, then
+/// observe the *new* state, build a perfectly fresh plan and commit a second
+/// time. Both commits are individually valid; nothing is ever stale; the user
+/// gets two commits. Building first means the second request carries the
+/// pre-mutation generation into the guard, where [`enforce_fresh`] sees the
+/// drift and refuses it (#145's gate doing the deciding, #60's guard doing the
+/// serializing).
+///
+/// What the guard must cover is `validate → enforce_fresh → execute`: those
+/// three are atomic, so the TOCTOU window between "the repository still matches
+/// this plan" and "mutate it" cannot be entered by another app write. Drift
+/// that happens *before* the guard is not a race — it is exactly the staleness
+/// the gate exists to catch.
+///
+/// Consequence, accepted: two genuinely different concurrent operations also
+/// end with one refusal, since the loser's generation moved too. At one user
+/// that is a retry, and the alternative is duplicate mutations.
+pub(crate) async fn plan_and_execute_in(
+    repo: &Path,
+    repo_id: Option<RepositoryId>,
+    tokens: (RepositoryToken, WorktreeToken),
+    op: GitOperation,
+) -> (StatusCode, String) {
+    let (plan, observed) = build_plan(repo, op, tokens).await;
+
+    let _guard = crate::coordinator::lock(repo_id).await;
+
+    // Outside git holds the index: refuse now, in words the browser can show,
+    // rather than letting git fail opaquely part-way through (#60).
+    if let Some(refused) = crate::coordinator::refuse_if_git_busy(repo).await {
+        return refused;
+    }
+
     if let Err(refused) = validate(&plan) {
         return refused;
     }
@@ -72,10 +114,11 @@ pub(crate) async fn plan_and_execute(op: GitOperation) -> (StatusCode, String) {
     // the generation and every build-time-verified precondition against the
     // live repository immediately before execution — the TOCTOU gap between
     // observation and mutation fails closed instead of proceeding stale.
-    if let Err(refused) = enforce_fresh(&repo, &plan, &observed).await {
+    if let Err(refused) = enforce_fresh(repo, &plan, &observed).await {
         return refused;
     }
-    execute(&repo, plan, observed).await
+    execute(repo, plan, observed).await
+    // `_guard` drops here: the next queued mutation of this repository proceeds.
 }
 
 /// Resolve arbitrary request input to an exact [`CommitOid`]. A full 40/64
@@ -1564,6 +1607,9 @@ async fn exec_reset_test_repo(repo: &Path) -> (StatusCode, String) {
 
 #[cfg(test)]
 mod contract_suite;
+
+#[cfg(test)]
+mod coordination_suite;
 
 #[cfg(test)]
 mod tests {
