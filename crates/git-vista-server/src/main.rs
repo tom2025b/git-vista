@@ -47,6 +47,10 @@ mod journal;
 // The versioned-API-contract layer (M1.02, #102): protocol negotiation, the
 // request id, the structured error envelope, and the contract response headers.
 mod middleware;
+// M1.08 (#61): the operation registry — idempotency keys, operation ids, the
+// lifecycle state machine, and the replayable terminal result every write is
+// recorded under.
+mod operations;
 // The shared write planner (M1.06b, #143): every write handler builds a typed
 // GitOperation and this module builds/validates/executes its reviewable Plan —
 // the only place a mutating git argv is constructed.
