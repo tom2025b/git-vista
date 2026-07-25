@@ -869,19 +869,45 @@ fn the_production_entry_point_composes_the_tested_stages_in_order() {
     }
 }
 
-/// The outer entry point still applies the write gate and delegates: the
-/// handlers' single funnel is unchanged by the #60 split.
+/// The outer entry point still applies the write gate and delegates, now
+/// through the lifecycle layer: the handlers' single funnel is unchanged by the
+/// #60 split or the #61 one.
+///
+/// Both hops are pinned because both are load-bearing. The gate and the
+/// idempotency-key requirement have to sit on the *outermost* entry point —
+/// that is what makes them impossible for a new handler to forget — while the
+/// guarded pipeline has to stay reachable underneath, or the tracked path would
+/// silently stop taking the repository guard.
 #[test]
-fn the_global_entry_point_delegates_to_the_guarded_pipeline() {
+fn the_global_entry_point_delegates_through_the_lifecycle_to_the_pipeline() {
     let src = source("src/planner.rs");
-    let body = fn_body(&src, "plan_and_execute");
+
+    let outer = fn_body(&src, "plan_and_execute");
     assert!(
-        body.contains("reject_if_read_only()"),
+        outer.contains("reject_if_read_only()"),
         "the write gate must stay on the global entry point"
     );
     assert!(
-        body.contains("plan_and_execute_in("),
-        "the global entry point must delegate to the guarded pipeline"
+        outer.contains("operations::current_key()"),
+        "every mutation must require the client's idempotency key at the funnel (#61)"
+    );
+    assert!(
+        outer.contains("plan_and_execute_tracked("),
+        "the global entry point must delegate through the lifecycle layer"
+    );
+
+    let tracked = fn_body(&src, "plan_and_execute_tracked");
+    for required in ["operations::admit(", "tokio::spawn(", "plan_and_execute_in("] {
+        assert!(
+            tracked.contains(required),
+            "the lifecycle layer no longer calls {required} — an operation must be \
+             admitted, run detached (so a disconnect can't cancel git), and reach \
+             the guarded pipeline"
+        );
+    }
+    assert!(
+        tracked.contains("wait_terminal()"),
+        "the request must await the recorded terminal result, so a retry replays it"
     );
 }
 

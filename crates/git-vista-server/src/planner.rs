@@ -24,7 +24,7 @@
 //! #145 makes the validation load-bearing, both on top of exactly this
 //! pipeline.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use axum::http::StatusCode;
@@ -34,9 +34,10 @@ use git_vista_core::activity::ActivityKind;
 use git_vista_core::identity::{GenerationInputs, RepositoryId};
 use git_vista_core::seed::{parse_seed, reset_plan, Seed};
 use git_vista_protocol::{
-    BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, OperationHash, Plan,
-    Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName, RepositoryToken,
-    RiskLevel, UnixSeconds, WorktreeToken,
+    BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, IdempotencyKey,
+    OperationHash, OperationStage, Plan, Precondition, RecoveryStrategy, RefChange, RefName,
+    RefState, RemoteName, RepositoryToken, RiskLevel, UnixSeconds, WorktreeToken,
+    IDEMPOTENCY_HEADER,
 };
 
 use crate::git_cmd::{git_ok, rev_parse};
@@ -62,9 +63,86 @@ pub(crate) async fn plan_and_execute(op: GitOperation) -> (StatusCode, String) {
     if let Some(rejected) = reject_if_read_only() {
         return rejected;
     }
+    // M1.08: every mutation needs the client's name for the intent behind it.
+    // Required *here* rather than in a middleware route list, because a route
+    // list drifts the moment someone adds an endpoint and this chokepoint
+    // cannot — a handler that reaches the planner is a write, by definition.
+    let Some(key) = crate::operations::current_key() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "This request needs the {IDEMPOTENCY_HEADER} header, so a retry \
+                 can be recognised as a retry. Reload the app to update."
+            ),
+        );
+    };
     let repo = current().0;
     let repo_id = current_handle().map(|handle| handle.repository);
-    plan_and_execute_in(&repo, repo_id, selection_tokens(), op).await
+    plan_and_execute_tracked(key, repo, repo_id, selection_tokens(), op).await
+}
+
+/// Run one operation under a recorded lifecycle (M1.08, #61): admit it to the
+/// registry under the client's key, run the pipeline **detached**, and wait for
+/// the recorded terminal result.
+///
+/// Three things follow from the detached run, and all three are the point:
+///
+/// - **A dropped client no longer cancels git.** Axum drops the handler future
+///   when the connection dies; here that only drops the *waiting*. The pipeline
+///   is a `tokio::spawn`ed task that runs to completion and records its result,
+///   so the outcome is knowable afterwards instead of lost.
+/// - **A retry replays instead of re-running.** A second request carrying the
+///   same key never reaches the pipeline: it awaits the in-flight record, or
+///   returns the recorded response verbatim. One user action, one git command.
+/// - **A key reused for a different operation is refused**, never answered with
+///   a result computed for something else.
+///
+/// The response body and status are unchanged from before this existed — git's
+/// own message, forwarded verbatim. Only the operation-id response header is
+/// new, so no endpoint's contract changed shape.
+async fn plan_and_execute_tracked(
+    key: IdempotencyKey,
+    repo: PathBuf,
+    repo_id: Option<RepositoryId>,
+    tokens: (RepositoryToken, WorktreeToken),
+    op: GitOperation,
+) -> (StatusCode, String) {
+    let hash = operation_hash(&op);
+    let (repository, worktree) = tokens.clone();
+
+    let (handle, record) = match crate::operations::admit(&key, &op, &hash, repository, worktree) {
+        crate::operations::Admission::Fresh(handle, record) => (handle, record),
+        crate::operations::Admission::Existing(record) => {
+            // The same intent, already in flight or already answered.
+            crate::operations::note_minted(&record.id());
+            return record.wait_terminal().await;
+        }
+        crate::operations::Admission::Conflict => {
+            return (
+                StatusCode::CONFLICT,
+                "That idempotency key was already used for a different operation. \
+                 Reload and try again."
+                    .to_string(),
+            );
+        }
+    };
+
+    crate::operations::note_minted(&record.id());
+
+    // Detached on purpose: this task owns the operation from here, and nothing
+    // the client does to its connection can cancel it. `handle`'s Drop is the
+    // backstop — a panic in the pipeline still terminalises the record, so the
+    // waiter below can never hang.
+    tokio::spawn(crate::operations::with_progress(record.clone(), async move {
+        let (status, message) = plan_and_execute_in(&repo, repo_id, tokens, op).await;
+        // The generation *after* execution: the datum a reconnecting client
+        // uses to decide whether its cached graph is stale, without re-reading
+        // the repository. Best-effort, like every other observation here.
+        let generation = Some(generation_token(&repo, &observe_live(&repo).await).await);
+        handle.finish(status, message, generation);
+    }));
+
+    record.wait_terminal().await
 }
 
 /// The guarded pipeline, with the selection injected rather than read from the
@@ -96,8 +174,16 @@ pub(crate) async fn plan_and_execute_in(
     tokens: (RepositoryToken, WorktreeToken),
     op: GitOperation,
 ) -> (StatusCode, String) {
+    // The stage reports are no-ops unless this pipeline is running under a
+    // tracked operation (M1.08), so the seam the test suites drive is
+    // unchanged. `Waiting` is reported *before* the guard on purpose: it is the
+    // one stage a user can sit in for a long time, and "waiting for another
+    // operation on this repository" is the only honest thing to show them.
+    crate::operations::stage(OperationStage::Planning);
     let (plan, observed) = build_plan(repo, op, tokens).await;
+    crate::operations::note_recovery(&plan.recovery);
 
+    crate::operations::stage(OperationStage::Waiting);
     let _guard = crate::coordinator::lock(repo_id).await;
 
     // Outside git holds the index: refuse now, in words the browser can show,
@@ -106,6 +192,7 @@ pub(crate) async fn plan_and_execute_in(
         return refused;
     }
 
+    crate::operations::stage(OperationStage::Checking);
     if let Err(refused) = validate(&plan) {
         return refused;
     }
@@ -116,6 +203,7 @@ pub(crate) async fn plan_and_execute_in(
     if let Err(refused) = enforce_fresh(repo, &plan, &observed).await {
         return refused;
     }
+    crate::operations::stage(OperationStage::Executing);
     execute(repo, plan, observed).await
     // `_guard` drops here: the next queued mutation of this repository proceeds.
 }
