@@ -897,7 +897,11 @@ fn the_global_entry_point_delegates_through_the_lifecycle_to_the_pipeline() {
     );
 
     let tracked = fn_body(&src, "plan_and_execute_tracked");
-    for required in ["operations::admit(", "tokio::spawn(", "plan_and_execute_in("] {
+    for required in [
+        "operations::admit(",
+        "tokio::spawn(",
+        "plan_and_execute_in(",
+    ] {
         assert!(
             tracked.contains(required),
             "the lifecycle layer no longer calls {required} — an operation must be \

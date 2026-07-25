@@ -364,12 +364,27 @@ fn api_router(session_state: SessionState, hosts: HostPolicy, full_routes: bool)
             .route("/api/rebase", post(rebase))
             // iPad-testing follow-up: restore a seeded *test repo* to its recorded
             // state (gated on the seed files `gv --seed` writes).
-            .route("/api/reset-test-repo", post(reset_test_repo));
+            .route("/api/reset-test-repo", post(reset_test_repo))
+            // M1.08 (#61): what happened to one write, and its live progress.
+            // Registered with the writes, not the reads — these describe write
+            // outcomes, so the LAN router must never see them either (ADR 0005).
+            .route(
+                "/api/operations/{id}",
+                get(handlers::operations::operation_status),
+            )
+            .route(
+                "/api/operations/{id}/events",
+                get(handlers::operations::operation_events),
+            );
     }
 
     api
-        // Innermost: a panicking handler becomes a 500 with the panic text (not a
-        // reset connection) *before* the layers above see it, so that 500 is
+        // Innermost: the M1.08 idempotency scope. Inside the auth gate, so an
+        // unauthenticated request never mints an operation, and inside the panic
+        // catch, so the id it stamps is on a real handler response.
+        .layer(axum::middleware::from_fn(middleware::idempotency))
+        // A panicking handler becomes a 500 with the panic text (not a reset
+        // connection) *before* the layers above see it, so that 500 is
         // rewrapped into the structured error envelope like any other failure.
         .layer(CatchPanicLayer::custom(panic_to_response))
         // Middle: the M1.04 auth gate — Origin/Host/CSRF/content-type/method and a
