@@ -6,10 +6,12 @@
 #   - git-vista-server  native axum backend: serves the SPA + /api/commits
 #   - git-vista         Leptos frontend, built to WASM by Trunk (crates/git-vista)
 #
-# Three jobs run in parallel, each mapped to a concrete check:
+# Four jobs run in parallel, each mapped to a concrete check:
 #   1. lint      format + strict native/WASM Clippy + shell syntax
 #   2. core      test + check the pure-logic, git-reading, server, and UI crates
-#   3. frontend  build the real WASM bundle with Trunk
+#   3. contract  the M1.06 write contract (#146): planner pipeline, argv
+#                boundary, staleness gates — its own named check on every PR
+#   4. frontend  build the real WASM bundle with Trunk
 name: CI
 
 on:
@@ -94,6 +96,46 @@ jobs:
 
       - name: Test core + git + server + frontend crates
         run: cargo test -p git-vista-core -p git-vista-git -p git-vista-server -p git-vista
+
+  # ---------------------------------------------------------------------------
+  # 3. The M1.06 write contract (#146, parent #59), as its own job so it is a
+  #    distinct named check on every PR: the end-to-end pipeline suite
+  #    (build → validate → execute for every GitOperation kind + the
+  #    single-funnel proof), the #144 argv boundary (tripwire + adversarial
+  #    wire fixtures), and the #145 staleness gates.
+  #
+  #    The same tests also run inside the `core` job's full sweep — running on
+  #    every PR is a superset of "PRs touching the planner or a write handler",
+  #    chosen over path filters so the check can never be skipped by a filter
+  #    gap (and a path-filtered required check would hang pending on
+  #    non-matching PRs). This job exists so a contract regression is readable
+  #    at a glance in the checks list, and so the contract stays enforced even
+  #    if the core job's test invocation is ever narrowed.
+  # ---------------------------------------------------------------------------
+  contract:
+    name: M1.06 write contract (planner + argv boundary + staleness)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # libtest exits 0 on "0 passed" — a renamed module would turn the filter
+      # into a green no-op. The count floor makes silent de-selection loud.
+      - name: Contract suites (with a not-silently-empty floor)
+        run: |
+          set -o pipefail
+          cargo test -p git-vista-server -- contract_suite argv_boundary planner::tests \
+            | tee contract-tests.log
+          passed=$(grep -oE '[0-9]+ passed' contract-tests.log | awk '{s+=$1} END {print s}')
+          echo "contract tests passed: ${passed:-0}"
+          if [ "${passed:-0}" -lt 30 ]; then
+            echo "::error::Contract filter matched too few tests (${passed:-0} < 30) — did a suite module get renamed?"
+            exit 1
+          fi
 
   # ---------------------------------------------------------------------------
   # 2. Frontend: build the WASM bundle with Trunk.
