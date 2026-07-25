@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use git_vista_core::identity::RepositoryId;
-use git_vista_protocol::OperationState;
+use git_vista_protocol::{OperationId, OperationState, OperationStatus};
 
 use crate::operations::{self, Admission};
 
@@ -291,4 +291,83 @@ async fn the_record_is_fetchable_by_its_minted_id() {
     let found = operations::lookup(&id).expect("the record must be fetchable by id");
     assert_eq!(found.status().id, id);
     assert!(found.status().is_terminal());
+}
+
+// ---------------------------------------------------------------------------
+// M1.09 — the durable journal, end to end across the module boundary
+// ---------------------------------------------------------------------------
+
+/// A tracked write is durable by the time its own request has its answer: the
+/// journal row exists and matches the in-memory record, no polling or delay
+/// needed. Exercises [`crate::durable::recover`] directly, rather than through
+/// its own unit tests against a scratch connection, so this pins the
+/// cross-module contract [`crate::operations`] relies on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_operation_is_durable_by_the_time_the_request_returns() {
+    let (_dir, repo) = seeded_repo();
+    let k = key("durable-by-return");
+    let op = commit("journaled");
+
+    let (status, _) = tracked(k.clone(), &repo, op.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let id = record_for(&k, &op).id();
+
+    let journaled = crate::durable::recover().await;
+    let row = journaled
+        .iter()
+        .find(|(_, s)| s.id == id)
+        .expect("the finished operation must already be in the journal");
+    assert_eq!(row.0, k);
+    assert_eq!(row.1.state, OperationState::Succeeded);
+    assert_eq!(row.1.operation, op);
+}
+
+/// **The crash-recovery integration path.** A row the durable layer would see
+/// as `Running` — the shape a killed process leaves behind — is closed out as
+/// `Failed` by [`crate::durable::recover`], and rehydrating it makes it
+/// fetchable again through the ordinary registry lookup, exactly as if the
+/// server had never restarted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_left_running_recovers_as_failed_and_is_rehydrated_into_the_registry() {
+    let (_dir, repo) = seeded_repo();
+    let k = key("crash-recovery");
+    let id = OperationId::new("crash-recovery-op").unwrap();
+    let hash = operation_hash(&commit("never finished"));
+
+    let mid_flight = OperationStatus {
+        id: id.clone(),
+        state: OperationState::Running,
+        stage: OperationStage::Executing,
+        operation: commit("never finished"),
+        operation_hash: hash,
+        repository: tokens().0,
+        worktree: tokens().1,
+        accepted_at: UnixSeconds(1),
+        ended_at: None,
+        status: None,
+        message: None,
+        generation: None,
+        recovery: None,
+    };
+    crate::durable::persist(k.clone(), mid_flight).await;
+
+    let recovered = crate::durable::recover().await;
+    let (recovered_key, recovered_status) = recovered
+        .into_iter()
+        .find(|(_, s)| s.id == id)
+        .expect("the seeded row must come back from recover()");
+    assert_eq!(recovered_key, k);
+    assert_eq!(recovered_status.state, OperationState::Failed);
+    assert!(recovered_status
+        .message
+        .as_deref()
+        .unwrap_or_default()
+        .contains("restarted"));
+
+    operations::rehydrate(vec![(recovered_key, recovered_status)]);
+    let found = operations::lookup(&id).expect("rehydrate must make it fetchable again");
+    assert_eq!(found.status().state, OperationState::Failed);
+    assert!(found.status().is_terminal());
+
+    let _ = repo; // seeded but unused directly — the row is entirely synthetic
 }

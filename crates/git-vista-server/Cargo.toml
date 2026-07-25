@@ -25,6 +25,10 @@ git-vista-core = { workspace = true }
 # envelope, request-id, and the shared request/response DTOs the router deserialises.
 git-vista-protocol = { workspace = true }
 git-vista-git = { workspace = true }
+# The durable operation journal (M1.09, #62): SQLite so operation results
+# survive a process restart. `bundled` compiles SQLite in rather than linking
+# the system library — one less thing this headless server depends on finding.
+rusqlite = { version = "0.32", features = ["bundled"] }
 # The activity feed's journal is JSONL on disk, and its query params derive
 # Deserialize — the same serde the shared models already use.
 serde = { workspace = true }
