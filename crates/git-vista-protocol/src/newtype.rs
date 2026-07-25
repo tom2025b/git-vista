@@ -48,10 +48,9 @@ impl fmt::Display for PlanFieldError {
             PlanFieldError::TooLong { field, max } => {
                 write!(f, "{field} can't be longer than {max} characters")
             }
-            PlanFieldError::NotToken(field) => write!(
-                f,
-                "{field} may only contain letters, digits, '-' and '_'"
-            ),
+            PlanFieldError::NotToken(field) => {
+                write!(f, "{field} may only contain letters, digits, '-' and '_'")
+            }
         }
     }
 }

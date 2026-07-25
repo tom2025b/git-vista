@@ -133,14 +133,17 @@ async fn plan_and_execute_tracked(
     // the client does to its connection can cancel it. `handle`'s Drop is the
     // backstop — a panic in the pipeline still terminalises the record, so the
     // waiter below can never hang.
-    tokio::spawn(crate::operations::with_progress(record.clone(), async move {
-        let (status, message) = plan_and_execute_in(&repo, repo_id, tokens, op).await;
-        // The generation *after* execution: the datum a reconnecting client
-        // uses to decide whether its cached graph is stale, without re-reading
-        // the repository. Best-effort, like every other observation here.
-        let generation = Some(generation_token(&repo, &observe_live(&repo).await).await);
-        handle.finish(status, message, generation);
-    }));
+    tokio::spawn(crate::operations::with_progress(
+        record.clone(),
+        async move {
+            let (status, message) = plan_and_execute_in(&repo, repo_id, tokens, op).await;
+            // The generation *after* execution: the datum a reconnecting client
+            // uses to decide whether its cached graph is stale, without re-reading
+            // the repository. Best-effort, like every other observation here.
+            let generation = Some(generation_token(&repo, &observe_live(&repo).await).await);
+            handle.finish(status, message, generation);
+        },
+    ));
 
     record.wait_terminal().await
 }
