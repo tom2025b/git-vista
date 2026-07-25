@@ -219,8 +219,9 @@ mod tests {
     #[test]
     fn this_builds_own_version_is_inside_the_window_it_advertises() {
         // A server that refuses its own client is a shipping-blocker, and the
-        // window is edited by hand on every bump — so pin it.
-        assert!(MIN_CLIENT_PROTOCOL <= MAX_CLIENT_PROTOCOL);
+        // window is edited by hand on every bump — so pin it. Const-block so
+        // an inverted window fails the *build*, not just the test run.
+        const { assert!(MIN_CLIENT_PROTOCOL <= MAX_CLIENT_PROTOCOL) };
         assert_eq!(
             check_compatibility(PROTOCOL_VERSION, MIN_CLIENT_PROTOCOL, MAX_CLIENT_PROTOCOL),
             Compatibility::Compatible

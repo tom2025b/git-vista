@@ -106,11 +106,6 @@ impl Record {
         self.status.subscribe()
     }
 
-    /// Whether the record has already reached a terminal state.
-    pub(crate) fn is_terminal(&self) -> bool {
-        self.status.borrow().is_terminal()
-    }
-
     /// Await the terminal state and return the recorded response, verbatim.
     ///
     /// This is what both the request that *owns* an operation and every retry
@@ -188,18 +183,6 @@ pub(crate) struct OperationHandle {
 }
 
 impl OperationHandle {
-    /// The record this handle writes to — the same `Arc` the requesting task
-    /// awaits.
-    pub(crate) fn record(&self) -> Arc<Record> {
-        Arc::clone(&self.record)
-    }
-
-    /// Report the pipeline stage. Also moves `Accepted → Running` on the first
-    /// report, so the two are never out of step.
-    pub(crate) fn stage(&self, stage: OperationStage) {
-        self.record.set_stage(stage);
-    }
-
     /// Record the terminal result: the response to replay, plus the
     /// post-execution generation.
     ///
@@ -378,7 +361,11 @@ fn evict(reg: &mut Registry, now: i64) {
         // removal below is free to take a mutable one.
         let Some((key, terminal, ended_at)) = reg.by_id.get(&id).map(|record| {
             let snapshot = record.status.borrow();
-            (record.key.clone(), snapshot.is_terminal(), snapshot.ended_at)
+            (
+                record.key.clone(),
+                snapshot.is_terminal(),
+                snapshot.ended_at,
+            )
         }) else {
             continue; // already gone
         };
@@ -518,10 +505,9 @@ static LIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
 impl StreamPermit {
     /// Take a permit, or `None` when the process is already at its cap.
     pub(crate) fn acquire() -> Option<StreamPermit> {
-        let taken = LIVE_STREAMS
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < MAX_LIVE_STREAMS).then_some(n + 1)
-            });
+        let taken = LIVE_STREAMS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n < MAX_LIVE_STREAMS).then_some(n + 1)
+        });
         taken.ok().map(|_| StreamPermit)
     }
 }
@@ -650,7 +636,7 @@ mod tests {
         let Admission::Fresh(handle, record) = admit_op(&k, &op("staged"), &hash('a')) else {
             panic!("admission");
         };
-        handle.stage(OperationStage::Planning);
+        record.set_stage(OperationStage::Planning);
         assert_eq!(record.status().state, OperationState::Running);
         assert_eq!(record.status().stage, OperationStage::Planning);
 
@@ -700,10 +686,7 @@ mod tests {
     async fn the_key_is_only_visible_inside_its_scope() {
         assert!(current_key().is_none());
         let slot = Arc::new(StdMutex::new(None));
-        let seen = with_key(key("scoped"), Arc::clone(&slot), async {
-            current_key()
-        })
-        .await;
+        let seen = with_key(key("scoped"), Arc::clone(&slot), async { current_key() }).await;
         assert_eq!(seen, Some(key("scoped")));
         assert!(current_key().is_none(), "the scope must not leak");
     }

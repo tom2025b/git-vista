@@ -21,7 +21,8 @@ use git_vista_core::status::RepoStatus;
 use git_vista_protocol::{
     ApiError, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
     DeleteCloneRequest, ProtocolInfo, RebaseStatus, RepoMode, RepositoryDescriptor, SelectRequest,
-    SessionInfo, SessionRequest, CSRF_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
+    SessionInfo, SessionRequest, CSRF_HEADER, IDEMPOTENCY_HEADER, PROTOCOL_HEADER,
+    PROTOCOL_VERSION,
 };
 
 // The current session's CSRF token (M1.04). Set once the session is established
@@ -119,6 +120,83 @@ fn req_post(url: &str) -> RequestBuilder {
         Some(token) => builder.header(CSRF_HEADER, &token),
         None => builder,
     }
+}
+
+/// A fresh idempotency key: this client's name for **one user action** (M1.08,
+/// #61). The server refuses a write without one, records the operation under
+/// it, and replays the recorded result for any request that repeats it.
+///
+/// Unique, not unguessable — the key is the client's own name for its own
+/// intent, and the session cookie is what authorises the request. Millisecond
+/// clock for cross-tab distinctness, a per-tab counter so two actions inside
+/// one millisecond still differ, and a random draw so two tabs opened in the
+/// same millisecond don't collide. Token-shaped (`[A-Za-z0-9-]`) and far inside
+/// the server's length cap.
+fn new_idempotency_key() -> String {
+    thread_local! {
+        static COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    let n = COUNTER.with(|c| {
+        let next = c.get().wrapping_add(1);
+        c.set(next);
+        next
+    });
+    let ms = js_sys::Date::now() as u64;
+    let noise = (js_sys::Math::random() * 4_294_967_296.0) as u64;
+    format!("gv-{ms:x}-{n:x}-{noise:x}")
+}
+
+/// Send one write, **retried once on a network-level failure, under the same
+/// idempotency key**.
+///
+/// The retry exists for one concrete failure: iPad Safari re-using a pooled TCP
+/// socket that died silently while the tab was suspended (and, the same shape,
+/// an SSH tunnel dropping mid-request). The first attempt evicts that socket, so
+/// the second goes out on a fresh connection — no delay needed.
+///
+/// Before M1.08 that retry was only safe on `POST /api/branch`, where a
+/// duplicate is harmless. Now it is safe *everywhere*, and for the reason the
+/// key exists: both attempts name the same operation, so if the first one did
+/// land, the server replays its recorded result instead of running git twice.
+/// The key is minted **once, here** — minting inside the attempt would make the
+/// retry a second intent and give back exactly the double-commit this protects
+/// against.
+///
+/// Only network errors are retried. An HTTP error is an answer, and answers are
+/// returned to the caller.
+async fn send_write(url: &str, body: Option<String>) -> Result<gloo_net::http::Response, String> {
+    let key = new_idempotency_key();
+    let attempt = || async {
+        let builder = req_post(url).header(IDEMPOTENCY_HEADER, &key);
+        match &body {
+            Some(json) => builder
+                .header("content-type", "application/json")
+                .body(json.clone())
+                .map_err(|e| e.to_string())?
+                .send()
+                .await
+                .map_err(network_error),
+            None => builder.send().await.map_err(network_error),
+        }
+    };
+    match attempt().await {
+        Ok(resp) => Ok(resp),
+        Err(_) => attempt().await,
+    }
+}
+
+/// [`send_write`] with a JSON body.
+async fn write_json<T: serde::Serialize>(
+    url: &str,
+    body: &T,
+) -> Result<gloo_net::http::Response, String> {
+    let json = serde_json::to_string(body).map_err(|e| e.to_string())?;
+    send_write(url, Some(json)).await
+}
+
+/// [`send_write`] with no body — the bodyless writes (stage, unstage, rebase…).
+async fn write_empty(url: &str) -> Result<gloo_net::http::Response, String> {
+    send_write(url, None).await
 }
 
 /// Exchange a one-time bootstrap token for a session (`POST /api/session`, M1.04).
@@ -246,12 +324,7 @@ pub async fn clone_request(url: &str) -> Result<RepositoryDescriptor, String> {
     let body = CloneRequest {
         url: url.to_string(),
     };
-    let resp = req_post("/api/clone")
-        .json(&body)
-        .map_err(|e| e.to_string())?
-        .send()
-        .await
-        .map_err(network_error)?;
+    let resp = write_json("/api/clone", &body).await?;
     if resp.ok() {
         resp.json::<RepositoryDescriptor>()
             .await
@@ -267,30 +340,16 @@ pub async fn clone_request(url: &str) -> Result<RepositoryDescriptor, String> {
 /// On a non-2xx response the body is git's own error text, returned as `Err` so
 /// the caller can show the real reason (branch exists, bad name, …).
 ///
-/// A network-level send failure gets ONE automatic retry: the classic iPad
-/// cause is Safari re-using a pooled TCP socket that silently died while the
-/// tab was suspended — the failed attempt evicts that socket, so the second
-/// attempt goes out on a fresh connection (no delay needed). The retry is safe
-/// for *this* endpoint because a duplicated `git branch` is harmless: if the
-/// first request did land, the retry just returns git's own "already exists".
+/// The network-failure retry that used to live here is now [`send_write`]'s,
+/// for every write rather than only this one: since M1.08 both attempts carry
+/// the same idempotency key, so a duplicate is replayed rather than re-run.
 pub async fn create_branch_request(name: &str, commit: &str) -> Result<(), String> {
     refuse_if_visualize()?;
     let body = CreateBranchRequest {
         name: name.to_string(),
         commit: commit.to_string(),
     };
-    let send = || async {
-        req_post("/api/branch")
-            .json(&body)
-            .map_err(|e| e.to_string())?
-            .send()
-            .await
-            .map_err(network_error)
-    };
-    let resp = match send().await {
-        Ok(resp) => resp,
-        Err(_) => send().await?,
-    };
+    let resp = write_json("/api/branch", &body).await?;
     if resp.ok() {
         Ok(())
     } else {
@@ -318,12 +377,7 @@ pub async fn create_commit_request(
         allow_empty,
         branch: branch.map(str::to_string),
     };
-    let resp = req_post("/api/commit")
-        .json(&body)
-        .map_err(|e| e.to_string())?
-        .send()
-        .await
-        .map_err(network_error)?;
+    let resp = write_json("/api/commit", &body).await?;
     if resp.ok() {
         Ok(())
     } else {
@@ -340,7 +394,7 @@ pub async fn create_commit_request(
 /// own error text, returned as `Err` for the caller to show.
 pub async fn stage_request() -> Result<(), String> {
     refuse_if_visualize()?;
-    let resp = req_post("/api/stage").send().await.map_err(network_error)?;
+    let resp = write_empty("/api/stage").await?;
     if resp.ok() {
         Ok(())
     } else {
@@ -357,10 +411,7 @@ pub async fn stage_request() -> Result<(), String> {
 /// error posture as staging.
 pub async fn unstage_request() -> Result<(), String> {
     refuse_if_visualize()?;
-    let resp = req_post("/api/unstage")
-        .send()
-        .await
-        .map_err(network_error)?;
+    let resp = write_empty("/api/unstage").await?;
     if resp.ok() {
         Ok(())
     } else {
@@ -432,12 +483,7 @@ pub async fn fetch_undoables(commit: &str) -> Result<Vec<Undoable>, String> {
 /// for the confirm flow to show.
 pub async fn undo_request(action: &UndoAction) -> Result<(), String> {
     refuse_if_visualize()?;
-    let resp = req_post("/api/undo")
-        .json(action)
-        .map_err(|e| e.to_string())?
-        .send()
-        .await
-        .map_err(network_error)?;
+    let resp = write_json("/api/undo", action).await?;
     if resp.ok() {
         Ok(())
     } else {
@@ -550,10 +596,7 @@ pub async fn fetch_rebase_status() -> Result<RebaseStatus, String> {
 /// is git's own error text (conflicts, detached HEAD, …), returned as `Err`.
 pub async fn rebase_request() -> Result<String, String> {
     refuse_if_visualize()?;
-    let resp = req_post("/api/rebase")
-        .send()
-        .await
-        .map_err(network_error)?;
+    let resp = write_empty("/api/rebase").await?;
     if resp.ok() {
         Ok(resp.text().await.unwrap_or_default())
     } else {
@@ -572,10 +615,7 @@ pub async fn rebase_request() -> Result<String, String> {
 /// the exact git step that refused), returned as `Err` for the dialog to show.
 pub async fn reset_test_repo_request() -> Result<String, String> {
     refuse_if_visualize()?;
-    let resp = req_post("/api/reset-test-repo")
-        .send()
-        .await
-        .map_err(network_error)?;
+    let resp = write_empty("/api/reset-test-repo").await?;
     if resp.ok() {
         Ok(resp.text().await.unwrap_or_default())
     } else {
@@ -597,12 +637,7 @@ pub async fn branch_op_request(path: &str, branch: &str) -> Result<String, Strin
     let body = BranchRequest {
         branch: branch.to_string(),
     };
-    let resp = req_post(path)
-        .json(&body)
-        .map_err(|e| e.to_string())?
-        .send()
-        .await
-        .map_err(network_error)?;
+    let resp = write_json(path, &body).await?;
     if resp.ok() {
         Ok(resp.text().await.unwrap_or_default())
     } else {
@@ -637,12 +672,7 @@ pub async fn select_request(worktree: &str, mode: RepoMode) -> Result<(), String
         worktree: worktree.to_string(),
         mode,
     };
-    let resp = req_post("/api/select")
-        .json(&body)
-        .map_err(|e| e.to_string())?
-        .send()
-        .await
-        .map_err(network_error)?;
+    let resp = write_json("/api/select", &body).await?;
     if resp.ok() {
         Ok(())
     } else {
@@ -654,10 +684,7 @@ pub async fn select_request(worktree: &str, mode: RepoMode) -> Result<(), String
 /// the server's one-line summary for the picker to show.
 pub async fn rescan_request() -> Result<String, String> {
     refuse_if_lan_view()?;
-    let resp = req_post("/api/rescan")
-        .send()
-        .await
-        .map_err(network_error)?;
+    let resp = write_empty("/api/rescan").await?;
     if resp.ok() {
         Ok(resp.text().await.unwrap_or_default())
     } else {
@@ -673,12 +700,7 @@ pub async fn delete_clone_request(worktree: &str) -> Result<String, String> {
     let body = DeleteCloneRequest {
         worktree: worktree.to_string(),
     };
-    let resp = req_post("/api/delete-clone")
-        .json(&body)
-        .map_err(|e| e.to_string())?
-        .send()
-        .await
-        .map_err(network_error)?;
+    let resp = write_json("/api/delete-clone", &body).await?;
     if resp.ok() {
         Ok(resp.text().await.unwrap_or_default())
     } else {
