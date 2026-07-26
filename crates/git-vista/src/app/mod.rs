@@ -593,16 +593,21 @@ pub fn App() -> impl IntoView {
                         }
                         // The conflict/warning glyph flags the failure at a glance.
                         HistoryPhase::SeedError { epoch } => {
+                            // The failure is read back out of the resource, but
+                            // only the one belonging to *this* epoch: reporting
+                            // a retired epoch's error would name a cause that no
+                            // longer applies.
                             let message = seed
                                 .map(|(e, result)| match result {
                                     Err(err) if *e == epoch => Some(err.to_string()),
                                     _ => None,
                                 })
-                                .flatten();
+                                .flatten()
+                                .unwrap_or_else(|| "the request did not complete".to_string());
                             view! {
                                 <p class="status error">
                                     <span class="nf">{ic.conflict}</span>
-                                    {message.map(|m| format!(" Failed to load history: {m}"))}
+                                    {format!(" Failed to load history: {message}")}
                                 </p>
                             }
                             .into_view()
