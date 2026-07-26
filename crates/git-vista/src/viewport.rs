@@ -12,6 +12,7 @@
 
 use crate::camera::Camera;
 use crate::geometry::{PAD_Y, ROW_HEIGHT};
+use crate::history::MAX_LIVE_ROWS;
 
 /// The half-open range `[start, end)` of row indices whose nodes fall inside a
 /// `viewport_h`-tall viewport under `cam`, padded by `overscan` rows on each side
@@ -43,12 +44,20 @@ pub fn visible_row_range(
     let n = row_count as i64;
     let start = first.clamp(0, n) as usize;
     let end = (last + 1).clamp(0, n) as usize; // +1: half-open, includes `last`
-    (start, end.max(start))
+    let end = end.max(start);
+    // Hard ceiling, applied *after* the overscan so the padding is never what
+    // pushes the range over. Paged history can hold tens of thousands of rows, and
+    // a camera zoomed far out genuinely "sees" all of them — but the renderer's
+    // cost is the SVG node count, so the culler caps what it will hand over rather
+    // than letting one pinch-zoom build a graph the browser can't paint.
+    let end = end.min(start.saturating_add(MAX_LIVE_ROWS));
+    (start, end)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::MAX_LIVE_ROWS;
 
     // Row count comfortably larger than any window used in the tests.
     const ROWS: usize = 1000;
@@ -137,5 +146,40 @@ mod tests {
             6,
             "overscan extends the bottom by exactly its size"
         );
+    }
+
+    #[test]
+    fn pathological_viewport_is_clamped_to_2000_rows() {
+        // Paged history (M1.10, #63) means the aggregate can hold far more rows
+        // than a screen ever wants, and the number that stalls the browser is the
+        // SVG node count, not the aggregate size. A camera zoomed almost all the
+        // way out over a tall viewport "sees" the whole repository, so the culler
+        // itself has to refuse to hand over more than MAX_LIVE_ROWS.
+        const MANY_ROWS: usize = 10_000;
+        let cam = Camera {
+            tx: 0.0,
+            ty: 0.0,
+            scale: 0.001,
+        };
+        let (start, end) = visible_row_range(cam, 1.0e6, MANY_ROWS, 6);
+        assert!(start <= end);
+        assert!(end - start <= MAX_LIVE_ROWS);
+        assert_eq!(
+            (start, end),
+            (0, MAX_LIVE_ROWS),
+            "the cap trims the tail, keeping the rows nearest the top of the view"
+        );
+
+        // Same ceiling deep in the history, where the top edge is not clamped at
+        // row 0 and the overscan has actually widened both sides.
+        let deep = Camera {
+            tx: 0.0,
+            ty: -100_000.0,
+            scale: 0.001,
+        };
+        let (start, end) = visible_row_range(deep, 1.0e6, MANY_ROWS, 6);
+        assert!(start > 0, "the top rows are off-screen, start = {start}");
+        assert!(start <= end);
+        assert!(end - start <= MAX_LIVE_ROWS);
     }
 }
