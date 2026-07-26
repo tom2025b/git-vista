@@ -166,7 +166,113 @@ pub fn read_commit(path: &Path, id: &str) -> Result<CommitDetail, RepoError> {
         committer_email: committer.email.to_string().trim().to_string(),
         commit_time: seconds(&committer),
         message,
+        // Reading one commit says nothing about remotes; the caller stamps the
+        // exact answer with `remote_membership` (M1.10, #63).
+        on_remote: false,
     })
+}
+
+/// Exactly which of `requested` are reachable from a remote-tracking ref.
+///
+/// The bounded-query counterpart to [`read_remote_commits`] (M1.10, #63). That
+/// one answers "which of the newest `limit` remote commits exist" — fine for the
+/// legacy whole-history graph, useless for paged history, where the commit a user
+/// opens is routinely far below the loaded page and far past any cap. This walks
+/// with **no `HISTORY_LIMIT`** and stops the moment every requested id has been
+/// found, so the cost is bounded by how deep the *deepest requested* commit is,
+/// not by the size of history.
+///
+/// Seeds from every remote-tracking tip (`refs/remotes/*`), exactly as
+/// [`read_remote_commits`] does. Traversal order is irrelevant here — only
+/// membership is — so the walk uses gix's default breadth-first sorting rather
+/// than paying to keep a commit-time priority queue.
+///
+/// Returns only the subset of `requested` that is on a remote; ids that are
+/// malformed, absent, or simply not reachable are left out rather than erroring,
+/// so one bad id in a page can't fail the whole read. An empty request, or a
+/// repository with no remote-tracking refs, is an empty answer with no walk.
+pub fn remote_membership(
+    path: &Path,
+    requested: &HashSet<Oid>,
+) -> Result<HashSet<Oid>, RepoError> {
+    if requested.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let repo =
+        gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
+
+    // What we're still looking for, keyed by parsed object id so the walk does no
+    // string formatting per commit. A request that isn't a well-formed hex id can
+    // never be found, so it simply never enters the map.
+    let mut outstanding: std::collections::HashMap<gix::ObjectId, Oid> = requested
+        .iter()
+        .filter_map(|oid| {
+            gix::ObjectId::from_hex(oid.0.as_bytes())
+                .ok()
+                .map(|parsed| (parsed, oid.clone()))
+        })
+        .collect();
+    if outstanding.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let mut seen = HashSet::new();
+    let mut tips: Vec<gix::ObjectId> = Vec::new();
+    let platform = repo
+        .references()
+        .map_err(|e| RepoError::Walk(format!("opening the ref store: {e}")))?;
+    let all = platform
+        .all()
+        .map_err(|e| RepoError::Walk(format!("listing refs: {e}")))?;
+    for reference in all {
+        let reference = match reference {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("git-vista: skipping an unreadable ref while scanning remotes: {e}");
+                continue;
+            }
+        };
+        if !matches!(
+            reference.name().category_and_short_name(),
+            Some((Category::RemoteBranch, _))
+        ) {
+            continue;
+        }
+        if let Ok(id) = reference.into_fully_peeled_id() {
+            let oid = id.detach();
+            if seen.insert(oid) {
+                tips.push(oid);
+            }
+        }
+    }
+
+    if tips.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let walk = repo
+        .rev_walk(tips)
+        .sorting(Sorting::BreadthFirst)
+        .all()
+        .map_err(|e| RepoError::Walk(e.to_string()))?;
+
+    let mut found = HashSet::new();
+    for info in walk {
+        let info = info.map_err(|e| RepoError::Walk(e.to_string()))?;
+        if let Some(oid) = outstanding.remove(&info.id().detach()) {
+            found.insert(oid);
+            // Every requested id accounted for: stop, however much remote history
+            // is left. This is the whole point of the helper.
+            if outstanding.is_empty() {
+                break;
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// The set of commit ids (hex) reachable from the repository's remote-tracking
@@ -278,6 +384,75 @@ pub(crate) mod tests {
             .success()
             .then_some(())
             .expect("git commit failed");
+    }
+
+    /// Run a git command in `dir`, returning its trimmed stdout; fails the test
+    /// loudly if git errors.
+    pub(crate) fn git_out(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git should be runnable");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A **real** repository holding `count` linear commits on `main`, with
+    /// `refs/remotes/origin/main` planted at the chain's tip.
+    ///
+    /// Built through one `git fast-import` process rather than `count` `git
+    /// commit` spawns: the fixtures this backs are deliberately deeper than the
+    /// retained 5,000-commit history cap, and five thousand process spawns would
+    /// take minutes. Commit times ascend with depth, so the root is unambiguously
+    /// the oldest commit and a capped newest-first walk truncates before it.
+    pub(crate) fn deep_remote_chain(count: usize) -> tempfile::TempDir {
+        use std::io::Write;
+
+        assert!(count > 0, "a chain needs at least one commit");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+
+        let mut stream = String::new();
+        for n in 1..=count {
+            let message = format!("commit {n}\n");
+            stream.push_str("commit refs/heads/main\n");
+            stream.push_str(&format!("mark :{n}\n"));
+            stream.push_str(&format!(
+                "committer Ada Lovelace <ada@example.com> {} +0000\n",
+                1_000 + n
+            ));
+            stream.push_str(&format!("data {}\n{message}", message.len()));
+            if n > 1 {
+                stream.push_str(&format!("from :{}\n", n - 1));
+            }
+            stream.push('\n');
+        }
+        // The remote-tracking ref sits exactly at the imported tip.
+        stream.push_str("reset refs/remotes/origin/main\n");
+        stream.push_str(&format!("from :{count}\n\n"));
+        stream.push_str("done\n");
+
+        let mut child = Command::new("git")
+            .args(["fast-import", "--quiet", "--done"])
+            .current_dir(p)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("git fast-import should run");
+        child
+            .stdin
+            .take()
+            .expect("fast-import stdin is piped")
+            .write_all(stream.as_bytes())
+            .expect("writing the fast-import stream");
+        let status = child.wait().expect("git fast-import should finish");
+        assert!(status.success(), "git fast-import failed");
+        dir
     }
 
     /// Build a small fixture repo:
@@ -440,6 +615,66 @@ pub(crate) mod tests {
         assert!(remote.contains(&id("C third")));
         assert!(!remote.contains(&id("D on feature")), "D is unpushed");
         assert!(!remote.contains(&id("E merge feature")), "E is unpushed");
+    }
+
+    /// M1.10 (#63): remote reachability for a *bounded requested set* is exact,
+    /// with no `HISTORY_LIMIT`. The commit whose detail a user opens is very often
+    /// far below whatever page is loaded — in a >5,000-commit repository the
+    /// retained, capped [`read_remote_commits`] walk simply cannot see it, so the
+    /// panel would call a pushed commit unpushed and refuse to link it.
+    #[test]
+    fn remote_membership_finds_requested_commit_beyond_5000() {
+        let dir = deep_remote_chain(5_001);
+        let p = dir.path();
+        // One local commit past the remote tip, so "on a remote" is a real
+        // question and not something a walk could answer "yes" to by accident.
+        commit(p, "local tip never pushed", 9_000);
+
+        let depth: usize = git_out(p, &["rev-list", "--count", "refs/remotes/origin/main"])
+            .parse()
+            .expect("rev-list --count prints a number");
+        assert!(
+            depth > 5_000,
+            "the fixture must be deeper than the retained cap, got {depth}"
+        );
+
+        let oid = |spec: &str| Oid(git_out(p, &["rev-parse", spec]));
+        let remote_tip = oid("refs/remotes/origin/main");
+        let local_tip = oid("HEAD");
+        // An arbitrary parent that a two-row page would never hold.
+        let arbitrary = oid("refs/remotes/origin/main~3");
+        let root = Oid(git_out(
+            p,
+            &["rev-list", "--max-parents=0", "refs/remotes/origin/main"],
+        ));
+
+        // The two rows a two-row page would own — neither request below is in it.
+        let page: HashSet<Oid> = [local_tip.clone(), remote_tip].into_iter().collect();
+        assert!(!page.contains(&arbitrary), "the fixture's premise");
+        assert!(!page.contains(&root), "the fixture's premise");
+
+        let requested: HashSet<Oid> = [root.clone(), arbitrary.clone(), local_tip.clone()]
+            .into_iter()
+            .collect();
+        let found = remote_membership(p, &requested).unwrap();
+
+        assert!(found.contains(&root), "the deep root is on the remote");
+        assert!(
+            found.contains(&arbitrary),
+            "an arbitrary unloaded parent is on the remote"
+        );
+        assert!(
+            !found.contains(&local_tip),
+            "the unpushed local tip is not on the remote"
+        );
+        assert_eq!(found.len(), 2, "only the requested subset comes back");
+
+        // ...and this is precisely what the retained capped walk cannot do.
+        let capped = read_remote_commits(p, 5_000).unwrap();
+        assert!(
+            !capped.contains(&root.0),
+            "a 5,000-commit cap truncates before the root — the reason this helper exists"
+        );
     }
 
     #[test]

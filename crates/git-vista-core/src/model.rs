@@ -58,6 +58,19 @@ pub struct CommitDetail {
     pub commit_time: i64,
     /// The full commit message, verbatim — summary line and body together.
     pub message: String,
+    /// True when this commit is reachable from one of the repository's
+    /// remote-tracking refs — i.e. it really is on the remote, so a forge link to
+    /// it will resolve rather than 404 (M1.10, #63).
+    ///
+    /// Answered *exactly*, for this one commit, by a bounded requested-set walk
+    /// (`git_vista_git::remote_membership`) rather than by membership of a capped
+    /// prefix of remote history: the commit whose detail a user opens is routinely
+    /// far below whatever page is loaded.
+    ///
+    /// `#[serde(default)]` so a payload minted before this field existed still
+    /// decodes — absent on the wire means "not known to be on a remote".
+    #[serde(default)]
+    pub on_remote: bool,
 }
 
 /// What a [`GitRef`] is, so the UI can badge and prioritise it. `Head` is the
@@ -104,6 +117,15 @@ pub struct GraphRow {
     /// graph, so the UI can colour a branch consistently regardless of which
     /// lane it happens to occupy. The UI maps the index onto its palette.
     pub color: usize,
+    /// True when this commit is reachable from a remote-tracking ref (M1.10,
+    /// #63). Per-row rather than per-graph: paged history has no whole-history
+    /// `Graph.remote_commits` set to consult, so each emitted row carries its own
+    /// exact answer, computed only for the OIDs the page actually emits.
+    ///
+    /// `#[serde(default)]` so an older payload still decodes as "not known to be
+    /// on a remote".
+    #[serde(default)]
+    pub on_remote: bool,
 }
 
 /// A line drawn between a commit and one of its parents.
@@ -205,6 +227,33 @@ pub struct BranchStub {
     /// fanning back to the shared commit. (Git records no "created from which
     /// stub" link, so the cascade is ordered deterministically by branch name.)
     #[serde(default)]
+    pub depth: usize,
+}
+
+/// The paged-history twin of [`BranchStub`] (M1.10, #63).
+///
+/// A page is a window into history, so it cannot speak in absolute row indices or
+/// absolute lanes the way the whole-graph [`BranchStub`] does: its rows are only
+/// meaningful relative to the page, and the lane a stub finally occupies depends
+/// on the commit-lane high-water of everything drawn so far. So this anchors by
+/// **commit id** and carries a **lane offset** past the page's commit lanes,
+/// which the renderer adds to that high-water to get an absolute column.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameStub {
+    /// Branch name — the badge text, e.g. `"feature/ui-dark-mode"`.
+    pub name: String,
+    /// The commit this branch forks from, by id (a page-local row index would be
+    /// meaningless to a client assembling several pages).
+    pub anchor_commit: Oid,
+    /// Column past the commit lanes: absolute lane = commit-lane high-water +
+    /// this. Cumulative across every stub emitted so far, so two stubs never land
+    /// in the same column.
+    pub lane_offset: usize,
+    /// The stub's own colour slot — distinct from the branch it forked off.
+    pub color: usize,
+    /// Position in the cascade of stubs sharing this anchor commit: 0 forks
+    /// straight off the commit, 1 off stub 0's tip, and so on. See
+    /// [`BranchStub::depth`].
     pub depth: usize,
 }
 

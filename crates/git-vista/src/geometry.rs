@@ -376,6 +376,7 @@ mod tests {
             lane,
             refs: vec![],
             color: 0,
+            on_remote: false,
         };
         let mut g = Graph {
             rows: vec![row(0, 0), row(1, 2), row(2, 0), row(3, 0)],

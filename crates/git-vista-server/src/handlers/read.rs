@@ -2,6 +2,7 @@
 //! commit's detail and diff, and the two live "state" reads (checked-out branch,
 //! working-tree status). Reads, so they work on read-only clones too.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use axum::extract::{Path as AxumPath, Query};
@@ -12,7 +13,7 @@ use serde::Deserialize;
 
 use git_vista_core::identity::{RepositoryHandle, WorktreeId};
 use git_vista_core::layout;
-use git_vista_core::model::{CommitSummary, GitRef, RefKind};
+use git_vista_core::model::{CommitDetail, CommitSummary, GitRef, RefKind};
 use git_vista_core::status::parse_porcelain_v2;
 use git_vista_git::{read_commit, read_refs, walk_history, RepoError};
 
@@ -128,15 +129,36 @@ pub(crate) async fn commit_detail(
     Query(q): Query<RepoQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let repo = resolve_repo(q.repo.as_deref())?.0;
-    let detail = read_commit(&repo, &id).map_err(|e| match e {
+    let detail = commit_detail_for_repo(&repo, &id)?;
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(detail)))
+}
+
+/// Read one commit and stamp its **exact** remote reachability (M1.10, #63).
+///
+/// Split out from the handler so a test can drive it against a temp repository:
+/// the handler itself resolves the repo from the process-wide selection. The
+/// remote flag comes from a singleton `remote_membership` query rather than from
+/// a capped prefix of remote history — the commit a user opens is routinely far
+/// below the loaded page, and a truncated answer would call a pushed commit
+/// unpushed and refuse to link it.
+///
+/// A remote-scan failure leaves the flag `false` (the same lenient posture the
+/// graph read takes): the panel loses a link, it does not lose the commit.
+fn commit_detail_for_repo(repo: &Path, id: &str) -> Result<CommitDetail, (StatusCode, String)> {
+    let mut detail = read_commit(repo, id).map_err(|e| match e {
         RepoError::CommitNotFound(_) => (StatusCode::NOT_FOUND, "No such commit.".to_string()),
         other => {
             eprintln!("git-vista: /api/commit/{id} failed: {other}");
             (StatusCode::INTERNAL_SERVER_ERROR, other.to_string())
         }
     })?;
-    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
-    Ok((no_store, Json(detail)))
+    let requested = HashSet::from([detail.id.clone()]);
+    match git_vista_git::remote_membership(repo, &requested) {
+        Ok(found) => detail.on_remote = found.contains(&detail.id),
+        Err(e) => eprintln!("git-vista: /api/commit/{id} could not scan remotes: {e}"),
+    }
+    Ok(detail)
 }
 
 /// Upper bound on the patch text returned by `/api/diff/{id}`. A huge commit
@@ -992,5 +1014,97 @@ mod tests {
         // Deserialises as the descriptor list, and no descriptor carries a path.
         let list: Vec<RepositoryDescriptor> = serde_json::from_slice(&bytes).unwrap();
         assert!(list.iter().all(|d| d.path.is_none()));
+    }
+
+    // ---- exact remote reachability for one commit (M1.10, #63) ---------------
+
+    /// A **real** repository of `count` linear commits with
+    /// `refs/remotes/origin/main` at the chain tip and one further local-only
+    /// commit on top. Built through a single `git fast-import` so a fixture
+    /// deeper than the retained 5,000-commit cap costs a second, not minutes.
+    fn deep_remote_repo(count: usize) -> (tempfile::TempDir, PathBuf) {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@example.invalid"]);
+        run(&repo, &["config", "user.name", "t"]);
+
+        let mut stream = String::new();
+        for n in 1..=count {
+            let message = format!("commit {n}\n");
+            stream.push_str("commit refs/heads/main\n");
+            stream.push_str(&format!("mark :{n}\n"));
+            stream.push_str(&format!(
+                "committer t <t@example.invalid> {} +0000\n",
+                1_000 + n
+            ));
+            stream.push_str(&format!("data {}\n{message}", message.len()));
+            if n > 1 {
+                stream.push_str(&format!("from :{}\n", n - 1));
+            }
+            stream.push('\n');
+        }
+        stream.push_str("reset refs/remotes/origin/main\n");
+        stream.push_str(&format!("from :{count}\n\n"));
+        stream.push_str("done\n");
+
+        let mut child = std::process::Command::new("git")
+            .args(["fast-import", "--quiet", "--done"])
+            .current_dir(&repo)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stream.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success(), "git fast-import failed");
+
+        // One local commit past the remote tip: "on a remote" stays a real question.
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "local tip"]);
+        (dir, repo)
+    }
+
+    /// The detail panel's remote flag is exact for an arbitrary commit, however
+    /// deep. A two-row page holds only the local tip and the remote tip; the deep
+    /// root and an arbitrary unloaded parent are both still reported as pushed,
+    /// which a `HISTORY_LIMIT`-capped remote walk could not manage.
+    #[test]
+    fn commit_detail_marks_unloaded_remote_parent() {
+        let (_dir, repo) = deep_remote_repo(5_001);
+
+        let local_tip = out(&repo, &["rev-parse", "HEAD"]);
+        let remote_tip = out(&repo, &["rev-parse", "refs/remotes/origin/main"]);
+        let arbitrary = out(&repo, &["rev-parse", "refs/remotes/origin/main~3"]);
+        let root = out(
+            &repo,
+            &["rev-list", "--max-parents=0", "refs/remotes/origin/main"],
+        );
+        let depth: usize = out(&repo, &["rev-list", "--count", "refs/remotes/origin/main"])
+            .parse()
+            .unwrap();
+        assert!(depth > 5_000, "fixture must exceed the cap, got {depth}");
+
+        // The rows a two-row page would own; neither request below is among them.
+        let page = [local_tip.as_str(), remote_tip.as_str()];
+        assert!(!page.contains(&arbitrary.as_str()));
+        assert!(!page.contains(&root.as_str()));
+
+        for id in [&root, &arbitrary] {
+            let detail = commit_detail_for_repo(&repo, id).expect("detail read");
+            assert_eq!(&detail.id.0, id);
+            assert!(detail.on_remote, "an unloaded parent is on the remote");
+        }
+
+        let unpushed = commit_detail_for_repo(&repo, &local_tip).expect("detail read");
+        assert!(
+            !unpushed.on_remote,
+            "the local tip was never pushed anywhere"
+        );
     }
 }
