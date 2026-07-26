@@ -43,9 +43,14 @@
 /*.png
 /Test/
 
-# ADR PDFs are rendered twins of the tracked Markdown, kept for local reading
-# only. The `.md` under docs/adr/ is the durable, reviewable record.
+# Rendered PDFs are TRACKED, and they all live in one place:
+# docs/superpowers/pdf/. Keeping them out of docs/adr/ stops a rendered twin
+# sitting beside its source and being mistaken for the record — the `.md` is
+# always the record; the PDF is the printable copy of it.
 /docs/adr/*.pdf
+/docs/superpowers/plans/*.pdf
+/docs/superpowers/specs/*.pdf
+!/docs/superpowers/pdf/
 
 # Local print/archive outputs generated from the documentation set
 /ALL_DOCUMENTATION.md

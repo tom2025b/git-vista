@@ -21,34 +21,38 @@ use super::RenderCtx;
 const MAX_STUB_NAME_CHARS: usize = 24;
 
 /// Stub tips get the branch glyph beside their hollow ring, in the same
-/// toggleable layer. Stubs are few and eager (see [`stubs`]), so this is
-/// a plain reactive closure — reading the icon signal re-renders on toggle.
-pub fn stub_icons(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>) -> impl IntoView {
-    move || {
-        let ic = icon_set(nerd_icons.get());
-        ctx.with_value(|c| {
-            c.graph
-                .stubs
-                .iter()
-                .map(|s| {
-                    // Same colour rule as the stub's own line/ring: the branch
-                    // name's stable colour.
-                    let color = branch_color(s.color);
-                    view! {
-                        <text
-                            x=node_cx(s.lane) - NODE_RADIUS - 5
-                            y=stub_node_cy(s.anchor_row, s.depth) + 4
-                            text-anchor="end"
-                            class="nf node-icon"
-                            fill=color
-                        >
-                            {ic.branch}
-                        </text>
-                    }
-                })
-                .collect_view()
-        })
-    }
+/// toggleable layer. Stubs are few and eager (see [`stubs`]), so this reads the
+/// icon signal directly and the caller re-runs it — the enclosing closure in
+/// `canvas.rs` also reads `stub_epoch`, so a page that shifts the lane
+/// high-water repaints these glyphs at their new columns.
+///
+/// Only *resolved* stubs (M1.10, #63): a `FrameStub` whose anchor commit isn't
+/// loaded has no row and no lane, so there is nowhere to draw it.
+pub fn stub_icons(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>) -> View {
+    let ic = icon_set(nerd_icons.get());
+    ctx.with_value(|c| {
+        c.loaded
+            .resolved_stubs()
+            .iter()
+            .map(|s| {
+                // Same colour rule as the stub's own line/ring: the branch
+                // name's stable colour.
+                let color = branch_color(s.stub.color);
+                view! {
+                    <text
+                        x=node_cx(s.lane) - NODE_RADIUS - 5
+                        y=stub_node_cy(s.anchor_row, s.stub.depth) + 4
+                        text-anchor="end"
+                        class="nf node-icon"
+                        fill=color
+                    >
+                        {ic.branch}
+                    </text>
+                }
+            })
+            .collect_view()
+    })
+    .into_view()
 }
 
 /// Branch stubs: a local branch with no commits of its own (e.g. one just
@@ -72,37 +76,36 @@ pub fn stubs(
     // paint over the ring below it — and, worse, sit on top of that ring's hit
     // circle, swallowing taps aimed dead-centre. The paths are decorative, so
     // they also get pointer-events:none; belt and braces with the ordering.
-    let paths = ctx.with_value(|c| {
-        c.graph
-            .stubs
-            .iter()
-            .map(|s| {
-                let color = branch_color(s.color);
-                let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.depth);
-                view! {
-                    <path
-                        d=d
-                        fill="none"
-                        stroke=color
-                        stroke-width="2"
-                        stroke-linecap="round"
-                        pointer-events="none"
-                    />
-                }
-            })
-            .collect_view()
-    });
-    let tips = ctx.with_value(|c| c.graph
-        .stubs
+    // Resolved once for both passes: `resolved_stubs` places each stub against
+    // the aggregate's current lane high-water, so the two passes can't disagree.
+    let resolved = ctx.with_value(|c| c.loaded.resolved_stubs());
+    let paths = resolved
+        .iter()
+        .map(|s| {
+            let color = branch_color(s.stub.color);
+            let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.stub.depth);
+            view! {
+                <path
+                    d=d
+                    fill="none"
+                    stroke=color
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    pointer-events="none"
+                />
+            }
+        })
+        .collect_view();
+    let tips = ctx.with_value(|c| resolved
         .iter()
         .map(|s| {
             // The branch name's stable colour — the same colour this branch's
             // line will wear once it owns commits, so committing on the stub
             // reads as the stub growing into its line.
-            let color = branch_color(s.color);
+            let color = branch_color(s.stub.color);
             let sx = node_cx(s.lane);
-            let sy = stub_node_cy(s.anchor_row, s.depth);
-            let name = s.name.clone();
+            let sy = stub_node_cy(s.anchor_row, s.stub.depth);
+            let name = s.stub.name.clone();
 
             // The stub is a *branch*, not the commit it happens to sit on, so its
             // menu takes the branch's identity (Issue #30): the header is the
@@ -111,18 +114,21 @@ pub fn stubs(
             // same rule the branch badges use. "Create branch" still targets the
             // stub's tip commit, so forking from the stub forks off that commit
             // (Issue #24).
-            let anchor = &c.graph.rows[s.anchor_row].commit;
-            let commit_id = anchor.id.0.clone();
-            let header = s.name.clone();
-            let branch_name = s.name.clone();
-            let github_url = c.repo_url.as_ref().and_then(|base| {
+            //
+            // The anchor commit is the stub's own `anchor_commit`, so it needs no
+            // row lookup — `resolved_stubs` only yields stubs whose anchor is
+            // loaded, which is exactly the guarantee that makes this safe.
+            let commit_id = s.stub.anchor_commit.0.clone();
+            let header = s.stub.name.clone();
+            let branch_name = s.stub.name.clone();
+            let github_url = c.frame.repo_url.as_ref().and_then(|base| {
                 c.remote_branches
-                    .contains(&s.name)
-                    .then(|| format!("{base}/tree/{}", s.name))
+                    .contains(&s.stub.name)
+                    .then(|| format!("{base}/tree/{}", s.stub.name))
             });
             // The repo's GitHub base, for the menu's "Create Pull Request" link.
-            let repo_url = c.repo_url.clone();
-            let remote_web_url = c.graph.remote_web_url.clone();
+            let repo_url = c.frame.repo_url.clone();
+            let remote_web_url = c.frame.remote_web_url.clone();
             // Issue #139: pointerup, not click — same reasoning as the commit
             // dots in nodes.rs (iPad DuckDuckGo click synthesis). Propagation
             // stays live for the svg's gesture cleanup.
@@ -169,7 +175,7 @@ pub fn stubs(
                     fill=color
                     pointer-events="none"
                 >
-                    {truncate(&s.name, MAX_STUB_NAME_CHARS)}
+                    {truncate(&s.stub.name, MAX_STUB_NAME_CHARS)}
                 </text>
                 // A larger, invisible hit target on top so the tip is easy to tap,
                 // exactly like the commit dots.
