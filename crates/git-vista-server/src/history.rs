@@ -57,6 +57,14 @@ pub(crate) struct HistorySnapshot {
     /// The checked-out branch's short name; `None` when detached.
     pub head_branch: Option<String>,
     /// The commit HEAD resolves to; `None` for an unborn HEAD.
+    ///
+    /// Carried because the plan's snapshot pins *both* HEAD halves, but read
+    /// only by this module's tests: the digest and the seed set are built from
+    /// `materials.resolved_head` before the snapshot exists, and the wire
+    /// `HistoryFrame` has no resolved-head field to fill. The allow is
+    /// `not(test)`-scoped on purpose — a blanket `allow` would also hide a
+    /// genuinely unused field in the test build.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub resolved_head: Option<Oid>,
     /// Validated, sorted, deduplicated `$GIT_DIR/shallow` boundary set.
     pub shallow_boundaries: Vec<Oid>,

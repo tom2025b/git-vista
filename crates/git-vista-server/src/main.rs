@@ -4,11 +4,14 @@
 //! read a git repo itself. This server runs the native git reader
 //! ([`git_vista_git::walk_history`]) + the pure layout ([`git_vista_core::layout`])
 //! and serves, on a single origin:
-//!   - `GET /api/commits` — the laid-out [`Graph`] as JSON, and
+//!   - `GET /api/frame` — the once-per-view refs/branch-colours envelope,
+//!   - `GET /api/commits` — one cursor-signed [`Page`](handlers::read::Page) of
+//!     laid-out history rows/edges/stubs (protocol v4, stateless paging), and
 //!   - everything else    — the wasm SPA bundle Trunk builds into the frontend's
 //!     `dist/` directory.
 //!
-//! The frontend just `fetch`es `/api/commits` (same origin, no CORS).
+//! The frontend `fetch`es `/api/frame` once per view and `/api/commits` per
+//! page (same origin, no CORS).
 //!
 //! # Module layout
 //!
@@ -48,10 +51,9 @@ mod git_cmd;
 mod handlers;
 // M1.10 Task 3 (#63): the paged-history snapshot (refs + HEAD + shallow), its
 // `history-v1` generation token, and the Frame/Page representation validators.
-// Task 4 wires these into the frame/page handlers; until then nothing in the
-// binary target calls them, so the narrow allow keeps `-D warnings` honest
-// without deleting tested, plan-mandated seams.
-#[allow(dead_code)]
+// Task 4 wires these into the `/api/frame` and paged `/api/commits` handlers
+// registered by `api_router` below, sharing the one `Arc<CursorCodec>` minted
+// in `main`.
 mod history;
 mod journal;
 // The versioned-API-contract layer (M1.02, #102): protocol negotiation, the
@@ -81,7 +83,7 @@ use axum::response::IntoResponse;
 use axum::{
     http::{header, HeaderValue, StatusCode},
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use tower::Layer;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -96,12 +98,13 @@ use handlers::clone::{clone_repo, delete_clone_repo};
 use handlers::commit::{create_commit, stage_all, unstage_all};
 use handlers::protocol::protocol_info;
 use handlers::read::{
-    commit_detail, commit_diff, commits, file_at_commit, head_branch, worktree_status,
+    commit_detail, commit_diff, commits, file_at_commit, frame, head_branch, worktree_status,
 };
 use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
 use handlers::select::{rescan, select_repo};
 use handlers::session::{create_session, revoke_session, session_status, SessionState};
+use history::CursorCodec;
 use ratelimit::SignInLimiter;
 use security::{AuthState, HostPolicy};
 use session::{SessionManager, BOOTSTRAP_REFRESH_INTERVAL};
@@ -250,7 +253,17 @@ async fn main() {
         via_lan: false,
         rate_limiter: None,
     };
-    let loopback_app = build_app(loopback_session_state, HostPolicy::loopback(PORT), true);
+    // M1.10 (#63): the one `Arc<CursorCodec>` shared by both listeners, so a
+    // history cursor minted against the loopback router decodes on the LAN
+    // router too (and vice versa) — two independently-minted codecs would
+    // silently reject every cursor across listeners.
+    let history_codec = Arc::new(CursorCodec::new());
+    let loopback_app = build_app(
+        loopback_session_state,
+        HostPolicy::loopback(PORT),
+        true,
+        history_codec.clone(),
+    );
 
     print_startup_banner(&bootstrap_token_path(), lan_addr);
 
@@ -264,7 +277,12 @@ async fn main() {
                 via_lan: true,
                 rate_limiter: Some(Arc::new(SignInLimiter::new())),
             };
-            let lan_app = build_app(lan_session_state, HostPolicy::lan(lan_ip, PORT), false);
+            let lan_app = build_app(
+                lan_session_state,
+                HostPolicy::lan(lan_ip, PORT),
+                false,
+                history_codec.clone(),
+            );
             let loopback_serve = axum::serve(
                 listener,
                 loopback_app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -299,7 +317,12 @@ async fn main() {
 /// merely gated, so a mode-check regression can't reopen them. Kept separate
 /// from [`build_app`] so a test can exercise route registration directly,
 /// without the static-file fallback (and its `DIST_DIR` dependency) in the way.
-fn api_router(session_state: SessionState, hosts: HostPolicy, full_routes: bool) -> Router {
+fn api_router(
+    session_state: SessionState,
+    hosts: HostPolicy,
+    full_routes: bool,
+    codec: Arc<CursorCodec>,
+) -> Router {
     let auth_state = AuthState {
         manager: session_state.manager.clone(),
         hosts,
@@ -309,6 +332,13 @@ fn api_router(session_state: SessionState, hosts: HostPolicy, full_routes: bool)
     // (protocol negotiation, request id, structured errors, response headers)
     // wraps them all — and only them, never the static SPA served alongside it.
     let mut api = Router::new()
+        // M1.10 (#63): protocol v4's stateless paged history. `/api/frame` is
+        // the once-per-view refs/branch-colours envelope; the paged
+        // `/api/commits` replaces the old whole-graph read with one
+        // cursor-signed window. Both read the one shared `Arc<CursorCodec>`
+        // below, so a cursor minted on one listener decodes on the other.
+        .route("/api/frame", get(frame))
+        .route("/api/commits", get(commits))
         // The one unversioned endpoint: a client hits it to learn the protocol
         // before it can be required to speak it (so it's exempt from the header
         // check inside the contract layer).
@@ -325,7 +355,6 @@ fn api_router(session_state: SessionState, hosts: HostPolicy, full_routes: bool)
                 .post(create_session)
                 .delete(revoke_session),
         )
-        .route("/api/commits", get(commits))
         // Phase 10: full detail for one commit, read on demand for the side panel.
         .route("/api/commit/{id}", get(commit_detail))
         // Activity/Undo feature, step 2: one commit's diff (file list + patch),
@@ -421,6 +450,11 @@ fn api_router(session_state: SessionState, hosts: HostPolicy, full_routes: bool)
         // Outermost: the M1.02 versioned-API contract — protocol negotiation,
         // request id, the consistent error envelope, and the response headers.
         .layer(axum::middleware::from_fn(middleware::api_contract))
+        // M1.10 (#63): the one shared `Arc<CursorCodec>` `/api/frame` and the
+        // paged `/api/commits` extract via `Extension`. Minted once in `main`
+        // and passed into both listener builds — never a fresh codec per
+        // router — so a cursor minted on one listener decodes on the other.
+        .layer(Extension(codec))
         // The session store the session handlers (and the auth layer) resolve
         // against. Erases the router's state type back to `()`.
         .with_state(session_state)
@@ -428,7 +462,12 @@ fn api_router(session_state: SessionState, hosts: HostPolicy, full_routes: bool)
 
 /// Assemble one full application — [`api_router`] plus the static SPA fallback
 /// and the two outer layers — for one listener.
-fn build_app(session_state: SessionState, hosts: HostPolicy, full_routes: bool) -> Router {
+fn build_app(
+    session_state: SessionState,
+    hosts: HostPolicy,
+    full_routes: bool,
+    codec: Arc<CursorCodec>,
+) -> Router {
     // Serve the SPA bundle with `Cache-Control: no-cache` so the browser always
     // revalidates index.html (and thus picks up a freshly built wasm hash) instead
     // of running a stale, cached frontend — the cache layered on top of the live
@@ -441,7 +480,7 @@ fn build_app(session_state: SessionState, hosts: HostPolicy, full_routes: bool) 
     .layer(ServeDir::new(DIST_DIR).append_index_html_on_directories(true));
 
     Router::new()
-        .merge(api_router(session_state, hosts, full_routes))
+        .merge(api_router(session_state, hosts, full_routes, codec))
         // Anything that isn't the API is served from the built SPA bundle.
         .fallback_service(spa)
         // Global backstop for the static SPA / fallback. The `/api` space has its
@@ -566,6 +605,7 @@ mod tests {
             session_state,
             HostPolicy::lan("192.168.1.42".parse().unwrap(), PORT),
             false,
+            Arc::new(CursorCodec::new()),
         );
         let cookie = bootstrap_cookie(router.clone(), "192.168.1.42:8080", &token).await;
         let resp = router
@@ -593,7 +633,12 @@ mod tests {
             via_lan: false,
             rate_limiter: None,
         };
-        let router = api_router(session_state, HostPolicy::loopback(PORT), true);
+        let router = api_router(
+            session_state,
+            HostPolicy::loopback(PORT),
+            true,
+            Arc::new(CursorCodec::new()),
+        );
         let cookie = bootstrap_cookie(router.clone(), "localhost:8080", &token).await;
         // /api/commit is registered POST-only; a GET reaches real routing and
         // gets axum's own 405 -- proving the path exists, in contrast to the

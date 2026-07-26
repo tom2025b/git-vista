@@ -215,6 +215,9 @@ impl StreamLayout {
             lane,
             refs: Vec::new(),
             color: 0,
+            // Layout is pure and knows nothing about remotes; the server stamps
+            // exact remote reachability onto the emitted rows (M1.10, #63).
+            on_remote: false,
         });
         self.next_row = row + 1;
         self.lane_high_water = self.lane_high_water.max(lane + 1);

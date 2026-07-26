@@ -27,19 +27,24 @@ use serde::{Deserialize, Serialize};
 /// send no key, so its writes would silently lose the replay guarantee this
 /// version exists to give — hence a hard window move rather than a tolerated
 /// omission.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// **v4 (M1.10, #63)** — history is paged and diffs are bounded: the generic
+/// [`crate::history::HistoryFrame`]/[`crate::history::HistoryPage`] envelopes
+/// replace the old whole-history payload shape. A v3 client expects the whole
+/// graph in one response and cannot page, so this is a hard window move, not a
+/// tolerated omission — the same reasoning as the v3 bump above.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The oldest client protocol version this server build still accepts. Together
 /// with [`MAX_CLIENT_PROTOCOL`] it is the compatibility window a client's version
 /// must fall inside. Equal to [`PROTOCOL_VERSION`] until a compatible-but-older
 /// contract must be supported.
-pub const MIN_CLIENT_PROTOCOL: u32 = 3;
+pub const MIN_CLIENT_PROTOCOL: u32 = 4;
 
 /// The newest client protocol version this server build can accept. A client
 /// reporting a version above this is *ahead* of the server (the server was
 /// downgraded, or the client cache is from a newer deploy) and is refused the
 /// same way as one that is too old.
-pub const MAX_CLIENT_PROTOCOL: u32 = 3;
+pub const MAX_CLIENT_PROTOCOL: u32 = 4;
 
 /// Request header a client must send on every `/api/*` call **except**
 /// `GET /api/protocol`, carrying the [`PROTOCOL_VERSION`] it was built against.
@@ -214,6 +219,19 @@ mod tests {
             info.compatibility(MAX_CLIENT_PROTOCOL + 1),
             Compatibility::ClientTooNew
         );
+    }
+
+    #[test]
+    fn protocol_v4_is_hard_compatibility_window() {
+        // M1.10 (#63) bumped the wire protocol to 4 and moved the whole window,
+        // not just the ceiling: a v3 client cannot page history, so v3 must be
+        // refused exactly like any other out-of-window version, not tolerated.
+        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(MIN_CLIENT_PROTOCOL, 4);
+        assert_eq!(MAX_CLIENT_PROTOCOL, 4);
+        assert_eq!(check_compatibility(3, 4, 4), Compatibility::ClientTooOld);
+        assert_eq!(check_compatibility(4, 4, 4), Compatibility::Compatible);
+        assert_eq!(check_compatibility(5, 4, 4), Compatibility::ClientTooNew);
     }
 
     #[test]

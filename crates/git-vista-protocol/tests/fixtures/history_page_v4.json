@@ -1,0 +1,60 @@
+{
+  "rows": [
+    {
+      "commit": {
+        "id": "1111111111111111111111111111111111111111",
+        "parents": [
+          "2222222222222222222222222222222222222222"
+        ],
+        "summary": "feat: land the thing",
+        "author": "Ada Lovelace",
+        "time": 1753300000
+      },
+      "row": 0,
+      "lane": 0,
+      "refs": [
+        {
+          "name": "HEAD",
+          "kind": "Head",
+          "target": "1111111111111111111111111111111111111111"
+        }
+      ],
+      "color": 0,
+      "on_remote": false
+    },
+    {
+      "commit": {
+        "id": "2222222222222222222222222222222222222222",
+        "parents": [],
+        "summary": "chore: first commit",
+        "author": "Ada Lovelace",
+        "time": 1753200000
+      },
+      "row": 1,
+      "lane": 0,
+      "refs": [],
+      "color": 0,
+      "on_remote": true
+    }
+  ],
+  "edges": [
+    {
+      "from_row": 0,
+      "from_lane": 0,
+      "to_row": 1,
+      "to_lane": 0
+    }
+  ],
+  "stubs": [
+    {
+      "name": "feature/idea",
+      "anchor_commit": "2222222222222222222222222222222222222222",
+      "lane_offset": 0,
+      "color": 1,
+      "depth": 0
+    }
+  ],
+  "lane_count": 1,
+  "cursor": "row:2",
+  "generation": "12345678901234567890"
+}
