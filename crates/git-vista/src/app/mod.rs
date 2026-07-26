@@ -29,7 +29,6 @@ use std::fmt;
 
 use leptos::*;
 
-use git_vista_core::model::{BranchStub, Graph};
 use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
 use crate::api::{fetch_frame, fetch_page, fetch_protocol, fetch_status, HistoryFetchError};
@@ -37,7 +36,6 @@ use crate::dialogs;
 use crate::history::{Frame, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT};
 use crate::icons::icon_set;
 use crate::prefs::{load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref};
-use crate::print::print_graph_view;
 use crate::session::{establish_session, not_connected_view};
 use crate::update_required::update_required_view;
 
@@ -133,52 +131,6 @@ async fn seed_for_epoch(epoch: u32) -> Result<HistorySeed, HistorySeedError> {
         frame,
         loaded,
     })
-}
-
-/// Rebuild the whole-graph [`Graph`] the canvas and print view still take, out
-/// of the seed's Frame and first page.
-///
-/// **Temporary scaffolding**, and deliberately the only place the two shapes
-/// meet: steps 7-9 of this task move the canvas, renderers and print view onto
-/// the mounted `RenderCtx` (Frame + `LoadedHistory`), at which point this
-/// function and the `Graph` import go away. Until then it keeps the render path
-/// compiling and running against page 1 without teaching it two data models.
-fn seed_graph(seed: &HistorySeed) -> Graph {
-    let loaded = &seed.loaded;
-    Graph {
-        rows: loaded.rows.clone(),
-        edges: loaded.edges.clone(),
-        lane_count: loaded.lane_high_water,
-        repo_url: seed.frame.repo_url.clone(),
-        remote_web_url: seed.frame.remote_web_url.clone(),
-        // Per-row now (`GraphRow.on_remote`), not a whole-history set: a page
-        // knows the exact answer for the OIDs it emits and nothing beyond them.
-        remote_commits: loaded
-            .rows
-            .iter()
-            .filter(|r| r.on_remote)
-            .map(|r| r.commit.id.0.clone())
-            .collect(),
-        // Only stubs whose anchor commit is loaded can be placed; the aggregate
-        // has already resolved their absolute rows and lanes.
-        stubs: loaded
-            .resolved_stubs()
-            .into_iter()
-            .map(|s| BranchStub {
-                name: s.stub.name,
-                anchor_row: s.anchor_row,
-                anchor_lane: s.anchor_lane,
-                lane: s.lane,
-                color: s.stub.color,
-                depth: s.stub.depth,
-            })
-            .collect(),
-        repo_label: seed.frame.repo_label.clone(),
-        repo_id: seed.frame.repo_id.clone(),
-        worktree_id: seed.frame.worktree_id.clone(),
-        read_only: seed.frame.read_only,
-        resettable: seed.frame.resettable,
-    }
 }
 
 #[component]

@@ -179,19 +179,35 @@ pub fn print_graph_view(
 /// Build the whole graph as one static SVG: every edge, dot, glyph, badge,
 /// label tier and stub — the interactive builders' geometry and colours, minus
 /// links, menus, virtualization and LOD, with dark text for paper.
-fn graph_sheet(g: &Graph, nerd: bool) -> View {
+///
+/// Every scrap of it comes out of the one mounted aggregate (M1.10, #63): rows,
+/// edges and the monotonic per-row label x from
+/// [`LoadedHistory`](crate::history::LoadedHistory), stubs from its
+/// `resolved_stubs()`, repo metadata from the Frame. No `Graph`, no second
+/// `text_x`, no per-row colour vector — a second copy assembled for the printout
+/// would be exactly the copy that disagrees with the graph on screen.
+fn graph_sheet(c: &RenderCtx, nerd: bool) -> View {
     let ic = icon_set(nerd);
-    let text_x = label_x_per_row(g);
-    let row_color: Vec<usize> = g.rows.iter().map(|gr| gr.color).collect();
-    let headroom = stub_headroom(&g.stubs) as i32;
+    let rows = &c.loaded.rows;
+    // Grown page by page and read back through the aggregate's accessor: the
+    // whole-`Graph` `label_x_per_row` has nothing to be handed here, because
+    // paged history never holds a whole `Graph`.
+    let text_x = c.loaded.text_x();
+    // Only stubs whose anchor commit is loaded can be placed at all; the
+    // aggregate has already resolved their absolute rows and lanes.
+    let stubs = c.loaded.resolved_stubs();
+    let headroom = stub_headroom_for(stubs.iter().map(|s| (s.anchor_row, s.stub.depth))) as i32;
 
     // Sheet size: tall enough for every row (plus stub headroom above row 0),
-    // wide enough that no row's badges + message overrun the right edge.
-    let height = headroom + PAD_Y * 2 + (g.rows.len().saturating_sub(1) as i32) * ROW_HEIGHT;
-    let width = g
-        .rows
+    // wide enough that no row's badges + message overrun the right edge. Rows
+    // and their label x are *zipped* rather than indexed by `gr.row`: the two
+    // are the same length by construction, and zipping makes that structural
+    // instead of a bounds check repeated on every row.
+    let height = headroom + PAD_Y * 2 + (rows.len().saturating_sub(1) as i32) * ROW_HEIGHT;
+    let width = rows
         .iter()
-        .map(|gr| {
+        .zip(text_x)
+        .map(|(gr, &tx)| {
             let badges: i32 = gr
                 .refs
                 .iter()
@@ -211,66 +227,61 @@ fn graph_sheet(g: &Graph, nerd: bool) -> View {
             )
             .chars()
             .count() as i32;
-            text_x[gr.row] + badges + msg.max(meta) * MSG_CHAR_W
+            tx + badges + msg.max(meta) * MSG_CHAR_W
         })
         .max()
         .unwrap_or(400)
         + PAD_Y;
 
     // Edges — same colour rule as render/edges.rs: first-parent links wear the
-    // child's branch colour, merge links the merged-in parent's.
-    let edges = g
+    // child's branch colour, merge links the merged-in parent's. Both endpoints
+    // are looked up *checked*, for the same reason the interactive builder does
+    // it: an edge whose rows aren't both loaded has nothing to connect, and a
+    // panic here would take the overlay down instead of dropping one line.
+    let edges = c
+        .loaded
         .edges
         .iter()
-        .map(|e| {
+        .filter_map(|e| {
+            let (from, to) = (rows.get(e.from_row)?, rows.get(e.to_row)?);
             let d = edge_path(e);
-            let child = &g.rows[e.from_row].commit;
-            let parent_oid = &g.rows[e.to_row].commit.id;
-            let is_first_parent = child.parents.first() == Some(parent_oid);
-            let color_row = if is_first_parent {
-                e.from_row
-            } else {
-                e.to_row
-            };
-            let color = branch_color(row_color[color_row]);
-            view! {
+            let is_first_parent = from.commit.parents.first() == Some(&to.commit.id);
+            let color = branch_color(if is_first_parent { from.color } else { to.color });
+            Some(view! {
                 <path d=d fill="none" stroke=color stroke-width="2" stroke-linecap="round" />
-            }
+            })
         })
         .collect_view();
 
     // Stub connectors + rings + names (render/stubs.rs, minus the tap targets).
-    let stub_paths = g
-        .stubs
+    let stub_paths = stubs
         .iter()
         .map(|s| {
-            let color = branch_color(s.color);
-            let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.depth);
+            let color = branch_color(s.stub.color);
+            let d = stub_path(s.anchor_lane, s.anchor_row, s.lane, s.stub.depth);
             view! {
                 <path d=d fill="none" stroke=color stroke-width="2" stroke-linecap="round" />
             }
         })
         .collect_view();
-    let stub_tips = g
-        .stubs
+    let stub_tips = stubs
         .iter()
         .map(|s| {
-            let color = branch_color(s.color);
+            let color = branch_color(s.stub.color);
             let sx = node_cx(s.lane);
-            let sy = stub_node_cy(s.anchor_row, s.depth);
+            let sy = stub_node_cy(s.anchor_row, s.stub.depth);
             view! {
                 // White-filled ring on paper (the canvas fill is the dark bg).
                 <circle cx=sx cy=sy r=NODE_RADIUS fill="#ffffff" stroke=color stroke-width="2" />
                 <text x=sx + NODE_RADIUS + 6 y=sy + 4 class="stub-label" fill=color>
-                    {truncate(&s.name, 24)}
+                    {truncate(&s.stub.name, 24)}
                 </text>
             }
         })
         .collect_view();
 
     // Dots + the per-node glyph (merge vs commit), like nodes.rs.
-    let nodes = g
-        .rows
+    let nodes = rows
         .iter()
         .map(|gr| {
             let cx = node_cx(gr.lane);
@@ -299,11 +310,11 @@ fn graph_sheet(g: &Graph, nerd: bool) -> View {
     // The two label tiers, dark-on-white: badges keep their colours, the
     // message/meta text goes near-black/grey (classes pg-msg / pg-meta) so the
     // printout reads like a document rather than inverted screen colours.
-    let labels = g
-        .rows
+    let labels = rows
         .iter()
-        .map(|gr| {
-            let mut bx = text_x[gr.row];
+        .zip(text_x)
+        .map(|(gr, &tx)| {
+            let mut bx = tx;
             let badges = gr
                 .refs
                 .iter()
@@ -356,7 +367,7 @@ fn graph_sheet(g: &Graph, nerd: bool) -> View {
             view! {
                 {badges}
                 <text x=bx y=label_top_y(gr.row) class="label-msg pg-msg">{msg}</text>
-                <text x=text_x[gr.row] y=label_bottom_y(gr.row) class="label-meta pg-meta">
+                <text x=tx y=label_bottom_y(gr.row) class="label-meta pg-meta">
                     <tspan class="nf">{ic.commit}</tspan>
                     {meta}
                 </text>
