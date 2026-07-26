@@ -65,12 +65,17 @@
 //!     entry points below are a full-window feed through the same walk.
 //!   * [`color`]    — the palette and the first-parent-chain colouring.
 //!   * [`badges`]   — attaching refs to their commits.
+//!   * [`replay`]   — the same colouring/badging/stub decisions taken one row at
+//!     a time, for paged history, which never holds the whole graph. It is
+//!     proven equivalent to [`color`] + [`decorate`] on every fixture in the
+//!     crate; the whole-graph passes below stay the oracle.
 //!
 //! The two entry points ([`layout`] and [`layout_with_refs`]) stay here and
 //! orchestrate those passes.
 
 mod badges;
 mod color;
+pub mod replay;
 pub mod stream;
 mod topology;
 

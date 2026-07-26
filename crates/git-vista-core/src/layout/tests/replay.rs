@@ -494,7 +494,12 @@ fn frame_stubs_by_anchor(whole: &Graph) -> Vec<FrameStub> {
 ///
 /// Grounded against `whole` rather than merely re-derived: every stub's colour
 /// and the trunk's own row colour must agree with what this claims.
-fn named_slots(whole: &Graph, refs: &[GitRef]) -> Vec<(String, usize)> {
+///
+/// Takes `head` as well as the plan's `(&whole, &refs)` because the trunk rule
+/// itself does (`layout/color.rs:99-105`): with neither a local `main` nor a
+/// local `master`, the checked-out branch owns slot 0, and nothing in `whole`
+/// names it (`HEAD` is a badge on a commit, not a branch name).
+fn named_slots(whole: &Graph, refs: &[GitRef], head: Option<&str>) -> Vec<(String, usize)> {
     let has_local = |name: &str| {
         refs.iter()
             .any(|r| matches!(r.kind, RefKind::Branch) && r.name == name)
@@ -504,7 +509,7 @@ fn named_slots(whole: &Graph, refs: &[GitRef]) -> Vec<(String, usize)> {
     } else if has_local("master") {
         Some("master")
     } else {
-        None
+        head.filter(|h| has_local(h))
     };
     let slot_of = |name: &str| {
         if Some(name) == trunk_name {
@@ -646,7 +651,7 @@ fn whole_graph_and_replay_classifier_match() {
         );
         assert_eq!(
             replayed_branch_colors,
-            named_slots(&whole, &case.refs),
+            named_slots(&whole, &case.refs, case.head),
             "{what}: named slots"
         );
 
