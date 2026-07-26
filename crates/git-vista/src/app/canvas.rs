@@ -226,7 +226,10 @@ pub(super) fn graph_canvas(
     // Window listeners (resize → viewport height; keydown → shortcuts), each
     // removed on cleanup so a graph reload doesn't stack duplicate handlers.
     gestures::install_resize_listener(vp_h);
-    gestures::install_key_listener(camera, home.get_untracked(), reload, overlays);
+    // `home` goes in as the signal, not its current value: an accepted page can
+    // move the home camera down (a taller stub cascade), and the `0` key must
+    // land on wherever it is *now* — same rule as the Reset-view button.
+    gestures::install_key_listener(camera, home, reload, overlays);
     let visible = create_memo(move |_| {
         visible_row_range(camera.get(), vp_h.get(), row_count.get(), OVERSCAN_ROWS)
     });

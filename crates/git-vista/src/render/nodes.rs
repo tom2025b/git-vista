@@ -38,6 +38,11 @@ pub fn build_node(
         let color = branch_color(gr.color);
         let fill = color;
         let stroke_width = "2";
+        // The row's identity in the DOM (M1.10, #63). This `<g>` is the one and
+        // only per-row group — the label/meta/icon tiers deliberately add none —
+        // so counting `.graph-row` counts live rows exactly, which is how the
+        // MAX_LIVE_ROWS cull is observable from outside the app at all.
+        let oid = gr.commit.id.0.clone();
 
         // Issue #18: tapping a dot opens a context menu. Gather this commit's
         // menu data now; the click handler clones it in (it may fire repeatedly).
@@ -97,7 +102,7 @@ pub fn build_node(
         };
 
         view! {
-            <g>
+            <g class="graph-row" data-oid=oid>
                 <circle
                     cx=cx
                     cy=cy
