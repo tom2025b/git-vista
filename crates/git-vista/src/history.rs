@@ -376,6 +376,13 @@ impl LoadedHistory {
 
     /// Per-row rightmost occupied lane — the dot, anything passing through, and
     /// any stub ring hanging over the row.
+    ///
+    /// The view never needs this — it reads [`Self::text_x`], the x the occupancy
+    /// resolves to — so the accessor exists for the host tests that pin the
+    /// monotonic-growth rule. Hence the wasm-only `dead_code` guard, per-item like
+    /// the ones in [`crate::geometry`]: on the browser target it genuinely has no
+    /// caller, and that is by design rather than a loose end.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn label_occupancy(&self) -> &[usize] {
         &self.label_occupancy
     }

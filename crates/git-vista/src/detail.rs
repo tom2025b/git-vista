@@ -181,11 +181,13 @@ pub fn detail_panel_view(
                         // gating, shown only when there's no GitHub base so it
                         // never doubles the row above.
                         let forge_row = ctx.with_value(|c| {
-                            if c.repo_url.is_some() {
+                            if c.frame.repo_url.is_some() {
                                 return None;
                             }
-                            c.graph.remote_web_url.as_ref().and_then(|base| {
-                                c.remote_set.contains(&d.id.0).then(|| {
+                            c.frame.remote_web_url.as_ref().and_then(|base| {
+                                // Same per-commit answer as the GitHub row above:
+                                // the detail payload, never the loaded rows.
+                                d.on_remote.then(|| {
                                     let url =
                                         git_vista_core::forge::commit_url(base, &d.id.0);
                                     let host = git_vista_core::forge::host_label(base);
