@@ -30,7 +30,7 @@ use crate::git_cmd::git_stdout_capped;
 use crate::handlers::reset::has_seed;
 use crate::history::{
     if_none_match, read_history_snapshot, representation_etag, require_same_generation,
-    CursorCodec, CursorScope, HistoryCursor, RepresentationKind,
+    CursorCodec, CursorError, CursorScope, HistoryCursor, RepresentationKind,
 };
 use crate::state::{current, current_handle, repo_label, resolve_worktree, HISTORY_LIMIT};
 
@@ -280,10 +280,13 @@ pub(crate) async fn frame(
 ///
 /// `walks` is injected the way `commit_diff_for_repo`'s `metadata_cap` is: so a
 /// test can prove a rejected cursor never reaches the traversal, and that a
-/// Frame read never counts as one.
+/// Frame read never counts as one. It is an ordinary parameter, not a
+/// `cfg(test)` device: production passes a real counter through the handler, so
+/// nothing about the pipeline's behaviour changes between profiles.
 ///
-/// Plan Step 7 implements the page-1 path; the cursor branch — authentication,
-/// scope/generation gates and the `[0,n)` prefix replay — is plan Step 8.
+/// Paging is stateless and honestly quadratic over a full scroll: a page at row
+/// `n` re-walks `[0,n)` from the same seeds, because the entire server-side
+/// state is one signed row number.
 #[allow(dead_code)] // wired by plan Step 9 (route registration)
 async fn page_for_target(
     target: &ResolvedHistoryTarget,
@@ -2010,6 +2013,371 @@ mod tests {
                 assert_eq!(&revalidated, tag, "{what}: 304 keeps its own validator");
                 assert!(body.is_empty(), "{what}: a 304 carries no body");
             }
+        }
+    }
+
+    // ---- paged replay: contiguity, edge ownership, stub ownership -------------
+
+    /// One commit in `repo` at a fixed author/committer timestamp, so the Topo
+    /// `DateOrder` these fixtures depend on is not a function of wall-clock time.
+    fn commit_at(repo: &Path, file: &str, message: &str, epoch: i64) {
+        std::fs::write(repo.join(file), format!("{message}\n")).unwrap();
+        run(repo, &["add", "-A"]);
+        let stamp = format!("{epoch} +0000");
+        run_env(
+            repo,
+            &["commit", "-q", "-m", message],
+            &[("GIT_AUTHOR_DATE", &stamp), ("GIT_COMMITTER_DATE", &stamp)],
+        );
+    }
+
+    /// The plan's adversarial edge fixture, and the reason it is adversarial:
+    ///
+    /// ```text
+    ///   row 0  M   merge, parents [A, B]
+    ///   row 1  A   parent [R]
+    ///   row 2  R   recorded shallow boundary — its parent Z is cut
+    ///   row 3  B   unrelated root, older than R
+    /// ```
+    ///
+    /// Topo `DateOrder` emits `M(0) -> [A(1), B(3)]` and `A(1) -> R(2)`, so the
+    /// `M -> B` edge resolves three rows below its own row: any page containing
+    /// row 3 owns an edge whose `from_row` is 0. That is the shape a page-local
+    /// row index cannot express, which is what `ResolvedEdge.parent_ordinal` and
+    /// the checkpointed `PendingEdge` list exist for.
+    ///
+    /// Returns `(repo, z_oid)` — `Z` must never appear in any page.
+    fn adversarial_edge_repo(parent: &Path) -> (PathBuf, String) {
+        let repo = parent.join("edges");
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@example.invalid"]);
+        run(&repo, &["config", "user.name", "t"]);
+
+        commit_at(&repo, "z.txt", "z", 1_700_001_000);
+        let z = out(&repo, &["rev-parse", "HEAD"]);
+        commit_at(&repo, "r.txt", "r", 1_700_003_000);
+        let r = out(&repo, &["rev-parse", "HEAD"]);
+        commit_at(&repo, "a.txt", "a", 1_700_004_000);
+
+        // B: an unrelated root, deliberately *older* than R so `DateOrder` puts
+        // it last even though it is the merge's second parent.
+        run(&repo, &["checkout", "-q", "--orphan", "bside"]);
+        run(&repo, &["rm", "-r", "-f", "-q", "--cached", "."]);
+        for stale in ["z.txt", "r.txt", "a.txt"] {
+            std::fs::remove_file(repo.join(stale)).unwrap();
+        }
+        commit_at(&repo, "b.txt", "b", 1_700_002_000);
+
+        run(&repo, &["checkout", "-q", "main"]);
+        let stamp = format!("{} +0000", 1_700_005_000_i64);
+        run_env(
+            &repo,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "--allow-unrelated-histories",
+                "-m",
+                "m",
+                "bside",
+            ],
+            &[("GIT_AUTHOR_DATE", &stamp), ("GIT_COMMITTER_DATE", &stamp)],
+        );
+
+        // Record R as a shallow boundary *after* every commit is written: from
+        // here on Z is unreachable to the traversal, cut rather than missing.
+        std::fs::write(repo.join(".git").join("shallow"), format!("{r}\n")).unwrap();
+        (repo, z)
+    }
+
+    /// A linear history carrying two stub anchors: one local branch demoted at
+    /// row 1, and a three-branch cascade demoted at row 3. Local `main` outranks
+    /// every one of them, so each is a [`FrameStub`] rather than a badge.
+    fn stub_cascade_repo(parent: &Path) -> PathBuf {
+        let repo = deterministic_repo(parent, "stubs", 6);
+        run(&repo, &["branch", "zeta", "HEAD~1"]);
+        run(&repo, &["branch", "alpha", "HEAD~3"]);
+        run(&repo, &["branch", "beta", "HEAD~3"]);
+        run(&repo, &["branch", "gamma", "HEAD~3"]);
+        repo
+    }
+
+    /// Paging is a partition of the same replay, not a different one: at any page
+    /// size, the concatenated pages are the uninterrupted walk's rows, in order,
+    /// with absolute row numbers that never repeat and never skip.
+    #[tokio::test]
+    async fn pages_are_contiguous_at_limits_one_and_seven() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 8);
+
+        let (_, _, oracle_body, _) = page_one_parts(&repo, MAX_PAGE_LIMIT, &HeaderMap::new()).await;
+        let oracle: Page = serde_json::from_slice(&oracle_body).unwrap();
+        assert_eq!(oracle.rows.len(), 8, "the uninterrupted page holds it all");
+        assert!(
+            oracle.cursor.is_none(),
+            "a walk that ended before the window filled opens no next page"
+        );
+
+        for limit in [1_usize, 7] {
+            let pages = all_pages(&repo, limit).await;
+
+            let mut expected_start = 0_usize;
+            let mut union: Vec<GraphRow> = Vec::new();
+            for (index, page) in pages.iter().enumerate() {
+                assert!(
+                    page.rows.len() <= limit,
+                    "limit {limit}: page {index} overran the window"
+                );
+                for (offset, row) in page.rows.iter().enumerate() {
+                    assert_eq!(
+                        row.row,
+                        expected_start + offset,
+                        "limit {limit}: page {index} row {offset} is not contiguous"
+                    );
+                }
+                expected_start += page.rows.len();
+                union.extend(page.rows.iter().cloned());
+            }
+
+            assert_eq!(
+                union.iter().map(|r| r.row).collect::<Vec<_>>(),
+                (0..8).collect::<Vec<_>>(),
+                "limit {limit}: absolute rows are 0..8 exactly once, in order"
+            );
+            assert_eq!(
+                union
+                    .iter()
+                    .map(|r| r.commit.id.clone())
+                    .collect::<Vec<_>>(),
+                oracle
+                    .rows
+                    .iter()
+                    .map(|r| r.commit.id.clone())
+                    .collect::<Vec<_>>(),
+                "limit {limit}: the pages replay the uninterrupted walk"
+            );
+            assert_eq!(
+                union.iter().map(|r| r.lane).collect::<Vec<_>>(),
+                oracle.rows.iter().map(|r| r.lane).collect::<Vec<_>>(),
+                "limit {limit}: lanes survive the checkpoint/resume boundary"
+            );
+            assert_eq!(
+                union.iter().map(|r| r.color).collect::<Vec<_>>(),
+                oracle.rows.iter().map(|r| r.color).collect::<Vec<_>>(),
+                "limit {limit}: the prefix replay rebuilt the same claims"
+            );
+            assert_eq!(
+                union
+                    .iter()
+                    .map(|r| r.refs.iter().map(|x| x.name.clone()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                oracle
+                    .rows
+                    .iter()
+                    .map(|r| r.refs.iter().map(|x| x.name.clone()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                "limit {limit}: badges land on their own row, once"
+            );
+
+            let generations: HashSet<_> = pages.iter().map(|p| p.generation.clone()).collect();
+            assert_eq!(
+                generations.len(),
+                1,
+                "limit {limit}: one stable history, one generation"
+            );
+            assert!(
+                pages.last().unwrap().cursor.is_none(),
+                "limit {limit}: the chain ends without a cursor"
+            );
+        }
+    }
+
+    /// Edge ownership at every page boundary, over the plan's adversarial graph.
+    ///
+    /// Each edge is delivered exactly once, on the page that owns its *parent*
+    /// row, even when the child row is pages away. Raw concatenation is therefore
+    /// deliberately **not** canonical order — only a canonicalized clone of the
+    /// completed union is, and it must equal the uninterrupted walk's own edges.
+    #[tokio::test]
+    async fn paged_edge_union_canonicalizes_to_uninterrupted_oracle_at_every_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, z) = adversarial_edge_repo(dir.path());
+
+        let (_, _, oracle_body, _) = page_one_parts(&repo, MAX_PAGE_LIMIT, &HeaderMap::new()).await;
+        let oracle: Page = serde_json::from_slice(&oracle_body).unwrap();
+
+        // The fixture really is `M(0) -> [A(1), B(3)]`, `A(1) -> R(2)`, cut at R.
+        let summaries: Vec<&str> = oracle
+            .rows
+            .iter()
+            .map(|r| r.commit.summary.as_str())
+            .collect();
+        assert_eq!(
+            summaries,
+            vec!["m", "a", "r", "b"],
+            "the adversarial Topo DateOrder the plan specifies"
+        );
+        assert!(
+            oracle.rows[2].commit.parents.is_empty(),
+            "a recorded shallow boundary reaches the layout as a root"
+        );
+        assert!(
+            !oracle.rows.iter().any(|r| r.commit.id.0 == z),
+            "the commit below the boundary is cut, not paged"
+        );
+        assert_eq!(
+            oracle.edges,
+            vec![
+                Edge { from_row: 0, from_lane: 0, to_row: 1, to_lane: 0 },
+                Edge { from_row: 0, from_lane: 0, to_row: 3, to_lane: 1 },
+                Edge { from_row: 1, from_lane: 0, to_row: 2, to_lane: 0 },
+            ],
+            "the uninterrupted oracle is canonical (from_row, parent ordinal, …)"
+        );
+
+        let mut saw_edge_from_an_earlier_page = false;
+        let mut saw_noncanonical_raw_union = false;
+
+        for limit in 1..=oracle.rows.len() {
+            let pages = all_pages(&repo, limit).await;
+
+            let mut start = 0_usize;
+            let mut union_rows: Vec<GraphRow> = Vec::new();
+            let mut raw_union: Vec<Edge> = Vec::new();
+            for (index, page) in pages.iter().enumerate() {
+                let end = start + page.rows.len();
+                for edge in &page.edges {
+                    assert!(
+                        (start..end).contains(&edge.to_row),
+                        "limit {limit}: page {index} [{start},{end}) must own only \
+                         edges whose destination row it holds, got {edge:?}"
+                    );
+                    if edge.from_row < start {
+                        saw_edge_from_an_earlier_page = true;
+                    }
+                }
+                start = end;
+                union_rows.extend(page.rows.iter().cloned());
+                raw_union.extend(page.edges.iter().cloned());
+            }
+
+            assert_eq!(
+                union_rows.len(),
+                oracle.rows.len(),
+                "limit {limit}: the union is the whole history"
+            );
+            assert_eq!(
+                raw_union.len(),
+                oracle.edges.len(),
+                "limit {limit}: every edge exactly once — no duplicate, no drop"
+            );
+            let distinct: HashSet<_> = raw_union
+                .iter()
+                .map(|e| (e.from_row, e.from_lane, e.to_row, e.to_lane))
+                .collect();
+            assert_eq!(
+                distinct.len(),
+                oracle.edges.len(),
+                "limit {limit}: the union holds no repeated edge"
+            );
+
+            if raw_union != oracle.edges {
+                saw_noncanonical_raw_union = true;
+            }
+
+            // Only *this* — a canonicalized clone of the completed union, indexed
+            // against absolute rows starting at zero — is required to equal the
+            // oracle. `canonicalize_edges` is never called on page-local rows.
+            let mut canonical = raw_union.clone();
+            canonicalize_edges(&union_rows, &mut canonical);
+            assert_eq!(
+                canonical, oracle.edges,
+                "limit {limit}: the completed union canonicalizes to the \
+                 uninterrupted new-pipeline oracle"
+            );
+        }
+
+        assert!(
+            saw_edge_from_an_earlier_page,
+            "the fixture must exercise a page owning an edge with from_row < n"
+        );
+        assert!(
+            saw_noncanonical_raw_union,
+            "raw concatenated page edge order is deliberately not required to be \
+             canonical order; a fixture where it always happens to be proves nothing"
+        );
+    }
+
+    /// Stub ownership at every page boundary: a stub rides the page that owns its
+    /// anchor row and no other, a suppressed prefix emits none, and the cumulative
+    /// column numbering survives the prefix replay.
+    ///
+    /// Per accepted decision D18, paged `lane_offset` is **row**-order numbering:
+    /// the streaming classifier emits each stub on its anchor's page and cannot
+    /// see later rows, so it cannot reproduce the whole-graph pass's
+    /// priority-sorted seed order. The oracle here is the uninterrupted *new*
+    /// pipeline, which is exactly what the frontend will render.
+    #[tokio::test]
+    async fn page_stubs_emit_once_on_anchor_page_with_stable_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = stub_cascade_repo(dir.path());
+
+        let (_, _, oracle_body, _) = page_one_parts(&repo, MAX_PAGE_LIMIT, &HeaderMap::new()).await;
+        let oracle: Page = serde_json::from_slice(&oracle_body).unwrap();
+        assert_eq!(oracle.rows.len(), 6);
+
+        let anchor_one = oracle.rows[1].commit.id.clone();
+        let anchor_three = oracle.rows[3].commit.id.clone();
+        assert_eq!(
+            oracle
+                .stubs
+                .iter()
+                .map(|s| (s.name.as_str(), s.anchor_commit.clone(), s.lane_offset, s.depth))
+                .collect::<Vec<_>>(),
+            vec![
+                ("zeta", anchor_one.clone(), 0, 0),
+                ("alpha", anchor_three.clone(), 1, 0),
+                ("beta", anchor_three.clone(), 2, 1),
+                ("gamma", anchor_three.clone(), 3, 2),
+            ],
+            "row-order cumulative offsets, name-sorted within one anchor (D18)"
+        );
+        for name in ["zeta", "alpha", "beta", "gamma"] {
+            assert!(
+                !oracle
+                    .rows
+                    .iter()
+                    .any(|r| r.refs.iter().any(|x| x.name == name)),
+                "{name} is drawn as a stub line, never as a second badge"
+            );
+        }
+
+        for limit in 1..=oracle.rows.len() {
+            let pages = all_pages(&repo, limit).await;
+
+            let mut start = 0_usize;
+            let mut union: Vec<FrameStub> = Vec::new();
+            for (index, page) in pages.iter().enumerate() {
+                let end = start + page.rows.len();
+                let owned: HashSet<Oid> =
+                    page.rows.iter().map(|r| r.commit.id.clone()).collect();
+                for stub in &page.stubs {
+                    assert!(
+                        owned.contains(&stub.anchor_commit),
+                        "limit {limit}: page {index} [{start},{end}) carries a stub \
+                         whose anchor row it does not own: {stub:?}"
+                    );
+                }
+                start = end;
+                union.extend(page.stubs.iter().cloned());
+            }
+
+            assert_eq!(
+                union, oracle.stubs,
+                "limit {limit}: each stub once, on its anchor page, with the \
+                 cumulative offsets the uninterrupted classification hands out"
+            );
         }
     }
 }
