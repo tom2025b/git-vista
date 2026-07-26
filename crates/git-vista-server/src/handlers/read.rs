@@ -953,8 +953,9 @@ mod tests {
     use super::*;
     use axum::routing::get;
     use axum::Router;
+    use git_vista_core::identity::RepositoryId;
     use git_vista_core::layout::stream::canonicalize_edges;
-    use git_vista_protocol::RepositoryDescriptor;
+    use git_vista_protocol::{ApiError, ErrorCode, RepositoryDescriptor, PROTOCOL_HEADER, PROTOCOL_VERSION};
     use tower::ServiceExt;
 
     async fn status_of(app: Router, uri: &str) -> StatusCode {
