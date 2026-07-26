@@ -71,6 +71,11 @@ pub enum ErrorCode {
     Unauthenticated,
     /// The addressed thing (commit, file, …) does not exist.
     NotFound,
+    /// The repository state a paged read was pinned to moved between pages
+    /// (M1.10, #63): the generation inside the client's cursor no longer
+    /// matches the freshly re-read one. The frontend restarts its history
+    /// aggregate at page 1 — rows from two different histories never splice.
+    Conflict,
     /// The operation is not permitted in the current state.
     Forbidden,
     /// A write was attempted against a read-only clone.
@@ -95,6 +100,7 @@ impl ErrorCode {
             ErrorCode::BadRequest => 400,
             ErrorCode::Unauthenticated => 401,
             ErrorCode::NotFound => 404,
+            ErrorCode::Conflict => 409,
             ErrorCode::Forbidden | ErrorCode::ReadOnly => 403,
             ErrorCode::GitFailed | ErrorCode::Internal => 500,
         }
@@ -109,6 +115,9 @@ impl ErrorCode {
             401 => ErrorCode::Unauthenticated,
             403 => ErrorCode::Forbidden,
             404 => ErrorCode::NotFound,
+            // Before the 4xx catch-all below, or a handler's 409 would come
+            // back as a generic `bad_request` instead of `conflict`.
+            409 => ErrorCode::Conflict,
             426 => ErrorCode::ProtocolIncompatible,
             // Every other 4xx — including the 422 an unprocessable body produces
             // (e.g. a rejected unknown field) — is a client error, not a server one.
@@ -234,6 +243,21 @@ mod tests {
         assert!(ErrorCode::ProtocolIncompatible.is_protocol_mismatch());
         assert!(!ErrorCode::BadRequest.is_protocol_mismatch());
         assert!(!ErrorCode::GitFailed.is_protocol_mismatch());
+    }
+
+    #[test]
+    fn conflict_wire_and_status_mappings_are_stable() {
+        // M1.10 (#63): paged history's generation-drift signal. The wire
+        // string is contract, exactly like its siblings above.
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::Conflict).unwrap(),
+            "\"conflict\""
+        );
+        assert_eq!(ErrorCode::Conflict.http_status(), 409);
+        assert_eq!(ErrorCode::from_status(409), ErrorCode::Conflict);
+        // Drift drives inline "history moved, restarting" UI, never the
+        // Update-Required screen.
+        assert!(!ErrorCode::Conflict.is_protocol_mismatch());
     }
 
     #[test]
