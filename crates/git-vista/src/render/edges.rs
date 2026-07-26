@@ -58,7 +58,11 @@ pub fn build_edge(ctx: StoredValue<RenderCtx>, ei: usize) -> View {
         let is_first_parent = from.commit.parents.first() == Some(&to.commit.id);
         // A first-parent link belongs to the child's own branch; a merge link to
         // the merged-in parent's — so each takes that row's colour slot.
-        let color = branch_color(if is_first_parent { from.color } else { to.color });
+        let color = branch_color(if is_first_parent {
+            from.color
+        } else {
+            to.color
+        });
         view! {
             <path d=d fill="none" stroke=color stroke-width="2" stroke-linecap="round" />
         }
