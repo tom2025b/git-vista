@@ -111,10 +111,15 @@ pub fn detail_panel_view(
                         // Link to the commit on GitHub when the repo has a github.com
                         // origin *and* this commit is pushed — same rule the labels
                         // and menu use, so the link never 404s.
+                        // Whether this commit is on the remote comes from the
+                        // *detail payload* (M1.10, #63), not from the loaded
+                        // rows: the panel routinely shows a commit far below the
+                        // last loaded page — walking parents reaches arbitrary
+                        // history — so "is it in a row we happen to have" would
+                        // wrongly dim every link outside the loaded window.
                         let github = ctx.with_value(|c| {
-                            c.repo_url.as_ref().and_then(|base| {
-                                c.remote_set
-                                    .contains(&d.id.0)
+                            c.frame.repo_url.as_ref().and_then(|base| {
+                                d.on_remote
                                     .then(|| format!("{base}/commit/{}", d.id.0))
                             })
                         });
