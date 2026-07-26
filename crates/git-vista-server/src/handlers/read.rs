@@ -955,7 +955,9 @@ mod tests {
     use axum::Router;
     use git_vista_core::identity::RepositoryId;
     use git_vista_core::layout::stream::canonicalize_edges;
-    use git_vista_protocol::{ApiError, ErrorCode, RepositoryDescriptor, PROTOCOL_HEADER, PROTOCOL_VERSION};
+    use git_vista_protocol::{
+        ApiError, ErrorCode, RepositoryDescriptor, PROTOCOL_HEADER, PROTOCOL_VERSION,
+    };
     use tower::ServiceExt;
 
     async fn status_of(app: Router, uri: &str) -> StatusCode {
@@ -2582,7 +2584,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = deterministic_repo(dir.path(), "alpha", 4);
 
-        let (status_one, _, body_one, walks_one) = page_one_parts(&repo, 1, &HeaderMap::new()).await;
+        let (status_one, _, body_one, walks_one) =
+            page_one_parts(&repo, 1, &HeaderMap::new()).await;
         assert_eq!(status_one, StatusCode::OK);
         assert_eq!(walks_one, 1);
         let page_one: Page = serde_json::from_slice(&body_one).unwrap();
@@ -2698,9 +2701,16 @@ mod tests {
         let codec = history_codec();
         let target = history_target(&repo, &codec);
         let walks = AtomicUsize::new(0);
-        let error = page_for_target(&target, Some(&tampered), 1, &codec, &HeaderMap::new(), &walks)
-            .await
-            .expect_err("a tampered cursor must be refused");
+        let error = page_for_target(
+            &target,
+            Some(&tampered),
+            1,
+            &codec,
+            &HeaderMap::new(),
+            &walks,
+        )
+        .await
+        .expect_err("a tampered cursor must be refused");
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
         assert_eq!(error.1, "invalid history cursor");
         assert_eq!(walks.load(Ordering::Relaxed), 0);
@@ -2775,7 +2785,11 @@ mod tests {
 
         let snapshot = read_history_snapshot(&path).await.expect("snapshot read");
         let cursor = codec
-            .encode(scope_main, &snapshot.generation, &HistoryCursor { next_row: 1 })
+            .encode(
+                scope_main,
+                &snapshot.generation,
+                &HistoryCursor { next_row: 1 },
+            )
             .expect("signing a cursor for the main worktree's scope");
 
         let walks = AtomicUsize::new(0);
@@ -2809,7 +2823,8 @@ mod tests {
         let ref_before = std::fs::read(&ref_path).unwrap();
 
         let (_, tag_frame_before, _) = frame_parts(&repo, &HeaderMap::new()).await;
-        let (_, tag_page_before, body_before, _) = page_one_parts(&repo, 1, &HeaderMap::new()).await;
+        let (_, tag_page_before, body_before, _) =
+            page_one_parts(&repo, 1, &HeaderMap::new()).await;
         let page_before: Page = serde_json::from_slice(&body_before).unwrap();
         let cursor_before = page_before.cursor.clone().expect("more rows remain");
         let generation_before = page_before.generation.clone();
@@ -2820,7 +2835,11 @@ mod tests {
         // --- deepen: record a shallow boundary. Only `.git/shallow` changes.
         let boundary = out(&repo, &["rev-parse", "HEAD~2"]);
         std::fs::write(path.join(".git").join("shallow"), format!("{boundary}\n")).unwrap();
-        assert_eq!(std::fs::read(&head_path).unwrap(), head_before, "HEAD is untouched by a deepen");
+        assert_eq!(
+            std::fs::read(&head_path).unwrap(),
+            head_before,
+            "HEAD is untouched by a deepen"
+        );
         assert_eq!(
             std::fs::read(&ref_path).unwrap(),
             ref_before,
@@ -2855,7 +2874,11 @@ mod tests {
 
         // --- unshallow: clear the boundary. Again, only `.git/shallow` moves.
         std::fs::remove_file(path.join(".git").join("shallow")).unwrap();
-        assert_eq!(std::fs::read(&head_path).unwrap(), head_before, "HEAD is untouched by an unshallow");
+        assert_eq!(
+            std::fs::read(&head_path).unwrap(),
+            head_before,
+            "HEAD is untouched by an unshallow"
+        );
         assert_eq!(
             std::fs::read(&ref_path).unwrap(),
             ref_before,
@@ -2901,9 +2924,16 @@ mod tests {
         let codec = history_codec();
         let target = history_target(&repo, &codec);
         let walks = AtomicUsize::new(0);
-        let error = page_for_target(&target, None, DEFAULT_PAGE_LIMIT, &codec, &HeaderMap::new(), &walks)
-            .await
-            .expect_err("malformed shallow metadata must be an explicit error, not a silent unshallow");
+        let error = page_for_target(
+            &target,
+            None,
+            DEFAULT_PAGE_LIMIT,
+            &codec,
+            &HeaderMap::new(),
+            &walks,
+        )
+        .await
+        .expect_err("malformed shallow metadata must be an explicit error, not a silent unshallow");
         assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(error.1.contains("shallow"), "{}", error.1);
         assert_eq!(
@@ -2942,7 +2972,11 @@ mod tests {
             "drift takes precedence over the walk's own error: {error:?}"
         );
         assert_eq!(error.1, "history moved");
-        assert_eq!(walks.load(Ordering::Relaxed), 1, "the walk ran once before failing");
+        assert_eq!(
+            walks.load(Ordering::Relaxed),
+            1,
+            "the walk ran once before failing"
+        );
     }
 
     /// The same missing-object failure, but nothing else moves: the combined
@@ -2957,15 +2991,26 @@ mod tests {
         let codec = history_codec();
         let target = history_target(&repo, &codec);
         let walks = AtomicUsize::new(0);
-        let error = page_for_target(&target, None, MAX_PAGE_LIMIT, &codec, &HeaderMap::new(), &walks)
-            .await
-            .expect_err("a missing commit object must surface as an explicit read error");
+        let error = page_for_target(
+            &target,
+            None,
+            MAX_PAGE_LIMIT,
+            &codec,
+            &HeaderMap::new(),
+            &walks,
+        )
+        .await
+        .expect_err("a missing commit object must surface as an explicit read error");
         assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert_ne!(
             error.0,
             StatusCode::CONFLICT,
             "nothing moved, so this must never be reported as drift"
         );
-        assert_eq!(walks.load(Ordering::Relaxed), 1, "the walk counted its one attempt before failing");
+        assert_eq!(
+            walks.load(Ordering::Relaxed),
+            1,
+            "the walk counted its one attempt before failing"
+        );
     }
 }
