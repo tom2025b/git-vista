@@ -1740,7 +1740,7 @@ mod tests {
         let repo = deterministic_repo(dir.path(), "alpha", 2);
         let headers = HeaderMap::new();
 
-        let (_, before_tag, before_body, _) = frame_parts(&repo, &headers).await;
+        let (_, before_tag, before_body) = frame_parts(&repo, &headers).await;
         let before: Frame = serde_json::from_slice(&before_body).unwrap();
         assert!(
             before.remote_web_url.is_none(),
@@ -1752,7 +1752,7 @@ mod tests {
             &["remote", "add", "origin", "https://github.com/o/r.git"],
         );
 
-        let (_, after_tag, after_body, _) = frame_parts(&repo, &headers).await;
+        let (_, after_tag, after_body) = frame_parts(&repo, &headers).await;
         let after: Frame = serde_json::from_slice(&after_body).unwrap();
         assert!(
             after.remote_web_url.is_some(),
@@ -1779,8 +1779,8 @@ mod tests {
         let beta = deterministic_repo(dir.path(), "beta", 3);
         let headers = HeaderMap::new();
 
-        let (_, alpha_tag, alpha_body, _) = frame_parts(&alpha, &headers).await;
-        let (_, beta_tag, beta_body, _) = frame_parts(&beta, &headers).await;
+        let (_, alpha_tag, alpha_body) = frame_parts(&alpha, &headers).await;
+        let (_, beta_tag, beta_body) = frame_parts(&beta, &headers).await;
         let a: Frame = serde_json::from_slice(&alpha_body).unwrap();
         let b: Frame = serde_json::from_slice(&beta_body).unwrap();
 
@@ -1849,7 +1849,7 @@ mod tests {
         let repo = deterministic_repo(dir.path(), "alpha", 3);
         let none = HeaderMap::new();
 
-        let (_, frame_tag, _, _) = frame_parts(&repo, &none).await;
+        let (_, frame_tag, _) = frame_parts(&repo, &none).await;
         let (_, page_tag, _, _) = page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &none).await;
         assert_ne!(frame_tag, page_tag);
 
@@ -1865,7 +1865,7 @@ mod tests {
         assert!(!body.is_empty());
 
         let presented = if_none_match_header(page_tag.to_str().unwrap());
-        let (status, tag, body, _) = frame_parts(&repo, &presented).await;
+        let (status, tag, body) = frame_parts(&repo, &presented).await;
         assert_eq!(status, StatusCode::OK, "nor a Page tag a Frame");
         assert_eq!(tag, frame_tag);
         assert!(!body.is_empty());
@@ -1878,16 +1878,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = deterministic_repo(dir.path(), "alpha", 3);
 
-        let (status, tag, body, _) = frame_parts(&repo, &HeaderMap::new()).await;
+        let (status, tag, body) = frame_parts(&repo, &HeaderMap::new()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(!body.is_empty());
 
         let presented = if_none_match_header(tag.to_str().unwrap());
-        let (status, revalidated, body, walks) = frame_parts(&repo, &presented).await;
+        let (status, revalidated, body) = frame_parts(&repo, &presented).await;
         assert_eq!(status, StatusCode::NOT_MODIFIED);
         assert_eq!(revalidated, tag, "a 304 keeps the validator it matched");
         assert!(body.is_empty(), "a 304 carries no body");
-        assert_eq!(walks, 0);
     }
 
     /// Page 1 evaluates the precondition against its own current tag, and a
@@ -1918,7 +1917,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = deterministic_repo(dir.path(), "alpha", 3);
 
-        let (_, frame_tag, _, _) = frame_parts(&repo, &HeaderMap::new()).await;
+        let (_, frame_tag, _) = frame_parts(&repo, &HeaderMap::new()).await;
         let (_, page_tag, _, _) =
             page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &HeaderMap::new()).await;
 
@@ -1931,10 +1930,12 @@ mod tests {
             ];
             for validator in validators {
                 let presented = if_none_match_header(&validator);
-                let (status, revalidated, body, _) = if what == "frame" {
+                let (status, revalidated, body) = if what == "frame" {
                     frame_parts(&repo, &presented).await
                 } else {
-                    page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &presented).await
+                    let (status, tag, body, _) =
+                        page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &presented).await;
+                    (status, tag, body)
                 };
                 assert_eq!(
                     status,
