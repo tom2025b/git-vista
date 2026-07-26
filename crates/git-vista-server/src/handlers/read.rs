@@ -1,4 +1,6 @@
-//! The read endpoints (all `no-store` GETs): the laid-out history graph, one
+//! The read endpoints (all `no-store` GETs): protocol v4's stateless paged
+//! history — `GET /api/frame` (refs/branch-colours, no commits) and the paged
+//! `GET /api/commits` (one cursor-signed window of rows/edges/stubs) — plus one
 //! commit's detail and diff, and the two live "state" reads (checked-out branch,
 //! working-tree status). Reads, so they work on read-only clones too.
 
@@ -18,9 +20,7 @@ use git_vista_core::identity::{RepositoryHandle, WorktreeId};
 use git_vista_core::layout::replay::ReplayClassifier;
 use git_vista_core::layout::stream::{strip_resolved_edges, StreamLayout};
 use git_vista_core::layout::trunk_reserve_tip;
-use git_vista_core::model::{
-    CommitDetail, CommitSummary, Edge, FrameStub, GitRef, GraphRow, Oid, RefKind,
-};
+use git_vista_core::model::{CommitDetail, Edge, FrameStub, GitRef, GraphRow, Oid};
 use git_vista_core::status::parse_porcelain_v2;
 use git_vista_git::{read_commit, walk_history_topo, RepoError};
 use git_vista_protocol::{HistoryFrame, HistoryPage};
@@ -31,7 +31,7 @@ use crate::history::{
     if_none_match, read_history_snapshot, representation_etag, require_same_generation,
     CursorCodec, CursorError, CursorScope, HistoryCursor, RepresentationKind,
 };
-use crate::state::{current, current_handle, repo_label, resolve_worktree, HISTORY_LIMIT};
+use crate::state::{current, current_handle, repo_label, resolve_worktree};
 
 /// The optional opaque repository selector shared by the read endpoints (M1.03):
 /// `?repo=<worktree-id>` addresses one servable worktree by its opaque id. When

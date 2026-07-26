@@ -4,11 +4,14 @@
 //! read a git repo itself. This server runs the native git reader
 //! ([`git_vista_git::walk_history`]) + the pure layout ([`git_vista_core::layout`])
 //! and serves, on a single origin:
-//!   - `GET /api/commits` — the laid-out [`Graph`] as JSON, and
+//!   - `GET /api/frame` — the once-per-view refs/branch-colours envelope,
+//!   - `GET /api/commits` — one cursor-signed [`Page`](handlers::read::Page) of
+//!     laid-out history rows/edges/stubs (protocol v4, stateless paging), and
 //!   - everything else    — the wasm SPA bundle Trunk builds into the frontend's
 //!     `dist/` directory.
 //!
-//! The frontend just `fetch`es `/api/commits` (same origin, no CORS).
+//! The frontend `fetch`es `/api/frame` once per view and `/api/commits` per
+//! page (same origin, no CORS).
 //!
 //! # Module layout
 //!
@@ -48,10 +51,9 @@ mod git_cmd;
 mod handlers;
 // M1.10 Task 3 (#63): the paged-history snapshot (refs + HEAD + shallow), its
 // `history-v1` generation token, and the Frame/Page representation validators.
-// Task 4 wires these into the frame/page handlers; until then nothing in the
-// binary target calls them, so the narrow allow keeps `-D warnings` honest
-// without deleting tested, plan-mandated seams.
-#[allow(dead_code)]
+// Task 4 wires these into the `/api/frame` and paged `/api/commits` handlers
+// registered by `api_router` below, sharing the one `Arc<CursorCodec>` minted
+// in `main`.
 mod history;
 mod journal;
 // The versioned-API-contract layer (M1.02, #102): protocol negotiation, the
@@ -81,7 +83,7 @@ use axum::response::IntoResponse;
 use axum::{
     http::{header, HeaderValue, StatusCode},
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use tower::Layer;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -96,8 +98,9 @@ use handlers::clone::{clone_repo, delete_clone_repo};
 use handlers::commit::{create_commit, stage_all, unstage_all};
 use handlers::protocol::protocol_info;
 use handlers::read::{
-    commit_detail, commit_diff, commits, file_at_commit, head_branch, worktree_status,
+    commit_detail, commit_diff, commits, file_at_commit, frame, head_branch, worktree_status,
 };
+use history::CursorCodec;
 use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
 use handlers::select::{rescan, select_repo};
@@ -299,7 +302,12 @@ async fn main() {
 /// merely gated, so a mode-check regression can't reopen them. Kept separate
 /// from [`build_app`] so a test can exercise route registration directly,
 /// without the static-file fallback (and its `DIST_DIR` dependency) in the way.
-fn api_router(session_state: SessionState, hosts: HostPolicy, full_routes: bool) -> Router {
+fn api_router(
+    session_state: SessionState,
+    hosts: HostPolicy,
+    full_routes: bool,
+    codec: Arc<CursorCodec>,
+) -> Router {
     let auth_state = AuthState {
         manager: session_state.manager.clone(),
         hosts,
@@ -309,6 +317,13 @@ fn api_router(session_state: SessionState, hosts: HostPolicy, full_routes: bool)
     // (protocol negotiation, request id, structured errors, response headers)
     // wraps them all — and only them, never the static SPA served alongside it.
     let mut api = Router::new()
+        // M1.10 (#63): protocol v4's stateless paged history. `/api/frame` is
+        // the once-per-view refs/branch-colours envelope; the paged
+        // `/api/commits` replaces the old whole-graph read with one
+        // cursor-signed window. Both read the one shared `Arc<CursorCodec>`
+        // below, so a cursor minted on one listener decodes on the other.
+        .route("/api/frame", get(frame))
+        .route("/api/commits", get(commits))
         // The one unversioned endpoint: a client hits it to learn the protocol
         // before it can be required to speak it (so it's exempt from the header
         // check inside the contract layer).
