@@ -118,30 +118,136 @@ pub fn walk_history(path: &Path, limit: usize) -> Result<Vec<CommitSummary>, Rep
     Ok(commits)
 }
 
-// INTERMEDIATE SCAFFOLD (M1.10 #63 Task 4 Step 3) — the pre-existing newest-first
-// walk, lifted behind the new signature so the Step 3/5 tests can run red against
-// something real. It has no shallow adapter and no topological ordering; both are
-// what the tests are about.
+/// An object-database view in which *recorded* shallow boundaries look like root
+/// commits (M1.10, #63).
+///
+/// A shallow clone keeps every boundary commit's bytes verbatim — `parent`
+/// headers and all — and records the boundary separately, in `$GIT_DIR/shallow`.
+/// So a traversal reading the object database directly asks for parents that were
+/// never fetched. The fix is emphatically *not* "tolerate objects that fail to
+/// load": that turns real corruption into a silently truncated graph and would
+/// make the visualiser lie. The fix is to consult the recorded set, which is all
+/// this adapter does:
+///
+/// * every object that is **not** a recorded boundary is delegated verbatim, so
+///   missing, wrong-kind, malformed and corrupt objects keep failing loudly;
+/// * a recorded boundary is loaded and validated *first*, and only then are the
+///   `parent` headers stripped from the copy the traversal sees. A boundary whose
+///   object is absent, or that isn't a commit at all, is still an error.
+///
+/// Only the commit whose own id is in the set loses parents; being *named by* a
+/// boundary changes nothing.
+struct ShallowAwareObjects<F> {
+    inner: F,
+    boundaries: HashSet<gix::ObjectId>,
+}
+
+impl<F: gix::prelude::Find> gix::prelude::Find for ShallowAwareObjects<F> {
+    fn try_find<'a>(
+        &self,
+        id: &gix::hash::oid,
+        buffer: &'a mut Vec<u8>,
+    ) -> Result<Option<gix::objs::Data<'a>>, gix::objs::find::Error> {
+        use gix::objs::{CommitRef, Data, Kind, WriteTo};
+
+        if !self.boundaries.contains(id) {
+            return self.inner.try_find(id, buffer);
+        }
+
+        // Re-borrow, and let only the `Copy` object kind escape the lookup, so the
+        // buffer is free to be rewritten below.
+        let kind = match self.inner.try_find(id, &mut *buffer)? {
+            Some(data) => data.kind,
+            None => {
+                return Err(format!(
+                    "recorded shallow boundary {id} is not in the object database"
+                )
+                .into())
+            }
+        };
+        if kind != Kind::Commit {
+            return Err(
+                format!("recorded shallow boundary {id} is a {kind}, not a commit").into(),
+            );
+        }
+
+        // `CommitRef` borrows the bytes it parsed, so rewriting in place needs one
+        // copy. A repository has a handful of boundaries, never a hot path.
+        let raw = buffer.clone();
+        let mut commit = CommitRef::from_bytes(&raw, id.kind())
+            .map_err(|e| -> gix::objs::find::Error { Box::new(e) })?;
+        commit.parents.clear();
+        buffer.clear();
+        commit
+            .write_to(&mut *buffer)
+            .map_err(|e| -> gix::objs::find::Error { Box::new(e) })?;
+        Ok(Some(Data::new(buffer, Kind::Commit, id.kind())))
+    }
+}
+
+/// Traverse history in Topo `DateOrder`, honouring recorded shallow boundaries,
+/// handing each commit to `visit` as it is produced (M1.10, #63).
+///
+/// This is the accepted traversal for paged history, and it differs from
+/// [`walk_history`] in three ways that all matter:
+///
+/// 1. **Ordering.** `git rev-list --date-order`: newest-first *subject to* never
+///    emitting a commit before all of its children. A plain newest-first walk
+///    happily prints a parent above its own child whenever clocks disagree, which
+///    draws an edge going the wrong way up the graph.
+/// 2. **Shallowness.** The walk reads the object database through
+///    [`ShallowAwareObjects`], so a shallow clone terminates because its boundary
+///    is *recorded*, never because a read failed.
+/// 3. **Streaming.** `visit` returns [`ControlFlow`], so a caller can stop at a
+///    page boundary without the walk ever materialising the rows before it. This
+///    is what makes "replay and skip" paging possible with no server-side state:
+///    the traversal is a pure function of (repository, `sorted_tips`,
+///    `shallow_boundaries`), so re-running it and discarding `n` rows reproduces
+///    the same sequence exactly. The cost is honest and quadratic over a full
+///    scroll — a page starting at row `n` still walks rows `0..n`.
+///
+/// `sorted_tips` must be the snapshot's canonical `(full ref name, object id)`
+/// list; tip *object* ids are de-duplicated here while that order is preserved,
+/// because gix breaks equal-commit-time ties by seeding order and replay
+/// determinism rests on it. `shallow_boundaries` must likewise be the snapshot's
+/// canonical set — sorted by id and de-duplicated — which is validated rather
+/// than assumed. An empty tip list is an empty history, not an error.
 pub fn walk_history_topo<F>(
     path: &Path,
     sorted_tips: &[(String, Oid)],
-    _shallow_boundaries: &[Oid],
+    shallow_boundaries: &[Oid],
     mut visit: F,
 ) -> Result<(), RepoError>
 where
     F: FnMut(CommitSummary) -> ControlFlow<()>,
 {
-    let repo =
-        gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
-            path: path.to_path_buf(),
-            message: e.to_string(),
-        })?;
-
-    let mut seen = HashSet::new();
-    let mut tips: Vec<gix::ObjectId> = Vec::new();
-    for (full_name, oid) in sorted_tips {
+    // The boundary set is a contract, not a hint: strictly ascending by hex id is
+    // exactly "sorted and de-duplicated", and checking it here stops a caller from
+    // quietly handing over a set whose membership tests would then be a lottery.
+    for pair in shallow_boundaries.windows(2) {
+        if pair[0].0 >= pair[1].0 {
+            return Err(RepoError::Walk(format!(
+                "shallow boundaries must be sorted and de-duplicated, but {} does not precede {}",
+                pair[0].0, pair[1].0
+            )));
+        }
+    }
+    let mut boundaries: HashSet<gix::ObjectId> = HashSet::with_capacity(shallow_boundaries.len());
+    for oid in shallow_boundaries {
         let parsed = gix::ObjectId::from_hex(oid.0.as_bytes())
-            .map_err(|e| RepoError::Walk(format!("malformed tip id for {full_name}: {e}")))?;
+            .map_err(|e| RepoError::Walk(format!("malformed shallow boundary {}: {e}", oid.0)))?;
+        boundaries.insert(parsed);
+    }
+
+    // Several full ref names routinely resolve to one object (HEAD, the local
+    // branch, its remote-tracking twin, a tag). Collapse them to one tip, keeping
+    // first-seen order.
+    let mut seen: HashSet<gix::ObjectId> = HashSet::with_capacity(sorted_tips.len());
+    let mut tips: Vec<gix::ObjectId> = Vec::with_capacity(sorted_tips.len());
+    for (full_name, oid) in sorted_tips {
+        let parsed = gix::ObjectId::from_hex(oid.0.as_bytes()).map_err(|e| {
+            RepoError::Walk(format!("malformed tip object id for {full_name}: {e}"))
+        })?;
         if seen.insert(parsed) {
             tips.push(parsed);
         }
@@ -150,18 +256,51 @@ where
         return Ok(());
     }
 
-    let walk = repo
-        .rev_walk(tips)
-        .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst))
-        .all()
-        .map_err(|e| RepoError::Walk(e.to_string()))?;
+    let repo =
+        gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
+
+    // Never hand the traversal `repo.objects` itself: it would read a boundary
+    // commit's real parent headers and fail on objects that were never fetched.
+    // No commit-graph is attached either — one would answer from its own cached
+    // parent lists and bypass this adapter completely.
+    let objects = ShallowAwareObjects {
+        inner: repo.objects.clone(),
+        boundaries,
+    };
+    let walk = gix::traverse::commit::topo::Builder::from_iters(
+        objects,
+        tips,
+        None::<Vec<gix::ObjectId>>,
+    )
+    .sorting(gix::traverse::commit::topo::Sorting::DateOrder)
+    .build()
+    .map_err(|e| RepoError::Walk(e.to_string()))?;
 
     for info in walk {
         let info = info.map_err(|e| RepoError::Walk(e.to_string()))?;
-        let commit = info.object().map_err(|e| RepoError::Walk(e.to_string()))?;
+        // The traversal yields ids, parent ids and times, but not the object; the
+        // summary line and author name need the commit itself.
+        let commit = repo
+            .find_commit(info.id)
+            .map_err(|e| RepoError::Walk(format!("{}: {e}", info.id)))?;
+        let time = match info.commit_time {
+            Some(seconds) => seconds,
+            // `DateOrder` always carries the time; fall back rather than invent one.
+            None => commit
+                .committer()
+                .ok()
+                .and_then(|c| c.time().ok())
+                .map(|t| t.seconds)
+                .unwrap_or(0),
+        };
         let summary = CommitSummary {
-            id: Oid(info.id().detach().to_string()),
-            parents: info.parent_ids().map(|p| Oid(p.detach().to_string())).collect(),
+            id: Oid(info.id.to_string()),
+            // Parents come from the traversal, not from the object, so a recorded
+            // boundary is a root on the wire exactly as it is in the lane layout.
+            parents: info.parent_ids.iter().map(|p| Oid(p.to_string())).collect(),
             summary: commit
                 .message()
                 .map(|m| m.summary().to_string())
@@ -172,7 +311,7 @@ where
                 .unwrap_or_default()
                 .trim()
                 .to_string(),
-            time: info.commit_time(),
+            time,
         };
         if visit(summary).is_break() {
             break;
