@@ -29,8 +29,8 @@ use git_vista_protocol::{HistoryFrame, HistoryPage};
 use crate::git_cmd::git_stdout_capped;
 use crate::handlers::reset::has_seed;
 use crate::history::{
-    if_none_match, read_history_snapshot, representation_etag, require_same_generation, CursorCodec,
-    CursorScope, HistoryCursor, RepresentationKind,
+    if_none_match, read_history_snapshot, representation_etag, require_same_generation,
+    CursorCodec, CursorScope, HistoryCursor, RepresentationKind,
 };
 use crate::state::{current, current_handle, repo_label, resolve_worktree, HISTORY_LIMIT};
 
@@ -1577,7 +1577,9 @@ mod tests {
     async fn frame_parts(repo: &Path, headers: &HeaderMap) -> (StatusCode, HeaderValue, Vec<u8>) {
         let codec = history_codec();
         let target = history_target(repo, &codec);
-        let response = frame_for_target(&target, headers).await.expect("frame read");
+        let response = frame_for_target(&target, headers)
+            .await
+            .expect("frame read");
         parts_of(response).await
     }
 
@@ -1854,8 +1856,7 @@ mod tests {
         assert_ne!(frame_tag, page_tag);
 
         let presented = if_none_match_header(frame_tag.to_str().unwrap());
-        let (status, tag, body, _) =
-            page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &presented).await;
+        let (status, tag, body, _) = page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &presented).await;
         assert_eq!(
             status,
             StatusCode::OK,
