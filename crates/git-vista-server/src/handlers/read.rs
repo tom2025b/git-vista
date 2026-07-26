@@ -3,22 +3,35 @@
 //! working-tree status). Reads, so they work on read-only clones too.
 
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use axum::extract::{Path as AxumPath, Query};
-use axum::http::{header, HeaderValue, StatusCode};
-use axum::response::IntoResponse;
-use axum::Json;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
 use serde::Deserialize;
 
 use git_vista_core::identity::{RepositoryHandle, WorktreeId};
 use git_vista_core::layout;
-use git_vista_core::model::{CommitDetail, CommitSummary, GitRef, RefKind};
+use git_vista_core::layout::replay::ReplayClassifier;
+use git_vista_core::layout::stream::{strip_resolved_edges, StreamLayout};
+use git_vista_core::layout::trunk_reserve_tip;
+use git_vista_core::model::{
+    CommitDetail, CommitSummary, Edge, FrameStub, GitRef, GraphRow, Oid, RefKind,
+};
 use git_vista_core::status::parse_porcelain_v2;
-use git_vista_git::{read_commit, read_refs, walk_history, RepoError};
+use git_vista_git::{read_commit, read_refs, walk_history, walk_history_topo, RepoError};
+use git_vista_protocol::{HistoryFrame, HistoryPage};
 
 use crate::git_cmd::git_stdout_capped;
 use crate::handlers::reset::has_seed;
+use crate::history::{
+    if_none_match, read_history_snapshot, representation_etag, require_same_generation, CursorCodec,
+    CursorScope, HistoryCursor, RepresentationKind,
+};
 use crate::state::{current, current_handle, repo_label, resolve_worktree, HISTORY_LIMIT};
 
 /// The optional opaque repository selector shared by the read endpoints (M1.03):
