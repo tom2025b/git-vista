@@ -19,7 +19,7 @@ use super::RenderCtx;
 pub fn visible_edges(ctx: StoredValue<RenderCtx>, range: (usize, usize)) -> Vec<usize> {
     let (start, end) = range;
     ctx.with_value(|c| {
-        c.graph
+        c.loaded
             .edges
             .iter()
             .enumerate()

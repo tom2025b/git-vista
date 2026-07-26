@@ -84,6 +84,13 @@ pub fn label_x(lane_count: usize) -> i32 {
 /// ([`edge_path`]): at its two endpoint rows the curve is still within a lane
 /// of the endpoint (the bulge allowance below), and on rows strictly between it
 /// can be anywhere between the lanes, so those take the outer lane.
+///
+/// M1.10 (#63): the *paged* views no longer call this — a page-at-a-time graph
+/// grows its occupancy incrementally and monotonically inside
+/// [`crate::history::LoadedHistory`], which reads back through
+/// `LoadedHistory::text_x`. This whole-`Graph` form stays as the documented
+/// reference the incremental one mirrors, pinned by the tests below.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn label_x_per_row(graph: &Graph) -> Vec<i32> {
     // Every row is at least as wide as its own dot.
     let mut occ: Vec<usize> = graph.rows.iter().map(|r| r.lane).collect();
@@ -198,11 +205,25 @@ const STUB_TOP_MARGIN: i32 = 6;
 /// half-clipped at the default view, invisible until the user pans. Returns the
 /// overshoot of the highest ring past the top edge (plus a small margin), or
 /// zero when nothing reaches above the canvas.
+///
+/// M1.10 (#63): the paged views place stubs from
+/// [`ResolvedStub`](crate::history::ResolvedStub), which is not a `BranchStub`,
+/// so they call [`stub_headroom_for`] with the same `(anchor_row, depth)` pairs.
+/// This form stays as the whole-`Graph` reference its tests below pin.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn stub_headroom(stubs: &[BranchStub]) -> f64 {
+    stub_headroom_for(stubs.iter().map(|s| (s.anchor_row, s.depth)))
+}
+
+/// [`stub_headroom`] over bare `(anchor_row, depth)` pairs, so a caller holding
+/// resolved paged stubs doesn't have to fabricate `BranchStub`s to ask how far
+/// down the home camera must sit.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn stub_headroom_for(stubs: impl IntoIterator<Item = (usize, usize)>) -> f64 {
     stubs
-        .iter()
-        .map(|s| stub_node_cy(s.anchor_row, s.depth) - NODE_RADIUS - STUB_TOP_MARGIN)
+        .into_iter()
+        .map(|(anchor_row, depth)| stub_node_cy(anchor_row, depth) - NODE_RADIUS - STUB_TOP_MARGIN)
         .min()
         .map_or(0.0, |top| (-top).max(0) as f64)
 }
