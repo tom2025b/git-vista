@@ -246,7 +246,11 @@ fn graph_sheet(c: &RenderCtx, nerd: bool) -> View {
             let (from, to) = (rows.get(e.from_row)?, rows.get(e.to_row)?);
             let d = edge_path(e);
             let is_first_parent = from.commit.parents.first() == Some(&to.commit.id);
-            let color = branch_color(if is_first_parent { from.color } else { to.color });
+            let color = branch_color(if is_first_parent {
+                from.color
+            } else {
+                to.color
+            });
             Some(view! {
                 <path d=d fill="none" stroke=color stroke-width="2" stroke-linecap="round" />
             })

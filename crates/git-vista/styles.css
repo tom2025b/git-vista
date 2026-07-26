@@ -76,6 +76,12 @@ html, body {
 }
 .refresh:hover { border-color: var(--accent); }
 .refresh:active { background: #30363d; }
+/* A topbar action that genuinely isn't available yet — today only "Print Graph"
+   before the last page of history has landed (M1.10, #63). Dimmed rather than
+   hidden so the action is discoverable and its tooltip can say what's missing;
+   the browser's own `disabled` is what actually blocks the click. */
+.refresh:disabled { opacity: 0.45; cursor: not-allowed; }
+.refresh:disabled:hover { border-color: #30363d; }
 /* The gated "Reset Test Repo" button (only on a gv --seed repo): reads as the
    hazard it is, like the menu's delete item. The first .refresh takes the
    margin-left:auto gap, so later buttons need it off to stay adjacent. */
@@ -758,6 +764,7 @@ button.detail-file:hover .detail-file-path { color: var(--accent); }
   html[data-print] .status,
   html[data-print] .graph-svg,
   html[data-print] .reset-view,
+  html[data-print] .history-page-status,
   html[data-print] .ctx-menu,
   html[data-print] .detail-panel { display: none !important; }
   /* Un-trap the surface from the app's fixed/overflow layout: everything on
