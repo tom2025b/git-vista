@@ -16,3 +16,8 @@ serde = { workspace = true }
 [dev-dependencies]
 # Round-trip (serialize → JSON → deserialize) tests for every wire type.
 serde_json = { workspace = true }
+# Dev-only: the history golden test deserializes fixtures through the actual
+# core nested types (GitRef/GraphRow/Edge/FrameStub) to prove the generic
+# envelopes carry them losslessly. Never a non-dev dependency — this crate
+# must stay pure and wasm-safe, and git-vista-core is neither.
+git-vista-core = { workspace = true }
