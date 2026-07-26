@@ -68,6 +68,362 @@ fn resolve_repo(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Paged history: the Frame and one Page (M1.10, #63)
+//
+// The `#[allow(dead_code)]` markers below are the same narrow, temporary device
+// `main.rs` uses for `mod history`: plan Step 8 adds the cursor-replay handler
+// and Step 9 registers `/api/frame` plus the paged `/api/commits` on both
+// routers. Until those routes exist nothing in the binary target reaches this
+// code, and deleting tested, plan-mandated seams to satisfy `-D warnings` would
+// be the wrong trade. Remove every marker in the Step 9 edit.
+
+/// The server's history Frame: the generic transport envelope over core's
+/// display refs. The frontend declares its own same-shaped alias (Task 5); a
+/// server-private alias is never imported across the crate boundary.
+pub type Frame = HistoryFrame<GitRef>;
+
+/// The server's history Page: the generic transport envelope over core's
+/// laid-out rows, wire edges, and OID-anchored stubs.
+pub type Page = HistoryPage<GraphRow, Edge, FrameStub>;
+
+/// One paged-history read's target, resolved and canonicalized exactly once.
+///
+/// Everything downstream — the snapshot, the cursor scope, the Frame's metadata
+/// — comes from this single resolution, so a request can never mix two
+/// repositories, and an absent `?repo=` captures the mutable default selection
+/// once instead of re-reading it per stage.
+pub(crate) struct ResolvedHistoryTarget {
+    /// The canonical on-disk path. Process-internal only: it never enters a
+    /// cursor or a response body.
+    pub path: PathBuf,
+    /// A cloned, view-only repository.
+    pub read_only: bool,
+    /// The catalog identity pair, or `None` in degraded (unregistered) mode.
+    pub handle: Option<RepositoryHandle>,
+    /// The opaque scope every cursor for this target is bound to.
+    pub scope: CursorScope,
+}
+
+/// Resolve the `?repo=` selector to one [`ResolvedHistoryTarget`].
+///
+/// A registered target's scope binds **both** halves of its
+/// [`RepositoryHandle`], so a cursor follows neither another repository nor a
+/// sibling worktree of the same one. A degraded target has no ids, so it binds
+/// its canonical path through the per-process key instead — which is why the
+/// path is canonicalized here rather than taken as spelled: `state::set_current`
+/// stores a degraded selection's path verbatim, and two spellings of one
+/// directory would otherwise bind two different scopes. Canonicalization is
+/// best-effort, matching the launch path's own posture.
+#[allow(dead_code)] // wired by plan Step 9 (route registration)
+fn resolve_history_target(
+    selector: Option<&str>,
+    codec: &CursorCodec,
+) -> Result<ResolvedHistoryTarget, (StatusCode, String)> {
+    let (path, read_only, handle) = resolve_repo(selector)?;
+    let path = path.canonicalize().unwrap_or(path);
+    let scope = codec.scope_for_target(handle.as_ref(), &path);
+    Ok(ResolvedHistoryTarget {
+        path,
+        read_only,
+        handle,
+        scope,
+    })
+}
+
+/// The page size an absent `?limit=` gets.
+const DEFAULT_PAGE_LIMIT: usize = 250;
+
+/// The largest page any client can ask for.
+const MAX_PAGE_LIMIT: usize = 1_000;
+
+/// Clamp a requested page size into `1..=MAX_PAGE_LIMIT`. Zero would mint a
+/// cursor that never advances, and an oversized request is clamped rather than
+/// refused — a client asking for too much gets a smaller page plus a cursor,
+/// never a 400.
+#[allow(dead_code)] // wired by plan Step 9 (route registration)
+fn page_limit(raw: Option<usize>) -> usize {
+    raw.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT)
+}
+
+/// The paged-history query: the shared repository selector plus the opaque
+/// cursor and the requested page size.
+///
+/// Deliberately **not** `deny_unknown_fields`: the frontend appends its own
+/// `?t=<millis>` cache-buster to every history read (see `crates/git-vista/
+/// src/api.rs`), and that must never be answered with a 400.
+#[derive(Deserialize)]
+#[allow(dead_code)] // wired by plan Step 9 (route registration)
+pub(crate) struct PageQuery {
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Serializing a representation we just built cannot fail on well-formed data;
+/// if it somehow does, it is our bug, not the client's.
+fn history_serialization_failed(e: serde_json::Error) -> (StatusCode, String) {
+    eprintln!("git-vista: serializing a history representation failed: {e}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "could not serialize history".to_string(),
+    )
+}
+
+/// Build the `200` — or the empty `304` — for one **already serialized**
+/// representation.
+///
+/// The validator is SHA-256 over exactly these bytes and the response body is
+/// this same buffer, so an ETag can never describe a re-serialization or be
+/// derived from the generation. Both statuses retain the quoted tag;
+/// `Cache-Control: no-store` is stamped centrally by the auth middleware
+/// (`security::require_auth`) and is deliberately not repeated here.
+///
+/// `honor_precondition` is false for a cursor page: only a Frame and page 1 are
+/// stable, addressable representations a client can revalidate.
+fn representation_response(
+    kind: RepresentationKind,
+    body: Vec<u8>,
+    headers: &HeaderMap,
+    honor_precondition: bool,
+) -> Response {
+    let etag = representation_etag(kind, &body);
+    if honor_precondition && if_none_match(headers, &etag) {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::ETAG, etag),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Build one repository's Frame response.
+///
+/// `O(refs)`: branch slots come from [`ReplayClassifier::new`], which never
+/// touches the object database, so a Frame answers without walking a single
+/// commit and never increments a walk counter. A Frame carries no stubs — only
+/// a page's own rows can anchor one.
+///
+/// Split out from the [`frame`] handler so a test can drive it against a
+/// temporary repository; the handler itself resolves the process-wide default
+/// selection, which every test in this binary shares.
+async fn frame_for_target(
+    target: &ResolvedHistoryTarget,
+    headers: &HeaderMap,
+) -> Result<Response, (StatusCode, String)> {
+    let repo = target.path.as_path();
+    let snapshot = read_history_snapshot(repo).await?;
+    let frame = Frame {
+        generation: snapshot.generation.clone(),
+        refs: snapshot.refs.clone(),
+        head_branch: snapshot.head_branch.clone(),
+        branch_colors: ReplayClassifier::new(&snapshot.refs, snapshot.head_branch.as_deref())
+            .branch_colors(),
+        // A short non-path label, so the header can say *which* repo without
+        // leaking the server's filesystem (M1.03).
+        repo_label: Some(repo_label(repo)),
+        repo_id: target.handle.map(|handle| handle.repository.to_string()),
+        worktree_id: target.handle.map(|handle| handle.worktree.to_string()),
+        read_only: target.read_only,
+        resettable: !target.read_only && has_seed(repo),
+        repo_url: git_vista_git::github_web_base(repo),
+        remote_web_url: git_vista_git::remote_web_base(repo),
+    };
+    // The combined re-read: the metadata above reads config, not refs, but the
+    // repository can still move under a Frame read, and a Frame that advertises
+    // a generation no longer current would hand the client a cursor seed for a
+    // history that has already gone.
+    let fresh = read_history_snapshot(repo).await?;
+    require_same_generation(&snapshot.generation, &fresh.generation)?;
+
+    let body = serde_json::to_vec(&frame).map_err(history_serialization_failed)?;
+    Ok(representation_response(
+        RepresentationKind::Frame,
+        body,
+        headers,
+        true,
+    ))
+}
+
+/// The cheap, once-per-view half of paged history: refs, branch colour slots,
+/// and the resolved target's metadata — no commits at all.
+#[allow(dead_code)] // registered by plan Step 9
+pub(crate) async fn frame(
+    Extension(codec): Extension<Arc<CursorCodec>>,
+    headers: HeaderMap,
+    Query(query): Query<RepoQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let target = resolve_history_target(query.repo.as_deref(), codec.as_ref())?;
+    frame_for_target(&target, &headers).await
+}
+
+/// Build one Page response for `target`.
+///
+/// The construction order is the plan's and is load-bearing: the target is
+/// already resolved, then one combined refs + HEAD + shallow snapshot is read,
+/// then a cursor (when present) is authenticated and its scope and generation
+/// compared **before** `walks` moves or Topo opens, then the walk runs, then
+/// exact remote membership is stamped on the emitted rows only, then the
+/// combined snapshot is re-read and drift is a 409, and only then is the body
+/// built, serialized exactly once, and hashed into its own `gv4-page` tag.
+///
+/// `walks` is injected the way `commit_diff_for_repo`'s `metadata_cap` is: so a
+/// test can prove a rejected cursor never reaches the traversal, and that a
+/// Frame read never counts as one.
+///
+/// Plan Step 7 implements the page-1 path; the cursor branch — authentication,
+/// scope/generation gates and the `[0,n)` prefix replay — is plan Step 8.
+#[allow(dead_code)] // wired by plan Step 9 (route registration)
+async fn page_for_target(
+    target: &ResolvedHistoryTarget,
+    cursor: Option<&str>,
+    limit: usize,
+    codec: &CursorCodec,
+    headers: &HeaderMap,
+    walks: &AtomicUsize,
+) -> Result<Response, (StatusCode, String)> {
+    let repo = target.path.as_path();
+
+    // 1. One combined snapshot, read after the target was resolved, so refs,
+    //    both HEAD halves and the canonical shallow set describe one moment.
+    let snapshot = read_history_snapshot(repo).await?;
+
+    // 2. A cursor is authenticated, scope-compared and drift-compared here,
+    //    before anything below runs. Plan Step 8 owns that path and the prefix
+    //    replay it enables; until then only page 1 is served.
+    if cursor.is_some() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "paged history replay is not implemented yet".to_string(),
+        ));
+    }
+    let start_row = 0_usize;
+    let end_row = start_row.saturating_add(limit);
+
+    // 3. Rebuild the shallow-aware Topo `DateOrder` walk from the snapshot's own
+    //    sorted tips and exact boundary set — never from a re-read of the refs.
+    let tips: Vec<(String, Oid)> = snapshot
+        .tips
+        .iter()
+        .map(|tip| (tip.full_ref_name.clone(), tip.object_id.clone()))
+        .collect();
+    let boundaries: HashSet<Oid> = snapshot.shallow_boundaries.iter().cloned().collect();
+    let trunk_tip = trunk_reserve_tip(&snapshot.refs, snapshot.head_branch.as_deref());
+    let mut stream = StreamLayout::new(trunk_tip);
+    let mut walked = 0_usize;
+    walks.fetch_add(1, Ordering::Relaxed);
+    walk_history_topo(repo, &tips, &snapshot.shallow_boundaries, |summary| {
+        // A recorded boundary commit's parents are cut: they may not even be in
+        // the object database, so they reserve no lane and wire no edge. Every
+        // non-boundary parent stays required.
+        let cut = boundaries.contains(&summary.id);
+        stream.push(summary, |_parent| !cut);
+        walked += 1;
+        if walked >= end_row {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .map_err(|e| {
+        eprintln!("git-vista: /api/commits failed walking history: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    let chunk = stream.finish();
+
+    // 4/5. Decorate every row in ascending row order, exactly once — the
+    //      classifier propagates claims along first parents and hands out stub
+    //      columns cumulatively, so a skipped or out-of-order row corrupts both.
+    //      Page 1 has no prefix, so nothing is suppressed here.
+    let mut classifier = ReplayClassifier::new(&snapshot.refs, snapshot.head_branch.as_deref());
+    let mut rows: Vec<GraphRow> = Vec::with_capacity(chunk.rows.len());
+    let mut stubs: Vec<FrameStub> = Vec::new();
+    for mut row in chunk.rows {
+        let emit = row.row >= start_row;
+        let produced = classifier.decorate(&mut row, emit);
+        if emit {
+            stubs.extend(produced);
+            rows.push(row);
+        }
+    }
+
+    // 6. Exact remote reachability, for the emitted OIDs only — one walk, never
+    //    one per row. A remote-scan failure leaves the flags false, the same
+    //    lenient posture the commit-detail read takes: the page loses forge
+    //    links, it does not lose the history.
+    let requested: HashSet<Oid> = rows.iter().map(|row| row.commit.id.clone()).collect();
+    match git_vista_git::remote_membership(repo, &requested) {
+        Ok(found) => {
+            for row in &mut rows {
+                row.on_remote = found.contains(&row.commit.id);
+            }
+        }
+        Err(e) => eprintln!("git-vista: /api/commits could not scan remotes: {e}"),
+    }
+
+    // The combined re-read on success: a ref that moved while we walked would
+    // otherwise let this page splice two histories together.
+    let fresh = read_history_snapshot(repo).await?;
+    require_same_generation(&snapshot.generation, &fresh.generation)?;
+
+    // 7. Sign the next absolute row under the same target scope and the stable
+    //    generation. A walk that ended before the window filled has no next
+    //    page, so it carries no cursor.
+    let cursor = if walked >= end_row {
+        let signed = codec
+            .encode(
+                target.scope,
+                &snapshot.generation,
+                &HistoryCursor { next_row: end_row },
+            )
+            .map_err(|_| {
+                eprintln!("git-vista: /api/commits could not sign a history cursor");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not sign a history cursor".to_string(),
+                )
+            })?;
+        Some(signed)
+    } else {
+        None
+    };
+
+    let page = Page {
+        rows,
+        // Already in canonical `(from_row, parent_ordinal, …)` order: the chunk
+        // sorted its own `ResolvedEdge`s through their sidecars, which is what
+        // lets a page that does not start at row 0 sort without row indexing.
+        edges: strip_resolved_edges(chunk.resolved_edges),
+        stubs,
+        // Commit-lane high-water only; stub columns sit past it at
+        // `lane_count + FrameStub::lane_offset`.
+        lane_count: chunk.lane_count,
+        cursor,
+        generation: snapshot.generation.clone(),
+    };
+
+    // 8. Page 1 answers `If-None-Match` against its own current tag; a cursor
+    //    page ignores the precondition and always returns 200.
+    let body = serde_json::to_vec(&page).map_err(history_serialization_failed)?;
+    Ok(representation_response(
+        RepresentationKind::Page,
+        body,
+        headers,
+        start_row == 0,
+    ))
+}
+
 /// Walk the configured repository (see [`repo_path`]) and return its laid-out
 /// graph as JSON, with branch/tag/HEAD refs attached for badging and per-branch
 /// colouring.
@@ -1205,17 +1561,24 @@ mod tests {
         (status, etag, body)
     }
 
-    /// The Frame read for `repo` under `headers`, plus the walk count it caused.
-    async fn frame_parts(
-        repo: &Path,
-        headers: &HeaderMap,
-    ) -> (StatusCode, HeaderValue, Vec<u8>, usize) {
+    /// The loose-object path for `oid`. Deleting one is how these tests make a
+    /// commit traversal impossible while leaving refs and HEAD intact.
+    fn loose_object(repo: &Path, oid: &str) -> PathBuf {
+        repo.join(".git")
+            .join("objects")
+            .join(&oid[..2])
+            .join(&oid[2..])
+    }
+
+    /// The Frame read for `repo` under `headers`. There is deliberately no walk
+    /// counter to pass: `frame_for_target` takes none because a Frame has
+    /// nothing to walk — the claim is proved below by breaking the object
+    /// database and watching a Frame answer anyway.
+    async fn frame_parts(repo: &Path, headers: &HeaderMap) -> (StatusCode, HeaderValue, Vec<u8>) {
         let codec = history_codec();
         let target = history_target(repo, &codec);
-        let walks = AtomicUsize::new(0);
         let response = frame_for_target(&target, headers).await.expect("frame read");
-        let (status, etag, body) = parts_of(response).await;
-        (status, etag, body, walks.load(Ordering::Relaxed))
+        parts_of(response).await
     }
 
     /// The page-1 read for `repo` at `limit` under `headers`, plus its walk count.
@@ -1291,13 +1654,8 @@ mod tests {
         let repo = deterministic_repo(dir.path(), "alpha", 4);
         let headers = HeaderMap::new();
 
-        let (frame_status, frame_tag, frame_body, frame_walks) =
-            frame_parts(&repo, &headers).await;
+        let (frame_status, frame_tag, frame_body) = frame_parts(&repo, &headers).await;
         assert_eq!(frame_status, StatusCode::OK);
-        assert_eq!(
-            frame_walks, 0,
-            "a Frame is O(refs): it must never walk commits"
-        );
 
         let (page_status, page_tag, page_body, page_walks) =
             page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &headers).await;
@@ -1338,11 +1696,38 @@ mod tests {
             vec![("main".to_string(), 0)],
             "the trunk's stable slot comes from the refs, with no walk"
         );
-        assert!(!frame_body
-            .windows(7)
-            .any(|w| w == b"\"stubs\""), "a Frame never carries stubs");
+        assert!(
+            !frame_body.windows(7).any(|w| w == b"\"stubs\""),
+            "a Frame never carries stubs"
+        );
         assert_eq!(page.rows.len(), 4);
         assert_eq!(page.rows[0].row, 0);
+
+        // The `O(refs)` claim, with teeth: remove one interior commit object, so
+        // every commit traversal in this repository now fails, and the Frame
+        // still answers the identical body. Nothing below the ref tips feeds it,
+        // which is why it needs — and is given — no walk counter at all.
+        let interior = out(&repo, &["rev-parse", "HEAD~2"]);
+        std::fs::remove_file(loose_object(&repo, &interior)).expect("a loose interior commit");
+        let walks = AtomicUsize::new(0);
+        let codec = history_codec();
+        let target = history_target(&repo, &codec);
+        page_for_target(&target, None, DEFAULT_PAGE_LIMIT, &codec, &headers, &walks)
+            .await
+            .expect_err("a Page cannot be built without the commit objects");
+        assert_eq!(
+            walks.load(Ordering::Relaxed),
+            1,
+            "the Page read counted its one walk before failing in it"
+        );
+
+        let (status, revalidated, body) = frame_parts(&repo, &headers).await;
+        assert_eq!(status, StatusCode::OK, "a Frame needs no commit object");
+        assert_eq!(
+            revalidated, frame_tag,
+            "the Frame is a pure function of refs, HEAD and the shallow set"
+        );
+        assert_eq!(body, frame_body);
     }
 
     /// A change the generation deliberately excludes — repository config, not a
