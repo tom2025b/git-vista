@@ -239,6 +239,31 @@ mod tests {
     }
 
     #[test]
+    fn graph_row_deserializes_old_fixture_with_on_remote_false() {
+        // M1.10 (#63): paged rows carry exact remote reachability, but a payload
+        // minted before that field existed must still decode — absent on the wire
+        // means "not known to be on a remote", not a hard deserialization failure.
+        let row: GraphRow = serde_json::from_str(
+            r#"{"commit":{"id":"0123456789","parents":[],"summary":"s","author":"a","time":0},
+                "row":0,"lane":0,"refs":[],"color":0}"#,
+        )
+        .expect("a row without on_remote must still deserialize");
+        assert!(!row.on_remote);
+    }
+
+    #[test]
+    fn commit_detail_deserializes_old_fixture_with_on_remote_false() {
+        // Same contract rule for the detail panel's payload (M1.10, #63).
+        let detail: CommitDetail = serde_json::from_str(
+            r#"{"id":"0123456789","parents":[],"author_name":"a","author_email":"a@example.com",
+                "author_time":0,"committer_name":"c","committer_email":"c@example.com",
+                "commit_time":0,"message":"m"}"#,
+        )
+        .expect("a detail without on_remote must still deserialize");
+        assert!(!detail.on_remote);
+    }
+
+    #[test]
     fn merge_detection() {
         let two_parents = CommitSummary {
             id: Oid("a".into()),
