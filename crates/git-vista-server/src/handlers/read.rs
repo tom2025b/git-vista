@@ -1676,7 +1676,8 @@ mod tests {
         let mut pages: Vec<Page> = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let (status, _, body, walks) = page_parts(repo, cursor.as_deref(), limit, &headers).await;
+            let (status, _, body, walks) =
+                page_parts(repo, cursor.as_deref(), limit, &headers).await;
             assert_eq!(status, StatusCode::OK, "every page in a chain is a 200");
             assert_eq!(walks, 1, "one page, one Topo walk");
             let page: Page = serde_json::from_slice(&body).expect("Page decodes");
@@ -2280,9 +2281,24 @@ mod tests {
         assert_eq!(
             oracle.edges,
             vec![
-                Edge { from_row: 0, from_lane: 0, to_row: 1, to_lane: 0 },
-                Edge { from_row: 0, from_lane: 0, to_row: 3, to_lane: 1 },
-                Edge { from_row: 1, from_lane: 0, to_row: 2, to_lane: 0 },
+                Edge {
+                    from_row: 0,
+                    from_lane: 0,
+                    to_row: 1,
+                    to_lane: 0
+                },
+                Edge {
+                    from_row: 0,
+                    from_lane: 0,
+                    to_row: 3,
+                    to_lane: 1
+                },
+                Edge {
+                    from_row: 1,
+                    from_lane: 0,
+                    to_row: 2,
+                    to_lane: 0
+                },
             ],
             "the uninterrupted oracle is canonical (from_row, parent ordinal, …)"
         );
@@ -2384,7 +2400,12 @@ mod tests {
             oracle
                 .stubs
                 .iter()
-                .map(|s| (s.name.as_str(), s.anchor_commit.clone(), s.lane_offset, s.depth))
+                .map(|s| (
+                    s.name.as_str(),
+                    s.anchor_commit.clone(),
+                    s.lane_offset,
+                    s.depth
+                ))
                 .collect::<Vec<_>>(),
             vec![
                 ("zeta", anchor_one.clone(), 0, 0),
@@ -2411,8 +2432,7 @@ mod tests {
             let mut union: Vec<FrameStub> = Vec::new();
             for (index, page) in pages.iter().enumerate() {
                 let end = start + page.rows.len();
-                let owned: HashSet<Oid> =
-                    page.rows.iter().map(|r| r.commit.id.clone()).collect();
+                let owned: HashSet<Oid> = page.rows.iter().map(|r| r.commit.id.clone()).collect();
                 for stub in &page.stubs {
                     assert!(
                         owned.contains(&stub.anchor_commit),
