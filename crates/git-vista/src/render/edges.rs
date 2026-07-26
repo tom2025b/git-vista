@@ -39,19 +39,26 @@ pub fn visible_edges(ctx: StoredValue<RenderCtx>, range: (usize, usize)) -> Vec<
 ///    it takes that parent's colour as it curves in.
 ///
 /// Only main (colour slot 0) ever stays blue this way.
+///
+/// Every index is *checked* (M1.10, #63). With paged history an edge index and a
+/// row index no longer come from the same snapshot: a `<For>` can still be
+/// holding an index built a moment before the aggregate changed shape. Panicking
+/// on that would take the whole canvas down, so an edge whose endpoints aren't
+/// both loaded simply draws nothing until the page owning them lands.
 pub fn build_edge(ctx: StoredValue<RenderCtx>, ei: usize) -> View {
     ctx.with_value(|c| {
-        let e = &c.graph.edges[ei];
-        let d = edge_path(e);
-        let child = &c.graph.rows[e.from_row].commit;
-        let parent_oid = &c.graph.rows[e.to_row].commit.id;
-        let is_first_parent = child.parents.first() == Some(parent_oid);
-        let color_row = if is_first_parent {
-            e.from_row
-        } else {
-            e.to_row
+        let rows = &c.loaded.rows;
+        let Some(e) = c.loaded.edges.get(ei) else {
+            return ().into_view();
         };
-        let color = branch_color(c.row_color[color_row]);
+        let (Some(from), Some(to)) = (rows.get(e.from_row), rows.get(e.to_row)) else {
+            return ().into_view();
+        };
+        let d = edge_path(e);
+        let is_first_parent = from.commit.parents.first() == Some(&to.commit.id);
+        // A first-parent link belongs to the child's own branch; a merge link to
+        // the merged-in parent's — so each takes that row's colour slot.
+        let color = branch_color(if is_first_parent { from.color } else { to.color });
         view! {
             <path d=d fill="none" stroke=color stroke-width="2" stroke-linecap="round" />
         }

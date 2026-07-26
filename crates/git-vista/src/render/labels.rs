@@ -43,19 +43,30 @@ pub fn build_msg(
         // Untracked read, same as build_node: the <For> keys carry the icon
         // mode, so a toggle rebuilds the rows.
         let ic = icon_set(nerd_icons.get_untracked());
-        let gr = &c.graph.rows[i];
-        let mut bx = c.text_x[gr.row];
+        let (Some(gr), Some(&text_x)) = (c.loaded.rows.get(i), c.loaded.text_x().get(i)) else {
+            return ().into_view();
+        };
+        let mut bx = text_x;
         // The row's label colour. Normally the commit's own branch colour, so the
         // label matches the dot it describes. But when an open-circle stub — a
         // branch with no commits of its own — forks off this row, the label follows
         // that branch's colour instead, faded, so the empty-branch row reads as its
         // hollow ring rather than the line it happens to sit on.
-        let stub_slot = c.graph.stubs.iter().find(|s| s.anchor_row == gr.row).map(|s| s.color);
+        // Matched by anchor *commit*, not by a resolved row: that's the index the
+        // aggregate already keeps, so this stays allocation-free per row.
+        let stub_slot = c
+            .loaded
+            .stubs
+            .iter()
+            .find(|s| c.loaded.oid_to_row.get(&s.anchor_commit) == Some(&gr.row))
+            .map(|s| s.color);
         let row_color = branch_color(stub_slot.unwrap_or(gr.color));
         let faded = stub_slot.is_some();
         // Is this row's commit on the remote? Drives whether its message, HEAD
-        // badge and tag badges link out (an unpushed commit would 404).
-        let commit_on_remote = c.remote_set.contains(&gr.commit.id.0);
+        // badge and tag badges link out (an unpushed commit would 404). The row
+        // answers for itself (M1.10, #63) — with paging there is no whole-repo
+        // pushed set to consult, and "is it in a loaded row" is not the question.
+        let commit_on_remote = gr.on_remote;
         let badges = gr
             .refs
             .iter()
@@ -94,7 +105,7 @@ pub fn build_msg(
                 //    the same name exists.
                 //  * remote branch -> its tree page (it's on the remote by
                 //    definition); its leading "<remote>/" is stripped.
-                let badge_url = c.repo_url.as_ref().and_then(|base| match r.kind {
+                let badge_url = c.frame.repo_url.as_ref().and_then(|base| match r.kind {
                     RefKind::Head | RefKind::Tag => {
                         commit_on_remote.then(|| format!("{base}/commit/{}", gr.commit.id.0))
                     }
@@ -110,7 +121,7 @@ pub fn build_msg(
                 let clickable = badge_url.is_some();
                 // A GitHub repo where this ref simply isn't pushed: show it, but
                 // dimmed and unlinked, so it's clear it has no GitHub page yet.
-                let unpushed = c.repo_url.is_some() && badge_url.is_none();
+                let unpushed = c.frame.repo_url.is_some() && badge_url.is_none();
                 let pill = view! {
                     <rect
                         x=x
