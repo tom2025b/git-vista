@@ -299,13 +299,14 @@ async fn page_for_target(
     //    the codec's own generic 400: a probing client must not learn whether it
     //    guessed a real target. Generation drift is the 409 the frontend keys
     //    "restart the aggregate at page 1" on.
+    walks.fetch_add(1, Ordering::Relaxed);
     let start_row = match cursor {
         None => 0_usize,
         Some(encoded) => {
             let decoded = codec
                 .decode::<HistoryCursor>(encoded)
                 .map_err(CursorError::response)?;
-            if false && decoded.scope != target.scope {
+            if decoded.scope != target.scope {
                 return Err(CursorError.response());
             }
             require_same_generation(&decoded.generation, &snapshot.generation)?;
@@ -328,7 +329,6 @@ async fn page_for_target(
     let mut stream = Some(StreamLayout::new(trunk_tip));
     let mut prefix_rows: Vec<GraphRow> = Vec::new();
     let mut walked = 0_usize;
-    walks.fetch_add(1, Ordering::Relaxed);
     let walk = walk_history_topo(repo, &tips, &snapshot.shallow_boundaries, |summary| {
         // 4. Checkpoint immediately *before* row `n`, never after: lanes and the
         //    unresolved `PendingEdge` list ride across in the checkpoint, while
