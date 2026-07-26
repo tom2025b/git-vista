@@ -626,6 +626,10 @@ pub fn App() -> impl IntoView {
                                     let repo = seed.frame.repo_label.clone();
                                     let branch = seed.frame.head_branch.clone();
                                     let remote_web_url = seed.frame.remote_web_url.clone();
+                                    // Still a whole-`Graph` snapshot, but only for
+                                    // the print view: `print_graph_view` is Step 9's
+                                    // to move onto the mounted `RenderCtx`. The
+                                    // canvas takes the seed itself.
                                     let graph = seed_graph(&seed);
                                     view! {
                                         // Repo glyph + name, then branch glyph + checked-out
@@ -661,13 +665,14 @@ pub fn App() -> impl IntoView {
                                             </p>
                                         })}
                                         {print_graph_view(
-                                            graph.clone(),
+                                            graph,
                                             history_ui.print_open,
                                             nerd_icons,
                                         )}
                                         {graph_canvas(
-                                            graph,
+                                            seed,
                                             reload,
+                                            history_ui,
                                             nerd_icons,
                                             show_node_icons,
                                             activity_open,
