@@ -1,8 +1,10 @@
 //! Walking commit history and finding which commits are on a remote.
 //!
-//! Both walks open the repository in isolated mode, seed a revision walk from a
-//! set of tips, and traverse newest-first — [`walk_history`] from HEAD and every
-//! ref tip, [`read_remote_commits`] from remote-tracking refs alone.
+//! Every walk here opens the repository in isolated mode and seeds a revision
+//! walk from a set of tips: [`walk_history`] traverses newest-first from HEAD and
+//! every ref tip, [`read_remote_commits`] newest-first from remote-tracking refs
+//! alone, and [`remote_membership`] answers exact remote reachability for a
+//! bounded set of requested ids with no cap at all (M1.10, #63).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -191,10 +193,7 @@ pub fn read_commit(path: &Path, id: &str) -> Result<CommitDetail, RepoError> {
 /// malformed, absent, or simply not reachable are left out rather than erroring,
 /// so one bad id in a page can't fail the whole read. An empty request, or a
 /// repository with no remote-tracking refs, is an empty answer with no walk.
-pub fn remote_membership(
-    path: &Path,
-    requested: &HashSet<Oid>,
-) -> Result<HashSet<Oid>, RepoError> {
+pub fn remote_membership(path: &Path, requested: &HashSet<Oid>) -> Result<HashSet<Oid>, RepoError> {
     if requested.is_empty() {
         return Ok(HashSet::new());
     }
