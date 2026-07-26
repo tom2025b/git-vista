@@ -414,11 +414,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             what: "clock-skewed parent under a decorated trunk",
-            commits: vec![
-                at("T", &["P"], 50),
-                at("P", &["R"], 100),
-                at("R", &[], 10),
-            ],
+            commits: vec![at("T", &["P"], 50), at("P", &["R"], 100), at("R", &[], 10)],
             refs: vec![
                 gitref("HEAD", RefKind::Head, "T"),
                 gitref("main", RefKind::Branch, "T"),

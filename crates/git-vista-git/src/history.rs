@@ -159,16 +159,13 @@ impl<F: gix::prelude::Find> gix::prelude::Find for ShallowAwareObjects<F> {
         let kind = match self.inner.try_find(id, &mut *buffer)? {
             Some(data) => data.kind,
             None => {
-                return Err(format!(
-                    "recorded shallow boundary {id} is not in the object database"
+                return Err(
+                    format!("recorded shallow boundary {id} is not in the object database").into(),
                 )
-                .into())
             }
         };
         if kind != Kind::Commit {
-            return Err(
-                format!("recorded shallow boundary {id} is a {kind}, not a commit").into(),
-            );
+            return Err(format!("recorded shallow boundary {id} is a {kind}, not a commit").into());
         }
 
         // `CommitRef` borrows the bytes it parsed, so rewriting in place needs one
@@ -270,14 +267,11 @@ where
         inner: repo.objects.clone(),
         boundaries,
     };
-    let walk = gix::traverse::commit::topo::Builder::from_iters(
-        objects,
-        tips,
-        None::<Vec<gix::ObjectId>>,
-    )
-    .sorting(gix::traverse::commit::topo::Sorting::DateOrder)
-    .build()
-    .map_err(|e| RepoError::Walk(e.to_string()))?;
+    let walk =
+        gix::traverse::commit::topo::Builder::from_iters(objects, tips, None::<Vec<gix::ObjectId>>)
+            .sorting(gix::traverse::commit::topo::Sorting::DateOrder)
+            .build()
+            .map_err(|e| RepoError::Walk(e.to_string()))?;
 
     for info in walk {
         let info = info.map_err(|e| RepoError::Walk(e.to_string()))?;
@@ -1267,7 +1261,14 @@ pub(crate) mod tests {
             );
             let head = git_stdin(
                 repo,
-                &["hash-object", "-t", "commit", "-w", "--stdin", "--literally"],
+                &[
+                    "hash-object",
+                    "-t",
+                    "commit",
+                    "-w",
+                    "--stdin",
+                    "--literally",
+                ],
                 bytes.as_bytes(),
             );
             git(repo, &["update-ref", "refs/heads/main", &head]);
@@ -1483,10 +1484,7 @@ pub(crate) mod tests {
         }
         for order in orders {
             let canonical = canonical_tips(order);
-            assert_eq!(
-                canonical, tips,
-                "canonicalisation erases enumeration order"
-            );
+            assert_eq!(canonical, tips, "canonicalisation erases enumeration order");
             let replayed: Vec<Oid> = topo_walk(repo, &canonical, &[])
                 .expect("walk from a re-enumerated ref set")
                 .into_iter()
