@@ -36,8 +36,9 @@
 //! branches stay narrow, while branches that are live at the same time always get
 //! distinct lanes and never share a column.
 //!
-//! Lanes are assigned in one forward pass (each commit's *final* lane); edges are
-//! wired in a second pass so they connect each commit to its parent's final lane
+//! Lanes are assigned in one forward pass (each commit's *final* lane); an edge
+//! is held open from the moment its child is placed and only closed when the
+//! parent's own row arrives, so it always connects to the parent's *final* lane
 //! even when sibling lanes collapsed left at a merge.
 //!
 //! ## Determinism
@@ -56,7 +57,12 @@
 //! This split is move-only — the passes described above just live in their own
 //! files now:
 //!
-//!   * [`topology`] — order normalisation, lane assignment, edge wiring.
+//!   * [`topology`] — order normalisation and the lane-picking primitives.
+//!   * [`stream`]   — the lane walk itself, checkpointable: it can be cut at any
+//!     row into a chunk plus a resumable checkpoint, so paged history can lay
+//!     out one window at a time without reflowing what came before. There is
+//!     exactly one lane algorithm in the crate, and this is it — the one-shot
+//!     entry points below are a full-window feed through the same walk.
 //!   * [`color`]    — the palette and the first-parent-chain colouring.
 //!   * [`badges`]   — attaching refs to their commits.
 //!
@@ -65,49 +71,66 @@
 
 mod badges;
 mod color;
+pub mod stream;
 mod topology;
 
 use std::collections::HashSet;
 
 use crate::color::stable_color_slot;
-use crate::model::{BranchStub, CommitSummary, GitRef, Graph};
+use crate::model::{BranchStub, CommitSummary, GitRef, Graph, Oid};
 
 use badges::attach_ref_badges;
 use color::assign_branch_colors;
-use topology::{layout_topology, stable_topo_order, trunk_reserve_tip};
+use stream::{canonicalize_edges, strip_resolved_edges, StreamLayout};
+use topology::{stable_topo_order, trunk_reserve_tip};
 
-/// Lay commits out into a [`Graph`], with no ref information. `commits` must be
-/// newest-first. Every commit still gets a stable per-branch [`color`], derived
-/// purely from topology (first-parent chains). Use [`layout_with_refs`] to also
-/// attach branch/tag/HEAD badges and let real branch tips drive the colouring.
+/// The topology pass over a whole window at once: feed every commit through the
+/// checkpointable [`stream`] walk and close it. This is the *only* lane
+/// algorithm — a one-shot layout is just a paged layout whose first page holds
+/// everything, which is what keeps `layout()`/`layout_with_refs()` and paged
+/// history provably identical.
 ///
-/// [`color`]: crate::model::GraphRow::color
-pub fn layout(commits: Vec<CommitSummary>) -> Graph {
-    let commits = stable_topo_order(commits);
-    let mut graph = layout_topology(commits, None);
-    assign_branch_colors(&mut graph, &[], None);
-    graph
+/// Leaves every row's `refs` empty and `color` at 0 — [`decorate`] fills those.
+/// `trunk_tip` (if given and in-window) holds lane 0 for the trunk's line; see
+/// [`trunk_reserve_tip`] for why.
+fn layout_topology(commits: Vec<CommitSummary>, trunk_tip: Option<Oid>) -> Graph {
+    // The exact membership set for this window: a parent outside it is dangling,
+    // so it reserves no lane and wires no edge. The trunk reservation is filtered
+    // through the very same set the predicate uses — a lane held for a commit
+    // that never arrives would never be released.
+    let present: HashSet<Oid> = commits.iter().map(|c| c.id.clone()).collect();
+    let mut stream = StreamLayout::new(trunk_tip.filter(|tip| present.contains(tip)));
+    for commit in commits {
+        stream.push(commit, |oid| present.contains(oid));
+    }
+    let chunk = stream.finish();
+
+    // One window starting at absolute row zero, so the full-aggregate canonical
+    // order applies: row-major, then the child's own parent-vector order.
+    let mut edges = strip_resolved_edges(chunk.resolved_edges);
+    canonicalize_edges(&chunk.rows, &mut edges);
+
+    Graph {
+        rows: chunk.rows,
+        edges,
+        lane_count: chunk.lane_count,
+        ..Default::default()
+    }
 }
 
-/// Lay commits out and decorate the graph with `refs`: attach each ref as a badge
-/// on the commit it points at, and colour each branch consistently across the
-/// whole graph (branch tips seed the colouring; `head_branch` — the checked-out
-/// branch — is preferred for the trunk). A local branch that ends up with no
-/// commits of its own (e.g. one just created from an existing commit) is drawn as
-/// a distinct stub line via [`Graph::stubs`] rather than a second badge.
-/// `commits` must be newest-first.
-pub fn layout_with_refs(
-    commits: Vec<CommitSummary>,
-    refs: Vec<GitRef>,
-    head_branch: Option<&str>,
-) -> Graph {
-    let commits = stable_topo_order(commits);
-    let trunk_tip = trunk_reserve_tip(&refs, head_branch);
-    let mut graph = layout_topology(commits, trunk_tip.as_ref());
+/// The decoration pass both entry points share: colour every row, lay the stub
+/// cascades the colouring turned up out to the right of the commit lanes, then
+/// badge whatever refs are left.
+///
+/// With no refs at all (what [`layout`] passes) there are no branch seeds, so
+/// there are no stub seeds and nothing to badge — colouring is the only step
+/// with any work to do, and the graph keeps its empty `stubs` and unchanged
+/// `lane_count`.
+fn decorate(graph: &mut Graph, refs: Vec<GitRef>, head_branch: Option<&str>) {
     // Colouring also tells us which local branches own no commits of their own
     // (their tip was already claimed by a higher-priority branch) — those become
     // distinct stub lines instead of a second badge on the shared commit.
-    let stub_seeds = assign_branch_colors(&mut graph, &refs, head_branch);
+    let stub_seeds = assign_branch_colors(graph, &refs, head_branch);
 
     // Lay the stubs out as *cascades*: all stubs that point at the same commit
     // stack into a staircase, each forking off the previous one's tip rather than
@@ -158,7 +181,39 @@ pub fn layout_with_refs(
 
     // Badge the remaining refs on their commits — but not the stub branches, which
     // are drawn as their own lines (the whole point of this feature).
-    attach_ref_badges(&mut graph, refs, &stub_names);
+    attach_ref_badges(graph, refs, &stub_names);
+}
+
+/// Lay commits out into a [`Graph`], with no ref information. `commits` must be
+/// newest-first. Every commit still gets a stable per-branch [`color`], derived
+/// purely from topology (first-parent chains). Use [`layout_with_refs`] to also
+/// attach branch/tag/HEAD badges and let real branch tips drive the colouring.
+///
+/// [`color`]: crate::model::GraphRow::color
+pub fn layout(commits: Vec<CommitSummary>) -> Graph {
+    let commits = stable_topo_order(commits);
+    let mut graph = layout_topology(commits, None);
+    // No refs => colouring only; see [`decorate`].
+    decorate(&mut graph, Vec::new(), None);
+    graph
+}
+
+/// Lay commits out and decorate the graph with `refs`: attach each ref as a badge
+/// on the commit it points at, and colour each branch consistently across the
+/// whole graph (branch tips seed the colouring; `head_branch` — the checked-out
+/// branch — is preferred for the trunk). A local branch that ends up with no
+/// commits of its own (e.g. one just created from an existing commit) is drawn as
+/// a distinct stub line via [`Graph::stubs`] rather than a second badge.
+/// `commits` must be newest-first.
+pub fn layout_with_refs(
+    commits: Vec<CommitSummary>,
+    refs: Vec<GitRef>,
+    head_branch: Option<&str>,
+) -> Graph {
+    let commits = stable_topo_order(commits);
+    let trunk_tip = trunk_reserve_tip(&refs, head_branch);
+    let mut graph = layout_topology(commits, trunk_tip);
+    decorate(&mut graph, refs, head_branch);
     graph
 }
 
