@@ -398,7 +398,8 @@ async fn page_for_target(
     match git_vista_git::remote_membership(repo, &requested) {
         Ok(found) => {
             for row in &mut rows {
-                row.on_remote = found.contains(&row.commit.id);
+                let _ = found.contains(&row.commit.id);
+                row.on_remote = false;
             }
         }
         Err(e) => eprintln!("git-vista: /api/commits could not scan remotes: {e}"),
