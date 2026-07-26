@@ -28,12 +28,21 @@ pub fn build_node(
     i: usize,
 ) -> View {
     ctx.with_value(|c| {
-        let gr = &c.graph.rows[i];
+        // Checked, like every row lookup since paging (M1.10, #63): a `<For>`
+        // key can outlive the shape it was built from by one frame.
+        let Some(gr) = c.loaded.rows.get(i) else {
+            return ().into_view();
+        };
         let cx = node_cx(gr.lane);
         let cy = node_cy(gr.row);
         let color = branch_color(gr.color);
         let fill = color;
         let stroke_width = "2";
+        // The row's identity in the DOM (M1.10, #63). This `<g>` is the one and
+        // only per-row group — the label/meta/icon tiers deliberately add none —
+        // so counting `.graph-row` counts live rows exactly, which is how the
+        // MAX_LIVE_ROWS cull is observable from outside the app at all.
+        let oid = gr.commit.id.0.clone();
 
         // Issue #18: tapping a dot opens a context menu. Gather this commit's
         // menu data now; the click handler clones it in (it may fire repeatedly).
@@ -53,16 +62,19 @@ pub fn build_node(
             .collect();
         // Link target only when the repo is on GitHub *and* this commit is
         // pushed — same rule the labels use, so the menu never offers a 404.
-        let github_url = c.repo_url.as_ref().and_then(|base| {
-            c.remote_set
-                .contains(&commit_id)
-                .then(|| format!("{base}/commit/{commit_id}"))
-        });
+        // The row carries its own exact answer (`on_remote`): paged history has
+        // no whole-repo pushed-commit set, and inferring one from the rows that
+        // happen to be loaded would mislabel everything below the last page.
+        let github_url = c
+            .frame
+            .repo_url
+            .as_ref()
+            .and_then(|base| gr.on_remote.then(|| format!("{base}/commit/{commit_id}")));
         // The repo's GitHub base, carried into the menu for the "Create Pull
         // Request" compare link (independent of whether this commit is pushed).
-        let repo_url = c.repo_url.clone();
+        let repo_url = c.frame.repo_url.clone();
         // The any-host forge base (ADR 0010), for the non-GitHub branch links.
-        let remote_web_url = c.graph.remote_web_url.clone();
+        let remote_web_url = c.frame.remote_web_url.clone();
         // Issue #139: opened on pointerup, not click — iPad DuckDuckGo doesn't
         // reliably synthesize a click from a touch on these SVG circles, so the
         // menu depends only on raw pointer events. The `moved` gate still
@@ -90,7 +102,7 @@ pub fn build_node(
         };
 
         view! {
-            <g>
+            <g class="graph-row" data-oid=oid>
                 <circle
                     cx=cx
                     cy=cy
@@ -128,7 +140,9 @@ pub fn build_node_icon(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>, 
         // Untracked read, same as the other builders: the <For> keys carry
         // the icon mode, so a toggle rebuilds the rows.
         let ic = icon_set(nerd_icons.get_untracked());
-        let gr = &c.graph.rows[i];
+        let Some(gr) = c.loaded.rows.get(i) else {
+            return ().into_view();
+        };
         let icon = if gr.commit.parents.len() > 1 {
             ic.merge
         } else {

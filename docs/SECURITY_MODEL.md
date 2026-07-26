@@ -16,6 +16,16 @@ stale tabs, malicious LAN clients, credential leakage, or command races.
 - Provider and Git credentials never enter logs, URLs, API payloads, or browser
   storage unnecessarily.
 - A repository cannot cause unbounded memory, disk, child-process, or render use.
+  *(Implemented for history and file reads: ADR 0022, #63 — every git read goes
+  through `git_vista_git::git_stdout_capped`, which streams under a per-kind cap
+  (8 MiB diff metadata → 413, 200 KB per patch within 5 MB, 2 MB per file) and
+  carries `kill_on_drop`, so a disconnected client kills the child instead of
+  letting it finish into a buffer. History is paged rather than buffered whole,
+  and paging keeps **no** per-client server state: the entire state of a scroll
+  is one signed offset in the client's cursor, so memory is independent of both
+  repository size and the number of connected clients. The frontend culls to at
+  most 2,000 live rows regardless of camera. The memory bound is a
+  denial-of-service control, not merely a performance measure.)*
 - Recovery data is protected at least as strongly as the repository itself.
 - Security remains understandable for one person to operate.
 
@@ -200,6 +210,14 @@ it did not itself register.
   `git-vista-server::argv_boundary` scans both native crates and fails on any
   process-spawn site that is not allowlisted or does not name `git` literally.)*
 - Build argv only from typed operation planners and validated domain values.
+  *(Extended to read state: ADR 0022, #63 — a paging cursor is server-authored
+  and HMAC-SHA256 signed. The client may echo it back but may not author it. It
+  is validated in a fixed order — length guard, single dot, bounded base64,
+  constant-time tag comparison, only then JSON parse — so a forged or foreign
+  cursor is rejected before `serde_json` sees attacker-shaped bytes and before
+  any repository walk opens. A cursor scoped to a different repository or
+  worktree returns the generic `400`, deliberately not a distinguishing error, so
+  probing cannot confirm that another target exists.)*
   *(Implemented for every served-repository mutation: ADR 0015/0016, #142/#143 —
   write handlers build a typed `GitOperation`, and `git-vista-server::planner`
   is the only place a mutating git argv is constructed. Proven at the API

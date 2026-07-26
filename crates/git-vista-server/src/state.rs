@@ -92,8 +92,11 @@ fn parse_lan_ip_env(value: Option<&str>) -> Option<Result<SocketAddr, String>> {
     Some(Ok(SocketAddr::new(ip, PORT)))
 }
 
-// Upper bound on how much history to walk; plenty for now. Shared by the graph
-// read (`handlers::read`) and the activity feed's remote-commit lookup.
+// Upper bound on how much history to walk; plenty for now. `/api/frame` and the
+// paged `/api/commits` (M1.10, #63) no longer use this — paging has no
+// whole-history cap, only a per-page `?limit=` clamped by `page_limit`. It
+// remains the cap for the activity feed's remote-commit lookup
+// (`activity::activity_feed`), which still needs one whole-history scan.
 pub(crate) const HISTORY_LIMIT: usize = 5_000;
 
 /// Environment variable that opts the operator into exposing absolute filesystem

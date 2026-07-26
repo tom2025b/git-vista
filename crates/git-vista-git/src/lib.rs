@@ -33,12 +33,14 @@ pub mod reflog;
 pub mod refs;
 
 pub use github::{github_web_base, remote_web_base};
-pub use history::{read_commit, read_remote_commits, walk_history};
+pub use history::{
+    read_commit, read_remote_commits, remote_membership, walk_history, walk_history_topo,
+};
 pub use identity::{
     read_generation, read_generation_inputs, read_handle, read_repo_facts, RepoFacts, WorktreeKind,
 };
 pub use reflog::read_reflogs;
-pub use refs::{read_head_branch, read_refs};
+pub use refs::{read_head_branch, read_history_materials, read_refs, HistoryMaterials};
 
 #[derive(Debug, Error)]
 pub enum RepoError {

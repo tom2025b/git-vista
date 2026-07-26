@@ -58,6 +58,19 @@ pub struct CommitDetail {
     pub commit_time: i64,
     /// The full commit message, verbatim — summary line and body together.
     pub message: String,
+    /// True when this commit is reachable from one of the repository's
+    /// remote-tracking refs — i.e. it really is on the remote, so a forge link to
+    /// it will resolve rather than 404 (M1.10, #63).
+    ///
+    /// Answered *exactly*, for this one commit, by a bounded requested-set walk
+    /// (`git_vista_git::remote_membership`) rather than by membership of a capped
+    /// prefix of remote history: the commit whose detail a user opens is routinely
+    /// far below whatever page is loaded.
+    ///
+    /// `#[serde(default)]` so a payload minted before this field existed still
+    /// decodes — absent on the wire means "not known to be on a remote".
+    #[serde(default)]
+    pub on_remote: bool,
 }
 
 /// What a [`GitRef`] is, so the UI can badge and prioritise it. `Head` is the
@@ -104,6 +117,15 @@ pub struct GraphRow {
     /// graph, so the UI can colour a branch consistently regardless of which
     /// lane it happens to occupy. The UI maps the index onto its palette.
     pub color: usize,
+    /// True when this commit is reachable from a remote-tracking ref (M1.10,
+    /// #63). Per-row rather than per-graph: paged history has no whole-history
+    /// `Graph.remote_commits` set to consult, so each emitted row carries its own
+    /// exact answer, computed only for the OIDs the page actually emits.
+    ///
+    /// `#[serde(default)]` so an older payload still decodes as "not known to be
+    /// on a remote".
+    #[serde(default)]
+    pub on_remote: bool,
 }
 
 /// A line drawn between a commit and one of its parents.
@@ -208,6 +230,33 @@ pub struct BranchStub {
     pub depth: usize,
 }
 
+/// The paged-history twin of [`BranchStub`] (M1.10, #63).
+///
+/// A page is a window into history, so it cannot speak in absolute row indices or
+/// absolute lanes the way the whole-graph [`BranchStub`] does: its rows are only
+/// meaningful relative to the page, and the lane a stub finally occupies depends
+/// on the commit-lane high-water of everything drawn so far. So this anchors by
+/// **commit id** and carries a **lane offset** past the page's commit lanes,
+/// which the renderer adds to that high-water to get an absolute column.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameStub {
+    /// Branch name — the badge text, e.g. `"feature/ui-dark-mode"`.
+    pub name: String,
+    /// The commit this branch forks from, by id (a page-local row index would be
+    /// meaningless to a client assembling several pages).
+    pub anchor_commit: Oid,
+    /// Column past the commit lanes: absolute lane = commit-lane high-water +
+    /// this. Cumulative across every stub emitted so far, so two stubs never land
+    /// in the same column.
+    pub lane_offset: usize,
+    /// The stub's own colour slot — distinct from the branch it forked off.
+    pub color: usize,
+    /// Position in the cascade of stubs sharing this anchor commit: 0 forks
+    /// straight off the commit, 1 off stub 0's tip, and so on. See
+    /// [`BranchStub::depth`].
+    pub depth: usize,
+}
+
 // The request/response transport DTOs that used to live here — `CreateBranchRequest`,
 // `CreateCommitRequest`, `BranchRequest`, `CloneRequest`, `RebaseStatus`, and the
 // `validate_clone_url` gate — moved to the `git-vista-protocol` crate (M1.02, #102):
@@ -236,6 +285,31 @@ mod tests {
         // server's payload — absent on the wire deserializes to None.
         let g: Graph = serde_json::from_str(r#"{"rows":[],"edges":[],"lane_count":0}"#).unwrap();
         assert_eq!(g.remote_web_url, None);
+    }
+
+    #[test]
+    fn graph_row_deserializes_old_fixture_with_on_remote_false() {
+        // M1.10 (#63): paged rows carry exact remote reachability, but a payload
+        // minted before that field existed must still decode — absent on the wire
+        // means "not known to be on a remote", not a hard deserialization failure.
+        let row: GraphRow = serde_json::from_str(
+            r#"{"commit":{"id":"0123456789","parents":[],"summary":"s","author":"a","time":0},
+                "row":0,"lane":0,"refs":[],"color":0}"#,
+        )
+        .expect("a row without on_remote must still deserialize");
+        assert!(!row.on_remote);
+    }
+
+    #[test]
+    fn commit_detail_deserializes_old_fixture_with_on_remote_false() {
+        // Same contract rule for the detail panel's payload (M1.10, #63).
+        let detail: CommitDetail = serde_json::from_str(
+            r#"{"id":"0123456789","parents":[],"author_name":"a","author_email":"a@example.com",
+                "author_time":0,"committer_name":"c","committer_email":"c@example.com",
+                "commit_time":0,"message":"m"}"#,
+        )
+        .expect("a detail without on_remote must still deserialize");
+        assert!(!detail.on_remote);
     }
 
     #[test]

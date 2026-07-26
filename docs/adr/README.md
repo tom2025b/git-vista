@@ -33,3 +33,4 @@ it, and note the link in both.
 | [0019](0019-serialized-mutations-per-repository.md) | One mutation at a time per shared repository | Accepted |
 | [0020](0020-idempotent-operation-lifecycles.md) | Idempotent operation lifecycles and reconnectable progress | Accepted |
 | [0021](0021-durable-operation-journal-and-recovery-refs.md) | Durable operation journal and recovery references | Accepted |
+| [0022](0022-paged-history-and-bounded-reads.md) | Paged history, signed cursors, and bounded reads | Accepted |
