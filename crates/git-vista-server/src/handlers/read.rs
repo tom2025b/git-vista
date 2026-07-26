@@ -379,8 +379,9 @@ async fn page_for_target(
 
     // 7. Sign the next absolute row under the same target scope and the stable
     //    generation. A walk that ended before the window filled has no next
-    //    page, so it carries no cursor.
-    let cursor = if walked >= end_row {
+    //    page, so it carries no cursor; a walk stopped exactly at the window's
+    //    end does carry one, and the page it opens is legitimately empty.
+    let next_cursor = if walked >= end_row {
         let signed = codec
             .encode(
                 target.scope,
@@ -409,7 +410,7 @@ async fn page_for_target(
         // Commit-lane high-water only; stub columns sit past it at
         // `lane_count + FrameStub::lane_offset`.
         lane_count: chunk.lane_count,
-        cursor,
+        cursor: next_cursor,
         generation: snapshot.generation.clone(),
     };
 
