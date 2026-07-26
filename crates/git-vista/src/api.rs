@@ -10,12 +10,13 @@
 //! so this stays testable on its own away from the view code.
 
 use std::cell::RefCell;
+use std::fmt;
 
 use gloo_net::http::{Request, RequestBuilder};
 
 use git_vista_core::activity::{ActivityEvent, UndoAction, Undoable};
 use git_vista_core::diff::{CommitDiff, FileContent};
-use git_vista_core::model::{CommitDetail, Graph};
+use git_vista_core::model::CommitDetail;
 use git_vista_core::net::network_error_text;
 use git_vista_core::status::RepoStatus;
 use git_vista_protocol::{
@@ -24,6 +25,13 @@ use git_vista_protocol::{
     SessionInfo, SessionRequest, CSRF_HEADER, IDEMPOTENCY_HEADER, PROTOCOL_HEADER,
     PROTOCOL_VERSION,
 };
+
+use crate::history::{Frame, Page};
+
+/// The largest page the server will mint, mirrored here so a caller's request is
+/// clamped before it goes out rather than silently rewritten server-side. Kept
+/// in step with `MAX_PAGE_LIMIT` in `git-vista-server`'s read handlers.
+const MAX_PAGE_LIMIT: usize = 1_000;
 
 // The current session's CSRF token (M1.04). Set once the session is established
 // (`POST`/`GET /api/session`), then echoed in the [`CSRF_HEADER`] on every write —
@@ -280,21 +288,114 @@ async fn response_error(resp: gloo_net::http::Response) -> String {
     }
 }
 
-/// Fetch the laid-out graph from the backend. Relative URL → same origin as the
-/// served SPA, so no CORS and no hardcoded host.
+/// Why a history read failed (M1.10, #63).
 ///
-/// The URL carries a per-load cache-busting `t=<ms>` param: the backend already
-/// sends `Cache-Control: no-store`, but a unique URL each launch is belt-and-
-/// braces against iOS Safari's persistent cache serving a stale graph (so a branch
-/// created since the last launch never shows). The backend ignores the param.
-pub async fn fetch_graph() -> Result<Graph, String> {
-    let url = format!("/api/commits?t={}", js_sys::Date::now());
-    let resp = req_get(&url).send().await.map_err(network_error)?;
-    if resp.ok() {
-        resp.json::<Graph>().await.map_err(|e| e.to_string())
-    } else {
-        Err(response_error(resp).await)
+/// The old whole-graph read flattened every failure into a `String`, which is
+/// exactly what paged history can't afford: the *status* is the instruction. A
+/// `409` means history moved under us (reseed from a fresh Frame), a `400` on a
+/// cursor request means the server refused that cursor (never send it again),
+/// and everything else is retryable with the same cursor. So the status survives
+/// the call instead of being formatted away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryFetchError {
+    Network(String),
+    Http { status: u16, message: String },
+    Decode(String),
+}
+
+impl fmt::Display for HistoryFetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Both already carry a message written for a human — the network
+            // hint from core, or the server's own error text.
+            Self::Network(message) | Self::Http { message, .. } => f.write_str(message),
+            // A body we couldn't parse is nobody's fault but ours, so name the
+            // failure rather than showing a bare serde message on its own.
+            Self::Decode(message) => write!(f, "Invalid history response: {message}"),
+        }
     }
+}
+
+/// Percent-encode one query-parameter value, so an opaque id or signed cursor
+/// containing `&`, `=`, `+` or `/` can't cut the query short or be silently
+/// re-read as a different parameter.
+fn encode_component(value: &str) -> String {
+    js_sys::encode_uri_component(value)
+        .as_string()
+        .unwrap_or_default()
+}
+
+/// Decode one history representation, **checking the status first**.
+///
+/// The status has to be read off the response before the body is consumed, and
+/// preserved: a `409`'s body is not a decode failure, and reporting it as one
+/// would hide the one signal the drift path keys on. 304 is never interpreted —
+/// these requests send no `If-None-Match`, so the server has nothing to match
+/// and a 304 would be a protocol violation, not a cache hit.
+async fn history_json<T: serde::de::DeserializeOwned>(
+    resp: gloo_net::http::Response,
+) -> Result<T, HistoryFetchError> {
+    if !resp.ok() {
+        let status = resp.status();
+        let message = response_error(resp).await;
+        return Err(HistoryFetchError::Http { status, message });
+    }
+    resp.json::<T>()
+        .await
+        .map_err(|e| HistoryFetchError::Decode(e.to_string()))
+}
+
+/// Fetch the once-per-view [`Frame`] (`GET /api/frame`, M1.10): refs, branch
+/// colours and the repo's own metadata — no commits at all. Relative URL → same
+/// origin as the served SPA, cache-busted with `t=<ms>` like every other read
+/// (the backend ignores the param; iOS Safari's persistent cache does not).
+///
+/// No `?repo=` selector: the Frame *is* what resolves the view's target, and
+/// every page fetched after it pins that answer via
+/// [`Frame::worktree_id`](git_vista_protocol::HistoryFrame::worktree_id).
+pub async fn fetch_frame() -> Result<Frame, HistoryFetchError> {
+    let url = format!("/api/frame?t={}", js_sys::Date::now());
+    let resp = req_get(&url)
+        .send()
+        .await
+        .map_err(|e| HistoryFetchError::Network(network_error(e)))?;
+    history_json(resp).await
+}
+
+/// Fetch one page of history (`GET /api/commits`, M1.10): rows, edges and stubs
+/// plus the cursor for the next page, or `None` once history is exhausted.
+///
+/// `repo` is the accepted Frame's `worktree_id` — passed on page 1 *and* on
+/// every append, so a server whose default selection changes mid-scroll can't
+/// splice another repository's rows onto this graph. A degraded Frame has no id
+/// and passes `None`, which keeps the server's default-selection behaviour.
+/// `cursor` is `None` for page 1. Both are percent-encoded; `limit` is clamped
+/// into the server's own accepted range.
+pub async fn fetch_page(
+    repo: Option<&str>,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<Page, HistoryFetchError> {
+    // Built by appending, not by `format!`ing a fixed shape: an absent selector
+    // must be *omitted*, not sent empty — an empty `?repo=` is a different
+    // request from no `?repo=` at all.
+    let mut url = String::from("/api/commits?");
+    if let Some(repo) = repo {
+        url.push_str(&format!("repo={}&", encode_component(repo)));
+    }
+    if let Some(cursor) = cursor {
+        url.push_str(&format!("cursor={}&", encode_component(cursor)));
+    }
+    url.push_str(&format!(
+        "limit={}&t={}",
+        limit.clamp(1, MAX_PAGE_LIMIT),
+        js_sys::Date::now()
+    ));
+    let resp = req_get(&url)
+        .send()
+        .await
+        .map_err(|e| HistoryFetchError::Network(network_error(e)))?;
+    history_json(resp).await
 }
 
 /// Fetch one commit's full detail for the side panel (Phase 10,

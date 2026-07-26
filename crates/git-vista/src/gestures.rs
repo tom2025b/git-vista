@@ -253,9 +253,17 @@ pub fn install_resize_listener(vp_h: RwSignal<f64>) {
 /// boxes) and when a modifier is held, so typing an "r" — or the browser's own
 /// Cmd/Ctrl-R reload — is left untouched. Removed on cleanup, like the resize
 /// listener above, so a reload doesn't leave duplicate handlers behind.
+/// `home` is a *signal*, not a value (M1.10, #63): with paged history the home
+/// camera moves after mount — a later page can raise the lane high-water and
+/// grow the stub cascade past the top edge, which shifts `Camera::home`. Taking
+/// it by value here would freeze the reset target at the page-1 view, so `0`
+/// would recentre on a layout that no longer exists. It is read *untracked at
+/// key-press time* for the same reason the Reset-view button does: this is a
+/// listener, not a reactive computation, and nothing should re-run when home
+/// moves.
 pub fn install_key_listener(
     camera: RwSignal<Camera>,
-    home: Camera,
+    home: RwSignal<Camera>,
     reload: RwSignal<u32>,
     overlays: Overlays,
 ) {
@@ -318,8 +326,10 @@ pub fn install_key_listener(
                     }
                     // The graph's home view — not the raw identity, so a repo
                     // whose stub cascades overshoot the top edge resets to a
-                    // view that actually shows them (see `Camera::home`).
-                    "0" => camera.set(home),
+                    // view that actually shows them (see `Camera::home`). Read
+                    // at press time, so it is wherever the pages landed so far
+                    // put it, never the mount-time value.
+                    "0" => camera.set(home.get_untracked()),
                     "r" | "R" => reload.update(|n| *n = n.wrapping_add(1)),
                     _ => {}
                 }
