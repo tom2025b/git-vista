@@ -896,6 +896,7 @@ mod tests {
     use super::*;
     use axum::routing::get;
     use axum::Router;
+    use git_vista_core::layout::stream::canonicalize_edges;
     use git_vista_protocol::RepositoryDescriptor;
     use tower::ServiceExt;
 
@@ -1584,20 +1585,57 @@ mod tests {
         parts_of(response).await
     }
 
-    /// The page-1 read for `repo` at `limit` under `headers`, plus its walk count.
-    async fn page_one_parts(
+    /// One page read for `repo` at `cursor`/`limit` under `headers`, plus its
+    /// walk count. `history_codec` is keyed deterministically, so a cursor minted
+    /// by one call opens on the next exactly as it would inside one process.
+    async fn page_parts(
         repo: &Path,
+        cursor: Option<&str>,
         limit: usize,
         headers: &HeaderMap,
     ) -> (StatusCode, HeaderValue, Vec<u8>, usize) {
         let codec = history_codec();
         let target = history_target(repo, &codec);
         let walks = AtomicUsize::new(0);
-        let response = page_for_target(&target, None, limit, &codec, headers, &walks)
+        let response = page_for_target(&target, cursor, limit, &codec, headers, &walks)
             .await
             .expect("page read");
         let (status, etag, body) = parts_of(response).await;
         (status, etag, body, walks.load(Ordering::Relaxed))
+    }
+
+    /// The page-1 read for `repo` at `limit` under `headers`, plus its walk count.
+    async fn page_one_parts(
+        repo: &Path,
+        limit: usize,
+        headers: &HeaderMap,
+    ) -> (StatusCode, HeaderValue, Vec<u8>, usize) {
+        page_parts(repo, None, limit, headers).await
+    }
+
+    /// Follow the cursor chain from page 1 to exhaustion at `limit`, decoding
+    /// every page. The last page a history yields is the one that carries no
+    /// cursor — which may legitimately be an empty page, when the previous walk
+    /// stopped exactly at the window's end.
+    async fn all_pages(repo: &Path, limit: usize) -> Vec<Page> {
+        let headers = HeaderMap::new();
+        let mut pages: Vec<Page> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let (status, _, body, walks) = page_parts(repo, cursor.as_deref(), limit, &headers).await;
+            assert_eq!(status, StatusCode::OK, "every page in a chain is a 200");
+            assert_eq!(walks, 1, "one page, one Topo walk");
+            let page: Page = serde_json::from_slice(&body).expect("Page decodes");
+            cursor = page.cursor.clone();
+            pages.push(page);
+            assert!(
+                pages.len() <= 64,
+                "paging at limit {limit} must terminate on a fixture this small"
+            );
+            if cursor.is_none() {
+                return pages;
+            }
+        }
     }
 
     /// An `If-None-Match:` header map carrying exactly `value`.
