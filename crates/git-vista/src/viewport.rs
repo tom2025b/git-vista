@@ -24,7 +24,8 @@ use crate::history::MAX_LIVE_ROWS;
 /// above and below the node centre.
 ///
 /// The returned range is always ordered (`start <= end`) and in bounds, so the
-/// caller can iterate it directly.
+/// caller can iterate it directly, and never spans more than
+/// [`crate::history::MAX_LIVE_ROWS`].
 pub fn visible_row_range(
     cam: Camera,
     viewport_h: f64,
@@ -57,7 +58,6 @@ pub fn visible_row_range(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::MAX_LIVE_ROWS;
 
     // Row count comfortably larger than any window used in the tests.
     const ROWS: usize = 1000;

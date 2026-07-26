@@ -722,7 +722,11 @@ mod tests {
             .expect("a page raising the lane high-water is valid");
 
         assert!(delta.stub_geometry_changed);
-        assert_eq!(history.resolved_stubs()[0].lane, 3, "high-water 3 + offset 0");
+        assert_eq!(
+            history.resolved_stubs()[0].lane,
+            3,
+            "high-water 3 + offset 0"
+        );
         assert_no_shrink(&occupancy_before, history.label_occupancy());
         assert_eq!(
             history.label_occupancy()[0],
