@@ -2474,6 +2474,11 @@ mod tests {
         run(&repo, &["init", "-q", "-b", "main"]);
         run(&repo, &["config", "user.email", "t@example.invalid"]);
         run(&repo, &["config", "user.name", "t"]);
+        // `git fast-import` only unpacks a batch this size automatically up to
+        // `transfer.unpackLimit` (default 100); above that it always writes one
+        // pack regardless of how few "M" commands the stream carries. Raise the
+        // limit so a fixture of any size the tests below choose stays loose.
+        run(&repo, &["config", "transfer.unpackLimit", "1000000"]);
 
         let mut stream = String::new();
         for n in 1..=count {
