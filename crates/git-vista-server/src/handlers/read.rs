@@ -1606,6 +1606,31 @@ mod tests {
         headers
     }
 
+    /// The history target resolves through the same fail-closed selector arms
+    /// the other read endpoints use: a malformed id never reaches path
+    /// resolution, and an id the catalog never registered resolves to nothing
+    /// rather than falling back to any path. (Not a plan-named test — it exists
+    /// so the new resolution seam's refusals are pinned, since the nine tests
+    /// below construct their targets directly.)
+    #[test]
+    fn resolve_history_target_fails_closed_on_a_bad_selector() {
+        let codec = history_codec();
+
+        // Matched rather than `expect_err`-ed on purpose: the Ok variant holds a
+        // canonical filesystem path, and a `Debug` bound would put it in a panic
+        // message.
+        let Err((status, _)) = resolve_history_target(Some("not-an-id"), &codec) else {
+            panic!("a malformed selector must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let unknown = WorktreeId::from_git_dir("/no/such/repo/.git").to_string();
+        let Err((status, _)) = resolve_history_target(Some(&unknown), &codec) else {
+            panic!("an unregistered id must be refused");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
     /// The default page is the plan's 250; a client may ask for less, may ask for
     /// more and be clamped, and can never ask for a page that would fail to
     /// advance the cursor. An unknown query key (the frontend's `?t=`) is
