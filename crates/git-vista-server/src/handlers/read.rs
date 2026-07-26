@@ -15,7 +15,6 @@ use axum::{Extension, Json};
 use serde::Deserialize;
 
 use git_vista_core::identity::{RepositoryHandle, WorktreeId};
-use git_vista_core::layout;
 use git_vista_core::layout::replay::ReplayClassifier;
 use git_vista_core::layout::stream::{strip_resolved_edges, StreamLayout};
 use git_vista_core::layout::trunk_reserve_tip;
@@ -23,7 +22,7 @@ use git_vista_core::model::{
     CommitDetail, CommitSummary, Edge, FrameStub, GitRef, GraphRow, Oid, RefKind,
 };
 use git_vista_core::status::parse_porcelain_v2;
-use git_vista_git::{read_commit, read_refs, walk_history, walk_history_topo, RepoError};
+use git_vista_git::{read_commit, walk_history_topo, RepoError};
 use git_vista_protocol::{HistoryFrame, HistoryPage};
 
 use crate::git_cmd::git_stdout_capped;
@@ -71,12 +70,9 @@ fn resolve_repo(
 // ---------------------------------------------------------------------------
 // Paged history: the Frame and one Page (M1.10, #63)
 //
-// The `#[allow(dead_code)]` markers below are the same narrow, temporary device
-// `main.rs` uses for `mod history`: plan Step 8 adds the cursor-replay handler
-// and Step 9 registers `/api/frame` plus the paged `/api/commits` on both
-// routers. Until those routes exist nothing in the binary target reaches this
-// code, and deleting tested, plan-mandated seams to satisfy `-D warnings` would
-// be the wrong trade. Remove every marker in the Step 9 edit.
+// `GET /api/frame` and the paged `GET /api/commits` register these below on
+// both the loopback and LAN routers (plan Step 9); the whole-graph handler
+// this route used to serve is gone.
 
 /// The server's history Frame: the generic transport envelope over core's
 /// display refs. The frontend declares its own same-shaped alias (Task 5); a
@@ -115,7 +111,6 @@ pub(crate) struct ResolvedHistoryTarget {
 /// stores a degraded selection's path verbatim, and two spellings of one
 /// directory would otherwise bind two different scopes. Canonicalization is
 /// best-effort, matching the launch path's own posture.
-#[allow(dead_code)] // wired by plan Step 9 (route registration)
 fn resolve_history_target(
     selector: Option<&str>,
     codec: &CursorCodec,
@@ -141,7 +136,6 @@ const MAX_PAGE_LIMIT: usize = 1_000;
 /// cursor that never advances, and an oversized request is clamped rather than
 /// refused — a client asking for too much gets a smaller page plus a cursor,
 /// never a 400.
-#[allow(dead_code)] // wired by plan Step 9 (route registration)
 fn page_limit(raw: Option<usize>) -> usize {
     raw.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT)
 }
@@ -153,7 +147,6 @@ fn page_limit(raw: Option<usize>) -> usize {
 /// `?t=<millis>` cache-buster to every history read (see `crates/git-vista/
 /// src/api.rs`), and that must never be answered with a 400.
 #[derive(Deserialize)]
-#[allow(dead_code)] // wired by plan Step 9 (route registration)
 pub(crate) struct PageQuery {
     #[serde(default)]
     repo: Option<String>,
@@ -258,7 +251,6 @@ async fn frame_for_target(
 
 /// The cheap, once-per-view half of paged history: refs, branch colour slots,
 /// and the resolved target's metadata — no commits at all.
-#[allow(dead_code)] // registered by plan Step 9
 pub(crate) async fn frame(
     Extension(codec): Extension<Arc<CursorCodec>>,
     headers: HeaderMap,
@@ -287,7 +279,6 @@ pub(crate) async fn frame(
 /// Paging is stateless and honestly quadratic over a full scroll: a page at row
 /// `n` re-walks `[0,n)` from the same seeds, because the entire server-side
 /// state is one signed row number.
-#[allow(dead_code)] // wired by plan Step 9 (route registration)
 async fn page_for_target(
     target: &ResolvedHistoryTarget,
     cursor: Option<&str>,
@@ -482,69 +473,34 @@ async fn page_for_target(
     ))
 }
 
-/// Walk the configured repository (see [`repo_path`]) and return its laid-out
-/// graph as JSON, with branch/tag/HEAD refs attached for badging and per-branch
-/// colouring.
+/// One page of the checked-out repository's laid-out history — protocol v4,
+/// replacing the whole-graph `Graph` this route used to return.
 ///
-/// Sent `Cache-Control: no-store` so the browser never caches the graph: the repo
-/// changes underneath us (new commits, new/switched branches) between launches,
-/// and iOS Safari's on-disk cache otherwise persists a stale graph across app —
-/// and even device — restarts, making freshly created branches never appear.
+/// `?repo=` selects the target the same way every other read endpoint does;
+/// `?cursor=` resumes a prior page (absent => page 1); `?limit=` overrides the
+/// [`DEFAULT_PAGE_LIMIT`], clamped to [`MAX_PAGE_LIMIT`] by [`page_limit`]. See
+/// [`page_for_target`]'s doc comment for the full eight-part construction order.
 pub(crate) async fn commits(
-    Query(q): Query<RepoQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (repo, read_only, handle) = resolve_repo(q.repo.as_deref())?;
-    let repo = repo.as_path();
-    let history = walk_history(repo, HISTORY_LIMIT).map_err(|e| {
-        eprintln!("git-vista: /api/commits failed reading history: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
-    let refs = read_refs(repo).map_err(|e| {
-        eprintln!("git-vista: /api/commits failed reading refs: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
-    // Log, to the local terminal, exactly which branches this read found. This is
-    // the diagnostic for issue #16's "a new branch doesn't show up": if the branch
-    // you just made is listed here but not on the iPad, the graph is being read
-    // fine and the browser is showing a cached copy; if it's missing here, the
-    // problem is the repo being served (wrong path) or a ref the walk couldn't read.
-    log_commits_summary(repo, &history, &refs);
-    // The checked-out branch owns its line, so a branch just created from its tip
-    // is the one drawn as a new stub line (not the trunk). See `layout_with_refs`.
-    let head_branch = git_vista_git::read_head_branch(repo);
-    let mut graph = layout::layout_with_refs(history, refs, head_branch.as_deref());
-    // Tell the UI which repo this graph came from, as a short non-path label so
-    // the header can show *which* repo without leaking the server's filesystem
-    // (M1.03; the full path only when the operator opts into `GIT_VISTA_EXPOSE_PATHS`).
-    graph.repo_label = Some(repo_label(repo));
-    // Stamp the opaque ids the client addresses this repo by (M1.03), so a later
-    // request can select this exact worktree with `?repo=`. Absent in degraded mode.
-    if let Some(handle) = handle {
-        graph.repo_id = Some(handle.repository.to_string());
-        graph.worktree_id = Some(handle.worktree.to_string());
-    }
-    // A cloned URL is view-only: tell the UI to hide every write action.
-    graph.read_only = read_only;
-    // Offer "Reset Test Repo" only for a repo explicitly opted in with
-    // `gv --seed` (the seed files exist) — and never on a read-only clone.
-    graph.resettable = !read_only && has_seed(repo);
-    // Attach the GitHub web base (if this repo has a github.com origin) so the UI
-    // can link commits and refs. None => the frontend renders plain-text labels.
-    graph.repo_url = git_vista_git::github_web_base(repo);
-    // Any-host web base (ADR 0010) for the general forge links; repo_url above
-    // stays GitHub-only for the existing pushed-commit link behavior.
-    graph.remote_web_url = git_vista_git::remote_web_base(repo);
-    // Mark which commits are on the remote, so the UI only links pushed objects —
-    // an unpushed commit/ref would 404 on the forge. Only worth computing when we
-    // have a web base to link to (either the GitHub-only base or the any-host
-    // one); on failure we leave it empty (nothing linked).
-    if graph.repo_url.is_some() || graph.remote_web_url.is_some() {
-        if let Ok(remote) = git_vista_git::read_remote_commits(repo, HISTORY_LIMIT) {
-            graph.remote_commits = remote.into_iter().collect();
-        }
-    }
-    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
-    Ok((no_store, Json(graph)))
+    Extension(codec): Extension<Arc<CursorCodec>>,
+    headers: HeaderMap,
+    Query(query): Query<PageQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let target = resolve_history_target(query.repo.as_deref(), codec.as_ref())?;
+    let limit = page_limit(query.limit);
+    // Discarded after the call: this handler has no test double to prove
+    // anything against, unlike `page_for_target`'s own tests, which pass their
+    // own counter directly. Production still exercises the exact same counted
+    // code path — nothing about the pipeline's behaviour changes here.
+    let walks = AtomicUsize::new(0);
+    page_for_target(
+        &target,
+        query.cursor.as_deref(),
+        limit,
+        codec.as_ref(),
+        &headers,
+        &walks,
+    )
+    .await
 }
 
 /// Full detail for one commit (Phase 10 — the detail panel): the whole message
@@ -919,33 +875,6 @@ pub(crate) async fn worktree_status(
     let parsed = parse_porcelain_v2(&String::from_utf8_lossy(&output.stdout));
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
     Ok((no_store, Json(parsed)))
-}
-
-/// Print, to the local terminal, a one-line summary of what a `/api/commits` read
-/// found: the repo served, the commit count, and — crucially — the local branch
-/// names. It's the fastest answer to "I made a branch and it isn't showing":
-/// reload the page and look here. If the branch is in this list, the server sees
-/// it and the browser is caching a stale graph; if it's absent, the server is
-/// reading the wrong repo or couldn't read the ref (see any warnings above).
-fn log_commits_summary(repo: &Path, history: &[CommitSummary], refs: &[GitRef]) {
-    let mut local = Vec::new();
-    let (mut remote, mut tags, mut has_head) = (0usize, 0usize, false);
-    for r in refs {
-        match r.kind {
-            RefKind::Branch => local.push(r.name.as_str()),
-            RefKind::RemoteBranch => remote += 1,
-            RefKind::Tag => tags += 1,
-            RefKind::Head => has_head = true,
-        }
-    }
-    println!(
-        "[/api/commits] {} — {} commit(s); {} local branch(es) [{}]; {remote} remote, {tags} tag(s){}",
-        repo.display(),
-        history.len(),
-        local.len(),
-        local.join(", "),
-        if has_head { "; HEAD" } else { "" },
-    );
 }
 
 #[cfg(test)]
