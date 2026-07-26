@@ -719,6 +719,7 @@ dependencies = [
 name = "git-vista-protocol"
 version = "0.1.0"
 dependencies = [
+ "git-vista-core",
  "serde",
  "serde_json",
 ]

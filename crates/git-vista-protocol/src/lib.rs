@@ -48,6 +48,7 @@ pub mod newtype;
 
 pub mod dto;
 pub mod error;
+pub mod history;
 pub mod operation;
 pub mod plan;
 pub mod version;
@@ -58,6 +59,7 @@ pub use dto::{
     SelectRequest, SessionInfo, SessionRequest,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
+pub use history::{HistoryFrame, HistoryPage};
 pub use operation::{
     IdempotencyKey, OperationId, OperationStage, OperationState, OperationStatus, ProgressEvent,
     MAX_IDEMPOTENCY_KEY_LEN, MAX_OPERATION_ID_LEN, PROGRESS_EVENT, RESULT_EVENT,
