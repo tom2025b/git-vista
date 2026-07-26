@@ -1107,4 +1107,445 @@ mod tests {
             "the local tip was never pushed anywhere"
         );
     }
+
+    // ---- paged history: Frame, page limits, exact-body validators (M1.10, #63) --
+    //
+    // These drive the repo-parameterized `frame_for_target` / `page_for_target`
+    // seams directly, exactly as the bounded diff/file tests above drive
+    // `commit_diff_for_repo`. The axum handlers resolve their repository from the
+    // process-global `CURRENT` selection, shared by every test in this binary, so
+    // a handler-level test would race with `state::tests` and with its own
+    // siblings. The only production code skipped is `resolve_history_target`,
+    // whose selector arms are already pinned by the two tests at the top of this
+    // module.
+
+    /// `git <args…>` in `repo` with `envs` set; asserts success. Fixed
+    /// author/committer dates are what make two independently built repositories
+    /// share one history generation.
+    fn run_env(repo: &Path, args: &[&str], envs: &[(&str, &str)]) {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(args).current_dir(repo);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        let status = cmd.status().unwrap();
+        assert!(status.success(), "git {args:?} failed in {repo:?}");
+    }
+
+    /// A repository named `name` under `parent`, on `main`, with `commits`
+    /// commits whose ids are a pure function of their content — two copies built
+    /// this way are byte-identical histories and share one generation.
+    fn deterministic_repo(parent: &Path, name: &str, commits: usize) -> PathBuf {
+        assert!(commits >= 1, "a history fixture needs at least one commit");
+        let repo = parent.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@example.invalid"]);
+        run(&repo, &["config", "user.name", "t"]);
+        for i in 0..commits {
+            std::fs::write(repo.join(format!("f{i}.txt")), format!("{i}\n")).unwrap();
+            run(&repo, &["add", "-A"]);
+            let stamp = format!("{} +0000", 1_700_000_000 + i);
+            let message = format!("c{i}");
+            run_env(
+                &repo,
+                &["commit", "-q", "-m", &message],
+                &[("GIT_AUTHOR_DATE", &stamp), ("GIT_COMMITTER_DATE", &stamp)],
+            );
+        }
+        repo
+    }
+
+    /// A deterministic cursor codec, so nothing here depends on the per-process
+    /// random key.
+    fn history_codec() -> CursorCodec {
+        CursorCodec::with_key([0x27; 32])
+    }
+
+    /// The degraded-mode target for `repo`: canonical path, no catalog ids, scope
+    /// bound through the codec's key — what `resolve_history_target` builds for a
+    /// selection the catalog never registered.
+    fn history_target(repo: &Path, codec: &CursorCodec) -> ResolvedHistoryTarget {
+        let path = repo.canonicalize().expect("a temp repo path resolves");
+        let scope = codec.scope_for_target(None, &path);
+        ResolvedHistoryTarget {
+            path,
+            read_only: false,
+            handle: None,
+            scope,
+        }
+    }
+
+    /// Split a history response into `(status, etag, body)`. Every 200 and 304
+    /// must carry its quoted representation tag.
+    async fn parts_of(response: Response) -> (StatusCode, HeaderValue, Vec<u8>) {
+        let status = response.status();
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .expect("every history response carries its representation tag")
+            .clone();
+        let body = axum::body::to_bytes(response.into_body(), 8 << 20)
+            .await
+            .expect("a bounded history body")
+            .to_vec();
+        (status, etag, body)
+    }
+
+    /// The Frame read for `repo` under `headers`, plus the walk count it caused.
+    async fn frame_parts(
+        repo: &Path,
+        headers: &HeaderMap,
+    ) -> (StatusCode, HeaderValue, Vec<u8>, usize) {
+        let codec = history_codec();
+        let target = history_target(repo, &codec);
+        let walks = AtomicUsize::new(0);
+        let response = frame_for_target(&target, headers).await.expect("frame read");
+        let (status, etag, body) = parts_of(response).await;
+        (status, etag, body, walks.load(Ordering::Relaxed))
+    }
+
+    /// The page-1 read for `repo` at `limit` under `headers`, plus its walk count.
+    async fn page_one_parts(
+        repo: &Path,
+        limit: usize,
+        headers: &HeaderMap,
+    ) -> (StatusCode, HeaderValue, Vec<u8>, usize) {
+        let codec = history_codec();
+        let target = history_target(repo, &codec);
+        let walks = AtomicUsize::new(0);
+        let response = page_for_target(&target, None, limit, &codec, headers, &walks)
+            .await
+            .expect("page read");
+        let (status, etag, body) = parts_of(response).await;
+        (status, etag, body, walks.load(Ordering::Relaxed))
+    }
+
+    /// An `If-None-Match:` header map carrying exactly `value`.
+    fn if_none_match_header(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    /// The default page is the plan's 250; a client may ask for less, may ask for
+    /// more and be clamped, and can never ask for a page that would fail to
+    /// advance the cursor. An unknown query key (the frontend's `?t=`) is
+    /// accepted, never a 400.
+    #[test]
+    fn page_limit_defaults_and_clamps() {
+        assert_eq!(DEFAULT_PAGE_LIMIT, 250);
+        assert_eq!(MAX_PAGE_LIMIT, 1_000);
+
+        assert_eq!(
+            page_limit(None),
+            DEFAULT_PAGE_LIMIT,
+            "an absent ?limit= is the default page"
+        );
+        assert_eq!(
+            page_limit(Some(0)),
+            1,
+            "a zero-row page would never advance the cursor"
+        );
+        assert_eq!(page_limit(Some(1)), 1);
+        assert_eq!(page_limit(Some(7)), 7);
+        assert_eq!(page_limit(Some(DEFAULT_PAGE_LIMIT)), DEFAULT_PAGE_LIMIT);
+        assert_eq!(page_limit(Some(MAX_PAGE_LIMIT)), MAX_PAGE_LIMIT);
+        assert_eq!(
+            page_limit(Some(MAX_PAGE_LIMIT + 1)),
+            MAX_PAGE_LIMIT,
+            "an oversized ?limit= clamps rather than failing the read"
+        );
+        assert_eq!(page_limit(Some(usize::MAX)), MAX_PAGE_LIMIT);
+
+        // `PageQuery` must not deny unknown fields: the frontend appends its own
+        // cache-buster and must not be answered with a 400.
+        let parsed: PageQuery = serde_json::from_str(
+            r#"{"repo":null,"cursor":"opaque","limit":7,"t":"1737000000000"}"#,
+        )
+        .expect("PageQuery tolerates the frontend's ?t= cache-buster");
+        assert!(parsed.repo.is_none());
+        assert_eq!(parsed.cursor.as_deref(), Some("opaque"));
+        assert_eq!(page_limit(parsed.limit), 7);
+    }
+
+    /// One snapshot, one generation — but two different resources, so two
+    /// different, type-prefixed, exact-body validators. The Frame is `O(refs)`:
+    /// it must not touch the walk counter at all.
+    #[tokio::test]
+    async fn frame_and_page_one_share_generation_but_have_distinct_etags() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 4);
+        let headers = HeaderMap::new();
+
+        let (frame_status, frame_tag, frame_body, frame_walks) =
+            frame_parts(&repo, &headers).await;
+        assert_eq!(frame_status, StatusCode::OK);
+        assert_eq!(
+            frame_walks, 0,
+            "a Frame is O(refs): it must never walk commits"
+        );
+
+        let (page_status, page_tag, page_body, page_walks) =
+            page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &headers).await;
+        assert_eq!(page_status, StatusCode::OK);
+        assert_eq!(page_walks, 1, "page 1 walks exactly once");
+
+        let frame: Frame = serde_json::from_slice(&frame_body).expect("Frame decodes");
+        let page: Page = serde_json::from_slice(&page_body).expect("Page decodes");
+        assert_eq!(
+            frame.generation, page.generation,
+            "one combined snapshot, one generation"
+        );
+        assert_ne!(frame_tag, page_tag);
+        assert!(
+            frame_tag.to_str().unwrap().starts_with("\"gv4-frame:"),
+            "{frame_tag:?}"
+        );
+        assert!(
+            page_tag.to_str().unwrap().starts_with("\"gv4-page:"),
+            "{page_tag:?}"
+        );
+
+        // The tags are hashes of the exact bytes that were sent, not of a
+        // re-serialization and never of the generation.
+        assert_eq!(
+            representation_etag(RepresentationKind::Frame, &frame_body),
+            frame_tag
+        );
+        assert_eq!(
+            representation_etag(RepresentationKind::Page, &page_body),
+            page_tag
+        );
+
+        // The Frame answers branch slots from refs alone and carries no stubs
+        // (the envelope has no such field); the Page carries the rows.
+        assert_eq!(
+            frame.branch_colors,
+            vec![("main".to_string(), 0)],
+            "the trunk's stable slot comes from the refs, with no walk"
+        );
+        assert!(!frame_body
+            .windows(7)
+            .any(|w| w == b"\"stubs\""), "a Frame never carries stubs");
+        assert_eq!(page.rows.len(), 4);
+        assert_eq!(page.rows[0].row, 0);
+    }
+
+    /// A change the generation deliberately excludes — repository config, not a
+    /// ref, HEAD, or a shallow boundary — still changes the Frame's body, so it
+    /// must change the Frame's validator. Generation and ETag are separate
+    /// things.
+    #[tokio::test]
+    async fn frame_metadata_change_changes_etag_without_generation_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 2);
+        let headers = HeaderMap::new();
+
+        let (_, before_tag, before_body, _) = frame_parts(&repo, &headers).await;
+        let before: Frame = serde_json::from_slice(&before_body).unwrap();
+        assert!(
+            before.remote_web_url.is_none(),
+            "the fixture starts with no remote"
+        );
+
+        run(
+            &repo,
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+
+        let (_, after_tag, after_body, _) = frame_parts(&repo, &headers).await;
+        let after: Frame = serde_json::from_slice(&after_body).unwrap();
+        assert!(
+            after.remote_web_url.is_some(),
+            "adding a remote gives the Frame a forge base"
+        );
+        assert_eq!(
+            before.generation, after.generation,
+            "config moves no ref, no HEAD half and no shallow boundary"
+        );
+        assert_ne!(
+            before_tag, after_tag,
+            "the validator is derived from the sent body, so metadata moves it"
+        );
+    }
+
+    /// Two selections over byte-identical histories share a generation but are
+    /// different resources: the resolved-target metadata rides in the Frame body,
+    /// so switching the default selection must move the Frame's validator — and
+    /// the two targets must bind different cursor scopes.
+    #[tokio::test]
+    async fn default_selection_switch_same_history_changes_frame_etag() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = deterministic_repo(dir.path(), "alpha", 3);
+        let beta = deterministic_repo(dir.path(), "beta", 3);
+        let headers = HeaderMap::new();
+
+        let (_, alpha_tag, alpha_body, _) = frame_parts(&alpha, &headers).await;
+        let (_, beta_tag, beta_body, _) = frame_parts(&beta, &headers).await;
+        let a: Frame = serde_json::from_slice(&alpha_body).unwrap();
+        let b: Frame = serde_json::from_slice(&beta_body).unwrap();
+
+        assert_eq!(
+            a.generation, b.generation,
+            "identical committed topology is one history generation"
+        );
+        assert!(a
+            .repo_label
+            .as_deref()
+            .is_some_and(|label| label.ends_with("alpha")));
+        assert!(b
+            .repo_label
+            .as_deref()
+            .is_some_and(|label| label.ends_with("beta")));
+        assert_ne!(
+            alpha_tag, beta_tag,
+            "one generation, two selections, two validators"
+        );
+
+        let codec = history_codec();
+        assert_ne!(
+            history_target(&alpha, &codec).scope,
+            history_target(&beta, &codec).scope,
+            "a cursor minted for one selection must not open on the other"
+        );
+    }
+
+    /// Page 1 at two different limits is two different representations of one
+    /// generation, each with its own exact-body validator and its own cursor.
+    #[tokio::test]
+    async fn page_one_limits_one_and_seven_have_distinct_etags() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 8);
+        let headers = HeaderMap::new();
+
+        let (_, tag_one, body_one, _) = page_one_parts(&repo, 1, &headers).await;
+        let (_, tag_seven, body_seven, _) = page_one_parts(&repo, 7, &headers).await;
+        let one: Page = serde_json::from_slice(&body_one).unwrap();
+        let seven: Page = serde_json::from_slice(&body_seven).unwrap();
+
+        assert_eq!(one.rows.len(), 1);
+        assert_eq!(seven.rows.len(), 7);
+        assert_eq!(one.rows[0].row, 0, "both pages start at absolute row 0");
+        assert_eq!(seven.rows[0].row, 0);
+        assert_eq!(one.rows[0].commit.id, seven.rows[0].commit.id);
+        assert_eq!(
+            one.generation, seven.generation,
+            "the page size is not part of the history generation"
+        );
+        assert_ne!(tag_one, tag_seven);
+        assert!(one.cursor.is_some(), "seven more rows remain after limit 1");
+        assert!(seven.cursor.is_some(), "one more row remains after limit 7");
+        assert_ne!(
+            one.cursor, seven.cursor,
+            "the two cursors name different next rows"
+        );
+    }
+
+    /// The two tag namespaces are sealed: a Frame validator can never satisfy a
+    /// Page's precondition, nor a Page validator a Frame's. Both requests are
+    /// answered 200 with their own tag and a real body.
+    #[tokio::test]
+    async fn frame_etag_cannot_304_page_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 3);
+        let none = HeaderMap::new();
+
+        let (_, frame_tag, _, _) = frame_parts(&repo, &none).await;
+        let (_, page_tag, _, _) = page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &none).await;
+        assert_ne!(frame_tag, page_tag);
+
+        let presented = if_none_match_header(frame_tag.to_str().unwrap());
+        let (status, tag, body, _) =
+            page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &presented).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a Frame tag must not 304 a Page: they are different resources"
+        );
+        assert_eq!(tag, page_tag);
+        assert!(!body.is_empty());
+
+        let presented = if_none_match_header(page_tag.to_str().unwrap());
+        let (status, tag, body, _) = frame_parts(&repo, &presented).await;
+        assert_eq!(status, StatusCode::OK, "nor a Page tag a Frame");
+        assert_eq!(tag, frame_tag);
+        assert!(!body.is_empty());
+    }
+
+    /// A Frame whose own current validator is presented is answered with an
+    /// empty 304 that still carries that validator.
+    #[tokio::test]
+    async fn frame_matching_validator_returns_304_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 3);
+
+        let (status, tag, body, _) = frame_parts(&repo, &HeaderMap::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.is_empty());
+
+        let presented = if_none_match_header(tag.to_str().unwrap());
+        let (status, revalidated, body, walks) = frame_parts(&repo, &presented).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated, tag, "a 304 keeps the validator it matched");
+        assert!(body.is_empty(), "a 304 carries no body");
+        assert_eq!(walks, 0);
+    }
+
+    /// Page 1 evaluates the precondition against its own current tag, and a
+    /// match is an empty 304 carrying that tag.
+    #[tokio::test]
+    async fn page_one_matching_validator_returns_304_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 3);
+
+        let (status, tag, body, _) =
+            page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &HeaderMap::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.is_empty());
+
+        let presented = if_none_match_header(tag.to_str().unwrap());
+        let (status, revalidated, body, _) =
+            page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &presented).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated, tag);
+        assert!(body.is_empty(), "a 304 carries no body");
+    }
+
+    /// RFC 9110 weak comparison, on both representations: a `W/`-prefixed tag, a
+    /// matching member of a comma-separated list, and `*` each revalidate to an
+    /// empty 304 carrying the representation's own tag.
+    #[tokio::test]
+    async fn frame_and_page_one_weak_list_and_star_validators_return_304_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 3);
+
+        let (_, frame_tag, _, _) = frame_parts(&repo, &HeaderMap::new()).await;
+        let (_, page_tag, _, _) =
+            page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &HeaderMap::new()).await;
+
+        for (what, tag) in [("frame", &frame_tag), ("page", &page_tag)] {
+            let quoted = tag.to_str().unwrap();
+            let validators = [
+                format!("W/{quoted}"),
+                format!("\"gv4-page:0000000000000000000000000000000000000000000000000000000000000000\", {quoted}"),
+                "*".to_string(),
+            ];
+            for validator in validators {
+                let presented = if_none_match_header(&validator);
+                let (status, revalidated, body, _) = if what == "frame" {
+                    frame_parts(&repo, &presented).await
+                } else {
+                    page_one_parts(&repo, DEFAULT_PAGE_LIMIT, &presented).await
+                };
+                assert_eq!(
+                    status,
+                    StatusCode::NOT_MODIFIED,
+                    "{what} must revalidate on {validator}"
+                );
+                assert_eq!(&revalidated, tag, "{what}: 304 keeps its own validator");
+                assert!(body.is_empty(), "{what}: a 304 carries no body");
+            }
+        }
+    }
 }
