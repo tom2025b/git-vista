@@ -483,12 +483,31 @@ pub fn App() -> impl IntoView {
                 // "Print Graph" appears once a Frame is accepted — it opens
                 // the full static print view (every loaded row, light
                 // background) with Print / Save PDF controls.
+                //
+                // Paged history makes it *conditional* (M1.10, #63). The
+                // printout is a document, and a document of the newest 250
+                // commits captioned "the whole graph" is quietly wrong — worse
+                // than no printout, because nothing on paper says it was
+                // partial. So the button carries the real HTML `disabled`
+                // attribute until the last page has landed, and the handler
+                // re-reads `complete` regardless: the attribute is an
+                // affordance, not the guarantee. A drift reload can un-complete
+                // the history between the paint and the tap.
                 {move || frame().map(|_| view! {
                     <button
                         class="refresh"
-                        on:click=move |_| history_ui.print_open.set(true)
-                        title="A clean, printable view of the whole graph — \
-                               print it or save it as a PDF"
+                        disabled=move || !history_complete.get()
+                        on:click=move |_| {
+                            if history_complete.get_untracked() {
+                                history_ui.print_open.set(true);
+                            }
+                        }
+                        title=move || if history_complete.get() {
+                            "A clean, printable view of the whole graph — \
+                             print it or save it as a PDF"
+                        } else {
+                            "Load all history before printing."
+                        }
                     >
                         "Print Graph"
                     </button>
@@ -578,11 +597,6 @@ pub fn App() -> impl IntoView {
                                     let repo = seed.frame.repo_label.clone();
                                     let branch = seed.frame.head_branch.clone();
                                     let remote_web_url = seed.frame.remote_web_url.clone();
-                                    // Still a whole-`Graph` snapshot, but only for
-                                    // the print view: `print_graph_view` is Step 9's
-                                    // to move onto the mounted `RenderCtx`. The
-                                    // canvas takes the seed itself.
-                                    let graph = seed_graph(&seed);
                                     view! {
                                         // Repo glyph + name, then branch glyph + checked-out
                                         // branch — the icons carry what the old "repository:"
@@ -616,11 +630,10 @@ pub fn App() -> impl IntoView {
                                                 })}
                                             </p>
                                         })}
-                                        {print_graph_view(
-                                            graph,
-                                            history_ui.print_open,
-                                            nerd_icons,
-                                        )}
+                                        // The print view is no longer mounted
+                                        // here: it reads the same aggregate the
+                                        // canvas owns, so it lives *inside*
+                                        // `graph_canvas` and is disposed with it.
                                         {graph_canvas(
                                             seed,
                                             reload,

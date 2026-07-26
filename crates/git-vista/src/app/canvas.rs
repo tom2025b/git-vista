@@ -42,6 +42,7 @@ use crate::history::{
     DEFAULT_PAGE_LIMIT,
 };
 use crate::lod::detail_for;
+use crate::print::print_graph_view;
 use crate::render::{self, RenderCtx};
 use crate::state::{CommitDialog, MenuData, Overlays, PendingOp, Settings, ViewerDoc};
 use crate::viewport::visible_row_range;
@@ -601,6 +602,15 @@ pub(super) fn graph_canvas(
         >
             "Reset view"
         </button>
+        // "Print Graph" (crate::print), mounted here rather than in the App
+        // shell since M1.10 (#63): it draws the *whole* history, which now only
+        // exists inside this canvas's aggregate. Mounting it here means it can
+        // borrow `ctx` instead of being handed a copy that a later page would
+        // silently contradict — and that it is disposed together with the epoch
+        // it belongs to. Its own overlay is `position: fixed`, so it adds no
+        // layout to the canvas it sits beside. The topbar button that sets
+        // `print_open` is disabled until the last page lands.
+        {print_graph_view(ctx, history_ui.print_open, nerd_icons)}
         // The overlays: the context menu, the two modals, and the detail panel.
         // They're mutually exclusive (opening either modal closes the menu), and
         // each is `position: fixed`, so this wrapper adds no layout. Each view is a
