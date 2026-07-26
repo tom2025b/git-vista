@@ -109,6 +109,301 @@ fn every_process_spawn_site_is_allowlisted_and_spawns_only_git() {
     }
 }
 
+/// Blank out comments and the *contents* of string/char literals, so a
+/// structural scan of source text sees code and nothing else. Delimiters and
+/// newlines are kept, so offsets stay meaningful and a blanked region never
+/// merges two lines together.
+///
+/// Without this, a prose sentence in a comment ("we no longer call
+/// `git_stdout(`…") would be counted as a call site — and a brace inside a
+/// string or comment would desynchronise the body extractor.
+fn code_only(src: &str) -> String {
+    let c: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    fn blank(out: &mut String, ch: char) {
+        out.push(if ch == '\n' { '\n' } else { ' ' });
+    }
+    let mut i = 0usize;
+    while i < c.len() {
+        let ch = c[i];
+        let next = c.get(i + 1).copied();
+        // Line comment: blank to (not including) the newline.
+        if ch == '/' && next == Some('/') {
+            while i < c.len() && c[i] != '\n' {
+                blank(&mut out, c[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment, nesting as Rust's do.
+        if ch == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while i < c.len() {
+                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    blank(&mut out, c[i]);
+                    blank(&mut out, c[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    blank(&mut out, c[i]);
+                    blank(&mut out, c[i + 1]);
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                blank(&mut out, c[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // Raw string: r"…", r#"…"#, r##"…"##. Only when `r` starts a token.
+        let prev_is_ident = i > 0 && (c[i - 1].is_alphanumeric() || c[i - 1] == '_');
+        if ch == 'r' && !prev_is_ident {
+            let mut hashes = 0usize;
+            while c.get(i + 1 + hashes) == Some(&'#') {
+                hashes += 1;
+            }
+            if c.get(i + 1 + hashes) == Some(&'"') {
+                out.push('r');
+                for _ in 0..hashes {
+                    out.push('#');
+                }
+                out.push('"');
+                i += hashes + 2;
+                loop {
+                    if i >= c.len() {
+                        break;
+                    }
+                    if c[i] == '"' && (1..=hashes).all(|h| c.get(i + h) == Some(&'#')) {
+                        out.push('"');
+                        for _ in 0..hashes {
+                            out.push('#');
+                        }
+                        i += hashes + 1;
+                        break;
+                    }
+                    blank(&mut out, c[i]);
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        // Ordinary string literal, honouring backslash escapes.
+        if ch == '"' {
+            out.push('"');
+            i += 1;
+            while i < c.len() {
+                if c[i] == '\\' {
+                    blank(&mut out, c[i]);
+                    if i + 1 < c.len() {
+                        blank(&mut out, c[i + 1]);
+                    }
+                    i += 2;
+                    continue;
+                }
+                if c[i] == '"' {
+                    out.push('"');
+                    i += 1;
+                    break;
+                }
+                blank(&mut out, c[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // `'` is a char literal only when it closes within two chars; otherwise
+        // it is a lifetime (`&'a str`) and must be passed through untouched.
+        if ch == '\'' {
+            let escaped = next == Some('\\');
+            let closes = if escaped {
+                (2..=8).find(|&k| c.get(i + k) == Some(&'\''))
+            } else if c.get(i + 2) == Some(&'\'') {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(k) = closes {
+                out.push('\'');
+                for j in 1..k {
+                    blank(&mut out, c[i + j]);
+                }
+                out.push('\'');
+                i += k + 1;
+                continue;
+            }
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
+/// The body of the one **production** `fn <name>` in `code` (already passed
+/// through [`code_only`]), matched brace-for-brace.
+///
+/// Deliberately strict: exactly one definition must exist, and it must sit
+/// ahead of `mod tests`, so a same-named test helper can neither be picked up
+/// instead of the real thing nor make the scan ambiguous.
+fn production_body<'a>(code: &'a str, name: &str) -> &'a str {
+    let marker = format!("fn {name}");
+    let defs = code.matches(&marker).count();
+    assert_eq!(
+        defs, 1,
+        "expected exactly one `{marker}` definition in handlers/read.rs, found {defs}"
+    );
+    let at = code.find(&marker).expect("counted above");
+    let tests_at = code
+        .find("mod tests")
+        .expect("handlers/read.rs has a test module");
+    assert!(
+        at < tests_at,
+        "`{marker}` was found inside `mod tests`, not in production code"
+    );
+
+    let open = at
+        + code[at..]
+            .find('{')
+            .expect("a function signature is followed by its body brace");
+    let mut depth = 0usize;
+    for (offset, ch) in code[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let body = &code[open + 1..open + offset];
+                    assert!(
+                        body.len() > 200,
+                        "extracted body for `{marker}` is implausibly small ({} bytes)",
+                        body.len()
+                    );
+                    return body;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces while extracting `{marker}`");
+}
+
+/// Layer 1b (M1.10, #63): the *streaming* source boundary. Every git read the
+/// two bounded read handlers perform must go through the capped, killable
+/// primitive — proved structurally, on the source, not inferred from the size
+/// of a returned buffer.
+///
+/// Exactly one production body is extracted for each of `commit_diff_for_repo`
+/// and `file_at_commit_for_repo`; across only those two bodies there must be
+/// exactly four `git_stdout_capped(` call sites (three diff reads, one file
+/// read) and no escape hatch — no uncapped `git_stdout(`, no `.output()`, no
+/// `.wait_with_output()`, no direct `Command` construction, each of which would
+/// buffer whatever git chose to print.
+///
+/// The scope is deliberately narrow. The unrelated `worktree_status` read in
+/// the very same file legitimately owns a direct process invocation with static
+/// args, and the assertion below that the *file* still contains such a call
+/// while the two extracted *bodies* do not is what proves the extractor cut
+/// where it claims to, instead of quietly matching nothing.
+#[test]
+fn bounded_read_source_boundary_is_streaming_and_exactly_four() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/read.rs");
+    let src = std::fs::read_to_string(&path).expect("readable handlers/read.rs");
+    let code = code_only(&src);
+
+    let capped = ["git_stdout", "_capped("].concat();
+    let uncapped = ["git_stdout", "("].concat();
+    // Assembled at runtime, like the spawn scan above, so this file's own source
+    // never contains the bare patterns it forbids.
+    let banned: [(String, &str); 3] = [
+        ([".output", "()"].concat(), "buffers all of git's stdout"),
+        (
+            [".wait_with", "_output()"].concat(),
+            "buffers all of git's stdout",
+        ),
+        (
+            ["Command", "::new"].concat(),
+            "spawns git outside the capped primitive",
+        ),
+    ];
+
+    let diff_body = production_body(&code, "commit_diff_for_repo");
+    let file_body = production_body(&code, "file_at_commit_for_repo");
+
+    // The two bodies are distinct regions of the same file.
+    assert_ne!(
+        diff_body.as_ptr(),
+        file_body.as_ptr(),
+        "the extractor returned the same body twice"
+    );
+
+    let diff_calls = diff_body.matches(&capped).count();
+    let file_calls = file_body.matches(&capped).count();
+    assert_eq!(
+        diff_calls, 3,
+        "commit_diff_for_repo must perform exactly three bounded reads \
+         (--name-status -z, --numstat -z, --patch), found {diff_calls}"
+    );
+    assert_eq!(
+        file_calls, 1,
+        "file_at_commit_for_repo must perform exactly one bounded read, found {file_calls}"
+    );
+    assert_eq!(
+        diff_calls + file_calls,
+        4,
+        "exactly four target callers cross the capped boundary"
+    );
+
+    for (what, body) in [
+        ("commit_diff_for_repo", diff_body),
+        ("file_at_commit_for_repo", file_body),
+    ] {
+        assert_eq!(
+            body.matches(&uncapped).count(),
+            0,
+            "{what}: an uncapped `{uncapped}` read survives — every read here \
+             must name its own cap"
+        );
+        for (needle, why) in banned.iter() {
+            assert_eq!(
+                body.matches(needle.as_str()).count(),
+                0,
+                "{what}: `{needle}` {why}; the bounded primitive owns the child"
+            );
+        }
+    }
+
+    // Narrowness, both directions. The file as a whole still contains the
+    // unrelated direct invocation — `worktree_status` runs
+    // `git status --porcelain=v2` and buffers its (tiny, static-arg) output —
+    // so the two extractions above cut where they claim to rather than
+    // swallowing the whole file and asserting over nothing. (`porcelain=v2` is
+    // checked against the raw source: `code_only` blanks string contents.)
+    let direct_output = [".output", "()"].concat();
+    assert!(
+        code.matches(direct_output.as_str()).count() > 0,
+        "file-wide `{direct_output}` vanished: either worktree_status changed, \
+         or this guard is now passing vacuously"
+    );
+    assert!(
+        src.contains("porcelain=v2"),
+        "the unrelated worktree-status read is expected to remain in this file"
+    );
+    // Each extracted body really is the one under test, not a stray region that
+    // happens to be brace-balanced.
+    assert!(
+        diff_body.contains("patch_cap(full)"),
+        "the extracted diff body does not select a patch cap"
+    );
+    assert!(
+        file_body.contains("FILE_CONTENT_CAP"),
+        "the extracted file body does not name the file content cap"
+    );
+}
+
 /// Layer 2: no write DTO tolerates smuggled extras or non-object shapes. The
 /// interesting property is *where* these die: at deserialization, before any
 /// handler code runs.
