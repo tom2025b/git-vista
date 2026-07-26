@@ -16,6 +16,12 @@ mod camera;
 mod datetime;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod geometry;
+// M1.10 (#63): the paged-history aggregate and its request state. Pure
+// validate-then-commit logic over the wire types — no Leptos, no DOM — so the
+// all-or-nothing invariants are unit-tested on the host like the geometry above,
+// not only exercised in a browser.
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+mod history;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod icons;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
