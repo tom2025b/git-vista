@@ -231,9 +231,9 @@ pub fn App() -> impl IntoView {
     // keeps its previous value while the next load runs, and an out-of-order
     // completion would otherwise mark a live reload Ready with retired data.
     create_effect(move |_| {
-        let Some((epoch, complete)) = seed.map(|(epoch, result)| {
-            (*epoch, result.as_ref().ok().map(|s| s.loaded.is_complete()))
-        }) else {
+        let Some((epoch, complete)) = seed
+            .map(|(epoch, result)| (*epoch, result.as_ref().ok().map(|s| s.loaded.is_complete())))
+        else {
             return;
         };
         if epoch != reload.get_untracked() {
