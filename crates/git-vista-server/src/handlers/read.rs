@@ -469,13 +469,16 @@ async fn page_for_target(
     };
 
     // 8. Page 1 answers `If-None-Match` against its own current tag; a cursor
-    //    page ignores the precondition and always returns 200.
+    //    page ignores the precondition and always returns 200 with its own
+    //    body-derived tag. The rule is keyed on the *request* — "did the client
+    //    present a cursor?" — not on the resolved row, because only the cursorless
+    //    page 1 is a stable, addressable representation a client can revalidate.
     let body = serde_json::to_vec(&page).map_err(history_serialization_failed)?;
     Ok(representation_response(
         RepresentationKind::Page,
         body,
         headers,
-        start_row == 0,
+        cursor.is_none(),
     ))
 }
 
