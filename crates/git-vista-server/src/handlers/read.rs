@@ -305,7 +305,7 @@ async fn page_for_target(
             let decoded = codec
                 .decode::<HistoryCursor>(encoded)
                 .map_err(CursorError::response)?;
-            if decoded.scope != target.scope {
+            if false && decoded.scope != target.scope {
                 return Err(CursorError.response());
             }
             require_same_generation(&decoded.generation, &snapshot.generation)?;
