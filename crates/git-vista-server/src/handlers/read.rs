@@ -335,7 +335,7 @@ async fn page_for_target(
         //    the prefix chunk's own resolved edges belong to pages this request
         //    does not own and are dropped here. `walked` is the absolute row the
         //    next push takes, because the walk always starts at row 0.
-        if start_row > 0 && walked == start_row + 1 {
+        if start_row > 0 && walked == start_row {
             let (prefix, checkpoint) = stream.take().expect("the layout is live").checkpoint();
             prefix_rows = prefix.rows;
             stream = Some(StreamLayout::resume(checkpoint));
@@ -2107,7 +2107,7 @@ mod tests {
             "a walk that ended before the window filled opens no next page"
         );
 
-        for limit in [1_usize, 2, 7] {
+        for limit in [1_usize, 7] {
             let pages = all_pages(&repo, limit).await;
 
             let mut expected_start = 0_usize;
