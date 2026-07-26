@@ -302,16 +302,25 @@ async fn page_for_target(
     //    both HEAD halves and the canonical shallow set describe one moment.
     let snapshot = read_history_snapshot(repo).await?;
 
-    // 2. A cursor is authenticated, scope-compared and drift-compared here,
-    //    before anything below runs. Plan Step 8 owns that path and the prefix
-    //    replay it enables; until then only page 1 is served.
-    if cursor.is_some() {
-        return Err((
-            StatusCode::NOT_IMPLEMENTED,
-            "paged history replay is not implemented yet".to_string(),
-        ));
-    }
-    let start_row = 0_usize;
+    // 2. A cursor is authenticated, scope-compared and generation-compared here
+    //    — strictly before `walks` moves or Topo opens, so a forged, foreign or
+    //    stale cursor costs nothing but an HMAC. Scope mismatch is deliberately
+    //    the codec's own generic 400: a probing client must not learn whether it
+    //    guessed a real target. Generation drift is the 409 the frontend keys
+    //    "restart the aggregate at page 1" on.
+    let start_row = match cursor {
+        None => 0_usize,
+        Some(encoded) => {
+            let decoded = codec
+                .decode::<HistoryCursor>(encoded)
+                .map_err(CursorError::response)?;
+            if decoded.scope != target.scope {
+                return Err(CursorError.response());
+            }
+            require_same_generation(&decoded.generation, &snapshot.generation)?;
+            decoded.state.next_row
+        }
+    };
     let end_row = start_row.saturating_add(limit);
 
     // 3. Rebuild the shallow-aware Topo `DateOrder` walk from the snapshot's own
@@ -323,36 +332,65 @@ async fn page_for_target(
         .collect();
     let boundaries: HashSet<Oid> = snapshot.shallow_boundaries.iter().cloned().collect();
     let trunk_tip = trunk_reserve_tip(&snapshot.refs, snapshot.head_branch.as_deref());
-    let mut stream = StreamLayout::new(trunk_tip);
+    // `Option` only so the checkpoint can consume the layout mid-walk and put the
+    // resumed one back; it is `Some` at every observable moment.
+    let mut stream = Some(StreamLayout::new(trunk_tip));
+    let mut prefix_rows: Vec<GraphRow> = Vec::new();
     let mut walked = 0_usize;
     walks.fetch_add(1, Ordering::Relaxed);
-    walk_history_topo(repo, &tips, &snapshot.shallow_boundaries, |summary| {
+    let walk = walk_history_topo(repo, &tips, &snapshot.shallow_boundaries, |summary| {
+        // 4. Checkpoint immediately *before* row `n`, never after: lanes and the
+        //    unresolved `PendingEdge` list ride across in the checkpoint, while
+        //    the prefix chunk's own resolved edges belong to pages this request
+        //    does not own and are dropped here. `walked` is the absolute row the
+        //    next push takes, because the walk always starts at row 0.
+        if start_row > 0 && walked == start_row {
+            let (prefix, checkpoint) = stream.take().expect("the layout is live").checkpoint();
+            prefix_rows = prefix.rows;
+            stream = Some(StreamLayout::resume(checkpoint));
+        }
         // A recorded boundary commit's parents are cut: they may not even be in
         // the object database, so they reserve no lane and wire no edge. Every
         // non-boundary parent stays required.
         let cut = boundaries.contains(&summary.id);
-        stream.push(summary, |_parent| !cut);
+        stream
+            .as_mut()
+            .expect("the layout is live")
+            .push(summary, |_parent| !cut);
         walked += 1;
         if walked >= end_row {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
         }
-    })
-    .map_err(|e| {
+    });
+    // 6a. A traversal or object-read failure is ambiguous until the snapshot is
+    //     re-read: a ref that moved mid-walk can strand the walk on an object
+    //     that is no longer reachable. Drift takes precedence, so the client is
+    //     told to restart rather than shown a phantom corruption.
+    if let Err(e) = walk {
+        let fresh = read_history_snapshot(repo).await?;
+        require_same_generation(&snapshot.generation, &fresh.generation)?;
         eprintln!("git-vista: /api/commits failed walking history: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
-    let chunk = stream.finish();
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
+    let chunk = stream.take().expect("the layout is live").finish();
 
-    // 4/5. Decorate every row in ascending row order, exactly once — the
-    //      classifier propagates claims along first parents and hands out stub
-    //      columns cumulatively, so a skipped or out-of-order row corrupts both.
-    //      Page 1 has no prefix, so nothing is suppressed here.
+    // 5. Decorate every row in ascending row order, exactly once — the classifier
+    //    propagates claims along first parents and hands out stub columns
+    //    cumulatively, so a skipped or out-of-order row corrupts both. The prefix
+    //    advances all of that state with emission suppressed; only `[n,n+k)`
+    //    produces badges and stubs.
     let mut classifier = ReplayClassifier::new(&snapshot.refs, snapshot.head_branch.as_deref());
+    for mut row in prefix_rows {
+        classifier.decorate(&mut row, false);
+    }
     let mut rows: Vec<GraphRow> = Vec::with_capacity(chunk.rows.len());
     let mut stubs: Vec<FrameStub> = Vec::new();
     for mut row in chunk.rows {
+        // Normally every row here is in the window. The exception is a history
+        // that ended *before* row `n`: the checkpoint never fired, so this chunk
+        // is entirely prefix and the window is legitimately empty.
         let emit = row.row >= start_row;
         let produced = classifier.decorate(&mut row, emit);
         if emit {
@@ -361,7 +399,7 @@ async fn page_for_target(
         }
     }
 
-    // 6. Exact remote reachability, for the emitted OIDs only — one walk, never
+    // 6b. Exact remote reachability, for the emitted OIDs only — one walk, never
     //    one per row. A remote-scan failure leaves the flags false, the same
     //    lenient posture the commit-detail read takes: the page loses forge
     //    links, it does not lose the history.
@@ -403,12 +441,25 @@ async fn page_for_target(
         None
     };
 
+    // This page owns all and only the edges whose *destination* row it holds —
+    // `from_row < n` is normal and expected, a merge parent can resolve pages
+    // below its child. Resuming from the checkpoint already guarantees that, so
+    // the filter only bites in the empty-window case above, where the walk ended
+    // before row `n` and every resolved edge is prefix. Ordering comes from the
+    // chunk's own `ResolvedEdge` sidecars — `(from_row, parent_ordinal, …)`,
+    // never a row index — which is what lets a page that does not start at row 0
+    // sort itself at all.
+    let edges = strip_resolved_edges(
+        chunk
+            .resolved_edges
+            .into_iter()
+            .filter(|resolved| resolved.edge.to_row >= start_row)
+            .collect(),
+    );
+
     let page = Page {
         rows,
-        // Already in canonical `(from_row, parent_ordinal, …)` order: the chunk
-        // sorted its own `ResolvedEdge`s through their sidecars, which is what
-        // lets a page that does not start at row 0 sort without row indexing.
-        edges: strip_resolved_edges(chunk.resolved_edges),
+        edges,
         stubs,
         // Commit-lane high-water only; stub columns sit past it at
         // `lane_count + FrameStub::lane_offset`.
