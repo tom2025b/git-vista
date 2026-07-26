@@ -10,11 +10,15 @@
 //!   * [`color`]    — per-branch colouring, the trunk slot, and branch stubs
 //!     (which the colouring pass produces).
 //!   * [`badges`]   — attaching refs to their commits.
+//!   * [`stream`]   — the checkpointable topology core: absolute rows across
+//!     checkpoints, cross-page edges, and serialized equivalence with the
+//!     legacy one-shot layout.
 
 use crate::model::{CommitSummary, Edge, GitRef, Graph, Oid, RefKind};
 
 mod badges;
 mod color;
+mod stream;
 mod topology;
 
 fn gitref(name: &str, kind: RefKind, target: &str) -> GitRef {
