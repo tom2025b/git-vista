@@ -10,6 +10,9 @@
 //!   * [`color`]    — per-branch colouring, the trunk slot, and branch stubs
 //!     (which the colouring pass produces).
 //!   * [`badges`]   — attaching refs to their commits.
+//!   * [`replay`]   — the streaming classifier paged history uses, proven to
+//!     agree with the whole-graph colouring/stub/badge passes on every fixture
+//!     above, at every page boundary.
 //!   * [`stream`]   — the checkpointable topology core: absolute rows across
 //!     checkpoints, cross-page edges, and serialized equivalence with the
 //!     legacy one-shot layout.
@@ -18,6 +21,7 @@ use crate::model::{CommitSummary, Edge, GitRef, Graph, Oid, RefKind};
 
 mod badges;
 mod color;
+mod replay;
 mod stream;
 mod topology;
 

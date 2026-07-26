@@ -187,6 +187,7 @@ pub fn fake_graph() -> Graph {
             // Phase 7 colours by branch; the fixture has no refs, so fall back to
             // the lane index as a stand-in (this module is test-only now).
             color: c.lane,
+            on_remote: false,
         })
         .collect();
 

@@ -114,7 +114,7 @@ pub(super) fn leftmost_free_right_of(lanes: &mut Vec<Option<Oid>>, after: usize)
 /// "main keeps changing colour" instability of the July test round. Now the
 /// trunk line always ends at the trunk's tip, and any branch ahead of it forks
 /// right in its own stable colour, checked out or not.
-pub(super) fn trunk_reserve_tip(refs: &[GitRef], head_branch: Option<&str>) -> Option<Oid> {
+pub fn trunk_reserve_tip(refs: &[GitRef], head_branch: Option<&str>) -> Option<Oid> {
     let local = |name: &str| {
         refs.iter()
             .find(|r| matches!(r.kind, crate::model::RefKind::Branch) && r.name == name)

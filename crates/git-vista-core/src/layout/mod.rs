@@ -65,12 +65,17 @@
 //!     entry points below are a full-window feed through the same walk.
 //!   * [`color`]    — the palette and the first-parent-chain colouring.
 //!   * [`badges`]   — attaching refs to their commits.
+//!   * [`replay`]   — the same colouring/badging/stub decisions taken one row at
+//!     a time, for paged history, which never holds the whole graph. It is
+//!     proven equivalent to [`color`] + [`decorate`] on every fixture in the
+//!     crate; the whole-graph passes below stay the oracle.
 //!
 //! The two entry points ([`layout`] and [`layout_with_refs`]) stay here and
 //! orchestrate those passes.
 
 mod badges;
 mod color;
+pub mod replay;
 pub mod stream;
 mod topology;
 
@@ -82,7 +87,16 @@ use crate::model::{BranchStub, CommitSummary, GitRef, Graph, Oid};
 use badges::attach_ref_badges;
 use color::assign_branch_colors;
 use stream::{canonicalize_edges, strip_resolved_edges, StreamLayout};
-use topology::{stable_topo_order, trunk_reserve_tip};
+use topology::stable_topo_order;
+
+/// The lane-0 reservation rule, re-exported for paged history (M1.10, #63).
+///
+/// A page builder outside this crate has to reserve lane 0 for the trunk's own
+/// tip exactly as [`layout_with_refs`] does, or a side branch at row 0 would
+/// glue itself onto the trunk's line — the whole reason the reservation exists.
+/// Exporting the one tested implementation keeps the paged and one-shot
+/// pipelines from drifting apart on the trunk decision.
+pub use topology::trunk_reserve_tip;
 
 /// The topology pass over a whole window at once: feed every commit through the
 /// checkpointable [`stream`] walk and close it. This is the *only* lane
