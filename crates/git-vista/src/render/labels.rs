@@ -174,11 +174,11 @@ pub fn build_msg(
         // The message links to the commit page on GitHub (Issue #12), but only
         // when the commit is on the remote — otherwise it's dimmed and the
         // tooltip says why, rather than linking to a page that would 404.
-        let msg_url = c.repo_url.as_ref().and_then(|base| {
+        let msg_url = c.frame.repo_url.as_ref().and_then(|base| {
             commit_on_remote.then(|| format!("{base}/commit/{}", gr.commit.id.0))
         });
         let msg_clickable = msg_url.is_some();
-        let msg_unpushed = c.repo_url.is_some() && msg_url.is_none();
+        let msg_unpushed = c.frame.repo_url.is_some() && msg_url.is_none();
         let title = if msg_unpushed {
             format!("{} — not pushed to GitHub", gr.commit.summary)
         } else {
@@ -227,15 +227,17 @@ pub fn build_meta(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>, i: us
         // Untracked read, same as build_node: the <For> keys carry the icon
         // mode, so a toggle rebuilds the rows.
         let ic = icon_set(nerd_icons.get_untracked());
-        let gr = &c.graph.rows[i];
+        let (Some(gr), Some(&text_x)) = (c.loaded.rows.get(i), c.loaded.text_x().get(i)) else {
+            return ().into_view();
+        };
         // Same open-circle rule as build_msg: a stub's anchor row takes the stub's
         // branch colour instead of the line it sits on (the meta line's own opacity
         // already gives it the faded, secondary look).
         let stub_slot = c
-            .graph
+            .loaded
             .stubs
             .iter()
-            .find(|s| s.anchor_row == gr.row)
+            .find(|s| c.loaded.oid_to_row.get(&s.anchor_commit) == Some(&gr.row))
             .map(|s| s.color);
         let meta = format!(
             " {} · {} · {}",
@@ -249,7 +251,7 @@ pub fn build_meta(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>, i: us
             // branch colour (the glyph inherits it), faded to stay secondary
             // (see .label-meta's opacity).
             <text
-                x=c.text_x[gr.row]
+                x=text_x
                 y=label_bottom_y(gr.row)
                 class="label-meta"
                 fill=branch_color(stub_slot.unwrap_or(gr.color))
