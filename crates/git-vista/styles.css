@@ -76,6 +76,12 @@ html, body {
 }
 .refresh:hover { border-color: var(--accent); }
 .refresh:active { background: #30363d; }
+/* A topbar action that genuinely isn't available yet — today only "Print Graph"
+   before the last page of history has landed (M1.10, #63). Dimmed rather than
+   hidden so the action is discoverable and its tooltip can say what's missing;
+   the browser's own `disabled` is what actually blocks the click. */
+.refresh:disabled { opacity: 0.45; cursor: not-allowed; }
+.refresh:disabled:hover { border-color: #30363d; }
 /* The gated "Reset Test Repo" button (only on a gv --seed repo): reads as the
    hazard it is, like the menu's delete item. The first .refresh takes the
    margin-left:auto gap, so later buttons need it off to stay adjacent. */
@@ -138,7 +144,11 @@ html, body {
 .diff-hunk { color: #2f81f7; }
 .diff-meta { color: var(--muted); }
 
-.graph { flex: 1; overflow: hidden; }
+/* The graph panel. `position: relative` (M1.10, #63) makes it the containing
+   block for the paging affordance below, which must sit at a fixed spot over
+   the canvas rather than travel with the camera. Still `overflow: hidden`: the
+   shell never scrolls (ADR 0012), the camera moves the content. */
+.graph { flex: 1; overflow: hidden; position: relative; }
 .placeholder { color: var(--muted); }
 
 /* Icon system (icons.rs). `.nf` marks a span/tspan holding an icon glyph: the
@@ -329,6 +339,52 @@ html, body {
 }
 .reset-view:hover { opacity: 1; border-color: var(--accent); }
 .reset-view:active { background: #30363d; }
+
+/* M1.10 (#63): the paging affordance — "Loading more history…" while the next
+   page is in flight, or the failure line plus its Retry button. Positioned
+   against `.graph` (hence the `position: relative` there) and rendered as a
+   SIBLING of the <svg>, never inside the camera's <g transform>: pan and zoom
+   are unbounded, so anything living in graph space can be carried off screen,
+   and this is precisely the element that must still be there when the user has
+   panned into empty space wondering where the rest of the history is.
+
+   It floats *over* the canvas — it never replaces or reflows it, so the rows
+   already drawn stay readable while the next page loads or fails. The loading
+   line is inert (`pointer-events: none`) so it can't swallow a pan that starts
+   under it; the error variant takes pointer events back, because its Retry
+   button is the only way out of the error state (nothing retries on its own). */
+.history-page-status {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  max-width: calc(100% - 24px);
+  padding: 0.35rem 0.85rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  background: rgba(33, 38, 45, 0.9);
+  border: 1px solid #30363d;
+  border-radius: 999px;
+  pointer-events: none;
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+}
+.history-page-status.error {
+  color: #f78166;
+  border-color: #f85149;
+  pointer-events: auto;
+}
+/* The Retry button reuses the topbar recipe, minus its `margin-left: auto`
+   (which inside this flex row would shove it against the right edge). */
+.history-page-status .refresh {
+  margin-left: 0;
+  padding: 0.2rem 0.65rem;
+  font-size: 0.75rem;
+}
 
 /* Issue #12: commit messages and ref badges that link to GitHub. */
 .clickable { cursor: pointer; }
@@ -708,6 +764,7 @@ button.detail-file:hover .detail-file-path { color: var(--accent); }
   html[data-print] .status,
   html[data-print] .graph-svg,
   html[data-print] .reset-view,
+  html[data-print] .history-page-status,
   html[data-print] .ctx-menu,
   html[data-print] .detail-panel { display: none !important; }
   /* Un-trap the surface from the app's fixed/overflow layout: everything on
