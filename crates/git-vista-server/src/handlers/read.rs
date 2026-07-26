@@ -2455,4 +2455,512 @@ mod tests {
             );
         }
     }
+
+    // ---- cursor drift, tamper, scope, and error precedence (Step 8, part B) ---
+
+    /// A `count`-commit linear history built via `git fast-import`, carrying no
+    /// `M` (modify) commands — every commit shares one empty tree, so the batch
+    /// is small enough that fast-import writes it as individually addressable
+    /// **loose** objects rather than one pack. The two walk-error fixtures below
+    /// need that: they force a traversal failure by deleting one specific
+    /// commit's object file, and a duplicate copy sitting in a pack would defeat
+    /// the deletion.
+    fn deep_linear_repo(parent: &Path, count: usize) -> (PathBuf, String, String) {
+        use std::io::Write;
+        assert!(count >= 2, "a walk-error fixture needs a root and a child");
+
+        let repo = parent.join(format!("deep-{count}"));
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@example.invalid"]);
+        run(&repo, &["config", "user.name", "t"]);
+
+        let mut stream = String::new();
+        for n in 1..=count {
+            let message = format!("commit {n}\n");
+            stream.push_str("commit refs/heads/main\n");
+            stream.push_str(&format!("mark :{n}\n"));
+            stream.push_str(&format!(
+                "committer t <t@example.invalid> {} +0000\n",
+                1_000 + n
+            ));
+            stream.push_str(&format!("data {}\n{message}", message.len()));
+            if n > 1 {
+                stream.push_str(&format!("from :{}\n", n - 1));
+            }
+            stream.push('\n');
+        }
+        stream.push_str("done\n");
+
+        let mut child = std::process::Command::new("git")
+            .args(["fast-import", "--quiet", "--done"])
+            .current_dir(&repo)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stream.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success(), "git fast-import failed");
+        assert!(
+            std::fs::read_dir(repo.join(".git/objects/pack"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "no \"M\" commands means fast-import must never pack this fixture"
+        );
+
+        let tip = out(&repo, &["rev-parse", "refs/heads/main"]);
+        let root = out(&repo, &["rev-list", "--max-parents=0", "refs/heads/main"]);
+        (repo, tip, root)
+    }
+
+    /// Move `repo`'s `ref_name` to `new_oid` from a background thread, after a
+    /// short fixed delay. The delay is comfortably longer than the calling
+    /// test's already-in-flight snapshot read (a handful of small file reads,
+    /// microseconds) and comfortably shorter than the multi-hundred/thousand
+    /// commit walk these tests give it to race against, so the mutation lands
+    /// strictly between the two.
+    fn race_ref_move(
+        repo: &Path,
+        ref_name: &'static str,
+        new_oid: &str,
+    ) -> std::thread::JoinHandle<()> {
+        let repo = repo.to_path_buf();
+        let new_oid = new_oid.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            run(&repo, &["update-ref", ref_name, &new_oid]);
+        })
+    }
+
+    /// A cursor page never revalidates against `If-None-Match`, even when the
+    /// client presents that exact page's own current tag: only a Frame and page
+    /// 1 are stable, addressable representations.
+    #[tokio::test]
+    async fn cursor_page_ignores_if_none_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 3);
+
+        let (status_one, _, body_one, _) = page_one_parts(&repo, 1, &HeaderMap::new()).await;
+        assert_eq!(status_one, StatusCode::OK);
+        let page_one: Page = serde_json::from_slice(&body_one).unwrap();
+        let cursor = page_one.cursor.clone().expect("more rows remain");
+
+        let (status_two, tag_two, body_two, walks_two) =
+            page_parts(&repo, Some(&cursor), 1, &HeaderMap::new()).await;
+        assert_eq!(status_two, StatusCode::OK);
+        assert_eq!(walks_two, 1);
+
+        // Presenting that exact, freshly computed tag back must still 200.
+        let presented = if_none_match_header(tag_two.to_str().unwrap());
+        let (status_three, tag_three, body_three, walks_three) =
+            page_parts(&repo, Some(&cursor), 1, &presented).await;
+        assert_eq!(
+            status_three,
+            StatusCode::OK,
+            "a cursor page always 200s despite a matching If-None-Match"
+        );
+        assert_eq!(tag_three, tag_two);
+        assert_eq!(body_three, body_two);
+        assert_eq!(walks_three, 1);
+    }
+
+    /// A ref moving between the page that mints a cursor and the page that
+    /// consumes it is refused as a 409 — caught by the cursor's own generation
+    /// comparison, strictly before any traversal.
+    #[tokio::test]
+    async fn ref_move_between_pages_returns_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 4);
+
+        let (status_one, _, body_one, walks_one) = page_one_parts(&repo, 1, &HeaderMap::new()).await;
+        assert_eq!(status_one, StatusCode::OK);
+        assert_eq!(walks_one, 1);
+        let page_one: Page = serde_json::from_slice(&body_one).unwrap();
+        let cursor = page_one.cursor.clone().expect("more rows remain");
+
+        // The branch this cursor was minted against moves: a new commit lands.
+        commit_at(&repo, "extra.txt", "extra", 1_700_009_000);
+
+        let codec = history_codec();
+        let target = history_target(&repo, &codec);
+        let walks = AtomicUsize::new(0);
+        let error = page_for_target(&target, Some(&cursor), 1, &codec, &HeaderMap::new(), &walks)
+            .await
+            .expect_err("a cursor pinned to a generation the repository has left must be refused");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(error.1, "history moved");
+        assert_eq!(
+            walks.load(Ordering::Relaxed),
+            0,
+            "generation drift is caught before any walk"
+        );
+    }
+
+    /// The generation can move *during* a page that never presented a cursor at
+    /// all: the walk itself completes (against the seeds the initial snapshot
+    /// captured), but the repository has moved by the time the success-path
+    /// combined re-read runs, and that re-read still refuses the page. Driven
+    /// through the real `api_contract` middleware, so the wire JSON — not just
+    /// the handler's own tuple — is proved to carry `error.code == "conflict"`.
+    #[tokio::test]
+    async fn generation_move_during_page_returns_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, tip, _root) = deep_linear_repo(dir.path(), 1_500);
+
+        // A new commit, built but referenced by nothing yet: the racer below
+        // moves `main` onto it only after this request is already under way.
+        let tree = out(&repo, &["rev-parse", &format!("{tip}^{{tree}}")]);
+        let extra = out(&repo, &["commit-tree", &tree, "-p", &tip, "-m", "extra"]);
+        let racer = race_ref_move(&repo, "refs/heads/main", &extra);
+
+        let walks = Arc::new(AtomicUsize::new(0));
+        let repo_for_route = repo.clone();
+        let walks_for_route = Arc::clone(&walks);
+        let app = Router::new()
+            .route(
+                "/api/commits",
+                get(move || {
+                    let repo_for_route = repo_for_route.clone();
+                    let walks_for_route = Arc::clone(&walks_for_route);
+                    async move {
+                        let codec = history_codec();
+                        let target = history_target(&repo_for_route, &codec);
+                        page_for_target(
+                            &target,
+                            None,
+                            1_500,
+                            &codec,
+                            &HeaderMap::new(),
+                            walks_for_route.as_ref(),
+                        )
+                        .await
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn(crate::middleware::api_contract));
+
+        let req = axum::http::Request::get("/api/commits")
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        racer.join().unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "the walk ran against the old seeds; the repository moved before the re-read"
+        );
+        assert_eq!(
+            walks.load(Ordering::Relaxed),
+            1,
+            "the walk itself ran exactly once, unlike a rejected cursor"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let err: ApiError = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            err.error.code,
+            ErrorCode::Conflict,
+            "the real middleware envelope, not just the handler's own tuple"
+        );
+        assert_eq!(err.error.message, "history moved");
+    }
+
+    /// A cursor whose signature no longer verifies — one flipped character — is
+    /// the same generic 400 as every other codec failure, and costs nothing but
+    /// the failed HMAC check.
+    #[tokio::test]
+    async fn tampered_cursor_is_bad_request_before_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 3);
+
+        let (_, _, body, _) = page_one_parts(&repo, 1, &HeaderMap::new()).await;
+        let page: Page = serde_json::from_slice(&body).unwrap();
+        let cursor = page.cursor.clone().expect("more rows remain");
+
+        let mut chars: Vec<char> = cursor.chars().collect();
+        chars[0] = if chars[0] == 'A' { 'B' } else { 'A' };
+        let tampered: String = chars.into_iter().collect();
+        assert_ne!(tampered, cursor);
+
+        let codec = history_codec();
+        let target = history_target(&repo, &codec);
+        let walks = AtomicUsize::new(0);
+        let error = page_for_target(&target, Some(&tampered), 1, &codec, &HeaderMap::new(), &walks)
+            .await
+            .expect_err("a tampered cursor must be refused");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error.1, "invalid history cursor");
+        assert_eq!(walks.load(Ordering::Relaxed), 0);
+    }
+
+    /// A cursor minted for one repository must not open on a different one, even
+    /// when the two happen to share a generation (byte-identical committed
+    /// topology): the codec's own signature still verifies, so only the scope
+    /// comparison — the same generic 400 — catches it.
+    #[tokio::test]
+    async fn same_generation_other_repository_cursor_is_rejected_before_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = deterministic_repo(dir.path(), "alpha", 3);
+        let beta = deterministic_repo(dir.path(), "beta", 3);
+
+        let (_, _, alpha_body, _) = page_one_parts(&alpha, 1, &HeaderMap::new()).await;
+        let alpha_page: Page = serde_json::from_slice(&alpha_body).unwrap();
+        let cursor = alpha_page.cursor.clone().expect("more rows remain");
+
+        let (_, _, beta_body, _) = page_one_parts(&beta, 1, &HeaderMap::new()).await;
+        let beta_page: Page = serde_json::from_slice(&beta_body).unwrap();
+        assert_eq!(
+            alpha_page.generation, beta_page.generation,
+            "identical committed topology shares one generation"
+        );
+
+        let codec = history_codec();
+        let target = history_target(&beta, &codec);
+        let walks = AtomicUsize::new(0);
+        let error = page_for_target(&target, Some(&cursor), 1, &codec, &HeaderMap::new(), &walks)
+            .await
+            .expect_err(
+                "a cursor minted for one repository must not open on another, \
+                 even at the same generation",
+            );
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error.1, "invalid history cursor");
+        assert_eq!(walks.load(Ordering::Relaxed), 0);
+    }
+
+    /// A registered target's scope binds both halves of its `RepositoryHandle`:
+    /// a cursor minted for one worktree of a repository must not open on a
+    /// sibling worktree of that same repository, even though both share the
+    /// same generation (they are the same committed history).
+    #[tokio::test]
+    async fn same_repository_sibling_worktree_cursor_is_rejected_before_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 3);
+        let path = repo.canonicalize().expect("a temp repo path resolves");
+        let common = path.join(".git");
+        let common_str = common.to_str().expect("a temp path is valid utf-8");
+
+        let repository = RepositoryId::from_common_dir(common_str);
+        let worktree_main = WorktreeId::from_git_dir(common_str);
+        let worktree_other = WorktreeId::from_git_dir(&format!("{common_str}/worktrees/other"));
+        let handle_main = RepositoryHandle::new(repository, worktree_main);
+        let handle_other = RepositoryHandle::new(repository, worktree_other);
+        assert_ne!(handle_main.worktree, handle_other.worktree);
+
+        let codec = history_codec();
+        let scope_main = codec.scope_for_target(Some(&handle_main), &path);
+        let target_other = ResolvedHistoryTarget {
+            path: path.clone(),
+            read_only: false,
+            handle: Some(handle_other),
+            scope: codec.scope_for_target(Some(&handle_other), &path),
+        };
+        assert_ne!(
+            scope_main, target_other.scope,
+            "sibling worktrees of one repository bind different scopes"
+        );
+
+        let snapshot = read_history_snapshot(&path).await.expect("snapshot read");
+        let cursor = codec
+            .encode(scope_main, &snapshot.generation, &HistoryCursor { next_row: 1 })
+            .expect("signing a cursor for the main worktree's scope");
+
+        let walks = AtomicUsize::new(0);
+        let error = page_for_target(
+            &target_other,
+            Some(&cursor),
+            1,
+            &codec,
+            &HeaderMap::new(),
+            &walks,
+        )
+        .await
+        .expect_err("a cursor scoped to a sibling worktree must not open on this one");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error.1, "invalid history cursor");
+        assert_eq!(walks.load(Ordering::Relaxed), 0);
+    }
+
+    /// A shallow boundary set changing — deepening, then unshallowing — moves
+    /// the generation without moving a single ref or either HEAD half. A cursor
+    /// pinned before either move is a stale, rejected-before-walk 409 in both
+    /// directions, and every fresh Frame/Page tag moves with it.
+    #[tokio::test]
+    async fn deepen_without_ref_move_rejects_stale_cursor_with_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 5);
+        let path = repo.canonicalize().unwrap();
+        let head_path = path.join(".git").join("HEAD");
+        let ref_path = path.join(".git").join("refs").join("heads").join("main");
+        let head_before = std::fs::read(&head_path).unwrap();
+        let ref_before = std::fs::read(&ref_path).unwrap();
+
+        let (_, tag_frame_before, _) = frame_parts(&repo, &HeaderMap::new()).await;
+        let (_, tag_page_before, body_before, _) = page_one_parts(&repo, 1, &HeaderMap::new()).await;
+        let page_before: Page = serde_json::from_slice(&body_before).unwrap();
+        let cursor_before = page_before.cursor.clone().expect("more rows remain");
+        let generation_before = page_before.generation.clone();
+
+        let codec = history_codec();
+        let target = history_target(&repo, &codec);
+
+        // --- deepen: record a shallow boundary. Only `.git/shallow` changes.
+        let boundary = out(&repo, &["rev-parse", "HEAD~2"]);
+        std::fs::write(path.join(".git").join("shallow"), format!("{boundary}\n")).unwrap();
+        assert_eq!(std::fs::read(&head_path).unwrap(), head_before, "HEAD is untouched by a deepen");
+        assert_eq!(
+            std::fs::read(&ref_path).unwrap(),
+            ref_before,
+            "the branch ref is untouched by a deepen"
+        );
+
+        let walks_deepen = AtomicUsize::new(0);
+        let error_deepen = page_for_target(
+            &target,
+            Some(&cursor_before),
+            1,
+            &codec,
+            &HeaderMap::new(),
+            &walks_deepen,
+        )
+        .await
+        .expect_err("a cursor pinned before a deepen must be refused");
+        assert_eq!(error_deepen.0, StatusCode::CONFLICT);
+        assert_eq!(walks_deepen.load(Ordering::Relaxed), 0);
+
+        let (_, tag_frame_deepened, _) = frame_parts(&repo, &HeaderMap::new()).await;
+        let (_, tag_page_deepened, body_deepened, _) =
+            page_one_parts(&repo, 1, &HeaderMap::new()).await;
+        let page_deepened: Page = serde_json::from_slice(&body_deepened).unwrap();
+        assert_ne!(
+            generation_before, page_deepened.generation,
+            "the shallow boundary is part of the history generation"
+        );
+        assert_ne!(tag_frame_before, tag_frame_deepened);
+        assert_ne!(tag_page_before, tag_page_deepened);
+        let cursor_deepened = page_deepened.cursor.clone().expect("more rows remain");
+
+        // --- unshallow: clear the boundary. Again, only `.git/shallow` moves.
+        std::fs::remove_file(path.join(".git").join("shallow")).unwrap();
+        assert_eq!(std::fs::read(&head_path).unwrap(), head_before, "HEAD is untouched by an unshallow");
+        assert_eq!(
+            std::fs::read(&ref_path).unwrap(),
+            ref_before,
+            "the branch ref is untouched by an unshallow"
+        );
+
+        let walks_unshallow = AtomicUsize::new(0);
+        let error_unshallow = page_for_target(
+            &target,
+            Some(&cursor_deepened),
+            1,
+            &codec,
+            &HeaderMap::new(),
+            &walks_unshallow,
+        )
+        .await
+        .expect_err("a cursor pinned before an unshallow must be refused");
+        assert_eq!(error_unshallow.0, StatusCode::CONFLICT);
+        assert_eq!(walks_unshallow.load(Ordering::Relaxed), 0);
+
+        let (_, tag_frame_final, _) = frame_parts(&repo, &HeaderMap::new()).await;
+        let (_, tag_page_final, body_final, _) = page_one_parts(&repo, 1, &HeaderMap::new()).await;
+        let page_final: Page = serde_json::from_slice(&body_final).unwrap();
+        assert_ne!(
+            page_deepened.generation, page_final.generation,
+            "unshallowing moves the generation again"
+        );
+        assert_ne!(tag_frame_deepened, tag_frame_final);
+        assert_ne!(tag_page_deepened, tag_page_final);
+    }
+
+    /// Malformed `.git/shallow` content fails the very first combined snapshot
+    /// read `page_for_target` performs — before any cursor is even looked at —
+    /// so it is the handler-level twin of
+    /// `history::tests::malformed_shallow_metadata_is_snapshot_error`: an
+    /// explicit read error, never a silent "unshallow".
+    #[tokio::test]
+    async fn malformed_shallow_metadata_is_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = deterministic_repo(dir.path(), "alpha", 2);
+        std::fs::write(repo.join(".git").join("shallow"), "not-hex\n").unwrap();
+
+        let codec = history_codec();
+        let target = history_target(&repo, &codec);
+        let walks = AtomicUsize::new(0);
+        let error = page_for_target(&target, None, DEFAULT_PAGE_LIMIT, &codec, &HeaderMap::new(), &walks)
+            .await
+            .expect_err("malformed shallow metadata must be an explicit error, not a silent unshallow");
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(error.1.contains("shallow"), "{}", error.1);
+        assert_eq!(
+            walks.load(Ordering::Relaxed),
+            0,
+            "the snapshot read fails before the walk counter ever moves"
+        );
+    }
+
+    /// A traversal failure and a concurrent repository move can happen
+    /// together; the combined re-read this triggers must report the move, not
+    /// the walk's own error — a 409 always outranks a simultaneous read error.
+    #[tokio::test]
+    async fn walk_error_after_snapshot_move_returns_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, tip, root) = deep_linear_repo(dir.path(), 1_500);
+        // The root is visited last under `DateOrder`, so the walk must process
+        // nearly the entire history before failing — the racer's whole window.
+        std::fs::remove_file(loose_object(&repo, &root)).expect("the root is a real loose object");
+
+        let tree = out(&repo, &["rev-parse", &format!("{tip}^{{tree}}")]);
+        let extra = out(&repo, &["commit-tree", &tree, "-p", &tip, "-m", "extra"]);
+        let racer = race_ref_move(&repo, "refs/heads/main", &extra);
+
+        let codec = history_codec();
+        let target = history_target(&repo, &codec);
+        let walks = AtomicUsize::new(0);
+        let error = page_for_target(&target, None, 1_500, &codec, &HeaderMap::new(), &walks)
+            .await
+            .expect_err("a walk that fails while the repository has moved must report the move");
+        racer.join().unwrap();
+
+        assert_eq!(
+            error.0,
+            StatusCode::CONFLICT,
+            "drift takes precedence over the walk's own error: {error:?}"
+        );
+        assert_eq!(error.1, "history moved");
+        assert_eq!(walks.load(Ordering::Relaxed), 1, "the walk ran once before failing");
+    }
+
+    /// The same missing-object failure, but nothing else moves: the combined
+    /// re-read finds the identical generation, so the explicit read error is
+    /// surfaced rather than an invented conflict.
+    #[tokio::test]
+    async fn walk_error_with_stable_snapshot_returns_explicit_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, _tip, root) = deep_linear_repo(dir.path(), 30);
+        std::fs::remove_file(loose_object(&repo, &root)).expect("the root is a real loose object");
+
+        let codec = history_codec();
+        let target = history_target(&repo, &codec);
+        let walks = AtomicUsize::new(0);
+        let error = page_for_target(&target, None, MAX_PAGE_LIMIT, &codec, &HeaderMap::new(), &walks)
+            .await
+            .expect_err("a missing commit object must surface as an explicit read error");
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(
+            error.0,
+            StatusCode::CONFLICT,
+            "nothing moved, so this must never be reported as drift"
+        );
+        assert_eq!(walks.load(Ordering::Relaxed), 1, "the walk counted its one attempt before failing");
+    }
 }
