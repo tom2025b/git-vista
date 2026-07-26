@@ -84,6 +84,13 @@ pub fn label_x(lane_count: usize) -> i32 {
 /// ([`edge_path`]): at its two endpoint rows the curve is still within a lane
 /// of the endpoint (the bulge allowance below), and on rows strictly between it
 /// can be anywhere between the lanes, so those take the outer lane.
+///
+/// M1.10 (#63): the *paged* views no longer call this — a page-at-a-time graph
+/// grows its occupancy incrementally and monotonically inside
+/// [`crate::history::LoadedHistory`], which reads back through
+/// `LoadedHistory::text_x`. This whole-`Graph` form stays as the documented
+/// reference the incremental one mirrors, pinned by the tests below.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn label_x_per_row(graph: &Graph) -> Vec<i32> {
     // Every row is at least as wide as its own dot.
     let mut occ: Vec<usize> = graph.rows.iter().map(|r| r.lane).collect();
@@ -198,11 +205,25 @@ const STUB_TOP_MARGIN: i32 = 6;
 /// half-clipped at the default view, invisible until the user pans. Returns the
 /// overshoot of the highest ring past the top edge (plus a small margin), or
 /// zero when nothing reaches above the canvas.
+///
+/// M1.10 (#63): the paged views place stubs from
+/// [`ResolvedStub`](crate::history::ResolvedStub), which is not a `BranchStub`,
+/// so they call [`stub_headroom_for`] with the same `(anchor_row, depth)` pairs.
+/// This form stays as the whole-`Graph` reference its tests below pin.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn stub_headroom(stubs: &[BranchStub]) -> f64 {
+    stub_headroom_for(stubs.iter().map(|s| (s.anchor_row, s.depth)))
+}
+
+/// [`stub_headroom`] over bare `(anchor_row, depth)` pairs, so a caller holding
+/// resolved paged stubs doesn't have to fabricate `BranchStub`s to ask how far
+/// down the home camera must sit.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn stub_headroom_for(stubs: impl IntoIterator<Item = (usize, usize)>) -> f64 {
     stubs
-        .iter()
-        .map(|s| stub_node_cy(s.anchor_row, s.depth) - NODE_RADIUS - STUB_TOP_MARGIN)
+        .into_iter()
+        .map(|(anchor_row, depth)| stub_node_cy(anchor_row, depth) - NODE_RADIUS - STUB_TOP_MARGIN)
         .min()
         .map_or(0.0, |top| (-top).max(0) as f64)
 }
@@ -523,5 +544,278 @@ mod tests {
         let d = edge_path(&curved);
         assert!(d.starts_with('M'), "starts with a move");
         assert!(d.contains(" C "), "lane-changing edge is a cubic curve");
+    }
+
+    // ---- paged-history geometry (M1.10, #63) --------------------------------
+    //
+    // [`label_x_per_row`] above computes label geometry from a whole `Graph`, which
+    // only exists when the entire history has arrived. Paged history never has
+    // that: rows appear a page at a time, so geometry is *grown* by
+    // [`crate::history::LoadedHistory`] instead — each append widens rows, never
+    // narrows them. These tests pin that monotonicity and the resolved-stub
+    // placement, reading geometry only through the aggregate's `label_occupancy()`
+    // / `text_x()` accessors, because the backing vectors are private precisely so
+    // nothing outside that module can shrink them.
+
+    use crate::history::{LoadedHistory, Page, ResolvedStub};
+    use git_vista_core::model::{CommitSummary, FrameStub, GraphRow, Oid};
+    use git_vista_protocol::GenerationToken;
+
+    /// Every fixture page below belongs to one repository generation.
+    const GEN: &str = "g1";
+
+    fn hrow(index: usize, lane: usize, id: &str) -> GraphRow {
+        GraphRow {
+            commit: CommitSummary {
+                id: Oid(id.into()),
+                parents: vec![],
+                summary: format!("commit {id}"),
+                author: "tester".into(),
+                time: 0,
+            },
+            row: index,
+            lane,
+            refs: vec![],
+            color: 0,
+            on_remote: false,
+        }
+    }
+
+    fn hedge(from_row: usize, from_lane: usize, to_row: usize, to_lane: usize) -> Edge {
+        Edge {
+            from_row,
+            from_lane,
+            to_row,
+            to_lane,
+        }
+    }
+
+    fn hstub(name: &str, anchor: &str, lane_offset: usize) -> FrameStub {
+        FrameStub {
+            name: name.into(),
+            anchor_commit: Oid(anchor.into()),
+            lane_offset,
+            color: 3,
+            depth: 0,
+        }
+    }
+
+    fn hpage(
+        rows: Vec<GraphRow>,
+        edges: Vec<Edge>,
+        stubs: Vec<FrameStub>,
+        lane_count: usize,
+        cursor: Option<&str>,
+    ) -> Page {
+        Page {
+            rows,
+            edges,
+            stubs,
+            lane_count,
+            cursor: cursor.map(str::to_owned),
+            generation: GenerationToken::new(GEN).expect("test generation token"),
+        }
+    }
+
+    /// Page 1 for these tests: rows 0..2 in lane 0, joined by the straight edge.
+    fn hseeded() -> LoadedHistory {
+        LoadedHistory::from_first_page(hpage(
+            vec![hrow(0, 0, "aaa0"), hrow(1, 0, "bbb1")],
+            vec![hedge(0, 0, 1, 0)],
+            vec![],
+            1,
+            Some("c1"),
+        ))
+        .expect("page 1 is valid")
+    }
+
+    /// Nothing an append does may pull a row's label back toward the graph: a
+    /// label that jumps left under the reader's eye is the failure mode this
+    /// whole incremental path exists to prevent.
+    fn assert_no_shrink(before: &[usize], after: &[usize]) {
+        for (r, b) in before.iter().enumerate() {
+            assert!(
+                after[r] >= *b,
+                "row {r} occupancy shrank from {b} to {}",
+                after[r]
+            );
+        }
+    }
+
+    #[test]
+    fn cross_page_edge_monotonically_widens_old_label() {
+        let mut history = hseeded();
+        let occupancy_before = history.label_occupancy().to_vec();
+        let text_x_before = history.text_x().to_vec();
+
+        // Page 2 lands a commit in lane 1 whose edge starts back in page 1: the
+        // curve now sweeps across rows the prefix already drew, so their labels
+        // must move right to clear it.
+        let delta = history
+            .append_page(
+                "c1",
+                hpage(
+                    vec![hrow(2, 1, "ccc2")],
+                    vec![hedge(0, 0, 2, 1)],
+                    vec![],
+                    2,
+                    None,
+                ),
+            )
+            .expect("a cross-page source edge is valid on the destination's page");
+
+        assert!(delta.prefix_geometry_changed);
+        let occupancy_after = history.label_occupancy();
+        assert_no_shrink(&occupancy_before, occupancy_after);
+        // Endpoint row 0 allows one lane of bulge (capped at the outer lane);
+        // middle row 1 takes the outer lane outright.
+        assert_eq!(occupancy_after, [1, 1, 1]);
+        assert!(
+            history.text_x()[0] > text_x_before[0],
+            "the old label moved right, from {} to {}",
+            text_x_before[0],
+            history.text_x()[0]
+        );
+        assert_eq!(history.text_x()[1], node_cx(1) + LABEL_GAP);
+    }
+
+    #[test]
+    fn straight_append_does_not_rekey_prefix() {
+        let mut history = hseeded();
+        let occupancy_before = history.label_occupancy().to_vec();
+        let text_x_before = history.text_x().to_vec();
+
+        // A commit straight below the tip in the same lane touches nothing above
+        // it, so every prefix label must keep the exact x it already had —
+        // otherwise every page would repaint the whole graph.
+        let delta = history
+            .append_page(
+                "c1",
+                hpage(
+                    vec![hrow(2, 0, "ccc2")],
+                    vec![hedge(1, 0, 2, 0)],
+                    vec![],
+                    1,
+                    None,
+                ),
+            )
+            .expect("a straight same-lane page 2 is valid");
+
+        assert!(!delta.prefix_geometry_changed);
+        assert_eq!(&history.label_occupancy()[..2], &occupancy_before[..]);
+        assert_eq!(&history.text_x()[..2], &text_x_before[..]);
+        assert_eq!(history.text_x()[2], node_cx(0) + LABEL_GAP);
+    }
+
+    #[test]
+    fn lane_high_water_shift_rekeys_all_resolved_stubs() {
+        // Page 1 carries a stub on its own anchor, so it is already resolved and
+        // already widening the row its ring hangs over.
+        let mut history = LoadedHistory::from_first_page(hpage(
+            vec![hrow(0, 0, "aaa0"), hrow(1, 0, "bbb1")],
+            vec![hedge(0, 0, 1, 0)],
+            vec![hstub("wip", "aaa0", 0)],
+            1,
+            Some("c1"),
+        ))
+        .expect("page 1 is valid");
+        assert_eq!(
+            history.resolved_stubs()[0].lane,
+            1,
+            "stub columns start past the commit lanes"
+        );
+        let occupancy_before = history.label_occupancy().to_vec();
+
+        // Page 2 raises the commit-lane high-water. Stub lanes are *relative* to
+        // it, so a stub that resolved pages ago slides right even though this page
+        // delivered no stub of its own.
+        let delta = history
+            .append_page(
+                "c1",
+                hpage(
+                    vec![hrow(2, 1, "ccc2")],
+                    vec![hedge(1, 0, 2, 1)],
+                    vec![],
+                    3,
+                    None,
+                ),
+            )
+            .expect("a page raising the lane high-water is valid");
+
+        assert!(delta.stub_geometry_changed);
+        assert_eq!(
+            history.resolved_stubs()[0].lane,
+            3,
+            "high-water 3 + offset 0"
+        );
+        assert_no_shrink(&occupancy_before, history.label_occupancy());
+        assert_eq!(
+            history.label_occupancy()[0],
+            3,
+            "the shifted ring drags its anchor row's label with it"
+        );
+        assert_eq!(history.text_x()[0], node_cx(3) + LABEL_GAP);
+    }
+
+    #[test]
+    fn same_page_stub_resolves_by_oid() {
+        let mut history = hseeded();
+
+        // The page delivering a stub also delivers its anchor commit, so the
+        // aggregate can place it the moment it arrives.
+        history
+            .append_page(
+                "c1",
+                hpage(
+                    vec![hrow(2, 1, "ccc2")],
+                    vec![hedge(1, 0, 2, 1)],
+                    vec![hstub("wip", "ccc2", 1)],
+                    2,
+                    None,
+                ),
+            )
+            .expect("a page carrying its stub's anchor is valid");
+
+        assert_eq!(
+            history.resolved_stubs(),
+            vec![ResolvedStub {
+                stub: hstub("wip", "ccc2", 1),
+                anchor_row: 2,
+                anchor_lane: 1,
+                lane: 3,
+            }],
+            "anchor row/lane come from the indexed commit; lane is high-water + offset"
+        );
+    }
+
+    #[test]
+    fn unresolved_stub_is_skipped_defensively() {
+        let mut history = hseeded();
+
+        // A stub whose anchor_commit matches no loaded row. This is malformed
+        // input, not a sequence the server is allowed to produce; the client keeps
+        // it rather than indexing it so a bad payload degrades to "not drawn"
+        // instead of a panic in the middle of a render.
+        history
+            .append_page(
+                "c1",
+                hpage(
+                    vec![hrow(2, 0, "ccc2")],
+                    vec![hedge(1, 0, 2, 0)],
+                    vec![hstub("orphan", "zzz9", 0)],
+                    1,
+                    None,
+                ),
+            )
+            .expect("the page's own rows and edges are still valid");
+
+        assert!(
+            history.resolved_stubs().is_empty(),
+            "an unknown anchor yields no placement"
+        );
+        assert_eq!(history.stubs.len(), 1, "but the stub is retained");
+        // Geometry is complete and untouched by the orphan.
+        assert_eq!(history.text_x().len(), history.rows.len());
+        assert_eq!(history.label_occupancy(), [0, 0, 0]);
     }
 }
