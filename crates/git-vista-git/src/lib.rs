@@ -38,7 +38,7 @@ pub use identity::{
     read_generation, read_generation_inputs, read_handle, read_repo_facts, RepoFacts, WorktreeKind,
 };
 pub use reflog::read_reflogs;
-pub use refs::{read_head_branch, read_refs};
+pub use refs::{read_head_branch, read_history_materials, read_refs, HistoryMaterials};
 
 #[derive(Debug, Error)]
 pub enum RepoError {
