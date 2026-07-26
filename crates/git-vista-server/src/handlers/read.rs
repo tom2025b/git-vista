@@ -2950,11 +2950,7 @@ mod tests {
     /// return just the `Cookie` header value. Duplicated from `main.rs`'s own
     /// test helper of the same shape (private to that module, unreachable from
     /// here) rather than exposed across the crate for one shared test helper.
-    async fn bootstrap_cookie_for(
-        router: Router,
-        host: &str,
-        token: &str,
-    ) -> String {
+    async fn bootstrap_cookie_for(router: Router, host: &str, token: &str) -> String {
         let resp = router
             .oneshot(
                 axum::http::Request::builder()
@@ -3006,16 +3002,15 @@ mod tests {
                 rate_limiter: None,
             };
             let hosts = if via_lan {
-                crate::security::HostPolicy::lan("192.168.1.42".parse().unwrap(), crate::state::PORT)
+                crate::security::HostPolicy::lan(
+                    "192.168.1.42".parse().unwrap(),
+                    crate::state::PORT,
+                )
             } else {
                 crate::security::HostPolicy::loopback(crate::state::PORT)
             };
-            let router = crate::api_router(
-                session_state,
-                hosts,
-                full_routes,
-                Arc::new(history_codec()),
-            );
+            let router =
+                crate::api_router(session_state, hosts, full_routes, Arc::new(history_codec()));
             let cookie = bootstrap_cookie_for(router.clone(), host, &token).await;
 
             for (method, uri) in [("GET", "/api/frame"), ("GET", "/api/commits")] {
@@ -3084,8 +3079,7 @@ mod tests {
     /// worst case stays comfortably inside it.
     #[test]
     fn default_page_pathological_fixture_is_at_most_512_kib() {
-        let long_author =
-            "Alexandra Christodoulopoulou-Fitzgerald-Nakamura-Petrov \
+        let long_author = "Alexandra Christodoulopoulou-Fitzgerald-Nakamura-Petrov \
              <alexandra.christodoulopoulou-fitzgerald-nakamura-petrov@\
              an-extremely-long-corporate-engineering-subdomain.example-enterprises.co.uk>";
         let long_summary = "refactor(auth,session): replace the legacy cookie-based session \

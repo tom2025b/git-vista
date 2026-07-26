@@ -100,11 +100,11 @@ use handlers::protocol::protocol_info;
 use handlers::read::{
     commit_detail, commit_diff, commits, file_at_commit, frame, head_branch, worktree_status,
 };
-use history::CursorCodec;
 use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
 use handlers::select::{rescan, select_repo};
 use handlers::session::{create_session, revoke_session, session_status, SessionState};
+use history::CursorCodec;
 use ratelimit::SignInLimiter;
 use security::{AuthState, HostPolicy};
 use session::{SessionManager, BOOTSTRAP_REFRESH_INTERVAL};
