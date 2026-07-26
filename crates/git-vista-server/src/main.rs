@@ -46,6 +46,13 @@ mod coordinator;
 mod durable;
 mod git_cmd;
 mod handlers;
+// M1.10 Task 3 (#63): the paged-history snapshot (refs + HEAD + shallow), its
+// `history-v1` generation token, and the Frame/Page representation validators.
+// Task 4 wires these into the frame/page handlers; until then nothing in the
+// binary target calls them, so the narrow allow keeps `-D warnings` honest
+// without deleting tested, plan-mandated seams.
+#[allow(dead_code)]
+mod history;
 mod journal;
 // The versioned-API-contract layer (M1.02, #102): protocol negotiation, the
 // request id, the structured error envelope, and the contract response headers.

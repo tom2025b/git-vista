@@ -67,12 +67,21 @@ const SESSION_IDLE_TTL: Duration = Duration::from_secs(SESSION_MAX_AGE_SECS);
 /// from the OS CSPRNG, hex-encoded to 64 ASCII chars.
 const SECRET_BYTES: usize = 32;
 
-/// A fresh, high-entropy secret as lowercase hex. Panics only if the OS entropy
-/// source fails, which on a running server is unrecoverable.
+/// 256 fresh bits straight from the OS CSPRNG — the single entropy tap behind
+/// every secret this server holds: the session/bootstrap/CSRF secrets below
+/// (hex-encoded via [`mint_secret`]) and the paged-history cursor-signing key
+/// ([`crate::history`], M1.10 #63), which wants the raw bytes. Panics only if
+/// the OS entropy source fails, which on a running server is unrecoverable.
+pub(crate) fn random_secret_bytes() -> [u8; 32] {
+    let mut bytes = [0_u8; SECRET_BYTES];
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable");
+    bytes
+}
+
+/// A fresh, high-entropy secret as lowercase hex. The token text format is
+/// unchanged: [`SECRET_BYTES`] = 32 bytes, 64 lowercase hex characters.
 fn mint_secret() -> String {
-    let mut buf = [0u8; SECRET_BYTES];
-    getrandom::getrandom(&mut buf).expect("OS CSPRNG (getrandom) unavailable");
-    to_hex(&buf)
+    to_hex(&random_secret_bytes())
 }
 
 /// Lowercase-hex encode — a handful of bytes, so a tiny inline encoder beats a
