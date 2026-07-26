@@ -10,19 +10,28 @@
 //!
 //! While open it stamps `data-print` on `<html>` so the `@media print` rules
 //! print only the sheet, scaled to the page width and flowing across pages.
+//!
+//! Since M1.10 (#63) "the whole graph" is whatever the mounted [`RenderCtx`]
+//! holds, and the sheet is built from *that* — never from a snapshot taken when
+//! the view opened, and never by fetching pages of its own. Printing half a
+//! history would be a quietly wrong document, so the topbar button that opens
+//! this view is disabled until every page has landed (`history_complete`), and
+//! any epoch change closes it. Reading straight out of the aggregate is what
+//! makes "what you printed is what was loaded" true by construction.
 
 use leptos::*;
 
 use git_vista_core::color::{branch_color, BADGE_DARK, HEAD_BADGE, TAG_BADGE};
-use git_vista_core::model::{Graph, RefKind};
+use git_vista_core::model::RefKind;
 
 use crate::datetime::local_timestamp;
 use crate::geometry::{
     badge_text_dx, badge_text_y, badge_top_y, badge_width, edge_path, label_bottom_y, label_top_y,
-    label_x_per_row, node_cx, node_cy, stub_headroom, stub_node_cy, stub_path, BADGE_GAP,
-    BADGE_HEIGHT, BADGE_RADIUS, NODE_RADIUS, PAD_Y, ROW_HEIGHT,
+    node_cx, node_cy, stub_headroom_for, stub_node_cy, stub_path, BADGE_GAP, BADGE_HEIGHT,
+    BADGE_RADIUS, NODE_RADIUS, PAD_Y, ROW_HEIGHT,
 };
 use crate::icons::icon_set;
+use crate::render::RenderCtx;
 use crate::text::truncate;
 
 /// Same truncation the interactive labels use (render/labels.rs).
@@ -91,14 +100,16 @@ fn scale_button(scale: RwSignal<PrintScale>, this: PrintScale) -> impl IntoView 
 /// The "Print Graph" overlay: a white preview sheet holding the full static
 /// graph SVG, a Normal/Large/Extra-Large size picker, and one Print / Save PDF
 /// button (plus Close). Rendered while `open` is true.
+///
+/// `ctx` is the mounted canvas's own aggregate — the same `StoredValue` every
+/// row builder reads, borrowed, not copied. That is why this view lives inside
+/// `graph_canvas`: it has no history of its own to go stale, and it is disposed
+/// with the canvas the moment the epoch it belongs to is retired.
 pub fn print_graph_view(
-    graph: Graph,
+    ctx: StoredValue<RenderCtx>,
     open: RwSignal<bool>,
     nerd_icons: RwSignal<bool>,
 ) -> impl IntoView {
-    // The graph parks in a StoredValue so the reactive closure below can read
-    // it per open without cloning it into every render.
-    let graph = store_value(graph);
     // Print magnification. Read only by the sheet wrapper's reactive width
     // below, so toggling it re-styles that one wrapper without rebuilding the
     // SVG — and never touches the interactive canvas.
@@ -107,9 +118,12 @@ pub fn print_graph_view(
         let is_open = open.get();
         set_print_attr(is_open);
         is_open.then(|| {
-            let sheet = graph.with_value(|g| graph_sheet(g, nerd_icons.get()));
-            let repo = graph
-                .with_value(|g| g.repo_label.clone())
+            // Built per *open*, straight out of the live aggregate: the sheet is
+            // a rendering of what is loaded right now, not a snapshot kept
+            // alongside it that a later page could contradict.
+            let sheet = ctx.with_value(|c| graph_sheet(c, nerd_icons.get()));
+            let repo = ctx
+                .with_value(|c| c.frame.repo_label.clone())
                 .unwrap_or_default();
             view! {
                 <div class="print-graph-modal print-surface">
