@@ -1,1 +1,43 @@
-{}
+{
+  "generation": "12345678901234567890",
+  "refs": [
+    {
+      "name": "HEAD",
+      "kind": "Head",
+      "target": "1111111111111111111111111111111111111111"
+    },
+    {
+      "name": "main",
+      "kind": "Branch",
+      "target": "1111111111111111111111111111111111111111"
+    },
+    {
+      "name": "origin/main",
+      "kind": "RemoteBranch",
+      "target": "2222222222222222222222222222222222222222"
+    },
+    {
+      "name": "v1.0.0",
+      "kind": "Tag",
+      "target": "3333333333333333333333333333333333333333"
+    }
+  ],
+  "head_branch": "main",
+  "branch_colors": [
+    [
+      "main",
+      0
+    ],
+    [
+      "origin/main",
+      1
+    ]
+  ],
+  "repo_label": "git-vista-test",
+  "repo_id": "repo-abc",
+  "worktree_id": "worktree-def",
+  "read_only": false,
+  "resettable": true,
+  "repo_url": "https://github.com/owner/repo",
+  "remote_web_url": "https://github.com/owner/repo"
+}
