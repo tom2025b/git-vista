@@ -7,6 +7,7 @@
 //! bounded set of requested ids with no cap at all (M1.10, #63).
 
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use gix::refs::Category;
@@ -115,6 +116,69 @@ pub fn walk_history(path: &Path, limit: usize) -> Result<Vec<CommitSummary>, Rep
     }
 
     Ok(commits)
+}
+
+// INTERMEDIATE SCAFFOLD (M1.10 #63 Task 4 Step 3) — the pre-existing newest-first
+// walk, lifted behind the new signature so the Step 3/5 tests can run red against
+// something real. It has no shallow adapter and no topological ordering; both are
+// what the tests are about.
+pub fn walk_history_topo<F>(
+    path: &Path,
+    sorted_tips: &[(String, Oid)],
+    _shallow_boundaries: &[Oid],
+    mut visit: F,
+) -> Result<(), RepoError>
+where
+    F: FnMut(CommitSummary) -> ControlFlow<()>,
+{
+    let repo =
+        gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
+
+    let mut seen = HashSet::new();
+    let mut tips: Vec<gix::ObjectId> = Vec::new();
+    for (full_name, oid) in sorted_tips {
+        let parsed = gix::ObjectId::from_hex(oid.0.as_bytes())
+            .map_err(|e| RepoError::Walk(format!("malformed tip id for {full_name}: {e}")))?;
+        if seen.insert(parsed) {
+            tips.push(parsed);
+        }
+    }
+    if tips.is_empty() {
+        return Ok(());
+    }
+
+    let walk = repo
+        .rev_walk(tips)
+        .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst))
+        .all()
+        .map_err(|e| RepoError::Walk(e.to_string()))?;
+
+    for info in walk {
+        let info = info.map_err(|e| RepoError::Walk(e.to_string()))?;
+        let commit = info.object().map_err(|e| RepoError::Walk(e.to_string()))?;
+        let summary = CommitSummary {
+            id: Oid(info.id().detach().to_string()),
+            parents: info.parent_ids().map(|p| Oid(p.detach().to_string())).collect(),
+            summary: commit
+                .message()
+                .map(|m| m.summary().to_string())
+                .unwrap_or_default(),
+            author: commit
+                .author()
+                .map(|a| a.name.to_string())
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            time: info.commit_time(),
+        };
+        if visit(summary).is_break() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Read one commit in full, by its hex id (Phase 10 — the detail panel).
@@ -399,6 +463,109 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Run a git command in `dir` feeding it `stdin`, returning trimmed stdout.
+    ///
+    /// Needed for `git hash-object --literally`, the only way to plant a commit
+    /// object whose parent header names something git would never write.
+    fn git_stdin(dir: &Path, args: &[&str], stdin: &[u8]) -> String {
+        use std::io::Write;
+
+        let mut child = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("git should be runnable");
+        child
+            .stdin
+            .take()
+            .expect("stdin is piped")
+            .write_all(stdin)
+            .expect("writing git stdin");
+        let output = child.wait_with_output().expect("git should finish");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Merge `other` into the checked-out branch as a real merge commit with a
+    /// pinned timestamp, so reconvergence fixtures are byte-stable.
+    fn merge(dir: &Path, message: &str, ts: i64, other: &str) {
+        let date = format!("@{ts} +0000");
+        Command::new("git")
+            .args(["merge", "-q", "--no-ff", "-m", message, other])
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "Ada Lovelace")
+            .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_NAME", "Ada Lovelace")
+            .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .status()
+            .expect("git merge should run")
+            .success()
+            .then_some(())
+            .expect("git merge failed");
+    }
+
+    /// Path of a loose object inside `repo`'s object database.
+    fn loose_object_path(repo: &Path, oid: &Oid) -> std::path::PathBuf {
+        repo.join(".git")
+            .join("objects")
+            .join(&oid.0[..2])
+            .join(&oid.0[2..])
+    }
+
+    /// Every full-named ref tip plus a `HEAD` pseudo-tip, exactly as the server's
+    /// history snapshot assembles them — but deliberately in the ref store's own
+    /// enumeration order, so tests can shuffle it before canonicalising.
+    fn enumerated_tips(repo: &Path) -> Vec<(String, Oid)> {
+        let materials = crate::read_history_materials(repo).expect("reading history materials");
+        let mut tips = materials.full_ref_targets.clone();
+        if let Some(head) = materials.resolved_head.clone() {
+            if !tips.iter().any(|(_, oid)| *oid == head) {
+                tips.push(("HEAD".to_string(), head));
+            }
+        }
+        tips
+    }
+
+    /// The canonical tip list `HistorySnapshot` supplies: sorted by full ref name
+    /// then object id, with exact duplicates dropped. Object-id de-duplication is
+    /// `walk_history_topo`'s own job and deliberately not done here.
+    fn canonical_tips(mut tips: Vec<(String, Oid)>) -> Vec<(String, Oid)> {
+        tips.sort_by(|a, b| (&a.0, &a.1 .0).cmp(&(&b.0, &b.1 .0)));
+        tips.dedup();
+        tips
+    }
+
+    /// The canonical shallow-boundary set `HistorySnapshot` supplies: sorted by
+    /// object id and de-duplicated.
+    fn canonical_boundaries(mut boundaries: Vec<Oid>) -> Vec<Oid> {
+        boundaries.sort_by(|a, b| a.0.cmp(&b.0));
+        boundaries.dedup();
+        boundaries
+    }
+
+    /// Drain a whole `walk_history_topo` into a vector.
+    fn topo_walk(
+        repo: &Path,
+        tips: &[(String, Oid)],
+        boundaries: &[Oid],
+    ) -> Result<Vec<CommitSummary>, RepoError> {
+        let mut out = Vec::new();
+        walk_history_topo(repo, tips, boundaries, |commit| {
+            out.push(commit);
+            ControlFlow::Continue(())
+        })?;
+        Ok(out)
     }
 
     /// A **real** repository holding `count` linear commits on `main`, with
@@ -790,5 +957,403 @@ pub(crate) mod tests {
             0,
             "feature is distinct from the trunk"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // M1.10 (#63) Task 4 Step 3 — shallow-aware Topo `DateOrder` traversal.
+    //
+    // All three of these run against **real** repositories: a synthetic
+    // membership fixture cannot show what gix does when an object genuinely
+    // isn't in the store, which is the entire question here.
+    // ---------------------------------------------------------------------
+
+    /// A depth-one clone is the real shape of the problem: git keeps the tip's
+    /// commit object byte-for-byte, so it still carries a `parent` header naming
+    /// an object that was never fetched, and records that tip in `.git/shallow`.
+    ///
+    /// The walk must stop there because the boundary is *recorded*, and must
+    /// still fail loudly when it isn't — shallow state is never inferred from a
+    /// lookup that didn't work out.
+    #[test]
+    fn walk_history_topo_stops_at_recorded_shallow_boundary() {
+        let src = tempfile::tempdir().unwrap();
+        let s = src.path();
+        git(s, &["init", "-q", "-b", "main"]);
+        commit(s, "root", 1);
+        commit(s, "middle", 2);
+        commit(s, "tip", 3);
+
+        // `--depth` is only honoured over a transport, hence the file:// URL.
+        let home = tempfile::tempdir().unwrap();
+        let url = format!("file://{}", s.display());
+        git(
+            home.path(),
+            &["clone", "-q", "--depth", "1", url.as_str(), "shallow"],
+        );
+        let repo = home.path().join("shallow");
+
+        let materials = crate::read_history_materials(&repo).unwrap();
+        let boundaries = canonical_boundaries(materials.shallow.clone());
+        assert_eq!(
+            boundaries.len(),
+            1,
+            "a depth-one clone records exactly one boundary"
+        );
+        let boundary = boundaries[0].clone();
+
+        // The fixture's premise: the boundary commit still names a parent, and
+        // that parent genuinely is not in this repository's object database.
+        let raw = git_out(&repo, &["cat-file", "-p", &boundary.0]);
+        let absent = raw
+            .lines()
+            .find_map(|line| line.strip_prefix("parent "))
+            .expect("the boundary commit still carries a parent header")
+            .to_string();
+        assert!(
+            !Command::new("git")
+                .args(["cat-file", "-e", &absent])
+                .current_dir(&repo)
+                .status()
+                .expect("git should be runnable")
+                .success(),
+            "the named parent must genuinely be absent"
+        );
+
+        let tips = canonical_tips(enumerated_tips(&repo));
+        let walked = topo_walk(&repo, &tips, &boundaries)
+            .expect("the recorded boundary makes the traversal finite");
+
+        assert_eq!(
+            walked.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            vec![boundary.clone()],
+            "only the boundary commit itself is emitted"
+        );
+        assert!(
+            walked[0].parents.is_empty(),
+            "a recorded boundary is delivered parentless, so it lays out as a root"
+        );
+
+        // Same repository, same tips, no recorded boundary: a hard error naming
+        // the object that could not be read.
+        let err = topo_walk(&repo, &tips, &[]).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, RepoError::Walk(_)),
+            "an unreadable parent is a read error, got {err:?}"
+        );
+        assert!(
+            text.contains(&absent),
+            "the error must name the absent parent, got {text:?}"
+        );
+    }
+
+    /// An object simply missing from the store, with nothing recording it as a
+    /// boundary, must propagate. Recording the *missing object itself* does not
+    /// excuse it either; only a commit whose own id is recorded loses parents.
+    #[test]
+    fn walk_history_topo_rejects_unrecorded_missing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        commit(repo, "root", 1);
+        commit(repo, "middle", 2);
+        commit(repo, "tip", 3);
+
+        let oid = |spec: &str| Oid(git_out(repo, &["rev-parse", spec]));
+        let tip = oid("HEAD");
+        let middle = oid("HEAD~1");
+        let root = oid("HEAD~2");
+        let tips = canonical_tips(enumerated_tips(repo));
+
+        std::fs::remove_file(loose_object_path(repo, &root))
+            .expect("the root should be a loose object");
+
+        let err = topo_walk(repo, &tips, &[]).unwrap_err();
+        assert!(
+            matches!(err, RepoError::Walk(_)),
+            "a missing parent is a read error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&root.0),
+            "the error must name the missing object, got {err}"
+        );
+
+        // A recorded boundary whose *object* is gone is still an error: the
+        // boundary commit has to be loaded and validated before it can be cut.
+        let err = topo_walk(repo, &tips, std::slice::from_ref(&root)).unwrap_err();
+        assert!(
+            err.to_string().contains(&root.0),
+            "a missing boundary object is still an error, got {err}"
+        );
+
+        // Recording the *child* is what cuts the edge, and it cuts only its own
+        // parents: the tip above it keeps the real parent it names.
+        let walked = topo_walk(repo, &tips, std::slice::from_ref(&middle))
+            .expect("recording the commit whose parent is absent makes the walk finite");
+        assert_eq!(
+            walked.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            vec![tip.clone(), middle.clone()]
+        );
+        assert!(
+            walked[1].parents.is_empty(),
+            "the recorded boundary lost its parents"
+        );
+        assert_eq!(
+            walked[0].parents,
+            vec![middle],
+            "a non-boundary commit keeps every parent it names"
+        );
+    }
+
+    /// Two independent malformed-store cases that must never be mistaken for a
+    /// shallow cut: a parent header pointing at a blob, and a parent object whose
+    /// bytes on disk are corrupt.
+    #[test]
+    fn walk_history_topo_rejects_wrong_kind_or_corrupt_parent() {
+        // --- wrong kind: the parent header names a blob -------------------
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            git(repo, &["init", "-q", "-b", "main"]);
+
+            let blob = git_stdin(repo, &["hash-object", "-w", "--stdin"], b"not a commit");
+            let tree = git_out(repo, &["hash-object", "-t", "tree", "-w", "/dev/null"]);
+            // `--literally` is the only way to write a commit git would refuse to
+            // build, which is exactly the corrupt repository we need to survive.
+            let bytes = format!(
+                "tree {tree}\nparent {blob}\n\
+                 author Ada Lovelace <ada@example.com> 5 +0000\n\
+                 committer Ada Lovelace <ada@example.com> 5 +0000\n\n\
+                 wrong-kind parent\n"
+            );
+            let head = git_stdin(
+                repo,
+                &["hash-object", "-t", "commit", "-w", "--stdin", "--literally"],
+                bytes.as_bytes(),
+            );
+            git(repo, &["update-ref", "refs/heads/main", &head]);
+
+            let tips = canonical_tips(enumerated_tips(repo));
+            let err = topo_walk(repo, &tips, &[]).unwrap_err();
+            assert!(
+                matches!(err, RepoError::Walk(_)),
+                "a wrong-kind parent is a read error, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains(&blob),
+                "the error must name the offending object, got {err}"
+            );
+        }
+
+        // --- corrupt: the parent object's bytes are garbage ---------------
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            git(repo, &["init", "-q", "-b", "main"]);
+            commit(repo, "root", 1);
+            commit(repo, "child", 2);
+
+            let child = Oid(git_out(repo, &["rev-parse", "HEAD"]));
+            let root = Oid(git_out(repo, &["rev-parse", "HEAD~1"]));
+            let tips = canonical_tips(enumerated_tips(repo));
+
+            // Loose objects are written read-only, so replace rather than patch.
+            let path = loose_object_path(repo, &root);
+            std::fs::remove_file(&path).expect("the root should be a loose object");
+            std::fs::write(&path, b"this is not a zlib stream").expect("planting garbage");
+
+            let err = topo_walk(repo, &tips, &[]).unwrap_err();
+            assert!(
+                matches!(err, RepoError::Walk(_)),
+                "a corrupt parent is a read error, got {err:?}"
+            );
+
+            // The contrast that matters: a *declared* boundary at the child is
+            // what stops the walk, not the corruption below it.
+            let walked = topo_walk(repo, &tips, std::slice::from_ref(&child))
+                .expect("a recorded boundary never loads the parent below it");
+            assert_eq!(
+                walked.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+                vec![child]
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // M1.10 (#63) Task 4 Step 5 — replay ordering at every page boundary.
+    // ---------------------------------------------------------------------
+
+    /// The plan's normative reconvergence graph:
+    ///
+    /// ```text
+    ///        M(110)
+    ///       /      \
+    ///    A(90)    B(10)
+    ///       \      /
+    ///        C(100)
+    /// ```
+    ///
+    /// extended with two equal-timestamp side tips (`alpha` → L(105), `zulu` →
+    /// Z(105), both off C) and several distinct full ref names that resolve to
+    /// the same object, so tip de-duplication is exercised too.
+    fn reconvergence_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        commit(repo, "C base", 100);
+        let c = git_out(repo, &["rev-parse", "HEAD"]);
+
+        git(repo, &["checkout", "-q", "-b", "topic-a"]);
+        commit(repo, "A older than its own parent", 90);
+        git(repo, &["checkout", "-q", "-b", "topic-b", &c]);
+        commit(repo, "B much older still", 10);
+
+        git(repo, &["checkout", "-q", "topic-a"]);
+        merge(repo, "M reconvergence", 110, "topic-b");
+        let m = git_out(repo, &["rev-parse", "HEAD"]);
+
+        // Three more full ref names at the very same object.
+        git(repo, &["update-ref", "refs/heads/main", &m]);
+        git(repo, &["update-ref", "refs/remotes/origin/main", &m]);
+        git(repo, &["tag", "v1", &m]);
+
+        // Two tips whose commit times are exactly equal.
+        git(repo, &["checkout", "-q", "-b", "alpha", &c]);
+        commit(repo, "L equal time", 105);
+        git(repo, &["checkout", "-q", "-b", "zulu", &c]);
+        commit(repo, "Z equal time", 105);
+        git(repo, &["checkout", "-q", "topic-a"]);
+        dir
+    }
+
+    /// Choice A: a page starting at row `n` re-runs the whole traversal and
+    /// discards the first `n` rows. That is only sound if the traversal is a
+    /// pure function of (repository, canonical tips, canonical boundaries), so
+    /// this pins it at **every** boundary, in two page sizes, against one
+    /// uninterrupted oracle — and pins the oracle itself to `DateOrder`
+    /// semantics, which a plain newest-first walk does not satisfy.
+    #[test]
+    fn topo_date_order_replay_matches_uninterrupted_at_every_boundary() {
+        let dir = reconvergence_fixture();
+        let repo = dir.path();
+
+        let enumerated = enumerated_tips(repo);
+        let tips = canonical_tips(enumerated.clone());
+        let oracle: Vec<Oid> = topo_walk(repo, &tips, &[])
+            .expect("uninterrupted walk")
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+
+        // --- the oracle really is a topological date order ----------------
+        let summary_of = |id: &Oid| git_out(repo, &["log", "-1", "--format=%s", &id.0]);
+        let names: Vec<String> = oracle.iter().map(summary_of).collect();
+        assert_eq!(names.len(), 6, "six commits: C, A, B, M, L, Z");
+        assert_eq!(names[0], "M reconvergence", "the newest tip comes first");
+        assert_eq!(
+            names[names.len() - 1],
+            "C base",
+            "C is held back until all four of its children are out, even though \
+             a newest-first sort would place it fourth of six"
+        );
+        let position = |summary: &str| {
+            names
+                .iter()
+                .position(|n| n == summary)
+                .unwrap_or_else(|| panic!("{summary:?} missing from {names:?}"))
+        };
+        assert!(
+            position("B much older still") < position("C base"),
+            "topology outranks the clock: B(10) precedes its own parent C(100)"
+        );
+        assert!(
+            position("A older than its own parent") < position("C base"),
+            "A(90) precedes its own parent C(100)"
+        );
+        assert_eq!(
+            oracle.iter().collect::<HashSet<_>>().len(),
+            oracle.len(),
+            "no commit is emitted twice"
+        );
+
+        // --- one page: re-run, discard `skip`, take at most `size` ---------
+        let page = |skip: usize, size: usize| -> Vec<Oid> {
+            let mut discarded = 0usize;
+            let mut out: Vec<Oid> = Vec::new();
+            walk_history_topo(repo, &tips, &[], |commit| {
+                if discarded < skip {
+                    discarded += 1;
+                    return ControlFlow::Continue(());
+                }
+                out.push(commit.id);
+                if out.len() == size {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .expect("replayed walk");
+            out
+        };
+
+        let len = oracle.len();
+        for boundary in 0..=len {
+            for size in [1usize, 7] {
+                let mut collected: Vec<Oid> = Vec::new();
+                let mut next = boundary;
+                loop {
+                    let rows = page(next, size);
+                    if rows.is_empty() {
+                        break;
+                    }
+                    assert!(rows.len() <= size, "a page never exceeds its size");
+                    next += rows.len();
+                    collected.extend(rows);
+                }
+
+                assert_eq!(
+                    collected.iter().collect::<HashSet<_>>().len(),
+                    collected.len(),
+                    "no duplicate row scrolling from {boundary} at page size {size}"
+                );
+                assert_eq!(
+                    collected.as_slice(),
+                    &oracle[boundary..],
+                    "no gap scrolling from {boundary} at page size {size}"
+                );
+
+                let mut rejoined = oracle[..boundary].to_vec();
+                rejoined.extend(collected);
+                assert_eq!(
+                    rejoined, oracle,
+                    "prefix + paged remainder must rebuild the uninterrupted order \
+                     (boundary {boundary}, page size {size})"
+                );
+            }
+        }
+
+        // --- independent of how the ref store happened to enumerate -------
+        let mut orders: Vec<Vec<(String, Oid)>> = vec![enumerated.clone()];
+        let mut reversed = enumerated.clone();
+        reversed.reverse();
+        orders.push(reversed);
+        for rotation in 1..enumerated.len() {
+            let mut rotated = enumerated.clone();
+            rotated.rotate_left(rotation);
+            orders.push(rotated);
+        }
+        for order in orders {
+            let canonical = canonical_tips(order);
+            assert_eq!(
+                canonical, tips,
+                "canonicalisation erases enumeration order"
+            );
+            let replayed: Vec<Oid> = topo_walk(repo, &canonical, &[])
+                .expect("walk from a re-enumerated ref set")
+                .into_iter()
+                .map(|c| c.id)
+                .collect();
+            assert_eq!(replayed, oracle, "the order is enumeration-independent");
+        }
     }
 }
