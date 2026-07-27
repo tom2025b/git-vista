@@ -38,6 +38,11 @@ web-sys = { version = "0.3", features = [
     "Document",
     "DomRect",
     "Element",
+    # M1.11 (#64): the operation progress stream. `EventSource` cannot set request
+    # headers, which is why ADR 0020 gave that one route a query-string protocol
+    # negotiation path instead.
+    "EventSource",
+    "MessageEvent",
     "Event",
     "EventTarget",
     # M1.02 "Update Required" screen: window.location().reload() when the client's

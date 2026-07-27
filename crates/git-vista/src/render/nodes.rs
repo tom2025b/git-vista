@@ -9,12 +9,13 @@ use leptos::*;
 
 use git_vista_core::model::RefKind;
 
+use crate::features::shell::signals::Shell;
 use crate::geometry::{node_cx, node_cy, NODE_RADIUS};
 use crate::icons::icon_set;
 use crate::state::MenuData;
 use git_vista_core::color::branch_color;
 
-use super::RenderCtx;
+use crate::features::graph::core::RenderCtx;
 
 /// Per-commit node builder — a filled dot in the branch colour plus a larger
 /// invisible hit target, built by a `<For>` only for rows in the viewport.
@@ -23,7 +24,7 @@ use super::RenderCtx;
 /// merge, which has real content, never reads as empty (Issue #30).
 pub fn build_node(
     ctx: StoredValue<RenderCtx>,
-    menu: RwSignal<Option<MenuData>>,
+    shell: Shell,
     moved: StoredValue<bool>,
     i: usize,
 ) -> View {
@@ -84,7 +85,7 @@ pub fn build_node(
             if moved.get_value() {
                 return;
             }
-            menu.set(Some(MenuData {
+            shell.open_menu(MenuData {
                 commit: commit_id.clone(),
                 header: short.clone(),
                 x: ev.client_x() as f64,
@@ -98,7 +99,7 @@ pub fn build_node(
                 is_branch: false,
                 repo_url: repo_url.clone(),
                 remote_web_url: remote_web_url.clone(),
-            }));
+            });
         };
 
         view! {

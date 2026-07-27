@@ -19,8 +19,9 @@ use git_vista_core::diff::{CommitDiff, FileContent};
 
 use crate::api::{fetch_diff_full, fetch_file};
 use crate::detail::{diff_line_class, file_change_marker};
+use crate::features::shell::signals::Shell;
 use crate::icons::icon_set;
-use crate::state::{Overlays, Settings, ViewerDoc};
+use crate::state::{Settings, ViewerDoc};
 
 /// Stamp (or clear) the `data-print` attribute on `<html>`. The print styles
 /// key off it, so a plain browser print with no viewer open still prints the
@@ -43,17 +44,16 @@ fn print_now() {
     }
 }
 
-/// The full-screen viewer overlay. Renders while `overlays.viewer` is `Some`;
+/// The full-screen viewer overlay. Renders while the shell holds a viewer document;
 /// fetches its document lazily (keyed on the open doc, like the detail panel),
 /// and closes via its own visible button.
-pub fn viewer_view(overlays: Overlays, settings: Settings) -> impl IntoView {
-    let viewer = overlays.viewer;
+pub fn viewer_view(shell: Shell, settings: Settings) -> impl IntoView {
     let nerd_icons = settings.nerd_icons;
     // One resource for either document kind: the key carries the enum, the
     // fetch picks the endpoint. A stale response is ignored via the id/path
     // echo, same rule as the detail panel's fetches.
     let doc = create_local_resource(
-        move || viewer.get(),
+        move || shell.viewer_doc(),
         |doc| async move {
             match doc {
                 None => None,
@@ -65,7 +65,7 @@ pub fn viewer_view(overlays: Overlays, settings: Settings) -> impl IntoView {
         },
     );
     move || {
-        let open = viewer.get();
+        let open = shell.viewer_doc();
         // The print CSS keys off <html data-print> — set while open, cleared
         // when closed, so a plain print without the viewer stays the full page.
         set_print_attr(open.is_some());
@@ -119,7 +119,7 @@ pub fn viewer_view(overlays: Overlays, settings: Settings) -> impl IntoView {
                             <button
                                 class="viewer-btn viewer-close"
                                 title="Close"
-                                on:click=move |_| viewer.set(None)
+                                on:click=move |_| shell.close_viewer()
                             >
                                 "Close ×"
                             </button>

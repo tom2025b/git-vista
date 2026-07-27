@@ -5,13 +5,15 @@ use leptos::*;
 use git_vista_protocol::RepositoryDescriptor;
 
 use crate::api::clone_request;
-use crate::state::DIALOG_GUARD_MS;
+use crate::features::dialogs::core::Dialog;
+use crate::features::dialogs::signals::Dialogs;
+use crate::features::graph::core::GraphCore;
 
 /// The "Open URL" modal (Phase 12): clone a public repo and view it read-only.
 /// Same iPad-proven inline-styled overlay as the commit modal, and a `<textarea>`
 /// (NOT a void `<input>`, which panics the Leptos CSR node-walk on iOS WebKit)
 /// for the URL field. `cloning` disables the button while git works so a slow
-/// clone can't be fired twice; `open_opened_at` guards the backdrop against the
+/// clone can't be fired twice; the shared `dialogs` guard protects the backdrop from the
 /// iOS ghost-click, same trick as the commit modal. Unlike the other `dialogs/*`
 /// modals (z-index 30), this one is also reachable from inside the open picker
 /// (ADR 0006's "Clone URL…" button, which doesn't close the picker) — its
@@ -20,8 +22,8 @@ pub fn open_url_view(
     open_url: RwSignal<bool>,
     clone_url: RwSignal<String>,
     cloning: RwSignal<bool>,
-    open_opened_at: StoredValue<f64>,
-    reload: RwSignal<u32>,
+    dialogs: Dialogs,
+    graph: RwSignal<GraphCore>,
     mode_for: RwSignal<Option<RepositoryDescriptor>>,
 ) -> impl IntoView {
     let submit_clone = move || {
@@ -38,7 +40,9 @@ pub fn open_url_view(
                     clone_url.set(String::new());
                     // The server opened the clone look-only; the reload shows
                     // it, and the mode screen asks Visualize/Active (ADR 0008).
-                    reload.update(|n| *n = n.wrapping_add(1));
+                    graph.update(|g| {
+                        g.force_bump();
+                    });
                     mode_for.set(Some(descriptor));
                 }
                 Err(e) => {
@@ -57,7 +61,8 @@ pub fn open_url_view(
                    z-index:910; display:flex; align-items:center; \
                    justify-content:center; background:rgba(1,4,9,0.6);"
             on:click=move |_| {
-                if js_sys::Date::now() - open_opened_at.get_value() > DIALOG_GUARD_MS {
+                if dialogs.may_dismiss() {
+                    dialogs.close(Dialog::OpenUrl);
                     open_url.set(false);
                 }
             }

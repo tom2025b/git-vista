@@ -16,9 +16,9 @@ use git_vista_core::status::ChangeKind;
 
 use crate::api::fetch_diff;
 use crate::datetime::local_timestamp;
+use crate::features::graph::core::RenderCtx;
 use crate::icons::{icon_set, GitIcons};
-use crate::render::RenderCtx;
-use crate::state::{DetailResource, Overlays, Settings, ViewerDoc};
+use crate::state::{DetailResource, Features, Settings, ViewerDoc};
 
 /// CSS class for one line of the unified patch, keyed off its prefix. The
 /// file/hunk headers are checked *before* the bare +/- so `+++`/`---` read as
@@ -67,20 +67,18 @@ pub(crate) fn file_change_marker(ic: &GitIcons, kind: ChangeKind) -> (&'static s
 /// `detail_id`; `ctx` supplies the repo's GitHub base + pushed-commit set for the
 /// "Open on GitHub" link.
 pub fn detail_panel_view(
-    overlays: Overlays,
+    features: Features,
     settings: Settings,
     detail: DetailResource,
     ctx: StoredValue<RenderCtx>,
 ) -> impl IntoView {
-    let detail_id = overlays.detail_id;
-    let scroll_diff = overlays.scroll_diff;
-    let viewer = overlays.viewer;
+    let Features { shell, .. } = features;
     let nerd_icons = settings.nerd_icons;
     // The commit's diff (file list + patch), fetched lazily alongside the
     // detail and keyed on the same open hash — so walking to a parent
     // re-fetches both, and closing the panel idles both.
     let diff = create_local_resource(
-        move || detail_id.get(),
+        move || shell.detail_id(),
         |id| async move {
             match id {
                 Some(id) => Some(fetch_diff(&id).await),
@@ -89,7 +87,7 @@ pub fn detail_panel_view(
         },
     );
     move || {
-        detail_id.get().map(|open_id| {
+        shell.detail_id().map(|open_id| {
             // Tracked read, like the menu: the panel re-renders live if the icon
             // style is toggled while it's open.
             let ic = icon_set(nerd_icons.get());
@@ -156,7 +154,7 @@ pub fn detail_panel_view(
                                     view! {
                                         <button
                                             class="detail-parent"
-                                            on:click=move |_| detail_id.set(Some(full.clone()))
+                                            on:click=move |_| shell.open_detail(full.clone(), false)
                                             title="View this parent"
                                         >
                                             {short}
@@ -282,10 +280,10 @@ pub fn detail_panel_view(
                                 let file_id = d.id.clone();
                                 let file_path = f.path.clone();
                                 let open_file = move |_| {
-                                    viewer.set(Some(ViewerDoc::File {
+                                    shell.open_viewer(ViewerDoc::File {
                                         id: file_id.clone(),
                                         path: file_path.clone(),
-                                    }));
+                                    });
                                 };
                                 view! {
                                     <button
@@ -331,8 +329,9 @@ pub fn detail_panel_view(
                         // now that it exists. RAF defers until after the DOM
                         // commit; the flag is one-shot so a later re-render
                         // (icon toggle, parent walk) doesn't scroll again.
-                        if scroll_diff.get_value() {
-                            scroll_diff.set_value(false);
+                        // Reads *and* clears in one call, so a wish left by "Show diff"
+                        // cannot fire again on the next commit's panel.
+                        if shell.take_diff_scroll() {
                             request_animation_frame(|| {
                                 if let Some(el) =
                                     document().get_element_by_id("detail-changes")
@@ -350,9 +349,9 @@ pub fn detail_panel_view(
                                 title="Open the whole diff full-screen, uncapped, \
                                        with Print / Save PDF"
                                 on:click=move |_| {
-                                    viewer.set(Some(ViewerDoc::Diff {
+                                    shell.open_viewer(ViewerDoc::Diff {
                                         id: expand_id.clone(),
-                                    }));
+                                    });
                                 }
                             >
                                 "Expand Full Diff"
@@ -387,7 +386,7 @@ pub fn detail_panel_view(
                         <button
                             class="detail-close"
                             title="Close"
-                            on:click=move |_| detail_id.set(None)
+                            on:click=move |_| shell.close_detail()
                         >
                             "×"
                         </button>

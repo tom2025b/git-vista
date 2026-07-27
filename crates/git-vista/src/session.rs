@@ -16,7 +16,9 @@
 
 use leptos::*;
 
-use crate::api::{get_session, post_session, set_csrf_token, set_via_lan};
+use crate::api::{get_session, post_session};
+use crate::features::session::core::SessionEvent;
+use crate::features::session::signals as session_state;
 
 /// Establish the session on load. Returns `Ok(true)` when authenticated (cookie is
 /// live and the CSRF token is recorded), `Ok(false)` when the app needs the
@@ -26,16 +28,22 @@ pub async fn establish_session() -> Result<bool, String> {
     // A bootstrap token in the fragment wins: exchange it for a fresh session.
     if let Some(token) = take_bootstrap_token() {
         if let Ok(info) = post_session(&token).await {
-            set_csrf_token(info.csrf.clone());
-            set_via_lan(info.via_lan);
+            // One event, so the credential and the transport fact can never be
+            // recorded half-way (M1.11, #64). `Established` is always accepted.
+            let _ = session_state::apply(SessionEvent::Established {
+                csrf: info.csrf.clone(),
+                via_lan: info.via_lan,
+            });
             return Ok(info.authenticated);
         }
         // The token was invalid or already spent — fall through to see whether a
         // usable session cookie is nonetheless present.
     }
     let info = get_session().await?;
-    set_csrf_token(info.csrf.clone());
-    set_via_lan(info.via_lan);
+    let _ = session_state::apply(SessionEvent::Established {
+        csrf: info.csrf.clone(),
+        via_lan: info.via_lan,
+    });
     Ok(info.authenticated)
 }
 
