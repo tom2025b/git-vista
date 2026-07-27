@@ -12,7 +12,6 @@
 
 use leptos::{Resource, RwSignal, StoredValue};
 
-use git_vista_core::activity::Undoable;
 use git_vista_core::model::CommitDetail;
 
 /// State for the per-commit context menu (Issue #18): which commit was tapped,
@@ -80,58 +79,14 @@ pub struct CommitDialog {
     pub branch: Option<String>,
 }
 
-/// A branch operation awaiting confirmation in the modal (Issue #33 follow-up).
-/// Merge and delete change history/refs and push reaches the network, so each is
-/// confirmed before it runs — reusing the same in-app modal the commit dialog uses
-/// (a native `confirm()` gets blocked/flashed by the webview, same as `prompt()`).
-#[derive(Clone)]
-pub enum PendingOp {
-    /// Merge `branch` into the checked-out branch (`git merge <branch>`). `into` is
-    /// the live HEAD branch, fetched when the item is clicked, so the confirmation
-    /// names the true target; `None` => detached HEAD (the confirm button is disabled).
-    Merge {
-        branch: String,
-        into: Option<String>,
-    },
-    /// Push `branch` to origin (`git push origin <branch>`).
-    Push { branch: String },
-    /// Delete `branch` (`git branch -d <branch>`). `current` is the live HEAD branch,
-    /// fetched on click; when it equals `branch` the confirm button is disabled (git
-    /// refuses to delete the checked-out branch). `None` => detached HEAD (deletable).
-    Delete {
-        branch: String,
-        current: Option<String>,
-    },
-    /// Check out `branch` (`git checkout <branch>`), moving HEAD and the working
-    /// tree to it. `current` is the live HEAD branch, fetched on click; when it
-    /// equals `branch` the confirm button is disabled (nothing to switch to).
-    /// `None` => detached HEAD — checkout is *allowed* there, it re-attaches HEAD.
-    Checkout {
-        branch: String,
-        current: Option<String>,
-    },
-    /// Force-delete `branch` (`git branch -D <branch>`), discarding unmerged commits.
-    /// Only reached after the safe [`PendingOp::Delete`] is refused with "not fully
-    /// merged": the modal re-opens as this so the user can override rather than hit a
-    /// dead-end error.
-    ForceDelete { branch: String },
-    /// Rebase the checked-out branch onto main (`git rebase main`, or `origin/main`
-    /// when that remote-tracking ref exists — resolved server-side). `current` is the
-    /// live HEAD branch, fetched on click, purely to name it in the dialog; `None` =>
-    /// detached HEAD (the confirm button is disabled — there's no branch to rebase).
-    /// `base` names the server's actual rebase target (from `/api/rebase-status`),
-    /// so the dialog says exactly what the branch will be replayed onto.
-    Rebase {
-        current: Option<String>,
-        base: String,
-    },
-    /// Execute one undo action (Activity/Undo step 5, `POST /api/undo`). Carries the
-    /// whole [`Undoable`] — the action plus its server-built label and `warn_pushed`
-    /// flag — so the dialog can name exactly what it's about to do and warn when the
-    /// discarded state is already on the remote. Offered from the graph menu's undo
-    /// section (`/api/undoables`) and straight from Activity feed rows.
-    Undo(Undoable),
-}
+// The branch-operation vocabulary moved to `features/operations/kind.rs` in M1.11
+// (#64): it is framework-free, so it compiles and is unit-tested on the host target,
+// while this module is wasm-only. Re-exported under its old name so the ~40 existing
+// `PendingOp::…` call sites in `menu.rs`, `dialogs/` and `activity.rs` keep reading
+// naturally; `dialogs/confirm.rs` still matches one arm per `api.rs` function.
+pub use crate::features::operations::kind::OperationKind as PendingOp;
+
+use crate::features::operations::core::{IntentSeq, PendingIntent};
 
 /// How long (ms) after the commit modal opens to ignore a backdrop dismiss, so
 /// iOS's synthesized post-tap "ghost click" can't close the modal it just opened.
@@ -190,6 +145,16 @@ pub struct Overlays {
     pub scroll_diff: StoredValue<bool>,
     /// When the current modal was opened (ms) — the iOS ghost-click guard.
     pub dialog_opened_at: StoredValue<f64>,
+    /// Mints the click-order sequence for branch operations (M1.11, #64). A
+    /// `StoredValue`, not a signal: minting is bookkeeping done inside an event
+    /// handler, and nothing renders from it.
+    pub intent_seq: StoredValue<IntentSeq>,
+    /// The newest branch-operation intent that has actually reached
+    /// [`Overlays::confirm_op`]. A menu item's `fetch_head_branch()` pre-check
+    /// resolves in network order, so each continuation compares against this
+    /// before committing and a straggler from an earlier click is dropped
+    /// instead of reopening its dialog over the one the user is looking at.
+    pub pending_intent: StoredValue<Option<PendingIntent>>,
     /// The App's fetch counter; bumped to re-read the repo after a write.
     pub reload: RwSignal<u32>,
 }
