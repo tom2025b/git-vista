@@ -9,6 +9,12 @@
 .claude/settings.local.json
 .claude/settings.local.json.tmp.*
 
+# Dual-account parallel-work coordination mailbox. Local IPC between two
+# concurrently-running Claude Code sessions (Max orchestrator + Pro worker);
+# session state, not project history. Both sessions read/write it at one
+# absolute path so it works across git worktrees.
+.claude/parallel/
+
 # Local Codex architecture review and continuation handoff
 /codex-code-review.md
 /codex-code-review.pdf
