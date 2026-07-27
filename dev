@@ -92,7 +92,11 @@ cmd_wip() {
   [[ -n "$msg" ]] || msg="wip: checkpoint $(git rev-parse --abbrev-ref HEAD)"
   local branch; branch="$(git rev-parse --abbrev-ref HEAD)"
   [[ "$branch" != "main" ]] || die "refuse to WIP-commit on main — 'dev start <issue#>' first"
-  if git diff --quiet && git diff --cached --quiet; then
+  # Emptiness must be tested with `status --porcelain`, not `diff`: `git diff` only
+  # reports TRACKED files, so a checkpoint whose only change was a brand-new file
+  # (a fresh plan, spec or module) looked "clean" and was silently never committed.
+  # --porcelain counts untracked files too, and still honours .gitignore.
+  if [[ -z "$(git status --porcelain)" ]]; then
     echo "dev: nothing to commit; pushing branch to be safe…"
   else
     git add -A
