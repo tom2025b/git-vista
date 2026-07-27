@@ -14,7 +14,7 @@ pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
         commit_dialog,
         commit_msg,
         dialog_opened_at,
-        reload,
+        graph,
         ..
     } = overlays;
     let submit_commit = move || {
@@ -32,7 +32,9 @@ pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
         commit_dialog.set(None);
         spawn_local(async move {
             match create_commit_request(&message, allow_empty, branch.as_deref()).await {
-                Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+                Ok(()) => graph.update(|g| {
+                    g.force_bump();
+                }),
                 Err(e) => {
                     if let Some(w) = web_sys::window() {
                         let _ = w.alert_with_message(&format!("Couldn't create commit:\n{e}"));

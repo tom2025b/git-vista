@@ -5,6 +5,7 @@ use leptos::*;
 use git_vista_protocol::RepositoryDescriptor;
 
 use crate::api::clone_request;
+use crate::features::graph::core::GraphCore;
 use crate::state::DIALOG_GUARD_MS;
 
 /// The "Open URL" modal (Phase 12): clone a public repo and view it read-only.
@@ -21,7 +22,7 @@ pub fn open_url_view(
     clone_url: RwSignal<String>,
     cloning: RwSignal<bool>,
     open_opened_at: StoredValue<f64>,
-    reload: RwSignal<u32>,
+    graph: RwSignal<GraphCore>,
     mode_for: RwSignal<Option<RepositoryDescriptor>>,
 ) -> impl IntoView {
     let submit_clone = move || {
@@ -38,7 +39,9 @@ pub fn open_url_view(
                     clone_url.set(String::new());
                     // The server opened the clone look-only; the reload shows
                     // it, and the mode screen asks Visualize/Active (ADR 0008).
-                    reload.update(|n| *n = n.wrapping_add(1));
+                    graph.update(|g| {
+                        g.force_bump();
+                    });
                     mode_for.set(Some(descriptor));
                 }
                 Err(e) => {

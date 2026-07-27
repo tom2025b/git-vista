@@ -3,6 +3,7 @@
 use leptos::*;
 
 use crate::api::reset_test_repo_request;
+use crate::features::graph::core::GraphCore;
 use crate::state::DIALOG_GUARD_MS;
 
 use super::alert;
@@ -16,7 +17,7 @@ use super::alert;
 pub fn reset_repo_view(
     reset_open: RwSignal<bool>,
     reset_opened_at: StoredValue<f64>,
-    reload: RwSignal<u32>,
+    graph: RwSignal<GraphCore>,
 ) -> impl IntoView {
     let run_reset = move || {
         reset_open.set(false);
@@ -27,11 +28,15 @@ pub fn reset_repo_view(
                 // both reload: even a failed reset may have moved refs.
                 Ok(msg) => {
                     alert(&msg);
-                    reload.update(|n| *n = n.wrapping_add(1));
+                    graph.update(|g| {
+                        g.force_bump();
+                    });
                 }
                 Err(e) => {
                     alert(&format!("Couldn't reset the test repo:\n{e}"));
-                    reload.update(|n| *n = n.wrapping_add(1));
+                    graph.update(|g| {
+                        g.force_bump();
+                    });
                 }
             }
         });

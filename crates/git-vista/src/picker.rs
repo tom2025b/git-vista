@@ -13,6 +13,7 @@ use leptos::*;
 
 use git_vista_protocol::{RepoMode, RepositoryDescriptor, RepositoryKind};
 
+use crate::features::graph::core::GraphCore;
 use crate::features::operations::core::{result_is_newest, IntentSeq};
 use crate::features::operations::signals as ops;
 use crate::features::session::core::SessionEvent;
@@ -29,7 +30,7 @@ pub fn picker_view(
     open_url: RwSignal<bool>,
     clone_url: RwSignal<String>,
     open_opened_at: StoredValue<f64>,
-    reload: RwSignal<u32>,
+    graph: RwSignal<GraphCore>,
 ) -> impl IntoView {
     // Refetch every time the picker opens (and after a rescan) — the catalog
     // changes at runtime (clones, rescans), so a cached list would mislead.
@@ -38,7 +39,7 @@ pub fn picker_view(
     // it (the same recovery the graph/status reads use).
     let bump = create_rw_signal(0u32);
     let catalog = create_local_resource(
-        move || (open.get(), bump.get(), reload.get()),
+        move || (open.get(), bump.get(), graph.get().epoch()),
         |(is_open, _, _)| async move {
             if is_open {
                 Some(fetch_catalog().await)
@@ -179,7 +180,7 @@ pub fn picker_view(
                             // session (and its via_lan flag) lands, the same
                             // recovery the catalog fetch above uses.
                             {move || {
-                                reload.get();
+                                graph.get().epoch();
                                 (!session_state::is_lan()).then(|| view! {
                                     <button
                                         style="padding:8px 16px; font:inherit; color:var(--fg); \
@@ -253,7 +254,7 @@ pub fn picker_view(
 pub fn mode_view(
     mode_for: RwSignal<Option<RepositoryDescriptor>>,
     picker_open: RwSignal<bool>,
-    reload: RwSignal<u32>,
+    graph: RwSignal<GraphCore>,
 ) -> impl IntoView {
     let busy = create_rw_signal(false);
     let err = create_rw_signal(String::new());
@@ -279,7 +280,9 @@ pub fn mode_view(
                                 let _ = session_state::apply(SessionEvent::UiModeSelected(mode));
                                 mode_for.set(None);
                                 picker_open.set(false);
-                                reload.update(|n| *n = n.wrapping_add(1));
+                                graph.update(|g| {
+                                    g.force_bump();
+                                });
                             }
                             Err(e) => err.set(e),
                         }

@@ -350,7 +350,7 @@ pub(super) fn graph_canvas(
                     status: HTTP_CONFLICT,
                     ..
                 }) => {
-                    let next = graph.update(|g| g.force_bump());
+                    let next = graph.try_update(|g| g.force_bump()).unwrap_or_default();
                     history_ui
                         .phase
                         .set(HistoryPhase::DriftReloading { epoch: next });
@@ -449,7 +449,7 @@ pub(super) fn graph_canvas(
             // `Error`: returning it to `Idle` would let the threshold effect
             // spend the rejected cursor again before the replacement mounts.
             PageRetry::Reseed => {
-                let next = graph.update(|g| g.force_bump());
+                let next = graph.try_update(|g| g.force_bump()).unwrap_or_default();
                 history_ui
                     .phase
                     .set(HistoryPhase::SeedLoading { epoch: next });

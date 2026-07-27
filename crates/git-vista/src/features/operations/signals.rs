@@ -251,7 +251,9 @@ fn commit_settlement(
     outcome: Settlement,
 ) {
     let id = id.clone();
-    let published = core.try_update(move |c| c.settle(&id, outcome).ok()).flatten();
+    let published = core
+        .try_update(move |c| c.settle(&id, outcome).ok())
+        .flatten();
     // A replayed terminal event settles nothing and publishes nothing, so a reconnected
     // stream cannot run `on_invalidate` twice. When it DOES publish, `on_invalidate` is
     // the D3 payoff: a settlement carrying the generation the graph already has skips the

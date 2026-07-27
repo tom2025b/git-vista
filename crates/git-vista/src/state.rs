@@ -86,8 +86,8 @@ pub struct CommitDialog {
 // naturally; `dialogs/confirm.rs` still matches one arm per `api.rs` function.
 pub use crate::features::operations::kind::OperationKind as PendingOp;
 
-use crate::features::operations::core::{IntentSeq, PendingIntent};
 use crate::features::graph::core::GraphCore;
+use crate::features::operations::core::{IntentSeq, PendingIntent};
 use crate::features::operations::signals::Operations;
 
 /// How long (ms) after the commit modal opens to ignore a backdrop dismiss, so

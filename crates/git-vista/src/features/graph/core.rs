@@ -171,7 +171,11 @@ mod graph_core_tests {
         let before = g.epoch();
         let reported = g.force_bump();
         assert_eq!(g.epoch(), before + 1);
-        assert_eq!(reported, before + 1, "the caller needs the epoch it is loading INTO");
+        assert_eq!(
+            reported,
+            before + 1,
+            "the caller needs the epoch it is loading INTO"
+        );
     }
 }
 

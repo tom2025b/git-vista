@@ -80,7 +80,7 @@ pub fn activity_panel_view(
     let Overlays {
         detail_id,
         activity_open,
-        reload,
+        graph,
         ..
     } = overlays;
     let nerd_icons = settings.nerd_icons;
@@ -90,7 +90,7 @@ pub fn activity_panel_view(
     // a branch created from a row's menu — refreshes it in place. Closed →
     // resolve to None without touching the network.
     let feed = create_local_resource(
-        move || (activity_open.get(), reload.get()),
+        move || (activity_open.get(), graph.get().epoch()),
         |(open, _)| async move {
             if open {
                 Some(fetch_activity(FEED_LIMIT).await)
@@ -100,7 +100,7 @@ pub fn activity_panel_view(
         },
     );
     let status = create_local_resource(
-        move || (activity_open.get(), reload.get()),
+        move || (activity_open.get(), graph.get().epoch()),
         |(open, _)| async move {
             if open {
                 fetch_status().await.ok()
@@ -242,7 +242,9 @@ pub fn activity_panel_view(
                             <button
                                 class="act-refresh"
                                 title="Re-read the repository and this feed"
-                                on:click=move |_| reload.update(|n| *n = n.wrapping_add(1))
+                                on:click=move |_| graph.update(|g| {
+                                    g.force_bump();
+                                })
                             >
                                 "Refresh"
                             </button>

@@ -73,7 +73,12 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
     // instead of offering a rebase that no-ops. `None` (still loading, or the
     // fetch failed) leaves the item enabled — the server no-ops safely anyway.
     let rebase_status = create_local_resource(
-        move || (menu.get().filter(|m| !m.is_branch).is_some(), graph.get().epoch()),
+        move || {
+            (
+                menu.get().filter(|m| !m.is_branch).is_some(),
+                graph.get().epoch(),
+            )
+        },
         |(open, _)| async move {
             if open {
                 fetch_rebase_status().await.ok()
@@ -282,8 +287,8 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     spawn_local(async move {
                         match stage_request().await {
                             Ok(()) => graph.update(|g| {
-                            g.force_bump();
-                        }),
+                                g.force_bump();
+                            }),
                             Err(e) => {
                                 if let Some(w) = web_sys::window() {
                                     let _ = w.alert_with_message(&format!(
@@ -326,8 +331,8 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     spawn_local(async move {
                         match unstage_request().await {
                             Ok(()) => graph.update(|g| {
-                            g.force_bump();
-                        }),
+                                g.force_bump();
+                            }),
                             Err(e) => {
                                 if let Some(w) = web_sys::window() {
                                     let _ = w.alert_with_message(&format!(
