@@ -13,84 +13,52 @@
 //!
 //! Same chrome recipe as the detail panel (it shares the `.detail-panel` CSS
 //! family): an explicit ✕ close button — never Esc-only, the iPad keyboard
-//! has no Esc — and both fetches re-fire every time the panel opens, so it
-//! never shows a stale feed (the issue-16 lesson).
+//! has no Esc — and it never shows a stale feed (the issue-16 lesson): the feed
+//! re-fetches every time the panel opens, and the working-tree status does too,
+//! now via the one shared read in `features/status` rather than a second private
+//! copy of the topbar's (M1.11, #64).
 
 use leptos::*;
 
-use git_vista_core::activity::{ActivityEvent, ActivityKind, ActivitySource};
+use git_vista_core::activity::{ActivityEvent, ActivitySource};
 
-use crate::api::{fetch_activity, fetch_status};
+use crate::api::fetch_activity;
 use crate::datetime::time_ago;
-use crate::icons::{icon_set, GitIcons};
-use crate::state::{MenuData, Overlays, PendingOp, Settings};
+use crate::features::activity::core::{event_commit, kind_glyph, kind_label};
+use crate::features::dialogs::core::Dialog;
+use crate::features::status::signals as status_seam;
+use crate::icons::icon_set;
+use crate::menu;
+use crate::state::{Features, PendingOp, Settings};
 
 /// How many events to request. The panel is a scrollable feed, not an
 /// archive; the backend caps harder anyway.
 const FEED_LIMIT: usize = 100;
-
-/// The glyph for one event kind. Rebase deliberately shares the merge glyph —
-/// the existing "Rebase onto main" menu item already reads that way — and
-/// pull shares it too (a pull *is* fetch + merge).
-fn kind_glyph(ic: &GitIcons, kind: ActivityKind) -> &'static str {
-    match kind {
-        ActivityKind::Commit | ActivityKind::CherryPick | ActivityKind::Other => ic.commit,
-        ActivityKind::Amend => ic.modified,
-        ActivityKind::Merge | ActivityKind::Rebase | ActivityKind::Pull => ic.merge,
-        ActivityKind::Checkout => ic.checkout,
-        ActivityKind::Reset | ActivityKind::Revert => ic.undo,
-        ActivityKind::BranchCreated => ic.branch,
-        ActivityKind::BranchDeleted => ic.deleted,
-        ActivityKind::Push => ic.push,
-        ActivityKind::Fetch => ic.branch_alt,
-        ActivityKind::Clone => ic.repository,
-    }
-}
-
-/// Short human name for one event kind — the row's leading word.
-fn kind_label(kind: ActivityKind) -> &'static str {
-    match kind {
-        ActivityKind::Commit => "Commit",
-        ActivityKind::Amend => "Amend",
-        ActivityKind::Merge => "Merge",
-        ActivityKind::Rebase => "Rebase",
-        ActivityKind::Checkout => "Switch",
-        ActivityKind::Reset => "Reset",
-        ActivityKind::CherryPick => "Cherry-pick",
-        ActivityKind::Revert => "Revert",
-        ActivityKind::BranchCreated => "Branch created",
-        ActivityKind::BranchDeleted => "Branch deleted",
-        ActivityKind::Push => "Push",
-        ActivityKind::Fetch => "Fetch",
-        ActivityKind::Pull => "Pull",
-        ActivityKind::Clone => "Clone",
-        ActivityKind::Other => "Event",
-    }
-}
 
 /// Build the Activity panel view. Rendered inside the overlays wrapper, so it
 /// shares the reactive context the menu and modals use. `read_only` (Visualize
 /// mode, ADR 0006/0007) hides the rows' Undo buttons — the feed itself is a
 /// read and stays available.
 pub fn activity_panel_view(
-    overlays: Overlays,
+    features: Features,
     settings: Settings,
     read_only: bool,
 ) -> impl IntoView {
-    let Overlays {
-        detail_id,
-        activity_open,
-        reload,
+    let Features {
+        graph,
+        status,
+        shell,
         ..
-    } = overlays;
+    } = features;
     let nerd_icons = settings.nerd_icons;
 
-    // Both fetches key on (open, reload): opening the panel fetches fresh,
-    // and any post-operation reload — an undo confirmed from this very panel,
-    // a branch created from a row's menu — refreshes it in place. Closed →
-    // resolve to None without touching the network.
+    // The feed keys on (open, reload): opening the panel fetches fresh, and any
+    // post-operation reload — an undo confirmed from this very panel, a branch created
+    // from a row's menu — refreshes it in place. Closed → resolve to None without
+    // touching the network. The working-tree status is no longer fetched here at all:
+    // `status` is the app's one read, passed in (M1.11, #64, Task 7).
     let feed = create_local_resource(
-        move || (activity_open.get(), reload.get()),
+        move || (shell.activity_is_open(), graph.get().epoch()),
         |(open, _)| async move {
             if open {
                 Some(fetch_activity(FEED_LIMIT).await)
@@ -99,34 +67,23 @@ pub fn activity_panel_view(
             }
         },
     );
-    let status = create_local_resource(
-        move || (activity_open.get(), reload.get()),
-        |(open, _)| async move {
-            if open {
-                fetch_status().await.ok()
-            } else {
-                None
-            }
-        },
-    );
 
-    // The right edge belongs to one panel at a time: opening Activity closes
-    // the commit detail panel (and the menu handlers do the reverse).
-    create_effect(move |_| {
-        if activity_open.get() {
-            detail_id.set(None);
-        }
-    });
+    // The right-edge exclusivity effect that used to sit here is gone (M1.11, #64,
+    // Task 8). It cleared the detail panel one reactive tick *after* this panel's
+    // visibility flipped, while the opposite direction wrote synchronously from a click
+    // handler — so for one frame both panels rendered. The rule now lives in
+    // `OverlayStack::present`, which evicts whatever already holds the right edge before
+    // this panel is ever marked open, and it runs in the same tick as the tap.
 
     move || {
-        activity_open.get().then(|| {
+        shell.activity_is_open().then(|| {
             // Tracked read, like the other overlays: the panel re-renders live
             // if the icon style is toggled while it's open.
             let ic = icon_set(nerd_icons.get());
 
             // -- The working-tree status section (step 1's data, richer). ----
             let status_section = move || {
-                status.get().flatten().map(|s| {
+                status_seam::read(status).map(|s| {
                     let ic = icon_set(nerd_icons.get());
                     let (glyph, class, headline) = if !s.conflicted.is_empty() {
                         (
@@ -227,7 +184,7 @@ pub fn activity_panel_view(
                 .into_view(),
                 Some(Ok(events)) => events
                     .into_iter()
-                    .map(|e| activity_row(e, nerd_icons, overlays, read_only))
+                    .map(|e| activity_row(e, nerd_icons, features, read_only))
                     .collect_view(),
             };
 
@@ -242,14 +199,16 @@ pub fn activity_panel_view(
                             <button
                                 class="act-refresh"
                                 title="Re-read the repository and this feed"
-                                on:click=move |_| reload.update(|n| *n = n.wrapping_add(1))
+                                on:click=move |_| graph.update(|g| {
+                                    g.force_bump();
+                                })
                             >
                                 "Refresh"
                             </button>
                             <button
                                 class="detail-close"
                                 title="Close"
-                                on:click=move |_| activity_open.set(false)
+                                on:click=move |_| shell.close_activity()
                             >
                                 "×"
                             </button>
@@ -281,15 +240,10 @@ pub fn activity_panel_view(
 fn activity_row(
     event: ActivityEvent,
     nerd_icons: RwSignal<bool>,
-    overlays: Overlays,
+    features: Features,
     read_only: bool,
 ) -> impl IntoView {
-    let Overlays {
-        menu,
-        confirm_op,
-        dialog_opened_at,
-        ..
-    } = overlays;
+    let Features { dialogs, shell, .. } = features;
     let ic = icon_set(nerd_icons.get_untracked());
     let glyph = kind_glyph(ic, event.kind);
     let when = time_ago(event.time);
@@ -304,20 +258,10 @@ fn activity_row(
         .clone()
         .map(|r| view! { <span class="act-pill act-ref">{r}</span> });
 
-    // The commit this event is "about": where the ref ended up — or, for a
-    // deletion (no new state), the tip that was deleted. A null oid (all
-    // zeros, e.g. a creation's old side) never gets here: new_oid is the
-    // created tip and deletions carry a real old_oid.
-    let commit = event
-        .new_oid
-        .clone()
-        .filter(|oid| !oid.bytes().all(|b| b == b'0'))
-        .or_else(|| {
-            event
-                .old_oid
-                .clone()
-                .filter(|oid| !oid.bytes().all(|b| b == b'0'))
-        });
+    // The commit this event is "about" — where the ref ended up, or the tip a deletion
+    // killed. The null-oid rule that decides it is host-tested in the feature core
+    // (M1.11, #64); it used to be an inline pair of `.filter()`s here.
+    let commit = event_commit(&event);
 
     let header = format!(
         "{}{}",
@@ -341,8 +285,12 @@ fn activity_row(
         let on = move |ev: web_sys::MouseEvent| {
             // The row underneath opens the context menu — this tap shouldn't.
             ev.stop_propagation();
-            dialog_opened_at.set_value(js_sys::Date::now());
-            confirm_op.set(Some(PendingOp::Undo(u.clone())));
+            // Opens the shared confirm modal; it is that modal's own Confirm button that
+            // dispatches the undo. Deliberately NOT `operations.dispatch(…)` directly:
+            // this is a destructive action reachable from two places, and the graph
+            // menu's identical item confirms first.
+            dialogs.open(Dialog::Confirm);
+            shell.open_confirm(PendingOp::Undo(u.clone()));
         };
         view! {
             <button class="act-undo" title=title on:click=on>
@@ -368,26 +316,18 @@ fn activity_row(
     match commit {
         Some(commit) => {
             let on_tap = move |ev: web_sys::MouseEvent| {
-                // The same MenuData the graph's dots build — one menu, two
-                // entry points. No GitHub link from here (the panel doesn't
-                // carry the pushed-commit set, and a wrong link that 404s is
-                // worse than a disabled item). Raw tap coords: the menu view
-                // itself clamps every entry point (geometry.rs::menu_placement),
-                // which replaced the right-edge clamp that used to live here.
-                menu.set(Some(MenuData {
-                    commit: commit.clone(),
-                    header: header.clone(),
-                    x: ev.client_x() as f64,
-                    y: ev.client_y() as f64,
-                    github_url: None,
-                    github_label: "Open on GitHub",
-                    create_label: "Create branch from this commit…",
-                    is_head: false,
-                    branches: Vec::new(),
-                    is_branch: false,
-                    repo_url: None,
-                    remote_web_url: None,
-                }));
+                // The same menu the graph's dots open — one menu, two entry points — but
+                // built by the module that owns `MenuData` rather than by a literal here
+                // (M1.11, #64). Raw tap coords: the menu view itself clamps every entry
+                // point (geometry.rs::menu_placement), which replaced the right-edge
+                // clamp that used to live here.
+                menu::open_for_commit(
+                    shell,
+                    commit.clone(),
+                    header.clone(),
+                    ev.client_x() as f64,
+                    ev.client_y() as f64,
+                );
             };
             view! {
                 <div class="act-row" on:click=on_tap>

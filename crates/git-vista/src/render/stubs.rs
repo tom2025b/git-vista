@@ -7,13 +7,14 @@
 
 use leptos::*;
 
+use crate::features::shell::signals::Shell;
 use crate::geometry::{node_cx, stub_node_cy, stub_path, NODE_RADIUS};
 use crate::icons::icon_set;
 use crate::state::MenuData;
 use crate::text::truncate;
 use git_vista_core::color::{branch_color, MERGE_FILL};
 
-use super::RenderCtx;
+use crate::features::graph::core::RenderCtx;
 
 /// A stub's branch-name label is truncated past this (the full name stays in
 /// the ring's hover tooltip and the menu header). Short enough that a deep
@@ -65,11 +66,7 @@ pub fn stub_icons(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>) -> Vi
 /// handful — one per commit-less new branch — and their cascade fans *upward*
 /// off the anchor commit, so they don't map onto the row window as cleanly as
 /// nodes/edges/labels; rendering them all is cheap and avoids that edge case.
-pub fn stubs(
-    ctx: StoredValue<RenderCtx>,
-    menu: RwSignal<Option<MenuData>>,
-    moved: StoredValue<bool>,
-) -> View {
+pub fn stubs(ctx: StoredValue<RenderCtx>, shell: Shell, moved: StoredValue<bool>) -> View {
     // Two passes: every connector path first, then every ring + hit target. A
     // cascade's deeper connector starts exactly at the previous tip's centre
     // (and the first at the anchor commit's), so drawn interleaved it would
@@ -136,7 +133,7 @@ pub fn stubs(
                 if moved.get_value() {
                     return;
                 }
-                menu.set(Some(MenuData {
+                shell.open_menu(MenuData {
                     commit: commit_id.clone(),
                     header: header.clone(),
                     x: ev.client_x() as f64,
@@ -152,7 +149,7 @@ pub fn stubs(
                     is_branch: true,
                     repo_url: repo_url.clone(),
                     remote_web_url: remote_web_url.clone(),
-                }));
+                });
             };
             view! {
                 // Hollow, clickable ring (Issue #28) — a stub branch owns no

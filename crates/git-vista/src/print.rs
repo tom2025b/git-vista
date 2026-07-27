@@ -25,13 +25,13 @@ use git_vista_core::color::{branch_color, BADGE_DARK, HEAD_BADGE, TAG_BADGE};
 use git_vista_core::model::RefKind;
 
 use crate::datetime::local_timestamp;
+use crate::features::graph::core::RenderCtx;
 use crate::geometry::{
     badge_text_dx, badge_text_y, badge_top_y, badge_width, edge_path, label_bottom_y, label_top_y,
     node_cx, node_cy, stub_headroom_for, stub_node_cy, stub_path, BADGE_GAP, BADGE_HEIGHT,
     BADGE_RADIUS, NODE_RADIUS, PAD_Y, ROW_HEIGHT,
 };
 use crate::icons::icon_set;
-use crate::render::RenderCtx;
 use crate::text::truncate;
 
 /// Same truncation the interactive labels use (render/labels.rs).
@@ -182,7 +182,7 @@ pub fn print_graph_view(
 ///
 /// Every scrap of it comes out of the one mounted aggregate (M1.10, #63): rows,
 /// edges and the monotonic per-row label x from
-/// [`LoadedHistory`](crate::history::LoadedHistory), stubs from its
+/// [`LoadedHistory`](crate::features::graph::core::LoadedHistory), stubs from its
 /// `resolved_stubs()`, repo metadata from the Frame. No `Graph`, no second
 /// `text_x`, no per-row colour vector — a second copy assembled for the printout
 /// would be exactly the copy that disagrees with the graph on screen.
