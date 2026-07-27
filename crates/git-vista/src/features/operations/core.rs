@@ -1,7 +1,239 @@
 //! The in-flight operations registry — framework-free (M1.11 D1).
+//!
+//! This is where an operation *lives* between the click that asked for it and the terminal
+//! event that resolves it. Before M1.11 it lived nowhere: `dialogs/confirm.rs` cleared the
+//! dialog and spawned a fire-and-forget future, so closing a panel mid-write left the user
+//! with no record that anything was happening (acceptance criterion 2).
+//!
+//! The lifecycle types are the protocol's own — [`OperationState`], [`OperationStage`],
+//! [`IdempotencyKey`], [`OperationId`] — not parallel client copies, so an SSE
+//! [`ProgressEvent`](git_vista_protocol::operation::ProgressEvent) maps straight in.
 
-use crate::features::core_traits::RequestKey;
+use git_vista_protocol::operation::{IdempotencyKey, OperationId, OperationStage, OperationState};
+use git_vista_protocol::plan::GenerationToken;
+
+use crate::features::core_traits::{Applied, Invalidate, InvalidateScope, RequestKey};
 use crate::features::operations::kind::OperationKind;
+
+/// How many settled operations are kept for display.
+///
+/// Bounded on purpose: the list exists so a failure is visible and dismissible, not as a
+/// session-long audit log — the Activity feed is the durable record. An unbounded list
+/// would grow for the life of the tab.
+pub const MAX_RECENT: usize = 8;
+
+/// An operation the client has started and not yet seen resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlight {
+    /// This client's name for the user action (ADR 0020). Stable across retries.
+    pub key: IdempotencyKey,
+    /// The server's handle, once the write response has been read. `None` between the
+    /// dispatch and the response — a real window, and the reason progress for an unbound
+    /// id is refused rather than invented.
+    pub id: Option<OperationId>,
+    pub kind: OperationKind,
+    pub state: OperationState,
+    pub stage: OperationStage,
+}
+
+/// What the client needs from a terminal record: whether it worked, what git said, and the
+/// generation observed *after* execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settlement {
+    pub state: OperationState,
+    pub message: Option<String>,
+    pub generation: Option<GenerationToken>,
+}
+
+impl Settlement {
+    /// Build a settlement from a record's terminal fields, or `None` if it has not
+    /// finished. The guard is the point: `GET /api/operations/{id}` answers with a full
+    /// record whether or not the operation is over.
+    pub fn from_terminal(
+        state: OperationState,
+        message: Option<String>,
+        generation: Option<GenerationToken>,
+    ) -> Option<Self> {
+        state.is_terminal().then_some(Self {
+            state,
+            message,
+            generation,
+        })
+    }
+}
+
+/// The follow-up an outcome invites, if any.
+///
+/// git's safe `branch -d` refuses an unmerged branch with "not fully merged". Dead-ending
+/// on that error would be worse than useless — the user asked to delete a branch and the
+/// tool knows exactly how — so the confirm modal re-opens offering `-D`. That rule lived
+/// inside `dialogs/confirm.rs`'s Delete arm, which made it a dialog decision; it is an
+/// operations decision, and stating it here makes it testable (design spec D4).
+pub fn escalation(kind: &OperationKind, message: &str) -> Option<OperationKind> {
+    match kind {
+        OperationKind::Delete { branch, .. } if message.contains("not fully merged") => {
+            Some(OperationKind::ForceDelete {
+                branch: branch.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// An operation that has resolved, kept briefly so its outcome can be shown and dismissed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settled {
+    pub id: OperationId,
+    pub kind: OperationKind,
+    pub outcome: Settlement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationsRejection {
+    /// ADR 0020's client-side mirror of the server's 409: one key names one operation.
+    KeyBoundToDifferentOperation,
+    /// No in-flight entry matches — never seen, or already resolved and forgotten.
+    UnknownOperation,
+    /// The terminal event arrived twice (a resumed stream replays it).
+    AlreadySettled,
+}
+
+/// The registry. Every fallible transition validates before it mutates, so a rejection
+/// leaves the core byte-identical (global constraint 4).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OperationsCore {
+    in_flight: Vec<InFlight>,
+    /// Newest first, capped at [`MAX_RECENT`].
+    recent: Vec<Settled>,
+}
+
+impl OperationsCore {
+    /// Register a user action. Re-admitting the same key with the same operation is the
+    /// retry case and changes nothing; re-using it for a *different* operation is refused.
+    pub fn admit(
+        &mut self,
+        key: IdempotencyKey,
+        kind: OperationKind,
+    ) -> Result<Applied, OperationsRejection> {
+        if let Some(existing) = self.in_flight.iter().find(|e| e.key == key) {
+            return if existing.kind == kind {
+                Ok(Applied::NoChange)
+            } else {
+                Err(OperationsRejection::KeyBoundToDifferentOperation)
+            };
+        }
+        self.in_flight.push(InFlight {
+            key,
+            id: None,
+            kind,
+            state: OperationState::Accepted,
+            stage: OperationStage::Queued,
+        });
+        Ok(Applied::Committed)
+    }
+
+    /// Attach the server's handle, read from the write response's `x-git-vista-operation`.
+    pub fn bind_id(
+        &mut self,
+        key: &IdempotencyKey,
+        id: OperationId,
+    ) -> Result<Applied, OperationsRejection> {
+        let entry = self
+            .in_flight
+            .iter_mut()
+            .find(|e| &e.key == key)
+            .ok_or(OperationsRejection::UnknownOperation)?;
+        if entry.id.as_ref() == Some(&id) {
+            return Ok(Applied::NoChange);
+        }
+        entry.id = Some(id);
+        Ok(Applied::Committed)
+    }
+
+    /// Record one progress event.
+    pub fn observe(
+        &mut self,
+        id: &OperationId,
+        state: OperationState,
+        stage: OperationStage,
+    ) -> Result<Applied, OperationsRejection> {
+        let entry = self
+            .in_flight
+            .iter_mut()
+            .find(|e| e.id.as_ref() == Some(id))
+            .ok_or(OperationsRejection::UnknownOperation)?;
+        if entry.state == state && entry.stage == stage {
+            return Ok(Applied::NoChange);
+        }
+        entry.state = state;
+        entry.stage = stage;
+        Ok(Applied::Committed)
+    }
+
+    /// Resolve an operation and publish what the rest of the app must reconcile against.
+    ///
+    /// The returned [`Invalidate`] carries the post-execution generation, so a feature
+    /// holding server state can compare it with what it already has and re-read only when
+    /// the repository actually moved (design spec D3).
+    pub fn settle(
+        &mut self,
+        id: &OperationId,
+        outcome: Settlement,
+    ) -> Result<Invalidate, OperationsRejection> {
+        let Some(index) = self
+            .in_flight
+            .iter()
+            .position(|e| e.id.as_ref() == Some(id))
+        else {
+            // Distinguish "never heard of it" from "the stream replayed the terminal
+            // event": only the second is expected, and it must be a no-op rather than a
+            // second invalidation.
+            return Err(if self.recent.iter().any(|s| &s.id == id) {
+                OperationsRejection::AlreadySettled
+            } else {
+                OperationsRejection::UnknownOperation
+            });
+        };
+        let entry = self.in_flight.remove(index);
+        let invalidate = Invalidate {
+            generation: outcome.generation.clone(),
+            // A write can move refs, the working tree and the journal at once, so nothing
+            // narrower than `Everything` is honest here. The generation is what stops that
+            // from meaning "re-read blindly".
+            scope: InvalidateScope::Everything,
+        };
+        self.recent.insert(
+            0,
+            Settled {
+                id: id.clone(),
+                kind: entry.kind,
+                outcome,
+            },
+        );
+        self.recent.truncate(MAX_RECENT);
+        Ok(invalidate)
+    }
+
+    /// Drop a settled entry the user has acknowledged.
+    pub fn dismiss(&mut self, id: &OperationId) -> Applied {
+        match self.recent.iter().position(|s| &s.id == id) {
+            Some(index) => {
+                self.recent.remove(index);
+                Applied::Committed
+            }
+            None => Applied::NoChange,
+        }
+    }
+
+    pub fn in_flight(&self) -> impl Iterator<Item = &InFlight> {
+        self.in_flight.iter()
+    }
+
+    /// Settled operations, newest first.
+    pub fn recent(&self) -> impl Iterator<Item = &Settled> {
+        self.recent.iter()
+    }
+}
 
 /// Mints the monotone sequence that orders user intents by *click* time.
 ///
@@ -135,7 +367,11 @@ mod core_tests {
             )
             .unwrap_err();
         assert_eq!(err, OperationsRejection::KeyBoundToDifferentOperation);
-        assert_eq!(c.in_flight().count(), 1, "the refused admit changed nothing");
+        assert_eq!(
+            c.in_flight().count(),
+            1,
+            "the refused admit changed nothing"
+        );
     }
 
     #[test]
@@ -143,7 +379,9 @@ mod core_tests {
         // The criterion-4 datum: reconcile against the generation the server observed
         // AFTER execution, instead of blindly re-reading everything.
         let mut c = running();
-        let inv = c.settle(&id("op-1"), succeeded("77")).expect("settle accepted");
+        let inv = c
+            .settle(&id("op-1"), succeeded("77"))
+            .expect("settle accepted");
         assert_eq!(inv.generation.as_ref().map(|g| g.as_str()), Some("77"));
         assert_eq!(inv.scope, InvalidateScope::Everything);
         assert_eq!(
@@ -197,10 +435,18 @@ mod core_tests {
     fn observing_the_same_stage_twice_reports_no_change() {
         // The stream heartbeats and can repeat; a repeat is not a transition.
         let mut c = running();
-        c.observe(&id("op-1"), OperationState::Running, OperationStage::Planning)
-            .unwrap();
+        c.observe(
+            &id("op-1"),
+            OperationState::Running,
+            OperationStage::Planning,
+        )
+        .unwrap();
         let applied = c
-            .observe(&id("op-1"), OperationState::Running, OperationStage::Planning)
+            .observe(
+                &id("op-1"),
+                OperationState::Running,
+                OperationStage::Planning,
+            )
             .unwrap();
         assert_eq!(applied, Applied::NoChange);
     }
@@ -223,7 +469,10 @@ mod core_tests {
         let settled: Vec<_> = c.recent().collect();
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].outcome.state, OperationState::Failed);
-        assert_eq!(settled[0].outcome.message.as_deref(), Some("not fully merged"));
+        assert_eq!(
+            settled[0].outcome.message.as_deref(),
+            Some("not fully merged")
+        );
     }
 
     #[test]
@@ -258,6 +507,36 @@ mod core_tests {
     }
 
     #[test]
+    fn an_unmerged_delete_escalates_to_a_force_delete_of_the_same_branch() {
+        let refused = OperationKind::Delete {
+            branch: "feature".into(),
+            current: Some("main".into()),
+        };
+        assert_eq!(
+            escalation(&refused, "error: the branch 'feature' is not fully merged"),
+            Some(OperationKind::ForceDelete {
+                branch: "feature".into()
+            })
+        );
+    }
+
+    #[test]
+    fn nothing_else_escalates() {
+        // A delete that failed for another reason is a dead end on purpose: offering `-D`
+        // for, say, a locked ref would suggest force is the answer when it is not.
+        let delete = OperationKind::Delete {
+            branch: "feature".into(),
+            current: None,
+        };
+        assert_eq!(escalation(&delete, "permission denied"), None);
+        assert_eq!(
+            escalation(&merge(), "error: the branch is not fully merged"),
+            None,
+            "only a delete escalates, whatever the message says"
+        );
+    }
+
+    #[test]
     fn binding_an_id_to_an_unknown_key_is_refused() {
         let mut c = OperationsCore::default();
         let err = c.bind_id(&key("k1"), id("op-1")).unwrap_err();
@@ -272,7 +551,11 @@ mod core_tests {
         let mut c = OperationsCore::default();
         c.admit(key("k1"), merge()).unwrap();
         let err = c
-            .observe(&id("op-1"), OperationState::Running, OperationStage::Planning)
+            .observe(
+                &id("op-1"),
+                OperationState::Running,
+                OperationStage::Planning,
+            )
             .unwrap_err();
         assert_eq!(err, OperationsRejection::UnknownOperation);
     }

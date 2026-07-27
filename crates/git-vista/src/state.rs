@@ -87,6 +87,7 @@ pub struct CommitDialog {
 pub use crate::features::operations::kind::OperationKind as PendingOp;
 
 use crate::features::operations::core::{IntentSeq, PendingIntent};
+use crate::features::operations::signals::Operations;
 
 /// How long (ms) after the commit modal opens to ignore a backdrop dismiss, so
 /// iOS's synthesized post-tap "ghost click" can't close the modal it just opened.
@@ -157,6 +158,9 @@ pub struct Overlays {
     pub pending_intent: StoredValue<Option<PendingIntent>>,
     /// The App's fetch counter; bumped to re-read the repo after a write.
     pub reload: RwSignal<u32>,
+    /// Where writes go (M1.11, #64). Created in `App`, **above** `graph_canvas`, so an
+    /// in-flight operation outlives the canvas an epoch bump rebuilds.
+    pub operations: Operations,
 }
 
 /// The lazily-fetched commit detail (Phase 10): keyed on the open commit's hash,

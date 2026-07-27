@@ -33,6 +33,8 @@ use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
 use crate::api::{fetch_frame, fetch_page, fetch_protocol, fetch_status, HistoryFetchError};
 use crate::dialogs;
+use crate::features::operations::core::OperationsCore;
+use crate::features::operations::signals::Operations;
 use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
 use crate::history::{Frame, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT};
@@ -147,6 +149,14 @@ pub fn App() -> impl IntoView {
     // request is stamped with it, and a reply carrying a retired epoch is dropped.
     let reload = create_rw_signal(0u32);
     let refresh = move |_| reload.update(|n| *n = n.wrapping_add(1));
+
+    // The write registry (M1.11, #64). Deliberately created HERE and not inside
+    // `graph_canvas`: an epoch bump rebuilds the canvas and every overlay in it, so an
+    // operation living down there would be destroyed by the very re-read its own
+    // completion triggers. Owning it in the shell is what lets a write survive a panel
+    // change (acceptance criterion 2).
+    let operations_core = create_rw_signal(OperationsCore::default());
+    let operations = Operations::new(operations_core, reload);
 
     // The history signals the App owns (M1.10, #63). `print_graph_open` opens the
     // full static print view (crate::print) from the topbar; `history_complete`
@@ -645,6 +655,7 @@ pub fn App() -> impl IntoView {
                                             nerd_icons,
                                             show_node_icons,
                                             activity_open,
+                                            operations,
                                         )}
                                     }
                                     .into_view()

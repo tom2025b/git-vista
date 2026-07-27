@@ -36,6 +36,7 @@ use git_vista_core::model::RefKind;
 use crate::api::{fetch_commit_detail, fetch_page, HistoryFetchError};
 use crate::camera::Camera;
 use crate::features::operations::core::{IntentSeq, PendingIntent};
+use crate::features::operations::signals::Operations;
 use crate::geometry::stub_headroom_for;
 use crate::gestures::{self, GestureState};
 use crate::history::{
@@ -83,6 +84,7 @@ pub(super) fn graph_canvas(
     nerd_icons: RwSignal<bool>,
     show_node_icons: RwSignal<bool>,
     activity_open: RwSignal<bool>,
+    operations: Operations,
 ) -> impl IntoView {
     let HistorySeed {
         epoch,
@@ -203,6 +205,7 @@ pub(super) fn graph_canvas(
         intent_seq,
         pending_intent,
         reload,
+        operations,
     };
 
     // What an append changes, published as signals so the view repaints the
