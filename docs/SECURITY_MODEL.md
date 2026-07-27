@@ -131,6 +131,13 @@ listener, bound to one explicit, operator-confirmed LAN IP:
   sharing one in-memory session store; a session established via either
   listener carries a `via_lan` flag purely so the UI can hide the Active
   option — the actual write boundary is the LAN router's absent routes.
+  *(Implemented: ADR 0024, #64 — the frontend's CSRF token and `via_lan` flag,
+  formerly two independent `thread_local!`s with no rule tying them together,
+  now live together in one `SessionCore` with a typed
+  `SessionRejection::UiModeChangeWhileLan`, so "a LAN-view session may not
+  select Active mode" is answerable from one place. This is a client-side
+  UI affordance only, reinforcing — not replacing — the write boundary
+  above, which remains the LAN router's absent routes.)*
 - Accepted, documented risk: plain HTTP means repo contents and the session
   cookie are readable by anyone on the same network. Suitable for a trusted
   home LAN, never a guest or shared network — the startup banner and `gv
