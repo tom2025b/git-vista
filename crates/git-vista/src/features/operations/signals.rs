@@ -18,7 +18,8 @@ use git_vista_protocol::operation::{
 use git_vista_protocol::PROTOCOL_VERSION;
 
 use crate::api::{self, WriteReceipt};
-use crate::features::core_traits::{Invalidate, RequestKey, RequestTarget};
+use crate::features::core_traits::{RequestKey, RequestTarget};
+use crate::features::graph::core::GraphCore;
 use crate::features::operations::core::{
     escalation, latest_wins, IntentSeq, OperationsCore, PendingIntent, Settled, Settlement,
 };
@@ -42,9 +43,9 @@ pub fn next_seq(intent_seq: StoredValue<IntentSeq>) -> u64 {
 /// `generation` is `None` here: the branch-operation endpoints predate M1.10 and do not
 /// report one, so these intents are fenced by epoch alone — which is exactly the case
 /// [`RequestKey::is_current`] documents as correct for pre-generation endpoints.
-pub fn request_key(reload: RwSignal<u32>, target: RequestTarget) -> RequestKey {
+pub fn request_key(graph: RwSignal<GraphCore>, target: RequestTarget) -> RequestKey {
     RequestKey {
-        epoch: u64::from(reload.get_untracked()),
+        epoch: graph.get_untracked().epoch(),
         generation: None,
         target,
     }
@@ -60,13 +61,10 @@ pub fn request_key(reload: RwSignal<u32>, target: RequestTarget) -> RequestKey {
 ///   looking at with something they asked for *earlier*.
 pub fn admit_intent(
     pending_intent: StoredValue<Option<PendingIntent>>,
-    reload: RwSignal<u32>,
+    graph: RwSignal<GraphCore>,
     intent: &PendingIntent,
 ) -> bool {
-    if !intent
-        .key
-        .is_current(u64::from(reload.get_untracked()), None)
-    {
+    if !intent.key.is_current(graph.get_untracked().epoch(), None) {
         return false;
     }
     let wins = pending_intent
@@ -89,15 +87,15 @@ pub fn admit_intent(
 #[derive(Clone, Copy)]
 pub struct Operations {
     core: RwSignal<OperationsCore>,
-    /// Where an invalidation lands today. Task 6 replaces this with `GraphEpoch` plus
-    /// scoped invalidation; until then a settled write bumps the App's fetch counter,
-    /// which is exactly what the old fire-and-forget path did.
-    reload: RwSignal<u32>,
+    /// Where a settled write's invalidation lands (M1.11 D3, Task 6): `on_invalidate`
+    /// skips the epoch bump when the settlement's generation matches what the graph
+    /// already has, so a write that didn't move the repository doesn't force a re-read.
+    graph: RwSignal<GraphCore>,
 }
 
 impl Operations {
-    pub fn new(core: RwSignal<OperationsCore>, reload: RwSignal<u32>) -> Self {
-        Self { core, reload }
+    pub fn new(core: RwSignal<OperationsCore>, graph: RwSignal<GraphCore>) -> Self {
+        Self { core, graph }
     }
 
     /// The in-flight and recently-settled registry, for views that render it.
@@ -115,7 +113,7 @@ impl Operations {
     pub fn dispatch(&self, kind: OperationKind) {
         let key = api::new_idempotency_key();
         let core = self.core;
-        let reload = self.reload;
+        let graph = self.graph;
         // A rejected admission means this exact key already names a different operation —
         // impossible for a freshly minted key, but refusing beats sending a request the
         // registry cannot account for.
@@ -130,7 +128,7 @@ impl Operations {
                 // serialize). Settle it locally so the refusal is visible state rather
                 // than a silently dropped intent.
                 Err(reason) => {
-                    settle_locally(core, reload, &key, reason, false);
+                    settle_locally(core, graph, &key, reason, false);
                 }
                 Ok(receipt) => {
                     match receipt.operation.clone() {
@@ -142,14 +140,14 @@ impl Operations {
                                 .try_update(|c| c.bind_id(&key, id.clone()))
                                 .is_some_and(|r| r.is_ok())
                             {
-                                subscribe(core, reload, id);
+                                subscribe(core, graph, id);
                             }
                         }
                         // Not operation-tracked (`select`, `rescan`, `clone`,
                         // `delete-clone` never reach the server's planner). The HTTP
                         // answer is the whole outcome.
                         None => {
-                            settle_locally(core, reload, &key, receipt.message, receipt.ok);
+                            settle_locally(core, graph, &key, receipt.message, receipt.ok);
                         }
                     }
                 }
@@ -217,7 +215,7 @@ async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt,
 /// the server to read.
 fn settle_locally(
     core: RwSignal<OperationsCore>,
-    reload: RwSignal<u32>,
+    graph: RwSignal<GraphCore>,
     key: &IdempotencyKey,
     message: String,
     ok: bool,
@@ -242,24 +240,24 @@ fn settle_locally(
         message: Some(message),
         generation: None,
     };
-    commit_settlement(core, reload, &id, outcome);
+    commit_settlement(core, graph, &id, outcome);
 }
 
 /// Apply a settlement and act on the invalidation it publishes.
 fn commit_settlement(
     core: RwSignal<OperationsCore>,
-    reload: RwSignal<u32>,
+    graph: RwSignal<GraphCore>,
     id: &OperationId,
     outcome: Settlement,
 ) {
     let id = id.clone();
-    let published: Option<Invalidate> = core
-        .try_update(move |c| c.settle(&id, outcome).ok())
-        .flatten();
+    let published = core.try_update(move |c| c.settle(&id, outcome).ok()).flatten();
     // A replayed terminal event settles nothing and publishes nothing, so a reconnected
-    // stream cannot bump the epoch twice.
-    if published.is_some() {
-        reload.update(|n| *n = n.wrapping_add(1));
+    // stream cannot run `on_invalidate` twice. When it DOES publish, `on_invalidate` is
+    // the D3 payoff: a settlement carrying the generation the graph already has skips the
+    // epoch bump entirely, instead of the old unconditional re-read after every write.
+    if let Some(inv) = published {
+        let _ = graph.try_update(|g| g.on_invalidate(&inv));
     }
 }
 
@@ -268,7 +266,7 @@ fn commit_settlement(
 /// The protocol version rides in the **query string**, not a header: `EventSource` cannot
 /// set request headers, which is exactly why ADR 0020 gave this one route a query-string
 /// negotiation path (the server allows it for this path alone).
-fn subscribe(core: RwSignal<OperationsCore>, reload: RwSignal<u32>, id: OperationId) {
+fn subscribe(core: RwSignal<OperationsCore>, graph: RwSignal<GraphCore>, id: OperationId) {
     let url = format!(
         "/api/operations/{}/events?protocol={}",
         id.as_str(),
@@ -309,7 +307,7 @@ fn subscribe(core: RwSignal<OperationsCore>, reload: RwSignal<u32>, id: Operatio
             else {
                 return;
             };
-            commit_settlement(core, reload, &record.id, outcome);
+            commit_settlement(core, graph, &record.id, outcome);
         });
 
     // A transport failure is not an outcome — the operation may well have run. Close the

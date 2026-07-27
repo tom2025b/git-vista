@@ -16,8 +16,8 @@ use git_vista_core::status::ChangeKind;
 
 use crate::api::fetch_diff;
 use crate::datetime::local_timestamp;
+use crate::features::graph::core::RenderCtx;
 use crate::icons::{icon_set, GitIcons};
-use crate::render::RenderCtx;
 use crate::state::{DetailResource, Overlays, Settings, ViewerDoc};
 
 /// CSS class for one line of the unified patch, keyed off its prefix. The

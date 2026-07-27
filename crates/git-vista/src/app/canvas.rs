@@ -35,17 +35,17 @@ use git_vista_core::model::RefKind;
 
 use crate::api::{fetch_commit_detail, fetch_page, HistoryFetchError};
 use crate::camera::Camera;
+use crate::features::graph::core::{
+    should_prefetch, show_fixed_loading_overlay, GraphCore, PageLoadState, PageRequestKey,
+    PageRetry, RenderCtx, DEFAULT_PAGE_LIMIT,
+};
 use crate::features::operations::core::{IntentSeq, PendingIntent};
 use crate::features::operations::signals::Operations;
 use crate::geometry::stub_headroom_for;
 use crate::gestures::{self, GestureState};
-use crate::history::{
-    should_prefetch, show_fixed_loading_overlay, PageLoadState, PageRequestKey, PageRetry,
-    DEFAULT_PAGE_LIMIT,
-};
 use crate::lod::detail_for;
 use crate::print::print_graph_view;
-use crate::render::{self, RenderCtx};
+use crate::render;
 use crate::state::{CommitDialog, MenuData, Overlays, PendingOp, Settings, ViewerDoc};
 use crate::viewport::visible_row_range;
 use crate::{activity, detail, dialogs, menu, viewer};
@@ -79,7 +79,7 @@ const HTTP_CONFLICT: u16 = 409;
 /// `show_node_icons` shows/hides the glyph beside each commit dot.
 pub(super) fn graph_canvas(
     seed: HistorySeed,
-    reload: RwSignal<u32>,
+    graph: RwSignal<GraphCore>,
     history_ui: HistoryUiSignals,
     nerd_icons: RwSignal<bool>,
     show_node_icons: RwSignal<bool>,
@@ -204,7 +204,7 @@ pub(super) fn graph_canvas(
         dialog_opened_at,
         intent_seq,
         pending_intent,
-        reload,
+        graph,
         operations,
     };
 
@@ -245,7 +245,7 @@ pub(super) fn graph_canvas(
     // `home` goes in as the signal, not its current value: an accepted page can
     // move the home camera down (a taller stub cascade), and the `0` key must
     // land on wherever it is *now* — same rule as the Reset-view button.
-    gestures::install_key_listener(camera, home, reload, overlays);
+    gestures::install_key_listener(camera, home, graph, overlays);
     let visible = create_memo(move |_| {
         visible_row_range(camera.get(), vp_h.get(), row_count.get(), OVERSCAN_ROWS)
     });
@@ -327,7 +327,7 @@ pub(super) fn graph_canvas(
             // `page_load` here would stamp one view's request state onto another.
             if ctx.try_with_value(|c| {
                 request_key.is_current(
-                    reload.get_untracked(),
+                    graph.get_untracked().epoch(),
                     &c.loaded.generation,
                     c.loaded.cursor.as_deref(),
                 )
@@ -350,13 +350,12 @@ pub(super) fn graph_canvas(
                     status: HTTP_CONFLICT,
                     ..
                 }) => {
-                    let next = reload.get_untracked().wrapping_add(1);
+                    let next = graph.update(|g| g.force_bump());
                     history_ui
                         .phase
                         .set(HistoryPhase::DriftReloading { epoch: next });
                     history_ui.print_open.set(false);
                     history_ui.complete.set(false);
-                    reload.set(next);
                     return;
                 }
                 Err(err) => {
@@ -450,11 +449,10 @@ pub(super) fn graph_canvas(
             // `Error`: returning it to `Idle` would let the threshold effect
             // spend the rejected cursor again before the replacement mounts.
             PageRetry::Reseed => {
-                let next = reload.get_untracked().wrapping_add(1);
+                let next = graph.update(|g| g.force_bump());
                 history_ui
                     .phase
                     .set(HistoryPhase::SeedLoading { epoch: next });
-                reload.set(next);
             }
         }
     };

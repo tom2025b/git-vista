@@ -13,7 +13,7 @@ use crate::state::MenuData;
 use crate::text::truncate;
 use git_vista_core::color::{branch_color, MERGE_FILL};
 
-use super::RenderCtx;
+use crate::features::graph::core::RenderCtx;
 
 /// A stub's branch-name label is truncated past this (the full name stays in
 /// the ring's hover tooltip and the menu header). Short enough that a deep

@@ -39,7 +39,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
         dialog_opened_at,
         intent_seq,
         pending_intent,
-        reload,
+        graph,
         ..
     } = overlays;
     let nerd_icons = settings.nerd_icons;
@@ -57,7 +57,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
         move || {
             (
                 menu.get().filter(|m| !m.is_branch).map(|m| m.commit),
-                reload.get(),
+                graph.get().epoch(),
             )
         },
         |(commit, _)| async move {
@@ -73,7 +73,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
     // instead of offering a rebase that no-ops. `None` (still loading, or the
     // fetch failed) leaves the item enabled — the server no-ops safely anyway.
     let rebase_status = create_local_resource(
-        move || (menu.get().filter(|m| !m.is_branch).is_some(), reload.get()),
+        move || (menu.get().filter(|m| !m.is_branch).is_some(), graph.get().epoch()),
         |(open, _)| async move {
             if open {
                 fetch_rebase_status().await.ok()
@@ -91,7 +91,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
         move || {
             (
                 menu.get().is_some_and(|m| m.is_head && !m.is_branch),
-                reload.get(),
+                graph.get().epoch(),
             )
         },
         |(open, _)| async move {
@@ -199,7 +199,9 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                 spawn_local(async move {
                     match create_branch_request(&name, &commit).await {
                         // Bump the fetch counter so the new branch appears.
-                        Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+                        Ok(()) => graph.update(|g| {
+                            g.force_bump();
+                        }),
                         Err(e) => {
                             if let Some(w) = web_sys::window() {
                                 let _ =
@@ -279,7 +281,9 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     menu.set(None);
                     spawn_local(async move {
                         match stage_request().await {
-                            Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+                            Ok(()) => graph.update(|g| {
+                            g.force_bump();
+                        }),
                             Err(e) => {
                                 if let Some(w) = web_sys::window() {
                                     let _ = w.alert_with_message(&format!(
@@ -321,7 +325,9 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     menu.set(None);
                     spawn_local(async move {
                         match unstage_request().await {
-                            Ok(()) => reload.update(|n| *n = n.wrapping_add(1)),
+                            Ok(()) => graph.update(|g| {
+                            g.force_bump();
+                        }),
                             Err(e) => {
                                 if let Some(w) = web_sys::window() {
                                     let _ = w.alert_with_message(&format!(
@@ -364,7 +370,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                             // answered (M1.11, #64).
                             let seq = ops::next_seq(intent_seq);
                             let key =
-                                ops::request_key(reload, RequestTarget::Branch(branch.clone()));
+                                ops::request_key(graph, RequestTarget::Branch(branch.clone()));
                             spawn_local(async move {
                                 let current = fetch_head_branch().await.unwrap_or(None);
                                 let intent = PendingIntent {
@@ -372,7 +378,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                                     key,
                                     kind: PendingOp::Checkout { branch, current },
                                 };
-                                if !ops::admit_intent(pending_intent, reload, &intent) {
+                                if !ops::admit_intent(pending_intent, graph, &intent) {
                                     return;
                                 }
                                 // Start the ghost-click guard when the modal opens.
@@ -401,7 +407,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                             menu.set(None);
                             let seq = ops::next_seq(intent_seq);
                             let key =
-                                ops::request_key(reload, RequestTarget::Branch(branch.clone()));
+                                ops::request_key(graph, RequestTarget::Branch(branch.clone()));
                             spawn_local(async move {
                                 let into = fetch_head_branch().await.unwrap_or(None);
                                 let intent = PendingIntent {
@@ -409,7 +415,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                                     key,
                                     kind: PendingOp::Merge { branch, into },
                                 };
-                                if !ops::admit_intent(pending_intent, reload, &intent) {
+                                if !ops::admit_intent(pending_intent, graph, &intent) {
                                     return;
                                 }
                                 // Start the ghost-click guard when the modal opens.
@@ -456,7 +462,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                             menu.set(None);
                             let seq = ops::next_seq(intent_seq);
                             let key =
-                                ops::request_key(reload, RequestTarget::Branch(branch.clone()));
+                                ops::request_key(graph, RequestTarget::Branch(branch.clone()));
                             spawn_local(async move {
                                 let current = fetch_head_branch().await.unwrap_or(None);
                                 let intent = PendingIntent {
@@ -464,7 +470,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                                     key,
                                     kind: PendingOp::Delete { branch, current },
                                 };
-                                if !ops::admit_intent(pending_intent, reload, &intent) {
+                                if !ops::admit_intent(pending_intent, graph, &intent) {
                                     return;
                                 }
                                 // Start the ghost-click guard when the modal opens.
@@ -584,7 +590,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     // Rebase targets the checked-out branch, not a named one, so its
                     // request identity is the repository itself.
                     let seq = ops::next_seq(intent_seq);
-                    let key = ops::request_key(reload, RequestTarget::Repository);
+                    let key = ops::request_key(graph, RequestTarget::Repository);
                     spawn_local(async move {
                         let current = fetch_head_branch().await.unwrap_or(None);
                         let intent = PendingIntent {
@@ -592,7 +598,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                             key,
                             kind: PendingOp::Rebase { current, base },
                         };
-                        if !ops::admit_intent(pending_intent, reload, &intent) {
+                        if !ops::admit_intent(pending_intent, graph, &intent) {
                             return;
                         }
                         dialog_opened_at.set_value(js_sys::Date::now());

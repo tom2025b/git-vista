@@ -14,6 +14,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::camera::{Camera, ZOOM_STEP};
+use crate::features::graph::core::GraphCore;
 use crate::geometry::drag_threshold;
 use crate::state::{MenuData, Overlays};
 
@@ -264,7 +265,7 @@ pub fn install_resize_listener(vp_h: RwSignal<f64>) {
 pub fn install_key_listener(
     camera: RwSignal<Camera>,
     home: RwSignal<Camera>,
-    reload: RwSignal<u32>,
+    graph: RwSignal<GraphCore>,
     overlays: Overlays,
 ) {
     let Overlays {
@@ -330,7 +331,11 @@ pub fn install_key_listener(
                     // at press time, so it is wherever the pages landed so far
                     // put it, never the mount-time value.
                     "0" => camera.set(home.get_untracked()),
-                    "r" | "R" => reload.update(|n| *n = n.wrapping_add(1)),
+                    "r" | "R" => {
+                        graph.update(|g| {
+                            g.force_bump();
+                        });
+                    }
                     _ => {}
                 }
             });

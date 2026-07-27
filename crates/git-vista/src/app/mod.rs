@@ -3,7 +3,7 @@
 //! Phase 4 fetched one whole laid-out `Graph`; M1.10 (#63) replaced that with
 //! *paged* history — a cheap once-per-view [`Frame`] (refs, colours, repo
 //! metadata) plus cursor-paginated pages of rows/edges/stubs, assembled by
-//! [`crate::history::LoadedHistory`]. So the App no longer holds a graph: it
+//! [`LoadedHistory`](crate::features::graph::core::LoadedHistory). So the App no longer holds a graph: it
 //! holds a **seed** (Frame + page 1) and an explicit [`HistoryPhase`], and every
 //! repo-metadata consumer reads the Frame rather than a row payload.
 //!
@@ -33,12 +33,14 @@ use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
 use crate::api::{fetch_frame, fetch_page, fetch_protocol, fetch_status, HistoryFetchError};
 use crate::dialogs;
+use crate::features::graph::core::{
+    Frame, GraphCore, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT,
+};
 use crate::features::operations::core::OperationsCore;
 use crate::features::operations::signals::Operations;
 use crate::features::operations::view::operations_status_view;
 use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
-use crate::history::{Frame, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT};
 use crate::icons::icon_set;
 use crate::prefs::{load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref};
 use crate::session::{establish_session, not_connected_view};
@@ -55,7 +57,7 @@ use canvas::graph_canvas;
 /// it can be recognised as stale instead of being mounted over the live one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistorySeed {
-    pub epoch: u32,
+    pub epoch: u64,
     pub frame: Frame,
     pub loaded: LoadedHistory,
 }
@@ -85,10 +87,10 @@ impl fmt::Display for HistorySeedError {
 /// reply for an earlier epoch can never advance the phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryPhase {
-    SeedLoading { epoch: u32 },
-    Ready { epoch: u32 },
-    DriftReloading { epoch: u32 },
-    SeedError { epoch: u32 },
+    SeedLoading { epoch: u64 },
+    Ready { epoch: u64 },
+    DriftReloading { epoch: u64 },
+    SeedError { epoch: u64 },
 }
 
 /// The three history signals the App owns and the canvas drives: which phase the
@@ -106,7 +108,7 @@ pub struct HistoryUiSignals {
 /// The tag rides on the *result*, not only on the success value: a failure has
 /// to be attributable to an epoch too, or a slow error from a retired epoch
 /// would raise [`HistoryPhase::SeedError`] over an epoch that is still loading.
-async fn load_seed(epoch: u32) -> (u32, Result<HistorySeed, HistorySeedError>) {
+async fn load_seed(epoch: u64) -> (u64, Result<HistorySeed, HistorySeedError>) {
     (epoch, seed_for_epoch(epoch).await)
 }
 
@@ -117,7 +119,7 @@ async fn load_seed(epoch: u32) -> (u32, Result<HistorySeed, HistorySeedError>) {
 /// otherwise splice rows onto refs that no longer describe them. Checking here
 /// means [`LoadedHistory::from_first_page`] can treat its own generation check
 /// as the tautology it is.
-async fn seed_for_epoch(epoch: u32) -> Result<HistorySeed, HistorySeedError> {
+async fn seed_for_epoch(epoch: u64) -> Result<HistorySeed, HistorySeedError> {
     let frame = fetch_frame().await.map_err(HistorySeedError::Fetch)?;
     let page = fetch_page(frame.worktree_id.as_deref(), None, DEFAULT_PAGE_LIMIT)
         .await
@@ -140,16 +142,23 @@ async fn seed_for_epoch(epoch: u32) -> Result<HistorySeed, HistorySeedError> {
 
 #[component]
 pub fn App() -> impl IntoView {
-    // A bump counter is the resource's reactive source, so changing it re-runs the
-    // fetch. The frontend used to fetch exactly once on load (`|| ()`, a constant
-    // source that never re-fires), so a branch or commit created *after* the page
-    // loaded never appeared until a full reload — the heart of issue #16. The
-    // Refresh button below bumps this to re-read the repo on demand. (Each fetch
-    // also cache-busts its URL, so the re-read reaches the server, not the cache.)
-    // Since M1.10 it doubles as the history *epoch*: every seed and every page
-    // request is stamped with it, and a reply carrying a retired epoch is dropped.
-    let reload = create_rw_signal(0u32);
-    let refresh = move |_| reload.update(|n| *n = n.wrapping_add(1));
+    // The graph epoch (M1.11, #64): `GraphCore` replaces the bare `reload: RwSignal<u32>`
+    // counter every writer used to bump unconditionally. The frontend used to fetch
+    // exactly once on load (`|| ()`, a constant source that never re-fires), so a
+    // branch or commit created *after* the page loaded never appeared until a full
+    // reload — the heart of issue #16; a bump counter fixed that, but bumped after
+    // EVERY write regardless of whether the repository actually moved. `GraphCore`
+    // makes that a tested decision (design spec D3): a settled operation reports its
+    // post-execution generation, and `on_invalidate` skips the bump when nothing
+    // moved. Explicit actions — Refresh, the "R" key, a 409 drift, session landing —
+    // have no generation to compare and call `force_bump` instead, exactly
+    // reproducing the old unconditional behaviour for those paths.
+    let graph = create_rw_signal(GraphCore::default());
+    let refresh = move |_| {
+        graph.update(|g| {
+            g.force_bump();
+        });
+    };
 
     // The write registry (M1.11, #64). Deliberately created HERE and not inside
     // `graph_canvas`: an epoch bump rebuilds the canvas and every overlay in it, so an
@@ -157,7 +166,7 @@ pub fn App() -> impl IntoView {
     // completion triggers. Owning it in the shell is what lets a write survive a panel
     // change (acceptance criterion 2).
     let operations_core = create_rw_signal(OperationsCore::default());
-    let operations = Operations::new(operations_core, reload);
+    let operations = Operations::new(operations_core, graph);
 
     // The history signals the App owns (M1.10, #63). `print_graph_open` opens the
     // full static print view (crate::print) from the topbar; `history_complete`
@@ -174,14 +183,14 @@ pub fn App() -> impl IntoView {
 
     // Frame + page 1, keyed on the epoch. `create_local_resource` because the
     // fetch future isn't `Send` (wasm).
-    let seed = create_local_resource(move || reload.get(), load_seed);
+    let seed = create_local_resource(move || graph.get().epoch(), load_seed);
 
     // Every epoch — Refresh, a post-operation reload, a drift reload — retires
     // the mounted history. Print can't span two generations and "complete" must
     // not survive into a graph that hasn't loaded a page yet, so both are reset
     // here rather than at each of the several places that bump `reload`.
     create_effect(move |_| {
-        let epoch = reload.get();
+        let epoch = graph.get().epoch();
         history_ui.print_open.set(false);
         history_ui.complete.set(false);
         // A drift reload has already announced itself with the epoch it is
@@ -201,7 +210,7 @@ pub fn App() -> impl IntoView {
         else {
             return;
         };
-        if epoch != reload.get_untracked() {
+        if epoch != graph.get_untracked().epoch() {
             return;
         }
         match complete {
@@ -235,7 +244,9 @@ pub fn App() -> impl IntoView {
     // session lands, bump `reload` once so they refetch authenticated.
     create_effect(move |_| {
         if matches!(session.get(), Some(Ok(true))) {
-            reload.update(|n| *n = n.wrapping_add(1));
+            graph.update(|g| {
+                g.force_bump();
+            });
         }
     });
 
@@ -245,7 +256,7 @@ pub fn App() -> impl IntoView {
     // this tab stays open, the next reload catches it. `protocol_gate` yields the
     // negotiation payload + verdict only when the client is *out* of the server's
     // accepted window; that drives the blocking "Update Required" overlay below.
-    let protocol = create_local_resource(move || reload.get(), |_| fetch_protocol());
+    let protocol = create_local_resource(move || graph.get().epoch(), |_| fetch_protocol());
     let protocol_gate = move || match protocol.get() {
         Some(Ok(info)) => {
             let verdict = check_compatibility(
@@ -267,7 +278,7 @@ pub fn App() -> impl IntoView {
     // `None`, which simply hides the chip: a broken status probe shouldn't
     // take the topbar down with it.
     let status = create_local_resource(
-        move || reload.get(),
+        move || graph.get().epoch(),
         |_| async { fetch_status().await.ok() },
     );
 
@@ -553,14 +564,14 @@ pub fn App() -> impl IntoView {
                     })}
             </header>
             // The "Open URL" modal (Phase 12), factored into `dialogs`.
-            {dialogs::open_url_view(open_url, clone_url, cloning, open_opened_at, reload, mode_for)}
+            {dialogs::open_url_view(open_url, clone_url, cloning, open_opened_at, graph, mode_for)}
             // The "Reset Test Repo" confirmation (only reachable via the gated
             // topbar button above).
-            {dialogs::reset_repo_view(reset_open, reset_opened_at, reload)}
+            {dialogs::reset_repo_view(reset_open, reset_opened_at, graph)}
             // The repo picker + mode screens (ADR 0006): blocking overlays under
             // the sign-in/protocol screens, over everything else.
-            {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, open_opened_at, reload)}
-            {crate::picker::mode_view(mode_for, picker_open, reload)}
+            {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, open_opened_at, graph)}
+            {crate::picker::mode_view(mode_for, picker_open, graph)}
             <section class="graph">
                 {move || {
                     // Read the icon set here, inside the reactive block, so the
@@ -656,7 +667,7 @@ pub fn App() -> impl IntoView {
                                         // `graph_canvas` and is disposed with it.
                                         {graph_canvas(
                                             seed,
-                                            reload,
+                                            graph,
                                             history_ui,
                                             nerd_icons,
                                             show_node_icons,

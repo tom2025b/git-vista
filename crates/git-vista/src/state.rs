@@ -87,6 +87,7 @@ pub struct CommitDialog {
 pub use crate::features::operations::kind::OperationKind as PendingOp;
 
 use crate::features::operations::core::{IntentSeq, PendingIntent};
+use crate::features::graph::core::GraphCore;
 use crate::features::operations::signals::Operations;
 
 /// How long (ms) after the commit modal opens to ignore a backdrop dismiss, so
@@ -156,8 +157,9 @@ pub struct Overlays {
     /// before committing and a straggler from an earlier click is dropped
     /// instead of reopening its dialog over the one the user is looking at.
     pub pending_intent: StoredValue<Option<PendingIntent>>,
-    /// The App's fetch counter; bumped to re-read the repo after a write.
-    pub reload: RwSignal<u32>,
+    /// The graph epoch (M1.11, #64): bumped, generation-aware, to re-read the repo
+    /// after a write. Replaces the old bare `reload: RwSignal<u32>` counter.
+    pub graph: RwSignal<GraphCore>,
     /// Where writes go (M1.11, #64). Created in `App`, **above** `graph_canvas`, so an
     /// in-flight operation outlives the canvas an epoch bump rebuilds.
     pub operations: Operations,

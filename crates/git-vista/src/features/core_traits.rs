@@ -34,7 +34,7 @@ pub enum RequestTarget {
 
 /// Identity carried by every async continuation that writes shared state.
 ///
-/// Generalises M1.10's `PageRequestKey` (`crate::history`) so the same fencing protects the
+/// Generalises M1.10's `PageRequestKey` (`crate::features::graph::core`) so the same fencing protects the
 /// bare `spawn_local` sites in `menu.rs` and `picker.rs`, which today write unconditionally
 /// and can race (design spec §3).
 #[derive(Debug, Clone, PartialEq, Eq)]

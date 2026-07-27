@@ -26,8 +26,8 @@ use git_vista_protocol::{
     PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
+use crate::features::graph::core::{Frame, Page};
 use crate::features::session::signals as session_state;
-use crate::history::{Frame, Page};
 
 /// The largest page the server will mint, mirrored here so a caller's request is
 /// clamped before it goes out rather than silently rewritten server-side. Kept

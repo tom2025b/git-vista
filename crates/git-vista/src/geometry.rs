@@ -87,7 +87,7 @@ pub fn label_x(lane_count: usize) -> i32 {
 ///
 /// M1.10 (#63): the *paged* views no longer call this — a page-at-a-time graph
 /// grows its occupancy incrementally and monotonically inside
-/// [`crate::history::LoadedHistory`], which reads back through
+/// [`crate::features::graph::core::LoadedHistory`], which reads back through
 /// `LoadedHistory::text_x`. This whole-`Graph` form stays as the documented
 /// reference the incremental one mirrors, pinned by the tests below.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -207,7 +207,7 @@ const STUB_TOP_MARGIN: i32 = 6;
 /// zero when nothing reaches above the canvas.
 ///
 /// M1.10 (#63): the paged views place stubs from
-/// [`ResolvedStub`](crate::history::ResolvedStub), which is not a `BranchStub`,
+/// [`ResolvedStub`](crate::features::graph::core::ResolvedStub), which is not a `BranchStub`,
 /// so they call [`stub_headroom_for`] with the same `(anchor_row, depth)` pairs.
 /// This form stays as the whole-`Graph` reference its tests below pin.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -551,13 +551,13 @@ mod tests {
     // [`label_x_per_row`] above computes label geometry from a whole `Graph`, which
     // only exists when the entire history has arrived. Paged history never has
     // that: rows appear a page at a time, so geometry is *grown* by
-    // [`crate::history::LoadedHistory`] instead — each append widens rows, never
+    // [`crate::features::graph::core::LoadedHistory`] instead — each append widens rows, never
     // narrows them. These tests pin that monotonicity and the resolved-stub
     // placement, reading geometry only through the aggregate's `label_occupancy()`
     // / `text_x()` accessors, because the backing vectors are private precisely so
     // nothing outside that module can shrink them.
 
-    use crate::history::{LoadedHistory, Page, ResolvedStub};
+    use crate::features::graph::core::{LoadedHistory, Page, ResolvedStub};
     use git_vista_core::model::{CommitSummary, FrameStub, GraphRow, Oid};
     use git_vista_protocol::GenerationToken;
 

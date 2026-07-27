@@ -31,19 +31,10 @@ pub type Page = HistoryPage<GraphRow, Edge, FrameStub>;
 /// EVERY operation regardless of whether the repository actually moved. `GraphCore`
 /// makes that decision a tested function of the invalidation's generation (design
 /// spec D3): the same generation means nothing moved, so nothing re-reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GraphCore {
     epoch: u64,
     generation: Option<GenerationToken>,
-}
-
-impl Default for GraphCore {
-    fn default() -> Self {
-        Self {
-            epoch: 0,
-            generation: None,
-        }
-    }
 }
 
 impl GraphCore {
@@ -52,18 +43,20 @@ impl GraphCore {
     pub fn at_generation(generation: &str) -> Self {
         Self {
             epoch: 0,
-            generation: Some(
-                GenerationToken::new(generation).expect("valid generation token"),
-            ),
+            generation: Some(GenerationToken::new(generation).expect("valid generation token")),
         }
     }
 
     /// Bump unconditionally — a repository switch, a 409 drift reseed, or an
-    /// explicit Refresh. These are not invalidations with a generation to compare
-    /// against; they are the user (or the server) saying "everything you have is
-    /// void," so there is nothing to be conservative about.
-    pub fn force_bump(&mut self) {
+    /// explicit Refresh — and report the new epoch. These are not invalidations
+    /// with a generation to compare against; they are the user (or the server)
+    /// saying "everything you have is void," so there is nothing to be
+    /// conservative about. Returning the new value lets a caller stamp a UI
+    /// phase (`SeedLoading { epoch }`, `DriftReloading { epoch }`) with the epoch
+    /// that will actually be live, not one read before the bump.
+    pub fn force_bump(&mut self) -> u64 {
         self.epoch += 1;
+        self.epoch
     }
 
     pub fn epoch(&self) -> u64 {
@@ -78,7 +71,10 @@ impl GraphCore {
     /// `InvalidateScope::Everything` are this core's business; anything else is
     /// silently `NoChange` — the invalidation was never addressed to it.
     pub fn on_invalidate(&mut self, inv: &Invalidate) -> Applied {
-        if !matches!(inv.scope, InvalidateScope::Graph | InvalidateScope::Everything) {
+        if !matches!(
+            inv.scope,
+            InvalidateScope::Graph | InvalidateScope::Everything
+        ) {
             return Applied::NoChange;
         }
         match &inv.generation {
@@ -170,14 +166,14 @@ mod graph_core_tests {
     }
 
     #[test]
-    fn force_bump_always_advances_regardless_of_generation() {
+    fn force_bump_always_advances_regardless_of_generation_and_reports_the_new_epoch() {
         let mut g = GraphCore::at_generation("77");
         let before = g.epoch();
-        g.force_bump();
+        let reported = g.force_bump();
         assert_eq!(g.epoch(), before + 1);
+        assert_eq!(reported, before + 1, "the caller needs the epoch it is loading INTO");
     }
 }
-
 
 /// Rows asked for per page. Big enough that a first screenful never needs a
 /// second round trip, small enough that page 1 is cheap on a huge repository.
@@ -562,7 +558,7 @@ impl LoadedHistory {
 pub struct RenderCtx {
     /// The reload epoch this canvas was mounted for. A page reply carrying any
     /// other epoch belongs to a retired view and is dropped.
-    pub epoch: u32,
+    pub epoch: u64,
     /// Refs, colours and every scrap of repo metadata — read once per view, and
     /// the *only* source of it now that paged rows carry none.
     pub frame: Frame,
@@ -667,7 +663,7 @@ pub enum PageLoadState {
 /// `generation` (history moved), and the `cursor` (the aggregate advanced).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageRequestKey {
-    pub epoch: u32,
+    pub epoch: u64,
     pub generation: GenerationToken,
     pub cursor: String,
 }
@@ -675,7 +671,7 @@ pub struct PageRequestKey {
 impl PageRequestKey {
     pub fn is_current(
         &self,
-        current_epoch: u32,
+        current_epoch: u64,
         current_generation: &GenerationToken,
         current_cursor: Option<&str>,
     ) -> bool {
