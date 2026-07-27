@@ -5,8 +5,8 @@
 //! keeping the pending intent in a `StoredValue` that survives the closures that write it.
 
 use leptos::{
-    spawn_local, RwSignal, SignalGetUntracked, SignalUpdate, SignalWith, SignalWithUntracked,
-    StoredValue,
+    spawn_local, store_value, RwSignal, SignalGetUntracked, SignalUpdate, SignalWith,
+    SignalWithUntracked, StoredValue,
 };
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
@@ -24,6 +24,23 @@ use crate::features::operations::core::{
     escalation, latest_wins, IntentSeq, OperationsCore, PendingIntent, Settled, Settlement,
 };
 use crate::features::operations::kind::OperationKind;
+
+/// Mint the next value of a click-order sequence.
+///
+/// Call this **synchronously inside the event handler**, before any `await`. That is the
+/// whole point: the sequence must record when the user acted, and a value taken after the
+/// pre-check resolves would record when the network answered instead.
+///
+/// Free-standing because `picker.rs` orders its *own* messages with a second, unrelated
+/// [`IntentSeq`]; [`Operations::next_seq`] is the same rule applied to the one this
+/// feature owns.
+pub fn next_seq(intent_seq: StoredValue<IntentSeq>) -> u64 {
+    // `try_update_value` returns `None` only when the owning scope is already disposed, in
+    // which case the continuation cannot write anything either. Sequence 0 is the reserved
+    // "no intent" value, so falling back to it makes such an intent lose every comparison
+    // rather than spuriously win one.
+    intent_seq.try_update_value(|s| s.next()).unwrap_or(0)
+}
 
 /// The reactive handle every feature uses to start and watch a write.
 ///
@@ -68,17 +85,12 @@ impl Operations {
         }
     }
 
-    /// Mint the next click-order sequence.
+    /// Mint the next click-order sequence for a branch operation.
     ///
-    /// Call this **synchronously inside the event handler**, before any `await`. That is
-    /// the whole point: the sequence must record when the user acted, and a value taken
-    /// after the pre-check resolves would record when the network answered instead.
+    /// Call this **synchronously inside the event handler**, before any `await` — see
+    /// [`next_seq`], which is where the rule and the disposed-scope fallback live.
     pub fn next_seq(&self) -> u64 {
-        // `try_update_value` returns `None` only when the owning scope is already disposed,
-        // in which case the continuation cannot write anything either. Sequence 0 is the
-        // reserved "no intent" value, so falling back to it makes such an intent lose every
-        // comparison rather than spuriously win one.
-        self.intent_seq.try_update_value(|s| s.next()).unwrap_or(0)
+        next_seq(self.intent_seq)
     }
 
     /// Stamp a request with the repository state it was raised against.

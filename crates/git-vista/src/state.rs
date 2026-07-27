@@ -95,7 +95,6 @@ pub struct CommitDialog {
 // naturally; `dialogs/confirm.rs` still matches one arm per `api.rs` function.
 pub use crate::features::operations::kind::OperationKind as PendingOp;
 
-use crate::features::activity::signals::Activity;
 use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::GraphCore;
 use crate::features::operations::signals::Operations;
@@ -130,16 +129,15 @@ pub struct Settings {
 /// The feature handles `App` owns and hands down to the graph canvas (M1.11, #64).
 ///
 /// Every one of these is created **above** `graph_canvas`, so it outlives the canvas that
-/// an epoch bump rebuilds — an in-flight operation, a modal's ghost-click guard and the
-/// panel's visibility all have to survive that rebuild. Bundled for the same reason
-/// [`Overlays`] is: they were threaded as five separate parameters, which is how
-/// `graph_canvas` reached nine arguments.
+/// an epoch bump rebuilds — an in-flight operation, a modal's ghost-click guard and every
+/// open overlay all have to survive that rebuild. Bundled because they were threaded as
+/// five separate parameters, which is how `graph_canvas` reached nine arguments; since
+/// Task 8 it is the *only* bundle the overlay views take, the retired `Overlays` having
+/// been the other.
 #[derive(Clone, Copy)]
 pub struct Features {
     /// The graph epoch: bumped, generation-aware, to re-read the repo after a write.
     pub graph: RwSignal<GraphCore>,
-    /// The Activity panel's visibility.
-    pub activity: Activity,
     /// The app's one iOS ghost-click guard.
     pub dialogs: Dialogs,
     /// Where writes go.
@@ -150,6 +148,11 @@ pub struct Features {
     /// Every overlay the app can put on screen, and the order they were raised in
     /// (M1.11, #64, Task 8). Replaces the `Overlays` bundle: the six overlay signals are
     /// private to it, so nothing can change what is visible without the stack hearing.
+    ///
+    /// The Activity panel's visibility is no longer a field of its own here. It is one of
+    /// those six, and handing out a second way to write it is exactly how the right edge
+    /// came to be governed by two rules on two different ticks. `App` still holds the
+    /// `Activity` handle directly, because the shared status read keys on it.
     pub shell: Shell,
 }
 

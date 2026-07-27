@@ -15,8 +15,8 @@ use wasm_bindgen::JsCast;
 
 use crate::camera::{Camera, ZOOM_STEP};
 use crate::features::graph::core::GraphCore;
+use crate::features::shell::signals::Shell;
 use crate::geometry::drag_threshold;
-use crate::state::{MenuData, Overlays};
 
 /// Current browser window inner height in CSS px, or a sane default when it can't
 /// be read. The window is always at least as tall as the SVG (the topbar sits
@@ -64,7 +64,9 @@ pub struct GestureState {
     pub camera: RwSignal<Camera>,
     /// Whether any pointer is currently pressed (drives the grab/grabbing cursor).
     pub dragging: RwSignal<bool>,
-    pub menu: RwSignal<Option<MenuData>>,
+    /// The overlay stack, so a press on the canvas can dismiss an open context menu
+    /// through the one writer rather than poking its signal (M1.11, #64, Task 8).
+    pub shell: Shell,
     pub moved: StoredValue<bool>,
     pub pointers: StoredValue<Vec<(i32, f64, f64)>>,
     pub pinch_dist: StoredValue<Option<f64>>,
@@ -88,7 +90,7 @@ fn svg_origin(ev: &web_sys::PointerEvent) -> (f64, f64) {
 /// so a plain tap stays a tap and its click reaches the link underneath.
 pub fn on_pointer_down(g: GestureState, ev: web_sys::PointerEvent) {
     let GestureState {
-        menu,
+        shell,
         moved,
         pointers,
         pinch_dist,
@@ -98,7 +100,7 @@ pub fn on_pointer_down(g: GestureState, ev: web_sys::PointerEvent) {
     // Any press on the canvas dismisses an open menu. A tap on a dot reopens it
     // on the click that follows (pointerdown fires before click), so this just
     // handles "tap empty space / start panning to close".
-    menu.set(None);
+    shell.close_menu();
     let id = ev.pointer_id();
     let (x, y) = (ev.client_x() as f64, ev.client_y() as f64);
     let first = pointers.with_value(|ps| ps.is_empty());
@@ -266,35 +268,20 @@ pub fn install_key_listener(
     camera: RwSignal<Camera>,
     home: RwSignal<Camera>,
     graph: RwSignal<GraphCore>,
-    overlays: Overlays,
+    shell: Shell,
 ) {
-    let Overlays {
-        menu,
-        commit_dialog,
-        confirm_op,
-        detail_id,
-        viewer,
-        ..
-    } = overlays;
     if let Some(win) = web_sys::window() {
         let cb =
             Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
                 if ev.key() == "Escape" {
-                    // Topmost first: the full-screen viewer sits over the panel
-                    // it was opened from. (Esc is a desktop convenience only —
-                    // every overlay keeps a visible close control, since the
-                    // iPad Magic Keyboard has no Esc key.)
-                    if viewer.is_open() {
-                        viewer.close();
-                    } else if menu.get_untracked().is_some() {
-                        menu.set(None);
-                    } else if commit_dialog.get_untracked().is_some() {
-                        commit_dialog.set(None);
-                    } else if confirm_op.get_untracked().is_some() {
-                        confirm_op.set(None);
-                    } else if detail_id.get_untracked().is_some() {
-                        detail_id.set(None);
-                    }
+                    // Topmost first, and "topmost" is now a fact the shell holds rather
+                    // than an `if/else if` chain this handler had to keep in step with the
+                    // overlay set. That chain is the bug this replaces: it covered five of
+                    // the six overlays and silently omitted the Activity panel, so Esc
+                    // could not close it (M1.11, #64, Task 8). (Esc is a desktop
+                    // convenience only — every overlay keeps a visible close control,
+                    // since the iPad Magic Keyboard has no Esc key.)
+                    shell.dismiss_top();
                     return;
                 }
                 // Leave keys alone while typing in a field, or when a modifier is held.
