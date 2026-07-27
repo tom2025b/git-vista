@@ -1,18 +1,13 @@
-//! The frontend's paged-history aggregate and its request state (M1.10, #63).
+//! Graph state: the frame, the paged-history aggregate, its request state, and the
+//! epoch that decides when a stale view must be discarded (M1.11, #64).
 //!
-//! History arrives as a cheap once-per-view [`Frame`] plus a stream of
-//! cursor-paginated [`Page`]s, so the browser now *assembles* the graph instead
-//! of receiving it whole. That assembly is the risky part: a page that starts at
-//! the wrong row, repeats an OID, or re-delivers an edge the prefix already owns
-//! would silently corrupt a graph the user is reading. So this module owns one
-//! mutable aggregate ([`LoadedHistory`]) and one validate-then-commit path — every
-//! check runs in temporary values, and a page that fails any of them leaves the
-//! aggregate byte-for-byte untouched.
-//!
-//! It's deliberately DOM-free and host-compiled, like [`crate::camera`],
-//! [`crate::geometry`] and [`crate::viewport`]: the invariants are the whole
-//! point, so they're unit-tested on the host rather than only exercised in a
-//! browser.
+//! Framework-free (M1.11 D1): this is the whole reason `LoadedHistory`'s validate-
+//! then-commit invariants are unit-tested on the host rather than only exercised in a
+//! browser, and it is the pattern the rest of the feature cores generalise. Moved here
+//! verbatim from the crate-root `history.rs` (M1.10, #63) and `render/mod.rs`'s
+//! `RenderCtx`; the 17 `LoadedHistory` tests below moved with it, unchanged.
+
+use crate::features::core_traits::{Applied, Invalidate, InvalidateScope};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -28,6 +23,161 @@ use crate::geometry::{node_cx, LABEL_GAP, ROW_HEIGHT};
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub type Frame = HistoryFrame<GitRef>;
 pub type Page = HistoryPage<GraphRow, Edge, FrameStub>;
+
+/// The reload epoch and the fencing rule that decides when it must bump.
+///
+/// Before M1.11 this was `reload: RwSignal<u32>` in `App` — a bare counter every
+/// writer bumped unconditionally after every write, so the graph re-read after
+/// EVERY operation regardless of whether the repository actually moved. `GraphCore`
+/// makes that decision a tested function of the invalidation's generation (design
+/// spec D3): the same generation means nothing moved, so nothing re-reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphCore {
+    epoch: u64,
+    generation: Option<GenerationToken>,
+}
+
+impl Default for GraphCore {
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            generation: None,
+        }
+    }
+}
+
+impl GraphCore {
+    /// Start at epoch 0, already at `generation` — the seed state once the first
+    /// Frame has landed and reported a generation.
+    pub fn at_generation(generation: &str) -> Self {
+        Self {
+            epoch: 0,
+            generation: Some(
+                GenerationToken::new(generation).expect("valid generation token"),
+            ),
+        }
+    }
+
+    /// Bump unconditionally — a repository switch, a 409 drift reseed, or an
+    /// explicit Refresh. These are not invalidations with a generation to compare
+    /// against; they are the user (or the server) saying "everything you have is
+    /// void," so there is nothing to be conservative about.
+    pub fn force_bump(&mut self) {
+        self.epoch += 1;
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn generation(&self) -> Option<&GenerationToken> {
+        self.generation.as_ref()
+    }
+
+    /// Apply a published invalidation. Only `InvalidateScope::Graph` and
+    /// `InvalidateScope::Everything` are this core's business; anything else is
+    /// silently `NoChange` — the invalidation was never addressed to it.
+    pub fn on_invalidate(&mut self, inv: &Invalidate) -> Applied {
+        if !matches!(inv.scope, InvalidateScope::Graph | InvalidateScope::Everything) {
+            return Applied::NoChange;
+        }
+        match &inv.generation {
+            // The server could not read a generation after execution (ADR 0020
+            // allows `None`). Re-reading is the safe default: silently skipping
+            // would strand a stale graph with no way to notice it moved.
+            None => {
+                self.epoch += 1;
+                Applied::Committed
+            }
+            Some(g) if self.generation.as_ref() == Some(g) => Applied::NoChange,
+            Some(g) => {
+                self.generation = Some(g.clone());
+                self.epoch += 1;
+                Applied::Committed
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod graph_core_tests {
+    use super::*;
+
+    fn gen(s: &str) -> GenerationToken {
+        GenerationToken::new(s).expect("valid generation token")
+    }
+
+    #[test]
+    fn an_invalidation_carrying_the_generation_we_already_have_does_not_bump_the_epoch() {
+        // The whole point of D3: stop re-reading everything after every write.
+        let mut g = GraphCore::at_generation("77");
+        let before = g.epoch();
+        let applied = g.on_invalidate(&Invalidate {
+            generation: Some(gen("77")),
+            scope: InvalidateScope::Graph,
+        });
+        assert_eq!(applied, Applied::NoChange);
+        assert_eq!(g.epoch(), before, "nothing moved, so nothing re-reads");
+    }
+
+    #[test]
+    fn an_invalidation_carrying_a_newer_generation_bumps_the_epoch() {
+        let mut g = GraphCore::at_generation("77");
+        let before = g.epoch();
+        let applied = g.on_invalidate(&Invalidate {
+            generation: Some(gen("78")),
+            scope: InvalidateScope::Graph,
+        });
+        assert_eq!(applied, Applied::Committed);
+        assert_eq!(g.epoch(), before + 1);
+    }
+
+    #[test]
+    fn an_invalidation_with_no_generation_bumps_conservatively() {
+        // The server could not read a generation after execution (ADR 0020 allows None).
+        // Re-reading is the safe default; silently skipping would strand a stale graph.
+        let mut g = GraphCore::at_generation("77");
+        let before = g.epoch();
+        g.on_invalidate(&Invalidate {
+            generation: None,
+            scope: InvalidateScope::Graph,
+        });
+        assert_eq!(g.epoch(), before + 1);
+    }
+
+    #[test]
+    fn an_invalidation_scoped_elsewhere_is_ignored() {
+        let mut g = GraphCore::at_generation("77");
+        let before = g.epoch();
+        let applied = g.on_invalidate(&Invalidate {
+            generation: Some(gen("78")),
+            scope: InvalidateScope::Activity,
+        });
+        assert_eq!(applied, Applied::NoChange);
+        assert_eq!(g.epoch(), before);
+    }
+
+    #[test]
+    fn an_invalidation_scoped_everything_still_bumps_the_graph() {
+        // `OperationsCore::settle` always publishes `InvalidateScope::Everything`
+        // (Task 4) — a write can move refs, the tree and the journal at once.
+        let mut g = GraphCore::at_generation("77");
+        let applied = g.on_invalidate(&Invalidate {
+            generation: Some(gen("78")),
+            scope: InvalidateScope::Everything,
+        });
+        assert_eq!(applied, Applied::Committed);
+    }
+
+    #[test]
+    fn force_bump_always_advances_regardless_of_generation() {
+        let mut g = GraphCore::at_generation("77");
+        let before = g.epoch();
+        g.force_bump();
+        assert_eq!(g.epoch(), before + 1);
+    }
+}
+
 
 /// Rows asked for per page. Big enough that a first screenful never needs a
 /// second round trip, small enough that page 1 is cheap on a huge repository.
@@ -397,6 +547,34 @@ impl LoadedHistory {
     pub fn is_complete(&self) -> bool {
         self.cursor.is_none()
     }
+}
+
+/// Everything the per-row / per-edge view builders need, bundled so a reactive
+/// `<For>` closure (Phase 8 viewport virtualization) can reach it cheaply.
+///
+/// This is the mounted canvas's single owner of history (M1.10, #63): the
+/// once-per-view [`Frame`] and the growing [`LoadedHistory`]. `remote_branches`
+/// is the only derived table kept here, and only because it is a property of the
+/// Frame — it cannot drift as pages land. Moved here from `render/mod.rs`
+/// (M1.11, #64): a plain data bundle has no reason to live in the view-builder
+/// module, and belongs beside the state it bundles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderCtx {
+    /// The reload epoch this canvas was mounted for. A page reply carrying any
+    /// other epoch belongs to a retired view and is dropped.
+    pub epoch: u32,
+    /// Refs, colours and every scrap of repo metadata — read once per view, and
+    /// the *only* source of it now that paged rows carry none.
+    pub frame: Frame,
+    /// Every page accepted so far, as one graph: rows, edges, stubs, the cursor,
+    /// and the monotonic per-row label geometry.
+    pub loaded: LoadedHistory,
+    /// Remote branch short-names (the part after the `<remote>/` prefix),
+    /// derived once from [`Frame::refs`] — a local branch links out only when a
+    /// remote branch shares its name. Derived from the Frame, never from the
+    /// loaded rows: with paging, whichever rows happen to be loaded say nothing
+    /// about which branches exist on the remote.
+    pub remote_branches: HashSet<String>,
 }
 
 fn edge_identity(e: &Edge) -> (usize, usize, usize, usize) {

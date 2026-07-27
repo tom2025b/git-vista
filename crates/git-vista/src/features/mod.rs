@@ -7,6 +7,7 @@
 pub mod core_traits;
 
 pub mod diff;
+pub mod graph;
 pub mod operations;
 pub mod session;
 pub mod status;

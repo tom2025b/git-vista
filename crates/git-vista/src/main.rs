@@ -16,12 +16,6 @@ mod camera;
 mod datetime;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod geometry;
-// M1.10 (#63): the paged-history aggregate and its request state. Pure
-// validate-then-commit logic over the wire types — no Leptos, no DOM — so the
-// all-or-nothing invariants are unit-tested on the host like the geometry above,
-// not only exercised in a browser.
-#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
-mod history;
 // M1.11 (#64): the feature boundaries. NOT cfg-gated, on purpose — the feature *cores*
 // are framework-free and must compile on the host target so `cargo test --workspace` runs
 // their tests. Only the `signals.rs` wrappers inside are wasm-gated. Gating this line
