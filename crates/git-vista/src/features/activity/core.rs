@@ -53,16 +53,23 @@ impl ActivityCore {
 /// backend's activity encoding (`git_vista_core::activity`), which is exactly why it is
 /// worth a test rather than an inline `.filter()` in a view closure.
 pub fn event_commit(event: &ActivityEvent) -> Option<String> {
-    fn real(oid: &Option<String>) -> Option<String> {
-        oid.as_ref().filter(|o| !is_null_oid(o)).cloned()
+    fn usable(oid: &Option<String>) -> Option<String> {
+        oid.as_ref().filter(|o| is_usable_oid(o)).cloned()
     }
-    real(&event.new_oid).or_else(|| real(&event.old_oid))
+    usable(&event.new_oid).or_else(|| usable(&event.old_oid))
 }
 
-/// Git's null oid: all ASCII zeros. Length is not checked — sha-1 and sha-256 repos give
-/// 40 and 64 characters respectively, and an empty string is not a valid oid either way.
-fn is_null_oid(oid: &str) -> bool {
-    !oid.is_empty() && oid.bytes().all(|b| b == b'0')
+/// Whether `oid` names something a menu can be opened on.
+///
+/// Excludes git's null oid — all ASCII zeros — and the empty string. Length is not
+/// checked: sha-1 and sha-256 repos give 40 and 64 characters respectively.
+///
+/// The empty case is load-bearing and easy to lose. The inline version this replaces was
+/// `!oid.bytes().all(|b| b == b'0')`, and `all` on an empty iterator is `true`, so an
+/// empty oid fell out as "null" by accident. Writing the check the obvious way round —
+/// "is it all zeros?" — silently reverses that and lets `""` through as a commit hash.
+fn is_usable_oid(oid: &str) -> bool {
+    !oid.is_empty() && !oid.bytes().all(|b| b == b'0')
 }
 
 /// Short human name for one event kind — the row's leading word.
@@ -165,6 +172,16 @@ mod tests {
     #[test]
     fn an_event_referencing_nothing_yields_no_commit() {
         assert_eq!(event_commit(&event(None, None)), None);
+    }
+
+    #[test]
+    fn an_empty_oid_is_not_a_commit() {
+        // Pins the vacuous-truth trap documented on `is_usable_oid`: the inline check this
+        // came from dropped `""` only because `all` is `true` on an empty iterator, so the
+        // extraction is one `!` away from opening a context menu on an empty hash.
+        let e = event(Some(TIP), Some(""));
+        assert_eq!(event_commit(&e).as_deref(), Some(TIP));
+        assert_eq!(event_commit(&event(Some(""), Some(""))), None);
     }
 
     #[test]
