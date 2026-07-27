@@ -4,33 +4,32 @@ use leptos::*;
 
 use crate::api::create_commit_request;
 use crate::features::dialogs::core::Dialog;
-use crate::state::{CommitDialog, Overlays};
+use crate::state::{CommitDialog, Features};
 
 /// The commit-message modal (Issue #33). Shown while `commit_dialog` is `Some`;
 /// a real overlay with a focused text box, so it prompts reliably where a native
 /// `window.prompt()` gets blocked/flashed by the webview. Confirming POSTs the
 /// commit and refreshes the graph; cancelling just closes it.
-pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
-    let Overlays {
-        commit_dialog,
-        commit_msg,
-        dialogs,
+pub fn commit_dialog_view(features: Features) -> impl IntoView {
+    let Features {
         graph,
+        dialogs,
+        shell,
         ..
-    } = overlays;
+    } = features;
     let submit_commit = move || {
         let Some(CommitDialog {
             allow_empty,
             branch,
-        }) = commit_dialog.get_untracked()
+        }) = shell.commit_dialog_untracked()
         else {
             return;
         };
-        let message = commit_msg.get_untracked().trim().to_string();
+        let message = dialogs.commit_msg_untracked().trim().to_string();
         if message.is_empty() {
             return; // Keep the dialog open; the Commit button is disabled anyway.
         }
-        commit_dialog.set(None);
+        shell.close_commit_dialog();
         spawn_local(async move {
             match create_commit_request(&message, allow_empty, branch.as_deref()).await {
                 Ok(()) => graph.update(|g| {
@@ -45,7 +44,7 @@ pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
         });
     };
     move || {
-        commit_dialog.get().map(
+        shell.commit_dialog().map(
             |CommitDialog {
                  allow_empty,
                  branch,
@@ -73,7 +72,7 @@ pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
                             // Ignore the iOS ghost click that fires just after opening.
                             if dialogs.may_dismiss() {
                                 dialogs.close(Dialog::Commit);
-                                commit_dialog.set(None);
+                                shell.close_commit_dialog();
                             }
                         }
                     >
@@ -92,8 +91,8 @@ pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
                                        resize:none;"
                                 rows="2"
                                 placeholder="Commit message"
-                                prop:value=move || commit_msg.get()
-                                on:input=move |ev| commit_msg.set(event_target_value(&ev))
+                                prop:value=move || dialogs.commit_msg()
+                                on:input=move |ev| dialogs.set_commit_msg(event_target_value(&ev))
                             ></textarea>
                             <div style="display:flex; gap:8px; justify-content:flex-end; \
                                         margin-top:14px;">
@@ -101,7 +100,7 @@ pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
                                     style="padding:6px 14px; font:inherit; color:var(--fg); \
                                            background:#21262d; border:1px solid #30363d; \
                                            border-radius:6px;"
-                                    on:click=move |_| commit_dialog.set(None)
+                                    on:click=move |_| shell.close_commit_dialog()
                                 >
                                     "Cancel"
                                 </button>
@@ -109,7 +108,7 @@ pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
                                     style="padding:6px 14px; font:inherit; color:#fff; \
                                            background:#238636; border:1px solid #2ea043; \
                                            border-radius:6px;"
-                                    prop:disabled=move || commit_msg.get().trim().is_empty()
+                                    prop:disabled=move || dialogs.commit_msg().trim().is_empty()
                                     on:click=move |_| submit_commit()
                                 >
                                     "Commit"
