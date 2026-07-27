@@ -44,6 +44,7 @@ use crate::features::operations::signals::Operations;
 use crate::features::operations::view::operations_status_view;
 use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
+use crate::features::shell::signals::Shell;
 use crate::features::status::signals as status_seam;
 use crate::icons::icon_set;
 use crate::prefs::{load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref};
@@ -289,6 +290,14 @@ pub fn App() -> impl IntoView {
     // Declared above `status` because that read's key includes it.
     let activity = Activity::new();
 
+    // Every overlay the app can show, and the order they were raised in (M1.11, #64,
+    // Task 8). Created here, not in `graph_canvas`, for three reasons: the Activity
+    // toggle it owns lives in the topbar, which exists before the graph does; an epoch
+    // bump's rebuild would otherwise destroy the six overlay signals mid-interaction; and
+    // this is where Task 6's deferred "move the overlay signals out of canvas scope" step
+    // actually lands, rather than migrating them twice.
+    let shell = Shell::new(activity);
+
     // The live working-tree status: the topbar chip (Activity/Undo step 1) and the
     // Activity panel's own status section both read THIS one resource — until M1.11
     // (#64, Task 7) the panel kept a second, independently-fetched copy. Owned by
@@ -322,10 +331,10 @@ pub fn App() -> impl IntoView {
     // drop it; `settings` is the display preferences every icon-drawing view reads.
     let features = Features {
         graph,
-        activity,
         dialogs: dialogs_guard,
         operations,
         status,
+        shell,
     };
     let settings = Settings {
         nerd_icons,
@@ -519,7 +528,10 @@ pub fn App() -> impl IntoView {
                 }}
                 <button
                     class="refresh"
-                    on:click=move |_| activity.toggle()
+                    // Through the shell, not `activity.toggle()`: the overlay stack is what
+                    // keeps the right edge to one panel, and a write that bypassed it would
+                    // put the detail panel back underneath (M1.11, #64, Task 8).
+                    on:click=move |_| shell.toggle_activity()
                     title="Everything that happened in this repo — commits, merges, \
                            branch operations — with what was done through the app \
                            marked, and undo where possible"

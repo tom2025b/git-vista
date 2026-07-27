@@ -5,19 +5,19 @@ use leptos::*;
 use git_vista_core::activity::UndoAction;
 
 use crate::features::dialogs::core::Dialog;
-use crate::state::{Overlays, PendingOp};
+use crate::state::{Features, PendingOp};
 
 /// The branch-op confirmation modal (Issue #33 follow-up). Reuses the commit
 /// modal's iPad-proven inline-styled overlay, minus any text input (so no void
 /// `<input>` to trip the WebKit CSR bug). Confirming hands the operation to the
 /// `operations` feature; cancelling or a backdrop tap closes it.
-pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
-    let Overlays {
-        confirm_op,
+pub fn confirm_modal_view(features: Features) -> impl IntoView {
+    let Features {
         dialogs,
         operations,
+        shell,
         ..
-    } = overlays;
+    } = features;
 
     // Confirming used to clear the dialog and then `spawn_local` a future nothing held —
     // so the write existed nowhere between the tap and its reply, and closing a panel
@@ -25,10 +25,10 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
     // dialog only *raises* the operation; `operations` owns it from here, and it is held
     // above the canvas, so it outlives this modal and the re-read its completion triggers.
     let run_confirmed = move || {
-        let Some(op) = confirm_op.get_untracked() else {
+        let Some(op) = shell.confirm_op_untracked() else {
             return;
         };
-        confirm_op.set(None);
+        shell.close_confirm();
         operations.dispatch(op);
     };
 
@@ -43,12 +43,12 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
             // Restamp the ghost-click guard, exactly as when the modal is first shown:
             // the modal never visually closes, but it is now asking a different question.
             dialogs.open(Dialog::Confirm);
-            confirm_op.set(Some(next));
+            shell.open_confirm(next);
         }
     });
 
     move || {
-        confirm_op.get().map(|op| {
+        shell.confirm_op().map(|op| {
             // `enabled` gates the confirm button: a merge into itself or a detached
             // HEAD has no valid target, so the dialog is informational (Cancel only).
             let (title, body, confirm_label, danger, enabled) = match &op {
@@ -212,7 +212,7 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
                         // Ignore the iOS ghost click that fires just after opening.
                         if dialogs.may_dismiss() {
                             dialogs.close(Dialog::Confirm);
-                            confirm_op.set(None);
+                            shell.close_confirm();
                         }
                     }
                 >
@@ -230,7 +230,7 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
                                 style="padding:6px 14px; font:inherit; color:var(--fg); \
                                        background:#21262d; border:1px solid #30363d; \
                                        border-radius:6px;"
-                                on:click=move |_| confirm_op.set(None)
+                                on:click=move |_| shell.close_confirm()
                             >
                                 "Cancel"
                             </button>

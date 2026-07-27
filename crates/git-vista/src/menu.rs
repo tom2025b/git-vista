@@ -4,7 +4,7 @@
 //! Each item leads with a glyph (icons.rs) matching its action, and every write
 //! item is suppressed on a read-only clone (Phase 12). A recurring, load-bearing
 //! ordering rule runs through the handlers: a signal write must happen *before*
-//! `menu.set(None)`, because closing the menu synchronously disposes the
+//! `shell.close_menu()`, because closing the menu synchronously disposes the
 //! handler's own reactive owner, after which a further signal write is
 //! unreliable. The "Commit …" and merge/push/delete items all follow it.
 
@@ -19,11 +19,11 @@ use crate::api::{
 use crate::features::core_traits::RequestTarget;
 use crate::features::dialogs::core::Dialog;
 use crate::features::operations::core::PendingIntent;
-use crate::features::operations::signals as ops;
+use crate::features::shell::signals::Shell;
 use crate::geometry::menu_placement;
 use crate::gestures::viewport_size;
 use crate::icons::icon_set;
-use crate::state::{CommitDialog, MenuData, Overlays, PendingOp, Settings};
+use crate::state::{CommitDialog, Features, MenuData, PendingOp, Settings};
 
 /// Open this menu on `commit`, for an entry point that knows only the commit and a
 /// header — not the richer context the graph's own dots carry (M1.11, #64).
@@ -34,14 +34,8 @@ use crate::state::{CommitDialog, MenuData, Overlays, PendingOp, Settings};
 /// reason the inline version left them so: this entry point carries neither the
 /// pushed-commit set nor the target's local branches, and a GitHub link that 404s is
 /// worse than a disabled item.
-pub fn open_for_commit(
-    menu: RwSignal<Option<MenuData>>,
-    commit: String,
-    header: String,
-    x: f64,
-    y: f64,
-) {
-    menu.set(Some(MenuData {
+pub fn open_for_commit(shell: Shell, commit: String, header: String, x: f64, y: f64) {
+    shell.open_menu(MenuData {
         commit,
         header,
         x,
@@ -54,25 +48,20 @@ pub fn open_for_commit(
         is_branch: false,
         repo_url: None,
         remote_web_url: None,
-    }));
+    });
 }
 
 /// The context menu overlay (Issue #18): a plain HTML pop-up positioned at the
 /// click, rendered outside the SVG so it never pans/zooms and isn't clipped.
 /// `read_only` (Phase 12) hides every write action on a cloned repo.
-pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> impl IntoView {
-    let Overlays {
-        menu,
-        commit_dialog,
-        commit_msg,
-        confirm_op,
-        scroll_diff,
-        dialogs,
-        intent_seq,
-        pending_intent,
+pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> impl IntoView {
+    let Features {
         graph,
+        dialogs,
+        operations,
+        shell,
         ..
-    } = overlays;
+    } = features;
     let nerd_icons = settings.nerd_icons;
     // The undo actions for the menu's commit (step 5), fetched the moment the
     // menu opens — computed live server-side, so the section reflects the repo
@@ -87,7 +76,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
     let undoables = create_local_resource(
         move || {
             (
-                menu.get().filter(|m| !m.is_branch).map(|m| m.commit),
+                shell.menu().filter(|m| !m.is_branch).map(|m| m.commit),
                 graph.get().epoch(),
             )
         },
@@ -106,7 +95,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
     let rebase_status = create_local_resource(
         move || {
             (
-                menu.get().filter(|m| !m.is_branch).is_some(),
+                shell.menu().filter(|m| !m.is_branch).is_some(),
                 graph.get().epoch(),
             )
         },
@@ -126,7 +115,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
     let staged_count = create_local_resource(
         move || {
             (
-                menu.get().is_some_and(|m| m.is_head && !m.is_branch),
+                shell.menu().is_some_and(|m| m.is_head && !m.is_branch),
                 graph.get().epoch(),
             )
         },
@@ -139,8 +128,8 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
         },
     );
     move || {
-        menu.get().map(|m| {
-            // Tracked read: the menu lives inside the overlays' reactive block,
+        shell.menu().map(|m| {
+            // Tracked read: the menu lives inside the overlay wrapper's reactive block,
             // so it re-renders live if the icon style is toggled while open.
             let ic = icon_set(nerd_icons.get());
             let label = m.github_label;
@@ -153,7 +142,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         href=url
                         target="_blank"
                         rel="noopener"
-                        on:click=move |_| menu.set(None)
+                        on:click=move |_| shell.close_menu()
                     >
                         // The GitHub mark flags the one item that leaves the app.
                         <span class="nf ctx-icon">{ic.github}</span>
@@ -176,18 +165,20 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             };
             // "View details" (Phase 10): open the side panel for this commit. A
             // read, so it's shown for read-only clones too. Set `detail_id` before
-            // closing the menu — `menu.set(None)` disposes this handler's reactive
+            // closing the menu — `shell.close_menu()` disposes this handler's reactive
             // owner, after which a signal write is unreliable (same caveat as below).
             let detail_commit = m.commit.clone();
             let on_details = move |_| {
-                // Plain details: make sure a leftover "scroll to diff" wish
-                // from an earlier "Show diff" doesn't fire on this open.
-                scroll_diff.set_value(false);
-                // The detail and Activity panels share the right edge — the one being
-                // opened replaces the other (this menu may itself have been opened from
-                // an Activity row). `Overlays` owns that pairing now (M1.11, #64).
-                overlays.open_detail_panel(detail_commit.clone());
-                menu.set(None);
+                // `false`: no "scroll to the Changes section" wish on a plain details
+                // open. It is an argument rather than a separate poke precisely so this
+                // path cannot forget to clear one left by an earlier "Show diff".
+                //
+                // Nothing here closes the Activity panel. The two share the right edge
+                // and the overlay stack evicts whichever is already docked there — the
+                // rule lives in one function now instead of at every opener (M1.11, #64,
+                // Task 8).
+                shell.open_detail(detail_commit.clone(), false);
+                shell.close_menu();
             };
             // "View details" opens a commit's detail panel — the commit glyph.
             let details_item = view! {
@@ -199,14 +190,12 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             // "Show diff": the same detail panel, but with the Changes section
             // scrolled into view once the diff lands — so the tap answers
             // "what did this commit change?" directly. The scroll wish rides
-            // in a one-shot StoredValue the panel consumes; `detail_id` is set
-            // before the menu closes (the reactive-owner ordering rule).
+            // as an argument to `open_detail`, raised before the menu closes
+            // (the reactive-owner ordering rule).
             let diff_commit = m.commit.clone();
             let on_diff = move |_| {
-                scroll_diff.set_value(true);
-                // Same right-edge exclusivity as "View details".
-                overlays.open_detail_panel(diff_commit.clone());
-                menu.set(None);
+                shell.open_detail(diff_commit.clone(), true);
+                shell.close_menu();
             };
             let diff_item = view! {
                 <button class="ctx-item" on:click=on_diff>
@@ -219,7 +208,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             // refresh the graph on success or show git's error on failure (B3).
             let commit = m.commit.clone();
             let on_branch = move |_| {
-                menu.set(None);
+                shell.close_menu();
                 let Some(win) = web_sys::window() else { return };
                 // A native prompt — simple and works in iPad Safari. Empty / cancel
                 // does nothing.
@@ -284,16 +273,16 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         .into_view();
                     }
                     let on_commit = move |_| {
-                        // Open the dialog *before* closing the menu: `menu.set(None)`
+                        // Open the dialog *before* closing the menu: `shell.close_menu()`
                         // synchronously disposes this handler's own reactive owner, so
                         // any signal write after it is unreliable. Set the dialog first.
-                        commit_msg.set(String::new());
+                        dialogs.clear_commit_msg();
                         dialogs.open(Dialog::Commit);
-                        commit_dialog.set(Some(CommitDialog {
+                        shell.open_commit_dialog(CommitDialog {
                             allow_empty,
                             branch: stub_branch.clone(),
-                        }));
-                        menu.set(None);
+                        });
+                        shell.close_menu();
                     };
                     view! {
                         <button class="ctx-item" on:click=on_commit>
@@ -313,7 +302,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             // Changes" has something to commit.
             let stage_changes = if is_head {
                 let on_stage = move |_| {
-                    menu.set(None);
+                    shell.close_menu();
                     spawn_local(async move {
                         match stage_request().await {
                             Ok(()) => graph.update(|g| {
@@ -357,7 +346,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             // fetch lands) and only on the HEAD commit, like staging.
             let unstage_changes = (is_head && staged_count.get().unwrap_or(0) > 0).then(|| {
                 let on_unstage = move |_| {
-                    menu.set(None);
+                    shell.close_menu();
                     spawn_local(async move {
                         match unstage_request().await {
                             Ok(()) => graph.update(|g| {
@@ -384,8 +373,8 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             // The branch operations (Issue #33 follow-up): merge / push / delete, one
             // set per local branch living at this target. Each opens the confirm modal
             // rather than acting immediately — the actual POST + refresh happens there.
-            // Set `confirm_op` *before* `menu.set(None)`, which disposes this handler's
-            // reactive owner (same ordering caveat as the commit items above).
+            // Raise the confirm modal *before* `shell.close_menu()`, which disposes this
+            // handler's reactive owner (same ordering caveat as the commit items above).
             let branch_items = m
                 .branches
                 .iter()
@@ -399,13 +388,12 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         let branch = b.clone();
                         let on = move |_| {
                             let branch = branch.clone();
-                            menu.set(None);
+                            shell.close_menu();
                             // Identity is minted here, synchronously, before the await —
                             // it must record when the user tapped, not when the pre-check
                             // answered (M1.11, #64).
-                            let seq = ops::next_seq(intent_seq);
-                            let key =
-                                ops::request_key(graph, RequestTarget::Branch(branch.clone()));
+                            let seq = operations.next_seq();
+                            let key = operations.request_key(RequestTarget::Branch(branch.clone()));
                             spawn_local(async move {
                                 let current = fetch_head_branch().await.unwrap_or(None);
                                 let intent = PendingIntent {
@@ -413,12 +401,12 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                                     key,
                                     kind: PendingOp::Checkout { branch, current },
                                 };
-                                if !ops::admit_intent(pending_intent, graph, &intent) {
+                                if !operations.admit_intent(&intent) {
                                     return;
                                 }
                                 // Start the ghost-click guard when the modal opens.
                                 dialogs.open(Dialog::Confirm);
-                                confirm_op.set(Some(intent.kind));
+                                shell.open_confirm(intent.kind);
                             });
                         };
                         view! {
@@ -439,10 +427,9 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         let branch = b.clone();
                         let on = move |_| {
                             let branch = branch.clone();
-                            menu.set(None);
-                            let seq = ops::next_seq(intent_seq);
-                            let key =
-                                ops::request_key(graph, RequestTarget::Branch(branch.clone()));
+                            shell.close_menu();
+                            let seq = operations.next_seq();
+                            let key = operations.request_key(RequestTarget::Branch(branch.clone()));
                             spawn_local(async move {
                                 let into = fetch_head_branch().await.unwrap_or(None);
                                 let intent = PendingIntent {
@@ -450,12 +437,12 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                                     key,
                                     kind: PendingOp::Merge { branch, into },
                                 };
-                                if !ops::admit_intent(pending_intent, graph, &intent) {
+                                if !operations.admit_intent(&intent) {
                                     return;
                                 }
                                 // Start the ghost-click guard when the modal opens.
                                 dialogs.open(Dialog::Confirm);
-                                confirm_op.set(Some(intent.kind));
+                                shell.open_confirm(intent.kind);
                             });
                         };
                         view! {
@@ -472,10 +459,10 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         let branch = b.clone();
                         let on = move |_| {
                             dialogs.open(Dialog::Confirm);
-                            confirm_op.set(Some(PendingOp::Push {
+                            shell.open_confirm(PendingOp::Push {
                                 branch: branch.clone(),
-                            }));
-                            menu.set(None);
+                            });
+                            shell.close_menu();
                         };
                         view! {
                             <button class="ctx-item" on:click=on>
@@ -494,10 +481,9 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         let branch = b.clone();
                         let on = move |_| {
                             let branch = branch.clone();
-                            menu.set(None);
-                            let seq = ops::next_seq(intent_seq);
-                            let key =
-                                ops::request_key(graph, RequestTarget::Branch(branch.clone()));
+                            shell.close_menu();
+                            let seq = operations.next_seq();
+                            let key = operations.request_key(RequestTarget::Branch(branch.clone()));
                             spawn_local(async move {
                                 let current = fetch_head_branch().await.unwrap_or(None);
                                 let intent = PendingIntent {
@@ -505,12 +491,12 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                                     key,
                                     kind: PendingOp::Delete { branch, current },
                                 };
-                                if !ops::admit_intent(pending_intent, graph, &intent) {
+                                if !operations.admit_intent(&intent) {
                                     return;
                                 }
                                 // Start the ghost-click guard when the modal opens.
                                 dialogs.open(Dialog::Confirm);
-                                confirm_op.set(Some(intent.kind));
+                                shell.open_confirm(intent.kind);
                             });
                         };
                         view! {
@@ -542,7 +528,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                                         href=url
                                         target="_blank"
                                         rel="noopener"
-                                        on:click=move |_| menu.set(None)
+                                        on:click=move |_| shell.close_menu()
                                     >
                                         <span class="nf ctx-icon">{ic.github}</span>
                                         {format!("View ‘{branch}’ on {host}")}
@@ -562,7 +548,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                                     href=url
                                     target="_blank"
                                     rel="noopener"
-                                    on:click=move |_| menu.set(None)
+                                    on:click=move |_| shell.close_menu()
                                 >
                                     // The pull-request glyph flags this GitHub action.
                                     <span class="nf ctx-icon">{ic.pull_request}</span>
@@ -621,11 +607,11 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                 }
                 let on = move |_| {
                     let base = base.clone();
-                    menu.set(None);
+                    shell.close_menu();
                     // Rebase targets the checked-out branch, not a named one, so its
                     // request identity is the repository itself.
-                    let seq = ops::next_seq(intent_seq);
-                    let key = ops::request_key(graph, RequestTarget::Repository);
+                    let seq = operations.next_seq();
+                    let key = operations.request_key(RequestTarget::Repository);
                     spawn_local(async move {
                         let current = fetch_head_branch().await.unwrap_or(None);
                         let intent = PendingIntent {
@@ -633,11 +619,11 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                             key,
                             kind: PendingOp::Rebase { current, base },
                         };
-                        if !ops::admit_intent(pending_intent, graph, &intent) {
+                        if !operations.admit_intent(&intent) {
                             return;
                         }
                         dialogs.open(Dialog::Confirm);
-                        confirm_op.set(Some(intent.kind));
+                        shell.open_confirm(intent.kind);
                     });
                 };
                 view! {
@@ -655,8 +641,8 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             // tip, a revert for any non-merge commit. The tracked read means
             // the menu re-renders when the fetch lands; until then (or with
             // nothing to offer) the section simply isn't there. Each item opens
-            // the shared confirm modal — `confirm_op` is set BEFORE the menu
-            // closes (the reactive-owner ordering rule above).
+            // the shared confirm modal — it is raised BEFORE the menu closes
+            // (the reactive-owner ordering rule above).
             let undo_items = undoables
                 .get()
                 .unwrap_or_default()
@@ -671,8 +657,8 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     let label = u.label.clone();
                     let on = move |_| {
                         dialogs.open(Dialog::Confirm);
-                        confirm_op.set(Some(PendingOp::Undo(u.clone())));
-                        menu.set(None);
+                        shell.open_confirm(PendingOp::Undo(u.clone()));
+                        shell.close_menu();
                     };
                     view! {
                         <button class=class on:click=on>
