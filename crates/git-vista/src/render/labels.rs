@@ -19,7 +19,8 @@ use crate::icons::icon_set;
 use crate::text::truncate;
 use git_vista_core::color::{branch_color, BADGE_DARK, HEAD_BADGE, TAG_BADGE};
 
-use super::{suppress, RenderCtx};
+use crate::features::graph::core::RenderCtx;
+use crate::features::graph::signals::suppress;
 
 /// Commit messages longer than this are truncated with an ellipsis in the label
 /// (the full text stays available via the node/label hover tooltip).

@@ -3,7 +3,7 @@
 //! Phase 4 fetched one whole laid-out `Graph`; M1.10 (#63) replaced that with
 //! *paged* history — a cheap once-per-view [`Frame`] (refs, colours, repo
 //! metadata) plus cursor-paginated pages of rows/edges/stubs, assembled by
-//! [`crate::history::LoadedHistory`]. So the App no longer holds a graph: it
+//! [`LoadedHistory`](crate::features::graph::core::LoadedHistory). So the App no longer holds a graph: it
 //! holds a **seed** (Frame + page 1) and an explicit [`HistoryPhase`], and every
 //! repo-metadata consumer reads the Frame rather than a row payload.
 //!
@@ -31,12 +31,24 @@ use leptos::*;
 
 use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
-use crate::api::{fetch_frame, fetch_page, fetch_protocol, fetch_status, HistoryFetchError};
+use crate::api::{fetch_frame, fetch_page, fetch_protocol, HistoryFetchError};
 use crate::dialogs;
-use crate::history::{Frame, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT};
+use crate::features::activity::signals::Activity;
+use crate::features::dialogs::core::Dialog;
+use crate::features::dialogs::signals::Dialogs;
+use crate::features::graph::core::{
+    Frame, GraphCore, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT,
+};
+use crate::features::operations::core::OperationsCore;
+use crate::features::operations::signals::Operations;
+use crate::features::operations::view::operations_status_view;
+use crate::features::session::core::SessionEvent;
+use crate::features::session::signals as session_state;
+use crate::features::status::signals as status_seam;
 use crate::icons::icon_set;
 use crate::prefs::{load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref};
 use crate::session::{establish_session, not_connected_view};
+use crate::state::{Features, Settings};
 use crate::update_required::update_required_view;
 
 mod canvas;
@@ -50,7 +62,7 @@ use canvas::graph_canvas;
 /// it can be recognised as stale instead of being mounted over the live one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistorySeed {
-    pub epoch: u32,
+    pub epoch: u64,
     pub frame: Frame,
     pub loaded: LoadedHistory,
 }
@@ -80,10 +92,10 @@ impl fmt::Display for HistorySeedError {
 /// reply for an earlier epoch can never advance the phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryPhase {
-    SeedLoading { epoch: u32 },
-    Ready { epoch: u32 },
-    DriftReloading { epoch: u32 },
-    SeedError { epoch: u32 },
+    SeedLoading { epoch: u64 },
+    Ready { epoch: u64 },
+    DriftReloading { epoch: u64 },
+    SeedError { epoch: u64 },
 }
 
 /// The three history signals the App owns and the canvas drives: which phase the
@@ -101,7 +113,7 @@ pub struct HistoryUiSignals {
 /// The tag rides on the *result*, not only on the success value: a failure has
 /// to be attributable to an epoch too, or a slow error from a retired epoch
 /// would raise [`HistoryPhase::SeedError`] over an epoch that is still loading.
-async fn load_seed(epoch: u32) -> (u32, Result<HistorySeed, HistorySeedError>) {
+async fn load_seed(epoch: u64) -> (u64, Result<HistorySeed, HistorySeedError>) {
     (epoch, seed_for_epoch(epoch).await)
 }
 
@@ -112,7 +124,7 @@ async fn load_seed(epoch: u32) -> (u32, Result<HistorySeed, HistorySeedError>) {
 /// otherwise splice rows onto refs that no longer describe them. Checking here
 /// means [`LoadedHistory::from_first_page`] can treat its own generation check
 /// as the tautology it is.
-async fn seed_for_epoch(epoch: u32) -> Result<HistorySeed, HistorySeedError> {
+async fn seed_for_epoch(epoch: u64) -> Result<HistorySeed, HistorySeedError> {
     let frame = fetch_frame().await.map_err(HistorySeedError::Fetch)?;
     let page = fetch_page(frame.worktree_id.as_deref(), None, DEFAULT_PAGE_LIMIT)
         .await
@@ -135,16 +147,31 @@ async fn seed_for_epoch(epoch: u32) -> Result<HistorySeed, HistorySeedError> {
 
 #[component]
 pub fn App() -> impl IntoView {
-    // A bump counter is the resource's reactive source, so changing it re-runs the
-    // fetch. The frontend used to fetch exactly once on load (`|| ()`, a constant
-    // source that never re-fires), so a branch or commit created *after* the page
-    // loaded never appeared until a full reload — the heart of issue #16. The
-    // Refresh button below bumps this to re-read the repo on demand. (Each fetch
-    // also cache-busts its URL, so the re-read reaches the server, not the cache.)
-    // Since M1.10 it doubles as the history *epoch*: every seed and every page
-    // request is stamped with it, and a reply carrying a retired epoch is dropped.
-    let reload = create_rw_signal(0u32);
-    let refresh = move |_| reload.update(|n| *n = n.wrapping_add(1));
+    // The graph epoch (M1.11, #64): `GraphCore` replaces the bare `reload: RwSignal<u32>`
+    // counter every writer used to bump unconditionally. The frontend used to fetch
+    // exactly once on load (`|| ()`, a constant source that never re-fires), so a
+    // branch or commit created *after* the page loaded never appeared until a full
+    // reload — the heart of issue #16; a bump counter fixed that, but bumped after
+    // EVERY write regardless of whether the repository actually moved. `GraphCore`
+    // makes that a tested decision (design spec D3): a settled operation reports its
+    // post-execution generation, and `on_invalidate` skips the bump when nothing
+    // moved. Explicit actions — Refresh, the "R" key, a 409 drift, session landing —
+    // have no generation to compare and call `force_bump` instead, exactly
+    // reproducing the old unconditional behaviour for those paths.
+    let graph = create_rw_signal(GraphCore::default());
+    let refresh = move |_| {
+        graph.update(|g| {
+            g.force_bump();
+        });
+    };
+
+    // The write registry (M1.11, #64). Deliberately created HERE and not inside
+    // `graph_canvas`: an epoch bump rebuilds the canvas and every overlay in it, so an
+    // operation living down there would be destroyed by the very re-read its own
+    // completion triggers. Owning it in the shell is what lets a write survive a panel
+    // change (acceptance criterion 2).
+    let operations_core = create_rw_signal(OperationsCore::default());
+    let operations = Operations::new(operations_core, graph);
 
     // The history signals the App owns (M1.10, #63). `print_graph_open` opens the
     // full static print view (crate::print) from the topbar; `history_complete`
@@ -161,14 +188,14 @@ pub fn App() -> impl IntoView {
 
     // Frame + page 1, keyed on the epoch. `create_local_resource` because the
     // fetch future isn't `Send` (wasm).
-    let seed = create_local_resource(move || reload.get(), load_seed);
+    let seed = create_local_resource(move || graph.get().epoch(), load_seed);
 
     // Every epoch — Refresh, a post-operation reload, a drift reload — retires
     // the mounted history. Print can't span two generations and "complete" must
     // not survive into a graph that hasn't loaded a page yet, so both are reset
     // here rather than at each of the several places that bump `reload`.
     create_effect(move |_| {
-        let epoch = reload.get();
+        let epoch = graph.get().epoch();
         history_ui.print_open.set(false);
         history_ui.complete.set(false);
         // A drift reload has already announced itself with the epoch it is
@@ -188,7 +215,7 @@ pub fn App() -> impl IntoView {
         else {
             return;
         };
-        if epoch != reload.get_untracked() {
+        if epoch != graph.get_untracked().epoch() {
             return;
         }
         match complete {
@@ -222,7 +249,9 @@ pub fn App() -> impl IntoView {
     // session lands, bump `reload` once so they refetch authenticated.
     create_effect(move |_| {
         if matches!(session.get(), Some(Ok(true))) {
-            reload.update(|n| *n = n.wrapping_add(1));
+            graph.update(|g| {
+                g.force_bump();
+            });
         }
     });
 
@@ -232,7 +261,7 @@ pub fn App() -> impl IntoView {
     // this tab stays open, the next reload catches it. `protocol_gate` yields the
     // negotiation payload + verdict only when the client is *out* of the server's
     // accepted window; that drives the blocking "Update Required" overlay below.
-    let protocol = create_local_resource(move || reload.get(), |_| fetch_protocol());
+    let protocol = create_local_resource(move || graph.get().epoch(), |_| fetch_protocol());
     let protocol_gate = move || match protocol.get() {
         Some(Ok(info)) => {
             let verdict = check_compatibility(
@@ -247,16 +276,26 @@ pub fn App() -> impl IntoView {
         _ => None,
     };
 
-    // The live working-tree status behind the topbar chip (Activity/Undo
-    // step 1): clean/dirty/conflicted at a glance, plus ahead/behind vs the
-    // upstream. Keyed on `reload` so Refresh — and every post-operation
-    // reload — re-reads it alongside the history. A fetch failure resolves to
-    // `None`, which simply hides the chip: a broken status probe shouldn't
-    // take the topbar down with it.
-    let status = create_local_resource(
-        move || reload.get(),
-        |_| async { fetch_status().await.ok() },
-    );
+    // The app's one iOS ghost-click guard (M1.11, #64). Lives here, not in
+    // `graph_canvas`, for two reasons: the topbar's own modals (Open URL, Reset) need it
+    // and exist before the graph does, and a canvas rebuilt by an epoch bump would
+    // otherwise reset the guard out from under a modal that is still up. Named
+    // `dialogs_guard` because the `dialogs` *module* is in scope here too.
+    let dialogs_guard = Dialogs::new();
+
+    // The Activity panel's visibility (Activity/Undo feature). Lives here — not in
+    // graph_canvas — because its button sits in the topbar, which exists even while the
+    // graph is still loading; threaded into the overlays bundle inside graph_canvas.
+    // Declared above `status` because that read's key includes it.
+    let activity = Activity::new();
+
+    // The live working-tree status: the topbar chip (Activity/Undo step 1) and the
+    // Activity panel's own status section both read THIS one resource — until M1.11
+    // (#64, Task 7) the panel kept a second, independently-fetched copy. Owned by
+    // `features/status`, which is where M2.15 (#68) will find a single owner waiting for
+    // it rather than two to reconcile. See that module for the key's two halves and for
+    // the one extra fetch collapsing them costs.
+    let status = status_seam::create(graph, activity);
 
     // Icon style (icons.rs): Nerd Font glyphs vs the plain-text fallback. A
     // signal so every icon in the app switches live when toggled; persisted in
@@ -278,28 +317,35 @@ pub fn App() -> impl IntoView {
         store_node_icons_pref(on);
     };
 
-    // Whether the Activity panel is open (Activity/Undo feature). Lives here —
-    // not in graph_canvas — because its button sits in the topbar, which
-    // exists even while the graph is still loading; threaded into the
-    // overlays bundle inside graph_canvas.
-    let activity_open = create_rw_signal(false);
+    // The two bundles `graph_canvas` takes (see `crate::state`). `features` is every
+    // handle created here, above the canvas, precisely so an epoch bump's rebuild cannot
+    // drop it; `settings` is the display preferences every icon-drawing view reads.
+    let features = Features {
+        graph,
+        activity,
+        dialogs: dialogs_guard,
+        operations,
+        status,
+    };
+    let settings = Settings {
+        nerd_icons,
+        show_node_icons,
+    };
 
     // Phase 12 — "Open URL": clone a public repo and view it read-only. `open_url`
     // toggles the modal; `clone_url` holds the field; `cloning` disables the button
-    // while git works so a slow clone can't be fired twice. `open_opened_at` guards
-    // the backdrop against the iOS ghost-click, same trick as the commit modal.
+    // while git works so a slow clone can't be fired twice. The shared `dialogs`
+    // guard protects the backdrop from the iOS ghost-click, same as every other modal.
     // The modal itself lives in `dialogs::open_url_view`.
     let open_url = create_rw_signal(false);
     let clone_url = create_rw_signal(String::new());
     let cloning = create_rw_signal(false);
-    let open_opened_at = store_value(0f64);
 
     // "Reset Test Repo" (iPad-testing follow-up): the button appears only when
     // the Frame says this repo carries a seed (`gv --seed`); the confirm modal
     // lives in `dialogs::reset_repo_view`, owned here like the Open-URL one
     // because its button sits in the topbar, not the graph canvas.
     let reset_open = create_rw_signal(false);
-    let reset_opened_at = store_value(0f64);
 
     // ADR 0006: ask every time — the repo picker opens on load (the sign-in and
     // protocol overlays sit above it when they apply) and from the topbar
@@ -311,20 +357,22 @@ pub fn App() -> impl IntoView {
     // ask-every-time picker would only dead-end there — close it once the
     // session lands and show the served repo's graph straight away.
     create_effect(move |_| {
-        if matches!(session.get(), Some(Ok(true))) && crate::api::is_lan_session() {
+        if matches!(session.get(), Some(Ok(true))) && session_state::is_lan() {
             picker_open.set(false);
         }
     });
 
-    // Defense in depth (ADR 0007): mirror the Frame's mode into api.rs so write
-    // calls refuse client-side too. The server's 403 remains the boundary.
+    // Defense in depth (ADR 0007): mirror the Frame's mode into the session core so
+    // write calls refuse client-side too. The server's 403 remains the boundary.
+    // `Observed`, not `Selected`: this is the server's report, not a user choice, so a
+    // LAN session must record it rather than refuse it (M1.11, #64).
     create_effect(move |_| {
         if let Some(f) = frame() {
-            crate::api::set_ui_mode(Some(if f.read_only {
+            let _ = session_state::apply(SessionEvent::UiModeObserved(Some(if f.read_only {
                 git_vista_protocol::RepoMode::Visualize
             } else {
                 git_vista_protocol::RepoMode::Active
-            }));
+            })));
         }
     });
 
@@ -336,6 +384,11 @@ pub fn App() -> impl IntoView {
             // M1.04: the blocking sign-in screen, shown when there's no session and
             // no bootstrap token to make one — the operator must open `gv`'s link.
             {move || needs_sign_in().then(not_connected_view)}
+            // M1.11 (#64): in-flight writes and their outcomes. Mounted in the shell,
+            // not the canvas, so it keeps reporting across the epoch bump a completed
+            // write triggers — and so a failure is dismissible app state rather than a
+            // native alert the app cannot see.
+            {operations_status_view(operations)}
             <header class="topbar">
                 // The git mark brands the title (icons.rs). Reactive so the
                 // topbar switches with the icon-style toggle like everything else.
@@ -450,12 +503,12 @@ pub fn App() -> impl IntoView {
                 // lands (it records via_lan before resolving).
                 {move || {
                     session.get();
-                    (!crate::api::is_lan_session()).then(|| view! {
+                    (!session_state::is_lan()).then(|| view! {
                         <button
                             class="refresh"
                             on:click=move |_| {
                                 clone_url.set(String::new());
-                                open_opened_at.set_value(js_sys::Date::now());
+                                dialogs_guard.open(Dialog::OpenUrl);
                                 open_url.set(true);
                             }
                             title="Clone a public repository from a URL and view its history (read-only)"
@@ -466,7 +519,7 @@ pub fn App() -> impl IntoView {
                 }}
                 <button
                     class="refresh"
-                    on:click=move |_| activity_open.update(|open| *open = !*open)
+                    on:click=move |_| activity.toggle()
                     title="Everything that happened in this repo — commits, merges, \
                            branch operations — with what was done through the app \
                            marked, and undo where possible"
@@ -521,7 +574,7 @@ pub fn App() -> impl IntoView {
                         <button
                             class="refresh danger"
                             on:click=move |_| {
-                                reset_opened_at.set_value(js_sys::Date::now());
+                                dialogs_guard.open(Dialog::Reset);
                                 reset_open.set(true);
                             }
                             title="Restore this test repo to its recorded seed state — \
@@ -533,14 +586,14 @@ pub fn App() -> impl IntoView {
                     })}
             </header>
             // The "Open URL" modal (Phase 12), factored into `dialogs`.
-            {dialogs::open_url_view(open_url, clone_url, cloning, open_opened_at, reload, mode_for)}
+            {dialogs::open_url_view(open_url, clone_url, cloning, dialogs_guard, graph, mode_for)}
             // The "Reset Test Repo" confirmation (only reachable via the gated
             // topbar button above).
-            {dialogs::reset_repo_view(reset_open, reset_opened_at, reload)}
+            {dialogs::reset_repo_view(reset_open, dialogs_guard, graph)}
             // The repo picker + mode screens (ADR 0006): blocking overlays under
             // the sign-in/protocol screens, over everything else.
-            {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, open_opened_at, reload)}
-            {crate::picker::mode_view(mode_for, picker_open, reload)}
+            {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, dialogs_guard, graph)}
+            {crate::picker::mode_view(mode_for, picker_open, graph)}
             <section class="graph">
                 {move || {
                     // Read the icon set here, inside the reactive block, so the
@@ -636,11 +689,9 @@ pub fn App() -> impl IntoView {
                                         // `graph_canvas` and is disposed with it.
                                         {graph_canvas(
                                             seed,
-                                            reload,
+                                            features,
                                             history_ui,
-                                            nerd_icons,
-                                            show_node_icons,
-                                            activity_open,
+                                            settings,
                                         )}
                                     }
                                     .into_view()

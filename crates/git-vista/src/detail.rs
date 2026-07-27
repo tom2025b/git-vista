@@ -16,8 +16,8 @@ use git_vista_core::status::ChangeKind;
 
 use crate::api::fetch_diff;
 use crate::datetime::local_timestamp;
+use crate::features::graph::core::RenderCtx;
 use crate::icons::{icon_set, GitIcons};
-use crate::render::RenderCtx;
 use crate::state::{DetailResource, Overlays, Settings, ViewerDoc};
 
 /// CSS class for one line of the unified patch, keyed off its prefix. The
@@ -282,10 +282,10 @@ pub fn detail_panel_view(
                                 let file_id = d.id.clone();
                                 let file_path = f.path.clone();
                                 let open_file = move |_| {
-                                    viewer.set(Some(ViewerDoc::File {
+                                    viewer.open(ViewerDoc::File {
                                         id: file_id.clone(),
                                         path: file_path.clone(),
-                                    }));
+                                    });
                                 };
                                 view! {
                                     <button
@@ -350,9 +350,9 @@ pub fn detail_panel_view(
                                 title="Open the whole diff full-screen, uncapped, \
                                        with Print / Save PDF"
                                 on:click=move |_| {
-                                    viewer.set(Some(ViewerDoc::Diff {
+                                    viewer.open(ViewerDoc::Diff {
                                         id: expand_id.clone(),
-                                    }));
+                                    });
                                 }
                             >
                                 "Expand Full Diff"

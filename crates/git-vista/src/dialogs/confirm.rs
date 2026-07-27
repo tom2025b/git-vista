@@ -4,106 +4,49 @@ use leptos::*;
 
 use git_vista_core::activity::UndoAction;
 
-use crate::api::{branch_op_request, rebase_request, undo_request};
-use crate::state::{Overlays, PendingOp, DIALOG_GUARD_MS};
-
-use super::{alert, report};
+use crate::features::dialogs::core::Dialog;
+use crate::state::{Overlays, PendingOp};
 
 /// The branch-op confirmation modal (Issue #33 follow-up). Reuses the commit
 /// modal's iPad-proven inline-styled overlay, minus any text input (so no void
-/// `<input>` to trip the WebKit CSR bug). Confirming runs the pending op and
-/// refreshes; cancelling or a backdrop tap closes it.
+/// `<input>` to trip the WebKit CSR bug). Confirming hands the operation to the
+/// `operations` feature; cancelling or a backdrop tap closes it.
 pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
     let Overlays {
         confirm_op,
-        dialog_opened_at,
-        reload,
+        dialogs,
+        operations,
         ..
     } = overlays;
+
+    // Confirming used to clear the dialog and then `spawn_local` a future nothing held —
+    // so the write existed nowhere between the tap and its reply, and closing a panel
+    // mid-flight lost every trace of it (M1.11, #64, acceptance criterion 2). Now the
+    // dialog only *raises* the operation; `operations` owns it from here, and it is held
+    // above the canvas, so it outlives this modal and the re-read its completion triggers.
     let run_confirmed = move || {
         let Some(op) = confirm_op.get_untracked() else {
             return;
         };
         confirm_op.set(None);
-        // Each arm runs its git op and then either bumps `reload` (re-read the graph)
-        // or surfaces git's own error. Two arms are special: Rebase hits a bodyless
-        // endpoint (it acts on HEAD, not a named branch), and Delete upgrades git's
-        // "not fully merged" refusal into a Force-Delete confirmation rather than a
-        // dead-end alert.
-        match op {
-            PendingOp::Merge { branch, .. } => spawn_local(async move {
-                match branch_op_request("/api/merge", &branch).await {
-                    // git's no-op: the branch brought nothing in and HEAD didn't
-                    // move. The graph won't visibly change, which reads as a
-                    // refresh failure — so say what (didn't) happen. Still bump
-                    // `reload`: the repo may have changed under us since the
-                    // graph was drawn, and a re-read after any op is cheap.
-                    Ok(msg) if msg.starts_with("Already up to date") => {
-                        alert(&msg);
-                        reload.update(|n| *n = n.wrapping_add(1));
-                    }
-                    other => report(other, &format!("merge ‘{branch}’"), reload),
-                }
-            }),
-            PendingOp::Push { branch } => spawn_local(async move {
-                report(
-                    branch_op_request("/api/push", &branch).await,
-                    &format!("push ‘{branch}’"),
-                    reload,
-                );
-            }),
-            PendingOp::Checkout { branch, .. } => spawn_local(async move {
-                match branch_op_request("/api/checkout", &branch).await {
-                    // The already-on-it no-op (raced from a stale menu): say what
-                    // (didn't) happen, mirroring the merge arm's up-to-date case.
-                    Ok(msg) if msg.starts_with("Already on") => {
-                        alert(&msg);
-                        reload.update(|n| *n = n.wrapping_add(1));
-                    }
-                    other => report(other, &format!("check out ‘{branch}’"), reload),
-                }
-            }),
-            PendingOp::ForceDelete { branch } => spawn_local(async move {
-                report(
-                    branch_op_request("/api/force-delete-branch", &branch).await,
-                    &format!("force-delete ‘{branch}’"),
-                    reload,
-                );
-            }),
-            PendingOp::Rebase { base, .. } => spawn_local(async move {
-                match rebase_request().await {
-                    // The already-based no-op (raced from a stale menu): say what
-                    // (didn't) happen, mirroring the merge arm's up-to-date case.
-                    Ok(msg) if msg.starts_with("Already up to date") => {
-                        alert(&msg);
-                        reload.update(|n| *n = n.wrapping_add(1));
-                    }
-                    other => report(other, &format!("rebase onto {base}"), reload),
-                }
-            }),
-            // The undo itself (step 5). The server re-checks everything that
-            // matters — compare-and-swap on the branch tip, clean-tree guard,
-            // revert auto-abort — so failure here surfaces its reason verbatim
-            // (e.g. "‘main’ has moved since this undo was offered").
-            PendingOp::Undo(u) => spawn_local(async move {
-                report(undo_request(&u.action).await, "undo", reload);
-            }),
-            PendingOp::Delete { branch, .. } => spawn_local(async move {
-                match branch_op_request("/api/delete-branch", &branch).await {
-                    Ok(_) => reload.update(|n| *n = n.wrapping_add(1)),
-                    // git's safe `-d` refuses an unmerged branch with "not fully
-                    // merged". Rather than dead-end on that error, re-open the modal
-                    // offering a force delete (`-D`). Reset the ghost-click guard as
-                    // the modal re-opens, exactly as when it's first shown.
-                    Err(e) if e.contains("not fully merged") => {
-                        dialog_opened_at.set_value(js_sys::Date::now());
-                        confirm_op.set(Some(PendingOp::ForceDelete { branch }));
-                    }
-                    Err(e) => alert(&format!("Couldn't delete ‘{branch}’:\n{e}")),
-                }
-            }),
-        }
+        operations.dispatch(op);
     };
+
+    // git's safe `branch -d` refuses an unmerged branch with "not fully merged"; rather
+    // than dead-end on that, the modal re-opens offering `-D`. The *rule* now lives in
+    // the operations core (`escalation`, host-tested); this effect is only the part that
+    // needs a dialog. `take_escalation` consumes the entry, so the offer cannot repeat.
+    create_effect(move |_| {
+        // Subscribe to the registry so this runs whenever an operation settles.
+        operations.core().with(|c| c.recent().count());
+        if let Some(next) = operations.take_escalation() {
+            // Restamp the ghost-click guard, exactly as when the modal is first shown:
+            // the modal never visually closes, but it is now asking a different question.
+            dialogs.open(Dialog::Confirm);
+            confirm_op.set(Some(next));
+        }
+    });
+
     move || {
         confirm_op.get().map(|op| {
             // `enabled` gates the confirm button: a merge into itself or a detached
@@ -267,7 +210,8 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
                            justify-content:center; background:rgba(1,4,9,0.6);"
                     on:click=move |_| {
                         // Ignore the iOS ghost click that fires just after opening.
-                        if js_sys::Date::now() - dialog_opened_at.get_value() > DIALOG_GUARD_MS {
+                        if dialogs.may_dismiss() {
+                            dialogs.close(Dialog::Confirm);
                             confirm_op.set(None);
                         }
                     }

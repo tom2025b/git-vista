@@ -35,16 +35,18 @@ use git_vista_core::model::RefKind;
 
 use crate::api::{fetch_commit_detail, fetch_page, HistoryFetchError};
 use crate::camera::Camera;
+use crate::features::dialogs::signals::Viewer;
+use crate::features::graph::core::{
+    should_prefetch, show_fixed_loading_overlay, PageLoadState, PageRequestKey, PageRetry,
+    RenderCtx, DEFAULT_PAGE_LIMIT,
+};
+use crate::features::operations::core::{IntentSeq, PendingIntent};
 use crate::geometry::stub_headroom_for;
 use crate::gestures::{self, GestureState};
-use crate::history::{
-    should_prefetch, show_fixed_loading_overlay, PageLoadState, PageRequestKey, PageRetry,
-    DEFAULT_PAGE_LIMIT,
-};
 use crate::lod::detail_for;
 use crate::print::print_graph_view;
-use crate::render::{self, RenderCtx};
-use crate::state::{CommitDialog, MenuData, Overlays, PendingOp, Settings, ViewerDoc};
+use crate::render;
+use crate::state::{CommitDialog, Features, MenuData, Overlays, PendingOp, Settings, ViewerDoc};
 use crate::viewport::visible_row_range;
 use crate::{activity, detail, dialogs, menu, viewer};
 
@@ -73,21 +75,30 @@ const HTTP_CONFLICT: u16 = 409;
 /// creation so the new branch shows without a full reload (Issue #18, reusing
 /// the Issue #16 refresh path) and, since M1.10, by the drift path. `history_ui`
 /// is the App's phase/complete/print bundle, which the append loop drives.
-/// `nerd_icons` picks the icon set (icons.rs) for the badges, labels and menus;
-/// `show_node_icons` shows/hides the glyph beside each commit dot.
+/// `features` carries the handles `App` owns and this canvas borrows — the graph epoch,
+/// the Activity panel, the dialogs guard, the operations registry and the one status
+/// read — each created above this canvas so an epoch bump's rebuild cannot drop them.
+/// `settings` picks the icon set (icons.rs) for the badges, labels and menus, and
+/// shows/hides the glyph beside each commit dot.
 pub(super) fn graph_canvas(
     seed: HistorySeed,
-    reload: RwSignal<u32>,
+    features: Features,
     history_ui: HistoryUiSignals,
-    nerd_icons: RwSignal<bool>,
-    show_node_icons: RwSignal<bool>,
-    activity_open: RwSignal<bool>,
+    settings: Settings,
 ) -> impl IntoView {
     let HistorySeed {
         epoch,
         frame,
         loaded,
     } = seed;
+    let Features {
+        graph,
+        activity,
+        dialogs,
+        operations,
+        status,
+    } = features;
+    let Settings { nerd_icons, .. } = settings;
 
     // Phase 12: a repo cloned from a URL is view-only, so every write action in the
     // context menu (create branch, commit, merge, push, delete) is suppressed. The
@@ -153,14 +164,18 @@ pub(super) fn graph_canvas(
             }
         },
     );
-    // When the commit modal was opened (ms). iOS synthesizes a `click` a few ms
-    // after a tap; opening the modal puts its full-screen backdrop under that tap
-    // point, so the ghost click hits the backdrop and closes the modal instantly.
-    // The backdrop ignores a dismiss that lands within `DIALOG_GUARD_MS` of opening.
-    let dialog_opened_at = store_value(0.0_f64);
     // One-shot "scroll the Changes section into view" instruction, set by the
     // menu's "Show diff" item and consumed by the detail panel's next render.
     let scroll_diff = store_value(false);
+    // Click ordering for branch operations (M1.11, #64). Every menu item that
+    // opens the confirm modal first awaits a live `fetch_head_branch()`, so two
+    // quick taps can resolve out of order; `intent_seq` records which tap came
+    // first and `pending_intent` records which one actually opened the dialog.
+    // Both reset when the canvas is rebuilt on an epoch bump, which is correct:
+    // an intent from the previous epoch fails its `RequestKey::is_current` check
+    // anyway, so there is nothing older left to compare against.
+    let intent_seq = store_value(IntentSeq::default());
+    let pending_intent = store_value(None::<PendingIntent>);
 
     // The mounted canvas's **single owner** of history (M1.10, #63). Frame and
     // aggregate move in here; every builder, the append loop and the overlays
@@ -174,23 +189,22 @@ pub(super) fn graph_canvas(
         remote_branches,
     });
 
-    // The signal bundles the split view modules take (see `crate::state`): one
-    // `Copy` handle each instead of a fistful of separate signals.
-    let settings = Settings {
-        nerd_icons,
-        show_node_icons,
-    };
+    // The overlay bundle the split view modules take (see `crate::state`): one `Copy`
+    // handle instead of a fistful of separate signals.
     let overlays = Overlays {
         menu,
         commit_dialog,
         commit_msg,
         confirm_op,
         detail_id,
-        viewer: viewer_doc,
-        activity_open,
+        viewer: Viewer::from_signal(viewer_doc),
+        activity,
         scroll_diff,
-        dialog_opened_at,
-        reload,
+        dialogs,
+        intent_seq,
+        pending_intent,
+        graph,
+        operations,
     };
 
     // What an append changes, published as signals so the view repaints the
@@ -230,7 +244,7 @@ pub(super) fn graph_canvas(
     // `home` goes in as the signal, not its current value: an accepted page can
     // move the home camera down (a taller stub cascade), and the `0` key must
     // land on wherever it is *now* — same rule as the Reset-view button.
-    gestures::install_key_listener(camera, home, reload, overlays);
+    gestures::install_key_listener(camera, home, graph, overlays);
     let visible = create_memo(move |_| {
         visible_row_range(camera.get(), vp_h.get(), row_count.get(), OVERSCAN_ROWS)
     });
@@ -312,7 +326,7 @@ pub(super) fn graph_canvas(
             // `page_load` here would stamp one view's request state onto another.
             if ctx.try_with_value(|c| {
                 request_key.is_current(
-                    reload.get_untracked(),
+                    graph.get_untracked().epoch(),
                     &c.loaded.generation,
                     c.loaded.cursor.as_deref(),
                 )
@@ -335,13 +349,12 @@ pub(super) fn graph_canvas(
                     status: HTTP_CONFLICT,
                     ..
                 }) => {
-                    let next = reload.get_untracked().wrapping_add(1);
+                    let next = graph.try_update(|g| g.force_bump()).unwrap_or_default();
                     history_ui
                         .phase
                         .set(HistoryPhase::DriftReloading { epoch: next });
                     history_ui.print_open.set(false);
                     history_ui.complete.set(false);
-                    reload.set(next);
                     return;
                 }
                 Err(err) => {
@@ -435,11 +448,10 @@ pub(super) fn graph_canvas(
             // `Error`: returning it to `Idle` would let the threshold effect
             // spend the rejected cursor again before the replacement mounts.
             PageRetry::Reseed => {
-                let next = reload.get_untracked().wrapping_add(1);
+                let next = graph.try_update(|g| g.force_bump()).unwrap_or_default();
                 history_ui
                     .phase
                     .set(HistoryPhase::SeedLoading { epoch: next });
-                reload.set(next);
             }
         }
     };
@@ -620,7 +632,7 @@ pub(super) fn graph_canvas(
             {dialogs::commit_dialog_view(overlays)}
             {dialogs::confirm_modal_view(overlays)}
             {detail::detail_panel_view(overlays, settings, detail, ctx)}
-            {activity::activity_panel_view(overlays, settings, read_only)}
+            {activity::activity_panel_view(overlays, settings, read_only, status)}
             {viewer::viewer_view(overlays, settings)}
         </div>
     }

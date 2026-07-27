@@ -14,6 +14,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::camera::{Camera, ZOOM_STEP};
+use crate::features::graph::core::GraphCore;
 use crate::geometry::drag_threshold;
 use crate::state::{MenuData, Overlays};
 
@@ -264,7 +265,7 @@ pub fn install_resize_listener(vp_h: RwSignal<f64>) {
 pub fn install_key_listener(
     camera: RwSignal<Camera>,
     home: RwSignal<Camera>,
-    reload: RwSignal<u32>,
+    graph: RwSignal<GraphCore>,
     overlays: Overlays,
 ) {
     let Overlays {
@@ -283,8 +284,8 @@ pub fn install_key_listener(
                     // it was opened from. (Esc is a desktop convenience only —
                     // every overlay keeps a visible close control, since the
                     // iPad Magic Keyboard has no Esc key.)
-                    if viewer.get_untracked().is_some() {
-                        viewer.set(None);
+                    if viewer.is_open() {
+                        viewer.close();
                     } else if menu.get_untracked().is_some() {
                         menu.set(None);
                     } else if commit_dialog.get_untracked().is_some() {
@@ -330,7 +331,11 @@ pub fn install_key_listener(
                     // at press time, so it is wherever the pages landed so far
                     // put it, never the mount-time value.
                     "0" => camera.set(home.get_untracked()),
-                    "r" | "R" => reload.update(|n| *n = n.wrapping_add(1)),
+                    "r" | "R" => {
+                        graph.update(|g| {
+                            g.force_bump();
+                        });
+                    }
                     _ => {}
                 }
             });
