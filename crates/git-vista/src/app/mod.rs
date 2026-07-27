@@ -35,6 +35,7 @@ use crate::api::{fetch_frame, fetch_page, fetch_protocol, fetch_status, HistoryF
 use crate::dialogs;
 use crate::features::operations::core::OperationsCore;
 use crate::features::operations::signals::Operations;
+use crate::features::operations::view::operations_status_view;
 use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
 use crate::history::{Frame, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT};
@@ -350,6 +351,11 @@ pub fn App() -> impl IntoView {
             // M1.04: the blocking sign-in screen, shown when there's no session and
             // no bootstrap token to make one — the operator must open `gv`'s link.
             {move || needs_sign_in().then(not_connected_view)}
+            // M1.11 (#64): in-flight writes and their outcomes. Mounted in the shell,
+            // not the canvas, so it keeps reporting across the epoch bump a completed
+            // write triggers — and so a failure is dismissible app state rather than a
+            // native alert the app cannot see.
+            {operations_status_view(operations)}
             <header class="topbar">
                 // The git mark brands the title (icons.rs). Reactive so the
                 // topbar switches with the icon-style toggle like everything else.

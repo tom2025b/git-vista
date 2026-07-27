@@ -163,13 +163,12 @@ async fn send_write_with_key(
 
 /// What a write answered with, beyond its body.
 ///
-/// The two extra facts are what let an operation *exist* on the client (M1.11, #64): the
-/// key it went out under, and — for the ten endpoints that reach the server's planner —
-/// the operation id to subscribe to. `operation` is `None` for the four writes that are
+/// The extra fact is what lets an operation *exist* on the client (M1.11, #64): for the
+/// ten endpoints that reach the server's planner, the operation id to subscribe to. The
+/// key is not echoed back — the caller minted it and already has it. `operation` is `None` for the four writes that are
 /// not operation-tracked (`select`, `rescan`, `clone`, `delete-clone`), which is a normal
 /// answer, not a failure: those settle from this response alone.
 pub struct WriteReceipt {
-    pub key: IdempotencyKey,
     pub operation: Option<OperationId>,
     /// Whether the HTTP status was 2xx.
     pub ok: bool,
@@ -178,7 +177,7 @@ pub struct WriteReceipt {
 }
 
 /// Read the headers *before* consuming the body: `text()` takes the response by value.
-async fn receipt(resp: gloo_net::http::Response, key: IdempotencyKey) -> WriteReceipt {
+async fn receipt(resp: gloo_net::http::Response) -> WriteReceipt {
     let operation = resp
         .headers()
         .get(OPERATION_HEADER)
@@ -190,7 +189,6 @@ async fn receipt(resp: gloo_net::http::Response, key: IdempotencyKey) -> WriteRe
         .await
         .unwrap_or_else(|_| format!("HTTP {status}"));
     WriteReceipt {
-        key,
         operation,
         ok,
         message,
@@ -592,8 +590,8 @@ pub async fn undo_request(
 ) -> Result<WriteReceipt, String> {
     refuse_if_visualize()?;
     let json = serde_json::to_string(action).map_err(|e| e.to_string())?;
-    let (resp, key) = send_write_with_key("/api/undo", Some(json), key).await?;
-    Ok(receipt(resp, key).await)
+    let (resp, _key) = send_write_with_key("/api/undo", Some(json), key).await?;
+    Ok(receipt(resp).await)
 }
 
 /// Fetch one commit's diff — file list + unified patch — for the detail
@@ -698,8 +696,8 @@ pub async fn fetch_rebase_status() -> Result<RebaseStatus, String> {
 /// is git's own error text (conflicts, detached HEAD, …), returned as `Err`.
 pub async fn rebase_request(key: IdempotencyKey) -> Result<WriteReceipt, String> {
     refuse_if_visualize()?;
-    let (resp, key) = send_write_with_key("/api/rebase", None, key).await?;
-    Ok(receipt(resp, key).await)
+    let (resp, _key) = send_write_with_key("/api/rebase", None, key).await?;
+    Ok(receipt(resp).await)
 }
 
 /// Ask the backend to reset a seeded *test repo* to its recorded state
@@ -737,8 +735,8 @@ pub async fn branch_op_request(
         branch: branch.to_string(),
     };
     let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-    let (resp, key) = send_write_with_key(path, Some(json), key).await?;
-    Ok(receipt(resp, key).await)
+    let (resp, _key) = send_write_with_key(path, Some(json), key).await?;
+    Ok(receipt(resp).await)
 }
 
 /// The servable repositories (`GET /api/catalog`) — M1.03 built the endpoint,

@@ -34,3 +34,4 @@ it, and note the link in both.
 | [0020](0020-idempotent-operation-lifecycles.md) | Idempotent operation lifecycles and reconnectable progress | Accepted |
 | [0021](0021-durable-operation-journal-and-recovery-refs.md) | Durable operation journal and recovery references | Accepted |
 | [0022](0022-paged-history-and-bounded-reads.md) | Paged history, signed cursors, and bounded reads | Accepted |
+| [0023](0023-rehearsal-workspaces-and-atomic-promotion.md) | Rehearsal workspaces promote results, atomically | Proposed |

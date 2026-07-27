@@ -4,7 +4,7 @@ use leptos::*;
 
 use git_vista_core::activity::UndoAction;
 
-use crate::state::{Overlays, DIALOG_GUARD_MS};
+use crate::state::{Overlays, PendingOp, DIALOG_GUARD_MS};
 
 /// The branch-op confirmation modal (Issue #33 follow-up). Reuses the commit
 /// modal's iPad-proven inline-styled overlay, minus any text input (so no void

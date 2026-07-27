@@ -10,3 +10,5 @@ pub mod kind;
 // run on the host under the ordinary `cargo test --workspace` (M1.11 D1).
 #[cfg(target_arch = "wasm32")]
 pub mod signals;
+#[cfg(target_arch = "wasm32")]
+pub mod view;

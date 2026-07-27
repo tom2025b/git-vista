@@ -65,3 +65,62 @@ pub enum OperationKind {
     /// section (`/api/undoables`) and straight from Activity feed rows.
     Undo(Undoable),
 }
+
+impl OperationKind {
+    /// A short human phrase naming what this operation does, for the status strip that
+    /// reports it. Lives beside the vocabulary so a new variant cannot be added without
+    /// deciding how it reads.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Merge { branch, .. } => format!("Merging \u{2018}{branch}\u{2019}"),
+            Self::Push { branch } => format!("Pushing \u{2018}{branch}\u{2019}"),
+            Self::Delete { branch, .. } => format!("Deleting \u{2018}{branch}\u{2019}"),
+            Self::ForceDelete { branch } => format!("Force-deleting \u{2018}{branch}\u{2019}"),
+            Self::Checkout { branch, .. } => format!("Checking out \u{2018}{branch}\u{2019}"),
+            Self::Rebase { base, .. } => format!("Rebasing onto {base}"),
+            Self::Undo(u) => format!("Undoing: {}", u.label),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_variant_describes_itself_without_naming_its_enum() {
+        // A status strip reading "ForceDelete" would be leaking the type name at the user.
+        let kinds = [
+            OperationKind::Merge {
+                branch: "feature".into(),
+                into: Some("main".into()),
+            },
+            OperationKind::Push {
+                branch: "feature".into(),
+            },
+            OperationKind::Delete {
+                branch: "feature".into(),
+                current: None,
+            },
+            OperationKind::ForceDelete {
+                branch: "feature".into(),
+            },
+            OperationKind::Checkout {
+                branch: "feature".into(),
+                current: None,
+            },
+            OperationKind::Rebase {
+                current: None,
+                base: "origin/main".into(),
+            },
+        ];
+        for k in kinds {
+            let text = k.describe();
+            assert!(!text.is_empty());
+            assert!(
+                !text.contains("OperationKind") && !text.contains("ForceDelete"),
+                "leaked a type name: {text}"
+            );
+        }
+    }
+}
