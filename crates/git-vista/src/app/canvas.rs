@@ -2,8 +2,8 @@
 //!
 //! Split out of `app.rs`. [`graph_canvas`] is the wiring layer between the [`App`]
 //! shell and the rest of the frontend: it moves the seed into the one mounted
-//! [`RenderCtx`], creates the shared overlay/gesture signals, bundles them
-//! ([`Settings`] / [`Overlays`] / [`GestureState`]), installs the window
+//! [`RenderCtx`], creates the gesture signals, takes the shell's overlay stack,
+//! ([`Settings`] / [`Features`] / [`GestureState`]), installs the window
 //! listeners, and assembles the `<svg>` from the [`crate::render`] builders and
 //! the overlay views.
 //!
@@ -35,16 +35,16 @@ use git_vista_core::model::RefKind;
 
 use crate::api::{fetch_commit_detail, fetch_page, HistoryFetchError};
 use crate::camera::Camera;
+use crate::features::graph::core::{
+    should_prefetch, show_fixed_loading_overlay, PageLoadState, PageRequestKey, PageRetry,
+    RenderCtx, DEFAULT_PAGE_LIMIT,
+};
 use crate::geometry::stub_headroom_for;
 use crate::gestures::{self, GestureState};
-use crate::history::{
-    should_prefetch, show_fixed_loading_overlay, PageLoadState, PageRequestKey, PageRetry,
-    DEFAULT_PAGE_LIMIT,
-};
 use crate::lod::detail_for;
 use crate::print::print_graph_view;
-use crate::render::{self, RenderCtx};
-use crate::state::{CommitDialog, MenuData, Overlays, PendingOp, Settings, ViewerDoc};
+use crate::render;
+use crate::state::{Features, Settings};
 use crate::viewport::visible_row_range;
 use crate::{activity, detail, dialogs, menu, viewer};
 
@@ -73,21 +73,26 @@ const HTTP_CONFLICT: u16 = 409;
 /// creation so the new branch shows without a full reload (Issue #18, reusing
 /// the Issue #16 refresh path) and, since M1.10, by the drift path. `history_ui`
 /// is the App's phase/complete/print bundle, which the append loop drives.
-/// `nerd_icons` picks the icon set (icons.rs) for the badges, labels and menus;
-/// `show_node_icons` shows/hides the glyph beside each commit dot.
+/// `features` carries the handles `App` owns and this canvas borrows — the graph epoch,
+/// the Activity panel, the dialogs guard, the operations registry and the one status
+/// read — each created above this canvas so an epoch bump's rebuild cannot drop them.
+/// `settings` picks the icon set (icons.rs) for the badges, labels and menus, and
+/// shows/hides the glyph beside each commit dot.
 pub(super) fn graph_canvas(
     seed: HistorySeed,
-    reload: RwSignal<u32>,
+    features: Features,
     history_ui: HistoryUiSignals,
-    nerd_icons: RwSignal<bool>,
-    show_node_icons: RwSignal<bool>,
-    activity_open: RwSignal<bool>,
+    settings: Settings,
 ) -> impl IntoView {
     let HistorySeed {
         epoch,
         frame,
         loaded,
     } = seed;
+    // The canvas itself needs only the epoch and the overlay stack; every other handle in
+    // the bundle is passed straight through to the view that owns it (M1.11, #64, Task 8).
+    let Features { graph, shell, .. } = features;
+    let Settings { nerd_icons, .. } = settings;
 
     // Phase 12: a repo cloned from a URL is view-only, so every write action in the
     // context menu (create branch, commit, merge, push, delete) is suppressed. The
@@ -122,30 +127,16 @@ pub(super) fn graph_canvas(
     // Whether the current gesture has become a drag (set in pointermove). Defined
     // here so the link click handlers (render) and gesture handlers share one flag.
     let moved = store_value(false);
-    // The open context menu, if any (Issue #18). `None` => no menu. Set when a dot
-    // is tapped (render::build_node), cleared on a pan/tap-elsewhere (pointerdown).
-    let menu = create_rw_signal(None::<MenuData>);
-    // The open commit-message dialog, if any (Issue #33): which kind of commit
-    // (empty vs staged) and, for a branch stub, which branch it lands on.
-    // A real in-app modal, not `window.prompt()`, which webviews block/flash.
-    let commit_dialog = create_rw_signal(None::<CommitDialog>);
-    // The text currently typed into that dialog's message box.
-    let commit_msg = create_rw_signal(String::new());
-    // The branch operation awaiting confirmation, if any (Issue #33 follow-up).
-    // `Some` => the confirm modal is showing; confirming runs the op then refreshes.
-    // Mutually exclusive with the commit dialog (only one overlay is ever open).
-    let confirm_op = create_rw_signal(None::<PendingOp>);
-    // The commit whose detail panel is open (Phase 10), by full hash. `None` => no
-    // panel. Set from the context menu's "View details" item; cleared by the
-    // panel's close button. A `Resource` keyed on it fetches the full commit lazily
-    // — so the graph payload stays lean and the panel shows the whole message body
-    // and both signatures, which the row summary doesn't carry.
-    let detail_id = create_rw_signal(None::<String>);
-    // The full-screen viewer's document (viewer.rs): the full diff or one
-    // file's content, opened from the detail panel, with Print / Save PDF.
-    let viewer_doc = create_rw_signal(None::<ViewerDoc>);
+    // Every overlay signal that used to be created here — the context menu, the two
+    // modals, the detail panel's open hash, the viewer's document — now belongs to
+    // `shell`, created in `App` above this canvas (M1.11, #64, Task 8). That is what
+    // makes them survive the rebuild an epoch bump causes, and it is what closes the
+    // Esc and right-edge-exclusivity bugs: `shell` is the only writer, so "which
+    // overlays are up" is one ordered list rather than six independent signals. The
+    // click-ordering pair (`intent_seq` / `pending_intent`) moved to `operations` and
+    // the commit draft to `dialogs` for the same reason.
     let detail = create_local_resource(
-        move || detail_id.get(),
+        move || shell.detail_id(),
         |id| async move {
             match id {
                 Some(id) => Some(fetch_commit_detail(&id).await),
@@ -153,14 +144,6 @@ pub(super) fn graph_canvas(
             }
         },
     );
-    // When the commit modal was opened (ms). iOS synthesizes a `click` a few ms
-    // after a tap; opening the modal puts its full-screen backdrop under that tap
-    // point, so the ghost click hits the backdrop and closes the modal instantly.
-    // The backdrop ignores a dismiss that lands within `DIALOG_GUARD_MS` of opening.
-    let dialog_opened_at = store_value(0.0_f64);
-    // One-shot "scroll the Changes section into view" instruction, set by the
-    // menu's "Show diff" item and consumed by the detail panel's next render.
-    let scroll_diff = store_value(false);
 
     // The mounted canvas's **single owner** of history (M1.10, #63). Frame and
     // aggregate move in here; every builder, the append loop and the overlays
@@ -173,25 +156,6 @@ pub(super) fn graph_canvas(
         loaded,
         remote_branches,
     });
-
-    // The signal bundles the split view modules take (see `crate::state`): one
-    // `Copy` handle each instead of a fistful of separate signals.
-    let settings = Settings {
-        nerd_icons,
-        show_node_icons,
-    };
-    let overlays = Overlays {
-        menu,
-        commit_dialog,
-        commit_msg,
-        confirm_op,
-        detail_id,
-        viewer: viewer_doc,
-        activity_open,
-        scroll_diff,
-        dialog_opened_at,
-        reload,
-    };
 
     // What an append changes, published as signals so the view repaints the
     // minimum. Everything else about the history stays inside `ctx`:
@@ -230,7 +194,7 @@ pub(super) fn graph_canvas(
     // `home` goes in as the signal, not its current value: an accepted page can
     // move the home camera down (a taller stub cascade), and the `0` key must
     // land on wherever it is *now* — same rule as the Reset-view button.
-    gestures::install_key_listener(camera, home, reload, overlays);
+    gestures::install_key_listener(camera, home, graph, shell);
     let visible = create_memo(move |_| {
         visible_row_range(camera.get(), vp_h.get(), row_count.get(), OVERSCAN_ROWS)
     });
@@ -312,7 +276,7 @@ pub(super) fn graph_canvas(
             // `page_load` here would stamp one view's request state onto another.
             if ctx.try_with_value(|c| {
                 request_key.is_current(
-                    reload.get_untracked(),
+                    graph.get_untracked().epoch(),
                     &c.loaded.generation,
                     c.loaded.cursor.as_deref(),
                 )
@@ -335,13 +299,12 @@ pub(super) fn graph_canvas(
                     status: HTTP_CONFLICT,
                     ..
                 }) => {
-                    let next = reload.get_untracked().wrapping_add(1);
+                    let next = graph.try_update(|g| g.force_bump()).unwrap_or_default();
                     history_ui
                         .phase
                         .set(HistoryPhase::DriftReloading { epoch: next });
                     history_ui.print_open.set(false);
                     history_ui.complete.set(false);
-                    reload.set(next);
                     return;
                 }
                 Err(err) => {
@@ -435,11 +398,10 @@ pub(super) fn graph_canvas(
             // `Error`: returning it to `Idle` would let the threshold effect
             // spend the rejected cursor again before the replacement mounts.
             PageRetry::Reseed => {
-                let next = reload.get_untracked().wrapping_add(1);
+                let next = graph.try_update(|g| g.force_bump()).unwrap_or_default();
                 history_ui
                     .phase
                     .set(HistoryPhase::SeedLoading { epoch: next });
-                reload.set(next);
             }
         }
     };
@@ -453,7 +415,7 @@ pub(super) fn graph_canvas(
     let gs = GestureState {
         camera,
         dragging,
-        menu,
+        shell,
         moved,
         pointers,
         pinch_dist,
@@ -500,7 +462,7 @@ pub(super) fn graph_canvas(
                         (s..e).map(|i| (i, le)).collect::<Vec<_>>()
                     }
                     key=|k| *k
-                    children=move |(i, _)| render::build_node(ctx, menu, moved, i)
+                    children=move |(i, _)| render::build_node(ctx, shell, moved, i)
                 />
                 // Phase 9 (level of detail): the two label tiers, each hidden as the
                 // graph is zoomed out. The message tier (badges + message) drops
@@ -559,7 +521,7 @@ pub(super) fn graph_canvas(
                     // when a page raises the lane high-water.
                     {move || { stub_epoch.get(); render::stub_icons(ctx, nerd_icons) }}
                 </g>
-                {move || { stub_epoch.get(); render::stubs(ctx, menu, moved) }}
+                {move || { stub_epoch.get(); render::stubs(ctx, shell, moved) }}
             </g>
         </svg>
         // The paging affordance (M1.10, #63). A sibling of the `<svg>`, never a
@@ -616,12 +578,12 @@ pub(super) fn graph_canvas(
         // each is `position: fixed`, so this wrapper adds no layout. Each view is a
         // reactive closure that renders only when its signal is set.
         <div class="overlays">
-            {menu::menu_view(overlays, settings, read_only)}
-            {dialogs::commit_dialog_view(overlays)}
-            {dialogs::confirm_modal_view(overlays)}
-            {detail::detail_panel_view(overlays, settings, detail, ctx)}
-            {activity::activity_panel_view(overlays, settings, read_only)}
-            {viewer::viewer_view(overlays, settings)}
+            {menu::menu_view(features, settings, read_only)}
+            {dialogs::commit_dialog_view(features)}
+            {dialogs::confirm_modal_view(features)}
+            {detail::detail_panel_view(features, settings, detail, ctx)}
+            {activity::activity_panel_view(features, settings, read_only)}
+            {viewer::viewer_view(shell, settings)}
         </div>
     }
 }

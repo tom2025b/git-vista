@@ -9,7 +9,7 @@ use leptos::*;
 use crate::geometry::edge_path;
 use git_vista_core::color::branch_color;
 
-use super::RenderCtx;
+use crate::features::graph::core::RenderCtx;
 
 /// Indices of edges whose row span intersects the visible row window `[start,
 /// end)`. An edge is kept whenever any part of it could cross the viewport — even
