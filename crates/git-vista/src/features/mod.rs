@@ -12,4 +12,5 @@ pub mod diff;
 pub mod graph;
 pub mod operations;
 pub mod session;
+pub mod shell;
 pub mod status;
