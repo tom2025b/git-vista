@@ -11,8 +11,8 @@
 //! `t + scale * c`. A row `r` sits at world-y [`crate::geometry::node_cy`]`(r)`.
 
 use crate::camera::Camera;
+use crate::features::graph::core::MAX_LIVE_ROWS;
 use crate::geometry::{PAD_Y, ROW_HEIGHT};
-use crate::history::MAX_LIVE_ROWS;
 
 /// The half-open range `[start, end)` of row indices whose nodes fall inside a
 /// `viewport_h`-tall viewport under `cam`, padded by `overscan` rows on each side
@@ -25,7 +25,7 @@ use crate::history::MAX_LIVE_ROWS;
 ///
 /// The returned range is always ordered (`start <= end`) and in bounds, so the
 /// caller can iterate it directly, and never spans more than
-/// [`crate::history::MAX_LIVE_ROWS`].
+/// [`crate::features::graph::core::MAX_LIVE_ROWS`].
 pub fn visible_row_range(
     cam: Camera,
     viewport_h: f64,

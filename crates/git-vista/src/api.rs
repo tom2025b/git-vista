@@ -9,7 +9,6 @@
 //! failure, so the UI can show the real reason. Pure data plumbing — no UI —
 //! so this stays testable on its own away from the view code.
 
-use std::cell::RefCell;
 use std::fmt;
 
 use gloo_net::http::{Request, RequestBuilder};
@@ -19,69 +18,21 @@ use git_vista_core::diff::{CommitDiff, FileContent};
 use git_vista_core::model::CommitDetail;
 use git_vista_core::net::network_error_text;
 use git_vista_core::status::RepoStatus;
+use git_vista_protocol::operation::{IdempotencyKey, OperationId};
 use git_vista_protocol::{
     ApiError, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
     DeleteCloneRequest, ProtocolInfo, RebaseStatus, RepoMode, RepositoryDescriptor, SelectRequest,
-    SessionInfo, SessionRequest, CSRF_HEADER, IDEMPOTENCY_HEADER, PROTOCOL_HEADER,
-    PROTOCOL_VERSION,
+    SessionInfo, SessionRequest, CSRF_HEADER, IDEMPOTENCY_HEADER, OPERATION_HEADER,
+    PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
-use crate::history::{Frame, Page};
+use crate::features::graph::core::{Frame, Page};
+use crate::features::session::signals as session_state;
 
 /// The largest page the server will mint, mirrored here so a caller's request is
 /// clamped before it goes out rather than silently rewritten server-side. Kept
 /// in step with `MAX_PAGE_LIMIT` in `git-vista-server`'s read handlers.
 const MAX_PAGE_LIMIT: usize = 1_000;
-
-// The current session's CSRF token (M1.04). Set once the session is established
-// (`POST`/`GET /api/session`), then echoed in the [`CSRF_HEADER`] on every write —
-// the server refuses a state-changing request without it. A `thread_local` is all
-// we need: wasm is single-threaded, and the token is per-tab, not persisted.
-thread_local! {
-    static CSRF_TOKEN: RefCell<Option<String>> = const { RefCell::new(None) };
-}
-
-/// Record (or clear) the session's CSRF token — called by [`crate::session`] after
-/// establishing or checking the session. `None` clears it (logged out / no session).
-pub fn set_csrf_token(token: Option<String>) {
-    CSRF_TOKEN.with(|c| *c.borrow_mut() = token);
-}
-
-fn csrf_token() -> Option<String> {
-    CSRF_TOKEN.with(|c| c.borrow().clone())
-}
-
-// The mode the current repo is open in (ADR 0006/0007), mirrored from the last
-// graph load / selection. Purely defense in depth: in Visualize the write fns
-// below refuse before any network call; the server's 403 is the real boundary.
-thread_local! {
-    static UI_MODE: RefCell<Option<RepoMode>> = const { RefCell::new(None) };
-}
-
-/// Record the current repo's mode — set when a graph lands and when a selection
-/// is made. `None` clears it (unknown, e.g. before the first load).
-pub fn set_ui_mode(mode: Option<RepoMode>) {
-    UI_MODE.with(|m| *m.borrow_mut() = mode);
-}
-
-// Whether the current session came through the LAN listener (ADR 0005) —
-// mirrored from the session-establish/-check response. Purely a UI signal: it
-// drives hiding the Active option on the mode screen. The server's own route
-// absence on the LAN listener is the actual write boundary.
-thread_local! {
-    static VIA_LAN: RefCell<bool> = const { RefCell::new(false) };
-}
-
-/// Record whether the current session is LAN-scoped — called by
-/// [`crate::session`] after establishing or checking the session.
-pub fn set_via_lan(via_lan: bool) {
-    VIA_LAN.with(|v| *v.borrow_mut() = via_lan);
-}
-
-/// Whether the current session came through the LAN listener (ADR 0005).
-pub fn is_lan_session() -> bool {
-    VIA_LAN.with(|v| *v.borrow())
-}
 
 /// The ADR 0005 client-side counterpart of the LAN listener's structural
 /// read-only-ness: clone/select/rescan/delete refuse up front on a LAN-view
@@ -89,7 +40,7 @@ pub fn is_lan_session() -> bool {
 /// route-less LAN listener answers with. The absent server route remains the
 /// actual boundary.
 fn refuse_if_lan_view() -> Result<(), String> {
-    if is_lan_session() {
+    if session_state::is_lan() {
         Err("This is a read-only LAN view session — open the localhost \
              (SSH-tunnel) link to clone, rescan, or switch repositories."
             .to_string())
@@ -102,8 +53,7 @@ fn refuse_if_lan_view() -> Result<(), String> {
 /// up front in Visualize mode, so a gating gap in the UI can't even attempt a
 /// mutation. The server's own 403 remains the actual boundary.
 fn refuse_if_visualize() -> Result<(), String> {
-    let visualize = UI_MODE.with(|m| *m.borrow() == Some(RepoMode::Visualize));
-    if visualize {
+    if session_state::refuses_writes() {
         Err("This repository is open in Visualize mode — look-only.".to_string())
     } else {
         Ok(())
@@ -124,7 +74,7 @@ fn req_get(url: &str) -> RequestBuilder {
 /// through here. The session cookie is sent automatically (same-origin).
 fn req_post(url: &str) -> RequestBuilder {
     let builder = Request::post(url).header(PROTOCOL_HEADER, &PROTOCOL_VERSION.to_string());
-    match csrf_token() {
+    match session_state::csrf_token() {
         Some(token) => builder.header(CSRF_HEADER, &token),
         None => builder,
     }
@@ -140,7 +90,7 @@ fn req_post(url: &str) -> RequestBuilder {
 /// one millisecond still differ, and a random draw so two tabs opened in the
 /// same millisecond don't collide. Token-shaped (`[A-Za-z0-9-]`) and far inside
 /// the server's length cap.
-fn new_idempotency_key() -> String {
+pub fn new_idempotency_key() -> IdempotencyKey {
     thread_local! {
         static COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
@@ -151,7 +101,9 @@ fn new_idempotency_key() -> String {
     });
     let ms = js_sys::Date::now() as u64;
     let noise = (js_sys::Math::random() * 4_294_967_296.0) as u64;
-    format!("gv-{ms:x}-{n:x}-{noise:x}")
+    // Hex digits and dashes only, so the validated newtype always accepts it.
+    IdempotencyKey::new(format!("gv-{ms:x}-{n:x}-{noise:x}"))
+        .expect("a hex-and-dash key is a valid idempotency key")
 }
 
 /// Send one write, **retried once on a network-level failure, under the same
@@ -172,10 +124,26 @@ fn new_idempotency_key() -> String {
 ///
 /// Only network errors are retried. An HTTP error is an answer, and answers are
 /// returned to the caller.
-async fn send_write(url: &str, body: Option<String>) -> Result<gloo_net::http::Response, String> {
-    let key = new_idempotency_key();
+async fn send_write(
+    url: &str,
+    body: Option<String>,
+) -> Result<(gloo_net::http::Response, IdempotencyKey), String> {
+    send_write_with_key(url, body, new_idempotency_key()).await
+}
+
+/// [`send_write`] under a key the *caller* minted.
+///
+/// The dispatched operations need this: ADR 0020 mints a key per **user action**, and only
+/// the caller knows where an action begins. Minting here would also mean the client could
+/// not register the operation until the response came back, leaving the whole flight
+/// unrepresented — the exact gap M1.11 closes.
+async fn send_write_with_key(
+    url: &str,
+    body: Option<String>,
+    key: IdempotencyKey,
+) -> Result<(gloo_net::http::Response, IdempotencyKey), String> {
     let attempt = || async {
-        let builder = req_post(url).header(IDEMPOTENCY_HEADER, &key);
+        let builder = req_post(url).header(IDEMPOTENCY_HEADER, key.as_str());
         match &body {
             Some(json) => builder
                 .header("content-type", "application/json")
@@ -188,8 +156,42 @@ async fn send_write(url: &str, body: Option<String>) -> Result<gloo_net::http::R
         }
     };
     match attempt().await {
-        Ok(resp) => Ok(resp),
-        Err(_) => attempt().await,
+        Ok(resp) => Ok((resp, key)),
+        Err(_) => attempt().await.map(|resp| (resp, key)),
+    }
+}
+
+/// What a write answered with, beyond its body.
+///
+/// The extra fact is what lets an operation *exist* on the client (M1.11, #64): for the
+/// ten endpoints that reach the server's planner, the operation id to subscribe to. The
+/// key is not echoed back — the caller minted it and already has it. `operation` is `None` for the four writes that are
+/// not operation-tracked (`select`, `rescan`, `clone`, `delete-clone`), which is a normal
+/// answer, not a failure: those settle from this response alone.
+pub struct WriteReceipt {
+    pub operation: Option<OperationId>,
+    /// Whether the HTTP status was 2xx.
+    pub ok: bool,
+    /// The response body — git's own message on success, the server's reason on failure.
+    pub message: String,
+}
+
+/// Read the headers *before* consuming the body: `text()` takes the response by value.
+async fn receipt(resp: gloo_net::http::Response) -> WriteReceipt {
+    let operation = resp
+        .headers()
+        .get(OPERATION_HEADER)
+        .and_then(|v| OperationId::new(v).ok());
+    let ok = resp.ok();
+    let status = resp.status();
+    let message = resp
+        .text()
+        .await
+        .unwrap_or_else(|_| format!("HTTP {status}"));
+    WriteReceipt {
+        operation,
+        ok,
+        message,
     }
 }
 
@@ -197,13 +199,13 @@ async fn send_write(url: &str, body: Option<String>) -> Result<gloo_net::http::R
 async fn write_json<T: serde::Serialize>(
     url: &str,
     body: &T,
-) -> Result<gloo_net::http::Response, String> {
+) -> Result<(gloo_net::http::Response, IdempotencyKey), String> {
     let json = serde_json::to_string(body).map_err(|e| e.to_string())?;
     send_write(url, Some(json)).await
 }
 
 /// [`send_write`] with no body — the bodyless writes (stage, unstage, rebase…).
-async fn write_empty(url: &str) -> Result<gloo_net::http::Response, String> {
+async fn write_empty(url: &str) -> Result<(gloo_net::http::Response, IdempotencyKey), String> {
     send_write(url, None).await
 }
 
@@ -425,7 +427,7 @@ pub async fn clone_request(url: &str) -> Result<RepositoryDescriptor, String> {
     let body = CloneRequest {
         url: url.to_string(),
     };
-    let resp = write_json("/api/clone", &body).await?;
+    let (resp, _key) = write_json("/api/clone", &body).await?;
     if resp.ok() {
         resp.json::<RepositoryDescriptor>()
             .await
@@ -450,7 +452,7 @@ pub async fn create_branch_request(name: &str, commit: &str) -> Result<(), Strin
         name: name.to_string(),
         commit: commit.to_string(),
     };
-    let resp = write_json("/api/branch", &body).await?;
+    let (resp, _key) = write_json("/api/branch", &body).await?;
     if resp.ok() {
         Ok(())
     } else {
@@ -478,7 +480,7 @@ pub async fn create_commit_request(
         allow_empty,
         branch: branch.map(str::to_string),
     };
-    let resp = write_json("/api/commit", &body).await?;
+    let (resp, _key) = write_json("/api/commit", &body).await?;
     if resp.ok() {
         Ok(())
     } else {
@@ -495,7 +497,7 @@ pub async fn create_commit_request(
 /// own error text, returned as `Err` for the caller to show.
 pub async fn stage_request() -> Result<(), String> {
     refuse_if_visualize()?;
-    let resp = write_empty("/api/stage").await?;
+    let (resp, _key) = write_empty("/api/stage").await?;
     if resp.ok() {
         Ok(())
     } else {
@@ -512,7 +514,7 @@ pub async fn stage_request() -> Result<(), String> {
 /// error posture as staging.
 pub async fn unstage_request() -> Result<(), String> {
     refuse_if_visualize()?;
-    let resp = write_empty("/api/unstage").await?;
+    let (resp, _key) = write_empty("/api/unstage").await?;
     if resp.ok() {
         Ok(())
     } else {
@@ -582,17 +584,14 @@ pub async fn fetch_undoables(commit: &str) -> Result<Vec<Undoable>, String> {
 /// it out. A non-2xx body is the server's reason — including the 409s for a
 /// moved branch (compare-and-swap) or a dirty working tree — returned as `Err`
 /// for the confirm flow to show.
-pub async fn undo_request(action: &UndoAction) -> Result<(), String> {
+pub async fn undo_request(
+    action: &UndoAction,
+    key: IdempotencyKey,
+) -> Result<WriteReceipt, String> {
     refuse_if_visualize()?;
-    let resp = write_json("/api/undo", action).await?;
-    if resp.ok() {
-        Ok(())
-    } else {
-        Err(resp
-            .text()
-            .await
-            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
-    }
+    let json = serde_json::to_string(action).map_err(|e| e.to_string())?;
+    let (resp, _key) = send_write_with_key("/api/undo", Some(json), key).await?;
+    Ok(receipt(resp).await)
 }
 
 /// Fetch one commit's diff — file list + unified patch — for the detail
@@ -695,17 +694,10 @@ pub async fn fetch_rebase_status() -> Result<RebaseStatus, String> {
 /// server's success line so the caller can tell a real rebase from the
 /// "Already up to date" no-op (a raced click from a stale menu). A non-2xx body
 /// is git's own error text (conflicts, detached HEAD, …), returned as `Err`.
-pub async fn rebase_request() -> Result<String, String> {
+pub async fn rebase_request(key: IdempotencyKey) -> Result<WriteReceipt, String> {
     refuse_if_visualize()?;
-    let resp = write_empty("/api/rebase").await?;
-    if resp.ok() {
-        Ok(resp.text().await.unwrap_or_default())
-    } else {
-        Err(resp
-            .text()
-            .await
-            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
-    }
+    let (resp, _key) = send_write_with_key("/api/rebase", None, key).await?;
+    Ok(receipt(resp).await)
 }
 
 /// Ask the backend to reset a seeded *test repo* to its recorded state
@@ -716,7 +708,7 @@ pub async fn rebase_request() -> Result<String, String> {
 /// the exact git step that refused), returned as `Err` for the dialog to show.
 pub async fn reset_test_repo_request() -> Result<String, String> {
     refuse_if_visualize()?;
-    let resp = write_empty("/api/reset-test-repo").await?;
+    let (resp, _key) = write_empty("/api/reset-test-repo").await?;
     if resp.ok() {
         Ok(resp.text().await.unwrap_or_default())
     } else {
@@ -733,20 +725,18 @@ pub async fn reset_test_repo_request() -> Result<String, String> {
 /// non-2xx body is git's own error text, returned as `Err` for the caller to show.
 /// `Ok` carries the server's success line — most callers ignore it, but the merge
 /// flow reads it to tell a real merge from git's "Already up to date" no-op.
-pub async fn branch_op_request(path: &str, branch: &str) -> Result<String, String> {
+pub async fn branch_op_request(
+    path: &str,
+    branch: &str,
+    key: IdempotencyKey,
+) -> Result<WriteReceipt, String> {
     refuse_if_visualize()?;
     let body = BranchRequest {
         branch: branch.to_string(),
     };
-    let resp = write_json(path, &body).await?;
-    if resp.ok() {
-        Ok(resp.text().await.unwrap_or_default())
-    } else {
-        Err(resp
-            .text()
-            .await
-            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
-    }
+    let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+    let (resp, _key) = send_write_with_key(path, Some(json), key).await?;
+    Ok(receipt(resp).await)
 }
 
 /// The servable repositories (`GET /api/catalog`) — M1.03 built the endpoint,
@@ -773,7 +763,7 @@ pub async fn select_request(worktree: &str, mode: RepoMode) -> Result<(), String
         worktree: worktree.to_string(),
         mode,
     };
-    let resp = write_json("/api/select", &body).await?;
+    let (resp, _key) = write_json("/api/select", &body).await?;
     if resp.ok() {
         Ok(())
     } else {
@@ -785,7 +775,7 @@ pub async fn select_request(worktree: &str, mode: RepoMode) -> Result<(), String
 /// the server's one-line summary for the picker to show.
 pub async fn rescan_request() -> Result<String, String> {
     refuse_if_lan_view()?;
-    let resp = write_empty("/api/rescan").await?;
+    let (resp, _key) = write_empty("/api/rescan").await?;
     if resp.ok() {
         Ok(resp.text().await.unwrap_or_default())
     } else {
@@ -801,7 +791,7 @@ pub async fn delete_clone_request(worktree: &str) -> Result<String, String> {
     let body = DeleteCloneRequest {
         worktree: worktree.to_string(),
     };
-    let resp = write_json("/api/delete-clone", &body).await?;
+    let (resp, _key) = write_json("/api/delete-clone", &body).await?;
     if resp.ok() {
         Ok(resp.text().await.unwrap_or_default())
     } else {

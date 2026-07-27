@@ -9,6 +9,11 @@
 //! ignores a dismiss landing within [`DIALOG_GUARD_MS`] of opening, so iOS's
 //! synthesized post-tap "ghost click" can't close the modal it just opened.
 //!
+//! All four consult **one** guard since M1.11 (#64) — [`Dialogs`], created in `App`.
+//! Before that there were three separate `StoredValue<f64>` clocks and eleven inlined
+//! copies of the same `Date::now()` comparison; the rule was right everywhere by
+//! repetition rather than by construction.
+//!
 //! # Module layout
 //!
 //! This split is move-only — one file per overlay, with the two error-reporting
@@ -19,7 +24,8 @@
 //!   * [`reset`]    — the Reset Test Repo confirmation.
 //!   * [`open_url`] — the clone-by-URL dialog.
 //!
-//! [`DIALOG_GUARD_MS`]: crate::state::DIALOG_GUARD_MS
+//! [`DIALOG_GUARD_MS`]: crate::features::dialogs::core::DIALOG_GUARD_MS
+//! [`Dialogs`]: crate::features::dialogs::signals::Dialogs
 
 use leptos::*;
 
@@ -34,19 +40,13 @@ pub use open_url::open_url_view;
 pub use reset::reset_repo_view;
 
 /// Pop a native alert with `msg` (there's always a window in the running SPA).
+///
+/// Only the test-repo reset still uses this. The branch operations moved off it in M1.11
+/// (#64): a modal outside the component tree cannot be styled, cannot be dismissed by the
+/// app, and — the real problem — is not *state*, so a failure it reported left nothing
+/// behind. Those outcomes now settle into the operations core instead.
 fn alert(msg: &str) {
     if let Some(w) = web_sys::window() {
         let _ = w.alert_with_message(msg);
-    }
-}
-
-/// Resolve a git op's result: bump `reload` so the graph re-reads on success, or
-/// surface git's own error text ("Couldn't {what}:\n<git stderr>") on failure.
-/// Generic over the success payload — some requests return `()`, the branch ops
-/// return the server's success line — since either way it's dropped here.
-fn report<T>(result: Result<T, String>, what: &str, reload: RwSignal<u32>) {
-    match result {
-        Ok(_) => reload.update(|n| *n = n.wrapping_add(1)),
-        Err(e) => alert(&format!("Couldn't {what}:\n{e}")),
     }
 }

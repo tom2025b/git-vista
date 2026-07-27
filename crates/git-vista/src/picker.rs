@@ -13,9 +13,15 @@ use leptos::*;
 
 use git_vista_protocol::{RepoMode, RepositoryDescriptor, RepositoryKind};
 
-use crate::api::{
-    delete_clone_request, fetch_catalog, rescan_request, select_request, set_ui_mode,
-};
+use crate::features::dialogs::core::Dialog;
+use crate::features::dialogs::signals::Dialogs;
+use crate::features::graph::core::GraphCore;
+use crate::features::operations::core::{result_is_newest, IntentSeq};
+use crate::features::operations::signals as ops;
+use crate::features::session::core::SessionEvent;
+use crate::features::session::signals as session_state;
+
+use crate::api::{delete_clone_request, fetch_catalog, rescan_request, select_request};
 
 /// The blocking repo list. `open` shows/hides it; picking a repo hands its
 /// descriptor to `mode_for` (the mode screen); "Clone URL…" opens the existing
@@ -25,8 +31,8 @@ pub fn picker_view(
     mode_for: RwSignal<Option<RepositoryDescriptor>>,
     open_url: RwSignal<bool>,
     clone_url: RwSignal<String>,
-    open_opened_at: StoredValue<f64>,
-    reload: RwSignal<u32>,
+    dialogs: Dialogs,
+    graph: RwSignal<GraphCore>,
 ) -> impl IntoView {
     // Refetch every time the picker opens (and after a rescan) — the catalog
     // changes at runtime (clones, rescans), so a cached list would mislead.
@@ -35,7 +41,7 @@ pub fn picker_view(
     // it (the same recovery the graph/status reads use).
     let bump = create_rw_signal(0u32);
     let catalog = create_local_resource(
-        move || (open.get(), bump.get(), reload.get()),
+        move || (open.get(), bump.get(), graph.get().epoch()),
         |(is_open, _, _)| async move {
             if is_open {
                 Some(fetch_catalog().await)
@@ -44,7 +50,12 @@ pub fn picker_view(
             }
         },
     );
-    let rescan_msg = create_rw_signal(String::new());
+    // The one status line under the picker, written by two independent async actions
+    // (delete-clone and Rescan). Stamped with the click sequence that produced it so a
+    // slower earlier reply cannot overwrite the newer one (M1.11, #64); sequence 0 means
+    // nothing has been shown yet.
+    let rescan_msg = create_rw_signal((0_u64, String::new()));
+    let msg_seq = store_value(IntentSeq::default());
     move || {
         open.get().then(|| {
             view! {
@@ -88,7 +99,7 @@ pub fn picker_view(
                                     // ADR 0005: a LAN-view session can't select —
                                     // the row stays as a label, not a dead-end.
                                     let pick = move |_| {
-                                        if !crate::api::is_lan_session() {
+                                        if !session_state::is_lan() {
                                             mode_for.set(Some(d.clone()));
                                         }
                                     };
@@ -108,13 +119,22 @@ pub fn picker_view(
                                             return;
                                         }
                                         let worktree = worktree.clone();
+                                        let seq = ops::next_seq(msg_seq);
                                         spawn_local(async move {
-                                            match delete_clone_request(&worktree).await {
+                                            let text = match delete_clone_request(&worktree)
+                                                .await
+                                            {
                                                 Ok(msg) => {
-                                                    rescan_msg.set(msg);
                                                     bump.update(|n| *n = n.wrapping_add(1));
+                                                    msg
                                                 }
-                                                Err(e) => rescan_msg.set(e),
+                                                Err(e) => e,
+                                            };
+                                            if result_is_newest(
+                                                rescan_msg.get_untracked().0,
+                                                seq,
+                                            ) {
+                                                rescan_msg.set((seq, text));
                                             }
                                         });
                                     };
@@ -138,7 +158,7 @@ pub fn picker_view(
                                             // re-render post-session (catalog is
                                             // keyed on `reload`), so the flag is
                                             // settled by the time it's read.
-                                            {(is_clone && !crate::api::is_lan_session()).then(|| view! {
+                                            {(is_clone && !session_state::is_lan()).then(|| view! {
                                                 <button
                                                     style="padding:12px; font:inherit; \
                                                            color:#f85149; background:#0d1117; \
@@ -162,15 +182,15 @@ pub fn picker_view(
                             // session (and its via_lan flag) lands, the same
                             // recovery the catalog fetch above uses.
                             {move || {
-                                reload.get();
-                                (!crate::api::is_lan_session()).then(|| view! {
+                                graph.get().epoch();
+                                (!session_state::is_lan()).then(|| view! {
                                     <button
                                         style="padding:8px 16px; font:inherit; color:var(--fg); \
                                                background:#21262d; border:1px solid #30363d; \
                                                border-radius:6px;"
                                         on:click=move |_| {
                                             clone_url.set(String::new());
-                                            open_opened_at.set_value(js_sys::Date::now());
+                                            dialogs.open(Dialog::OpenUrl);
                                             open_url.set(true);
                                         }
                                     >
@@ -181,13 +201,20 @@ pub fn picker_view(
                                                background:#21262d; border:1px solid #30363d; \
                                                border-radius:6px;"
                                         on:click=move |_| {
+                                            let seq = ops::next_seq(msg_seq);
                                             spawn_local(async move {
-                                                match rescan_request().await {
+                                                let text = match rescan_request().await {
                                                     Ok(msg) => {
-                                                        rescan_msg.set(msg);
                                                         bump.update(|n| *n = n.wrapping_add(1));
+                                                        msg
                                                     }
-                                                    Err(e) => rescan_msg.set(e),
+                                                    Err(e) => e,
+                                                };
+                                                if result_is_newest(
+                                                    rescan_msg.get_untracked().0,
+                                                    seq,
+                                                ) {
+                                                    rescan_msg.set((seq, text));
                                                 }
                                             });
                                         }
@@ -208,10 +235,10 @@ pub fn picker_view(
                             </button>
                         </div>
                         {move || {
-                            (!rescan_msg.get().is_empty()).then(|| {
+                            (!rescan_msg.get().1.is_empty()).then(|| {
                                 view! {
                                     <div style="margin-top:8px; font-size:0.85em; opacity:0.7;">
-                                        {rescan_msg.get()}
+                                        {rescan_msg.get().1}
                                     </div>
                                 }
                             })
@@ -229,7 +256,7 @@ pub fn picker_view(
 pub fn mode_view(
     mode_for: RwSignal<Option<RepositoryDescriptor>>,
     picker_open: RwSignal<bool>,
-    reload: RwSignal<u32>,
+    graph: RwSignal<GraphCore>,
 ) -> impl IntoView {
     let busy = create_rw_signal(false);
     let err = create_rw_signal(String::new());
@@ -248,10 +275,16 @@ pub fn mode_view(
                     spawn_local(async move {
                         match select_request(&worktree, mode).await {
                             Ok(()) => {
-                                set_ui_mode(Some(mode));
+                                // The server accepted the selection, so this is the user's
+                                // choice taking effect. A LAN session cannot reach here —
+                                // `select_request` refuses first (ADR 0005) — so the core's
+                                // rejection is unreachable and deliberately ignored.
+                                let _ = session_state::apply(SessionEvent::UiModeSelected(mode));
                                 mode_for.set(None);
                                 picker_open.set(false);
-                                reload.update(|n| *n = n.wrapping_add(1));
+                                graph.update(|g| {
+                                    g.force_bump();
+                                });
                             }
                             Err(e) => err.set(e),
                         }
@@ -279,7 +312,7 @@ pub fn mode_view(
                         >
                             "Visualize — look only, with links out"
                         </button>
-                        {(!crate::api::is_lan_session()).then(|| view! {
+                        {(!session_state::is_lan()).then(|| view! {
                             <button
                                 style="display:block; width:100%; padding:16px; margin:8px 0; \
                                        font:inherit; font-size:1.05em; color:#fff; \

@@ -10,9 +10,8 @@
 //! reference into the reactive arena, not the value), so a bundle is a cheap
 //! handle to copy into a closure, never a clone of any actual state.
 
-use leptos::{Resource, RwSignal, StoredValue};
+use leptos::{Resource, RwSignal, SignalSet, StoredValue};
 
-use git_vista_core::activity::Undoable;
 use git_vista_core::model::CommitDetail;
 
 /// State for the per-commit context menu (Issue #18): which commit was tapped,
@@ -80,62 +79,23 @@ pub struct CommitDialog {
     pub branch: Option<String>,
 }
 
-/// A branch operation awaiting confirmation in the modal (Issue #33 follow-up).
-/// Merge and delete change history/refs and push reaches the network, so each is
-/// confirmed before it runs — reusing the same in-app modal the commit dialog uses
-/// (a native `confirm()` gets blocked/flashed by the webview, same as `prompt()`).
-#[derive(Clone)]
-pub enum PendingOp {
-    /// Merge `branch` into the checked-out branch (`git merge <branch>`). `into` is
-    /// the live HEAD branch, fetched when the item is clicked, so the confirmation
-    /// names the true target; `None` => detached HEAD (the confirm button is disabled).
-    Merge {
-        branch: String,
-        into: Option<String>,
-    },
-    /// Push `branch` to origin (`git push origin <branch>`).
-    Push { branch: String },
-    /// Delete `branch` (`git branch -d <branch>`). `current` is the live HEAD branch,
-    /// fetched on click; when it equals `branch` the confirm button is disabled (git
-    /// refuses to delete the checked-out branch). `None` => detached HEAD (deletable).
-    Delete {
-        branch: String,
-        current: Option<String>,
-    },
-    /// Check out `branch` (`git checkout <branch>`), moving HEAD and the working
-    /// tree to it. `current` is the live HEAD branch, fetched on click; when it
-    /// equals `branch` the confirm button is disabled (nothing to switch to).
-    /// `None` => detached HEAD — checkout is *allowed* there, it re-attaches HEAD.
-    Checkout {
-        branch: String,
-        current: Option<String>,
-    },
-    /// Force-delete `branch` (`git branch -D <branch>`), discarding unmerged commits.
-    /// Only reached after the safe [`PendingOp::Delete`] is refused with "not fully
-    /// merged": the modal re-opens as this so the user can override rather than hit a
-    /// dead-end error.
-    ForceDelete { branch: String },
-    /// Rebase the checked-out branch onto main (`git rebase main`, or `origin/main`
-    /// when that remote-tracking ref exists — resolved server-side). `current` is the
-    /// live HEAD branch, fetched on click, purely to name it in the dialog; `None` =>
-    /// detached HEAD (the confirm button is disabled — there's no branch to rebase).
-    /// `base` names the server's actual rebase target (from `/api/rebase-status`),
-    /// so the dialog says exactly what the branch will be replayed onto.
-    Rebase {
-        current: Option<String>,
-        base: String,
-    },
-    /// Execute one undo action (Activity/Undo step 5, `POST /api/undo`). Carries the
-    /// whole [`Undoable`] — the action plus its server-built label and `warn_pushed`
-    /// flag — so the dialog can name exactly what it's about to do and warn when the
-    /// discarded state is already on the remote. Offered from the graph menu's undo
-    /// section (`/api/undoables`) and straight from Activity feed rows.
-    Undo(Undoable),
-}
+// The branch-operation vocabulary moved to `features/operations/kind.rs` in M1.11
+// (#64): it is framework-free, so it compiles and is unit-tested on the host target,
+// while this module is wasm-only. Re-exported under its old name so the ~40 existing
+// `PendingOp::…` call sites in `menu.rs`, `dialogs/` and `activity.rs` keep reading
+// naturally; `dialogs/confirm.rs` still matches one arm per `api.rs` function.
+pub use crate::features::operations::kind::OperationKind as PendingOp;
 
-/// How long (ms) after the commit modal opens to ignore a backdrop dismiss, so
-/// iOS's synthesized post-tap "ghost click" can't close the modal it just opened.
-pub const DIALOG_GUARD_MS: f64 = 400.0;
+use crate::features::activity::signals::Activity;
+use crate::features::dialogs::signals::{Dialogs, Viewer};
+use crate::features::graph::core::GraphCore;
+use crate::features::operations::core::{IntentSeq, PendingIntent};
+use crate::features::operations::signals::Operations;
+use crate::features::status::signals::StatusResource;
+
+// `DIALOG_GUARD_MS` used to live here. It moved to `features/dialogs/core.rs` in M1.11
+// (#64), next to the comparison that reads it — a guard window stated apart from the
+// arithmetic it governs is a number nobody can check. Both are host-tested there now.
 
 /// What the full-screen viewer (viewer.rs) is showing: a commit's whole diff
 /// (the detail panel's "Expand Full Diff"), or one file's full content at a
@@ -158,6 +118,28 @@ pub struct Settings {
     pub show_node_icons: RwSignal<bool>,
 }
 
+/// The feature handles `App` owns and hands down to the graph canvas (M1.11, #64).
+///
+/// Every one of these is created **above** `graph_canvas`, so it outlives the canvas that
+/// an epoch bump rebuilds — an in-flight operation, a modal's ghost-click guard and the
+/// panel's visibility all have to survive that rebuild. Bundled for the same reason
+/// [`Overlays`] is: they were threaded as five separate parameters, which is how
+/// `graph_canvas` reached nine arguments.
+#[derive(Clone, Copy)]
+pub struct Features {
+    /// The graph epoch: bumped, generation-aware, to re-read the repo after a write.
+    pub graph: RwSignal<GraphCore>,
+    /// The Activity panel's visibility.
+    pub activity: Activity,
+    /// The app's one iOS ghost-click guard.
+    pub dialogs: Dialogs,
+    /// Where writes go.
+    pub operations: Operations,
+    /// The app's one working-tree status read — the topbar chip and the Activity
+    /// panel's status section both render from it.
+    pub status: StatusResource,
+}
+
 /// The mutually-exclusive overlay signals (context menu, the two modals, the
 /// detail panel) plus the ghost-click guard timestamp and the shared fetch
 /// counter — everything the menu items and modals need to open, close and
@@ -175,23 +157,68 @@ pub struct Overlays {
     pub confirm_op: RwSignal<Option<PendingOp>>,
     /// The commit whose detail panel is open (Phase 10), by full hash.
     pub detail_id: RwSignal<Option<String>>,
-    /// The full-screen viewer's document (full diff / full file), if open.
-    /// Sits on top of the detail panel it was opened from.
-    pub viewer: RwSignal<Option<ViewerDoc>>,
-    /// Whether the Activity panel is open (Activity/Undo feature). Created in
-    /// `App` — the topbar owns its button — and threaded through here so the
-    /// panel, the menu and the detail panel can keep each other exclusive
-    /// (both are right-docked; stacking them would just hide one).
-    pub activity_open: RwSignal<bool>,
+    /// The full-screen viewer (full diff / full file). Sits on top of the detail
+    /// panel it was opened from. A [`Viewer`] rather than a bare signal since
+    /// M1.11 (#64): `detail.rs` used to construct the document and poke the raw
+    /// signal itself.
+    pub viewer: Viewer,
+    /// The Activity panel's visibility (Activity/Undo feature). Created in `App` —
+    /// the topbar owns its button — and threaded through here so the panel, the
+    /// menu and the detail panel can keep each other exclusive (both are
+    /// right-docked; stacking them would just hide one).
+    pub activity: Activity,
     /// One-shot flag set by the menu's "Show diff" item: when the panel's
     /// Changes section next finishes rendering, scroll it into view, then
     /// clear the flag. A `StoredValue` (not a signal) on purpose — it's an
     /// instruction consumed by the next render, not state the UI reflects.
     pub scroll_diff: StoredValue<bool>,
-    /// When the current modal was opened (ms) — the iOS ghost-click guard.
-    pub dialog_opened_at: StoredValue<f64>,
-    /// The App's fetch counter; bumped to re-read the repo after a write.
-    pub reload: RwSignal<u32>,
+    /// The iOS ghost-click guard (M1.11, #64). Replaces `dialog_opened_at:
+    /// StoredValue<f64>` — and, once every modal was routed through it, the two
+    /// further clocks (`reset_opened_at`, `open_opened_at`) that `App` used to keep
+    /// alongside it. One guard, one owner, one tested rule.
+    pub dialogs: Dialogs,
+    /// Mints the click-order sequence for branch operations (M1.11, #64). A
+    /// `StoredValue`, not a signal: minting is bookkeeping done inside an event
+    /// handler, and nothing renders from it.
+    pub intent_seq: StoredValue<IntentSeq>,
+    /// The newest branch-operation intent that has actually reached
+    /// [`Overlays::confirm_op`]. A menu item's `fetch_head_branch()` pre-check
+    /// resolves in network order, so each continuation compares against this
+    /// before committing and a straggler from an earlier click is dropped
+    /// instead of reopening its dialog over the one the user is looking at.
+    pub pending_intent: StoredValue<Option<PendingIntent>>,
+    /// The graph epoch (M1.11, #64): bumped, generation-aware, to re-read the repo
+    /// after a write. Replaces the old bare `reload: RwSignal<u32>` counter.
+    pub graph: RwSignal<GraphCore>,
+    /// Where writes go (M1.11, #64). Created in `App`, **above** `graph_canvas`, so an
+    /// in-flight operation outlives the canvas an epoch bump rebuilds.
+    pub operations: Operations,
+}
+
+impl Overlays {
+    /// Right-edge exclusivity, the detail-panel direction: opening the detail panel on
+    /// `id` closes Activity, because both dock the same edge and would otherwise stack
+    /// and hide one another.
+    ///
+    /// Collapses what were two identical pairs of raw signal pokes in `menu.rs` ("View
+    /// details" and "Show diff") into one named place (M1.11, #64, Task 7). This is an
+    /// intermediate, not the fix: the rule still lives in two methods that each writer
+    /// must remember to call, rather than in one stack that makes the invariant
+    /// unrepresentable. Task 8's `shell.overlay_stack` replaces both outright.
+    pub fn open_detail_panel(&self, id: String) {
+        self.activity.close();
+        self.detail_id.set(Some(id));
+    }
+
+    /// The reverse direction: opening Activity closes the detail panel.
+    ///
+    /// Still driven by a reactive effect in `activity.rs` that fires one tick *after*
+    /// the panel's visibility flips — not synchronously from the topbar button that
+    /// flipped it — so both panels can still render together for a frame. Naming the
+    /// write does not close that window; only Task 8's single dismiss path does.
+    pub fn close_detail_for_activity(&self) {
+        self.detail_id.set(None);
+    }
 }
 
 /// The lazily-fetched commit detail (Phase 10): keyed on the open commit's hash,
