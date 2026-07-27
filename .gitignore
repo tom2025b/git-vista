@@ -50,6 +50,7 @@
 /docs/adr/*.pdf
 /docs/superpowers/plans/*.pdf
 /docs/superpowers/specs/*.pdf
+/docs/superpowers/evidence/*.pdf
 !/docs/superpowers/pdf/
 
 # Local print/archive outputs generated from the documentation set
