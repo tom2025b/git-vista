@@ -12,22 +12,52 @@
 //! never-opened sentinel; hoisting it means a rebuild while a modal is up no longer
 //! silently drops that modal's guard.
 
-use leptos::{store_value, RwSignal, SignalGet, SignalSet, SignalWithUntracked, StoredValue};
+use leptos::{
+    create_rw_signal, store_value, RwSignal, SignalGet, SignalGetUntracked, SignalSet, StoredValue,
+};
 
 use crate::features::dialogs::core::{Dialog, DialogsCore};
-use crate::state::ViewerDoc;
 
-/// The app's one ghost-click guard.
+/// The app's one ghost-click guard, and the commit modal's message draft.
 #[derive(Clone, Copy)]
 pub struct Dialogs {
     core: StoredValue<DialogsCore>,
+    /// The text currently typed into the commit modal's message box.
+    ///
+    /// Moved here from the `Overlays` bundle in Task 8 (M1.11, #64): it is the commit
+    /// dialog's *content*, so it belongs to the dialogs feature rather than to the overlay
+    /// stack, which only decides what is on screen. One consequence is deliberate and
+    /// worth naming — living in `App` rather than in `graph_canvas`, a half-typed message
+    /// now survives the canvas rebuild an epoch bump causes, where before it was silently
+    /// discarded.
+    commit_msg: RwSignal<String>,
 }
 
 impl Dialogs {
     pub fn new() -> Self {
         Self {
             core: store_value(DialogsCore::default()),
+            commit_msg: create_rw_signal(String::new()),
         }
+    }
+
+    /// A tracked read — the modal's `<textarea>` and its Commit button both render from it.
+    pub fn commit_msg(&self) -> String {
+        self.commit_msg.get()
+    }
+
+    /// An untracked read, for the submit handler that must not subscribe.
+    pub fn commit_msg_untracked(&self) -> String {
+        self.commit_msg.get_untracked()
+    }
+
+    pub fn set_commit_msg(&self, msg: String) {
+        self.commit_msg.set(msg);
+    }
+
+    /// Blank the draft, for an opener starting a fresh message.
+    pub fn clear_commit_msg(&self) {
+        self.commit_msg.set(String::new());
     }
 
     /// Record that `d` is opening now, and start its guard window.
@@ -44,11 +74,16 @@ impl Dialogs {
     /// Record that `d` closed. A no-op if some other dialog has since replaced it.
     ///
     /// Only the backdrop-dismiss paths call this today. A modal also closes via its own
-    /// Cancel/Confirm button and via Esc (`gestures.rs`), and neither routes through here,
-    /// so the core's record of *which* dialog is up can lag reality. That is why this type
-    /// deliberately exposes no `open_dialog()` reader: the only thing it is authoritative
-    /// about is the guard window, which depends on the stamp alone. Task 8's overlay stack
-    /// is what makes open/close single-pathed, and only then is the record worth reading.
+    /// Cancel/Confirm button and via Esc, and neither routes through here, so the core's
+    /// record of *which* dialog is up can lag reality. That is why this type deliberately
+    /// exposes no `open_dialog()` reader: the only thing it is authoritative about is the
+    /// guard window, which depends on the stamp alone.
+    ///
+    /// Task 8 made *visibility* single-pathed through
+    /// [`crate::features::shell::signals::Shell`], but deliberately did not fold the guard
+    /// into it: the stack decides what is on screen, the guard decides whether a tap
+    /// arriving right now is real. Two rules, two owners. The record here is still only
+    /// worth as much as its stamp.
     pub fn close(&self, d: Dialog) {
         self.core.update_value(|c| c.close(d));
     }
@@ -69,37 +104,9 @@ impl Default for Dialogs {
     }
 }
 
-/// The full-screen viewer's document.
-///
-/// Not a [`Dialog`]: the viewer has no backdrop dismiss and so has never consulted the
-/// guard (see [`Dialog`]'s doc comment). It lives in this module because it is the other
-/// overlay the detail panel opens, and `detail.rs` reaching into a raw
-/// `RwSignal<Option<ViewerDoc>>` was one of the cross-feature writes M1.11 removes.
-#[derive(Clone, Copy)]
-pub struct Viewer {
-    doc: RwSignal<Option<ViewerDoc>>,
-}
-
-impl Viewer {
-    pub fn from_signal(doc: RwSignal<Option<ViewerDoc>>) -> Self {
-        Self { doc }
-    }
-
-    /// Show `doc` full-screen, over whatever panel it was opened from.
-    pub fn open(&self, doc: ViewerDoc) {
-        self.doc.set(Some(doc));
-    }
-
-    pub fn close(&self) {
-        self.doc.set(None);
-    }
-
-    /// A tracked read — the viewer's own view re-renders from it.
-    pub fn doc(&self) -> Option<ViewerDoc> {
-        self.doc.get()
-    }
-
-    pub fn is_open(&self) -> bool {
-        self.doc.with_untracked(Option::is_some)
-    }
-}
+// The `Viewer` handle used to live here. Task 7 put it in this module for want of a
+// better one — the doc comment said so outright, "because it is the other overlay the
+// detail panel opens". Task 8 gave overlays an actual owner, so the full-screen viewer is
+// now one entry in `features::shell`'s stack like the rest, and the separate handle is
+// gone rather than left as a second way to open the same thing. It was never a [`Dialog`]:
+// it has no backdrop dismiss and so has never consulted the guard.

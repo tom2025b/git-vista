@@ -25,58 +25,6 @@ use crate::features::operations::core::{
 };
 use crate::features::operations::kind::OperationKind;
 
-/// Mint the next click-order sequence.
-///
-/// Call this **synchronously inside the event handler**, before any `await`. That is the
-/// whole point: the sequence must record when the user acted, and a value taken after the
-/// pre-check resolves would record when the network answered instead.
-pub fn next_seq(intent_seq: StoredValue<IntentSeq>) -> u64 {
-    // `try_update_value` returns `None` only when the owning scope is already disposed, in
-    // which case the continuation cannot write anything either. Sequence 0 is the reserved
-    // "no intent" value, so falling back to it makes such an intent lose every comparison
-    // rather than spuriously win one.
-    intent_seq.try_update_value(|s| s.next()).unwrap_or(0)
-}
-
-/// Stamp a request with the repository state it was raised against.
-///
-/// `generation` is `None` here: the branch-operation endpoints predate M1.10 and do not
-/// report one, so these intents are fenced by epoch alone — which is exactly the case
-/// [`RequestKey::is_current`] documents as correct for pre-generation endpoints.
-pub fn request_key(graph: RwSignal<GraphCore>, target: RequestTarget) -> RequestKey {
-    RequestKey {
-        epoch: graph.get_untracked().epoch(),
-        generation: None,
-        target,
-    }
-}
-
-/// Whether a resolved pre-check may still open its dialog; records it if so.
-///
-/// Two independent reasons to drop a continuation, and both matter:
-///
-/// * the repository moved while the pre-check was in flight (a Refresh, a repo switch, a
-///   drift reload), so the answer describes a repository the user is no longer looking at;
-/// * a later tap already owns the dialog, so committing now would replace what the user is
-///   looking at with something they asked for *earlier*.
-pub fn admit_intent(
-    pending_intent: StoredValue<Option<PendingIntent>>,
-    graph: RwSignal<GraphCore>,
-    intent: &PendingIntent,
-) -> bool {
-    if !intent.key.is_current(graph.get_untracked().epoch(), None) {
-        return false;
-    }
-    let wins = pending_intent
-        .try_with_value(|current| latest_wins(current.as_ref(), intent))
-        .unwrap_or(false);
-    if !wins {
-        return false;
-    }
-    pending_intent.set_value(Some(intent.clone()));
-    true
-}
-
 /// The reactive handle every feature uses to start and watch a write.
 ///
 /// `Copy`, like the rest of the app's signal bundles, so it drops into a closure without
@@ -91,11 +39,86 @@ pub struct Operations {
     /// skips the epoch bump when the settlement's generation matches what the graph
     /// already has, so a write that didn't move the repository doesn't force a re-read.
     graph: RwSignal<GraphCore>,
+    /// Mints the click-order sequence for branch operations. A `StoredValue`, not a
+    /// signal: minting is bookkeeping done inside an event handler, and nothing renders
+    /// from it.
+    intent_seq: StoredValue<IntentSeq>,
+    /// The newest branch-operation intent that has actually opened its confirm dialog. A
+    /// menu item's `fetch_head_branch()` pre-check resolves in network order, so each
+    /// continuation compares against this before committing and a straggler from an
+    /// earlier click is dropped instead of reopening its dialog over the one the user is
+    /// looking at.
+    ///
+    /// Moved here from the `Overlays` bundle in Task 8 (M1.11, #64), which also moved it
+    /// above `graph_canvas`. `Overlays` reset both on every epoch bump and argued that was
+    /// correct; it is equally correct not to, and for the same reason the old comment
+    /// gave — an intent raised before the bump fails [`RequestKey::is_current`] anyway,
+    /// and sequences only ever increase, so a surviving record can never out-rank a newer
+    /// tap.
+    pending_intent: StoredValue<Option<PendingIntent>>,
 }
 
 impl Operations {
     pub fn new(core: RwSignal<OperationsCore>, graph: RwSignal<GraphCore>) -> Self {
-        Self { core, graph }
+        Self {
+            core,
+            graph,
+            intent_seq: store_value(IntentSeq::default()),
+            pending_intent: store_value(None::<PendingIntent>),
+        }
+    }
+
+    /// Mint the next click-order sequence.
+    ///
+    /// Call this **synchronously inside the event handler**, before any `await`. That is
+    /// the whole point: the sequence must record when the user acted, and a value taken
+    /// after the pre-check resolves would record when the network answered instead.
+    pub fn next_seq(&self) -> u64 {
+        // `try_update_value` returns `None` only when the owning scope is already disposed,
+        // in which case the continuation cannot write anything either. Sequence 0 is the
+        // reserved "no intent" value, so falling back to it makes such an intent lose every
+        // comparison rather than spuriously win one.
+        self.intent_seq.try_update_value(|s| s.next()).unwrap_or(0)
+    }
+
+    /// Stamp a request with the repository state it was raised against.
+    ///
+    /// `generation` is `None` here: the branch-operation endpoints predate M1.10 and do
+    /// not report one, so these intents are fenced by epoch alone — which is exactly the
+    /// case [`RequestKey::is_current`] documents as correct for pre-generation endpoints.
+    pub fn request_key(&self, target: RequestTarget) -> RequestKey {
+        RequestKey {
+            epoch: self.graph.get_untracked().epoch(),
+            generation: None,
+            target,
+        }
+    }
+
+    /// Whether a resolved pre-check may still open its dialog; records it if so.
+    ///
+    /// Two independent reasons to drop a continuation, and both matter:
+    ///
+    /// * the repository moved while the pre-check was in flight (a Refresh, a repo switch,
+    ///   a drift reload), so the answer describes a repository the user is no longer
+    ///   looking at;
+    /// * a later tap already owns the dialog, so committing now would replace what the
+    ///   user is looking at with something they asked for *earlier*.
+    pub fn admit_intent(&self, intent: &PendingIntent) -> bool {
+        if !intent
+            .key
+            .is_current(self.graph.get_untracked().epoch(), None)
+        {
+            return false;
+        }
+        let wins = self
+            .pending_intent
+            .try_with_value(|current| latest_wins(current.as_ref(), intent))
+            .unwrap_or(false);
+        if !wins {
+            return false;
+        }
+        self.pending_intent.set_value(Some(intent.clone()));
+        true
     }
 
     /// The in-flight and recently-settled registry, for views that render it.
