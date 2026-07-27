@@ -14,7 +14,7 @@ use crate::icons::icon_set;
 use crate::state::MenuData;
 use git_vista_core::color::branch_color;
 
-use super::RenderCtx;
+use crate::features::graph::core::RenderCtx;
 
 /// Per-commit node builder — a filled dot in the branch colour plus a larger
 /// invisible hit target, built by a `<For>` only for rows in the viewport.
