@@ -33,6 +33,8 @@ use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
 use crate::api::{fetch_frame, fetch_page, fetch_protocol, fetch_status, HistoryFetchError};
 use crate::dialogs;
+use crate::features::session::core::SessionEvent;
+use crate::features::session::signals as session_state;
 use crate::history::{Frame, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT};
 use crate::icons::icon_set;
 use crate::prefs::{load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref};
@@ -311,20 +313,22 @@ pub fn App() -> impl IntoView {
     // ask-every-time picker would only dead-end there — close it once the
     // session lands and show the served repo's graph straight away.
     create_effect(move |_| {
-        if matches!(session.get(), Some(Ok(true))) && crate::api::is_lan_session() {
+        if matches!(session.get(), Some(Ok(true))) && session_state::is_lan() {
             picker_open.set(false);
         }
     });
 
-    // Defense in depth (ADR 0007): mirror the Frame's mode into api.rs so write
-    // calls refuse client-side too. The server's 403 remains the boundary.
+    // Defense in depth (ADR 0007): mirror the Frame's mode into the session core so
+    // write calls refuse client-side too. The server's 403 remains the boundary.
+    // `Observed`, not `Selected`: this is the server's report, not a user choice, so a
+    // LAN session must record it rather than refuse it (M1.11, #64).
     create_effect(move |_| {
         if let Some(f) = frame() {
-            crate::api::set_ui_mode(Some(if f.read_only {
+            let _ = session_state::apply(SessionEvent::UiModeObserved(Some(if f.read_only {
                 git_vista_protocol::RepoMode::Visualize
             } else {
                 git_vista_protocol::RepoMode::Active
-            }));
+            })));
         }
     });
 
@@ -450,7 +454,7 @@ pub fn App() -> impl IntoView {
                 // lands (it records via_lan before resolving).
                 {move || {
                     session.get();
-                    (!crate::api::is_lan_session()).then(|| view! {
+                    (!session_state::is_lan()).then(|| view! {
                         <button
                             class="refresh"
                             on:click=move |_| {

@@ -35,6 +35,7 @@ use git_vista_core::model::RefKind;
 
 use crate::api::{fetch_commit_detail, fetch_page, HistoryFetchError};
 use crate::camera::Camera;
+use crate::features::operations::core::{IntentSeq, PendingIntent};
 use crate::geometry::stub_headroom_for;
 use crate::gestures::{self, GestureState};
 use crate::history::{
@@ -161,6 +162,15 @@ pub(super) fn graph_canvas(
     // One-shot "scroll the Changes section into view" instruction, set by the
     // menu's "Show diff" item and consumed by the detail panel's next render.
     let scroll_diff = store_value(false);
+    // Click ordering for branch operations (M1.11, #64). Every menu item that
+    // opens the confirm modal first awaits a live `fetch_head_branch()`, so two
+    // quick taps can resolve out of order; `intent_seq` records which tap came
+    // first and `pending_intent` records which one actually opened the dialog.
+    // Both reset when the canvas is rebuilt on an epoch bump, which is correct:
+    // an intent from the previous epoch fails its `RequestKey::is_current` check
+    // anyway, so there is nothing older left to compare against.
+    let intent_seq = store_value(IntentSeq::default());
+    let pending_intent = store_value(None::<PendingIntent>);
 
     // The mounted canvas's **single owner** of history (M1.10, #63). Frame and
     // aggregate move in here; every builder, the append loop and the overlays
@@ -190,6 +200,8 @@ pub(super) fn graph_canvas(
         activity_open,
         scroll_diff,
         dialog_opened_at,
+        intent_seq,
+        pending_intent,
         reload,
     };
 

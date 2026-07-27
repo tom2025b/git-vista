@@ -6,3 +6,7 @@
 
 pub mod core;
 pub mod kind;
+// The reactive half. Gated because it imports Leptos; the core above is not, so its tests
+// run on the host under the ordinary `cargo test --workspace` (M1.11 D1).
+#[cfg(target_arch = "wasm32")]
+pub mod signals;

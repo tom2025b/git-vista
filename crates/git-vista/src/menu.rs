@@ -16,6 +16,9 @@ use crate::api::{
     create_branch_request, fetch_head_branch, fetch_rebase_status, fetch_status, fetch_undoables,
     stage_request, unstage_request,
 };
+use crate::features::core_traits::RequestTarget;
+use crate::features::operations::core::PendingIntent;
+use crate::features::operations::signals as ops;
 use crate::geometry::menu_placement;
 use crate::gestures::viewport_size;
 use crate::icons::icon_set;
@@ -34,6 +37,8 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
         activity_open,
         scroll_diff,
         dialog_opened_at,
+        intent_seq,
+        pending_intent,
         reload,
         ..
     } = overlays;
@@ -354,11 +359,25 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         let on = move |_| {
                             let branch = branch.clone();
                             menu.set(None);
+                            // Identity is minted here, synchronously, before the await —
+                            // it must record when the user tapped, not when the pre-check
+                            // answered (M1.11, #64).
+                            let seq = ops::next_seq(intent_seq);
+                            let key =
+                                ops::request_key(reload, RequestTarget::Branch(branch.clone()));
                             spawn_local(async move {
                                 let current = fetch_head_branch().await.unwrap_or(None);
+                                let intent = PendingIntent {
+                                    seq,
+                                    key,
+                                    kind: PendingOp::Checkout { branch, current },
+                                };
+                                if !ops::admit_intent(pending_intent, reload, &intent) {
+                                    return;
+                                }
                                 // Start the ghost-click guard when the modal opens.
                                 dialog_opened_at.set_value(js_sys::Date::now());
-                                confirm_op.set(Some(PendingOp::Checkout { branch, current }));
+                                confirm_op.set(Some(intent.kind));
                             });
                         };
                         view! {
@@ -380,11 +399,22 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         let on = move |_| {
                             let branch = branch.clone();
                             menu.set(None);
+                            let seq = ops::next_seq(intent_seq);
+                            let key =
+                                ops::request_key(reload, RequestTarget::Branch(branch.clone()));
                             spawn_local(async move {
                                 let into = fetch_head_branch().await.unwrap_or(None);
+                                let intent = PendingIntent {
+                                    seq,
+                                    key,
+                                    kind: PendingOp::Merge { branch, into },
+                                };
+                                if !ops::admit_intent(pending_intent, reload, &intent) {
+                                    return;
+                                }
                                 // Start the ghost-click guard when the modal opens.
                                 dialog_opened_at.set_value(js_sys::Date::now());
-                                confirm_op.set(Some(PendingOp::Merge { branch, into }));
+                                confirm_op.set(Some(intent.kind));
                             });
                         };
                         view! {
@@ -424,11 +454,22 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         let on = move |_| {
                             let branch = branch.clone();
                             menu.set(None);
+                            let seq = ops::next_seq(intent_seq);
+                            let key =
+                                ops::request_key(reload, RequestTarget::Branch(branch.clone()));
                             spawn_local(async move {
                                 let current = fetch_head_branch().await.unwrap_or(None);
+                                let intent = PendingIntent {
+                                    seq,
+                                    key,
+                                    kind: PendingOp::Delete { branch, current },
+                                };
+                                if !ops::admit_intent(pending_intent, reload, &intent) {
+                                    return;
+                                }
                                 // Start the ghost-click guard when the modal opens.
                                 dialog_opened_at.set_value(js_sys::Date::now());
-                                confirm_op.set(Some(PendingOp::Delete { branch, current }));
+                                confirm_op.set(Some(intent.kind));
                             });
                         };
                         view! {
@@ -540,10 +581,22 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                 let on = move |_| {
                     let base = base.clone();
                     menu.set(None);
+                    // Rebase targets the checked-out branch, not a named one, so its
+                    // request identity is the repository itself.
+                    let seq = ops::next_seq(intent_seq);
+                    let key = ops::request_key(reload, RequestTarget::Repository);
                     spawn_local(async move {
                         let current = fetch_head_branch().await.unwrap_or(None);
+                        let intent = PendingIntent {
+                            seq,
+                            key,
+                            kind: PendingOp::Rebase { current, base },
+                        };
+                        if !ops::admit_intent(pending_intent, reload, &intent) {
+                            return;
+                        }
                         dialog_opened_at.set_value(js_sys::Date::now());
-                        confirm_op.set(Some(PendingOp::Rebase { current, base }));
+                        confirm_op.set(Some(intent.kind));
                     });
                 };
                 view! {

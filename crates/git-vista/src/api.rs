@@ -9,7 +9,6 @@
 //! failure, so the UI can show the real reason. Pure data plumbing — no UI —
 //! so this stays testable on its own away from the view code.
 
-use std::cell::RefCell;
 use std::fmt;
 
 use gloo_net::http::{Request, RequestBuilder};
@@ -26,6 +25,7 @@ use git_vista_protocol::{
     PROTOCOL_VERSION,
 };
 
+use crate::features::session::signals as session_state;
 use crate::history::{Frame, Page};
 
 /// The largest page the server will mint, mirrored here so a caller's request is
@@ -33,63 +33,13 @@ use crate::history::{Frame, Page};
 /// in step with `MAX_PAGE_LIMIT` in `git-vista-server`'s read handlers.
 const MAX_PAGE_LIMIT: usize = 1_000;
 
-// The current session's CSRF token (M1.04). Set once the session is established
-// (`POST`/`GET /api/session`), then echoed in the [`CSRF_HEADER`] on every write —
-// the server refuses a state-changing request without it. A `thread_local` is all
-// we need: wasm is single-threaded, and the token is per-tab, not persisted.
-thread_local! {
-    static CSRF_TOKEN: RefCell<Option<String>> = const { RefCell::new(None) };
-}
-
-/// Record (or clear) the session's CSRF token — called by [`crate::session`] after
-/// establishing or checking the session. `None` clears it (logged out / no session).
-pub fn set_csrf_token(token: Option<String>) {
-    CSRF_TOKEN.with(|c| *c.borrow_mut() = token);
-}
-
-fn csrf_token() -> Option<String> {
-    CSRF_TOKEN.with(|c| c.borrow().clone())
-}
-
-// The mode the current repo is open in (ADR 0006/0007), mirrored from the last
-// graph load / selection. Purely defense in depth: in Visualize the write fns
-// below refuse before any network call; the server's 403 is the real boundary.
-thread_local! {
-    static UI_MODE: RefCell<Option<RepoMode>> = const { RefCell::new(None) };
-}
-
-/// Record the current repo's mode — set when a graph lands and when a selection
-/// is made. `None` clears it (unknown, e.g. before the first load).
-pub fn set_ui_mode(mode: Option<RepoMode>) {
-    UI_MODE.with(|m| *m.borrow_mut() = mode);
-}
-
-// Whether the current session came through the LAN listener (ADR 0005) —
-// mirrored from the session-establish/-check response. Purely a UI signal: it
-// drives hiding the Active option on the mode screen. The server's own route
-// absence on the LAN listener is the actual write boundary.
-thread_local! {
-    static VIA_LAN: RefCell<bool> = const { RefCell::new(false) };
-}
-
-/// Record whether the current session is LAN-scoped — called by
-/// [`crate::session`] after establishing or checking the session.
-pub fn set_via_lan(via_lan: bool) {
-    VIA_LAN.with(|v| *v.borrow_mut() = via_lan);
-}
-
-/// Whether the current session came through the LAN listener (ADR 0005).
-pub fn is_lan_session() -> bool {
-    VIA_LAN.with(|v| *v.borrow())
-}
-
 /// The ADR 0005 client-side counterpart of the LAN listener's structural
 /// read-only-ness: clone/select/rescan/delete refuse up front on a LAN-view
 /// session with a clear reason, instead of surfacing the bare `405` the
 /// route-less LAN listener answers with. The absent server route remains the
 /// actual boundary.
 fn refuse_if_lan_view() -> Result<(), String> {
-    if is_lan_session() {
+    if session_state::is_lan() {
         Err("This is a read-only LAN view session — open the localhost \
              (SSH-tunnel) link to clone, rescan, or switch repositories."
             .to_string())
@@ -102,8 +52,7 @@ fn refuse_if_lan_view() -> Result<(), String> {
 /// up front in Visualize mode, so a gating gap in the UI can't even attempt a
 /// mutation. The server's own 403 remains the actual boundary.
 fn refuse_if_visualize() -> Result<(), String> {
-    let visualize = UI_MODE.with(|m| *m.borrow() == Some(RepoMode::Visualize));
-    if visualize {
+    if session_state::refuses_writes() {
         Err("This repository is open in Visualize mode — look-only.".to_string())
     } else {
         Ok(())
@@ -124,7 +73,7 @@ fn req_get(url: &str) -> RequestBuilder {
 /// through here. The session cookie is sent automatically (same-origin).
 fn req_post(url: &str) -> RequestBuilder {
     let builder = Request::post(url).header(PROTOCOL_HEADER, &PROTOCOL_VERSION.to_string());
-    match csrf_token() {
+    match session_state::csrf_token() {
         Some(token) => builder.header(CSRF_HEADER, &token),
         None => builder,
     }
