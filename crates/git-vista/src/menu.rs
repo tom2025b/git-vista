@@ -17,12 +17,45 @@ use crate::api::{
     stage_request, unstage_request,
 };
 use crate::features::core_traits::RequestTarget;
+use crate::features::dialogs::core::Dialog;
 use crate::features::operations::core::PendingIntent;
 use crate::features::operations::signals as ops;
 use crate::geometry::menu_placement;
 use crate::gestures::viewport_size;
 use crate::icons::icon_set;
-use crate::state::{CommitDialog, Overlays, PendingOp, Settings};
+use crate::state::{CommitDialog, MenuData, Overlays, PendingOp, Settings};
+
+/// Open this menu on `commit`, for an entry point that knows only the commit and a
+/// header — not the richer context the graph's own dots carry (M1.11, #64).
+///
+/// The Activity panel's feed rows used to hand-build a `MenuData` literal themselves,
+/// which meant every field added here for the graph's menu had to be mirrored by hand at
+/// a call site in a different feature. The degraded fields are degraded for the same
+/// reason the inline version left them so: this entry point carries neither the
+/// pushed-commit set nor the target's local branches, and a GitHub link that 404s is
+/// worse than a disabled item.
+pub fn open_for_commit(
+    menu: RwSignal<Option<MenuData>>,
+    commit: String,
+    header: String,
+    x: f64,
+    y: f64,
+) {
+    menu.set(Some(MenuData {
+        commit,
+        header,
+        x,
+        y,
+        github_url: None,
+        github_label: "Open on GitHub",
+        create_label: "Create branch from this commit…",
+        is_head: false,
+        branches: Vec::new(),
+        is_branch: false,
+        repo_url: None,
+        remote_web_url: None,
+    }));
+}
 
 /// The context menu overlay (Issue #18): a plain HTML pop-up positioned at the
 /// click, rendered outside the SVG so it never pans/zooms and isn't clipped.
@@ -33,10 +66,8 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
         commit_dialog,
         commit_msg,
         confirm_op,
-        detail_id,
-        activity_open,
         scroll_diff,
-        dialog_opened_at,
+        dialogs,
         intent_seq,
         pending_intent,
         graph,
@@ -152,11 +183,10 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                 // Plain details: make sure a leftover "scroll to diff" wish
                 // from an earlier "Show diff" doesn't fire on this open.
                 scroll_diff.set_value(false);
-                // The detail and Activity panels share the right edge — the
-                // one being opened replaces the other (this menu may itself
-                // have been opened from an Activity row).
-                activity_open.set(false);
-                detail_id.set(Some(detail_commit.clone()));
+                // The detail and Activity panels share the right edge — the one being
+                // opened replaces the other (this menu may itself have been opened from
+                // an Activity row). `Overlays` owns that pairing now (M1.11, #64).
+                overlays.open_detail_panel(detail_commit.clone());
                 menu.set(None);
             };
             // "View details" opens a commit's detail panel — the commit glyph.
@@ -174,8 +204,8 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
             let diff_commit = m.commit.clone();
             let on_diff = move |_| {
                 scroll_diff.set_value(true);
-                activity_open.set(false); // same right-edge exclusivity as details
-                detail_id.set(Some(diff_commit.clone()));
+                // Same right-edge exclusivity as "View details".
+                overlays.open_detail_panel(diff_commit.clone());
                 menu.set(None);
             };
             let diff_item = view! {
@@ -258,7 +288,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         // synchronously disposes this handler's own reactive owner, so
                         // any signal write after it is unreliable. Set the dialog first.
                         commit_msg.set(String::new());
-                        dialog_opened_at.set_value(js_sys::Date::now());
+                        dialogs.open(Dialog::Commit);
                         commit_dialog.set(Some(CommitDialog {
                             allow_empty,
                             branch: stub_branch.clone(),
@@ -387,7 +417,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                                     return;
                                 }
                                 // Start the ghost-click guard when the modal opens.
-                                dialog_opened_at.set_value(js_sys::Date::now());
+                                dialogs.open(Dialog::Confirm);
                                 confirm_op.set(Some(intent.kind));
                             });
                         };
@@ -424,7 +454,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                                     return;
                                 }
                                 // Start the ghost-click guard when the modal opens.
-                                dialog_opened_at.set_value(js_sys::Date::now());
+                                dialogs.open(Dialog::Confirm);
                                 confirm_op.set(Some(intent.kind));
                             });
                         };
@@ -441,7 +471,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     let push_item = {
                         let branch = b.clone();
                         let on = move |_| {
-                            dialog_opened_at.set_value(js_sys::Date::now());
+                            dialogs.open(Dialog::Confirm);
                             confirm_op.set(Some(PendingOp::Push {
                                 branch: branch.clone(),
                             }));
@@ -479,7 +509,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                                     return;
                                 }
                                 // Start the ghost-click guard when the modal opens.
-                                dialog_opened_at.set_value(js_sys::Date::now());
+                                dialogs.open(Dialog::Confirm);
                                 confirm_op.set(Some(intent.kind));
                             });
                         };
@@ -606,7 +636,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                         if !ops::admit_intent(pending_intent, graph, &intent) {
                             return;
                         }
-                        dialog_opened_at.set_value(js_sys::Date::now());
+                        dialogs.open(Dialog::Confirm);
                         confirm_op.set(Some(intent.kind));
                     });
                 };
@@ -640,7 +670,7 @@ pub fn menu_view(overlays: Overlays, settings: Settings, read_only: bool) -> imp
                     };
                     let label = u.label.clone();
                     let on = move |_| {
-                        dialog_opened_at.set_value(js_sys::Date::now());
+                        dialogs.open(Dialog::Confirm);
                         confirm_op.set(Some(PendingOp::Undo(u.clone())));
                         menu.set(None);
                     };

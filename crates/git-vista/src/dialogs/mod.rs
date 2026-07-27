@@ -9,6 +9,11 @@
 //! ignores a dismiss landing within [`DIALOG_GUARD_MS`] of opening, so iOS's
 //! synthesized post-tap "ghost click" can't close the modal it just opened.
 //!
+//! All four consult **one** guard since M1.11 (#64) — [`Dialogs`], created in `App`.
+//! Before that there were three separate `StoredValue<f64>` clocks and eleven inlined
+//! copies of the same `Date::now()` comparison; the rule was right everywhere by
+//! repetition rather than by construction.
+//!
 //! # Module layout
 //!
 //! This split is move-only — one file per overlay, with the two error-reporting
@@ -19,7 +24,8 @@
 //!   * [`reset`]    — the Reset Test Repo confirmation.
 //!   * [`open_url`] — the clone-by-URL dialog.
 //!
-//! [`DIALOG_GUARD_MS`]: crate::state::DIALOG_GUARD_MS
+//! [`DIALOG_GUARD_MS`]: crate::features::dialogs::core::DIALOG_GUARD_MS
+//! [`Dialogs`]: crate::features::dialogs::signals::Dialogs
 
 use leptos::*;
 

@@ -31,8 +31,11 @@ use leptos::*;
 
 use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
-use crate::api::{fetch_frame, fetch_page, fetch_protocol, fetch_status, HistoryFetchError};
+use crate::api::{fetch_frame, fetch_page, fetch_protocol, HistoryFetchError};
 use crate::dialogs;
+use crate::features::activity::signals::Activity;
+use crate::features::dialogs::core::Dialog;
+use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::{
     Frame, GraphCore, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT,
 };
@@ -41,9 +44,11 @@ use crate::features::operations::signals::Operations;
 use crate::features::operations::view::operations_status_view;
 use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
+use crate::features::status::signals as status_seam;
 use crate::icons::icon_set;
 use crate::prefs::{load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref};
 use crate::session::{establish_session, not_connected_view};
+use crate::state::{Features, Settings};
 use crate::update_required::update_required_view;
 
 mod canvas;
@@ -271,16 +276,26 @@ pub fn App() -> impl IntoView {
         _ => None,
     };
 
-    // The live working-tree status behind the topbar chip (Activity/Undo
-    // step 1): clean/dirty/conflicted at a glance, plus ahead/behind vs the
-    // upstream. Keyed on `reload` so Refresh — and every post-operation
-    // reload — re-reads it alongside the history. A fetch failure resolves to
-    // `None`, which simply hides the chip: a broken status probe shouldn't
-    // take the topbar down with it.
-    let status = create_local_resource(
-        move || graph.get().epoch(),
-        |_| async { fetch_status().await.ok() },
-    );
+    // The app's one iOS ghost-click guard (M1.11, #64). Lives here, not in
+    // `graph_canvas`, for two reasons: the topbar's own modals (Open URL, Reset) need it
+    // and exist before the graph does, and a canvas rebuilt by an epoch bump would
+    // otherwise reset the guard out from under a modal that is still up. Named
+    // `dialogs_guard` because the `dialogs` *module* is in scope here too.
+    let dialogs_guard = Dialogs::new();
+
+    // The Activity panel's visibility (Activity/Undo feature). Lives here — not in
+    // graph_canvas — because its button sits in the topbar, which exists even while the
+    // graph is still loading; threaded into the overlays bundle inside graph_canvas.
+    // Declared above `status` because that read's key includes it.
+    let activity = Activity::new();
+
+    // The live working-tree status: the topbar chip (Activity/Undo step 1) and the
+    // Activity panel's own status section both read THIS one resource — until M1.11
+    // (#64, Task 7) the panel kept a second, independently-fetched copy. Owned by
+    // `features/status`, which is where M2.15 (#68) will find a single owner waiting for
+    // it rather than two to reconcile. See that module for the key's two halves and for
+    // the one extra fetch collapsing them costs.
+    let status = status_seam::create(graph, activity);
 
     // Icon style (icons.rs): Nerd Font glyphs vs the plain-text fallback. A
     // signal so every icon in the app switches live when toggled; persisted in
@@ -302,28 +317,35 @@ pub fn App() -> impl IntoView {
         store_node_icons_pref(on);
     };
 
-    // Whether the Activity panel is open (Activity/Undo feature). Lives here —
-    // not in graph_canvas — because its button sits in the topbar, which
-    // exists even while the graph is still loading; threaded into the
-    // overlays bundle inside graph_canvas.
-    let activity_open = create_rw_signal(false);
+    // The two bundles `graph_canvas` takes (see `crate::state`). `features` is every
+    // handle created here, above the canvas, precisely so an epoch bump's rebuild cannot
+    // drop it; `settings` is the display preferences every icon-drawing view reads.
+    let features = Features {
+        graph,
+        activity,
+        dialogs: dialogs_guard,
+        operations,
+        status,
+    };
+    let settings = Settings {
+        nerd_icons,
+        show_node_icons,
+    };
 
     // Phase 12 — "Open URL": clone a public repo and view it read-only. `open_url`
     // toggles the modal; `clone_url` holds the field; `cloning` disables the button
-    // while git works so a slow clone can't be fired twice. `open_opened_at` guards
-    // the backdrop against the iOS ghost-click, same trick as the commit modal.
+    // while git works so a slow clone can't be fired twice. The shared `dialogs`
+    // guard protects the backdrop from the iOS ghost-click, same as every other modal.
     // The modal itself lives in `dialogs::open_url_view`.
     let open_url = create_rw_signal(false);
     let clone_url = create_rw_signal(String::new());
     let cloning = create_rw_signal(false);
-    let open_opened_at = store_value(0f64);
 
     // "Reset Test Repo" (iPad-testing follow-up): the button appears only when
     // the Frame says this repo carries a seed (`gv --seed`); the confirm modal
     // lives in `dialogs::reset_repo_view`, owned here like the Open-URL one
     // because its button sits in the topbar, not the graph canvas.
     let reset_open = create_rw_signal(false);
-    let reset_opened_at = store_value(0f64);
 
     // ADR 0006: ask every time — the repo picker opens on load (the sign-in and
     // protocol overlays sit above it when they apply) and from the topbar
@@ -486,7 +508,7 @@ pub fn App() -> impl IntoView {
                             class="refresh"
                             on:click=move |_| {
                                 clone_url.set(String::new());
-                                open_opened_at.set_value(js_sys::Date::now());
+                                dialogs_guard.open(Dialog::OpenUrl);
                                 open_url.set(true);
                             }
                             title="Clone a public repository from a URL and view its history (read-only)"
@@ -497,7 +519,7 @@ pub fn App() -> impl IntoView {
                 }}
                 <button
                     class="refresh"
-                    on:click=move |_| activity_open.update(|open| *open = !*open)
+                    on:click=move |_| activity.toggle()
                     title="Everything that happened in this repo — commits, merges, \
                            branch operations — with what was done through the app \
                            marked, and undo where possible"
@@ -552,7 +574,7 @@ pub fn App() -> impl IntoView {
                         <button
                             class="refresh danger"
                             on:click=move |_| {
-                                reset_opened_at.set_value(js_sys::Date::now());
+                                dialogs_guard.open(Dialog::Reset);
                                 reset_open.set(true);
                             }
                             title="Restore this test repo to its recorded seed state — \
@@ -564,13 +586,13 @@ pub fn App() -> impl IntoView {
                     })}
             </header>
             // The "Open URL" modal (Phase 12), factored into `dialogs`.
-            {dialogs::open_url_view(open_url, clone_url, cloning, open_opened_at, graph, mode_for)}
+            {dialogs::open_url_view(open_url, clone_url, cloning, dialogs_guard, graph, mode_for)}
             // The "Reset Test Repo" confirmation (only reachable via the gated
             // topbar button above).
-            {dialogs::reset_repo_view(reset_open, reset_opened_at, graph)}
+            {dialogs::reset_repo_view(reset_open, dialogs_guard, graph)}
             // The repo picker + mode screens (ADR 0006): blocking overlays under
             // the sign-in/protocol screens, over everything else.
-            {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, open_opened_at, graph)}
+            {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, dialogs_guard, graph)}
             {crate::picker::mode_view(mode_for, picker_open, graph)}
             <section class="graph">
                 {move || {
@@ -667,12 +689,9 @@ pub fn App() -> impl IntoView {
                                         // `graph_canvas` and is disposed with it.
                                         {graph_canvas(
                                             seed,
-                                            graph,
+                                            features,
                                             history_ui,
-                                            nerd_icons,
-                                            show_node_icons,
-                                            activity_open,
-                                            operations,
+                                            settings,
                                         )}
                                     }
                                     .into_view()

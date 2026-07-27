@@ -35,18 +35,18 @@ use git_vista_core::model::RefKind;
 
 use crate::api::{fetch_commit_detail, fetch_page, HistoryFetchError};
 use crate::camera::Camera;
+use crate::features::dialogs::signals::Viewer;
 use crate::features::graph::core::{
-    should_prefetch, show_fixed_loading_overlay, GraphCore, PageLoadState, PageRequestKey,
-    PageRetry, RenderCtx, DEFAULT_PAGE_LIMIT,
+    should_prefetch, show_fixed_loading_overlay, PageLoadState, PageRequestKey, PageRetry,
+    RenderCtx, DEFAULT_PAGE_LIMIT,
 };
 use crate::features::operations::core::{IntentSeq, PendingIntent};
-use crate::features::operations::signals::Operations;
 use crate::geometry::stub_headroom_for;
 use crate::gestures::{self, GestureState};
 use crate::lod::detail_for;
 use crate::print::print_graph_view;
 use crate::render;
-use crate::state::{CommitDialog, MenuData, Overlays, PendingOp, Settings, ViewerDoc};
+use crate::state::{CommitDialog, Features, MenuData, Overlays, PendingOp, Settings, ViewerDoc};
 use crate::viewport::visible_row_range;
 use crate::{activity, detail, dialogs, menu, viewer};
 
@@ -75,22 +75,30 @@ const HTTP_CONFLICT: u16 = 409;
 /// creation so the new branch shows without a full reload (Issue #18, reusing
 /// the Issue #16 refresh path) and, since M1.10, by the drift path. `history_ui`
 /// is the App's phase/complete/print bundle, which the append loop drives.
-/// `nerd_icons` picks the icon set (icons.rs) for the badges, labels and menus;
-/// `show_node_icons` shows/hides the glyph beside each commit dot.
+/// `features` carries the handles `App` owns and this canvas borrows — the graph epoch,
+/// the Activity panel, the dialogs guard, the operations registry and the one status
+/// read — each created above this canvas so an epoch bump's rebuild cannot drop them.
+/// `settings` picks the icon set (icons.rs) for the badges, labels and menus, and
+/// shows/hides the glyph beside each commit dot.
 pub(super) fn graph_canvas(
     seed: HistorySeed,
-    graph: RwSignal<GraphCore>,
+    features: Features,
     history_ui: HistoryUiSignals,
-    nerd_icons: RwSignal<bool>,
-    show_node_icons: RwSignal<bool>,
-    activity_open: RwSignal<bool>,
-    operations: Operations,
+    settings: Settings,
 ) -> impl IntoView {
     let HistorySeed {
         epoch,
         frame,
         loaded,
     } = seed;
+    let Features {
+        graph,
+        activity,
+        dialogs,
+        operations,
+        status,
+    } = features;
+    let Settings { nerd_icons, .. } = settings;
 
     // Phase 12: a repo cloned from a URL is view-only, so every write action in the
     // context menu (create branch, commit, merge, push, delete) is suppressed. The
@@ -156,11 +164,6 @@ pub(super) fn graph_canvas(
             }
         },
     );
-    // When the commit modal was opened (ms). iOS synthesizes a `click` a few ms
-    // after a tap; opening the modal puts its full-screen backdrop under that tap
-    // point, so the ghost click hits the backdrop and closes the modal instantly.
-    // The backdrop ignores a dismiss that lands within `DIALOG_GUARD_MS` of opening.
-    let dialog_opened_at = store_value(0.0_f64);
     // One-shot "scroll the Changes section into view" instruction, set by the
     // menu's "Show diff" item and consumed by the detail panel's next render.
     let scroll_diff = store_value(false);
@@ -186,22 +189,18 @@ pub(super) fn graph_canvas(
         remote_branches,
     });
 
-    // The signal bundles the split view modules take (see `crate::state`): one
-    // `Copy` handle each instead of a fistful of separate signals.
-    let settings = Settings {
-        nerd_icons,
-        show_node_icons,
-    };
+    // The overlay bundle the split view modules take (see `crate::state`): one `Copy`
+    // handle instead of a fistful of separate signals.
     let overlays = Overlays {
         menu,
         commit_dialog,
         commit_msg,
         confirm_op,
         detail_id,
-        viewer: viewer_doc,
-        activity_open,
+        viewer: Viewer::from_signal(viewer_doc),
+        activity,
         scroll_diff,
-        dialog_opened_at,
+        dialogs,
         intent_seq,
         pending_intent,
         graph,
@@ -633,7 +632,7 @@ pub(super) fn graph_canvas(
             {dialogs::commit_dialog_view(overlays)}
             {dialogs::confirm_modal_view(overlays)}
             {detail::detail_panel_view(overlays, settings, detail, ctx)}
-            {activity::activity_panel_view(overlays, settings, read_only)}
+            {activity::activity_panel_view(overlays, settings, read_only, status)}
             {viewer::viewer_view(overlays, settings)}
         </div>
     }

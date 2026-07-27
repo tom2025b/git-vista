@@ -284,8 +284,8 @@ pub fn install_key_listener(
                     // it was opened from. (Esc is a desktop convenience only —
                     // every overlay keeps a visible close control, since the
                     // iPad Magic Keyboard has no Esc key.)
-                    if viewer.get_untracked().is_some() {
-                        viewer.set(None);
+                    if viewer.is_open() {
+                        viewer.close();
                     } else if menu.get_untracked().is_some() {
                         menu.set(None);
                     } else if commit_dialog.get_untracked().is_some() {

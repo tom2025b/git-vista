@@ -3,8 +3,9 @@
 use leptos::*;
 
 use crate::api::reset_test_repo_request;
+use crate::features::dialogs::core::Dialog;
+use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::GraphCore;
-use crate::state::DIALOG_GUARD_MS;
 
 use super::alert;
 
@@ -16,7 +17,7 @@ use super::alert;
 /// Confirming POSTs the reset, alerts the server's summary, and reloads.
 pub fn reset_repo_view(
     reset_open: RwSignal<bool>,
-    reset_opened_at: StoredValue<f64>,
+    dialogs: Dialogs,
     graph: RwSignal<GraphCore>,
 ) -> impl IntoView {
     let run_reset = move || {
@@ -50,7 +51,8 @@ pub fn reset_repo_view(
                            justify-content:center; background:rgba(1,4,9,0.6);"
                     on:click=move |_| {
                         // Ignore the iOS ghost click that fires just after opening.
-                        if js_sys::Date::now() - reset_opened_at.get_value() > DIALOG_GUARD_MS {
+                        if dialogs.may_dismiss() {
+                            dialogs.close(Dialog::Reset);
                             reset_open.set(false);
                         }
                     }

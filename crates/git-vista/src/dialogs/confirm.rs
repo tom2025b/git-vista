@@ -4,7 +4,8 @@ use leptos::*;
 
 use git_vista_core::activity::UndoAction;
 
-use crate::state::{Overlays, PendingOp, DIALOG_GUARD_MS};
+use crate::features::dialogs::core::Dialog;
+use crate::state::{Overlays, PendingOp};
 
 /// The branch-op confirmation modal (Issue #33 follow-up). Reuses the commit
 /// modal's iPad-proven inline-styled overlay, minus any text input (so no void
@@ -13,7 +14,7 @@ use crate::state::{Overlays, PendingOp, DIALOG_GUARD_MS};
 pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
     let Overlays {
         confirm_op,
-        dialog_opened_at,
+        dialogs,
         operations,
         ..
     } = overlays;
@@ -39,8 +40,9 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
         // Subscribe to the registry so this runs whenever an operation settles.
         operations.core().with(|c| c.recent().count());
         if let Some(next) = operations.take_escalation() {
-            // Restamp the ghost-click guard, exactly as when the modal is first shown.
-            dialog_opened_at.set_value(js_sys::Date::now());
+            // Restamp the ghost-click guard, exactly as when the modal is first shown:
+            // the modal never visually closes, but it is now asking a different question.
+            dialogs.open(Dialog::Confirm);
             confirm_op.set(Some(next));
         }
     });
@@ -208,7 +210,8 @@ pub fn confirm_modal_view(overlays: Overlays) -> impl IntoView {
                            justify-content:center; background:rgba(1,4,9,0.6);"
                     on:click=move |_| {
                         // Ignore the iOS ghost click that fires just after opening.
-                        if js_sys::Date::now() - dialog_opened_at.get_value() > DIALOG_GUARD_MS {
+                        if dialogs.may_dismiss() {
+                            dialogs.close(Dialog::Confirm);
                             confirm_op.set(None);
                         }
                     }

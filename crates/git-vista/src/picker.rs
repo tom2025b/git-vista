@@ -13,6 +13,8 @@ use leptos::*;
 
 use git_vista_protocol::{RepoMode, RepositoryDescriptor, RepositoryKind};
 
+use crate::features::dialogs::core::Dialog;
+use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::GraphCore;
 use crate::features::operations::core::{result_is_newest, IntentSeq};
 use crate::features::operations::signals as ops;
@@ -29,7 +31,7 @@ pub fn picker_view(
     mode_for: RwSignal<Option<RepositoryDescriptor>>,
     open_url: RwSignal<bool>,
     clone_url: RwSignal<String>,
-    open_opened_at: StoredValue<f64>,
+    dialogs: Dialogs,
     graph: RwSignal<GraphCore>,
 ) -> impl IntoView {
     // Refetch every time the picker opens (and after a rescan) — the catalog
@@ -188,7 +190,7 @@ pub fn picker_view(
                                                border-radius:6px;"
                                         on:click=move |_| {
                                             clone_url.set(String::new());
-                                            open_opened_at.set_value(js_sys::Date::now());
+                                            dialogs.open(Dialog::OpenUrl);
                                             open_url.set(true);
                                         }
                                     >

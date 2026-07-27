@@ -47,11 +47,15 @@ pub const DIALOG_GUARD_MS: f64 = 400.0;
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct DialogsCore {
     open: Option<Dialog>,
-    /// Milliseconds (a `js_sys::Date::now()` reading in the browser, an arbitrary
-    /// monotonic-enough scale in tests). `0.0` is the never-opened sentinel the old
-    /// `store_value(0.0_f64)` used, and it works the same way here: any realistic `now_ms`
-    /// is far beyond the guard window, so a stale core never suppresses a real dismiss.
-    opened_at: f64,
+    /// When the open dialog opened, in milliseconds (a `js_sys::Date::now()` reading in
+    /// the browser, an arbitrary monotonic-enough scale in tests).
+    ///
+    /// `None`, not the old `store_value(0.0_f64)` sentinel. `0.0` only behaved as
+    /// "never opened" because `Date::now()` is ~1.7e12 and therefore always more than
+    /// 400 ms past it — correct in the browser, but by accident of the epoch's origin
+    /// rather than by construction. Stating it as `Option` means the guard cannot be
+    /// wrong on any other clock scale.
+    opened_at: Option<f64>,
 }
 
 impl DialogsCore {
@@ -65,7 +69,7 @@ impl DialogsCore {
     /// answered the previous question could dismiss the new one.
     pub fn open(&mut self, d: Dialog, now_ms: f64) {
         self.open = Some(d);
-        self.opened_at = now_ms;
+        self.opened_at = Some(now_ms);
     }
 
     /// Clear the record if `d` is the dialog currently held.
@@ -88,9 +92,13 @@ impl DialogsCore {
     /// Whether a dismiss arriving at `now_ms` should be honoured.
     ///
     /// `>` not `>=`, matching the comparison every inlined call site used, so the extraction
-    /// cannot shift the boundary by one millisecond.
+    /// cannot shift the boundary by one millisecond. Nothing ever opened means nothing is
+    /// being protected, so the dismiss goes through.
     pub fn may_confirm(&self, now_ms: f64) -> bool {
-        now_ms - self.opened_at > DIALOG_GUARD_MS
+        match self.opened_at {
+            None => true,
+            Some(at) => now_ms - at > DIALOG_GUARD_MS,
+        }
     }
 }
 

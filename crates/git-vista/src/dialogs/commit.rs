@@ -3,7 +3,8 @@
 use leptos::*;
 
 use crate::api::create_commit_request;
-use crate::state::{CommitDialog, Overlays, DIALOG_GUARD_MS};
+use crate::features::dialogs::core::Dialog;
+use crate::state::{CommitDialog, Overlays};
 
 /// The commit-message modal (Issue #33). Shown while `commit_dialog` is `Some`;
 /// a real overlay with a focused text box, so it prompts reliably where a native
@@ -13,7 +14,7 @@ pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
     let Overlays {
         commit_dialog,
         commit_msg,
-        dialog_opened_at,
+        dialogs,
         graph,
         ..
     } = overlays;
@@ -70,9 +71,8 @@ pub fn commit_dialog_view(overlays: Overlays) -> impl IntoView {
                                justify-content:center; background:rgba(1,4,9,0.6);"
                         on:click=move |_| {
                             // Ignore the iOS ghost click that fires just after opening.
-                            if js_sys::Date::now() - dialog_opened_at.get_value()
-                                > DIALOG_GUARD_MS
-                            {
+                            if dialogs.may_dismiss() {
+                                dialogs.close(Dialog::Commit);
                                 commit_dialog.set(None);
                             }
                         }

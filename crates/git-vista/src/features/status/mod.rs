@@ -4,10 +4,13 @@
 //! whose requirements are not yet fixed; writing speculative state here would be worse than
 //! leaving a shaped hole (design spec D2).
 //!
-//! When #68 fills this in, it inherits ONE owner for the status read. Today there are two
-//! independently-fetched copies of the same `fetch_status()` data — the topbar's
-//! (`app/mod.rs:256`) and the activity panel's (`activity.rs:102`). Task 7 of the M1.11 plan
-//! collapses them onto this seam.
+//! When #68 fills this in, it inherits ONE owner for the status read. Task 7 made that
+//! true: [`signals::create`] is now the only place `fetch_status()` is called for the
+//! topbar chip and the Activity panel, which until then held two independently-fetched
+//! copies of the same data. No state machine came with it — that is still #68's to design.
+
+#[cfg(target_arch = "wasm32")]
+pub mod signals;
 
 /// Placeholder so the module has a public surface and `InvalidateScope::Status` has a
 /// documented destination. Carries no state by design.

@@ -10,7 +10,7 @@
 //! reference into the reactive arena, not the value), so a bundle is a cheap
 //! handle to copy into a closure, never a clone of any actual state.
 
-use leptos::{Resource, RwSignal, StoredValue};
+use leptos::{Resource, RwSignal, SignalSet, StoredValue};
 
 use git_vista_core::model::CommitDetail;
 
@@ -86,13 +86,16 @@ pub struct CommitDialog {
 // naturally; `dialogs/confirm.rs` still matches one arm per `api.rs` function.
 pub use crate::features::operations::kind::OperationKind as PendingOp;
 
+use crate::features::activity::signals::Activity;
+use crate::features::dialogs::signals::{Dialogs, Viewer};
 use crate::features::graph::core::GraphCore;
 use crate::features::operations::core::{IntentSeq, PendingIntent};
 use crate::features::operations::signals::Operations;
+use crate::features::status::signals::StatusResource;
 
-/// How long (ms) after the commit modal opens to ignore a backdrop dismiss, so
-/// iOS's synthesized post-tap "ghost click" can't close the modal it just opened.
-pub const DIALOG_GUARD_MS: f64 = 400.0;
+// `DIALOG_GUARD_MS` used to live here. It moved to `features/dialogs/core.rs` in M1.11
+// (#64), next to the comparison that reads it — a guard window stated apart from the
+// arithmetic it governs is a number nobody can check. Both are host-tested there now.
 
 /// What the full-screen viewer (viewer.rs) is showing: a commit's whole diff
 /// (the detail panel's "Expand Full Diff"), or one file's full content at a
@@ -115,6 +118,28 @@ pub struct Settings {
     pub show_node_icons: RwSignal<bool>,
 }
 
+/// The feature handles `App` owns and hands down to the graph canvas (M1.11, #64).
+///
+/// Every one of these is created **above** `graph_canvas`, so it outlives the canvas that
+/// an epoch bump rebuilds — an in-flight operation, a modal's ghost-click guard and the
+/// panel's visibility all have to survive that rebuild. Bundled for the same reason
+/// [`Overlays`] is: they were threaded as five separate parameters, which is how
+/// `graph_canvas` reached nine arguments.
+#[derive(Clone, Copy)]
+pub struct Features {
+    /// The graph epoch: bumped, generation-aware, to re-read the repo after a write.
+    pub graph: RwSignal<GraphCore>,
+    /// The Activity panel's visibility.
+    pub activity: Activity,
+    /// The app's one iOS ghost-click guard.
+    pub dialogs: Dialogs,
+    /// Where writes go.
+    pub operations: Operations,
+    /// The app's one working-tree status read — the topbar chip and the Activity
+    /// panel's status section both render from it.
+    pub status: StatusResource,
+}
+
 /// The mutually-exclusive overlay signals (context menu, the two modals, the
 /// detail panel) plus the ghost-click guard timestamp and the shared fetch
 /// counter — everything the menu items and modals need to open, close and
@@ -132,21 +157,26 @@ pub struct Overlays {
     pub confirm_op: RwSignal<Option<PendingOp>>,
     /// The commit whose detail panel is open (Phase 10), by full hash.
     pub detail_id: RwSignal<Option<String>>,
-    /// The full-screen viewer's document (full diff / full file), if open.
-    /// Sits on top of the detail panel it was opened from.
-    pub viewer: RwSignal<Option<ViewerDoc>>,
-    /// Whether the Activity panel is open (Activity/Undo feature). Created in
-    /// `App` — the topbar owns its button — and threaded through here so the
-    /// panel, the menu and the detail panel can keep each other exclusive
-    /// (both are right-docked; stacking them would just hide one).
-    pub activity_open: RwSignal<bool>,
+    /// The full-screen viewer (full diff / full file). Sits on top of the detail
+    /// panel it was opened from. A [`Viewer`] rather than a bare signal since
+    /// M1.11 (#64): `detail.rs` used to construct the document and poke the raw
+    /// signal itself.
+    pub viewer: Viewer,
+    /// The Activity panel's visibility (Activity/Undo feature). Created in `App` —
+    /// the topbar owns its button — and threaded through here so the panel, the
+    /// menu and the detail panel can keep each other exclusive (both are
+    /// right-docked; stacking them would just hide one).
+    pub activity: Activity,
     /// One-shot flag set by the menu's "Show diff" item: when the panel's
     /// Changes section next finishes rendering, scroll it into view, then
     /// clear the flag. A `StoredValue` (not a signal) on purpose — it's an
     /// instruction consumed by the next render, not state the UI reflects.
     pub scroll_diff: StoredValue<bool>,
-    /// When the current modal was opened (ms) — the iOS ghost-click guard.
-    pub dialog_opened_at: StoredValue<f64>,
+    /// The iOS ghost-click guard (M1.11, #64). Replaces `dialog_opened_at:
+    /// StoredValue<f64>` — and, once every modal was routed through it, the two
+    /// further clocks (`reset_opened_at`, `open_opened_at`) that `App` used to keep
+    /// alongside it. One guard, one owner, one tested rule.
+    pub dialogs: Dialogs,
     /// Mints the click-order sequence for branch operations (M1.11, #64). A
     /// `StoredValue`, not a signal: minting is bookkeeping done inside an event
     /// handler, and nothing renders from it.
@@ -163,6 +193,32 @@ pub struct Overlays {
     /// Where writes go (M1.11, #64). Created in `App`, **above** `graph_canvas`, so an
     /// in-flight operation outlives the canvas an epoch bump rebuilds.
     pub operations: Operations,
+}
+
+impl Overlays {
+    /// Right-edge exclusivity, the detail-panel direction: opening the detail panel on
+    /// `id` closes Activity, because both dock the same edge and would otherwise stack
+    /// and hide one another.
+    ///
+    /// Collapses what were two identical pairs of raw signal pokes in `menu.rs` ("View
+    /// details" and "Show diff") into one named place (M1.11, #64, Task 7). This is an
+    /// intermediate, not the fix: the rule still lives in two methods that each writer
+    /// must remember to call, rather than in one stack that makes the invariant
+    /// unrepresentable. Task 8's `shell.overlay_stack` replaces both outright.
+    pub fn open_detail_panel(&self, id: String) {
+        self.activity.close();
+        self.detail_id.set(Some(id));
+    }
+
+    /// The reverse direction: opening Activity closes the detail panel.
+    ///
+    /// Still driven by a reactive effect in `activity.rs` that fires one tick *after*
+    /// the panel's visibility flips — not synchronously from the topbar button that
+    /// flipped it — so both panels can still render together for a frame. Naming the
+    /// write does not close that window; only Task 8's single dismiss path does.
+    pub fn close_detail_for_activity(&self) {
+        self.detail_id.set(None);
+    }
 }
 
 /// The lazily-fetched commit detail (Phase 10): keyed on the open commit's hash,

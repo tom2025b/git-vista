@@ -155,7 +155,11 @@ mod tests {
     #[test]
     fn a_null_old_oid_on_a_creation_yields_no_commit() {
         let e = event(Some(NULL_SHA1), None);
-        assert_eq!(event_commit(&e), None, "a creation's old side is not a commit");
+        assert_eq!(
+            event_commit(&e),
+            None,
+            "a creation's old side is not a commit"
+        );
     }
 
     #[test]

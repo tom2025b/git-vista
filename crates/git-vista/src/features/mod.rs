@@ -6,6 +6,8 @@
 
 pub mod core_traits;
 
+pub mod activity;
+pub mod dialogs;
 pub mod diff;
 pub mod graph;
 pub mod operations;

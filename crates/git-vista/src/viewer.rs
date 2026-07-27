@@ -53,7 +53,7 @@ pub fn viewer_view(overlays: Overlays, settings: Settings) -> impl IntoView {
     // fetch picks the endpoint. A stale response is ignored via the id/path
     // echo, same rule as the detail panel's fetches.
     let doc = create_local_resource(
-        move || viewer.get(),
+        move || viewer.doc(),
         |doc| async move {
             match doc {
                 None => None,
@@ -65,7 +65,7 @@ pub fn viewer_view(overlays: Overlays, settings: Settings) -> impl IntoView {
         },
     );
     move || {
-        let open = viewer.get();
+        let open = viewer.doc();
         // The print CSS keys off <html data-print> — set while open, cleared
         // when closed, so a plain print without the viewer stays the full page.
         set_print_attr(open.is_some());
@@ -119,7 +119,7 @@ pub fn viewer_view(overlays: Overlays, settings: Settings) -> impl IntoView {
                             <button
                                 class="viewer-btn viewer-close"
                                 title="Close"
-                                on:click=move |_| viewer.set(None)
+                                on:click=move |_| viewer.close()
                             >
                                 "Close ×"
                             </button>
