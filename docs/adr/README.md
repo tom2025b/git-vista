@@ -35,3 +35,4 @@ it, and note the link in both.
 | [0021](0021-durable-operation-journal-and-recovery-refs.md) | Durable operation journal and recovery references | Accepted |
 | [0022](0022-paged-history-and-bounded-reads.md) | Paged history, signed cursors, and bounded reads | Accepted |
 | [0023](0023-rehearsal-workspaces-and-atomic-promotion.md) | Rehearsal workspaces promote results, atomically | Proposed |
+| [0024](0024-frontend-feature-boundaries.md) | Frontend overlay state moves into a `Dock`-keyed `OverlayStack` | Accepted |
