@@ -53,10 +53,10 @@ state is one step, moving *process* is N.
 
 ```mermaid
 flowchart LR
-    A[Workspace clone\nfinished state] -- objects: git fetch --> B[Live repo]
-    A -- "ref plan: {name, old, new}×N" --> T{update-ref --stdin\nold-value checked}
-    T -- all match --> C[All refs move atomically\n+ ONE recovery record]
-    T -- any moved --> D[Refused, nothing changed\ndrift reported]
+    A["Workspace clone<br/>finished state"] -- "objects: git fetch" --> B["Live repo"]
+    A -- "ref plan: name, old, new (×N)" --> T{"update-ref --stdin<br/>old-value checked"}
+    T -- "all match" --> C["All refs move atomically<br/>+ ONE recovery record"]
+    T -- "any moved" --> D["Refused, nothing changed<br/>drift reported"]
 ```
 
 ### One promotion ⇒ one recovery record ⇒ undo-all
@@ -81,9 +81,10 @@ The live repo's serve mode registers no write routes — the same mechanism that
 makes LAN sessions read-only today (ADR 0005), now applied by repo role rather
 than by listener. Promotion is the one privileged route, guarded by the strong
 credential; absent that credential the app falls closed to a fully functional
-read-only view. The sign-in token stops being printed to the terminal
-(delivery mechanism to be designed; the operator already runs a 0600-file
-Docker wrapper pattern for secrets of this shape).
+read-only view. The sign-in token stops being printed to the terminal: it is
+handed over by the operator's auth MCP, the same 0600-file Docker-wrapper
+pattern already proven on his GitHub PAT, so the secret never reaches argv,
+environment, or scrollback.
 
 ## Alternatives considered
 
@@ -97,9 +98,17 @@ Docker wrapper pattern for secrets of this shape).
 - **Mutate live directly, harder (status quo).** Rejected as the *default*
   workflow by the operator's own usage: rehearse-then-promote is how he already
   works with clones by hand.
-- **Shared object store for workspaces (`--shared`/`--reference`) from day
-  one.** Deferred: real `gc` pruning hazard against the origin. Plain clones
-  first; sharing is an optimization that needs its own safety argument.
+- **Shared object store for workspaces (`--shared`/`--reference`).** Rejected
+  outright, not deferred: it carries a real `gc` pruning hazard against the
+  origin, and the operator's repos are small enough (~80–100k) that a full
+  plain clone costs nothing worth trading safety for.
+- **Auto-deleting the workspace after promotion.** Rejected: the workspace is
+  archived out of band (borg, then MEGA) by a separate MCP, and deletion
+  happens only after that archive is confirmed. A tool that reclaims disk on
+  its own would race that pipeline.
+- **Mirroring every ref at promotion.** Rejected: it would delete live branches
+  the workspace does not carry, which contradicts the operator's standing
+  never-delete-branches rule. Only changed refs move.
 
 ## Consequences
 
@@ -111,9 +120,12 @@ Docker wrapper pattern for secrets of this shape).
   state it was built to hold.
 - Live-repo write routes eventually disappear from the default serve mode —
   a breaking change to be sequenced deliberately, not slipped in.
-- Workspace lifecycle (creation, naming, cleanup), promoted-ref scope, and the
-  no-print token delivery are open sub-designs; the milestone that implements
-  this ADR must resolve them.
+- The open sub-designs were resolved with the operator the same day (recorded
+  in the design doc): token delivery via his auth-MCP; workspaces are full
+  plain clones (`--shared` rejected, small repos); no auto-delete — archive
+  via his borg→MEGA pipeline, delete only on confirmation; promotion moves
+  **changed refs only**, listed in the reviewed plan; a dirty live worktree on
+  a moved, checked-out branch refuses promotion (undo's clean-tree guard).
 - The #64 plan reserved "ADR 0023" for the frontend feature boundaries record;
   that record now lands as **ADR 0024** (numbers are assigned at creation
   time).
@@ -125,3 +137,4 @@ diagrams live in `design-docs/2026-07-27-rehearsal-workspace-promotion.md`
 (untracked working note). Implementation begins after M1.11 (#64) closes.
 
 **Signed:** thomas2025 · 2026-07-27T01:44:04-04:00
+**Updated:** thomas2025 · 2026-07-27T01:57:15-04:00 — sub-designs resolved with the operator; `--shared`, auto-delete and ref-mirroring moved from open to rejected.
