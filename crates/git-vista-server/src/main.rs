@@ -69,6 +69,8 @@ mod operations;
 mod planner;
 // Per-source-IP sign-in rate limiting for the LAN listener (ADR 0005, #122).
 mod ratelimit;
+#[cfg(test)]
+mod route_authz;
 // The loopback session + request-protection layer (M1.04, #57): Origin/Host/CSRF/
 // content-type/method enforcement, the browser hardening headers, and the
 // bootstrap-token → session-cookie exchange.
