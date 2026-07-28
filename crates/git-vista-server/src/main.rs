@@ -101,6 +101,7 @@ use handlers::commit::{create_commit, stage_all, unstage_all};
 use handlers::protocol::protocol_info;
 use handlers::read::{
     commit_detail, commit_diff, commits, file_at_commit, frame, head_branch, worktree_status,
+    worktree_status_v2,
 };
 use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
@@ -373,6 +374,10 @@ fn api_router(
         // behind, and the staged/unstaged/untracked/conflicted file lists —
         // resolved fresh per request, like `head_branch`.
         .route("/api/status", get(worktree_status))
+        // #68c: the generation-tagged WorktreeStatus DTO (#68a/#68b), additive
+        // alongside the v1 shape above — not a replacement. See handlers::read
+        // for why both exist side by side.
+        .route("/api/status/v2", get(worktree_status_v2))
         // Activity/Undo feature, step 3: the chronological event feed —
         // journal + reflogs + snapshot diffs, folded and attributed.
         .route("/api/activity", get(activity::activity_feed))
