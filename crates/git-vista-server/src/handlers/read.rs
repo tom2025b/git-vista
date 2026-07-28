@@ -1360,6 +1360,262 @@ mod tests {
         assert!(!bin.truncated);
     }
 
+    // ---- malicious `{*path}` against GET /api/file/{id}/{*path} (#67) --------
+    //
+    // `file_at_commit_for_repo` turns `path` into a `<rev>:<path>` git revision
+    // spec and shells out to `git -C <repo> show <spec>`. `-C <repo>` is
+    // equivalent to `cd <repo> && git show <spec>` — the process's effective cwd
+    // for git's own `<rev>:./path` / `<rev>:../path` resolution (documented in
+    // gitrevisions(7)) is therefore always `repo`, which every real caller
+    // (`resolve_repo`/`resolve_worktree`/`current()`) sets to a registered
+    // worktree's own root, never a subdirectory of one. So the cwd-relative
+    // resolution these tests probe is always rooted at the tree root in
+    // production, and — as the tests below establish — git itself refuses a
+    // `../` that would walk above that cwd ("outside repository"), independent
+    // of anything this server does. That is the fact this whole battery exists
+    // to pin down instead of assume.
+
+    /// A repository shaped to exercise the malicious-path battery: a root file,
+    /// a subdirectory (so a tree-vs-blob path exists), and a **committed
+    /// symlink** whose target must come back as blob content, never followed.
+    fn path_battery_repo() -> (tempfile::TempDir, PathBuf) {
+        let (dir, repo) = seeded_repo();
+        std::fs::write(repo.join("secret.txt"), "root-secret\n").unwrap();
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::fs::write(repo.join("sub/file.txt"), "sub-file\n").unwrap();
+        std::os::unix::fs::symlink("file.txt", repo.join("sub/link.txt")).unwrap();
+        run(&repo, &["add", "-A"]);
+        run(&repo, &["commit", "-q", "-m", "path battery fixture"]);
+        (dir, repo)
+    }
+
+    /// `../../../etc/passwd`, and a same-depth `../` from the tree root: git's
+    /// own boundary check refuses to resolve a `<rev>:../path` that would walk
+    /// above the cwd it resolved `-C repo` to (the worktree root), independent
+    /// of the tree object. This is the uncertain case the task exists to
+    /// establish, and it comes back a hard refusal, not a path.
+    #[tokio::test]
+    async fn file_read_relative_traversal_cannot_walk_above_repo_root() {
+        let (_dir, repo) = path_battery_repo();
+        let id = out(&repo, &["rev-parse", "HEAD"]);
+
+        for path in ["../../../etc/passwd", "../secret.txt", "../../secret.txt"] {
+            let err = file_at_commit_for_repo(&repo, &id, path)
+                .await
+                .expect_err(&format!("{path} must not resolve"));
+            assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                err.1.contains("outside repository"),
+                "path {path:?} produced unexpected message: {}",
+                err.1
+            );
+        }
+    }
+
+    /// `./secret.txt` resolves from the same cwd (the repo root) precisely as
+    /// the bare tree-relative path does — the positive control for the
+    /// traversal test above: `./` and root-relative agree because cwd == tree
+    /// root in production.
+    #[tokio::test]
+    async fn file_read_dot_slash_prefix_matches_tree_relative_path() {
+        let (_dir, repo) = path_battery_repo();
+        let id = out(&repo, &["rev-parse", "HEAD"]);
+
+        let dotted = file_at_commit_for_repo(&repo, &id, "./secret.txt")
+            .await
+            .expect("./secret.txt must resolve, cwd is the tree root");
+        let bare = file_at_commit_for_repo(&repo, &id, "secret.txt")
+            .await
+            .expect("control read");
+        assert_eq!(dotted.content, bare.content);
+        assert_eq!(dotted.content, "root-secret\n");
+    }
+
+    /// A leading `/` is not tree-root shorthand — git treats it as a literal
+    /// path component and reports the object missing, the same shape as any
+    /// other not-found path.
+    #[tokio::test]
+    async fn file_read_leading_slash_is_not_found_not_root_shorthand() {
+        let (_dir, repo) = path_battery_repo();
+        let id = out(&repo, &["rev-parse", "HEAD"]);
+
+        let err = file_at_commit_for_repo(&repo, &id, "/secret.txt")
+            .await
+            .expect_err("a leading slash must not silently mean the tree root");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// axum's `{*path}` wildcard percent-decodes the captured string before the
+    /// handler ever sees it (verified here against the real extractor, not
+    /// assumed), so `%2e%2e%2f` arrives at `file_at_commit_for_repo` already
+    /// turned into a literal `../` — no double-decoding boundary for an
+    /// attacker to exploit, and the traversal refusal above still applies to
+    /// whatever comes out the other side.
+    #[tokio::test]
+    async fn axum_wildcard_decodes_percent_encoding_before_the_handler() {
+        async fn echo(AxumPath(path): AxumPath<String>) -> String {
+            path
+        }
+        let app = Router::new().route("/f/{*path}", get(echo));
+        let req = axum::http::Request::get("/f/%2e%2e%2fsecret.txt%2e%2e")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let decoded = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(decoded, "../secret.txt..");
+
+        // Double-encoded (`%252e` -> literal `%2e`, not `.`) must NOT decode a
+        // second time anywhere in the pipeline — it should reach the handler
+        // still percent-escaped text and fail as a not-found path, not as a
+        // second-order traversal.
+        let (_dir, repo) = path_battery_repo();
+        let id = out(&repo, &["rev-parse", "HEAD"]);
+        let err = file_at_commit_for_repo(&repo, &id, "%252e%252e%252fsecret.txt")
+            .await
+            .expect_err("double-encoded traversal must not resolve");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A path that names a **tree**, not a blob, does not error — `git show
+    /// <rev>:<dir>` prints a directory listing, and the handler forwards it
+    /// verbatim as if it were file content (no NUL, so it isn't even flagged
+    /// binary). This is documented git behaviour, not a boundary break — every
+    /// name it lists is one the diff/commit endpoints already expose for this
+    /// same commit — but the response shape is a listing wearing a
+    /// `FileContent`, which is worth having pinned down rather than assumed.
+    #[tokio::test]
+    async fn file_read_of_a_tree_path_returns_listing_not_an_error() {
+        let (_dir, repo) = path_battery_repo();
+        let id = out(&repo, &["rev-parse", "HEAD"]);
+
+        let file = file_at_commit_for_repo(&repo, &id, "sub")
+            .await
+            .expect("a tree path is a 200, not a 404, in real git");
+        assert!(!file.binary);
+        assert!(file.content.starts_with(&format!("tree {id}:sub")));
+        assert!(file.content.contains("file.txt"));
+        assert!(file.content.contains("link.txt"));
+    }
+
+    /// An empty path segment (`<id>:`) means the root tree in git, and behaves
+    /// exactly like the named-tree case above, one level up.
+    #[tokio::test]
+    async fn file_read_of_empty_path_returns_root_tree_listing() {
+        let (_dir, repo) = path_battery_repo();
+        let id = out(&repo, &["rev-parse", "HEAD"]);
+
+        let file = file_at_commit_for_repo(&repo, &id, "")
+            .await
+            .expect("an empty path is the root tree, not an error");
+        assert!(!file.binary);
+        assert!(file.content.starts_with(&format!("tree {id}:")));
+        assert!(file.content.contains("secret.txt"));
+        assert!(file.content.contains("sub/"));
+    }
+
+    /// A path with an embedded newline can never name a real git object, so it
+    /// must fail as a clean not-found — not panic, and not somehow be
+    /// interpreted as two arguments (it travels as a single argv element, same
+    /// belt-and-braces as the id check above it).
+    #[tokio::test]
+    async fn file_read_embedded_newline_is_a_clean_not_found() {
+        let (_dir, repo) = path_battery_repo();
+        let id = out(&repo, &["rev-parse", "HEAD"]);
+
+        let err = file_at_commit_for_repo(&repo, &id, "secret.txt\nsub/file.txt")
+            .await
+            .expect_err("a newline-bearing path cannot name a real object");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A several-KB path is refused cleanly by git (no such blob) rather than
+    /// causing unbounded allocation or a hang on this server's side — the read
+    /// is still going through `git_stdout_capped`, the same bounded reader as
+    /// every other file/diff read.
+    #[tokio::test]
+    async fn file_read_very_long_path_is_refused_cleanly() {
+        let (_dir, repo) = path_battery_repo();
+        let id = out(&repo, &["rev-parse", "HEAD"]);
+        let long_path = "a".repeat(8_000);
+
+        let err = file_at_commit_for_repo(&repo, &id, &long_path)
+            .await
+            .expect_err("no several-KB path exists in the fixture");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A committed symlink's blob **is** its target string — `git show` must
+    /// report that literal text, not follow the link and return the linked
+    /// file's content. Confirms path resolution never leaves git's own object
+    /// model to touch the filesystem's symlink semantics.
+    #[tokio::test]
+    async fn file_read_of_a_committed_symlink_returns_target_text_not_dereferenced() {
+        let (_dir, repo) = path_battery_repo();
+        let id = out(&repo, &["rev-parse", "HEAD"]);
+
+        let link = file_at_commit_for_repo(&repo, &id, "sub/link.txt")
+            .await
+            .expect("the symlink blob itself resolves");
+        assert_eq!(link.content, "file.txt");
+        assert!(!link.content.contains("sub-file"));
+    }
+
+    /// Every case above, again against the `<id>^:path>` fallback: build a
+    /// commit whose tree lacks all of the fixture's paths (so the first `show`
+    /// attempt always misses and the retry against the parent is what actually
+    /// answers), then repeat the security-relevant assertions. A malicious path
+    /// that only got exercised on the happy path would miss this second attempt
+    /// entirely.
+    #[tokio::test]
+    async fn malicious_paths_behave_identically_through_the_parent_fallback() {
+        let (_dir, repo) = path_battery_repo();
+        let parent_id = out(&repo, &["rev-parse", "HEAD"]);
+
+        // A child commit that deletes everything path_battery_repo added, so
+        // `<child>:<path>` always misses and every read below is answered by
+        // the `<child>^:<path>` retry against `parent_id`'s tree.
+        run(&repo, &["rm", "-q", "-r", "secret.txt", "sub"]);
+        run(&repo, &["commit", "-q", "-m", "delete everything"]);
+        let child_id = out(&repo, &["rev-parse", "HEAD"]);
+        assert_ne!(
+            child_id, parent_id,
+            "the fallback must actually cross a commit"
+        );
+
+        // Traversal is still refused.
+        let err = file_at_commit_for_repo(&repo, &child_id, "../secret.txt")
+            .await
+            .expect_err("traversal must be refused through the fallback too");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.contains("outside repository"));
+
+        // The symlink still comes back as its target text, not dereferenced.
+        // `FileContent.id` echoes back the *requested* commit id even when the
+        // content was actually read from its parent's tree — that's the
+        // existing contract (see `bounded_file_read_caps_without_parent_fallback`
+        // above), not something this test introduces.
+        let link = file_at_commit_for_repo(&repo, &child_id, "sub/link.txt")
+            .await
+            .expect("the fallback must reach the parent's symlink blob");
+        assert_eq!(link.content, "file.txt");
+        assert_eq!(link.id, child_id);
+
+        // A tree path still comes back as a listing, not an error.
+        let tree = file_at_commit_for_repo(&repo, &child_id, "sub")
+            .await
+            .expect("the fallback must reach the parent's tree too");
+        assert!(tree.content.contains("link.txt"));
+
+        // `truncated` must never be true for these tiny fixtures — a sign the
+        // cap logic didn't misfire on the retry path.
+        assert!(!link.truncated);
+        assert!(!tree.truncated);
+    }
+
     #[tokio::test]
     async fn catalog_endpoint_lists_entries_without_leaking_paths() {
         // The capability report is valid JSON and, by default, carries no paths.

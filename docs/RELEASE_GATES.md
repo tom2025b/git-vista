@@ -81,7 +81,7 @@ test suite, not assumed from the presence of `security.rs`/`middleware.rs`/
 | Origin | Yes | `security.rs`: `origin_must_be_same_origin_and_not_null`, `lan_origin_must_match_the_pinned_ip_and_not_be_null`, `a_cross_origin_or_null_origin_is_403` (wire-level, through the real middleware) |
 | Host | Yes | `security.rs`: `loopback_hosts_pass_and_others_fail`, `lan_host_pins_to_the_exact_ip_and_port`, `a_bad_host_is_403_before_anything_else` (wire-level) |
 | Clone (URL) | Yes | `argv_boundary.rs`: `hostile_clone_urls_are_refused_by_the_gate` (9 hostile shapes: `file://`, `ssh://`, `ext::`, option-smuggling, whitespace-splitting), `hostile_clone_urls_die_at_the_boundary` (wire-level, through real auth/CSRF) |
-| **Path** | **No — a real gap, not filled here** | Real defensive code exists (`catalog.rs`'s canonicalize-and-contain check for the allowed-roots gate, `state.rs`'s equivalent for the delete-clone containment check), and `catalog.rs` has tests for it — `register_fails_closed_outside_the_allowed_roots`, `register_fails_closed_on_a_symlink_escaping_the_allowed_root` — **but those exercise server-side catalog registration (operator-controlled allowed roots at startup), not a client-reachable path input.** The one endpoint that takes a client-supplied path-shaped string on the wire, `GET /api/file/{id}/{*path}` (`file_at_commit`), passes it straight into a `git show <id>:<path>` **tree-relative** spec — not a filesystem path, so a `../` segment is almost certainly harmless (git resolves it against the commit's tree object, not the filesystem) — but there is **no test proving that**, adversarial or otherwise, for this specific client-facing endpoint. Grepped `handlers/read.rs` for any malicious/traversal-named test against `file_at_commit`: none found. This is exactly the class of "assumed safe, never verified" gap this audit exists to catch. **Named, not fixed** — out of this task's scope per its own instructions. |
+| **Path** | **No, at the time of this audit — closed in M1.14 task 8** | Real defensive code exists (`catalog.rs`'s canonicalize-and-contain check for the allowed-roots gate, `state.rs`'s equivalent for the delete-clone containment check), and `catalog.rs` has tests for it — `register_fails_closed_outside_the_allowed_roots`, `register_fails_closed_on_a_symlink_escaping_the_allowed_root` — **but those exercise server-side catalog registration (operator-controlled allowed roots at startup), not a client-reachable path input.** The one endpoint that takes a client-supplied path-shaped string on the wire, `GET /api/file/{id}/{*path}` (`file_at_commit`), passes it straight into a `git show <id>:<path>` **tree-relative** spec — not a filesystem path, so a `../` segment is almost certainly harmless (git resolves it against the commit's tree object, not the filesystem) — but there is **no test proving that**, adversarial or otherwise, for this specific client-facing endpoint. Grepped `handlers/read.rs` for any malicious/traversal-named test against `file_at_commit`: none found. This is exactly the class of "assumed safe, never verified" gap this audit exists to catch. **Named here; a twelve-test battery closing it landed in M1.14 task 8 — see the closure checklist below and `pro-result.md` for that task.** |
 
 ### 4. "Supported Git and Safari versions are documented"
 
@@ -382,31 +382,41 @@ laid out below).
       1 criterion 3.
 - [x] **Clone malicious inputs tested** — done, evidence in Part 1
       criterion 3.
-- [ ] **Path malicious inputs tested** — **not done.** Real gap: no
-      adversarial test exists against `GET /api/file/{id}/{*path}`
-      specifically. Likely low actual risk (git resolves the path against
-      a tree object, not the filesystem) but "likely low risk, unverified"
-      is exactly the gap this criterion exists to close. Needs: a test in
-      `handlers/read.rs` or `argv_boundary.rs` feeding `file_at_commit` a
-      `../`-laden or absolute path and asserting it's refused or at least
-      behaves as a normal not-found rather than reading outside the
-      commit's tree. Not written here — out of this task's scope, named
-      per its own instruction not to fill gaps in.
+- [x] **Path malicious inputs tested** — done (M1.14, Part 8). Twelve
+      tests against the real `file_at_commit_for_repo` handler seam in
+      `handlers/read.rs`, each also run through the `<id>^:<path>` parent
+      fallback: relative traversal (`../../../etc/passwd`, `../secret.txt`)
+      is refused by git's own boundary check ("outside repository") because
+      the server always spawns `git -C <repo> show <spec>` with `repo` set
+      to a registered worktree's own root — never a subdirectory — so the
+      documented `<rev>:../path` cwd-relative resolution can never walk
+      above the tree root in production; `./` matches the bare tree-relative
+      path (cwd is root); a leading `/` is a plain not-found, not root
+      shorthand; axum's `{*path}` wildcard percent-decodes before the
+      handler (verified against the real extractor) and double-encoding
+      does not get a second decode pass; a path naming a tree returns git's
+      directory listing as content rather than an error — documented
+      behaviour, not a boundary break, since every name it lists is already
+      exposed by the diff/commit endpoints for the same commit; an empty
+      path is the root tree, same shape; an embedded newline and an 8 KB
+      path both fail as a clean not-found; a committed symlink comes back
+      as its literal target text, never dereferenced. No vulnerability
+      found — converts "likely low risk, unverified" to verified. See
+      `pro-result.md` (M1.14 task 8) for the full battery and reasoning.
 - [x] **Supported Git and Safari versions documented** — done, and Git's
       floor is now CI-enforced too (task 6), which exceeds what this
       bullet strictly asks.
 - [x] **Dependency exceptions have owners and expiration dates, and the
       expiry is enforced** — done, evidence in Part 1 criterion 5.
 
-**Honest conclusion**: #67 is not closeable today. Four of the six
-top-level bullets are genuinely done; the "path" sub-item under malicious
-inputs is a real, named, unfixed gap; and the load-bearing bullet —
-"failures block release" — is entirely unmet and requires an action
-(applying branch protection or a ruleset) that is explicitly outside any
-worker task's authority, Tom's alone. **#67 becomes closeable once (a)
-Tom applies one of the two proposals in Part 2, and (b) the path-input gap
-above gets a test** — (a) is the larger of the two by far; (b) is small
-enough to be a good candidate for whatever picks this up next.
+**Honest conclusion**: #67 is not closeable today. Five of the six
+top-level bullets are genuinely done, including the "path" sub-item under
+malicious inputs as of M1.14 task 8; the load-bearing bullet — "failures
+block release" — is entirely unmet and requires an action (applying branch
+protection or a ruleset) that is explicitly outside any worker task's
+authority, Tom's alone. **#67 becomes closeable once Tom applies one of
+the two proposals in Part 2.** That is the only remaining item, and it is
+his call to make, not a worker task's.
 
 ---
 
