@@ -190,6 +190,55 @@ impl OverlayStack {
     }
 }
 
+/// Which of four layout modes the window is in, decided from width alone.
+///
+/// A pure function of width, never of the previous mode — that property is why
+/// Rust owns this signal instead of a CSS/Rust hybrid: a breakpoint duplicated in
+/// both places leaves a band of widths where the two disagree, a bug that only
+/// reproduces at one exact window size. Stability under a Stage Manager drag
+/// comes from debouncing the resize signal upstream (`signals::install_mode_signal`),
+/// not from hysteresis here — hysteresis would make this a function of
+/// `(width, previous_mode)`, so the same width could answer two different ways
+/// depending on approach direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellMode {
+    /// < 600px — narrow Stage Manager / split screen. One primary task visible
+    /// at a time.
+    Compact,
+    /// 600–1023px — iPad portrait (834pt), medium split screen (507–678pt).
+    Portrait,
+    /// 1024–1439px — iPad landscape (1194pt).
+    Wide,
+    /// >= 1440px — a wide external monitor. Named for what's actually knowable:
+    /// a web app can see a width, never that a display is external.
+    UltraWide,
+}
+
+impl ShellMode {
+    pub fn for_width(width: f64) -> Self {
+        if width < 600.0 {
+            Self::Compact
+        } else if width < 1024.0 {
+            Self::Portrait
+        } else if width < 1440.0 {
+            Self::Wide
+        } else {
+            Self::UltraWide
+        }
+    }
+
+    /// The single CSS class the stylesheet keys off. No `@media` queries for
+    /// mode exist anywhere in `styles.css` — this class is the only decider.
+    pub fn css_class(self) -> &'static str {
+        match self {
+            Self::Compact => "shell-compact",
+            Self::Portrait => "shell-portrait",
+            Self::Wide => "shell-wide",
+            Self::UltraWide => "shell-ultrawide",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +410,53 @@ mod tests {
         );
         assert!(s.contains(Overlay::Detail));
         assert!(s.contains(Overlay::Viewer));
+    }
+
+    #[test]
+    fn for_width_picks_compact_below_600() {
+        assert_eq!(ShellMode::for_width(599.0), ShellMode::Compact);
+        assert_eq!(ShellMode::for_width(0.0), ShellMode::Compact);
+    }
+
+    #[test]
+    fn for_width_picks_portrait_from_600_to_1023() {
+        assert_eq!(ShellMode::for_width(600.0), ShellMode::Portrait);
+        assert_eq!(ShellMode::for_width(834.0), ShellMode::Portrait);
+        assert_eq!(ShellMode::for_width(1023.0), ShellMode::Portrait);
+    }
+
+    #[test]
+    fn for_width_picks_wide_from_1024_to_1439() {
+        assert_eq!(ShellMode::for_width(1024.0), ShellMode::Wide);
+        assert_eq!(ShellMode::for_width(1194.0), ShellMode::Wide);
+        assert_eq!(ShellMode::for_width(1439.0), ShellMode::Wide);
+    }
+
+    #[test]
+    fn for_width_picks_ultrawide_at_1440_and_above() {
+        assert_eq!(ShellMode::for_width(1440.0), ShellMode::UltraWide);
+        assert_eq!(ShellMode::for_width(2560.0), ShellMode::UltraWide);
+    }
+
+    #[test]
+    fn for_width_is_a_pure_function_same_width_same_answer_every_time() {
+        for _ in 0..5 {
+            assert_eq!(ShellMode::for_width(650.0), ShellMode::Portrait);
+        }
+    }
+
+    #[test]
+    fn css_class_has_one_distinct_class_per_variant() {
+        let classes = [
+            ShellMode::Compact.css_class(),
+            ShellMode::Portrait.css_class(),
+            ShellMode::Wide.css_class(),
+            ShellMode::UltraWide.css_class(),
+        ];
+        for c in &classes {
+            assert!(c.starts_with("shell-"), "unexpected class shape: {c}");
+        }
+        let unique: std::collections::HashSet<_> = classes.iter().collect();
+        assert_eq!(unique.len(), 4, "classes must be pairwise distinct");
     }
 }
