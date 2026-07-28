@@ -139,10 +139,11 @@ def glob_to_regex(pattern: str) -> re.Pattern:
 
     Supports exactly the shapes every `pro-task.md`/`task-queue.md` fence in
     this project actually uses: a literal path (`crates/.../read.rs`), a
-    `dir/**` meaning "the directory itself is not a match, but everything
-    under it is" (matches `git`'s own `.gitignore` `**` semantics, which is
-    what every fence author has had in mind when writing one), and a bare
-    `*` meaning "any run of characters not crossing a `/`."
+    `dir/**` meaning "everything under this directory" (also matches the bare
+    directory name itself, which is harmless — `git diff --name-only` never
+    lists a bare directory, only files, so that degenerate case never fires
+    in practice), and a bare `*` meaning "any run of characters not crossing
+    a `/`."
     """
     # Trailing "/**" — the directory tree, not the bare directory name.
     tree = pattern.endswith("/**")
