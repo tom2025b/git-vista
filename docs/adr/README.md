@@ -36,3 +36,4 @@ it, and note the link in both.
 | [0022](0022-paged-history-and-bounded-reads.md) | Paged history, signed cursors, and bounded reads | Accepted |
 | [0023](0023-rehearsal-workspaces-and-atomic-promotion.md) | Rehearsal workspaces promote results, atomically | Proposed |
 | [0024](0024-frontend-feature-boundaries.md) | Frontend overlay state moves into a `Dock`-keyed `OverlayStack` | Accepted |
+| [0025](0025-hook-policy-and-disclosure.md) | Hook policy: a declared, disclosed value, not yet enforced | Accepted |
