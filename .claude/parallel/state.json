@@ -22,19 +22,16 @@
   },
   "worker": {
     "account": "Pro (thomas2010)",
-    "status": "done",
-    "task": "Task 3 \u2014 fix #158, the flaky a_finished_operation_is_durable_by_the_time_the_request_returns test",
+    "status": "assigned",
+    "task": "Task 4 \u2014 leptos upgrade reconnaissance (READ-ONLY, no dependency/code changes, one document)",
     "worktree": "/home/tom/projects/Git-Vista-pro",
-    "branch": "worker/pro/158-flaky-durability-test",
-    "last_commit": "c24f0df",
-    "pr": "https://github.com/tom2025b/git-vista/pull/160",
+    "branch": "worker/pro/leptos-upgrade-recon",
+    "last_commit": "",
+    "pr": "",
     "owns_paths": [
-      "crates/git-vista-server/src/planner/lifecycle_suite.rs",
-      "crates/git-vista-server/src/durable.rs",
-      "crates/git-vista-server/src/operations.rs",
-      "crates/git-vista-server/src/planner.rs"
+      "design-docs/2026-07-XX-leptos-upgrade-recon.md"
     ],
-    "note": "Root cause fixed (publish-before-persist ordering in plan_and_execute_tracked). PR body says Closes #158. Also found 3 unrelated, pre-existing, load-sensitive flakes elsewhere in the suite while stress-testing the full binary \u2014 not fixed, documented as findings in pro-result.md, not touched otherwise."
+    "note": "Task 3 (#158) done \u2014 PR #160 merged, root cause fixed. Task 4 promoted from pro-task-4-QUEUED.md."
   },
-  "updated_at": "2026-07-28T02:50:28-04:00"
+  "updated_at": "2026-07-28T02:52:00-04:00"
 }
