@@ -76,6 +76,9 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     ),
     ("/api/head-branch", Method::GET, Authz::SessionRequired),
     ("/api/status", Method::GET, Authz::SessionRequired),
+    // #68c: the generation-tagged WorktreeStatus DTO — same read posture as
+    // the v1 endpoint immediately above.
+    ("/api/status/v2", Method::GET, Authz::SessionRequired),
     ("/api/activity", Method::GET, Authz::SessionRequired),
     ("/api/undoables/{id}", Method::GET, Authz::SessionRequired),
     ("/api/rebase-status", Method::GET, Authz::SessionRequired),
