@@ -75,7 +75,8 @@ pub use plan::{
     RepositoryToken, RiskLevel, UnixSeconds, WorktreeToken,
 };
 pub use status::{
-    ChangeKind, ChangeSides, ConflictKind, StatusEntry, SubmoduleState, WorktreeStatus,
+    parse_porcelain_v2_z, ChangeKind, ChangeSides, ConflictKind, ParsedStatus, StatusEntry,
+    SubmoduleState, WorktreeStatus,
 };
 pub use version::{
     check_compatibility, parse_protocol_header, Compatibility, ProtocolInfo, CSRF_HEADER,

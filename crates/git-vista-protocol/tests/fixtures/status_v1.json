@@ -65,10 +65,16 @@
       "path": "new/name.rs",
       "origin_path": "old/name.rs",
       "score": 100,
-      "sides": {
-        "side": "staged_only",
-        "staged": "modified"
-      },
+      "unstaged": null,
+      "submodule": null,
+      "binary": false
+    },
+    {
+      "entry_kind": "renamed",
+      "path": "new/edited.rs",
+      "origin_path": "old/edited.rs",
+      "score": 87,
+      "unstaged": "modified",
       "submodule": null,
       "binary": false
     },
