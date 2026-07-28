@@ -27,10 +27,14 @@ undocumented once #66 lands.
   test runs are on **git 2.43.0** (`git --version`), well above the 2.32
   floor.
 - **CI:** `ubuntu-latest` GitHub-hosted runners currently ship a git version
-  in the same 2.4x range, also clear of the floor. No CI job pins or checks
-  the git version explicitly today — that would be worth adding once #66's
-  policy actually ships and the floor becomes load-bearing rather than
-  forward-looking. Flagged, not done here (out of this task's scope).
+  in the same 2.4x range, also clear of the floor. **Now checked**: the
+  `core` job's "Git version meets the documented floor" step (#67 M1.14)
+  parses the `## Git: X.Y or later` heading above out of this file and fails
+  the build if the runner's `git --version` is older — one source of truth,
+  so the doc and the check cannot drift apart. Added ahead of #66 actually
+  landing, on the same reasoning as documenting the number early: it costs
+  nothing now and means the floor is already enforced the moment it becomes
+  load-bearing rather than being remembered later.
 
 ## Safari: 16.4 or later (iOS/iPadOS 16.4, and the matching macOS Safari 16.4)
 
