@@ -761,6 +761,11 @@ pub(crate) async fn file_at_commit(
     Ok((no_store, Json(file)))
 }
 
+/// Bound on `git cat-file -t <spec>`'s output: the real answers (`blob`,
+/// `tree`, `commit`, `tag`) are all under 8 bytes. Generous headroom, not a
+/// meaningful cap — this call can never legitimately produce much output.
+const OBJECT_TYPE_CAP: usize = 64;
+
 /// [`file_at_commit`] against an explicit repository — split out for the same
 /// reason as [`commit_diff_for_repo`]: the handler's repository comes from the
 /// process-wide `CURRENT` selection, which no test can set.
@@ -771,6 +776,28 @@ pub(crate) async fn file_at_commit(
 /// case. Only a genuine error retries `<id>^:<path>` — that retry exists for a
 /// file this commit deleted, and answering a cap with the parent's older
 /// content would be a wrong answer wearing a 200 (M1.10, #63).
+///
+/// Only a **blob** may answer this endpoint (#168). `git show <rev>:<path>`
+/// happily "succeeds" on a tree (prints a directory listing) or a commit
+/// entry — a submodule gitlink — (prints the referenced commit's log), and
+/// both would otherwise come back as a `200 FileContent` with git's
+/// human-facing output sitting in `content`, wearing a shape that promises
+/// real file bytes. A tree is a different resource, not a different
+/// representation of this one — the honest fix for tree browsing is a
+/// dedicated endpoint, not a discriminator bolted onto this DTO (which would
+/// also force a wire-format bump for a capability nothing currently uses) —
+/// so the decision here is reject, not describe.
+///
+/// The type is resolved *before* any content is read, and the `<id>^:<path>`
+/// retry ladder is built out of type resolutions, not content reads: the
+/// type check must never be applied only to the first attempt and skipped on
+/// the fallback, or a path that is a **file** in the parent but a
+/// **directory** in this commit would resolve as "not found" on the first
+/// attempt, fall through to the parent, and come back as a `200` with real
+/// file bytes from the wrong commit — the same failure mode `FileContent`'s
+/// cap logic was written to avoid (see above), one layer up. Once a spec
+/// resolves to `blob`, exactly one `git show` runs, against that exact spec —
+/// blob reads are otherwise byte-for-byte what they were before this change.
 async fn file_at_commit_for_repo(
     repo: &Path,
     id: &str,
@@ -781,21 +808,43 @@ async fn file_at_commit_for_repo(
     if id.len() < 4 || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string()));
     }
-    let show = |spec: String| async move {
+
+    let type_of = |spec: String| async move {
         git_stdout_capped(
             repo,
-            &["show".to_string(), spec],
+            &["cat-file".to_string(), "-t".to_string(), spec],
             "/api/file",
-            FILE_CONTENT_CAP,
+            OBJECT_TYPE_CAP,
         )
         .await
+        .map(|(bytes, _truncated)| String::from_utf8_lossy(&bytes).trim().to_string())
     };
-    let (bytes, truncated) = match show(format!("{id}:{path}")).await {
-        Ok(read) => read,
-        // Not in this commit's tree — a file this commit deleted. Show the
-        // version it deleted (from the first parent) instead of a dead end.
-        Err(first) => show(format!("{id}^:{path}")).await.map_err(|_| first)?,
+    let (spec, kind) = match type_of(format!("{id}:{path}")).await {
+        Ok(kind) => (format!("{id}:{path}"), kind),
+        // Not in this commit's tree — a file this commit deleted, a path
+        // this commit never had, or (M1.10, #63's original case) a file
+        // whose content should be shown from where it last existed. Resolve
+        // the *type* against the parent before deciding anything.
+        Err(first) => {
+            let spec = format!("{id}^:{path}");
+            let kind = type_of(spec.clone()).await.map_err(|_| first)?;
+            (spec, kind)
+        }
     };
+    if kind != "blob" {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("'{path}' is a {kind}, not a file."),
+        ));
+    }
+
+    let (bytes, truncated) = git_stdout_capped(
+        repo,
+        &["show".to_string(), spec],
+        "/api/file",
+        FILE_CONTENT_CAP,
+    )
+    .await?;
 
     // Binary sniff, the way git itself does it: a NUL in the first 8000 bytes.
     // The cap always retains far more than that, so bounding the read cannot
@@ -1480,41 +1529,163 @@ mod tests {
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    /// A path that names a **tree**, not a blob, does not error — `git show
-    /// <rev>:<dir>` prints a directory listing, and the handler forwards it
-    /// verbatim as if it were file content (no NUL, so it isn't even flagged
-    /// binary). This is documented git behaviour, not a boundary break — every
-    /// name it lists is one the diff/commit endpoints already expose for this
-    /// same commit — but the response shape is a listing wearing a
-    /// `FileContent`, which is worth having pinned down rather than assumed.
+    /// A path that names a **tree**, not a blob, is now a `404` (#168) — not
+    /// the `200` this test used to pin. `git show <rev>:<dir>` happily prints
+    /// a directory listing, and until this change the handler forwarded it
+    /// verbatim as if it were file content (no NUL, so it wasn't even flagged
+    /// binary). A tree is a different resource from a file, not another
+    /// representation of the same one, so the fix is a clean rejection
+    /// rather than a discriminator bolted onto `FileContent` — see the
+    /// doc comment on `file_at_commit_for_repo`. This test previously pinned
+    /// the listing-as-200 behaviour under a name saying so; it is now the
+    /// regression test for the rejection instead, renamed to match.
     #[tokio::test]
-    async fn file_read_of_a_tree_path_returns_listing_not_an_error() {
+    async fn file_read_of_a_tree_path_is_rejected_not_returned_as_content() {
         let (_dir, repo) = path_battery_repo();
         let id = out(&repo, &["rev-parse", "HEAD"]);
 
-        let file = file_at_commit_for_repo(&repo, &id, "sub")
+        let err = file_at_commit_for_repo(&repo, &id, "sub")
             .await
-            .expect("a tree path is a 200, not a 404, in real git");
-        assert!(!file.binary);
-        assert!(file.content.starts_with(&format!("tree {id}:sub")));
-        assert!(file.content.contains("file.txt"));
-        assert!(file.content.contains("link.txt"));
+            .expect_err("a tree path must not answer as file content");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(
+            err.1.contains("tree"),
+            "reason should name the object kind: {}",
+            err.1
+        );
     }
 
-    /// An empty path segment (`<id>:`) means the root tree in git, and behaves
-    /// exactly like the named-tree case above, one level up.
+    /// An empty path segment (`<id>:`) means the root tree in git, and is
+    /// rejected for exactly the same reason as the named-tree case above, one
+    /// level up — deliberately, not by accident: nothing distinguishes "no
+    /// path given" from "path names the root tree" once the type check is in
+    /// place, and the root tree is exactly as much "not a file" as `sub` is.
     #[tokio::test]
-    async fn file_read_of_empty_path_returns_root_tree_listing() {
+    async fn file_read_of_empty_path_is_rejected_as_the_root_tree() {
         let (_dir, repo) = path_battery_repo();
         let id = out(&repo, &["rev-parse", "HEAD"]);
 
-        let file = file_at_commit_for_repo(&repo, &id, "")
+        let err = file_at_commit_for_repo(&repo, &id, "")
             .await
-            .expect("an empty path is the root tree, not an error");
-        assert!(!file.binary);
-        assert!(file.content.starts_with(&format!("tree {id}:")));
-        assert!(file.content.contains("secret.txt"));
-        assert!(file.content.contains("sub/"));
+            .expect_err("an empty path names the root tree, not a file");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(
+            err.1.contains("tree"),
+            "reason should name the object kind: {}",
+            err.1
+        );
+    }
+
+    /// The trap this task exists to close: a path that is a regular **file**
+    /// in the parent commit and becomes a **directory** in the child commit.
+    /// A naive fix that made the tree case "fail" the existing `<id>:<path>`
+    /// vs `<id>^:<path>` content-read ladder would fall through to the
+    /// parent on the child's tree and hand back the parent's *file* bytes
+    /// with a 200 — silently answering a request for commit `X` with content
+    /// from `X^`. The type check must resolve against `X` first and reject
+    /// immediately on a tree, never reaching the parent at all.
+    #[tokio::test]
+    async fn a_file_that_becomes_a_directory_is_rejected_not_served_from_the_parent() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("was-a-file"), "PARENT-FILE-CONTENT\n").unwrap();
+        run(&repo, &["add", "-A"]);
+        run(
+            &repo,
+            &["commit", "-q", "-m", "parent: was-a-file is a file"],
+        );
+        let parent_id = out(&repo, &["rev-parse", "HEAD"]);
+
+        // The child replaces the file with a directory of the same name.
+        run(&repo, &["rm", "-q", "was-a-file"]);
+        std::fs::create_dir_all(repo.join("was-a-file")).unwrap();
+        std::fs::write(repo.join("was-a-file/inner.txt"), "inner\n").unwrap();
+        run(&repo, &["add", "-A"]);
+        run(
+            &repo,
+            &["commit", "-q", "-m", "child: was-a-file is now a directory"],
+        );
+        let child_id = out(&repo, &["rev-parse", "HEAD"]);
+        assert_ne!(child_id, parent_id);
+
+        let err = file_at_commit_for_repo(&repo, &child_id, "was-a-file")
+            .await
+            .expect_err("a directory in the requested commit must be rejected, not silently answered from the parent's file");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(!err.1.contains("PARENT-FILE-CONTENT"));
+
+        // Control: the parent's own read of the same path still works and
+        // still returns the file it always did — the fix changed only the
+        // child's answer, not the parent's.
+        let parent_file = file_at_commit_for_repo(&repo, &parent_id, "was-a-file")
+            .await
+            .expect("the parent's own read of the file is unaffected");
+        assert_eq!(parent_file.content, "PARENT-FILE-CONTENT\n");
+    }
+
+    /// The mirror of the trap test above, for the case #167's original
+    /// fallback exists to serve: a path this commit **deleted** (so the
+    /// first type resolution genuinely finds nothing) whose *parent* version
+    /// was a **tree**, not a file. Before #168 this returned the parent's
+    /// directory listing as a 200 — the same wart as the direct case, one
+    /// commit removed, reached only through the fallback ladder. The type
+    /// check must apply to the fallback's resolution too, not just the first
+    /// attempt.
+    #[tokio::test]
+    async fn a_deleted_path_whose_parent_was_a_tree_is_rejected_through_the_fallback() {
+        let (_dir, repo) = path_battery_repo();
+        let parent_id = out(&repo, &["rev-parse", "HEAD"]);
+
+        // The child deletes `sub` entirely, so `<child>:sub` resolves to
+        // nothing and the fallback is what actually answers.
+        run(&repo, &["rm", "-q", "-r", "sub"]);
+        run(&repo, &["commit", "-q", "-m", "child: delete sub"]);
+        let child_id = out(&repo, &["rev-parse", "HEAD"]);
+        assert_ne!(child_id, parent_id);
+
+        let err = file_at_commit_for_repo(&repo, &child_id, "sub")
+            .await
+            .expect_err("the parent's tree must not leak through the fallback as a 200");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(
+            !err.1.contains("file.txt"),
+            "no listing content should appear in the error"
+        );
+    }
+
+    /// A submodule (a `commit`-typed tree entry) is exactly as much "not a
+    /// file" as a directory — `git show <rev>:<submodule-path>` prints the
+    /// referenced commit's own log/diff, not the submodule's own bytes, which
+    /// is an even more misleading 200 than a directory listing would be.
+    #[tokio::test]
+    async fn a_submodule_entry_is_rejected_not_shown_as_the_referenced_commits_log() {
+        let (_dir, repo) = seeded_repo();
+        let inner_commit = out(&repo, &["rev-parse", "HEAD"]);
+        // A gitlink tree entry (mode 160000) pointing at some commit — enough
+        // to make git treat the path as type `commit`, with no real
+        // submodule checkout required for this handler-level test.
+        run(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &inner_commit,
+                "vendor/lib",
+            ],
+        );
+        run(&repo, &["commit", "-q", "-m", "add a submodule gitlink"]);
+        let id = out(&repo, &["rev-parse", "HEAD"]);
+
+        let err = file_at_commit_for_repo(&repo, &id, "vendor/lib")
+            .await
+            .expect_err("a submodule gitlink must not answer as file content");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(
+            err.1.contains("commit"),
+            "reason should name the object kind: {}",
+            err.1
+        );
     }
 
     /// A path with an embedded newline can never name a real git object, so it
@@ -1604,16 +1775,17 @@ mod tests {
         assert_eq!(link.content, "file.txt");
         assert_eq!(link.id, child_id);
 
-        // A tree path still comes back as a listing, not an error.
-        let tree = file_at_commit_for_repo(&repo, &child_id, "sub")
+        // A tree path is rejected through the fallback too (#168) — covered
+        // in full, including the "no listing leaks into the error" check, by
+        // `a_deleted_path_whose_parent_was_a_tree_is_rejected_through_the_fallback`.
+        let tree_err = file_at_commit_for_repo(&repo, &child_id, "sub")
             .await
-            .expect("the fallback must reach the parent's tree too");
-        assert!(tree.content.contains("link.txt"));
+            .expect_err("a tree must not answer as content, fallback or not");
+        assert_eq!(tree_err.0, StatusCode::NOT_FOUND);
 
-        // `truncated` must never be true for these tiny fixtures — a sign the
+        // `truncated` must never be true for this tiny fixture — a sign the
         // cap logic didn't misfire on the retry path.
         assert!(!link.truncated);
-        assert!(!tree.truncated);
     }
 
     #[tokio::test]

@@ -298,10 +298,16 @@ fn production_body<'a>(code: &'a str, name: &str) -> &'a str {
 ///
 /// Exactly one production body is extracted for each of `commit_diff_for_repo`
 /// and `file_at_commit_for_repo`; across only those two bodies there must be
-/// exactly four `git_stdout_capped(` call sites (three diff reads, one file
-/// read) and no escape hatch — no uncapped `git_stdout(`, no `.output()`, no
+/// exactly five `git_stdout_capped(` call sites (three diff reads, two file
+/// reads) and no escape hatch — no uncapped `git_stdout(`, no `.output()`, no
 /// `.wait_with_output()`, no direct `Command` construction, each of which would
 /// buffer whatever git chose to print.
+///
+/// `file_at_commit_for_repo` went from one call site to two in #168: a
+/// `git cat-file -t <spec>` type check now runs — through the same capped
+/// primitive, so this file's guarantee still holds — *before* the `git show`
+/// content read, so a tree or submodule entry is rejected without ever
+/// reading (or serving) its git-show output. See that function's doc comment.
 ///
 /// The scope is deliberately narrow. The unrelated `worktree_status` read in
 /// the very same file legitimately owns a direct process invocation with static
@@ -309,7 +315,7 @@ fn production_body<'a>(code: &'a str, name: &str) -> &'a str {
 /// while the two extracted *bodies* do not is what proves the extractor cut
 /// where it claims to, instead of quietly matching nothing.
 #[test]
-fn bounded_read_source_boundary_is_streaming_and_exactly_four() {
+fn bounded_read_source_boundary_is_streaming_and_exactly_five() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/read.rs");
     let src = std::fs::read_to_string(&path).expect("readable handlers/read.rs");
     let code = code_only(&src);
@@ -348,13 +354,14 @@ fn bounded_read_source_boundary_is_streaming_and_exactly_four() {
          (--name-status -z, --numstat -z, --patch), found {diff_calls}"
     );
     assert_eq!(
-        file_calls, 1,
-        "file_at_commit_for_repo must perform exactly one bounded read, found {file_calls}"
+        file_calls, 2,
+        "file_at_commit_for_repo must perform exactly two bounded reads \
+         (the cat-file -t type check, then the show content read), found {file_calls}"
     );
     assert_eq!(
         diff_calls + file_calls,
-        4,
-        "exactly four target callers cross the capped boundary"
+        5,
+        "exactly five target callers cross the capped boundary"
     );
 
     for (what, body) in [
