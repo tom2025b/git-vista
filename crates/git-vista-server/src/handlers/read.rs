@@ -3820,4 +3820,109 @@ mod tests {
             .await
             .expect("an ordinary dirty worktree must not hit the production cap");
     }
+
+    // ---- Large-worktree responsiveness (#68e) ---------------------------------
+    //
+    // #68's own text — "large worktrees stay responsive" — is unfalsifiable as
+    // written. This turns it into: a real measurement at several worktree
+    // sizes, a stated cap-boundary file count, and a budget a future change
+    // can actually fail against (`worktree_status_v2_budget_holds_at_1k_files`
+    // below, which runs in every `cargo test`; the full multi-N ladder is
+    // `#[ignore]`d — see that test's own doc comment for why).
+
+    /// `n` freshly created, distinctly named untracked files under `repo` —
+    /// the cheapest real worktree-size generator available: untracked
+    /// entries are one porcelain-v2 `? <path>` record each (no hash/mode
+    /// fields to compute), so file *creation* cost dominates over anything
+    /// `git status` itself has to do, keeping the measurement honest about
+    /// what it's actually timing.
+    fn generate_untracked_files(repo: &Path, n: usize) {
+        for i in 0..n {
+            std::fs::write(repo.join(format!("bench-{i:06}.txt")), "x\n").unwrap();
+        }
+    }
+
+    /// One measurement: wall-clock time for the **real** `#68c` handler seam
+    /// (git spawn, `-z` porcelain read, `parse_porcelain_v2_z`, and the full
+    /// generation derivation — `read_generation_inputs`'s ref walk plus the
+    /// sha256 digest) against a worktree with `n` untracked files.
+    async fn time_status_v2(repo: &Path, n: usize) -> (std::time::Duration, bool) {
+        generate_untracked_files(repo, n);
+        let start = std::time::Instant::now();
+        let result = worktree_status_v2_for_repo(repo, STATUS_V2_STDOUT_CAP).await;
+        let elapsed = start.elapsed();
+        (elapsed, result.is_ok())
+    }
+
+    /// The real measurement behind `docs/PERFORMANCE_BUDGETS.md`'s numbers —
+    /// **not** part of the normal test run. `#[ignore]`d because generating
+    /// up to 20,000 real files and shelling out to `git status` repeatedly
+    /// costs real wall-clock seconds, which has no place in every `cargo
+    /// test`/CI run; `worktree_status_v2_budget_holds_at_1k_files` below is
+    /// the fast, always-on regression check derived from what this found.
+    ///
+    /// Run explicitly to reproduce or update the recorded numbers:
+    /// `cargo test -p git-vista-server --bin git-vista-server -- --ignored \
+    ///  --nocapture large_worktree_responsiveness_ladder`
+    ///
+    /// One host, one run each — not a statistically controlled benchmark
+    /// suite. `docs/PERFORMANCE_BUDGETS.md` says so explicitly; treat the
+    /// printed numbers as "real and reproducible," not "precise to the
+    /// millisecond."
+    #[tokio::test]
+    #[ignore = "generates up to 20k real files and shells out to git repeatedly; run explicitly, see doc comment"]
+    async fn large_worktree_responsiveness_ladder() {
+        let (_dir, repo) = seeded_repo();
+        println!("\n#68e large-worktree responsiveness ladder (one host, one run each):");
+        println!("{:>8}  {:>12}  {:>8}", "n_files", "elapsed", "ok?");
+        for n in [100usize, 1_000, 5_000, 20_000] {
+            let (elapsed, ok) = time_status_v2(&repo, n).await;
+            println!("{n:>8}  {elapsed:>12?}  {ok:>8}");
+        }
+    }
+
+    /// Where the 8 MiB cap (`STATUS_V2_STDOUT_CAP`) actually bites, in file
+    /// count — not asserted from arithmetic on an assumed per-record size,
+    /// measured against a real, large, uniformly-named worktree (`? bench-
+    /// NNNNNN.txt\0` is 20 bytes/record: 2-byte marker+space, 15-byte name,
+    /// 1-byte NUL terminator; a real worktree's actual paths will differ, so
+    /// this is a lower bound on the file count that trips the cap for
+    /// *this* naming scheme, not a universal constant — `docs/
+    /// PERFORMANCE_BUDGETS.md` states that caveat explicitly). `#[ignore]`d
+    /// for the same reason as the ladder above: real cost, not a normal-run
+    /// check.
+    #[tokio::test]
+    #[ignore = "generates ~450k real files; run explicitly, see doc comment"]
+    async fn large_worktree_cap_boundary_in_file_count() {
+        let (_dir, repo) = seeded_repo();
+        // 20 bytes/record * ~450_000 ~= 8.6 MiB, comfortably past the 8 MiB
+        // cap for this naming scheme.
+        let (_elapsed, ok) = time_status_v2(&repo, 450_000).await;
+        assert!(
+            !ok,
+            "450,000 uniformly-named untracked files should exceed \
+             STATUS_V2_STDOUT_CAP for this record size — if this now \
+             succeeds, the cap boundary moved and docs/PERFORMANCE_BUDGETS.md \
+             needs its file-count figure re-measured"
+        );
+    }
+
+    /// The always-on regression check: 1,000 changed files (cheap enough for
+    /// every `cargo test`/CI run) must complete well inside a generous
+    /// multiple of the budget `docs/PERFORMANCE_BUDGETS.md` states — loose
+    /// enough not to flake on a loaded CI runner, tight enough that a real
+    /// regression (e.g. the generation derivation's ref walk becoming
+    /// accidentally quadratic) would still fail it.
+    #[tokio::test]
+    async fn worktree_status_v2_budget_holds_at_1k_files() {
+        let (_dir, repo) = seeded_repo();
+        let (elapsed, ok) = time_status_v2(&repo, 1_000).await;
+        assert!(ok, "1,000 untracked files must not hit the read cap");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "1,000-file worktree status took {elapsed:?}, budget is 2s \
+             (see docs/PERFORMANCE_BUDGETS.md) — this is a real regression, \
+             not flakiness, unless the CI runner is unusually loaded"
+        );
+    }
 }
