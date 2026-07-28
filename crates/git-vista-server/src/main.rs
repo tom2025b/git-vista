@@ -71,6 +71,10 @@ mod planner;
 mod ratelimit;
 #[cfg(test)]
 mod route_authz;
+// M1.13b (#66): the git-process sandbox — the pure argv chokepoint, the tier
+// enum, the gitdir validation, and the spawn wrappers every production spawn
+// site goes through. The fused shim it launches is `src/bin/gv-sandbox.rs`.
+mod sandbox;
 // The loopback session + request-protection layer (M1.04, #57): Origin/Host/CSRF/
 // content-type/method enforcement, the browser hardening headers, and the
 // bootstrap-token → session-cookie exchange.
