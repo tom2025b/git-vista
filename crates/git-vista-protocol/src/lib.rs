@@ -21,6 +21,10 @@
 //!   staged/unstaged/untracked/ignored/conflicted/renamed/submodule/binary
 //!   states as a closed [`StatusEntry`] vocabulary, reusing [`GenerationToken`]
 //!   (ADR 0001) rather than a new staleness mechanism.
+//! - [`diff`]    — [`ParsedPatch`] (M2.16, #69a): unified-diff text parsed
+//!   into files → hunks → lines with old/new line numbers, as a closed
+//!   [`FileDiff`] vocabulary (ordinary edit, mode-change-only, binary, pure
+//!   rename/copy, combined merge diff).
 //! - [`newtype`] — the validating-newtype machinery the three above share, so
 //!   every string-shaped wire value is checked in exactly one place.
 //!
@@ -50,6 +54,7 @@
 #[macro_use]
 pub mod newtype;
 
+pub mod diff;
 pub mod dto;
 pub mod error;
 pub mod history;
@@ -58,6 +63,7 @@ pub mod plan;
 pub mod status;
 pub mod version;
 
+pub use diff::{parse_unified_diff, DiffLine, FileDiff, Hunk, LineKind, ParsedPatch};
 pub use dto::{
     validate_clone_url, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
     DeleteCloneRequest, RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind,
