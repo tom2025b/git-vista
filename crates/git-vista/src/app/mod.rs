@@ -44,7 +44,7 @@ use crate::features::operations::signals::Operations;
 use crate::features::operations::view::operations_status_view;
 use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
-use crate::features::shell::signals::Shell;
+use crate::features::shell::signals::{install_mode_signal, Shell};
 use crate::features::status::signals as status_seam;
 use crate::icons::icon_set;
 use crate::prefs::{load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref};
@@ -298,6 +298,11 @@ pub fn App() -> impl IntoView {
     // actually lands, rather than migrating them twice.
     let shell = Shell::new(activity);
 
+    // The window's current layout mode (M1.12, #65). Created here, not in
+    // graph_canvas, for the same reason `shell` is: an epoch bump's rebuild must
+    // not tear down and reinstall the resize listener mid-session.
+    let mode = install_mode_signal();
+
     // The live working-tree status: the topbar chip (Activity/Undo step 1) and the
     // Activity panel's own status section both read THIS one resource — until M1.11
     // (#64, Task 7) the panel kept a second, independently-fetched copy. Owned by
@@ -386,7 +391,7 @@ pub fn App() -> impl IntoView {
     });
 
     view! {
-        <main class="app">
+        <main class=move || format!("app {}", mode.get().css_class())>
             // M1.02: the blocking "Update Required" screen, shown (over everything
             // else) only when this client's protocol is incompatible with the server.
             {move || protocol_gate().map(|(info, verdict)| update_required_view(info, verdict))}
