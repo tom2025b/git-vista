@@ -60,3 +60,7 @@
 
 # Local design documents (md + pdf pairs) — session artifacts, not product docs
 /design-docs/
+
+# Live dual-account mailbox — session state, not project history.
+# Both sessions read/write these at one absolute path; they must not travel through git.
+.claude/parallel/
