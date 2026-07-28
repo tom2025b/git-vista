@@ -1,0 +1,17 @@
+# cargo-audit config. Auto-discovered from .cargo/audit.toml (project root),
+# per https://github.com/RustSec/rustsec/blob/main/cargo-audit/audit.toml.example
+#
+# `ignore` lists RUSTSEC advisory IDs accepted as exceptions. Every ID here
+# MUST have a matching row in docs/DEPENDENCY_EXCEPTIONS.md with an owner and
+# an expiry date — the CI "Dependency exceptions register" step in
+# .github/workflows/ci.yml cross-checks the two lists and fails the build if
+# they diverge, and separately fails if any listed exception's expiry date
+# has passed. This file is the mechanism cargo-audit reads; the Markdown file
+# is the human-readable record of *why* each entry exists. Keep both in sync
+# by hand — add/remove an ID here only alongside the matching table row.
+[advisories]
+ignore = [
+    "RUSTSEC-2024-0436", # paste — see docs/DEPENDENCY_EXCEPTIONS.md
+    "RUSTSEC-2024-0370", # proc-macro-error — see docs/DEPENDENCY_EXCEPTIONS.md
+    "RUSTSEC-2026-0173", # proc-macro-error2 — see docs/DEPENDENCY_EXCEPTIONS.md
+]

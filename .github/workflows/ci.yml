@@ -6,12 +6,20 @@
 #   - git-vista-server  native axum backend: serves the SPA + /api/commits
 #   - git-vista         Leptos frontend, built to WASM by Trunk (crates/git-vista)
 #
-# Four jobs run in parallel, each mapped to a concrete check:
+# Six jobs run in parallel, each mapped to a concrete check:
 #   1. lint      format + strict native/WASM Clippy + shell syntax
 #   2. core      test + check the pure-logic, git-reading, server, and UI crates
 #   3. contract  the M1.06 write contract (#146): planner pipeline, argv
 #                boundary, staleness gates — its own named check on every PR
 #   4. frontend  build the real WASM bundle with Trunk
+#   5. audit     cargo-audit over the dependency tree (#67 M1.14): fails on any
+#                advisory, including "unmaintained" warnings, except IDs listed
+#                in .cargo/audit.toml with a matching, unexpired row in
+#                docs/DEPENDENCY_EXCEPTIONS.md — that cross-check is its own
+#                step so a stale or undocumented exception is a red build, not
+#                a silent pass
+#   6. secrets   gitleaks over the full repo history (#67 M1.14): committed
+#                credentials are a distinct named check, pinned to a commit SHA
 name: CI
 
 on:
@@ -171,3 +179,116 @@ jobs:
       # fetches the matching wasm-bindgen automatically.
       - name: Build frontend
         run: cd crates/git-vista && trunk build
+
+  # ---------------------------------------------------------------------------
+  # 5. Security advisory scan (#67 M1.14): cargo-audit over Cargo.lock.
+  #
+  # Deliberate choice, written down per the task: an advisory FAILS the build
+  # (`--deny warnings`, which denies both CVSS-scored vulnerabilities — always
+  # denied by cargo-audit regardless of this flag — and informational
+  # "unmaintained"/"unsound"/"yanked" warnings, which are not denied by
+  # default). Failing is survivable only because of the exceptions register:
+  # .cargo/audit.toml's `ignore` list is what cargo-audit itself reads: an
+  # advisory ID on that list is skipped. docs/DEPENDENCY_EXCEPTIONS.md is the
+  # human-readable record of *why* each ID is there, who owns it, and when it
+  # expires — cargo-audit's own config has no expiry concept, so the "register
+  # is honest" step below enforces it: every ignored ID must have a matching,
+  # unexpired row in the Markdown table, or the build fails even though
+  # cargo-audit itself would have passed.
+  # ---------------------------------------------------------------------------
+  audit:
+    name: Security audit (cargo audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-audit-0.22.2
+
+      # Pinned exact version — a floating `cargo install cargo-audit` would
+      # let the tool's own version drift unreviewed in a job whose entire
+      # purpose is supply-chain scrutiny.
+      - name: Install cargo-audit (pinned)
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      # Cross-checks .cargo/audit.toml's ignore list against
+      # docs/DEPENDENCY_EXCEPTIONS.md: every ignored advisory ID must have a
+      # matching table row, every table row must still be in the ignore list,
+      # and no row's expiry date may have passed. This is what makes an
+      # exception mean "ignore until this date," not "ignore forever" — a
+      # bare .cargo/audit.toml ignore entry has no expiry of its own.
+      - name: Dependency exceptions register is honest
+        run: |
+          python3 - <<'PYEOF'
+          import re, sys, datetime
+
+          audit_toml = open(".cargo/audit.toml").read()
+          exceptions_md = open("docs/DEPENDENCY_EXCEPTIONS.md").read()
+
+          toml_ids = set(re.findall(r'"(RUSTSEC-\d{4}-\d+)"', audit_toml))
+
+          row_re = re.compile(
+              r'\|\s*\[(RUSTSEC-\d{4}-\d+)\]\([^)]+\)\s*\|[^|]*\|[^|]*\|[^|]*\|\s*(\d{4}-\d{2}-\d{2})\s*\|'
+          )
+          md_rows = row_re.findall(exceptions_md)
+          md_ids = {rid for rid, _ in md_rows}
+
+          errors = []
+          only_in_toml = toml_ids - md_ids
+          only_in_md = md_ids - toml_ids
+          if only_in_toml:
+              errors.append(
+                  f"IDs in .cargo/audit.toml but missing a row in docs/DEPENDENCY_EXCEPTIONS.md: {sorted(only_in_toml)}"
+              )
+          if only_in_md:
+              errors.append(
+                  f"IDs documented in docs/DEPENDENCY_EXCEPTIONS.md but not ignored in .cargo/audit.toml: {sorted(only_in_md)}"
+              )
+
+          today = datetime.date.today()
+          for rid, expiry_str in md_rows:
+              expiry = datetime.date.fromisoformat(expiry_str)
+              if expiry < today:
+                  errors.append(
+                      f"{rid}: exception expired on {expiry_str} (today is {today.isoformat()}) — renew or remove it from both files"
+                  )
+
+          if errors:
+              for e in errors:
+                  print(f"::error::{e}")
+              sys.exit(1)
+
+          print(f"Dependency exceptions register OK: {len(md_ids)} exception(s), all in sync, none expired.")
+          PYEOF
+
+      # `--deny warnings` is the deliberate-failure choice explained above.
+      # `.cargo/audit.toml`'s ignore list (verified honest by the step above)
+      # is what makes today's three unmaintained-crate warnings survivable.
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+  # ---------------------------------------------------------------------------
+  # 6. Secret scanning (#67 M1.14): gitleaks over the full commit history.
+  #
+  # Pinned to a full commit SHA (not a floating `@v3` tag) — a supply-chain
+  # hole in the one job whose purpose is catching exactly that class of
+  # problem would defeat the point. `fetch-depth: 0` so gitleaks sees the
+  # whole history, not just the PR diff; this repo is small (a few thousand
+  # objects), so the full scan is cheap.
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: Secret scanning (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # gitleaks/gitleaks-action, tag v3.0.0, pinned to its release commit.
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
