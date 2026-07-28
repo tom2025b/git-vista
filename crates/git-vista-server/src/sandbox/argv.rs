@@ -17,11 +17,15 @@ fn policy(tier: Tier) -> Policy {
 }
 
 fn strs(argv: &[std::ffi::OsString]) -> Vec<String> {
-    argv.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    argv.iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
 }
 
 fn pairs(argv: &[String]) -> Vec<(&str, &str)> {
-    argv.windows(2).map(|w| (w[0].as_str(), w[1].as_str())).collect()
+    argv.windows(2)
+        .map(|w| (w[0].as_str(), w[1].as_str()))
+        .collect()
 }
 
 #[test]
@@ -51,7 +55,11 @@ fn strict_prefix_is_the_reviewed_constant() {
         STRICT_BWRAP_PREFIX[..],
         "the bwrap prefix drifted from its reviewed constant"
     );
-    assert_eq!(a[cut + 1], "/opt/gv/gv-sandbox", "the shim must follow bwrap's `--`");
+    assert_eq!(
+        a[cut + 1],
+        "/opt/gv/gv-sandbox",
+        "the shim must follow bwrap's `--`"
+    );
 }
 
 #[test]
@@ -69,8 +77,14 @@ fn network_tier_never_names_bwrap_and_never_unshares_net() {
 fn strict_tier_carries_c3_procfs_and_c4_devshm() {
     let a = strs(&sandbox_argv(&policy(Tier::Strict)));
     let w = pairs(&a);
-    assert!(w.contains(&("--proc", "/proc")), "C3: a fresh procfs is mandatory");
-    assert!(w.contains(&("--tmpfs", "/dev/shm")), "C4: a private /dev/shm is mandatory");
+    assert!(
+        w.contains(&("--proc", "/proc")),
+        "C3: a fresh procfs is mandatory"
+    );
+    assert!(
+        w.contains(&("--tmpfs", "/dev/shm")),
+        "C4: a private /dev/shm is mandatory"
+    );
     assert!(a.iter().any(|s| s == "--net-deny"));
 }
 
@@ -131,7 +145,10 @@ fn the_probe_argv_names_no_program_at_all() {
         "--self-probe",
         "the probe must not exec anything"
     );
-    assert!(!a.iter().any(|s| s == "git"), "the probe argv must never name git");
+    assert!(
+        !a.iter().any(|s| s == "git"),
+        "the probe argv must never name git"
+    );
 }
 
 /// The four policy-building sites (Tasks 6, 7, 9 and `shim_cli::workable`) must
@@ -152,7 +169,10 @@ fn system_trees_grant_dev_rw_and_proc_only_in_the_strict_tier() {
         "C3/A8: without /proc the shim cannot open /proc/self/ns/user and the probe lies"
     );
     for t in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
-        assert!(strict_ro.contains(&PathBuf::from(t)), "{t} must be readable+executable");
+        assert!(
+            strict_ro.contains(&PathBuf::from(t)),
+            "{t} must be readable+executable"
+        );
     }
 
     let (net_rw, net_ro) = default_system_trees(Tier::Network);
