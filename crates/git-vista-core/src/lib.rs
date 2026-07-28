@@ -19,6 +19,12 @@
 //! - [`virtualize`] — the windowed-list primitive (M2.16, #69c): item heights
 //!   and a scroll offset in, the visible render range out. Knows nothing
 //!   about diffs or the commit graph, so both can share it.
+//! - [`request_generation`] — cancellation via generation-tag (M2.16, #69d):
+//!   a monotonic counter a virtualized view bumps on every scroll-driven
+//!   refetch, so a late-arriving response can identify itself as stale and
+//!   be discarded instead of painting over newer content. Same shape as
+//!   [`identity::RepositoryGeneration`] (ADR 0001) applied to view state
+//!   instead of repository state.
 //!
 //! Reading real history (which needs `gix` and a filesystem, and so can't run in
 //! a browser) lives in the separate native-only `git-vista-git` crate. Keeping
@@ -32,6 +38,7 @@ pub mod identity;
 pub mod layout;
 pub mod model;
 pub mod net;
+pub mod request_generation;
 pub mod seed;
 pub mod status;
 pub mod virtualize;
