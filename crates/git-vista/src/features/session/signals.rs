@@ -44,3 +44,9 @@ pub fn refuses_writes() -> bool {
 pub fn ui_mode() -> Option<RepoMode> {
     SESSION.with(|s| s.borrow().ui_mode())
 }
+
+/// Whether the persistent hook-policy banner (M1.13a, #66, ADR 0025) should
+/// show for the current session.
+pub fn hook_policy_banner_visible() -> bool {
+    SESSION.with(|s| s.borrow().hook_policy_banner_visible())
+}
