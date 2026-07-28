@@ -1,0 +1,136 @@
+{
+  "generation": "status-v1:12345678901234567890",
+  "branch": "main",
+  "upstream": "origin/main",
+  "ahead": 2,
+  "behind": 1,
+  "entries": [
+    {
+      "entry_kind": "changed",
+      "path": "staged-only.rs",
+      "sides": {
+        "side": "staged_only",
+        "staged": "added"
+      },
+      "submodule": null,
+      "binary": false
+    },
+    {
+      "entry_kind": "changed",
+      "path": "unstaged-only.rs",
+      "sides": {
+        "side": "unstaged_only",
+        "unstaged": "modified"
+      },
+      "submodule": null,
+      "binary": false
+    },
+    {
+      "entry_kind": "changed",
+      "path": "both-sides.rs",
+      "sides": {
+        "side": "both",
+        "staged": "added",
+        "unstaged": "modified"
+      },
+      "submodule": null,
+      "binary": false
+    },
+    {
+      "entry_kind": "changed",
+      "path": "deleted.bin",
+      "sides": {
+        "side": "staged_only",
+        "staged": "deleted"
+      },
+      "submodule": null,
+      "binary": true
+    },
+    {
+      "entry_kind": "changed",
+      "path": "vendor/lib",
+      "sides": {
+        "side": "unstaged_only",
+        "unstaged": "modified"
+      },
+      "submodule": {
+        "commit_changed": false,
+        "has_tracked_changes": true,
+        "has_untracked_changes": true
+      },
+      "binary": false
+    },
+    {
+      "entry_kind": "renamed",
+      "path": "new/name.rs",
+      "origin_path": "old/name.rs",
+      "score": 100,
+      "sides": {
+        "side": "staged_only",
+        "staged": "modified"
+      },
+      "submodule": null,
+      "binary": false
+    },
+    {
+      "entry_kind": "untracked",
+      "path": "scratch.txt",
+      "binary": false
+    },
+    {
+      "entry_kind": "untracked",
+      "path": "scratch.bin",
+      "binary": true
+    },
+    {
+      "entry_kind": "ignored",
+      "path": "target/"
+    },
+    {
+      "entry_kind": "conflicted",
+      "path": "both-deleted.rs",
+      "kind": "both_deleted",
+      "submodule": null
+    },
+    {
+      "entry_kind": "conflicted",
+      "path": "added-by-us.rs",
+      "kind": "added_by_us",
+      "submodule": null
+    },
+    {
+      "entry_kind": "conflicted",
+      "path": "deleted-by-them.rs",
+      "kind": "deleted_by_them",
+      "submodule": null
+    },
+    {
+      "entry_kind": "conflicted",
+      "path": "added-by-them.rs",
+      "kind": "added_by_them",
+      "submodule": null
+    },
+    {
+      "entry_kind": "conflicted",
+      "path": "deleted-by-us.rs",
+      "kind": "deleted_by_us",
+      "submodule": null
+    },
+    {
+      "entry_kind": "conflicted",
+      "path": "both-added.rs",
+      "kind": "both_added",
+      "submodule": null
+    },
+    {
+      "entry_kind": "conflicted",
+      "path": "both-modified-submodule",
+      "kind": "both_modified",
+      "submodule": {
+        "commit_changed": false,
+        "has_tracked_changes": true,
+        "has_untracked_changes": true
+      }
+    }
+  ]
+}
