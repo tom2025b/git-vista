@@ -17,7 +17,10 @@ use git_vista_protocol::plan::{CommitOid, RefName};
 use git_vista_protocol::DiffSpec;
 
 const FIXTURE: &str = include_str!("fixtures/diff_spec_v1.json");
-const FIXTURE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/diff_spec_v1.json");
+const FIXTURE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/diff_spec_v1.json"
+);
 
 fn commit(hex_prefix: char) -> CommitOid {
     CommitOid::new(hex_prefix.to_string().repeat(40)).unwrap()
@@ -56,8 +59,7 @@ fn golden_fixture_round_trips_losslessly() {
         FIXTURE.to_string()
     };
 
-    let parsed: Vec<DiffSpec> =
-        serde_json::from_str(&fixture).expect("fixture must deserialize");
+    let parsed: Vec<DiffSpec> = serde_json::from_str(&fixture).expect("fixture must deserialize");
     assert_eq!(parsed, specs, "fixture and in-code golden specs diverged");
 
     let mut reserialized = serde_json::to_string_pretty(&parsed).unwrap();
@@ -91,5 +93,8 @@ fn golden_set_covers_every_mode() {
     .into_iter()
     .map(String::from)
     .collect();
-    assert_eq!(modes, expected, "a DiffSpec mode is missing from (or extra in) the golden set");
+    assert_eq!(
+        modes, expected,
+        "a DiffSpec mode is missing from (or extra in) the golden set"
+    );
 }
