@@ -209,8 +209,8 @@ pub enum ShellMode {
     Portrait,
     /// 1024–1439px — iPad landscape (1194pt).
     Wide,
-    /// >= 1440px — a wide external monitor. Named for what's actually knowable:
-    /// a web app can see a width, never that a display is external.
+    /// 1440px and above — a wide external monitor. Named for what's actually
+    /// knowable: a web app can see a width, never that a display is external.
     UltraWide,
 }
 
