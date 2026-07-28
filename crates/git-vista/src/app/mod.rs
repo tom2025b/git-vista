@@ -46,6 +46,7 @@ use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
 use crate::features::shell::signals::Shell;
 use crate::features::status::signals as status_seam;
+use crate::hook_policy_banner::hook_policy_banner_view;
 use crate::icons::icon_set;
 use crate::prefs::{load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref};
 use crate::session::{establish_session, not_connected_view};
@@ -393,6 +394,19 @@ pub fn App() -> impl IntoView {
             // M1.04: the blocking sign-in screen, shown when there's no session and
             // no bootstrap token to make one — the operator must open `gv`'s link.
             {move || needs_sign_in().then(not_connected_view)}
+            // M1.13a (#66, ADR 0025): the persistent hook-policy disclosure banner.
+            // Keyed on `session.get()` purely as the reactive trigger (the same
+            // resource `needs_sign_in` reads above) — `hook_policy_banner_visible`
+            // itself is a plain, non-reactive read of session_state, matching that
+            // module's own documented posture that these per-tab facts are fixed
+            // once `establish_session` resolves. Renders nothing until then, so the
+            // banner never flashes on with a stale default before the real session
+            // state is known.
+            {move || {
+                session
+                    .get()
+                    .map(|_| hook_policy_banner_view(session_state::hook_policy_banner_visible()))
+            }}
             // M1.11 (#64): in-flight writes and their outcomes. Mounted in the shell,
             // not the canvas, so it keeps reporting across the epoch bump a completed
             // write triggers — and so a failure is dismissible app state rather than a

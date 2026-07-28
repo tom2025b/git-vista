@@ -55,6 +55,10 @@ mod detail;
 mod dialogs;
 #[cfg(target_arch = "wasm32")]
 mod gestures;
+// M1.13a (#66, ADR 0025): the persistent disclosure banner shown while
+// SECURITY_MODEL.md:236's hook policy is `Allow` for this session.
+#[cfg(target_arch = "wasm32")]
+mod hook_policy_banner;
 #[cfg(target_arch = "wasm32")]
 mod menu;
 // The repo picker + Visualize/Active mode screens (ADR 0006/0009).

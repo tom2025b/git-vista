@@ -9,15 +9,20 @@
 //! real state (before the first graph loads) and is *not* the same as Visualize. Collapsing
 //! it to a default would silently start refusing writes that the old code allowed.
 
-use git_vista_protocol::RepoMode;
+use git_vista_protocol::{HookPolicy, RepoMode};
 
 use crate::features::core_traits::{Applied, FeatureCore};
 
+/// `#[derive(Default)]` gives `hook_policy: HookPolicy::default()`, which is
+/// `Restricted` (`git-vista-protocol`'s own fail-closed choice) — the right
+/// answer before the first `Established` event: err conservative rather
+/// than assume permissive.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SessionCore {
     csrf: Option<String>,
     via_lan: bool,
     ui_mode: Option<RepoMode>,
+    hook_policy: HookPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +31,7 @@ pub enum SessionEvent {
     Established {
         csrf: Option<String>,
         via_lan: bool,
+        hook_policy: HookPolicy,
     },
     /// The server told us what mode it believes is live (mirrors a loaded Frame).
     UiModeObserved(Option<RepoMode>),
@@ -50,6 +56,22 @@ impl SessionCore {
         self.via_lan
     }
 
+    /// The current hook policy (M1.13a, #66, ADR 0025) — **disclosed, not yet
+    /// enforced**; see `git_vista_protocol::HookPolicy`'s own doc comment.
+    pub fn hook_policy(&self) -> HookPolicy {
+        self.hook_policy
+    }
+
+    /// Whether the persistent hook-policy banner
+    /// (`crate::hook_policy_banner`) should show for this session's current
+    /// policy. Pure, so it's tested here on the host rather than only
+    /// visually — `hook_policy_banner.rs` is wasm32-gated (it imports
+    /// Leptos) and carries no test of its own, matching this crate's
+    /// existing view-file convention.
+    pub fn hook_policy_banner_visible(&self) -> bool {
+        matches!(self.hook_policy, HookPolicy::Allow)
+    }
+
     pub fn ui_mode(&self) -> Option<RepoMode> {
         self.ui_mode
     }
@@ -68,12 +90,17 @@ impl FeatureCore for SessionCore {
 
     fn apply(&mut self, ev: SessionEvent) -> Result<Applied, SessionRejection> {
         match ev {
-            SessionEvent::Established { csrf, via_lan } => {
-                if self.csrf == csrf && self.via_lan == via_lan {
+            SessionEvent::Established {
+                csrf,
+                via_lan,
+                hook_policy,
+            } => {
+                if self.csrf == csrf && self.via_lan == via_lan && self.hook_policy == hook_policy {
                     return Ok(Applied::NoChange);
                 }
                 self.csrf = csrf;
                 self.via_lan = via_lan;
+                self.hook_policy = hook_policy;
                 Ok(Applied::Committed)
             }
             SessionEvent::UiModeObserved(m) => {
@@ -114,6 +141,11 @@ mod tests {
         s.apply(SessionEvent::Established {
             csrf: Some("abc".into()),
             via_lan,
+            hook_policy: if via_lan {
+                HookPolicy::Restricted
+            } else {
+                HookPolicy::Allow
+            },
         })
         .expect("establish is always accepted");
         s
@@ -125,6 +157,42 @@ mod tests {
         assert_eq!(s.csrf_token(), None);
         assert!(!s.is_lan());
         assert_eq!(s.ui_mode(), None);
+        // Fail-closed default, before any Established event — see this
+        // struct's own doc comment.
+        assert_eq!(s.hook_policy(), HookPolicy::Restricted);
+    }
+
+    #[test]
+    fn establishing_a_session_records_the_hook_policy() {
+        assert_eq!(established(false).hook_policy(), HookPolicy::Allow);
+        assert_eq!(established(true).hook_policy(), HookPolicy::Restricted);
+    }
+
+    #[test]
+    fn the_banner_shows_only_for_allow() {
+        assert!(established(false).hook_policy_banner_visible());
+        assert!(!established(true).hook_policy_banner_visible());
+        // The fail-closed default (Restricted) also shows no banner — a
+        // fresh, not-yet-established session should not flash a warning
+        // it hasn't actually confirmed.
+        assert!(!SessionCore::default().hook_policy_banner_visible());
+    }
+
+    /// A change in `hook_policy` alone (everything else identical) must still
+    /// be reported as a real change — this is exactly the kind of field a
+    /// three-way `&&` comparison could silently forget to include.
+    #[test]
+    fn a_hook_policy_change_alone_is_reported_as_a_change() {
+        let mut s = established(false);
+        let applied = s
+            .apply(SessionEvent::Established {
+                csrf: Some("abc".into()),
+                via_lan: false,
+                hook_policy: HookPolicy::Restricted,
+            })
+            .unwrap();
+        assert_eq!(applied, Applied::Committed);
+        assert_eq!(s.hook_policy(), HookPolicy::Restricted);
     }
 
     #[test]
@@ -202,6 +270,7 @@ mod tests {
             .apply(SessionEvent::Established {
                 csrf: Some("abc".into()),
                 via_lan: false,
+                hook_policy: HookPolicy::Allow,
             })
             .unwrap();
         assert_eq!(applied, Applied::NoChange);
