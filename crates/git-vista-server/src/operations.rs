@@ -185,6 +185,34 @@ pub(crate) struct OperationHandle {
 }
 
 impl OperationHandle {
+    /// What [`finish`](Self::finish) would record, computed without
+    /// publishing it.
+    ///
+    /// **Exists so a caller can persist the terminal state durably before
+    /// anyone can observe the operation is done — see issue #158.**
+    /// `finish` publishes through a `watch` channel, which is exactly what
+    /// unblocks every `wait_terminal` waiter, including the request that owns
+    /// this operation. If the durable-journal write for the terminal state
+    /// happens *after* `finish`, a waiter can resume on another worker thread
+    /// and act on "the operation is done" — including, in the lifecycle
+    /// tests, immediately calling `crate::durable::recover()` — before that
+    /// write has landed. `recover()` cannot tell "hasn't been journaled yet"
+    /// from "orphaned by a crash" and force-fails whatever it finds
+    /// non-terminal, so the still-mid-flight row gets marked `Failed` even
+    /// though the operation genuinely succeeded. Computing the terminal value
+    /// here, persisting it, and only then calling `finish` closes that
+    /// window: nothing can observe "done" before the durable write is real.
+    pub(crate) fn terminal_status(
+        &self,
+        status: StatusCode,
+        message: &str,
+        generation: Option<GenerationToken>,
+    ) -> OperationStatus {
+        let mut s = self.record.status();
+        apply_terminal(&mut s, status, message.to_string(), generation);
+        s
+    }
+
     /// Record the terminal result: the response to replay, plus the
     /// post-execution generation.
     ///
@@ -202,20 +230,32 @@ impl OperationHandle {
         generation: Option<GenerationToken>,
     ) {
         self.finished = true;
-        let state = if status.is_success() {
-            OperationState::Succeeded
-        } else {
-            OperationState::Failed
-        };
-        self.record.status.send_modify(|s| {
-            s.state = state;
-            s.stage = OperationStage::Finished;
-            s.status = Some(status.as_u16());
-            s.message = Some(message);
-            s.generation = generation;
-            s.ended_at = Some(UnixSeconds(crate::activity::now_secs()));
-        });
+        self.record
+            .status
+            .send_modify(|s| apply_terminal(s, status, message, generation));
     }
+}
+
+/// The one place that knows what "finished" means for an [`OperationStatus`]:
+/// shared by [`OperationHandle::finish`] (which publishes it) and
+/// [`OperationHandle::terminal_status`] (which only computes it), so the two
+/// can never drift apart.
+fn apply_terminal(
+    s: &mut OperationStatus,
+    status: StatusCode,
+    message: String,
+    generation: Option<GenerationToken>,
+) {
+    s.state = if status.is_success() {
+        OperationState::Succeeded
+    } else {
+        OperationState::Failed
+    };
+    s.stage = OperationStage::Finished;
+    s.status = Some(status.as_u16());
+    s.message = Some(message);
+    s.generation = generation;
+    s.ended_at = Some(UnixSeconds(crate::activity::now_secs()));
 }
 
 impl Drop for OperationHandle {
