@@ -4,8 +4,14 @@ Status: proposed for V2
 
 Git-Vista is local-first and primarily single-user, but it controls real Git
 repositories and can execute destructive operations. "Only for me" reduces the
-identity problem; it does not remove browser-origin attacks, hostile repositories,
-stale tabs, malicious LAN clients, credential leakage, or command races.
+identity problem; it does not remove browser-origin attacks, stale tabs, malicious
+LAN clients, credential leakage, or command races. Repository *content* is also
+untrusted input: names, messages, refs and paths are treated as hostile and are
+validated. Repository *code* — hooks, filters, and any config key that names an
+executable — is a different matter. Git-Vista runs it under bounded, irreversible
+kernel restrictions that substantially reduce filesystem, IPC, network and lifetime
+authority, and it reports which policy is in force. It does not claim isolation from
+a same-uid adversary, and it cannot: see Known Non-Goals.
 
 ## Security Objectives
 
@@ -365,7 +371,10 @@ contents.
 ## Known Non-Goals
 
 - Protecting a repository from its own Unix account owner.
-- Sandboxing arbitrary Git hooks in Local mode.
+- **Fully** sandboxing arbitrary Git hooks in Local mode. Hooks run under a
+  bounded, disclosed policy (ADR 0025); a same-uid adversary with access to a
+  root-owned daemon socket, or to a writable file some outside process treats
+  as instructions, is out of scope.
 - Providing tenant isolation in V2.
 - Making remote force-push universally undoable.
 - Securing plain HTTP LAN mode; it should not exist as a supported write mode.
