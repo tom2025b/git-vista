@@ -151,6 +151,102 @@ pub struct ParsedPatch {
     pub files: Vec<FileDiff>,
 }
 
+/// An explicit diff source/target pair (M2.16, #69b) — the closed vocabulary
+/// of the four diff modes #69 requires: *"Add worktree, index, commit, and
+/// ref diff modes ... diff source and target are explicit."*
+///
+/// **New type, nothing consumes it yet.** No server endpoint accepts a
+/// `DiffSpec` today and no argv this maps to is ever spawned by this task —
+/// [`diff_spec_argv`] is a pure mapping, host-testable, that a later slice
+/// (an endpoint sub-task, then #69e wiring the diff view onto #65's shell)
+/// will call. Same posture #69a's `ParsedPatch` took relative to
+/// `CommitDiff.patch`, and #68a's `WorktreeStatus` took before #68b's parser
+/// and #68c's endpoint existed.
+///
+/// Internally tagged on `"mode"`, `snake_case` variant names — matching
+/// [`FileDiff`]'s and [`crate::StatusEntry`]'s wire shape.
+///
+/// ## Why `CommitVsCommit` and `RefVsRef` are two variants, not one
+///
+/// Both produce the identical `git diff <a> <b>` argv — [`diff_spec_argv`]'s
+/// match arms for them are byte-identical. They are still modelled as two
+/// wire variants rather than collapsed into one, because the argv is not the
+/// only thing a consumer needs: #69's acceptance criterion is "diff source
+/// and target are **explicit**", and a UI showing a diff between two
+/// arbitrary commit ids reads completely differently from one showing a diff
+/// between two named branches or tags (a Commit picker vs. a Ref picker; a
+/// commit-vs-commit diff is meaningful even after `RefVsRef`'s refs move,
+/// while a `RefVsRef` diff's whole point is that it re-resolves live). A
+/// caller collapsing the two would have to re-derive "was this pinned or
+/// live?" from the strings themselves — exactly the un-modelled ambiguity
+/// this type exists to remove. Keeping them separate costs nothing (the
+/// [`CommitOid`](crate::plan::CommitOid) and [`RefName`](crate::plan::RefName)
+/// newtypes already validate differently — a commit id is fixed-length hex,
+/// a ref name is not) and documents the caller's intent in the wire shape
+/// itself.
+///
+/// ## Why `IndexVsCommit`'s commit is always required, never implicit HEAD
+///
+/// `git diff --cached` with no commit argument diffs the index against HEAD
+/// implicitly. This type never emits that bare form — [`IndexVsCommit`]
+/// always carries an explicit [`CommitOid`], even when a caller wants "index
+/// vs HEAD" (they resolve HEAD's oid themselves and pass it). An implicit
+/// HEAD default is exactly the un-explicit shape #69's own acceptance
+/// criterion rules out.
+///
+/// [`IndexVsCommit`]: DiffSpec::IndexVsCommit
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum DiffSpec {
+    /// Uncommitted working-tree edits against the index — `git diff` with no
+    /// ref arguments. Verified against a real repo before writing this: `git
+    /// diff` (bare) is worktree-vs-index, and `git diff --cached` is the
+    /// other direction — easy to invert, checked rather than assumed.
+    WorktreeVsIndex,
+    /// Staged changes against an explicit commit — `git diff --cached
+    /// <commit>`. `commit` is never omitted (see the module doc above).
+    IndexVsCommit { commit: crate::plan::CommitOid },
+    /// Two pinned commits — `git diff <base> <target>`. Meaningful even after
+    /// any ref that once pointed at either commit has moved.
+    CommitVsCommit {
+        base: crate::plan::CommitOid,
+        target: crate::plan::CommitOid,
+    },
+    /// Two refs (branches or tags) — `git diff <base> <target>`, resolved
+    /// live by git at spawn time. Distinct from `CommitVsCommit` even though
+    /// the argv is identical (see the module doc above for why).
+    RefVsRef {
+        base: crate::plan::RefName,
+        target: crate::plan::RefName,
+    },
+}
+
+/// The `git diff` argv for a [`DiffSpec`] — pure, no process spawn. Matches
+/// `git_vista_core::diff::diff_argv`'s existing return shape (`Vec<String>`,
+/// argument order git expects, no leading `"git"`).
+pub fn diff_spec_argv(spec: &DiffSpec) -> Vec<String> {
+    match spec {
+        DiffSpec::WorktreeVsIndex => vec!["diff".to_string()],
+        DiffSpec::IndexVsCommit { commit } => vec![
+            "diff".to_string(),
+            "--cached".to_string(),
+            commit.as_str().to_string(),
+        ],
+        DiffSpec::CommitVsCommit { base, target } => {
+            vec![
+                "diff".to_string(),
+                base.as_str().to_string(),
+                target.as_str().to_string(),
+            ]
+        }
+        DiffSpec::RefVsRef { base, target } => vec![
+            "diff".to_string(),
+            base.as_str().to_string(),
+            target.as_str().to_string(),
+        ],
+    }
+}
+
 /// Parse the complete unified-diff text of `git show --patch --no-color` (or
 /// equivalent) into a [`ParsedPatch`].
 ///
@@ -711,5 +807,88 @@ index c2f2e5e,5909b84..084d8dd
     #[test]
     fn empty_patch_has_no_files() {
         assert_eq!(parse_unified_diff(""), ParsedPatch { files: vec![] });
+    }
+
+    fn oid(hex40: &str) -> crate::plan::CommitOid {
+        crate::plan::CommitOid::new(hex40).unwrap()
+    }
+
+    fn refname(name: &str) -> crate::plan::RefName {
+        crate::plan::RefName::new(name).unwrap()
+    }
+
+    // Verified against a real repo (see pro-result.md) before writing this:
+    // `git diff` with no ref arguments is worktree-vs-index, not the other
+    // direction — the single most common inversion bug in code wrapping this.
+    #[test]
+    fn worktree_vs_index_is_bare_git_diff() {
+        assert_eq!(diff_spec_argv(&DiffSpec::WorktreeVsIndex), vec!["diff"]);
+    }
+
+    #[test]
+    fn index_vs_commit_is_cached_with_an_explicit_commit_never_bare() {
+        let commit = oid(&"a".repeat(40));
+        let argv = diff_spec_argv(&DiffSpec::IndexVsCommit {
+            commit: commit.clone(),
+        });
+        assert_eq!(argv, vec!["diff", "--cached", commit.as_str()]);
+    }
+
+    #[test]
+    fn commit_vs_commit_is_diff_base_target() {
+        let base = oid(&"a".repeat(40));
+        let target = oid(&"b".repeat(40));
+        let argv = diff_spec_argv(&DiffSpec::CommitVsCommit {
+            base: base.clone(),
+            target: target.clone(),
+        });
+        assert_eq!(argv, vec!["diff", base.as_str(), target.as_str()]);
+    }
+
+    #[test]
+    fn ref_vs_ref_is_diff_base_target() {
+        let base = refname("main");
+        let target = refname("feature/x");
+        let argv = diff_spec_argv(&DiffSpec::RefVsRef {
+            base: base.clone(),
+            target: target.clone(),
+        });
+        assert_eq!(argv, vec!["diff", base.as_str(), target.as_str()]);
+    }
+
+    // commit_vs_commit and ref_vs_ref produce byte-identical argv on purpose
+    // (see the module doc) — pin that equivalence explicitly so a future
+    // change to one arm that silently diverges from the other is caught.
+    #[test]
+    fn commit_vs_commit_and_ref_vs_ref_argv_shapes_match() {
+        let a = oid(&"a".repeat(40));
+        let b = oid(&"b".repeat(40));
+        let commit_argv = diff_spec_argv(&DiffSpec::CommitVsCommit {
+            base: a.clone(),
+            target: b.clone(),
+        });
+
+        let base_ref = refname("main");
+        let target_ref = refname("feature/x");
+        let ref_argv = diff_spec_argv(&DiffSpec::RefVsRef {
+            base: base_ref,
+            target: target_ref,
+        });
+
+        assert_eq!(commit_argv[0], ref_argv[0]);
+        assert_eq!(commit_argv.len(), ref_argv.len());
+    }
+
+    #[test]
+    fn diff_spec_wire_shape_is_tagged_on_mode() {
+        let value = serde_json::to_value(DiffSpec::WorktreeVsIndex).unwrap();
+        assert_eq!(value["mode"], "worktree_vs_index");
+
+        let value = serde_json::to_value(DiffSpec::IndexVsCommit {
+            commit: oid(&"a".repeat(40)),
+        })
+        .unwrap();
+        assert_eq!(value["mode"], "index_vs_commit");
+        assert_eq!(value["commit"], "a".repeat(40));
     }
 }

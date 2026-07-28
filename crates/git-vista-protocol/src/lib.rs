@@ -24,7 +24,10 @@
 //! - [`diff`]    — [`ParsedPatch`] (M2.16, #69a): unified-diff text parsed
 //!   into files → hunks → lines with old/new line numbers, as a closed
 //!   [`FileDiff`] vocabulary (ordinary edit, mode-change-only, binary, pure
-//!   rename/copy, combined merge diff).
+//!   rename/copy, combined merge diff). [`DiffSpec`] (M2.16, #69b): the four
+//!   diff modes (worktree-vs-index, index-vs-commit, commit-vs-commit,
+//!   ref-vs-ref) as an explicit, closed source/target vocabulary, plus the
+//!   pure [`diff_spec_argv`] mapping to `git diff`'s argv.
 //! - [`newtype`] — the validating-newtype machinery the three above share, so
 //!   every string-shaped wire value is checked in exactly one place.
 //!
@@ -63,7 +66,9 @@ pub mod plan;
 pub mod status;
 pub mod version;
 
-pub use diff::{parse_unified_diff, DiffLine, FileDiff, Hunk, LineKind, ParsedPatch};
+pub use diff::{
+    diff_spec_argv, parse_unified_diff, DiffLine, DiffSpec, FileDiff, Hunk, LineKind, ParsedPatch,
+};
 pub use dto::{
     validate_clone_url, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
     DeleteCloneRequest, HookPolicy, RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind,
