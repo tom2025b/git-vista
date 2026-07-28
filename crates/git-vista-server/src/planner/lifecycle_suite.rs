@@ -327,9 +327,22 @@ async fn a_finished_operation_is_durable_by_the_time_the_request_returns() {
 /// `Failed` by [`crate::durable::recover`], and rehydrating it makes it
 /// fetchable again through the ordinary registry lookup, exactly as if the
 /// server had never restarted.
+///
+/// Runs against [`crate::durable::open_private`], not the shared journal
+/// (issue #158): this test's whole point is to seed a fake orphaned row and
+/// prove `recover`'s close-out sweep, but that sweep has no way to tell a
+/// genuine orphan from another concurrently-running test's operation that is
+/// simply still executing — every test in this binary shares one journal.
+/// Calling the real, shared-journal `recover` here would risk marking some
+/// other, real, in-flight test's row `Failed` too, which is exactly what made
+/// `a_finished_operation_is_durable_by_the_time_the_request_returns` flaky. A
+/// private connection makes that collision structurally impossible without
+/// weakening what's under test — the assertions below only look at the row
+/// this test itself seeded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_row_left_running_recovers_as_failed_and_is_rehydrated_into_the_registry() {
     let (_dir, repo) = seeded_repo();
+    let conn = crate::durable::open_private();
     let k = key("crash-recovery");
     let id = OperationId::new("crash-recovery-op").unwrap();
     let hash = operation_hash(&commit("never finished"));
@@ -349,9 +362,9 @@ async fn a_row_left_running_recovers_as_failed_and_is_rehydrated_into_the_regist
         generation: None,
         recovery: None,
     };
-    crate::durable::persist(k.clone(), mid_flight).await;
+    crate::durable::persist_to(conn, k.clone(), mid_flight).await;
 
-    let recovered = crate::durable::recover().await;
+    let recovered = crate::durable::recover_from(conn).await;
     let (recovered_key, recovered_status) = recovered
         .into_iter()
         .find(|(_, s)| s.id == id)
