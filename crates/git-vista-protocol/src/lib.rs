@@ -66,8 +66,8 @@ pub mod version;
 pub use diff::{parse_unified_diff, DiffLine, FileDiff, Hunk, LineKind, ParsedPatch};
 pub use dto::{
     validate_clone_url, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
-    DeleteCloneRequest, RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind,
-    SelectRequest, SessionInfo, SessionRequest,
+    DeleteCloneRequest, HookPolicy, RebaseStatus, RepoMode, RepositoryDescriptor,
+    RepositoryKind, SelectRequest, SessionInfo, SessionRequest,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use history::{HistoryFrame, HistoryPage};
