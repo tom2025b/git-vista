@@ -102,6 +102,10 @@ impl From<rusqlite::Error> for DurableError {
 
 static DB: OnceLock<StdMutex<Connection>> = OnceLock::new();
 
+/// Serializes the *opening* of [`DB`], closing the race [`db`]'s old comment
+/// dismissed as harmless. See [`db`] for why it wasn't.
+static DB_INIT: StdMutex<()> = StdMutex::new(());
+
 /// Open (creating and migrating if needed) the journal at `path`. Split from
 /// the process-wide [`DB`] singleton so a test can point this at a throwaway
 /// file instead of the real one.
@@ -146,15 +150,114 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 /// inside `spawn_blocking` closures — the same "never across an await"
 /// discipline [`crate::coordinator`] and [`crate::operations`] follow, just
 /// with `rusqlite::Connection` (which is `Send`, not `Sync`) in the slot.
+///
+/// **Root cause of #158.** This used to read `DB.get().is_none()` and, if so,
+/// call `open_at` unconditionally — on the stated assumption that "opening
+/// twice on a race is harmless (both succeed, one is discarded)". That's
+/// false: `open_at` calls `migrate`, which runs `CREATE TABLE` against the
+/// on-disk file (`db_path()` is one file shared by every test in this binary,
+/// same as it's one file per server process in production). Two threads that
+/// both observe `DB.get().is_none()` before either has finished migrating
+/// race two *separate* `rusqlite::Connection`s against that same file; SQLite
+/// allows only one writer, so the loser's `CREATE TABLE` — or, once the
+/// winner has committed, the loser's own first statement on its still-live
+/// but now-stale connection — returns `SQLITE_BUSY` ("database is locked").
+/// `persist()` treats that as a best-effort failure and only logs it, so the
+/// operation itself proceeds and finishes normally in memory, but its journal
+/// row is left stuck in a non-terminal state. The next call to [`recover`] —
+/// which assumes any non-terminal row is an orphan from a crashed process —
+/// then correctly-by-its-own-rules but wrongly-in-fact marks that row
+/// `Failed`, even though the operation actually succeeded. That is exactly
+/// the `left: Failed, right: Succeeded` assertion in
+/// `lifecycle_suite::a_finished_operation_is_durable_by_the_time_the_request_returns`:
+/// not a read-too-early bug, a real terminal state — just one written by a
+/// journal-write failure this function's old init race made possible.
+///
+/// `DB_INIT` fixes this with plain double-checked locking: only the thread
+/// holding `DB_INIT` ever calls `open_at`, so `migrate` runs against the file
+/// exactly once, and every other thread either finds `DB` already set (fast
+/// path, no lock contention after startup) or blocks on `DB_INIT` until the
+/// first opener finishes and then reads the same, single, fully-migrated
+/// connection. `OnceLock::get_or_try_init` would fit better once stable —
+/// this is the workaround, not a preference.
 fn db() -> Result<&'static StdMutex<Connection>, DurableError> {
-    // `OnceLock::get_or_try_init` would fit better, but is not yet stable;
-    // opening twice on a race is harmless (both succeed, one is discarded) and
-    // this runs at most a handful of times per process, all near startup.
     if DB.get().is_none() {
-        let conn = open_at(&db_path())?;
-        let _ = DB.set(StdMutex::new(conn));
+        let _init_guard = DB_INIT.lock().expect("db init lock");
+        // Re-check with the init lock held: another thread may have finished
+        // opening while this one was waiting for the lock, in which case
+        // opening again here would be exactly the race this guards against.
+        if DB.get().is_none() {
+            let conn = open_at(&db_path())?;
+            let _ = DB.set(StdMutex::new(conn));
+        }
     }
     Ok(DB.get().expect("just initialized above"))
+}
+
+/// A fresh, private, fully-migrated journal — a distinct file, distinct
+/// connection, not the shared process-wide [`DB`].
+///
+/// For a test whose job is to fabricate a "crashed process" row and prove
+/// [`recover`]'s close-out logic, not to exercise the shared journal itself.
+/// [`recover`] cannot tell a genuinely orphaned row from another test's
+/// operation that is simply still running (see its own doc comment); every
+/// test in this binary shares one `DB`, so calling the real [`persist`] /
+/// [`recover`] to seed and then sweep a synthetic row risks marking some
+/// other, real, concurrently in-flight test's row `Failed` too — which is
+/// what issue #158 actually was. Pair with [`persist_to`] / [`recover_from`].
+///
+/// Leaks its `TempDir` and its `Connection` deliberately: this returns
+/// `&'static` for the same reason `DB` is `'static` (spawned onto
+/// `spawn_blocking`, which requires it), the directory only needs to live as
+/// long as the test process does, and nothing has to clean it up any more
+/// than [`db_path`]'s shared `TEST_DB_DIR` does.
+#[cfg(test)]
+pub(crate) fn open_private() -> &'static StdMutex<Connection> {
+    let dir = tempfile::tempdir().expect("a throwaway dir for an isolated test journal connection");
+    let path = dir.path().join("operations.sqlite3");
+    let conn = open_at(&path).expect("a fresh, isolated journal opens cleanly");
+    std::mem::forget(dir);
+    Box::leak(Box::new(StdMutex::new(conn)))
+}
+
+/// [`persist`], against an explicit connection (typically from
+/// [`open_private`]) instead of the shared journal.
+#[cfg(test)]
+pub(crate) async fn persist_to(
+    conn: &'static StdMutex<Connection>,
+    key: IdempotencyKey,
+    status: OperationStatus,
+) {
+    let kind = redact_operation(&status.operation);
+    let result = tokio::task::spawn_blocking(move || persist_blocking(conn, &key, &status)).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!(
+            "git-vista: couldn't persist operation ({kind}) to an isolated test journal: {e}"
+        ),
+        Err(e) => eprintln!("git-vista: the journal write task ({kind}) panicked: {e}"),
+    }
+}
+
+/// [`recover`], against an explicit connection (typically from
+/// [`open_private`]) instead of the shared journal — safe to call mid-suite
+/// precisely because nothing else can be writing to a private connection.
+#[cfg(test)]
+pub(crate) async fn recover_from(
+    conn: &'static StdMutex<Connection>,
+) -> Vec<(IdempotencyKey, OperationStatus)> {
+    let loaded = tokio::task::spawn_blocking(move || recover_blocking(conn)).await;
+    match loaded {
+        Ok(Ok(records)) => records,
+        Ok(Err(e)) => {
+            eprintln!("git-vista: couldn't open the isolated test journal: {e}");
+            Vec::new()
+        }
+        Err(e) => {
+            eprintln!("git-vista: the isolated-journal recovery task panicked: {e}");
+            Vec::new()
+        }
+    }
 }
 
 /// The database this process writes to. In production this is the real,
@@ -198,7 +301,7 @@ pub(crate) async fn persist(key: IdempotencyKey, status: OperationStatus) {
     // below, the log line names what kind of operation failed to journal
     // without the free text (a commit message, say) it might carry.
     let kind = redact_operation(&status.operation);
-    let result = tokio::task::spawn_blocking(move || persist_blocking(&key, &status)).await;
+    let result = tokio::task::spawn_blocking(move || persist_blocking(db()?, &key, &status)).await;
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -208,8 +311,14 @@ pub(crate) async fn persist(key: IdempotencyKey, status: OperationStatus) {
     }
 }
 
-fn persist_blocking(key: &IdempotencyKey, status: &OperationStatus) -> Result<(), DurableError> {
-    let conn = db()?;
+/// Takes the connection explicitly (rather than calling [`db`] itself) so a
+/// caller can supply an isolated connection instead of the process-wide
+/// singleton — see [`open_private`] for why that matters.
+fn persist_blocking(
+    conn: &'static StdMutex<Connection>,
+    key: &IdempotencyKey,
+    status: &OperationStatus,
+) -> Result<(), DurableError> {
     let conn = conn.lock().expect("operations db lock");
     insert_or_update(&conn, key, status)?;
     Ok(())
@@ -361,8 +470,19 @@ fn parse_stage(s: &str) -> Option<OperationStage> {
 /// (corrupt file, unknown schema version) is logged and the server starts with
 /// an empty operation history rather than refusing to start at all — the
 /// journal is a recovery aid, not a prerequisite for serving repositories.
+///
+/// **This is a startup-only operation.** It has no way to distinguish "a row
+/// left non-terminal by a process that crashed" from "a row that is
+/// non-terminal because the operation is still genuinely running right now" —
+/// that distinction only holds if nothing is running yet, which is true at
+/// process start (see `main.rs`, the sole production caller) and is *not*
+/// true if this is called against a connection anything else might be
+/// concurrently writing to. Do not call this against the shared journal from
+/// a test or any other code path where operations may be in flight — use
+/// [`open_private`] plus [`recover_from`] for that instead of this function;
+/// this was the actual root cause of issue #158.
 pub(crate) async fn recover() -> Vec<(IdempotencyKey, OperationStatus)> {
-    let loaded = tokio::task::spawn_blocking(recover_blocking).await;
+    let loaded = tokio::task::spawn_blocking(|| recover_blocking(db()?)).await;
     match loaded {
         Ok(Ok(records)) => records,
         Ok(Err(e)) => {
@@ -376,8 +496,12 @@ pub(crate) async fn recover() -> Vec<(IdempotencyKey, OperationStatus)> {
     }
 }
 
-fn recover_blocking() -> Result<Vec<(IdempotencyKey, OperationStatus)>, DurableError> {
-    let conn = db()?;
+/// Takes the connection explicitly (rather than calling [`db`] itself) so a
+/// caller can supply an isolated connection instead of the process-wide
+/// singleton — see [`open_private`].
+fn recover_blocking(
+    conn: &'static StdMutex<Connection>,
+) -> Result<Vec<(IdempotencyKey, OperationStatus)>, DurableError> {
     let conn = conn.lock().expect("operations db lock");
     let mut records = load_all_blocking(&conn)?;
     let now = crate::activity::now_secs();
