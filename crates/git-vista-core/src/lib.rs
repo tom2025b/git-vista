@@ -16,6 +16,9 @@
 //! - [`activity`] — activity-feed types, reflog-message parsing, feed assembly.
 //! - [`net`]      — user-facing wording for network-level fetch failures.
 //! - [`seed`]     — test-repo seed parsing + reset planning ("Reset Test Repo").
+//! - [`virtualize`] — the windowed-list primitive (M2.16, #69c): item heights
+//!   and a scroll offset in, the visible render range out. Knows nothing
+//!   about diffs or the commit graph, so both can share it.
 //!
 //! Reading real history (which needs `gix` and a filesystem, and so can't run in
 //! a browser) lives in the separate native-only `git-vista-git` crate. Keeping
@@ -31,3 +34,4 @@ pub mod model;
 pub mod net;
 pub mod seed;
 pub mod status;
+pub mod virtualize;
