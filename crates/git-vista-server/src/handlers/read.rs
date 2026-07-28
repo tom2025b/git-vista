@@ -1024,7 +1024,8 @@ mod tests {
     use git_vista_core::layout::stream::canonicalize_edges;
     use git_vista_core::model::CommitSummary;
     use git_vista_protocol::{
-        ApiError, ErrorCode, RepositoryDescriptor, PROTOCOL_HEADER, PROTOCOL_VERSION,
+        ApiError, ChangeKind, ChangeSides, ErrorCode, RepositoryDescriptor, StatusEntry,
+        PROTOCOL_HEADER, PROTOCOL_VERSION,
     };
     use tower::ServiceExt;
 
