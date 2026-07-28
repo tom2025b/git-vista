@@ -274,21 +274,41 @@ jobs:
   # ---------------------------------------------------------------------------
   # 6. Secret scanning (#67 M1.14): gitleaks over the full commit history.
   #
-  # Pinned to a full commit SHA (not a floating `@v3` tag) — a supply-chain
-  # hole in the one job whose purpose is catching exactly that class of
-  # problem would defeat the point. `fetch-depth: 0` so gitleaks sees the
-  # whole history, not just the PR diff; this repo is small (a few thousand
-  # objects), so the full scan is cheap.
+  # Runs the gitleaks binary directly rather than gitleaks/gitleaks-action:
+  # the action scopes each run to the triggering event's own commits (one
+  # commit on a one-commit PR), which is silently NOT a full-history scan
+  # despite `fetch-depth: 0` — confirmed by running both side by side before
+  # picking this approach. `gitleaks detect` with no `--log-opts` scans the
+  # whole repo history by default, which is what "full history, since it's
+  # cheap" actually requires. The binary is downloaded from a specific
+  # release tag and its SHA-256 verified before use, rather than trusting a
+  # floating action tag — a supply-chain hole in the one job whose purpose is
+  # catching exactly that class of problem would defeat the point.
+  #
+  # `fetch-depth: 0` so the full history actually exists to scan; this repo
+  # is small (a few thousand objects, low single-digit MB), so a full scan
+  # costs single-digit seconds.
   # ---------------------------------------------------------------------------
   secrets:
     name: Secret scanning (gitleaks)
     runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # gitleaks/gitleaks-action, tag v3.0.0, pinned to its release commit.
-      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install gitleaks (pinned, checksum-verified)
+        run: |
+          curl -sSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version
+
+      # No --log-opts: this is a genuine full-history scan, not an event
+      # diff. --exit-code 1 (gitleaks' default) fails the job on any finding.
+      - name: gitleaks (full history)
+        run: ./gitleaks detect --source . --verbose --exit-code 1
