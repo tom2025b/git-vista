@@ -926,6 +926,95 @@ pub(crate) async fn worktree_status(
     Ok((no_store, Json(parsed)))
 }
 
+/// Upper bound on `git status --porcelain=v2 --branch -z`'s stdout. A cap hit
+/// here is a `413`, never a best-effort parse (see [`worktree_status_v2_for_repo`]'s
+/// doc comment for why) — 8 MiB is the same fail-safe ceiling
+/// `git_cmd::DEFAULT_GIT_STDOUT_CAP` uses for callers that haven't reasoned
+/// about size, named locally since that constant is private to `git_cmd`.
+const STATUS_V2_STDOUT_CAP: usize = 8 * 1024 * 1024;
+
+/// `GET /api/status/v2` (#68c): the generation-tagged [`WorktreeStatus`] DTO
+/// (#68a) built by [`parse_porcelain_v2_z`] (#68b) from a live
+/// `git status --porcelain=v2 --branch -z` read. Additive, not a replacement
+/// for [`worktree_status`] — the existing v1 shape stays exactly as it is
+/// (the live frontend depends on it today); migrating to this shape is 68d's
+/// job. Sent `no-store`, same as every other live read in this file.
+pub(crate) async fn worktree_status_v2(
+    Query(q): Query<RepoQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = resolve_repo(q.repo.as_deref())?.0;
+    let status = worktree_status_v2_for_repo(&repo).await?;
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(status)))
+}
+
+/// [`worktree_status_v2`] against an explicit repository — split out for the
+/// same reason as [`commit_diff_for_repo`]/[`file_at_commit_for_repo`]: the
+/// handler's repository comes from the process-wide `CURRENT` selection,
+/// which no test can set.
+///
+/// **A cap hit is refused, not parsed.** Unlike a file read — where a
+/// truncated prefix is still a valid, useful answer — a truncated
+/// porcelain-v2 stream can cut a record in half, and `parse_porcelain_v2_z`
+/// has no way to know that happened: it would either drop the partial last
+/// record (an honest undercount elsewhere in this file's parsers) or, worse,
+/// misparse it into something that looks like a complete but wrong entry.
+/// Serving that as a `200 WorktreeStatus` would be a wrong answer wearing a
+/// success status — the exact failure mode `FILE_CONTENT_CAP`'s "cap hit is a
+/// *success*" design deliberately avoids for file reads by *reporting* the
+/// truncation instead of hiding it. Status has no equivalent partial-content
+/// contract to report through, so refusing outright is the honest choice
+/// until one exists. True large-worktree responsiveness (bounding cost, not
+/// just correctness) is #68e's job, not this one's.
+async fn worktree_status_v2_for_repo(
+    repo: &Path,
+) -> Result<git_vista_protocol::WorktreeStatus, (StatusCode, String)> {
+    let (bytes, truncated) = git_stdout_capped(
+        repo,
+        &[
+            "status".to_string(),
+            "--porcelain=v2".to_string(),
+            "--branch".to_string(),
+            "-z".to_string(),
+        ],
+        "/api/status/v2",
+        STATUS_V2_STDOUT_CAP,
+    )
+    .await?;
+    if truncated {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "worktree status exceeded the read cap".to_string(),
+        ));
+    }
+
+    let parsed = git_vista_protocol::parse_porcelain_v2_z(&bytes);
+
+    // The generation (ADR 0001): HEAD + refs + index from a real repository
+    // read, plus a digest of *these exact bytes* as the worktree slot — so
+    // the generation changes on precisely the tracked/untracked edits this
+    // very read observed, per `status.rs`'s own module doc. `status-v1:` is
+    // the namespace prefix that doc comment already committed to, mirroring
+    // `history.rs`'s `history-v1:` precedent, so a status generation can
+    // never be confused with (or compared against) a history generation.
+    let mut inputs = git_vista_git::read_generation_inputs(repo).map_err(|e| {
+        eprintln!("git-vista: /api/status/v2 couldn't read generation inputs: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    };
+    inputs.worktree(&digest);
+    let generation = inputs.generation();
+    let token = git_vista_protocol::GenerationToken::new(format!("status-v1:{generation}"))
+        .expect("a formatted digest is always non-empty");
+
+    Ok(parsed.into_worktree_status(token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
