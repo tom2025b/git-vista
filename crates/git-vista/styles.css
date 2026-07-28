@@ -51,6 +51,14 @@ html, body {
   border-bottom: 1px solid #21262d;
 }
 
+/* M1.12 (#65): Compact's own wording is "one primary task visible at a time" —
+   tighten the topbar's padding so it takes less permanent vertical space on the
+   narrowest windows, where every pixel of height matters more than on Portrait. */
+.shell-compact .topbar {
+  padding: 0.5rem 0.75rem;
+  gap: 0.5rem;
+}
+
 .topbar h1 { margin: 0; font-size: 1.1rem; color: var(--accent); }
 
 /* The mode badge (ADR 0006): the current repo's Visualize/Active state, worn
@@ -415,6 +423,24 @@ html, body {
   box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
   font-size: 0.85rem;
 }
+
+/* M1.12 (#65): the detail panel's existing fixed-right-edge docking already
+   matches Wide/UltraWide's intent, so those two modes need no override — this
+   confirms the pre-existing default rather than silently relying on it staying
+   correct by accident. Compact/Portrait get the full-width behavior the panel's
+   own comment above already documents ("On a narrow screen it spans the full
+   width so the content stays readable") — made explicit and mode-driven here
+   instead of implicit in a fixed max-width. */
+.shell-wide .detail-panel,
+.shell-ultrawide .detail-panel {
+  width: min(420px, 100vw);
+}
+
+.shell-compact .detail-panel,
+.shell-portrait .detail-panel {
+  width: 100vw;
+}
+
 .detail-head {
   display: flex;
   align-items: center;
