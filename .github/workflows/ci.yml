@@ -10,7 +10,10 @@
 #   1. lint      format + strict native/WASM Clippy + shell syntax
 #   2. core      test + check the pure-logic, git-reading, server, and UI crates
 #   3. contract  the M1.06 write contract (#146): planner pipeline, argv
-#                boundary, staleness gates — its own named check on every PR
+#                boundary, staleness gates — plus, since #67 M1.14, the route-
+#                authorization gate (route_authz): every route main.rs
+#                registers must carry an explicit auth classification. Its own
+#                named check on every PR.
 #   4. frontend  build the real WASM bundle with Trunk
 #   5. audit     cargo-audit over the dependency tree (#67 M1.14): fails on any
 #                advisory, including "unmaintained" warnings, except IDs listed
@@ -106,22 +109,25 @@ jobs:
         run: cargo test -p git-vista-core -p git-vista-git -p git-vista-server -p git-vista
 
   # ---------------------------------------------------------------------------
-  # 3. The M1.06 write contract (#146, parent #59), as its own job so it is a
-  #    distinct named check on every PR: the end-to-end pipeline suite
-  #    (build → validate → execute for every GitOperation kind + the
-  #    single-funnel proof), the #144 argv boundary (tripwire + adversarial
-  #    wire fixtures), and the #145 staleness gates.
+  # 3. The M1.06 write contract (#146, parent #59) plus the #67 M1.14 route-
+  #    authorization gate, as one job so it is a distinct named check on every
+  #    PR: the end-to-end pipeline suite (build → validate → execute for every
+  #    GitOperation kind + the single-funnel proof), the #144 argv boundary
+  #    (tripwire + adversarial wire fixtures), the #145 staleness gates, and
+  #    (route_authz) the structural proof that every route main.rs registers
+  #    carries an explicit authorization classification — see
+  #    crates/git-vista-server/src/route_authz.rs for why that gate exists.
   #
   #    The same tests also run inside the `core` job's full sweep — running on
-  #    every PR is a superset of "PRs touching the planner or a write handler",
-  #    chosen over path filters so the check can never be skipped by a filter
-  #    gap (and a path-filtered required check would hang pending on
-  #    non-matching PRs). This job exists so a contract regression is readable
-  #    at a glance in the checks list, and so the contract stays enforced even
-  #    if the core job's test invocation is ever narrowed.
+  #    every PR is a superset of "PRs touching the planner, a write handler, or
+  #    the route table", chosen over path filters so the check can never be
+  #    skipped by a filter gap (and a path-filtered required check would hang
+  #    pending on non-matching PRs). This job exists so a contract or route-
+  #    authorization regression is readable at a glance in the checks list, and
+  #    stays enforced even if the core job's test invocation is ever narrowed.
   # ---------------------------------------------------------------------------
   contract:
-    name: M1.06 write contract (planner + argv boundary + staleness)
+    name: M1.06 write contract + #67 route authorization (planner + argv boundary + staleness + route authz)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -133,15 +139,15 @@ jobs:
 
       # libtest exits 0 on "0 passed" — a renamed module would turn the filter
       # into a green no-op. The count floor makes silent de-selection loud.
-      - name: Contract suites (with a not-silently-empty floor)
+      - name: Contract + route-authz suites (with a not-silently-empty floor)
         run: |
           set -o pipefail
-          cargo test -p git-vista-server -- contract_suite argv_boundary planner::tests \
+          cargo test -p git-vista-server -- contract_suite argv_boundary planner::tests route_authz \
             | tee contract-tests.log
           passed=$(grep -oE '[0-9]+ passed' contract-tests.log | awk '{s+=$1} END {print s}')
-          echo "contract tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 30 ]; then
-            echo "::error::Contract filter matched too few tests (${passed:-0} < 30) — did a suite module get renamed?"
+          echo "contract + route-authz tests passed: ${passed:-0}"
+          if [ "${passed:-0}" -lt 35 ]; then
+            echo "::error::Contract/route-authz filter matched too few tests (${passed:-0} < 35) — did a suite module get renamed?"
             exit 1
           fi
 
