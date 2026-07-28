@@ -25,14 +25,62 @@
 //! destroyed them. That is also what retires Task 6's deferred step — the signals leave
 //! canvas scope here rather than being moved twice.
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::Duration;
+
 use leptos::{
-    create_rw_signal, store_value, RwSignal, SignalGet, SignalGetUntracked, SignalSet,
-    SignalUpdate, StoredValue,
+    create_rw_signal, on_cleanup, store_value, RwSignal, SignalGet, SignalGetUntracked,
+    SignalSet, SignalUpdate, StoredValue,
 };
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::JsCast;
+
+use crate::gestures;
 
 use crate::features::activity::signals::Activity;
-use crate::features::shell::core::{Overlay, OverlayStack};
+use crate::features::shell::core::{Overlay, OverlayStack, ShellMode};
 use crate::state::{CommitDialog, MenuData, PendingOp, ViewerDoc};
+
+/// Feeds a `ShellMode` signal from window width, debounced 150ms so a Stage
+/// Manager drag doesn't thrash the layout on every intermediate resize event.
+///
+/// Debouncing here means "only the last event in a burst survives" — implemented
+/// with a generation counter rather than a cancellable JS timer handle: each
+/// resize bumps the counter and schedules a check; when that check's timeout
+/// fires, it only applies if no later resize has bumped the counter since. A
+/// stale, superseded timeout is a silent no-op rather than something that has to
+/// be found and cancelled.
+///
+/// No hysteresis: `ShellMode::for_width` never sees the previous mode, only the
+/// current width — see that function's doc comment for why.
+pub fn install_mode_signal() -> RwSignal<ShellMode> {
+    let mode = create_rw_signal(ShellMode::for_width(gestures::viewport_size().0));
+
+    if let Some(win) = web_sys::window() {
+        let generation = Rc::new(Cell::new(0u64));
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let this_generation = generation.get() + 1;
+            generation.set(this_generation);
+            let generation = generation.clone();
+            leptos::set_timeout(
+                move || {
+                    if generation.get() == this_generation {
+                        mode.set(ShellMode::for_width(gestures::viewport_size().0));
+                    }
+                },
+                Duration::from_millis(150),
+            );
+        });
+        let _ = win.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+        let win2 = win.clone();
+        on_cleanup(move || {
+            let _ = win2.remove_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+        });
+    }
+
+    mode
+}
 
 /// Every overlay the app can put on screen, and the order they were raised in.
 ///
