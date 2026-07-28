@@ -30,8 +30,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use leptos::{
-    create_rw_signal, on_cleanup, store_value, RwSignal, SignalGet, SignalGetUntracked,
-    SignalSet, SignalUpdate, StoredValue,
+    create_rw_signal, on_cleanup, store_value, RwSignal, SignalGet, SignalGetUntracked, SignalSet,
+    SignalUpdate, StoredValue,
 };
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
