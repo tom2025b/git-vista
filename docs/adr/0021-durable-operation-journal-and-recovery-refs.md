@@ -84,3 +84,19 @@ posture).
 - New failure mode class (journal write/read errors) is entirely
   non-blocking by design; there is no code path where a durable-layer error
   surfaces to the client.
+- **The durable write now happens *before* the terminal state is published,
+  and that costs latency.** *(Amended 2026-07-28 — #158, PR #160.)* The
+  original implementation called `finish()` first and persisted afterwards,
+  on the reasoning that persistence "adds no latency to what `wait_terminal`
+  is waiting on". That reasoning was wrong in a way that broke this ADR's
+  central promise: `finish()` unblocks every waiter, including the request's
+  own response, so a waiter could observe "done" before the row existed.
+  `recover()` cannot distinguish "not yet journaled" from "orphaned by a
+  crashed process", so its sweep force-failed rows for operations that had
+  genuinely succeeded. The order is now compute (`terminal_status`, read-only)
+  → persist → publish (`finish`). The consequence is deliberate and should not
+  be "optimised" back: **every tracked mutation's response now waits on a
+  SQLite write**, which on a spinning disk is real per-operation latency.
+  Durability before acknowledgement is the point of this ADR; if that cost
+  ever becomes unacceptable, the answer is a faster durable path, not
+  publishing before persisting.
