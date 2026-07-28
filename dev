@@ -16,6 +16,8 @@
 #   dev doctor            diagnose listener/session/tunnel state without secrets
 #   dev serve [path]      start the loopback-only server (delegates to ./gv)
 #   dev handoff           open/print handoff.md (the running "what's done / next" note)
+#   dev report            at-a-glance repo health: branches, merge status, WIP
+#                          commits, lines of code by crate (rex-check pattern)
 #
 # handoff.md is gitignored on purpose (local working note); the DURABLE record is
 # the WIP git commits. Keep handoff.md current as you work so a fresh session — or
@@ -135,6 +137,60 @@ cmd_resume() {
   if [[ -f handoff.md ]]; then cat handoff.md; else echo "  (no handoff.md — create one with the plan + checklist)"; fi
 }
 
+cmd_report() {
+  git fetch -q origin 2>/dev/null || true
+
+  echo "=== git-vista — repo health ==="
+  echo "$(date -Is)"
+  echo
+
+  echo "── branches (origin) ──────────────────────────────"
+  local total merged open
+  total="$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -vc '/HEAD$' || true)"
+  merged="$(git branch -r --merged origin/main | grep -v '\->' | wc -l)"
+  open=$((total - merged))
+  echo "  total:  $total"
+  echo "  merged: $merged"
+  echo "  open:   $open"
+  echo
+
+  echo "── open branches (not yet merged into main) ────────"
+  git branch -r --no-merged origin/main | grep -v '\->' | sed 's/^ */  /'
+  echo
+
+  echo "── WIP / auto-checkpoint commits, all branches ─────"
+  local wips
+  wips="$(git log --all --oneline --grep='^wip(' -i | wc -l)"
+  echo "  $wips total"
+  echo "  by branch:"
+  git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v '/HEAD$' | while read -r b; do
+    c="$(git log "$b" --oneline --grep='^wip(' -i 2>/dev/null | wc -l)"
+    [[ "$c" -gt 0 ]] && printf '    %-55s %s\n' "$b" "$c"
+  done
+  echo
+
+  echo "── lines of Rust, by crate ──────────────────────────"
+  local grand=0
+  for d in crates/*/; do
+    local name n
+    name="$(basename "$d")"
+    n="$(find "$d" -name '*.rs' -not -path '*/target/*' -exec cat {} + 2>/dev/null | wc -l)"
+    grand=$((grand + n))
+    printf '  %-22s %6d\n' "$name" "$n"
+  done
+  printf '  %-22s %6d\n' "total" "$grand"
+  echo
+
+  echo "── merged PRs, last 7 days ──────────────────────────"
+  if command -v gh >/dev/null; then
+    gh pr list --state merged --limit 60 --json number,title,mergedAt \
+      --jq '.[] | select(.mergedAt > (now - 7*86400 | todate)) | "  \(.mergedAt | .[0:10])  #\(.number)  \(.title)"' \
+      | sort
+  else
+    echo "  (gh not available)"
+  fi
+}
+
 cmd_signin() { ./gv --token; }
 cmd_doctor() { ./gv doctor; }
 cmd_serve()  { ./gv "$@"; }
@@ -153,8 +209,9 @@ case "${1:-}" in
   doctor)  shift; cmd_doctor "$@" ;;
   serve)   shift; cmd_serve "$@" ;;
   handoff) shift; cmd_handoff "$@" ;;
+  report)  shift; cmd_report "$@" ;;
   ""|-h|--help|help)
-    sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1 (try: dev help)" ;;
 esac
