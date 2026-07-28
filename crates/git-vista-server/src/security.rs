@@ -826,4 +826,47 @@ mod wire_tests {
             "loopback sign-in has no rate limit"
         );
     }
+
+    /// M1.13a (#66, ADR 0025): `hook_policy` reaches the real wire response,
+    /// not just the internal `hook_policy_for` mapping — a loopback session
+    /// discloses `Allow`, a LAN-shaped session discloses `Restricted`, driven
+    /// through the actual `POST /api/session` response the frontend reads.
+    #[tokio::test]
+    async fn hook_policy_is_disclosed_over_the_wire_and_differs_by_router() {
+        let (loopback_router, loopback_sessions) = app();
+        let token = loopback_sessions.current_bootstrap();
+        let resp = loopback_router
+            .oneshot(
+                req("POST", "/api/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"token":"{token}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let info: SessionInfo = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(info.hook_policy, git_vista_protocol::HookPolicy::Allow);
+        assert!(!info.via_lan);
+
+        let limiter = Arc::new(crate::ratelimit::SignInLimiter::new());
+        let (lan_router, lan_sessions) = app_with_limiter(Some(limiter));
+        let lan_token = lan_sessions.current_bootstrap();
+        let lan_resp = lan_router
+            .oneshot(
+                req("POST", "/api/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"token":"{lan_token}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let lan_bytes = to_bytes(lan_resp.into_body(), 64 * 1024).await.unwrap();
+        let lan_info: SessionInfo = serde_json::from_slice(&lan_bytes).unwrap();
+        assert_eq!(
+            lan_info.hook_policy,
+            git_vista_protocol::HookPolicy::Restricted
+        );
+        assert!(lan_info.via_lan);
+    }
 }

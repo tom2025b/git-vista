@@ -32,12 +32,14 @@
   "session_info_authenticated": {
     "authenticated": true,
     "csrf": "csrf-token-abc123",
-    "via_lan": false
+    "via_lan": false,
+    "hook_policy": "restricted"
   },
   "session_info_unauthenticated": {
     "authenticated": false,
     "csrf": null,
-    "via_lan": false
+    "via_lan": false,
+    "hook_policy": "allow"
   },
   "rebase_status": {
     "branch": "feature/idea",

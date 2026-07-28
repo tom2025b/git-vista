@@ -110,6 +110,43 @@ pub struct SessionRequest {
     pub token: String,
 }
 
+/// Whether repository hooks may run when this server spawns a git write
+/// (`SECURITY_MODEL.md:236`, #66/M1.13a, ADR 0025). Not a `bool`: a closed,
+/// named vocabulary can grow a third state later (e.g. an explicit allowlist
+/// of specific hooks) without a breaking wire-format change — the same
+/// reasoning this project already applies to [`crate::GitOperation`] (ADR
+/// 0015) rather than scattering booleans through the write path.
+///
+/// **This is a disclosed value, not yet an enforced one.** M1.13a (this ADR)
+/// is policy-and-disclosure only; no code path in `git-vista-server` or
+/// `git-vista-git` suppresses hooks today, so a session reporting
+/// `Restricted` currently still has its hooks run exactly like `Allow` would
+/// — the server simply hasn't been told to enforce it yet. Actual
+/// suppression (`core.hooksPath` override or equivalent, wired into the
+/// spawn chokepoint) is M1.13b, a separate, larger, not-yet-built piece. See
+/// ADR 0025 for the full reasoning; this comment exists so the gap is
+/// visible from the type itself, not only from a document a reader might
+/// not open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookPolicy {
+    /// Repository hooks run normally.
+    Allow,
+    /// Repository hooks are restricted — **declared, not yet enforced**; see
+    /// this type's own doc comment.
+    Restricted,
+}
+
+impl Default for HookPolicy {
+    /// Fail-closed: if this field is ever missing on the wire (an older
+    /// server response deserialized by a newer client — see `SessionInfo`'s
+    /// `#[serde(default)]`), assume the more conservative value rather than
+    /// the more permissive one.
+    fn default() -> Self {
+        HookPolicy::Restricted
+    }
+}
+
 /// Response of `GET`/`POST /api/session` (M1.04): whether the caller now has a
 /// live session and, when it does, the CSRF token to echo in the
 /// [`CSRF_HEADER`](crate::CSRF_HEADER) on every state-changing request. `csrf` is
@@ -126,6 +163,11 @@ pub struct SessionInfo {
     /// a client does with this flag.
     #[serde(default)]
     pub via_lan: bool,
+    /// The current hook policy (M1.13a, #66, ADR 0025) — see [`HookPolicy`]'s
+    /// own doc comment for what this does and does not mean today. Additive
+    /// field, same `#[serde(default)]` convention as `via_lan` above.
+    #[serde(default)]
+    pub hook_policy: HookPolicy,
 }
 
 /// Response of `GET /api/rebase-status`: whether "Rebase onto main" would do
@@ -368,12 +410,17 @@ mod tests {
             authenticated: true,
             csrf: Some("csrf-token".into()),
             via_lan: false,
+            hook_policy: HookPolicy::Allow,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert_eq!(serde_json::from_str::<SessionInfo>(&json).unwrap(), info);
-        // csrf defaults to None when absent (the unauthenticated response omits it).
+        // csrf defaults to None when absent (the unauthenticated response omits it);
+        // hook_policy fails closed to Restricted per its own Default impl, the same
+        // "an older/partial response still deserializes, safely" contract via_lan
+        // already established.
         let back: SessionInfo = serde_json::from_str(r#"{"authenticated":false}"#).unwrap();
         assert_eq!(back.csrf, None);
+        assert_eq!(back.hook_policy, HookPolicy::Restricted);
     }
 
     #[test]
