@@ -1,14 +1,18 @@
 # Continuous Integration for git-vista.
 #
 # Workspace layout this pipeline cares about:
-#   - git-vista-core    pure logic crate (model + layout); has tests
-#   - git-vista-git     native git reader via gix; has tests (uses the git binary)
-#   - git-vista-server  native axum backend: serves the SPA + /api/commits
-#   - git-vista         Leptos frontend, built to WASM by Trunk (crates/git-vista)
+#   - git-vista-core     pure logic crate (model + layout); has tests
+#   - git-vista-git      native git reader via gix; has tests (uses the git binary)
+#   - git-vista-protocol the versioned wire contract: version negotiation plus
+#                        golden-fixture DTO-shape guards (#67 M1.14); has tests
+#   - git-vista-server   native axum backend: serves the SPA + /api/commits
+#   - git-vista          Leptos frontend, built to WASM by Trunk (crates/git-vista)
 #
 # Six jobs run in parallel, each mapped to a concrete check:
 #   1. lint      format + strict native/WASM Clippy + shell syntax
-#   2. core      test + check the pure-logic, git-reading, server, and UI crates
+#   2. core      test + check the pure-logic, git-reading, protocol, server, and
+#                UI crates, plus (#67 M1.14) the runner's git version against
+#                the documented floor in docs/SUPPORTED_VERSIONS.md
 #   3. contract  the M1.06 write contract (#146): planner pipeline, argv
 #                boundary, staleness gates — plus, since #67 M1.14, the route-
 #                authorization gate (route_authz): every route main.rs
@@ -82,14 +86,20 @@ jobs:
           ./gv help >/dev/null
 
   # ---------------------------------------------------------------------------
-  # 1. Core + git + server + frontend crates: build check + tests.
+  # 1. Core + git + protocol + server + frontend crates: build check + tests,
+  #    plus the runner's own git version against the documented floor.
   #
   # git-vista-core is pure logic; git-vista-git reads real repos via gix (its
-  # tests shell out to the `git` binary, preinstalled on the runner);
-  # git-vista-server is the axum backend; git-vista is the Leptos frontend, whose
-  # host-side unit tests (colour/geometry/text/…) run natively because its
-  # wasm-only view module is `#[cfg]`-gated out. None need GTK/WebKit, so this job
-  # needs nothing beyond stable Rust. Together they carry the project's test suite.
+  # tests shell out to the `git` binary, preinstalled on the runner) — hence
+  # the version-floor check below runs first, in the job whose tests actually
+  # depend on it; git-vista-protocol is the wire contract (version negotiation
+  # plus the golden-fixture DTO-shape guards, #67 M1.14 — previously missing
+  # from every CI job's test invocation entirely, so a wire-format regression
+  # could pass every check green); git-vista-server is the axum backend;
+  # git-vista is the Leptos frontend, whose host-side unit tests (colour/
+  # geometry/text/…) run natively because its wasm-only view module is
+  # `#[cfg]`-gated out. None need GTK/WebKit, so this job needs nothing beyond
+  # stable Rust. Together they carry the project's test suite.
   # ---------------------------------------------------------------------------
   core:
     name: Core (check + test)
@@ -97,16 +107,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # #67 M1.14: the floor lives in exactly one place — the "## Git: X.Y or
+      # later" heading in docs/SUPPORTED_VERSIONS.md — and this step parses it
+      # out rather than duplicating the number, the same anti-drift pattern
+      # the dependency-exceptions step uses against .cargo/audit.toml. A
+      # runner below the floor fails loudly here, before any test that
+      # depends on git behaviour this old a binary might not have.
+      - name: Git version meets the documented floor
+        run: |
+          floor=$(grep -oP '^## Git: \K[0-9]+\.[0-9]+' docs/SUPPORTED_VERSIONS.md)
+          if [ -z "$floor" ]; then
+            echo "::error::couldn't parse the git version floor out of docs/SUPPORTED_VERSIONS.md (expected a '## Git: X.Y or later' heading) — the doc and this check may have drifted apart"
+            exit 1
+          fi
+          actual=$(git --version | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          echo "documented floor: $floor — runner git: $actual"
+          lowest=$(printf '%s\n%s\n' "$floor" "$actual" | sort -V | head -1)
+          if [ "$lowest" != "$floor" ]; then
+            echo "::error::runner git ($actual) is older than the documented floor ($floor, docs/SUPPORTED_VERSIONS.md)"
+            exit 1
+          fi
+
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check core + git + server crates build
-        run: cargo check -p git-vista-core -p git-vista-git -p git-vista-server
+      - name: Check core + git + protocol + server crates build
+        run: cargo check -p git-vista-core -p git-vista-git -p git-vista-protocol -p git-vista-server
 
-      - name: Test core + git + server + frontend crates
-        run: cargo test -p git-vista-core -p git-vista-git -p git-vista-server -p git-vista
+      - name: Test core + git + protocol + server + frontend crates
+        run: cargo test -p git-vista-core -p git-vista-git -p git-vista-protocol -p git-vista-server -p git-vista
 
   # ---------------------------------------------------------------------------
   # 3. The M1.06 write contract (#146, parent #59) plus the #67 M1.14 route-
