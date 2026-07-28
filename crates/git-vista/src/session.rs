@@ -33,6 +33,7 @@ pub async fn establish_session() -> Result<bool, String> {
             let _ = session_state::apply(SessionEvent::Established {
                 csrf: info.csrf.clone(),
                 via_lan: info.via_lan,
+                hook_policy: info.hook_policy,
             });
             return Ok(info.authenticated);
         }
@@ -43,6 +44,7 @@ pub async fn establish_session() -> Result<bool, String> {
     let _ = session_state::apply(SessionEvent::Established {
         csrf: info.csrf.clone(),
         via_lan: info.via_lan,
+        hook_policy: info.hook_policy,
     });
     Ok(info.authenticated)
 }
