@@ -1,0 +1,19 @@
+[
+  {
+    "mode": "worktree_vs_index"
+  },
+  {
+    "mode": "index_vs_commit",
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  {
+    "mode": "commit_vs_commit",
+    "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "target": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  {
+    "mode": "ref_vs_ref",
+    "base": "main",
+    "target": "feature/x"
+  }
+]
