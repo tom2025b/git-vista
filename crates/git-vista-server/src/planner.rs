@@ -156,16 +156,29 @@ async fn plan_and_execute_tracked(
             // uses to decide whether its cached graph is stale, without re-reading
             // the repository. Best-effort, like every other observation here.
             let generation = Some(generation_token(&repo, &observe_live(&repo).await).await);
-            handle.finish(status, message, generation);
 
-            // M1.09: the terminal record and its recovery ref. Both run after
-            // `finish` has already published the terminal snapshot, so neither
-            // adds latency to what `wait_terminal` below is waiting on.
-            let terminal = durable_record.status();
+            // M1.09: the terminal record and its recovery ref, persisted
+            // *before* `finish` publishes the same snapshot in-memory —
+            // deliberately reordered from the original "finish, then persist"
+            // (issue #158). `finish` unblocks every `wait_terminal` waiter,
+            // including this request's own response; a waiter that resumes
+            // before the durable write landed could call
+            // `crate::durable::recover()` and find this row still
+            // non-terminal, which `recover()` cannot distinguish from a
+            // crashed process and force-fails — marking a genuinely
+            // successful operation `Failed` in the journal. Computing the
+            // terminal value via `terminal_status` (which only reads, never
+            // publishes) and persisting it first closes that window: nothing
+            // can observe "done" before the durable write is real. See
+            // `OperationHandle::terminal_status`'s doc comment for the full
+            // account.
+            let terminal = handle.terminal_status(status, &message, generation.clone());
             crate::durable::persist(durable_key, terminal.clone()).await;
             if let Some(recovery) = &terminal.recovery {
                 crate::durable::write_recovery_ref(&repo, &terminal.id, recovery).await;
             }
+
+            handle.finish(status, message, generation);
         },
     ));
 
