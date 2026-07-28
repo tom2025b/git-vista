@@ -926,6 +926,100 @@ pub(crate) async fn worktree_status(
     Ok((no_store, Json(parsed)))
 }
 
+/// Upper bound on `git status --porcelain=v2 --branch -z`'s stdout. A cap hit
+/// here is a `413`, never a best-effort parse (see [`worktree_status_v2_for_repo`]'s
+/// doc comment for why) — 8 MiB is the same fail-safe ceiling
+/// `git_cmd::DEFAULT_GIT_STDOUT_CAP` uses for callers that haven't reasoned
+/// about size, named locally since that constant is private to `git_cmd`.
+const STATUS_V2_STDOUT_CAP: usize = 8 * 1024 * 1024;
+
+/// `GET /api/status/v2` (#68c): the generation-tagged [`WorktreeStatus`] DTO
+/// (#68a) built by [`parse_porcelain_v2_z`] (#68b) from a live
+/// `git status --porcelain=v2 --branch -z` read. Additive, not a replacement
+/// for [`worktree_status`] — the existing v1 shape stays exactly as it is
+/// (the live frontend depends on it today); migrating to this shape is 68d's
+/// job. Sent `no-store`, same as every other live read in this file.
+pub(crate) async fn worktree_status_v2(
+    Query(q): Query<RepoQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = resolve_repo(q.repo.as_deref())?.0;
+    let status = worktree_status_v2_for_repo(&repo, STATUS_V2_STDOUT_CAP).await?;
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(status)))
+}
+
+/// [`worktree_status_v2`] against an explicit repository — split out for the
+/// same reason as [`commit_diff_for_repo`]/[`file_at_commit_for_repo`]: the
+/// handler's repository comes from the process-wide `CURRENT` selection,
+/// which no test can set. `cap` is likewise explicit rather than the module
+/// constant baked in, the same shape `commit_diff_for_repo` already uses for
+/// its metadata caps — it lets a cap-hit test use a small, cheap cap instead
+/// of constructing gigabytes (or, for this endpoint, hundreds of thousands of
+/// filenames) of real porcelain output to exceed the production ceiling.
+///
+/// **A cap hit is refused, not parsed.** Unlike a file read — where a
+/// truncated prefix is still a valid, useful answer — a truncated
+/// porcelain-v2 stream can cut a record in half, and `parse_porcelain_v2_z`
+/// has no way to know that happened: it would either drop the partial last
+/// record (an honest undercount elsewhere in this file's parsers) or, worse,
+/// misparse it into something that looks like a complete but wrong entry.
+/// Serving that as a `200 WorktreeStatus` would be a wrong answer wearing a
+/// success status — the exact failure mode `FILE_CONTENT_CAP`'s "cap hit is a
+/// *success*" design deliberately avoids for file reads by *reporting* the
+/// truncation instead of hiding it. Status has no equivalent partial-content
+/// contract to report through, so refusing outright is the honest choice
+/// until one exists. True large-worktree responsiveness (bounding cost, not
+/// just correctness) is #68e's job, not this one's.
+async fn worktree_status_v2_for_repo(
+    repo: &Path,
+    cap: usize,
+) -> Result<git_vista_protocol::WorktreeStatus, (StatusCode, String)> {
+    let (bytes, truncated) = git_stdout_capped(
+        repo,
+        &[
+            "status".to_string(),
+            "--porcelain=v2".to_string(),
+            "--branch".to_string(),
+            "-z".to_string(),
+        ],
+        "/api/status/v2",
+        cap,
+    )
+    .await?;
+    if truncated {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "worktree status exceeded the read cap".to_string(),
+        ));
+    }
+
+    let parsed = git_vista_protocol::parse_porcelain_v2_z(&bytes);
+
+    // The generation (ADR 0001): HEAD + refs + index from a real repository
+    // read, plus a digest of *these exact bytes* as the worktree slot — so
+    // the generation changes on precisely the tracked/untracked edits this
+    // very read observed, per `status.rs`'s own module doc. `status-v1:` is
+    // the namespace prefix that doc comment already committed to, mirroring
+    // `history.rs`'s `history-v1:` precedent, so a status generation can
+    // never be confused with (or compared against) a history generation.
+    let mut inputs = git_vista_git::read_generation_inputs(repo).map_err(|e| {
+        eprintln!("git-vista: /api/status/v2 couldn't read generation inputs: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    };
+    inputs.worktree(&digest);
+    let generation = inputs.generation();
+    let token = git_vista_protocol::GenerationToken::new(format!("status-v1:{generation}"))
+        .expect("a formatted digest is always non-empty");
+
+    Ok(parsed.into_worktree_status(token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,7 +1029,8 @@ mod tests {
     use git_vista_core::layout::stream::canonicalize_edges;
     use git_vista_core::model::CommitSummary;
     use git_vista_protocol::{
-        ApiError, ErrorCode, RepositoryDescriptor, PROTOCOL_HEADER, PROTOCOL_VERSION,
+        ApiError, ChangeKind, ChangeSides, ErrorCode, RepositoryDescriptor, StatusEntry,
+        PROTOCOL_HEADER, PROTOCOL_VERSION,
     };
     use tower::ServiceExt;
 
@@ -3612,5 +3707,117 @@ mod tests {
              ceiling: a real repository could still produce a larger page than this",
             body.len()
         );
+    }
+
+    // ---- GET /api/status/v2: the live handler seam (#68c) ---------------------
+
+    /// The real handler, end to end: a dirty worktree (staged add, unstaged
+    /// modify, untracked file) produces a `WorktreeStatus` whose `entries`
+    /// actually reflect it, and whose `generation` is a real, non-empty
+    /// `status-v1:`-namespaced token — not the DTO's shape alone (task 10's
+    /// tests already pin that), but this file's own contribution: that the
+    /// three existing pieces (DTO, parser, generation inputs) are actually
+    /// wired together correctly.
+    #[tokio::test]
+    async fn worktree_status_v2_reflects_a_real_dirty_worktree() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+        run(&repo, &["add", "new.txt"]);
+
+        let status = worktree_status_v2_for_repo(&repo, STATUS_V2_STDOUT_CAP)
+            .await
+            .expect("a real repository read must succeed");
+
+        assert!(
+            status.generation.as_str().starts_with("status-v1:"),
+            "generation must carry the status-v1 namespace: {:?}",
+            status.generation
+        );
+        assert_eq!(status.branch.as_deref(), Some("main"));
+
+        let unstaged_a = status.entries.iter().any(|e| {
+            matches!(
+                e,
+                StatusEntry::Changed { path, sides: ChangeSides::UnstagedOnly { .. }, .. }
+                    if path == "a.txt"
+            )
+        });
+        assert!(
+            unstaged_a,
+            "a.txt's unstaged edit must appear: {:?}",
+            status.entries
+        );
+
+        let staged_new = status.entries.iter().any(|e| matches!(
+            e,
+            StatusEntry::Changed { path, sides: ChangeSides::StagedOnly { staged: ChangeKind::Added }, .. }
+                if path == "new.txt"
+        ));
+        assert!(
+            staged_new,
+            "new.txt's staged add must appear: {:?}",
+            status.entries
+        );
+    }
+
+    /// The generation changes across a real edit, and is stable when nothing
+    /// changed between two reads — the actual guarantee #68's "generation-
+    /// tagged and detects external changes" criterion is about, proven
+    /// against a real repository rather than assumed from the DTO's shape.
+    #[tokio::test]
+    async fn worktree_status_v2_generation_changes_with_the_worktree() {
+        let (_dir, repo) = seeded_repo();
+
+        let clean = worktree_status_v2_for_repo(&repo, STATUS_V2_STDOUT_CAP)
+            .await
+            .unwrap();
+        let clean_again = worktree_status_v2_for_repo(&repo, STATUS_V2_STDOUT_CAP)
+            .await
+            .unwrap();
+        assert_eq!(
+            clean.generation, clean_again.generation,
+            "two reads of an unchanged worktree must agree"
+        );
+
+        std::fs::write(repo.join("a.txt"), "dirty\n").unwrap();
+        let dirty = worktree_status_v2_for_repo(&repo, STATUS_V2_STDOUT_CAP)
+            .await
+            .unwrap();
+        assert_ne!(
+            clean.generation, dirty.generation,
+            "an unstaged edit must change the generation"
+        );
+    }
+
+    /// A porcelain-v2 stream past the cap is refused outright, not parsed
+    /// into a `WorktreeStatus` missing (or mangling) its cut-off last entry —
+    /// see `worktree_status_v2_for_repo`'s doc comment for why a status cap
+    /// hit cannot be a success the way a file-read cap hit is. Uses a small
+    /// injected cap (the same testability seam `commit_diff_for_repo`'s
+    /// metadata-cap tests use) rather than constructing enough real
+    /// porcelain output to exceed the production 8 MiB ceiling.
+    #[tokio::test]
+    async fn worktree_status_v2_refuses_rather_than_serving_a_truncated_parse() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+
+        let err = worktree_status_v2_for_repo(&repo, 4)
+            .await
+            .expect_err("a cap hit must be refused, not parsed");
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The production cap is generous enough that an ordinary dirty worktree
+    /// never trips it — the control for the test above, so a cap-hit failure
+    /// there is known to come from the injected small cap, not from
+    /// `STATUS_V2_STDOUT_CAP` itself being too tight for real use.
+    #[tokio::test]
+    async fn worktree_status_v2_production_cap_does_not_truncate_an_ordinary_worktree() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+        worktree_status_v2_for_repo(&repo, STATUS_V2_STDOUT_CAP)
+            .await
+            .expect("an ordinary dirty worktree must not hit the production cap");
     }
 }
