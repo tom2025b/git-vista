@@ -136,8 +136,20 @@ jobs:
       - name: Check core + git + protocol + server crates build
         run: cargo check -p git-vista-core -p git-vista-git -p git-vista-protocol -p git-vista-server
 
+      # #67 M1.14 closure audit: this used to name each crate explicitly,
+      # which is exactly how git-vista-protocol went missing from CI test
+      # runs for as long as it did (task 6) — a sixth workspace member added
+      # later could repeat that silently. `--workspace` is behaviourally
+      # identical today (these five `-p` names are the whole workspace,
+      # confirmed against Cargo.toml's `members`) and closes that class of
+      # gap going forward without needing anyone to remember to update this
+      # line. The `check` step above intentionally omits `git-vista` (its
+      # native check here is redundant with the `lint` job's
+      # `--workspace --all-targets` clippy pass and the `frontend` job's
+      # real Trunk build) — left as-is, that asymmetry predates this audit
+      # and isn't the gap being closed here.
       - name: Test core + git + protocol + server + frontend crates
-        run: cargo test -p git-vista-core -p git-vista-git -p git-vista-protocol -p git-vista-server -p git-vista
+        run: cargo test --workspace
 
   # ---------------------------------------------------------------------------
   # 3. The M1.06 write contract (#146, parent #59) plus the #67 M1.14 route-
