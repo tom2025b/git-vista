@@ -27,8 +27,8 @@
 
 use git_vista_protocol::{
     BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
-    RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo,
-    SessionRequest,
+    HookPolicy, RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest,
+    SessionInfo, SessionRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -89,17 +89,23 @@ fn golden_set() -> DtoGoldenSet {
             token: "bootstrap-token-deadbeef".to_string(),
         },
         // `csrf` present — the authenticated shape a client actually acts on.
+        // `hook_policy: Restricted` here (a LAN-style session) so both
+        // HookPolicy variants appear somewhere in this fixture set, the
+        // authenticated one carrying the "something to disclose" value.
         session_info_authenticated: SessionInfo {
             authenticated: true,
             csrf: Some("csrf-token-abc123".to_string()),
             via_lan: false,
+            hook_policy: HookPolicy::Restricted,
         },
         // `csrf` absent — the unauthenticated shape; `via_lan` also exercises
         // its `#[serde(default)]` additive-field posture at `false`.
+        // `hook_policy: Allow` covers the other variant.
         session_info_unauthenticated: SessionInfo {
             authenticated: false,
             csrf: None,
             via_lan: false,
+            hook_policy: HookPolicy::Allow,
         },
         rebase_status: RebaseStatus {
             branch: Some("feature/idea".to_string()),
