@@ -1,0 +1,118 @@
+{
+  "files": [
+    {
+      "shape": "hunks",
+      "old_path": "a.txt",
+      "new_path": "a.txt",
+      "hunks": [
+        {
+          "old_start": 1,
+          "old_len": 3,
+          "new_start": 1,
+          "new_len": 3,
+          "section_heading": "fn main() {",
+          "lines": [
+            {
+              "kind": "context",
+              "text": "one",
+              "no_newline_at_eof": false
+            },
+            {
+              "kind": "removed",
+              "text": "two",
+              "no_newline_at_eof": false
+            },
+            {
+              "kind": "added",
+              "text": "TWO",
+              "no_newline_at_eof": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "shape": "hunks",
+      "old_path": null,
+      "new_path": "new.txt",
+      "hunks": [
+        {
+          "old_start": 0,
+          "old_len": 0,
+          "new_start": 1,
+          "new_len": 1,
+          "section_heading": "",
+          "lines": [
+            {
+              "kind": "added",
+              "text": "hello",
+              "no_newline_at_eof": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "shape": "hunks",
+      "old_path": "gone.txt",
+      "new_path": null,
+      "hunks": [
+        {
+          "old_start": 1,
+          "old_len": 1,
+          "new_start": 0,
+          "new_len": 0,
+          "section_heading": "",
+          "lines": [
+            {
+              "kind": "removed",
+              "text": "bye",
+              "no_newline_at_eof": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "shape": "hunks",
+      "old_path": null,
+      "new_path": "empty.txt",
+      "hunks": []
+    },
+    {
+      "shape": "mode_change_only",
+      "path": "script.sh",
+      "old_mode": "100644",
+      "new_mode": "100755"
+    },
+    {
+      "shape": "binary",
+      "old_path": "image.png",
+      "new_path": "image.png"
+    },
+    {
+      "shape": "binary",
+      "old_path": null,
+      "new_path": "new-image.png"
+    },
+    {
+      "shape": "renamed",
+      "old_path": "old-name.rs",
+      "new_path": "new-name.rs",
+      "similarity": 100,
+      "is_copy": false
+    },
+    {
+      "shape": "renamed",
+      "old_path": "template.rs",
+      "new_path": "template-copy.rs",
+      "similarity": 95,
+      "is_copy": true
+    },
+    {
+      "shape": "combined",
+      "path": "conflict.txt",
+      "raw": "diff --combined conflict.txt\nindex 111,222..333\n--- a/conflict.txt\n+++ b/conflict.txt\n@@@ -1,1 -1,1 +1,1 @@@\n- a\n+ b\n"
+    }
+  ]
+}
