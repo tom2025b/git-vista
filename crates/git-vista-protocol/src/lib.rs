@@ -17,6 +17,10 @@
 //! - [`operation`] — operation identity and lifecycle (M1.08, #61): the client's
 //!   [`IdempotencyKey`], the server's [`OperationId`], the [`OperationState`]
 //!   machine, the replayable [`OperationStatus`] record, and [`ProgressEvent`].
+//! - [`status`]  — the generation-tagged [`WorktreeStatus`] DTO (M2.15, #68a):
+//!   staged/unstaged/untracked/ignored/conflicted/renamed/submodule/binary
+//!   states as a closed [`StatusEntry`] vocabulary, reusing [`GenerationToken`]
+//!   (ADR 0001) rather than a new staleness mechanism.
 //! - [`newtype`] — the validating-newtype machinery the three above share, so
 //!   every string-shaped wire value is checked in exactly one place.
 //!
@@ -51,6 +55,7 @@ pub mod error;
 pub mod history;
 pub mod operation;
 pub mod plan;
+pub mod status;
 pub mod version;
 
 pub use dto::{
@@ -68,6 +73,9 @@ pub use plan::{
     BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, OperationHash, Plan,
     PlanFieldError, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
     RepositoryToken, RiskLevel, UnixSeconds, WorktreeToken,
+};
+pub use status::{
+    ChangeKind, ChangeSides, ConflictKind, StatusEntry, SubmoduleState, WorktreeStatus,
 };
 pub use version::{
     check_compatibility, parse_protocol_header, Compatibility, ProtocolInfo, CSRF_HEADER,
