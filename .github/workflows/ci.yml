@@ -314,6 +314,23 @@ jobs:
           print(f"Dependency exceptions register OK: {len(md_ids)} exception(s), all in sync, none expired.")
           PYEOF
 
+      # F10: the advisory register above gates *suppressions*, not *additions*.
+      # Kernel-ABI crates get an explicit row with an owner and a rejected
+      # alternative — see docs/NATIVE_DEPENDENCIES.md.
+      - name: Native dependency register is honest
+        run: |
+          set -o pipefail
+          missing=0
+          for krate in libc seccompiler nix rustix landlock libseccomp; do
+            if grep -qE "^\s*${krate}\s*=" crates/git-vista-server/Cargo.toml; then
+              if ! grep -qF "| \`${krate}\` |" docs/NATIVE_DEPENDENCIES.md; then
+                echo "::error::${krate} is a direct dependency of git-vista-server with no row in docs/NATIVE_DEPENDENCIES.md"
+                missing=1
+              fi
+            fi
+          done
+          exit "$missing"
+
       # `--deny warnings` is the deliberate-failure choice explained above.
       # `.cargo/audit.toml`'s ignore list (verified honest by the step above)
       # is what makes today's three unmaintained-crate warnings survivable.

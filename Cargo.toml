@@ -35,8 +35,15 @@ repository = "https://github.com/tom2025b/git-vista"
 git-vista-core = { path = "crates/git-vista-core" }
 git-vista-protocol = { path = "crates/git-vista-protocol" }
 git-vista-git = { path = "crates/git-vista-git" }
+# Landlock/prctl raw syscalls (444/445/446, PR_SET_NO_NEW_PRIVS) for the M1.13b
+# (#66) sandbox shim — no stable std wrapper exists. See
+# docs/NATIVE_DEPENDENCIES.md (F10) for why this is a reviewed dependency.
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# cBPF assembly with masked argument comparisons (C2) for the M1.13b (#66)
+# sandbox shim's terminal-action seccomp filter. See docs/NATIVE_DEPENDENCIES.md.
+seccompiler = "0.5"
 thiserror = "1"
 # Opaque, path-independent repository/worktree identity (git-vista-core::identity).
 # Only the name-based `v5` constructor is enabled: it is deterministic (SHA-1 over a

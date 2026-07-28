@@ -32,10 +32,16 @@ git-vista-git = { workspace = true }
 # per-process random key, so a cursor can't be forged and dies with a restart.
 # digest-0.10-compatible, pairing with the existing `sha2` dependency below.
 hmac = "0.12"
+# Landlock + prctl raw syscalls for the M1.13b (#66) sandbox shim
+# (`gv-sandbox`). Reviewed kernel-ABI dependency — see docs/NATIVE_DEPENDENCIES.md.
+libc = { workspace = true }
 # The durable operation journal (M1.09, #62): SQLite so operation results
 # survive a process restart. `bundled` compiles SQLite in rather than linking
 # the system library — one less thing this headless server depends on finding.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# cBPF assembly for the M1.13b (#66) sandbox shim's terminal-action seccomp
+# filter. Reviewed kernel-ABI dependency — see docs/NATIVE_DEPENDENCIES.md.
+seccompiler = { workspace = true }
 # The activity feed's journal is JSONL on disk, and its query params derive
 # Deserialize — the same serde the shared models already use.
 serde = { workspace = true }
