@@ -10,14 +10,22 @@ const MANIFEST: &str = include_str!("../../Cargo.toml");
 /// Crates that touch the kernel ABI directly. Adding one to `Cargo.toml`
 /// without a row in the register fails here, in the `core` test job, before CI
 /// ever gets to the audit job.
-const KERNEL_API_CRATES: &[&str] = &["libc", "seccompiler", "nix", "rustix", "landlock", "libseccomp"];
+const KERNEL_API_CRATES: &[&str] = &[
+    "libc",
+    "seccompiler",
+    "nix",
+    "rustix",
+    "landlock",
+    "libseccomp",
+];
 
 #[test]
 fn every_kernel_api_dependency_has_a_register_row() {
     for krate in KERNEL_API_CRATES {
-        let declared = MANIFEST
-            .lines()
-            .any(|l| l.trim_start().starts_with(&format!("{krate} ")) || l.trim_start().starts_with(&format!("{krate}=")));
+        let declared = MANIFEST.lines().any(|l| {
+            l.trim_start().starts_with(&format!("{krate} "))
+                || l.trim_start().starts_with(&format!("{krate}="))
+        });
         if !declared {
             continue;
         }
@@ -36,6 +44,9 @@ fn the_register_names_an_owner_and_a_reason_for_each_row() {
         assert!(cells.len() >= 6, "malformed register row: {line}");
         assert!(!cells[2].is_empty(), "row has no reason: {line}");
         assert!(!cells[3].is_empty(), "row has no owner: {line}");
-        assert!(!cells[4].is_empty(), "row names no reviewed alternative: {line}");
+        assert!(
+            !cells[4].is_empty(),
+            "row names no reviewed alternative: {line}"
+        );
     }
 }
