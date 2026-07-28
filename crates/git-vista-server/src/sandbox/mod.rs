@@ -18,6 +18,8 @@ use std::path::PathBuf;
 
 #[cfg(test)]
 mod argv;
+#[cfg(test)]
+mod deps;
 
 /// The strict tier's outer launcher. An external binary, deliberately: it is
 /// the only thing here that creates namespaces, and `--unshare-net` is what
