@@ -3702,4 +3702,92 @@ mod tests {
             body.len()
         );
     }
+
+    // ---- GET /api/status/v2: the live handler seam (#68c) ---------------------
+
+    /// The real handler, end to end: a dirty worktree (staged add, unstaged
+    /// modify, untracked file) produces a `WorktreeStatus` whose `entries`
+    /// actually reflect it, and whose `generation` is a real, non-empty
+    /// `status-v1:`-namespaced token — not the DTO's shape alone (task 10's
+    /// tests already pin that), but this file's own contribution: that the
+    /// three existing pieces (DTO, parser, generation inputs) are actually
+    /// wired together correctly.
+    #[tokio::test]
+    async fn worktree_status_v2_reflects_a_real_dirty_worktree() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+        run(&repo, &["add", "new.txt"]);
+
+        let status = worktree_status_v2_for_repo(&repo)
+            .await
+            .expect("a real repository read must succeed");
+
+        assert!(
+            status.generation.as_str().starts_with("status-v1:"),
+            "generation must carry the status-v1 namespace: {:?}",
+            status.generation
+        );
+        assert_eq!(status.branch.as_deref(), Some("main"));
+
+        let unstaged_a = status.entries.iter().any(|e| matches!(
+            e,
+            StatusEntry::Changed { path, sides: ChangeSides::UnstagedOnly { .. }, .. }
+                if path == "a.txt"
+        ));
+        assert!(unstaged_a, "a.txt's unstaged edit must appear: {:?}", status.entries);
+
+        let staged_new = status.entries.iter().any(|e| matches!(
+            e,
+            StatusEntry::Changed { path, sides: ChangeSides::StagedOnly { staged: ChangeKind::Added }, .. }
+                if path == "new.txt"
+        ));
+        assert!(staged_new, "new.txt's staged add must appear: {:?}", status.entries);
+    }
+
+    /// The generation changes across a real edit, and is stable when nothing
+    /// changed between two reads — the actual guarantee #68's "generation-
+    /// tagged and detects external changes" criterion is about, proven
+    /// against a real repository rather than assumed from the DTO's shape.
+    #[tokio::test]
+    async fn worktree_status_v2_generation_changes_with_the_worktree() {
+        let (_dir, repo) = seeded_repo();
+
+        let clean = worktree_status_v2_for_repo(&repo).await.unwrap();
+        let clean_again = worktree_status_v2_for_repo(&repo).await.unwrap();
+        assert_eq!(
+            clean.generation, clean_again.generation,
+            "two reads of an unchanged worktree must agree"
+        );
+
+        std::fs::write(repo.join("a.txt"), "dirty\n").unwrap();
+        let dirty = worktree_status_v2_for_repo(&repo).await.unwrap();
+        assert_ne!(
+            clean.generation, dirty.generation,
+            "an unstaged edit must change the generation"
+        );
+    }
+
+    /// A porcelain-v2 stream past the cap is refused outright, not parsed
+    /// into a `WorktreeStatus` missing (or mangling) its cut-off last entry —
+    /// see `worktree_status_v2_for_repo`'s doc comment for why a status cap
+    /// hit cannot be a success the way a file-read cap hit is.
+    #[tokio::test]
+    async fn worktree_status_v2_refuses_rather_than_serving_a_truncated_parse() {
+        let (_dir, repo) = seeded_repo();
+        // Enough distinctly-named untracked files that the real
+        // `-z`-terminated porcelain output exceeds STATUS_V2_STDOUT_CAP.
+        // Long, near-unique names keep the per-record size high enough that
+        // this doesn't need an unreasonable file count.
+        let per_file = STATUS_V2_STDOUT_CAP / 2000;
+        for i in 0..3000 {
+            let name = format!("untracked-{i:05}-{}", "x".repeat(per_file));
+            std::fs::write(repo.join(&name), "").unwrap();
+        }
+
+        let err = worktree_status_v2_for_repo(&repo)
+            .await
+            .expect_err("a cap hit must be refused, not parsed");
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }
