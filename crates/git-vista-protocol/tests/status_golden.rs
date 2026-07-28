@@ -92,14 +92,25 @@ fn golden_status() -> WorktreeStatus {
                 submodule: Some(dirty_submodule()),
                 binary: false,
             },
-            // Renamed, required origin_path, with a similarity score.
+            // Renamed, required origin_path, with a similarity score, no
+            // further worktree change since the rename was staged.
             StatusEntry::Renamed {
                 path: "new/name.rs".to_string(),
                 origin_path: "old/name.rs".to_string(),
                 score: 100,
-                sides: ChangeSides::StagedOnly {
-                    staged: ChangeKind::Modified,
-                },
+                unstaged: None,
+                submodule: None,
+                binary: false,
+            },
+            // Renamed AND further modified in the worktree since — the "RM"
+            // case a real git repository produces (confirmed against a real
+            // `git status --porcelain=v2 -z` run, not assumed from the man
+            // page).
+            StatusEntry::Renamed {
+                path: "new/edited.rs".to_string(),
+                origin_path: "old/edited.rs".to_string(),
+                score: 87,
+                unstaged: Some(ChangeKind::Modified),
                 submodule: None,
                 binary: false,
             },
@@ -248,14 +259,16 @@ fn golden_set_covers_every_entry_kind_and_conflict_kind() {
         "a ConflictKind variant is missing from (or extra in) the golden set"
     );
 
-    // The three ChangeSides shapes and both a present and an absent
-    // SubmoduleState are exercised too — pinned structurally, not by tag
-    // string, since ChangeSides is internally tagged on "side" the same way.
+    // The three ChangeSides shapes (Changed only — Renamed carries no
+    // ChangeSides at all, see StatusEntry::Renamed's doc comment) and both a
+    // present and an absent SubmoduleState are exercised too — pinned
+    // structurally, not by tag string, since ChangeSides is internally
+    // tagged on "side" the same way.
     let sides_shapes: std::collections::BTreeSet<String> = status
         .entries
         .iter()
         .filter_map(|e| match e {
-            StatusEntry::Changed { sides, .. } | StatusEntry::Renamed { sides, .. } => Some(
+            StatusEntry::Changed { sides, .. } => Some(
                 serde_json::to_value(sides).unwrap()["side"]
                     .as_str()
                     .unwrap()
@@ -271,6 +284,20 @@ fn golden_set_covers_every_entry_kind_and_conflict_kind() {
             .map(String::from)
             .collect::<std::collections::BTreeSet<String>>(),
         "a ChangeSides shape is missing from the golden set"
+    );
+    // Renamed.unstaged: both None (rename only, not further edited) and
+    // Some(_) (the "RM" case a real repository produces) must be covered.
+    let renamed_unstaged: Vec<bool> = status
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            StatusEntry::Renamed { unstaged, .. } => Some(unstaged.is_some()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        renamed_unstaged.contains(&true) && renamed_unstaged.contains(&false),
+        "both Renamed.unstaged states (None and Some) must be in the golden set"
     );
     assert!(
         status.entries.iter().any(|e| matches!(
