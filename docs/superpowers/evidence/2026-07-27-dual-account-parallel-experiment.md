@@ -103,6 +103,35 @@ parallel with the design; it is dependent work wearing parallel clothing.
 The genuinely parallel seams were structural: different directories
 (`.github/` vs `crates/`), different concerns, no shared fixtures.
 
+## The accounts are not equivalent — size tasks to the smaller bucket
+
+The worker runs on a **Pro** account; the orchestrator on **Max**. Their usage
+budgets are very different sizes, so their context percentages are not
+comparable units. During this session the orchestrator briefly reasoned that
+"the worker is at 24% and I am at 73%, so the worker has three times the
+runway" — which is wrong. 76% remaining on Pro is plausibly *less* absolute
+capacity than 27% remaining on Max.
+
+**The worker's bucket is usually the scarcer resource.** That puts a ceiling on
+task size as well as a floor:
+
+- **Floor:** big enough to clear the fixed coordination overhead (~5-8 min per
+  task once setup is amortized). Below roughly an hour of work, doing it inline
+  is cheaper.
+- **Ceiling:** small enough to *finish* inside the worker's remaining budget. A
+  task that dies at 90% complete burns the bucket and produces nothing
+  mergeable — strictly worse than never delegating it.
+
+Prefer tasks that **fail safe**: ones with a partial result still worth having.
+Task 3 (#158) was well shaped this way by luck rather than design — even without
+the full race fix, landing the change that makes the failure self-diagnosing is
+a real deliverable on its own.
+
+A large mechanical job (e.g. migrating ~42 call sites across two crates) looks
+like ideal delegation because it is repetitive, but it is exactly the shape that
+runs long and strands halfway. Either keep it, or split it into per-file chunks
+that each stand alone.
+
 ## Cost note
 
 Right-size the worker per task rather than inheriting the session model.
