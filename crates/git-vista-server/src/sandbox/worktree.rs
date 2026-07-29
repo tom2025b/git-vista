@@ -87,7 +87,9 @@ pub(crate) fn linked_worktree_dirs(repo: &Path) -> Result<Option<LinkedWorktreeD
         return Ok(None); // a plain repository
     }
     if meta.file_type().is_symlink() {
-        return Err("`.git` is a symlink; a linked worktree's pointer must be a regular file".into());
+        return Err(
+            "`.git` is a symlink; a linked worktree's pointer must be a regular file".into(),
+        );
     }
     if !meta.is_file() {
         return Err("`.git` is neither a directory nor a regular file".into());
@@ -220,11 +222,7 @@ mod tests {
         let victim = t.path().join("victim");
         std::fs::create_dir_all(&victim).unwrap();
         std::fs::write(evil.join("commondir"), victim.display().to_string()).unwrap();
-        std::fs::write(
-            linked.join(".git"),
-            format!("gitdir: {}\n", evil.display()),
-        )
-        .unwrap();
+        std::fs::write(linked.join(".git"), format!("gitdir: {}\n", evil.display())).unwrap();
         let err = linked_worktree_dirs(&linked).unwrap_err();
         assert!(
             err.contains("not strictly inside"),
