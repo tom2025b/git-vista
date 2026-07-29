@@ -79,6 +79,29 @@ fn an_unknown_subcommand_fails_closed_to_local() {
     assert_eq!(network_need(&["some-new-porcelain"]), NetworkNeed::Local);
 }
 
+/// C10's strongest (failed) escalation attempt, kept as a regression guard.
+/// `git -c alias.x=push x origin` expands `x` to `push` and runs it, so the
+/// classifier's name-based view (`x` is unknown → `Local`) disagrees with what
+/// git executes. The security property that matters survives regardless: with
+/// `trusted=false` this can never reach `Unsandboxed`. The *availability*
+/// consequence — the hidden push runs under Strict and fails — is the
+/// intended fail-closed direction, not a hole.
+#[test]
+fn an_injected_alias_can_never_reach_unsandboxed() {
+    let args = ["-c", "alias.x=push", "x", "origin"];
+    let need = network_need(&args);
+    // The name-based classifier sees `x`, an unknown subcommand → Local. That is
+    // the documented fail-closed behaviour, asserted so a future change to it is
+    // deliberate.
+    assert_eq!(need, NetworkNeed::Local, "an unknown alias name classifies Local");
+    // The property that must hold no matter how classification lands:
+    assert_ne!(
+        tier_for(need, false),
+        Tier::Unsandboxed,
+        "an injected alias must never escalate an untrusted repo to no-sandbox"
+    );
+}
+
 // -------------------------------------------------------------------------
 // tier_for — the accidental-Unsandboxed guard
 // -------------------------------------------------------------------------
@@ -111,14 +134,21 @@ fn untrusted_dispatch_is_strict_for_local_and_network_for_remote() {
     assert_eq!(tier_for(NetworkNeed::Remote, false), Tier::Network);
 }
 
-/// The default `trusted` value in production is `false` until Task 7 lands the
-/// persisted trust flag, so today no repository is unsandboxed. This test pins
-/// that so a future change to the default is a deliberate, visible edit.
+/// Pin the actual production tier, not a local `let trusted = false` (which
+/// would pass even if the real caller used `true` — the C10 audit flagged the
+/// earlier version of this test as vacuous for exactly that reason). This
+/// exercises the real `policy_for_repo` and asserts the tier it hands out is
+/// never `Unsandboxed`. When Task 8's dispatch is wired in, this test must be
+/// updated to also cover the Strict/Network split — but the "never Unsandboxed
+/// without an explicit trust flag" property must survive that change.
 #[test]
-fn trust_defaults_false_so_nothing_is_unsandboxed_yet() {
-    // The production caller passes `trusted: false` unconditionally for now;
-    // this asserts the safe interim explicitly.
-    let interim_trusted = false;
-    assert_ne!(tier_for(NetworkNeed::Local, interim_trusted), Tier::Unsandboxed);
-    assert_ne!(tier_for(NetworkNeed::Remote, interim_trusted), Tier::Unsandboxed);
+fn the_production_policy_is_never_unsandboxed_today() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let policy = super::policy_for_repo(repo.path())
+        .expect("policy builds (shim present via tests/forces_shim_build.rs)");
+    assert_ne!(
+        policy.tier,
+        Tier::Unsandboxed,
+        "no repository may be unsandboxed until an explicit persisted trust flag exists"
+    );
 }
