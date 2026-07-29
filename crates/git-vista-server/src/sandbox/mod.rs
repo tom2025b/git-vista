@@ -29,6 +29,8 @@ pub(crate) mod shim;
 mod argv;
 #[cfg(test)]
 mod deps;
+#[cfg(test)]
+mod shim_cli;
 
 /// Absolute paths the strict tier's outer launcher is looked for at, in order.
 ///
