@@ -174,16 +174,55 @@ dotfiles repository. None currently resolves into or above an excluded
 directory, so there is no exposure today — but the mechanism is one `ln -s`
 away from voiding the whole exclude set, with nothing to signal it.
 
-**Therefore the enumeration must, after `stat()`, also `lstat()`, and for any
-entry that is a symlink, `canonicalize()` it and skip the entry unless the
-canonical target is a descendant of the tree being granted and is not equal to,
-inside, or an ancestor of any exclude.** An entry resolving to `$HOME`, `/home`
-or `/` must always be skipped: granting an ancestor of the secrets defeats the
-exclusion by union-upward semantics even without naming a secret.
+### The fix is at inode identity, not at path — because hard links exist
 
-This check is a hard invariant of the mechanism, not a hardening extra. It needs
-its own test, and the test must assert the direct-path row above — that
-`~/.ssh/known_hosts` is *still* denied after a hostile alias exists.
+The obvious repair is to `lstat()` each entry and, for symlinks, `canonicalize()`
+and skip anything whose target leaves the granted tree or touches an exclude.
+That is necessary and it is **not sufficient**, which an independent
+re-measurement established after this ADR was first written.
+
+A **hard link has no target.** It *is* the inode, under a second name. So
+`canonicalize()` returns the link's own innocent-looking path, the entry passes
+every symlink test, and granting it re-grants the canonical secret inode exactly
+as the symlink case did. Measured: "following a non-secret symlink into `.ssh`,
+**or granting a non-secret hard link to a secret file**, re-grants the canonical
+secret inode." Symlink-resolution logic is structurally incapable of seeing this,
+because there is no link to resolve.
+
+```mermaid
+flowchart TD
+  X["exclude set: ~/.ssh/id_ed25519"] --> S["stat() each exclude at policy-apply time<br/>record (st_dev, st_ino)"]
+  E["enumerated entry ~/notes.txt<br/>(a hard link to the key)"] --> T["stat() the entry"]
+  T --> Q{"(dev, ino) matches<br/>any exclude?"}
+  Q -->|yes| K["SKIP — this is the secret<br/>wearing another name"]
+  Q -->|no| C{"is it a symlink whose<br/>canonical target escapes<br/>the tree or hits an exclude?"}
+  C -->|yes| K
+  C -->|no| G["grant"]
+```
+
+**Therefore the enumeration must do all of the following**, and each is a hard
+invariant of the mechanism rather than a hardening extra:
+
+1. `stat()` every exclude at policy-apply time and record its `(st_dev, st_ino)`.
+   This means the exclusion check cannot be performed on the argv strings alone —
+   the shim must stat the excludes.
+2. For each enumerated entry, `stat()` it and **skip if its `(dev, ino)` matches
+   any exclude's.** This is what catches hard links.
+3. Additionally `lstat()`, and for any symlink `canonicalize()` and skip unless
+   the canonical target is a descendant of the tree being granted and is not
+   equal to, inside, or an ancestor of any exclude.
+4. Always skip an entry resolving to `$HOME`, `/home` or `/` — granting an
+   ancestor of the secrets defeats the exclusion by union-upward semantics
+   without ever naming a secret.
+
+The accepted alternative to (1)–(2) is a **documented same-filesystem
+assumption**, but it is a strictly weaker guarantee and must be written down as
+one rather than assumed silently.
+
+The test for this must assert the direct-path row from the table above — that
+`~/.ssh/known_hosts` is *still* denied once a hostile alias of either kind
+exists. Asserting only that the alias is denied would pass while the exclusion
+was void.
 
 ### Where the enumeration runs
 
