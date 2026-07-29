@@ -223,4 +223,48 @@ mod tests {
             );
         }
     }
+
+    /// C10 hazard #1, as a tripwire rather than a review convention.
+    ///
+    /// `SandboxedCommand` exists so an argv cannot change after `sandbox_argv`
+    /// classified it. Rust has no stable negative-impl assertion, and a plain
+    /// "we just won't add it" comment is exactly the kind of reviewer-enforced
+    /// invariant this milestone keeps finding holes in — so assert it against
+    /// the source text: the production `impl` block must expose no `arg`,
+    /// `args` or `env` method. A future edit that adds one fails here with the
+    /// reason, instead of silently reopening the hazard.
+    ///
+    /// The `#[cfg(test)]` escape hatch is matched deliberately and allowed:
+    /// test fixtures may strip the environment, production may not.
+    #[test]
+    fn the_sandboxed_command_exposes_no_way_to_change_what_runs() {
+        let src = include_str!("spawn.rs");
+        let start = src
+            .find("impl SandboxedCommand {")
+            .expect("the impl block moved or was renamed");
+        let block = &src[start..];
+        let end = block.find("\n}\n").expect("unterminated impl block");
+        let block = &block[..end];
+
+        for forbidden in ["fn arg", "fn args", "fn env"] {
+            for (i, line) in block.lines().enumerate() {
+                let line = line.trim();
+                if !line.starts_with("pub(crate) fn ") {
+                    continue;
+                }
+                // The one sanctioned exception, gated so production cannot reach it.
+                if line.contains("hermetic_env_for_test") {
+                    continue;
+                }
+                assert!(
+                    !line.contains(forbidden),
+                    "SandboxedCommand line {i} exposes `{forbidden}`: {line}\n\
+                     That reopens C10 hazard #1 — a caller could change the argv or \
+                     environment after `sandbox_argv` already classified it. If a spawn \
+                     site genuinely needs different arguments, pass them to \
+                     `command_async` so the classified argv is the executed argv."
+                );
+            }
+        }
+    }
 }

@@ -124,20 +124,29 @@ fn git_error(endpoint: &str, stderr: &[u8]) -> (StatusCode, String) {
 /// parsers handle that themselves. A cap hit is a *success*: the child is killed
 /// and reaped, and its (killed) exit status is deliberately not reinterpreted as
 /// a git error. Only the below-cap path inspects the exit status.
-/// Build a `git -C <repo>` command that runs **through the M1.13b sandbox**
-/// (#66, Task 6). The returned command is the composed launcher up to
-/// `git -C <repo>`; the caller appends the subcommand args exactly as before,
-/// so migrating a spawn site is a one-line change and its arguments are
-/// unchanged.
+/// Build a `git -C <repo> <args…>` command that runs **through the M1.13b
+/// sandbox** (#66, Task 5/6).
+///
+/// `args` is taken here, not appended by the caller, and that is the whole
+/// point. Until Task 5 this function passed an **empty** slice to
+/// `command_async` and handed back a bare `Command` that each caller then
+/// appended the real subcommand to — so the argv `sandbox_argv` classified was
+/// never the argv that ran (C10 hazard #1). The returned
+/// [`SandboxedCommand`](crate::sandbox::spawn::SandboxedCommand) has no `arg`,
+/// `args` or `env` method, so the classified argv is now the executed argv by
+/// construction rather than by convention.
 ///
 /// This is the single seam that makes the sandbox load-bearing: every git the
 /// server runs goes through here, and `argv_boundary.rs` proves nothing else in
 /// the crate spawns git directly. A policy that cannot be built (a missing shim,
 /// an unset `$HOME`) is a hard error rather than a silent fall-back to
 /// unsandboxed git — an unsandboxed spawn is exactly what this exists to prevent.
-fn sandboxed(repo: &Path) -> Result<tokio::process::Command, String> {
+fn sandboxed(
+    repo: &Path,
+    args: &[&str],
+) -> Result<crate::sandbox::spawn::SandboxedCommand, String> {
     let policy = crate::sandbox::policy_for_repo(repo).map_err(|e| e.to_string())?;
-    Ok(crate::sandbox::spawn::command_async(&policy, repo, &[]))
+    Ok(crate::sandbox::spawn::command_async(&policy, repo, args))
 }
 
 pub(crate) async fn git_stdout_capped(
@@ -146,9 +155,9 @@ pub(crate) async fn git_stdout_capped(
     endpoint: &str,
     cap: usize,
 ) -> Result<(Vec<u8>, bool), (StatusCode, String)> {
-    let child = sandboxed(repo)
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let child = sandboxed(repo, &borrowed)
         .map_err(|e| io_error(endpoint, std::io::Error::other(e)))?
-        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -250,10 +259,9 @@ pub(crate) async fn git_stdout(
 /// piece of state git itself throws away (the branch's reflog dies with it)
 /// and exactly what "Restore branch" later needs.
 pub(crate) async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
-    let output = sandboxed(repo)
+    let spec = format!("{rev}^{{commit}}");
+    let output = sandboxed(repo, &["rev-parse", "--verify", "--quiet", &spec])
         .ok()?
-        .args(["rev-parse", "--verify", "--quiet"])
-        .arg(format!("{rev}^{{commit}}"))
         .output()
         .await
         .ok()?;
@@ -268,11 +276,10 @@ pub(crate) async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
 /// --is-ancestor` exits 0 exactly then. "HEAD already contains the base tip" is
 /// the definition of "a rebase onto that base would change nothing".
 pub(crate) async fn is_ancestor(repo: &Path, ancestor: &str, rev: &str) -> bool {
-    let Ok(mut cmd) = sandboxed(repo) else {
+    let Ok(cmd) = sandboxed(repo, &["merge-base", "--is-ancestor", ancestor, rev]) else {
         return false;
     };
-    cmd.args(["merge-base", "--is-ancestor", ancestor, rev])
-        .output()
+    cmd.output()
         .await
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -281,8 +288,7 @@ pub(crate) async fn is_ancestor(repo: &Path, ancestor: &str, rev: &str) -> bool 
 /// Run one `git -C <repo> <args…>` for the reset, mapping any failure to git's
 /// own stderr so the response can say which exact step refused and why.
 pub(crate) async fn git_ok(repo: &Path, args: &[&str]) -> Result<(), String> {
-    let output = sandboxed(repo)?
-        .args(args)
+    let output = sandboxed(repo, args)?
         .output()
         .await
         .map_err(|e| format!("couldn't run git: {e}"))?;
@@ -301,14 +307,10 @@ pub(crate) async fn git_ok(repo: &Path, args: &[&str]) -> Result<(), String> {
 /// when the ref exists, non-zero otherwise. Used to prefer `origin/main` over the
 /// local `main` as a rebase base only when the remote-tracking ref is actually there.
 pub(crate) async fn git_ref_exists(repo: &Path, refname: &str) -> bool {
-    let Ok(mut cmd) = sandboxed(repo) else {
+    let Ok(cmd) = sandboxed(repo, &["rev-parse", "--verify", "--quiet", refname]) else {
         return false;
     };
-    cmd.arg("rev-parse")
-        .arg("--verify")
-        .arg("--quiet")
-        .arg(refname)
-        .output()
+    cmd.output()
         .await
         .map(|o| o.status.success())
         .unwrap_or(false)
