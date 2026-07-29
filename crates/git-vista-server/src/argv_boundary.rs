@@ -58,6 +58,10 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // rule and replaces that rule with "names no interpreter" — the program it
     // runs is `Policy::shim`, an absolute path this crate resolved itself.
     "src/sandbox/shim_cli.rs",
+    // The `#[cfg(test)]` escape battery. It launches the composed launcher via
+    // shim_cli, and separately runs the C compiler to build the adversarial
+    // probes it feeds in as hostile hooks. Also in LAUNCHER_SPAWN_SITES.
+    "src/sandbox/escape_suite.rs",
     // git-vista-git
     "src/history.rs", // read-side reflog/stash reads, static args
 ];
@@ -79,13 +83,25 @@ const LAUNCHER_SPAWN_SITES: &[&str] = &[
     // `Command::new(&argv[0])` is `Policy::shim`, resolved by this crate
     // through `sandbox::shim` (absolute, existence-checked, never PATH).
     "src/sandbox/shim_cli.rs",
+    // The `#[cfg(test)]` escape battery. It launches the composed launcher and
+    // also runs `cc` to compile the adversarial probes it feeds in as hooks.
+    // `cc` is not an interpreter of *its* arguments the way a shell is — it
+    // compiles a source file this test wrote — so it is permitted here while
+    // shells remain forbidden.
+    "src/sandbox/escape_suite.rs",
 ];
 
-/// A launcher site may name a non-literal program, but never an interpreter.
-/// Without this, the carve-out above would silently permit `Command::new("sh")`
-/// in the one file exempt from the literal rule.
+/// A launcher site may name a non-literal program, but never a **shell**.
+///
+/// The literal-`git` rule exists so no spawn site can be talked into running a
+/// program chosen at runtime; a shell is the sharpest form of that, because it
+/// re-interprets a string as a command. A launcher site is exempt from the
+/// literal rule (it runs `Policy::shim`, a resolved path) but must not reopen
+/// the shell hole. `cc` is deliberately *not* on this list: it compiles a file,
+/// it does not interpret an argument as a command, and the escape battery needs
+/// it to build the C probes that make the seccomp assertions real.
 #[test]
-fn launcher_sites_name_no_interpreter() {
+fn launcher_sites_name_no_shell() {
     let server_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
     let spawn = ["Command", "::new("].concat();
     for rel in LAUNCHER_SPAWN_SITES {
@@ -98,11 +114,13 @@ fn launcher_sites_name_no_interpreter() {
              remove it from LAUNCHER_SPAWN_SITES rather than leaving the \
              carve-out open"
         );
-        for interpreter in ["\"sh\"", "\"bash\"", "\"/bin/sh\"", "\"/bin/bash\"", "\"env\""] {
-            let needle = [&spawn, interpreter].concat();
+        for shell in [
+            "\"sh\"", "\"bash\"", "\"/bin/sh\"", "\"/bin/bash\"", "\"zsh\"", "\"env\"",
+        ] {
+            let needle = [&spawn, shell].concat();
             assert!(
                 !text.contains(&needle),
-                "{rel}: a launcher site must never name an interpreter ({interpreter})"
+                "{rel}: a launcher site must never name a shell ({shell})"
             );
         }
     }
