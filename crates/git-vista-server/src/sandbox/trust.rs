@@ -53,7 +53,17 @@ fn marker_name(canonical: &Path) -> String {
 /// path does not match. There is no path through this function to `true` that
 /// does not correspond to a marker `grant` wrote for this exact repository.
 pub(crate) fn is_trusted(canonical_repo: &Path) -> bool {
-    let marker = sandbox_trust_dir().join(marker_name(canonical_repo));
+    is_trusted_in(&sandbox_trust_dir(), canonical_repo)
+}
+
+/// The whole implementation, with the trust directory explicit. The public
+/// functions bind it to `sandbox_trust_dir()`; tests bind it to a temp dir.
+/// This split exists so tests never have to redirect `XDG_STATE_HOME`/`HOME`
+/// through the process environment — a previous version did, leaked the
+/// mutation, and intermittently killed every parallel test that reads `$HOME`
+/// (the whole escape battery among them).
+fn is_trusted_in(trust_dir: &Path, canonical_repo: &Path) -> bool {
+    let marker = trust_dir.join(marker_name(canonical_repo));
     let Ok(stored) = std::fs::read(&marker) else {
         return false; // no marker, or unreadable — untrusted
     };
@@ -70,9 +80,12 @@ pub(crate) fn is_trusted(canonical_repo: &Path) -> bool {
 /// Writing the marker is the *only* way `is_trusted` can later return `true`.
 #[cfg_attr(not(test), allow(dead_code))] // wired to the operator-trust handler in a later task
 pub(crate) fn grant(canonical_repo: &Path) -> std::io::Result<()> {
-    let dir = sandbox_trust_dir();
-    std::fs::create_dir_all(&dir)?;
-    let marker = dir.join(marker_name(canonical_repo));
+    grant_in(&sandbox_trust_dir(), canonical_repo)
+}
+
+fn grant_in(trust_dir: &Path, canonical_repo: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(trust_dir)?;
+    let marker = trust_dir.join(marker_name(canonical_repo));
     std::fs::write(&marker, canonical_repo.as_os_str().as_encoded_bytes())
 }
 
@@ -80,7 +93,11 @@ pub(crate) fn grant(canonical_repo: &Path) -> std::io::Result<()> {
 /// missing marker is success, because the desired state (not trusted) holds.
 #[cfg_attr(not(test), allow(dead_code))] // wired to the operator-revoke handler in a later task
 pub(crate) fn revoke(canonical_repo: &Path) -> std::io::Result<()> {
-    let marker = sandbox_trust_dir().join(marker_name(canonical_repo));
+    revoke_in(&sandbox_trust_dir(), canonical_repo)
+}
+
+fn revoke_in(trust_dir: &Path, canonical_repo: &Path) -> std::io::Result<()> {
+    let marker = trust_dir.join(marker_name(canonical_repo));
     match std::fs::remove_file(&marker) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -92,56 +109,59 @@ pub(crate) fn revoke(canonical_repo: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// The tests must not touch the real trust dir. `sandbox_trust_dir` is
-    /// derived from `XDG_STATE_HOME`/`HOME`; point them at a temp dir for the
-    /// duration of one serialized test. Env mutation races under parallel
-    /// `cargo test`, so every test that sets it runs inside this one function.
+    /// The tests must not touch the real trust dir, and they must not redirect
+    /// it through `XDG_STATE_HOME`/`HOME` either: process-environment mutation
+    /// under parallel `cargo test` is a suite-wide race, and a previous
+    /// version of this test proved it — its leaked `remove_var("HOME")`
+    /// intermittently killed every concurrently-running test that reads
+    /// `$HOME` (the escape battery among them). The `*_in` functions take the
+    /// directory explicitly, so nothing here touches the environment at all.
     #[test]
     fn trust_is_fail_closed_and_only_grant_can_flip_it() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        // Edition 2021: `set_var`/`remove_var` are safe. This is the only test
-        // that mutates these, and it is one function, so no intra-suite race.
-        std::env::set_var("XDG_STATE_HOME", tmp.path());
-        std::env::remove_var("HOME");
+        let dir = tmp.path().join("trusted-repos");
 
         let repo = tmp.path().join("some/canonical/repo/.git");
 
         // 1. Absent marker → not trusted.
         assert!(
-            !is_trusted(&repo),
+            !is_trusted_in(&dir, &repo),
             "a repo with no marker must not be trusted"
         );
 
         // 2. After an explicit grant → trusted.
-        grant(&repo).expect("grant writes a marker");
-        assert!(is_trusted(&repo), "an explicitly granted repo is trusted");
+        grant_in(&dir, &repo).expect("grant writes a marker");
+        assert!(
+            is_trusted_in(&dir, &repo),
+            "an explicitly granted repo is trusted"
+        );
 
         // 3. A *different* repo is still not trusted (no cross-contamination).
         let other = tmp.path().join("another/repo/.git");
         assert!(
-            !is_trusted(&other),
+            !is_trusted_in(&dir, &other),
             "granting one repo must not trust another"
         );
 
         // 4. Revoke returns to untrusted.
-        revoke(&repo).expect("revoke");
-        assert!(!is_trusted(&repo), "a revoked repo is no longer trusted");
+        revoke_in(&dir, &repo).expect("revoke");
+        assert!(
+            !is_trusted_in(&dir, &repo),
+            "a revoked repo is no longer trusted"
+        );
 
         // 5. Revoke is idempotent.
-        revoke(&repo).expect("revoke of an already-untrusted repo is Ok");
+        revoke_in(&dir, &repo).expect("revoke of an already-untrusted repo is Ok");
 
         // 6. A marker whose *content* does not match the repo path is not
         //    trusted — the guard against a hash collision silently trusting the
         //    wrong repository.
-        let dir = sandbox_trust_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(marker_name(&repo)), b"/some/other/path/.git").unwrap();
         assert!(
-            !is_trusted(&repo),
+            !is_trusted_in(&dir, &repo),
             "a marker with a mismatched stored path must not confer trust"
         );
-
-        std::env::remove_var("XDG_STATE_HOME");
     }
 
     /// The marker name is stable for a given path and differs across paths — the
