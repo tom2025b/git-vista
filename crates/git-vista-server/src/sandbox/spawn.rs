@@ -96,17 +96,45 @@ impl SandboxedCommand {
         self.0.spawn()
     }
 
-    /// Test-only: run with a stripped environment so a fixture's result does not
-    /// depend on the developer's shell. Gated to `#[cfg(test)]` precisely so the
-    /// production surface above stays free of environment control — see the type
-    /// doc for why `env` is a hazard, not a convenience.
+    /// Test-only: exit status, for fixture setup that only needs "did it work".
     #[cfg(test)]
-    pub(crate) fn hermetic_env_for_test(mut self) -> Self {
-        self.0
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", std::env::var("HOME").expect("HOME set in tests"));
+    pub(crate) async fn status(mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0.status().await
+    }
+
+    /// Test-only: **replace** the environment with `profile`, wholesale.
+    ///
+    /// Deliberately not an incremental `env(k, v)`. The escape battery's R7 rule
+    /// is that both legs of a case run under one *pinned* environment profile —
+    /// pinned meaning the environment is known in full, not "inherited plus a
+    /// few overrides". An incremental setter makes a half-pinned environment
+    /// expressible, and a half-pinned environment is how a developer's stray
+    /// `GIT_*` variable silently changes what a containment case observed.
+    ///
+    /// So this clears first and applies the profile as a unit: the same
+    /// discipline the argv now has, for the same reason. Gated to `#[cfg(test)]`
+    /// so the production surface stays free of environment control entirely —
+    /// see the type doc for why `env` is a hazard rather than a convenience.
+    #[cfg(test)]
+    pub(crate) fn pinned_env_for_test<K, V>(mut self, profile: &[(K, V)]) -> Self
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        self.0.env_clear();
+        for (k, v) in profile {
+            self.0.env(k, v);
+        }
         self
+    }
+
+    /// Test-only: the minimal pinned profile for fixtures that only need git to
+    /// run at all. Expressed through [`Self::pinned_env_for_test`] so there is
+    /// exactly one way an environment is applied.
+    #[cfg(test)]
+    pub(crate) fn hermetic_env_for_test(self) -> Self {
+        let home = std::env::var("HOME").expect("HOME set in tests");
+        self.pinned_env_for_test(&[("PATH", "/usr/bin:/bin".to_string()), ("HOME", home)])
     }
 }
 
