@@ -24,6 +24,9 @@ pub(crate) mod bwrap;
 /// file for the same reason as `bwrap` — `sandbox_argv` stays a total function
 /// of its `Policy`.
 pub(crate) mod shim;
+/// Task 5: the two spawn wrappers. The single chokepoint where the pure argv
+/// becomes a real git process. Task 6 migrates the server's spawn sites here.
+pub(crate) mod spawn;
 
 #[cfg(test)]
 mod argv;
