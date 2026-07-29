@@ -29,6 +29,8 @@ pub(crate) mod shim;
 pub(crate) mod spawn;
 /// Task 9: the factual capability probe — what tiers can this host provide.
 pub(crate) mod capabilities;
+/// Task 7: the persisted per-repo trust flag — the only route to `Unsandboxed`.
+pub(crate) mod trust;
 
 #[cfg(test)]
 mod argv;
