@@ -529,11 +529,86 @@ fn read_self_code_only() -> String {
     crate::argv_boundary::code_only(&read_rs("src/sandbox/escape_contract.rs"))
 }
 
-/// Split a battery file's `code_only`'d source at its `mod harness` block and
-/// return everything **outside** that block — the region R1 restricts.
+/// Blank comments only — never string-literal content. Unlike
+/// `argv_boundary::code_only` (which blanks both, because its callers scan
+/// for *structural* patterns), several tripwires here need to see actual
+/// quoted text (`env::var("HOME")`, `Command::new("git")`) while still being
+/// blind to a doc comment that merely *mentions* the same text in prose.
+fn comments_only_blanked(src: &str) -> String {
+    let c: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < c.len() {
+        let ch = c[i];
+        let next = c.get(i + 1).copied();
+        if ch == '/' && next == Some('/') {
+            while i < c.len() && c[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while i < c.len() {
+                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    continue;
+                }
+                if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                out.push(if c[i] == '\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '"' {
+            out.push('"');
+            i += 1;
+            while i < c.len() {
+                if c[i] == '\\' {
+                    out.push(c[i]);
+                    if i + 1 < c.len() {
+                        out.push(c[i + 1]);
+                    }
+                    i += 2;
+                    continue;
+                }
+                if c[i] == '"' {
+                    out.push('"');
+                    i += 1;
+                    break;
+                }
+                out.push(c[i]);
+                i += 1;
+            }
+            continue;
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
+/// Split a battery file's comment-blanked source at its `mod harness` block
+/// and return everything **outside** that block — the region R1 restricts.
+/// String-literal content is left intact (see `comments_only_blanked`),
+/// because several rules need to see real quoted text, not the structural
+/// blanking `argv_boundary::code_only` performs for its own callers.
 /// Panics (deliberately: see the module doc) if the file has no such marker.
 fn case_region(rel: &str) -> String {
-    let code = crate::argv_boundary::code_only(&read_rs(rel));
+    let code = comments_only_blanked(&read_rs(rel));
     let marker = "mod harness";
     let at = code.find(marker).unwrap_or_else(|| {
         panic!(
@@ -718,9 +793,14 @@ fn r6_every_inside_leg_spawns_through_the_production_seam() {
             );
         }
     }
-    let code = crate::argv_boundary::code_only(&read_rs("src/sandbox/escape_suite.rs"));
+    // Whole file, not just the case region: the legitimate `Command::new(`
+    // sites (compiling a probe with `cc`, the plain baseline `git`) live
+    // inside `mod harness`. String content must survive this scan, so it
+    // uses `comments_only_blanked`, never `code_only`.
+    let code = comments_only_blanked(&read_rs("src/sandbox/escape_suite.rs"));
     let spawn = ["Command", "::new("].concat();
     let mut i = 0usize;
+    let mut sites = 0usize;
     while let Some(pos) = code[i..].find(&spawn) {
         let after = code[i + pos + spawn.len()..].trim_start();
         assert!(
@@ -728,8 +808,10 @@ fn r6_every_inside_leg_spawns_through_the_production_seam() {
             "escape_suite.rs: a Command::new( site must be immediately followed by \
              \"cc\" or \"git\" (R6)"
         );
+        sites += 1;
         i += pos + spawn.len();
     }
+    assert!(sites > 0, "escape_suite.rs: no Command::new( sites found — the scan broke");
 }
 
 /// R7: both legs share exactly one env-building function; no `env_clear`/
@@ -837,7 +919,13 @@ fn r10_every_flag_sandbox_argv_emits_has_a_shim_parser_arm() {
     while let Some(start) = rest.find("\"--") {
         let after = &rest[start + 1..];
         let Some(end) = after.find('"') else { break };
-        emitted.insert(after[..end].to_string());
+        let flag = &after[..end];
+        // `"--"` is the separator, not a flag — it has its own arm in
+        // `parse()` (`"--" => { … break; }`) rather than a flag arm, and
+        // `arms` below excludes it for the same reason.
+        if flag != "--" {
+            emitted.insert(flag.to_string());
+        }
         rest = &after[end + 1..];
     }
     assert!(!emitted.is_empty(), "flag scan of shim_argv found nothing — the scan broke");
