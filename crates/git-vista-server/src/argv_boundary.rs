@@ -63,7 +63,6 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // in `LAUNCHER_SPAWN_SITES` below, which exempts it from the literal-`git`
     // rule and replaces that rule with "names no interpreter" — the program it
     // runs is `Policy::shim`, an absolute path this crate resolved itself.
-    "src/sandbox/shim_cli.rs",
     // The `#[cfg(test)]` escape battery. It launches the composed launcher via
     // shim_cli, and separately runs the C compiler to build the adversarial
     // probes it feeds in as hostile hooks. Also in LAUNCHER_SPAWN_SITES.
@@ -95,7 +94,6 @@ const LAUNCHER_SPAWN_SITES: &[&str] = &[
     // The `#[cfg(test)]` harness that drives the composed launcher. Its
     // `Command::new(&argv[0])` is `Policy::shim`, resolved by this crate
     // through `sandbox::shim` (absolute, existence-checked, never PATH).
-    "src/sandbox/shim_cli.rs",
     // The `#[cfg(test)]` escape battery. It launches the composed launcher and
     // also runs `cc` to compile the adversarial probes it feeds in as hooks.
     // `cc` is not an interpreter of *its* arguments the way a shell is — it

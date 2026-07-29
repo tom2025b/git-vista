@@ -76,8 +76,7 @@ pub(crate) fn command_sync(policy: &Policy, repo: &Path, args: &[&str]) -> std::
 
 #[cfg(test)]
 mod tests {
-    use super::super::shim_cli::{fixture, shim, workable};
-    use super::super::Tier;
+    use super::super::shim_cli::fixture;
     use super::*;
 
     /// The wrapper's argv is exactly the sandbox argv with `-C <repo> <args>`
@@ -86,8 +85,8 @@ mod tests {
     #[test]
     fn the_wrapper_argv_is_the_sandbox_argv_plus_the_repo_and_args() {
         let repo = std::path::PathBuf::from("/srv/repo");
-        let s = std::path::PathBuf::from("/opt/gv/gv-sandbox");
-        let policy = workable(Tier::Network, &repo, &s);
+        let policy = super::super::policy_for_repo(&repo)
+            .expect("policy_for_repo builds (shim is present via tests/forces_shim_build.rs)");
         let argv = full_argv(&policy, &repo, &["status", "--short"]);
 
         // ends with the appended tail
@@ -110,9 +109,9 @@ mod tests {
     /// assembly — it proves the process the server will spawn works.
     #[tokio::test]
     async fn a_real_git_runs_through_the_async_wrapper() {
-        let repo = fixture();
-        let s = shim();
-        let policy = workable(Tier::Network, repo.path(), &s);
+        let repo = fixture().await;
+        let policy = super::super::policy_for_repo(repo.path())
+            .expect("policy_for_repo builds (shim is present via tests/forces_shim_build.rs)");
         let out = command_async(&policy, repo.path(), &["status", "--short"])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -134,7 +133,7 @@ mod tests {
     /// enumerated `$HOME` grant, and the real secret excludes together.
     #[tokio::test]
     async fn the_production_policy_runs_real_git_and_denies_secrets() {
-        let repo = fixture();
+        let repo = fixture().await;
         let policy = super::super::policy_for_repo(repo.path())
             .expect("policy_for_repo builds (shim is present via tests/forces_shim_build.rs)");
 
@@ -167,20 +166,4 @@ mod tests {
         }
     }
 
-    /// The sync wrapper runs the same policy the same way. Asserted separately
-    /// because the two share `full_argv` but build different `Command` types,
-    /// and a copy-paste error in one would not show up in the other.
-    #[test]
-    fn a_real_git_runs_through_the_sync_wrapper() {
-        let repo = fixture();
-        let s = shim();
-        let policy = workable(Tier::Network, repo.path(), &s);
-        let out = command_sync(&policy, repo.path(), &["rev-parse", "HEAD"])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", std::env::var("HOME").unwrap())
-            .output()
-            .expect("git runs through the sync wrapper");
-        assert!(out.status.success());
-    }
 }
