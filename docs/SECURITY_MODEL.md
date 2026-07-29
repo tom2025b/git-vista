@@ -25,21 +25,31 @@ adversary, and it cannot: see Known Non-Goals.
 
 - A website opened in the same browser cannot command the local Git-Vista server.
 - A LAN device cannot discover and mutate repositories without explicit pairing.
-- The UI cannot request arbitrary paths, Git argv, environment variables, or shell.
+- No browser or API request can directly supply arbitrary paths, Git argv,
+  environment variables, or a shell — enforced at the browser/API surface
+  (ADR 0017). Repository code itself — hooks, filters, configured
+  executables — has its own execution authority once Git invokes it, and is
+  governed separately; see Command Execution and Known Non-Goals.
 - A stale or replayed request cannot repeat a mutation silently.
 - Provider and Git credentials never enter logs, URLs, API payloads, or browser
   storage unnecessarily.
-- A repository cannot cause unbounded memory, disk, child-process, or render use.
-  *(Implemented for history and file reads: ADR 0022, #63 — every git read goes
-  through `git_vista_git::git_stdout_capped`, which streams under a per-kind cap
-  (8 MiB diff metadata → 413, 200 KB per patch within 5 MB, 2 MB per file) and
-  carries `kill_on_drop`, so a disconnected client kills the child instead of
-  letting it finish into a buffer. History is paged rather than buffered whole,
-  and paging keeps **no** per-client server state: the entire state of a scroll
-  is one signed offset in the client's cursor, so memory is independent of both
-  repository size and the number of connected clients. The frontend culls to at
-  most 2,000 live rows regardless of camera. The memory bound is a
-  denial-of-service control, not merely a performance measure.)*
+- Git-Vista's own read paths cap memory use, output size, and process
+  lifetime — quantified ceilings on what Git-Vista itself spawns, not a
+  blanket bound on the repository. *(Implemented for history and file reads:
+  ADR 0022, #63 — every git read goes through `git_vista_git::git_stdout_capped`,
+  which streams under a per-kind cap (8 MiB diff metadata → 413, 200 KB per
+  patch within 5 MB, 2 MB per file) and carries `kill_on_drop`, so a
+  disconnected client kills the child instead of letting it finish into a
+  buffer. History is paged rather than buffered whole, and paging keeps
+  **no** per-client server state: the entire state of a scroll is one signed
+  offset in the client's cursor, so memory is independent of both repository
+  size and the number of connected clients. The frontend culls to at most
+  2,000 live rows regardless of camera. The memory bound is a
+  denial-of-service control, not merely a performance measure. **Disk use
+  and a hook's own child processes are not bounded by any of this** —
+  repository code executes as the real uid (ADR 0025) with no ceiling of its
+  own, and same-uid resource exhaustion is a Known Non-Goal, not a gap in
+  this control.)*
 - Recovery data is protected at least as strongly as the repository itself.
 - Security remains understandable for one person to operate.
 
@@ -226,10 +236,14 @@ it did not itself register.
 
 ## Command Execution
 
-- Use direct argv execution; never invoke a shell.
+- Every Git-Vista-owned spawn site uses direct argv execution; never a shell.
   *(Enforced by a tripwire test: ADR 0017, #144 —
   `git-vista-server::argv_boundary` scans both native crates and fails on any
-  process-spawn site that is not allowlisted or does not name `git` literally.)*
+  process-spawn site that is not allowlisted or does not name `git` literally.
+  This governs Git-Vista's own spawn sites only: once invoked, `git` may run a
+  repository hook, filter, or credential helper that itself invokes a shell —
+  that execution is Git's, not a Git-Vista spawn site, and is addressed by
+  Command Execution's hook policy and ADR 0025, not this tripwire.)*
 - Build argv only from typed operation planners and validated domain values.
   *(Extended to read state: ADR 0022, #63 — a paging cursor is server-authored
   and HMAC-SHA256 signed. The client may echo it back but may not author it. It
