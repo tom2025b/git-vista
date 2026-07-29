@@ -1,0 +1,17 @@
+--- a/crates/git-vista-server/src/bin/gv-sandbox/main.rs
++++ b/crates/git-vista-server/src/bin/gv-sandbox/main.rs
+@@ -562,14 +562,7 @@
+     // `git` is named literally so the argv tripwire can prove this process
+     // cannot exec anything else, and `validate` has already refused any
+     // program_args that did not begin with exactly `git`.
+     let mut cmd = Command::new("git");
+-    if let Some(dir) = &a.hooks_blocked_dir {
+-        // The same suppression the unsandboxed tier expresses, applied here so
+-        // a blocked-hooks policy means blocked hooks in every tier.
+-        let mut setting = std::ffi::OsString::from("core.hooksPath=");
+-        setting.push(dir);
+-        cmd.arg("-c").arg(setting);
+-    }
+     cmd.args(&a.program_args[1..]);
+     let err = cmd.exec();
+     die(EXIT_EXEC, &format!("exec git failed: {err}"));

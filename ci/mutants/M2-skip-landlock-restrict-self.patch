@@ -1,0 +1,20 @@
+--- a/crates/git-vista-server/src/bin/gv-sandbox/main.rs
++++ b/crates/git-vista-server/src/bin/gv-sandbox/main.rs
+@@ -525,13 +525,7 @@
+     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+         die(EXIT_LANDLOCK, "prctl(PR_SET_NO_NEW_PRIVS) failed");
+     }
+-    if unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset, 0usize) } != 0 {
+-        die(
+-            EXIT_LANDLOCK,
+-            &format!(
+-                "landlock_restrict_self failed: {}",
+-                std::io::Error::last_os_error()
+-            ),
+-        );
+-    }
+-    unsafe { libc::close(ruleset) };
++    return;
+ }
+ 
+ // A directory binary (`src/bin/gv-sandbox/main.rs`) rather than a single file,

@@ -1,0 +1,16 @@
+--- a/crates/git-vista-server/src/bin/gv-sandbox/main.rs
++++ b/crates/git-vista-server/src/bin/gv-sandbox/main.rs
+@@ -545,13 +545,7 @@
+ /// image is replaced — and both survive the `execve` because
+ /// `PR_SET_NO_NEW_PRIVS` is already set.
+ fn apply_seccomp() {
+-    let program = match seccomp_filter::build() {
+-        Ok(p) => p,
+-        Err(e) => die(EXIT_SECCOMP, &format!("seccomp filter build failed: {e}")),
+-    };
+-    if let Err(e) = seccompiler::apply_filter(&program) {
+-        die(EXIT_SECCOMP, &format!("seccomp apply failed: {e}"));
+-    }
+ }
+ 
+ fn main() {
