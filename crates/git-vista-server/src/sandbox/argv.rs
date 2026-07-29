@@ -264,7 +264,7 @@ fn blocked_hooks_name_the_empty_dir_and_running_hooks_do_not() {
         .any(|s| s == "--hooks-run"));
 }
 
-/// The four policy-building sites (Tasks 6, 7, 9 and `shim_cli::workable`) must
+/// The production policy-building sites (Tasks 6, 7 and 9) must
 /// not each hand-roll a system-tree list — the round-4 measured configuration
 /// granted `/dev` **and** `/proc`, and every list in the original plan omitted
 /// both. `/proc` is strict-tier-only on purpose: bwrap mounts a fresh procfs
