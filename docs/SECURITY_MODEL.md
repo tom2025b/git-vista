@@ -14,12 +14,14 @@ rules wherever repository code runs, Landlock network rules that scope the
 network tier to a fixed TCP port list — never to a destination host, see ADR
 0028 — seccomp syscall filtering, and, outside the network tier, a `bwrap`
 namespace boundary. **None of that enforcement is shipped yet.** What is true
-today: the policy a session will run under is computed and disclosed (ADR
-0025), and the pure argv chokepoint that will carry it is built and tested
-(ADR 0017); the shim that actually applies Landlock and seccomp to a hook
-process does not exist in the tree yet (ADR 0027), so today no hook process
-is restricted by any of this. It does not claim isolation from a same-uid
-adversary, and it cannot: see Known Non-Goals.
+today: whether a session's hooks are policy-flagged `Allow` or `Restricted` is
+computed and disclosed to the user (ADR 0025), and the pure, tested code that
+builds each tier's Landlock grants, excludes, and permitted ports already
+exists (ADR 0027, ADR 0028) — but the shim that actually applies Landlock and
+seccomp to a hook process does not exist in the tree yet (ADR 0027), so today
+no hook process is restricted by any of this; a `Restricted` session's hooks
+run exactly like an `Allow` session's. It does not claim isolation from a
+same-uid adversary, and it cannot: see Known Non-Goals.
 
 ## Security Objectives
 
@@ -243,7 +245,7 @@ it did not itself register.
   This governs Git-Vista's own spawn sites only: once invoked, `git` may run a
   repository hook, filter, or credential helper that itself invokes a shell —
   that execution is Git's, not a Git-Vista spawn site, and is addressed by
-  Command Execution's hook policy and ADR 0025, not this tripwire.)*
+  the hook-policy bullet below and ADR 0025, not this tripwire.)*
 - Build argv only from typed operation planners and validated domain values.
   *(Extended to read state: ADR 0022, #63 — a paging cursor is server-authored
   and HMAC-SHA256 signed. The client may echo it back but may not author it. It
