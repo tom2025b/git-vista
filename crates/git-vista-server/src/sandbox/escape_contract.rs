@@ -452,11 +452,35 @@ fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
         case.id
     );
 
-    let inside_obs = parse_observation(&inside.combined, nonce, case.probe_tag).unwrap_or_else(|e| {
-        panic!("{}: inside-leg `{}` observation missing: {}", case.id, case.probe_tag, e.detail)
-    });
-    let granted_obs = parse_observation(&inside.combined, nonce, "GRANTED")
-        .unwrap_or_else(|e| panic!("{}: inside-leg GRANTED observation missing (R3): {}", case.id, e.detail));
+    // A blocked hook cannot emit an inside-leg observation by definition. The
+    // functional case therefore observes the hook's exact filesystem effect:
+    // ENOENT means the marker was never created, while M6 (ignoring the empty
+    // hooks directory) runs the hook and yields errno 0. The already-asserted
+    // inside commit status is its paired positive: Git still completed under
+    // the same policy even though hook execution was suppressed.
+    let (inside_obs, granted_obs) = if case.hooks_blocked {
+        let marker = inside_repo.path().join(".git/gv_escape_hook_ran");
+        let observed = match std::fs::metadata(marker) {
+            Ok(_) => 0,
+            Err(e) => e.raw_os_error().unwrap_or(-1),
+        };
+        (observed, inside.commit_code)
+    } else {
+        let observed = parse_observation(&inside.combined, nonce, case.probe_tag)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{}: inside-leg `{}` observation missing: {}",
+                    case.id, case.probe_tag, e.detail
+                )
+            });
+        let granted = parse_observation(&inside.combined, nonce, "GRANTED").unwrap_or_else(|e| {
+            panic!(
+                "{}: inside-leg GRANTED observation missing (R3): {}",
+                case.id, e.detail
+            )
+        });
+        (observed, granted)
+    };
 
     if inside_obs != case.expect_inside.0 {
         return Outcome::Escaped {
