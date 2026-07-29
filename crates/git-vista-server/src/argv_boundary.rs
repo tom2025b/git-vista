@@ -57,6 +57,52 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     "src/history.rs", // read-side reflog/stash reads, static args
 ];
 
+/// The one carve-out from "every spawn site names `git` literally": sites that
+/// launch the **sandbox launcher** rather than git itself.
+///
+/// The literal rule exists so no spawn site can be talked into running a
+/// program chosen at runtime. A launcher site necessarily breaks it — the
+/// program it runs is `Policy::shim`, a path rather than a literal — so the
+/// rule is replaced here by a narrower one, asserted in
+/// `launcher_sites_name_no_interpreter` below: a launcher site may name a
+/// non-literal program, but it must never name a shell or interpreter.
+///
+/// Keep this list at one entry if at all possible. Every addition widens the
+/// only hole in the tripwire.
+const LAUNCHER_SPAWN_SITES: &[&str] = &[
+    // The `#[cfg(test)]` harness that drives the composed launcher. Its
+    // `Command::new(&argv[0])` is `Policy::shim`, resolved by this crate
+    // through `sandbox::shim` (absolute, existence-checked, never PATH).
+    "src/sandbox/shim_cli.rs",
+];
+
+/// A launcher site may name a non-literal program, but never an interpreter.
+/// Without this, the carve-out above would silently permit `Command::new("sh")`
+/// in the one file exempt from the literal rule.
+#[test]
+fn launcher_sites_name_no_interpreter() {
+    let server_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+    let spawn = ["Command", "::new("].concat();
+    for rel in LAUNCHER_SPAWN_SITES {
+        let path = server_root.join(rel);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("launcher site {rel} must exist"));
+        assert!(
+            text.contains(&spawn),
+            "{rel} is listed as a launcher site but constructs no Command; \
+             remove it from LAUNCHER_SPAWN_SITES rather than leaving the \
+             carve-out open"
+        );
+        for interpreter in ["\"sh\"", "\"bash\"", "\"/bin/sh\"", "\"/bin/bash\"", "\"env\""] {
+            let needle = [&spawn, interpreter].concat();
+            assert!(
+                !text.contains(&needle),
+                "{rel}: a launcher site must never name an interpreter ({interpreter})"
+            );
+        }
+    }
+}
+
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("readable source dir") {
         let path = entry.expect("dir entry").path();
@@ -106,7 +152,7 @@ fn every_process_spawn_site_is_allowlisted_and_spawns_only_git() {
             // This file talks *about* spawning without doing it; every other
             // allowlisted site must spawn `git` literally — no shells, no
             // dynamically chosen program names.
-            if rel != "src/argv_boundary.rs" {
+            if rel != "src/argv_boundary.rs" && !LAUNCHER_SPAWN_SITES.contains(&rel.as_str()) {
                 assert_eq!(
                     text.matches(&spawn_git).count(),
                     hits,
