@@ -111,14 +111,61 @@ pub(crate) const LANDLOCK_ABI_FLOOR: u32 = 6;
 pub(crate) const DEFAULT_SECRET_EXCLUDES: &[&str] = &[
     ".ssh",
     ".claude",
+    // Exact-name matching means `.claude` does not cover this file. It is a
+    // separate entry rather than a prefix rule because the shim matches whole
+    // path components; see `secret_excludes_for_home`.
+    ".claude.json",
     ".config/gh",
     ".aws",
     ".netrc",
+    // The direct analogue of `.netrc` for HTTPS remotes: it holds cleartext
+    // credentials and was missing from this list while `.netrc` was present.
+    ".git-credentials",
     ".npmrc",
+    ".gnupg",
+    ".docker",
+    ".kube",
     ".config/google-chrome",
     ".config/chromium",
     ".mozilla",
 ];
+
+/// The TCP ports the network tier may `connect()` to.
+///
+/// # These constrain ports, never hosts — read before trusting them
+///
+/// Landlock's `landlock_net_port_attr` has **no address field of any kind**.
+/// A rule granting port 443 permits `connect()` to port 443 on *every*
+/// destination, which was measured directly: one rule, and connections to two
+/// different real hosts both succeeded while the same host's port 80 stayed
+/// `EACCES`. Identical over IPv6.
+///
+/// So this list is not an egress policy and must never be described as one. It
+/// buys exactly one thing, and it is worth having: a process that reaches code
+/// execution inside the network tier cannot reach a service on an *arbitrary
+/// port* of the loopback interface — the local CUPS admin socket, a resolver, a
+/// development server, this server's own port. It cannot be used to argue that
+/// data is confined to the operator's own remote.
+///
+/// ADR 0028 records the decision to accept and document that limitation rather
+/// than build an egress boundary inside M1.13b.
+pub(crate) const DEFAULT_GIT_PORTS: &[u16] = &[
+    22,   // ssh://  and scp-style remotes
+    443,  // https:// — the only one every remote on this host actually uses
+    80,   // http://  — plaintext, but still a real remote scheme
+    9418, // git://   — the native protocol
+];
+
+/// Absolute paths for `Policy::secret_excludes`, given a home directory.
+///
+/// `DEFAULT_SECRET_EXCLUDES` is relative to `$HOME` while `Policy` requires
+/// absolute paths. Without this helper a policy site can pass the constant
+/// verbatim, every entry then fails to match anything the shim sees, and the
+/// secret set is silently empty — `~/.ssh` re-exposed with nothing to signal it.
+/// Every policy builder must go through here rather than joining by hand.
+pub(crate) fn secret_excludes_for_home(home: &std::path::Path) -> Vec<PathBuf> {
+    DEFAULT_SECRET_EXCLUDES.iter().map(|s| home.join(s)).collect()
+}
 
 /// System trees granted read+execute in every tier.
 pub(crate) const DEFAULT_RO_TREES: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc"];
@@ -214,6 +261,16 @@ pub(crate) struct Policy {
     /// Absolute paths withheld from the grants above by enumerate-and-skip.
     /// See `DEFAULT_SECRET_EXCLUDES` for why this is not a deny rule.
     pub secret_excludes: Vec<PathBuf>,
+    /// TCP ports the network tier may `connect()` to. Empty in every other
+    /// tier — the strict tier has no network at all (F3), and the unsandboxed
+    /// tier has no ruleset to put them in.
+    ///
+    /// This travels in the argv rather than living inside the shim on purpose.
+    /// The shim would otherwise hold a hardcoded egress list that no reviewer
+    /// reading a launcher command line could see, which is precisely the
+    /// property D5 Option B and INV-16 were chosen to preserve: what the
+    /// sandbox permits is auditable from the argv alone.
+    pub net_ports: Vec<u16>,
     pub hook_mode: HookMode,
 }
 
@@ -336,5 +393,14 @@ fn shim_argv(policy: &Policy) -> Vec<OsString> {
         Tier::Network => "--net-allow",
         Tier::Unsandboxed => unreachable!("handled by the caller"),
     }));
+    // Ports only follow `--net-allow`. Emitting them after `--net-deny` would
+    // be a contradiction the shim would have to arbitrate, and an argv that
+    // contradicts itself is one a reviewer cannot check by eye.
+    if policy.tier == Tier::Network {
+        for port in &policy.net_ports {
+            argv.push(OsString::from("--net-port"));
+            argv.push(OsString::from(port.to_string()));
+        }
+    }
     argv
 }
