@@ -8,7 +8,7 @@
 #   - git-vista-server   native axum backend: serves the SPA + /api/commits
 #   - git-vista          Leptos frontend, built to WASM by Trunk (crates/git-vista)
 #
-# Six jobs run in parallel, each mapped to a concrete check:
+# Seven jobs run in parallel, each mapped to a concrete check:
 #   1. lint      format + strict native/WASM Clippy + shell syntax
 #   2. core      test + check the pure-logic, git-reading, protocol, server, and
 #                UI crates, plus (#67 M1.14) the runner's git version against
@@ -27,6 +27,13 @@
 #                a silent pass
 #   6. secrets   gitleaks over the full repo history (#67 M1.14): committed
 #                credentials are a distinct named check, pinned to a commit SHA
+#   7. sandbox   #66 (M1.13b): the escape-battery gate, built from the
+#                anti-vacuity contract's step 1 (see
+#                design-docs/2026-07-29-escape-battery-anti-vacuity-contract.md)
+#                — a preflight naming any missing host capability, then the
+#                battery itself, then three shell-level assertions over the
+#                report file it writes, none of which the tests decide for
+#                themselves
 name: CI
 
 on:
