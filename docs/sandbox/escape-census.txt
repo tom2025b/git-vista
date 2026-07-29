@@ -3,3 +3,5 @@ high_bit_prctl_denied
 io_uring_denied
 secret_read_denied
 strict_listener_denied
+strict_tcp_bind_denied
+strict_udp_host_denied
