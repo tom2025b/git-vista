@@ -81,6 +81,8 @@ fn io_uring_denied() {
 
 #[test]
 fn high_bit_prctl_denied() {
+    let mut cmd = std::process::Command::new("git");
+    cmd.env("GV_R7_TRIPWIRE", "1");
     run_case(&CASE_HIGH_BIT_PRCTL_DENIED);
 }
 
