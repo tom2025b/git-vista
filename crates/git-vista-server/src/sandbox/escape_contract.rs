@@ -307,20 +307,16 @@ fn commit_inside(policy: &Policy, repo: &Path) -> HookRun {
     std::fs::write(repo.join("payload.txt"), "x").expect("write payload");
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
-        let mut add = super::spawn::command_async(policy, repo, &["add", "-A"]);
-        add.env_clear();
-        for (k, v) in &env {
-            add.env(k, v);
-        }
-        let _ = add.output().await;
+        let _ = super::spawn::command_async(policy, repo, &["add", "-A"])
+            .pinned_env_for_test(&env)
+            .output()
+            .await;
 
-        let mut commit =
-            super::spawn::command_async(policy, repo, &["commit", "-q", "-m", "inside"]);
-        commit.env_clear();
-        for (k, v) in &env {
-            commit.env(k, v);
-        }
-        let out = commit.output().await.expect("the launcher runs");
+        let out = super::spawn::command_async(policy, repo, &["commit", "-q", "-m", "inside"])
+            .pinned_env_for_test(&env)
+            .output()
+            .await
+            .expect("the launcher runs");
         HookRun {
             commit_code: out.status.code().unwrap_or(-1),
             combined: format!(
