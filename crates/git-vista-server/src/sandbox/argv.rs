@@ -48,25 +48,73 @@ fn every_sandboxed_argv_ends_in_dashdash_git() {
 }
 
 #[test]
-fn unsandboxed_is_bare_git_and_nothing_else() {
+fn unsandboxed_with_running_hooks_is_bare_git_and_nothing_else() {
     let a = strs(&sandbox_argv(&policy(Tier::Unsandboxed)));
     assert_eq!(a, vec!["git".to_string()]);
 }
 
+/// The combination that used to be silently dropped. `Unsandboxed` is an
+/// operator-trusted repository and `Blocked` is a host that failed the declared
+/// minimum (INV-13); together they are the one case where nothing in the argv
+/// suppresses hooks unless this does. Returning a bare `["git"]` here meant a
+/// policy that said "hooks blocked" ran them.
 #[test]
-fn strict_prefix_is_the_reviewed_constant() {
+fn unsandboxed_still_blocks_hooks_when_the_policy_says_blocked() {
+    let mut p = policy(Tier::Unsandboxed);
+    p.hook_mode = HookMode::Blocked {
+        empty_dir: PathBuf::from("/var/lib/gv/no-hooks"),
+    };
+    let a = strs(&sandbox_argv(&p));
+    assert_eq!(
+        a,
+        vec![
+            "git".to_string(),
+            "-c".to_string(),
+            "core.hooksPath=/var/lib/gv/no-hooks".to_string(),
+        ],
+        "an unsandboxed policy with blocked hooks must still suppress them"
+    );
+    assert_eq!(a[0], "git", "the caller appends `-C <repo>` after this");
+}
+
+#[test]
+fn strict_prefix_is_the_reviewed_constant_after_the_resolved_launcher() {
     let a = strs(&sandbox_argv(&policy(Tier::Strict)));
     let cut = a.iter().position(|s| s == "--").expect("a `--` separator");
     assert_eq!(
-        a[..cut],
-        STRICT_BWRAP_PREFIX[..],
-        "the bwrap prefix drifted from its reviewed constant"
+        a[0], FAKE_BWRAP,
+        "the launcher must be the policy's resolved absolute path"
+    );
+    assert!(
+        std::path::Path::new(&a[0]).is_absolute(),
+        "a bare launcher name would be resolved against the inherited PATH"
+    );
+    assert_eq!(
+        a[1..cut],
+        STRICT_BWRAP_ARGS[..],
+        "the bwrap arguments drifted from their reviewed constant"
     );
     assert_eq!(
         a[cut + 1],
         "/opt/gv/gv-sandbox",
         "the shim must follow bwrap's `--`"
     );
+}
+
+/// The launcher is never a bare name in any tier. This is the regression guard
+/// for the `BWRAP_BIN = "bwrap"` hole: a `PATH`-resolved launcher could be
+/// substituted wholesale, and because Landlock and seccomp are applied by the
+/// *shim* that bwrap execs, the substitute would produce an identical argv and
+/// an identical exit code with no namespaces at all.
+#[test]
+fn no_argv_entry_is_a_bare_bwrap_name() {
+    for tier in [Tier::Strict, Tier::Network, Tier::Unsandboxed] {
+        let a = strs(&sandbox_argv(&policy(tier)));
+        assert!(
+            !a.iter().any(|s| s == "bwrap"),
+            "{tier:?}: the launcher must be an absolute path, never a bare name"
+        );
+    }
 }
 
 #[test]
@@ -76,7 +124,7 @@ fn network_tier_never_names_bwrap_and_never_unshares_net() {
         a[0], "/opt/gv/gv-sandbox",
         "the network tier launches the shim directly (F3: netns breaks push)"
     );
-    assert!(!a.iter().any(|s| s == BWRAP_BIN || s == "--unshare-net"));
+    assert!(!a.iter().any(|s| s.contains("bwrap") || s == "--unshare-net"));
     assert!(a.iter().any(|s| s == "--net-allow"));
 }
 
@@ -146,7 +194,7 @@ fn blocked_hooks_name_the_empty_dir_and_running_hooks_do_not() {
 
 #[test]
 fn the_probe_argv_names_no_program_at_all() {
-    let a = strs(&probe_argv(&policy(Tier::Strict)));
+    let a = strs(&probe_argv(&policy(Tier::Strict)).expect("a strict policy is probeable"));
     assert_eq!(
         a.last().unwrap(),
         "--self-probe",
@@ -156,6 +204,15 @@ fn the_probe_argv_names_no_program_at_all() {
         !a.iter().any(|s| s == "git"),
         "the probe argv must never name git"
     );
+}
+
+/// There is no sandbox in the unsandboxed tier, so there is no argv that could
+/// probe one. This used to hit `unreachable!()` inside `shim_argv`, which meant
+/// probing an operator-trusted repository panicked a server worker thread — a
+/// crash for what is simply a legitimate answer.
+#[test]
+fn probing_the_unsandboxed_tier_returns_none_instead_of_panicking() {
+    assert!(probe_argv(&policy(Tier::Unsandboxed)).is_none());
 }
 
 /// The four policy-building sites (Tasks 6, 7, 9 and `shim_cli::workable`) must
