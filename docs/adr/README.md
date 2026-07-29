@@ -40,3 +40,4 @@ it, and note the link in both.
 | [0026](0026-shell-mode-foundation.md) | `ShellMode`: Rust owns the layout mode, CSS keys off one class | Accepted |
 | [0027](0027-landlock-enumerate-and-skip.md) | Secrets inside a granted `$HOME` are withheld by enumerate-and-skip, not a deny rule | Accepted |
 | [0028](0028-network-tier-ports-not-hosts.md) | Accept that the network tier constrains ports, not hosts (Option A) | Accepted |
+| [0029](0029-strict-tier-hard-fail-when-unavailable.md) | INV-13: hard-fail when the Strict tier is selected but unavailable | Accepted — implementation pending |
