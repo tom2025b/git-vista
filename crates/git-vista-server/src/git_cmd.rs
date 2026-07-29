@@ -124,15 +124,30 @@ fn git_error(endpoint: &str, stderr: &[u8]) -> (StatusCode, String) {
 /// parsers handle that themselves. A cap hit is a *success*: the child is killed
 /// and reaped, and its (killed) exit status is deliberately not reinterpreted as
 /// a git error. Only the below-cap path inspects the exit status.
+/// Build a `git -C <repo>` command that runs **through the M1.13b sandbox**
+/// (#66, Task 6). The returned command is the composed launcher up to
+/// `git -C <repo>`; the caller appends the subcommand args exactly as before,
+/// so migrating a spawn site is a one-line change and its arguments are
+/// unchanged.
+///
+/// This is the single seam that makes the sandbox load-bearing: every git the
+/// server runs goes through here, and `argv_boundary.rs` proves nothing else in
+/// the crate spawns git directly. A policy that cannot be built (a missing shim,
+/// an unset `$HOME`) is a hard error rather than a silent fall-back to
+/// unsandboxed git — an unsandboxed spawn is exactly what this exists to prevent.
+fn sandboxed(repo: &Path) -> Result<tokio::process::Command, String> {
+    let policy = crate::sandbox::policy_for_repo(repo).map_err(|e| e.to_string())?;
+    Ok(crate::sandbox::spawn::command_async(&policy, repo, &[]))
+}
+
 pub(crate) async fn git_stdout_capped(
     repo: &Path,
     args: &[String],
     endpoint: &str,
     cap: usize,
 ) -> Result<(Vec<u8>, bool), (StatusCode, String)> {
-    let child = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let child = sandboxed(repo)
+        .map_err(|e| io_error(endpoint, std::io::Error::other(e)))?
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -235,9 +250,8 @@ pub(crate) async fn git_stdout(
 /// piece of state git itself throws away (the branch's reflog dies with it)
 /// and exactly what "Restore branch" later needs.
 pub(crate) async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let output = sandboxed(repo)
+        .ok()?
         .args(["rev-parse", "--verify", "--quiet"])
         .arg(format!("{rev}^{{commit}}"))
         .output()
@@ -254,10 +268,10 @@ pub(crate) async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
 /// --is-ancestor` exits 0 exactly then. "HEAD already contains the base tip" is
 /// the definition of "a rebase onto that base would change nothing".
 pub(crate) async fn is_ancestor(repo: &Path, ancestor: &str, rev: &str) -> bool {
-    tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["merge-base", "--is-ancestor", ancestor, rev])
+    let Ok(mut cmd) = sandboxed(repo) else {
+        return false;
+    };
+    cmd.args(["merge-base", "--is-ancestor", ancestor, rev])
         .output()
         .await
         .map(|o| o.status.success())
@@ -267,9 +281,7 @@ pub(crate) async fn is_ancestor(repo: &Path, ancestor: &str, rev: &str) -> bool 
 /// Run one `git -C <repo> <args…>` for the reset, mapping any failure to git's
 /// own stderr so the response can say which exact step refused and why.
 pub(crate) async fn git_ok(repo: &Path, args: &[&str]) -> Result<(), String> {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let output = sandboxed(repo)?
         .args(args)
         .output()
         .await
