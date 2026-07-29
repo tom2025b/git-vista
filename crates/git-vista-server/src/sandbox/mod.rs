@@ -21,10 +21,30 @@ mod argv;
 #[cfg(test)]
 mod deps;
 
-/// The strict tier's outer launcher. An external binary, deliberately: it is
-/// the only thing here that creates namespaces, and `--unshare-net` is what
-/// makes the strict tier incompatible with `git push` (F3).
-pub(crate) const BWRAP_BIN: &str = "bwrap";
+/// Absolute paths the strict tier's outer launcher is looked for at, in order.
+///
+/// # Why this is not the bare name `bwrap`
+///
+/// It used to be, and that was a hole. Every other program path in a launcher
+/// argv is absolute — the shim, the repository, the grants — but a bare `bwrap`
+/// is resolved by `execvp` against the **inherited `PATH`** at spawn time.
+/// bwrap is the strict tier's entire namespace boundary: it is what creates the
+/// pid/net/ipc/uts/cgroup namespaces and mounts the fresh procfs (C3) and the
+/// private `/dev/shm` (C4). Anything able to influence this process's `PATH`
+/// — a systemd unit edit, an inherited environment, a `.env` loader — could
+/// substitute a different binary for it, and since Landlock and seccomp are
+/// applied by the *shim* that bwrap then execs, a substitute that simply execs
+/// its arguments would leave the strict tier looking identical from the outside
+/// while running with no namespaces at all. The failure is silent by
+/// construction: the argv is unchanged, the exit code is unchanged, and only an
+/// escape-battery probe would notice.
+///
+/// So the launcher is resolved once, from a fixed list of absolute paths, and
+/// `PATH` is never consulted. A host that keeps bwrap somewhere else is a host
+/// where the strict tier is unavailable — which is a *reported*, degradable
+/// condition (INV-13) rather than a silently weaker sandbox.
+pub(crate) const BWRAP_CANDIDATES: &[&str] =
+    &["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"];
 
 /// Overrides the shim path for tests and for a packaged install where the
 /// shim does not sit beside the server binary.
@@ -119,15 +139,18 @@ pub(crate) const DEFAULT_RW_TREES: &[&str] = &["/dev"];
 /// other process on the box, visible. ADR 0026 records this distinction.
 pub(crate) const STRICT_ONLY_RO_TREES: &[&str] = &["/proc"];
 
-/// The reviewed bwrap prefix, pinned as a constant so INV-16's structural
-/// assertion has something to compare against and a drift shows up as a test
-/// failure rather than as a quietly weaker sandbox.
+/// The reviewed bwrap **arguments**, pinned as a constant so INV-16's
+/// structural assertion has something to compare against and a drift shows up
+/// as a test failure rather than as a quietly weaker sandbox.
+///
+/// The launcher's own path is deliberately *not* in here: it is resolved per
+/// host into `Policy::bwrap` (see `BWRAP_CANDIDATES`), so this constant stays a
+/// fixed, reviewable value that cannot vary with where bwrap is installed.
 ///
 /// `--proc /proc` is C3 (a pid namespace does not update an inherited procfs).
 /// `--tmpfs /dev/shm` is C4 (an ipc namespace does not cover pathname-based
 /// POSIX shared memory). `--die-with-parent` plus `--unshare-pid` is INV-8.
-pub(crate) const STRICT_BWRAP_PREFIX: &[&str] = &[
-    BWRAP_BIN,
+pub(crate) const STRICT_BWRAP_ARGS: &[&str] = &[
     "--bind",
     "/",
     "/",
@@ -175,6 +198,12 @@ pub(crate) struct Policy {
     pub tier: Tier,
     /// Absolute path of the fused `gv-sandbox` shim.
     pub shim: PathBuf,
+    /// Absolute path of the strict tier's `bwrap` launcher, resolved once per
+    /// host from `BWRAP_CANDIDATES` — never from `PATH`. `None` in the tiers
+    /// that do not launch it; a `Strict` policy cannot be built without it,
+    /// because a strict tier that cannot find bwrap must degrade loudly
+    /// (INV-13) rather than run with no namespaces.
+    pub bwrap: Option<PathBuf>,
     pub rw_trees: Vec<PathBuf>,
     pub ro_trees: Vec<PathBuf>,
     /// Absolute paths withheld from the grants above by enumerate-and-skip.
