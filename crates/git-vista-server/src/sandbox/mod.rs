@@ -42,6 +42,18 @@ mod dispatch;
 mod shim_cli;
 #[cfg(test)]
 mod escape_suite;
+/// #66 Task 25, step 3: the anti-vacuity contract's tripwires and the
+/// EscapeCase/run_case harness step 5 rewrites the battery onto. Landed here
+/// (rather than left for whichever lane does step 5) so no later lane touches
+/// this module list — see
+/// `design-docs/2026-07-29-escape-battery-anti-vacuity-contract.md`.
+#[cfg(test)]
+mod escape_contract;
+/// #66 Task 25, step 5: the `class = functional` blocked-hooks case moves
+/// here out of `escape_suite.rs`. Landed as an empty stub in step 3 so the
+/// module list is fixed before any case is rewritten; step 5 populates it.
+#[cfg(test)]
+mod hook_mode_suite;
 
 /// Absolute paths the strict tier's outer launcher is looked for at, in order.
 ///
@@ -502,27 +514,6 @@ pub(crate) fn sandbox_argv(policy: &Policy) -> Vec<OsString> {
     argv.push(OsString::from("--"));
     argv.push(OsString::from("git"));
     argv
-}
-
-/// The escape battery's launcher. Identical setup, different terminal mode:
-/// the shim runs its built-in checks in-process instead of exec'ing anything.
-/// That is what lets the battery satisfy the composition rule — the checks run
-/// behind the very same Landlock and seccomp code path production uses —
-/// without ever teaching the shim to exec an arbitrary program.
-///
-/// `None` for `Tier::Unsandboxed`: there is no sandbox there to probe, so there
-/// is no argv that could probe it. It returns `None` rather than panicking
-/// because the caller reaches this on a real path — probing an operator-trusted
-/// repository — and a panic there takes down a server worker thread for a
-/// condition that is a legitimate answer, not a bug. The caller reports "no
-/// sandbox to probe"; INV-15's permanent banner is what tells the operator.
-pub(crate) fn probe_argv(policy: &Policy) -> Option<Vec<OsString>> {
-    if policy.tier == Tier::Unsandboxed {
-        return None;
-    }
-    let mut argv = shim_argv(policy);
-    argv.push(OsString::from("--self-probe"));
-    Some(argv)
 }
 
 /// # Panics

@@ -264,29 +264,6 @@ fn blocked_hooks_name_the_empty_dir_and_running_hooks_do_not() {
         .any(|s| s == "--hooks-run"));
 }
 
-#[test]
-fn the_probe_argv_names_no_program_at_all() {
-    let a = strs(&probe_argv(&policy(Tier::Strict)).expect("a strict policy is probeable"));
-    assert_eq!(
-        a.last().unwrap(),
-        "--self-probe",
-        "the probe must not exec anything"
-    );
-    assert!(
-        !a.iter().any(|s| s == "git"),
-        "the probe argv must never name git"
-    );
-}
-
-/// There is no sandbox in the unsandboxed tier, so there is no argv that could
-/// probe one. This used to hit `unreachable!()` inside `shim_argv`, which meant
-/// probing an operator-trusted repository panicked a server worker thread — a
-/// crash for what is simply a legitimate answer.
-#[test]
-fn probing_the_unsandboxed_tier_returns_none_instead_of_panicking() {
-    assert!(probe_argv(&policy(Tier::Unsandboxed)).is_none());
-}
-
 /// The four policy-building sites (Tasks 6, 7, 9 and `shim_cli::workable`) must
 /// not each hand-roll a system-tree list — the round-4 measured configuration
 /// granted `/dev` **and** `/proc`, and every list in the original plan omitted
