@@ -529,6 +529,13 @@ fn read_self_code_only() -> String {
     crate::argv_boundary::code_only(&read_rs("src/sandbox/escape_contract.rs"))
 }
 
+/// Same file, comments blanked but string-literal content intact — needed
+/// wherever a check must see an actual quoted value (e.g. `"GRANTED"`) that
+/// `code_only` would blank along with everything else inside the quotes.
+fn read_self_comments_only() -> String {
+    comments_only_blanked(&read_rs("src/sandbox/escape_contract.rs"))
+}
+
 /// Blank comments only — never string-literal content. Unlike
 /// `argv_boundary::code_only` (which blanks both, because its callers scan
 /// for *structural* patterns), several tripwires here need to see actual
@@ -740,9 +747,12 @@ fn r3_every_case_declares_and_asserts_a_paired_positive() {
         code.contains("expect_granted"),
         "R3: EscapeCase must carry a mandatory expect_granted field"
     );
-    let body = fn_body_in(&code, "execute");
+    // Raw-ish (comments blanked, strings intact): the "GRANTED" tag this
+    // checks for is itself a string literal, which `code_only` would blank.
+    let comments_blanked = read_self_comments_only();
+    let body = fn_body_in(&comments_blanked, "execute");
     assert!(
-        body.contains("expect_granted") && body.contains("GRANTED"),
+        body.contains("expect_granted") && body.contains("\"GRANTED\""),
         "R3: expect_granted must be asserted inside the harness's per-case runner, \
          against a paired-positive observation, not merely stored on the case"
     );
