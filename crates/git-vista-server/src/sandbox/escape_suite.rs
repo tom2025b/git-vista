@@ -38,6 +38,30 @@ fn hostile_hook_repo(script: &str) -> tempfile::TempDir {
     d
 }
 
+/// Compile a C probe **into the repository's own tree**, so the sandbox can
+/// `execve` it — the repo is a granted RW tree, exactly where a real hostile
+/// hook's compiled helper would live. A probe left in `/tmp` is correctly
+/// denied execution by the filesystem boundary (measured), which would make the
+/// seccomp tests fail for the wrong reason. Returns the path the hook should
+/// exec, relative to nothing — it is absolute, inside `repo`.
+fn probe_in_repo(repo: &Path, src: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let c = repo.join(format!("probe_{n}.c"));
+    let bin = repo.join(format!("probe_{n}"));
+    std::fs::write(&c, src).expect("write probe source");
+    let ok = Command::new("cc")
+        .args(["-O2", "-o"])
+        .arg(&bin)
+        .arg(&c)
+        .status()
+        .expect("cc runs")
+        .success();
+    assert!(ok, "probe failed to compile");
+    bin
+}
+
 /// Commit through the sandbox so the hook fires, returning `(code, stdout+stderr)`.
 /// Staging a file guarantees `pre-commit` actually runs — an empty commit may
 /// short-circuit before hooks on some git versions.
