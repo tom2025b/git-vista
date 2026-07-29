@@ -474,6 +474,21 @@ pub(crate) fn policy_for_repo(repo: &Path) -> Result<Policy, shim::ShimError> {
     let tier = Tier::Network;
     let (mut rw, mut ro) = default_system_trees(tier);
     rw.push(repo.to_path_buf());
+    // A linked worktree's git state lives outside the worktree path, in the
+    // main repository's `.git`. Resolve it (fail-closed — see `worktree`'s
+    // containment rule for why a refused resolution must refuse the whole
+    // policy) and grant the common dir; the per-worktree gitdir is proven to
+    // live inside it, so one grant covers both.
+    match worktree::linked_worktree_dirs(repo) {
+        Ok(None) => {}
+        Ok(Some(dirs)) => rw.push(dirs.commondir),
+        Err(why) => {
+            return Err(shim::ShimError::WorktreeGeometry {
+                repo: repo.to_path_buf(),
+                why,
+            })
+        }
+    }
     ro.push(home.clone());
     Ok(Policy {
         tier,
