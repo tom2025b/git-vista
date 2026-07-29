@@ -20,6 +20,10 @@ use std::path::PathBuf;
 /// strict tier's launcher. Task 5's policy builders call
 /// `bwrap::bwrap_path()` to fill `Policy::bwrap`.
 pub(crate) mod bwrap;
+/// The other impure corner: locating the `gv-sandbox` shim. Kept out of this
+/// file for the same reason as `bwrap` — `sandbox_argv` stays a total function
+/// of its `Policy`.
+pub(crate) mod shim;
 
 #[cfg(test)]
 mod argv;
