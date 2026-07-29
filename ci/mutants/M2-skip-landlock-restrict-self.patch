@@ -1,6 +1,6 @@
 --- a/crates/git-vista-server/src/bin/gv-sandbox/main.rs
 +++ b/crates/git-vista-server/src/bin/gv-sandbox/main.rs
-@@ -525,13 +525,7 @@
+@@ -519,16 +519,7 @@
      if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
          die(EXIT_LANDLOCK, "prctl(PR_SET_NO_NEW_PRIVS) failed");
      }

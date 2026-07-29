@@ -1,6 +1,6 @@
 --- a/crates/git-vista-server/src/sandbox/mod.rs
 +++ b/crates/git-vista-server/src/sandbox/mod.rs
-@@ -557,20 +557,27 @@
+@@ -557,19 +557,22 @@
              argv.push(empty_dir.clone().into_os_string());
          }
      }
@@ -14,6 +14,10 @@
 -    // contradicts itself is one a reviewer cannot check by eye.
 -    if policy.tier == Tier::Network {
 -        for port in &policy.net_ports {
+-            argv.push(OsString::from("--net-port"));
+-            argv.push(OsString::from(port.to_string()));
+-        }
+-    }
 +    match policy.tier {
 +        Tier::Strict => {
 +            argv.push(OsString::from("--net-allow"));
