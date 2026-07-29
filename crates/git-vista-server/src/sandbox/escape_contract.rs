@@ -1,7 +1,7 @@
 //! #66 (M1.13b) Task 25, step 3: the anti-vacuity contract's harness and
 //! source tripwires.
 //!
-//! See `design-docs/2026-07-29-escape-battery-anti-vacuity-contract.md` (the
+//! See `docs/sandbox/escape-battery-anti-vacuity-contract.md` (the
 //! specification this file implements) and `.claude/parallel/pro-task.md`
 //! (why it must land before any case is rewritten). This file has two jobs,
 //! deliberately in one place so they cannot drift apart:

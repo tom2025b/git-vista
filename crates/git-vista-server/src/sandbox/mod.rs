@@ -42,7 +42,7 @@ mod dispatch;
 /// EscapeCase/run_case harness step 5 rewrites the battery onto. Landed here
 /// (rather than left for whichever lane does step 5) so no later lane touches
 /// this module list — see
-/// `design-docs/2026-07-29-escape-battery-anti-vacuity-contract.md`.
+/// `docs/sandbox/escape-battery-anti-vacuity-contract.md`.
 #[cfg(test)]
 mod escape_contract;
 #[cfg(test)]

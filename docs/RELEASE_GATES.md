@@ -428,7 +428,7 @@ Landlock/seccomp/bwrap containment. It exists because that battery has
 **failed twice**: an earlier audit (C8) found it vacuous, a competent
 rewrite followed, and a second audit (C11) found the same defect had
 "merely moved from the inside assertion to the baseline gate" rather than
-being removed. `design-docs/2026-07-29-escape-battery-anti-vacuity-contract.md`
+being removed. `docs/sandbox/escape-battery-anti-vacuity-contract.md`
 is the response — eleven numbered rules (R1–R11), each enforced by a source
 tripwire or a CI-shell assertion rather than trusted to a reviewer's
 judgement, on the theory that a standard living only in a report is not

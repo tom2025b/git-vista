@@ -29,7 +29,7 @@
 #                credentials are a distinct named check, pinned to a commit SHA
 #   7. sandbox   #66 (M1.13b): the escape-battery gate, built from the
 #                anti-vacuity contract's step 1 (see
-#                design-docs/2026-07-29-escape-battery-anti-vacuity-contract.md)
+#                docs/sandbox/escape-battery-anti-vacuity-contract.md)
 #                — a preflight naming any missing host capability, then the
 #                battery itself, then three shell-level assertions over the
 #                report file it writes, none of which the tests decide for
@@ -205,7 +205,7 @@ jobs:
   # 7. Sandbox: the #66 (M1.13b) escape-battery gate.
   #
   # Built from the anti-vacuity contract's step 1, not from any earlier plan
-  # draft (see design-docs/2026-07-29-escape-battery-anti-vacuity-contract.md,
+  # draft (see docs/sandbox/escape-battery-anti-vacuity-contract.md,
   # "Skip policy" and "Ordered work" §1). Three verified false-green channels
   # rule out the obvious shortcuts: libtest swallows stdout+stderr of PASSING
   # tests, so a `grep SKIPPED` gate cannot distinguish "no skip happened" from
