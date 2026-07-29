@@ -792,30 +792,61 @@ fn r8_exemptions_expire_when_their_named_blocker_disappears() {
     );
 }
 
-/// R10: every `"--…"` literal `sandbox_argv`/`shim_argv` emits (`mod.rs`) has
-/// a matching arm in the shim's `parse()` (`bin/gv-sandbox/main.rs`), and
-/// vice versa — a dead sanctioned route (emitted, unparsed) is exactly what
-/// `probe_argv`/`--self-probe` was, and an unreachable terminal mode (parsed,
-/// never built) is its mirror image.
-#[test]
-fn r10_every_flag_sandbox_argv_emits_has_a_shim_parser_arm() {
-    let mod_code = crate::argv_boundary::code_only(&read_rs("src/sandbox/mod.rs"));
-    let main_code = crate::argv_boundary::code_only(&read_rs("src/bin/gv-sandbox/main.rs"));
-
-    let mut emitted: BTreeSet<String> = BTreeSet::new();
-    for line in mod_code.lines() {
-        let mut rest = line;
-        while let Some(start) = rest.find("\"--") {
-            let after = &rest[start + 1..];
-            let Some(end) = after.find('"') else { break };
-            emitted.insert(after[..end].to_string());
-            rest = &after[end + 1..];
+/// The raw (not `code_only`'d) body of `fn <name>` in `src`, matched
+/// brace-for-brace. R10 needs actual string-literal *content* (the flag
+/// text), which `code_only` deliberately blanks — so this walks raw source,
+/// scoped to one function body, which is what keeps a doc comment mentioning
+/// a flag in backticks (not a string literal) from being misread as a scan
+/// hit.
+fn fn_body_raw<'a>(src: &'a str, name: &str) -> &'a str {
+    let marker = format!("fn {name}");
+    let at = src
+        .find(&marker)
+        .unwrap_or_else(|| panic!("`{marker}` not found"));
+    let open = at + src[at..].find('{').expect("a fn signature has a body brace");
+    let mut depth = 0usize;
+    for (i, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open..open + i + 1];
+                }
+            }
+            _ => {}
         }
     }
-    assert!(!emitted.is_empty(), "flag scan of sandbox/mod.rs found nothing — the scan broke");
+    panic!("unbalanced braces extracting `{marker}`");
+}
+
+/// R10: every `"--…"` literal `shim_argv` emits (`mod.rs`) has a matching arm
+/// in the shim's `parse()` (`bin/gv-sandbox/main.rs`), and vice versa — a
+/// dead sanctioned route (emitted, unparsed) is exactly what
+/// `probe_argv`/`--self-probe` was, and an unreachable terminal mode (parsed,
+/// never built) is its mirror image. Scoped to the two builder/parser
+/// function bodies, on raw source, so a doc comment cannot pollute either
+/// direction of the scan.
+#[test]
+fn r10_every_flag_sandbox_argv_emits_has_a_shim_parser_arm() {
+    let mod_src = read_rs("src/sandbox/mod.rs");
+    let argv_body = fn_body_raw(&mod_src, "shim_argv");
+
+    let mut emitted: BTreeSet<String> = BTreeSet::new();
+    let mut rest = argv_body;
+    while let Some(start) = rest.find("\"--") {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('"') else { break };
+        emitted.insert(after[..end].to_string());
+        rest = &after[end + 1..];
+    }
+    assert!(!emitted.is_empty(), "flag scan of shim_argv found nothing — the scan broke");
+
+    let main_src = read_rs("src/bin/gv-sandbox/main.rs");
+    let parse_body = fn_body_raw(&main_src, "parse");
 
     let mut arms: BTreeSet<String> = BTreeSet::new();
-    for line in main_code.lines() {
+    for line in parse_body.lines() {
         let l = line.trim();
         let Some(rest) = l.strip_prefix('"') else { continue };
         let Some(end) = rest.find('"') else { continue };
