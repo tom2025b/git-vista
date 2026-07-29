@@ -205,7 +205,10 @@ pub(crate) const DEFAULT_RW_TREES: &[&str] = &["/dev"];
 /// mounts a **fresh** procfs for the child pid namespace, so what is granted
 /// there is the sandbox's own view. The network tier has no mount namespace at
 /// all, so granting `/proc` there would grant the **host's** procfs — every
-/// other process on the box, visible. ADR 0026 records this distinction.
+/// other process on the box, visible. The whole-sandbox ADR (M1.13b Task 18)
+/// records this distinction — named rather than numbered, because 0026, 0027
+/// and 0028 were each claimed by a different decision while this milestone was
+/// still in flight, and a hardcoded number went stale twice.
 pub(crate) const STRICT_ONLY_RO_TREES: &[&str] = &["/proc"];
 
 /// The reviewed bwrap **arguments**, pinned as a constant so INV-16's
