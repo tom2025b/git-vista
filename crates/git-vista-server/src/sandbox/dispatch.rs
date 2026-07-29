@@ -8,11 +8,39 @@ use super::*;
 
 #[test]
 fn remote_subcommands_need_the_network() {
-    for sub in ["push", "fetch", "clone", "ls-remote", "pull"] {
+    for sub in [
+        "push", "fetch", "clone", "ls-remote", "pull",
+        // plumbing / helpers added after the C10 audit
+        "fetch-pack", "send-pack", "http-fetch", "http-push",
+    ] {
         assert_eq!(
             network_need(&[sub, "origin"]),
             NetworkNeed::Remote,
             "`git {sub}` reaches a remote"
+        );
+    }
+}
+
+/// The C10 audit's list of network-capable commands the argv classifier still
+/// misses. These fail closed to `Local`/Strict, which *breaks* the network
+/// attempt rather than granting it — the safe direction. This test documents
+/// the known gap so the day someone moves classification to the typed operation
+/// model, these are the cases to cover. It asserts the *current* fail-closed
+/// behaviour, not that the gap is fixed.
+#[test]
+fn known_network_gaps_fail_closed_to_local_not_unsandboxed() {
+    for args in [
+        vec!["remote", "update"],
+        vec!["submodule", "update", "--remote"],
+        vec!["maintenance", "run", "--task=prefetch"],
+        vec!["credential", "fill"],
+    ] {
+        let need = network_need(&args);
+        assert_eq!(need, NetworkNeed::Local, "documented fail-closed gap: {args:?}");
+        assert_ne!(
+            tier_for(need, false),
+            Tier::Unsandboxed,
+            "even a misclassified network command must never be unsandboxed: {args:?}"
         );
     }
 }

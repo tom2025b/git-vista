@@ -317,19 +317,51 @@ pub(crate) enum NetworkNeed {
     Local,
 }
 
-/// The git subcommands that reach the network. **Fail-closed classification:**
-/// a subcommand *not* in this set is treated as `Local`, so a subcommand added
-/// to the codebase later defaults to `Strict`. That direction is deliberate — a
-/// network op wrongly given `Strict` *breaks loudly* (a visible failure a
-/// developer fixes), whereas a local op wrongly given `Network` would silently
-/// gain network access it did not need. Loud-and-safe beats silent-and-loose.
+/// Git subcommands known to reach the network. **This list is not
+/// authoritative and is not the primary classifier** — git's command surface is
+/// open-ended (plumbing like `fetch-pack`/`send-pack`, transport helpers like
+/// `remote-https`, `remote update`, `submodule --remote`, and partial-clone
+/// *lazy* fetches from otherwise-local commands like `checkout` all reach out),
+/// so no argv-name list can be complete. The C10 audit made this point: the
+/// authoritative signal is the **typed operation** the server chose, threaded
+/// explicitly from the call site (see `network_need`'s note), not a string
+/// match on argv.
 ///
-/// `remote` is deliberately absent: `git remote get-url`/`add`/`remove` only
-/// read or write `.git/config` and never open a socket, so they are `Local`.
-const REMOTE_SUBCOMMANDS: &[&str] = &["push", "fetch", "clone", "ls-remote", "pull"];
+/// This set exists for two narrower jobs: it is the fail-closed *fallback* when
+/// only an argv is available, and it documents the common cases. **Fail-closed
+/// classification:** a subcommand not in this set is treated as `Local` → the
+/// stricter `Strict` tier, so a network command missing from the list *breaks
+/// loudly* rather than silently gaining network. `remote` (the config verbs
+/// `get-url`/`add`/`remove`) is deliberately absent — those touch only
+/// `.git/config`, never a socket.
+const REMOTE_SUBCOMMANDS: &[&str] = &[
+    "push",
+    "fetch",
+    "clone",
+    "ls-remote",
+    "pull",
+    // plumbing / transport helpers the C10 audit flagged as network-capable
+    "fetch-pack",
+    "send-pack",
+    "http-fetch",
+    "http-push",
+];
 
-/// Classify a git argv's first non-flag token. Pure and total: every input maps
-/// to exactly one `NetworkNeed`, and the default is `Local` (Strict).
+/// Classify a git argv's first non-flag token — a **fail-closed fallback**, not
+/// the authoritative dispatch.
+///
+/// The C10 audit is right that argv-name classification cannot be complete
+/// (aliases expand to other subcommands, plumbing and helpers reach the network
+/// under many names, and a partial clone lazily fetches from `checkout`/`diff`).
+/// So when Task 8 is wired in, the primary signal must be the **typed operation
+/// the server chose** — threaded as an explicit `NetworkNeed` from each call
+/// site, which knows its own intent (the planner's `push` step is a push; the
+/// read helpers are reads) — and this function is the conservative default for
+/// any path that only has an argv. Both directions of its error are safe: an
+/// unrecognised network command falls to `Local`/`Strict` and breaks loudly,
+/// never gaining access.
+///
+/// Pure and total: every input maps to exactly one `NetworkNeed`.
 pub(crate) fn network_need(args: &[&str]) -> NetworkNeed {
     // The subcommand is the first token that is not a `-C <path>` / `-c k=v`
     // global flag. In practice the server always passes the subcommand first,
@@ -361,15 +393,23 @@ pub(crate) fn network_need(args: &[&str]) -> NetworkNeed {
 ///
 /// # Unsandboxed is reachable ONLY through `trusted`
 ///
-/// This is the single most important property of the dispatch, and it is
-/// structured so the compiler helps keep it true: `Unsandboxed` appears in
-/// exactly one arm, guarded by `trusted == true`, and `trusted` comes only from
-/// a persisted per-repo trust flag (Task 7) — never from the operation, the
-/// argv, or a default. A new `NetworkNeed` variant added later forces a new
-/// match arm here (no wildcard), so it cannot silently inherit `Unsandboxed`.
+/// This is the single most important property of the dispatch. `Unsandboxed` is
+/// returned by exactly one arm, `(true, _)`, so an **untrusted** repository can
+/// never reach it — and that half is compile-enforced: the match has no
+/// wildcard, so a new `NetworkNeed` variant forces a new `(false, NewVariant)`
+/// arm to be written, which cannot be `Unsandboxed` without a deliberate edit a
+/// reviewer would see. (The `(true, _)` arm *does* use a wildcard, so a new
+/// variant inherits `Unsandboxed` for an already-trusted repo — which is
+/// correct: trust is a property of the repository, not the operation.)
 ///
-/// `trusted` is `false` everywhere today: the persisted trust flag does not
-/// exist yet (Task 7), so no repository is unsandboxed, which is the safe state.
+/// `trusted` must come only from a persisted per-repo trust flag set by an
+/// explicit operator action (Task 7), stored **outside repository-writable
+/// paths** — the C10 audit noted that deriving it from `.git/config` or any file
+/// a hostile hook can write would turn the flag into an escalation path. Its
+/// absence, a read failure, or a parse failure must all mean `false`.
+///
+/// `trusted` is `false` everywhere today: the flag does not exist yet, so no
+/// repository is unsandboxed, which is the safe state.
 pub(crate) fn tier_for(need: NetworkNeed, trusted: bool) -> Tier {
     match (trusted, need) {
         // An operator-trusted repository runs with no sandbox at all, and flies
