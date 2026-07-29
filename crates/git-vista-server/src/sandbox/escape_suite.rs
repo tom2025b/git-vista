@@ -69,6 +69,40 @@ const CASE_STRICT_LISTENER_DENIED: EscapeCase = EscapeCase {
     },
 };
 
+const CASE_STRICT_UDP_HOST_DENIED: EscapeCase = EscapeCase {
+    id: "strict_udp_host_denied",
+    class: Class::Containment,
+    tier: Tier::Strict,
+    hooks_blocked: false,
+    build_hook: harness::strict_udp_host_probe,
+    probe_tag: "UDP_HOST",
+    expect_baseline: Errno(0),
+    expect_inside: Errno(101),
+    expect_granted: Errno(0),
+    expect_carrier_code: 0,
+    dies_under: &[MutantId::M4],
+    exemption: Exemption::NotProductionReachable {
+        blocker: "policy_for_repo hard-codes Tier::Network",
+    },
+};
+
+const CASE_STRICT_TCP_BIND_DENIED: EscapeCase = EscapeCase {
+    id: "strict_tcp_bind_denied",
+    class: Class::Containment,
+    tier: Tier::Strict,
+    hooks_blocked: false,
+    build_hook: harness::strict_tcp_bind_probe,
+    probe_tag: "TCP_BIND",
+    expect_baseline: Errno(0),
+    expect_inside: Errno(13),
+    expect_granted: Errno(0),
+    expect_carrier_code: 0,
+    dies_under: &[MutantId::M5],
+    exemption: Exemption::NotProductionReachable {
+        blocker: "policy_for_repo hard-codes Tier::Network",
+    },
+};
+
 #[test]
 fn secret_read_denied() {
     run_case(&CASE_SECRET_READ_DENIED);
@@ -87,6 +121,16 @@ fn high_bit_prctl_denied() {
 #[test]
 fn strict_listener_denied() {
     run_case(&CASE_STRICT_LISTENER_DENIED);
+}
+
+#[test]
+fn strict_udp_host_denied() {
+    run_case(&CASE_STRICT_UDP_HOST_DENIED);
+}
+
+#[test]
+fn strict_tcp_bind_denied() {
+    run_case(&CASE_STRICT_TCP_BIND_DENIED);
 }
 
 mod harness {
@@ -303,6 +347,129 @@ int main(void) {{
            rc, saved, prctl(PR_GET_SECCOMP), prctl(PR_GET_NO_NEW_PRIVS));
     int allowed = read_errno("{granted}");
     printf("GRANTED rc=%d errno=%d\n", allowed ? -1 : 0, allowed);
+    printf("GVPROBE {nonce} END\n");
+    return 0;
+}}
+"#,
+                nonce = ctx.nonce,
+            ),
+        )
+    }
+
+    pub(super) fn strict_udp_host_probe(ctx: &HarnessCtx) -> String {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP echo socket");
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .expect("set UDP echo timeout");
+        let port = socket.local_addr().expect("UDP echo address").port();
+        std::thread::spawn(move || {
+            let mut byte = [0_u8; 1];
+            if let Ok((len, peer)) = socket.recv_from(&mut byte) {
+                let _ = socket.send_to(&byte[..len], peer);
+            }
+        });
+        hook_for(
+            ctx,
+            format!(
+                r#"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+static int host_round_trip_errno(void) {{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return errno;
+    struct timeval timeout = {{ .tv_sec = 1, .tv_usec = 0 }};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout) != 0) {{
+        int saved = errno;
+        close(fd);
+        return saved;
+    }}
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof address);
+    address.sin_family = AF_INET;
+    address.sin_port = htons({port});
+    inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+    char byte = 'x';
+    errno = 0;
+    if (sendto(fd, &byte, 1, 0, (struct sockaddr *)&address, sizeof address) != 1) {{
+        int saved = errno;
+        close(fd);
+        return saved;
+    }}
+    errno = 0;
+    int saved = recv(fd, &byte, 1, 0) == 1 ? 0 : errno;
+    close(fd);
+    return saved;
+}}
+
+static int udp_bind_errno(void) {{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return errno;
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof address);
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons(0);
+    errno = 0;
+    int saved = bind(fd, (struct sockaddr *)&address, sizeof address) == 0 ? 0 : errno;
+    close(fd);
+    return saved;
+}}
+
+int main(void) {{
+    int denied = host_round_trip_errno();
+    int granted = udp_bind_errno();
+    printf("GVPROBE {nonce} BEGIN\n");
+    printf("UDP_HOST rc=%d errno=%d\n", denied ? -1 : 0, denied);
+    printf("GRANTED rc=%d errno=%d\n", granted ? -1 : 0, granted);
+    printf("GVPROBE {nonce} END\n");
+    return 0;
+}}
+"#,
+                nonce = ctx.nonce,
+            ),
+        )
+    }
+
+    pub(super) fn strict_tcp_bind_probe(ctx: &HarnessCtx) -> String {
+        hook_for(
+            ctx,
+            format!(
+                r#"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int bind_errno(int type, unsigned short port) {{
+    int fd = socket(AF_INET, type, 0);
+    if (fd < 0) return errno;
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof address);
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons(port);
+    errno = 0;
+    int saved = bind(fd, (struct sockaddr *)&address, sizeof address) == 0 ? 0 : errno;
+    close(fd);
+    return saved;
+}}
+
+int main(void) {{
+    int denied = bind_errno(SOCK_STREAM, 9418);
+    int granted = bind_errno(SOCK_DGRAM, 0);
+    printf("GVPROBE {nonce} BEGIN\n");
+    printf("TCP_BIND rc=%d errno=%d\n", denied ? -1 : 0, denied);
+    printf("GRANTED rc=%d errno=%d\n", granted ? -1 : 0, granted);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
