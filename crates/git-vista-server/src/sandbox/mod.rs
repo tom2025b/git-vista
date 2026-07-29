@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The one impure corner of `sandbox`: it stats the filesystem to find the
 /// strict tier's launcher. Task 5's policy builders call
