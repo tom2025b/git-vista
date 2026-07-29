@@ -68,11 +68,6 @@ fn split(argv: &[std::ffi::OsString]) -> (&std::ffi::OsString, &[std::ffi::OsStr
 pub(crate) struct SandboxedCommand(tokio::process::Command);
 
 impl SandboxedCommand {
-    pub(crate) fn args(mut self, extra: &[&str]) -> Self {
-        self.0.args(extra);
-        self
-    }
-
     pub(crate) fn stdin(mut self, cfg: impl Into<std::process::Stdio>) -> Self {
         self.0.stdin(cfg);
         self
