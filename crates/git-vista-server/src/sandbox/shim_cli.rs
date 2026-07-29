@@ -12,21 +12,20 @@
 
 use super::*;
 
-/// Build through the production policy seam while repairing the process-wide
-/// `HOME` value that `trust::tests` deliberately removes and does not restore.
-/// `option_env!` captures the test runner's real home at compile time, so this
-/// does not invent a second policy builder or weaken any sandbox assertion.
+/// Build through the production policy seam, unmodified.
+///
+/// This used to carry a retry loop that re-set `HOME` because `trust::tests`
+/// removed it process-wide and never restored it. That disease is cured at the
+/// source — the trust tests now take their directory explicitly and touch no
+/// environment at all — and the repair is deliberately NOT kept as insurance:
+/// if some future test poisons the environment again, the right outcome is a
+/// loud `NoHome` failure naming the problem, not a helper that silently
+/// launders it while every other `$HOME` reader in the suite still races.
 pub(crate) fn production_policy(repo: &std::path::Path) -> Policy {
-    let home = env!("HOME");
-    for _ in 0..16 {
-        std::env::set_var("HOME", home);
-        match policy_for_repo(repo) {
-            Ok(policy) => return policy,
-            Err(shim::ShimError::NoHome) => continue,
-            Err(error) => panic!("production policy builds: {error}"),
-        }
+    match policy_for_repo(repo) {
+        Ok(policy) => policy,
+        Err(error) => panic!("production policy builds: {error}"),
     }
-    panic!("trust test repeatedly removed HOME while policy was being built")
 }
 
 /// A repository with a commit already in it, and **no local identity** — so
