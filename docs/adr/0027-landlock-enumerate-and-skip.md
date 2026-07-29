@@ -182,14 +182,14 @@ status), not in the pure policy builder (`sandbox::sandbox_argv`,
   ruleset is built, because nothing enumerated it. This is a real, accepted
   limitation, not an oversight to silently work around.
 
-  ```mermaid
-  stateDiagram-v2
-      [*] --> RulesetBuilt: session starts,<br/>enumerate $HOME once
-      RulesetBuilt --> ExistingChildGranted: entry existed at build time
-      RulesetBuilt --> NewTopLevelChild: mkdir $HOME/newthing<br/>after restrict_self()
-      ExistingChildGranted --> Readable
-      NewTopLevelChild --> Denied: no rule was ever added for it
-  ```
+```mermaid
+stateDiagram-v2
+    [*] --> RulesetBuilt: session starts,<br/>enumerate $HOME once
+    RulesetBuilt --> ExistingChildGranted: entry existed at build time
+    RulesetBuilt --> NewTopLevelChild: mkdir $HOME/newthing<br/>after restrict_self()
+    ExistingChildGranted --> Readable
+    NewTopLevelChild --> Denied: no rule was ever added for it
+```
 
 - **A related correction, same mechanism, different tree.** Repositories are not
   cloned under `~/projects` — `resolve_clones_root`
