@@ -1,0 +1,35 @@
+--- a/crates/git-vista-server/src/sandbox/mod.rs
++++ b/crates/git-vista-server/src/sandbox/mod.rs
+@@ -557,20 +557,27 @@
+             argv.push(empty_dir.clone().into_os_string());
+         }
+     }
+-    argv.push(OsString::from(match policy.tier {
+-        Tier::Strict => "--net-deny",
+-        Tier::Network => "--net-allow",
+-        Tier::Unsandboxed => unreachable!("handled by the caller"),
+-    }));
+-    // Ports only follow `--net-allow`. Emitting them after `--net-deny` would
+-    // be a contradiction the shim would have to arbitrate, and an argv that
+-    // contradicts itself is one a reviewer cannot check by eye.
+-    if policy.tier == Tier::Network {
+-        for port in &policy.net_ports {
++    match policy.tier {
++        Tier::Strict => {
++            argv.push(OsString::from("--net-allow"));
++            for port in DEFAULT_GIT_PORTS {
++                argv.push(OsString::from("--net-port"));
++                argv.push(OsString::from(port.to_string()));
++            }
++        }
++        Tier::Network => {
++            argv.push(OsString::from("--net-allow"));
++            for port in &policy.net_ports {
++                argv.push(OsString::from("--net-port"));
++                argv.push(OsString::from(port.to_string()));
++            }
++        }
++        Tier::Unsandboxed => unreachable!("handled by the caller"),
++    }
+     argv
+ }
