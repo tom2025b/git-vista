@@ -63,7 +63,7 @@ const CASE_STRICT_LISTENER_DENIED: EscapeCase = EscapeCase {
     expect_inside: Errno(13),
     expect_granted: Errno(0),
     expect_carrier_code: 0,
-    dies_under: &[MutantId::M2],
+    dies_under: &[MutantId::M2, MutantId::M5],
     exemption: Exemption::NotProductionReachable {
         blocker: "policy_for_repo hard-codes Tier::Network",
     },
@@ -97,7 +97,7 @@ const CASE_STRICT_TCP_BIND_DENIED: EscapeCase = EscapeCase {
     expect_inside: Errno(13),
     expect_granted: Errno(0),
     expect_carrier_code: 0,
-    dies_under: &[MutantId::M5],
+    dies_under: &[MutantId::M2],
     exemption: Exemption::NotProductionReachable {
         blocker: "policy_for_repo hard-codes Tier::Network",
     },
@@ -299,7 +299,8 @@ int main(void) {{
     }
 
     pub(super) fn strict_listener_probe(ctx: &HarnessCtx) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind live listener");
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:9418").expect("bind git protocol listener");
         let port = listener.local_addr().expect("listener address").port();
         std::thread::spawn(move || {
             let _ = listener.accept();
