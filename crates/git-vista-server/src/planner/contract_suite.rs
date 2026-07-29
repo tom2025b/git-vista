@@ -440,14 +440,28 @@ async fn push_branch_executes_through_the_pipeline() {
     // fixture serves the bare remote over git:// on loopback: 9418 is in
     // `DEFAULT_GIT_PORTS`, the Network tier's Landlock connect grant covers
     // it, and the daemon (spawned unsandboxed by the test) does the receiving.
-    // A *stale* daemon (e.g. leaked when a previous run was SIGKILLed before
-    // the guard's Drop) would pass the readiness probe below while serving a
-    // dead base path, and every push would then fail with a baffling
-    // "connection reset". Name that failure instead of inheriting it.
+    // Port 9418 must be free, and two different things can hold it. A *stale*
+    // daemon (leaked when a run was SIGKILLed before the guard's Drop) would
+    // pass the readiness probe below while serving a dead base path, and every
+    // push would then fail with a baffling "connection reset". The other holder
+    // is inside this very test binary: `escape_suite::harness::
+    // strict_listener_probe` binds 127.0.0.1:9418 through a `OnceLock` and
+    // parks a thread in `accept()`, and under a *passing* denial case no
+    // connection ever arrives to unblock it — so that port is held for the rest
+    // of the process's life. Both tests genuinely need 9418 (it is the only
+    // unprivileged entry in `DEFAULT_GIT_PORTS`, so it is the only port a
+    // Network-tier Landlock connect grant covers), which makes them mutually
+    // exclusive in one binary. See handoff.md — the durable fix is to give the
+    // escape harness's listener a bounded lifetime and serialize the two behind
+    // a shared guard; until then this assertion names the collision instead of
+    // letting it surface as an unexplained transport error.
     assert!(
         std::net::TcpStream::connect(("127.0.0.1", 9418)).is_err(),
-        "port 9418 is already in use — a leaked `git daemon` from an earlier \
-         run? (`pgrep -af git-daemon`, kill it, rerun)"
+        "port 9418 is already in use. Either a leaked `git daemon` from an \
+         earlier run (`pgrep -af git-daemon`, kill it, rerun), or \
+         `escape_suite::strict_listener_denied` ran first in this same binary \
+         and is parked on that port — the two cannot share it (see the comment \
+         above)."
     );
     // `process_group(0)` — see `DaemonGuard`. Stdio all detached: an inherited
     // stdout pipe would keep any harness capturing this test's output alive
