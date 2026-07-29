@@ -56,6 +56,7 @@ const POINTER_FILE_CAP: u64 = 4096;
 /// The resolved directories of a linked worktree. `gitdir` is strictly inside
 /// `commondir.join("worktrees")` — that containment is checked, not assumed —
 /// so a policy needs to grant only `commondir` to cover both.
+#[derive(Debug)]
 pub(crate) struct LinkedWorktreeDirs {
     /// `<main>/.git/worktrees/<id>` — the worktree's private index/HEAD/locks.
     pub gitdir: PathBuf,
