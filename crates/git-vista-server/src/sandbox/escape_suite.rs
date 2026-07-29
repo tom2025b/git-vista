@@ -77,7 +77,7 @@ const CASE_STRICT_UDP_HOST_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::strict_udp_host_probe,
     probe_tag: "UDP_HOST",
     expect_baseline: Errno(0),
-    expect_inside: Errno(101),
+    expect_inside: Errno(11),
     expect_granted: Errno(0),
     expect_carrier_code: 0,
     dies_under: &[MutantId::M4],
