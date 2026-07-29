@@ -76,7 +76,7 @@ pub(crate) fn command_sync(policy: &Policy, repo: &Path, args: &[&str]) -> std::
 
 #[cfg(test)]
 mod tests {
-    use super::super::shim_cli::fixture;
+    use super::super::shim_cli::{fixture, production_policy};
     use super::*;
 
     /// The wrapper's argv is exactly the sandbox argv with `-C <repo> <args>`
@@ -85,8 +85,7 @@ mod tests {
     #[test]
     fn the_wrapper_argv_is_the_sandbox_argv_plus_the_repo_and_args() {
         let repo = std::path::PathBuf::from("/srv/repo");
-        let policy = super::super::policy_for_repo(&repo)
-            .expect("policy_for_repo builds (shim is present via tests/forces_shim_build.rs)");
+        let policy = production_policy(&repo);
         let argv = full_argv(&policy, &repo, &["status", "--short"]);
 
         // ends with the appended tail
@@ -114,8 +113,7 @@ mod tests {
     #[tokio::test]
     async fn a_real_git_runs_through_the_async_wrapper() {
         let repo = fixture().await;
-        let policy = super::super::policy_for_repo(repo.path())
-            .expect("policy_for_repo builds (shim is present via tests/forces_shim_build.rs)");
+        let policy = production_policy(repo.path());
         let out = command_async(&policy, repo.path(), &["status", "--short"])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -138,8 +136,7 @@ mod tests {
     #[tokio::test]
     async fn the_production_policy_runs_real_git_and_denies_secrets() {
         let repo = fixture().await;
-        let policy = super::super::policy_for_repo(repo.path())
-            .expect("policy_for_repo builds (shim is present via tests/forces_shim_build.rs)");
+        let policy = production_policy(repo.path());
 
         // A granted operation succeeds: proves the policy is not denying all.
         let ok = command_async(&policy, repo.path(), &["status", "--short"])

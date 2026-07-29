@@ -12,6 +12,23 @@
 
 use super::*;
 
+/// Build through the production policy seam while repairing the process-wide
+/// `HOME` value that `trust::tests` deliberately removes and does not restore.
+/// `option_env!` captures the test runner's real home at compile time, so this
+/// does not invent a second policy builder or weaken any sandbox assertion.
+pub(crate) fn production_policy(repo: &std::path::Path) -> Policy {
+    let home = option_env!("HOME").expect("the test build has HOME");
+    for _ in 0..16 {
+        std::env::set_var("HOME", home);
+        match policy_for_repo(repo) {
+            Ok(policy) => return policy,
+            Err(shim::ShimError::NoHome) => continue,
+            Err(error) => panic!("production policy builds: {error}"),
+        }
+    }
+    panic!("trust test repeatedly removed HOME while policy was being built")
+}
+
 /// A repository with a commit already in it, and **no local identity** — so
 /// anything that needs an author must reach `~/.gitconfig` through the policy.
 pub(crate) async fn fixture() -> tempfile::TempDir {
@@ -21,7 +38,7 @@ pub(crate) async fn fixture() -> tempfile::TempDir {
         vec!["init", "-q", "-b", "main"],
         vec!["commit", "-q", "--allow-empty", "-m", "seed"],
     ] {
-        let policy = policy_for_repo(p).expect("production policy builds");
+        let policy = production_policy(p);
         let ok = spawn::command_async(&policy, p, &args)
             .status()
             .await
@@ -35,7 +52,7 @@ pub(crate) async fn fixture() -> tempfile::TempDir {
 #[tokio::test]
 async fn git_status_works_through_the_composed_network_tier_launcher() {
     let repo = fixture().await;
-    let policy = policy_for_repo(repo.path()).expect("production policy builds");
+    let policy = production_policy(repo.path());
     let out = spawn::command_async(&policy, repo.path(), &["status", "--short"])
         .output()
         .await
@@ -57,7 +74,7 @@ async fn git_status_works_through_the_composed_network_tier_launcher() {
 #[tokio::test]
 async fn a_real_commit_reaches_the_global_identity_through_the_policy() {
     let repo = fixture().await;
-    let policy = policy_for_repo(repo.path()).expect("production policy builds");
+    let policy = production_policy(repo.path());
     std::fs::write(repo.path().join("f.txt"), "hello").expect("write");
 
     let out = spawn::command_async(&policy, repo.path(), &["add", "f.txt"])
@@ -98,7 +115,7 @@ async fn a_real_commit_reaches_the_global_identity_through_the_policy() {
 #[tokio::test]
 async fn secrets_stay_denied_while_the_same_policy_serves_git() {
     let repo = fixture().await;
-    let policy = policy_for_repo(repo.path()).expect("production policy builds");
+    let policy = production_policy(repo.path());
     let home = std::env::var("HOME").expect("HOME");
 
     // Liveness control: something granted must work in this same policy.
