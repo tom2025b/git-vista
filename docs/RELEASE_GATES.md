@@ -449,25 +449,43 @@ themselves (see the contract's "Skip policy"):
    equals `docs/sandbox/escape-census.txt` in **both directions** (equality,
    not a floor — a renamed module empties a floor-based gate silently);
    zero records read `result=capability-absent`.
+4. On pull requests that touch
+   `crates/git-vista-server/src/sandbox/**` or
+   `crates/git-vista-server/src/bin/gv-sandbox/**`, and on the nightly
+   schedule, `ci/mutation-matrix.sh` copies the tree, applies M1–M7 one at a
+   time with exact-context `patch --forward`, rebuilds, runs all five cases,
+   prints a mutant × case grid, and asserts M0 all-pass, every declared
+   `dies_under` cell FAIL, and case↔mutant closure in both directions. A patch
+   that does not apply fails the job; it is never treated as a skipped mutant.
 
-**Status as of this document's edit (Task 25, steps 1–3 of the contract's
-ordered work).** The CI job, the harness (`sandbox::escape_contract` —
-`EscapeCase`, `run_case`, the `Result`-returning probe parser, the nonce
-`GVPROBE` marker protocol, `production_env_profile()`), and source tripwires
-for R1, R2, R3, R4, R6, R7, R8, R10, R11 are landed. The five cases
-themselves are **not yet rewritten onto the contract** (step 5, blocked on
-step 4) — `escape_suite.rs` still has no `mod harness` marker, so the R1,
-R2, R4, R6 and R7 tripwires **fail today, deliberately**: a tripwire that
-cannot reject the file it was written against has not been shown to reject
-anything. `docs/sandbox/escape-census.txt` is empty-but-present for the same
-reason — the census↔report diff currently passes over an empty set, which
-is a placeholder, not a coverage claim. None of this blocks the `sandbox`
-job from existing as a real, gating check; it does mean the job reads red
-on `main` until step 5 lands, which is expected and recorded rather than
-worked around.
+```mermaid
+flowchart LR
+    T[Sandbox-path PR or nightly] --> C[Copy clean tree]
+    C --> M[Apply one M1-M7 patch]
+    M --> B[Build and run five cases]
+    B --> G[Emit mutant x case grid]
+    G --> A{M0 green, declared cells red,<br/>closure both ways?}
+    A -->|yes| P[Gate passes]
+    A -->|no| F[Gate fails with exact cell]
+```
+
+**Status after Task 26.** The contract tripwires are 10/10 and M0 is 5/5.
+The first host mutation run found the intended M4 discrepancy and one further
+survivor: both M4 and M5 leave `strict_listener_denied` green. M4 is redundant
+with Landlock's independent TCP denial. M5 grants only `DEFAULT_GIT_PORTS`,
+while the case deliberately binds an ephemeral port, so that observation also
+remains denied. The case's declaration was corrected from `[M4, M5]` to the
+observed `[M2]`; M2 removes Landlock and does kill it. M4 and M5 remain in the
+committed mutant set and are not falsely reported as killed. Consequently R9
+is intentionally red on mutant-to-case closure for M4 and M5 until an
+authorized follow-up widens the battery with observations those mechanisms
+alone can kill. The matrix is doing its job: it names the missing evidence
+instead of manufacturing a green gate.
 
 ---
 
 **Signed:** thomas2010 · 2026-07-28T01:37:53-04:00
 
 **Signed:** thomas2010 · 2026-07-29T11:30:00-04:00 (Part 3 addition, Task 25)
+
+**Signed:** claude_2010 · 2026-07-29 (Task 26 mutation-matrix evidence)
