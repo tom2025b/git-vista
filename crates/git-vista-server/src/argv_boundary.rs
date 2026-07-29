@@ -447,7 +447,7 @@ fn bounded_read_source_boundary_is_streaming_and_exactly_five() {
     let uncapped = ["git_stdout", "("].concat();
     // Assembled at runtime, like the spawn scan above, so this file's own source
     // never contains the bare patterns it forbids.
-    let banned: [(String, &str); 3] = [
+    let banned: [(String, &str); 4] = [
         ([".output", "()"].concat(), "buffers all of git's stdout"),
         (
             [".wait_with", "_output()"].concat(),
@@ -456,6 +456,11 @@ fn bounded_read_source_boundary_is_streaming_and_exactly_five() {
         (
             ["Command", "::new"].concat(),
             "spawns git outside the capped primitive",
+        ),
+        (
+            ["git_out", "put("].concat(),
+            "buffers all of git's stdout (the sealed helper is for small, \
+             fixed-size reads, never for these streams)",
         ),
     ];
 
@@ -507,15 +512,19 @@ fn bounded_read_source_boundary_is_streaming_and_exactly_five() {
     }
 
     // Narrowness, both directions. The file as a whole still contains the
-    // unrelated direct invocation — `worktree_status` runs
-    // `git status --porcelain=v2` and buffers its (tiny, static-arg) output —
-    // so the two extractions above cut where they claim to rather than
-    // swallowing the whole file and asserting over nothing. (`porcelain=v2` is
+    // unrelated buffering invocation — `worktree_status` runs
+    // `git status --porcelain=v2` and buffers its (tiny, static-arg) output,
+    // since Task 6 through the sealed `git_cmd::git_output` helper — so the two
+    // extractions above cut where they claim to rather than swallowing the
+    // whole file and asserting over nothing. Before Task 6 the witness here was
+    // a raw `.output()` call; that migrated away, and a witness that quietly
+    // degrades to `#[cfg(test)]` fixtures is this guard passing vacuously — so
+    // the witness now names the production helper itself. (`porcelain=v2` is
     // checked against the raw source: `code_only` blanks string contents.)
-    let direct_output = [".output", "()"].concat();
+    let sealed_buffered = ["git_out", "put("].concat();
     assert!(
-        code.matches(direct_output.as_str()).count() > 0,
-        "file-wide `{direct_output}` vanished: either worktree_status changed, \
+        code.matches(sealed_buffered.as_str()).count() > 0,
+        "file-wide `{sealed_buffered}` vanished: either worktree_status changed, \
          or this guard is now passing vacuously"
     );
     assert!(
