@@ -432,10 +432,11 @@ fn production_body<'a>(code: &'a str, name: &str) -> &'a str {
 /// reading (or serving) its git-show output. See that function's doc comment.
 ///
 /// The scope is deliberately narrow. The unrelated `worktree_status` read in
-/// the very same file legitimately owns a direct process invocation with static
-/// args, and the assertion below that the *file* still contains such a call
-/// while the two extracted *bodies* do not is what proves the extractor cut
-/// where it claims to, instead of quietly matching nothing.
+/// the very same file legitimately buffers a whole (tiny, static-arg) git
+/// output — since Task 6 through the sealed `git_cmd::git_output` helper rather
+/// than a raw `Command` — and the assertion below that the *file* still
+/// contains that call while the two extracted *bodies* do not is what proves
+/// the extractor cut where it claims to, instead of quietly matching nothing.
 #[test]
 fn bounded_read_source_boundary_is_streaming_and_exactly_five() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/read.rs");
