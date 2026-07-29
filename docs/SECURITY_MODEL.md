@@ -8,10 +8,18 @@ identity problem; it does not remove browser-origin attacks, stale tabs, malicio
 LAN clients, credential leakage, or command races. Repository *content* is also
 untrusted input: names, messages, refs and paths are treated as hostile and are
 validated. Repository *code* — hooks, filters, and any config key that names an
-executable — is a different matter. Git-Vista runs it under bounded, irreversible
-kernel restrictions that substantially reduce filesystem, IPC, network and lifetime
-authority, and it reports which policy is in force. It does not claim isolation from
-a same-uid adversary, and it cannot: see Known Non-Goals.
+executable — is a different matter. It is *designed* to run under bounded,
+irreversible kernel restrictions, tiered by operation kind: Landlock filesystem
+rules wherever repository code runs, Landlock network rules that scope the
+network tier to a fixed TCP port list — never to a destination host, see ADR
+0028 — seccomp syscall filtering, and, outside the network tier, a `bwrap`
+namespace boundary. **None of that enforcement is shipped yet.** What is true
+today: the policy a session will run under is computed and disclosed (ADR
+0025), and the pure argv chokepoint that will carry it is built and tested
+(ADR 0017); the shim that actually applies Landlock and seccomp to a hook
+process does not exist in the tree yet (ADR 0027), so today no hook process
+is restricted by any of this. It does not claim isolation from a same-uid
+adversary, and it cannot: see Known Non-Goals.
 
 ## Security Objectives
 
