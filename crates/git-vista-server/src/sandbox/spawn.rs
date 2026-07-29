@@ -47,20 +47,79 @@ fn split(argv: &[std::ffi::OsString]) -> (&std::ffi::OsString, &[std::ffi::OsStr
     (&argv[0], &argv[1..])
 }
 
-/// The async wrapper: a `tokio::process::Command` ready to `.spawn()` or
-/// `.output()`. Pipes and `kill_on_drop` are left to the caller, because the
-/// two async call sites want different shapes (a capped stream vs a simple
-/// output) and both are legitimate.
-pub(crate) fn command_async(
-    policy: &Policy,
-    repo: &Path,
-    args: &[&str],
-) -> tokio::process::Command {
+/// A composed launcher whose argv is **final**.
+///
+/// This is Task 5's half of C10 hazard #1. `command_async` used to hand back a
+/// bare `tokio::process::Command`, and the crate's only production caller —
+/// `git_cmd::sandboxed()` — built it with an *empty* arg slice and let each
+/// caller append the real subcommand afterward with `.args(…)`. Whatever
+/// `sandbox_argv` classified, it classified an argv the process never ran.
+///
+/// Threading the real args into `sandboxed(repo, args)` does not close that on
+/// its own: a `-> Command` return still lets a caller append more. So the argv
+/// is sealed by the *type* instead. There is deliberately no `arg`, no `args`
+/// and no `env` here — only stdio configuration, which cannot change what runs.
+/// `env` is excluded for the same reason as `arg`: `GIT_DIR`, `GIT_SSH_COMMAND`
+/// and `GIT_EXTERNAL_DIFF` redirect or execute, so an environment appended
+/// after classification is an argv change wearing a different hat.
+///
+/// The setters consume and return `Self` so a call site still reads as one
+/// chain ending in `output()`/`spawn()`.
+pub(crate) struct SandboxedCommand(tokio::process::Command);
+
+impl SandboxedCommand {
+    pub(crate) fn stdin(mut self, cfg: impl Into<std::process::Stdio>) -> Self {
+        self.0.stdin(cfg);
+        self
+    }
+
+    pub(crate) fn stdout(mut self, cfg: impl Into<std::process::Stdio>) -> Self {
+        self.0.stdout(cfg);
+        self
+    }
+
+    pub(crate) fn stderr(mut self, cfg: impl Into<std::process::Stdio>) -> Self {
+        self.0.stderr(cfg);
+        self
+    }
+
+    pub(crate) fn kill_on_drop(mut self, kill: bool) -> Self {
+        self.0.kill_on_drop(kill);
+        self
+    }
+
+    pub(crate) async fn output(mut self) -> std::io::Result<std::process::Output> {
+        self.0.output().await
+    }
+
+    pub(crate) fn spawn(mut self) -> std::io::Result<tokio::process::Child> {
+        self.0.spawn()
+    }
+
+    /// Test-only: run with a stripped environment so a fixture's result does not
+    /// depend on the developer's shell. Gated to `#[cfg(test)]` precisely so the
+    /// production surface above stays free of environment control — see the type
+    /// doc for why `env` is a hazard, not a convenience.
+    #[cfg(test)]
+    pub(crate) fn hermetic_env_for_test(mut self) -> Self {
+        self.0
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", std::env::var("HOME").expect("HOME set in tests"));
+        self
+    }
+}
+
+/// The async wrapper: a [`SandboxedCommand`] whose argv is already complete.
+/// Pipes and `kill_on_drop` are left to the caller, because the two async call
+/// sites want different shapes (a capped stream vs a simple output) and both
+/// are legitimate — but neither may touch the argv.
+pub(crate) fn command_async(policy: &Policy, repo: &Path, args: &[&str]) -> SandboxedCommand {
     let argv = full_argv(policy, repo, args);
     let (program, rest) = split(&argv);
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(rest);
-    cmd
+    SandboxedCommand(cmd)
 }
 
 /// The sync wrapper, for the `#[cfg(test)]` fixture builders and any blocking
@@ -115,9 +174,7 @@ mod tests {
         let repo = fixture().await;
         let policy = production_policy(repo.path());
         let out = command_async(&policy, repo.path(), &["status", "--short"])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", std::env::var("HOME").unwrap())
+            .hermetic_env_for_test()
             .output()
             .await
             .expect("git runs through the wrapper");
@@ -140,9 +197,7 @@ mod tests {
 
         // A granted operation succeeds: proves the policy is not denying all.
         let ok = command_async(&policy, repo.path(), &["status", "--short"])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", std::env::var("HOME").unwrap())
+            .hermetic_env_for_test()
             .output()
             .await
             .expect("git runs");
@@ -157,9 +212,7 @@ mod tests {
         let secret = format!("{home}/.ssh/known_hosts");
         if std::path::Path::new(&secret).exists() {
             let out = command_async(&policy, repo.path(), &["config", "-f", &secret, "--list"])
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("HOME", home)
+                .hermetic_env_for_test()
                 .output()
                 .await
                 .expect("git runs");
