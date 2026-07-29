@@ -847,7 +847,7 @@ fn r7_both_legs_share_one_pinned_environment_profile() {
         "R7: production_env_profile() must exist in escape_contract.rs"
     );
 
-    let main_code = crate::argv_boundary::code_only(&read_rs("src/main.rs"));
+    let main_code = comments_only_blanked(&read_rs("src/main.rs"));
     let mut git_vars: BTreeSet<&str> = BTreeSet::new();
     let mut rest = main_code.as_str();
     while let Some(start) = rest.find("\"GIT_") {
