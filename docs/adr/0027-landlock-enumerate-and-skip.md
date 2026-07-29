@@ -104,7 +104,7 @@ sequenceDiagram
   Shim->>FS: readdir($HOME)
   loop each top-level entry
     alt plain entry — .gitconfig, .bashrc, projects, ...
-      Shim->>LL: add_rule(entry, dir: EXECUTE|READ_FILE|READ_DIR; file: READ_FILE)
+      Shim->>LL: add_rule(entry, dir=EXECUTE|READ_FILE|READ_DIR, file=READ_FILE)
     else excluded outright — .ssh, .claude, .aws, .netrc, .npmrc, ...
       Shim->>Shim: skip entirely, no rule added
     else exclude nested inside — .config (holds gh)
