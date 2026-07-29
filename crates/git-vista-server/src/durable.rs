@@ -546,12 +546,7 @@ pub(crate) async fn write_recovery_ref(
         return;
     };
     let ref_name = format!("{RECOVERY_REF_PREFIX}/{}", operation.as_str());
-    let result = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["update-ref", &ref_name, oid.as_str()])
-        .output()
-        .await;
+    let result = crate::git_cmd::git_output(repo, &["update-ref", &ref_name, oid.as_str()]).await;
     match result {
         Ok(output) if output.status.success() => {}
         Ok(output) => eprintln!(

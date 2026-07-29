@@ -14,7 +14,7 @@
 //! of whatever git felt like printing (M1.10, #63).
 
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 
 use axum::http::StatusCode;
 use tokio::io::AsyncReadExt;
@@ -147,6 +147,28 @@ fn sandboxed(
 ) -> Result<crate::sandbox::spawn::SandboxedCommand, String> {
     let policy = crate::sandbox::policy_for_repo(repo).map_err(|e| e.to_string())?;
     Ok(crate::sandbox::spawn::command_async(&policy, repo, args))
+}
+
+/// Run `git -C <repo> <args…>` through the sealed launcher and collect its
+/// full [`Output`] — the one path from "a module needs git's `Output`" to
+/// `sandboxed` above, for callers that want status/stdout/stderr together
+/// rather than the capped-stdout or bool/Option shapes the other helpers in
+/// this file return (#66, Task 6).
+///
+/// Folding "the sandbox policy couldn't be built" into the same `io::Error`
+/// as "the spawn itself failed" is a real conflation — it is exactly the one
+/// `docs/sandbox/tier-dispatch-revised-design.md`'s D5 exists to fix, by
+/// giving execution-unavailable its own value instead of erasing it into a
+/// generic IO failure. This helper does not do that work; it takes the
+/// erased shape on purpose. It is still fail-safe: every caller today already
+/// maps an `io::Error` from git to the same 500 it would map a "policy
+/// unavailable" error to, so the two failures land on the same response
+/// either way. And it is strictly better than what it replaces — the raw
+/// `Command::new("git")` spawns this collapses into itself ran with no
+/// sandbox at all.
+pub(crate) async fn git_output(repo: &Path, args: &[&str]) -> std::io::Result<Output> {
+    let cmd = sandboxed(repo, args).map_err(std::io::Error::other)?;
+    cmd.output().await
 }
 
 pub(crate) async fn git_stdout_capped(
