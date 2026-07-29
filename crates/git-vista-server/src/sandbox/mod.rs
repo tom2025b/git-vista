@@ -27,6 +27,8 @@ pub(crate) mod shim;
 /// Task 5: the two spawn wrappers. The single chokepoint where the pure argv
 /// becomes a real git process. Task 6 migrates the server's spawn sites here.
 pub(crate) mod spawn;
+/// Task 9: the factual capability probe — what tiers can this host provide.
+pub(crate) mod capabilities;
 
 #[cfg(test)]
 mod argv;
