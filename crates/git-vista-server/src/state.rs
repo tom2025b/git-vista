@@ -399,6 +399,16 @@ pub(crate) fn bootstrap_token_path() -> PathBuf {
     state_dir().join("bootstrap.token")
 }
 
+/// Directory holding the per-repository sandbox trust markers (M1.13b, #66,
+/// Task 7). It lives under the server's own state directory *on purpose*: a
+/// sandboxed repository is granted `$HOME` read-only, so it can *read* this path
+/// but cannot *write* a marker to grant itself trust — which is the property
+/// that keeps the `Unsandboxed` tier reachable only by an explicit operator
+/// action, never by a hostile hook. See `sandbox::trust`.
+pub(crate) fn sandbox_trust_dir() -> PathBuf {
+    state_dir().join("trusted-repos")
+}
+
 /// Where the durable operation journal's SQLite file lives (M1.09, #62).
 /// Process-wide rather than per-repository: the operation registry already
 /// addresses repositories by opaque token, not path, and one file keeps
