@@ -16,6 +16,9 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+mod bwrap;
+pub(crate) use bwrap::bwrap_path;
+
 #[cfg(test)]
 mod argv;
 #[cfg(test)]
@@ -232,11 +235,33 @@ pub(crate) fn default_system_trees(tier: Tier) -> (Vec<PathBuf>, Vec<PathBuf>) {
 /// The chokepoint. Returns the complete launcher argv **up to and including
 /// the program name `git`**; the caller appends `-C <repo> <args…>`.
 ///
-/// INV-16: the result is either exactly `["git"]` (the `Unsandboxed` tier) or
-/// it ends in `["--", "git"]` after a fixed reviewed prefix.
+/// INV-16: the result is one of exactly three shapes —
+/// 1. `["git"]` — the `Unsandboxed` tier with hooks running;
+/// 2. `["git", "-c", "core.hooksPath=<dir>"]` — the `Unsandboxed` tier with
+///    hooks blocked (see below);
+/// 3. a fixed reviewed prefix ending in `["--", "git"]` — every sandboxed tier.
+///
+/// # Why shape 2 exists
+///
+/// `Unsandboxed` used to return a bare `["git"]` unconditionally, which threw
+/// away `HookMode::Blocked`. That combination is reachable and it is the worst
+/// one: `Blocked` is the state the probe drops to when the host cannot supply
+/// the declared minimum (INV-13), and `Unsandboxed` is a repository the
+/// operator has explicitly trusted. A trusted repository on a degraded host
+/// would therefore have run its hooks — arbitrary code, with no sandbox and no
+/// hook suppression — while the policy in memory said hooks were blocked.
+/// `-c core.hooksPath=<empty dir>` is the same suppression the shim applies,
+/// expressed in the only mechanism available when there is no shim in the argv.
 pub(crate) fn sandbox_argv(policy: &Policy) -> Vec<OsString> {
     if policy.tier == Tier::Unsandboxed {
-        return vec![OsString::from("git")];
+        let mut argv = vec![OsString::from("git")];
+        if let HookMode::Blocked { empty_dir } = &policy.hook_mode {
+            argv.push(OsString::from("-c"));
+            let mut setting = OsString::from("core.hooksPath=");
+            setting.push(empty_dir);
+            argv.push(setting);
+        }
+        return argv;
     }
     let mut argv = shim_argv(policy);
     argv.push(OsString::from("--"));
@@ -249,16 +274,37 @@ pub(crate) fn sandbox_argv(policy: &Policy) -> Vec<OsString> {
 /// That is what lets the battery satisfy the composition rule — the checks run
 /// behind the very same Landlock and seccomp code path production uses —
 /// without ever teaching the shim to exec an arbitrary program.
-pub(crate) fn probe_argv(policy: &Policy) -> Vec<OsString> {
+///
+/// `None` for `Tier::Unsandboxed`: there is no sandbox there to probe, so there
+/// is no argv that could probe it. It returns `None` rather than panicking
+/// because the caller reaches this on a real path — probing an operator-trusted
+/// repository — and a panic there takes down a server worker thread for a
+/// condition that is a legitimate answer, not a bug. The caller reports "no
+/// sandbox to probe"; INV-15's permanent banner is what tells the operator.
+pub(crate) fn probe_argv(policy: &Policy) -> Option<Vec<OsString>> {
+    if policy.tier == Tier::Unsandboxed {
+        return None;
+    }
     let mut argv = shim_argv(policy);
     argv.push(OsString::from("--self-probe"));
-    argv
+    Some(argv)
 }
 
+/// # Panics
+///
+/// Never for `Tier::Unsandboxed` — both callers return before reaching here.
+/// Panics if a `Strict` policy carries no `bwrap` path; `Policy` construction
+/// is responsible for degrading to `Network` or reporting INV-13 instead of
+/// building a strict policy that cannot launch its own namespace boundary.
 fn shim_argv(policy: &Policy) -> Vec<OsString> {
     let mut argv: Vec<OsString> = Vec::new();
     if policy.tier == Tier::Strict {
-        argv.extend(STRICT_BWRAP_PREFIX.iter().map(OsString::from));
+        let bwrap = policy.bwrap.as_ref().expect(
+            "a Strict policy must carry a resolved bwrap path; without namespaces it is \
+             not the strict tier and must degrade loudly (INV-13), never silently",
+        );
+        argv.push(bwrap.clone().into_os_string());
+        argv.extend(STRICT_BWRAP_ARGS.iter().map(OsString::from));
         argv.push(OsString::from("--"));
     }
     argv.push(policy.shim.clone().into_os_string());
