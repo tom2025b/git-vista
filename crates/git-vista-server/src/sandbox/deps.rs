@@ -55,33 +55,89 @@ const COL_REVIEW_DATE: usize = 6;
 /// Six columns plus the empty elements the leading and trailing `|` produce.
 const ROW_CELLS: usize = 8;
 
+/// `None` if the row is complete, otherwise what is missing.
+///
+/// Split out from the test that runs it over the real register so the gate can
+/// be pointed at a deliberately bad row and shown to *reject* it. A gate that
+/// has only ever been run against input it accepts has not been tested; it has
+/// been observed agreeing.
+fn row_defect(line: &str) -> Option<String> {
+    let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+    if cells.len() < ROW_CELLS {
+        return Some(format!(
+            "malformed row: want {ROW_CELLS} cells, got {}",
+            cells.len()
+        ));
+    }
+    for (col, what) in [
+        (COL_CRATE, "crate name"),
+        (COL_VERSION, "version"),
+        (COL_REASON, "reason it is unavoidable"),
+        (COL_OWNER, "owner"),
+        (COL_ALTERNATIVE, "reviewed alternative"),
+        (COL_REVIEW_DATE, "review date"),
+    ] {
+        if cells[col].is_empty() {
+            return Some(format!("row has no {what}"));
+        }
+    }
+    None
+}
+
 #[test]
 fn the_register_names_an_owner_and_a_reason_for_each_row() {
     let mut rows = 0usize;
     for line in REGISTER.lines().filter(|l| l.starts_with("| `")) {
         rows += 1;
-        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
         assert!(
-            cells.len() >= ROW_CELLS,
-            "malformed register row (want {ROW_CELLS} cells, got {}): {line}",
-            cells.len()
+            row_defect(line).is_none(),
+            "{}: {line}",
+            row_defect(line).unwrap()
         );
-        for (col, what) in [
-            (COL_CRATE, "crate name"),
-            (COL_VERSION, "version"),
-            (COL_REASON, "reason it is unavoidable"),
-            (COL_OWNER, "owner"),
-            (COL_ALTERNATIVE, "reviewed alternative"),
-            (COL_REVIEW_DATE, "review date"),
-        ] {
-            assert!(!cells[col].is_empty(), "row has no {what}: {line}");
-        }
     }
     assert!(
         rows > 0,
         "the register parsed zero rows — the row format changed and this gate is now \
          checking nothing at all"
     );
+}
+
+/// Proof the gate bites. Every row here is one a *correct* gate must reject,
+/// and the last two are the exact rows the previous off-by-one let through: it
+/// read cells 2/3/4 (version, reason, owner) while believing it read reason,
+/// owner and alternative, so the two columns that carry the actual review —
+/// the alternative considered and the date it was considered — were never
+/// checked at all. Both of those rows passed the old gate.
+#[test]
+fn the_gate_rejects_incomplete_rows() {
+    let bad = [
+        ("| `x` | 0.1 | why | who | alt |", "too few cells"),
+        ("| `x` |  | why | who | alt | 2026-01-01 |", "no version"),
+        ("| `x` | 0.1 |  | who | alt | 2026-01-01 |", "no reason"),
+        ("| `x` | 0.1 | why |  | alt | 2026-01-01 |", "no owner"),
+        (
+            "| `x` | 0.1 | why | who |  | 2026-01-01 |",
+            "no reviewed alternative — passed the old off-by-one gate",
+        ),
+        (
+            "| `x` | 0.1 | why | who | alt |  |",
+            "no review date — passed the old off-by-one gate",
+        ),
+    ];
+    for (row, why) in bad {
+        assert!(
+            row_defect(row).is_some(),
+            "the gate accepted a row that {why}: {row}"
+        );
+    }
+}
+
+/// The other half of the same proof: a complete row must be accepted, so the
+/// test above cannot be passing because `row_defect` rejects everything.
+#[test]
+fn the_gate_accepts_a_complete_row() {
+    let good = "| `x` | 0.1 | why it is unavoidable | Tom | the alternative, and why not | 2026-01-01 |";
+    assert_eq!(row_defect(good), None, "a complete row must pass");
 }
 
 /// The column indices above are asserted against the register's own header, so
