@@ -45,6 +45,12 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     "src/planner/lifecycle_suite.rs", // #[cfg(test)] git fixtures for the #61 lifecycle suite
     "src/state.rs",          // #[cfg(test)] fixture setup
     "src/argv_boundary.rs",  // this file (the scan reads its own source)
+    // The M1.13b spawn chokepoint (#66, Task 5). It builds a git Command from
+    // `sandbox_argv(policy)`, so `argv[0]` is the shim (or bare `git` in the
+    // unsandboxed tier), never a literal chosen here. Also in
+    // LAUNCHER_SPAWN_SITES: it is the whole point of the sandbox that this is
+    // where git is spawned, and Task 6 routes the existing sites through it.
+    "src/sandbox/spawn.rs",
     // The M1.13b sandbox shim (#66). It is the *blessed launcher*: the one
     // process that applies Landlock and seccomp and then replaces its own image
     // with git. It qualifies for this list more strongly than most entries —
@@ -89,6 +95,10 @@ const LAUNCHER_SPAWN_SITES: &[&str] = &[
     // compiles a source file this test wrote — so it is permitted here while
     // shells remain forbidden.
     "src/sandbox/escape_suite.rs",
+    // The Task 5 spawn chokepoint. Its `Command::new` program is
+    // `sandbox_argv(policy)[0]` — the resolved shim, or bare `git` in the
+    // unsandboxed tier — a value this crate produced, never a runtime string.
+    "src/sandbox/spawn.rs",
 ];
 
 /// A launcher site may name a non-literal program, but never a **shell**.
