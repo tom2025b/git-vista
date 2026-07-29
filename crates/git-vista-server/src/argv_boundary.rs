@@ -45,6 +45,14 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     "src/planner/lifecycle_suite.rs", // #[cfg(test)] git fixtures for the #61 lifecycle suite
     "src/state.rs",          // #[cfg(test)] fixture setup
     "src/argv_boundary.rs",  // this file (the scan reads its own source)
+    // The M1.13b sandbox shim (#66). It is the *blessed launcher*: the one
+    // process that applies Landlock and seccomp and then replaces its own image
+    // with git. It qualifies for this list more strongly than most entries —
+    // it names `git` literally AND its `validate()` refuses, with exit 90, any
+    // argv whose program is not exactly `git`, so it cannot exec anything else
+    // even if the literal rule below were relaxed. It uses `.exec()`, never
+    // `.spawn()`/`.output()`/`.status()`: it never becomes a parent.
+    "src/bin/gv-sandbox.rs",
     // git-vista-git
     "src/history.rs", // read-side reflog/stash reads, static args
 ];
