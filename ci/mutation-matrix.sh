@@ -118,6 +118,24 @@ for mutant in "${mutants[@]}"; do
   fi
 done
 
+# One snapshot of the source, taken once, before any tree is built.
+#
+# Every mutant tree is copied from this snapshot rather than from $repo_root,
+# so the whole grid describes exactly one version of the code. Copying from
+# the live repository per mutant — as this did originally — makes the grid
+# non-atomic: an edit landing mid-run (a developer, an agent, or the 60s
+# auto-checkpointer's own working tree) puts M0 and M5 on different sources,
+# and a grid whose cells describe different trees cannot support any claim
+# about which mechanism a case depends on. That silent incoherence is the
+# same disease as a vacuous assertion, one level up.
+pristine="$work_root/pristine"
+mkdir -p "$pristine"
+rsync -a \
+  --exclude '/.git/' \
+  --exclude '/target/' \
+  "$repo_root/" "$pristine/"
+printf 'mutation-matrix: source snapshot taken; the grid below describes it alone\n'
+
 declare -A outcome=()
 run_one_tree() {
   local label=$1
@@ -127,10 +145,7 @@ run_one_tree() {
   local build_log="$work_root/build-$label.log"
 
   mkdir -p "$tree"
-  rsync -a \
-    --exclude '/.git/' \
-    --exclude '/target/' \
-    "$repo_root/" "$tree/"
+  rsync -a "$pristine/" "$tree/"
 
   if [[ -n $patch_file ]]; then
     printf 'mutation-matrix: applying %s (%s)\n' "$label" "$patch_file"
