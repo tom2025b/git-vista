@@ -39,3 +39,4 @@ it, and note the link in both.
 | [0025](0025-hook-policy-and-disclosure.md) | Hook policy: a declared, disclosed value, not yet enforced | Accepted |
 | [0026](0026-shell-mode-foundation.md) | `ShellMode`: Rust owns the layout mode, CSS keys off one class | Accepted |
 | [0027](0027-landlock-enumerate-and-skip.md) | Secrets inside a granted `$HOME` are withheld by enumerate-and-skip, not a deny rule | Accepted |
+| [0028](0028-network-tier-ports-not-hosts.md) | Accept that the network tier constrains ports, not hosts (Option A) | Accepted |

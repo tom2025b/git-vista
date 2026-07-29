@@ -210,7 +210,7 @@ here as part of the decision, not as separate aspirations:
 stateDiagram-v2
     [*] --> PolicyBuilt: sandbox_argv builds the policy
     PolicyBuilt --> PortsInArgv: net_ports emitted as one<br/>net-port flag per port
-    PortsInArgv --> ShimReads: gv-sandbox shim reads<br/>the argv, Task 3, not built yet
+    PortsInArgv --> ShimReads: gv-sandbox shim parses<br/>the argv, Task 3, built
     ShimReads --> RulePerPort: landlock_add_rule per port,<br/>host byte order u64, no htons
     RulePerPort --> Enforced: NET_PORT ruleset active
     note right of PolicyBuilt
@@ -219,11 +219,33 @@ stateDiagram-v2
       the port list could hide.
     end note
     note right of ShimReads
-      Not yet built - same status
-      ADR 0027 records for the
-      filesystem enumeration.
+      Built 2026-07-29. The shim
+      refuses --net-port alongside
+      --net-deny with exit 90, so
+      the two cannot contradict.
     end note
 ```
+
+### Build status, as of 2026-07-29
+
+The `gv-sandbox` shim referred to above **now exists**
+(`crates/git-vista-server/src/bin/gv-sandbox.rs`, Task 3), so this decision is
+implemented rather than merely specified. What is measured working through the
+composed launcher:
+
+- the argv contract, including a hard refusal (exit 90) of `--net-port`
+  alongside `--net-deny`, so a policy cannot express a contradiction;
+- `--abi-floor` required rather than defaulted, refusing with exit 91 rather
+  than applying a weaker policy;
+- `landlock_net_port_attr` with a `__u64` port in **host byte order**, added
+  one rule per port;
+- ABI-6 scopes (`ABSTRACT_UNIX_SOCKET`, `SIGNAL`) enabled — measured A/B as the
+  thing that actually withholds abstract-socket and signal deputies, and
+  independent of the port list this ADR is about.
+
+What remains unbuilt is the **seccomp filter** (Task 4). Until it lands, the
+`io_uring` bypass recorded against round 4 of this design is expected to be
+reachable, and no claim in this ADR should be read as covering it.
 
 ## Alternatives considered
 
