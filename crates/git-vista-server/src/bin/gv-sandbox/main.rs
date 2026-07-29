@@ -523,7 +523,10 @@ fn apply_landlock(a: &Args) {
     unsafe { libc::close(ruleset) };
 }
 
-#[path = "seccomp_filter.rs"]
+// A directory binary (`src/bin/gv-sandbox/main.rs`) rather than a single file,
+// so this module can be a plain sibling. A `.rs` file directly under `src/bin/`
+// is auto-discovered by Cargo as its *own* binary target and would be required
+// to have a `main` of its own.
 mod seccomp_filter;
 
 /// Install the terminal denylist. Applied **after** Landlock and immediately
