@@ -29,8 +29,8 @@
 //! depend on the rewrite and pass today.
 
 #![allow(dead_code)] // Nothing outside this file calls `run_case` until step 5. See the
-                      // module doc above; remove once escape_suite.rs / hook_mode_suite.rs
-                      // wire cases through it (mirrors the sandbox/mod.rs Task-1 precedent).
+                     // module doc above; remove once escape_suite.rs / hook_mode_suite.rs
+                     // wire cases through it (mirrors the sandbox/mod.rs Task-1 precedent).
 
 use super::*;
 use std::collections::BTreeSet;
@@ -293,7 +293,10 @@ fn commit_outside(repo: &Path) -> HookRun {
     std::fs::write(repo.join("payload.txt"), "x").expect("write payload");
     let _ = run_git_outside(repo, &["add", "-A"], &env);
     let (code, combined) = run_git_outside(repo, &["commit", "-q", "-m", "baseline"], &env);
-    HookRun { commit_code: code, combined }
+    HookRun {
+        commit_code: code,
+        combined,
+    }
 }
 
 /// Fire the hook **inside** the composed launcher, through the one production
@@ -311,7 +314,8 @@ fn commit_inside(policy: &Policy, repo: &Path) -> HookRun {
         }
         let _ = add.output().await;
 
-        let mut commit = super::spawn::command_async(policy, repo, &["commit", "-q", "-m", "inside"]);
+        let mut commit =
+            super::spawn::command_async(policy, repo, &["commit", "-q", "-m", "inside"]);
         commit.env_clear();
         for (k, v) in &env {
             commit.env(k, v);
@@ -362,9 +366,15 @@ fn policy_for_case(case: &EscapeCase, repo: &Path) -> Policy {
         rw_trees: rw,
         ro_trees: ro,
         secret_excludes: secret_excludes_for_home(&home),
-        net_ports: if case.tier == Tier::Network { DEFAULT_GIT_PORTS.to_vec() } else { Vec::new() },
+        net_ports: if case.tier == Tier::Network {
+            DEFAULT_GIT_PORTS.to_vec()
+        } else {
+            Vec::new()
+        },
         hook_mode: if case.hooks_blocked {
-            HookMode::Blocked { empty_dir: leaked_empty_dir() }
+            HookMode::Blocked {
+                empty_dir: leaked_empty_dir(),
+            }
         } else {
             HookMode::Run
         },
@@ -400,7 +410,10 @@ fn report(case: &EscapeCase, outcome: &Outcome) {
             format!("capability-absent:{}", missing.replace('\n', " "))
         }
     };
-    let line = format!("GV-ESCAPE case={} result={} class={}\n", case.id, result, class);
+    let line = format!(
+        "GV-ESCAPE case={} result={} class={}\n",
+        case.id, result, class
+    );
     use std::io::Write as _;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -416,11 +429,17 @@ fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
 
     install_hook(
         base_repo.path(),
-        &(case.build_hook)(&HarnessCtx { repo: base_repo.path(), nonce }),
+        &(case.build_hook)(&HarnessCtx {
+            repo: base_repo.path(),
+            nonce,
+        }),
     );
     install_hook(
         inside_repo.path(),
-        &(case.build_hook)(&HarnessCtx { repo: inside_repo.path(), nonce }),
+        &(case.build_hook)(&HarnessCtx {
+            repo: inside_repo.path(),
+            nonce,
+        }),
     );
 
     let baseline = commit_outside(base_repo.path());
@@ -434,7 +453,10 @@ fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
                     "baseline {} wanted errno {} got {v}",
                     case.probe_tag, case.expect_baseline.0
                 ),
-                Err(e) => format!("baseline {} observation missing: {}", case.probe_tag, e.detail),
+                Err(e) => format!(
+                    "baseline {} observation missing: {}",
+                    case.probe_tag, e.detail
+                ),
             },
         };
     }
@@ -466,8 +488,8 @@ fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
         };
         (observed, inside.commit_code)
     } else {
-        let observed = parse_observation(&inside.combined, nonce, case.probe_tag)
-            .unwrap_or_else(|e| {
+        let observed =
+            parse_observation(&inside.combined, nonce, case.probe_tag).unwrap_or_else(|e| {
                 panic!(
                     "{}: inside-leg `{}` observation missing: {}",
                     case.id, case.probe_tag, e.detail
@@ -525,20 +547,44 @@ pub(crate) fn run_case(case: &EscapeCase) -> Outcome {
 /// another test without the old name surviving — fails the build here,
 /// rather than only being missed by whoever remembers to check.
 const RULES: &[(&str, &str)] = &[
-    ("R1-DECLARATIVE", "r1_case_region_has_no_freeform_control_flow_or_assertions"),
-    ("R2-EXACT-OBSERVATION", "r2_case_region_never_hand_writes_acceptance_conditions"),
-    ("R3-PAIRED-POSITIVE", "r3_every_case_declares_and_asserts_a_paired_positive"),
+    (
+        "R1-DECLARATIVE",
+        "r1_case_region_has_no_freeform_control_flow_or_assertions",
+    ),
+    (
+        "R2-EXACT-OBSERVATION",
+        "r2_case_region_never_hand_writes_acceptance_conditions",
+    ),
+    (
+        "R3-PAIRED-POSITIVE",
+        "r3_every_case_declares_and_asserts_a_paired_positive",
+    ),
     (
         "R4-CAPABILITY-BY-EXECUTION",
         "r4_capability_established_only_by_execution_never_by_probing_the_host",
     ),
-    ("R6-PRODUCTION-SEAM", "r6_every_inside_leg_spawns_through_the_production_seam"),
-    ("R7-ONE-ENVIRONMENT", "r7_both_legs_share_one_pinned_environment_profile"),
-    ("R8-EXPIRING-EXEMPTION", "r8_exemptions_expire_when_their_named_blocker_disappears"),
-    ("R10-FLAG-ROUND-TRIP", "r10_every_flag_sandbox_argv_emits_has_a_shim_parser_arm"),
+    (
+        "R6-PRODUCTION-SEAM",
+        "r6_every_inside_leg_spawns_through_the_production_seam",
+    ),
+    (
+        "R7-ONE-ENVIRONMENT",
+        "r7_both_legs_share_one_pinned_environment_profile",
+    ),
+    (
+        "R8-EXPIRING-EXEMPTION",
+        "r8_exemptions_expire_when_their_named_blocker_disappears",
+    ),
+    (
+        "R10-FLAG-ROUND-TRIP",
+        "r10_every_flag_sandbox_argv_emits_has_a_shim_parser_arm",
+    ),
 ];
 
-const BATTERY_FILES: &[&str] = &["src/sandbox/escape_suite.rs", "src/sandbox/hook_mode_suite.rs"];
+const BATTERY_FILES: &[&str] = &[
+    "src/sandbox/escape_suite.rs",
+    "src/sandbox/hook_mode_suite.rs",
+];
 
 fn server_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
@@ -687,7 +733,10 @@ fn fn_body_in<'a>(code: &'a str, name: &str) -> &'a str {
     let at = code
         .find(&marker)
         .unwrap_or_else(|| panic!("`{marker}` not found"));
-    let open = at + code[at..].find('{').expect("a fn signature has a body brace");
+    let open = at
+        + code[at..]
+            .find('{')
+            .expect("a fn signature has a body brace");
     let mut depth = 0usize;
     for (i, ch) in code[open..].char_indices() {
         match ch {
@@ -721,7 +770,14 @@ fn r1_case_region_has_no_freeform_control_flow_or_assertions() {
                 "{rel}: `{banned}` found outside `mod harness` (R1)"
             );
         }
-        for needle in ["assert!", "assert_eq!", "assert_ne!", "eprintln!", "&&", "||"] {
+        for needle in [
+            "assert!",
+            "assert_eq!",
+            "assert_ne!",
+            "eprintln!",
+            "&&",
+            "||",
+        ] {
             assert!(
                 !region.contains(needle),
                 "{rel}: `{needle}` found outside `mod harness` (R1)"
@@ -845,7 +901,10 @@ fn r6_every_inside_leg_spawns_through_the_production_seam() {
         sites += 1;
         i += pos + spawn.len();
     }
-    assert!(sites > 0, "escape_suite.rs: no Command::new( sites found — the scan broke");
+    assert!(
+        sites > 0,
+        "escape_suite.rs: no Command::new( sites found — the scan broke"
+    );
 }
 
 /// R7: both legs share exactly one env-building function; no `env_clear`/
@@ -919,7 +978,10 @@ fn fn_body_raw<'a>(src: &'a str, name: &str) -> &'a str {
     let at = src
         .find(&marker)
         .unwrap_or_else(|| panic!("`{marker}` not found"));
-    let open = at + src[at..].find('{').expect("a fn signature has a body brace");
+    let open = at
+        + src[at..]
+            .find('{')
+            .expect("a fn signature has a body brace");
     let mut depth = 0usize;
     for (i, ch) in src[open..].char_indices() {
         match ch {
@@ -962,7 +1024,10 @@ fn r10_every_flag_sandbox_argv_emits_has_a_shim_parser_arm() {
         }
         rest = &after[end + 1..];
     }
-    assert!(!emitted.is_empty(), "flag scan of shim_argv found nothing — the scan broke");
+    assert!(
+        !emitted.is_empty(),
+        "flag scan of shim_argv found nothing — the scan broke"
+    );
 
     let main_src = read_rs("src/bin/gv-sandbox/main.rs");
     let parse_body = fn_body_raw(&main_src, "parse");
@@ -970,10 +1035,13 @@ fn r10_every_flag_sandbox_argv_emits_has_a_shim_parser_arm() {
     let mut arms: BTreeSet<String> = BTreeSet::new();
     for line in parse_body.lines() {
         let l = line.trim();
-        let Some(rest) = l.strip_prefix('"') else { continue };
+        let Some(rest) = l.strip_prefix('"') else {
+            continue;
+        };
         let Some(end) = rest.find('"') else { continue };
         let flag = &rest[..end];
-        if flag.starts_with("--") && flag != "--" && rest[end + 1..].trim_start().starts_with("=>") {
+        if flag.starts_with("--") && flag != "--" && rest[end + 1..].trim_start().starts_with("=>")
+        {
             arms.insert(flag.to_string());
         }
     }
@@ -1012,7 +1080,10 @@ fn ci_preflight_host_meets_the_declared_minimum() {
     let caps = capabilities::probe();
     let mut missing = Vec::new();
     if !caps.landlock_meets_floor() {
-        missing.push(format!("landlock_abi={} below the declared floor", caps.landlock_abi));
+        missing.push(format!(
+            "landlock_abi={} below the declared floor",
+            caps.landlock_abi
+        ));
     }
     if !caps.bwrap_present {
         missing.push("bwrap not found at any BWRAP_CANDIDATES path".to_string());
@@ -1024,7 +1095,9 @@ fn ci_preflight_host_meets_the_declared_minimum() {
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok());
     if io_uring_disabled != Some(0) {
-        missing.push(format!("io_uring_disabled={io_uring_disabled:?}, want Some(0)"));
+        missing.push(format!(
+            "io_uring_disabled={io_uring_disabled:?}, want Some(0)"
+        ));
     }
     let cc_ok = std::process::Command::new("cc")
         .arg("--version")

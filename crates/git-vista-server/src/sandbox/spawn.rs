@@ -101,7 +101,11 @@ mod tests {
 
         // begins with the pure sandbox argv
         let pure = sandbox_argv(&policy);
-        assert_eq!(&argv[..pure.len()], &pure[..], "the launcher prefix drifted");
+        assert_eq!(
+            &argv[..pure.len()],
+            &pure[..],
+            "the launcher prefix drifted"
+        );
     }
 
     /// The composition test: a real git actually runs through the async wrapper
@@ -145,7 +149,11 @@ mod tests {
             .output()
             .await
             .expect("git runs");
-        assert!(ok.status.success(), "stderr={}", String::from_utf8_lossy(&ok.stderr));
+        assert!(
+            ok.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
 
         // A secret stays denied under the same production policy.
         let home = std::env::var("HOME").unwrap();
@@ -165,5 +173,4 @@ mod tests {
             );
         }
     }
-
 }

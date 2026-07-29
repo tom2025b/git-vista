@@ -1,6 +1,6 @@
 //! M1.13b (#66): declarative functional hook-mode case.
 
-use super::escape_contract::{Class, Errno, EscapeCase, Exemption, MutantId, run_case};
+use super::escape_contract::{run_case, Class, Errno, EscapeCase, Exemption, MutantId};
 use super::Tier;
 
 const CASE_BLOCKED_HOOKS: EscapeCase = EscapeCase {
