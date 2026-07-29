@@ -99,11 +99,10 @@ mod tests {
     #[test]
     fn trust_is_fail_closed_and_only_grant_can_flip_it() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: single-threaded within this test; no other test mutates these.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", tmp.path());
-            std::env::remove_var("HOME");
-        }
+        // Edition 2021: `set_var`/`remove_var` are safe. This is the only test
+        // that mutates these, and it is one function, so no intra-suite race.
+        std::env::set_var("XDG_STATE_HOME", tmp.path());
+        std::env::remove_var("HOME");
 
         let repo = tmp.path().join("some/canonical/repo/.git");
 
@@ -136,9 +135,7 @@ mod tests {
             "a marker with a mismatched stored path must not confer trust"
         );
 
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-        }
+        std::env::remove_var("XDG_STATE_HOME");
     }
 
     /// The marker name is stable for a given path and differs across paths — the
