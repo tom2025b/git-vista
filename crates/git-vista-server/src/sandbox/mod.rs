@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 /// strict tier's launcher. Task 5's policy builders call
 /// `bwrap::bwrap_path()` to fill `Policy::bwrap`.
 pub(crate) mod bwrap;
+/// Task 9: the factual capability probe — what tiers can this host provide.
+pub(crate) mod capabilities;
 /// The other impure corner: locating the `gv-sandbox` shim. Kept out of this
 /// file for the same reason as `bwrap` — `sandbox_argv` stays a total function
 /// of its `Policy`.
@@ -27,8 +29,6 @@ pub(crate) mod shim;
 /// Task 5: the two spawn wrappers. The single chokepoint where the pure argv
 /// becomes a real git process. Task 6 migrates the server's spawn sites here.
 pub(crate) mod spawn;
-/// Task 9: the factual capability probe — what tiers can this host provide.
-pub(crate) mod capabilities;
 /// Task 7: the persisted per-repo trust flag — the only route to `Unsandboxed`.
 pub(crate) mod trust;
 
@@ -38,10 +38,6 @@ mod argv;
 mod deps;
 #[cfg(test)]
 mod dispatch;
-#[cfg(test)]
-mod shim_cli;
-#[cfg(test)]
-mod escape_suite;
 /// #66 Task 25, step 3: the anti-vacuity contract's tripwires and the
 /// EscapeCase/run_case harness step 5 rewrites the battery onto. Landed here
 /// (rather than left for whichever lane does step 5) so no later lane touches
@@ -49,11 +45,15 @@ mod escape_suite;
 /// `design-docs/2026-07-29-escape-battery-anti-vacuity-contract.md`.
 #[cfg(test)]
 mod escape_contract;
+#[cfg(test)]
+mod escape_suite;
 /// #66 Task 25, step 5: the `class = functional` blocked-hooks case moves
 /// here out of `escape_suite.rs`. Landed as an empty stub in step 3 so the
 /// module list is fixed before any case is rewritten; step 5 populates it.
 #[cfg(test)]
 mod hook_mode_suite;
+#[cfg(test)]
+mod shim_cli;
 
 /// Absolute paths the strict tier's outer launcher is looked for at, in order.
 ///
@@ -193,7 +193,10 @@ pub(crate) const DEFAULT_GIT_PORTS: &[u16] = &[
 /// secret set is silently empty — `~/.ssh` re-exposed with nothing to signal it.
 /// Every policy builder must go through here rather than joining by hand.
 pub(crate) fn secret_excludes_for_home(home: &std::path::Path) -> Vec<PathBuf> {
-    DEFAULT_SECRET_EXCLUDES.iter().map(|s| home.join(s)).collect()
+    DEFAULT_SECRET_EXCLUDES
+        .iter()
+        .map(|s| home.join(s))
+        .collect()
 }
 
 /// System trees granted read+execute in every tier.

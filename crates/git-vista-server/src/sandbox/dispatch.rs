@@ -9,9 +9,16 @@ use super::*;
 #[test]
 fn remote_subcommands_need_the_network() {
     for sub in [
-        "push", "fetch", "clone", "ls-remote", "pull",
+        "push",
+        "fetch",
+        "clone",
+        "ls-remote",
+        "pull",
         // plumbing / helpers added after the C10 audit
-        "fetch-pack", "send-pack", "http-fetch", "http-push",
+        "fetch-pack",
+        "send-pack",
+        "http-fetch",
+        "http-push",
     ] {
         assert_eq!(
             network_need(&[sub, "origin"]),
@@ -36,7 +43,11 @@ fn known_network_gaps_fail_closed_to_local_not_unsandboxed() {
         vec!["credential", "fill"],
     ] {
         let need = network_need(&args);
-        assert_eq!(need, NetworkNeed::Local, "documented fail-closed gap: {args:?}");
+        assert_eq!(
+            need,
+            NetworkNeed::Local,
+            "documented fail-closed gap: {args:?}"
+        );
         assert_ne!(
             tier_for(need, false),
             Tier::Unsandboxed,
@@ -48,9 +59,24 @@ fn known_network_gaps_fail_closed_to_local_not_unsandboxed() {
 #[test]
 fn local_subcommands_do_not_need_the_network() {
     for sub in [
-        "status", "commit", "add", "reset", "checkout", "merge", "branch", "rev-parse",
-        "merge-base", "diff", "log", "cat-file", "config", "update-ref", "commit-tree",
-        "bundle", "stash", "reflog",
+        "status",
+        "commit",
+        "add",
+        "reset",
+        "checkout",
+        "merge",
+        "branch",
+        "rev-parse",
+        "merge-base",
+        "diff",
+        "log",
+        "cat-file",
+        "config",
+        "update-ref",
+        "commit-tree",
+        "bundle",
+        "stash",
+        "reflog",
     ] {
         assert_eq!(
             network_need(&[sub, "--whatever"]),
@@ -65,8 +91,14 @@ fn local_subcommands_do_not_need_the_network() {
 /// documents the distinction the code comment claims.
 #[test]
 fn remote_config_subcommands_are_local_not_networked() {
-    assert_eq!(network_need(&["remote", "get-url", "origin"]), NetworkNeed::Local);
-    assert_eq!(network_need(&["remote", "add", "origin", "url"]), NetworkNeed::Local);
+    assert_eq!(
+        network_need(&["remote", "get-url", "origin"]),
+        NetworkNeed::Local
+    );
+    assert_eq!(
+        network_need(&["remote", "add", "origin", "url"]),
+        NetworkNeed::Local
+    );
     assert_eq!(network_need(&["remote", "-v"]), NetworkNeed::Local);
 }
 
@@ -121,7 +153,11 @@ fn an_injected_alias_can_never_reach_unsandboxed() {
     // The name-based classifier sees `x`, an unknown subcommand → Local. That is
     // the documented fail-closed behaviour, asserted so a future change to it is
     // deliberate.
-    assert_eq!(need, NetworkNeed::Local, "an unknown alias name classifies Local");
+    assert_eq!(
+        need,
+        NetworkNeed::Local,
+        "an unknown alias name classifies Local"
+    );
     // The property that must hold no matter how classification lands:
     assert_ne!(
         tier_for(need, false),

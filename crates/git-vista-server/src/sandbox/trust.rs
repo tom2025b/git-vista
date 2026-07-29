@@ -107,7 +107,10 @@ mod tests {
         let repo = tmp.path().join("some/canonical/repo/.git");
 
         // 1. Absent marker → not trusted.
-        assert!(!is_trusted(&repo), "a repo with no marker must not be trusted");
+        assert!(
+            !is_trusted(&repo),
+            "a repo with no marker must not be trusted"
+        );
 
         // 2. After an explicit grant → trusted.
         grant(&repo).expect("grant writes a marker");
@@ -115,7 +118,10 @@ mod tests {
 
         // 3. A *different* repo is still not trusted (no cross-contamination).
         let other = tmp.path().join("another/repo/.git");
-        assert!(!is_trusted(&other), "granting one repo must not trust another");
+        assert!(
+            !is_trusted(&other),
+            "granting one repo must not trust another"
+        );
 
         // 4. Revoke returns to untrusted.
         revoke(&repo).expect("revoke");

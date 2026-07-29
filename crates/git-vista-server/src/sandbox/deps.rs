@@ -136,7 +136,8 @@ fn the_gate_rejects_incomplete_rows() {
 /// test above cannot be passing because `row_defect` rejects everything.
 #[test]
 fn the_gate_accepts_a_complete_row() {
-    let good = "| `x` | 0.1 | why it is unavoidable | Tom | the alternative, and why not | 2026-01-01 |";
+    let good =
+        "| `x` | 0.1 | why it is unavoidable | Tom | the alternative, and why not | 2026-01-01 |";
     assert_eq!(row_defect(good), None, "a complete row must pass");
 }
 
@@ -150,7 +151,11 @@ fn the_column_indices_match_the_registers_header() {
         .find(|l| l.starts_with("| Crate |"))
         .expect("the register must have a `| Crate |` header row");
     let cells: Vec<&str> = header.split('|').map(str::trim).collect();
-    assert_eq!(cells.len(), ROW_CELLS, "header column count changed: {header}");
+    assert_eq!(
+        cells.len(),
+        ROW_CELLS,
+        "header column count changed: {header}"
+    );
     assert_eq!(cells[COL_CRATE], "Crate");
     assert_eq!(cells[COL_VERSION], "Version");
     assert!(cells[COL_REASON].starts_with("Why it is unavoidable"));
