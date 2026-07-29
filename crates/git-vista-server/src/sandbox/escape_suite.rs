@@ -384,7 +384,13 @@ int main(void) {{
 static int host_round_trip_errno(void) {{
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return errno;
-    struct timeval timeout = {{ .tv_sec = 1, .tv_usec = 0 }};
+    // 5s, deliberately longer than the host echo thread's own 3s read window.
+    // A shorter child timeout than the host's would let a slow loopback round
+    // trip return EAGAIN and read as CONTAINED when the datagram actually
+    // escaped the namespace — a false negative in the dangerous direction,
+    // and one that would silently un-kill M4 on a loaded host (the mutation
+    // matrix rebuilds two crates seven times while this runs).
+    struct timeval timeout = {{ .tv_sec = 5, .tv_usec = 0 }};
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout) != 0) {{
         int saved = errno;
         close(fd);
