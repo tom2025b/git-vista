@@ -301,8 +301,8 @@ int main(void) {{
 
     pub(super) fn strict_listener_probe(ctx: &HarnessCtx) -> String {
         let port = *STRICT_LISTENER_PORT.get_or_init(|| {
-            let listener = std::net::TcpListener::bind("127.0.0.1:9418")
-                .expect("bind git protocol listener");
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:9418").expect("bind git protocol listener");
             let port = listener.local_addr().expect("listener address").port();
             std::thread::spawn(move || {
                 let _ = listener.accept();
