@@ -1,6 +1,6 @@
 --- a/crates/git-vista-server/src/sandbox/mod.rs
 +++ b/crates/git-vista-server/src/sandbox/mod.rs
-@@ -557,19 +557,22 @@
+@@ -558,19 +558,22 @@
              argv.push(empty_dir.clone().into_os_string());
          }
      }

@@ -248,8 +248,8 @@ jobs:
             base="${{ github.event.pull_request.base.sha }}"
             head="${{ github.event.pull_request.head.sha }}"
             if git diff --name-only "$base" "$head" -- \
-              'crates/git-vista-server/src/sandbox/**' \
-              'crates/git-vista-server/src/bin/gv-sandbox/**' \
+              crates/git-vista-server/src/sandbox \
+              crates/git-vista-server/src/bin/gv-sandbox \
               | grep -q .; then
               run=true
             fi
@@ -271,7 +271,7 @@ jobs:
       - name: Best-effort host setup (bwrap, a C compiler)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends bubblewrap build-essential
+          sudo apt-get install -y --no-install-recommends bubblewrap build-essential patch rsync
 
       - name: Sandbox preflight (host capability check)
         run: cargo test -p git-vista-server ci_preflight_host_meets_the_declared_minimum
