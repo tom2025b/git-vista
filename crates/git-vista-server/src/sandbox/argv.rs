@@ -129,7 +129,9 @@ fn network_tier_never_names_bwrap_and_never_unshares_net() {
         a[0], "/opt/gv/gv-sandbox",
         "the network tier launches the shim directly (F3: netns breaks push)"
     );
-    assert!(!a.iter().any(|s| s.contains("bwrap") || s == "--unshare-net"));
+    assert!(!a
+        .iter()
+        .any(|s| s.contains("bwrap") || s == "--unshare-net"));
     assert!(a.iter().any(|s| s == "--net-allow"));
 }
 

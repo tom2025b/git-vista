@@ -136,7 +136,12 @@ fn launcher_sites_name_no_shell() {
              carve-out open"
         );
         for shell in [
-            "\"sh\"", "\"bash\"", "\"/bin/sh\"", "\"/bin/bash\"", "\"zsh\"", "\"env\"",
+            "\"sh\"",
+            "\"bash\"",
+            "\"/bin/sh\"",
+            "\"/bin/bash\"",
+            "\"zsh\"",
+            "\"env\"",
         ] {
             let needle = [&spawn, shell].concat();
             assert!(

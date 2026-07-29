@@ -64,12 +64,20 @@ async fn a_real_commit_reaches_the_global_identity_through_the_policy() {
         .output()
         .await
         .expect("git add runs through the production seam");
-    assert!(out.status.success(), "git add failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = spawn::command_async(&policy, repo.path(), &["commit", "-q", "-m", "sandboxed"])
         .output()
         .await
         .expect("git commit runs through the production seam");
-    assert!(out.status.success(), "git commit failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let out = spawn::command_async(&policy, repo.path(), &["log", "-1", "--format=%ae"])
         .output()
@@ -110,7 +118,10 @@ async fn secrets_stay_denied_while_the_same_policy_serves_git() {
             .output()
             .await
             .expect("git config runs through the production seam");
-        assert!(!out.status.success(), "~/.ssh must not be readable through the sandbox");
+        assert!(
+            !out.status.success(),
+            "~/.ssh must not be readable through the sandbox"
+        );
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("Permission denied"),
             "it must fail with EACCES, not for some unrelated reason: {}",

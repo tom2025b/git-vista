@@ -4,7 +4,7 @@
 //! `escape_contract` owns parsing, exact errno comparisons, carrier checks,
 //! report emission, production-seam spawning, and capability absence.
 
-use super::escape_contract::{Class, Errno, EscapeCase, Exemption, MutantId, run_case};
+use super::escape_contract::{run_case, Class, Errno, EscapeCase, Exemption, MutantId};
 use super::Tier;
 
 const CASE_SECRET_READ_DENIED: EscapeCase = EscapeCase {
@@ -81,8 +81,6 @@ fn io_uring_denied() {
 
 #[test]
 fn high_bit_prctl_denied() {
-    let mut cmd = std::process::Command::new("git");
-    cmd.env("GV_R7_TRIPWIRE", "1");
     run_case(&CASE_HIGH_BIT_PRCTL_DENIED);
 }
 
