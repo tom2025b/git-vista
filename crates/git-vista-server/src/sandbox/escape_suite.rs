@@ -153,7 +153,9 @@ fn a_repo_symlink_into_a_secret_is_still_denied() {
 #[test]
 fn a_hook_cannot_open_an_io_uring() {
     let s = shim();
-    let probe = compile_probe(
+    let repo = fixture();
+    let probe = probe_in_repo(
+        repo.path(),
         r#"
         #include <stdio.h>
         #include <string.h>
@@ -171,7 +173,7 @@ fn a_hook_cannot_open_an_io_uring() {
         }
         "#,
     );
-    let repo = hostile_hook_repo(&format!("{} ", probe.display()));
+    install_hook(repo.path(), &format!("exec {}", probe.display()));
     let (_, out) = commit_firing_the_hook(&workable(Tier::Network, repo.path(), &s), repo.path());
     assert!(
         out.contains("IOURING_DENIED"),
@@ -191,7 +193,9 @@ fn a_hook_cannot_open_an_io_uring() {
 #[test]
 fn the_seccomp_argument_comparison_is_not_fooled_by_the_high_bits() {
     let s = shim();
-    let probe = compile_probe(
+    let repo = fixture();
+    let probe = probe_in_repo(
+        repo.path(),
         r#"
         #include <stdio.h>
         #include <errno.h>
@@ -201,7 +205,6 @@ fn the_seccomp_argument_comparison_is_not_fooled_by_the_high_bits() {
             errno=0;
             long r = syscall(SYS_prctl, (long)PR_SET_SECCOMP | 0x100000000L, 2, 0, 0, 0);
             printf(r<0 ? "HIGHBIT_DENIED %d\n" : "HIGHBIT_SLIPPED_THROUGH\n", errno);
-            /* control: a prctl the filter allows must still work */
             char name[16]; errno=0;
             long g = syscall(SYS_prctl, PR_GET_NAME, name, 0, 0, 0);
             printf(g==0 ? "CONTROL_PRCTL_OK\n" : "CONTROL_PRCTL_FAIL\n");
@@ -209,7 +212,7 @@ fn the_seccomp_argument_comparison_is_not_fooled_by_the_high_bits() {
         }
         "#,
     );
-    let repo = hostile_hook_repo(&format!("{} ", probe.display()));
+    install_hook(repo.path(), &format!("exec {}", probe.display()));
     let (_, out) = commit_firing_the_hook(&workable(Tier::Network, repo.path(), &s), repo.path());
     assert!(
         out.contains("HIGHBIT_DENIED"),
@@ -269,8 +272,7 @@ fn the_strict_tier_hook_has_no_network() {
         return;
     }
     let s = shim();
-    let probe = compile_probe(
-        r#"
+    let src = r#"
         #include <stdio.h>
         #include <errno.h>
         #include <sys/socket.h>
@@ -288,9 +290,10 @@ fn the_strict_tier_hook_has_no_network() {
             printf(r==0 ? "CONNECTED\n" : "NETPATH errno=%d\n", errno);
             return 0;
         }
-        "#,
-    );
-    let repo = hostile_hook_repo(&format!("{} ", probe.display()));
+        "#;
+    let repo = fixture();
+    let probe = probe_in_repo(repo.path(), src);
+    install_hook(repo.path(), &format!("exec {}", probe.display()));
     let (_, out) = commit_firing_the_hook(&workable(Tier::Strict, repo.path(), &s), repo.path());
     assert!(
         !out.contains("CONNECTED"),
@@ -306,25 +309,12 @@ fn the_strict_tier_hook_has_no_network() {
 // helper
 // -------------------------------------------------------------------------
 
-/// Compile a C probe into a unique temp path and return it. The probe becomes a
-/// hook body, so it must be an absolute executable. Returns a leaked path whose
-/// file lives in a process-lifetime temp dir — acceptable for a test binary.
-fn compile_probe(src: &str) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static N: AtomicUsize = AtomicUsize::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("gv-escape-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("probe dir");
-    let c = dir.join("p.c");
-    let bin = dir.join("p");
-    std::fs::write(&c, src).expect("write probe source");
-    let ok = Command::new("cc")
-        .args(["-O2", "-o"])
-        .arg(&bin)
-        .arg(&c)
-        .status()
-        .expect("cc runs")
-        .success();
-    assert!(ok, "probe failed to compile");
-    bin
+/// Replace a repository's `pre-commit` hook with a new body. Used when the
+/// probe must be compiled first (into the repo) and only then referenced.
+fn install_hook(repo: &Path, script: &str) {
+    let hook = repo.join(".git/hooks/pre-commit");
+    std::fs::create_dir_all(repo.join(".git/hooks")).expect("hooks dir");
+    let mut f = std::fs::File::create(&hook).expect("hook file");
+    writeln!(f, "#!/bin/sh\n{script}").expect("write hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
