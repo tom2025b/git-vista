@@ -31,6 +31,8 @@ mod argv;
 mod deps;
 #[cfg(test)]
 mod shim_cli;
+#[cfg(test)]
+mod escape_suite;
 
 /// Absolute paths the strict tier's outer launcher is looked for at, in order.
 ///
