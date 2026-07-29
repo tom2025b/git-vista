@@ -200,29 +200,89 @@ flowchart TD
   C -->|no| G["grant"]
 ```
 
-**Therefore the enumeration must do all of the following**, and each is a hard
-invariant of the mechanism rather than a hardening extra:
+#### Rejected: matching excluded inodes directly
 
-1. `stat()` every exclude at policy-apply time and record its `(st_dev, st_ino)`.
-   This means the exclusion check cannot be performed on the argv strings alone —
-   the shim must stat the excludes.
-2. For each enumerated entry, `stat()` it and **skip if its `(dev, ino)` matches
-   any exclude's.** This is what catches hard links.
-3. Additionally `lstat()`, and for any symlink `canonicalize()` and skip unless
-   the canonical target is a descendant of the tree being granted and is not
-   equal to, inside, or an ancestor of any exclude.
-4. Always skip an entry resolving to `$HOME`, `/home` or `/` — granting an
-   ancestor of the secrets defeats the exclusion by union-upward semantics
-   without ever naming a secret.
+The obvious repair for hard links is to record `(st_dev, st_ino)` for every inode
+under each exclude and skip any entry that matches. It is correct, and it was
+measured working — but it costs a recursive walk of every excluded tree at
+policy-apply time. On this host that is **10,895 entries**, dominated by
+`.claude` (6,568) and `.config/google-chrome` (4,006), on a path whose entire
+latency budget is ~9.9 ms. Rejected on cost, not on correctness.
 
-The accepted alternative to (1)–(2) is a **documented same-filesystem
-assumption**, but it is a strictly weaker guarantee and must be written down as
-one rather than assumed silently.
+#### Accepted: `st_nlink`, which is already in the `stat()` we perform
 
-The test for this must assert the direct-path row from the table above — that
-`~/.ssh/known_hosts` is *still* denied once a hostile alias of either kind
-exists. Asserting only that the alias is denied would pass while the exclusion
-was void.
+A hard link means, by definition, that an inode carries **more than one name**.
+So `st_nlink > 1` on a regular file is a *necessary* condition for the entry to
+be a hard-link alias. Skipping every enumerated regular file with `st_nlink > 1`
+therefore has **no false negatives**, costs no additional syscall, and requires
+no walk. It is conservative — a legitimately hard-linked regular file gets
+skipped too — and that is the documented trade. Measured: zero top-level `$HOME`
+entries on this host have `st_nlink > 1`.
+
+#### The complete rule, and the distinction that breaks `git commit` if collapsed
+
+For each entry, resolve it and then:
+
+| condition on the resolved path | action |
+|---|---|
+| equal to an exclude, or inside one | **skip** |
+| a directory that is a proper *ancestor* of an exclude | **recurse into it — never grant it whole** |
+| a regular file with `st_nlink > 1` | **skip** (hard-link guard) |
+| a symlink whose target escapes the tree, hits an exclude, or is `$HOME`/`/home`/`/` | **skip** |
+| anything else | grant |
+
+```mermaid
+flowchart TD
+  E["enumerated entry"] --> A{"equal to / inside<br/>an exclude?"}
+  A -->|yes| SK["SKIP"]
+  A -->|no| B{"directory that is an<br/>ANCESTOR of an exclude?"}
+  B -->|yes| RC["RECURSE — granting it whole<br/>would hand over the excluded child"]
+  B -->|no| C{"regular file,<br/>st_nlink &gt; 1?"}
+  C -->|yes| SK
+  C -->|no| D{"symlink escaping the tree,<br/>hitting an exclude,<br/>or resolving to $HOME / /home / /?"}
+  D -->|yes| SK
+  D -->|no| GR["GRANT"]
+```
+
+**Collapsing rows 1 and 2 into a single "touches an exclude → skip" test is a
+regression, and it is the one this project already shipped once as F-NEW-2.**
+`.config` is an ancestor of the exclude `.config/gh`. Treating that as *skip*
+drops `.config` entirely, `~/.config/git/ignore` becomes unreadable, and git
+fails outright:
+
+~~~text
+warning: unable to access '/home/tom/.config/git/ignore': Permission denied
+fatal: cannot use /home/tom/.config/git/ignore as an exclude file
+~~~
+
+Ancestor-of-exclude means **recurse**; only *equal-to* or *inside* means skip.
+For a symlink's canonical target the ancestor case remains disqualifying, because
+there the alias would grant the ancestor rather than descend into it — the same
+word, two different questions.
+
+#### Measured acceptance
+
+Against the real `$HOME`, the full exclude set, and an env stripped to `PATH` and
+`HOME` so identity could come from nowhere else:
+
+~~~text
+granted=172 skipped=5
+DENIED-CONTROL  ~/.ssh/known_hosts        DENIED
+DENIED-CONTROL  ~/.claude/CLAUDE.md       DENIED
+GRANTED-CONTROL ~/.gitconfig (symlink)    OK
+no local identity (correct)
+commit_exit=0
+author=tomb <thomaslane2025@gmail.com>
+secret via git: denied (correct)
+~~~
+
+All four alias attacks — symlink-to-directory, symlink-to-file, hard link, and
+symlink-to-`$HOME` — were denied, **including `~/.ssh/known_hosts` by its own
+canonical path**, which is the row that distinguishes a real fix from one that
+only blocks the alias while leaving the exclusion void.
+
+The test for this must assert that canonical-path row. Asserting only that the
+alias is denied would pass while the secret was readable by its real name.
 
 ### Where the enumeration runs
 
