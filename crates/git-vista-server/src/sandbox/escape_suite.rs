@@ -140,6 +140,7 @@ mod harness {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static PROBE_ID: AtomicUsize = AtomicUsize::new(0);
+    static STRICT_LISTENER_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
 
     fn c_string(path: &Path) -> String {
         path.to_string_lossy()
@@ -299,11 +300,14 @@ int main(void) {{
     }
 
     pub(super) fn strict_listener_probe(ctx: &HarnessCtx) -> String {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:9418").expect("bind git protocol listener");
-        let port = listener.local_addr().expect("listener address").port();
-        std::thread::spawn(move || {
-            let _ = listener.accept();
+        let port = *STRICT_LISTENER_PORT.get_or_init(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:9418")
+                .expect("bind git protocol listener");
+            let port = listener.local_addr().expect("listener address").port();
+            std::thread::spawn(move || {
+                let _ = listener.accept();
+            });
+            port
         });
         let granted = c_string(&granted_path(ctx));
         hook_for(
