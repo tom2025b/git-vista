@@ -19,6 +19,11 @@ fn policy(tier: Tier) -> Policy {
         rw_trees: vec![PathBuf::from("/srv/repos/r")],
         ro_trees: vec![PathBuf::from("/usr"), PathBuf::from("/home/tom")],
         secret_excludes: vec![PathBuf::from("/home/tom/.ssh")],
+        net_ports: if tier == Tier::Network {
+            DEFAULT_GIT_PORTS.to_vec()
+        } else {
+            Vec::new()
+        },
         hook_mode: HookMode::Run,
     }
 }
@@ -126,6 +131,73 @@ fn network_tier_never_names_bwrap_and_never_unshares_net() {
     );
     assert!(!a.iter().any(|s| s.contains("bwrap") || s == "--unshare-net"));
     assert!(a.iter().any(|s| s == "--net-allow"));
+}
+
+/// ADR 0028 (decision A): the network tier's permitted ports are part of the
+/// reviewed launcher argv, not a list buried in the shim. A reviewer reading a
+/// command line must be able to see every port the sandbox will allow.
+#[test]
+fn the_network_tier_names_every_permitted_port_in_the_argv() {
+    let a = strs(&sandbox_argv(&policy(Tier::Network)));
+    let w = pairs(&a);
+    for port in DEFAULT_GIT_PORTS {
+        assert!(
+            w.contains(&("--net-port", port.to_string().as_str())),
+            "port {port} must be visible in the argv, not hardcoded in the shim"
+        );
+    }
+    assert!(
+        a.iter().any(|s| s == "--net-allow"),
+        "ports are meaningless without the tier flag that enables them"
+    );
+}
+
+/// A tier with no network must not carry ports. `--net-deny` followed by a port
+/// list is an argv that contradicts itself, and INV-16's whole purpose is that
+/// the argv can be checked by eye.
+#[test]
+fn no_tier_without_network_ever_carries_a_port() {
+    for tier in [Tier::Strict, Tier::Unsandboxed] {
+        let a = strs(&sandbox_argv(&policy(tier)));
+        assert!(
+            !a.iter().any(|s| s == "--net-port"),
+            "{tier:?}: a tier with no network must name no ports"
+        );
+    }
+}
+
+/// The strict tier reaches the network through no path at all — bwrap's
+/// `--unshare-net` is the boundary there, not a port list (F3).
+#[test]
+fn the_strict_tier_denies_network_and_unshares_it() {
+    let a = strs(&sandbox_argv(&policy(Tier::Strict)));
+    assert!(a.iter().any(|s| s == "--net-deny"));
+    assert!(
+        a.iter().any(|s| s == "--unshare-net"),
+        "the strict tier's network denial is the namespace, not the ruleset"
+    );
+}
+
+/// `secret_excludes` is documented as absolute paths while
+/// `DEFAULT_SECRET_EXCLUDES` is relative to `$HOME`. A policy site that passes
+/// the constant verbatim gets a secret set that matches nothing, and `~/.ssh`
+/// is silently readable again. This asserts the conversion helper is the thing
+/// that closes that gap.
+#[test]
+fn secret_excludes_are_absolute_and_cover_every_default() {
+    let home = PathBuf::from("/home/someone");
+    let got = secret_excludes_for_home(&home);
+    assert_eq!(got.len(), DEFAULT_SECRET_EXCLUDES.len());
+    for p in &got {
+        assert!(p.is_absolute(), "{p:?} must be absolute to match anything");
+        assert!(p.starts_with(&home), "{p:?} must live under the given home");
+    }
+    for must in [".ssh", ".git-credentials", ".gnupg", ".claude.json"] {
+        assert!(
+            got.iter().any(|p| p == &home.join(must)),
+            "{must} must be withheld: it holds credentials"
+        );
+    }
 }
 
 #[test]
