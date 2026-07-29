@@ -1,0 +1,5 @@
+blocked_hooks
+high_bit_prctl_denied
+io_uring_denied
+secret_read_denied
+strict_listener_denied
