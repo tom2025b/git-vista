@@ -16,8 +16,10 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-mod bwrap;
-pub(crate) use bwrap::bwrap_path;
+/// The one impure corner of `sandbox`: it stats the filesystem to find the
+/// strict tier's launcher. Task 5's policy builders call
+/// `bwrap::bwrap_path()` to fill `Policy::bwrap`.
+pub(crate) mod bwrap;
 
 #[cfg(test)]
 mod argv;
