@@ -404,8 +404,17 @@ async fn merge_branch_executes_through_the_pipeline() {
 
 #[tokio::test]
 async fn push_branch_executes_through_the_pipeline() {
-    let (dir, repo) = seeded_repo();
-    let remote = dir.path().join("remote.git");
+    let (_dir, repo) = seeded_repo();
+    // The bare remote lives INSIDE the repo working tree, not beside it. The
+    // sandboxed push (Task 6) is granted the repo path and nothing else in the
+    // tempdir, and a filesystem-path remote outside the grant is denied by
+    // design: `remote.origin.url` is repository-writable, so granting whatever
+    // it names would be a repo-controlled escalation. Production remotes are
+    // URLs; this test's remote only exists to observe the push pipeline, so it
+    // sits where the grant already is. (An untracked dir in the worktree is
+    // harmless here — the pipeline's freshness checks see it identically at
+    // plan and execute time.)
+    let remote = repo.join("remote.git");
     std::fs::create_dir_all(&remote).unwrap();
     run(&remote, &["init", "-q", "--bare"]);
     run(
