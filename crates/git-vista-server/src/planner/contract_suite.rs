@@ -430,6 +430,15 @@ async fn push_branch_executes_through_the_pipeline() {
     // fixture serves the bare remote over git:// on loopback: 9418 is in
     // `DEFAULT_GIT_PORTS`, the Network tier's Landlock connect grant covers
     // it, and the daemon (spawned unsandboxed by the test) does the receiving.
+    // A *stale* daemon (e.g. leaked when a previous run was SIGKILLed before
+    // the guard's Drop) would pass the readiness probe below while serving a
+    // dead base path, and every push would then fail with a baffling
+    // "connection reset". Name that failure instead of inheriting it.
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", 9418)).is_err(),
+        "port 9418 is already in use — a leaked `git daemon` from an earlier \
+         run? (`pgrep -af git-daemon`, kill it, rerun)"
+    );
     let daemon = std::process::Command::new("git")
         .args([
             "daemon",
