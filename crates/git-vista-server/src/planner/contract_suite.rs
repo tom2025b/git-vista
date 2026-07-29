@@ -402,24 +402,61 @@ async fn merge_branch_executes_through_the_pipeline() {
     assert_eq!(out(&repo, &["status", "--porcelain"]), "");
 }
 
+/// Kills the fixture `git daemon` even when an assertion panics first — a
+/// leaked daemon would squat port 9418 and poison every later run.
+struct DaemonGuard(std::process::Child);
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[tokio::test]
 async fn push_branch_executes_through_the_pipeline() {
-    let (_dir, repo) = seeded_repo();
-    // The bare remote lives INSIDE the repo working tree, not beside it. The
-    // sandboxed push (Task 6) is granted the repo path and nothing else in the
-    // tempdir, and a filesystem-path remote outside the grant is denied by
-    // design: `remote.origin.url` is repository-writable, so granting whatever
-    // it names would be a repo-controlled escalation. Production remotes are
-    // URLs; this test's remote only exists to observe the push pipeline, so it
-    // sits where the grant already is. (An untracked dir in the worktree is
-    // harmless here — the pipeline's freshness checks see it identically at
-    // plan and execute time.)
-    let remote = repo.join("remote.git");
+    let (dir, repo) = seeded_repo();
+    let remote = dir.path().join("remote.git");
     std::fs::create_dir_all(&remote).unwrap();
     run(&remote, &["init", "-q", "--bare"]);
+
+    // The push crosses a real network transport, not the filesystem. Under the
+    // sandbox (Task 6) a filesystem-path remote is dead twice over: a path
+    // outside the grant is denied outright, and even a *granted* path fails,
+    // because receive-pack's quarantine migration is a cross-directory rename
+    // and the shim deliberately withholds `LANDLOCK_ACCESS_FS_REFER` (the
+    // kernel then reports EXDEV, git says "unable to migrate objects"). That
+    // is the intended posture — production remotes are URLs, where
+    // receive-pack runs on the far side, outside the pusher's sandbox. So this
+    // fixture serves the bare remote over git:// on loopback: 9418 is in
+    // `DEFAULT_GIT_PORTS`, the Network tier's Landlock connect grant covers
+    // it, and the daemon (spawned unsandboxed by the test) does the receiving.
+    let daemon = std::process::Command::new("git")
+        .args([
+            "daemon",
+            "--reuseaddr",
+            "--listen=127.0.0.1",
+            "--port=9418",
+            "--export-all",
+            "--enable=receive-pack",
+            &format!("--base-path={}", dir.path().display()),
+        ])
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("git daemon spawns");
+    let _daemon = DaemonGuard(daemon);
+    let ready = (0..50).any(|_| {
+        std::net::TcpStream::connect(("127.0.0.1", 9418))
+            .map(|_| true)
+            .unwrap_or_else(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            })
+    });
+    assert!(ready, "git daemon never came up on 127.0.0.1:9418");
+
     run(
         &repo,
-        &["remote", "add", "origin", &remote.display().to_string()],
+        &["remote", "add", "origin", "git://127.0.0.1:9418/remote.git"],
     );
     let (status, body) = pipeline(
         &repo,
