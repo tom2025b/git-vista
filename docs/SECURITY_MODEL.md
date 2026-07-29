@@ -269,6 +269,60 @@ it did not itself register.
 - Convert raw Git errors into structured safe errors; retain detailed stderr only
   in local protected logs with credential redaction.
 
+## Sandbox Mechanism Boundaries
+
+The Command Execution and Known Non-Goals sections state *what* is
+restricted and disclosed, and — as of this writing — that the enforcing
+shim is not built yet (ADR 0027). This section states what each mechanism
+actually covers once it does run, because a boundary that is silently
+narrower than it sounds is worse than one stated plainly. ADR 0027
+(filesystem) and ADR 0028 (network) are the durable record behind each item
+below.
+
+- **Landlock network rules authorize TCP ports, never hosts.** A single
+  rule granting a port permits `connect()` to that port on *every*
+  destination; the kernel's rule type carries no address field at all. The
+  network tier's port list (ADR 0028) blocks reaching an arbitrary *local*
+  port — a stray loopback service, a resolver, this server's own port — and
+  cannot confine which remote host a permitted port reaches.
+- **UDP and `AF_UNIX` are not mediated by these Landlock network rules at
+  all.** Only the strict tier's network namespace blocks UDP egress, by
+  removing network access entirely; the network tier's Landlock port rules
+  pass UDP and Unix-domain traffic through unmediated, in either direction.
+- **Landlock rules bind resolved inodes, not path strings.** A name excluded
+  from a grant is only actually withheld if the enumeration that builds the
+  grant set resolves symlinks and matches hard-link inodes before deciding
+  what to grant; a granted alias re-opens the excluded file by its own
+  canonical path too. See ADR 0027 for the measured mechanism and the
+  enumerate-and-skip algorithm this requires.
+- **A Landlock domain is inherited through `fork` and preserved through
+  `execve`, irreversibly.** This is *why* a hook or grandchild process stays
+  under the same restriction as its parent — the property the Command
+  Execution and hook-policy sections above depend on.
+- **Rule composition differs by scope.** More-permissive nested rules
+  *union* within one Landlock ruleset (a read-write grant nested under a
+  read-only ancestor adds the extra right); independently applied Landlock
+  domains *intersect* instead (stacking a second, separate restriction can
+  only narrow what the first already granted, never widen it). Treating the
+  two as interchangeable produces a policy that is wrong in one direction or
+  the other.
+- **`/run/docker.sock` is withheld by filesystem policy plus seccomp and
+  descriptor discipline, not by any network rule.** uid 1000's `docker`
+  group membership makes that socket passwordless root once reached;
+  nothing about Landlock's network mediation is what keeps it out of reach.
+
+```mermaid
+flowchart TD
+  Q{"Two Landlock<br/>restrictions apply"} -->|"same ruleset,<br/>nested rule is MORE permissive"| U["UNION —<br/>the nested grant adds the extra right"]
+  Q -->|"separate, independently<br/>applied domains"| I["INTERSECT —<br/>the second domain can only narrow,<br/>never widen, the first"]
+  U --> Ex1["example: read-write under<br/>a read-only $HOME ancestor<br/>(ADR 0027)"]
+  I --> Ex2["example: a hostile hook's<br/>own seccomp filter cannot<br/>re-widen the launcher's rules"]
+```
+
+None of the above is a defect introduced by this document; each is a true
+property of the underlying kernel mechanism that the sections above did not
+previously state.
+
 ## Remote and Forge Credentials
 
 - Prefer existing Git credential helpers and SSH agents on the Linux host.
@@ -393,10 +447,13 @@ contents.
 ## Known Non-Goals
 
 - Protecting a repository from its own Unix account owner.
-- **Fully** sandboxing arbitrary Git hooks in Local mode. Hooks run under a
-  bounded, disclosed policy (ADR 0025); a same-uid adversary with access to a
-  root-owned daemon socket, or to a writable file some outside process treats
-  as instructions, is out of scope.
+- **Fully** sandboxing arbitrary Git hooks in Local mode. Hook policy is
+  **declared and disclosed, not enforced** (ADR 0025) — a session's policy is
+  computed and shown to the user, but no code path suppresses or restricts a
+  hook today, so a `Restricted` session's hooks run exactly like an `Allow`
+  session's would. A same-uid adversary with access to a root-owned daemon
+  socket, or to a writable file some outside process treats as instructions,
+  is out of scope.
 - Providing tenant isolation in V2.
 - Making remote force-push universally undoable.
 - Securing plain HTTP LAN mode; it should not exist as a supported write mode.
