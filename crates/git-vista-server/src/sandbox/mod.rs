@@ -33,6 +33,8 @@ mod argv;
 #[cfg(test)]
 mod deps;
 #[cfg(test)]
+mod dispatch;
+#[cfg(test)]
 mod shim_cli;
 #[cfg(test)]
 mod escape_suite;
@@ -300,6 +302,85 @@ pub(crate) fn default_system_trees(tier: Tier) -> (Vec<PathBuf>, Vec<PathBuf>) {
         ro.extend(STRICT_ONLY_RO_TREES.iter().map(PathBuf::from));
     }
     (rw, ro)
+}
+
+/// Whether a git invocation needs to reach the network. This is the axis Task 8
+/// dispatches on: the tier is a property of *what the subcommand does*, not of
+/// the repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkNeed {
+    /// The subcommand talks to a remote (`push`/`fetch`/`clone`/`ls-remote`).
+    /// Only the `Network` tier can serve it (a namespace breaks push, F3).
+    Remote,
+    /// Everything else — reads, commits, branch and ref manipulation, merges.
+    /// These get the fuller-isolation `Strict` tier once it is available.
+    Local,
+}
+
+/// The git subcommands that reach the network. **Fail-closed classification:**
+/// a subcommand *not* in this set is treated as `Local`, so a subcommand added
+/// to the codebase later defaults to `Strict`. That direction is deliberate — a
+/// network op wrongly given `Strict` *breaks loudly* (a visible failure a
+/// developer fixes), whereas a local op wrongly given `Network` would silently
+/// gain network access it did not need. Loud-and-safe beats silent-and-loose.
+///
+/// `remote` is deliberately absent: `git remote get-url`/`add`/`remove` only
+/// read or write `.git/config` and never open a socket, so they are `Local`.
+const REMOTE_SUBCOMMANDS: &[&str] = &["push", "fetch", "clone", "ls-remote", "pull"];
+
+/// Classify a git argv's first non-flag token. Pure and total: every input maps
+/// to exactly one `NetworkNeed`, and the default is `Local` (Strict).
+pub(crate) fn network_need(args: &[&str]) -> NetworkNeed {
+    // The subcommand is the first token that is not a `-C <path>` / `-c k=v`
+    // global flag. In practice the server always passes the subcommand first,
+    // but skipping leading globals makes the classifier robust to `-c` config
+    // injection on the argv (which a hostile *repo* cannot do, but defence in
+    // depth is free here).
+    let mut it = args.iter();
+    while let Some(tok) = it.next() {
+        match *tok {
+            "-C" | "-c" => {
+                it.next(); // consume the flag's value
+            }
+            t if t.starts_with('-') => {} // a bare flag, skip it
+            t => {
+                return if REMOTE_SUBCOMMANDS.contains(&t) {
+                    NetworkNeed::Remote
+                } else {
+                    NetworkNeed::Local
+                };
+            }
+        }
+    }
+    // No subcommand at all (e.g. `git --version`) touches no network.
+    NetworkNeed::Local
+}
+
+/// The tier an operation runs in, given its network need and whether the
+/// repository is operator-trusted.
+///
+/// # Unsandboxed is reachable ONLY through `trusted`
+///
+/// This is the single most important property of the dispatch, and it is
+/// structured so the compiler helps keep it true: `Unsandboxed` appears in
+/// exactly one arm, guarded by `trusted == true`, and `trusted` comes only from
+/// a persisted per-repo trust flag (Task 7) — never from the operation, the
+/// argv, or a default. A new `NetworkNeed` variant added later forces a new
+/// match arm here (no wildcard), so it cannot silently inherit `Unsandboxed`.
+///
+/// `trusted` is `false` everywhere today: the persisted trust flag does not
+/// exist yet (Task 7), so no repository is unsandboxed, which is the safe state.
+pub(crate) fn tier_for(need: NetworkNeed, trusted: bool) -> Tier {
+    match (trusted, need) {
+        // An operator-trusted repository runs with no sandbox at all, and flies
+        // a permanent banner (INV-15). This is the ONLY route to Unsandboxed.
+        (true, _) => Tier::Unsandboxed,
+        // A remote operation needs the network, which only the Network tier
+        // provides (the strict tier's namespace breaks push — F3).
+        (false, NetworkNeed::Remote) => Tier::Network,
+        // Everything else gets the fuller-isolation strict tier.
+        (false, NetworkNeed::Local) => Tier::Strict,
+    }
 }
 
 /// Build the production policy for running git in `repo`.
