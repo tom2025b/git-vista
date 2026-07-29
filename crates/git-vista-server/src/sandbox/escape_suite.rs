@@ -63,7 +63,7 @@ const CASE_STRICT_LISTENER_DENIED: EscapeCase = EscapeCase {
     expect_inside: Errno(13),
     expect_granted: Errno(0),
     expect_carrier_code: 0,
-    dies_under: &[MutantId::M4, MutantId::M5],
+    dies_under: &[MutantId::M2],
     exemption: Exemption::NotProductionReachable {
         blocker: "policy_for_repo hard-codes Tier::Network",
     },
