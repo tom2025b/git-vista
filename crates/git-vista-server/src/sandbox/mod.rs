@@ -302,6 +302,43 @@ pub(crate) fn default_system_trees(tier: Tier) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (rw, ro)
 }
 
+/// Build the production policy for running git in `repo`.
+///
+/// This is the single production policy-construction site (Task 6). It mirrors
+/// what the `shim_cli::workable` test helper does, but resolves the shim through
+/// `sandbox::shim` — so a missing or moved shim is a named `ShimError` here,
+/// at construction time, rather than an ENOENT surfacing from inside a spawn.
+///
+/// # Tier is `Network` for now, deliberately
+///
+/// Choosing a tier per operation — read paths in the strict tier, network
+/// operations in the network tier, operator-trusted repositories unsandboxed —
+/// is Task 8's dispatch, and it depends on validated repository metadata that
+/// Task 7 produces. Until those land, every operation gets the **network
+/// tier**: the fuller-compatibility tier that can still reach a remote, so
+/// migrating the spawn sites (Task 6) cannot break `push`/`fetch` before the
+/// dispatch exists to route them. It is the safe default to start from, not the
+/// final policy. `secret_excludes` is populated regardless of tier, so the
+/// secret set is never silently empty during the interim.
+pub(crate) fn policy_for_repo(repo: &Path) -> Result<Policy, shim::ShimError> {
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or(shim::ShimError::NoCurrentExe)?);
+    let shim = shim::shim_path().map_err(Clone::clone)?.to_path_buf();
+    let tier = Tier::Network;
+    let (mut rw, mut ro) = default_system_trees(tier);
+    rw.push(repo.to_path_buf());
+    ro.push(home.clone());
+    Ok(Policy {
+        tier,
+        shim,
+        bwrap: None, // Network tier launches the shim directly (F3).
+        rw_trees: rw,
+        ro_trees: ro,
+        secret_excludes: secret_excludes_for_home(&home),
+        net_ports: DEFAULT_GIT_PORTS.to_vec(),
+        hook_mode: HookMode::Run,
+    })
+}
+
 /// The chokepoint. Returns the complete launcher argv **up to and including
 /// the program name `git`**; the caller appends `-C <repo> <args…>`.
 ///
