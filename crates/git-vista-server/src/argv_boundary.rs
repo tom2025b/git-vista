@@ -68,6 +68,13 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // shim_cli, and separately runs the C compiler to build the adversarial
     // probes it feeds in as hostile hooks. Also in LAUNCHER_SPAWN_SITES.
     "src/sandbox/escape_suite.rs",
+    // #66 Task 25 (step 3): the anti-vacuity contract's harness. Its baseline
+    // leg spawns plain `git` outside the sandbox (literal), and its CI
+    // preflight (`ci_preflight_host_meets_the_declared_minimum`) runs `cc
+    // --version` to confirm the compiler the escape battery needs is present
+    // — it never compiles or execs anything client-influenced. Also in
+    // LAUNCHER_SPAWN_SITES for the same `cc` reason as escape_suite.rs above.
+    "src/sandbox/escape_contract.rs",
     // git-vista-git
     "src/history.rs", // read-side reflog/stash reads, static args
 ];
@@ -95,6 +102,12 @@ const LAUNCHER_SPAWN_SITES: &[&str] = &[
     // compiles a source file this test wrote — so it is permitted here while
     // shells remain forbidden.
     "src/sandbox/escape_suite.rs",
+    // The contract harness's CI preflight runs `cc --version` (a capability
+    // check, not a compile). Its inside leg spawns through
+    // `spawn::command_async` — a real `Command` (`tokio::process::Command`),
+    // but built inside `spawn.rs`, not by a `Command::new(` in this file, so
+    // it does not itself need this carve-out for that path.
+    "src/sandbox/escape_contract.rs",
     // The Task 5 spawn chokepoint. Its `Command::new` program is
     // `sandbox_argv(policy)[0]` — the resolved shim, or bare `git` in the
     // unsandboxed tier — a value this crate produced, never a runtime string.
