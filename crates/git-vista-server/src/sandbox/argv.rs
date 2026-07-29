@@ -5,10 +5,17 @@
 use super::*;
 use std::path::PathBuf;
 
+/// A fixed, fake bwrap path. Fake on purpose: these tests pin the *shape* of
+/// the argv, and pinning them to wherever bwrap really lives on the build host
+/// would make them pass or fail for reasons that have nothing to do with the
+/// chokepoint. `bwrap::resolve` is what tests the real lookup.
+const FAKE_BWRAP: &str = "/usr/bin/bwrap";
+
 fn policy(tier: Tier) -> Policy {
     Policy {
         tier,
         shim: PathBuf::from("/opt/gv/gv-sandbox"),
+        bwrap: (tier == Tier::Strict).then(|| PathBuf::from(FAKE_BWRAP)),
         rw_trees: vec![PathBuf::from("/srv/repos/r")],
         ro_trees: vec![PathBuf::from("/usr"), PathBuf::from("/home/tom")],
         secret_excludes: vec![PathBuf::from("/home/tom/.ssh")],
