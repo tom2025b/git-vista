@@ -52,7 +52,7 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // argv whose program is not exactly `git`, so it cannot exec anything else
     // even if the literal rule below were relaxed. It uses `.exec()`, never
     // `.spawn()`/`.output()`/`.status()`: it never becomes a parent.
-    "src/bin/gv-sandbox.rs",
+    "src/bin/gv-sandbox/main.rs",
     // The `#[cfg(test)]` harness that drives the composed launcher. It is also
     // in `LAUNCHER_SPAWN_SITES` below, which exempts it from the literal-`git`
     // rule and replaces that rule with "names no interpreter" — the program it
