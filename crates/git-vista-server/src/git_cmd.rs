@@ -301,10 +301,10 @@ pub(crate) async fn git_ok(repo: &Path, args: &[&str]) -> Result<(), String> {
 /// when the ref exists, non-zero otherwise. Used to prefer `origin/main` over the
 /// local `main` as a rebase base only when the remote-tracking ref is actually there.
 pub(crate) async fn git_ref_exists(repo: &Path, refname: &str) -> bool {
-    tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("rev-parse")
+    let Ok(mut cmd) = sandboxed(repo) else {
+        return false;
+    };
+    cmd.arg("rev-parse")
         .arg("--verify")
         .arg("--quiet")
         .arg(refname)
