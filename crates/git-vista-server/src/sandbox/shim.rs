@@ -23,6 +23,10 @@ pub(crate) enum ShimError {
     NotFound { looked_in: PathBuf },
     /// `current_exe()` itself failed, so there is nothing to look beside.
     NoCurrentExe,
+    /// `$HOME` is unset, so a policy cannot say which tree to grant or which
+    /// secrets to withhold. Building a policy without it would grant nothing
+    /// and silently break git identity, so it is a hard error instead.
+    NoHome,
 }
 
 impl std::fmt::Display for ShimError {
@@ -43,6 +47,7 @@ impl std::fmt::Display for ShimError {
                 looked_in.display()
             ),
             Self::NoCurrentExe => write!(f, "current_exe() failed"),
+            Self::NoHome => write!(f, "$HOME is unset; cannot build a sandbox policy"),
         }
     }
 }

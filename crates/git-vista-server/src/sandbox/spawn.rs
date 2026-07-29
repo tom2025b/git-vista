@@ -127,6 +127,46 @@ mod tests {
         );
     }
 
+    /// The Task 6 shape end to end: the **production** `policy_for_repo` drives
+    /// real git through the wrapper. This is exactly what a migrated spawn site
+    /// will do, so it proves the production policy path works before any live
+    /// site depends on it — and it exercises `shim::shim_path` resolution, the
+    /// enumerated `$HOME` grant, and the real secret excludes together.
+    #[tokio::test]
+    async fn the_production_policy_runs_real_git_and_denies_secrets() {
+        let repo = fixture();
+        let policy = super::super::policy_for_repo(repo.path())
+            .expect("policy_for_repo builds (shim is present via tests/forces_shim_build.rs)");
+
+        // A granted operation succeeds: proves the policy is not denying all.
+        let ok = command_async(&policy, repo.path(), &["status", "--short"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", std::env::var("HOME").unwrap())
+            .output()
+            .await
+            .expect("git runs");
+        assert!(ok.status.success(), "stderr={}", String::from_utf8_lossy(&ok.stderr));
+
+        // A secret stays denied under the same production policy.
+        let home = std::env::var("HOME").unwrap();
+        let secret = format!("{home}/.ssh/known_hosts");
+        if std::path::Path::new(&secret).exists() {
+            let out = command_async(&policy, repo.path(), &["config", "-f", &secret, "--list"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", home)
+                .output()
+                .await
+                .expect("git runs");
+            assert!(
+                !out.status.success(),
+                "the production policy let git read ~/.ssh: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+    }
+
     /// The sync wrapper runs the same policy the same way. Asserted separately
     /// because the two share `full_argv` but build different `Command` types,
     /// and a copy-paste error in one would not show up in the other.

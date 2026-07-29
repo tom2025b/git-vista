@@ -321,7 +321,7 @@ pub(crate) fn default_system_trees(tier: Tier) -> (Vec<PathBuf>, Vec<PathBuf>) {
 /// final policy. `secret_excludes` is populated regardless of tier, so the
 /// secret set is never silently empty during the interim.
 pub(crate) fn policy_for_repo(repo: &Path) -> Result<Policy, shim::ShimError> {
-    let home = PathBuf::from(std::env::var_os("HOME").ok_or(shim::ShimError::NoCurrentExe)?);
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or(shim::ShimError::NoHome)?);
     let shim = shim::shim_path().map_err(Clone::clone)?.to_path_buf();
     let tier = Tier::Network;
     let (mut rw, mut ro) = default_system_trees(tier);
