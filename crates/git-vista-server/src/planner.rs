@@ -1033,13 +1033,12 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
 
 /// Spawn `git -C <repo> <args…>` and collect its output; `Err` is the
 /// "couldn't run git at all" case every endpoint maps to a 500.
+///
+/// Goes through the sealed sandbox launcher (`crate::git_cmd::git_output`,
+/// #66 Task 6) rather than a raw `Command::new("git")` — this is the
+/// executor, where every client-requested mutation's argv actually runs.
 async fn run_git(repo: &Path, args: &[&str]) -> std::io::Result<Output> {
-    tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .await
+    crate::git_cmd::git_output(repo, args).await
 }
 
 /// The uniform 500 for a git binary that couldn't be spawned, with the same
