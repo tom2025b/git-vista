@@ -127,20 +127,63 @@ symlinks too, so classifying by the link's own type rather than what it resolves
 to would grant the wrong access mode. Directories are granted
 `EXECUTE|READ_FILE|READ_DIR`; files, `READ_FILE` only.
 
-### Symlinks cannot route around the exclude set
+### Symlinks — the enumeration MUST resolve them, or the exclude set is voided
 
-Landlock enforces on the final resolved path, not the path a program opened.
+An earlier revision of this ADR claimed a symlink could not route around the
+exclude set. **That claim was wrong, and it was wrong in the most dangerous
+direction.** It is corrected here rather than deleted, because the reasoning that
+produced it is the reasoning a future reader is most likely to repeat.
+
+The false claim rested on a true fact: Landlock does enforce on the final
+resolved path. That fact is decisive for a symlink *inside* an already-granted
+tree, where no rule is ever created for the link itself. It is irrelevant at an
+**enumerated depth** — the top level of `$HOME`, and every child of `.config` —
+because there the enumeration creates a rule *for the entry itself*, and it
+classifies with `stat()`, which follows. So the rule is added on an fd opened on
+the **resolved inode**.
 
 ```mermaid
-flowchart LR
-  L["~/.config/innocent-link<br/>(granted directory, a symlink)"] -->|resolves to| T["~/.ssh/id_ed25519<br/>(excluded — no rule exists)"]
-  Op["open(O_PATH, follow-symlinks)"] --> R["Landlock evaluates<br/>the final resolved path"]
-  R --> D["no rule covers anything<br/>under ~/.ssh — EACCES"]
+flowchart TD
+  E["~/innocent-link<br/>(a top-level entry, so ENUMERATED)"] --> S["stat() follows it"]
+  S --> I["open(O_PATH) yields the<br/>~/.ssh INODE"]
+  I --> G["landlock_add_rule grants<br/>EXECUTE READ_FILE READ_DIR<br/>on that inode"]
+  G --> V["the exclude set is now VOID:<br/>Landlock rules bind inodes, not paths"]
 ```
 
-A symlink stored in a granted directory but resolving into `~/.ssh` is denied
-exactly as if it had been opened directly — there is no path through a granted
-parent that reaches an excluded child by indirection.
+Measured on this host (Landlock ABI 8), enumerating a fixture `$HOME` containing
+`innocent_dir_link -> .ssh` and `.config/innocent_file_link -> .ssh/known_hosts`,
+with `.ssh` correctly skipped by name:
+
+| probe | result |
+|---|---|
+| `/etc/hostname` (no rule — liveness control) | DENIED |
+| `normal/plain.txt` (granted — control) | OK |
+| `.config/innocent_file_link` | **readable** |
+| `innocent_dir_link/known_hosts` | **readable** |
+| `~/.ssh/known_hosts` **by its own direct path** | **readable** |
+
+The last row is the one that matters. Granting the `.ssh` inode through an alias
+re-opens the *canonical* path too, because a Landlock rule is a property of the
+inode. A symlink at an enumerated depth does not merely bypass the exclusion —
+it **silently deletes it**, and every later assertion about `~/.ssh` being
+unreachable becomes false while the ruleset still looks correct.
+
+This is live on any real machine: this host has seven top-level `$HOME`
+symlinks (`.bashrc`, `.gitconfig`, `.zshrc`, …), all pointing into a
+dotfiles repository. None currently resolves into or above an excluded
+directory, so there is no exposure today — but the mechanism is one `ln -s`
+away from voiding the whole exclude set, with nothing to signal it.
+
+**Therefore the enumeration must, after `stat()`, also `lstat()`, and for any
+entry that is a symlink, `canonicalize()` it and skip the entry unless the
+canonical target is a descendant of the tree being granted and is not equal to,
+inside, or an ancestor of any exclude.** An entry resolving to `$HOME`, `/home`
+or `/` must always be skipped: granting an ancestor of the secrets defeats the
+exclusion by union-upward semantics even without naming a secret.
+
+This check is a hard invariant of the mechanism, not a hardening extra. It needs
+its own test, and the test must assert the direct-path row above — that
+`~/.ssh/known_hosts` is *still* denied after a hostile alias exists.
 
 ### Where the enumeration runs
 
