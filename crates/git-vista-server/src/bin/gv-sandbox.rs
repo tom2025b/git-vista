@@ -523,12 +523,30 @@ fn apply_landlock(a: &Args) {
     unsafe { libc::close(ruleset) };
 }
 
+#[path = "seccomp_filter.rs"]
+mod seccomp_filter;
+
+/// Install the terminal denylist. Applied **after** Landlock and immediately
+/// before the exec, so the ordering matches the layering: the filesystem
+/// boundary is established first, then the syscall boundary, then the process
+/// image is replaced — and both survive the `execve` because
+/// `PR_SET_NO_NEW_PRIVS` is already set.
+fn apply_seccomp() {
+    let program = match seccomp_filter::build() {
+        Ok(p) => p,
+        Err(e) => die(EXIT_SECCOMP, &format!("seccomp filter build failed: {e}")),
+    };
+    if let Err(e) = seccompiler::apply_filter(&program) {
+        die(EXIT_SECCOMP, &format!("seccomp apply failed: {e}"));
+    }
+}
+
 fn main() {
     let a = parse();
     validate(&a);
     close_inherited_fds();
     apply_landlock(&a);
-    // Task 4 installs the seccomp filter here, before the exec.
+    apply_seccomp();
 
     // `git` is named literally so the argv tripwire can prove this process
     // cannot exec anything else, and `validate` has already refused any
