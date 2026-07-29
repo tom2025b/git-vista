@@ -41,7 +41,21 @@
 //! Every failure is an error, never a silent "no extra grant": a linked
 //! worktree that resolves strangely gets a refused operation with a named
 //! reason (fail-closed, same posture as INV-13), not a confusing downstream
-//! git error. Geometries this deliberately does not support, today: submodule
+//! git error. Only a genuinely *absent* `.git` is `Ok(None)` — an unreadable
+//! one is an error, because "I could not look" is not "there is nothing there".
+//!
+//! # What the grant deliberately does NOT separate
+//!
+//! Granting `commondir` gives a worktree's sandbox read-write on the whole
+//! `<main>/.git`, which includes *sibling* worktrees' admin dirs
+//! (`worktrees/<other>`) and the shared `hooks/`. That is a deliberate scope
+//! decision, not an oversight: every worktree of one repository already shares
+//! fate by git's own design — one object store, one ref store — so a
+//! per-worktree partition of `.git` would be a boundary git itself does not
+//! honour. It is distinct from the escalation rule 3 refuses, which is about
+//! reaching an *unrelated* directory. If per-worktree isolation is ever wanted,
+//! it needs a narrower grant set (objects + refs + own admin dir), not a
+//! tweak here. Geometries this deliberately does not support, today: submodule
 //! gitdir pointers (no `commondir`) and `--separate-git-dir` repositories
 //! (same) — both refuse rather than guess. D2 may later re-key this onto
 //! validated catalog metadata; the containment rule must survive that move.
@@ -81,7 +95,13 @@ pub(crate) fn linked_worktree_dirs(repo: &Path) -> Result<Option<LinkedWorktreeD
         // No `.git` at all: a bare repo path or not a repository. No extra
         // grant to compute; if it is not a repository, git itself will say so
         // from inside the sandbox.
-        Err(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // Anything else — a permission error, an I/O error — is not "this is a
+        // plain repository". Collapsing it into `Ok(None)` would under-grant
+        // silently and leave a legitimate linked worktree failing later with a
+        // confusing git error instead of this named cause. Fail-safe either
+        // way (nothing extra is granted), but only this branch says why.
+        Err(e) => return Err(format!("`.git` at {} is unreadable: {e}", dotgit.display())),
     };
     if meta.is_dir() {
         return Ok(None); // a plain repository
