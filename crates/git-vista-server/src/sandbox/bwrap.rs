@@ -36,10 +36,7 @@ pub(crate) fn bwrap_path() -> Option<&'static Path> {
 /// `/bin/bwrap -> /usr/bin/bwrap` is normal and both are in the candidate list
 /// anyway. What matters is that the final target exists and is a regular file.
 fn resolve(candidates: &[&str]) -> Option<PathBuf> {
-    candidates
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.is_file())
+    candidates.iter().map(PathBuf::from).find(|p| p.is_file())
 }
 
 #[cfg(test)]

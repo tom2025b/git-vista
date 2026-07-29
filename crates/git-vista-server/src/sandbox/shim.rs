@@ -95,10 +95,7 @@ fn resolve() -> Result<PathBuf, ShimError> {
     }
 
     let exe = std::env::current_exe().map_err(|_| ShimError::NoCurrentExe)?;
-    let mut dir = exe
-        .parent()
-        .ok_or(ShimError::NoCurrentExe)?
-        .to_path_buf();
+    let mut dir = exe.parent().ok_or(ShimError::NoCurrentExe)?.to_path_buf();
     // Under `cargo test` the running binary is `target/<profile>/deps/<name>-<hash>`,
     // so the sibling lookup must step *out* of `deps` first. Measured: without
     // this the path resolves to `target/<profile>/deps/gv-sandbox`, which does

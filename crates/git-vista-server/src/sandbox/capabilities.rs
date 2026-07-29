@@ -161,24 +161,52 @@ mod tests {
     /// against constructed capability sets, not the live host.
     #[test]
     fn strict_needs_all_three_and_network_needs_only_landlock() {
-        let full = Capabilities { landlock_abi: 8, bwrap_present: true, userns: true };
+        let full = Capabilities {
+            landlock_abi: 8,
+            bwrap_present: true,
+            userns: true,
+        };
         assert!(full.strict_available());
         assert!(full.network_available());
 
-        let no_bwrap = Capabilities { bwrap_present: false, ..full };
+        let no_bwrap = Capabilities {
+            bwrap_present: false,
+            ..full
+        };
         assert!(!no_bwrap.strict_available(), "strict needs bwrap");
         assert!(no_bwrap.network_available(), "network does not need bwrap");
 
-        let no_userns = Capabilities { userns: false, ..full };
+        let no_userns = Capabilities {
+            userns: false,
+            ..full
+        };
         assert!(!no_userns.strict_available(), "strict needs userns");
-        assert!(no_userns.network_available(), "network does not need userns");
+        assert!(
+            no_userns.network_available(),
+            "network does not need userns"
+        );
 
-        let below_floor = Capabilities { landlock_abi: LANDLOCK_ABI_FLOOR as i32 - 1, ..full };
-        assert!(!below_floor.strict_available(), "strict needs the ABI floor");
-        assert!(!below_floor.network_available(), "network also needs the ABI floor");
+        let below_floor = Capabilities {
+            landlock_abi: LANDLOCK_ABI_FLOOR as i32 - 1,
+            ..full
+        };
+        assert!(
+            !below_floor.strict_available(),
+            "strict needs the ABI floor"
+        );
+        assert!(
+            !below_floor.network_available(),
+            "network also needs the ABI floor"
+        );
 
-        let no_landlock = Capabilities { landlock_abi: -1, ..full };
-        assert!(!no_landlock.network_available(), "no Landlock, no sandboxed tier");
+        let no_landlock = Capabilities {
+            landlock_abi: -1,
+            ..full
+        };
+        assert!(
+            !no_landlock.network_available(),
+            "no Landlock, no sandboxed tier"
+        );
     }
 
     /// The floor is the declared minimum, not the host's actual ABI: a host at
