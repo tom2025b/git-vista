@@ -17,7 +17,7 @@ use super::*;
 /// `option_env!` captures the test runner's real home at compile time, so this
 /// does not invent a second policy builder or weaken any sandbox assertion.
 pub(crate) fn production_policy(repo: &std::path::Path) -> Policy {
-    let home = option_env!("HOME").expect("the test build has HOME");
+    let home = env!("HOME");
     for _ in 0..16 {
         std::env::set_var("HOME", home);
         match policy_for_repo(repo) {

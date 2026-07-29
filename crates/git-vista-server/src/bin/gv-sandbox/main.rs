@@ -240,10 +240,16 @@ fn absolute(s: &str, flag: &str) -> PathBuf {
 /// default nobody can see from a command line.
 fn validate(a: &Args) {
     if a.abi_floor.is_none() {
-        die(EXIT_ARGV, "--abi-floor is required (it must travel in the argv, never default)");
+        die(
+            EXIT_ARGV,
+            "--abi-floor is required (it must travel in the argv, never default)",
+        );
     }
     if !a.hooks_seen {
-        die(EXIT_ARGV, "one of --hooks-run or --hooks-blocked is required");
+        die(
+            EXIT_ARGV,
+            "one of --hooks-run or --hooks-blocked is required",
+        );
     }
     let Some(net_allow) = a.net_allow else {
         die(EXIT_ARGV, "one of --net-allow or --net-deny is required");
@@ -451,7 +457,9 @@ fn apply_landlock(a: &Args) {
     if (abi as u32) < floor {
         die(
             EXIT_ABI_FLOOR,
-            &format!("Landlock ABI {abi} is below the declared floor {floor}; refusing to run a weaker policy"),
+            &format!(
+                "Landlock ABI {abi} is below the declared floor {floor}; refusing to run a weaker policy"
+            ),
         );
     }
 
