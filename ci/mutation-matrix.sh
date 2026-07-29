@@ -5,6 +5,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/git-vista-mutation-matrix.XXXXXX")
 trap 'rm -rf -- "$work_root"' EXIT
+shared_target="$work_root/target"
 
 readonly -a mutants=(M1 M2 M3 M4 M5 M6 M7)
 declare -Ar mutant_patch=(
@@ -141,7 +142,7 @@ run_one_tree() {
 
   if ! (
     cd "$tree"
-    CARGO_TARGET_DIR="$tree/target" cargo test -p git-vista-server --no-run
+    CARGO_TARGET_DIR="$shared_target" cargo test -p git-vista-server --no-run
   ) > "$build_log" 2>&1; then
     printf 'mutation-matrix: %s did not build; tail follows\n' "$label" >&2
     tail -80 "$build_log" >&2
@@ -159,7 +160,7 @@ run_one_tree() {
     if (
       cd "$tree"
       GV_ESCAPE_REPORT="$report" \
-        CARGO_TARGET_DIR="$tree/target" \
+        CARGO_TARGET_DIR="$shared_target" \
         cargo test -p git-vista-server "$test_name" -- --exact --test-threads=1
     ) > "$test_log" 2>&1; then
       status=0
