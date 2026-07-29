@@ -50,14 +50,29 @@ fn denied_outright() -> Vec<(i64, &'static str)> {
         // worker context, which is a different path through the kernel than the
         // one Landlock was reasoned about on. Denying the three setup calls is
         // what closes it — there is no io_uring without them.
-        (libc::SYS_io_uring_setup, "io_uring bypasses path-based mediation"),
-        (libc::SYS_io_uring_enter, "io_uring bypasses path-based mediation"),
-        (libc::SYS_io_uring_register, "io_uring bypasses path-based mediation"),
+        (
+            libc::SYS_io_uring_setup,
+            "io_uring bypasses path-based mediation",
+        ),
+        (
+            libc::SYS_io_uring_enter,
+            "io_uring bypasses path-based mediation",
+        ),
+        (
+            libc::SYS_io_uring_register,
+            "io_uring bypasses path-based mediation",
+        ),
         // Namespace manipulation. A sandboxed process that can create a user
         // namespace gains capabilities inside it, and `setns` would let it join
         // one that already exists.
-        (libc::SYS_unshare, "namespace creation escapes the tier's boundary"),
-        (libc::SYS_setns, "joining a namespace escapes the tier's boundary"),
+        (
+            libc::SYS_unshare,
+            "namespace creation escapes the tier's boundary",
+        ),
+        (
+            libc::SYS_setns,
+            "joining a namespace escapes the tier's boundary",
+        ),
         // C1: deny the child the ability to install its own seccomp filter, so
         // it cannot use non-monotonic stacking to continue a syscall this
         // filter denied.
@@ -65,18 +80,36 @@ fn denied_outright() -> Vec<(i64, &'static str)> {
         // Kernel module and kexec surfaces. Not reachable unprivileged, denied
         // anyway so the filter states the boundary rather than relying on the
         // absence of a capability.
-        (libc::SYS_init_module, "kernel code loading is never in scope"),
-        (libc::SYS_finit_module, "kernel code loading is never in scope"),
-        (libc::SYS_delete_module, "kernel code loading is never in scope"),
-        (libc::SYS_kexec_load, "kernel code loading is never in scope"),
+        (
+            libc::SYS_init_module,
+            "kernel code loading is never in scope",
+        ),
+        (
+            libc::SYS_finit_module,
+            "kernel code loading is never in scope",
+        ),
+        (
+            libc::SYS_delete_module,
+            "kernel code loading is never in scope",
+        ),
+        (
+            libc::SYS_kexec_load,
+            "kernel code loading is never in scope",
+        ),
         // ptrace: attaching to another process of the same uid would let a
         // hostile hook read or drive a process outside the sandbox. Landlock's
         // ABI-6 signal scope covers signalling; this covers inspection.
         (libc::SYS_ptrace, "same-uid inspection escapes the boundary"),
         // process_vm_*: reading or writing another process's memory directly,
         // same reasoning as ptrace and not covered by it.
-        (libc::SYS_process_vm_readv, "same-uid memory access escapes the boundary"),
-        (libc::SYS_process_vm_writev, "same-uid memory access escapes the boundary"),
+        (
+            libc::SYS_process_vm_readv,
+            "same-uid memory access escapes the boundary",
+        ),
+        (
+            libc::SYS_process_vm_writev,
+            "same-uid memory access escapes the boundary",
+        ),
     ]
 }
 
@@ -167,7 +200,10 @@ mod tests {
     #[test]
     fn every_denial_states_why() {
         for (nr, why) in denied_outright() {
-            assert!(!why.is_empty(), "syscall {nr} is denied with no stated reason");
+            assert!(
+                !why.is_empty(),
+                "syscall {nr} is denied with no stated reason"
+            );
         }
     }
 }
