@@ -36,7 +36,6 @@ use std::process::Command;
 const EXIT_ARGV: i32 = 90;
 const EXIT_ABI_FLOOR: i32 = 91;
 const EXIT_LANDLOCK: i32 = 92;
-#[allow(dead_code)] // Task 4 wires the seccomp filter and uses this.
 const EXIT_SECCOMP: i32 = 93;
 const EXIT_EXEC: i32 = 94;
 
