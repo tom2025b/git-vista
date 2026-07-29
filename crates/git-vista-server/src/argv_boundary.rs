@@ -32,14 +32,29 @@ use std::path::{Path, PathBuf};
 /// other entry here is a read-only helper or `#[cfg(test)]` fixture setup.
 const ALLOWED_SPAWN_SITES: &[&str] = &[
     // git-vista-server
-    "src/planner.rs",        // the executor — every client-requested mutation's argv
-    "src/durable.rs",        // `git update-ref` for recovery refs (#62) — see above
-    "src/git_cmd.rs",        // shared read-only git helpers
+    // The executor — every client-requested mutation's argv is built here.
+    // Its production spawn (`run_git`) now goes through
+    // `crate::git_cmd::git_output`, the sealed sandbox launcher (#66 Task 6);
+    // this entry now covers only its `#[cfg(test)]` fixture setup.
+    "src/planner.rs",
+    // `git update-ref` for recovery refs (#62) — see the module doc above.
+    // The production call (`write_recovery_ref`) now goes through
+    // `crate::git_cmd::git_output` (#66 Task 6); this entry now covers only
+    // its `#[cfg(test)]` fixture setup.
+    "src/durable.rs",
+    "src/git_cmd.rs", // shared read-only git helpers, and the sealed `git_output` launcher (#66 Task 6)
     "src/handlers/clone.rs", // `git clone` with a validated URL as its own argv entry
-    "src/handlers/read.rs",  // `git status --porcelain=v2` (static args)
-    "src/catalog.rs",        // static-arg read at registration
-    "src/journal.rs",        // #[cfg(test)] fixture setup
-    "src/coordinator.rs",    // `git rev-parse --absolute-git-dir` (static args, read-only)
+    // `git status --porcelain=v2` (static args). The production call
+    // (`worktree_status`) now goes through `crate::git_cmd::git_output`
+    // (#66 Task 6); this entry now covers only its `#[cfg(test)]` fixtures.
+    "src/handlers/read.rs",
+    "src/catalog.rs", // static-arg read at registration
+    "src/journal.rs", // #[cfg(test)] fixture setup
+    // `git rev-parse --absolute-git-dir` (static args, read-only). The
+    // production call (`absolute_git_dir`) now goes through
+    // `crate::git_cmd::git_output` (#66 Task 6); this entry now covers only
+    // its `#[cfg(test)]` fixture setup.
+    "src/coordinator.rs",
     "src/planner/contract_suite.rs", // #[cfg(test)] git fixtures for the #146 pipeline suite
     "src/planner/coordination_suite.rs", // #[cfg(test)] git fixtures for the #60 coordination suite
     "src/planner/lifecycle_suite.rs", // #[cfg(test)] git fixtures for the #61 lifecycle suite

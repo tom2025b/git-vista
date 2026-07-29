@@ -115,11 +115,7 @@ pub(crate) async fn refuse_if_git_busy(repo: &Path) -> Option<(StatusCode, Strin
 /// This worktree's own git directory, absolute; `None` when git can't tell us
 /// (not a repository, or git couldn't run — both already handled downstream).
 async fn absolute_git_dir(repo: &Path) -> Option<PathBuf> {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--absolute-git-dir"])
-        .output()
+    let output = crate::git_cmd::git_output(repo, &["rev-parse", "--absolute-git-dir"])
         .await
         .ok()?;
     if !output.status.success() {
