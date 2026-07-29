@@ -420,4 +420,54 @@ his call to make, not a worker task's.
 
 ---
 
+## Part 3 — the sandbox gate (#66 M1.13b, added 2026-07-29)
+
+A seventh named check, `sandbox`, gates the escape battery — the test suite
+whose whole job is proving a hostile repository's hooks cannot escape
+Landlock/seccomp/bwrap containment. It exists because that battery has
+**failed twice**: an earlier audit (C8) found it vacuous, a competent
+rewrite followed, and a second audit (C11) found the same defect had
+"merely moved from the inside assertion to the baseline gate" rather than
+being removed. `design-docs/2026-07-29-escape-battery-anti-vacuity-contract.md`
+is the response — eleven numbered rules (R1–R11), each enforced by a source
+tripwire or a CI-shell assertion rather than trusted to a reviewer's
+judgement, on the theory that a standard living only in a report is not
+open during the next rewrite.
+
+**What the job actually asserts**, none of it decided by the Rust tests
+themselves (see the contract's "Skip policy"):
+
+1. A preflight names any missing host capability with `::error::` before any
+   test runs — a mis-provisioned runner is a *differently-named* red check
+   from a real containment failure, so nobody learns to click past the
+   security one.
+2. The battery runs, writing one record per case to a report file the test
+   process owns (immune to libtest's stdout/stderr capture on passing
+   tests — the channel the previous, since-condemned CI draft tried to
+   `grep` and could not have worked).
+3. Three shell-level assertions over that file: it exists; its case-id set
+   equals `docs/sandbox/escape-census.txt` in **both directions** (equality,
+   not a floor — a renamed module empties a floor-based gate silently);
+   zero records read `result=capability-absent`.
+
+**Status as of this document's edit (Task 25, steps 1–3 of the contract's
+ordered work).** The CI job, the harness (`sandbox::escape_contract` —
+`EscapeCase`, `run_case`, the `Result`-returning probe parser, the nonce
+`GVPROBE` marker protocol, `production_env_profile()`), and source tripwires
+for R1, R2, R3, R4, R6, R7, R8, R10, R11 are landed. The five cases
+themselves are **not yet rewritten onto the contract** (step 5, blocked on
+step 4) — `escape_suite.rs` still has no `mod harness` marker, so the R1,
+R2, R4, R6 and R7 tripwires **fail today, deliberately**: a tripwire that
+cannot reject the file it was written against has not been shown to reject
+anything. `docs/sandbox/escape-census.txt` is empty-but-present for the same
+reason — the census↔report diff currently passes over an empty set, which
+is a placeholder, not a coverage claim. None of this blocks the `sandbox`
+job from existing as a real, gating check; it does mean the job reads red
+on `main` until step 5 lands, which is expected and recorded rather than
+worked around.
+
+---
+
 **Signed:** thomas2010 · 2026-07-28T01:37:53-04:00
+
+**Signed:** thomas2010 · 2026-07-29T11:30:00-04:00 (Part 3 addition, Task 25)
