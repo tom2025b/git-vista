@@ -112,7 +112,7 @@ fn errno_for(out: &str, tag: &str) -> Option<i32> {
     for line in out.lines() {
         if let Some(rest) = line.trim().strip_prefix(tag) {
             if let Some(e) = rest.split("errno=").nth(1) {
-                return e.trim().split_whitespace().next()?.parse().ok();
+                return e.split_whitespace().next()?.parse().ok();
             }
         }
     }
