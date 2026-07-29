@@ -202,6 +202,94 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # 7. Sandbox: the #66 (M1.13b) escape-battery gate.
+  #
+  # Built from the anti-vacuity contract's step 1, not from any earlier plan
+  # draft (see design-docs/2026-07-29-escape-battery-anti-vacuity-contract.md,
+  # "Skip policy" and "Ordered work" §1). Three verified false-green channels
+  # rule out the obvious shortcuts: libtest swallows stdout+stderr of PASSING
+  # tests, so a `grep SKIPPED` gate cannot distinguish "no skip happened" from
+  # "a skip happened and nothing prints it"; `cargo test <filter>` exits 0 on
+  # "0 passed; 0 filtered out", so a renamed module empties a filter-based gate
+  # silently; and neither failure mode is survivable from *inside* the tests,
+  # because the tests never decide severity — the job does, over an artifact
+  # (the report file) both a real run and a mis-provisioned runner produce
+  # identically.
+  #
+  # Two independently-named red checks, on purpose: a preflight step that
+  # fails with `::error::` naming exactly which host capability is missing
+  # (so "this runner cannot provide the sandbox" is never mistaken for "the
+  # sandbox failed to contain something"), then the battery itself, then three
+  # shell-level assertions over `$GV_ESCAPE_REPORT`. A false green would need
+  # two independent mistakes, not one.
+  #
+  # Until step 5 (case rewrite) lands, `docs/sandbox/escape-census.txt` is
+  # empty and no case exists to populate the report, so the census-diff
+  # assertion passes vacuously on an empty set — that is a placeholder state,
+  # not a claim of coverage. `sandbox::escape_contract`'s own tripwires (R1,
+  # R2, R4, R6, R7) are expected to FAIL until that rewrite lands; that
+  # redness is itself acceptance evidence (D) that the tripwires bite.
+  # ---------------------------------------------------------------------------
+  sandbox:
+    name: Sandbox (#66 escape-battery gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Best-effort: gives the strict tier its two host dependencies before
+      # the preflight measures what is actually available. Does not touch any
+      # sysctl — apparmor_restrict_unprivileged_userns and friends are read,
+      # never written, by capabilities::probe(); a runner that restricts
+      # unprivileged userns stays restricted, and the preflight reports that
+      # honestly rather than the job silently working around it.
+      - name: Best-effort host setup (bwrap, a C compiler)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap build-essential
+
+      - name: Sandbox preflight (host capability check)
+        run: cargo test -p git-vista-server ci_preflight_host_meets_the_declared_minimum
+
+      - name: Escape battery + anti-vacuity tripwires
+        run: |
+          set -o pipefail
+          export GV_ESCAPE_REPORT="${GITHUB_WORKSPACE}/gv-escape-report.txt"
+          cargo test -p git-vista-server -- escape_suite hook_mode_suite escape_contract
+
+      - name: Report assertions (exists / census diff both ways / zero capability-absent)
+        run: |
+          set -o pipefail
+          report="${GITHUB_WORKSPACE}/gv-escape-report.txt"
+          census="docs/sandbox/escape-census.txt"
+
+          if [ ! -f "$report" ]; then
+            echo "::error::GV_ESCAPE_REPORT ($report) was not written — either no case ran, or the env var did not reach the test process. An unset variable must fail closed, per the contract (R5)."
+            exit 1
+          fi
+
+          grep -oE 'case=[^ ]+' "$report" | sed 's/^case=//' | sort -u > /tmp/got-ids.txt
+          sort -u "$census" > /tmp/want-ids.txt
+          if ! diff -q /tmp/got-ids.txt /tmp/want-ids.txt > /dev/null; then
+            echo "::error::$census and the report's case-id set differ (equality both directions, not a floor — a rename must break this build, not silently empty the gate):"
+            diff /tmp/got-ids.txt /tmp/want-ids.txt || true
+            exit 1
+          fi
+
+          absent=$(grep -c 'result=capability-absent' "$report" || true)
+          if [ "${absent:-0}" -ne 0 ]; then
+            echo "::error::${absent} case(s) recorded capability-absent on the gating runner — see the report:"
+            grep 'result=capability-absent' "$report"
+            exit 1
+          fi
+
+          echo "sandbox gate OK: $(wc -l < "$report") case record(s), census matched, zero capability-absent."
+
+  # ---------------------------------------------------------------------------
   # 2. Frontend: build the WASM bundle with Trunk.
   #
   # This is the closest CI gets to "the real app builds" — Trunk compiles the
