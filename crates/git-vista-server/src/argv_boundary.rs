@@ -136,7 +136,7 @@ fn launcher_sites_name_no_shell() {
     }
 }
 
-fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+pub(crate) fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("readable source dir") {
         let path = entry.expect("dir entry").path();
         if path.is_dir() {
@@ -204,7 +204,11 @@ fn every_process_spawn_site_is_allowlisted_and_spawns_only_git() {
 /// Without this, a prose sentence in a comment ("we no longer call
 /// `git_stdout(`…") would be counted as a call site — and a brace inside a
 /// string or comment would desynchronise the body extractor.
-fn code_only(src: &str) -> String {
+/// `#66` Task 25 (step 3) promotes this from private to `pub(crate)` so
+/// `sandbox::escape_contract`'s tripwires can reuse the same comment/string
+/// blanking this file's own scans rely on, rather than re-implementing it and
+/// risking the two copies drifting apart.
+pub(crate) fn code_only(src: &str) -> String {
     let c: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
     fn blank(out: &mut String, ch: char) {
