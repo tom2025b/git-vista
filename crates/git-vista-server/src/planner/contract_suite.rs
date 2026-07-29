@@ -404,10 +404,20 @@ async fn merge_branch_executes_through_the_pipeline() {
 
 /// Kills the fixture `git daemon` even when an assertion panics first — a
 /// leaked daemon would squat port 9418 and poison every later run.
+///
+/// It must kill the **process group**, not the child: `/usr/bin/git` forks
+/// `git-daemon` and exits (a live daemon shows PPID 1), so the `Child` this
+/// holds is only the short-lived wrapper and `Child::kill` would strike a
+/// corpse while the real daemon lives on. The spawn below puts the wrapper in
+/// its own group (`process_group(0)`), the daemon inherits it, and the
+/// wrapper's un-reaped zombie keeps the group id from being recycled until the
+/// `wait` here releases it.
 struct DaemonGuard(std::process::Child);
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
+        unsafe {
+            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+        }
         let _ = self.0.wait();
     }
 }
@@ -439,19 +449,27 @@ async fn push_branch_executes_through_the_pipeline() {
         "port 9418 is already in use — a leaked `git daemon` from an earlier \
          run? (`pgrep -af git-daemon`, kill it, rerun)"
     );
-    let daemon = std::process::Command::new("git")
-        .args([
-            "daemon",
-            "--reuseaddr",
-            "--listen=127.0.0.1",
-            "--port=9418",
-            "--export-all",
-            "--enable=receive-pack",
-            &format!("--base-path={}", dir.path().display()),
-        ])
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("git daemon spawns");
+    // `process_group(0)` — see `DaemonGuard`. Stdio all detached: an inherited
+    // stdout pipe would keep any harness capturing this test's output alive
+    // for as long as the daemon lives, turning a daemon leak into a hang.
+    let daemon = {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("git")
+            .args([
+                "daemon",
+                "--reuseaddr",
+                "--listen=127.0.0.1",
+                "--port=9418",
+                "--export-all",
+                "--enable=receive-pack",
+                &format!("--base-path={}", dir.path().display()),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("git daemon spawns")
+    };
     let _daemon = DaemonGuard(daemon);
     let ready = (0..50).any(|_| {
         std::net::TcpStream::connect(("127.0.0.1", 9418))
