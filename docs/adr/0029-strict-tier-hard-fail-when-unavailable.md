@@ -5,7 +5,7 @@
 - **Milestone / issue:** M1.13b — the Git-process sandbox (#66). Resolves
   INV-13, which the escape-battery anti-vacuity contract's ordered-work step 7
   listed as "BLOCKED ON TOM — not an agent's call"
-  (`design-docs/2026-07-29-escape-battery-anti-vacuity-contract.md`). Load-
+  (`docs/sandbox/escape-battery-anti-vacuity-contract.md`). Load-
   bearing for plan Tasks 8, 9 and 16
   (`docs/superpowers/plans/2026-07-28-m1.13b-sandbox.md`), none of which have
   landed as of this ADR.
