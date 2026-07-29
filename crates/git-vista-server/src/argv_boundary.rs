@@ -53,6 +53,11 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // even if the literal rule below were relaxed. It uses `.exec()`, never
     // `.spawn()`/`.output()`/`.status()`: it never becomes a parent.
     "src/bin/gv-sandbox.rs",
+    // The `#[cfg(test)]` harness that drives the composed launcher. It is also
+    // in `LAUNCHER_SPAWN_SITES` below, which exempts it from the literal-`git`
+    // rule and replaces that rule with "names no interpreter" — the program it
+    // runs is `Policy::shim`, an absolute path this crate resolved itself.
+    "src/sandbox/shim_cli.rs",
     // git-vista-git
     "src/history.rs", // read-side reflog/stash reads, static args
 ];
