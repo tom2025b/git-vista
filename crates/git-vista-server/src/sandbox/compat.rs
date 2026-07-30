@@ -1301,14 +1301,15 @@ mod contract {
             .collect()
     }
 
-    /// The `CompatCase` ids declared in the case region, in source order.
+    /// The `CompatCase` ids declared in this file, in source order.
     ///
-    /// Read off the *region*, not the whole file, so a stray `id: "…"` inside
-    /// the harness or a tripwire cannot pad the census. String literals survive
-    /// here because this scan reads the raw source rather than `code()`.
+    /// Read off the raw source, because the id *is* a string literal and
+    /// `code()` blanks those. The only `id: "…"` lines in the file are the case
+    /// constants — the struct's own field is `pub id: &'static str` and matches
+    /// nothing here — so this cannot be padded by the harness or the tripwires
+    /// without a deliberate edit that a reviewer sees in the same diff as the
+    /// census it would be padding.
     fn declared_ids() -> Vec<String> {
-        let region_len = case_region().len();
-        let _ = region_len; // the region is used for the R1 scan; ids come from the raw text
         let raw = source();
         let mut ids = Vec::new();
         for line in raw.lines() {
@@ -1339,7 +1340,11 @@ mod contract {
                  of them to review."
             );
         }
-        for banned in ["assert", "eprintln", "println", "unwrap", "expect"] {
+        // Substring needles rather than tokens, because these are the shapes an
+        // acceptance condition or an escape hatch takes. `.expect(`/`.unwrap(`
+        // carry the leading dot so the declarative field names
+        // `expect_commit_code`/`expect_commit` are not mistaken for them.
+        for banned in ["assert", "eprintln", "println", ".unwrap(", ".expect("] {
             assert!(
                 !region.contains(banned),
                 "compat.rs: `{banned}` found outside `mod harness`/`mod contract` (R1)"
@@ -1445,7 +1450,7 @@ mod contract {
              through `spawn::command_async`, which is what makes a compat claim a claim \
              about the shipped launcher (R6)"
         );
-        for banned in ["shim_cli::launch", "shim_cli::workable", "Policy {"] {
+        for banned in ["shim_cli::launch", "shim_cli::workable"] {
             assert!(
                 !code.contains(banned),
                 "compat.rs: `{banned}` is not a route this file may take (R6). A compat \
@@ -1453,6 +1458,17 @@ mod contract {
                  proves nothing about the shipped configuration."
             );
         }
+        // A `Policy` *literal* would be a second policy builder wearing a
+        // different hat. `-> Policy {` is a function signature, not a
+        // construction, and is subtracted rather than special-cased away.
+        let literal = ["Policy", " {"].concat();
+        let signature = ["-> Policy", " {"].concat();
+        assert_eq!(
+            code.matches(&literal).count() - code.matches(&signature).count(),
+            0,
+            "compat.rs: a `Policy` literal here is a compat-only policy — R3'/R6 require \
+             the inside leg to run under the same constructor the escape battery uses"
+        );
         assert!(
             code.contains("command_async(policy, cwd, args)"),
             "compat.rs: the single spawn helper must call `command_async` (R6)"

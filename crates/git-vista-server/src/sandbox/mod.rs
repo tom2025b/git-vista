@@ -56,6 +56,14 @@ pub(crate) mod worktree;
 
 #[cfg(test)]
 mod argv;
+/// #66 / #200 (plan Task 14): the **compatibility** battery — the mirror of the
+/// escape battery. Every case is a real `git commit` run twice over one
+/// fixture, once at `Tier::Unsandboxed` and once at `Tier::Strict`, so a pass
+/// is attributable to the policy rather than to git working regardless. Its
+/// census is `docs/sandbox/compat-census.txt`, kept separate from the escape
+/// census — see its own module doc for why.
+#[cfg(test)]
+mod compat;
 #[cfg(test)]
 mod deps;
 #[cfg(test)]
