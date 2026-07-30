@@ -110,10 +110,12 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // even if the literal rule below were relaxed. It uses `.exec()`, never
     // `.spawn()`/`.output()`/`.status()`: it never becomes a parent.
     "src/bin/gv-sandbox/main.rs",
-    // The `#[cfg(test)]` harness that drives the composed launcher. It is also
-    // in `LAUNCHER_SPAWN_SITES` below, which exempts it from the literal-`git`
-    // rule and replaces that rule with "names no interpreter" — the program it
-    // runs is `Policy::shim`, an absolute path this crate resolved itself.
+    // (An orphaned paragraph describing `shim_cli.rs` — "the `#[cfg(test)]`
+    // harness that drives the composed launcher" — used to sit here, left
+    // behind when that entry was removed. `shim_cli.rs` constructs no
+    // `Command`: it composes argv and hands it to `sandbox::spawn`. A comment
+    // with no entry under it is worse than none, because the next reader
+    // attaches it to whichever entry follows.)
     // The `#[cfg(test)]` escape battery. It launches the composed launcher via
     // shim_cli, and separately runs the C compiler to build the adversarial
     // probes it feeds in as hostile hooks. Also in LAUNCHER_SPAWN_SITES.
@@ -125,6 +127,15 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // — it never compiles or execs anything client-influenced. Also in
     // LAUNCHER_SPAWN_SITES for the same `cc` reason as escape_suite.rs above.
     "src/sandbox/escape_contract.rs",
+    // Deliberately absent: `src/sandbox/documented_gaps.rs` and
+    // `src/sandbox/lifecycle.rs`, the suites #66's Task 15 round adds beside
+    // this one. `documented_gaps.rs` exists and constructs no `Command` at all,
+    // so an entry for it would be a permission with nothing behind it;
+    // `lifecycle.rs` did not exist when this list was last reviewed, so nobody
+    // has read the spawn it may or may not contain. Neither was pre-added on
+    // purpose — see `every_allowlist_entry_names_a_live_spawn_site` below for
+    // why an entry written ahead of its file is the failure mode this list is
+    // supposed to prevent, not a convenience.
     // git-vista-git
     // `#[cfg(test)]` fixture setup only. This entry used to read "read-side
     // reflog/stash reads, static args"; that is stale — the crate's production
@@ -145,12 +156,15 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
 /// `launcher_sites_name_no_interpreter` below: a launcher site may name a
 /// non-literal program, but it must never name a shell or interpreter.
 ///
-/// Keep this list at one entry if at all possible. Every addition widens the
-/// only hole in the tripwire.
+/// Keep this list as short as possible. Every addition widens the only hole in
+/// the tripwire. It stands at three: one production chokepoint (`spawn.rs`) and
+/// two `#[cfg(test)]` harnesses that need `cc`. (This doc used to say "keep
+/// this list at one entry", written when it held one; leaving that in while the
+/// list grew to three turned a live budget into a slogan nobody could act on.)
 const LAUNCHER_SPAWN_SITES: &[&str] = &[
-    // The `#[cfg(test)]` harness that drives the composed launcher. Its
-    // `Command::new(&argv[0])` is `Policy::shim`, resolved by this crate
-    // through `sandbox::shim` (absolute, existence-checked, never PATH).
+    // (As in `ALLOWED_SPAWN_SITES` above, an orphaned paragraph about
+    // `shim_cli.rs` was left here when that entry was removed. It is gone: the
+    // file constructs no `Command`.)
     // The `#[cfg(test)]` escape battery. It launches the composed launcher and
     // also runs `cc` to compile the adversarial probes it feeds in as hooks.
     // `cc` is not an interpreter of *its* arguments the way a shell is — it
