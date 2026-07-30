@@ -468,12 +468,26 @@ struct GitProtocolPort {
 }
 
 impl GitProtocolPort {
-    /// How long the accept thread will wait for the baseline leg's connect
-    /// before giving up on its own. Generous — `execute` compiles two C probes
-    /// and runs a `git commit` before the probe ever connects — but finite, so
-    /// a forgotten thread cannot outlive the run even if the lease itself is
-    /// leaked.
-    const ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+    /// The accept loop has **no wall-clock deadline**, deliberately.
+    ///
+    /// An earlier version gave it 60 s "so a forgotten thread cannot outlive the
+    /// run." That was the wrong trade, and it recreated the disease this whole
+    /// contract exists to prevent. Between the moment this binds and the moment
+    /// the baseline leg connects, `execute` builds two fixture repositories,
+    /// compiles a C probe, and runs a `git commit` — and on a loaded host (the
+    /// mutation matrix rebuilds two crates seven times while this can be
+    /// running) that window can exceed any constant someone picks. If the
+    /// deadline fires first, the listener closes early, the baseline connect
+    /// gets `ECONNREFUSED` instead of the expected `0`, the case reports
+    /// `CapabilityAbsent`, and it proves nothing. A timeout that turns a slow
+    /// machine into a silently vacuous security test is worse than no timeout.
+    ///
+    /// The thread's lifetime is already bounded by ownership, which is the
+    /// honest mechanism: the lease is held for exactly the body of `execute`,
+    /// and `Drop` sets the stop flag and **joins** the thread before releasing
+    /// the port claim. A leaked lease is the only way this thread could outlive
+    /// the run, and a leaked lease would hold the `PortClaim` mutex too — which
+    /// the next claimant reports loudly rather than hanging on silently.
     const POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
     fn claim(use_: GitPortUse) -> Option<Self> {
@@ -493,8 +507,7 @@ impl GitProtocolPort {
                 .expect("non-blocking listener");
             let stop_thread = std::sync::Arc::clone(&stop);
             let accepting = std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + Self::ACCEPT_DEADLINE;
-                while !stop_thread.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                while !stop_thread.load(Ordering::Relaxed) {
                     match listener.accept() {
                         // Serve exactly one connection, then drop the listener
                         // — the baseline leg's connect has landed and the port
@@ -644,15 +657,50 @@ fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
 }
 
 /// The chokepoint (R11): every `#[test]` body in the battery is exactly this
-/// call. It always returns a value (R4 — no early `return`, no panic on
-/// absence), always records (R5) before ever failing loudly, and only raises
-/// an assertion failure for a genuine `Escaped` outcome.
+/// call. It always records (R5) before ever failing loudly, and it fails loudly
+/// for **both** ways a case can stop proving something.
+///
+/// # Why `CapabilityAbsent` panics too
+///
+/// It did not, and that silence hid a vacuous case for an unknown number of
+/// runs. `strict_tcp_bind_denied`'s baseline leg binds a fixed port to
+/// establish the capability; a TIME-WAIT socket left by *any* other test that
+/// touched that port made the bind return `EADDRINUSE` instead of the expected
+/// `0`, which `execute` reports as `CapabilityAbsent`. `run_case` then returned
+/// it quietly, `cargo test` printed `ok`, and the case asserted **nothing about
+/// containment** — the exact disease this contract exists to prevent, wearing
+/// the costume of a skip.
+///
+/// The reason a skip looked defensible was "the host might not be able to
+/// demonstrate this." That is no longer true here:
+/// `ci_preflight_host_meets_the_declared_minimum` asserts the landlock floor,
+/// `bwrap`, unprivileged userns, io_uring, and a runnable `cc` *before* any
+/// case runs. Once the preflight passes, every capability the battery needs is
+/// present — so a `CapabilityAbsent` from a case is a defect in the harness (a
+/// contended port, a listener closed too early, a fixture that did not build),
+/// not a fact about the host. A harness defect must fail the run, because a
+/// green test that proved nothing is worse than a red one.
+///
+/// R4 is unaffected: capability is still established only by *executing* the
+/// baseline leg, never by probing the host and branching. This changes what
+/// happens when that execution does not establish it, not how it is
+/// established. `GV_ESCAPE_REPORT` still records the outcome first, so the
+/// report and the mutation matrix (which already scores `capability-absent` as
+/// a non-PASS) keep seeing exactly what happened.
 pub(crate) fn run_case(case: &EscapeCase) -> Outcome {
     let nonce = fresh_nonce();
     let outcome = execute(case, &nonce);
     report(case, &outcome);
-    if let Outcome::Escaped { detail } = &outcome {
-        panic!("{}: ESCAPED — {detail}", case.id);
+    match &outcome {
+        Outcome::Escaped { detail } => panic!("{}: ESCAPED — {detail}", case.id),
+        Outcome::CapabilityAbsent { missing, .. } => panic!(
+            "{}: proved NOTHING — {missing}.\nThe CI preflight already asserts this host \
+             supplies every capability the battery needs, so this is a harness defect, not \
+             a host limitation. Fix the harness; do not silence this. (See run_case's doc \
+             comment for why this is a hard failure rather than a skip.)",
+            case.id
+        ),
+        Outcome::Contained => {}
     }
     outcome
 }
