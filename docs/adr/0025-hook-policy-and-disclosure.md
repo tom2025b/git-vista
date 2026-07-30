@@ -227,3 +227,33 @@ which one is currently in effect.
 - `crates/git-vista/src/hook_policy_banner.rs` — the persistent banner view.
 - `crates/git-vista/src/app/mod.rs` — mounted alongside the other top-level,
   session-driven notices (`update_required_view`, `not_connected_view`).
+
+## Amendment (2026-07-30, M1.13b)
+
+M1.13b (#66) built the enforcement half this ADR's "What this decision does
+not do" section named as future work, and it changed two things this record
+originally shipped. Recorded here, append-only — the text above is left as
+written.
+
+1. **`HookPolicy` widened from two variants to four.** `Allow`/`Restricted`
+   named a permission, not a mechanism; once a real sandbox existed, "allow"
+   and "restricted" were not the only outcomes a repository could report.
+   The wire type now names the sandbox's own tiers directly —
+   `Strict`/`Network`/`Unsandboxed` — plus `Blocked` for "hooks are not known
+   to be running." The old wire strings (`allow`, `restricted`) still
+   deserialize via `#[serde(alias = ...)]`; nothing emits them again.
+2. **`CapabilityAbsent`/`FailOpen` refuse the operation; they do not map to
+   `HookPolicy::Blocked`.** A host that cannot supply the tier a repository's
+   operation needs returns an error, not a policy value that claims hooks
+   ran (or didn't) under some guarantee nothing measured — the
+   degrade-and-block-hooks posture the M1.13b plan initially proposed and
+   ADR 0029 rejects by name. `sandbox::hook_policy`'s own tests assert this
+   directly (`capability_absent_refuses_and_never_becomes_blocked`).
+
+See [0029](0029-strict-tier-hard-fail-when-unavailable.md) for the refusal
+decision in full and [0030](0030-git-process-sandbox.md) for the whole-sandbox
+record this amendment is a footnote to.
+
+---
+
+**Signed:** thomas2025 · 2026-07-30T17:58:03-04:00
