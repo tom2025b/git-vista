@@ -73,7 +73,7 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // in production (every real boot), not only under `#[cfg(test)]` — the
     // whole point of a boot gate is that it runs for real.
     "src/sandbox/probe.rs",
-    "src/journal.rs",         // #[cfg(test)] fixture setup
+    "src/journal.rs", // #[cfg(test)] fixture setup
     // `git rev-parse --absolute-git-dir` (static args, read-only). The
     // production call (`absolute_git_dir`) now goes through
     // `crate::git_cmd::git_output` (#66 Task 6); this entry now covers only

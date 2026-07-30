@@ -138,6 +138,20 @@ async fn main() {
     std::env::set_var("GIT_TERMINAL_PROMPT", "0");
     std::env::set_var("GIT_EDITOR", "true");
 
+    // M1.13b (#66) Task 9 — INV-13 / Global Constraint 15's boot gate. This
+    // must run before ANYTHING in this process spawns a git process — the
+    // whole point of the gate is that a host whose sandbox does not actually
+    // compose never executes a byte of repository content, and
+    // `durable::recover()` a little further down is exactly such a spawn (it
+    // writes recovery refs via the sandboxed launcher). So this sits here,
+    // ahead of every catalog registration and ahead of `durable::recover()`,
+    // not merely ahead of the listener binds. There is no degrade: a verdict
+    // other than `Contained` means no server, full stop (ADR 0029).
+    if let Err(refusal) = sandbox::probe::run_at_startup().await {
+        eprintln!("error: {refusal}");
+        std::process::exit(1);
+    }
+
     // Resolve which repo to serve: first CLI arg, else the default checkout.
     // Canonicalise so relative paths (e.g. `.`) and the banner are absolute; if
     // that fails (path missing) keep the raw value so the error is reported.
