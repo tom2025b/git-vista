@@ -15,22 +15,12 @@
 //! the Active option on a LAN session. This is a UI signal only: the LAN
 //! router's write routes are structurally absent regardless (main.rs).
 //!
-//! Every response also carries `hook_policy` (M1.13a, #66, ADR 0025) —
-//! `Restricted` when `via_lan` is true, `Allow` otherwise. **That mapping is
-//! now stale**: `HookPolicy` widened to the four sandbox tier names in M1.13b
-//! Task 16 and `via_lan` no longer selects a tier at all. See
-//! [`hook_policy_for`]'s own doc comment for what is true instead, why the
-//! correction is blocked, and why plan Task 16.5's proposed replacement is
-//! itself wrong. The paragraph below records ADR 0025's original reasoning,
-//! which is history now rather than current behaviour. `via_lan` is the
-//! closest **existing** session distinction to `SECURITY_MODEL.md:236`'s
-//! "Team mode should default to restricted" — a LAN-view session already
-//! carries reduced trust (single-use bootstrap token, rate-limited,
-//! read-scoped by the router's own absent write routes). This is a
-//! deliberate stand-in, not a real implementation of "Team mode" (which
-//! does not exist in this codebase yet — see ADR 0025); when Team mode is
-//! actually built, its own default plugs into the same [`HookPolicy`] type
-//! and this mapping does not need to change.
+//! Every response also carries `hook_policy` (M1.13a, #66, ADR 0025; corrected
+//! by #202). It is now the **measured** policy for the current selection — see
+//! [`session_hook_policy_for`] — not a function of `via_lan`. ADR 0025's
+//! original `via_lan → Restricted/Allow` mapping was a stand-in adopted when the
+//! server had no real hook policy to report at all; M1.13b gave it one, and that
+//! stand-in became a wrong answer rather than a placeholder. It is gone.
 //!
 //! The cookie is **not** `Secure`: the supported modes (Local, SSH tunnel, LAN
 //! view) all serve plain HTTP, where a `Secure` cookie would simply be dropped.
@@ -49,6 +39,8 @@ use axum::{
 use git_vista_protocol::{HookPolicy, SessionInfo, SessionRequest};
 
 use crate::ratelimit::SignInLimiter;
+use crate::sandbox::hook_policy::hook_policy_for_repo;
+use crate::sandbox::probe::ProbeVerdict;
 use crate::security::cookie_value;
 use crate::session::{SessionManager, SESSION_COOKIE, SESSION_MAX_AGE_SECS};
 
@@ -62,62 +54,101 @@ pub(crate) struct SessionState {
     pub rate_limiter: Option<Arc<SignInLimiter>>,
 }
 
-/// The hook policy a session discloses (M1.13a, #66, ADR 0025) — see this
-/// module's own doc comment for why `via_lan` is the chosen stand-in.
+/// The hook policy a session discloses: the **real** per-repository policy for
+/// the current selection, measured the same way the git-spawn chokepoint
+/// measures it.
 ///
-/// # STALE, and knowingly left so — M1.13b Task 16.5 is blocked
+/// # What replaced `hook_policy_for(via_lan)`, and why it had to go
 ///
-/// This mapping is ADR 0025's, unchanged, and it is **no longer true**. It is
-/// spelled with `HookPolicy::{Restricted, Allow}` — the transition aliases
-/// `git-vista-protocol` kept when `HookPolicy` widened to the four tier names —
-/// precisely so a reader sees an un-migrated value rather than a decided one.
-/// What it now puts on the wire is `"strict"` for a LAN session and
-/// `"unsandboxed"` for a loopback session.
+/// The previous mapping was ADR 0025's: `Restricted` for a LAN session, `Allow`
+/// for a loopback one. After `HookPolicy` widened to the sandbox's own tier
+/// names those two constants resolved to `Strict` and `Unsandboxed`, which made
+/// the LAN branch actively harmful rather than merely stale:
+/// [`HookPolicy::Strict`] is the **one** variant that silences INV-15's banner
+/// ([`HookPolicy::requires_banner`]). So the least-trusted session shape — the
+/// one reached from another machine on the network — was the only one
+/// guaranteed to show the user nothing, no matter what policy its repository
+/// actually ran under. A repository the operator had explicitly trusted to run
+/// **unsandboxed** disclosed "strict" to a LAN client. That is precisely the
+/// failure INV-15 names: a policy computed but not disclosed is worse than none,
+/// because it manufactures the appearance of a safety property.
 ///
-/// **What is actually true after Task 8.** Every git spawn funnels through
-/// `sandbox::policy_for`, whose tier comes from `sandbox::tier_for(need,
-/// trusted)`. `via_lan` is not one of its inputs and never reaches it: a local
-/// operation on an untrusted repository is `Tier::Strict` on *both* routers, a
-/// remote one is `Tier::Network` on both, and only per-repository operator
-/// trust yields `Tier::Unsandboxed`. So the session-level answer for both
-/// routers today is `HookPolicy::Strict`, and the loopback value here
-/// over-warns (the banner shows when it need not) rather than under-warns —
-/// the safe direction to be wrong in, which is the only reason leaving it is
-/// tolerable at all.
+/// # What a LAN session should disclose
 ///
-/// **Why it was not corrected here.** Two blockers, both outside this change's
-/// file ownership:
+/// The same thing every other session discloses, and the reasoning is short.
+/// Disclosure reports what enforcement *does*; it is not a lever for expressing
+/// what we wish enforcement did. `via_lan` is not an input to
+/// `sandbox::tier_for` and never reaches `sandbox::policy_for` — a local
+/// operation on an untrusted repository is `Tier::Strict` on both listeners, a
+/// remote one is `Tier::Network` on both, and only per-repository operator trust
+/// yields `Tier::Unsandboxed`. Two listeners, one dispatch. Any router-dependent
+/// answer here would therefore be a claim about a distinction the enforcement
+/// path does not make.
 ///
-/// * `crate::state` has no `sandbox_verdict()`. Plan Task 16.5 reads the boot
-///   probe's verdict from process state; `probe::run_at_startup` computes one
-///   but nothing stores it, and `state.rs` was not in scope.
-/// * `security.rs`'s `hook_policy_is_disclosed_over_the_wire_and_differs_by_router`
-///   asserts this exact stale mapping through the real router. Its *premise* —
-///   that the two routers disclose different policies — is what Task 8 falsified,
-///   so any honest correction here turns that test red. Rewriting it belongs
-///   with the correction, in one edit, not split across two lanes.
+/// The intuition behind ADR 0025's stand-in — "the less-trusted session should
+/// see the more conservative value" — is not wrong, it is *misplaced*: it is an
+/// argument for LAN sessions getting a stricter **tier**, which is a change to
+/// `tier_for` (and a future Team-mode ADR), not a change to what we report.
+/// Reporting a stricter tier than is enforced would be the same lie in the
+/// opposite direction, and — as above — it lands on the exact value that
+/// silences the warning. If reduced LAN trust should mean something, it must
+/// mean it in `sandbox::tier_for` first, and this function will then report it
+/// for free.
 ///
-/// **And plan Task 16.5's own replacement is wrong too — do not paste it.** It
-/// maps `Contained && via_lan` to `HookPolicy::Network`, calling that
-/// "narrowed... for reduced trust." `Network` is the *weaker* tier: it is
-/// Landlock + seccomp with no network namespace and outbound TCP permitted on
-/// `DEFAULT_GIT_PORTS`, whereas `Strict` adds pid/net/ipc/uts/cgroup namespaces
-/// and no network at all. Handing the less-trusted LAN session the tier with
-/// egress inverts the intent it cites ADR 0025 for.
+/// Note the direction the fix moves the banner: a LAN session viewing a trusted
+/// repository now *gains* a banner it never had. That is the point of the fix,
+/// not a side effect of it.
 ///
-/// The correct replacement, once a `sandbox_verdict()` exists and `security.rs`
-/// can be edited in the same change: `Contained` → `HookPolicy::Strict` for
-/// both routers (the session *floor* — what a local operation would get),
-/// leaving genuine divergence to the per-repository value
-/// (`sandbox::hook_policy::hook_policy_for_repo`), which is where INV-15 says
-/// disclosure actually belongs; and a non-`Contained` verdict → no session at
-/// all, because the boot gate already exited the process (INV-13 / ADR 0029).
-fn hook_policy_for(via_lan: bool) -> HookPolicy {
-    if via_lan {
-        HookPolicy::Restricted
-    } else {
-        HookPolicy::Allow
-    }
+/// # Known gap: this is a snapshot of the current selection
+///
+/// `POST /api/select` can move the selection without the client re-fetching
+/// `/api/session`, so this value can go stale mid-session. Named rather than
+/// papered over. The non-stale, per-repository disclosure is
+/// [`git_vista_protocol::RepositoryDescriptor::hook_policy`], which the client
+/// refetches with the catalog and which INV-15 treats as the authoritative
+/// per-repository answer; this session-level field is the coarse "what am I
+/// looking at right now" signal the persistent banner keys on.
+fn session_hook_policy() -> HookPolicy {
+    session_hook_policy_for(
+        crate::state::current_path_if_set().as_deref(),
+        crate::sandbox::probe::boot_verdict(),
+    )
+}
+
+/// [`session_hook_policy`] with both process-globals hoisted into parameters,
+/// so the mapping is testable without a booted server or a process-wide
+/// selection.
+///
+/// **It takes no `via_lan`, and that absence is the fix**: there is no input by
+/// which a LAN session can be handed a different — in particular, a
+/// banner-silencing — answer than a loopback one.
+///
+/// # Both `None` arms, and the refusal, fold to `HookPolicy::default()`
+///
+/// [`HookPolicy::default`] is [`HookPolicy::Blocked`], documented in the
+/// protocol crate as the value meaning *"hooks are not known to be running"* —
+/// which is exactly the state here: no verdict measured, no repository
+/// selected, or the host refusing the operation outright (INV-13 / ADR 0029).
+/// It flies the banner, which is the only property that must hold. Deliberately
+/// **not** [`HookPolicy::Strict`]: that is the one value that claims a guarantee
+/// *and* goes silent, so defaulting to it would turn "we don't know" into an
+/// unearned green light — the same mistake the old LAN branch made.
+///
+/// None of these arms is reachable in a live server: `main` gates boot on the
+/// probe and sets the selection before any listener binds. They exist because a
+/// total function with an honest worst case is better than an `expect()` on a
+/// network-reachable path.
+fn session_hook_policy_for(
+    repo: Option<&std::path::Path>,
+    verdict: Option<&ProbeVerdict>,
+) -> HookPolicy {
+    let (Some(repo), Some(verdict)) = (repo, verdict) else {
+        return HookPolicy::default();
+    };
+    hook_policy_for_repo(repo, verdict).unwrap_or_else(|refused| {
+        eprintln!("git-vista: session discloses no hook policy — {refused}");
+        HookPolicy::default()
+    })
 }
 
 /// `POST /api/session`: exchange a bootstrap token for a session cookie.
@@ -147,7 +178,7 @@ pub(crate) async fn create_session(
                     authenticated: true,
                     csrf: Some(session.csrf),
                     via_lan: state.via_lan,
-                    hook_policy: hook_policy_for(state.via_lan),
+                    hook_policy: session_hook_policy(),
                 }),
             )
                 .into_response()
@@ -173,7 +204,7 @@ pub(crate) async fn session_status(
         authenticated: csrf.is_some(),
         csrf,
         via_lan: state.via_lan,
-        hook_policy: hook_policy_for(state.via_lan),
+        hook_policy: session_hook_policy(),
     })
     .into_response()
 }
@@ -196,7 +227,7 @@ pub(crate) async fn revoke_session(
             authenticated: false,
             csrf: None,
             via_lan: state.via_lan,
-            hook_policy: hook_policy_for(state.via_lan),
+            hook_policy: session_hook_policy(),
         }),
     )
         .into_response()
