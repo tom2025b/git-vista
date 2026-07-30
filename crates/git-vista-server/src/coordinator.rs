@@ -97,9 +97,10 @@ pub(crate) async fn lock(repo: Option<RepositoryId>) -> OwnedMutexGuard<()> {
 /// The path is resolved with `git rev-parse --absolute-git-dir` rather than
 /// assumed to be `<repo>/.git`: a linked worktree's git dir lives under the
 /// common directory and keeps its own index (and so its own `index.lock`),
-/// while `.git` in that worktree is a *file* pointing there. A path whose git
-/// dir cannot be resolved is left alone — the planner's own stages surface
-/// git's error for something that isn't a repository.
+/// while `.git` in that worktree is a *file* pointing there. A path git itself
+/// reports is not a repository is left alone — the planner's own stages surface
+/// git's error for it. A path where git could not be *run* is refused instead;
+/// see the `Err` arm below for why those two had to stop sharing an answer.
 pub(crate) async fn refuse_if_git_busy(repo: &Path) -> Option<(StatusCode, String)> {
     match absolute_git_dir(repo).await {
         // git could not be run (D5, #66 Task 19). This preflight had the same
