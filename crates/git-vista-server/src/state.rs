@@ -284,17 +284,55 @@ pub(crate) fn current_handle() -> Option<RepositoryHandle> {
         .handle
 }
 
-/// D2 (#66, Task 7): whether `path` is registered in the catalog as a
-/// read-only entry — the signal `sandbox::policy_for` uses to withhold the
-/// sandbox's write grant, independent of the live selection's mode
-/// ([`reject_if_read_only`]'s own signal; see `policy_for`'s doc comment for
-/// why the two are deliberately separate checks). `false` for any path with
-/// no matching catalog entry: an unregistered path — a test fixture spawning
-/// git against its own throwaway `tempdir()`, a clone destination not yet
-/// registered, a degraded-mode selection — carries no read-only record, so
-/// it gets exactly the "nothing restricts this" answer it always got before
-/// D2 introduced the check at all.
+/// D2 (#66, Task 7): whether `path` should get the sandbox's write grant
+/// withheld — the signal `sandbox::policy_for` uses.
+///
+/// **Decision 2026-07-30 (design-docs/2026-07-30-read-only-vs-mode-conflict.md,
+/// Option A):** this must agree with [`reject_if_read_only`], not diverge from
+/// it. An earlier version of this function answered from the catalog's
+/// static, registration-time `read_only` flag instead — reasoned as "defense
+/// in depth" against a hypothetical bug in the app-level gate, but it silently
+/// reintroduced exactly the always-read-only-clone posture ADR 0007 already
+/// considered and rejected: *"a clone opened in active mode accepts local
+/// writes... `RepoEntry.read_only` is superseded."* The visible bug that
+/// exposed the divergence: reselecting a clone into Active mode passed
+/// `reject_if_read_only` (mode says Active) and then failed writes two layers
+/// down with a raw sandbox permission error, because this function still said
+/// read-only. Mode is the single source of truth; there must be only one.
+///
+/// For `path` equal to the current selection **at the moment this is called**,
+/// this is exactly `current_mode() == Visualize` — the same value [`current`]'s
+/// compat bool already returns. For any other path (including when `CURRENT`
+/// has not been initialized at all — most of this crate's ~40 spawn-focused
+/// unit tests deliberately run git against their own throwaway `tempdir()`
+/// with no `set_current`/catalog registration whatsoever, by design; see
+/// `sandbox::policy_for`'s doc comment), this falls back to the catalog's
+/// record, same as before D2. The grant only matters for writes, and reads
+/// don't care whether they get an `rw_trees` or `ro_trees` grant.
+///
+/// **Known residual gap, not closed by this function alone (adversarial
+/// review, 2026-07-30):** this reads `CURRENT` fresh at call time, not at the
+/// moment a write request's target was resolved. Between
+/// `state::resolve_target()` capturing "repo B, Active" for an in-flight
+/// mutation and that mutation's eventual `git_cmd::sandboxed` spawn — real
+/// `.await` points sit in between (durable persistence, task admission) — a
+/// *different* request can reselect `CURRENT` to repo C. The in-flight write
+/// to B then finds `CURRENT.path != B` here, falls through to the catalog,
+/// and can get spuriously denied by a stale flag even though B was
+/// legitimately Active when the write was authorized. This is **fail-closed
+/// only** (a legitimate write can be wrongly refused; nothing insecure can
+/// succeed) — same-path mode flips, the case this fix targets and the
+/// regression test proves, are unaffected. Closing it properly means
+/// `resolve_target` capturing `read_only` alongside the path and threading
+/// that snapshot through to `sandbox::policy_for` instead of re-deriving it
+/// here at spawn time; not done tonight — named so it isn't silently lost.
 pub(crate) fn read_only_for_path(path: &Path) -> bool {
+    if let Some(lock) = CURRENT.get() {
+        let g = lock.read().expect("CURRENT lock not poisoned");
+        if g.path == path {
+            return g.mode == RepoMode::Visualize;
+        }
+    }
     catalog()
         .read()
         .expect("catalog lock")
@@ -645,6 +683,22 @@ mod tests {
             .success());
         set_current(&clone_dir, RepoMode::Visualize); // registers, like /api/clone
         let clone_wt = current_handle().expect("clone registered").worktree;
+
+        // --- 2026-07-30 (design-docs/2026-07-30-read-only-vs-mode-conflict.md, ---
+        // --- Option A): reselecting a clone into Active mode must actually ------
+        // --- make it writable — ADR 0007, not a stale catalog snapshot. --------
+        assert!(
+            read_only_for_path(&clone_dir),
+            "a clone just registered in Visualize mode reads read-only"
+        );
+        assert!(select_registered(clone_wt, RepoMode::Active));
+        assert!(
+            !read_only_for_path(&clone_dir),
+            "reselecting the SAME clone into Active mode must lift the sandbox's \
+             write grant, not silently keep it read-only underneath a gate that \
+             already says writes are allowed"
+        );
+        assert!(select_registered(clone_wt, RepoMode::Visualize)); // restore for the flow below
 
         // The currently open clone is not deletable (the server would be
         // serving a removed directory).

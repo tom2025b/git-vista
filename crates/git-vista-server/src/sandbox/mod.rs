@@ -610,19 +610,35 @@ pub(crate) fn tier_for(need: NetworkNeed, trusted: bool) -> Tier {
 /// # `read_only` withholds the write grant (D2's actual behavioural change)
 ///
 /// Before D2 this function granted `repo` (and any resolved worktree
-/// commondir) read-write **unconditionally** — the catalog's own
-/// `read_only` flag (a clone opened look-only) was never consulted at the
-/// sandbox layer at all, only by the application-level `reject_if_read_only`
-/// gate. That gate and this one are independent signals: `reject_if_read_only`
-/// keys off the *current selection's live mode* (`RepoMode`, toggled per
-/// request via `/api/select`), while `read_only` here comes from the
-/// *catalog's own record* for whichever path the caller names — which can
-/// diverge from the live mode (re-selecting a clone into Active mode changes
-/// the mode without updating the catalog entry). A `read_only == true` path
-/// therefore gets **no RW grant at all**: `repo` and any resolved worktree
-/// commondir go into `ro_trees` instead of `rw_trees`. This is genuine
-/// defense in depth, not a duplicate of the app-layer gate — it holds even if
-/// that gate has a bug, or a future code path forgets to call it.
+/// commondir) read-write **unconditionally**. A `read_only == true` path now
+/// gets **no RW grant at all**: `repo` and any resolved worktree commondir go
+/// into `ro_trees` instead of `rw_trees`.
+///
+/// **`read_only` and `reject_if_read_only` must agree — they are the same
+/// fact, checked twice, not two independent signals.** An earlier version of
+/// this comment argued the opposite: that `state::read_only_for_path` should
+/// key off the catalog's own static record rather than the current
+/// selection's live mode, as "defense in depth... it holds even if
+/// [`reject_if_read_only`] has a bug." That reasoning silently reintroduced
+/// the always-read-only-clone posture ADR 0007 already considered and
+/// rejected (*"a clone opened in active mode accepts local writes...
+/// `RepoEntry.read_only` is superseded"*), and it shipped a real bug:
+/// reselecting a clone into Active mode passed the app-level gate and then
+/// failed writes here anyway, with a raw sandbox error instead of a clean
+/// refusal or an actual success. Decided 2026-07-30, Option A of
+/// `design-docs/2026-07-30-read-only-vs-mode-conflict.md`: mode is the single
+/// source of truth. `state::read_only_for_path` now derives its answer from
+/// live mode for the current selection, read at call time — the same one
+/// `reject_if_read_only` reads, not a second, independently-drifting record.
+///
+/// **Not a closed race, though — see `read_only_for_path`'s own doc comment.**
+/// "At call time" is doing real work in that sentence: a write's target is
+/// captured once, early, but this function (and the `read_only` it's handed)
+/// runs later, after real `.await` points, so a *concurrent* reselection to a
+/// different repo in between can make this fall back to the catalog's stale
+/// flag for the original repo. Fail-closed only (a legitimate write can be
+/// wrongly refused; never the reverse) and narrow — same-path mode flips,
+/// what this fix targets, are unaffected — but real, and not fixed tonight.
 ///
 /// # `need` is accepted but not yet consulted — tier is `Network` for now
 ///
