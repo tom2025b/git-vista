@@ -268,15 +268,23 @@ pub(crate) async fn resolve_commit_oid(
         return Ok(oid);
     }
     match rev_parse(repo, given).await {
-        Some(full) => CommitOid::new(full).map_err(|e| {
+        Ok(Some(full)) => CommitOid::new(full).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("git rev-parse returned an unusable id: {e}"),
             )
         }),
-        None => Err((
+        // git ran and refused the name: the request is wrong. 400, git's words.
+        Ok(None) => Err((
             StatusCode::BAD_REQUEST,
             format!("fatal: not a valid object name: '{given}'"),
+        )),
+        // D5: git never ran, so nothing was refused. Telling the user their
+        // object name is invalid would be a claim we have no evidence for —
+        // and it would send them to fix a request that is probably fine.
+        Err(e) => Err(couldnt_run(
+            "resolve_commit_oid",
+            &format!("couldn't resolve ‘{given}’: {e}"),
         )),
     }
 }
@@ -653,6 +661,22 @@ async fn enforce_fresh(
     observed: &Observed,
 ) -> Result<(), (StatusCode, String)> {
     let live = observe_live(repo).await;
+    // D5: an observation that never happened cannot certify freshness. The
+    // generation digest already fails closed here — `Obs::Unknown` carries a
+    // nonce, so an unknown on either side makes the tokens differ — but that
+    // refusal would say "the repository changed", which is a claim about the
+    // repository we are in no position to make. Say what actually happened.
+    let unknown = observed.head_tip.is_unknown()
+        || observed.status.is_unknown()
+        || live.head_tip.is_unknown()
+        || live.status.is_unknown();
+    if unknown {
+        return Err(couldnt_run(
+            "staleness gate",
+            &"couldn't read the repository's state, so this plan cannot be \
+              re-verified before executing",
+        ));
+    }
     if generation_token(repo, &live).await.as_str() != plan.generation.as_str() {
         return Err((
             StatusCode::CONFLICT,
@@ -670,45 +694,86 @@ async fn enforce_fresh(
 
 /// Check one [`Precondition`] against the live repository. `live` supplies the
 /// already-read HEAD and status; ref lookups go to git directly. Refusals are
-/// 409s that say what moved.
+/// 409s that say what moved — except the one D5 adds, below.
+///
+/// # "git could not run" is a refusal, not a satisfied precondition
+///
+/// Before D5 (#66, Task 19) `rev_parse` answered `None` both for "git ran and
+/// the ref does not resolve" and for "git could not be run", and the three
+/// ref-shaped arms below disagreed about what that meant:
+///
+/// | Arm | on `None` | fail-closed? |
+/// |---|---|---|
+/// | `RefAt` | refuse ("disappeared") | yes, by luck |
+/// | `RefExists` | refuse ("disappeared") | yes, by luck |
+/// | `RefAbsent` | **`Ok(())` — the gate passes** | **no** |
+///
+/// The first two are fail-closed only incidentally: they test for *presence*,
+/// so an unreadable ref reads as "not present" and refuses. `RefAbsent` tests
+/// for absence, so the identical unreadable answer reads as "absent" and the
+/// gate opens. `RefAbsent` is what stops `CreateBranch` and `RestoreBranch`
+/// from writing over a ref that already exists, so on a host where git cannot
+/// be launched every one of those plans passed its own guard.
+///
+/// A mechanical `Option` → `Result` rewrite would have preserved that
+/// asymmetry exactly, mapping `Err` onto each arm's existing `None` behaviour.
+/// All three now refuse on `Err`, with a 500 rather than the 409 they use for
+/// a ref that genuinely moved: the repository did nothing wrong.
 async fn verify_precondition(
     repo: &Path,
     precondition: &Precondition,
     live: &Observed,
 ) -> Result<(), (StatusCode, String)> {
     let refuse = |why: String| Err((StatusCode::CONFLICT, why));
+    // D5: git failing to run is never evidence about a ref. Every ref-shaped
+    // precondition below refuses on it — including `RefAbsent`, which is the
+    // one that used to be *satisfied* by it (see this function's doc comment).
+    let unreadable = |ref_name: &str, e: &ExecUnavailable| {
+        Err(couldnt_run(
+            &format!("precondition on ‘{ref_name}’"),
+            &format!(
+                "couldn't check ‘{ref_name}’, so this plan cannot be verified: {e}"
+            ),
+        ))
+    };
     match precondition {
         Precondition::RefAt { ref_name, oid } => match rev_parse(repo, ref_name.as_str()).await {
-            Some(at) if at == oid.as_str() => Ok(()),
-            Some(_) => refuse(format!(
+            Ok(Some(at)) if at == oid.as_str() => Ok(()),
+            Ok(Some(_)) => refuse(format!(
                 "‘{}’ moved while this plan was pending — refresh and try again.",
                 ref_name.as_str()
             )),
-            None => refuse(format!(
+            Ok(None) => refuse(format!(
                 "‘{}’ disappeared while this plan was pending — refresh and try again.",
                 ref_name.as_str()
             )),
+            Err(e) => unreadable(ref_name.as_str(), &e),
         },
-        Precondition::RefExists { ref_name } => {
-            if rev_parse(repo, ref_name.as_str()).await.is_some() {
-                Ok(())
-            } else {
-                refuse(format!(
-                    "‘{}’ disappeared while this plan was pending — refresh and try again.",
-                    ref_name.as_str()
-                ))
-            }
-        }
-        Precondition::RefAbsent { ref_name } => {
-            if rev_parse(repo, ref_name.as_str()).await.is_none() {
-                Ok(())
-            } else {
-                refuse(format!(
-                    "‘{}’ appeared while this plan was pending — refresh and try again.",
-                    ref_name.as_str()
-                ))
-            }
-        }
+        Precondition::RefExists { ref_name } => match rev_parse(repo, ref_name.as_str()).await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => refuse(format!(
+                "‘{}’ disappeared while this plan was pending — refresh and try again.",
+                ref_name.as_str()
+            )),
+            Err(e) => unreadable(ref_name.as_str(), &e),
+        },
+        Precondition::RefAbsent { ref_name } => match rev_parse(repo, ref_name.as_str()).await {
+            // git ran and said the ref does not resolve: genuinely absent.
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => refuse(format!(
+                "‘{}’ appeared while this plan was pending — refresh and try again.",
+                ref_name.as_str()
+            )),
+            // The polarity bug this arm used to have: `rev_parse` returned
+            // `None` both for "not there" and for "git could not run", and
+            // `is_none()` accepted *both* as proof of absence. So on a host
+            // where git could not be launched at all, every `RefAbsent`
+            // precondition passed — and `RefAbsent` is what guards
+            // `CreateBranch` and `RestoreBranch` from clobbering a ref that
+            // already exists. Its two siblings above happened to fail closed
+            // on the same input purely because they test for presence.
+            Err(e) => unreadable(ref_name.as_str(), &e),
+        },
         Precondition::BranchCheckedOut { branch } => {
             if live.head_branch.as_deref() == Some(branch.as_str()) {
                 Ok(())
@@ -729,18 +794,26 @@ async fn verify_precondition(
                 ))
             }
         }
-        Precondition::CleanWorktree => match live.status.as_deref() {
-            Some("") => Ok(()),
-            Some(_) => refuse(
+        Precondition::CleanWorktree => match &live.status {
+            Obs::Known(s) if s.is_empty() => Ok(()),
+            Obs::Known(_) => refuse(
                 "The working tree picked up uncommitted changes while this plan was \
                  pending — refresh and try again."
                     .to_string(),
             ),
-            // Unreadable state on a plan that requires a clean tree: refuse
-            // rather than guess (fail-closed).
-            None => refuse(
+            // git ran and refused (not a working tree) on a plan that requires
+            // a clean tree: refuse rather than guess (fail-closed). Unchanged
+            // wording — this arm's meaning is unchanged too.
+            Obs::Absent => refuse(
                 "Couldn't verify the working tree is clean — refusing to execute.".to_string(),
             ),
+            // D5: git could not be run. Same refusal *decision*, different
+            // status and different words, because the cause is ours, not the
+            // repository's.
+            Obs::Unknown => Err(couldnt_run(
+                "precondition CleanWorktree",
+                &"couldn't run git status, so the working tree cannot be verified",
+            )),
         },
         Precondition::RemoteConfigured { remote } => {
             if git_ok(repo, &["remote", "get-url", remote.as_str()])
