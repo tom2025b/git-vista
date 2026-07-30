@@ -113,6 +113,35 @@ const RW_ACCESS: u64 = A_EXECUTE
 
 const RO_DIR_ACCESS: u64 = A_EXECUTE | A_READ_FILE | A_READ_DIR;
 
+/// Landlock's own `ACCESS_FILE` set: the **only** rights `landlock_add_rule`
+/// accepts on a `path_beneath` rule whose target is not a directory. Every other
+/// bit is directory-only, and offering one for a regular file does not grant a
+/// subset — it makes the entire rule fail with `EINVAL`.
+///
+/// Measured on this host 2026-07-29 (`/tmp/shimfix/llprobe.c`, ABI 8, one
+/// ruleset declaring `HANDLED_FS`, nine `landlock_add_rule` calls):
+///
+/// ```text
+/// FILE + RO_DIR_ACCESS                     -> EINVAL   (READ_DIR is dir-only)
+/// FILE + RW_ACCESS                         -> EINVAL
+/// FILE + RW_ACCESS & !(READ_DIR|EXECUTE)   -> EINVAL   (MAKE_*/REMOVE_* are dir-only)
+/// FILE + RO_DIR_ACCESS & ACCESS_FILE       -> 0
+/// FILE + RW_ACCESS   & ACCESS_FILE         -> 0
+/// FILE + 0                                 -> ENOMSG   (an empty rule is not a rule)
+/// DIR  + RO_DIR_ACCESS                     -> 0
+/// DIR  + RW_ACCESS                         -> 0
+/// ```
+///
+/// The third line is why this constant exists rather than the narrower
+/// `& !(A_READ_DIR | A_EXECUTE)` mask `enumerate` used to carry: that mask is
+/// sufficient for a read-only tree *by luck* — `RO_DIR_ACCESS` happens to have
+/// no other directory-only bit — and **insufficient for a read-write one**,
+/// which still kept `MAKE_DIR`/`MAKE_REG`/`MAKE_SOCK`/`MAKE_FIFO`/`MAKE_SYM`/
+/// `REMOVE_DIR`/`REMOVE_FILE` and was rejected outright. So a regular file
+/// inside an enumerated `--rw` tree was silently granted nothing too; only the
+/// read-only half of the enumerate path ever worked.
+const ACCESS_FILE: u64 = A_EXECUTE | A_WRITE_FILE | A_READ_FILE | A_TRUNCATE | A_IOCTL_DEV;
+
 /// Every filesystem right this ruleset mediates. Anything omitted here is
 /// **allowed unconditionally** — Landlock only forbids what a ruleset declares
 /// it handles, so an under-declared mask is a silently weaker sandbox.
@@ -310,19 +339,118 @@ fn abi_version() -> i32 {
     }
 }
 
-fn add_path_rule(ruleset: i32, path: &Path, access: u64) -> bool {
+/// The rights that can actually be granted on one object.
+///
+/// `EXECUTE` is deliberately **kept** for a non-directory: the kernel accepts it
+/// on a file (measured above), and a whole-tree grant of the same `--ro` path
+/// already confers it on every file beneath. Stripping it only where the tree
+/// happens to be enumerated would make one policy mean two different things
+/// depending on whether a secret exclude lives underneath — the kind of
+/// invisible divergence this file's header exists to forbid.
+fn rights_for_target(declared: u64, is_dir: bool) -> u64 {
+    if is_dir {
+        declared
+    } else {
+        declared & ACCESS_FILE
+    }
+}
+
+/// Why one `path_beneath` rule could not be added.
+///
+/// A named error rather than the `bool` this used to return, because exactly one
+/// of these is benign and the old signature could not say which: every caller
+/// discarded the `false` and carried on with a *weaker* ruleset that reported
+/// success.
+#[derive(Debug)]
+enum AddRuleError {
+    /// The path could not be opened, so there is nothing to grant. The one
+    /// tolerated case: `DEFAULT_RO_TREES`/`NETWORK_ONLY_RO_TREES` name system
+    /// paths that legitimately do not exist on every host (`/run/resolvconf` is
+    /// absent on this one), and an enumerated tree can lose an entry to a race
+    /// between `read_dir` and `open`.
+    Unopenable(std::io::Error),
+    /// The descriptor could not be stat'ed, so the mask cannot be computed.
+    /// Never tolerated: guessing "not a directory" here would silently narrow a
+    /// directory grant to file rights.
+    Unstattable(std::io::Error),
+    /// Every declared right was directory-only and the target is not a
+    /// directory, so masking left nothing to add (the kernel answers `ENOMSG`
+    /// for an empty rule). Never tolerated — the policy asked for something this
+    /// object cannot carry.
+    NoApplicableRight { declared: u64 },
+    /// The kernel refused the rule. Never tolerated: this is the silent no-op
+    /// that motivated all of the above.
+    Refused {
+        effective: u64,
+        is_dir: bool,
+        error: std::io::Error,
+    },
+}
+
+impl AddRuleError {
+    /// Is this "the path is not here", as opposed to "the grant failed"?
+    fn is_absent(&self) -> bool {
+        matches!(self, AddRuleError::Unopenable(_))
+    }
+}
+
+impl std::fmt::Display for AddRuleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddRuleError::Unopenable(e) => write!(f, "cannot open the path ({e})"),
+            AddRuleError::Unstattable(e) => write!(f, "cannot fstat the opened path ({e})"),
+            AddRuleError::NoApplicableRight { declared } => write!(
+                f,
+                "every declared right ({declared:#x}) is directory-only and this is not a \
+                 directory, so the grant would be empty"
+            ),
+            AddRuleError::Refused {
+                effective,
+                is_dir,
+                error,
+            } => write!(
+                f,
+                "landlock_add_rule rejected access {effective:#x} (is_dir={is_dir}): {error}"
+            ),
+        }
+    }
+}
+
+/// Add one `path_beneath` rule, masked to the rights the target can carry.
+///
+/// Returns the access actually granted, so a caller (and the tests below) can
+/// assert what the kernel was handed rather than only that *something* was.
+fn add_path_rule(ruleset: i32, path: &Path, declared: u64) -> Result<u64, AddRuleError> {
     let Ok(c) = CString::new(path.as_os_str().as_bytes()) else {
-        return false;
+        return Err(AddRuleError::Unopenable(std::io::Error::from(
+            std::io::ErrorKind::InvalidInput,
+        )));
     };
     // `O_PATH` so this never blocks and never needs read permission: a plain
     // open on a FIFO in an enumerated directory would hang the shim forever,
     // and with it every git operation the server runs.
     let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if fd < 0 {
-        return false;
+        return Err(AddRuleError::Unopenable(std::io::Error::last_os_error()));
+    }
+    // Directory-ness is read from the very descriptor that will carry the rule,
+    // not from a second `metadata()` call on the path: the mask has to describe
+    // the object the kernel is about to be handed, and a path can be replaced
+    // between the two lookups.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(AddRuleError::Unstattable(error));
+    }
+    let is_dir = (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+    let effective = rights_for_target(declared, is_dir);
+    if effective == 0 {
+        unsafe { libc::close(fd) };
+        return Err(AddRuleError::NoApplicableRight { declared });
     }
     let attr = PathBeneathAttr {
-        allowed_access: access,
+        allowed_access: effective,
         parent_fd: fd,
     };
     let rc = unsafe {
@@ -334,8 +462,46 @@ fn add_path_rule(ruleset: i32, path: &Path, access: u64) -> bool {
             0usize,
         )
     };
+    let error = std::io::Error::last_os_error();
     unsafe { libc::close(fd) };
-    rc == 0
+    if rc != 0 {
+        return Err(AddRuleError::Refused {
+            effective,
+            is_dir,
+            error,
+        });
+    }
+    Ok(effective)
+}
+
+/// Add one rule, or **refuse the launch**.
+///
+/// A rule the kernel rejected is the disease this function exists to prevent.
+/// `add_path_rule` used to return a bare `bool` that every caller discarded, so
+/// a `--ro`/`--rw` entry naming a regular file granted nothing and reported
+/// success. That does not fail closed: it produces a *weaker* sandbox wearing
+/// the costume of a configured one, which is strictly worse than refusing to
+/// start, because the operator's policy file still reads as if the grant landed.
+///
+/// Measured before the fix, on this host: `--ro <dir>/f` followed by
+/// `git config -f <dir>/f --list` returned `Permission denied` and exit 128 —
+/// byte-identical to passing no grant at all, with no diagnostic anywhere.
+///
+/// An unopenable path is the one tolerated outcome, and it is tolerated because
+/// it is not a grant failure at all (see `AddRuleError::Unopenable`).
+fn grant_one(ruleset: i32, path: &Path, declared: u64) -> usize {
+    match add_path_rule(ruleset, path, declared) {
+        Ok(_) => 1,
+        Err(e) if e.is_absent() => 0,
+        Err(e) => die(
+            EXIT_LANDLOCK,
+            &format!(
+                "cannot grant `{}`: {e}. Refusing to run: a grant that silently grants \
+                 nothing makes a weaker sandbox look like a configured one",
+                path.display()
+            ),
+        ),
+    }
 }
 
 fn add_net_rule(ruleset: i32, port: u16) -> bool {
@@ -378,12 +544,19 @@ fn is_ancestor_of_exclude(p: &Path, excludes: &[PathBuf]) -> bool {
 /// a tree that actually contains a secret pays the cost of enumeration. This is
 /// what keeps the rule count proportional to the exclusions rather than to
 /// `$HOME`.
+///
+/// **`tree` need not be a directory.** A policy entry naming a regular file is a
+/// legitimate grant, and `grant_one` masks the rights accordingly rather than
+/// handing the kernel a directory-only right it will reject — which is what this
+/// function used to do, silently, for every `--ro`/`--rw` file entry. See
+/// `ACCESS_FILE` for the measurement and `grant_one` for why the failure is now
+/// terminal.
 fn grant_tree(ruleset: i32, tree: &Path, access: u64, excludes: &[PathBuf]) -> usize {
     if is_or_inside_exclude(tree, excludes) {
         return 0;
     }
     if !is_ancestor_of_exclude(tree, excludes) {
-        return usize::from(add_path_rule(ruleset, tree, access));
+        return grant_one(ruleset, tree, access);
     }
     enumerate(ruleset, tree, tree, access, excludes)
 }
