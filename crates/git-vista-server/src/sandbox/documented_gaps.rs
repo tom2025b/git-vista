@@ -82,7 +82,8 @@ async fn tmp_experiment_chmod_target_outside_every_grant() {
     // Marker goes in the REPO worktree (already granted rw by the production
     // policy); the chmod TARGET stays outside every grant. No rw_trees push.
     let repo = hostile_hook_repo(&format!(
-        "chmod 777 {t}; echo $? > chmod-result\n",
+        "chmod 777 {t}; echo $? > chmod-result\n\
+         printf mutated > {t} 2>/dev/null; echo $? > write-result\n",
         t = target.display(),
     ));
     let p = strict_baseline(repo.path(), "tmp-experiment").await;
@@ -99,7 +100,10 @@ async fn tmp_experiment_chmod_target_outside_every_grant() {
         String::from_utf8_lossy(&out.stderr)
     );
     let raw = std::fs::read_to_string(repo.path().join("chmod-result"));
-    eprintln!("EXPERIMENT marker={raw:?}");
+    eprintln!("EXPERIMENT chmod marker={raw:?}");
+    let w = std::fs::read_to_string(repo.path().join("write-result"));
+    eprintln!("EXPERIMENT write marker={w:?}");
+    eprintln!("EXPERIMENT content after = {:?}", std::fs::read_to_string(&target));
     let mode = <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::mode(
         &std::fs::metadata(&target).expect("target still there").permissions(),
     );
