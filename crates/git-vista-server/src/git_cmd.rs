@@ -143,35 +143,35 @@ fn git_error(endpoint: &str, stderr: &[u8]) -> (StatusCode, String) {
 /// a hard error rather than a silent fall-back to unsandboxed git — an
 /// unsandboxed spawn is exactly what this exists to prevent.
 ///
-/// # `read_only` and `NetworkNeed` are derived here, not threaded from callers
+/// # `read_only` is derived here; `NetworkNeed` is **declared** by the caller
 ///
-/// D2 (#66, Task 7) made `sandbox::policy_for` take `read_only` and `need`, but
-/// this function's own signature — and every one of its ~50 call sites across
-/// the crate, spanning every read and write handler — is unchanged. Both extra
-/// values are recovered right here instead:
+/// D2 (#66, Task 7) made `sandbox::policy_for` take `read_only` and `need`.
+/// `read_only` is still recovered right here — it comes from
+/// `state::read_only_for_path`, a catalog lookup keyed on `repo` itself. Every
+/// caller already resolved `repo` from either the catalog
+/// (`resolve_repo`/`resolve_target`) or a path with no catalog entry at all (an
+/// unregistered test fixture, a not-yet-registered clone destination, a
+/// degraded-mode selection) — the lookup returns `false` for the latter, which
+/// is the same "no restriction recorded" answer those paths already got before
+/// D2, so nothing already working changes shape.
 ///
-/// * `read_only` comes from `state::read_only_for_path`, a catalog lookup keyed
-///   on `repo` itself. Every caller already resolved `repo` from either the
-///   catalog (`resolve_repo`/`resolve_target`) or a path with no catalog entry
-///   at all (an unregistered test fixture, a not-yet-registered clone
-///   destination, a degraded-mode selection) — the lookup returns `false` for
-///   the latter, which is the same "no restriction recorded" answer those
-///   paths already got before D2, so nothing already working changes shape.
-/// * `need` comes from `network_need(args)` — already `sandboxed`'s own argv,
-///   already the fail-closed classifier that function's doc comment names as
-///   the right tool for exactly this "only an argv is available" situation.
+/// `need` is different, and Task 8/D3 is what changed it. It used to be
+/// recovered here too, from `network_need(args)` — the argv classifier that
+/// function's own doc comment describes as "a fail-closed fallback, not the
+/// authoritative dispatch". That was harmless only because `policy_for`
+/// discarded it. Now that `need` picks the tier, the authority moves to the
+/// caller: `declared` is passed in, and `network_need(args)` is demoted to a
+/// cross-check (`sandbox::reconcile_need`) that may only tighten, never widen.
 ///
-/// Neither recovery changes today's tier (`policy_for` hard-codes
-/// `Tier::Network` regardless of `need` until Task 8), so this is purely
-/// plumbing the two new parameters through their one production call site
-/// without rippling a third parameter into every caller for a value none of
-/// them need to decide.
+/// See [`git_output`] and [`git_stdout_capped`] for where each of this crate's
+/// callers gets its declaration from.
 fn sandboxed(
     repo: &Path,
     args: &[&str],
+    declared: crate::sandbox::NetworkNeed,
 ) -> Result<crate::sandbox::spawn::SandboxedCommand, String> {
     let read_only = crate::state::read_only_for_path(repo);
-    let need = crate::sandbox::network_need(args);
+    let need = crate::sandbox::reconcile_need(declared, args);
     let policy = crate::sandbox::policy_for(repo, read_only, need).map_err(|e| e.to_string())?;
     Ok(crate::sandbox::spawn::command_async(&policy, repo, args))
 }
