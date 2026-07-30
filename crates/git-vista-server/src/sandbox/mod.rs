@@ -73,6 +73,13 @@ mod hook_mode_suite;
 /// from `escape_suite` — see this module's own doc comment for the boundary.
 #[cfg(test)]
 mod hostile;
+/// #66 / #198 (plan Task 12): the process-lifecycle battery — INV-8 orphan
+/// reaping, A8/C3 fresh procfs, A9/C4 private `/dev/shm`. Outside
+/// `escape_contract.rs`'s `EscapeCase` harness on purpose (its claims are
+/// process-tree- and wall-clock-shaped, not single-errno-shaped); see its own
+/// module doc for what replaces the R5 census gate there.
+#[cfg(test)]
+pub(crate) mod lifecycle;
 #[cfg(test)]
 mod shim_cli;
 
