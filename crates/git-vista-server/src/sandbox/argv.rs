@@ -297,3 +297,33 @@ fn system_trees_grant_dev_rw_and_proc_only_in_the_strict_tier() {
         "the network tier has no mount namespace: /proc there is the host's procfs"
     );
 }
+
+/// The DNS grant, both halves. On a systemd-resolved host `/etc/resolv.conf` is
+/// a symlink into `/run`, so without this the network tier cannot resolve a
+/// hostname and every named remote fails `Could not resolve host` — measured, see
+/// `NETWORK_ONLY_RO_TREES`. And it must stay out of the strict tier, whose
+/// posture is no network at all: resolver state there is access granted for an
+/// operation that tier does not permit.
+#[test]
+fn resolver_state_is_readable_in_the_network_tier_and_never_in_the_strict_one() {
+    let (_, net_ro) = default_system_trees(Tier::Network);
+    for t in NETWORK_ONLY_RO_TREES {
+        assert!(
+            net_ro.contains(&PathBuf::from(t)),
+            "{t} must be readable in the network tier or DNS fails"
+        );
+    }
+
+    let (_, strict_ro) = default_system_trees(Tier::Strict);
+    for t in NETWORK_ONLY_RO_TREES {
+        assert!(
+            !strict_ro.contains(&PathBuf::from(t)),
+            "{t}: the strict tier has no network (--net-deny + --unshare-net), so it \
+             must not be granted resolver state"
+        );
+    }
+    assert!(
+        !strict_ro.iter().any(|p| p.starts_with("/run")),
+        "no /run grant belongs in the strict tier"
+    );
+}
