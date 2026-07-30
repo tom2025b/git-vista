@@ -561,10 +561,11 @@ mod harness {
                 // `command_async` passes `-C <repo>`, so git's working directory
                 // is the repository and `.husky` resolves inside it.
                 append_config(&cwd.join(".git/config"), "[core]\n\thooksPath = .husky\n")?;
+                let decoy = cwd.join(MARK_DECOY);
                 Fixture {
                     _dirs: vec![dir],
                     cwd,
-                    decoy: Some(cwd.join(MARK_DECOY)),
+                    decoy: Some(decoy),
                 }
             }
 
@@ -1213,8 +1214,10 @@ mod contract {
     //! source and the census beside it, so a case that stops being declarative,
     //! a leg that stops going through the production seam, or a case that is
     //! renamed out of the census breaks the **build**.
-
-    use super::*;
+    //!
+    //! Deliberately no `use super::*`: these tests read this file as *text*, and
+    //! importing its items would let one of them accidentally exercise the
+    //! battery instead of scanning it.
 
     /// R11: every rule this file claims to honour, paired with the test that
     /// enforces it. A rule whose enforcement is deleted fails
