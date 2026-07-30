@@ -160,11 +160,15 @@ pub enum HookPolicy {
     /// a network namespace breaks DNS resolution. Hooks run with `AF_INET`
     /// reachable, which is why this flies the banner even though it is
     /// sandboxed.
-    #[serde(alias = "allow")]
     Network,
     /// No sandbox at all (`sandbox::Tier::Unsandboxed`). Reachable only through
     /// explicit, persisted, per-repository operator trust
     /// (`sandbox::trust::grant`), and it flies a permanent banner.
+    ///
+    /// ADR 0025's `allow` deserializes here, and that is the truthful reading
+    /// rather than a convenient one: when M1.13a emitted `allow` there was no
+    /// sandbox anywhere in the server, so hooks really did run unconfined.
+    #[serde(alias = "allow")]
     Unsandboxed,
     /// Hooks do not run at all — `core.hooksPath` pointed at a server-owned
     /// empty directory.
@@ -231,11 +235,10 @@ impl Default for HookPolicy {
 /// tier names directly. Nothing new should reference them.
 #[allow(non_upper_case_globals)]
 impl HookPolicy {
-    /// ADR 0025's `Allow` — "hooks run unrestricted." Now [`Network`](Self::Network):
-    /// sandboxed but network-reachable is the closest live tier to what the old
-    /// value actually described for a session that could push.
+    /// ADR 0025's `Allow` — "hooks run unrestricted," from a build with no
+    /// sandbox at all. Now [`Unsandboxed`](Self::Unsandboxed).
     #[doc(hidden)]
-    pub const Allow: HookPolicy = HookPolicy::Network;
+    pub const Allow: HookPolicy = HookPolicy::Unsandboxed;
     /// ADR 0025's `Restricted`. Now [`Strict`](Self::Strict).
     #[doc(hidden)]
     pub const Restricted: HookPolicy = HookPolicy::Strict;
@@ -509,12 +512,91 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         assert_eq!(serde_json::from_str::<SessionInfo>(&json).unwrap(), info);
         // csrf defaults to None when absent (the unauthenticated response omits it);
-        // hook_policy fails closed to Restricted per its own Default impl, the same
+        // hook_policy fails closed to `Blocked` per its own Default impl, the same
         // "an older/partial response still deserializes, safely" contract via_lan
         // already established.
         let back: SessionInfo = serde_json::from_str(r#"{"authenticated":false}"#).unwrap();
         assert_eq!(back.csrf, None);
-        assert_eq!(back.hook_policy, HookPolicy::Restricted);
+        assert_eq!(back.hook_policy, HookPolicy::Blocked);
+        assert!(
+            back.hook_policy.requires_banner(),
+            "an absent hook_policy must not silence the banner"
+        );
+    }
+
+    /// INV-15's wire half. Every variant is pinned to the exact string the
+    /// server's own `sandbox::Tier` names it by, in both directions, so a
+    /// rename on either side of the wire is a failing test rather than a
+    /// silently-misread policy.
+    #[test]
+    fn hook_policy_wire_names_match_the_sandbox_tier_names() {
+        for (variant, wire) in [
+            (HookPolicy::Strict, "strict"),
+            (HookPolicy::Network, "network"),
+            (HookPolicy::Unsandboxed, "unsandboxed"),
+            (HookPolicy::Blocked, "blocked"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&variant).unwrap(),
+                format!("\"{wire}\""),
+                "{variant:?} must serialize as {wire}"
+            );
+            assert_eq!(
+                serde_json::from_str::<HookPolicy>(&format!("\"{wire}\"")).unwrap(),
+                variant
+            );
+        }
+        // An unknown policy name is a hard error, never a silent default —
+        // `#[serde(default)]` governs an *absent* field, not a garbage one.
+        assert!(serde_json::from_str::<HookPolicy>("\"contained\"").is_err());
+    }
+
+    /// ADR 0025's two shipped wire strings still deserialize (a stored older
+    /// value must not be a hard error) and map to the tier that was actually
+    /// in force when they were written — but they are never emitted again.
+    #[test]
+    fn adr_0025_wire_strings_still_deserialize_and_never_serialize() {
+        assert_eq!(
+            serde_json::from_str::<HookPolicy>("\"restricted\"").unwrap(),
+            HookPolicy::Strict
+        );
+        assert_eq!(
+            serde_json::from_str::<HookPolicy>("\"allow\"").unwrap(),
+            HookPolicy::Unsandboxed
+        );
+        for v in [
+            HookPolicy::Strict,
+            HookPolicy::Network,
+            HookPolicy::Unsandboxed,
+            HookPolicy::Blocked,
+        ] {
+            let json = serde_json::to_string(&v).unwrap();
+            assert!(
+                json != "\"allow\"" && json != "\"restricted\"",
+                "{v:?} re-emitted a retired ADR 0025 wire string: {json}"
+            );
+        }
+        // The Rust-level transition aliases agree with the serde ones, so a
+        // call site that has not migrated yet cannot mean something different
+        // from what the same string deserializes to.
+        assert_eq!(HookPolicy::Allow, HookPolicy::Unsandboxed);
+        assert_eq!(HookPolicy::Restricted, HookPolicy::Strict);
+    }
+
+    /// INV-15's banner half: the banner is silent for exactly one variant.
+    /// Written as a full enumeration rather than by calling `requires_banner`'s
+    /// own `!matches!`, so this would still fail if the implementation were
+    /// inverted.
+    #[test]
+    fn only_strict_silences_the_banner() {
+        assert!(!HookPolicy::Strict.requires_banner());
+        for p in [
+            HookPolicy::Network,
+            HookPolicy::Unsandboxed,
+            HookPolicy::Blocked,
+        ] {
+            assert!(p.requires_banner(), "{p:?} must fly the banner");
+        }
     }
 
     #[test]
