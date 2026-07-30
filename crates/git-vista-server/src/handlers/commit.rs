@@ -14,7 +14,7 @@ use git_vista_protocol::{BranchName, CommitMessage, CommitOid, CreateCommitReque
 
 use crate::git_cmd::rev_parse;
 use crate::planner;
-use crate::state::{current, reject_if_read_only};
+use crate::state::reject_if_read_only;
 
 /// Create a commit in the served repository (Issue #33).
 ///
@@ -43,7 +43,12 @@ pub(crate) async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (Stat
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()),
     };
 
-    let repo = current().0;
+    // D2 (#66, Task 7): the validated resolution, replacing a raw
+    // `state::current()` call — see `state::resolve_target`'s doc comment.
+    let repo = match crate::state::resolve_target() {
+        Ok((repo, _entry)) => repo,
+        Err(rejected) => return rejected,
+    };
 
     // A named target that isn't the checked-out branch takes the ref-write
     // path. The checked-out branch itself falls through to the plain
@@ -114,7 +119,12 @@ async fn commit_empty_on_branch(
     }
     // Resolve the branch's tip — also confirms a local branch by that name
     // exists. This is the tip the operation's compare-and-swap is pinned to.
-    let repo = current().0;
+    // D2 (#66, Task 7): the validated resolution, replacing a raw
+    // `state::current()` call — see `state::resolve_target`'s doc comment.
+    let repo = match crate::state::resolve_target() {
+        Ok((repo, _entry)) => repo,
+        Err(rejected) => return rejected,
+    };
     let refname = format!("refs/heads/{branch}");
     let Some(tip) = rev_parse(&repo, &refname).await else {
         return (
