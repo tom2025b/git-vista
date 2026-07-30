@@ -18,6 +18,55 @@
 //! names**, and the filesystem boundary is carried by Landlock, which is
 //! deny-by-default and does not have this problem.
 //!
+//! # The arch check does not distinguish x32 — measured, and it is why every
+//! # key is inserted twice
+//!
+//! `SeccompFilter::new` is handed `TargetArch::x86_64`, which seccompiler
+//! compiles into a prologue that loads `seccomp_data.arch` and
+//! `SECCOMP_RET_KILL_PROCESS`es anything that is not `AUDIT_ARCH_X86_64`. That
+//! closes the sibling i386 vector *fatally*. It does **not** close x32: the x32
+//! ABI has no `AUDIT_ARCH` of its own — it reports `AUDIT_ARCH_X86_64` and marks
+//! itself by setting `__X32_SYSCALL_BIT` (`0x4000_0000`) in `seccomp_data.nr`
+//! instead. Since seccompiler emits one `BPF_JEQ` per *bare* key against the raw
+//! `nr` and appends `mismatch_action` (Allow) as the fallthrough, an
+//! x32-numbered syscall matched no key here and fell through to Allow — and
+//! because the miss happens at the shared `nr` load, it fell through for the
+//! **whole map at once**: io_uring, `unshare`/`setns`, `seccomp` (the C1
+//! stacking denial), `ptrace`, and the AF_UNIX rules, all voided together.
+//!
+//! Measured 2026-07-29 with hand-built cBPF of exactly seccompiler's shape
+//! (`/tmp/shimfix/x32probe.c`, `x32probe2.c`), in a 64-bit process:
+//!
+//! ```text
+//! bare key 425          : io_uring_setup()          EFAULT -> EPERM   (filter live)
+//! bare key 425          : X32BIT|io_uring_setup()    ENOSYS -> ENOSYS  (never matched)
+//! key __X32_BIT|425     : X32BIT|io_uring_setup()    ENOSYS -> EPERM   (matched)
+//! key __X32_BIT|425     : io_uring_setup()           EFAULT            (bare no longer matched)
+//! ```
+//!
+//! The high-bit process was never killed, which is the direct evidence that the
+//! arch prologue reads `AUDIT_ARCH_X86_64` for an x32-numbered call. The third
+//! line is the whole reason for the doubled keys, and the fourth is why they are
+//! *added* rather than substituted.
+//!
+//! **Not exploitable on this host, and that is not a security property.**
+//! `/boot/config-7.0.0-28-generic` has `# CONFIG_X86_X32_ABI is not set`, so
+//! `do_syscall_x32()` is compiled out, dispatch falls to `__x64_sys_ni_syscall`,
+//! and every x32-numbered call returns `ENOSYS` — measured, and confirmed by the
+//! control (`X32BIT|getpid` → ENOSYS while plain `getpid` → OK). An x32 *binary*
+//! cannot even be exec'd here (`ENOEXEC`). But that is one kernel-config line
+//! away from being live, the sandbox neither controls nor observes the setting,
+//! and this shim is not only ever run on this laptop. Seccomp evaluates in
+//! `syscall_enter_from_user_mode()`, i.e. **before** the x64/x32 dispatch split,
+//! which is why a high-bit key can return `EPERM` at all — and why the fix is
+//! fully verifiable here even though the exploit is not. The escape battery's
+//! `high_bit_io_uring_denied` is that verification: `ENOSYS` outside, `EPERM`
+//! inside, a two-sided assertion needing no x32 ABI and therefore no skip.
+//!
+//! Do **not** try to express this as "reject any `nr` with bit 30 set":
+//! seccompiler's API has no masked-`nr` primitive, only per-key `JEQ` plus
+//! argument conditions.
+//!
 //! # C1 — the composition rule that decides the action
 //!
 //! Seccomp filter stacking is **not monotonic**: a later `SECCOMP_RET_USER_NOTIF`
@@ -37,6 +86,13 @@ use std::collections::BTreeMap;
 const TARGET_ARCH: TargetArch = TargetArch::x86_64;
 #[cfg(target_arch = "aarch64")]
 const TARGET_ARCH: TargetArch = TargetArch::aarch64;
+
+/// `__X32_SYSCALL_BIT`: the bit the x32 ABI sets in `seccomp_data.nr`, and the
+/// only thing that distinguishes an x32 call from an x86_64 one as far as this
+/// filter can see. See the module header for the measurement; `rules_with_x32_aliases`
+/// is what uses it. x86_64-only: there is no such bit on aarch64.
+#[cfg(target_arch = "x86_64")]
+const X32_SYSCALL_BIT: i64 = 0x4000_0000;
 
 /// Whether the tier this filter is being built for has network access — the one
 /// axis on which the filter differs between tiers.
@@ -239,13 +295,44 @@ fn rules_for(net: NetScope) -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompil
     Ok(rules)
 }
 
+/// `rules_for`'s bare keys, plus — on x86_64 — an `__X32_SYSCALL_BIT` twin of
+/// **every** one of them, carrying the identical rule.
+///
+/// Written as a post-pass over the finished map rather than as a second
+/// `insert` beside each first one, for two reasons. It cannot drift: a key added
+/// to `rules_for` later gets its x32 twin for free, whereas a hand-paired insert
+/// is one a future edit can forget, and a forgotten one is invisible (the miss
+/// looks exactly like the syscall being allowed on purpose). And it leaves
+/// `rules_for` byte-for-byte unchanged, which keeps the committed mutants that
+/// patch that function — `ci/mutants/M8-remove-af-unix-socket-rule.patch` — applying
+/// at zero fuzz.
+///
+/// The keys cannot collide: every real syscall number is far below
+/// `0x4000_0000`, so the twin is always a fresh `BTreeMap` entry. And they stay
+/// inside seccompiler's `u32` narrowing (`filter.rs`'s
+/// `syscall_number.try_into().unwrap()`): `0x4000_0000 | 425 == 1073742249`.
+fn rules_with_x32_aliases(
+    net: NetScope,
+) -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompiler::BackendError> {
+    let mut rules = rules_for(net)?;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let aliases: Vec<(i64, Vec<SeccompRule>)> = rules
+            .iter()
+            .map(|(nr, rule)| (X32_SYSCALL_BIT | *nr, rule.clone()))
+            .collect();
+        rules.extend(aliases);
+    }
+    Ok(rules)
+}
+
 /// Build the filter program.
 ///
 /// `mismatch_action` is `Allow`: anything not named above proceeds. See the
 /// module comment for why an allowlist is the wrong shape for git.
 pub fn build(net: NetScope) -> Result<BpfProgram, Box<dyn std::error::Error>> {
     let filter = SeccompFilter::new(
-        rules_for(net)?,
+        rules_with_x32_aliases(net)?,
         // Not named -> allowed.
         SeccompAction::Allow,
         // Named -> denied terminally. EPERM rather than KillProcess so a git
@@ -360,6 +447,62 @@ mod tests {
             assert!(
                 denied.contains(&required),
                 "syscall {required} must be denied; removing it reopens a named escape"
+            );
+        }
+    }
+
+    /// Every key the filter is compiled from must have an `__X32_SYSCALL_BIT`
+    /// twin carrying the *same* rule — otherwise an x32-numbered call misses
+    /// every key and falls through to `mismatch_action` (Allow), voiding the
+    /// whole denylist at once rather than one entry of it. See the module header
+    /// for the measurement.
+    ///
+    /// This asserts the twin carries the **same rule**, not merely that the key
+    /// exists: an alias keyed to an empty rule vector where the bare key is
+    /// argument-scoped would be a blanket denial reachable only over x32, and an
+    /// alias keyed to nothing where the bare key is blanket is a hole. Both are
+    /// silent.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn every_key_is_also_denied_under_the_x32_syscall_bit() {
+        for net in [NetScope::Denied, NetScope::Allowed] {
+            let bare = rules_for(net).expect("bare rules build");
+            let all = rules_with_x32_aliases(net).expect("aliased rules build");
+            assert_eq!(
+                all.len(),
+                bare.len() * 2,
+                "every bare key must gain exactly one x32 twin ({net:?})"
+            );
+            for (nr, rule) in &bare {
+                let alias = X32_SYSCALL_BIT | *nr;
+                assert!(
+                    alias > *nr,
+                    "syscall {nr} already carries bit 30; the aliasing scheme would collide"
+                );
+                assert_eq!(
+                    all.get(&alias),
+                    Some(rule),
+                    "syscall {nr} has no x32 twin carrying the identical rule ({net:?}); an \
+                     x32-numbered call would fall through to Allow and take the entire \
+                     denylist with it"
+                );
+            }
+        }
+    }
+
+    /// Doubling the jump table must not push the program past seccompiler's
+    /// `BPF_MAX_LEN`. A filter that fails to *build* would be caught by
+    /// `apply_seccomp`'s `die`, so this is not a silent failure — but it would be
+    /// a launch that refuses on every host, and it is cheaper to know here.
+    #[test]
+    fn both_tiers_still_fit_the_bpf_program_budget_with_the_aliases() {
+        for net in [NetScope::Denied, NetScope::Allowed] {
+            let program = build(net).unwrap_or_else(|e| {
+                panic!("{net:?} filter must still compile with the x32 aliases: {e}")
+            });
+            assert!(
+                !program.is_empty(),
+                "an empty BPF program filters nothing ({net:?})"
             );
         }
     }
