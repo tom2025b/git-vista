@@ -22,6 +22,11 @@ use std::path::{Path, PathBuf};
 pub(crate) mod bwrap;
 /// Task 9: the factual capability probe — what tiers can this host provide.
 pub(crate) mod capabilities;
+/// D2 (#66, Task 7): validated repository-metadata resolution — resolves a
+/// repository's actual git directory(ies) and refuses when that resolution
+/// lands outside the server's managed root. See its module doc for how this
+/// composes with (rather than duplicates) `worktree`'s containment rule.
+pub(crate) mod repo_paths;
 /// The other impure corner: locating the `gv-sandbox` shim. Kept out of this
 /// file for the same reason as `bwrap` — `sandbox_argv` stays a total function
 /// of its `Policy`.
@@ -52,6 +57,10 @@ mod dispatch;
 mod escape_contract;
 #[cfg(test)]
 mod escape_suite;
+/// D2 (#66, Task 7): the hostile-geometry battery for `repo_paths`. Distinct
+/// from `escape_suite` — see this module's own doc comment for the boundary.
+#[cfg(test)]
+mod hostile;
 /// #66 Task 25, step 5: the `class = functional` blocked-hooks case moves
 /// here out of `escape_suite.rs`. Landed as an empty stub in step 3 so the
 /// module list is fixed before any case is rewritten; step 5 populates it.

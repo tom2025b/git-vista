@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use super::repo_paths::RepoPathsError;
 use super::SHIM_BIN_ENV;
 
 /// Why a shim path could not be produced. A named error rather than a panic:
@@ -27,14 +28,17 @@ pub(crate) enum ShimError {
     /// secrets to withhold. Building a policy without it would grant nothing
     /// and silently break git identity, so it is a hard error instead.
     NoHome,
-    /// `<repo>/.git` is a gitdir pointer whose geometry could not be proven
-    /// safe (see `sandbox::worktree`'s containment rule). The policy the
-    /// grants would describe is wrong either way — too narrow for a real
-    /// linked worktree, or attacker-chosen for a tampered pointer — so
-    /// construction refuses instead (fail-closed, the INV-13 posture).
-    /// Living on `ShimError` is a naming wart; D5's error rework is where
-    /// policy-construction failures get their own type.
-    WorktreeGeometry { repo: PathBuf, why: String },
+    /// `<repo>`'s git directory could not be resolved and validated (D2, #66
+    /// Task 7): a gitdir pointer whose geometry could not be proven safe (see
+    /// `sandbox::worktree`'s containment rule), or one that resolved cleanly
+    /// but lands outside the server's managed root (see
+    /// `sandbox::repo_paths`). The policy the grants would describe is wrong
+    /// either way — too narrow for a real linked worktree, or attacker-chosen
+    /// for a tampered pointer, or pointed at a location this server was never
+    /// configured to serve — so construction refuses instead (fail-closed,
+    /// the INV-13 posture). Living on `ShimError` is a naming wart; D5's
+    /// error rework is where policy-construction failures get their own type.
+    RepoPaths(RepoPathsError),
 }
 
 impl std::fmt::Display for ShimError {
@@ -56,13 +60,7 @@ impl std::fmt::Display for ShimError {
             ),
             Self::NoCurrentExe => write!(f, "current_exe() failed"),
             Self::NoHome => write!(f, "$HOME is unset; cannot build a sandbox policy"),
-            Self::WorktreeGeometry { repo, why } => write!(
-                f,
-                "cannot resolve the linked-worktree git directory of {}: {why}. \
-                 The sandbox grants only directories it can prove belong to \
-                 this worktree, so the operation is refused.",
-                repo.display()
-            ),
+            Self::RepoPaths(e) => write!(f, "{e}"),
         }
     }
 }
