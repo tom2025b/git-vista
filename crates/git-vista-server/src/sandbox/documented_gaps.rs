@@ -31,7 +31,6 @@
 use super::escape_suite::hostile_hook_repo;
 use super::lifecycle::strict_baseline;
 use super::spawn::command_async;
-use super::*;
 
 /// F-NEW-3, observed via a hook marker file under the granted scratch tree —
 /// never via the deleted JSON self-probe (see the module doc above). A
@@ -71,6 +70,40 @@ async fn landlock_does_not_mediate_chmod() {
          non-coverage section by name — its number is assigned only when Task 18 runs. Do not just \
          delete this test."
     );
+}
+
+#[tokio::test]
+async fn tmp_experiment_chmod_target_outside_every_grant() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let target = scratch.path().join("chmod-target");
+    std::fs::write(&target, b"probe target").expect("create chmod target");
+    std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("seed mode");
+    // Marker goes in the REPO worktree (already granted rw by the production
+    // policy); the chmod TARGET stays outside every grant. No rw_trees push.
+    let repo = hostile_hook_repo(&format!(
+        "chmod 777 {t}; echo $? > chmod-result\n",
+        t = target.display(),
+    ));
+    let p = strict_baseline(repo.path(), "tmp-experiment").await;
+    eprintln!("EXPERIMENT rw_trees={:?}", p.rw_trees);
+    eprintln!("EXPERIMENT ro_trees={:?}", p.ro_trees);
+    eprintln!("EXPERIMENT target={}", target.display());
+    let out = command_async(&p, repo.path(), &["commit", "--allow-empty", "-m", "chmod"])
+        .output()
+        .await
+        .expect("launcher runs");
+    eprintln!("EXPERIMENT commit status={:?}", out.status);
+    eprintln!(
+        "EXPERIMENT stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let raw = std::fs::read_to_string(repo.path().join("chmod-result"));
+    eprintln!("EXPERIMENT marker={raw:?}");
+    let mode = <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::mode(
+        &std::fs::metadata(&target).expect("target still there").permissions(),
+    );
+    eprintln!("EXPERIMENT host mode after = {:o}", mode & 0o7777);
 }
 
 /// The other half of INV-17, stated rather than tested: the confused-deputy
