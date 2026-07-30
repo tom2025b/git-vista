@@ -393,7 +393,10 @@ impl<T: std::fmt::Display> Obs<T> {
         match self {
             Obs::Known(v) => format!("known:{v}"),
             Obs::Absent => "absent".to_string(),
-            Obs::Unknown => "unknown".to_string(),
+            Obs::Unknown => format!(
+                "unknown:{}",
+                UNKNOWN_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
         }
     }
 }
@@ -695,7 +698,7 @@ async fn enforce_fresh(
         || observed.status.is_unknown()
         || live.head_tip.is_unknown()
         || live.status.is_unknown();
-    if false && unknown {
+    if unknown {
         return Err(couldnt_run(
             "staleness gate",
             &"couldn't read the repository's state, so this plan cannot be \
@@ -756,9 +759,7 @@ async fn verify_precondition(
     let unreadable = |ref_name: &str, e: &ExecUnavailable| {
         Err(couldnt_run(
             &format!("precondition on ‘{ref_name}’"),
-            &format!(
-                "couldn't check ‘{ref_name}’, so this plan cannot be verified: {e}"
-            ),
+            &format!("couldn't check ‘{ref_name}’, so this plan cannot be verified: {e}"),
         ))
     };
     match precondition {
@@ -785,7 +786,6 @@ async fn verify_precondition(
         Precondition::RefAbsent { ref_name } => match rev_parse(repo, ref_name.as_str()).await {
             // git ran and said the ref does not resolve: genuinely absent.
             Ok(None) => Ok(()),
-            Err(_) => Ok(()),
             Ok(Some(_)) => refuse(format!(
                 "‘{}’ appeared while this plan was pending — refresh and try again.",
                 ref_name.as_str()
@@ -2480,7 +2480,10 @@ mod tests {
             "a ref that really is there is a 409 about the repository, \
              not a 500 about us"
         );
-        assert!(why.contains("appeared while this plan was pending"), "{why}");
+        assert!(
+            why.contains("appeared while this plan was pending"),
+            "{why}"
+        );
     }
 
     /// **The freshness criterion.** Two `Unknown` observations must not

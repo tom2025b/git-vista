@@ -387,10 +387,7 @@ pub(crate) async fn git_stdout(
 /// operation — e.g. a branch's tip *before* deleting it, which is the one
 /// piece of state git itself throws away (the branch's reflog dies with it)
 /// and exactly what "Restore branch" later needs.
-pub(crate) async fn rev_parse(
-    repo: &Path,
-    rev: &str,
-) -> Result<Option<String>, ExecUnavailable> {
+pub(crate) async fn rev_parse(repo: &Path, rev: &str) -> Result<Option<String>, ExecUnavailable> {
     let spec = format!("{rev}^{{commit}}");
     // Local (D3): resolving a rev reads the object database, never a remote.
     let output = sandboxed(
@@ -459,10 +456,7 @@ pub(crate) async fn git_ok(repo: &Path, args: &[&str]) -> Result<(), String> {
 /// `Err` when git did not run (D5): the old bare `bool` reported a missing
 /// shim as "the ref is not there", which then silently picked a *different*
 /// rebase base.
-pub(crate) async fn git_ref_exists(
-    repo: &Path,
-    refname: &str,
-) -> Result<bool, ExecUnavailable> {
+pub(crate) async fn git_ref_exists(repo: &Path, refname: &str) -> Result<bool, ExecUnavailable> {
     // Local (D3): a ref existence check reads `.git`, never a remote.
     let out = sandboxed(
         repo,

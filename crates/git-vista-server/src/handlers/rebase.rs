@@ -125,3 +125,51 @@ pub(crate) async fn rebase_status() -> axum::response::Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(repo: &Path, args: &[&str]) {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn seeded_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@example.invalid"]);
+        run(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        run(&repo, &["add", "a.txt"]);
+        run(&repo, &["commit", "-q", "-m", "seed"]);
+        (dir, repo)
+    }
+
+    /// D5 (#66, Task 19): "no `origin/main`" and "we could not look" chose the
+    /// *same* base before this change, because `git_ref_exists` returned a
+    /// bare `bool`. They are different rebases onto different commits, so the
+    /// second one must not silently become the first.
+    #[tokio::test]
+    async fn an_unreadable_repository_does_not_silently_pick_the_local_main() {
+        let (_dir, repo) = seeded_repo();
+        assert_eq!(
+            rebase_base(&repo).await.expect("git runs here"),
+            "main",
+            "with no origin/main, the local main really is the base"
+        );
+
+        let (_hostile_dir, hostile) = crate::git_cmd::unrunnable_repo();
+        assert!(
+            rebase_base(&hostile).await.is_err(),
+            "an unreadable repository must not answer ‘main’ — that is a \
+             choice of rebase target made on no evidence"
+        );
+    }
+}

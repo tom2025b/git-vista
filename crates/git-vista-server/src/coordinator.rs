@@ -113,7 +113,10 @@ pub(crate) async fn refuse_if_git_busy(repo: &Path) -> Option<(StatusCode, Strin
         // function is that the lock it looks for is git's, not ours.
         Err(e) => Some(crate::planner::couldnt_run(
             "busy preflight",
-            &format!("couldn't resolve the git directory of {}: {e}", repo.display()),
+            &format!(
+                "couldn't resolve the git directory of {}: {e}",
+                repo.display()
+            ),
         )),
         // git ran and this is not a repository. Left alone exactly as before —
         // the planner's own stages surface git's error for it.
@@ -287,5 +290,39 @@ mod tests {
     async fn a_path_that_is_not_a_repository_is_not_reported_busy() {
         let dir = tempfile::tempdir().unwrap();
         assert!(refuse_if_git_busy(dir.path()).await.is_none());
+    }
+
+    /// D5 (#66, Task 19): the busy preflight's own polarity bug.
+    ///
+    /// `None` from this function means **proceed with the mutation**, and the
+    /// old body reached it via `absolute_git_dir(repo).await?` — where
+    /// `absolute_git_dir` returned `None` for "git could not be run" just as
+    /// readily as for "git says this is not a repository". So the one answer
+    /// that means *we know nothing about this repository* read as a clean bill
+    /// of health.
+    ///
+    /// The two assertions are the whole point: the fixture must land on the
+    /// git-unavailable path (a 500) while the plain non-repository above still
+    /// lands on `None`. If both answered the same, this preflight would have
+    /// been "fixed" into refusing every degraded-mode write.
+    #[tokio::test]
+    async fn a_repository_git_cannot_run_in_is_refused_not_declared_idle() {
+        let (_dir, hostile) = crate::git_cmd::unrunnable_repo();
+
+        // The pre-D5 expression, written out against the same fixture.
+        let pre_d5_said_not_busy = crate::git_cmd::git_output(&hostile, &["rev-parse"])
+            .await
+            .is_err();
+        assert!(
+            pre_d5_said_not_busy,
+            "the fixture must be one where git genuinely cannot run, or this \
+             test pins nothing"
+        );
+
+        let (status, why) = refuse_if_git_busy(&hostile)
+            .await
+            .expect("git failing to run is not evidence that nobody holds the index");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(why.contains("Couldn't run git"), "{why}");
     }
 }
