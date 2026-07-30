@@ -588,12 +588,22 @@ mod tests {
 
     #[test]
     fn an_exact_tie_resolves_to_the_shorter_detent_and_uncovers_the_graph() {
-        // 0.35 is exactly between 0.2 and 0.5; 0.7 exactly between 0.5 and 0.9.
         // IPAD_DESIGN.md:64 — the sheet "must not cover the selected graph item" — so
         // an ambiguous gesture resolves downward.
-        let g = geo();
-        assert_eq!(g.resolve_release(0.35, 0.0), SheetDetent::Summary);
-        assert_eq!(g.resolve_release(0.70, 0.0), SheetDetent::Half);
+        //
+        // This deliberately abandons `geo()` for a geometry whose every value is an
+        // exact binary fraction (0.25, 0.5, 0.75 and the midpoints 0.375, 0.625 are all
+        // sums of powers of two). With `geo()`'s 0.2/0.5/0.9 the "midpoints" are not
+        // midpoints at all once rounded to f64 — 0.35 sits ~1e-16 nearer 0.2 than 0.5 —
+        // so the assertion would pass on a rounding accident without the tie-break
+        // branch ever running. Here the two distances are bit-identical 0.125, and the
+        // only thing that can decide is the rule.
+        let g = SheetGeometry::new(0.25, 0.5, 0.75, 1.0).expect("exact-binary geometry");
+        assert_eq!(0.375_f64 - 0.25, 0.5 - 0.375, "the tie must be a real tie");
+        assert_eq!(0.625_f64 - 0.5, 0.75 - 0.625, "the tie must be a real tie");
+
+        assert_eq!(g.resolve_release(0.375, 0.0), SheetDetent::Summary);
+        assert_eq!(g.resolve_release(0.625, 0.0), SheetDetent::Half);
     }
 
     #[test]
