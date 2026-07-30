@@ -417,20 +417,80 @@ fn commit_inside(policy: &Policy, repo: &Path) -> HookRun {
     })
 }
 
-/// R8: builds the policy for a case. Production-constructible cases (no
-/// exemption) go through the real `policy_for_repo` — the same function
-/// production calls, zero change. Exempted cases (Strict, blocked hooks) are
-/// built directly here, in the harness, since `policy_for_repo` cannot
-/// represent them yet (Task 8 is blocked). This function itself contains a
-/// `Policy { .. }` literal on purpose — R6's ban on that literal scopes to
-/// `escape_suite.rs`/`hook_mode_suite.rs`, not to the harness that serves
-/// them, because the point of R6 is that the *battery* cannot fabricate its
-/// own policy; the harness fabricating one for a not-yet-wired tier, in one
-/// reviewed place, is exactly R8's expiring exemption.
+/// R8: builds the policy for a case.
+///
+/// Production-constructible cases (no exemption) go through the **production
+/// dispatch**, with the declared [`NetworkNeed`] taken from the tier the case is
+/// written against. That mapping is not a harness knob — it is `tier_for`'s own:
+/// a *local* operation on an untrusted repository is `Strict`, a *remote* one is
+/// `Network`. Nothing here asserts the tier by construction; the `assert_eq!`
+/// below re-reads it off the policy production actually returned, so an edit to
+/// `tier_for` or to the trust lookup that re-tiered a case fails the run instead
+/// of silently changing what that case proves.
+///
+/// # Why the Strict cases stopped being exempt (#206)
+///
+/// Until #197 this function could only reach `policy_for_repo(repo)` — a fixed
+/// one-argument entry point with no way to say which tier the case wanted — and
+/// before #197 that function *hard-coded* `Tier::Network` besides. Seven Strict
+/// cases therefore carried `Exemption::NotProductionReachable`. #197 made the
+/// tier a function of the declared need, which made production Strict genuinely
+/// reachable; #206 retired those seven exemptions by teaching this function to
+/// declare that need. The exemption was the only thing standing between those
+/// cases and the production path, and it is gone rather than reworded.
+///
+/// Network-tier cases keep routing through `policy_for_repo`, deliberately. It
+/// *is* `policy_for(repo, false, NetworkNeed::Remote)` plus a self-check (see
+/// its own doc comment), so this is the same policy by construction — and
+/// keeping the nine already-green cases on the entry point they have always used
+/// means retiring the Strict exemptions changed nothing about them.
+///
+/// # The one exemption left
+///
+/// `hook_mode_suite`'s `blocked_hooks` is still built here, in the harness,
+/// because **no production policy constructor yields `HookMode::Blocked`** —
+/// `policy_for`, `policy_for_clone` and `probe::boot_probe_policy` all spell
+/// `HookMode::Run`, and ADR 0029 rejects the degrade-and-block posture by name.
+/// That is the blocker `r8_exemptions_expire_when_their_named_blocker_disappears`
+/// checks, over production source, and it is the condition that has to disappear
+/// before this last exemption can be retired.
+///
+/// This function contains a `Policy { .. }` literal on purpose — R6's ban on
+/// that literal scopes to `escape_suite.rs`/`hook_mode_suite.rs`, not to the
+/// harness that serves them, because the point of R6 is that the *battery*
+/// cannot fabricate its own policy; the harness fabricating one for a shape
+/// production cannot express, in one reviewed place, is exactly R8's expiring
+/// exemption.
 fn policy_for_case(case: &EscapeCase, repo: &Path) -> Policy {
     if case.exemption == Exemption::None {
-        return policy_for_repo(repo)
-            .expect("policy_for_repo must build for a case with no R8 exemption");
+        let policy = match case.tier {
+            Tier::Network => policy_for_repo(repo)
+                .expect("policy_for_repo must build for a case with no R8 exemption"),
+            Tier::Strict => policy_for(repo, false, NetworkNeed::Local).unwrap_or_else(|e| {
+                panic!(
+                    "{}: production policy_for(.., NetworkNeed::Local) refused to build \
+                     the Strict tier on this host ({e:?}). The CI preflight asserts \
+                     bwrap, unprivileged user namespaces and the Landlock floor before \
+                     any case runs, so this is a real refusal (INV-13 / ADR 0029), never \
+                     a reason to fall back to a harness-built policy.",
+                    case.id
+                )
+            }),
+            Tier::Unsandboxed => panic!(
+                "{}: no battery case may declare Tier::Unsandboxed — it installs no \
+                 ruleset at all, so a containment claim written against it is vacuous \
+                 by construction",
+                case.id
+            ),
+        };
+        assert_eq!(
+            policy.tier, case.tier,
+            "{}: the production dispatch returned a tier the case is not written \
+             against — the case would have gone on passing while proving something \
+             about a different sandbox",
+            case.id
+        );
+        return policy;
     }
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
     let (mut rw, mut ro) = default_system_trees(case.tier);
