@@ -1,0 +1,26 @@
+--- a/crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs
++++ b/crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs
+@@ -123,23 +123,6 @@
+ /// an unexplained entry is one a later session cannot safely remove.
+ fn denied_outright() -> Vec<(i64, &'static str)> {
+     vec![
+-        // io_uring: the round-4 bypass. Landlock's filesystem rules are checked
+-        // when a path is opened; io_uring can submit an OPENAT from a kernel
+-        // worker context, which is a different path through the kernel than the
+-        // one Landlock was reasoned about on. Denying the three setup calls is
+-        // what closes it — there is no io_uring without them.
+-        (
+-            libc::SYS_io_uring_setup,
+-            "io_uring bypasses path-based mediation",
+-        ),
+-        (
+-            libc::SYS_io_uring_enter,
+-            "io_uring bypasses path-based mediation",
+-        ),
+-        (
+-            libc::SYS_io_uring_register,
+-            "io_uring bypasses path-based mediation",
+-        ),
+         // Namespace manipulation. A sandboxed process that can create a user
+         // namespace gains capabilities inside it, and `setns` would let it join
+         // one that already exists.
