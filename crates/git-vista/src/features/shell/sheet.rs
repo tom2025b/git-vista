@@ -274,8 +274,8 @@ impl Default for SheetGeometry {
 /// rendering moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InspectorPlacement {
-    /// A persistent third column. `IPAD_DESIGN.md:33` — the wide layout's
-    /// `inspector / plan` column — and `:43`: *"The inspector preserves selected-object
+    /// A persistent third column. `IPAD_DESIGN.md:36` — the wide layout's
+    /// `inspector / plan` column — and `:44`: *"The inspector preserves selected-object
     /// context while the graph remains usable."*
     RightColumn,
     /// A bottom sheet resting at the given detent. `IPAD_DESIGN.md:59` — *"inspector or
@@ -309,7 +309,7 @@ impl InspectorPlacement {
 ///   puts the inspector in a sheet here, and `:108` says selecting a commit *"show[s] a
 ///   summary sheet"* — so Portrait opens at the smallest detent and the user expands.
 /// - [`ShellMode::Wide`] and [`ShellMode::UltraWide`] → [`InspectorPlacement::RightColumn`].
-///   The wide skeleton at `IPAD_DESIGN.md:33` has a dedicated inspector column, and `:78`
+///   The wide skeleton at `IPAD_DESIGN.md:36` has a dedicated inspector column, and `:78`
 ///   keeps it at ultra-wide: *"Permit graph plus side-by-side diff plus inspector when
 ///   width allows."* UltraWide differs from Wide in density, not skeleton — which is why
 ///   they share an arm rather than having two identical ones.
@@ -722,7 +722,7 @@ mod tests {
 
     #[test]
     fn wide_and_ultrawide_keep_the_inspector_as_a_column() {
-        // IPAD_DESIGN.md:33's skeleton has an "inspector / plan" column; :78 keeps it
+        // IPAD_DESIGN.md:36's skeleton has an "inspector / plan" column; :78 keeps it
         // at ultra-wide.
         assert_eq!(
             default_placement_for(ShellMode::Wide),
