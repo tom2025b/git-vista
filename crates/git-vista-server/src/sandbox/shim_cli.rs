@@ -107,6 +107,67 @@ async fn a_real_commit_reaches_the_global_identity_through_the_policy() {
     );
 }
 
+/// A policy entry naming a **regular file** must actually grant that file.
+///
+/// This is the regression test for the silent file-grant no-op. The shim's
+/// non-enumerated fast path handed `landlock_add_rule` the directory-only right
+/// `READ_DIR` for every `--ro`/`--rw` entry regardless of what the entry named;
+/// the kernel answered `EINVAL` for a regular file, the shim mapped that to
+/// `false`, discarded it, and reported `0 granted` with no diagnostic. So a
+/// policy naming a file was indistinguishable — in behaviour and in output —
+/// from a policy naming nothing, which is how a *weaker* sandbox comes to look
+/// like a configured one.
+///
+/// Both legs matter and neither is redundant. The control leg proves the file is
+/// unreachable without the grant (otherwise the second leg would pass on a
+/// sandbox that grants everything); the granted leg proves the same file is
+/// readable with it. `production_policy` builds both, and the only difference
+/// between them is one pushed `ro_trees` entry, so nothing else can account for
+/// the change in outcome.
+#[tokio::test]
+async fn a_read_only_grant_naming_a_regular_file_is_honoured() {
+    let repo = fixture().await;
+    // Deliberately outside every default tree and outside the repository: the
+    // only thing that can make this readable is the grant under test.
+    let outside = tempfile::tempdir().expect("tempdir");
+    let file = outside.path().join("granted.cfg");
+    std::fs::write(&file, "[gv]\n\tmarker = present\n").expect("write the granted file");
+    let arg = file.to_string_lossy().to_string();
+    let read_it = ["config", "-f", arg.as_str(), "--list"];
+
+    let ungranted = production_policy(repo.path());
+    let out = spawn::command_async(&ungranted, repo.path(), &read_it)
+        .output()
+        .await
+        .expect("git runs through the production seam");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success(),
+        "control leg: an ungranted file must not be readable, or this test proves nothing"
+    );
+    assert!(
+        stderr.contains("Permission denied"),
+        "control leg must fail with EACCES, not for some unrelated reason: {stderr}"
+    );
+
+    let mut granted = production_policy(repo.path());
+    granted.ro_trees.push(file.clone());
+    let out = spawn::command_async(&granted, repo.path(), &read_it)
+        .output()
+        .await
+        .expect("git runs through the production seam");
+    assert!(
+        out.status.success(),
+        "a `--ro <regular file>` grant must be honoured: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "gv.marker=present",
+        "the granted file must be readable through the sandbox"
+    );
+}
+
 /// The other half of the same policy: the identity file is readable and the
 /// secrets beside it are not. Asserted in the same tier and the same fixture,
 /// because "secrets denied" proves nothing if the whole policy is denying

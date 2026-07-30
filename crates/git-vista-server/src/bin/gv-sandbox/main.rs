@@ -710,6 +710,56 @@ fn apply_landlock(a: &Args) {
 // to have a `main` of its own.
 mod seccomp_filter;
 
+/// Install the terminal denylist. Applied **after** Landlock and immediately
+/// before the exec, so the ordering matches the layering: the filesystem
+/// boundary is established first, then the syscall boundary, then the process
+/// image is replaced — and both survive the `execve` because
+/// `PR_SET_NO_NEW_PRIVS` is already set.
+///
+/// `net` is the tier, derived in `main` from the `--net-deny`/`--net-allow` flag
+/// the launcher already emits. One rule varies with it (AF_UNIX socket creation,
+/// denied in Strict only); everything else is identical in both tiers. See
+/// `seccomp_filter::af_unix_rule`.
+fn apply_seccomp(net: seccomp_filter::NetScope) {
+    let program = match seccomp_filter::build(net) {
+        Ok(p) => p,
+        Err(e) => die(EXIT_SECCOMP, &format!("seccomp filter build failed: {e}")),
+    };
+    if let Err(e) = seccompiler::apply_filter(&program) {
+        die(EXIT_SECCOMP, &format!("seccomp apply failed: {e}"));
+    }
+}
+
+fn main() {
+    let a = parse();
+    validate(&a);
+    close_inherited_fds();
+    apply_landlock(&a);
+    // `validate` has already refused an argv carrying neither net flag, so the
+    // catch-all arm is unreachable — and it resolves to the *stronger* filter, so
+    // if that ever stops being true the failure is a compatibility complaint and
+    // not a silently weaker sandbox.
+    apply_seccomp(match a.net_allow {
+        Some(true) => seccomp_filter::NetScope::Allowed,
+        _ => seccomp_filter::NetScope::Denied,
+    });
+
+    // `git` is named literally so the argv tripwire can prove this process
+    // cannot exec anything else, and `validate` has already refused any
+    // program_args that did not begin with exactly `git`.
+    let mut cmd = Command::new("git");
+    if let Some(dir) = &a.hooks_blocked_dir {
+        // The same suppression the unsandboxed tier expresses, applied here so
+        // a blocked-hooks policy means blocked hooks in every tier.
+        let mut setting = std::ffi::OsString::from("core.hooksPath=");
+        setting.push(dir);
+        cmd.arg("-c").arg(setting);
+    }
+    cmd.args(&a.program_args[1..]);
+    let err = cmd.exec();
+    die(EXIT_EXEC, &format!("exec git failed: {err}"));
+}
+
 /// Landlock grant tests. They build a **real** ruleset and call the real
 /// `landlock_add_rule`, then throw the ruleset away without
 /// `landlock_restrict_self` — so nothing here restricts the test process, and
@@ -904,54 +954,4 @@ mod tests {
         assert_eq!(rights_for_target(A_READ_DIR | A_MAKE_DIR, false), 0);
         unsafe { libc::close(rs) };
     }
-}
-
-/// Install the terminal denylist. Applied **after** Landlock and immediately
-/// before the exec, so the ordering matches the layering: the filesystem
-/// boundary is established first, then the syscall boundary, then the process
-/// image is replaced — and both survive the `execve` because
-/// `PR_SET_NO_NEW_PRIVS` is already set.
-///
-/// `net` is the tier, derived in `main` from the `--net-deny`/`--net-allow` flag
-/// the launcher already emits. One rule varies with it (AF_UNIX socket creation,
-/// denied in Strict only); everything else is identical in both tiers. See
-/// `seccomp_filter::af_unix_rule`.
-fn apply_seccomp(net: seccomp_filter::NetScope) {
-    let program = match seccomp_filter::build(net) {
-        Ok(p) => p,
-        Err(e) => die(EXIT_SECCOMP, &format!("seccomp filter build failed: {e}")),
-    };
-    if let Err(e) = seccompiler::apply_filter(&program) {
-        die(EXIT_SECCOMP, &format!("seccomp apply failed: {e}"));
-    }
-}
-
-fn main() {
-    let a = parse();
-    validate(&a);
-    close_inherited_fds();
-    apply_landlock(&a);
-    // `validate` has already refused an argv carrying neither net flag, so the
-    // catch-all arm is unreachable — and it resolves to the *stronger* filter, so
-    // if that ever stops being true the failure is a compatibility complaint and
-    // not a silently weaker sandbox.
-    apply_seccomp(match a.net_allow {
-        Some(true) => seccomp_filter::NetScope::Allowed,
-        _ => seccomp_filter::NetScope::Denied,
-    });
-
-    // `git` is named literally so the argv tripwire can prove this process
-    // cannot exec anything else, and `validate` has already refused any
-    // program_args that did not begin with exactly `git`.
-    let mut cmd = Command::new("git");
-    if let Some(dir) = &a.hooks_blocked_dir {
-        // The same suppression the unsandboxed tier expresses, applied here so
-        // a blocked-hooks policy means blocked hooks in every tier.
-        let mut setting = std::ffi::OsString::from("core.hooksPath=");
-        setting.push(dir);
-        cmd.arg("-c").arg(setting);
-    }
-    cmd.args(&a.program_args[1..]);
-    let err = cmd.exec();
-    die(EXIT_EXEC, &format!("exec git failed: {err}"));
 }
