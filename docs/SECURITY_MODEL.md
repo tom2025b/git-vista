@@ -308,7 +308,44 @@ below.
   over SSH wants an agent socket and the carve-out is deferred (issue #188), so
   that tier's filter is unchanged. Proven by `af_unix_socket_denied` and
   `af_unix_socketpair_denied` in the escape battery, which die under
-  `ci/mutants/M8-remove-af-unix-socket-rule.patch`.
+  `ci/mutants/M8-remove-af-unix-socket-rule.patch`. The rule's `Dword`
+  comparison width carries its own guard: `high_bit_af_unix_denied` issues a raw
+  `syscall(SYS_socket, AF_UNIX | 1<<32, …)` — libc's `int`-typed wrapper would
+  truncate the hostile bits before the seccomp-visible register held them — and
+  dies under `ci/mutants/M9-widen-af-unix-comparison.patch`.
+- **A seccomp denylist keyed on bare syscall numbers does not cover the x32
+  ABI, and the filter's arch check does not catch it either.** x32 has no
+  `AUDIT_ARCH` of its own: it reports `AUDIT_ARCH_X86_64` and marks itself by
+  setting `__X32_SYSCALL_BIT` (`0x4000_0000`) in `seccomp_data.nr`. seccompiler
+  emits one `BPF_JEQ` per bare key against the raw `nr` with `mismatch_action =
+  Allow` as the fallthrough, so an x32-numbered call matched no key and fell
+  through — and because the miss happens at the shared `nr` load, it voided the
+  **entire** map at once: io_uring, `unshare`/`setns`, `seccomp` (the C1 stacking
+  denial), `ptrace`, and the AF_UNIX rules together. Measured 2026-07-29 with
+  hand-built cBPF of seccompiler's exact shape; the sibling i386 vector *is*
+  closed, and closed fatally (`AUDIT_ARCH_I386` mismatch →
+  `SECCOMP_RET_KILL_PROCESS`). Not exploitable on the development host — its
+  kernel has `# CONFIG_X86_X32_ABI is not set`, so every x32-numbered call
+  returns `ENOSYS` and no x32 binary can even be exec'd — but that is one
+  kernel-config line away from live, and the sandbox neither controls nor
+  observes the setting. `seccomp_filter::rules_with_x32_aliases` therefore
+  inserts every key twice, bare and `__X32_SYSCALL_BIT`-set. Seccomp evaluates
+  before the kernel's x64/x32 dispatch split, so the fix is verifiable on a host
+  where the exploit is not: `high_bit_io_uring_denied` observes `ENOSYS` outside
+  the sandbox and `EPERM` inside, and dies under
+  `ci/mutants/M1-apply-seccomp-empty.patch`.
+- **A Landlock `path_beneath` rule carrying a directory-only right is rejected
+  outright when the target is a regular file — there is no partial grant.** The
+  accepted set for a non-directory is Landlock's own `ACCESS_FILE`
+  (`EXECUTE`, `WRITE_FILE`, `READ_FILE`, `TRUNCATE`, `IOCTL_DEV`); anything else
+  fails the whole rule with `EINVAL`, and an empty mask fails with `ENOMSG`.
+  Measured 2026-07-29 (ABI 8). This is why the shim masks every grant to the
+  rights its target can carry (`gv-sandbox`'s `rights_for_target`) and why a
+  rejected rule now **refuses the launch** rather than being discarded: a
+  `--ro`/`--rw` entry naming a file used to grant nothing and report success,
+  which is not failing closed — it is a weaker sandbox wearing the costume of a
+  configured one. An unopenable path stays tolerated, because a host without
+  `/run/resolvconf` is not a grant failure.
 - **Landlock rules bind resolved inodes, not path strings.** A name excluded
   from a grant is only actually withheld if the enumeration that builds the
   grant set resolves symlinks and matches hard-link inodes before deciding
