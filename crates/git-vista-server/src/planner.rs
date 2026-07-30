@@ -1200,7 +1200,7 @@ async fn exec_commit_on_head(
     args.push("-m");
     args.push(message.as_str());
 
-    let output = match run_git(repo, &args).await {
+    let output = match run_git(repo, need, &args).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/commit", &e),
     };
@@ -1245,6 +1245,7 @@ async fn exec_empty_commit_on_branch(
     // Write the commit object: the parent's own tree, so nothing changes.
     let output = match run_git(
         repo,
+        need,
         &[
             "commit-tree",
             &format!("{tip}^{{tree}}"),
@@ -1289,6 +1290,7 @@ async fn exec_empty_commit_on_branch(
         .to_string();
     let output = match run_git(
         repo,
+        need,
         &[
             "update-ref",
             "-m",
@@ -1532,6 +1534,7 @@ async fn exec_delete(
     };
     let resp = run_branch_cmd(
         repo,
+        need,
         endpoint,
         &["branch", flag],
         branch,
@@ -1739,7 +1742,7 @@ async fn exec_revert(
         Err(msg) => {
             // Back out of a conflicted half-applied revert so the tree isn't
             // stuck. Harmless when no revert is in progress.
-            let _ = git(repo, &["revert", "--abort"]).await;
+            let _ = git(repo, need, &["revert", "--abort"]).await;
             eprintln!("git-vista: /api/undo revert failed (aborted): {msg}");
             (StatusCode::BAD_REQUEST, msg)
         }
