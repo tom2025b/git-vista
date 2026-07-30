@@ -20,11 +20,16 @@
 //! thing left to arbitrate is *who has it right now*.
 
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// The one owner of TCP port 9418 in this test binary.
 static GIT_PROTOCOL_PORT: Mutex<()> = Mutex::new(());
+
+/// Which thread holds the claim right now (`0` = none). Advisory only: it turns
+/// a nested re-acquire from a silent whole-binary deadlock into a named panic.
+static OWNER: AtomicU64 = AtomicU64::new(0);
 
 /// An exclusive claim on port 9418, released on drop.
 ///
@@ -47,6 +52,23 @@ impl PortClaim {
 
     /// Block until port 9418 is ours.
     pub(crate) fn acquire() -> Self {
+        // A std `Mutex` is not reentrant, so a thread that already holds the
+        // claim and asks again deadlocks — and libtest has no per-test timeout,
+        // so the whole binary would hang with no output at all, which is the
+        // hardest failure mode there is to diagnose. Nothing nests a claim
+        // today; this makes it loud the moment something starts to, instead of
+        // silent. The check is advisory (it cannot make the mutex reentrant),
+        // so it must run *before* the blocking `lock()` call.
+        let me = thread_id();
+        assert!(
+            OWNER.load(Ordering::Acquire) != me,
+            "this thread already holds the port {} claim and is asking for it \
+             again. A std Mutex is not reentrant, so proceeding would deadlock \
+             the entire test binary with no output. Hold one claim per test and \
+             pass the port down, or restructure so the nested path does not need \
+             its own claim.",
+            Self::PORT
+        );
         // Poison recovery is deliberate, and load-bearing. If a test panics
         // while holding this claim, `lock()` returns `Err(PoisonError)` for the
         // rest of the process — so a plain `unwrap()` here would turn *one*
@@ -59,12 +81,33 @@ impl PortClaim {
         // bound to the port — is not tracked by the flag at all; that is
         // `wait_until_free`'s job, below, and it runs either way.
         let guard = GIT_PROTOCOL_PORT.lock().unwrap_or_else(|e| e.into_inner());
+        OWNER.store(me, Ordering::Release);
         // Only after the mutex is ours: a previous holder's socket can linger
         // briefly while it closes, and a *leaked* `git daemon` from an earlier
         // SIGKILLed run is outside this mutex's knowledge entirely.
         wait_until_free();
         Self { _guard: guard }
     }
+}
+
+impl Drop for PortClaim {
+    fn drop(&mut self) {
+        // Clear before `_guard` releases the mutex, so the next claimant can
+        // never observe a stale owner. Unconditional: this runs on the unwind
+        // path too, which is exactly when a stale owner would be most harmful.
+        OWNER.store(0, Ordering::Release);
+    }
+}
+
+/// The thread currently holding the claim, `0` for none. Only ever compared for
+/// equality against the calling thread, so any injective-enough id works;
+/// `ThreadId` is not `as_u64`-stable on stable Rust, hence the address of a
+/// thread-local.
+fn thread_id() -> u64 {
+    thread_local! {
+        static ANCHOR: u8 = const { 0 };
+    }
+    ANCHOR.with(|a| std::ptr::from_ref(a) as u64)
 }
 
 /// Poll until nothing answers on 9418, or panic naming both possible holders.
