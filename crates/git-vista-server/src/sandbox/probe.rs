@@ -293,14 +293,23 @@ fn boot_probe_fixture() -> std::io::Result<BootProbeFixture> {
 
 /// The Strict policy the boot probe runs the fixture under.
 ///
-/// Hand-built rather than routed through `policy_for`/`policy_for_repo`:
-/// those hard-code `Tier::Network` until Task 8 wires real per-operation tier
-/// dispatch in (see `sandbox::policy_for`'s own doc comment), and the whole
-/// point of this probe is to prove the **Strict** tier — the one that needs
-/// bwrap and userns — actually composes. Written field-for-field in the same
-/// order `policy_for` uses so the two stay diffable; when Task 8 lands this
-/// should become `policy_for(scratch, false, ...)` with an explicit
-/// `Tier::Strict` override rather than staying an independent constructor.
+/// Hand-built rather than routed through `policy_for`, and it must stay that
+/// way even though Task 8 has landed and `policy_for(scratch, false,
+/// NetworkNeed::Local)` now genuinely returns a `Strict` policy.
+///
+/// Two reasons. First, the grants differ: this probe needs RW on **two**
+/// directories — the scratch repository *and* the marker directory the hostile
+/// hook writes its observations into — and `policy_for` grants exactly one
+/// repository by construction. Second, and more importantly, `policy_for` now
+/// *refuses* when the host cannot supply Strict (INV-13 / ADR 0029,
+/// `ShimError::StrictUnavailable`). Building the probe's policy through it
+/// would make the probe inherit that refusal and report "policy failed" for the
+/// very condition it exists to measure and classify into a
+/// [`ProbeVerdict::CapabilityAbsent`]. The probe must be able to *attempt* the
+/// strict tier on a host that cannot provide it; that is its whole job.
+///
+/// Still written field-for-field in the same order `policy_for` uses, so the
+/// two stay diffable by eye.
 ///
 /// `HookMode::Run` — **not** `Blocked` — because the hook is the observer
 /// here; blocking it would make the probe blind to everything it exists to

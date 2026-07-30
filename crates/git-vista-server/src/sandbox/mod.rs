@@ -449,9 +449,10 @@ pub(crate) fn default_system_trees(tier: Tier) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (rw, ro)
 }
 
-/// Whether a git invocation needs to reach the network. This is the axis Task 8
-/// dispatches on: the tier is a property of *what the subcommand does*, not of
-/// the repository.
+/// Whether a git invocation needs to reach the network. This is the axis
+/// `policy_for` dispatches on (Task 8 / D3): the tier is a property of *what
+/// the operation does*, not of the repository — with the single exception of
+/// operator trust, which is a property of the repository and overrides both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NetworkNeed {
     /// The subcommand talks to a remote (`push`/`fetch`/`clone`/`ls-remote`).
@@ -498,13 +499,15 @@ const REMOTE_SUBCOMMANDS: &[&str] = &[
 /// The C10 audit is right that argv-name classification cannot be complete
 /// (aliases expand to other subcommands, plumbing and helpers reach the network
 /// under many names, and a partial clone lazily fetches from `checkout`/`diff`).
-/// So when Task 8 is wired in, the primary signal must be the **typed operation
-/// the server chose** — threaded as an explicit `NetworkNeed` from each call
-/// site, which knows its own intent (the planner's `push` step is a push; the
-/// read helpers are reads) — and this function is the conservative default for
-/// any path that only has an argv. Both directions of its error are safe: an
-/// unrecognised network command falls to `Local`/`Strict` and breaks loudly,
-/// never gaining access.
+/// That is now how it works (Task 8 / D3): the primary signal is the **typed
+/// operation the server chose**, classified by `network_need_for_operation` and
+/// threaded as an explicit `NetworkNeed` from each call site, which knows its
+/// own intent (the planner's `push` step is a push; the read helpers are
+/// reads). This function survives as the **cross-check** on that declaration —
+/// see `reconcile_need`, which may only ever tighten. Both directions of its
+/// error remain safe: an unrecognised network command falls to `Local`, which
+/// `reconcile_need` cannot use to widen anything, and which routes to `Strict`
+/// and breaks loudly rather than gaining access.
 ///
 /// Pure and total: every input maps to exactly one `NetworkNeed`.
 pub(crate) fn network_need(args: &[&str]) -> NetworkNeed {
@@ -743,8 +746,12 @@ fn repo_is_trusted(repo: &Path) -> bool {
 /// a hostile hook can write would turn the flag into an escalation path. Its
 /// absence, a read failure, or a parse failure must all mean `false`.
 ///
-/// `trusted` is `false` everywhere today: the flag does not exist yet, so no
-/// repository is unsandboxed, which is the safe state.
+/// As of Task 8 that argument has a real production source: `policy_for` fills
+/// it from `repo_is_trusted` → `sandbox::trust::is_trusted`, keyed on the
+/// canonicalised repository path and backed by a marker file under the
+/// server's own state directory that a sandboxed repository can read but never
+/// write. Until an operator grants one, no marker exists and every repository
+/// is `false` — still the safe state, now by rule rather than by omission.
 pub(crate) fn tier_for(need: NetworkNeed, trusted: bool) -> Tier {
     match (trusted, need) {
         // An operator-trusted repository runs with no sandbox at all, and flies
@@ -1023,14 +1030,13 @@ pub(crate) fn policy_for_repo(repo: &Path) -> Result<Policy, shim::ShimError> {
 /// # Why clone gets its own constructor instead of reusing `policy_for`
 ///
 /// Clone is the one operation that fetches attacker-chosen content by design
-/// — the URL is the request. `policy_for`'s signature has no `trusted`
-/// parameter today (Task 8/`tier_for`'s per-repo trust lookup is not wired
-/// into either constructor yet), so nothing currently distinguishes them on
-/// that axis; this function exists anyway so that when Task 8 *does* wire
-/// trust into `policy_for`, clone is not accidentally swept into eligibility
-/// for `Unsandboxed` by sharing its call path. A dedicated function makes
-/// that a structural property — clone has no repository to look a trust flag
-/// up *for* — rather than a runtime check some future edit could remove.
+/// — the URL is the request. Task 8 wired the per-repo trust lookup into
+/// `policy_for`, which is what makes this separation load-bearing rather than
+/// anticipatory: `policy_for` can now return `Tier::Unsandboxed`, and clone
+/// must never be able to. It cannot, structurally — clone has no repository to
+/// look a trust flag up *for*, so this function neither takes nor derives one
+/// and the tier below is a constant. That is a property of the signature, not a
+/// runtime check some future edit could remove.
 pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimError> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or(shim::ShimError::NoHome)?);
     let shim = shim::shim_path().map_err(Clone::clone)?.to_path_buf();
