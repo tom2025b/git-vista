@@ -89,23 +89,31 @@ fn golden_set() -> DtoGoldenSet {
             token: "bootstrap-token-deadbeef".to_string(),
         },
         // `csrf` present — the authenticated shape a client actually acts on.
-        // `hook_policy: Restricted` here (a LAN-style session) so both
-        // HookPolicy variants appear somewhere in this fixture set, the
-        // authenticated one carrying the "something to disclose" value.
+        // `hook_policy: Strict` here: the one variant that silences INV-15's
+        // banner, so it is the value most worth pinning on the wire.
+        //
+        // The committed fixture used to spell these `restricted`/`allow`
+        // (ADR 0025's two-variant vocabulary). #202 widened `HookPolicy` to
+        // the server's own `sandbox::Tier` names, which is a **value-domain**
+        // change, not an additive field — hence the regeneration. The old
+        // strings still deserialize via `#[serde(alias)]`, and the fact that
+        // the *deserialize* half of this test kept passing against the older
+        // committed fixture is what proved those aliases work on real stored
+        // data; only the re-serialize half needed updating.
         session_info_authenticated: SessionInfo {
             authenticated: true,
             csrf: Some("csrf-token-abc123".to_string()),
             via_lan: false,
-            hook_policy: HookPolicy::Restricted,
+            hook_policy: HookPolicy::Strict,
         },
         // `csrf` absent — the unauthenticated shape; `via_lan` also exercises
         // its `#[serde(default)]` additive-field posture at `false`.
-        // `hook_policy: Allow` covers the other variant.
+        // `hook_policy: Unsandboxed` covers a banner-flying variant.
         session_info_unauthenticated: SessionInfo {
             authenticated: false,
             csrf: None,
             via_lan: false,
-            hook_policy: HookPolicy::Allow,
+            hook_policy: HookPolicy::Unsandboxed,
         },
         rebase_status: RebaseStatus {
             branch: Some("feature/idea".to_string()),
