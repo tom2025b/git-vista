@@ -434,6 +434,19 @@ tripwire or a CI-shell assertion rather than trusted to a reviewer's
 judgement, on the theory that a standard living only in a report is not
 open during the next rewrite.
 
+**The job unclamps unprivileged user namespaces first (D6 Option A).**
+GitHub's `ubuntu-latest` ships `kernel.apparmor_restrict_unprivileged_userns=1`;
+under that clamp `bwrap` cannot create its namespaces, the Strict tier cannot be
+constructed, and — since a case that cannot demonstrate its own premise is a hard
+failure rather than a skip — the battery would go red without testing a single
+invariant. So the job writes the sysctl and **fails loudly if the write does not
+take**, never falling through to a degraded run: a silent workaround would be
+indistinguishable from a sandbox that works. Safe because GitHub-hosted runners
+are single-job ephemeral VMs, destroyed after the run; that reasoning does *not*
+transfer to a self-hosted or reused runner. Decision and alternatives:
+`design-docs/2026-07-29-d6-sandbox-ci-preflight-decision.md`; plan Global
+Constraint 11.
+
 **What the job actually asserts**, none of it decided by the Rust tests
 themselves (see the contract's "Skip policy"):
 
