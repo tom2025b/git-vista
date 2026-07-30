@@ -55,6 +55,12 @@ mod argv;
 mod deps;
 #[cfg(test)]
 mod dispatch;
+/// #66 / #199 (plan Task 13): INV-17, "documented non-coverage is tested as
+/// non-coverage". Its tests assert that attacks **succeed** — see its own
+/// module doc. Outside the `EscapeCase` harness on purpose: an inverted claim
+/// cannot be scored by `run_case`'s contained/escaped verdict.
+#[cfg(test)]
+mod documented_gaps;
 /// #66 Task 25, step 3: the anti-vacuity contract's tripwires and the
 /// EscapeCase/run_case harness step 5 rewrites the battery onto. Landed here
 /// (rather than left for whichever lane does step 5) so no later lane touches
