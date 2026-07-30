@@ -239,6 +239,231 @@ const CASE_HIGH_BIT_IO_URING_DENIED: EscapeCase = EscapeCase {
     git_port: GitPortUse::Unused,
 };
 
+/// INV-1, the read-only-grant boundary: `$HOME` is granted, and granted **read
+/// only**, so a write there is the one filesystem boundary in this policy whose
+/// paired positive can be fully attributable.
+///
+/// R3 is carried here by the strongest pairing available anywhere in this
+/// battery — the denied write and the granted read are siblings under the *same
+/// tree*, in the same run, under the same policy. `enumerate()` implements
+/// exclusion by omission and Landlock is deny-by-default, so `EACCES` from an
+/// ungranted path and `EACCES` from a read-only grant are the same kernel
+/// event; the `$HOME/.gitconfig` read is what says which one this is. Without
+/// it, deleting the `ro.push(home)` line outright would leave this case green
+/// while the secret set stopped being enumerated at all.
+const CASE_WRITE_HOME_DENIED: EscapeCase = EscapeCase {
+    id: "write_home_denied",
+    class: Class::Containment,
+    tier: Tier::Network,
+    hooks_blocked: false,
+    build_hook: harness::fs_boundary_probe,
+    probe_tag: "WRITEHOME",
+    expect_baseline: Errno(0),
+    expect_inside: Errno(13),
+    expect_granted: Errno(0),
+    expect_carrier_code: 0,
+    dies_under: &[MutantId::M2],
+    exemption: Exemption::None,
+    git_port: GitPortUse::Unused,
+};
+
+/// INV-1, the never-granted-tree boundary: the cgroup hierarchy is in no tier's
+/// `rw_trees` or `ro_trees`, so a hostile hook cannot reach it at all.
+///
+/// The claim is stated as a **read** denial rather than the write the plan
+/// sketches, and `harness::fs_boundary_probe`'s doc comment carries the
+/// measurement that forced that: an unprivileged write into `/sys/fs/cgroup`
+/// returns `EACCES` on the bare host too, so a write-shaped case would have
+/// `expect_baseline == expect_inside` and could not tell Landlock from cgroupfs.
+/// A tree that cannot be read cannot be written, and this form has a real
+/// baseline (the control file is mode 444).
+///
+/// Its paired positive is the `$HOME/.gitconfig` read rather than a sibling
+/// under `/sys` — by construction there is no granted sibling there, which is
+/// the claim. What the positive rules out is the only alternative explanation
+/// available: that the policy denied *everything* the hook tried.
+const CASE_CGROUP_TREE_DENIED: EscapeCase = EscapeCase {
+    id: "cgroup_tree_denied",
+    class: Class::Containment,
+    tier: Tier::Network,
+    hooks_blocked: false,
+    build_hook: harness::fs_boundary_probe,
+    probe_tag: "CGROUPTREE",
+    expect_baseline: Errno(0),
+    expect_inside: Errno(13),
+    expect_granted: Errno(0),
+    expect_carrier_code: 0,
+    dies_under: &[MutantId::M2],
+    exemption: Exemption::None,
+    git_port: GitPortUse::Unused,
+};
+
+/// INV-3a: `NO_NEW_PRIVS` is set for the process git actually runs in, and an
+/// explicit attempt to clear it changes nothing.
+///
+/// **The observed integer is not an errno**, and it is deliberate. The clear
+/// attempt itself returns `EINVAL` on both legs — the kernel refuses any
+/// `PR_SET_NO_NEW_PRIVS` whose second argument is not `1`, host and sandbox
+/// alike — so an errno-shaped case here would be the textbook vacuity: two legs
+/// agreeing for a reason that has nothing to do with this sandbox. What is
+/// attributable is the *state after the attempt*, read back through `prctl`:
+/// `NoNewPrivs * 10 + Seccomp`, i.e. `0` outside (neither set) and `12` inside
+/// (`NoNewPrivs: 1`, `Seccomp: 2`). That is the kernel's own report about the
+/// post-`execve` process, which the contract's acceptance evidence (F) asks
+/// every probe to print and which, until this case, nothing asserted.
+///
+/// **Why `M1` and not a mutant on the `NO_NEW_PRIVS` call itself.** There is no
+/// single-hunk mutant that can clear this flag: `apply_landlock` sets it
+/// explicitly *and* `seccompiler::apply_filter` sets it again on the way to
+/// `SECCOMP_SET_MODE_FILTER` (seccompiler 0.5.0, `src/lib.rs:344`), so removing
+/// either site leaves the flag set by the other. `M1` empties the filter, which
+/// drops the `Seccomp` half of the composite from `2` to `0` and is what this
+/// cell measures.
+const CASE_NO_NEW_PRIVS_IRREVOCABLE: EscapeCase = EscapeCase {
+    id: "no_new_privs_irrevocable",
+    class: Class::Containment,
+    tier: Tier::Network,
+    hooks_blocked: false,
+    build_hook: harness::irrevocability_probe,
+    probe_tag: "NNPSTATE",
+    expect_baseline: Errno(0),
+    expect_inside: Errno(12),
+    expect_granted: Errno(0),
+    expect_carrier_code: 0,
+    dies_under: &[MutantId::M1],
+    exemption: Exemption::None,
+    git_port: GitPortUse::Unused,
+};
+
+/// INV-3b: a hostile hook may install a second, allow-**all** Landlock ruleset,
+/// and it does not widen what the first one granted.
+///
+/// The shim's filter does not deny `landlock_create_ruleset`/`add_rule`/
+/// `restrict_self`, so the hook genuinely performs this — the containment comes
+/// from the kernel intersecting every layer of a Landlock domain, never unioning
+/// them. The probe therefore installs a ruleset that grants every ABI-1 access
+/// right on `/` and *then* writes into `$HOME`.
+///
+/// The baseline leg is what makes this attributable, and it is doing real work:
+/// outside the sandbox that same allow-all ruleset is the process's *only*
+/// domain, so the write succeeds (`0`). Crucially the probe reports the install
+/// chain's own errno if any step of it fails, so a baseline `0` means "the
+/// ruleset was installed **and** the write went through" — not "nothing
+/// restricted me". (Measured against the negative control: the identical
+/// sequence with the `/` rule omitted denies the same write with `EACCES`, so
+/// `landlock_restrict_self` is demonstrably taking effect on the baseline leg.)
+const CASE_SECOND_LANDLOCK_RULESET_DENIED: EscapeCase = EscapeCase {
+    id: "second_landlock_ruleset_denied",
+    class: Class::Containment,
+    tier: Tier::Network,
+    hooks_blocked: false,
+    build_hook: harness::irrevocability_probe,
+    probe_tag: "LANDLOCK2",
+    expect_baseline: Errno(0),
+    expect_inside: Errno(13),
+    expect_granted: Errno(0),
+    expect_carrier_code: 0,
+    dies_under: &[MutantId::M2],
+    exemption: Exemption::None,
+    git_port: GitPortUse::Unused,
+};
+
+/// INV-3c: `unshare -Ur`'s syscall is not reachable, so there is no user
+/// namespace in which the hook could hold uid 0 in the first place.
+///
+/// The baseline leg is the load-bearing half: unprivileged user namespaces are
+/// *available* on this host (the CI preflight asserts `capabilities::probe()`
+/// reports `userns`), so `unshare(CLONE_NEWUSER)` returns `0` outside. A host
+/// that had them restricted would make this case report `CapabilityAbsent`
+/// rather than pass — F-NEW-4 recorded that `unshare -Ur` did not escape
+/// Landlock on kernel 7.0, and a case that could not tell "denied" from
+/// "unavailable" would quietly convert that first-party evidence into nothing.
+const CASE_UNSHARE_USERNS_DENIED: EscapeCase = EscapeCase {
+    id: "unshare_userns_denied",
+    class: Class::Containment,
+    tier: Tier::Network,
+    hooks_blocked: false,
+    build_hook: harness::irrevocability_probe,
+    probe_tag: "UNSHARE",
+    expect_baseline: Errno(0),
+    expect_inside: Errno(1),
+    expect_granted: Errno(0),
+    expect_carrier_code: 0,
+    dies_under: &[MutantId::M1],
+    exemption: Exemption::None,
+    git_port: GitPortUse::Unused,
+};
+
+/// INV-4's io_uring entry point: an `AF_UNIX` socket obtained through
+/// `IORING_OP_SOCKET`, which never issues `socket(2)` and therefore never meets
+/// the seccomp rule keyed on that syscall's first argument.
+///
+/// **This is not a second spelling of `io_uring_denied`.** That case claims
+/// `io_uring_setup` returns `EPERM`. This one claims the *consequence*: that
+/// closing io_uring is what closes AF_UNIX at this entry point, because nothing
+/// else in the stack does. Its baseline leg proves the bypass is real rather
+/// than asserting it — outside the sandbox the probe builds a ring, submits one
+/// `IORING_OP_SOCKET` SQE for `AF_UNIX`/`SOCK_STREAM`, and gets a live socket
+/// fd back from the CQE (measured on this host: `res >= 0`). No `socket(2)` is
+/// ever issued, so `seccomp_filter::af_unix_rule` cannot see it.
+///
+/// The tier is `Strict` for exactly that reason: `Strict` is the tier whose
+/// threat model says "no AF_UNIX", and whose AF_UNIX denial is a `socket(2)`
+/// argument rule. In `Network` the sub-claim would be untestable, since AF_UNIX
+/// is deliberately permitted there (#188's deferred ssh-agent carve-out).
+///
+/// `M10` is what makes the claim mechanical: it removes only the io_uring
+/// denials and leaves the AF_UNIX rules installed, so a red cell there says
+/// "the AF_UNIX rule was in force and an AF_UNIX socket was created anyway."
+/// `M1` alone could never say that — it removes both mechanisms at once.
+const CASE_URING_SOCKET_BYPASS: EscapeCase = EscapeCase {
+    id: "uring_socket_bypass_denied",
+    class: Class::Containment,
+    tier: Tier::Strict,
+    hooks_blocked: false,
+    build_hook: harness::uring_socket_probe,
+    probe_tag: "URINGSOCKET",
+    expect_baseline: Errno(0),
+    expect_inside: Errno(1),
+    expect_granted: Errno(0),
+    expect_carrier_code: 0,
+    dies_under: &[MutantId::M1, MutantId::M10],
+    exemption: Exemption::NotProductionReachable {
+        blocker: "policy_for_repo hard-codes Tier::Network",
+    },
+    git_port: GitPortUse::Unused,
+};
+
+#[test]
+fn write_home_denied() {
+    run_case(&CASE_WRITE_HOME_DENIED);
+}
+
+#[test]
+fn cgroup_tree_denied() {
+    run_case(&CASE_CGROUP_TREE_DENIED);
+}
+
+#[test]
+fn no_new_privs_irrevocable() {
+    run_case(&CASE_NO_NEW_PRIVS_IRREVOCABLE);
+}
+
+#[test]
+fn second_landlock_ruleset_denied() {
+    run_case(&CASE_SECOND_LANDLOCK_RULESET_DENIED);
+}
+
+#[test]
+fn unshare_userns_denied() {
+    run_case(&CASE_UNSHARE_USERNS_DENIED);
+}
+
+#[test]
+fn uring_socket_bypass_denied() {
+    run_case(&CASE_URING_SOCKET_BYPASS);
+}
+
 #[test]
 fn secret_read_denied() {
     run_case(&CASE_SECRET_READ_DENIED);

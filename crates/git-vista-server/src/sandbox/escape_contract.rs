@@ -1149,8 +1149,12 @@ fn r5_census_names_exactly_the_declared_cases() {
     );
 
     let census_path = server_root().join("../../docs/sandbox/escape-census.txt");
-    let census_text = std::fs::read_to_string(&census_path)
-        .unwrap_or_else(|e| panic!("{}: the R5 census must be readable: {e}", census_path.display()));
+    let census_text = std::fs::read_to_string(&census_path).unwrap_or_else(|e| {
+        panic!(
+            "{}: the R5 census must be readable: {e}",
+            census_path.display()
+        )
+    });
     let census: BTreeSet<String> = census_text
         .lines()
         .map(str::trim)

@@ -203,12 +203,22 @@ fn boot_probe_hook_script() -> String {
     format!(
         r#"#!/bin/sh
 m="../markers"
+# `true`, not `:` — measured. `:` is a POSIX SPECIAL builtin, and POSIX
+# requires a non-interactive shell to EXIT OUTRIGHT on a redirection error
+# for a special builtin, before the `else` branch (or anything after this
+# line) ever runs. Confirmed directly: `if : > /no/perm 2>/dev/null; then …`
+# under dash aborts the whole script the moment the denied write is
+# attempted, so no marker is ever written and the carrier commit fails with
+# no diagnosis beyond dash's own "cannot create …" line. `true` is an
+# ordinary utility (not a special builtin), so the identical redirection
+# failure is just this one command's exit status and the `if` proceeds to
+# `else` normally.
 # Landlock: $HOME is granted read-only, so this write must fail.
-if : > "$HOME/{ESCAPE_WITNESS}" 2>/dev/null; then echo OPEN; else echo DENIED; fi > "$m/fs_write_outside"
+if true > "$HOME/{ESCAPE_WITNESS}" 2>/dev/null; then echo OPEN; else echo DENIED; fi > "$m/fs_write_outside"
 # R3's mandatory paired positive: a sibling write inside the repo's OWN
 # granted rw tree (cwd is the repo's worktree root). If this is not OK, the
 # denial above proves nothing about the boundary.
-if : > payload.txt 2>/dev/null; then echo OK; else echo FAIL; fi > "$m/fs_write_inside"
+if true > payload.txt 2>/dev/null; then echo OK; else echo FAIL; fi > "$m/fs_write_inside"
 # The kernel's own self-report, after execve — stronger provenance than any
 # errno, and shell-readable.
 awk '/^Seccomp:/{{print $2}}'    /proc/self/status > "$m/seccomp_mode"
@@ -742,31 +752,5 @@ mod tests {
             .await
             .expect("this host is known to compose the strict tier");
         assert_eq!(v, ProbeVerdict::Contained);
-    }
-
-    #[tokio::test]
-    async fn debug_carrier() {
-        let fixture = boot_probe_fixture().expect("fixture");
-        let policy = boot_probe_policy(&fixture.repo(), &fixture.markers()).expect("policy");
-        let out = command_async(
-            &policy,
-            &fixture.repo(),
-            &[
-                "-c",
-                "user.name=gv-boot-probe",
-                "-c",
-                "user.email=gv@localhost",
-                "commit",
-                "--allow-empty",
-                "-m",
-                "boot-probe",
-            ],
-        )
-        .output()
-        .await
-        .expect("spawn");
-        eprintln!("status={:?}", out.status);
-        eprintln!("stdout={}", String::from_utf8_lossy(&out.stdout));
-        eprintln!("stderr={}", String::from_utf8_lossy(&out.stderr));
     }
 }
