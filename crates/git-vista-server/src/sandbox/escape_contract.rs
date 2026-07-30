@@ -1313,23 +1313,168 @@ fn r7_both_legs_share_one_pinned_environment_profile() {
     );
 }
 
-/// R8: the named blocker for each exemption must still exist in production
-/// source. `policy_for_repo` hard-coding `Tier::Network`/`HookMode::Run` is
-/// today's blocker for the Strict and blocked-hooks exemptions (Task 8 is
-/// what removes it) — when it goes, this fails the build and forces step 9.
+/// The one blocker any battery case may still name, spelled once. It must match
+/// `hook_mode_suite.rs`'s `blocker:` string byte for byte — that equality is
+/// half of R8, and it is what makes a *reworded* blocker fail the build instead
+/// of quietly re-labelling an exemption whose reason has changed.
+const CHECKED_BLOCKERS: &[&str] = &["no production policy constructor yields HookMode::Blocked"];
+
+/// R8: every exemption's named blocker must still be a true statement about
+/// production source — **and every blocker the battery names must be one this
+/// test knows how to check.**
+///
+/// # Why the previous form had stopped checking anything (#206)
+///
+/// R8 used to grep `sandbox::policy_for_repo`'s body for the literal tokens
+/// `Tier::Network` and `HookMode::Run`, because before #197 that function
+/// hard-coded both and the two hard-codes *were* the declared blockers. #197
+/// removed the hard-code — `policy_for` now derives the tier from the declared
+/// `NetworkNeed`, so production Strict became reachable — but the two tokens
+/// survived the change, having moved into a `debug_assert!` inside what is now a
+/// `#[cfg(test)]` compatibility wrapper. The grep went on passing while the
+/// condition it stood for no longer existed, and the eight exemptions were
+/// reworded rather than retired. A tripwire anchored to a token in test-only
+/// code cannot expire, which is the single thing R8 exists to do.
+///
+/// # What it is anchored to now
+///
+/// Two checks, both about the property rather than about a token:
+///
+///  1. **The declared blocker set equals `CHECKED_BLOCKERS`.** A new exemption
+///     carrying a blocker nobody checks fails here — the old hard-coded pair
+///     silently permitted exactly that — and a blocker this test still checks
+///     after the last case naming it is gone fails here too.
+///  2. **No production policy constructor yields `HookMode::Blocked`.** Every
+///     production module under `src/sandbox` is walked (the test-only ones are
+///     *derived* from `mod.rs`'s own `#[cfg(test)] mod …;` declarations, so a new
+///     production module is scanned without anyone remembering to add it), each
+///     file's pre-`mod tests` region is taken, and every `Policy { … }` literal
+///     in it must spell the field `hook_mode: HookMode::Run` — a *literal*, so a
+///     `hook_mode: hook_mode_for(x)` helper fails it too — with nothing anywhere
+///     assigning `HookMode::Blocked`. Give any constructor a route to `Blocked`
+///     and this goes red, which is precisely when `hook_mode_suite`'s exemption
+///     must be retired.
 #[test]
 fn r8_exemptions_expire_when_their_named_blocker_disappears() {
-    let code = crate::argv_boundary::code_only(&read_rs("src/sandbox/mod.rs"));
-    let body = fn_body_in(&code, "policy_for_repo");
-    assert!(
-        body.contains("Tier::Network"),
-        "R8: policy_for_repo no longer hard-codes Tier::Network — the Strict-tier \
-         exemption in escape_suite.rs must be retired (step 9), not left standing"
+    // (1) Every blocker string the battery declares. String content must
+    // survive the blanking here — the blockers *are* string literals.
+    let mut declared: BTreeSet<String> = BTreeSet::new();
+    for rel in BATTERY_FILES {
+        let src = comments_only_blanked(&read_rs(rel));
+        let mut rest = src.as_str();
+        let marker = ["blocker", ": \""].concat();
+        while let Some(at) = rest.find(&marker) {
+            let tail = &rest[at + marker.len()..];
+            let end = tail
+                .find('"')
+                .unwrap_or_else(|| panic!("{rel}: unterminated blocker string literal"));
+            declared.insert(tail[..end].to_string());
+            rest = &tail[end..];
+        }
+    }
+    let checked: BTreeSet<String> = CHECKED_BLOCKERS.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        declared,
+        checked,
+        "R8: every exemption blocker a battery file names must have a source check in \
+         this test, and every check here must still have a case naming it. Named but \
+         unchecked: {:?}. Checked but no longer named: {:?}.",
+        declared.difference(&checked).collect::<Vec<_>>(),
+        checked.difference(&declared).collect::<Vec<_>>(),
     );
+
+    // (2) `no production policy constructor yields HookMode::Blocked`, checked
+    // over production source. The test-only module list is read out of
+    // `mod.rs`'s own declarations rather than restated here, so this cannot
+    // drift from the module list the crate actually compiles.
+    let mod_code = crate::argv_boundary::code_only(&read_rs("src/sandbox/mod.rs"));
+    let mut test_only: BTreeSet<String> = BTreeSet::new();
+    let cfg_test = ["#[cfg", "(test)]"].concat();
+    let mut rest = mod_code.as_str();
+    while let Some(at) = rest.find(&cfg_test) {
+        let after = &rest[at + cfg_test.len()..];
+        let Some(semi) = after.find(';') else { break };
+        let head = after[..semi].trim();
+        let decl = head
+            .strip_prefix("pub(crate) ")
+            .or_else(|| head.strip_prefix("pub "))
+            .unwrap_or(head);
+        if let Some(name) = decl.strip_prefix("mod ") {
+            let name = name.trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                test_only.insert(name.to_string());
+            }
+        }
+        rest = &after[semi..];
+    }
+    for expected in ["escape_contract", "escape_suite", "hook_mode_suite"] {
+        assert!(
+            test_only.contains(expected),
+            "R8: the test-only module scan of sandbox/mod.rs missed `{expected}` — the \
+             scan broke, and everything below it would be scanning the wrong file set"
+        );
+    }
+
+    let mut files = Vec::new();
+    crate::argv_boundary::rs_files(&server_root().join("src/sandbox"), &mut files);
+    files.sort();
+    let mut sites = 0usize;
+    for path in &files {
+        let stem = path
+            .file_stem()
+            .expect("a .rs file has a stem")
+            .to_string_lossy()
+            .to_string();
+        if test_only.contains(&stem) {
+            continue;
+        }
+        let code = crate::argv_boundary::code_only(
+            &std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("{}: must be readable: {e}", path.display())),
+        );
+        // Everything before the file's inline `#[cfg(test)] mod tests` block —
+        // a production file's own unit tests may build whatever policy they
+        // like, and often must.
+        let prod = match code.find("mod tests") {
+            Some(at) => &code[..at],
+            None => code.as_str(),
+        };
+        assert!(
+            !prod.contains("= HookMode::Blocked"),
+            "R8: {stem}.rs assigns HookMode::Blocked in production code — the \
+             blocked-hooks exemption in hook_mode_suite.rs must be retired, not left \
+             standing"
+        );
+        let literal = ["Policy", " {"].concat();
+        let mut rest = prod;
+        while let Some(at) = rest.find(&literal) {
+            let before = rest[..at].trim_end();
+            let tail = &rest[at..];
+            rest = &tail[literal.len()..];
+            // `struct Policy {` / `impl Policy {` are not constructions.
+            if before.ends_with("struct") || before.ends_with("impl") {
+                continue;
+            }
+            let field = ["hook_mode", ":"].concat();
+            let f = tail.find(&field).unwrap_or_else(|| {
+                panic!("R8: a `Policy` literal in {stem}.rs has no hook_mode field — the scan broke")
+            });
+            let value = tail[f + field.len()..].trim_start();
+            assert!(
+                value.starts_with("HookMode::Run"),
+                "R8: a production `Policy` literal in {stem}.rs sets hook_mode to \
+                 something other than the literal `HookMode::Run` — production can now \
+                 express a policy that blocks hooks, so the blocked-hooks exemption in \
+                 hook_mode_suite.rs must be retired, not left standing"
+            );
+            sites += 1;
+        }
+    }
     assert!(
-        body.contains("HookMode::Run"),
-        "R8: policy_for_repo no longer hard-codes HookMode::Run — the blocked-hooks \
-         exemption in hook_mode_suite.rs must be retired (step 9), not left standing"
+        sites >= 3,
+        "R8: found only {sites} production `Policy` construction sites under \
+         src/sandbox — policy_for, policy_for_clone and probe::boot_probe_policy are \
+         the three that must be there, so the scan broke rather than the code shrinking"
     );
 }
 
