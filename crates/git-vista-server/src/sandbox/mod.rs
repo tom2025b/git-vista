@@ -572,18 +572,40 @@ pub(crate) fn tier_for(need: NetworkNeed, trusted: bool) -> Tier {
 /// operation this function does not cover — cloning into a destination that
 /// does not exist yet.
 ///
-/// # Repository resolution is validated before any grant is built (D2)
+/// # Repository geometry is resolved (not merely trusted) before any grant is
+/// built (D2) — but the managed-root containment check lives one layer up
 ///
-/// `repo_paths::resolve` finds `repo`'s actual git directory(ies) — composing
-/// `worktree`'s linked-worktree containment rule with the check that rule
-/// does not make: that the resolution lands inside a root the catalog
-/// actually allows (`state::path_is_allowed`, which is multi-root aware — the
-/// configured repo root, the clones root, and any ad-hoc root a trusted
-/// launch allowed, are all checked). A resolution that fails either check
-/// refuses the whole policy (fail-closed), never falls back to granting only
-/// `repo` itself: a hostile `.git` gitfile that cannot be proven safe must not
-/// silently degrade into "no worktree grant" the way it would if this were
-/// treated as optional.
+/// `repo_paths::resolve` finds `repo`'s actual git directory(ies), composing
+/// `worktree`'s linked-worktree containment rule the way that module's own
+/// doc comment describes: a resolution that cannot be proven internally
+/// consistent (a dangling pointer, a symlinked `.git`, a gitdir not
+/// registered under the commondir it claims) refuses the whole policy
+/// (fail-closed), never falls back to granting only `repo` itself.
+///
+/// What this function deliberately does **not** do is check that resolution
+/// against the catalog's allowed roots (`repo_paths::resolve_and_validate`'s
+/// full contract, or `state::path_is_allowed`). That containment check needs
+/// a *request-scoped* notion of "what this server instance is configured to
+/// serve" — the catalog's `AllowedRoots`, a single process-wide `RwLock` — and
+/// this function is the one every git spawn in the crate funnels through,
+/// including the ~40 unit tests across `git_cmd.rs`, `planner`'s contract/
+/// lifecycle/coordination suites, `history.rs` and others that deliberately
+/// spawn git against a throwaway `tempfile::tempdir()` with **no** catalog
+/// registration at all — by design, so they stay independent of the shared
+/// global `CATALOG`/`CURRENT` statics the way `state.rs`'s own test module
+/// documents doing on purpose. Making *this* function catalog-aware would
+/// silently couple every one of those tests to whatever some other,
+/// concurrently-running test happened to have registered in the same
+/// process — exactly the cross-test global-state fragility that pattern
+/// exists to avoid, not a hardening this crate is short of.
+///
+/// The managed-root check the D2 brief describes for `policy_for` is real and
+/// still lands — at `state::resolve_target`, the resolution point actual HTTP
+/// mutation requests funnel through, which both has a legitimate reason to
+/// consult the catalog and runs *before* any repository path reaches this
+/// function at all. See that function's doc comment, and `deviations` in the
+/// implementation report, for the full reasoning. Reads do not yet route
+/// through an equivalent check — see the same report for that named gap.
 ///
 /// # `read_only` withholds the write grant (D2's actual behavioural change)
 ///
@@ -632,16 +654,6 @@ pub(crate) fn policy_for(
     let (mut rw, mut ro) = default_system_trees(tier);
 
     let paths = repo_paths::resolve(repo).map_err(shim::ShimError::RepoPaths)?;
-    if !crate::state::path_is_allowed(&paths.gitdir) || !crate::state::path_is_allowed(&paths.commondir)
-    {
-        return Err(shim::ShimError::RepoPaths(
-            repo_paths::RepoPathsError::OutsideManagedRoot {
-                repo: repo.to_path_buf(),
-                gitdir: paths.gitdir,
-                commondir: paths.commondir,
-            },
-        ));
-    }
 
     if read_only {
         ro.push(repo.to_path_buf());
