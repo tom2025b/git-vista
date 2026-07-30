@@ -24,6 +24,11 @@ use git_vista_protocol::GitOperation;
 pub(crate) mod bwrap;
 /// Task 9: the factual capability probe — what tiers can this host provide.
 pub(crate) mod capabilities;
+/// Task 16: INV-15's disclosure seam — the one crossing from the internal
+/// [`Tier`] to the wire `HookPolicy`, plus ADR 0029's refusal for a host that
+/// cannot supply the tier a repository needs. See its module doc for why the
+/// plan's `CapabilityAbsent => Blocked` mapping is not implemented.
+pub(crate) mod hook_policy;
 /// Task 9, part 2: the boot probe — launches the composed launcher against a
 /// throwaway hostile-hook repo and classifies the result into a
 /// [`probe::ProbeVerdict`], gating server startup (INV-13 / Global
@@ -41,11 +46,6 @@ pub(crate) mod shim;
 /// Task 5: the two spawn wrappers. The single chokepoint where the pure argv
 /// becomes a real git process. Task 6 migrates the server's spawn sites here.
 pub(crate) mod spawn;
-/// Task 16: INV-15's disclosure seam — the one crossing from the internal
-/// [`Tier`] to the wire `HookPolicy`, plus ADR 0029's refusal for a host that
-/// cannot supply the tier a repository needs. See its module doc for why the
-/// plan's `CapabilityAbsent => Blocked` mapping is not implemented.
-pub(crate) mod hook_policy;
 /// Task 7: the persisted per-repo trust flag — the only route to `Unsandboxed`.
 pub(crate) mod trust;
 /// The third impure corner: resolving a linked worktree's real git directory
