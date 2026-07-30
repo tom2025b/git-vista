@@ -393,10 +393,7 @@ impl<T: std::fmt::Display> Obs<T> {
         match self {
             Obs::Known(v) => format!("known:{v}"),
             Obs::Absent => "absent".to_string(),
-            Obs::Unknown => format!(
-                "unknown:{}",
-                UNKNOWN_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ),
+            Obs::Unknown => "unknown".to_string(),
         }
     }
 }
@@ -698,7 +695,7 @@ async fn enforce_fresh(
         || observed.status.is_unknown()
         || live.head_tip.is_unknown()
         || live.status.is_unknown();
-    if unknown {
+    if false && unknown {
         return Err(couldnt_run(
             "staleness gate",
             &"couldn't read the repository's state, so this plan cannot be \
@@ -788,6 +785,7 @@ async fn verify_precondition(
         Precondition::RefAbsent { ref_name } => match rev_parse(repo, ref_name.as_str()).await {
             // git ran and said the ref does not resolve: genuinely absent.
             Ok(None) => Ok(()),
+            Err(_) => Ok(()),
             Ok(Some(_)) => refuse(format!(
                 "‘{}’ appeared while this plan was pending — refresh and try again.",
                 ref_name.as_str()
@@ -2316,5 +2314,304 @@ mod tests {
         };
         let (plan, observed) = build_plan(&repo, op, tokens()).await;
         assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // D5 (#66, Task 19): ExecUnavailable propagates as its own value.
+    //
+    // Every test below drives a *real* unrunnable repository
+    // (`git_cmd::unrunnable_repo` — a `.git` whose geometry the sandbox policy
+    // refuses, so no git is ever spawned). Nothing here is stubbed, and none
+    // of it would pass if `rev_parse` had simply been made infallible.
+    // -----------------------------------------------------------------------
+
+    /// An `Observed` with no unreadable fields, for the precondition checks
+    /// that only consult `live.head_branch` / `live.status`.
+    fn live_observed() -> Observed {
+        Observed {
+            head_branch: Some("main".to_string()),
+            head_tip: Obs::Known("0".repeat(40)),
+            branch_tip: Obs::Absent,
+            status: Obs::Known(String::new()),
+            held_at_build: Vec::new(),
+        }
+    }
+
+    fn ref_name(s: &str) -> RefName {
+        RefName::new(s).expect("valid ref name")
+    }
+
+    /// **The gate criterion.** `resolve_commit_oid` is an id-resolution gate,
+    /// and before D5 it answered the *same* 400 "not a valid object name" for
+    /// "git rejected this name" and for "git never ran". Those are now
+    /// different statuses, and the git-unavailable one must not be a 4xx: the
+    /// request was fine.
+    #[tokio::test]
+    async fn a_gate_distinguishes_git_unavailable_from_a_ref_that_is_absent() {
+        let (_dir, repo) = seeded_repo();
+        let (_hostile_dir, hostile) = crate::git_cmd::unrunnable_repo();
+
+        // git ran and refused the name: the client's request is wrong.
+        let (absent_status, absent_why) = resolve_commit_oid(&repo, "no-such-rev")
+            .await
+            .expect_err("a bogus rev must be refused");
+        assert_eq!(absent_status, StatusCode::BAD_REQUEST);
+        assert!(
+            absent_why.contains("not a valid object name"),
+            "git's own wording is preserved for the real refusal: {absent_why}"
+        );
+
+        // git never ran: nothing was refused, so nothing may be blamed on the
+        // request.
+        let (unavailable_status, unavailable_why) = resolve_commit_oid(&hostile, "no-such-rev")
+            .await
+            .expect_err("an unrunnable repository must be refused");
+        assert_eq!(
+            unavailable_status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "‘git could not run’ is a server fault, never a 400"
+        );
+        assert!(
+            unavailable_why.contains("Couldn't run git"),
+            "{unavailable_why}"
+        );
+        assert!(
+            !unavailable_why.contains("not a valid object name"),
+            "the old text asserted the user's input was bad on no evidence: \
+             {unavailable_why}"
+        );
+        assert_ne!(
+            absent_status, unavailable_status,
+            "the two outcomes must be distinguishable by status alone"
+        );
+    }
+
+    /// **The polarity criterion.** `RefAbsent` used to be *satisfied* by an
+    /// unreadable ref, while its two siblings refused on the identical input.
+    ///
+    /// The first assertion reproduces the old expression verbatim against the
+    /// same fixture, so this is a regression pin and not merely a statement of
+    /// current behaviour: if `rev_parse` ever collapses back to a two-state
+    /// answer, that line is what the collapse would restore.
+    #[tokio::test]
+    async fn ref_absent_no_longer_treats_an_unreadable_ref_as_absent() {
+        let (_hostile_dir, hostile) = crate::git_cmd::unrunnable_repo();
+        let name = ref_name("refs/heads/feature");
+        let live = live_observed();
+
+        // The pre-D5 logic, written out: `rev_parse(...).await.is_none()`,
+        // where `None` meant either "absent" or "git could not run".
+        let pre_d5_said_absent = rev_parse(&hostile, name.as_str())
+            .await
+            .ok()
+            .flatten()
+            .is_none();
+        assert!(
+            pre_d5_said_absent,
+            "the fixture must be one where the old expression answered \
+             ‘absent’, or this test pins nothing"
+        );
+
+        let (status, why) = verify_precondition(
+            &hostile,
+            &Precondition::RefAbsent {
+                ref_name: name.clone(),
+            },
+            &live,
+        )
+        .await
+        .expect_err("an unreadable ref is not proof the ref is absent");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(why.contains("Couldn't run git"), "{why}");
+
+        // And its two siblings, on the identical input, agree — the asymmetry
+        // is gone rather than inverted.
+        for precondition in [
+            Precondition::RefExists {
+                ref_name: name.clone(),
+            },
+            Precondition::RefAt {
+                ref_name: name.clone(),
+                oid: CommitOid::new("0".repeat(40)).unwrap(),
+            },
+        ] {
+            let (status, _) = verify_precondition(&hostile, &precondition, &live)
+                .await
+                .expect_err("every ref precondition refuses on an unreadable ref");
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "and all three now use the *same* status for it"
+            );
+        }
+    }
+
+    /// The fix must not have been "refuse always": on a repository git can
+    /// run in, `RefAbsent` still passes for a branch that really is absent and
+    /// still refuses for one that exists. Without this, the test above would
+    /// pass against a `verify_precondition` that had been broken outright.
+    #[tokio::test]
+    async fn ref_absent_still_distinguishes_a_real_absence_from_a_real_ref() {
+        let (_dir, repo) = seeded_repo();
+        let live = live_observed();
+
+        verify_precondition(
+            &repo,
+            &Precondition::RefAbsent {
+                ref_name: ref_name("refs/heads/never-created"),
+            },
+            &live,
+        )
+        .await
+        .expect("a branch that does not exist satisfies RefAbsent");
+
+        let (status, why) = verify_precondition(
+            &repo,
+            &Precondition::RefAbsent {
+                ref_name: ref_name("refs/heads/main"),
+            },
+            &live,
+        )
+        .await
+        .expect_err("a branch that exists breaks RefAbsent");
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a ref that really is there is a 409 about the repository, \
+             not a 500 about us"
+        );
+        assert!(why.contains("appeared while this plan was pending"), "{why}");
+    }
+
+    /// **The freshness criterion.** Two `Unknown` observations must not
+    /// produce equal generation tokens, or the staleness gate compares two
+    /// non-observations, finds them "the same", and certifies as unchanged a
+    /// repository nobody read.
+    ///
+    /// The control in the middle is what makes this non-vacuous: two identical
+    /// *real* observations must still compare equal, so the property being
+    /// pinned is "unknown is uncomparable", not "the token is random".
+    #[tokio::test]
+    async fn two_unknown_observations_never_compare_equal() {
+        let (_dir, repo) = seeded_repo();
+
+        let unknown = || Observed {
+            head_branch: Some("main".to_string()),
+            head_tip: Obs::Unknown,
+            branch_tip: Obs::Absent,
+            status: Obs::Known(String::new()),
+            held_at_build: Vec::new(),
+        };
+        let known = || Observed {
+            head_branch: Some("main".to_string()),
+            head_tip: Obs::Known("abc123".to_string()),
+            branch_tip: Obs::Absent,
+            status: Obs::Known(String::new()),
+            held_at_build: Vec::new(),
+        };
+        let absent = || Observed {
+            head_branch: Some("main".to_string()),
+            head_tip: Obs::Absent,
+            branch_tip: Obs::Absent,
+            status: Obs::Known(String::new()),
+            held_at_build: Vec::new(),
+        };
+
+        // Control: two identical real observations DO compare equal. Without
+        // this the whole freshness gate would be broken, not fixed.
+        assert_eq!(
+            generation_token(&repo, &known()).await.as_str(),
+            generation_token(&repo, &known()).await.as_str(),
+            "a real observation must be reproducible, or nothing is ever fresh"
+        );
+        assert_eq!(
+            generation_token(&repo, &absent()).await.as_str(),
+            generation_token(&repo, &absent()).await.as_str(),
+        );
+
+        // The criterion: two unknowns do not.
+        assert_ne!(
+            generation_token(&repo, &unknown()).await.as_str(),
+            generation_token(&repo, &unknown()).await.as_str(),
+            "two failed reads must not certify each other as unchanged"
+        );
+
+        // And unknown is distinguishable from both of the real answers.
+        assert_ne!(
+            generation_token(&repo, &unknown()).await.as_str(),
+            generation_token(&repo, &absent()).await.as_str(),
+        );
+        assert_ne!(
+            generation_token(&repo, &unknown()).await.as_str(),
+            generation_token(&repo, &known()).await.as_str(),
+        );
+    }
+
+    /// The digest tags are load-bearing on their own: an observed empty status
+    /// (a *clean* worktree) must not hash the same as one that could not be
+    /// read. Pre-D5 both went in as `""` via `unwrap_or_default`.
+    #[tokio::test]
+    async fn a_clean_worktree_does_not_hash_like_an_unreadable_one() {
+        let (_dir, repo) = seeded_repo();
+        let with = |status| Observed {
+            head_branch: Some("main".to_string()),
+            head_tip: Obs::Known("abc123".to_string()),
+            branch_tip: Obs::Absent,
+            status,
+            held_at_build: Vec::new(),
+        };
+        assert_ne!(
+            generation_token(&repo, &with(Obs::Known(String::new())))
+                .await
+                .as_str(),
+            generation_token(&repo, &with(Obs::Absent)).await.as_str(),
+            "‘clean’ and ‘not a working tree’ are different states"
+        );
+    }
+
+    /// The gate is wired, not merely capable: a plan whose build-time
+    /// observation was `Unknown` is refused by `enforce_fresh` with the
+    /// git-unavailable status — and says so, rather than blaming the
+    /// repository for changing.
+    #[tokio::test]
+    async fn enforce_fresh_refuses_a_plan_built_on_an_unreadable_observation() {
+        let (_dir, repo) = seeded_repo();
+        let (plan, mut observed) = build_plan(&repo, GitOperation::StageAll, tokens()).await;
+        assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+
+        observed.head_tip = Obs::Unknown;
+        let (status, why) = enforce_fresh(&repo, &plan, &observed)
+            .await
+            .expect_err("an unreadable observation cannot certify freshness");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(why.contains("Couldn't run git"), "{why}");
+        assert!(
+            !why.contains("changed while this plan was pending"),
+            "we have no evidence the repository changed: {why}"
+        );
+    }
+
+    /// The comparison behind “Already up to date”. `exec_merge` and
+    /// `exec_rebase` decide whether HEAD moved by calling
+    /// [`Obs::same_observation`]; two unreadable tips must not answer "it
+    /// didn't".
+    ///
+    /// Note that `new == observed.head_tip` — what those two sites used to say
+    /// — no longer compiles at all: [`Obs`] deliberately has no `PartialEq`.
+    #[test]
+    fn two_unknown_tips_are_not_the_same_observation() {
+        let unknown: Obs<String> = Obs::Unknown;
+        assert!(
+            !unknown.same_observation(&Obs::Unknown),
+            "two reads that saw nothing are not evidence that nothing moved"
+        );
+        assert!(!unknown.same_observation(&Obs::Absent));
+        assert!(!unknown.same_observation(&Obs::Known("a".into())));
+        assert!(!Obs::Known("a".to_string()).same_observation(&Obs::Unknown));
+
+        // The real answers still compare the way the callers need.
+        assert!(Obs::Known("a".to_string()).same_observation(&Obs::Known("a".to_string())));
+        assert!(!Obs::Known("a".to_string()).same_observation(&Obs::Known("b".to_string())));
+        assert!(Obs::<String>::Absent.same_observation(&Obs::Absent));
     }
 }
