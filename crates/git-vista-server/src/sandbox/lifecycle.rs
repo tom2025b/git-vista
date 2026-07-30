@@ -168,9 +168,7 @@ pub(crate) async fn strict_baseline(repo: &Path, case: &str) -> Policy {
             status = out.status,
             err = String::from_utf8_lossy(&out.stderr),
         ),
-        Err(e) => panic!(
-            "{case}: the composed Strict launcher could not be spawned at all: {e}"
-        ),
+        Err(e) => panic!("{case}: the composed Strict launcher could not be spawned at all: {e}"),
     }
 }
 
@@ -182,9 +180,8 @@ pub(crate) async fn strict_baseline(repo: &Path, case: &str) -> Policy {
 /// has **no bwrap and no namespaces at all**, which is exactly the "same
 /// everything, minus the mechanism under test" leg a containment claim needs.
 fn network_control(repo: &Path, case: &str) -> Policy {
-    let policy = policy_for_repo(repo).unwrap_or_else(|e| {
-        panic!("{case}: the Network-tier control policy must build: {e}")
-    });
+    let policy = policy_for_repo(repo)
+        .unwrap_or_else(|e| panic!("{case}: the Network-tier control policy must build: {e}"));
     assert_eq!(
         policy.tier,
         Tier::Network,
@@ -225,9 +222,8 @@ fn marker(repo: &Path, name: &str, leg: &str) -> String {
 /// Parse a marker that must be a non-negative integer.
 fn numeric_marker(repo: &Path, name: &str, leg: &str) -> i64 {
     let raw = marker(repo, name, leg);
-    raw.parse().unwrap_or_else(|_| {
-        panic!("{leg}: marker `{name}` must be an integer, got {raw:?}")
-    })
+    raw.parse()
+        .unwrap_or_else(|_| panic!("{leg}: marker `{name}` must be an integer, got {raw:?}"))
 }
 
 /// A suffix unique to this process, so two concurrently running test binaries
@@ -418,7 +414,8 @@ async fn strict_reaps_a_double_forked_setsid_orphan_that_the_network_tier_does_n
         subject.ticks_at_kill
     );
     assert_eq!(
-        subject.ticks_at_kill, subject.ticks_after,
+        subject.ticks_at_kill,
+        subject.ticks_after,
         "INV-8: a descendant kept running after the supervisor died — the tick log \
          grew from {} to {} in the {:?} after SIGKILL",
         subject.ticks_at_kill,
@@ -477,11 +474,15 @@ async fn strict_mounts_a_fresh_procfs_that_cannot_see_the_host_process_table() {
     ));
 
     let policy = strict_baseline(repo.path(), case).await;
-    let out = command_async(&policy, repo.path(), &["commit", "--allow-empty", "-m", "procfs"])
-        .pinned_env_for_test(&production_env_profile())
-        .output()
-        .await
-        .expect("the composed launcher runs");
+    let out = command_async(
+        &policy,
+        repo.path(),
+        &["commit", "--allow-empty", "-m", "procfs"],
+    )
+    .pinned_env_for_test(&production_env_profile())
+    .output()
+    .await
+    .expect("the composed launcher runs");
     assert!(
         out.status.success(),
         "{leg}: the commit must land, so the hook's own inability to write is never \
@@ -611,12 +612,20 @@ async fn strict_gets_a_private_dev_shm_tmpfs_that_the_network_tier_does_not() {
     run_shm_leg(control_repo.path(), &control_policy, "control(Network)").await;
 
     assert_eq!(
-        marker(control_repo.path(), "lifecycle-shm-write", "control(Network)"),
+        marker(
+            control_repo.path(),
+            "lifecycle-shm-write",
+            "control(Network)"
+        ),
         "0",
         "control(Network): the write into the host's /dev/shm must succeed"
     );
     assert_eq!(
-        marker(control_repo.path(), "lifecycle-shm-host", "control(Network)"),
+        marker(
+            control_repo.path(),
+            "lifecycle-shm-host",
+            "control(Network)"
+        ),
         "PRESENT",
         "control(Network): the host's /dev/shm marker must be visible to a tier with \
          no mount namespace. If it is not, this test cannot see its own marker at all \
