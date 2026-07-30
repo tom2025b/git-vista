@@ -84,6 +84,20 @@ pub(crate) enum MutantId {
     /// `Dword` comparison from a `Qword` one. `high_bit_af_unix_denied` is the
     /// case that can.
     M9,
+    /// `ci/mutants/M10-allow-io-uring.patch` — removes *only* the three
+    /// `io_uring_setup`/`enter`/`register` entries from
+    /// `seccomp_filter::denied_outright`, leaving every other denial — including
+    /// the Strict tier's AF_UNIX `socket`/`socketpair` rules — installed.
+    ///
+    /// M1 (whole filter emptied) kills the io_uring cases too, and cannot tell
+    /// the two mechanisms apart. M10 is what makes
+    /// `uring_socket_bypass_denied`'s claim mechanical rather than editorial:
+    /// with the AF_UNIX rules **demonstrably still in force**, the probe still
+    /// obtains an `AF_UNIX` socket through `IORING_OP_SOCKET`. That is the whole
+    /// sub-claim — a seccomp rule keyed on `socket(2)`'s first argument does not
+    /// reach a socket io_uring creates on the process's behalf, so the io_uring
+    /// denial, and not the AF_UNIX rule, is what closes that path.
+    M10,
 }
 
 /// R8: a case whose configuration production cannot build yet carries the
@@ -316,6 +330,30 @@ fn fixture() -> tempfile::TempDir {
         assert!(ok, "fixture setup failed: git {args:?}");
     }
     d
+}
+
+/// A throwaway repository whose `pre-commit` hook is `script` — the single
+/// constructor the lifecycle (Task 12), non-coverage (Task 13) and
+/// compatibility (Task 14) batteries all name.
+///
+/// **Composed, never duplicated.** It is exactly `fixture()` followed by
+/// `install_hook()`, the same two pieces `execute` uses for both of its own
+/// legs, so a hostile-hook repository built by another battery is
+/// byte-for-byte the repository this one runs its containment claims against:
+/// the same seed commit, the same deliberately absent local identity (a hook
+/// that needs an author must therefore reach `~/.gitconfig` *through the policy
+/// under test*), and the same `#!/bin/sh` + `0755` hook wrapper. A second
+/// constructor that drifted on any of those would silently change what a
+/// neighbouring battery's "same fixture" claim means.
+///
+/// Re-exported from `escape_suite` (`pub(crate) use`) so those tasks'
+/// `use super::escape_suite::hostile_hook_repo;` resolves as written, without
+/// any of them reaching into the harness for `fixture`/`install_hook`
+/// separately and re-pairing them by hand.
+pub(crate) fn hostile_hook_repo(script: &str) -> tempfile::TempDir {
+    let repo = fixture();
+    install_hook(repo.path(), script);
+    repo
 }
 
 fn run_git_outside(repo: &Path, args: &[&str], env: &[(&str, String)]) -> (i32, String) {
@@ -750,6 +788,10 @@ const RULES: &[(&str, &str)] = &[
     (
         "R4-CAPABILITY-BY-EXECUTION",
         "r4_capability_established_only_by_execution_never_by_probing_the_host",
+    ),
+    (
+        "R5-REPORT-FILE-CENSUS",
+        "r5_census_names_exactly_the_declared_cases",
     ),
     (
         "R6-PRODUCTION-SEAM",
