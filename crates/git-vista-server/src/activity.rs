@@ -266,7 +266,12 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
     if let Some(rejected) = crate::state::reject_if_read_only() {
         return rejected;
     }
-    let repo = crate::state::current().0;
+    // D2 (#66, Task 7): the validated resolution, replacing a raw
+    // `state::current()` call — see `state::resolve_target`'s doc comment.
+    let repo = match crate::state::resolve_target() {
+        Ok((repo, _entry)) => repo,
+        Err(rejected) => return rejected,
+    };
     let op = match action {
         UndoAction::RestoreBranch { name, tip } => {
             let name = name.trim();

@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use git_vista_core::identity::{RepositoryHandle, WorktreeId};
 use git_vista_protocol::{RepoMode, RepositoryDescriptor};
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, RepoEntry};
 
 // Which repository to visualise *initially*. Taken from the first CLI argument
 // (`git-vista-server <path>`), falling back to the current working directory (`.`,
@@ -282,6 +282,92 @@ pub(crate) fn current_handle() -> Option<RepositoryHandle> {
         .read()
         .expect("CURRENT lock not poisoned")
         .handle
+}
+
+/// D2 (#66, Task 7): whether `path` is registered in the catalog as a
+/// read-only entry — the signal `sandbox::policy_for` uses to withhold the
+/// sandbox's write grant, independent of the live selection's mode
+/// ([`reject_if_read_only`]'s own signal; see `policy_for`'s doc comment for
+/// why the two are deliberately separate checks). `false` for any path with
+/// no matching catalog entry: an unregistered path — a test fixture spawning
+/// git against its own throwaway `tempdir()`, a clone destination not yet
+/// registered, a degraded-mode selection — carries no read-only record, so
+/// it gets exactly the "nothing restricts this" answer it always got before
+/// D2 introduced the check at all.
+pub(crate) fn read_only_for_path(path: &Path) -> bool {
+    catalog()
+        .read()
+        .expect("catalog lock")
+        .read_only_for_path(path)
+        .unwrap_or(false)
+}
+
+/// D2 (#66, Task 7): the single validated resolution every write handler and
+/// the planner's execution entry point use in place of a raw
+/// `current()`/`current_handle()` call.
+///
+/// Mutation endpoints take no `?repo=` selector — they always act on the
+/// current default selection (unlike the read endpoints' `resolve_repo`,
+/// which additionally accepts an explicit id) — so this resolves exactly
+/// that selection, but does two things a bare `current()` never did:
+///
+/// 1. **Fails closed on degraded mode.** A selection with no catalog entry
+///    (the path never classified as a git repository) refuses here rather
+///    than handing back a raw, unvalidated path a mutating git argv would
+///    then be built against. This is a deliberate asymmetry with the read
+///    side: `resolve_repo`'s doc comment records that a degraded selection's
+///    *reads* run and surface git's own "not a repository" error, and that
+///    established, lenient read-side posture is untouched by this function —
+///    a mutation simply has no legitimate reason to run against a directory
+///    that was never a repository in the first place.
+/// 2. **Re-validates the selection's `.git` geometry** via
+///    `sandbox::repo_paths::resolve`, composed with the catalog's own
+///    multi-root `path_is_allowed` exactly the way `sandbox::policy_for`'s
+///    doc comment describes doing at the *request-resolution* layer rather
+///    than inside policy construction itself (see that doc comment for why).
+///    A hostile `.git` gitfile written since the selection was last read is
+///    refused here, before any mutating argv is built — not merely when the
+///    eventual git spawn's own policy gets around to it.
+///
+/// Returns the entry's own canonical path (not whatever spelling the
+/// in-memory selection happened to hold) alongside the full [`RepoEntry`], so
+/// a caller that needs `read_only`/`kind`/the handle has it without a second
+/// lookup.
+pub(crate) fn resolve_target() -> Result<(PathBuf, RepoEntry), (StatusCode, String)> {
+    let handle = current_handle().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "The current selection isn't a recognised repository.".to_string(),
+        )
+    })?;
+    let entry = catalog()
+        .read()
+        .expect("catalog lock")
+        .resolve(handle.worktree)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                "The current selection is no longer registered.".to_string(),
+            )
+        })?;
+    let paths = crate::sandbox::repo_paths::resolve(&entry.path).map_err(|e| {
+        eprintln!("git-vista: resolve_target refused a mutation target: {e}");
+        (StatusCode::CONFLICT, e.to_string())
+    })?;
+    if !path_is_allowed(&paths.gitdir) || !path_is_allowed(&paths.commondir) {
+        eprintln!(
+            "git-vista: resolve_target refused {} — its git directory resolves outside \
+             the server's managed root",
+            entry.path.display()
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            "This repository's git directory is outside the server's managed root."
+                .to_string(),
+        ));
+    }
+    Ok((entry.path.clone(), entry))
 }
 
 /// Point the server at a new repository (startup, or after a clone), registering
