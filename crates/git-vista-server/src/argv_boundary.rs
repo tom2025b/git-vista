@@ -43,7 +43,17 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // its `#[cfg(test)]` fixture setup.
     "src/durable.rs",
     "src/git_cmd.rs", // shared read-only git helpers, and the sealed `git_output` launcher (#66 Task 6)
-    "src/handlers/clone.rs", // `git clone` with a validated URL as its own argv entry
+    // `src/handlers/clone.rs` was here for its raw `git clone` spawn. It is
+    // gone: the production call goes through `crate::git_cmd::git_output`, the
+    // sealed sandbox launcher (#66 Task 6, plan step 6.7), and unlike the other
+    // migrated entries below the file has **no** `#[cfg(test)]` `Command::new`
+    // left either — its tests exercise pure helpers (`clone_dir_name`,
+    // `unique_dest`) and the delete handler. So the entry was removed rather
+    // than re-commented: an allowlist entry for a file that constructs no
+    // `Command` is a standing permission nobody needs, and the scan below only
+    // consults this list for files that *do* spawn, so a stale entry would
+    // silently pre-authorise a future raw spawn there — in the one handler that
+    // fetches attacker-chosen content.
     // `git status --porcelain=v2` (static args). The production call
     // (`worktree_status`) now goes through `crate::git_cmd::git_output`
     // (#66 Task 6); this entry now covers only its `#[cfg(test)]` fixtures.
