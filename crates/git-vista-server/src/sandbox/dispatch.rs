@@ -202,9 +202,15 @@ fn untrusted_dispatch_is_strict_for_local_and_network_for_remote() {
 /// would pass even if the real caller used `true` — the C10 audit flagged the
 /// earlier version of this test as vacuous for exactly that reason). This
 /// exercises the real `policy_for_repo` and asserts the tier it hands out is
-/// never `Unsandboxed`. When Task 8's dispatch is wired in, this test must be
-/// updated to also cover the Strict/Network split — but the "never Unsandboxed
-/// without an explicit trust flag" property must survive that change.
+/// never `Unsandboxed`.
+///
+/// Task 8 wired the Strict/Network split in; the additional coverage that asked
+/// for lives below (`a_local_operation_gets_the_strict_tier_with_no_ports`,
+/// `a_remote_operation_gets_the_network_tier_with_the_git_ports`,
+/// `an_untrusted_repository_can_never_be_unsandboxed`). This test is kept as
+/// written because it now pins a second thing: `policy_for_repo` is the entry
+/// point `escape_contract::policy_for_case` calls, and the ten Network-tier
+/// battery cases depend on it staying non-`Unsandboxed`.
 #[test]
 fn the_production_policy_is_never_unsandboxed_today() {
     let repo = tempfile::tempdir().expect("tempdir");
