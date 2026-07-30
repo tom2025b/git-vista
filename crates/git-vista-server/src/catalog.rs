@@ -186,6 +186,22 @@ impl Catalog {
         self.entries.get(&worktree)
     }
 
+    /// Whether `path` (exact canonical-path equality — the same spelling
+    /// `register` stored) is a registered entry's read-only flag, or `None`
+    /// when nothing in the catalog was registered at that exact path.
+    ///
+    /// D2 (#66, Task 7): the lookup behind `sandbox::policy_for`'s read-only
+    /// grant decision, and independent of `Catalog::resolve` — that one is
+    /// keyed by opaque id (what a *request* addresses a repository by), this
+    /// one by path (what a *sandbox policy* is built for). A linear scan
+    /// over `entries`, deliberately: the catalog holds at most a handful of
+    /// repositories, this runs once per git spawn, and a path→entry reverse
+    /// index would be one more piece of state that could drift from the
+    /// primary map for no measurable benefit at this scale.
+    pub(crate) fn read_only_for_path(&self, path: &Path) -> Option<bool> {
+        self.entries.values().find(|e| e.path == path).map(|e| e.read_only)
+    }
+
     /// Drop the entry for `worktree`, returning it (`None` when not held). The
     /// allowed root it lived under stays — other clones share it.
     pub(crate) fn remove(&mut self, worktree: WorktreeId) -> Option<RepoEntry> {

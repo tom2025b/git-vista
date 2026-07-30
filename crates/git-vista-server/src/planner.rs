@@ -42,7 +42,7 @@ use git_vista_protocol::{
 
 use crate::git_cmd::{git_ok, rev_parse};
 use crate::journal;
-use crate::state::{current, current_handle, reject_if_read_only};
+use crate::state::{current_handle, reject_if_read_only};
 
 /// How long a freshly issued plan stays executable. Enforced by [`validate`]
 /// (#145); unreachable in practice while plans execute in the same request
@@ -76,8 +76,14 @@ pub(crate) async fn plan_and_execute(op: GitOperation) -> (StatusCode, String) {
             ),
         );
     };
-    let repo = current().0;
-    let repo_id = current_handle().map(|handle| handle.repository);
+    // D2 (#66, Task 7): the validated resolution — degraded-mode selections
+    // and hostile/out-of-managed-root `.git` geometries refuse here, before
+    // any mutating argv is built. See `state::resolve_target`'s doc comment.
+    let (repo, entry) = match crate::state::resolve_target() {
+        Ok(v) => v,
+        Err(rejected) => return rejected,
+    };
+    let repo_id = Some(entry.handle.repository);
     plan_and_execute_tracked(key, repo, repo_id, selection_tokens(), op).await
 }
 
