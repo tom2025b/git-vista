@@ -269,6 +269,44 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends bubblewrap build-essential patch rsync
 
+      # D6 Option A — decided by Tom 2026-07-29, re-confirmed 2026-07-30.
+      # Rationale in design-docs/2026-07-29-d6-sandbox-ci-preflight-decision.md
+      # and plan Global Constraint 11.
+      #
+      # GitHub's ubuntu-latest ships kernel.apparmor_restrict_unprivileged_userns=1.
+      # Under that clamp `bwrap` cannot create its namespaces, so the Strict tier
+      # cannot be constructed at all — and because a case that cannot demonstrate
+      # its own premise is now a HARD FAILURE rather than a skip, the escape
+      # battery would go red without ever testing a single invariant. Either way
+      # the 17 invariants this milestone exists to prove would never gate a merge.
+      #
+      # So the clamp is lifted here, deliberately and visibly, and the step FAILS
+      # LOUDLY if the write does not take — it never falls through to a degraded
+      # run. That distinction is the whole point: a silent workaround would be
+      # indistinguishable from a sandbox that works.
+      #
+      # Safe here specifically because GitHub-hosted runners are single-job,
+      # ephemeral VMs, destroyed after the run and never reused — there is no
+      # "left the box weaker" concern that would apply on a persistent host. Do
+      # NOT copy this step to a self-hosted or reused runner without revisiting
+      # that reasoning.
+      - name: Preflight — unclamp unprivileged user namespaces (D6 Option A)
+        run: |
+          set -euo pipefail
+          before="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 'absent')"
+          echo "apparmor_restrict_unprivileged_userns before: $before"
+          if [ "$before" = "absent" ]; then
+            echo "sysctl not present on this kernel — nothing to unclamp; the capability preflight below is the real check."
+            exit 0
+          fi
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          after="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+          echo "apparmor_restrict_unprivileged_userns after: $after"
+          if [ "$after" != "0" ]; then
+            echo "::error::Failed to unclamp unprivileged user namespaces (still '$after'). Refusing to continue: without this the Strict tier cannot be built, so the escape battery would report capability-absent and prove nothing. Failing loudly is the decided posture (D6 Option A) — do not add a fallback that lets the job pass having tested nothing."
+            exit 1
+          fi
+
       - name: Sandbox preflight (host capability check)
         run: cargo test -p git-vista-server ci_preflight_host_meets_the_declared_minimum
 
