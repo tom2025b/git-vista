@@ -12,8 +12,20 @@
 
 use super::*;
 
-/// Build through the production policy seam, unmodified.
+/// Build through the production policy seam, unmodified — the **Strict** tier,
+/// because every command these tests run (`init`, `commit`, `status`, `config`)
+/// is a local operation, and after Task 8's dispatch a local operation on an
+/// untrusted repository is exactly what `Tier::Strict` means.
 ///
+/// This is deliberately `policy_for(.., NetworkNeed::Local)` rather than the
+/// one-argument `policy_for_repo`, which now declares `Remote` for the escape
+/// battery's Network-tier cases (see its doc comment). Routing these tests
+/// through `Local` is the point: they are the "drive it exactly like production
+/// does" suite, and after Task 8 production drives `git commit` through bwrap's
+/// namespaces. Before Task 8 they ran in the Network tier and proved nothing
+/// about the tier real mutations now use.
+///
+
 /// This used to carry a retry loop that re-set `HOME` because `trust::tests`
 /// removed it process-wide and never restored it. That disease is cured at the
 /// source — the trust tests now take their directory explicitly and touch no
@@ -22,7 +34,7 @@ use super::*;
 /// loud `NoHome` failure naming the problem, not a helper that silently
 /// launders it while every other `$HOME` reader in the suite still races.
 pub(crate) fn production_policy(repo: &std::path::Path) -> Policy {
-    match policy_for_repo(repo) {
+    match policy_for(repo, false, NetworkNeed::Local) {
         Ok(policy) => policy,
         Err(error) => panic!("production policy builds: {error}"),
     }

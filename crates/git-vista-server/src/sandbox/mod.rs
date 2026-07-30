@@ -16,6 +16,8 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use git_vista_protocol::GitOperation;
+
 /// The one impure corner of `sandbox`: it stats the filesystem to find the
 /// strict tier's launcher. Task 5's policy builders call
 /// `bwrap::bwrap_path()` to fill `Policy::bwrap`.
@@ -955,44 +957,58 @@ pub(crate) fn policy_for(
     })
 }
 
-/// Compatibility wrapper reproducing `policy_for_repo`'s exact pre-D2 shape:
-/// `read_only = false` (D2's whole behavioural change was making that
-/// conditional; the pre-D2 caller always got the unconditional RW grant) and
-/// `need = NetworkNeed::Local` (irrelevant either way while tier is
-/// hard-coded — see `policy_for`'s doc comment).
+/// The **Network-tier** production policy for `repo`, at the one-argument arity
+/// `escape_contract::policy_for_case` is pinned to.
 ///
-/// # Why this still exists after D2 renamed the production function
+/// `read_only = false` (D2's behavioural change was making that conditional;
+/// this caller always wants the RW grant) and `need = NetworkNeed::Remote`.
 ///
-/// `sandbox::shim_cli::production_policy` — the "drive it exactly like
-/// production does" helper the escape battery and several other test modules
-/// share — and `sandbox::escape_contract::policy_for_case` both call
-/// `policy_for_repo(repo)` by that exact name and arity.
-/// `sandbox::escape_contract` is one of this workflow's explicitly
-/// off-limits files (a concurrent workflow may still be editing it), so its
-/// call site cannot be updated to the new three-argument `policy_for` here —
-/// this wrapper is what keeps it (and every test that goes through
-/// `shim_cli::production_policy`) compiling and behaving identically, with
-/// zero edits to that file. New code should call `policy_for` directly; this
-/// name is kept for exactly these two callers, not as a second production
-/// entry point.
+/// # Why `Remote`, and why this function did not become the Strict one (Task 8)
+///
+/// Before Task 8 this wrapper was `need = NetworkNeed::Local` and the note here
+/// said the argument was irrelevant, because `policy_for` hard-coded
+/// `Tier::Network` regardless. That is no longer true: `need` now *chooses* the
+/// tier, so this wrapper has to declare what it actually wants — and what its
+/// remaining caller wants is the **Network** tier.
+///
+/// `escape_contract::policy_for_case` routes every battery case whose
+/// `exemption` is `Exemption::None` through this function, and all ten such
+/// cases declare `tier: Tier::Network` (`secret_read_denied`,
+/// `io_uring_denied`, `high_bit_prctl_denied`, `high_bit_io_uring_denied`,
+/// `write_home_denied`, `cgroup_tree_denied`, `no_new_privs_irrevocable`,
+/// `second_landlock_ruleset_denied`, `unshare_userns_denied`, and
+/// `hook_mode_suite`'s `blocked_hooks`). Each is a containment claim written
+/// *against that tier* — `unshare_userns_denied` in particular is only a
+/// meaningful claim where nothing has already unshared a user namespace, which
+/// bwrap does for us in Strict. Declaring `Local` here to make the wrapper
+/// "more production-like" would silently re-tier all ten and quietly change
+/// what they prove, which is the exact anti-vacuity failure the R-rules exist
+/// to catch. `NetworkNeed::Remote` is therefore not a fudge: a remote operation
+/// on an untrusted repository is genuinely how production reaches this tier,
+/// and it is what these cases are written about.
+///
+/// The Strict half of the production dispatch is exercised instead by
+/// `shim_cli::production_policy` (which declares `Local`, drives real
+/// `git init`/`commit`/`status`/`config` through the composed bwrap launcher,
+/// and is what `spawn.rs`'s end-to-end tests use) and by `dispatch.rs`'s
+/// tier-selection tests.
 ///
 /// # Why this delegates through a real policy build, not a one-line forward
 ///
 /// `escape_contract.rs`'s own R8 anti-vacuity tripwire,
 /// `r8_exemptions_expire_when_their_named_blocker_disappears`, greps this
 /// exact function's *body* (via `argv_boundary::code_only`, so comments do
-/// not count) for the literal tokens `Tier::Network` and `HookMode::Run` — it
-/// is what forces a future Task 8 change that makes either conditional to
-/// also retire the matching `escape_suite.rs`/`hook_mode_suite.rs` exemption,
-/// rather than leaving it standing unnoticed. That test is also in the
-/// off-limits set, so it cannot be repointed at `policy_for` instead. The
+/// not count) for the literal tokens `Tier::Network` and `HookMode::Run`. The
 /// `debug_assert_eq!`/`debug_assert!` below are not decoration for the
 /// scanner: they are a real self-check that this wrapper's behaviour has not
-/// drifted from what it claims, and their literal tokens happen to be
-/// exactly what the tripwire needs to keep seeing.
+/// drifted from what it claims — after Task 8 they are a genuinely load-bearing
+/// pin, because the tier is now *derived* rather than constant, and a future
+/// edit to `tier_for` or to `network_need_for_operation` that moved a remote
+/// operation off the Network tier would land here as a failing assertion
+/// instead of as ten battery cases silently changing tier.
 #[cfg(test)]
 pub(crate) fn policy_for_repo(repo: &Path) -> Result<Policy, shim::ShimError> {
-    let policy = policy_for(repo, false, NetworkNeed::Local)?;
+    let policy = policy_for(repo, false, NetworkNeed::Remote)?;
     debug_assert_eq!(policy.tier, Tier::Network);
     debug_assert!(matches!(policy.hook_mode, HookMode::Run));
     Ok(policy)
