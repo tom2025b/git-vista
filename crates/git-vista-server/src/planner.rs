@@ -1436,8 +1436,8 @@ async fn exec_commit_on_head(
     observed: &Observed,
 ) -> (StatusCode, String) {
     // The pre-commit tip, captured for the journal before git moves anything.
-    // `None` on an unborn HEAD (first commit) — journaled as a creation-like
-    // event with no old state, which is exactly what it is.
+    // `Obs::Absent` on an unborn HEAD (first commit) — journaled as a
+    // creation-like event with no old state, which is exactly what it is.
     let old = observed.head_tip.clone();
 
     let mut args = vec!["commit"];
@@ -1453,7 +1453,7 @@ async fn exec_commit_on_head(
     };
     if output.status.success() {
         println!("[/api/commit] created commit (allow_empty={allow_empty})");
-        let new = rev_parse(repo, "HEAD").await;
+        let new = Obs::from_read(rev_parse(repo, "HEAD").await);
         // The branch the commit landed on; "HEAD" when detached.
         let branch = read_head_branch_blocking(repo)
             .await
@@ -1574,8 +1574,11 @@ async fn exec_empty_commit_on_branch(
         repo,
         ActivityKind::Commit,
         Some(branch.as_str().to_string()),
-        Some(tip.to_string()),
-        Some(new),
+        // Both known first-hand: `tip` is the CAS pin this operation was built
+        // on, `new` is `commit-tree`'s own stdout. Neither is a read that
+        // could have come back unknown.
+        Obs::Known(tip.to_string()),
+        Obs::Known(new),
         summary,
     )
     .await;
@@ -1667,7 +1670,7 @@ async fn exec_checkout(
                 format!("Already on ‘{branch}’ — it's the checked-out branch."),
             );
         }
-        let new = rev_parse(repo, "HEAD").await;
+        let new = Obs::from_read(rev_parse(repo, "HEAD").await);
         journal_app_event(
             repo,
             ActivityKind::Checkout,
@@ -1698,11 +1701,17 @@ async fn exec_merge(
     )
     .await;
     if resp.0 == StatusCode::OK {
-        let new = rev_parse(repo, "HEAD").await;
+        let new = Obs::from_read(rev_parse(repo, "HEAD").await);
         // git exits 0 with "Already up to date." when the branch brings
         // nothing in — HEAD hasn't moved. That's no merge: journalling one
         // would put an event in the Activity feed that never happened.
-        if new == observed.head_tip {
+        //
+        // D5: `same_observation`, not `==`. Both sides are reads that can come
+        // back `Unknown`, and `Unknown == Unknown` would report "already up to
+        // date" — a statement about where HEAD is — on the strength of two
+        // reads that never saw HEAD at all. `Obs` has no `PartialEq` precisely
+        // so this line cannot be written the wrong way.
+        if new.same_observation(&observed.head_tip) {
             return (
                 StatusCode::OK,
                 format!("Already up to date — ‘{branch}’ has no commits the current branch doesn’t already have."),
@@ -1748,12 +1757,12 @@ async fn exec_push(
     )
     .await;
     if resp.0 == StatusCode::OK {
-        let tip = rev_parse(repo, branch.as_str()).await;
+        let tip = Obs::from_read(rev_parse(repo, branch.as_str()).await);
         journal_app_event(
             repo,
             ActivityKind::Push,
             Some(branch.as_str().to_string()),
-            None,
+            Obs::Absent, // a push records only where the branch ended up
             tip,
             format!("pushed ‘{branch}’ to {remote}"),
         )
@@ -1794,7 +1803,7 @@ async fn exec_delete(
             ActivityKind::BranchDeleted,
             Some(branch.as_str().to_string()),
             observed.branch_tip.clone(),
-            None,
+            Obs::Absent, // the branch is gone: its new tip is a real absence
             format!("{verb} branch ‘{branch}’"),
         )
         .await;
@@ -1822,14 +1831,17 @@ async fn exec_rebase(
         Err(e) => return couldnt_run("/api/rebase", &e),
     };
     if output.status.success() {
-        let new = rev_parse(repo, "HEAD").await;
+        let new = Obs::from_read(rev_parse(repo, "HEAD").await);
         let branch = read_head_branch_blocking(repo)
             .await
             .unwrap_or_else(|| "HEAD".into());
         // git exits 0 without moving HEAD when the branch is already based on
         // the base — that's no rebase, and journalling one would put a phantom
         // event in the Activity feed. Say what (didn't) happen instead.
-        if new == old {
+        //
+        // D5: same reasoning as `exec_merge` — two unreadable tips are not
+        // evidence that HEAD stayed put.
+        if new.same_observation(&old) {
             return (
                 StatusCode::OK,
                 format!("Already up to date — ‘{branch}’ is already based on {base}."),
@@ -1876,8 +1888,8 @@ async fn exec_restore_branch(
                 repo,
                 ActivityKind::BranchCreated,
                 Some(name.as_str().to_string()),
-                None,
-                Some(tip.as_str().to_string()),
+                Obs::Absent, // restored from nothing: there was no branch here
+                Obs::Known(tip.as_str().to_string()),
                 format!("restored branch ‘{name}’ at {}", short(tip.as_str())),
             )
             .await;
@@ -1905,7 +1917,9 @@ async fn exec_reset_branch(
     // Compare-and-swap: the hint was computed against `expected_tip`; if the
     // branch has moved since, this undo would discard newer work the user
     // never saw in the dialog — refuse instead.
-    if observed.branch_tip.as_deref() != Some(expected_tip.as_str()) {
+    // D5: `Obs::Unknown` fails this check, the same as a mismatch would — a
+    // compare-and-swap whose "compare" never read anything must not swap.
+    if observed.branch_tip.known().map(String::as_str) != Some(expected_tip.as_str()) {
         return (
             StatusCode::CONFLICT,
             format!("‘{branch}’ has moved since this undo was offered — refresh and try again."),
@@ -1941,8 +1955,9 @@ async fn exec_reset_branch(
                 repo,
                 ActivityKind::Reset,
                 Some(branch.as_str().to_string()),
-                Some(expected_tip.as_str().to_string()),
-                Some(to.as_str().to_string()),
+                // Both are exact ids from the request, not reads.
+                Obs::Known(expected_tip.as_str().to_string()),
+                Obs::Known(to.as_str().to_string()),
                 format!("undid — reset ‘{branch}’ to {}", short(to.as_str())),
             )
             .await;
@@ -1971,7 +1986,7 @@ async fn exec_revert(
     match git(repo, need, &["revert", "--no-edit", commit]).await {
         Ok(()) => {
             println!("[/api/undo] reverted {}", short(commit));
-            let new = rev_parse(repo, "HEAD").await;
+            let new = Obs::from_read(rev_parse(repo, "HEAD").await);
             let branch = read_head_branch_blocking(repo)
                 .await
                 .unwrap_or_else(|| "HEAD".into());
@@ -2046,19 +2061,30 @@ async fn exec_reset_test_repo(repo: &Path, need: NetworkNeed) -> (StatusCode, St
         }
     }
     for r in &seed.refs {
-        if rev_parse(repo, &format!("{}^{{commit}}", r.oid))
-            .await
-            .is_none()
-        {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "Seed commit {} for ‘{}’ no longer exists in this repo — \
-                     re-record the seed with `gv --seed`.",
-                    &r.oid[..7],
-                    r.name
-                ),
-            );
+        match rev_parse(repo, &format!("{}^{{commit}}", r.oid)).await {
+            Ok(Some(_)) => {}
+            // git ran and could not find the object: a real, reportable
+            // problem with the seed.
+            Ok(None) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Seed commit {} for ‘{}’ no longer exists in this repo — \
+                         re-record the seed with `gv --seed`.",
+                        &r.oid[..7],
+                        r.name
+                    ),
+                )
+            }
+            // D5: git never ran. Telling the operator to re-record a seed that
+            // is probably intact would send them to destroy the one recovery
+            // point this endpoint restores from. Refuse without a diagnosis.
+            Err(e) => {
+                return couldnt_run(
+                    "/api/reset-test-repo",
+                    &format!("couldn't verify seed commit for ‘{}’: {e}", r.name),
+                )
+            }
         }
     }
 
