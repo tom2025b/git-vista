@@ -662,6 +662,96 @@ mod tests {
         );
     }
 
+    /// TEMPORARY — D2 end-to-end proof, removed before this workflow finishes
+    /// (see the implementation report's `e2e_demo`). Touches the global
+    /// `CURRENT`/`CATALOG` statics like `selection_flow_carries_mode_and_gates_writes`
+    /// above, so it is not meant to survive alongside that test long-term —
+    /// this crate's convention is exactly one test owning that global state,
+    /// and this one exists only to be run once, in isolation
+    /// (`--test-threads=1` or `--exact`), to observe a REAL handler refuse a
+    /// hostile gitfile through the actual request-shaped code path rather
+    /// than through `sandbox::repo_paths::resolve_and_validate` in isolation.
+    #[tokio::test]
+    async fn e2e_scratch_a_linked_worktree_whose_main_repo_is_outside_the_managed_root_is_refused_by_the_real_rebase_handler(
+    ) {
+        let managed = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+
+        // A REAL git repository (not hand-rolled files) with a REAL linked
+        // worktree, built with actual `git worktree add` — so the geometry is
+        // exactly what an attacker's tampered `.git` would have to reproduce
+        // to pass `worktree.rs`'s own containment rule, and exactly what a
+        // legitimate linked worktree looks like to `gix`/`read_repo_facts`.
+        let main = elsewhere.path().join("main-repo");
+        std::fs::create_dir_all(&main).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@example.invalid"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "-q", "--allow-empty", "-m", "seed"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&main)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let linked = managed.path().join("linked-worktree");
+        assert!(std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ])
+            .current_dir(&main)
+            .status()
+            .unwrap()
+            .success());
+
+        // The operator configured `managed` as the served root — `main` (and
+        // therefore its `.git`, which is what the linked worktree's gitdir
+        // and commondir resolve into) sits entirely outside it. This is
+        // exactly the D2 threat: `worktree.rs`'s own containment rule is
+        // fully satisfied (this IS a real, registered linked worktree of
+        // `main`), so only the NEW managed-root check can catch it.
+        allow_repo_root(managed.path());
+        set_current(&linked, RepoMode::Active);
+        assert_eq!(
+            current_mode(),
+            RepoMode::Active,
+            "fixture invariant: the write gate must be open, so only the D2 \
+             managed-root check can be what refuses this"
+        );
+
+        // Sanity: `worktree.rs`'s OWN rule alone sees nothing wrong here —
+        // proving the managed-root check is what does the refusing, not a
+        // rule that already existed.
+        assert!(
+            crate::sandbox::worktree::linked_worktree_dirs(&linked)
+                .expect("the geometry is a real, valid linked worktree")
+                .is_some()
+        );
+
+        // The real production handler — POST /api/rebase's actual body, not
+        // a direct call into `sandbox::repo_paths::resolve_and_validate`.
+        let (status, msg) = crate::handlers::rebase::rebase().await;
+        println!("[e2e] POST /api/rebase -> {status} {msg}");
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a mutation against a repo whose linked-worktree main lives \
+             outside the managed root must be refused, not executed"
+        );
+        assert!(
+            msg.to_lowercase().contains("managed root"),
+            "the refusal should name why: {msg}"
+        );
+    }
+
     #[test]
     fn bind_address_defaults_to_loopback() {
         assert_eq!(parse_bind_addr(None).unwrap(), LOOPBACK_ADDR);
