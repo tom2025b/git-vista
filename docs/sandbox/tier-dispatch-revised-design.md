@@ -1,8 +1,14 @@
-# Revised tier-dispatch design — AWAITING TOM'S APPROVAL
+# Revised tier-dispatch design — D2, D3, D4, D5 APPROVED
 
-**Status:** presented 2026-07-29 ~13:25 EDT. **Not approved yet.** Brainstorming's
-HARD-GATE forbids writing the implementation spec until Tom says go. This file is the
-approval artifact, not the spec.
+**Status:** presented 2026-07-29 ~13:25 EDT. **D2, D3, D4, D5 approved by Tom
+2026-07-29 ~21:45 EDT**, conditions: preserve fail-closed behaviour, keep it modular,
+comprehensive tests, docs stay in sync, follow-on work tracked not hidden. D5
+additionally requires a formal task + acceptance criteria before implementation
+(added as plan Task 19, not started — see that entry). D6, D1, D7 were already
+settled outside this approval (see their own sections). If implementation surfaces a
+materially conflicting architectural fact, stop and produce a new decision doc rather
+than deviating silently. Full approval package:
+`design-docs/2026-07-29-sandbox-decisions-for-approval.md` (untracked, Tom's copy).
 
 **Milestone:** M1.13b (issue #66), branch `feature/m1.13b-sandbox-plan`.
 
@@ -82,7 +88,7 @@ C12 refuted boot-gate totality (claim 12). NEW-2 makes it worse than C12 stated.
 - The boot capability gate stays — it fails fast and cheap — but it is a *gate*, never a
   policy source.
 
-*Satisfies C12 correction #4.*
+*Satisfies C12 correction #4.* **APPROVED 2026-07-29.**
 
 ## D3 — tier from declared intent; argv sniffing demoted to a tripwire
 
@@ -94,6 +100,8 @@ The caller declares `NetworkNeed`. `GitOperation` is a closed enum
 (`git-vista-protocol/src/plan.rs:153`), so variant-to-need is a match the compiler
 checks. `network_need(argv)` survives as a cross-check: declared `Local` but argv looks
 `Remote` → debug panic, release escalate to Strict and log.
+
+**APPROVED 2026-07-29.**
 
 ## D4 — clone gets its own policy constructor
 
@@ -112,7 +120,9 @@ persisted-trust lookup, no operator override. `need = Remote` → Network tier, 
 attacker-chosen content, so it is the one operation that must be unreachable at
 Unsandboxed.
 
-*Satisfies C12 correction #3.*
+*Satisfies C12 correction #3.* **APPROVED 2026-07-29** (interim already in flight —
+`clone.rs` now routes through `policy_for_repo(&clones_root())`; the dedicated
+`policy_for_clone` constructor above refines that, does not gate it).
 
 ## D5 — execution-unavailable propagates as its own value
 
@@ -136,6 +146,10 @@ Handling is **not** mechanical — see NEW-3. Three buckets:
 *Satisfies C12 correction #5, and implements the session decision that the planner needs
 one explicit "unknown observation" posture rather than site-by-site defaults — 20
 individually-reasoned sites is 20 chances to relaunder unknown into fact.*
+
+**Direction APPROVED 2026-07-29 — implementation gated on plan Task 19** (formal task +
+acceptance criteria, required before any of the 23 sites are touched; see that entry).
+Recommended sequencing: after D2/D3 land, not concurrent with them.
 
 ## D6 — INV-13 hard-fail, unchanged
 
