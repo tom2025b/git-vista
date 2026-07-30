@@ -348,9 +348,9 @@ pub(crate) async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
         crate::sandbox::NetworkNeed::Local,
     )
     .ok()?
-        .output()
-        .await
-        .ok()?;
+    .output()
+    .await
+    .ok()?;
     if !output.status.success() {
         return None;
     }
