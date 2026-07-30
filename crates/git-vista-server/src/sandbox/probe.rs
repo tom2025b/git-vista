@@ -328,8 +328,12 @@ fn boot_probe_policy(scratch: &Path, markers: &Path) -> Result<Policy, &'static 
         ro_trees: ro,
         secret_excludes: secret_excludes_for_home(&home),
         net_ports: Vec::new(),
-        hook_mode: HookMode::Run,
+        hook_mode: mutant_hook_mode(),
     })
+}
+
+fn mutant_hook_mode() -> HookMode {
+    HookMode::Run
 }
 
 /// Which named capability is absent, given a measured [`Capabilities`] — the
