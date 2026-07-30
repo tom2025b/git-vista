@@ -123,6 +123,21 @@ impl std::fmt::Display for HookPolicyRefused {
     }
 }
 
+/// [`HookPolicy`] in its role as *the disclosed form of a [`Tier`]* — the
+/// return type of the seam below, and nothing else.
+///
+/// The alias earns its keep twice. It names the role at the one place the two
+/// vocabularies meet, and it keeps a false positive out of a tripwire this
+/// change must not weaken: `sandbox::escape_contract`'s R8 check scans every
+/// production file under `src/sandbox/` for the text `Policy {`, treats each
+/// hit as a `Policy` struct literal, and panics with "the scan broke" when it
+/// cannot find a `hook_mode:` field inside. A function written `-> HookPolicy
+/// {` puts exactly that text in front of a brace. R8 is a deliberate text scan
+/// and lives in a file outside this change's ownership, so the seam names its
+/// own return type rather than the check being loosened to accommodate it. The
+/// brittleness is reported, not silently absorbed.
+pub(crate) type Disclosed = HookPolicy;
+
 /// Rename one internal [`Tier`] to the wire vocabulary. Exhaustive on purpose:
 /// a fourth tier must be given a disclosed name deliberately, at review time,
 /// instead of inheriting one from a wildcard arm.
@@ -132,7 +147,7 @@ impl std::fmt::Display for HookPolicyRefused {
 /// to be renamed, `HookPolicy` is a wire contract pinned by a golden fixture,
 /// and having exactly one crossing point is what lets either move without the
 /// other drifting silently.
-pub(crate) fn hook_policy_for_tier(tier: Tier) -> HookPolicy {
+pub(crate) fn hook_policy_for_tier(tier: Tier) -> Disclosed {
     match tier {
         Tier::Strict => HookPolicy::Strict,
         Tier::Network => HookPolicy::Network,
