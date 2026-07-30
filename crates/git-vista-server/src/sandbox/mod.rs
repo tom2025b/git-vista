@@ -531,6 +531,196 @@ pub(crate) fn network_need(args: &[&str]) -> NetworkNeed {
     NetworkNeed::Local
 }
 
+/// **The authoritative classifier (D3).** The network need of a typed
+/// [`GitOperation`] — what the server *decided to do*, not what its argv looks
+/// like.
+///
+/// # Why this outranks `network_need`
+///
+/// `network_need`'s own doc comment already says a string match on argv cannot
+/// be complete: aliases expand, plumbing reaches the network under names no
+/// list will hold (`fetch-pack`, `send-pack`, transport helpers), and a partial
+/// clone lazily fetches from otherwise-local commands. The C10 audit's
+/// conclusion was that the dispatch must key on the *typed operation the server
+/// chose*, because that value is known before any argv exists and is the only
+/// thing that carries intent.
+///
+/// # Why a match with no wildcard arm
+///
+/// [`GitOperation`] is a closed enum, so this match is checked by the compiler.
+/// Adding a variant **fails the build here** until somebody states what network
+/// that operation needs — which is the whole reason this is a match and not a
+/// lookup table or a `_ => Local` default. A default arm would silently
+/// classify tomorrow's `FetchRemote` as `Local`, route it to the strict tier,
+/// and break it at runtime instead of at compile time; worse, a default of
+/// `Remote` would silently *widen* every new operation's sandbox. Neither
+/// failure is acceptable, and the fix for both is to refuse to have a default.
+///
+/// If a variant's answer is ever unobvious, the tie-break is fail-closed:
+/// `Local` routes to the stricter tier, so a misclassified network operation
+/// breaks loudly rather than quietly gaining a socket.
+pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
+    match op {
+        // The one operation in the enum that talks to a remote. `remote` is
+        // part of its argv, but that is not why it is classified here — it is
+        // classified here because pushing is what the server decided to do.
+        GitOperation::PushBranch { .. } => NetworkNeed::Remote,
+
+        // Everything below manipulates refs, the index, the working tree or
+        // the object database, all of it local. None of them opens a socket in
+        // any configuration this server constructs: no `--recurse-submodules`,
+        // no partial-clone promisor (a promisor fetch would make `CheckoutBranch`
+        // and `RevertCommit` reach the network — see the note below), no
+        // `git merge` of a remote-tracking ref this server does not create.
+        GitOperation::CreateBranch { .. } => NetworkNeed::Local,
+        GitOperation::CommitOnHead { .. } => NetworkNeed::Local,
+        GitOperation::EmptyCommitOnBranch { .. } => NetworkNeed::Local,
+        GitOperation::StageAll => NetworkNeed::Local,
+        GitOperation::UnstageAll => NetworkNeed::Local,
+        GitOperation::CheckoutBranch { .. } => NetworkNeed::Local,
+        GitOperation::MergeBranch { .. } => NetworkNeed::Local,
+        GitOperation::DeleteBranch { .. } => NetworkNeed::Local,
+        GitOperation::ForceDeleteBranch { .. } => NetworkNeed::Local,
+        GitOperation::RebaseOntoBase { .. } => NetworkNeed::Local,
+        GitOperation::RestoreBranch { .. } => NetworkNeed::Local,
+        GitOperation::ResetBranch { .. } => NetworkNeed::Local,
+        GitOperation::RevertCommit { .. } => NetworkNeed::Local,
+        GitOperation::ResetTestRepo => NetworkNeed::Local,
+    }
+}
+
+/// D3's cross-check: the declared need is authoritative, the argv classifier is
+/// a **tripwire on it**, and the tripwire may only ever tighten.
+///
+/// # The one disagreement that matters, and why only one
+///
+/// There are two ways `declared` and `network_need(args)` can disagree, and
+/// they are not symmetric.
+///
+/// * **Declared `Local`, argv looks `Remote`.** A caller said "this operation
+///   needs no network" and then built an argv whose first subcommand is in
+///   `REMOTE_SUBCOMMANDS`. That is a *bug in the server*, not a hostile input —
+///   nothing outside this process picks the subcommand. In a debug build it
+///   panics, because a developer should meet it the first time they write it.
+///   In release it is logged and the **declared** value is kept.
+///
+///   Keeping `Local` *is* the escalation: `tier_for(Local, false)` is
+///   `Tier::Strict`, the tier with no network at all, which is strictly
+///   stricter than the `Tier::Network` the argv would have argued for. So the
+///   release behaviour and the "escalate to the stricter tier" instruction are
+///   the same action, and the operation fails closed — a genuinely-remote
+///   command mislabelled `Local` gets `EACCES` on `connect()` and reports it,
+///   which is loud, rather than silently gaining a socket it was not declared
+///   to need.
+///
+/// * **Declared `Remote`, argv looks `Local`.** This is *expected* and is not
+///   reported. `REMOTE_SUBCOMMANDS` is documented as incomplete by
+///   construction, so this direction is what an argv the list has never heard
+///   of looks like. Acting on it would mean narrowing `Remote` to `Local`,
+///   i.e. taking the network away from an operation that declared it needs the
+///   network, on the word of a list that admits it is not authoritative. That
+///   breaks working pushes to fix nothing: the declaration is the tighter
+///   signal about intent, and a wrongly-`Remote` declaration costs a wider
+///   sandbox for one spawn, not an escape.
+///
+/// So this function is a **checked identity**: it returns `declared`, always.
+/// That is the point — after D3 the argv can only ever *complain*, never
+/// decide. Anything else would reintroduce exactly the "argv is the dispatch"
+/// posture C10 rejected, just with an extra step.
+pub(crate) fn reconcile_need(declared: NetworkNeed, args: &[&str]) -> NetworkNeed {
+    if declared == NetworkNeed::Local && network_need(args) == NetworkNeed::Remote {
+        debug_assert!(
+            false,
+            "sandbox tier cross-check (D3): an operation declared \
+             NetworkNeed::Local but its argv starts with a known remote \
+             subcommand — argv = {args:?}. Either the declaration in \
+             `network_need_for_operation` is wrong for this operation, or this \
+             call site is running a remote command under a local declaration. \
+             Fix the declaration; do not widen the tier."
+        );
+        eprintln!(
+            "git-vista: sandbox tier cross-check (D3): declared NetworkNeed::Local \
+             but argv looks remote ({args:?}); keeping the stricter tier (Strict). \
+             This is a server bug — the operation will fail if it really needs a socket."
+        );
+    }
+    declared
+}
+
+/// INV-13 / ADR 0029, at policy-construction time: the strict tier's launcher,
+/// or a named refusal.
+///
+/// Pure in its inputs so the refusal is testable without a broken host — the
+/// caller passes the measured [`capabilities::Capabilities`] and the resolved
+/// bwrap path, and a unit test can pass a synthetic pair. That matters: the
+/// only alternative way to test "Strict was selected and the host cannot supply
+/// it" is to uninstall bwrap on the development machine.
+///
+/// # Why it refuses instead of returning a different tier
+///
+/// The boot probe (`sandbox::probe`) already gates startup on this host being
+/// able to compose the strict tier, so on a healthy host this never fires. It
+/// exists for the case the boot gate cannot cover: a capability that goes away
+/// *after* boot (bwrap uninstalled by a package upgrade, `max_user_namespaces`
+/// set to 0 by a sysctl push, a live-patched kernel), and for the process that
+/// reaches policy construction without having run the boot probe at all — every
+/// `cargo test` binary in this crate. In both cases the honest answer is the
+/// same one ADR 0029 mandates for the boot case: refuse, and name what is
+/// missing. Returning `Tier::Network` here would mean a repository the operator
+/// believes runs with namespaces, a fresh procfs and no network is quietly
+/// running with none of the three; returning `HookMode::Blocked` would be the
+/// posture ADR 0029 rejects by name.
+fn strict_launcher(
+    caps: &capabilities::Capabilities,
+    bwrap_path: Option<PathBuf>,
+) -> Result<PathBuf, shim::ShimError> {
+    match bwrap_path {
+        // `strict_missing` is consulted even when a bwrap path was found,
+        // because bwrap alone is not the strict tier: without usable user
+        // namespaces it cannot create the pid/net/ipc/uts/cgroup namespaces
+        // that make the tier what it claims to be, and without Landlock at the
+        // floor the shim it launches exits 91 before git ever runs.
+        Some(path) if caps.strict_available() => Ok(path),
+        _ => {
+            let mut missing = caps.strict_missing();
+            // A host that clears every capability knob but has no launcher at
+            // the reviewed absolute paths still cannot run the tier. Naming it
+            // separately keeps the message truthful rather than empty.
+            if missing.is_empty() {
+                missing.push("bwrap");
+            }
+            Err(shim::ShimError::StrictUnavailable { missing })
+        }
+    }
+}
+
+/// Whether the operator has explicitly trusted `repo` enough to run it with no
+/// sandbox at all — `tier_for`'s `trusted` argument, and the **only** route to
+/// [`Tier::Unsandboxed`].
+///
+/// # Canonicalisation is part of the check, not a convenience
+///
+/// `trust::is_trusted` requires an already-canonical path and compares it
+/// byte-for-byte against what `trust::grant` stored. Handing it the raw `repo`
+/// would mean `/home/tom/projects/x`, `/home/tom/projects/./x` and a path
+/// reached through a symlink are three different repositories as far as trust
+/// is concerned — which is not merely untidy: a request that reaches this
+/// function by a spelling the operator did not grant would be told "untrusted"
+/// (harmless, fail-closed) while a request that reaches it by a spelling that
+/// *aliases* a granted path would be told "trusted" (not harmless). Resolving
+/// to the real path first collapses both.
+///
+/// A canonicalisation failure — the path does not exist, a component is not
+/// searchable, a symlink loop — returns `false`. Every uncertainty in this
+/// whole chain means untrusted, which is what makes `Unsandboxed` unreachable
+/// by accident.
+fn repo_is_trusted(repo: &Path) -> bool {
+    match repo.canonicalize() {
+        Ok(canonical) => trust::is_trusted(&canonical),
+        Err(_) => false,
+    }
+}
+
 /// The tier an operation runs in, given its network need and whether the
 /// repository is operator-trusted.
 ///
@@ -645,33 +835,69 @@ pub(crate) fn tier_for(need: NetworkNeed, trusted: bool) -> Tier {
 /// wrongly refused; never the reverse) and narrow — same-path mode flips,
 /// what this fix targets, are unaffected — but real, and not fixed tonight.
 ///
-/// # `need` is accepted but not yet consulted — tier is `Network` for now
+/// # `need` selects the tier (Task 8 / D3) — this is the production dispatch
 ///
-/// Choosing a tier per operation — read paths in the strict tier, network
-/// operations in the network tier, operator-trusted repositories unsandboxed —
-/// is Task 8's dispatch (`tier_for`), and it additionally depends on the
-/// per-repo trust flag Task 7 (`sandbox::trust`) built but nothing calls yet.
-/// Until Task 8 lands, every operation gets the **network tier**: the
-/// fuller-compatibility tier that can still reach a remote, so migrating the
-/// spawn sites (Task 6) could not break `push`/`fetch` before the dispatch
-/// existed to route them. `need` is threaded into this signature now — every
-/// call site already computes it, via `network_need`'s fail-closed argv
-/// classifier — precisely so Task 8 only has to change what this function
-/// *does* with it, not thread a new parameter through every caller.
+/// `need` is the **declared** network need of the operation: for a planner
+/// mutation it comes from `network_need_for_operation`, an exhaustive match on
+/// the typed [`git_vista_protocol::GitOperation`] the server chose; for the
+/// read and ref-maintenance helpers that have no typed operation it is declared
+/// at the helper (all `Local` — see `git_cmd`'s own doc comments). Whatever its
+/// origin, it reaches `tier_for` unchanged; the argv classifier `network_need`
+/// only cross-checks it (`reconcile_need`), and only in the tightening
+/// direction.
+///
+/// The second dispatch input is `trusted`, from `repo_is_trusted` →
+/// `sandbox::trust::is_trusted`. This is that module's **first production
+/// caller**: before Task 8 the persisted trust flag existed, was tested, and
+/// was consulted by nothing, so `Unsandboxed` was unreachable in production by
+/// accident rather than by rule. It is now unreachable by rule — `tier_for`
+/// returns it from exactly one arm, and that arm needs a marker file only an
+/// explicit operator action writes, outside every repository-writable path.
+///
+/// So the three outcomes are: local operation on an untrusted repository →
+/// `Strict`; remote operation on an untrusted repository → `Network`; any
+/// operation on an operator-trusted repository → `Unsandboxed`.
+///
+/// # Strict is refused, never downgraded (INV-13 / ADR 0029)
+///
+/// A `Strict` policy needs a `bwrap` launcher at a reviewed absolute path plus
+/// usable user namespaces and Landlock at the floor. When the dispatch selects
+/// `Strict` and the host cannot supply it, this function returns
+/// [`shim::ShimError::StrictUnavailable`] and the operation refuses. It does
+/// **not** fall back to `Network` (a weaker sandbox than the one selected, with
+/// outbound TCP the operation has no use for) and it does not degrade-and-block
+/// hooks — ADR 0029 rejects that posture by name. See `strict_launcher`.
+///
+/// # Tier-dependent fields
+///
+/// `net_ports` is `DEFAULT_GIT_PORTS` in `Network` and **empty** everywhere
+/// else: `Strict` has no network at all (F3, `--net-deny`), and `Unsandboxed`
+/// has no ruleset to put ports in. `bwrap` is `Some` only in `Strict`.
 /// `secret_excludes` is populated regardless of tier, so the secret set is
-/// never silently empty during the interim.
+/// never silently empty in any of them.
 pub(crate) fn policy_for(
     repo: &Path,
     read_only: bool,
     need: NetworkNeed,
 ) -> Result<Policy, shim::ShimError> {
-    // Tier does not vary with `need` yet — see the doc comment above. Task 8
-    // is the only thing that should change this line.
-    let _ = need;
-    let tier = Tier::Network;
+    // D3's dispatch, in two lines. `need` is the caller's declaration; trust is
+    // a persisted property of the repository. Nothing else feeds the tier —
+    // notably not the argv, which by this point has already had its say through
+    // `reconcile_need` at the call site.
+    let tier = tier_for(need, repo_is_trusted(repo));
 
     let home = PathBuf::from(std::env::var_os("HOME").ok_or(shim::ShimError::NoHome)?);
     let shim = shim::shim_path().map_err(Clone::clone)?.to_path_buf();
+    // INV-13: refuse *before* building anything else, so a host that cannot
+    // supply the selected tier produces one named error rather than a policy
+    // that dies later inside `shim_argv`'s `expect`.
+    let bwrap = match tier {
+        Tier::Strict => Some(strict_launcher(
+            &capabilities::current(),
+            bwrap::bwrap_path().map(Path::to_path_buf),
+        )?),
+        Tier::Network | Tier::Unsandboxed => None,
+    };
     let (mut rw, mut ro) = default_system_trees(tier);
 
     // An absent `.git` is not a hostile or malformed geometry to refuse —
