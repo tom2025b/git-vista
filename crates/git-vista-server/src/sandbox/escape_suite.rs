@@ -1058,4 +1058,372 @@ int main(void) {{
             ),
         )
     }
+
+    /// INV-1's two filesystem boundaries in one binary: a write into the
+    /// read-only `$HOME` grant, and a read of the cgroup tree, which no tier
+    /// grants at all. Two cases read two tags out of one run — the same shape
+    /// `af_unix_probe` uses — so both boundaries are observed under identical
+    /// conditions rather than through two probes that could drift apart.
+    ///
+    /// # Why the cgroup half is a read, and not the write the plan sketches
+    ///
+    /// Measured on this host, the write form is not an A/B at all. As an
+    /// unprivileged user, `open("/sys/fs/cgroup/gv.pwned", O_WRONLY|O_CREAT)`
+    /// returns `EACCES` and `mkdir("/sys/fs/cgroup/gv.pwned")` returns `EACCES`
+    /// **on the bare host** — byte-identical to what Landlock returns inside. A
+    /// case built that way would carry `expect_baseline == expect_inside == 13`
+    /// and could never distinguish "Landlock denied it" from "cgroupfs would
+    /// have denied it anyway". R4 rejects it outright: its baseline leg cannot
+    /// establish that the operation is possible on this host in the first place.
+    ///
+    /// The one cgroup path this user *can* write is its own systemd-delegated
+    /// scope (`/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/…`,
+    /// verified writable here). A case depending on that would report
+    /// `CapabilityAbsent` — a hard failure by design — on any runner without
+    /// systemd user delegation, turning a CI host detail into a security-shaped
+    /// red check. So the claim is made in the form that is sound everywhere: the
+    /// tree is not reachable at all, evidenced against a world-readable control
+    /// file (`cgroup.controllers`, mode 444) that reads fine outside and returns
+    /// `EACCES` inside. A tree that cannot be read cannot be written.
+    ///
+    /// `Seccomp:`/`NoNewPrivs:` are read with all five `prctl` arguments
+    /// supplied. `prctl(PR_GET_NO_NEW_PRIVS)` with the variadic arguments
+    /// omitted returns `-1` on this host — whatever the call frame happened to
+    /// leave in `rdx`/`r10`/`r8` is not zero, and the kernel rejects the call —
+    /// so the older probes in this file print `-1` for both fields regardless of
+    /// the real state.
+    pub(super) fn fs_boundary_probe(ctx: &HarnessCtx) -> String {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+        let pwned = c_string(&home.join(format!("gv-escape-write-{}", ctx.nonce)));
+        let granted = c_string(&home.join(".gitconfig"));
+        hook_for(
+            ctx,
+            format!(
+                r#"
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+
+static int write_errno(const char *path) {{
+    errno = 0;
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return errno;
+    ssize_t n = write(fd, "x", 1);
+    int saved = n < 0 ? errno : 0;
+    close(fd);
+    unlink(path);
+    return saved;
+}}
+
+static int read_errno(const char *path) {{
+    errno = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return errno;
+    char byte;
+    ssize_t n = read(fd, &byte, 1);
+    int saved = n < 0 ? errno : 0;
+    close(fd);
+    return saved;
+}}
+
+int main(void) {{
+    int home_write = write_errno("{pwned}");
+    int cgroup = read_errno("/sys/fs/cgroup/cgroup.controllers");
+    int granted = read_errno("{granted}");
+    printf("GVPROBE {nonce} BEGIN\n");
+    printf("WRITEHOME rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           home_write ? -1 : 0, home_write,
+           prctl(PR_GET_SECCOMP, 0, 0, 0, 0), prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0));
+    printf("CGROUPTREE rc=%d errno=%d\n", cgroup ? -1 : 0, cgroup);
+    printf("GRANTED rc=%d errno=%d\n", granted ? -1 : 0, granted);
+    printf("GVPROBE {nonce} END\n");
+    return 0;
+}}
+"#,
+                nonce = ctx.nonce,
+            ),
+        )
+    }
+
+    /// INV-3's irrevocability triple, in one binary and three tags:
+    /// `NNPSTATE` (a), `LANDLOCK2` (b), `UNSHARE` (c).
+    ///
+    /// # The order of operations is load-bearing
+    ///
+    /// Each step below would corrupt the next one's observation if moved:
+    ///
+    /// 1. `NNPSTATE` is read **first**, because step 2 has to set
+    ///    `NO_NEW_PRIVS` itself — `landlock_restrict_self` refuses an
+    ///    unprivileged caller without it — and on the baseline leg that would
+    ///    manufacture exactly the `1` this observation exists to look for.
+    /// 2. `LANDLOCK2` installs the second ruleset and performs the write.
+    /// 3. `GRANTED` is read after it, so the paired positive also witnesses that
+    ///    the second ruleset did not break ordinary reads.
+    /// 4. `UNSHARE` runs **last**. A successful `unshare(CLONE_NEWUSER)` leaves
+    ///    the process with no mapping in the new namespace (uid 65534), after
+    ///    which no read of `$HOME` succeeds — run earlier, it would turn the
+    ///    baseline leg's paired positive into a false negative.
+    ///
+    /// # Install-chain failures are reported as `1000 + errno`, never as an errno
+    ///
+    /// `widen_then_write_errno` returns the write's errno only if the whole
+    /// ruleset install succeeded. Any earlier failure comes back offset by
+    /// 1000. Without that offset a case could pass for precisely the wrong
+    /// reason: if `open("/", O_PATH)` were denied inside, the install chain
+    /// would return `EACCES` — the same `13` the *claim* expects — and
+    /// "Landlock intersected my allow-all ruleset" would be indistinguishable
+    /// from "I never managed to build one". With it, that outcome reads `1013`
+    /// and the case reports `escaped`, loudly.
+    pub(super) fn irrevocability_probe(ctx: &HarnessCtx) -> String {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+        let widen = c_string(&home.join(format!("gv-escape-widen-{}", ctx.nonce)));
+        let granted = c_string(&home.join(".gitconfig"));
+        hook_for(
+            ctx,
+            format!(
+                r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/types.h>
+#include <sched.h>
+#include <stdio.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+/* Stable UAPI numbers; glibc ships no wrappers for these three. */
+#define GV_LANDLOCK_CREATE_RULESET 444
+#define GV_LANDLOCK_ADD_RULE       445
+#define GV_LANDLOCK_RESTRICT_SELF  446
+#define GV_LANDLOCK_RULE_PATH_BENEATH 1
+
+/* Every ABI-1 filesystem access right (bits 0..12), used both as the set this
+   ruleset HANDLES and as the set it GRANTS on "/". Deliberately not the widest
+   mask this kernel knows: a right a ruleset does not handle is left
+   unrestricted by that ruleset, so handling fewer rights can only make this
+   second layer MORE permissive — the direction that would expose the claim if
+   the claim were false. */
+#define GV_LANDLOCK_ABI1_FS 0x1fffULL
+
+struct gv_ruleset_attr {{ __u64 handled_access_fs; }};
+struct gv_path_beneath {{ __u64 allowed_access; __s32 parent_fd; }} __attribute__((packed));
+
+static int write_errno(const char *path) {{
+    errno = 0;
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return errno;
+    ssize_t n = write(fd, "x", 1);
+    int saved = n < 0 ? errno : 0;
+    close(fd);
+    unlink(path);
+    return saved;
+}}
+
+static int read_errno(const char *path) {{
+    errno = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return errno;
+    char byte;
+    ssize_t n = read(fd, &byte, 1);
+    int saved = n < 0 ? errno : 0;
+    close(fd);
+    return saved;
+}}
+
+static int widen_then_write_errno(const char *path) {{
+    errno = 0;
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return 1000 + errno;
+    struct gv_ruleset_attr attr;
+    attr.handled_access_fs = GV_LANDLOCK_ABI1_FS;
+    errno = 0;
+    long rs = syscall(GV_LANDLOCK_CREATE_RULESET, &attr, sizeof attr, 0);
+    if (rs < 0) return 1000 + errno;
+    errno = 0;
+    int root = open("/", O_PATH | O_CLOEXEC);
+    if (root < 0) {{ int saved = errno; close((int)rs); return 1000 + saved; }}
+    struct gv_path_beneath rule;
+    rule.allowed_access = GV_LANDLOCK_ABI1_FS;
+    rule.parent_fd = root;
+    errno = 0;
+    if (syscall(GV_LANDLOCK_ADD_RULE, (int)rs, GV_LANDLOCK_RULE_PATH_BENEATH, &rule, 0) != 0) {{
+        int saved = errno;
+        close(root);
+        close((int)rs);
+        return 1000 + saved;
+    }}
+    close(root);
+    errno = 0;
+    if (syscall(GV_LANDLOCK_RESTRICT_SELF, (int)rs, 0) != 0) {{
+        int saved = errno;
+        close((int)rs);
+        return 1000 + saved;
+    }}
+    close((int)rs);
+    return write_errno(path);
+}}
+
+int main(void) {{
+    /* The kernel refuses any PR_SET_NO_NEW_PRIVS whose second argument is not
+       1, host and sandbox alike, so this call's own errno is EINVAL on both
+       legs and proves nothing. What is attributable is the state it failed to
+       change, read back on the next line. */
+    (void)prctl(PR_SET_NO_NEW_PRIVS, 0, 0, 0, 0);
+    int nnp_state = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) * 10
+                  + prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int widened = widen_then_write_errno("{widen}");
+    int granted = read_errno("{granted}");
+    errno = 0;
+    int un = unshare(CLONE_NEWUSER);
+    int unshared = un < 0 ? errno : 0;
+    printf("GVPROBE {nonce} BEGIN\n");
+    printf("NNPSTATE rc=%d errno=%d\n", nnp_state, nnp_state);
+    printf("LANDLOCK2 rc=%d errno=%d\n", widened ? -1 : 0, widened);
+    printf("UNSHARE rc=%d errno=%d\n", un, unshared);
+    printf("GRANTED rc=%d errno=%d\n", granted ? -1 : 0, granted);
+    printf("GVPROBE {nonce} END\n");
+    return 0;
+}}
+"#,
+                nonce = ctx.nonce,
+            ),
+        )
+    }
+
+    /// INV-4 through io_uring: obtain an `AF_UNIX` socket with
+    /// `IORING_OP_SOCKET`, which issues no `socket(2)` and therefore never meets
+    /// `seccomp_filter::af_unix_rule`.
+    ///
+    /// The ring is driven by hand rather than through liburing (not a
+    /// dependency of this repo, and not one worth adding to a test): three
+    /// `mmap`s of the submission ring, the SQE array and the completion ring,
+    /// one SQE, one `io_uring_enter`, one CQE. The SQE layout is liburing's own
+    /// `io_uring_prep_socket` — `fd` carries the address family, `off` the
+    /// socket type, `len` the protocol — and the opcode is written as the
+    /// literal `45` because `IORING_OP_SOCKET` is a stable UAPI value that
+    /// `<linux/io_uring.h>` only exposes through an anonymous enum that older
+    /// header packages predate.
+    ///
+    /// # What the two legs mean, and why the offsets exist
+    ///
+    /// A `0` means an `AF_UNIX` socket really was created through the ring
+    /// (measured on this host, bare: `res >= 0`) — the baseline's job is to
+    /// demonstrate the bypass, not to assume it. Inside, `io_uring_setup` is
+    /// denied and its errno is returned unmodified, which is the containment
+    /// observation. Everything that can go wrong *after* a successful setup is
+    /// offset — `1000 + errno` for a failed mmap or enter, `2000 + -res` for a
+    /// CQE the kernel completed with an error, `3000` for no CQE at all — so no
+    /// incidental failure can ever be mistaken for the `EPERM` the claim
+    /// expects. Without those offsets an `EPERM` from any later step would read
+    /// as containment while the ring had in fact been created.
+    pub(super) fn uring_socket_probe(ctx: &HarnessCtx) -> String {
+        let granted = c_string(&granted_path(ctx));
+        hook_for(
+            ctx,
+            format!(
+                r#"
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/io_uring.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define GV_IORING_OP_SOCKET 45
+
+static int read_errno(const char *path) {{
+    errno = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return errno;
+    close(fd);
+    return 0;
+}}
+
+static int uring_af_unix_errno(void) {{
+    struct io_uring_params p;
+    memset(&p, 0, sizeof p);
+    errno = 0;
+    long ring = syscall(__NR_io_uring_setup, 8, &p);
+    if (ring < 0) return errno;
+    int fd = (int)ring;
+
+    size_t sq_sz = p.sq_off.array + p.sq_entries * sizeof(unsigned);
+    size_t cq_sz = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
+    if (p.features & IORING_FEAT_SINGLE_MMAP) {{
+        if (cq_sz > sq_sz) sq_sz = cq_sz;
+        cq_sz = sq_sz;
+    }}
+    errno = 0;
+    void *sq = mmap(0, sq_sz, PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
+    if (sq == MAP_FAILED) {{ int saved = errno; close(fd); return 1000 + saved; }}
+    void *cq = sq;
+    if (!(p.features & IORING_FEAT_SINGLE_MMAP)) {{
+        errno = 0;
+        cq = mmap(0, cq_sz, PROT_READ | PROT_WRITE,
+                  MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_CQ_RING);
+        if (cq == MAP_FAILED) {{ int saved = errno; close(fd); return 1000 + saved; }}
+    }}
+    errno = 0;
+    struct io_uring_sqe *sqes = mmap(0, p.sq_entries * sizeof(struct io_uring_sqe),
+                                     PROT_READ | PROT_WRITE,
+                                     MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
+    if (sqes == MAP_FAILED) {{ int saved = errno; close(fd); return 1000 + saved; }}
+
+    unsigned *sq_tail  = (unsigned *)((char *)sq + p.sq_off.tail);
+    unsigned *sq_mask  = (unsigned *)((char *)sq + p.sq_off.ring_mask);
+    unsigned *sq_array = (unsigned *)((char *)sq + p.sq_off.array);
+    unsigned *cq_head  = (unsigned *)((char *)cq + p.cq_off.head);
+    unsigned *cq_tail  = (unsigned *)((char *)cq + p.cq_off.tail);
+    unsigned *cq_mask  = (unsigned *)((char *)cq + p.cq_off.ring_mask);
+    struct io_uring_cqe *cqes = (struct io_uring_cqe *)((char *)cq + p.cq_off.cqes);
+
+    unsigned tail = __atomic_load_n(sq_tail, __ATOMIC_ACQUIRE);
+    unsigned idx = tail & *sq_mask;
+    struct io_uring_sqe *sqe = &sqes[idx];
+    memset(sqe, 0, sizeof *sqe);
+    sqe->opcode = GV_IORING_OP_SOCKET;
+    sqe->fd = AF_UNIX;        /* io_uring_prep_socket puts the family here */
+    sqe->off = SOCK_STREAM;   /* ...the type here... */
+    sqe->len = 0;             /* ...and the protocol here. */
+    sqe->user_data = 1;
+    sq_array[idx] = idx;
+    __atomic_store_n(sq_tail, tail + 1, __ATOMIC_RELEASE);
+
+    errno = 0;
+    long entered = syscall(__NR_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, (void *)0, 0);
+    if (entered < 0) {{ int saved = errno; close(fd); return 1000 + saved; }}
+
+    unsigned head = __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);
+    unsigned filled = __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
+    if (head == filled) {{ close(fd); return 3000; }}
+    int res = cqes[head & *cq_mask].res;
+    __atomic_store_n(cq_head, head + 1, __ATOMIC_RELEASE);
+    close(fd);
+    if (res < 0) return 2000 + -res;
+    close(res);
+    return 0;
+}}
+
+int main(void) {{
+    int denied = uring_af_unix_errno();
+    int granted = read_errno("{granted}");
+    printf("GVPROBE {nonce} BEGIN\n");
+    printf("URINGSOCKET rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           denied ? -1 : 0, denied,
+           prctl(PR_GET_SECCOMP, 0, 0, 0, 0), prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0));
+    printf("GRANTED rc=%d errno=%d\n", granted ? -1 : 0, granted);
+    printf("GVPROBE {nonce} END\n");
+    return 0;
+}}
+"#,
+                nonce = ctx.nonce,
+            ),
+        )
+    }
 }
