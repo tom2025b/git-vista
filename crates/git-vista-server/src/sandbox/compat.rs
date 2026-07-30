@@ -178,6 +178,27 @@
 //!    denial. Three more `plain_fixture` cases whose only difference is the
 //!    subcommand would add census rows, not evidence.
 //!
+//! # Demonstrated reds — the evidence that these cases are not vacuous
+//!
+//! A gate never observed to fail is not known to be a gate, and the mirror-image
+//! vacuity here ("would this pass with the sandbox never applied?") is exactly
+//! the question a mutation answers and a review does not. Four single-mechanism
+//! mutations were applied to this file and measured on 2026-07-30. Every one was
+//! reverted; they are recorded rather than committed because R9's driver
+//! (`ci/mutation-matrix.sh`) belongs to another lane and mutates *production*
+//! source, which is the right home for a permanent grid.
+//!
+//! | mutation | measured result |
+//! |---|---|
+//! | **A** — the inside leg runs under the *baseline* (`Tier::Unsandboxed`) policy: the sandbox is never applied | **all six cases FAIL**, each on `the hook inside the sandbox reports \`Seccomp: 0\`, not 2`. `contract::r6_every_leg_goes_through_the_production_seam` fails independently, off the source. |
+//! | **B** — `core.hooksPath` is never written, so the repository keeps ordinary `.git/hooks` | **`husky_hook_runs` and `husky_hook_gates` FAIL** on the decoy (`the decoy hook in .git/hooks fired`); the other four stay green. The husky *shape*, not merely "a hook ran", is what those two cases test. |
+//! | **C** — the rejecting hook's `exit 1` becomes `exit 0` | **`husky_hook_gates` alone FAILS**; `husky_hook_runs` stays green. INV-11's two halves are genuinely independent cases, not one test asserting two things. |
+//! | **D** — the linked-worktree case runs in the main repository instead of the worktree | **`linked_worktree_commit` FAILS** on `gitdir == commondir … the geometry under test does not exist here`. A case cannot silently degrade into a plain-repository case. |
+//!
+//! Mutation A is the load-bearing one: it is the exact defect this battery's
+//! predecessor shipped (`blocked_hooks`, satisfied by `Tier::Unsandboxed`), and
+//! every case here dies under it.
+//!
 //! # The submodule geometry — a finding, measured, not inferred
 //!
 //! The case this file carries is `submodule_parent_commit`: a commit in a
@@ -365,11 +386,15 @@ mod harness {
         FunctionalOk,
         /// The operation did not work under the policy. This is the finding the
         /// battery exists to produce.
-        FunctionalBroken { detail: String },
+        FunctionalBroken {
+            detail: String,
+        },
         /// The premise could not be established — the baseline leg, which runs
         /// with no sandbox at all, did not do what the case declares. Recorded,
         /// then raised: it is never a silent pass (deviation 1).
-        CapabilityAbsent { missing: String },
+        CapabilityAbsent {
+            missing: String,
+        },
     }
 
     impl Outcome {
@@ -538,7 +563,10 @@ mod harness {
     /// were ignored the commit would still succeed — the *only* thing that
     /// notices is this marker, which is why the marker exists.
     fn decoy_script(cwd: &Path) -> String {
-        format!("echo fired > \"{}\"\nexit 0\n", cwd.join(MARK_DECOY).display())
+        format!(
+            "echo fired > \"{}\"\nexit 0\n",
+            cwd.join(MARK_DECOY).display()
+        )
     }
 
     /// Write `body` as an executable `pre-commit` hook in `hooks_dir`, with an
@@ -730,8 +758,7 @@ mod harness {
         let mut text = std::fs::read_to_string(config)
             .map_err(|e| format!("cannot read {}: {e}", config.display()))?;
         text.push_str(section);
-        std::fs::write(config, text)
-            .map_err(|e| format!("cannot write {}: {e}", config.display()))
+        std::fs::write(config, text).map_err(|e| format!("cannot write {}: {e}", config.display()))
     }
 
     // -----------------------------------------------------------------------
@@ -897,7 +924,12 @@ mod harness {
                 log.combined
             ));
         }
-        let subjects = log.stdout.lines().map(str::trim).map(String::from).collect();
+        let subjects = log
+            .stdout
+            .lines()
+            .map(str::trim)
+            .map(String::from)
+            .collect();
 
         let author = git(policy, &f.cwd, &["log", "-1", "--format=%ae"]).await;
         if author.code != 0 {
@@ -967,7 +999,11 @@ mod harness {
             return Err(format!(
                 "with no sandbox at all, the commit {} where the case declares it {}",
                 if landed_now { "landed" } else { "did not land" },
-                if should_land { "lands" } else { "does not land" },
+                if should_land {
+                    "lands"
+                } else {
+                    "does not land"
+                },
             ));
         }
         if base.seccomp != 0 {
@@ -1040,7 +1076,11 @@ mod harness {
                 "under the policy the commit {} where the case declares it {} \
                  (with no sandbox, the same fixture behaved as declared)",
                 if landed_now { "landed" } else { "did not land" },
-                if should_land { "lands" } else { "does not land" },
+                if should_land {
+                    "lands"
+                } else {
+                    "does not land"
+                },
             ));
         }
 
@@ -1496,8 +1536,7 @@ mod contract {
             );
         }
         assert_eq!(
-            census,
-            declared,
+            census, declared,
             "docs/sandbox/compat-census.txt does not match the cases declared in compat.rs. \
              Left is the census, right is the source. A renamed case must be renamed in \
              both, or the gate silently stops covering it."
@@ -1596,4 +1635,3 @@ mod contract {
         }
     }
 }
-
