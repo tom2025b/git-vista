@@ -110,41 +110,135 @@ pub struct SessionRequest {
     pub token: String,
 }
 
-/// Whether repository hooks may run when this server spawns a git write
-/// (`SECURITY_MODEL.md:236`, #66/M1.13a, ADR 0025). Not a `bool`: a closed,
-/// named vocabulary can grow a third state later (e.g. an explicit allowlist
-/// of specific hooks) without a breaking wire-format change — the same
-/// reasoning this project already applies to [`crate::GitOperation`] (ADR
-/// 0015) rather than scattering booleans through the write path.
+/// The sandbox policy a repository's hooks actually run under
+/// (`SECURITY_MODEL.md:236`, #66 — declared by ADR 0025, made real by M1.13b's
+/// tier dispatch). Not a `bool`, for ADR 0015's reason: a closed, *named*
+/// vocabulary can grow without a breaking wire change, which is exactly what
+/// happened here.
 ///
-/// **This is a disclosed value, not yet an enforced one.** M1.13a (this ADR)
-/// is policy-and-disclosure only; no code path in `git-vista-server` or
-/// `git-vista-git` suppresses hooks today, so a session reporting
-/// `Restricted` currently still has its hooks run exactly like `Allow` would
-/// — the server simply hasn't been told to enforce it yet. Actual
-/// suppression (`core.hooksPath` override or equivalent, wired into the
-/// spawn chokepoint) is M1.13b, a separate, larger, not-yet-built piece. See
-/// ADR 0025 for the full reasoning; this comment exists so the gap is
-/// visible from the type itself, not only from a document a reader might
-/// not open.
+/// # These four names are the server's own `sandbox::Tier`, plus one
+///
+/// [`Strict`](Self::Strict), [`Network`](Self::Network) and
+/// [`Unsandboxed`](Self::Unsandboxed) are the three tiers
+/// `git-vista-server`'s `sandbox::tier_for` dispatches to, reported on the
+/// wire under the same names so the disclosed value and the enforced value
+/// cannot drift into two vocabularies. [`Blocked`](Self::Blocked) is the
+/// fourth: hooks suppressed outright.
+///
+/// # What changed from ADR 0025, and why it is not additive
+///
+/// ADR 0025 shipped two variants, `allow` / `restricted`, *session*-scoped and
+/// **declared, not enforced** — no code read them. INV-15 needs a per-repository
+/// value that names the tier the git-spawn chokepoint really uses, and the
+/// banner polarity inverts with it (ADR 0025 flew the banner on `allow`; INV-15
+/// flies it on anything that is **not** `strict` — see [`requires_banner`]).
+/// The old wire strings still *deserialize* (`restricted` → `Strict`, `allow` →
+/// `Unsandboxed`) so a stored older value is not a hard error, but they are
+/// never emitted again. This is a value-domain change, not an additive field:
+/// see the note in `dto_golden.rs` when its fixture is regenerated.
+///
+/// [`requires_banner`]: Self::requires_banner
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookPolicy {
-    /// Repository hooks run normally.
-    Allow,
-    /// Repository hooks are restricted — **declared, not yet enforced**; see
-    /// this type's own doc comment.
-    Restricted,
+    /// Landlock + seccomp inside a bwrap pid/net/ipc/uts/cgroup namespace
+    /// (`sandbox::Tier::Strict`). Hooks run, and they reach no network and no
+    /// unix socket.
+    ///
+    /// **This is not "confined to the repository."** The same policy also
+    /// grants read-only system trees, `$HOME` read-only minus the secret
+    /// exclusion set, and a private `/dev` read-write. What it guarantees is
+    /// narrower and stated in the server's own `sandbox` module docs: nothing
+    /// is *written* outside the declared read-write trees, and nothing is
+    /// *read* outside the declared read-only grants minus `secret_excludes`.
+    /// The banner is silent for this one variant only, so overstating it here
+    /// would be the one place a reader could be misled.
+    #[serde(alias = "restricted")]
+    Strict,
+    /// Landlock + seccomp with no network namespace (`sandbox::Tier::Network`)
+    /// — the only tier under which `git push`/`fetch`/`clone` can work, because
+    /// a network namespace breaks DNS resolution. Hooks run with `AF_INET`
+    /// reachable, which is why this flies the banner even though it is
+    /// sandboxed.
+    #[serde(alias = "allow")]
+    Network,
+    /// No sandbox at all (`sandbox::Tier::Unsandboxed`). Reachable only through
+    /// explicit, persisted, per-repository operator trust
+    /// (`sandbox::trust::grant`), and it flies a permanent banner.
+    Unsandboxed,
+    /// Hooks do not run at all — `core.hooksPath` pointed at a server-owned
+    /// empty directory.
+    ///
+    /// **No production policy constructor yields this today**, and that is
+    /// checked, not merely asserted: `sandbox::escape_contract`'s R8 scan fails
+    /// if any production `Policy` literal in the server sets a blocked hook
+    /// mode. The variant exists because [`default`](Self::default) needs a
+    /// value meaning "hooks are not known to be running," and because ADR 0029
+    /// rules out the one mapping that would otherwise produce it: a host that
+    /// cannot supply the strict tier must **refuse the operation**, not run it
+    /// with hooks suppressed.
+    Blocked,
+}
+
+impl HookPolicy {
+    /// INV-15: a persistent, non-dismissible banner is required for anything
+    /// other than [`Strict`](Self::Strict).
+    ///
+    /// The polarity is inverted from ADR 0025 on purpose. ADR 0025's `Allow`
+    /// meant "hooks run unrestricted," so the banner marked the *permissive*
+    /// case; these four name tiers, so the banner marks everything that is not
+    /// the fullest isolation — including [`Blocked`](Self::Blocked), because
+    /// "your hooks silently did not run" is a surprise a user must be told
+    /// about just as much as "your hooks ran unsandboxed."
+    ///
+    /// Written as `!matches!(self, Strict)` rather than as an exhaustive match
+    /// so a variant added later flies the banner by default. That is the
+    /// fail-safe direction: a new tier no one has written banner text for
+    /// over-warns instead of going silent.
+    pub fn requires_banner(self) -> bool {
+        !matches!(self, HookPolicy::Strict)
+    }
 }
 
 impl Default for HookPolicy {
-    /// Fail-closed: if this field is ever missing on the wire (an older
-    /// server response deserialized by a newer client — see `SessionInfo`'s
-    /// `#[serde(default)]`), assume the more conservative value rather than
-    /// the more permissive one.
+    /// Fail-closed, and one notch stricter than ADR 0025's `Restricted`: if the
+    /// field is missing on the wire (an older server's response read by a newer
+    /// client, via `SessionInfo`'s / `RepositoryDescriptor`'s
+    /// `#[serde(default)]`), assume hooks are not running rather than assume
+    /// they are running under a guarantee nothing measured.
+    ///
+    /// [`Strict`](Self::Strict) would be the wrong default precisely because it
+    /// is the one variant that claims a guarantee *and* silences the banner —
+    /// defaulting to it would turn an absent field into an unearned green
+    /// light.
     fn default() -> Self {
-        HookPolicy::Restricted
+        HookPolicy::Blocked
     }
+}
+
+/// Transitional aliases for ADR 0025's two Rust variant names, so the four-way
+/// widening above does not break call sites in crates this change does not own.
+///
+/// **These are a migration shim with a deletion date, not API.** They exist
+/// because `HookPolicy::{Allow, Restricted}` is still spelled in
+/// `git-vista-server/src/security.rs`, `git-vista/src/features/session/core.rs`
+/// and `git-vista-protocol/tests/dto_golden.rs`, none of which were in scope
+/// for the change that widened this enum. The mapping is the same one the
+/// `#[serde(alias)]`es above use, so a call site reading `HookPolicy::Allow`
+/// keeps meaning exactly what it deserialized to.
+///
+/// Delete both, and the `#[serde(alias)]`es, once those three files spell the
+/// tier names directly. Nothing new should reference them.
+#[allow(non_upper_case_globals)]
+impl HookPolicy {
+    /// ADR 0025's `Allow` — "hooks run unrestricted." Now [`Network`](Self::Network):
+    /// sandboxed but network-reachable is the closest live tier to what the old
+    /// value actually described for a session that could push.
+    #[doc(hidden)]
+    pub const Allow: HookPolicy = HookPolicy::Network;
+    /// ADR 0025's `Restricted`. Now [`Strict`](Self::Strict).
+    #[doc(hidden)]
+    pub const Restricted: HookPolicy = HookPolicy::Strict;
 }
 
 /// Response of `GET`/`POST /api/session` (M1.04): whether the caller now has a
