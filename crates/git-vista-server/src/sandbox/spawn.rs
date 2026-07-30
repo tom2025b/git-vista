@@ -1,23 +1,32 @@
-//! M1.13b (#66) Task 5: the two spawn wrappers that are the *only* way the
-//! server starts a git process.
+//! M1.13b (#66) Task 5: the spawn wrapper that is the *only* way the server
+//! starts a git process.
 //!
 //! Everything above this in `sandbox` is pure — it produces argv. This is where
 //! that argv becomes a real `Command`, and it is deliberately the single
 //! chokepoint: `argv_boundary.rs` proves no other file in the crate constructs
-//! a git `Command` outside the allowlist, and Task 6 migrates the existing
-//! spawn sites onto these two functions so that proof means "every git the
-//! server runs is sandboxed."
+//! a git `Command` outside the allowlist, and Task 6 migrated the existing
+//! spawn sites onto [`command_async`] so that proof means "every git the server
+//! runs is sandboxed."
 //!
-//! # Why two functions and not one
+//! # Why one function and not two
 //!
-//! The server runs git both ways: `git_stdout_capped` streams a child's stdout
-//! under a cap on the async runtime, and a handful of helpers (`rev_parse`,
-//! `is_ancestor`) want a simple blocking `output()`. Both must go through the
-//! same policy, so the sandboxing cannot live in either call style — it lives
-//! here, in `configure`, which both wrappers share. Neither needs a
-//! `pre_exec` closure or a `block_on`, because the sandbox is *argv*: the shim
-//! applies Landlock and seccomp in its own process, after this one has already
-//! exec'd it.
+//! This module shipped with a `command_sync` beside `command_async`, for
+//! "blocking helpers" — and Task 6 then found there are none. Every production
+//! git in the crate is reached from an `async fn` (`git_output`,
+//! `git_stdout_capped`, `rev_parse`, `is_ancestor`, `git_ref_exists`, the
+//! planner's `run_git`, and as of plan step 6.7 the clone handler), and every
+//! remaining `std::process::Command` in the crate is `#[cfg(test)]` fixture
+//! setup that deliberately spawns *unsandboxed* git to build a repository
+//! before the sandbox is applied. `command_sync` had no caller at all — not
+//! even a test — and was carrying an `allow(dead_code)` to say so, which is
+//! exactly the kind of "someone will wire this up" placeholder that outlives
+//! the reason it existed. It was deleted rather than left dead; if a genuinely
+//! blocking call site ever appears, the four lines are cheap to write back with
+//! a caller attached.
+//!
+//! Neither call style needs a `pre_exec` closure or a `block_on`, because the
+//! sandbox is *argv*: the shim applies Landlock and seccomp in its own process,
+//! after this one has already exec'd it.
 
 use std::path::Path;
 
@@ -138,27 +147,16 @@ impl SandboxedCommand {
     }
 }
 
-/// The async wrapper: a [`SandboxedCommand`] whose argv is already complete.
-/// Pipes and `kill_on_drop` are left to the caller, because the two async call
-/// sites want different shapes (a capped stream vs a simple output) and both
-/// are legitimate — but neither may touch the argv.
+/// The one wrapper: a [`SandboxedCommand`] whose argv is already complete.
+/// Pipes and `kill_on_drop` are left to the caller, because the call sites want
+/// different shapes (a capped stream vs a simple output) and both are
+/// legitimate — but none of them may touch the argv.
 pub(crate) fn command_async(policy: &Policy, repo: &Path, args: &[&str]) -> SandboxedCommand {
     let argv = full_argv(policy, repo, args);
     let (program, rest) = split(&argv);
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(rest);
     SandboxedCommand(cmd)
-}
-
-/// The sync wrapper, for the `#[cfg(test)]` fixture builders and any blocking
-/// helper. Same argv, same policy, `std::process::Command`.
-#[cfg_attr(not(test), allow(dead_code))] // Task 6 wires the production blocking callers.
-pub(crate) fn command_sync(policy: &Policy, repo: &Path, args: &[&str]) -> std::process::Command {
-    let argv = full_argv(policy, repo, args);
-    let (program, rest) = split(&argv);
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(rest);
-    cmd
 }
 
 #[cfg(test)]

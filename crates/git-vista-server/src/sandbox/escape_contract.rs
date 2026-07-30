@@ -337,8 +337,10 @@ fn commit_outside(repo: &Path) -> HookRun {
 }
 
 /// Fire the hook **inside** the composed launcher, through the one production
-/// seam (R6): `sandbox::spawn::command_async` — never `command_sync`, never
-/// `shim_cli::launch`.
+/// seam (R6): `sandbox::spawn::command_async` — never `shim_cli::launch`.
+/// (It used to say "never `command_sync`" too; that wrapper had no caller in
+/// production or in tests and was deleted in Task 6, so `command_async` is now
+/// the only seam there is.)
 fn commit_inside(policy: &Policy, repo: &Path) -> HookRun {
     let env = production_env_profile();
     std::fs::write(repo.join("payload.txt"), "x").expect("write payload");
