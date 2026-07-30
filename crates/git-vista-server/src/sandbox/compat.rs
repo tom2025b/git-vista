@@ -1312,7 +1312,7 @@ const CASE_INTERPRETER_IDENTITY: CompatCase = CompatCase {
     interpreter: InterpreterClaim::MustMatchBaseline,
 };
 #[test]
-fn interpreter_identity() {
+fn interpreter_identity() { if true {}
     run_compat_case(&CASE_INTERPRETER_IDENTITY);
 }
 
