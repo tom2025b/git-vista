@@ -1097,6 +1097,78 @@ fn r4_capability_established_only_by_execution_never_by_probing_the_host() {
     );
 }
 
+/// R5's source half: "a source tripwire asserts the census file's id set equals
+/// the set of `EscapeCase` constants in the battery."
+///
+/// The shell half of R5 lives in the gating job, which diffs
+/// `$GV_ESCAPE_REPORT`'s case-ids against `docs/sandbox/escape-census.txt` in
+/// both directions. That check alone cannot tell a *rename* from a *deletion*:
+/// both show up as a diff, in CI, after a full battery run, with no indication
+/// of which file is wrong. This one makes the census's disagreement with the
+/// source a **build** failure at the point of edit — which is the difference
+/// R5's "a rename breaks the BUILD rather than emptying the GATE" is naming.
+///
+/// It is not hypothetical. When this test was written the census was missing
+/// `high_bit_af_unix_denied` and `high_bit_io_uring_denied`: two cases had
+/// landed, both green, both writing report records the gating job would have
+/// diffed against a census that did not know about them. The gate would have
+/// gone red on the next CI run for a reason that looks exactly like a security
+/// regression. Nothing in the tree could catch that before this test existed —
+/// the contract specified it, and it was the one R5 clause never built.
+#[test]
+fn r5_census_names_exactly_the_declared_cases() {
+    let mut declared: BTreeSet<String> = BTreeSet::new();
+    for rel in BATTERY_FILES {
+        // Comments blanked, string content intact: the ids being collected are
+        // themselves string literals, which `code_only` would blank away.
+        let src = comments_only_blanked(&read_rs(rel));
+        let mut rest = src.as_str();
+        while let Some(at) = rest.find("const CASE_") {
+            let after = &rest[at + "const CASE_".len()..];
+            // `id` is the first field of every `EscapeCase` literal (R1 forbids
+            // `..Default::default()`, so it is always written out), which is
+            // what makes "the first `id: \"` after the const marker" exact.
+            let Some(id_at) = after.find("id: \"") else {
+                break;
+            };
+            let tail = &after[id_at + "id: \"".len()..];
+            let Some(end) = tail.find('"') else { break };
+            let id = &tail[..end];
+            assert!(
+                declared.insert(id.to_string()),
+                "{rel}: duplicate EscapeCase id `{id}` — the report file is a \
+                 multiset the gating job compares by id, so two cases sharing one \
+                 id make both unattributable"
+            );
+            rest = &tail[end..];
+        }
+    }
+    assert!(
+        !declared.is_empty(),
+        "no `const CASE_…: EscapeCase` declarations found in {BATTERY_FILES:?} — the scan broke"
+    );
+
+    let census_path = server_root().join("../../docs/sandbox/escape-census.txt");
+    let census_text = std::fs::read_to_string(&census_path)
+        .unwrap_or_else(|e| panic!("{}: the R5 census must be readable: {e}", census_path.display()));
+    let census: BTreeSet<String> = census_text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    assert_eq!(
+        declared,
+        census,
+        "R5: docs/sandbox/escape-census.txt and the battery's EscapeCase ids must name \
+         the same set in both directions. In source but not the census: {:?}. In the \
+         census but not source: {:?}.",
+        declared.difference(&census).collect::<Vec<_>>(),
+        census.difference(&declared).collect::<Vec<_>>(),
+    );
+}
+
 /// R6: the composed launcher is reached only through `spawn::command_async`;
 /// no battery file builds its own `Policy` or calls the deleted
 /// `shim_cli::launch`/`workable`; every `Command::new(` in `escape_suite.rs`

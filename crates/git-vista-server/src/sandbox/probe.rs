@@ -743,4 +743,30 @@ mod tests {
             .expect("this host is known to compose the strict tier");
         assert_eq!(v, ProbeVerdict::Contained);
     }
+
+    #[tokio::test]
+    async fn debug_carrier() {
+        let fixture = boot_probe_fixture().expect("fixture");
+        let policy = boot_probe_policy(&fixture.repo(), &fixture.markers()).expect("policy");
+        let out = command_async(
+            &policy,
+            &fixture.repo(),
+            &[
+                "-c",
+                "user.name=gv-boot-probe",
+                "-c",
+                "user.email=gv@localhost",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "boot-probe",
+            ],
+        )
+        .output()
+        .await
+        .expect("spawn");
+        eprintln!("status={:?}", out.status);
+        eprintln!("stdout={}", String::from_utf8_lossy(&out.stdout));
+        eprintln!("stderr={}", String::from_utf8_lossy(&out.stderr));
+    }
 }
