@@ -178,6 +178,52 @@
 //!    denial. Three more `plain_fixture` cases whose only difference is the
 //!    subcommand would add census rows, not evidence.
 //!
+//! # The submodule geometry — a finding, measured, not inferred
+//!
+//! The case this file carries is `submodule_parent_commit`: a commit in a
+//! repository that **contains** a submodule. The obvious case — a commit
+//! *inside* the submodule's working directory — is not here, and the reason is
+//! not that it was hard. **It cannot run at all.** Measured 2026-07-30 on this
+//! host, through the production builder, git 2.x:
+//!
+//! ```text
+//! git -C <outer> -c protocol.file.allow=always submodule add -q <inner> sub   rc=0
+//! <outer>/sub/.git            = "gitdir: ../.git/modules/sub\n"
+//! repo_paths::resolve(<outer>/sub)
+//!     = Err(WorktreeGeometry { why: "`commondir` at
+//!           <outer>/.git/modules/sub/commondir is unreadable: No such file or directory" })
+//! policy_for(<outer>/sub, false, NetworkNeed::Local)
+//!     = Err(RepoPaths(WorktreeGeometry { .. }))          <-- no policy is built
+//! policy_for(<outer>, ..)  = Ok(..)   and a real `git commit` there under
+//!                                     Tier::Strict exits 0
+//! ```
+//!
+//! So **every git operation whose repository path is a submodule working
+//! directory is refused before a sandbox is even constructed.** That is not a
+//! regression and not an accident: `worktree::linked_worktree_dirs` requires a
+//! `commondir` file, which a linked worktree has and a submodule does not, and
+//! that module's doc names the consequence — *"Geometries this deliberately
+//! does not support, today: submodule gitdir pointers (no `commondir`) and
+//! `--separate-git-dir` repositories (same) — both refuse rather than guess."*
+//! Fail-closed is the right posture for an unproven pointer geometry.
+//!
+//! What is **not** recorded anywhere is the user-visible consequence: a
+//! submodule cannot be served as a repository, at all, in any tier. Two things
+//! follow, and neither is this lane's file to write:
+//!
+//! - the inverted claim ("a submodule working directory is refused with a named
+//!   error, not a confusing downstream git failure") is an INV-17
+//!   documented-non-coverage claim and belongs in `documented_gaps.rs`;
+//! - whether to *support* the geometry (grant `<outer>/.git/modules/<name>`
+//!   after an equivalent containment proof) is a security decision about a
+//!   repository-writable pointer file, which is an ADR, not a test.
+//!
+//! A case asserting the commit works inside a submodule would be asserting that
+//! production should do something it deliberately decided not to do; a case that
+//! quietly ran in the parent while claiming the submodule id would be the
+//! vacuity this file exists to prevent. So the claim is scoped to the parent,
+//! the id says so, and the gap is written down here with its measurement.
+//!
 //! # Why the baseline leg is `Tier::Unsandboxed` and not a raw `git`
 //!
 //! The obvious baseline is `Command::new("git")`, which is what
@@ -236,9 +282,18 @@ mod harness {
         /// under the main repository's common directory, outside the worktree
         /// (INV-10 / A14).
         LinkedWorktree,
-        /// A submodule — its git directory is `<outer>/.git/modules/<name>`,
-        /// reached through a `.git` *file* pointer (INV-10).
-        Submodule,
+        /// A repository that **contains** a submodule: `.gitmodules`, a gitlink
+        /// entry, and a `sub/.git` *file* pointing into
+        /// `<outer>/.git/modules/<name>`.
+        ///
+        /// The case runs in the **outer** repository, not inside the submodule,
+        /// and that is not a convenience — see "The submodule geometry" in the
+        /// module doc. `policy_for` **refuses** a submodule working directory
+        /// outright, by a decision `worktree.rs` records deliberately, so a case
+        /// that ran there would be asserting production should do something it
+        /// decided not to do. The parent-side claim is the one the shipped
+        /// server actually makes, and it was untested.
+        SubmoduleParent,
     }
 
     /// What the `pre-commit` hook does after writing its witness markers.
@@ -609,7 +664,7 @@ mod harness {
                 }
             }
 
-            Geometry::Submodule => {
+            Geometry::SubmoduleParent => {
                 let inner = hostile_hook_repo(PLACEHOLDER_HOOK);
                 let outer_dir = hostile_hook_repo(PLACEHOLDER_HOOK);
                 let outer = outer_dir.path().to_path_buf();
@@ -636,20 +691,29 @@ mod harness {
                         added.code, added.combined
                     ));
                 }
-                let cwd = outer.join("sub");
-                let paths = repo_paths::resolve(&cwd)
-                    .map_err(|e| format!("the submodule does not resolve: {e:?}"))?;
-                if paths.gitdir == cwd.join(".git") {
+                // Without this the case degrades silently into a second
+                // `commit_without_repo_identity`: a plain repository, no
+                // submodule geometry in it, and a green result that says
+                // nothing about submodules at all.
+                let pointer = outer.join("sub/.git");
+                let text = std::fs::read_to_string(&pointer).map_err(|e| {
+                    format!(
+                        "`git submodule add` left no `.git` pointer file at {} ({e}) — the \
+                         geometry this case is about does not exist here",
+                        pointer.display()
+                    )
+                })?;
+                if !text.trim_start().starts_with("gitdir:") {
                     return Err(format!(
-                        "this git kept the submodule's git directory inside the submodule \
-                         ({}) — the `.git`-file geometry under test does not exist here",
-                        paths.gitdir.display()
+                        "the submodule's `.git` is not a `gitdir:` pointer ({text:?}) — this \
+                         git kept the submodule's git directory inside the submodule, so the \
+                         geometry under test does not exist here"
                     ));
                 }
-                install_hook(&paths.gitdir.join("hooks"), &witness(&cwd))?;
+                install_hook(&outer.join(".git/hooks"), &witness(&outer))?;
                 Fixture {
                     _dirs: vec![inner, outer_dir],
-                    cwd,
+                    cwd: outer,
                     decoy: None,
                 }
             }
@@ -1171,11 +1235,14 @@ fn linked_worktree_commit() {
     run_compat_case(&CASE_LINKED_WORKTREE_COMMIT);
 }
 
-// INV-10's other positive pair: a submodule reaches its git directory through a
-// `.git` *file* pointer into `<outer>/.git/modules/<name>`.
-const CASE_SUBMODULE_COMMIT: CompatCase = CompatCase {
-    id: "submodule_commit",
-    geometry: Geometry::Submodule,
+// INV-10's other positive pair, scoped to the claim production actually makes:
+// a repository that CONTAINS a submodule still works under the policy. Running
+// *inside* the submodule is refused by `policy_for` — a decision `worktree.rs`
+// records deliberately, measured here on 2026-07-30, and written up as a named
+// gap in this file's module doc rather than asserted against.
+const CASE_SUBMODULE_PARENT_COMMIT: CompatCase = CompatCase {
+    id: "submodule_parent_commit",
+    geometry: Geometry::SubmoduleParent,
     hook: HookVerdict::Accepts,
     expect_commit_code: 0,
     expect_commit: CommitOutcome::Lands,
@@ -1183,8 +1250,8 @@ const CASE_SUBMODULE_COMMIT: CompatCase = CompatCase {
     interpreter: InterpreterClaim::NotClaimed,
 };
 #[test]
-fn submodule_commit() {
-    run_compat_case(&CASE_SUBMODULE_COMMIT);
+fn submodule_parent_commit() {
+    run_compat_case(&CASE_SUBMODULE_PARENT_COMMIT);
 }
 
 // INV-12 / F6: the interpreter the hook's `#!` line resolves to inside the
@@ -1530,32 +1597,3 @@ mod contract {
     }
 }
 
-#[test]
-fn tmp_measure_submodule_policy() {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let inner = hostile_hook_repo("exit 0");
-        let outer_d = hostile_hook_repo("exit 0");
-        let outer = outer_d.path().to_path_buf();
-        trust::grant(&outer.canonicalize().unwrap()).unwrap();
-        let p = policy_for(&outer, false, NetworkNeed::Local).unwrap();
-        assert_eq!(p.tier, Tier::Unsandboxed);
-        let url = inner.path().display().to_string();
-        let out = command_async(&p, &outer, &["-c","protocol.file.allow=always","submodule","add","-q",url.as_str(),"sub"])
-            .pinned_env_for_test(&production_env_profile()).output().await.unwrap();
-        println!("submodule add rc={:?} err={}", out.status.code(), String::from_utf8_lossy(&out.stderr));
-        let sub = outer.join("sub");
-        println!(".git file contents: {:?}", std::fs::read_to_string(sub.join(".git")));
-        println!("resolve(sub) = {:?}", repo_paths::resolve(&sub));
-        println!("policy_for(sub) = {:?}", policy_for(&sub, false, NetworkNeed::Local).map(|p| p.tier));
-        println!("policy_for(outer) = {:?}", policy_for(&outer, false, NetworkNeed::Local).map(|p| p.tier));
-        let _ = trust::revoke(&outer.canonicalize().unwrap());
-        // outer commit under strict
-        let strict = shim_cli::production_policy(&outer);
-        println!("outer strict tier = {:?}", strict.tier);
-        let c = command_async(&strict, &outer, &["commit","--allow-empty","-m","outer-with-submodule"])
-            .pinned_env_for_test(&production_env_profile()).output().await.unwrap();
-        println!("outer commit under strict rc={:?} out={} err={}", c.status.code(),
-            String::from_utf8_lossy(&c.stdout), String::from_utf8_lossy(&c.stderr));
-    });
-}
