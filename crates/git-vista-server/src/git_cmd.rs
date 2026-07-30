@@ -193,11 +193,43 @@ fn sandboxed(
 /// either way. And it is strictly better than what it replaces — the raw
 /// `Command::new("git")` spawns this collapses into itself ran with no
 /// sandbox at all.
+/// # Declares `NetworkNeed::Local` (D3)
+///
+/// Not a fallback and not a guess: this arity exists for the callers that have
+/// **no typed `GitOperation`** in scope, and every one of them is a local
+/// command by inspection —
+///
+/// * `coordinator::absolute_git_dir` — `rev-parse --absolute-git-dir`;
+/// * `durable::write_recovery_ref` — `update-ref <ref> <oid>`;
+/// * `handlers::read::worktree_status` — `status --porcelain=v2 --branch`.
+///
+/// None of them reaches a remote, so `Local` is the truthful declaration rather
+/// than a conservative default. The planner, which *does* have a typed
+/// operation, does not use this arity: it goes through [`git_output_for`] with
+/// the need `sandbox::network_need_for_operation` derived from the operation
+/// itself. If a future caller of this function ever needs a remote, it must use
+/// `git_output_for` — declaring `Remote` explicitly — because the cross-check
+/// in `sandboxed` will otherwise fire on it, which is the intended way to find
+/// out.
 pub(crate) async fn git_output(repo: &Path, args: &[&str]) -> std::io::Result<Output> {
-    let cmd = sandboxed(repo, args).map_err(std::io::Error::other)?;
+    git_output_for(repo, args, crate::sandbox::NetworkNeed::Local).await
+}
+
+/// [`git_output`] with the network need stated explicitly — the arity the
+/// planner uses, where the declaration comes from the typed `GitOperation`
+/// being executed rather than from this file's knowledge of its callers.
+pub(crate) async fn git_output_for(
+    repo: &Path,
+    args: &[&str],
+    declared: crate::sandbox::NetworkNeed,
+) -> std::io::Result<Output> {
+    let cmd = sandboxed(repo, args, declared).map_err(std::io::Error::other)?;
     cmd.output().await
 }
 
+/// Declares `NetworkNeed::Local` for the same reason [`git_output`] does: all
+/// five production call sites are read endpoints (`/api/diff`'s three `diff`
+/// reads and `/api/file`'s two `show` reads), none of which can reach a remote.
 pub(crate) async fn git_stdout_capped(
     repo: &Path,
     args: &[String],
@@ -205,7 +237,7 @@ pub(crate) async fn git_stdout_capped(
     cap: usize,
 ) -> Result<(Vec<u8>, bool), (StatusCode, String)> {
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    let child = sandboxed(repo, &borrowed)
+    let child = sandboxed(repo, &borrowed, crate::sandbox::NetworkNeed::Local)
         .map_err(|e| io_error(endpoint, std::io::Error::other(e)))?
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -309,8 +341,13 @@ pub(crate) async fn git_stdout(
 /// and exactly what "Restore branch" later needs.
 pub(crate) async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
     let spec = format!("{rev}^{{commit}}");
-    let output = sandboxed(repo, &["rev-parse", "--verify", "--quiet", &spec])
-        .ok()?
+    // Local (D3): resolving a rev reads the object database, never a remote.
+    let output = sandboxed(
+        repo,
+        &["rev-parse", "--verify", "--quiet", &spec],
+        crate::sandbox::NetworkNeed::Local,
+    )
+    .ok()?
         .output()
         .await
         .ok()?;
@@ -325,7 +362,12 @@ pub(crate) async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
 /// --is-ancestor` exits 0 exactly then. "HEAD already contains the base tip" is
 /// the definition of "a rebase onto that base would change nothing".
 pub(crate) async fn is_ancestor(repo: &Path, ancestor: &str, rev: &str) -> bool {
-    let Ok(cmd) = sandboxed(repo, &["merge-base", "--is-ancestor", ancestor, rev]) else {
+    // Local (D3): `merge-base` walks the local object graph.
+    let Ok(cmd) = sandboxed(
+        repo,
+        &["merge-base", "--is-ancestor", ancestor, rev],
+        crate::sandbox::NetworkNeed::Local,
+    ) else {
         return false;
     };
     cmd.output()
@@ -337,7 +379,10 @@ pub(crate) async fn is_ancestor(repo: &Path, ancestor: &str, rev: &str) -> bool 
 /// Run one `git -C <repo> <args…>` for the reset, mapping any failure to git's
 /// own stderr so the response can say which exact step refused and why.
 pub(crate) async fn git_ok(repo: &Path, args: &[&str]) -> Result<(), String> {
-    let output = sandboxed(repo, args)?
+    // Local (D3): every call site is a local step — the seed reset's
+    // `checkout`/`reset`/`clean`/`branch -D`, `bundle unbundle`, and
+    // `remote get-url`, which reads `.git/config` and opens no socket.
+    let output = sandboxed(repo, args, crate::sandbox::NetworkNeed::Local)?
         .output()
         .await
         .map_err(|e| format!("couldn't run git: {e}"))?;
@@ -356,7 +401,12 @@ pub(crate) async fn git_ok(repo: &Path, args: &[&str]) -> Result<(), String> {
 /// when the ref exists, non-zero otherwise. Used to prefer `origin/main` over the
 /// local `main` as a rebase base only when the remote-tracking ref is actually there.
 pub(crate) async fn git_ref_exists(repo: &Path, refname: &str) -> bool {
-    let Ok(cmd) = sandboxed(repo, &["rev-parse", "--verify", "--quiet", refname]) else {
+    // Local (D3): a ref existence check reads `.git`, never a remote.
+    let Ok(cmd) = sandboxed(
+        repo,
+        &["rev-parse", "--verify", "--quiet", refname],
+        crate::sandbox::NetworkNeed::Local,
+    ) else {
         return false;
     };
     cmd.output()
