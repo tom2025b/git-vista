@@ -274,8 +274,11 @@ pub(crate) const DEFAULT_RW_TREES: &[&str] = &["/dev"];
 /// The `--exclude` secret set applies to this grant exactly as it does to every
 /// other (`grant_tree` checks the excludes first), so nothing here can
 /// re-expose a path that `DEFAULT_SECRET_EXCLUDES` withholds.
-pub(crate) const NETWORK_ONLY_RO_TREES: &[&str] =
-    &["/run/systemd/resolve", "/run/resolvconf", "/run/NetworkManager"];
+pub(crate) const NETWORK_ONLY_RO_TREES: &[&str] = &[
+    "/run/systemd/resolve",
+    "/run/resolvconf",
+    "/run/NetworkManager",
+];
 
 /// Granted read+execute in the **strict tier only**. Landlock mediates procfs,
 /// so without a `/proc` grant the shim cannot open `/proc/self/ns/user`
