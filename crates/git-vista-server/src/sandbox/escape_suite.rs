@@ -476,9 +476,31 @@ int main(void) {{
 #include <sys/socket.h>
 #include <unistd.h>
 
-static int bind_errno(int type, unsigned short port) {{
+// `reuse` sets SO_REUSEADDR, which the fixed-port leg needs and the ephemeral
+// one does not. Without it a TIME_WAIT socket left on 127.0.0.1:{port} by any
+// *earlier* user of the git protocol port — the escape battery's own connect
+// case, the planner's `git daemon` push fixture, a run 30 seconds ago — makes
+// this bind fail EADDRINUSE, which `run_case` then reports as
+// `CapabilityAbsent`: a silently-vacuous pass, the exact failure mode the
+// anti-vacuity contract exists to prevent. TIME_WAIT residue is not "this host
+// cannot bind"; it is an artifact with a 60-second half-life, and SO_REUSEADDR
+// is what every real server sets to ignore it (`git daemon --reuseaddr`, and
+// Rust's own `TcpListener::bind`, both do). It is orthogonal to the claim under
+// test: Landlock denies the bind with EACCES either way, and a live listener on
+// the port would still be EADDRINUSE, which is why the case also holds
+// `GitPortUse::Exclusive`.
+static int bind_errno(int type, unsigned short port, int reuse) {{
     int fd = socket(AF_INET, type, 0);
     if (fd < 0) return errno;
+    if (reuse) {{
+        int on = 1;
+        errno = 0;
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on) != 0) {{
+            int saved = errno;
+            close(fd);
+            return saved;
+        }}
+    }}
     struct sockaddr_in address;
     memset(&address, 0, sizeof address);
     address.sin_family = AF_INET;
@@ -491,8 +513,8 @@ static int bind_errno(int type, unsigned short port) {{
 }}
 
 int main(void) {{
-    int denied = bind_errno(SOCK_STREAM, {port});
-    int granted = bind_errno(SOCK_DGRAM, 0);
+    int denied = bind_errno(SOCK_STREAM, {port}, 1);
+    int granted = bind_errno(SOCK_DGRAM, 0, 0);
     printf("GVPROBE {nonce} BEGIN\n");
     printf("TCP_BIND rc=%d errno=%d\n", denied ? -1 : 0, denied);
     printf("GRANTED rc=%d errno=%d\n", granted ? -1 : 0, granted);
