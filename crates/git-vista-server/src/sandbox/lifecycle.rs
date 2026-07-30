@@ -399,7 +399,7 @@ async fn strict_reaps_a_double_forked_setsid_orphan_that_the_network_tier_does_n
 
     // ---- subject: the mechanism is present, so the orphan must be reaped ----
     let repo = hostile_hook_repo(&orphan_hook());
-    let policy = strict_baseline(repo.path(), case).await;
+    let policy = network_control(repo.path(), case); // MUTANT
     let subject = observe_orphan(repo.path(), &policy, "subject(Strict)").await;
 
     assert!(
@@ -473,7 +473,7 @@ async fn strict_mounts_a_fresh_procfs_that_cannot_see_the_host_process_table() {
          exit 0\n"
     ));
 
-    let policy = strict_baseline(repo.path(), case).await;
+    let policy = network_control(repo.path(), case); // MUTANT
     let out = command_async(
         &policy,
         repo.path(),
@@ -640,7 +640,7 @@ async fn strict_gets_a_private_dev_shm_tmpfs_that_the_network_tier_does_not() {
 
     // ---- subject: a private tmpfs, in both directions ----
     let repo = hostile_hook_repo(&shm_hook(&shm.host, &shm.inside_subject));
-    let policy = strict_baseline(repo.path(), case).await;
+    let policy = network_control(repo.path(), case); // MUTANT
     run_shm_leg(repo.path(), &policy, "subject(Strict)").await;
 
     assert_eq!(

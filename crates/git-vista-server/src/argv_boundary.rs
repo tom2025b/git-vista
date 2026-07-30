@@ -136,7 +136,34 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // purpose — see `every_allowlist_entry_names_a_live_spawn_site` below for
     // why an entry written ahead of its file is the failure mode this list is
     // supposed to prevent, not a convenience.
-    // git-vista-git
+    //
+    // #63's paged-history module. `#[cfg(test)]` fixture setup only: its two
+    // `Command::new("git")` sites are the suite's private `run_env`/`out`
+    // helpers, below `mod tests`.
+    //
+    // **This entry is new, and why it was missing is the point.** The list used
+    // to be one flat set of crate-relative paths shared by both crates, and
+    // `git-vista-git`'s `src/history.rs` has been on it since long before this
+    // module existed. When #63 added a *second* `src/history.rs` under this
+    // crate, the scan stripped the same relative path off it, found that path
+    // already allowlisted, and passed — so a spawn site in the server crate was
+    // authorised by a review of a different crate's file, and stayed that way
+    // from 2026-07-26 until the liveness guard below turned the collision up.
+    // The lists are per-crate now, so one crate can no longer bless another's
+    // same-named file, and this entry records the review that never happened.
+    "src/history.rs",
+];
+
+/// The same list for the **git-vista-git** crate.
+///
+/// Kept separate from [`ALLOWED_SPAWN_SITES`] rather than merged into it
+/// because the entries are crate-*relative*. A single shared list made
+/// `src/history.rs` mean whichever crate's file the scan happened to be
+/// walking, which is exactly how this workspace ended up with an unreviewed
+/// spawn site: #63 added `git-vista-server/src/history.rs`, and the entry
+/// written years-of-commits earlier for `git-vista-git/src/history.rs` covered
+/// it silently. Two lists, one per root, makes that collision unrepresentable.
+const ALLOWED_GIT_CRATE_SPAWN_SITES: &[&str] = &[
     // `#[cfg(test)]` fixture setup only. This entry used to read "read-side
     // reflog/stash reads, static args"; that is stale — the crate's production
     // history reads (`walk_history`, `read_commit`, `remote_membership`,
