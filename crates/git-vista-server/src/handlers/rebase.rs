@@ -130,39 +130,24 @@ pub(crate) async fn rebase_status() -> axum::response::Response {
 mod tests {
     use super::*;
 
-    fn run(repo: &Path, args: &[&str]) {
-        assert!(std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .status()
-            .unwrap()
-            .success());
-    }
-
-    fn seeded_repo() -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        run(&repo, &["init", "-q", "-b", "main"]);
-        run(&repo, &["config", "user.email", "t@example.invalid"]);
-        run(&repo, &["config", "user.name", "t"]);
-        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-        run(&repo, &["add", "a.txt"]);
-        run(&repo, &["commit", "-q", "-m", "seed"]);
-        (dir, repo)
-    }
-
-    /// D5 (#66, Task 19): "no `origin/main`" and "we could not look" chose the
-    /// *same* base before this change, because `git_ref_exists` returned a
-    /// bare `bool`. They are different rebases onto different commits, so the
-    /// second one must not silently become the first.
+    /// D5 (#66, Task 19): "git ran and there is no `refs/remotes/origin/main`"
+    /// and "git could not be run" chose the *same* base before this change,
+    /// because `git_ref_exists` returned a bare `bool` and swallowed the
+    /// second case into `false`. They are different rebases onto different
+    /// commits, so the second must not silently become the first.
+    ///
+    /// The control deliberately spawns no git of its own — this file is not on
+    /// `argv_boundary`'s spawn allowlist, and it should stay that way. A plain
+    /// empty directory is enough: `policy_for` tolerates a missing `.git`, so
+    /// git really is launched and really does exit non-zero, which is exactly
+    /// the "git answered no" half of the contrast.
     #[tokio::test]
     async fn an_unreadable_repository_does_not_silently_pick_the_local_main() {
-        let (_dir, repo) = seeded_repo();
+        let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            rebase_base(&repo).await.expect("git runs here"),
+            rebase_base(dir.path()).await.expect("git ran"),
             "main",
-            "with no origin/main, the local main really is the base"
+            "when git runs and reports no origin/main, `main` is the answer"
         );
 
         let (_hostile_dir, hostile) = crate::git_cmd::unrunnable_repo();
