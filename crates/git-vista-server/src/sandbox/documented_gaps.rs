@@ -50,9 +50,7 @@ async fn landlock_does_not_mediate_chmod() {
         t = target.display(),
         r = result.display()
     ));
-    let Ok(mut p) = strict_baseline(repo.path(), "documented-gaps-chmod-outside").await else {
-        return;
-    };
+    let mut p = strict_baseline(repo.path(), "documented-gaps-chmod-outside").await;
     p.rw_trees.push(scratch.path().to_path_buf());
     let out = command_async(&p, repo.path(), &["commit", "--allow-empty", "-m", "chmod"])
         .output()
