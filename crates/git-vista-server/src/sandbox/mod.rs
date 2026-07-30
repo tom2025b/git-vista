@@ -563,48 +563,134 @@ pub(crate) fn tier_for(need: NetworkNeed, trusted: bool) -> Tier {
 
 /// Build the production policy for running git in `repo`.
 ///
-/// This is the single production policy-construction site (Task 6). It mirrors
-/// what the `shim_cli::workable` test helper does, but resolves the shim through
-/// `sandbox::shim` — so a missing or moved shim is a named `ShimError` here,
-/// at construction time, rather than an ENOENT surfacing from inside a spawn.
+/// This is the single production policy-construction site for repository
+/// operations (Task 6; D2, #66 Task 7 gave it its current signature). It
+/// mirrors what the `shim_cli::workable` test helper does, but resolves the
+/// shim through `sandbox::shim` — so a missing or moved shim is a named
+/// `ShimError` here, at construction time, rather than an ENOENT surfacing
+/// from inside a spawn. `policy_for_clone` (D4) is the sibling for the one
+/// operation this function does not cover — cloning into a destination that
+/// does not exist yet.
 ///
-/// # Tier is `Network` for now, deliberately
+/// # Repository resolution is validated before any grant is built (D2)
+///
+/// `repo_paths::resolve` finds `repo`'s actual git directory(ies) — composing
+/// `worktree`'s linked-worktree containment rule with the check that rule
+/// does not make: that the resolution lands inside a root the catalog
+/// actually allows (`state::path_is_allowed`, which is multi-root aware — the
+/// configured repo root, the clones root, and any ad-hoc root a trusted
+/// launch allowed, are all checked). A resolution that fails either check
+/// refuses the whole policy (fail-closed), never falls back to granting only
+/// `repo` itself: a hostile `.git` gitfile that cannot be proven safe must not
+/// silently degrade into "no worktree grant" the way it would if this were
+/// treated as optional.
+///
+/// # `read_only` withholds the write grant (D2's actual behavioural change)
+///
+/// Before D2 this function granted `repo` (and any resolved worktree
+/// commondir) read-write **unconditionally** — the catalog's own
+/// `read_only` flag (a clone opened look-only) was never consulted at the
+/// sandbox layer at all, only by the application-level `reject_if_read_only`
+/// gate. That gate and this one are independent signals: `reject_if_read_only`
+/// keys off the *current selection's live mode* (`RepoMode`, toggled per
+/// request via `/api/select`), while `read_only` here comes from the
+/// *catalog's own record* for whichever path the caller names — which can
+/// diverge from the live mode (re-selecting a clone into Active mode changes
+/// the mode without updating the catalog entry). A `read_only == true` path
+/// therefore gets **no RW grant at all**: `repo` and any resolved worktree
+/// commondir go into `ro_trees` instead of `rw_trees`. This is genuine
+/// defense in depth, not a duplicate of the app-layer gate — it holds even if
+/// that gate has a bug, or a future code path forgets to call it.
+///
+/// # `need` is accepted but not yet consulted — tier is `Network` for now
 ///
 /// Choosing a tier per operation — read paths in the strict tier, network
 /// operations in the network tier, operator-trusted repositories unsandboxed —
-/// is Task 8's dispatch, and it depends on validated repository metadata that
-/// Task 7 produces. Until those land, every operation gets the **network
-/// tier**: the fuller-compatibility tier that can still reach a remote, so
-/// migrating the spawn sites (Task 6) cannot break `push`/`fetch` before the
-/// dispatch exists to route them. It is the safe default to start from, not the
-/// final policy. `secret_excludes` is populated regardless of tier, so the
-/// secret set is never silently empty during the interim.
-pub(crate) fn policy_for_repo(repo: &Path) -> Result<Policy, shim::ShimError> {
+/// is Task 8's dispatch (`tier_for`), and it additionally depends on the
+/// per-repo trust flag Task 7 (`sandbox::trust`) built but nothing calls yet.
+/// Until Task 8 lands, every operation gets the **network tier**: the
+/// fuller-compatibility tier that can still reach a remote, so migrating the
+/// spawn sites (Task 6) could not break `push`/`fetch` before the dispatch
+/// existed to route them. `need` is threaded into this signature now — every
+/// call site already computes it, via `network_need`'s fail-closed argv
+/// classifier — precisely so Task 8 only has to change what this function
+/// *does* with it, not thread a new parameter through every caller.
+/// `secret_excludes` is populated regardless of tier, so the secret set is
+/// never silently empty during the interim.
+pub(crate) fn policy_for(
+    repo: &Path,
+    read_only: bool,
+    need: NetworkNeed,
+) -> Result<Policy, shim::ShimError> {
+    // Tier does not vary with `need` yet — see the doc comment above. Task 8
+    // is the only thing that should change this line.
+    let _ = need;
+    let tier = Tier::Network;
+
     let home = PathBuf::from(std::env::var_os("HOME").ok_or(shim::ShimError::NoHome)?);
     let shim = shim::shim_path().map_err(Clone::clone)?.to_path_buf();
-    let tier = Tier::Network;
     let (mut rw, mut ro) = default_system_trees(tier);
-    rw.push(repo.to_path_buf());
-    // A linked worktree's git state lives outside the worktree path, in the
-    // main repository's `.git`. Resolve it (fail-closed — see `worktree`'s
-    // containment rule for why a refused resolution must refuse the whole
-    // policy) and grant the common dir; the per-worktree gitdir is proven to
-    // live inside it, so one grant covers both.
-    match worktree::linked_worktree_dirs(repo) {
-        Ok(None) => {}
-        Ok(Some(dirs)) => rw.push(dirs.commondir),
-        Err(why) => {
-            return Err(shim::ShimError::WorktreeGeometry {
+
+    let paths = repo_paths::resolve(repo).map_err(shim::ShimError::RepoPaths)?;
+    if !crate::state::path_is_allowed(&paths.gitdir) || !crate::state::path_is_allowed(&paths.commondir)
+    {
+        return Err(shim::ShimError::RepoPaths(
+            repo_paths::RepoPathsError::OutsideManagedRoot {
                 repo: repo.to_path_buf(),
-                why,
-            })
-        }
+                gitdir: paths.gitdir,
+                commondir: paths.commondir,
+            },
+        ));
+    }
+
+    if read_only {
+        ro.push(repo.to_path_buf());
+        ro.push(paths.commondir);
+    } else {
+        rw.push(repo.to_path_buf());
+        rw.push(paths.commondir);
     }
     ro.push(home.clone());
     Ok(Policy {
         tier,
         shim,
         bwrap: None, // Network tier launches the shim directly (F3).
+        rw_trees: rw,
+        ro_trees: ro,
+        secret_excludes: secret_excludes_for_home(&home),
+        net_ports: DEFAULT_GIT_PORTS.to_vec(),
+        hook_mode: HookMode::Run,
+    })
+}
+
+/// Build the production policy for `git clone` (D4): RW on the clones root
+/// (the clone's destination does not exist yet at policy time, so
+/// `repo_paths` — which resolves an *existing* repository's `.git` — has
+/// nothing to validate here), and `trusted` structurally absent from this
+/// signature rather than merely defaulted to `false`.
+///
+/// # Why clone gets its own constructor instead of reusing `policy_for`
+///
+/// Clone is the one operation that fetches attacker-chosen content by design
+/// — the URL is the request. `policy_for`'s signature has no `trusted`
+/// parameter today (Task 8/`tier_for`'s per-repo trust lookup is not wired
+/// into either constructor yet), so nothing currently distinguishes them on
+/// that axis; this function exists anyway so that when Task 8 *does* wire
+/// trust into `policy_for`, clone is not accidentally swept into eligibility
+/// for `Unsandboxed` by sharing its call path. A dedicated function makes
+/// that a structural property — clone has no repository to look a trust flag
+/// up *for* — rather than a runtime check some future edit could remove.
+pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimError> {
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or(shim::ShimError::NoHome)?);
+    let shim = shim::shim_path().map_err(Clone::clone)?.to_path_buf();
+    let tier = Tier::Network; // clone is always NetworkNeed::Remote.
+    let (mut rw, mut ro) = default_system_trees(tier);
+    rw.push(clones_root.to_path_buf());
+    ro.push(home.clone());
+    Ok(Policy {
+        tier,
+        shim,
+        bwrap: None,
         rw_trees: rw,
         ro_trees: ro,
         secret_excludes: secret_excludes_for_home(&home),
