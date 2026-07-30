@@ -67,10 +67,15 @@ tower = "0.5"
 # `catch-panic` turns any handler panic into a 500 response instead of a reset
 # connection (which iPad Safari would report as an opaque "Load failed").
 tower-http = { version = "0.7.0", features = ["fs", "set-header", "catch-panic"] }
+# Throwaway repos for the M1.13b (#66) Task 9 boot probe (`sandbox::probe`):
+# it builds a scratch repo with a hostile hook on every real server boot, not
+# only under test, so this moved here out of [dev-dependencies] — a
+# dev-dependency crate is unresolved (E0433) from code the release binary
+# actually calls.
+tempfile = "3"
 
 [dev-dependencies]
-# Throwaway repos for the journal/snapshot round-trip tests.
-tempfile = "3"
+
 # `ServiceExt::oneshot` drives the router in the contract-layer tests (protocol
 # negotiation, the error envelope, the no-path-based-selection guard) without a
 # live socket. Test-only: the release binary never pulls tower's `util` feature.

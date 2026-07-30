@@ -64,6 +64,15 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // production spawn.
     "src/sandbox/repo_paths.rs",
     "src/sandbox/hostile.rs", // same: `#[cfg(test)]` fixture setup only
+    // Task 9's boot probe (#66, INV-13/GC15). Its ONE `Command::new("git")`
+    // is `boot_probe_fixture`'s unsandboxed `git init` for a throwaway
+    // scratch repo — fixture construction, not the thing under test, run
+    // outside the sandbox on purpose so a fixture failure is never
+    // misreported as a capability-absent verdict (see that function's doc
+    // comment). Unlike the other fixture-only entries above, this one runs
+    // in production (every real boot), not only under `#[cfg(test)]` — the
+    // whole point of a boot gate is that it runs for real.
+    "src/sandbox/probe.rs",
     "src/journal.rs",         // #[cfg(test)] fixture setup
     // `git rev-parse --absolute-git-dir` (static args, read-only). The
     // production call (`absolute_git_dir`) now goes through

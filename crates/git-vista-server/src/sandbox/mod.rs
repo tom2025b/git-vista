@@ -22,6 +22,11 @@ use std::path::{Path, PathBuf};
 pub(crate) mod bwrap;
 /// Task 9: the factual capability probe — what tiers can this host provide.
 pub(crate) mod capabilities;
+/// Task 9, part 2: the boot probe — launches the composed launcher against a
+/// throwaway hostile-hook repo and classifies the result into a
+/// [`probe::ProbeVerdict`], gating server startup (INV-13 / Global
+/// Constraint 15). See its own module doc for the full account.
+pub(crate) mod probe;
 /// D2 (#66, Task 7): validated repository-metadata resolution — resolves a
 /// repository's actual git directory(ies) and refuses when that resolution
 /// lands outside the server's managed root. See its module doc for how this
