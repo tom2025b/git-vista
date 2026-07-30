@@ -213,7 +213,7 @@ mod tests {
         .expect("policy builds for a served path");
 
         assert!(
-            policy.secret_excludes.iter().any(|e| *e == trust_dir),
+            policy.secret_excludes.contains(&trust_dir),
             "the trust store {} must be withheld from every grant, but the \
              policy's excludes were {:?}. Without it, a hostile hook in a repo \
              whose grant covers the store can forge its own marker and escalate \
@@ -224,7 +224,7 @@ mod tests {
         // And the hazard this guards is real: the served tree really is granted
         // read-write, so the exclude is the only thing standing in the way.
         assert!(
-            policy.rw_trees.iter().any(|p| *p == served),
+            policy.rw_trees.contains(&served),
             "precondition: the served path is granted read-write, or this test \
              is not exercising the escalation it claims to"
         );
