@@ -7,6 +7,15 @@
 use super::escape_contract::{run_case, Class, Errno, EscapeCase, Exemption, GitPortUse, MutantId};
 use super::Tier;
 
+/// The one hostile-hook repository constructor, re-exported here because the
+/// lifecycle (Task 12), non-coverage (Task 13) and compatibility (Task 14)
+/// batteries all name it as `escape_suite::hostile_hook_repo`. It is defined in
+/// `escape_contract` — composed from the same `fixture()` + `install_hook()`
+/// pair `run_case`'s own two legs use — so a neighbouring battery's "same
+/// fixture as the escape battery" is a fact about one function, not a
+/// convention two files have to keep agreeing on.
+pub(crate) use super::escape_contract::hostile_hook_repo;
+
 const CASE_SECRET_READ_DENIED: EscapeCase = EscapeCase {
     id: "secret_read_denied",
     class: Class::Containment,
