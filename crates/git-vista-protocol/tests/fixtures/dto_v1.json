@@ -33,13 +33,13 @@
     "authenticated": true,
     "csrf": "csrf-token-abc123",
     "via_lan": false,
-    "hook_policy": "restricted"
+    "hook_policy": "strict"
   },
   "session_info_unauthenticated": {
     "authenticated": false,
     "csrf": null,
     "via_lan": false,
-    "hook_policy": "allow"
+    "hook_policy": "unsandboxed"
   },
   "rebase_status": {
     "branch": "feature/idea",
