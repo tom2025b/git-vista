@@ -81,6 +81,13 @@ mod sandbox;
 mod security;
 mod session;
 mod state;
+// M1.13b (#66): the single owner of TCP port 9418 in the test binary. Three
+// tests across `sandbox::escape_suite` and `planner::contract_suite` need that
+// one port (it is the only unprivileged entry in `DEFAULT_GIT_PORTS`, so the
+// only port a Network-tier Landlock connect grant covers) and `cargo test` runs
+// them concurrently in one process.
+#[cfg(test)]
+mod test_ports;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
