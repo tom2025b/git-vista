@@ -685,6 +685,78 @@ mod tests {
         assert_ne!(msg, "git failed.", "the empty-stderr fallback is not a fit");
     }
 
+    // --- D5 (#66, Task 19): execution-unavailable is its own value ----------
+
+    /// The fixture must actually be unrunnable, or every D5 test below is
+    /// vacuous — a `Some`/`None` assertion that passes because git quietly
+    /// worked. Pinned first, on its own, against a *control*: the same call
+    /// against a real repository must succeed, so the `Err` cannot be blamed
+    /// on the call itself being broken.
+    #[tokio::test]
+    async fn the_unrunnable_fixture_really_cannot_run_git() {
+        let (_dir, repo) = seeded_repo();
+        rev_parse(&repo, "HEAD")
+            .await
+            .expect("control: git runs in a real repository")
+            .expect("control: HEAD resolves");
+
+        let (_hostile_dir, hostile) = unrunnable_repo();
+        let err = rev_parse(&hostile, "HEAD")
+            .await
+            .expect_err("a `.git` the policy cannot resolve must not spawn git");
+        assert!(
+            !err.to_string().is_empty(),
+            "the reason must survive for the log line and the 500 body"
+        );
+    }
+
+    /// The three-way split, on all three helpers: "git ran and it is not
+    /// there" and "git could not run" are different values now. Before D5
+    /// both were `None`/`false`.
+    #[tokio::test]
+    async fn absent_and_unavailable_are_different_answers() {
+        let (_dir, repo) = seeded_repo();
+        let (_hostile_dir, hostile) = unrunnable_repo();
+
+        // rev_parse: a ref that genuinely does not exist.
+        assert!(
+            rev_parse(&repo, "refs/heads/no-such-branch")
+                .await
+                .expect("git ran")
+                .is_none(),
+            "a missing ref is Ok(None) — a fact"
+        );
+        assert!(rev_parse(&hostile, "refs/heads/no-such-branch")
+            .await
+            .is_err());
+
+        // git_ref_exists: same ref, bool shape.
+        assert!(
+            !git_ref_exists(&repo, "refs/heads/no-such-branch")
+                .await
+                .expect("git ran"),
+            "a missing ref is Ok(false) — a fact"
+        );
+        assert!(git_ref_exists(&hostile, "refs/heads/no-such-branch")
+            .await
+            .is_err());
+
+        // is_ancestor: a real negative needs two real commits, so make one.
+        run(&repo, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+        run(&repo, &["add", "b.txt"]);
+        run(&repo, &["commit", "-q", "-m", "side"]);
+        assert!(
+            !is_ancestor(&repo, "side", "main").await.expect("git ran"),
+            "`side` is not an ancestor of `main`: Ok(false), a fact"
+        );
+        assert!(
+            is_ancestor(&repo, "main", "side").await.expect("git ran"),
+            "and the positive direction still answers Ok(true)"
+        );
+        assert!(is_ancestor(&hostile, "main", "side").await.is_err());
+    }
+
     /// Cancellation — a browser tab closing mid-diff — must reach the git
     /// process, not just the Rust future. The collector owns the child for its
     /// whole future, so dropping the future drops the kill-on-drop owner.
