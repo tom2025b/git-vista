@@ -849,3 +849,84 @@ button.detail-file:hover .detail-file-path { color: var(--accent); }
     margin: 0;
   }
 }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   M1.12 (#65): keyboard focus, and motion the user asked not to see.
+
+   Two rules govern everything below, and both are enforced by the tripwires in
+   `features/a11y/audit.rs` rather than by review:
+
+   1. EVERY `:hover` selector has a `:focus-visible` twin declaring at least the
+      same properties. Before this section the app had none — a keyboard or
+      Switch Control user got the browser's default ring and none of the state
+      changes a mouse user sees, and on `.act-row` / `.ctx-item` (transparent,
+      borderless rows) that ring is the only thing distinguishing the focused
+      row from its neighbours. `:focus-visible` (not `:focus`) so a tap or a
+      click does not leave a ring behind on touch.
+   2. The reduced-motion block is a standing guarantee, not a reaction: this
+      stylesheet declares no transitions or animations today, and the tripwire
+      makes sure that if one is added it is already covered rather than
+      remembered later.
+
+   What this section does NOT establish: that the ring is legible against every
+   surface it lands on. Nobody on this project can see the rendered page, so
+   contrast is asserted nowhere — the accent is reused from the existing hover
+   affordance, which is the most defensible choice available without eyes on it.
+   ───────────────────────────────────────────────────────────────────────────── */
+
+/* The baseline ring, for every focusable element including the ones with no
+   hover styling of their own (inputs, the textarea in the commit dialog, links
+   inside the detail panel). `outline-offset` keeps it clear of the element's
+   own border so the two do not read as one thick edge. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Topbar buttons (.refresh and its variants). */
+.refresh:focus-visible { border-color: var(--accent); }
+.refresh:disabled:focus-visible { border-color: #30363d; }
+.refresh.danger:focus-visible { border-color: #f85149; }
+
+/* Context-menu items. */
+.ctx-item:focus-visible { background: #21262d; }
+.ctx-item.disabled:focus-visible,
+.ctx-item:disabled:focus-visible { background: transparent; }
+.ctx-item.danger:focus-visible { background: #2d1517; }
+
+/* The floating "Reset view" control: normally faded, so focus must also bring
+   it to full opacity or the ring lands on a half-transparent control. */
+.reset-view:focus-visible { opacity: 1; border-color: var(--accent); }
+
+/* Detail panel. */
+.detail-close:focus-visible { background: #21262d; color: var(--fg); }
+.detail-parent:focus-visible { border-color: var(--accent); }
+.detail-github:focus-visible { text-decoration: underline; }
+.detail-expand:focus-visible { border-color: var(--accent); }
+button.detail-file:focus-visible { background: #21262d; }
+button.detail-file:focus-visible .detail-file-path { color: var(--accent); }
+
+/* Activity feed. */
+.act-refresh:focus-visible { border-color: var(--accent); }
+.act-row:focus-visible { background: #21262d; }
+.act-row.act-row-static:focus-visible { background: transparent; }
+.act-undo:focus-visible { background: #21262d; }
+
+/* Full-screen viewer and the print-size controls. */
+.viewer-btn:focus-visible { border-color: var(--accent); }
+.scale-btn:focus-visible { border-color: var(--accent); }
+
+/* Respect the OS "reduce motion" setting. The near-zero duration (rather than
+   `none`) is the conventional form: it keeps `transitionend` / `animationend`
+   listeners firing, so a future component that waits on one does not hang for
+   exactly the users who asked for less movement. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
