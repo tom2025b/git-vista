@@ -283,6 +283,348 @@ fn every_process_spawn_site_is_allowlisted_and_spawns_only_git() {
     }
 }
 
+/// The allowlist is a **review record, not a standing permission**. Every entry
+/// must name a file that exists and that actually constructs a `Command`.
+///
+/// This is the `clone.rs` lesson mechanised. That entry sat on the list after
+/// its raw `git clone` had migrated to the sealed launcher, and the only thing
+/// that removed it was a human noticing — in the one handler that fetches
+/// attacker-chosen content. The scan above structurally *cannot* catch it: it
+/// consults the list only for files that already spawn, so a dead entry is
+/// invisible to it and silently pre-blesses whatever raw spawn appears in that
+/// file next.
+///
+/// It also settles the question that comes up every time a new suite is written
+/// beside this one: may an entry be added *ahead* of its file, so the scan does
+/// not go red the moment that file lands? No — this test makes such an entry
+/// fail, on purpose. A spawn site is allowlisted after it has been read, never
+/// before it exists. If a new file lands carrying a git fixture, one red run is
+/// the tripwire doing its job; the fix is to read the file and add the entry
+/// with its reason, which is the review this list exists to record.
+#[test]
+fn every_allowlist_entry_names_a_live_spawn_site() {
+    let server_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+    let git_root = server_root.parent().unwrap().join("git-vista-git");
+    let spawn = ["Command", "::new("].concat();
+
+    for (i, rel) in ALLOWED_SPAWN_SITES.iter().enumerate() {
+        assert!(
+            !ALLOWED_SPAWN_SITES[..i].contains(rel),
+            "{rel} is listed twice; two reviews of one file cannot disagree \
+             usefully, and a duplicate hides which comment is current"
+        );
+        // Entries are relative to *their own* crate root, so resolve against
+        // both and insist on exactly one hit — an ambiguous entry would grant
+        // one file's permission to another crate's same-named file.
+        let candidates: Vec<PathBuf> = [&server_root, &git_root]
+            .iter()
+            .map(|root| root.join(rel))
+            .filter(|p| p.is_file())
+            .collect();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "{rel}: expected exactly one of the two crate roots to contain this \
+             file, found {}. A dead entry pre-authorises a spawn nobody has \
+             read; an ambiguous one authorises the wrong file.",
+            candidates.len()
+        );
+        let text = std::fs::read_to_string(&candidates[0]).expect("readable source file");
+        assert!(
+            text.contains(&spawn),
+            "{rel} is allowlisted but constructs no Command. Remove the entry \
+             rather than leaving it: the scan only consults this list for files \
+             that spawn, so this one grants a permission that is invisible \
+             until someone adds a raw spawn to that file."
+        );
+    }
+
+    // The launcher carve-out is a *narrowing* of the main list, never a way
+    // around it: a file exempted from the literal-`git` rule that was not on
+    // the main allowlist would be flagged by the scan above anyway, so an entry
+    // here that is missing there means one of the two lists has drifted.
+    for rel in LAUNCHER_SPAWN_SITES {
+        assert!(
+            ALLOWED_SPAWN_SITES.contains(rel),
+            "{rel} carries the launcher carve-out but is not on the main \
+             allowlist; the carve-out narrows that list, it does not replace it"
+        );
+    }
+}
+
+/// INV-16, the value half asserted **exhaustively over the tier enum**: every
+/// argv `sandbox_argv` can produce is one of exactly three shapes, and in the
+/// sandboxed shapes the tail is `-- git` with `git` named exactly once.
+///
+/// `sandbox::argv` already pins each shape against its reviewed constants. What
+/// this adds — and the reason it lives in the tripwire file rather than beside
+/// those — is coverage that cannot silently miss a case, plus the negative
+/// space:
+///
+///  * The tiers are walked through an exhaustive `match` (`next_tier`), so a
+///    new `Tier` variant is a **compile error here** rather than an untested
+///    shape. `sandbox::argv` iterates hand-written arrays, which a fourth tier
+///    would slip past without a word.
+///  * Both hook modes are crossed with every tier. `HookMode::Blocked` is the
+///    state a host that failed INV-13 drops to, and the `Unsandboxed`/`Blocked`
+///    corner is the one that already shipped broken once (a bare `["git"]` that
+///    ran hooks a policy said were blocked).
+///  * `git` must appear **exactly once** in a sandboxed argv, as the last
+///    entry, and the element before `-- git` must be a reviewed policy flag or
+///    its value. Together those say nothing can be appended between the
+///    reviewed prefix and the program, and no second program name can ride
+///    along — neither of which follows from checking the tail alone.
+#[test]
+fn sandbox_argv_is_one_of_inv16s_three_shapes_in_every_tier() {
+    use crate::sandbox::{sandbox_argv, HookMode, Policy, Tier, DEFAULT_GIT_PORTS};
+
+    /// The tier walk. Exhaustive on purpose: adding a `Tier` variant will not
+    /// compile until it is given an arm, and linking it into the chain is what
+    /// puts it under every assertion below.
+    fn next_tier(tier: Tier) -> Option<Tier> {
+        match tier {
+            Tier::Strict => Some(Tier::Network),
+            Tier::Network => Some(Tier::Unsandboxed),
+            Tier::Unsandboxed => None,
+        }
+    }
+
+    const SHIM: &str = "/opt/gv/gv-sandbox";
+    const HOOK_DIR: &str = "/var/lib/gv/no-hooks";
+
+    let policy = |tier: Tier, hook_mode: HookMode| Policy {
+        tier,
+        shim: PathBuf::from(SHIM),
+        // Fake but absolute, like `sandbox::argv`'s: these assertions are about
+        // shape, and pinning to wherever bwrap really lives would make them
+        // pass or fail for reasons unrelated to the chokepoint.
+        bwrap: (tier == Tier::Strict).then(|| PathBuf::from("/usr/bin/bwrap")),
+        rw_trees: vec![PathBuf::from("/srv/repos/r")],
+        ro_trees: vec![PathBuf::from("/usr"), PathBuf::from("/home/tom")],
+        secret_excludes: vec![PathBuf::from("/home/tom/.ssh")],
+        net_ports: if tier == Tier::Network {
+            DEFAULT_GIT_PORTS.to_vec()
+        } else {
+            Vec::new()
+        },
+        hook_mode,
+    };
+
+    let mut tiers = Vec::new();
+    let mut cursor = Some(Tier::Strict);
+    while let Some(tier) = cursor {
+        assert!(!tiers.contains(&tier), "the tier walk loops: {tier:?}");
+        tiers.push(tier);
+        cursor = next_tier(tier);
+    }
+    assert_eq!(
+        tiers.len(),
+        3,
+        "the tier census drifted — {} tiers walked, three shapes documented in \
+         `sandbox_argv`'s INV-16 comment. Either a tier was added without a \
+         shape, or the walk lost one.",
+        tiers.len()
+    );
+
+    for tier in tiers {
+        for hook_mode in [
+            HookMode::Run,
+            HookMode::Blocked {
+                empty_dir: PathBuf::from(HOOK_DIR),
+            },
+        ] {
+            let blocked = matches!(hook_mode, HookMode::Blocked { .. });
+            let argv: Vec<String> = sandbox_argv(&policy(tier, hook_mode))
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let what = format!("{tier:?}/blocked={blocked}");
+
+            if tier == Tier::Unsandboxed {
+                // Shapes 1 and 2. `git` leads here — there is no launcher in
+                // front of it — and nothing may follow but the hook
+                // suppression, which is the only argument this tier is allowed
+                // to add.
+                let expected: Vec<String> = if blocked {
+                    vec![
+                        "git".into(),
+                        "-c".into(),
+                        format!("core.hooksPath={HOOK_DIR}"),
+                    ]
+                } else {
+                    vec!["git".into()]
+                };
+                assert_eq!(
+                    argv, expected,
+                    "{what}: the unsandboxed argv is not one of INV-16's two \
+                     unsandboxed shapes"
+                );
+                continue;
+            }
+
+            // Shape 3: a reviewed prefix, then `-- git`.
+            assert!(
+                argv.len() > 2,
+                "{what}: a sandboxed argv is a prefix *and* `-- git`, got {argv:?}"
+            );
+            assert_eq!(
+                &argv[argv.len() - 2..],
+                ["--".to_string(), "git".to_string()],
+                "{what}: the launcher argv must end in `-- git`"
+            );
+            assert_eq!(
+                argv.iter().filter(|s| *s == "git").count(),
+                1,
+                "{what}: `git` appears more than once — the program name must be \
+                 the single last entry, or a reviewer cannot tell which one runs"
+            );
+            assert!(
+                Path::new(&argv[0]).is_absolute(),
+                "{what}: the launcher must be an absolute path ({}); a bare name \
+                 resolves against the inherited PATH",
+                argv[0]
+            );
+            assert_eq!(
+                argv.iter().filter(|s| *s == SHIM).count(),
+                1,
+                "{what}: the shim must appear exactly once in the argv"
+            );
+
+            // Nothing sits between the reviewed policy flags and `-- git`. The
+            // last prefix element is either the net decision or, in the network
+            // tier, the final `--net-port` value.
+            let terminator = &argv[argv.len() - 3];
+            assert!(
+                terminator == "--net-deny"
+                    || terminator == "--net-allow"
+                    || terminator.parse::<u16>().is_ok(),
+                "{what}: `{terminator}` was appended after the reviewed policy \
+                 flags and before `-- git`; every argument the shim reads must \
+                 sit inside the reviewed prefix"
+            );
+
+            // Exactly one hook decision reaches the shim. Neither is silence.
+            let hook_flags = argv
+                .iter()
+                .filter(|s| *s == "--hooks-run" || *s == "--hooks-blocked")
+                .count();
+            assert_eq!(
+                hook_flags, 1,
+                "{what}: expected exactly one hook decision in the argv, found \
+                 {hook_flags}"
+            );
+            assert_eq!(
+                argv.iter().any(|s| s == "--hooks-blocked"),
+                blocked,
+                "{what}: the argv's hook decision contradicts the policy's"
+            );
+
+            // And no interpreter anywhere in it — the same rule
+            // `launcher_sites_name_no_shell` applies to the source, applied to
+            // the value, because a path that arrived from a policy field is not
+            // covered by a source scan.
+            for bad in ["sh", "bash", "/bin/sh", "/bin/bash", "zsh", "env", "-c"] {
+                assert!(
+                    !argv.iter().any(|s| s == bad),
+                    "{what}: `{bad}` must never appear in a launcher argv"
+                );
+            }
+        }
+    }
+}
+
+/// The shim `exec`s and **never forks**.
+///
+/// `gv-sandbox`'s module doc has asserted this in prose since it was written —
+/// "this file must contain `.exec()` and must not contain `.spawn()`,
+/// `.output()` or `.status()`" — and named this file as the place that proves
+/// it. Nothing did. That prose was the entire guarantee, which is the shape of
+/// claim this milestone has been burned by five times.
+///
+/// It matters because the shim's containment is *inherited through the exec*.
+/// Landlock and seccomp are applied to the shim's own process and survive
+/// `execve`; they would equally be inherited by a forked child, but a fork
+/// gives the shim a second life — it stays resident as a parent, with an
+/// argv it has already validated, in a process that could then exec something
+/// else. `execve` is what makes the validation final: after it, there is no
+/// gv-sandbox process left to run anything, only git wearing its restrictions.
+///
+/// Scanned on [`code_only`] output rather than raw source, so the module doc's
+/// own mention of `.spawn()` is not counted as a use of it — the mistake that
+/// makes a prose-driven scan report the file it is quoting.
+#[test]
+fn the_shim_execs_and_never_forks() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/gv-sandbox/main.rs");
+    let src = std::fs::read_to_string(&path).expect("readable gv-sandbox main.rs");
+    let code = code_only(&src);
+
+    let spawn = ["Command", "::new("].concat();
+    let spawn_git = ["Command", "::new(\"git\")"].concat();
+
+    // Exactly one command is built, and it names `git` literally. The literal
+    // is checked against the raw source because `code_only` blanks the contents
+    // of string literals — the count is checked against code so a comment
+    // quoting the pattern cannot inflate it.
+    assert_eq!(
+        code.matches(&spawn).count(),
+        1,
+        "the shim must construct exactly one Command; a second one is a second \
+         thing it could exec"
+    );
+    assert_eq!(
+        src.matches(&spawn_git).count(),
+        1,
+        "the shim's one Command must name `git` literally"
+    );
+
+    // It replaces its own image.
+    let exec = [".exec", "()"].concat();
+    assert_eq!(
+        code.matches(&exec).count(),
+        1,
+        "the shim must `{exec}` exactly once — that call is what makes the \
+         validated argv final"
+    );
+    assert!(
+        code.contains("use std::os::unix::process::CommandExt"),
+        "`{exec}` comes from `CommandExt`; if that import is gone, the call \
+         above is not the exec this test thinks it is"
+    );
+
+    // It never becomes a parent.
+    for (needle, why) in [
+        (
+            [".spawn", "()"].concat(),
+            "forks a child and leaves the shim resident as its parent",
+        ),
+        (
+            [".output", "()"].concat(),
+            "forks a child and waits on it; the shim never waits on anything",
+        ),
+        (
+            [".status", "()"].concat(),
+            "forks a child and waits on it; the shim never waits on anything",
+        ),
+        (
+            ["fork", "("].concat(),
+            "duplicates the shim process outright",
+        ),
+        (
+            ["daemon", "("].concat(),
+            "forks and detaches — the shim must not outlive its exec",
+        ),
+    ] {
+        assert_eq!(
+            code.matches(needle.as_str()).count(),
+            0,
+            "gv-sandbox/main.rs: `{needle}` {why}. The shim applies Landlock and \
+             seccomp to *itself* and then becomes git; anything that keeps it \
+             alive as a parent keeps a validated-argv process around to exec \
+             again."
+        );
+    }
+}
+
 /// Blank out comments and the *contents* of string/char literals, so a
 /// structural scan of source text sees code and nothing else. Delimiters and
 /// newlines are kept, so offsets stay meaningful and a blanked region never
