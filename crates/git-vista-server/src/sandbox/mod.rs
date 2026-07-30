@@ -937,11 +937,20 @@ pub(crate) fn policy_for(
     Ok(Policy {
         tier,
         shim,
-        bwrap: None, // Network tier launches the shim directly (F3).
+        // `Some` only in Strict; the Network tier launches the shim directly
+        // (F3) and Unsandboxed launches nothing at all.
+        bwrap,
         rw_trees: rw,
         ro_trees: ro,
         secret_excludes: secret_excludes_for_home(&home),
-        net_ports: DEFAULT_GIT_PORTS.to_vec(),
+        // Ports are a Network-tier ruleset entry. Strict denies the network
+        // outright (`--net-deny`, plus bwrap's `--unshare-net`) and
+        // Unsandboxed installs no ruleset, so a non-empty list in either would
+        // be an argv that contradicts itself — see `shim_argv`.
+        net_ports: match tier {
+            Tier::Network => DEFAULT_GIT_PORTS.to_vec(),
+            Tier::Strict | Tier::Unsandboxed => Vec::new(),
+        },
         hook_mode: HookMode::Run,
     })
 }
