@@ -517,6 +517,12 @@ pub fn App() -> impl IntoView {
                                         read_only: f.read_only,
                                         path: None,
                                         remote_web_url: f.remote_web_url.clone(),
+                                        // Synthesized from the Frame, which
+                                        // carries no hook policy — so this is
+                                        // "not disclosed", never a guessed
+                                        // value. The mode screen does not read
+                                        // it; the banner reads the session's.
+                                        hook_policy: None,
                                     }));
                                 }
                             }

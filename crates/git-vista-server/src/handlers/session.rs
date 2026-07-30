@@ -237,48 +237,146 @@ pub(crate) async fn revoke_session(
 mod tests {
     use super::*;
 
-    /// The `via_lan` stand-in this module's own doc comment argues for —
-    /// pinned as a real test, not just prose, so a future change to the
-    /// mapping is a deliberate act, not an accidental drift.
-    #[test]
-    fn hook_policy_defaults_restricted_on_lan_allow_otherwise() {
-        assert_eq!(hook_policy_for(true), HookPolicy::Restricted);
-        assert_eq!(hook_policy_for(false), HookPolicy::Allow);
-    }
-
-    /// What the stale mapping above now actually emits, spelled out in the
-    /// four-variant vocabulary rather than left behind the transition aliases.
+    /// The session policy now agrees with the dispatch instead of contradicting
+    /// it: an untrusted repository on a contained host discloses `strict`,
+    /// checked against `tier_for` itself rather than against a restated copy of
+    /// its rules.
     ///
-    /// This test exists to make the staleness *visible in a test run* instead
-    /// of only in a doc comment: a loopback session claims `unsandboxed` while
-    /// `sandbox::tier_for(NetworkNeed::Local, false)` gives it `Tier::Strict`.
-    /// Deleting this test is part of Task 16.5's correction, not a way to
-    /// quiet it.
+    /// The temp directory is the load-bearing part — it has no operator-trust
+    /// marker, so `hook_policy_for_repo` reaches the real `trust::is_trusted`
+    /// and gets the fail-closed `false`. Nothing here fabricates the trust
+    /// answer.
     #[test]
-    fn the_session_policy_is_stale_and_over_warns_rather_than_under_warns() {
-        assert_eq!(hook_policy_for(false), HookPolicy::Unsandboxed);
-        assert_eq!(hook_policy_for(true), HookPolicy::Strict);
+    fn a_contained_host_discloses_the_tier_the_dispatch_actually_uses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disclosed = session_hook_policy_for(Some(dir.path()), Some(&ProbeVerdict::Contained));
 
-        // The tier a local operation on an untrusted repository really runs
-        // in, on either router — read from the dispatch itself, not restated.
         let enforced = crate::sandbox::hook_policy::hook_policy_for_tier(crate::sandbox::tier_for(
             crate::sandbox::NetworkNeed::Local,
             false,
         ));
-        assert_eq!(enforced, HookPolicy::Strict);
+        assert_eq!(
+            disclosed, enforced,
+            "the session must disclose the tier the git-spawn chokepoint really \
+             uses, not a session-level guess"
+        );
+        assert_eq!(disclosed, HookPolicy::Strict);
+    }
+
+    /// **Blocker 3, pinned.** The old mapping handed a LAN session
+    /// `HookPolicy::Restricted`, which after the four-tier widening *is*
+    /// `Strict` — the one value that silences INV-15's banner. A LAN session
+    /// therefore reported the strongest possible guarantee regardless of what
+    /// the repository actually ran under.
+    ///
+    /// The structural fix is that `session_hook_policy_for` has **no `via_lan`
+    /// parameter at all**, so there is no input that can produce a
+    /// router-specific answer; this test pins the consequence that matters. It
+    /// walks every policy an operator-trust state can produce and asserts the
+    /// session value is that policy — in particular that the trusted case
+    /// (`Unsandboxed`, banner-flying) is not silently replaced by `Strict` the
+    /// way the LAN branch used to do.
+    ///
+    /// `Unsandboxed` is obtained from the real dispatch (`tier_for(_, true)`),
+    /// not written as a literal, so this fails if trust ever stops meaning
+    /// "no sandbox" rather than quietly passing against a stale expectation.
+    #[test]
+    fn a_lan_session_cannot_silence_the_banner_for_a_trusted_repository() {
+        let trusted_answer = crate::sandbox::hook_policy::hook_policy_for_tier(
+            crate::sandbox::tier_for(crate::sandbox::NetworkNeed::Local, true),
+        );
+        assert_eq!(trusted_answer, HookPolicy::Unsandboxed);
+        assert!(
+            trusted_answer.requires_banner(),
+            "precondition: a trusted repository is a banner case, or this test \
+             is not exercising the silencing bug it claims to"
+        );
         assert_ne!(
-            hook_policy_for(false),
-            enforced,
-            "if these now agree, Task 16.5 has landed — delete this test and the \
-             staleness note on `hook_policy_for`"
+            trusted_answer,
+            HookPolicy::Strict,
+            "the old LAN branch returned Strict unconditionally; if the trusted \
+             answer were Strict too, this test would prove nothing"
         );
 
-        // The one property that makes leaving it stale tolerable: it errs
-        // toward showing the banner, never toward silencing it.
-        assert!(
-            hook_policy_for(false).requires_banner(),
-            "a stale session policy must never be the one variant that silences \
-             the banner"
+        // The untrusted case, through the real entry point, is the other half:
+        // a LAN client asking about an untrusted repo gets the same `strict` a
+        // loopback client gets — same function, same inputs, no router in them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            session_hook_policy_for(Some(dir.path()), Some(&ProbeVerdict::Contained)),
+            HookPolicy::Strict
         );
+    }
+
+    /// The three "we don't know" arms — no verdict, no selection, and an
+    /// ADR-0029 refusal — all disclose a value that flies the banner, and
+    /// specifically never `Strict`.
+    ///
+    /// The `assert_ne!` against `Strict` is not redundant with
+    /// `requires_banner()`: `requires_banner` is implemented as `!matches!(self,
+    /// Strict)`, so asserting only the banner would pass trivially if the
+    /// fallback and the banner rule were ever changed together. Pinning the
+    /// concrete value as well means a future edit has to break both.
+    #[test]
+    fn an_unknown_or_refused_policy_flies_the_banner_and_is_never_strict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let refused = ProbeVerdict::CapabilityAbsent {
+            missing: vec!["bwrap"],
+        };
+
+        for (label, got) in [
+            (
+                "no boot verdict",
+                session_hook_policy_for(Some(dir.path()), None),
+            ),
+            (
+                "no current selection",
+                session_hook_policy_for(None, Some(&ProbeVerdict::Contained)),
+            ),
+            (
+                "the host refuses this repository's operations (ADR 0029)",
+                session_hook_policy_for(Some(dir.path()), Some(&refused)),
+            ),
+        ] {
+            assert!(got.requires_banner(), "{label}: must fly the banner");
+            assert_ne!(
+                got,
+                HookPolicy::Strict,
+                "{label}: must not claim the one tier that silences the banner"
+            );
+            assert_eq!(
+                got,
+                HookPolicy::default(),
+                "{label}: the unknown case is the type's own fail-closed value"
+            );
+        }
+    }
+
+    /// ADR 0029 again, at this seam: a capability-absent host must not turn
+    /// into `HookPolicy::Blocked` *as a disclosure of blocked hooks*. It does
+    /// land on `Blocked` here — but only via `HookPolicy::default()`'s
+    /// documented "not known to be running" meaning, and only after
+    /// `hook_policy_for_repo` has already refused rather than mapped.
+    ///
+    /// So what is actually asserted is the thing that must not regress: the
+    /// underlying mapping still returns `Err`, not `Ok(Blocked)`. If someone
+    /// "simplified" `hook_policy_for_repo` to return `Ok(Blocked)` for a
+    /// capability-absent host, the session value above would be unchanged and
+    /// only this assertion would catch it.
+    #[test]
+    fn capability_absent_still_refuses_at_the_mapping_rather_than_becoming_blocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let got = hook_policy_for_repo(
+            dir.path(),
+            &ProbeVerdict::CapabilityAbsent {
+                missing: vec!["bwrap"],
+            },
+        );
+        assert!(
+            got.is_err(),
+            "ADR 0029: a capability-absent host refuses; it does not disclose a \
+             policy, blocked or otherwise"
+        );
+        assert_ne!(got.ok(), Some(HookPolicy::Blocked));
     }
 }
