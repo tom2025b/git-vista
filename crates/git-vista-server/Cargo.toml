@@ -75,7 +75,6 @@ tower-http = { version = "0.7.0", features = ["fs", "set-header", "catch-panic"]
 tempfile = "3"
 
 [dev-dependencies]
-
 # `ServiceExt::oneshot` drives the router in the contract-layer tests (protocol
 # negotiation, the error envelope, the no-path-based-selection guard) without a
 # live socket. Test-only: the release binary never pulls tower's `util` feature.
