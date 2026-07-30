@@ -154,11 +154,73 @@ fn prctl_rule() -> Result<SeccompRule, seccompiler::BackendError> {
     )?])
 }
 
-/// Build the filter program.
+/// `socket(2)` and `socketpair(2)` with `AF_UNIX` (== `AF_LOCAL` == 1) as the
+/// address family, denied in the **Strict** tier only. Every other family —
+/// `AF_INET`, `AF_INET6`, `AF_NETLINK` — is untouched, because a blanket denial
+/// of `socket` would break the Network tier's TCP and anything in git that opens
+/// a socket for a reason this design never objected to.
 ///
-/// `mismatch_action` is `Allow`: anything not named above proceeds. See the
-/// module comment for why an allowlist is the wrong shape for git.
-pub fn build() -> Result<BpfProgram, Box<dyn std::error::Error>> {
+/// # Why this rule exists
+///
+/// The design's Strict-tier threat model is "no network, no AF_UNIX, no
+/// io_uring", and until this rule landed the AF_UNIX third of that sentence was
+/// **as-designed, not as-built** (`docs/superpowers/plans/2026-07-28-m1.13b-sandbox.md`
+/// step 4.3; the anti-vacuity contract records the same gap as INV-4). Measured
+/// on this host inside the real bwrap + Landlock + seccomp Strict stack, with the
+/// probe run as a `pre-commit` hook so it inherited the sandboxed git's filter
+/// and Landlock domain: `socket(AF_UNIX, SOCK_STREAM, 0)` and
+/// `socketpair(AF_UNIX, …)` both **succeeded**, identical to the bare host, while
+/// a `ptrace(PTRACE_TRACEME)` control in the same run went from success on the
+/// host to `EPERM` inside — so the filter was demonstrably loaded and the AF_UNIX
+/// success was a real gap, not a sandbox that failed to apply.
+///
+/// Landlock does not cover it. `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` (set in
+/// `apply_landlock`) mediates *connecting* to an abstract socket created outside
+/// the sandbox's domain; it says nothing about socket construction, and ABI 8
+/// does not mediate **pathname** sockets at all. Nor do the Strict tier's
+/// namespaces: an IPC namespace does not cover `AF_UNIX`, and a network namespace
+/// does not either. So a hostile hook in Strict could reach
+/// `/run/docker.sock`, `ssh-agent`, `gpg-agent` and the D-Bus session bus — every
+/// one of them a full escape — with nothing in the stack objecting.
+///
+/// # Why Strict only, and not the Network tier
+///
+/// The Network tier is where `git push`/`fetch` over SSH lives, and SSH
+/// legitimately wants an `ssh-agent` socket, which is a pathname `AF_UNIX`
+/// socket. Issue #188 defers that carve-out deliberately, so denying AF_UNIX in
+/// the Network tier here would either break authenticated remotes or force a
+/// carve-out this task is not allowed to build. The Network tier therefore keeps
+/// exactly the filter it had before this rule existed: a tier whose whole purpose
+/// is reaching the network does not gain much from losing its local sockets, and
+/// a denial nobody has measured git against is how a filter gets widened until it
+/// means nothing (see the module comment).
+///
+/// # C2 — register width
+///
+/// Same trap as `prctl_rule`, for the same reason. Seccomp compares the raw
+/// 64-bit register *before* the kernel truncates the argument to the `int` that
+/// `socket`'s `domain` parameter declares, so a `Qword` comparison would let
+/// `AF_UNIX | 0x1_0000_0000` sail past this rule while the kernel went on to
+/// create an ordinary AF_UNIX socket from the low bits.
+/// `SeccompCmpArgLen::Dword` masks the comparison to the effective low 32 bits.
+/// `ci/mutants/M7-widen-prctl-comparison.patch` and the escape battery's
+/// `high_bit_prctl_denied` are the committed proof that this width is
+/// load-bearing on the sibling rule; the width here is not a guess copied from
+/// it but the same defect avoided in the same place.
+fn af_unix_rule() -> Result<SeccompRule, seccompiler::BackendError> {
+    SeccompRule::new(vec![SeccompCondition::new(
+        0, // socket(2)/socketpair(2) first argument, the address family
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Eq,
+        libc::AF_UNIX as u64,
+    )?])
+}
+
+/// The syscall-to-rules map the filter is compiled from. Split out of `build`
+/// so the unit tests below can assert *which* syscalls carry rules and that the
+/// socket rules are argument-scoped rather than blanket denials — properties a
+/// compiled `BpfProgram` no longer exposes.
+fn rules_for(net: NetScope) -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompiler::BackendError> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
     // An empty rule vector means "every invocation of this syscall matches".
@@ -167,8 +229,23 @@ pub fn build() -> Result<BpfProgram, Box<dyn std::error::Error>> {
     }
     rules.insert(libc::SYS_prctl, vec![prctl_rule()?]);
 
+    // Strict only — see `af_unix_rule` for the measurement that motivates the
+    // rule and for why the Network tier is deliberately left alone (#188).
+    if net == NetScope::Denied {
+        rules.insert(libc::SYS_socket, vec![af_unix_rule()?]);
+        rules.insert(libc::SYS_socketpair, vec![af_unix_rule()?]);
+    }
+
+    Ok(rules)
+}
+
+/// Build the filter program.
+///
+/// `mismatch_action` is `Allow`: anything not named above proceeds. See the
+/// module comment for why an allowlist is the wrong shape for git.
+pub fn build(net: NetScope) -> Result<BpfProgram, Box<dyn std::error::Error>> {
     let filter = SeccompFilter::new(
-        rules,
+        rules_for(net)?,
         // Not named -> allowed.
         SeccompAction::Allow,
         // Named -> denied terminally. EPERM rather than KillProcess so a git
@@ -190,8 +267,81 @@ mod tests {
     /// syscall this one meant to stop.
     #[test]
     fn the_filter_builds_and_denies_terminally() {
-        let program = build().expect("filter builds");
-        assert!(!program.is_empty(), "an empty BPF program filters nothing");
+        for net in [NetScope::Denied, NetScope::Allowed] {
+            let program = build(net).expect("filter builds");
+            assert!(
+                !program.is_empty(),
+                "an empty BPF program filters nothing ({net:?})"
+            );
+        }
+    }
+
+    /// The AF_UNIX denial is scoped two ways, and both scopes are the point.
+    ///
+    /// Scoped to the **family**: a rule vector of length 1 means `socket` is
+    /// denied only for arguments matching that one condition. An empty vector
+    /// would mean "every invocation matches" — a blanket denial that would take
+    /// the Network tier's TCP down with it.
+    ///
+    /// Scoped to the **tier**: the Network tier must carry no socket rule at all
+    /// while #188 defers the `ssh-agent` carve-out. If this half starts failing
+    /// because someone widened the rule to both tiers, that is not a test to
+    /// relax — it is a git-over-SSH regression that has not been measured.
+    #[test]
+    fn af_unix_is_denied_in_strict_and_left_alone_in_the_network_tier() {
+        let strict = rules_for(NetScope::Denied).expect("strict rules build");
+        for nr in [libc::SYS_socket, libc::SYS_socketpair] {
+            let scoped = strict
+                .get(&nr)
+                .unwrap_or_else(|| panic!("syscall {nr} must carry an AF_UNIX rule in Strict"));
+            assert_eq!(
+                scoped.len(),
+                1,
+                "syscall {nr}'s denial must be argument-scoped to AF_UNIX; an empty rule \
+                 vector is a blanket denial and would break AF_INET too"
+            );
+        }
+
+        let network = rules_for(NetScope::Allowed).expect("network rules build");
+        for nr in [libc::SYS_socket, libc::SYS_socketpair] {
+            assert!(
+                !network.contains_key(&nr),
+                "syscall {nr} must be untouched in the Network tier: git over SSH needs an \
+                 agent socket and issue #188 defers that carve-out"
+            );
+        }
+    }
+
+    /// Both tiers' filters must still be terminal denylists that leave the
+    /// unnamed syscalls alone — the AF_UNIX rule adds exactly two keys to Strict
+    /// and nothing to Network.
+    #[test]
+    fn the_af_unix_rule_is_the_only_difference_between_the_two_tiers() {
+        let strict: Vec<i64> = rules_for(NetScope::Denied)
+            .expect("strict rules build")
+            .keys()
+            .copied()
+            .collect();
+        let network: Vec<i64> = rules_for(NetScope::Allowed)
+            .expect("network rules build")
+            .keys()
+            .copied()
+            .collect();
+        let extra: Vec<i64> = strict
+            .iter()
+            .copied()
+            .filter(|nr| !network.contains(nr))
+            .collect();
+        assert_eq!(
+            extra,
+            {
+                let mut want = vec![libc::SYS_socket, libc::SYS_socketpair];
+                want.sort_unstable();
+                want
+            },
+            "the only tier-conditional rules may be the two AF_UNIX ones; a filter that \
+             quietly differs elsewhere is one no reviewer can attribute to a tier"
+        );
     }
 
     /// The io_uring denial is the round-4 bypass and must never be quietly

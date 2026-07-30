@@ -542,8 +542,13 @@ mod seccomp_filter;
 /// boundary is established first, then the syscall boundary, then the process
 /// image is replaced — and both survive the `execve` because
 /// `PR_SET_NO_NEW_PRIVS` is already set.
-fn apply_seccomp() {
-    let program = match seccomp_filter::build() {
+///
+/// `net` is the tier, derived in `main` from the `--net-deny`/`--net-allow` flag
+/// the launcher already emits. One rule varies with it (AF_UNIX socket creation,
+/// denied in Strict only); everything else is identical in both tiers. See
+/// `seccomp_filter::af_unix_rule`.
+fn apply_seccomp(net: seccomp_filter::NetScope) {
+    let program = match seccomp_filter::build(net) {
         Ok(p) => p,
         Err(e) => die(EXIT_SECCOMP, &format!("seccomp filter build failed: {e}")),
     };
@@ -557,7 +562,14 @@ fn main() {
     validate(&a);
     close_inherited_fds();
     apply_landlock(&a);
-    apply_seccomp();
+    // `validate` has already refused an argv carrying neither net flag, so the
+    // catch-all arm is unreachable — and it resolves to the *stronger* filter, so
+    // if that ever stops being true the failure is a compatibility complaint and
+    // not a silently weaker sandbox.
+    apply_seccomp(match a.net_allow {
+        Some(true) => seccomp_filter::NetScope::Allowed,
+        _ => seccomp_filter::NetScope::Denied,
+    });
 
     // `git` is named literally so the argv tripwire can prove this process
     // cannot exec anything else, and `validate` has already refused any
