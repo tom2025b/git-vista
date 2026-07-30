@@ -41,6 +41,11 @@ pub(crate) mod shim;
 /// Task 5: the two spawn wrappers. The single chokepoint where the pure argv
 /// becomes a real git process. Task 6 migrates the server's spawn sites here.
 pub(crate) mod spawn;
+/// Task 16: INV-15's disclosure seam — the one crossing from the internal
+/// [`Tier`] to the wire `HookPolicy`, plus ADR 0029's refusal for a host that
+/// cannot supply the tier a repository needs. See its module doc for why the
+/// plan's `CapabilityAbsent => Blocked` mapping is not implemented.
+pub(crate) mod hook_policy;
 /// Task 7: the persisted per-repo trust flag — the only route to `Unsandboxed`.
 pub(crate) mod trust;
 /// The third impure corner: resolving a linked worktree's real git directory
