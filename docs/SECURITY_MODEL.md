@@ -8,20 +8,25 @@ identity problem; it does not remove browser-origin attacks, stale tabs, malicio
 LAN clients, credential leakage, or command races. Repository *content* is also
 untrusted input: names, messages, refs and paths are treated as hostile and are
 validated. Repository *code* — hooks, filters, and any config key that names an
-executable — is a different matter. It is *designed* to run under bounded,
-irreversible kernel restrictions, tiered by operation kind: Landlock filesystem
-rules wherever repository code runs, Landlock network rules that scope the
-network tier to a fixed TCP port list — never to a destination host, see ADR
-0028 — seccomp syscall filtering, and, outside the network tier, a `bwrap`
-namespace boundary. **None of that enforcement is shipped yet.** What is true
-today: whether a session's hooks are policy-flagged `Allow` or `Restricted` is
-computed and disclosed to the user (ADR 0025), and the pure, tested code that
-builds each tier's Landlock grants, excludes, and permitted ports already
-exists (ADR 0027, ADR 0028) — but the shim that actually applies Landlock and
-seccomp to a hook process does not exist in the tree yet (ADR 0027), so today
-no hook process is restricted by any of this; a `Restricted` session's hooks
-run exactly like an `Allow` session's. It does not claim isolation from a
-same-uid adversary, and it cannot: see Known Non-Goals.
+executable — is a different matter. It runs under bounded, irreversible kernel
+restrictions, tiered by operation kind: Landlock filesystem rules wherever
+repository code runs, Landlock network rules that scope the network tier to a
+fixed TCP port list — never to a destination host, see ADR 0028 — seccomp
+syscall filtering, and, outside the network tier, a `bwrap` namespace boundary.
+**This enforcement has shipped (ADR 0030).** Every local git operation the
+server spawns for an untrusted repository now runs inside `Tier::Strict` or
+`Tier::Network` — bwrap namespaces, then Landlock, then seccomp, applied by the
+`gv-sandbox` shim after `exec`, reached through a sealed argv chokepoint a
+caller cannot append to. `Tier::Unsandboxed` exists for operator-trusted
+repositories only and is reachable by rule, not yet by any handler-facing
+route. What a session's hooks actually run under is disclosed per repository
+as one of four named values — `Strict`/`Network`/`Unsandboxed`/`Blocked` —
+matching the real tiers directly, not the old `Allow`/`Restricted` labels
+(ADR 0025, amended by ADR 0030); an undisclosed policy is the field's
+*absence*, never a value that claims more than was measured. It does not claim
+isolation from a same-uid adversary, and it cannot: see Known Non-Goals and
+Sandbox Mechanism Boundaries below for exactly what each layer covers and
+where it does not.
 
 ## Security Objectives
 
@@ -265,7 +270,15 @@ it did not itself register.
   editors, pagers, and hooks where the operation semantics permit.
 - Decide hook policy explicitly. Running repository hooks may execute arbitrary
   local code; local mode may allow them, but the UI must report that fact and Team
-  mode should default to a restricted policy.
+  mode should default to a restricted policy. *(Implemented: ADR 0025 (declared +
+  disclosed) amended by ADR 0030 (enforced) — `sandbox::tier_for` decides the real
+  tier per operation and `sandbox::hook_policy::hook_policy_for_repo` only renames
+  that answer to the wire vocabulary, never re-derives it, so disclosure cannot
+  drift from enforcement. `RepositoryDescriptor.hook_policy` and
+  `SessionInfo.hook_policy` carry it to the client; `via_lan` has no bearing on the
+  value reported (`session_hook_policy_for`, `crates/git-vista-server/src/handlers/
+  session.rs`) — see the ADR 0025 amendment. The frontend banner that renders this
+  is still the session-level, pre-#202 view; see ADR 0030 Consequences.)*
 - Apply timeouts, cancellation, stdout/stderr limits, process-group termination,
   and concurrency quotas.
 - Convert raw Git errors into structured safe errors; retain detailed stderr only
@@ -518,13 +531,16 @@ contents.
 ## Known Non-Goals
 
 - Protecting a repository from its own Unix account owner.
-- **Fully** sandboxing arbitrary Git hooks in Local mode. Hook policy is
-  **declared and disclosed, not enforced** (ADR 0025) — a session's policy is
-  computed and shown to the user, but no code path suppresses or restricts a
-  hook today, so a `Restricted` session's hooks run exactly like an `Allow`
-  session's would. A same-uid adversary with access to a root-owned daemon
-  socket, or to a writable file some outside process treats as instructions,
-  is out of scope.
+- **Fully** sandboxing arbitrary Git hooks in Local mode. Enforcement has
+  landed (ADR 0030): an untrusted repository's local operations run inside a
+  Landlock+seccomp+bwrap tier, and the tier actually in force is disclosed —
+  never a stronger one than what ran (ADR 0025's amendment). What "fully"
+  still excludes, documented in Sandbox Mechanism Boundaries above: Landlock
+  does not mediate metadata operations (`chmod`, `chown`, `utime`, `stat`,
+  `flock`, ...) at all; the network tier confines ports, never destination
+  hosts; and a same-uid adversary with access to a root-owned daemon socket,
+  or to a writable file some outside process treats as instructions, is out
+  of scope regardless of tier.
 - Providing tenant isolation in V2.
 - Making remote force-push universally undoable.
 - Securing plain HTTP LAN mode; it should not exist as a supported write mode.
