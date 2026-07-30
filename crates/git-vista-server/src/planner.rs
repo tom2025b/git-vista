@@ -41,8 +41,8 @@ use git_vista_protocol::{
 };
 
 use crate::git_cmd::{git_ok, rev_parse};
-use crate::sandbox::{network_need_for_operation, NetworkNeed};
 use crate::journal;
+use crate::sandbox::{network_need_for_operation, NetworkNeed};
 use crate::state::{current_handle, reject_if_read_only};
 
 /// How long a freshly issued plan stays executable. Enforced by [`validate`]
@@ -1024,9 +1024,7 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
     // discarded it would leave that match decorative and the guarantee empty.
     let need = network_need_for_operation(&plan.operation);
     match plan.operation {
-        GitOperation::CreateBranch { name, at } => {
-            exec_create_branch(repo, need, &name, &at).await
-        }
+        GitOperation::CreateBranch { name, at } => exec_create_branch(repo, need, &name, &at).await,
         GitOperation::CommitOnHead {
             message,
             allow_empty,

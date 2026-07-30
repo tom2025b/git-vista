@@ -25,7 +25,6 @@ use super::*;
 /// namespaces. Before Task 8 they ran in the Network tier and proved nothing
 /// about the tier real mutations now use.
 ///
-
 /// This used to carry a retry loop that re-set `HOME` because `trust::tests`
 /// removed it process-wide and never restored it. That disease is cured at the
 /// source — the trust tests now take their directory explicitly and touch no
