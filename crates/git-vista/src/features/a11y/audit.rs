@@ -294,8 +294,12 @@ fn the_guarantee_predicate_can_say_yes() {
          .pct { min-height: 100%; min-width: 100%; } \
          .small { min-height: 30px; min-width: 30px; }",
     );
-    for (selector, expected) in [(".big", true), (".rem", true), (".pct", false), (".small", false)]
-    {
+    for (selector, expected) in [
+        (".big", true),
+        (".rem", true),
+        (".pct", false),
+        (".small", false),
+    ] {
         assert_eq!(
             guarantees_min_extent(&rules, selector, &["min-width", "width"]),
             expected,
@@ -337,7 +341,10 @@ fn commit_dot_hit_target_is_thirty_pixels_at_default_zoom() {
 #[test]
 fn node_hit_padding_still_matches_the_render_code() {
     let expected = format!("r=NODE_RADIUS + {}", NODE_HIT_PADDING as i32);
-    for (name, src) in [("render/nodes.rs", RENDER_NODES), ("render/stubs.rs", RENDER_STUBS)] {
+    for (name, src) in [
+        ("render/nodes.rs", RENDER_NODES),
+        ("render/stubs.rs", RENDER_STUBS),
+    ] {
         assert!(
             src.contains(&expected),
             "{name} no longer draws its hit circle as `{expected}` — \
@@ -373,8 +380,10 @@ fn a_reduced_motion_block_neutralises_animation_and_transition() {
     let universal = reduced
         .iter()
         .find(|r| r.selectors.iter().any(|s| s == "*"))
-        .expect("the reduced-motion block does not apply to `*` — a per-selector opt-in \
-                 is exactly the list someone forgets to extend");
+        .expect(
+            "the reduced-motion block does not apply to `*` — a per-selector opt-in \
+                 is exactly the list someone forgets to extend",
+        );
 
     for property in ["animation-duration", "transition-duration"] {
         let declaration = universal
@@ -456,7 +465,10 @@ fn the_graph_section_carries_an_accessible_name() {
 #[test]
 fn opening_tag_stops_at_the_first_angle_bracket() {
     assert_eq!(
-        opening_tag("x <section class=\"graph\" aria-label=X> inner </section>", "<section"),
+        opening_tag(
+            "x <section class=\"graph\" aria-label=X> inner </section>",
+            "<section"
+        ),
         Some("<section class=\"graph\" aria-label=X>")
     );
     assert_eq!(opening_tag("nothing here", "<section"), None);

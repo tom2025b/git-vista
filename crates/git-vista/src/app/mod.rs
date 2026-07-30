@@ -652,7 +652,7 @@ pub fn App() -> impl IntoView {
             // an anonymous container and VoiceOver's rotor has nothing to jump to. The
             // name comes from `a11y::core` rather than a literal here so the markup and
             // the tripwire that checks it cannot drift apart.
-            <section class="graph" aria-label=GRAPH_REGION_LABEL>
+            <section class="graph">
                 {move || {
                     // Read the icon set here, inside the reactive block, so the
                     // status lines re-render when the icon style is toggled.

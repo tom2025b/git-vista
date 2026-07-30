@@ -306,8 +306,9 @@ impl InspectorPlacement {
 ///   *"Replace persistent inspector with a full-height sheet"* — reinforced by `:71`,
 ///   *"Present one primary task at a time"*.
 /// - [`ShellMode::Portrait`] → a sheet at [`SheetDetent::Summary`]. `IPAD_DESIGN.md:59`
-///   puts the inspector in a sheet here, and `:108` says selecting a commit *"show[s] a
-///   summary sheet"* — so Portrait opens at the smallest detent and the user expands.
+///   puts the inspector in a sheet here, and `:108` is *"Tap a commit to select it and
+///   show a summary sheet"* — so Portrait opens at the smallest detent and the user
+///   expands from there.
 /// - [`ShellMode::Wide`] and [`ShellMode::UltraWide`] → [`InspectorPlacement::RightColumn`].
 ///   The wide skeleton at `IPAD_DESIGN.md:36` has a dedicated inspector column, and `:78`
 ///   keeps it at ultra-wide: *"Permit graph plus side-by-side diff plus inspector when
