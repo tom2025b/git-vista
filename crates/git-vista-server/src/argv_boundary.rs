@@ -42,7 +42,12 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // `crate::git_cmd::git_output` (#66 Task 6); this entry now covers only
     // its `#[cfg(test)]` fixture setup.
     "src/durable.rs",
-    "src/git_cmd.rs", // shared read-only git helpers, and the sealed `git_output` launcher (#66 Task 6)
+    // The shared read-only git helpers, including the sealed `git_output`
+    // launcher (#66 Task 6). Note what this entry does *not* cover any more:
+    // `git_output` builds no `Command` of its own — it goes through
+    // `sandbox::spawn::command_async`, which is the chokepoint — so every
+    // `Command::new` left in this file is `#[cfg(test)]` fixture setup.
+    "src/git_cmd.rs",
     // `src/handlers/clone.rs` was here for its raw `git clone` spawn. It is
     // gone: the production call goes through `crate::git_cmd::git_output`, the
     // sealed sandbox launcher (#66 Task 6, plan step 6.7), and unlike the other
@@ -58,7 +63,14 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // (`worktree_status`) now goes through `crate::git_cmd::git_output`
     // (#66 Task 6); this entry now covers only its `#[cfg(test)]` fixtures.
     "src/handlers/read.rs",
-    "src/catalog.rs", // static-arg read at registration
+    // `#[cfg(test)]` fixture setup only — `git init -q`, to build repositories
+    // `read_repo_facts` can classify. This entry used to read "static-arg read
+    // at registration", which stopped being true when registration moved to the
+    // sealed helpers: the file's only `Command::new` today sits inside
+    // `#[cfg(test)] mod tests`. A comment that describes a production spawn the
+    // file no longer performs is how a later reviewer talks themselves into
+    // leaving a permission wider than the file needs.
+    "src/catalog.rs",
     // D2 (#66, Task 7): `#[cfg(test)]` fixture setup only (`git init`, to
     // build real repos for the hostile-geometry/managed-root tests) — no
     // production spawn.
@@ -114,7 +126,13 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // LAUNCHER_SPAWN_SITES for the same `cc` reason as escape_suite.rs above.
     "src/sandbox/escape_contract.rs",
     // git-vista-git
-    "src/history.rs", // read-side reflog/stash reads, static args
+    // `#[cfg(test)]` fixture setup only. This entry used to read "read-side
+    // reflog/stash reads, static args"; that is stale — the crate's production
+    // history reads (`walk_history`, `read_commit`, `remote_membership`,
+    // `read_remote_commits`) do not spawn a process at all, and every
+    // `Command::new` left in the file is below its `#[cfg(test)] pub(crate) mod
+    // tests` line, building real repositories for the suites to read.
+    "src/history.rs",
 ];
 
 /// The one carve-out from "every spawn site names `git` literally": sites that
