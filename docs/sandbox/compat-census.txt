@@ -3,4 +3,4 @@ husky_hook_gates
 husky_hook_runs
 interpreter_identity
 linked_worktree_commit
-submodule_commit
+submodule_parent_commit
