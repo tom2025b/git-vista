@@ -41,6 +41,7 @@ use git_vista_protocol::{
 };
 
 use crate::git_cmd::{git_ok, rev_parse};
+use crate::sandbox::{network_need_for_operation, NetworkNeed};
 use crate::journal;
 use crate::state::{current_handle, reject_if_read_only};
 
@@ -491,7 +492,11 @@ async fn journal_clear_blocking(repo: &Path) {
 /// `git status --porcelain=v2` at this instant; `None` when git couldn't run
 /// or the path isn't a working tree — best-effort, like every observation.
 async fn worktree_status(repo: &Path) -> Option<String> {
-    let out = run_git(repo, &["status", "--porcelain=v2"]).await.ok()?;
+    // An observation, not part of any operation: `status` reads the index and
+    // the working tree, so it declares `Local` on its own behalf (D3).
+    let out = run_git(repo, NetworkNeed::Local, &["status", "--porcelain=v2"])
+        .await
+        .ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -1003,35 +1008,60 @@ fn validate(plan: &Plan) -> Result<(), (StatusCode, String)> {
 /// handler's execution code moved here unchanged — same argv, same journaling,
 /// same responses.
 async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, String) {
+    // D3 (#66, Task 8): the sandbox tier is chosen from the *declared* network
+    // need of the typed operation, and this is the only place in the server
+    // where that operation's identity is still in scope. Derive it here, before
+    // the match consumes `plan.operation`, and thread it down through every
+    // `exec_*` to `run_git` → `git_cmd::git_output_for` → `sandbox::policy_for`.
+    //
+    // Threading it rather than re-deriving it further down is the whole point.
+    // By the time the argv exists, the operation is gone and only a string
+    // match on the subcommand is left — the classifier `network_need` itself
+    // documents as incomplete-by-construction. Passing the value keeps
+    // `network_need_for_operation`'s exhaustive, wildcard-free match *in the
+    // live data path*, so a new `GitOperation` variant cannot be added without
+    // stating its network need. A version of this that computed the need and
+    // discarded it would leave that match decorative and the guarantee empty.
+    let need = network_need_for_operation(&plan.operation);
     match plan.operation {
-        GitOperation::CreateBranch { name, at } => exec_create_branch(repo, &name, &at).await,
+        GitOperation::CreateBranch { name, at } => {
+            exec_create_branch(repo, need, &name, &at).await
+        }
         GitOperation::CommitOnHead {
             message,
             allow_empty,
-        } => exec_commit_on_head(repo, &message, allow_empty, &observed).await,
+        } => exec_commit_on_head(repo, need, &message, allow_empty, &observed).await,
         GitOperation::EmptyCommitOnBranch {
             branch,
             message,
             expected_tip,
-        } => exec_empty_commit_on_branch(repo, &branch, &message, &expected_tip).await,
-        GitOperation::StageAll => exec_stage_all(repo).await,
-        GitOperation::UnstageAll => exec_unstage_all(repo).await,
-        GitOperation::CheckoutBranch { branch } => exec_checkout(repo, &branch, &observed).await,
-        GitOperation::MergeBranch { branch } => exec_merge(repo, &branch, &observed).await,
-        GitOperation::PushBranch { branch, remote } => exec_push(repo, &branch, &remote).await,
-        GitOperation::DeleteBranch { branch } => exec_delete(repo, &branch, &observed, false).await,
-        GitOperation::ForceDeleteBranch { branch } => {
-            exec_delete(repo, &branch, &observed, true).await
+        } => exec_empty_commit_on_branch(repo, need, &branch, &message, &expected_tip).await,
+        GitOperation::StageAll => exec_stage_all(repo, need).await,
+        GitOperation::UnstageAll => exec_unstage_all(repo, need).await,
+        GitOperation::CheckoutBranch { branch } => {
+            exec_checkout(repo, need, &branch, &observed).await
         }
-        GitOperation::RebaseOntoBase { base } => exec_rebase(repo, &base, &observed).await,
-        GitOperation::RestoreBranch { name, tip } => exec_restore_branch(repo, &name, &tip).await,
+        GitOperation::MergeBranch { branch } => exec_merge(repo, need, &branch, &observed).await,
+        GitOperation::PushBranch { branch, remote } => {
+            exec_push(repo, need, &branch, &remote).await
+        }
+        GitOperation::DeleteBranch { branch } => {
+            exec_delete(repo, need, &branch, &observed, false).await
+        }
+        GitOperation::ForceDeleteBranch { branch } => {
+            exec_delete(repo, need, &branch, &observed, true).await
+        }
+        GitOperation::RebaseOntoBase { base } => exec_rebase(repo, need, &base, &observed).await,
+        GitOperation::RestoreBranch { name, tip } => {
+            exec_restore_branch(repo, need, &name, &tip).await
+        }
         GitOperation::ResetBranch {
             branch,
             to,
             expected_tip,
-        } => exec_reset_branch(repo, &branch, &to, &expected_tip, &observed).await,
-        GitOperation::RevertCommit { commit } => exec_revert(repo, &commit, &observed).await,
-        GitOperation::ResetTestRepo => exec_reset_test_repo(repo).await,
+        } => exec_reset_branch(repo, need, &branch, &to, &expected_tip, &observed).await,
+        GitOperation::RevertCommit { commit } => exec_revert(repo, need, &commit, &observed).await,
+        GitOperation::ResetTestRepo => exec_reset_test_repo(repo, need).await,
     }
 }
 
@@ -1043,8 +1073,8 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
 /// Goes through the sealed sandbox launcher (`crate::git_cmd::git_output`,
 /// #66 Task 6) rather than a raw `Command::new("git")` — this is the
 /// executor, where every client-requested mutation's argv actually runs.
-async fn run_git(repo: &Path, args: &[&str]) -> std::io::Result<Output> {
-    crate::git_cmd::git_output(repo, args).await
+async fn run_git(repo: &Path, need: NetworkNeed, args: &[&str]) -> std::io::Result<Output> {
+    crate::git_cmd::git_output_for(repo, args, need).await
 }
 
 /// The uniform 500 for a git binary that couldn't be spawned, with the same
@@ -1086,8 +1116,8 @@ fn stderr_stdout_or(output: &Output, fallback: &str) -> String {
 /// Run one git command, mapping failure to git's own explanation (stderr, then
 /// stdout, then a generic line) — the undo executions' shared runner, moved
 /// from `crate::activity`.
-async fn git(repo: &Path, args: &[&str]) -> Result<(), String> {
-    let output = run_git(repo, args)
+async fn git(repo: &Path, need: NetworkNeed, args: &[&str]) -> Result<(), String> {
+    let output = run_git(repo, need, args)
         .await
         .map_err(|e| format!("Couldn't run git: {e}"))?;
     if output.status.success() {
@@ -1099,8 +1129,8 @@ async fn git(repo: &Path, args: &[&str]) -> Result<(), String> {
 /// Whether the working tree has any change at all (`git status --porcelain`
 /// non-empty): staged, unstaged, untracked or conflicted — any of them makes
 /// a hard reset unsafe. Moved from `crate::activity`.
-async fn worktree_dirty(repo: &Path) -> Result<bool, String> {
-    let output = run_git(repo, &["status", "--porcelain"])
+async fn worktree_dirty(repo: &Path, need: NetworkNeed) -> Result<bool, String> {
+    let output = run_git(repo, need, &["status", "--porcelain"])
         .await
         .map_err(|e| format!("Couldn't run git: {e}"))?;
     if !output.status.success() {
@@ -1120,10 +1150,11 @@ fn short(oid: &str) -> &str {
 /// name, refuses a duplicate, and its stderr is forwarded verbatim on failure.
 async fn exec_create_branch(
     repo: &Path,
+    need: NetworkNeed,
     name: &BranchName,
     at: &CommitOid,
 ) -> (StatusCode, String) {
-    let output = match run_git(repo, &["branch", name.as_str(), at.as_str()]).await {
+    let output = match run_git(repo, need, &["branch", name.as_str(), at.as_str()]).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/branch", &e),
     };
@@ -1152,6 +1183,7 @@ async fn exec_create_branch(
 /// `git commit [--allow-empty] -m <message>` on HEAD (`/api/commit`).
 async fn exec_commit_on_head(
     repo: &Path,
+    need: NetworkNeed,
     message: &CommitMessage,
     allow_empty: bool,
     observed: &Observed,
@@ -1202,6 +1234,7 @@ async fn exec_commit_on_head(
 /// untouched throughout.
 async fn exec_empty_commit_on_branch(
     repo: &Path,
+    need: NetworkNeed,
     branch: &BranchName,
     message: &CommitMessage,
     expected_tip: &CommitOid,
@@ -1301,8 +1334,8 @@ async fn exec_empty_commit_on_branch(
 }
 
 /// `git add -A` (`/api/stage`).
-async fn exec_stage_all(repo: &Path) -> (StatusCode, String) {
-    let output = match run_git(repo, &["add", "-A"]).await {
+async fn exec_stage_all(repo: &Path, need: NetworkNeed) -> (StatusCode, String) {
+    let output = match run_git(repo, need, &["add", "-A"]).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/stage", &e),
     };
@@ -1318,8 +1351,8 @@ async fn exec_stage_all(repo: &Path) -> (StatusCode, String) {
 
 /// `git reset -q HEAD` (`/api/unstage`) — the exact inverse of stage-all; the
 /// working tree keeps every edit, so nothing is lost.
-async fn exec_unstage_all(repo: &Path) -> (StatusCode, String) {
-    let output = match run_git(repo, &["reset", "-q", "HEAD"]).await {
+async fn exec_unstage_all(repo: &Path, need: NetworkNeed) -> (StatusCode, String) {
+    let output = match run_git(repo, need, &["reset", "-q", "HEAD"]).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/unstage", &e),
     };
@@ -1337,6 +1370,7 @@ async fn exec_unstage_all(repo: &Path) -> (StatusCode, String) {
 /// (stderr, then stdout, then a generic line) — the old `run_branch_op` core.
 async fn run_branch_cmd(
     repo: &Path,
+    need: NetworkNeed,
     endpoint: &str,
     args: &[&str],
     branch: &BranchName,
@@ -1344,7 +1378,7 @@ async fn run_branch_cmd(
 ) -> (StatusCode, String) {
     let mut argv: Vec<&str> = args.to_vec();
     argv.push(branch.as_str());
-    let output = match run_git(repo, &argv).await {
+    let output = match run_git(repo, need, &argv).await {
         Ok(o) => o,
         Err(e) => return couldnt_run(endpoint, &e),
     };
@@ -1364,11 +1398,13 @@ async fn run_branch_cmd(
 /// feed's dedup collapses git's own reflog copy into it.
 async fn exec_checkout(
     repo: &Path,
+    need: NetworkNeed,
     branch: &BranchName,
     observed: &Observed,
 ) -> (StatusCode, String) {
     let resp = run_branch_cmd(
         repo,
+        need,
         "/api/checkout",
         &["checkout"],
         branch,
@@ -1397,9 +1433,15 @@ async fn exec_checkout(
 }
 
 /// `git merge --no-edit <branch>` into the checked-out branch (`/api/merge`).
-async fn exec_merge(repo: &Path, branch: &BranchName, observed: &Observed) -> (StatusCode, String) {
+async fn exec_merge(
+    repo: &Path,
+    need: NetworkNeed,
+    branch: &BranchName,
+    observed: &Observed,
+) -> (StatusCode, String) {
     let resp = run_branch_cmd(
         repo,
+        need,
         "/api/merge",
         &["merge", "--no-edit"],
         branch,
@@ -1434,9 +1476,22 @@ async fn exec_merge(repo: &Path, branch: &BranchName, observed: &Observed) -> (S
 }
 
 /// `git push <remote> <branch>` (`/api/push`).
-async fn exec_push(repo: &Path, branch: &BranchName, remote: &RemoteName) -> (StatusCode, String) {
+async fn exec_push(
+    repo: &Path,
+    need: NetworkNeed,
+    branch: &BranchName,
+    remote: &RemoteName,
+) -> (StatusCode, String) {
+    debug_assert_eq!(
+        need,
+        NetworkNeed::Remote,
+        "push is the one operation in the enum that reaches a remote; if it \
+         arrives here declared Local, `network_need_for_operation` is wrong and \
+         the sandbox will (correctly) deny the connect"
+    );
     let resp = run_branch_cmd(
         repo,
+        need,
         "/api/push",
         &["push", remote.as_str()],
         branch,
@@ -1465,6 +1520,7 @@ async fn exec_push(repo: &Path, branch: &BranchName, remote: &RemoteName) -> (St
 /// the ONLY path back to the commits (until gc).
 async fn exec_delete(
     repo: &Path,
+    need: NetworkNeed,
     branch: &BranchName,
     observed: &Observed,
     force: bool,
@@ -1502,11 +1558,16 @@ async fn exec_delete(
 /// `git rebase <base>` of the checked-out branch (`/api/rebase`). A failed
 /// rebase (almost always conflicts) is `--abort`ed so a browser-only user is
 /// never left mid-rebase with no shell to fix it.
-async fn exec_rebase(repo: &Path, base: &RefName, observed: &Observed) -> (StatusCode, String) {
+async fn exec_rebase(
+    repo: &Path,
+    need: NetworkNeed,
+    base: &RefName,
+    observed: &Observed,
+) -> (StatusCode, String) {
     let old = observed.head_tip.clone();
     let base = base.as_str();
 
-    let output = match run_git(repo, &["rebase", base]).await {
+    let output = match run_git(repo, need, &["rebase", base]).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/rebase", &e),
     };
@@ -1540,7 +1601,7 @@ async fn exec_rebase(repo: &Path, base: &RefName, observed: &Observed) -> (Statu
         // Best-effort: back out of the half-applied rebase so the working tree
         // isn't stuck mid-rebase. Harmless (exits non-zero, ignored) when none
         // is running.
-        let _ = run_git(repo, &["rebase", "--abort"]).await;
+        let _ = run_git(repo, need, &["rebase", "--abort"]).await;
         eprintln!("git-vista: /api/rebase failed (aborted): {msg}");
         (StatusCode::BAD_REQUEST, msg)
     }
@@ -1551,10 +1612,11 @@ async fn exec_rebase(repo: &Path, base: &RefName, observed: &Observed) -> (Statu
 /// fails by itself if the name came back into use since the hint.
 async fn exec_restore_branch(
     repo: &Path,
+    need: NetworkNeed,
     name: &BranchName,
     tip: &CommitOid,
 ) -> (StatusCode, String) {
-    match git(repo, &["branch", name.as_str(), tip.as_str()]).await {
+    match git(repo, need, &["branch", name.as_str(), tip.as_str()]).await {
         Ok(()) => {
             println!(
                 "[/api/undo] restored branch '{name}' at {}",
@@ -1584,6 +1646,7 @@ async fn exec_restore_branch(
 /// can never reset away work that happened after it was shown.
 async fn exec_reset_branch(
     repo: &Path,
+    need: NetworkNeed,
     branch: &BranchName,
     to: &CommitOid,
     expected_tip: &CommitOid,
@@ -1602,7 +1665,7 @@ async fn exec_reset_branch(
     let result = if checked_out {
         // `git reset --hard` rewrites the working tree, so it runs only
         // against a fully clean one — never eat uncommitted work.
-        match worktree_dirty(repo).await {
+        match worktree_dirty(repo, need).await {
             Err(msg) => Err(msg),
             Ok(true) => {
                 return (
@@ -1612,11 +1675,11 @@ async fn exec_reset_branch(
                         .to_string(),
                 );
             }
-            Ok(false) => git(repo, &["reset", "--hard", to.as_str()]).await,
+            Ok(false) => git(repo, need, &["reset", "--hard", to.as_str()]).await,
         }
     } else {
         // Not checked out: move the ref alone, no worktree involved.
-        git(repo, &["branch", "-f", branch.as_str(), to.as_str()]).await
+        git(repo, need, &["branch", "-f", branch.as_str(), to.as_str()]).await
     };
     match result {
         Ok(()) => {
@@ -1648,9 +1711,14 @@ async fn exec_reset_branch(
 /// `git revert --no-edit <commit>` (`/api/undo`) — the history-preserving
 /// undo; a conflicted revert is auto-aborted (like `/api/rebase`) so a
 /// browser-only user is never left mid-revert.
-async fn exec_revert(repo: &Path, commit: &CommitOid, observed: &Observed) -> (StatusCode, String) {
+async fn exec_revert(
+    repo: &Path,
+    need: NetworkNeed,
+    commit: &CommitOid,
+    observed: &Observed,
+) -> (StatusCode, String) {
     let commit = commit.as_str();
-    match git(repo, &["revert", "--no-edit", commit]).await {
+    match git(repo, need, &["revert", "--no-edit", commit]).await {
         Ok(()) => {
             println!("[/api/undo] reverted {}", short(commit));
             let new = rev_parse(repo, "HEAD").await;
@@ -1693,7 +1761,13 @@ fn read_seed(repo: &Path) -> Option<Result<Seed, String>> {
 /// allowed nowhere else in git-vista — and wipe the app journal (its events
 /// describe history that no longer exists). Hard-gated: only a repo
 /// explicitly opted in with `gv --seed <path>` has seed files.
-async fn exec_reset_test_repo(repo: &Path) -> (StatusCode, String) {
+async fn exec_reset_test_repo(repo: &Path, need: NetworkNeed) -> (StatusCode, String) {
+    // `need` is threaded for the same reason every other `exec_*` threads it —
+    // so the declared value reaches `policy_for` — but this operation's git
+    // steps go through `git_cmd::git_ok`, which declares `Local` at its own
+    // seam (see its comment). Consume it explicitly so a future edit that adds
+    // a `run_git` step here has the right value already in scope.
+    let _ = need;
     let seed = match read_seed(repo) {
         None => {
             return (
@@ -1741,6 +1815,7 @@ async fn exec_reset_test_repo(repo: &Path) -> (StatusCode, String) {
     // What the repo looks like NOW, then the pure plan of moves + deletions.
     let current_refs = match run_git(
         repo,
+        need,
         &[
             "for-each-ref",
             "refs/heads",
