@@ -596,9 +596,12 @@ mod tests {
 
     /// One test fn drives the CURRENT/CATALOG globals end-to-end — keeping every
     /// global mutation in a single test means parallel test threads never fight
-    /// over the process-wide selection (no other test touches it).
-    #[test]
-    fn selection_flow_carries_mode_and_gates_writes() {
+    /// over the process-wide selection (no other test touches it). `async` (a
+    /// `tokio::test` rather than a plain `#[test]`) so the D2 section at the
+    /// end can call the real async handler `crate::handlers::rebase::rebase`
+    /// directly — see that section's own comment for why.
+    #[tokio::test]
+    async fn selection_flow_carries_mode_and_gates_writes() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("project");
         std::fs::create_dir_all(&repo).unwrap();
@@ -660,28 +663,22 @@ mod tests {
             delete_clone(clone_wt, &clones),
             DeleteCloneOutcome::NotFound
         );
-    }
 
-    /// TEMPORARY — D2 end-to-end proof, removed before this workflow finishes
-    /// (see the implementation report's `e2e_demo`). Touches the global
-    /// `CURRENT`/`CATALOG` statics like `selection_flow_carries_mode_and_gates_writes`
-    /// above, so it is not meant to survive alongside that test long-term —
-    /// this crate's convention is exactly one test owning that global state,
-    /// and this one exists only to be run once, in isolation
-    /// (`--test-threads=1` or `--exact`), to observe a REAL handler refuse a
-    /// hostile gitfile through the actual request-shaped code path rather
-    /// than through `sandbox::repo_paths::resolve_and_validate` in isolation.
-    #[tokio::test]
-    async fn e2e_scratch_a_linked_worktree_whose_main_repo_is_outside_the_managed_root_is_refused_by_the_real_rebase_handler(
-    ) {
-        let managed = tempfile::tempdir().unwrap();
+        // --- D2 (#66, Task 7): the real handler refuses an out-of-managed- --
+        // --- root linked worktree, end to end -------------------------------
+        //
+        // Everything above already leaves the selection on `repo` (Active,
+        // writable) — reused rather than building a third throwaway repo.
+        // This section proves the managed-root check at the actual
+        // request-shaped seam (a real handler function), not merely as a
+        // unit test of `sandbox::repo_paths::resolve_and_validate` in
+        // isolation: a REAL linked worktree (built with actual `git worktree
+        // add`, not hand-rolled files) whose main repository sits entirely
+        // outside the managed root satisfies `worktree.rs`'s own containment
+        // rule completely — that module alone would grant it — and is
+        // refused only because `state::resolve_target` additionally checks
+        // containment against the catalog's allowed roots.
         let elsewhere = tempfile::tempdir().unwrap();
-
-        // A REAL git repository (not hand-rolled files) with a REAL linked
-        // worktree, built with actual `git worktree add` — so the geometry is
-        // exactly what an attacker's tampered `.git` would have to reproduce
-        // to pass `worktree.rs`'s own containment rule, and exactly what a
-        // legitimate linked worktree looks like to `gix`/`read_repo_facts`.
         let main = elsewhere.path().join("main-repo");
         std::fs::create_dir_all(&main).unwrap();
         for args in [
@@ -697,7 +694,13 @@ mod tests {
                 .unwrap()
                 .success());
         }
-        let linked = managed.path().join("linked-worktree");
+        // `linked` lands under the same `root` this test's other fixtures use
+        // (no root needs pre-allowing here: `set_current` below allows the
+        // linked worktree's own canonical directory the same way it already
+        // did for `repo` and `clone_dir` above — that is what makes the
+        // scenario realistic). `main` sits in a wholly separate `elsewhere`
+        // tempdir that nothing in this test ever allows.
+        let linked = root.path().join("linked-worktree");
         assert!(std::process::Command::new("git")
             .args([
                 "worktree",
@@ -712,13 +715,6 @@ mod tests {
             .unwrap()
             .success());
 
-        // The operator configured `managed` as the served root — `main` (and
-        // therefore its `.git`, which is what the linked worktree's gitdir
-        // and commondir resolve into) sits entirely outside it. This is
-        // exactly the D2 threat: `worktree.rs`'s own containment rule is
-        // fully satisfied (this IS a real, registered linked worktree of
-        // `main`), so only the NEW managed-root check can catch it.
-        allow_repo_root(managed.path());
         set_current(&linked, RepoMode::Active);
         assert_eq!(
             current_mode(),
@@ -726,25 +722,22 @@ mod tests {
             "fixture invariant: the write gate must be open, so only the D2 \
              managed-root check can be what refuses this"
         );
-
-        // Sanity: `worktree.rs`'s OWN rule alone sees nothing wrong here —
-        // proving the managed-root check is what does the refusing, not a
-        // rule that already existed.
+        // Sanity: `worktree.rs`'s own rule alone sees nothing wrong here —
+        // proving the managed-root check is what does the refusing below,
+        // not a rule that already existed before D2.
         assert!(
             crate::sandbox::worktree::linked_worktree_dirs(&linked)
                 .expect("the geometry is a real, valid linked worktree")
                 .is_some()
         );
 
-        // The real production handler — POST /api/rebase's actual body, not
-        // a direct call into `sandbox::repo_paths::resolve_and_validate`.
+        // The real production handler — `POST /api/rebase`'s actual body.
         let (status, msg) = crate::handlers::rebase::rebase().await;
-        println!("[e2e] POST /api/rebase -> {status} {msg}");
         assert_ne!(
             status,
             StatusCode::OK,
             "a mutation against a repo whose linked-worktree main lives \
-             outside the managed root must be refused, not executed"
+             outside the managed root must be refused, not executed: {msg}"
         );
         assert!(
             msg.to_lowercase().contains("managed root"),
