@@ -239,6 +239,85 @@ impl ShellMode {
     }
 }
 
+/// The decision half of the debounced resize listener: which resize checks are still
+/// current, and whether a check that *is* current actually changes anything (M1.12, #65).
+///
+/// This exists because the one thing nobody could confirm about M1.12's first slice was
+/// the thing that matters most — that the layout class **settles** under a Stage Manager
+/// drag rather than thrashing. That question used to be answerable only by watching a
+/// real browser, because the whole debounce lived inside a `#[cfg(target_arch = "wasm32")]`
+/// closure in `signals.rs` with `web_sys` and `set_timeout` braided through it. Splitting
+/// the *decision* out from the *scheduling* makes the settling property provable at the
+/// host level; what remains browser-only is that `resize` fires and that
+/// `gestures::viewport_size()` reports the width, neither of which is where the subtle
+/// behaviour was.
+///
+/// Two independent reasons a scheduled check publishes nothing:
+///
+/// 1. **It was superseded.** Each resize event takes a fresh token from
+///    [`Self::observe_resize`]; [`Self::settle`] ignores any token that is not the latest.
+///    A burst of a hundred drag events therefore produces at most one publication — the
+///    last one — and the ninety-nine stale timeouts are silent no-ops rather than
+///    something that has to be found and cancelled.
+/// 2. **Nothing changed.** Most resizes never leave the current band: dragging a window
+///    from 700px to 780px is still `Portrait`. Publishing there would notify every
+///    subscriber of the mode signal — Leptos's `set` fires on write, not on difference —
+///    so the class attribute would be rewritten on every settled drag that changed
+///    nothing. [`Self::settle`] returns `Some` only on an actual band change, which is
+///    what makes "settles rather than thrashes" true for a *reader* of the signal and not
+///    merely for the DOM.
+///
+/// Deliberately not a debouncer: it owns no clock and no timer. It cannot be, if it is to
+/// be testable off-target — and the timing half (150ms, one timeout per event) is the part
+/// that is genuinely uninteresting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeSettler {
+    current: ShellMode,
+    generation: u64,
+}
+
+impl ModeSettler {
+    /// Start from the width the window has right now, with no check outstanding.
+    pub fn new(initial_width: f64) -> Self {
+        Self {
+            current: ShellMode::for_width(initial_width),
+            generation: 0,
+        }
+    }
+
+    /// The mode last published — what the signal currently holds.
+    pub fn current(&self) -> ShellMode {
+        self.current
+    }
+
+    /// A resize event arrived. Returns the token the check scheduled for *this* event
+    /// must present to [`Self::settle`]; every token handed out before this one is now
+    /// stale.
+    pub fn observe_resize(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    /// A scheduled check fired. Returns the new mode to publish, or `None` — either
+    /// because a later resize superseded this check, or because `width` is still in the
+    /// band already current.
+    ///
+    /// Takes the width at the moment the check fires rather than the width at the moment
+    /// the event arrived, on purpose: the surviving check is the one that must reflect
+    /// where the drag actually stopped.
+    pub fn settle(&mut self, token: u64, width: f64) -> Option<ShellMode> {
+        if token != self.generation {
+            return None;
+        }
+        let next = ShellMode::for_width(width);
+        if next == self.current {
+            return None;
+        }
+        self.current = next;
+        Some(next)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
