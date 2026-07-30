@@ -4,7 +4,9 @@
 //! `escape_contract` owns parsing, exact errno comparisons, carrier checks,
 //! report emission, production-seam spawning, and capability absence.
 
-use super::escape_contract::{run_case, Class, Errno, EscapeCase, Exemption, MutantId};
+use super::escape_contract::{
+    run_case, Class, Errno, EscapeCase, Exemption, GitPortUse, MutantId,
+};
 use super::Tier;
 
 const CASE_SECRET_READ_DENIED: EscapeCase = EscapeCase {
@@ -20,6 +22,7 @@ const CASE_SECRET_READ_DENIED: EscapeCase = EscapeCase {
     expect_carrier_code: 0,
     dies_under: &[MutantId::M2, MutantId::M3],
     exemption: Exemption::None,
+    git_port: GitPortUse::Unused,
 };
 
 const CASE_IO_URING_DENIED: EscapeCase = EscapeCase {
@@ -35,6 +38,7 @@ const CASE_IO_URING_DENIED: EscapeCase = EscapeCase {
     expect_carrier_code: 0,
     dies_under: &[MutantId::M1],
     exemption: Exemption::None,
+    git_port: GitPortUse::Unused,
 };
 
 const CASE_HIGH_BIT_PRCTL_DENIED: EscapeCase = EscapeCase {
@@ -50,6 +54,7 @@ const CASE_HIGH_BIT_PRCTL_DENIED: EscapeCase = EscapeCase {
     expect_carrier_code: 0,
     dies_under: &[MutantId::M1, MutantId::M7],
     exemption: Exemption::None,
+    git_port: GitPortUse::Unused,
 };
 
 const CASE_STRICT_LISTENER_DENIED: EscapeCase = EscapeCase {
@@ -67,6 +72,9 @@ const CASE_STRICT_LISTENER_DENIED: EscapeCase = EscapeCase {
     exemption: Exemption::NotProductionReachable {
         blocker: "policy_for_repo hard-codes Tier::Network",
     },
+    // The probe connects to 9418, so the harness holds the listener; see
+    // `test_ports` for why every holder of that one port must be serialized.
+    git_port: GitPortUse::ExclusiveWithListener,
 };
 
 const CASE_STRICT_UDP_HOST_DENIED: EscapeCase = EscapeCase {
@@ -84,6 +92,7 @@ const CASE_STRICT_UDP_HOST_DENIED: EscapeCase = EscapeCase {
     exemption: Exemption::NotProductionReachable {
         blocker: "policy_for_repo hard-codes Tier::Network",
     },
+    git_port: GitPortUse::Unused,
 };
 
 const CASE_STRICT_TCP_BIND_DENIED: EscapeCase = EscapeCase {
@@ -101,6 +110,10 @@ const CASE_STRICT_TCP_BIND_DENIED: EscapeCase = EscapeCase {
     exemption: Exemption::NotProductionReachable {
         blocker: "policy_for_repo hard-codes Tier::Network",
     },
+    // Exclusive but listener-free: this probe's baseline leg *binds* 9418 to
+    // establish the capability, so any listener there would turn the baseline
+    // into EADDRINUSE and the whole case into a silent CapabilityAbsent.
+    git_port: GitPortUse::Exclusive,
 };
 
 #[test]

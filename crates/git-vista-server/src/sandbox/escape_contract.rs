@@ -449,7 +449,99 @@ fn report(case: &EscapeCase, outcome: &Outcome) {
     f.write_all(line.as_bytes()).expect("write report line");
 }
 
+/// One case's exclusive hold on TCP 9418, scoped to one `execute` call.
+///
+/// Bounded lifetime is the whole point. The pre-contract battery bound its
+/// listener through a `static OnceLock` and parked a thread in a blocking
+/// `accept()`; under a *passing* denial case no connection ever arrives, so the
+/// thread never returned, the listener was never dropped, and the port stayed
+/// held for the rest of the process — which is what made this test and
+/// `planner::contract_suite`'s `git daemon` push test mutually exclusive.
+struct GitProtocolPort {
+    /// `Some` when a listener is bound — the value handed to `HarnessCtx`.
+    port: Option<u16>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    accepting: Option<std::thread::JoinHandle<()>>,
+    /// Declared last so it is released only after `drop` has joined the accept
+    /// thread: the next claimant must never see the listener still bound.
+    _claim: crate::test_ports::PortClaim,
+}
+
+impl GitProtocolPort {
+    /// How long the accept thread will wait for the baseline leg's connect
+    /// before giving up on its own. Generous — `execute` compiles two C probes
+    /// and runs a `git commit` before the probe ever connects — but finite, so
+    /// a forgotten thread cannot outlive the run even if the lease itself is
+    /// leaked.
+    const ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+    fn claim(use_: GitPortUse) -> Option<Self> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        if use_ == GitPortUse::Unused {
+            return None;
+        }
+        let claim = crate::test_ports::PortClaim::acquire();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, accepting) = if use_ == GitPortUse::ExclusiveWithListener {
+            let listener =
+                std::net::TcpListener::bind(("127.0.0.1", crate::test_ports::PortClaim::PORT))
+                    .expect("bind git protocol listener");
+            let port = listener.local_addr().expect("listener address").port();
+            listener
+                .set_nonblocking(true)
+                .expect("non-blocking listener");
+            let stop_thread = std::sync::Arc::clone(&stop);
+            let accepting = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Self::ACCEPT_DEADLINE;
+                while !stop_thread.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        // Serve exactly one connection, then drop the listener
+                        // — the baseline leg's connect has landed and the port
+                        // must be closed again, so the sandboxed inside leg
+                        // observes a denial (EACCES) rather than a success, and
+                        // a mutant that removes the denial observes
+                        // ECONNREFUSED rather than errno 0.
+                        Ok(_) => return,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Self::POLL);
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+            (Some(port), Some(accepting))
+        } else {
+            (None, None)
+        };
+        Some(Self {
+            port,
+            stop,
+            accepting,
+            _claim: claim,
+        })
+    }
+}
+
+impl Drop for GitProtocolPort {
+    fn drop(&mut self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.accepting.take() {
+            // Joining is what makes the release honest: the thread owns the
+            // listener, so only its exit closes the port. `_claim` is dropped
+            // after this body returns.
+            let _ = t.join();
+        }
+    }
+}
+
 fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
+    // Held for the whole call — both `build_hook` invocations below bake the
+    // port into their hook bodies, and both legs then run against it.
+    let git_port = GitProtocolPort::claim(case.git_port);
+    let listener_port = git_port.as_ref().and_then(|p| p.port);
+
     let base_repo = fixture();
     let inside_repo = fixture();
 
@@ -458,6 +550,7 @@ fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
         &(case.build_hook)(&HarnessCtx {
             repo: base_repo.path(),
             nonce,
+            listener_port,
         }),
     );
     install_hook(
@@ -465,6 +558,7 @@ fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
         &(case.build_hook)(&HarnessCtx {
             repo: inside_repo.path(),
             nonce,
+            listener_port,
         }),
     );
 
