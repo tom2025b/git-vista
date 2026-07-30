@@ -11,7 +11,7 @@ use axum::Json;
 
 use git_vista_protocol::{GitOperation, RebaseStatus, RefName};
 
-use crate::git_cmd::{git_ref_exists, is_ancestor, rev_parse};
+use crate::git_cmd::{git_ref_exists, is_ancestor, rev_parse, ExecUnavailable};
 use crate::planner;
 use crate::state::{current, reject_if_read_only};
 
@@ -39,7 +39,20 @@ pub(crate) async fn rebase() -> (StatusCode, String) {
         Ok((repo, _entry)) => repo,
         Err(rejected) => return rejected,
     };
-    let base = rebase_base(&repo).await;
+    // D5 (#66, Task 19): the base is *chosen* by a git read, so an unreadable
+    // one must not silently fall through to `main`. Rebasing onto the local
+    // `main` when the intent was `origin/main` is a different operation on a
+    // different commit — and the old `bool` return made that the outcome of
+    // every host where git could not be launched.
+    let base = match rebase_base(&repo).await {
+        Ok(base) => base,
+        Err(e) => {
+            return planner::couldnt_run(
+                "/api/rebase",
+                &format!("couldn't determine the rebase base: {e}"),
+            )
+        }
+    };
     let base = RefName::new(base).expect("'origin/main' and 'main' are valid ref names");
     planner::plan_and_execute(GitOperation::RebaseOntoBase { base }).await
 }
@@ -49,24 +62,58 @@ pub(crate) async fn rebase() -> (StatusCode, String) {
 /// onto the freshest pushed main — and the local `main` otherwise. Shared by
 /// the rebase handler and `/api/rebase-status`, so the menu's gate always
 /// describes exactly what the rebase would do.
-async fn rebase_base(repo: &Path) -> &'static str {
-    if git_ref_exists(repo, "refs/remotes/origin/main").await {
+///
+/// `Err` when git could not be run: "the remote-tracking ref is not there" and
+/// "we could not look" pick different bases, so they may not share a return
+/// value (D5).
+async fn rebase_base(repo: &Path) -> Result<&'static str, ExecUnavailable> {
+    Ok(if git_ref_exists(repo, "refs/remotes/origin/main").await? {
         "origin/main"
     } else {
         "main"
-    }
+    })
 }
 
 /// Whether "Rebase onto main" would do anything right now (see [`RebaseStatus`]),
 /// resolved fresh per request like `/api/head-branch` — the graph on screen may
 /// predate a rebase or a branch switch. Sent `no-store` like the other live reads.
-pub(crate) async fn rebase_status() -> impl IntoResponse {
+/// # D5: an unreadable repository answers 500, not `base_exists: false`
+///
+/// [`RebaseStatus`] is a protocol type with two `bool`s and no way to say "we
+/// could not tell", so the honest answer when git cannot be run is not a body
+/// at all. It used to be `{base: "main", base_exists: false, up_to_date:
+/// false}` — three separate false statements about the repository, which the
+/// menu renders as "Rebase onto main — base does not exist". The frontend
+/// already treats a failed fetch as "unknown" (`fetch_rebase_status().ok()`),
+/// so the degraded item is what it shows for a 500 too, minus the fiction.
+pub(crate) async fn rebase_status() -> axum::response::Response {
     let repo = current().0;
     let branch = git_vista_git::read_head_branch(&repo);
-    let base = rebase_base(&repo).await;
-    let base_exists = rev_parse(&repo, base).await.is_some();
-    let up_to_date = base_exists && is_ancestor(&repo, base, "HEAD").await;
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+
+    // One fallible block: any of the three reads failing means the answer is
+    // unknown, and `?` keeps that from being written any other way.
+    let observed = async {
+        let base = rebase_base(&repo).await?;
+        let base_exists = rev_parse(&repo, base).await?.is_some();
+        let up_to_date = base_exists && is_ancestor(&repo, base, "HEAD").await?;
+        Ok::<_, ExecUnavailable>((base, base_exists, up_to_date))
+    }
+    .await;
+
+    let (base, base_exists, up_to_date) = match observed {
+        Ok(observed) => observed,
+        Err(e) => {
+            return (
+                no_store,
+                planner::couldnt_run(
+                    "/api/rebase-status",
+                    &format!("couldn't read the rebase state: {e}"),
+                ),
+            )
+                .into_response()
+        }
+    };
     (
         no_store,
         Json(RebaseStatus {
@@ -76,4 +123,5 @@ pub(crate) async fn rebase_status() -> impl IntoResponse {
             up_to_date,
         }),
     )
+        .into_response()
 }
