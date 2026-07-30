@@ -153,7 +153,6 @@ mod harness {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static PROBE_ID: AtomicUsize = AtomicUsize::new(0);
-    static STRICT_LISTENER_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
 
     fn c_string(path: &Path) -> String {
         path.to_string_lossy()
@@ -312,16 +311,17 @@ int main(void) {{
         )
     }
 
+    /// The listener this probe connects to is owned by the harness (see
+    /// `escape_contract::GitProtocolPort`), not by this function: it is bound
+    /// under a `test_ports::PortClaim` and torn down when the case ends. The
+    /// pre-contract version bound it here through a process-lifetime `OnceLock`
+    /// and parked a thread in a blocking `accept()`, which held port 9418 for
+    /// the rest of the binary's life and collided with the two other tests that
+    /// need it.
     pub(super) fn strict_listener_probe(ctx: &HarnessCtx) -> String {
-        let port = *STRICT_LISTENER_PORT.get_or_init(|| {
-            let listener =
-                std::net::TcpListener::bind("127.0.0.1:9418").expect("bind git protocol listener");
-            let port = listener.local_addr().expect("listener address").port();
-            std::thread::spawn(move || {
-                let _ = listener.accept();
-            });
-            port
-        });
+        let port = ctx
+            .listener_port
+            .expect("the harness must bind a listener for an ExclusiveWithListener case");
         let granted = c_string(&granted_path(ctx));
         hook_for(
             ctx,
@@ -461,6 +461,10 @@ int main(void) {{
         )
     }
 
+    /// The bound port is `PortClaim::PORT`, not a bare literal: this probe's
+    /// baseline leg genuinely binds it on the host, so the case holds an
+    /// exclusive (listener-free) claim on exactly that port and the two must not
+    /// be able to drift apart.
     pub(super) fn strict_tcp_bind_probe(ctx: &HarnessCtx) -> String {
         hook_for(
             ctx,
@@ -489,7 +493,7 @@ static int bind_errno(int type, unsigned short port) {{
 }}
 
 int main(void) {{
-    int denied = bind_errno(SOCK_STREAM, 9418);
+    int denied = bind_errno(SOCK_STREAM, {port});
     int granted = bind_errno(SOCK_DGRAM, 0);
     printf("GVPROBE {nonce} BEGIN\n");
     printf("TCP_BIND rc=%d errno=%d\n", denied ? -1 : 0, denied);
@@ -499,6 +503,7 @@ int main(void) {{
 }}
 "#,
                 nonce = ctx.nonce,
+                port = crate::test_ports::PortClaim::PORT,
             ),
         )
     }
