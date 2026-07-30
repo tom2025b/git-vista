@@ -69,7 +69,7 @@ impl SessionCore {
     /// Leptos) and carries no test of its own, matching this crate's
     /// existing view-file convention.
     pub fn hook_policy_banner_visible(&self) -> bool {
-        matches!(self.hook_policy, HookPolicy::Allow)
+        self.hook_policy.requires_banner()
     }
 
     pub fn ui_mode(&self) -> Option<RepoMode> {
@@ -141,10 +141,16 @@ mod tests {
         s.apply(SessionEvent::Established {
             csrf: Some("abc".into()),
             via_lan,
+            // The two values `handlers::session::hook_policy_for(via_lan)`
+            // actually emits today, spelled in the tier vocabulary rather
+            // than through the `Restricted`/`Allow` transition aliases. That
+            // mapping is itself known-stale (#202 left it deliberately
+            // over-warning until Task 16.5 lands); this helper mirrors what
+            // the server sends, it does not endorse it.
             hook_policy: if via_lan {
-                HookPolicy::Restricted
+                HookPolicy::Strict
             } else {
-                HookPolicy::Allow
+                HookPolicy::Unsandboxed
             },
         })
         .expect("establish is always accepted");
@@ -158,24 +164,55 @@ mod tests {
         assert!(!s.is_lan());
         assert_eq!(s.ui_mode(), None);
         // Fail-closed default, before any Established event — see this
-        // struct's own doc comment.
-        assert_eq!(s.hook_policy(), HookPolicy::Restricted);
+        // struct's own doc comment. `Blocked`, not `Strict`: an absent field
+        // must not become an unearned green light.
+        assert_eq!(s.hook_policy(), HookPolicy::Blocked);
     }
 
     #[test]
     fn establishing_a_session_records_the_hook_policy() {
-        assert_eq!(established(false).hook_policy(), HookPolicy::Allow);
-        assert_eq!(established(true).hook_policy(), HookPolicy::Restricted);
+        assert_eq!(established(false).hook_policy(), HookPolicy::Unsandboxed);
+        assert_eq!(established(true).hook_policy(), HookPolicy::Strict);
     }
 
+    /// INV-15's polarity, and the reason this is not the old
+    /// `the_banner_shows_only_for_allow`.
+    ///
+    /// When `HookPolicy` had two variants, `matches!(_, Allow)` and "not
+    /// `Strict`" were the same predicate. Widening it to the four tier names
+    /// split them apart, and the old expression kept the *narrow* half: it
+    /// went silent for `Network` (sandboxed, but hooks reach the network) and
+    /// for `Blocked` (hooks silently did not run) — under-warning on exactly
+    /// the two values that did not exist when it was written. Enumerated
+    /// explicitly here rather than by calling `requires_banner()`, so an
+    /// inverted implementation of that method would still fail this.
     #[test]
-    fn the_banner_shows_only_for_allow() {
-        assert!(established(false).hook_policy_banner_visible());
+    fn the_banner_shows_for_everything_except_strict() {
+        for policy in [
+            HookPolicy::Network,
+            HookPolicy::Unsandboxed,
+            HookPolicy::Blocked,
+        ] {
+            let mut s = SessionCore::default();
+            s.apply(SessionEvent::Established {
+                csrf: Some("abc".into()),
+                via_lan: false,
+                hook_policy: policy,
+            })
+            .expect("establish is always accepted");
+            assert!(
+                s.hook_policy_banner_visible(),
+                "{policy:?} is not the fullest isolation, so the user must be told"
+            );
+        }
         assert!(!established(true).hook_policy_banner_visible());
-        // The fail-closed default (Restricted) also shows no banner — a
-        // fresh, not-yet-established session should not flash a warning
-        // it hasn't actually confirmed.
-        assert!(!SessionCore::default().hook_policy_banner_visible());
+        assert!(established(false).hook_policy_banner_visible());
+        // The fail-closed default (`Blocked`) *does* fly the banner. This
+        // reverses the old comment here on purpose: a fresh, not-yet-
+        // established session has confirmed no guarantee, and the safe
+        // direction for a banner is to over-warn and then go quiet once the
+        // server discloses `strict` — not to stay silent on no evidence.
+        assert!(SessionCore::default().hook_policy_banner_visible());
     }
 
     /// A change in `hook_policy` alone (everything else identical) must still
@@ -188,11 +225,11 @@ mod tests {
             .apply(SessionEvent::Established {
                 csrf: Some("abc".into()),
                 via_lan: false,
-                hook_policy: HookPolicy::Restricted,
+                hook_policy: HookPolicy::Strict,
             })
             .unwrap();
         assert_eq!(applied, Applied::Committed);
-        assert_eq!(s.hook_policy(), HookPolicy::Restricted);
+        assert_eq!(s.hook_policy(), HookPolicy::Strict);
     }
 
     #[test]
@@ -270,7 +307,7 @@ mod tests {
             .apply(SessionEvent::Established {
                 csrf: Some("abc".into()),
                 via_lan: false,
-                hook_policy: HookPolicy::Allow,
+                hook_policy: HookPolicy::Unsandboxed,
             })
             .unwrap();
         assert_eq!(applied, Applied::NoChange);
