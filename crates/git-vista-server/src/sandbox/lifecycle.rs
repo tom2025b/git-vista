@@ -402,6 +402,9 @@ async fn strict_reaps_a_double_forked_setsid_orphan_that_the_network_tier_does_n
     let policy = strict_baseline(repo.path(), case).await;
     let subject = observe_orphan(repo.path(), &policy, "subject(Strict)").await;
 
+    eprintln!("MEASURED orphan: control ticks {}->{} marker={} | subject ticks {}->{} marker={} teardown={:?}",
+        control.ticks_at_kill, control.ticks_after, control.delayed_marker,
+        subject.ticks_at_kill, subject.ticks_after, subject.delayed_marker, subject.teardown);
     assert!(
         subject.teardown < Duration::from_secs(5),
         "subject(Strict): waitid did not confirm teardown promptly ({:?})",
@@ -515,6 +518,7 @@ async fn strict_mounts_a_fresh_procfs_that_cannot_see_the_host_process_table() {
     );
 
     let highest = numeric_marker(repo.path(), MAX, leg);
+    eprintln!("MEASURED procfs: host_pid={host_pid} inside_init={} inside_host={} highest_inside={highest} hook_pid_inside={}", marker(repo.path(), INIT, leg), marker(repo.path(), HOST, leg), numeric_marker(repo.path(), SELF, leg));
     assert!(
         (1..100).contains(&highest),
         "C3: the highest pid visible inside was {highest}. A fresh procfs over a \
@@ -656,6 +660,9 @@ async fn strict_gets_a_private_dev_shm_tmpfs_that_the_network_tier_does_not() {
         "C4: the host's /dev/shm marker was visible from inside the strict sandbox — \
          /dev/shm is not a private tmpfs there"
     );
+    eprintln!("MEASURED devshm: control write={} host={} leaked_to_host={} | subject write={} host={} leaked_to_host={}",
+        marker(control_repo.path(), "lifecycle-shm-write", "c"), marker(control_repo.path(), "lifecycle-shm-host", "c"), shm.inside_control.is_file(),
+        marker(repo.path(), "lifecycle-shm-write", "s"), marker(repo.path(), "lifecycle-shm-host", "s"), shm.inside_subject.exists());
     assert!(
         !shm.inside_subject.exists(),
         "C4: the sandbox's own /dev/shm write reached the host at {} — a private \
