@@ -96,6 +96,62 @@ pub fn for_repository(descriptor: &RepositoryDescriptor) -> HookPolicyDisclosure
     }
 }
 
+/// The sentence the **session** banner shows, for `SessionInfo::hook_policy`.
+///
+/// # Why this exists — the banner's text used to be a constant
+///
+/// [`crate::hook_policy_banner`] decided *whether* to show a bar by asking
+/// [`HookPolicy::requires_banner`] — correctly, a function of the policy — and
+/// then rendered **one fixed string** for every warning state: *"Repository
+/// hooks run automatically for this session. A malicious repository's hooks
+/// execute with your permissions."*
+///
+/// For [`HookPolicy::Blocked`] that is the **exact opposite of the truth**:
+/// hooks do not run at all. For [`HookPolicy::Network`] it omits the sandbox
+/// entirely, describing a sandboxed-but-networked session as though nothing
+/// contained it. The visibility predicate was a function of the policy while
+/// the words were a constant, so the two drifted apart the moment `HookPolicy`
+/// grew past two variants (#202 deleted `Allow`/`Restricted`, which is what
+/// surfaced it).
+///
+/// Both errors **over**-warn, so no user was ever given a false green light —
+/// the fail-safe direction held. That makes this a credibility bug rather than
+/// a safety one: a banner that cries wolf on a session where hooks are blocked
+/// teaches the reader to dismiss the same bar on a session where they are not.
+/// INV-15 is a disclosure invariant, and a disclosure nobody believes has
+/// already failed.
+///
+/// Session-scoped, not repository-scoped: this describes the policy the
+/// *current selection* would run under, and it can legitimately disagree with
+/// [`for_repository`] — see this module's header. It is also a snapshot:
+/// `POST /api/select` can move the selection without the client refetching
+/// `/api/session`, so the non-stale answer is always the per-repository one.
+/// That staleness is why the text below never claims more than the policy
+/// value itself supports.
+///
+/// Exhaustive, no `_` arm, for the same reason as [`for_repository`]: a new
+/// variant must fail the build until someone writes honest words for it.
+pub fn for_session(policy: HookPolicy) -> &'static str {
+    match policy {
+        HookPolicy::Strict => {
+            "Repository hooks run sandboxed for this session: no network, and no \
+             writes outside the trees the server declared."
+        }
+        HookPolicy::Network => {
+            "Repository hooks run sandboxed for this session, but with the network \
+             reachable — a malicious repository's hooks can talk to the outside world."
+        }
+        HookPolicy::Unsandboxed => {
+            "Repository hooks run with no sandbox for this session. A malicious \
+             repository's hooks execute with your permissions."
+        }
+        HookPolicy::Blocked => {
+            "Repository hooks do not run for this session, so a repository that \
+             relies on its hooks will behave differently here."
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +266,88 @@ mod tests {
     fn the_unsandboxed_badge_says_so_on_its_own() {
         let d = for_repository(&descriptor(Some(HookPolicy::Unsandboxed)));
         assert!(d.label.contains("NOT sandboxed"), "{}", d.label);
+    }
+
+    /// The bug this function exists to fix, pinned so it cannot come back.
+    ///
+    /// The old banner told every warning state that hooks "run automatically".
+    /// For `Blocked` that is the exact opposite of the truth. Asserted on the
+    /// literal words a user reads, not on a property of the policy, because
+    /// the original defect was precisely that the text stopped tracking the
+    /// value.
+    #[test]
+    fn the_session_sentence_never_claims_hooks_run_when_they_are_blocked() {
+        let s = for_session(HookPolicy::Blocked);
+        assert!(
+            s.contains("do not run"),
+            "Blocked must say hooks do not run, got: {s}"
+        );
+        assert!(
+            !s.contains("execute with your permissions"),
+            "Blocked must not inherit the unsandboxed warning, got: {s}"
+        );
+    }
+
+    /// A sandboxed-but-networked session must not read as though nothing
+    /// contained it — the other half of the constant-text defect.
+    #[test]
+    fn the_session_sentence_mentions_the_sandbox_when_one_is_applied() {
+        for policy in [HookPolicy::Strict, HookPolicy::Network] {
+            let s = for_session(policy);
+            assert!(
+                s.contains("sandboxed"),
+                "{policy:?} runs sandboxed and must say so, got: {s}"
+            );
+        }
+        assert!(
+            for_session(HookPolicy::Network).contains("network"),
+            "Network must disclose the network specifically"
+        );
+        assert!(
+            !for_session(HookPolicy::Strict).contains("network reachable"),
+            "Strict must not inherit Network's warning"
+        );
+    }
+
+    /// Every state reads differently. Catches a copy-pasted arm making two
+    /// risk levels indistinguishable — which is the constant-text bug in its
+    /// smaller, partial form.
+    #[test]
+    fn every_session_state_reads_differently() {
+        let all = [
+            for_session(HookPolicy::Strict),
+            for_session(HookPolicy::Network),
+            for_session(HookPolicy::Unsandboxed),
+            for_session(HookPolicy::Blocked),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "two session states share wording: {a}");
+                }
+            }
+        }
+    }
+
+    /// Only `Unsandboxed` may carry the strongest claim. Written as literals
+    /// per state rather than by calling `requires_banner()`, because asserting
+    /// a mapping against the function that defines it passes whichever way the
+    /// polarity runs.
+    #[test]
+    fn only_the_unsandboxed_session_says_hooks_run_with_your_permissions() {
+        let expected = [
+            (HookPolicy::Strict, false),
+            (HookPolicy::Network, false),
+            (HookPolicy::Unsandboxed, true),
+            (HookPolicy::Blocked, false),
+        ];
+        for (policy, should_claim) in expected {
+            let s = for_session(policy);
+            assert_eq!(
+                s.contains("execute with your permissions"),
+                should_claim,
+                "{policy:?} got the wrong risk claim: {s}"
+            );
+        }
     }
 }
