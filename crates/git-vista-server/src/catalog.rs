@@ -199,7 +199,10 @@ impl Catalog {
     /// index would be one more piece of state that could drift from the
     /// primary map for no measurable benefit at this scale.
     pub(crate) fn read_only_for_path(&self, path: &Path) -> Option<bool> {
-        self.entries.values().find(|e| e.path == path).map(|e| e.read_only)
+        self.entries
+            .values()
+            .find(|e| e.path == path)
+            .map(|e| e.read_only)
     }
 
     /// Drop the entry for `worktree`, returning it (`None` when not held). The

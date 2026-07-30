@@ -135,10 +135,13 @@ pub(crate) fn resolve(repo: &Path) -> Result<RepoPaths, RepoPathsError> {
     let dotgit = repo.join(".git");
     match std::fs::symlink_metadata(&dotgit) {
         Ok(meta) if meta.is_dir() => {
-            let canonical = dotgit.canonicalize().map_err(|e| RepoPathsError::UnreadableGitFile {
-                repo: repo.to_path_buf(),
-                why: e.to_string(),
-            })?;
+            let canonical =
+                dotgit
+                    .canonicalize()
+                    .map_err(|e| RepoPathsError::UnreadableGitFile {
+                        repo: repo.to_path_buf(),
+                        why: e.to_string(),
+                    })?;
             Ok(RepoPaths {
                 gitdir: canonical.clone(),
                 commondir: canonical,
@@ -153,11 +156,9 @@ pub(crate) fn resolve(repo: &Path) -> Result<RepoPaths, RepoPathsError> {
             repo: repo.to_path_buf(),
             why: "`.git` changed shape between two resolution passes".to_string(),
         }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(RepoPathsError::MissingGitFile {
-                repo: repo.to_path_buf(),
-            })
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(RepoPathsError::MissingGitFile {
+            repo: repo.to_path_buf(),
+        }),
         Err(e) => Err(RepoPathsError::UnreadableGitFile {
             repo: repo.to_path_buf(),
             why: e.to_string(),

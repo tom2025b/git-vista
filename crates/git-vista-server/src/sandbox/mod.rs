@@ -57,15 +57,15 @@ mod dispatch;
 mod escape_contract;
 #[cfg(test)]
 mod escape_suite;
-/// D2 (#66, Task 7): the hostile-geometry battery for `repo_paths`. Distinct
-/// from `escape_suite` — see this module's own doc comment for the boundary.
-#[cfg(test)]
-mod hostile;
 /// #66 Task 25, step 5: the `class = functional` blocked-hooks case moves
 /// here out of `escape_suite.rs`. Landed as an empty stub in step 3 so the
 /// module list is fixed before any case is rewritten; step 5 populates it.
 #[cfg(test)]
 mod hook_mode_suite;
+/// D2 (#66, Task 7): the hostile-geometry battery for `repo_paths`. Distinct
+/// from `escape_suite` — see this module's own doc comment for the boundary.
+#[cfg(test)]
+mod hostile;
 #[cfg(test)]
 mod shim_cli;
 
@@ -673,6 +673,31 @@ pub(crate) fn policy_for(
         net_ports: DEFAULT_GIT_PORTS.to_vec(),
         hook_mode: HookMode::Run,
     })
+}
+
+/// Compatibility wrapper reproducing `policy_for_repo`'s exact pre-D2 shape:
+/// `read_only = false` (D2's whole behavioural change was making that
+/// conditional; the pre-D2 caller always got the unconditional RW grant) and
+/// `need = NetworkNeed::Local` (irrelevant either way while tier is
+/// hard-coded — see `policy_for`'s doc comment).
+///
+/// # Why this still exists after D2 renamed the production function
+///
+/// `sandbox::shim_cli::production_policy` — the "drive it exactly like
+/// production does" helper the escape battery and several other test modules
+/// share — and `sandbox::escape_contract::policy_for_case` both call
+/// `policy_for_repo(repo)` by that exact name and arity.
+/// `sandbox::escape_contract` is one of this workflow's explicitly
+/// off-limits files (a concurrent workflow may still be editing it), so its
+/// call site cannot be updated to the new three-argument `policy_for` here —
+/// this wrapper is what keeps it (and every test that goes through
+/// `shim_cli::production_policy`) compiling and behaving identically, with
+/// zero edits to that file. New code should call `policy_for` directly; this
+/// name is kept for exactly these two callers, not as a second production
+/// entry point.
+#[cfg(test)]
+pub(crate) fn policy_for_repo(repo: &Path) -> Result<Policy, shim::ShimError> {
+    policy_for(repo, false, NetworkNeed::Local)
 }
 
 /// Build the production policy for `git clone` (D4): RW on the clones root

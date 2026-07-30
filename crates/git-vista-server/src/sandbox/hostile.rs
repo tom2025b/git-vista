@@ -175,7 +175,10 @@ fn a_missing_dot_git_is_refused_by_name() {
     let repo = base.path().join("not-a-repo");
     std::fs::create_dir_all(&repo).unwrap();
     let err = resolve(&repo).unwrap_err();
-    assert!(matches!(err, RepoPathsError::MissingGitFile { .. }), "got: {err}");
+    assert!(
+        matches!(err, RepoPathsError::MissingGitFile { .. }),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -185,7 +188,10 @@ fn a_gitfile_with_no_gitdir_prefix_is_refused() {
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join(".git"), "not a gitdir pointer at all\n").unwrap();
     let err = resolve(&repo).unwrap_err();
-    assert!(matches!(err, RepoPathsError::WorktreeGeometry { .. }), "got: {err}");
+    assert!(
+        matches!(err, RepoPathsError::WorktreeGeometry { .. }),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -195,7 +201,10 @@ fn a_dangling_gitdir_pointer_is_refused_not_silently_ungranted() {
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join(".git"), "gitdir: /nonexistent/worktrees/x\n").unwrap();
     let err = resolve(&repo).unwrap_err();
-    assert!(matches!(err, RepoPathsError::WorktreeGeometry { .. }), "got: {err}");
+    assert!(
+        matches!(err, RepoPathsError::WorktreeGeometry { .. }),
+        "got: {err}"
+    );
 }
 
 /// A `.git` pointer chain with no `commondir` (a submodule or
@@ -215,7 +224,10 @@ fn a_pointer_without_a_commondir_is_refused() {
     )
     .unwrap();
     let err = resolve(&repo).unwrap_err();
-    assert!(matches!(err, RepoPathsError::WorktreeGeometry { .. }), "got: {err}");
+    assert!(
+        matches!(err, RepoPathsError::WorktreeGeometry { .. }),
+        "got: {err}"
+    );
 }
 
 /// A gitdir whose `commondir` file names a real, existing but unrelated
@@ -235,6 +247,12 @@ fn a_gitdir_not_registered_under_its_claimed_commondir_is_refused() {
     std::fs::write(linked.join(".git"), format!("gitdir: {}\n", evil.display())).unwrap();
 
     let err = resolve(&linked).unwrap_err();
-    assert!(matches!(err, RepoPathsError::WorktreeGeometry { .. }), "got: {err}");
-    assert!(err.to_string().contains("not strictly inside"), "got: {err}");
+    assert!(
+        matches!(err, RepoPathsError::WorktreeGeometry { .. }),
+        "got: {err}"
+    );
+    assert!(
+        err.to_string().contains("not strictly inside"),
+        "got: {err}"
+    );
 }
