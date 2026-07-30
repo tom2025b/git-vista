@@ -1,8 +1,10 @@
 # 0030 — The git-process sandbox: a pure argv boundary, tiers by declared intent, and tests that prove their own premise
 
-- **Status:** Accepted — core mechanism and INV-15 disclosure both landed and
-  tested at the wire; the frontend UI that renders the per-repository policy is
-  being built in parallel with this record, not yet done (see Consequences).
+- **Status:** Accepted — core mechanism and INV-15 disclosure landed and tested
+  at the wire, and the per-repository policy now renders in the frontend picker
+  (#208, landed in parallel with this record). The *session*-level banner is
+  still the pre-#202 view and its text is wrong for two of the four policy
+  values; see Consequences.
 - **Date:** 2026-07-30
 - **Milestone / issue:** M1.13b — the git-process sandbox (#66). Written for issue
   #205 (Task 18, "the whole-sandbox ADR and security-model closure"), the record
@@ -486,13 +488,32 @@ stateDiagram-v2
   `hook_policy_is_disclosed_over_the_wire_and_does_not_differ_by_router` proves
   the loopback and LAN-view listeners agree. The stale `via_lan →
   Restricted/Allow` session-level mapping ADR 0025 introduced is gone:
-  `session_hook_policy_for` takes no `via_lan` parameter at all. What is *not*
-  landed: the frontend does not consume any of this yet.
-  `crates/git-vista/src/hook_policy_banner.rs` still carries its original
-  M1.13a text and `Allow`/`Restricted` framing, session-scoped only, and no
-  view in the tree reads the new per-repository `RepositoryDescriptor.hook_policy`
-  field. That UI work is in progress in parallel with this ADR being written
-  and is not claimed done here.
+  `session_hook_policy_for` takes no `via_lan` parameter at all.
+
+  The frontend now consumes the per-repository half: `#208` added
+  `crates/git-vista/src/hook_policy_disclosure.rs` (the pure
+  descriptor-to-wording map, host-tested) and `picker.rs` renders it twice —
+  a badge on every catalog row and the full sentence on the mode screen, both
+  as visible text rather than a `title=`/tooltip. `None` renders as
+  "not disclosed" with the warning styling, so an absent field cannot read as
+  a green light. **What that is and is not proof of:** the mapping is proved
+  by host tests, and the call sites are proved to *exist* by the wasm clippy
+  build; that the markup reaches a real user's eyes is not proved by anything,
+  because this crate has no `wasm-bindgen-test` harness and nobody has driven
+  the UI in a browser.
+
+  What is *still* not landed: the **session**-level banner.
+  `crates/git-vista/src/hook_policy_banner.rs` carries its original M1.13a
+  text and `Allow`/`Restricted` framing. That is not merely stale wording —
+  `SessionCore::hook_policy_banner_visible` delegates to
+  `HookPolicy::requires_banner`, which is deliberately true for `Blocked` and
+  `Network`, while the banner's fixed text says "Repository hooks run
+  automatically for this session… execute with your permissions." For
+  `Blocked` that is the opposite of the truth, and for `Network` it omits the
+  sandbox. Both errors are in the over-warning direction, so this is a
+  credibility bug rather than a false-reassurance one, but the banner text
+  must become a function of the policy — as the per-repository disclosure
+  already is — before INV-15's session half can be called satisfied.
 - **The anti-vacuity contract's own tripwires have rotted once, after
   landing.** R8's exemption-expiry check grepped `policy_for_repo`'s body for
   literal `Tier::Network`/`HookMode::Run`; when Task 8 removed that
@@ -542,10 +563,13 @@ stateDiagram-v2
   `crates/git-vista-server/src/handlers/session.rs` — INV-15 disclosure
   wiring (`disclosed_hook_policy`, `session_hook_policy_for`), landed and
   committed.
+- `crates/git-vista/src/hook_policy_disclosure.rs`,
+  `crates/git-vista/src/picker.rs` — the per-repository disclosure the client
+  actually shows (#208): the pure wording map plus the row badge and the
+  mode-screen sentence. Landed.
 - `crates/git-vista/src/hook_policy_banner.rs` — the session-level banner
-  from ADR 0025; **not yet updated** for the four-tier vocabulary or the new
-  per-repository disclosure — frontend work tracked in parallel, not this
-  ADR's — see Consequences.
+  from ADR 0025; **not yet updated** for the four-tier vocabulary, and its
+  text is factually wrong for `Blocked` and `Network` — see Consequences.
 - `crates/git-vista-server/src/sandbox/escape_contract.rs`,
   `.../escape_suite.rs`, `.../hook_mode_suite.rs`,
   `.../documented_gaps.rs` — the escape battery and its anti-vacuity harness.
