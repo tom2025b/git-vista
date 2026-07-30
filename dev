@@ -194,6 +194,70 @@ cmd_report() {
 cmd_signin() { ./gv --token; }
 cmd_doctor() { ./gv doctor; }
 cmd_serve()  { ./gv "$@"; }
+
+# dev testbed <ref> [port] — stand up an isolated, human-drivable copy of the app
+# at <ref>, on its own port, in its own worktree, without disturbing whatever is
+# already running.
+#
+# Why this exists: `dev gate` proves the tests pass. It does NOT prove the app
+# works — a green suite over a broken feature is a real failure mode this project
+# has already hit (a push test passed against a literal IP while DNS inside the
+# sandbox was dead). The only cure is a human driving the actual UI. This makes
+# that cheap enough to do before every merge instead of never.
+#
+# What it buys beyond "just test it": a NAMED, REPRODUCIBLE anchor. When
+# something breaks later, "it worked at <sha>, driven by hand on <date>" is the
+# difference between a five-minute bisect and an afternoon of archaeology.
+#
+# Isolation is by construction, not by discipline: separate worktree (own source,
+# own target/), separate port, separate branch. Nothing the main tree does can
+# reach it. That is why this is a worktree and not a container — the code is our
+# own at our own commit, so the only boundaries needed are filesystem and port,
+# both of which git and a const already give us.
+cmd_testbed() {
+  local ref="${1:-main}" port="${2:-8081}"
+  local dir="$REPO-testbed-$port"
+  local branch="testbed/$(echo "$ref" | tr '/' '-')-$(date +%Y%m%d-%H%M)"
+
+  [[ -e $dir ]] && die "$dir already exists — remove it or pick another port (dev testbed <ref> <port>)"
+  git rev-parse --verify "$ref" >/dev/null 2>&1 || die "unknown ref: $ref"
+  if ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .; then
+    die "port $port is already in use — pick another (dev testbed <ref> <port>)"
+  fi
+
+  local sha; sha="$(git rev-parse --short "$ref")"
+  echo "dev: testbed for $ref ($sha) on port $port"
+  git worktree add "$dir" -b "$branch" "$ref"
+
+  # The port is a compile-time const (state.rs) because the server is
+  # deliberately loopback-only — no env override exists, by design. Rewriting it
+  # here is safe precisely because this worktree is a dead end: its branch is
+  # never merged, so the edit cannot escape into main.
+  local state="$dir/crates/git-vista-server/src/state.rs"
+  sed -i "s/pub(crate) const PORT: u16 = 8080;/pub(crate) const PORT: u16 = $port;/" "$state"
+  grep -q "const PORT: u16 = $port;" "$state" || die "could not retarget PORT in $state"
+
+  echo "dev: building (frontend first — this is the slow part)"
+  ( cd "$dir" && trunk build --release --config crates/git-vista/Trunk.toml )
+  ( cd "$dir" && cargo build -p git-vista-server )
+
+  cat <<EOF
+
+dev: testbed ready.
+  ref     $ref ($sha)
+  branch  $branch   (dead end — never merge this)
+  dir     $dir
+  port    $port
+
+Start it, then get the sign-in link:
+  cd $dir && ./target/debug/git-vista-server <repo-to-open> &
+  cd $dir && ./dev signin
+
+Open the repo in VISUALIZE mode for a true read-only session.
+Tear down when finished:
+  git worktree remove $dir            # keeps the branch, per project rule
+EOF
+}
 cmd_handoff() {
   [[ -f handoff.md ]] && { cat handoff.md; exit 0; }
   echo "dev: no handoff.md yet. Create it with: the goal, a [ ]/[x] checklist, and 'next step'."
@@ -208,6 +272,7 @@ case "${1:-}" in
   signin)  shift; cmd_signin "$@" ;;
   doctor)  shift; cmd_doctor "$@" ;;
   serve)   shift; cmd_serve "$@" ;;
+  testbed) shift; cmd_testbed "$@" ;;
   handoff) shift; cmd_handoff "$@" ;;
   report)  shift; cmd_report "$@" ;;
   ""|-h|--help|help)
