@@ -525,8 +525,7 @@ impl GitProtocolPort {
 
 impl Drop for GitProtocolPort {
     fn drop(&mut self) {
-        self.stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(t) = self.accepting.take() {
             // Joining is what makes the release honest: the thread owns the
             // listener, so only its exit closes the port. `_claim` is dropped

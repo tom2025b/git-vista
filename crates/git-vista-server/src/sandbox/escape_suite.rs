@@ -4,9 +4,7 @@
 //! `escape_contract` owns parsing, exact errno comparisons, carrier checks,
 //! report emission, production-seam spawning, and capability absence.
 
-use super::escape_contract::{
-    run_case, Class, Errno, EscapeCase, Exemption, GitPortUse, MutantId,
-};
+use super::escape_contract::{run_case, Class, Errno, EscapeCase, Exemption, GitPortUse, MutantId};
 use super::Tier;
 
 const CASE_SECRET_READ_DENIED: EscapeCase = EscapeCase {
