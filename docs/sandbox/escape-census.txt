@@ -1,3 +1,5 @@
+af_unix_socket_denied
+af_unix_socketpair_denied
 blocked_hooks
 high_bit_prctl_denied
 io_uring_denied

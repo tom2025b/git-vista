@@ -114,6 +114,56 @@ const CASE_STRICT_TCP_BIND_DENIED: EscapeCase = EscapeCase {
     git_port: GitPortUse::Exclusive,
 };
 
+/// INV-4's `socket()` entry point. Two cases rather than one because the filter
+/// carries two rules: `M8` removes both in one hunk, so a single case would go
+/// red for either — but a later edit that dropped only the `socketpair` insert
+/// would leave a green battery behind a half-removed claim. One case per
+/// syscall is what makes that impossible.
+///
+/// `expect_granted` is an `AF_INET` socket **creation**, not a connect. Creation
+/// is what the rule under test is scoped away from, and it succeeds in Strict
+/// (bwrap's netns has no route, but the socket is still constructible);
+/// `connect()` is Landlock's job and is denied here, which is
+/// `strict_listener_denied`'s claim, not this one.
+const CASE_AF_UNIX_SOCKET_DENIED: EscapeCase = EscapeCase {
+    id: "af_unix_socket_denied",
+    class: Class::Containment,
+    tier: Tier::Strict,
+    hooks_blocked: false,
+    build_hook: harness::af_unix_probe,
+    probe_tag: "UNIXSOCK",
+    expect_baseline: Errno(0),
+    expect_inside: Errno(1),
+    expect_granted: Errno(0),
+    expect_carrier_code: 0,
+    dies_under: &[MutantId::M1, MutantId::M8],
+    exemption: Exemption::NotProductionReachable {
+        blocker: "policy_for_repo hard-codes Tier::Network",
+    },
+    git_port: GitPortUse::Unused,
+};
+
+/// INV-4's `socketpair()` entry point — the sub-claim the plan left as an open
+/// follow-up. Same probe binary and same run shape as
+/// `CASE_AF_UNIX_SOCKET_DENIED`; only the observed tag differs.
+const CASE_AF_UNIX_SOCKETPAIR_DENIED: EscapeCase = EscapeCase {
+    id: "af_unix_socketpair_denied",
+    class: Class::Containment,
+    tier: Tier::Strict,
+    hooks_blocked: false,
+    build_hook: harness::af_unix_probe,
+    probe_tag: "UNIXPAIR",
+    expect_baseline: Errno(0),
+    expect_inside: Errno(1),
+    expect_granted: Errno(0),
+    expect_carrier_code: 0,
+    dies_under: &[MutantId::M1, MutantId::M8],
+    exemption: Exemption::NotProductionReachable {
+        blocker: "policy_for_repo hard-codes Tier::Network",
+    },
+    git_port: GitPortUse::Unused,
+};
+
 #[test]
 fn secret_read_denied() {
     run_case(&CASE_SECRET_READ_DENIED);
@@ -142,6 +192,16 @@ fn strict_udp_host_denied() {
 #[test]
 fn strict_tcp_bind_denied() {
     run_case(&CASE_STRICT_TCP_BIND_DENIED);
+}
+
+#[test]
+fn af_unix_socket_denied() {
+    run_case(&CASE_AF_UNIX_SOCKET_DENIED);
+}
+
+#[test]
+fn af_unix_socketpair_denied() {
+    run_case(&CASE_AF_UNIX_SOCKETPAIR_DENIED);
 }
 
 mod harness {
@@ -300,6 +360,65 @@ int main(void) {{
            rc, saved, prctl(PR_GET_SECCOMP), prctl(PR_GET_NO_NEW_PRIVS));
     int allowed = read_errno("{granted}");
     printf("GRANTED rc=%d errno=%d\n", allowed ? -1 : 0, allowed);
+    printf("GVPROBE {nonce} END\n");
+    return 0;
+}}
+"#,
+                nonce = ctx.nonce,
+            ),
+        )
+    }
+
+    /// One probe binary serving both AF_UNIX cases. Each case reads its own tag
+    /// (`UNIXSOCK`, `UNIXPAIR`) out of the same output, so the two claims are
+    /// observed under identical conditions instead of through two probes that
+    /// could drift apart. The tags deliberately share no prefix: `parse_observation`
+    /// matches a line by `strip_prefix(tag)`, so `UNIX_SOCKET`/`UNIX_SOCKETPAIR`
+    /// would be a trap — the shorter tag would match the longer line's head.
+    ///
+    /// The paired positive is an `AF_INET` socket creation in the same process,
+    /// under the same filter: without it, "AF_UNIX is denied" would be
+    /// indistinguishable from "this filter denies `socket(2)` outright", which is
+    /// exactly the blanket denial the rule is scoped to avoid and would break the
+    /// Network tier's TCP.
+    pub(super) fn af_unix_probe(ctx: &HarnessCtx) -> String {
+        hook_for(
+            ctx,
+            format!(
+                r#"
+#include <errno.h>
+#include <stdio.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+static int socket_errno(int family) {{
+    errno = 0;
+    int fd = socket(family, SOCK_STREAM, 0);
+    if (fd < 0) return errno;
+    close(fd);
+    return 0;
+}}
+
+static int socketpair_errno(void) {{
+    int fds[2] = {{ -1, -1 }};
+    errno = 0;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) return errno;
+    close(fds[0]);
+    close(fds[1]);
+    return 0;
+}}
+
+int main(void) {{
+    int unix_sock = socket_errno(AF_UNIX);
+    int unix_pair = socketpair_errno();
+    int inet_sock = socket_errno(AF_INET);
+    printf("GVPROBE {nonce} BEGIN\n");
+    printf("UNIXSOCK rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           unix_sock ? -1 : 0, unix_sock, prctl(PR_GET_SECCOMP), prctl(PR_GET_NO_NEW_PRIVS));
+    printf("UNIXPAIR rc=%d errno=%d\n", unix_pair ? -1 : 0, unix_pair);
+    printf("GRANTED rc=%d errno=%d\n", inet_sock ? -1 : 0, inet_sock);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
