@@ -452,17 +452,20 @@ themselves (see the contract's "Skip policy"):
 4. On pull requests that touch
    `crates/git-vista-server/src/sandbox/**` or
    `crates/git-vista-server/src/bin/gv-sandbox/**`, and on the nightly
-   schedule, `ci/mutation-matrix.sh` copies the tree, applies M1–M7 one at a
-   time with exact-context `patch --forward`, rebuilds, runs all five cases,
-   prints a mutant × case grid, and asserts M0 all-pass, every declared
+   schedule, `ci/mutation-matrix.sh` copies the tree, applies M1–M8 one at a
+   time with exact-context `patch --forward`, rebuilds, runs every declared
+   case, prints a mutant × case grid, and asserts M0 all-pass, every declared
    `dies_under` cell FAIL, and case↔mutant closure in both directions. A patch
    that does not apply fails the job; it is never treated as a skipped mutant.
+   The case list is read out of the battery source, never hardcoded here — a
+   count in this document would go stale the first time a case is added, which
+   is exactly what happened to the "five cases" this sentence used to name.
 
 ```mermaid
 flowchart LR
     T[Sandbox-path PR or nightly] --> C[Copy clean tree]
-    C --> M[Apply one M1-M7 patch]
-    M --> B[Build and run five cases]
+    C --> M[Apply one M1-M8 patch]
+    M --> B[Build and run every declared case]
     B --> G[Emit mutant x case grid]
     G --> A{M0 green, declared cells red,<br/>closure both ways?}
     A -->|yes| P[Gate passes]
