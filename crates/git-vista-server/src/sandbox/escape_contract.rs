@@ -1457,7 +1457,9 @@ fn r8_exemptions_expire_when_their_named_blocker_disappears() {
             }
             let field = ["hook_mode", ":"].concat();
             let f = tail.find(&field).unwrap_or_else(|| {
-                panic!("R8: a `Policy` literal in {stem}.rs has no hook_mode field — the scan broke")
+                panic!(
+                    "R8: a `Policy` literal in {stem}.rs has no hook_mode field — the scan broke"
+                )
             });
             let value = tail[f + field.len()..].trim_start();
             assert!(

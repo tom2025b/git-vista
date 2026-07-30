@@ -4,50 +4,54 @@
 //! `escape_contract` owns parsing, exact errno comparisons, carrier checks,
 //! report emission, production-seam spawning, and capability absence.
 //!
-//! # Why the Strict cases are still exempt after Task 8 (#66, D3)
+//! # No case in this file is exempt any more (#206)
 //!
-//! Seven cases here declare `tier: Tier::Strict` with
-//! `Exemption::NotProductionReachable`, and their named blocker was
-//! `"policy_for_repo hard-codes Tier::Network"`. Task 8 removed that hard-code:
-//! `sandbox::policy_for` now dispatches on the declared `NetworkNeed` and an
-//! untrusted repository running a *local* operation genuinely gets
-//! `Tier::Strict` — which is every mutation the planner executes and every read
-//! the handlers perform. **The Strict tier is production-reachable now.** The
-//! old blocker text was therefore false and has been corrected rather than left
-//! standing; R8 exists precisely so a blocker cannot outlive its reason
-//! unnoticed.
+//! Every case here now declares `Exemption::None`, Strict ones included, and
+//! `escape_contract::policy_for_case` builds all sixteen through the production
+//! dispatch. That is a change of substance, not of wording, and it is worth
+//! recording how it went wrong first.
 //!
-//! What has *not* changed is the one thing that keeps these seven exempt.
-//! `escape_contract::policy_for_case` builds an `Exemption::None` case's policy
-//! by calling `policy_for_repo(repo)` — a fixed, one-argument entry point with
-//! no way to say which tier the case wants. Ten cases share it
-//! (`secret_read_denied`, `io_uring_denied`, `high_bit_prctl_denied`,
-//! `high_bit_io_uring_denied`, `write_home_denied`, `cgroup_tree_denied`,
-//! `no_new_privs_irrevocable`, `second_landlock_ruleset_denied`,
-//! `unshare_userns_denied`, and `hook_mode_suite`'s `blocked_hooks`), all of
-//! them `tier: Tier::Network`, and every one is a containment claim written
-//! against that tier — `unshare_userns_denied` most sharply, since it is only a
-//! meaningful claim where nothing has already unshared a user namespace, which
-//! bwrap does for us in Strict. So `policy_for_repo` must keep yielding
-//! `Tier::Network`, and while it does, a Strict case cannot be served by it.
+//! Seven cases declare `tier: Tier::Strict`. Before #197 they carried
+//! `Exemption::NotProductionReachable` with the blocker `"policy_for_repo
+//! hard-codes Tier::Network"`, and that was simply true: `policy_for` returned
+//! the Network tier whatever the caller asked for, so a Strict policy could only
+//! be fabricated by the harness. #197 removed the hard-code — `policy_for` now
+//! dispatches on the declared `NetworkNeed`, and an untrusted repository running
+//! a *local* operation genuinely gets `Tier::Strict`, which is every mutation
+//! the planner executes and every read the handlers perform.
 //!
-//! Retiring these seven therefore needs one edit this task could not make:
-//! teaching `policy_for_case` to pick the need from `case.tier`
-//! (`Tier::Strict => NetworkNeed::Local`, otherwise `Remote`) and calling
-//! `policy_for` directly. `escape_contract.rs` is named as off-limits by
-//! `sandbox::policy_for_repo`'s own doc comment (a concurrent workflow may be
-//! editing it), so that edit is left as the follow-on, not smuggled in.
+//! At that point the blocker was false. What happened instead of retirement was
+//! a **rewording**: the seven exemptions were kept and their blocker changed to
+//! `"policy_for_repo yields Tier::Network"`, on the argument that
+//! `policy_for_case` could only reach the fixed one-argument `policy_for_repo`
+//! and therefore still could not ask for Strict. That argument named a limit of
+//! the *harness*, not of production — and R8, whose whole job is to make a
+//! blocker expire with its reason, went on passing because the literal token it
+//! grepped for had merely moved from a hard-code into a `debug_assert!` in a
+//! `#[cfg(test)]` wrapper. A tripwire watching test-only code cannot expire.
 //!
-//! R8 is untouched and still load-bearing for exactly these seven: its
-//! assertion is that `policy_for_repo`'s body still contains `Tier::Network`,
-//! which is the same fact the corrected blocker names. Make `policy_for_repo`
-//! yield Strict and R8 fires, which is what should happen — at that point these
-//! seven can drop to `Exemption::None` and the ten Network cases need a home.
+//! #206 retired all seven the honest way: `policy_for_case` now derives the
+//! declared need from the tier the case is written against
+//! (`Tier::Strict => NetworkNeed::Local`, `Tier::Network => Remote`) and reads
+//! the resulting tier back off the policy production returned, so these seven
+//! run against the same `Strict` policy a local planner mutation gets —
+//! `strict_launcher`'s INV-13 refusal, the trust-store secret exclude and all.
+//! R8 was re-anchored at the same time, to the property rather than to a token;
+//! see `r8_exemptions_expire_when_their_named_blocker_disappears`.
 //!
-//! `hook_mode_suite`'s `blocked_hooks` exemption is a different story and is
-//! **not** touched: `policy_for` still sets `hook_mode: HookMode::Run`
-//! unconditionally, so its blocker (`"policy_for_repo hard-codes
-//! HookMode::Run"`) remains true word for word.
+//! The nine `Tier::Network` cases are deliberately untouched: they still route
+//! through `policy_for_repo`, which *is* `policy_for(repo, false, Remote)`, and
+//! each is a containment claim written against that tier —
+//! `unshare_userns_denied` most sharply, since it is only a meaningful claim
+//! where nothing has already unshared a user namespace, which bwrap does for us
+//! in Strict. Re-tiering them to look "more production-like" would silently
+//! change what they prove.
+//!
+//! One exemption survives anywhere in the battery, and it is not in this file:
+//! `hook_mode_suite`'s `blocked_hooks`. Its blocker is now stated as the fact it
+//! actually rests on — no production policy constructor yields
+//! `HookMode::Blocked` — which R8 checks across every production module under
+//! `src/sandbox` rather than by grepping one function.
 
 use super::escape_contract::{run_case, Class, Errno, EscapeCase, Exemption, GitPortUse, MutantId};
 use super::Tier;
