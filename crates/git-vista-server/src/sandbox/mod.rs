@@ -951,7 +951,42 @@ pub(crate) fn policy_for(
         bwrap,
         rw_trees: rw,
         ro_trees: ro,
-        secret_excludes: secret_excludes_for_home(&home),
+        // The `$HOME`-relative secret set, plus the one path that must be
+        // withheld from *every* grant regardless of what is being served: the
+        // trust store.
+        //
+        // # Why the trust store is an exclude and not merely un-granted
+        //
+        // `trust.rs`'s security argument is that a sandboxed repository cannot
+        // forge its own trust marker, because markers live outside every
+        // repository and `$HOME` is granted read-only. That argument had a
+        // hole, and it is the `rw.push(repo)` above: whatever path the operator
+        // is serving gets **read-write**, and nothing stopped that path from
+        // containing the state directory. Serve a repository at or above
+        // `~/.local/state` — or point `XDG_STATE_HOME` inside a served tree —
+        // and a hostile hook could write its own marker, so the *next*
+        // operation on that repository would resolve `trusted = true` and
+        // `tier_for` would hand it `Tier::Unsandboxed`. A total sandbox bypass,
+        // reached entirely through sanctioned paths, and the precise
+        // escalation `trust.rs`'s module doc claims is impossible.
+        //
+        // An exclude closes it because the shim withholds excluded paths from
+        // every tree it grants, read-write ones included
+        // (`is_or_inside_exclude` / `is_ancestor_of_exclude` in
+        // `bin/gv-sandbox/main.rs`) — the one mechanism here that outranks a
+        // grant rather than competing with it.
+        //
+        // Computed from `state::sandbox_trust_dir()` rather than added to
+        // `DEFAULT_SECRET_EXCLUDES` as a `$HOME`-relative string, because the
+        // real location follows `XDG_STATE_HOME` when that is set. A
+        // `$HOME/.local/state/…` literal would silently protect nothing on any
+        // host that sets it — the same silent-miss class `secret_excludes_for_home`'s
+        // own doc comment already records being bitten by once.
+        secret_excludes: {
+            let mut excludes = secret_excludes_for_home(&home);
+            excludes.push(crate::state::sandbox_trust_dir());
+            excludes
+        },
         // Ports are a Network-tier ruleset entry. Strict denies the network
         // outright (`--net-deny`, plus bwrap's `--unshare-net`) and
         // Unsandboxed installs no ruleset, so a non-empty list in either would
