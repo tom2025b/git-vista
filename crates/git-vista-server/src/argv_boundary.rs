@@ -272,7 +272,13 @@ fn every_process_spawn_site_is_allowlisted_and_spawns_only_git() {
     let spawn = ["Command", "::new("].concat();
     let spawn_git = ["Command", "::new(\"git\")"].concat();
 
-    for root in [&server_root, &git_root] {
+    // One allowlist per crate root. A single shared list would let an entry
+    // reviewed for one crate authorise a same-named file in the other — see
+    // `ALLOWED_GIT_CRATE_SPAWN_SITES` for the time that actually happened.
+    for (root, allowed) in [
+        (&server_root, ALLOWED_SPAWN_SITES),
+        (&git_root, ALLOWED_GIT_CRATE_SPAWN_SITES),
+    ] {
         let mut files = Vec::new();
         rs_files(&root.join("src"), &mut files);
         assert!(
@@ -291,10 +297,12 @@ fn every_process_spawn_site_is_allowlisted_and_spawns_only_git() {
                 .to_string_lossy()
                 .replace('\\', "/");
             assert!(
-                ALLOWED_SPAWN_SITES.contains(&rel.as_str()),
-                "NEW PROCESS-SPAWN SITE: {rel} constructs a Command but is not \
-                 allowlisted in argv_boundary.rs. Review it — a mutating git argv \
-                 belongs in the planner's executor, nowhere else."
+                allowed.contains(&rel.as_str()),
+                "NEW PROCESS-SPAWN SITE: {rel} (in {root:?}) constructs a Command \
+                 but is not allowlisted in argv_boundary.rs. Review it — a \
+                 mutating git argv belongs in the planner's executor, nowhere \
+                 else. Note the allowlists are per-crate: an entry for the same \
+                 path in the *other* crate's list does not cover this file."
             );
             // This file talks *about* spawning without doing it; every other
             // allowlisted site must spawn `git` literally — no shells, no
@@ -334,36 +342,33 @@ fn every_allowlist_entry_names_a_live_spawn_site() {
     let git_root = server_root.parent().unwrap().join("git-vista-git");
     let spawn = ["Command", "::new("].concat();
 
-    for (i, rel) in ALLOWED_SPAWN_SITES.iter().enumerate() {
-        assert!(
-            !ALLOWED_SPAWN_SITES[..i].contains(rel),
-            "{rel} is listed twice; two reviews of one file cannot disagree \
-             usefully, and a duplicate hides which comment is current"
-        );
-        // Entries are relative to *their own* crate root, so resolve against
-        // both and insist on exactly one hit — an ambiguous entry would grant
-        // one file's permission to another crate's same-named file.
-        let candidates: Vec<PathBuf> = [&server_root, &git_root]
-            .iter()
-            .map(|root| root.join(rel))
-            .filter(|p| p.is_file())
-            .collect();
-        assert_eq!(
-            candidates.len(),
-            1,
-            "{rel}: expected exactly one of the two crate roots to contain this \
-             file, found {}. A dead entry pre-authorises a spawn nobody has \
-             read; an ambiguous one authorises the wrong file.",
-            candidates.len()
-        );
-        let text = std::fs::read_to_string(&candidates[0]).expect("readable source file");
-        assert!(
-            text.contains(&spawn),
-            "{rel} is allowlisted but constructs no Command. Remove the entry \
-             rather than leaving it: the scan only consults this list for files \
-             that spawn, so this one grants a permission that is invisible \
-             until someone adds a raw spawn to that file."
-        );
+    for (root, allowed) in [
+        (&server_root, ALLOWED_SPAWN_SITES),
+        (&git_root, ALLOWED_GIT_CRATE_SPAWN_SITES),
+    ] {
+        for (i, rel) in allowed.iter().enumerate() {
+            assert!(
+                !allowed[..i].contains(rel),
+                "{rel} is listed twice in {root:?}'s allowlist; two reviews of \
+                 one file cannot disagree usefully, and a duplicate hides which \
+                 comment is current"
+            );
+            let path = root.join(rel);
+            assert!(
+                path.is_file(),
+                "{rel} is allowlisted for {root:?} but no such file exists. A \
+                 dead entry pre-authorises a spawn nobody has read — remove it, \
+                 or add it back when the file lands and has been reviewed."
+            );
+            let text = std::fs::read_to_string(&path).expect("readable source file");
+            assert!(
+                text.contains(&spawn),
+                "{rel} is allowlisted for {root:?} but constructs no Command. \
+                 Remove the entry rather than leaving it: the scan only consults \
+                 this list for files that spawn, so this one grants a permission \
+                 that is invisible until someone adds a raw spawn to that file."
+            );
+        }
     }
 
     // The launcher carve-out is a *narrowing* of the main list, never a way
