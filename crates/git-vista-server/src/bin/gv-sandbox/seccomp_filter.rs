@@ -259,10 +259,16 @@ fn prctl_rule() -> Result<SeccompRule, seccompiler::BackendError> {
 /// `AF_UNIX | 0x1_0000_0000` sail past this rule while the kernel went on to
 /// create an ordinary AF_UNIX socket from the low bits.
 /// `SeccompCmpArgLen::Dword` masks the comparison to the effective low 32 bits.
-/// `ci/mutants/M7-widen-prctl-comparison.patch` and the escape battery's
-/// `high_bit_prctl_denied` are the committed proof that this width is
-/// load-bearing on the sibling rule; the width here is not a guess copied from
-/// it but the same defect avoided in the same place.
+///
+/// The width was **measured** correct when this rule landed:
+/// `socket(AF_UNIX | 1<<32)` returns `EPERM` inside Strict. A measurement proves
+/// today's code and nothing else, which is why the width now also carries its own
+/// mutant and its own case — `ci/mutants/M9-widen-af-unix-comparison.patch` and
+/// `high_bit_af_unix_denied` — rather than borrowing the sibling rule's
+/// (`M7-widen-prctl-comparison.patch` / `high_bit_prctl_denied`). Borrowing was
+/// the gap: every other AF_UNIX case constructs its family as a 32-bit `int`, so
+/// none of them can tell a `Dword` comparison from a `Qword` one, and this exact
+/// defect class could have reopened here with the whole battery green.
 fn af_unix_rule() -> Result<SeccompRule, seccompiler::BackendError> {
     SeccompRule::new(vec![SeccompCondition::new(
         0, // socket(2)/socketpair(2) first argument, the address family

@@ -72,6 +72,18 @@ pub(crate) enum MutantId {
     /// shows the case notices its **own** mechanism rather than the filter's
     /// existence.
     M8,
+    /// `ci/mutants/M9-widen-af-unix-comparison.patch` — widens the AF_UNIX
+    /// rules' arg0 comparison from `Dword` to `Qword`, exactly as M7 does to the
+    /// sibling `prctl` rule.
+    ///
+    /// The width was measured correct when the rule landed, and a measurement
+    /// only ever proves today's code. M7 exists because this project already
+    /// shipped this defect once; without a mutant on the AF_UNIX rule the same
+    /// class can reopen there with the whole battery green, since every existing
+    /// AF_UNIX case constructs its family as a 32-bit `int` and cannot tell a
+    /// `Dword` comparison from a `Qword` one. `high_bit_af_unix_denied` is the
+    /// case that can.
+    M9,
 }
 
 /// R8: a case whose configuration production cannot build yet carries the

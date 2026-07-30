@@ -6,7 +6,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/git-vista-mutation-matrix.XXXXXX")
 trap 'rm -rf -- "$work_root"' EXIT
 
-readonly -a mutants=(M1 M2 M3 M4 M5 M6 M7 M8)
+readonly -a mutants=(M1 M2 M3 M4 M5 M6 M7 M8 M9)
 declare -Ar mutant_patch=(
   [M1]="ci/mutants/M1-apply-seccomp-empty.patch"
   [M2]="ci/mutants/M2-skip-landlock-restrict-self.patch"
@@ -16,6 +16,7 @@ declare -Ar mutant_patch=(
   [M6]="ci/mutants/M6-ignore-hooks-blocked-dir.patch"
   [M7]="ci/mutants/M7-widen-prctl-comparison.patch"
   [M8]="ci/mutants/M8-remove-af-unix-socket-rule.patch"
+  [M9]="ci/mutants/M9-widen-af-unix-comparison.patch"
 )
 
 failures=0
@@ -53,7 +54,12 @@ import pathlib
 import re
 import sys
 
-known = {f"M{i}" for i in range(1, 9)}
+# Upper bound is exclusive: range(1, 10) == M1..M9. This set is the third and
+# most-missed registration site for a new mutant (the `mutants` array and the
+# `mutant_patch` map above are the other two) — an unlisted id makes the parser
+# reject the case that names it, with a message about an *unknown mutant* rather
+# than about this line.
+known = {f"M{i}" for i in range(1, 10)}
 case_re = re.compile(
     r"const\s+CASE_[A-Z0-9_]+:\s*EscapeCase\s*=\s*EscapeCase\s*\{(.*?)\n\};",
     re.DOTALL,
