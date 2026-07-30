@@ -255,10 +255,7 @@ mod tests {
     #[test]
     fn fail_open_refuses_distinguishably_and_never_becomes_blocked() {
         let got = hook_policy_for_trusted_repo(false, &fail_open());
-        assert!(matches!(
-            got,
-            Err(HookPolicyRefused::FailOpen { .. })
-        ));
+        assert!(matches!(got, Err(HookPolicyRefused::FailOpen { .. })));
         assert_ne!(got.ok(), Some(HookPolicy::Blocked));
 
         let a = hook_policy_for_trusted_repo(false, &absent()).unwrap_err();
@@ -266,10 +263,7 @@ mod tests {
         assert_ne!(a, f, "the two refusals must not collapse into one");
         // ...and the diagnosis reaches an operator without reading this file.
         assert!(a.to_string().contains("bwrap"), "{a}");
-        assert!(
-            f.to_string().contains("fs_write_outside=OPEN"),
-            "{f}"
-        );
+        assert!(f.to_string().contains("fs_write_outside=OPEN"), "{f}");
         assert!(
             !a.to_string().contains("bug"),
             "capability absence is a host problem, not a git-vista bug: {a}"
