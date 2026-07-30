@@ -101,7 +101,35 @@ The caller declares `NetworkNeed`. `GitOperation` is a closed enum
 checks. `network_need(argv)` survives as a cross-check: declared `Local` but argv looks
 `Remote` → debug panic, release escalate to Strict and log.
 
-**APPROVED 2026-07-29.**
+**APPROVED 2026-07-29. LANDED 2026-07-30 (plan Task 8, issue #197).** As built:
+
+- `sandbox::network_need_for_operation(&GitOperation) -> NetworkNeed` — exhaustive,
+  no wildcard arm. Exactly one variant (`PushBranch`) declares `Remote`.
+- The value is threaded from `planner::execute`'s match — the only point where the
+  operation's identity is in scope — through all fifteen `exec_*` functions and the
+  shared runners (`run_git`/`git`/`worktree_dirty`/`run_branch_cmd`) into
+  `git_cmd::git_output_for` → `sandbox::policy_for`. Threading rather than
+  re-deriving is what keeps the exhaustive match in the live data path; a version
+  that computed the need and dropped it would leave the compile-time guarantee empty.
+- Call sites with no `GitOperation` (`handlers/read.rs`, `coordinator.rs`,
+  `durable.rs`, `git_cmd`'s `rev_parse`/`is_ancestor`/`git_ref_exists`/`git_ok`)
+  declare `Local` at their own seam — a truthful declaration, not an argv fallback;
+  every one of them is a local read or ref write by inspection.
+- `sandbox::reconcile_need(declared, argv)` is the cross-check. It is a **checked
+  identity**: it returns `declared`, always. On the one disagreement worth acting on
+  (declared `Local`, argv looks `Remote`) it `debug_assert!`s and logs. Keeping
+  `Local` *is* "escalate to the stricter tier" — `tier_for(Local, false)` is
+  `Strict`, which has no network at all, strictly stricter than the `Network` tier
+  the argv argued for. The reverse direction is deliberately not acted on:
+  `REMOTE_SUBCOMMANDS` is incomplete by construction, so narrowing a declared
+  `Remote` would break working pushes on the word of a list that admits it is not
+  authoritative.
+- `tier_for`'s `trusted` argument gets its first production source:
+  `sandbox::trust::is_trusted`, keyed on the **canonicalised** repository path
+  (`sandbox::repo_is_trusted`; a canonicalisation failure means untrusted).
+- INV-13/D6 is enforced at policy-construction time, not only at boot:
+  `ShimError::StrictUnavailable { missing }` refuses when Strict is selected and the
+  host cannot supply it. No degrade to Network, no degrade-and-block-hooks.
 
 ## D4 — clone gets its own policy constructor
 
