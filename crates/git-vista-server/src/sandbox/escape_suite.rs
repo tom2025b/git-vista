@@ -3,6 +3,51 @@
 //! Case declarations contain no acceptance logic. The single shared runner in
 //! `escape_contract` owns parsing, exact errno comparisons, carrier checks,
 //! report emission, production-seam spawning, and capability absence.
+//!
+//! # Why the Strict cases are still exempt after Task 8 (#66, D3)
+//!
+//! Seven cases here declare `tier: Tier::Strict` with
+//! `Exemption::NotProductionReachable`, and their named blocker was
+//! `"policy_for_repo hard-codes Tier::Network"`. Task 8 removed that hard-code:
+//! `sandbox::policy_for` now dispatches on the declared `NetworkNeed` and an
+//! untrusted repository running a *local* operation genuinely gets
+//! `Tier::Strict` — which is every mutation the planner executes and every read
+//! the handlers perform. **The Strict tier is production-reachable now.** The
+//! old blocker text was therefore false and has been corrected rather than left
+//! standing; R8 exists precisely so a blocker cannot outlive its reason
+//! unnoticed.
+//!
+//! What has *not* changed is the one thing that keeps these seven exempt.
+//! `escape_contract::policy_for_case` builds an `Exemption::None` case's policy
+//! by calling `policy_for_repo(repo)` — a fixed, one-argument entry point with
+//! no way to say which tier the case wants. Ten cases share it
+//! (`secret_read_denied`, `io_uring_denied`, `high_bit_prctl_denied`,
+//! `high_bit_io_uring_denied`, `write_home_denied`, `cgroup_tree_denied`,
+//! `no_new_privs_irrevocable`, `second_landlock_ruleset_denied`,
+//! `unshare_userns_denied`, and `hook_mode_suite`'s `blocked_hooks`), all of
+//! them `tier: Tier::Network`, and every one is a containment claim written
+//! against that tier — `unshare_userns_denied` most sharply, since it is only a
+//! meaningful claim where nothing has already unshared a user namespace, which
+//! bwrap does for us in Strict. So `policy_for_repo` must keep yielding
+//! `Tier::Network`, and while it does, a Strict case cannot be served by it.
+//!
+//! Retiring these seven therefore needs one edit this task could not make:
+//! teaching `policy_for_case` to pick the need from `case.tier`
+//! (`Tier::Strict => NetworkNeed::Local`, otherwise `Remote`) and calling
+//! `policy_for` directly. `escape_contract.rs` is named as off-limits by
+//! `sandbox::policy_for_repo`'s own doc comment (a concurrent workflow may be
+//! editing it), so that edit is left as the follow-on, not smuggled in.
+//!
+//! R8 is untouched and still load-bearing for exactly these seven: its
+//! assertion is that `policy_for_repo`'s body still contains `Tier::Network`,
+//! which is the same fact the corrected blocker names. Make `policy_for_repo`
+//! yield Strict and R8 fires, which is what should happen — at that point these
+//! seven can drop to `Exemption::None` and the ten Network cases need a home.
+//!
+//! `hook_mode_suite`'s `blocked_hooks` exemption is a different story and is
+//! **not** touched: `policy_for` still sets `hook_mode: HookMode::Run`
+//! unconditionally, so its blocker (`"policy_for_repo hard-codes
+//! HookMode::Run"`) remains true word for word.
 
 use super::escape_contract::{run_case, Class, Errno, EscapeCase, Exemption, GitPortUse, MutantId};
 use super::Tier;
@@ -85,7 +130,13 @@ const CASE_STRICT_LISTENER_DENIED: EscapeCase = EscapeCase {
     expect_carrier_code: 0,
     dies_under: &[MutantId::M2, MutantId::M5],
     exemption: Exemption::NotProductionReachable {
-        blocker: "policy_for_repo hard-codes Tier::Network",
+        // Task 8 changed *why* this exemption stands — see the module doc's
+        // "Why the Strict cases are still exempt after Task 8". The Strict tier
+        // is now production-reachable (every local git operation runs in it);
+        // what is still not reachable is Strict *from the one entry point this
+        // harness calls*, `policy_for_repo(repo)`, which declares
+        // `NetworkNeed::Remote` for the ten Network-tier cases that share it.
+        blocker: "policy_for_repo yields Tier::Network",
     },
     // The probe connects to 9418, so the harness holds the listener; see
     // `test_ports` for why every holder of that one port must be serialized.
@@ -105,7 +156,13 @@ const CASE_STRICT_UDP_HOST_DENIED: EscapeCase = EscapeCase {
     expect_carrier_code: 0,
     dies_under: &[MutantId::M4],
     exemption: Exemption::NotProductionReachable {
-        blocker: "policy_for_repo hard-codes Tier::Network",
+        // Task 8 changed *why* this exemption stands — see the module doc's
+        // "Why the Strict cases are still exempt after Task 8". The Strict tier
+        // is now production-reachable (every local git operation runs in it);
+        // what is still not reachable is Strict *from the one entry point this
+        // harness calls*, `policy_for_repo(repo)`, which declares
+        // `NetworkNeed::Remote` for the ten Network-tier cases that share it.
+        blocker: "policy_for_repo yields Tier::Network",
     },
     git_port: GitPortUse::Unused,
 };
@@ -123,7 +180,13 @@ const CASE_STRICT_TCP_BIND_DENIED: EscapeCase = EscapeCase {
     expect_carrier_code: 0,
     dies_under: &[MutantId::M2],
     exemption: Exemption::NotProductionReachable {
-        blocker: "policy_for_repo hard-codes Tier::Network",
+        // Task 8 changed *why* this exemption stands — see the module doc's
+        // "Why the Strict cases are still exempt after Task 8". The Strict tier
+        // is now production-reachable (every local git operation runs in it);
+        // what is still not reachable is Strict *from the one entry point this
+        // harness calls*, `policy_for_repo(repo)`, which declares
+        // `NetworkNeed::Remote` for the ten Network-tier cases that share it.
+        blocker: "policy_for_repo yields Tier::Network",
     },
     // Exclusive but listener-free: this probe's baseline leg *binds* 9418 to
     // establish the capability, so any listener there would turn the baseline
@@ -155,7 +218,13 @@ const CASE_AF_UNIX_SOCKET_DENIED: EscapeCase = EscapeCase {
     expect_carrier_code: 0,
     dies_under: &[MutantId::M1, MutantId::M8],
     exemption: Exemption::NotProductionReachable {
-        blocker: "policy_for_repo hard-codes Tier::Network",
+        // Task 8 changed *why* this exemption stands — see the module doc's
+        // "Why the Strict cases are still exempt after Task 8". The Strict tier
+        // is now production-reachable (every local git operation runs in it);
+        // what is still not reachable is Strict *from the one entry point this
+        // harness calls*, `policy_for_repo(repo)`, which declares
+        // `NetworkNeed::Remote` for the ten Network-tier cases that share it.
+        blocker: "policy_for_repo yields Tier::Network",
     },
     git_port: GitPortUse::Unused,
 };
@@ -176,7 +245,13 @@ const CASE_AF_UNIX_SOCKETPAIR_DENIED: EscapeCase = EscapeCase {
     expect_carrier_code: 0,
     dies_under: &[MutantId::M1, MutantId::M8],
     exemption: Exemption::NotProductionReachable {
-        blocker: "policy_for_repo hard-codes Tier::Network",
+        // Task 8 changed *why* this exemption stands — see the module doc's
+        // "Why the Strict cases are still exempt after Task 8". The Strict tier
+        // is now production-reachable (every local git operation runs in it);
+        // what is still not reachable is Strict *from the one entry point this
+        // harness calls*, `policy_for_repo(repo)`, which declares
+        // `NetworkNeed::Remote` for the ten Network-tier cases that share it.
+        blocker: "policy_for_repo yields Tier::Network",
     },
     git_port: GitPortUse::Unused,
 };
@@ -210,7 +285,13 @@ const CASE_HIGH_BIT_AF_UNIX_DENIED: EscapeCase = EscapeCase {
     expect_carrier_code: 0,
     dies_under: &[MutantId::M9],
     exemption: Exemption::NotProductionReachable {
-        blocker: "policy_for_repo hard-codes Tier::Network",
+        // Task 8 changed *why* this exemption stands — see the module doc's
+        // "Why the Strict cases are still exempt after Task 8". The Strict tier
+        // is now production-reachable (every local git operation runs in it);
+        // what is still not reachable is Strict *from the one entry point this
+        // harness calls*, `policy_for_repo(repo)`, which declares
+        // `NetworkNeed::Remote` for the ten Network-tier cases that share it.
+        blocker: "policy_for_repo yields Tier::Network",
     },
     git_port: GitPortUse::Unused,
 };
@@ -437,7 +518,13 @@ const CASE_URING_SOCKET_BYPASS: EscapeCase = EscapeCase {
     expect_carrier_code: 0,
     dies_under: &[MutantId::M1, MutantId::M10],
     exemption: Exemption::NotProductionReachable {
-        blocker: "policy_for_repo hard-codes Tier::Network",
+        // Task 8 changed *why* this exemption stands — see the module doc's
+        // "Why the Strict cases are still exempt after Task 8". The Strict tier
+        // is now production-reachable (every local git operation runs in it);
+        // what is still not reachable is Strict *from the one entry point this
+        // harness calls*, `policy_for_repo(repo)`, which declares
+        // `NetworkNeed::Remote` for the ten Network-tier cases that share it.
+        blocker: "policy_for_repo yields Tier::Network",
     },
     git_port: GitPortUse::Unused,
 };
