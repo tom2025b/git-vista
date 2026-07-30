@@ -725,11 +725,9 @@ mod tests {
         // Sanity: `worktree.rs`'s own rule alone sees nothing wrong here —
         // proving the managed-root check is what does the refusing below,
         // not a rule that already existed before D2.
-        assert!(
-            crate::sandbox::worktree::linked_worktree_dirs(&linked)
-                .expect("the geometry is a real, valid linked worktree")
-                .is_some()
-        );
+        assert!(crate::sandbox::worktree::linked_worktree_dirs(&linked)
+            .expect("the geometry is a real, valid linked worktree")
+            .is_some());
 
         // The real production handler — `POST /api/rebase`'s actual body.
         let (status, msg) = crate::handlers::rebase::rebase().await;
