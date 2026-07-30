@@ -37,7 +37,10 @@ use std::path::{Path, PathBuf};
 
 use git_vista_core::identity::{RepositoryHandle, WorktreeId};
 use git_vista_git::{read_repo_facts, WorktreeKind};
-use git_vista_protocol::{RepositoryDescriptor, RepositoryKind};
+use git_vista_protocol::{HookPolicy, RepositoryDescriptor, RepositoryKind};
+
+use crate::sandbox::hook_policy::hook_policy_for_repo;
+use crate::sandbox::probe::ProbeVerdict;
 
 /// Why a path could not be admitted to the catalog. Surfaced today only through
 /// [`Display`](std::fmt::Display) — the trusted-launch path logs it and drops to
@@ -249,11 +252,20 @@ impl Catalog {
     /// addressed by id. Absolute paths are included only when `expose_paths` is
     /// set (the operator's opt-in); otherwise the descriptors carry no path.
     /// Sorted by display name so the report is stable across calls.
-    pub(crate) fn descriptors(&self, expose_paths: bool) -> Vec<RepositoryDescriptor> {
+    ///
+    /// `verdict` is the boot sandbox measurement
+    /// ([`crate::sandbox::probe::boot_verdict`]) — see
+    /// [`disclosed_hook_policy`] for what each entry does with it, and why it
+    /// is a parameter rather than a global read from inside here.
+    pub(crate) fn descriptors(
+        &self,
+        expose_paths: bool,
+        verdict: Option<&ProbeVerdict>,
+    ) -> Vec<RepositoryDescriptor> {
         let mut out: Vec<RepositoryDescriptor> = self
             .entries
             .values()
-            .map(|e| Self::descriptor(e, expose_paths))
+            .map(|e| Self::descriptor(e, expose_paths, verdict))
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name).then(a.worktree.cmp(&b.worktree)));
         out
@@ -266,14 +278,38 @@ impl Catalog {
         &self,
         worktree: WorktreeId,
         expose_paths: bool,
+        verdict: Option<&ProbeVerdict>,
     ) -> Option<RepositoryDescriptor> {
         self.entries
             .get(&worktree)
-            .map(|e| Self::descriptor(e, expose_paths))
+            .map(|e| Self::descriptor(e, expose_paths, verdict))
     }
 
     /// One entry's wire form — shared by the list and single-entry views.
-    fn descriptor(e: &RepoEntry, expose_paths: bool) -> RepositoryDescriptor {
+    fn descriptor(
+        e: &RepoEntry,
+        expose_paths: bool,
+        verdict: Option<&ProbeVerdict>,
+    ) -> RepositoryDescriptor {
+        Self::descriptor_with_policy(e, expose_paths, disclosed_hook_policy(&e.path, verdict))
+    }
+
+    /// [`descriptor`](Self::descriptor) with the policy lookup hoisted out, so
+    /// the wire-shape half is a pure function of its inputs.
+    ///
+    /// The split is the same one `sandbox::hook_policy` makes for the same
+    /// reason: the trusted branch of the disclosure cannot be exercised without
+    /// writing a marker into the operator's **real** `~/.local/state`
+    /// directory, which this crate's test conventions forbid (see
+    /// `sandbox::trust`'s test module for the parallel-test race that rule
+    /// exists to prevent). Hoisting lets a test feed the mapping's own answer
+    /// for a trusted repository in and check the descriptor carries it
+    /// unchanged.
+    fn descriptor_with_policy(
+        e: &RepoEntry,
+        expose_paths: bool,
+        hook_policy: Option<HookPolicy>,
+    ) -> RepositoryDescriptor {
         RepositoryDescriptor {
             repository: e.handle.repository.to_string(),
             worktree: e.handle.worktree.to_string(),
@@ -282,6 +318,51 @@ impl Catalog {
             read_only: e.read_only,
             path: expose_paths.then(|| e.path.display().to_string()),
             remote_web_url: e.remote_web_url.clone(),
+            hook_policy,
+        }
+    }
+}
+
+/// INV-15's per-repository disclosure, in the one place a
+/// [`RepositoryDescriptor`] is built — this is what makes
+/// `sandbox::hook_policy::hook_policy_for_repo` a *production* function rather
+/// than a computation with tests and no callers.
+///
+/// # Why the verdict is passed in
+///
+/// `boot_verdict()` is process-global and set by the boot gate. Reading it from
+/// inside here would make every catalog unit test's expected output depend on
+/// whether some *other* test in the same binary had already driven
+/// `probe::run_at_startup` — a genuinely order-dependent assertion, which is
+/// the sort of test that passes for the wrong reason. `crate::state` supplies
+/// the real value at the two production call sites; tests supply theirs.
+///
+/// # The three `None`s, and why none of them invents a policy
+///
+/// * **No verdict yet** — the probe has not run in this process. Unknown.
+/// * **A refusal** ([`crate::sandbox::hook_policy::HookPolicyRefused`]) — the
+///   host cannot supply the tier this repository's operations require, so those
+///   operations refuse to run (INV-13 / ADR 0029). There is no [`HookPolicy`]
+///   that honestly says that, and mapping it to
+///   [`HookPolicy::Blocked`] would be exactly the degrade-and-block-hooks
+///   posture ADR 0029 rejects by name — arriving through the descriptor instead
+///   of through `hook_policy_for_repo`, but the same wrong claim. So: nothing is
+///   disclosed, and `RepositoryDescriptor::hook_policy_requires_banner` folds
+///   the absence to "fly the banner".
+/// * Both are unreachable in a live server (the boot gate exits on anything but
+///   `Contained`), which is why the refusal is *logged* rather than silently
+///   dropped: if it ever does happen, it is evidence of something the gate was
+///   supposed to have caught.
+fn disclosed_hook_policy(path: &Path, verdict: Option<&ProbeVerdict>) -> Option<HookPolicy> {
+    let verdict = verdict?;
+    match hook_policy_for_repo(path, verdict) {
+        Ok(policy) => Some(policy),
+        Err(refused) => {
+            eprintln!(
+                "git-vista: no hook policy disclosed for {} — {refused}",
+                path.display()
+            );
+            None
         }
     }
 }

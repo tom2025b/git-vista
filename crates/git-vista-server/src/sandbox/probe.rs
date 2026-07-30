@@ -78,6 +78,7 @@
 //!   stand in for a host lacking a capability — see the test module.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use super::spawn::command_async;
 use super::{default_system_trees, secret_excludes_for_home, HookMode, Policy, Tier};
@@ -528,6 +529,63 @@ pub(crate) async fn verdict(caps: &Capabilities) -> ProbeVerdict {
     }
 }
 
+/// The verdict this process measured at boot, or `None` before
+/// [`run_at_startup`] has run.
+///
+/// # Why this exists
+///
+/// [`run_at_startup`] used to compute a [`ProbeVerdict`], print it, gate boot on
+/// it, and drop it on the floor. INV-15's per-repository disclosure
+/// ([`super::hook_policy::hook_policy_for_repo`]) needs that same verdict at
+/// *request* time, and re-running the probe per request is not an option: it
+/// costs a `git init`, a bwrap spawn and a commit, and it would be measuring a
+/// different scratch repository than the one boot refused (or did not refuse)
+/// on. So the boot measurement is recorded once, here, and read back later.
+///
+/// # Is this a security property, the way `bwrap_path`'s cache is?
+///
+/// **No, and the difference is worth being explicit about.**
+/// [`super::bwrap::bwrap_path`] and [`super::shim::shim_path`] cache for a
+/// reason their own doc comments state: caching means the launcher "cannot
+/// change identity between the moment a policy is built and the moment it is
+/// spawned" — a TOCTOU window closed by never resolving twice. Nothing
+/// analogous is true here. This value is *reported*, never enforced on: it
+/// feeds disclosure only, and the thing that actually refuses an operation on a
+/// host that cannot supply the tier is per-operation policy construction
+/// (`sandbox::policy_for` → `ShimError::StrictUnavailable`), which runs afresh
+/// for every spawn. If this cached value were somehow stale, the consequence
+/// would be a *wrong banner*, not a weakened boundary — and the boot gate means
+/// the only value a live server can hold is [`ProbeVerdict::Contained`] anyway.
+///
+/// The caching is therefore a cost-and-consistency choice, not a boundary. It is
+/// spelled as a `OnceLock` for the house style, but note the shape differs from
+/// its two neighbours in one way that matters: they use `get_or_init` and are
+/// *lazy*, computing on first read; this one is written exactly once, by
+/// [`run_at_startup`], before any listener binds — a verdict that computed
+/// itself lazily on the first request would have skipped the gate entirely,
+/// which is the whole thing INV-13 exists to prevent.
+static BOOT_VERDICT: OnceLock<ProbeVerdict> = OnceLock::new();
+
+/// Read back what [`run_at_startup`] measured. `None` means the boot probe has
+/// not run in this process — impossible in the real server (`main` calls it
+/// before anything else), but the honest answer in a unit test that never
+/// booted, and every consumer must treat it as *unknown*, never as a pass.
+pub(crate) fn boot_verdict() -> Option<&'static ProbeVerdict> {
+    BOOT_VERDICT.get()
+}
+
+/// Record the boot measurement. Deliberately records **every** verdict, not
+/// only `Contained`: a refusing verdict makes `main` exit, so nothing will read
+/// it there, and recording only the green one would mean "the field is set"
+/// silently doubled as "the probe passed" — two facts one value must not carry.
+///
+/// A second call is a no-op rather than a panic. Only `run_at_startup` calls
+/// this, and `main` calls that once; the tolerant `set` is for the test binary,
+/// where more than one test legitimately drives the real boot path.
+fn record_boot_verdict(verdict: &ProbeVerdict) {
+    let _ = BOOT_VERDICT.set(verdict.clone());
+}
+
 /// The INV-13/Global Constraint 15 mapping: [`ProbeVerdict::Contained`] is
 /// the only verdict that permits boot. Split out from `run_at_startup` so it
 /// is unit-testable against a constructed `ProbeVerdict` — proving the
@@ -557,6 +615,11 @@ pub(crate) async fn run_at_startup() -> Result<ProbeVerdict, BootRefusal> {
         caps.landlock_abi, caps.seccomp_available, caps.userns, caps.bwrap_present
     );
     let v = verdict(&caps).await;
+    // Recorded before the gate, so the stored value is what was *measured*
+    // rather than what survived the gate — and so `boot_verdict()` is already
+    // readable by the time this function returns `Ok`, which is the point at
+    // which `main` goes on to register repositories and bind listeners.
+    record_boot_verdict(&v);
     match &v {
         ProbeVerdict::Contained => {
             println!("[sandbox] verdict=contained — the strict tier composes on this host");
@@ -755,11 +818,59 @@ mod tests {
     }
 
     /// `run_at_startup` end to end: `Ok` on this host, carrying `Contained`.
+    ///
+    /// **And the verdict survives the call** (#202 blocker 1) — this is the
+    /// property that used to be missing entirely: the boot probe computed a
+    /// verdict and nothing stored it, so no request-time consumer could ever
+    /// see it.
+    ///
+    /// The assertion is deliberately ordered "read after boot", never "read
+    /// before boot": another test in this binary also drives `run_at_startup`,
+    /// so asserting `boot_verdict().is_none()` first would be a test that
+    /// passes or fails on thread scheduling. What is checked instead holds no
+    /// matter who got there first — after a successful boot the stored verdict
+    /// is present, and it is the same value the gate let through.
     #[tokio::test]
-    async fn run_at_startup_succeeds_on_this_host() {
+    async fn run_at_startup_succeeds_and_the_verdict_survives_for_request_time() {
         let v = run_at_startup()
             .await
             .expect("this host is known to compose the strict tier");
         assert_eq!(v, ProbeVerdict::Contained);
+
+        let stored = boot_verdict().expect(
+            "the boot probe's verdict must be readable after boot — a verdict \
+             that is computed and thrown away cannot reach INV-15's disclosure",
+        );
+        assert_eq!(
+            *stored, v,
+            "the stored verdict must be the one boot actually measured"
+        );
+    }
+
+    /// The recorder itself, on the two properties the storage contract rests
+    /// on: it is readable after a write, and a second write does not clobber
+    /// the first (`OnceLock::set` returning `Err` is swallowed on purpose — see
+    /// `record_boot_verdict`).
+    ///
+    /// This shares the one process-wide `OnceLock` with the boot test above, so
+    /// it asserts only what is true regardless of ordering: after this function
+    /// has recorded something, *some* verdict is readable, and recording a
+    /// different one afterwards does not change it.
+    #[test]
+    fn the_recorded_verdict_is_write_once_and_readable() {
+        record_boot_verdict(&ProbeVerdict::Contained);
+        let first = boot_verdict()
+            .expect("recording a verdict makes it readable")
+            .clone();
+
+        record_boot_verdict(&ProbeVerdict::FailOpen {
+            failed_checks: vec!["a later write must not clobber the boot value".to_string()],
+        });
+        assert_eq!(
+            boot_verdict(),
+            Some(&first),
+            "the boot verdict is write-once: a later record must be a no-op, \
+             not a way to overwrite what the gate acted on"
+        );
     }
 }

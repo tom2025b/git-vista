@@ -204,20 +204,27 @@ pub(crate) fn scan_clones_root() -> (usize, usize) {
 /// The capability view of the catalog for `GET /api/catalog`: the servable
 /// repositories addressed by opaque id, with absolute paths included only when
 /// the operator opted in ([`expose_paths`]).
+/// INV-15 (#66, #202): each descriptor also carries the hook policy that
+/// repository's local operations actually run under, computed from the boot
+/// sandbox verdict and the repository's own operator-trust state. The verdict is
+/// read here — one process-global read at the production seam — rather than
+/// inside [`Catalog::descriptors`], so the catalog's own unit tests are not
+/// order-dependent on whether the boot probe happened to have run.
 pub(crate) fn catalog_descriptors() -> Vec<RepositoryDescriptor> {
     catalog()
         .read()
         .expect("catalog lock")
-        .descriptors(expose_paths())
+        .descriptors(expose_paths(), crate::sandbox::probe::boot_verdict())
 }
 
 /// The capability descriptor for one registered worktree — the clone handler's
 /// success body (ADR 0008) — or `None` for an id the catalog does not hold.
 pub(crate) fn descriptor_for(worktree: WorktreeId) -> Option<RepositoryDescriptor> {
-    catalog()
-        .read()
-        .expect("catalog lock")
-        .descriptor_of(worktree, expose_paths())
+    catalog().read().expect("catalog lock").descriptor_of(
+        worktree,
+        expose_paths(),
+        crate::sandbox::probe::boot_verdict(),
+    )
 }
 
 /// The repository the server is currently serving *by default* — the selection a
@@ -261,6 +268,22 @@ pub(crate) fn current() -> (PathBuf, bool) {
         .read()
         .expect("CURRENT lock not poisoned");
     (g.path.clone(), g.mode == RepoMode::Visualize)
+}
+
+/// The current selection's path, or `None` when nothing has been selected yet.
+///
+/// The non-panicking sibling of [`current`]. [`current`] is right for the
+/// request handlers — by the time a request is served, `main` has long since
+/// called [`set_current`], and a panic there would mean a broken invariant, not
+/// a case to handle. This one exists for a caller that must produce an answer
+/// even before startup has run: the session handler's INV-15 disclosure
+/// (#202), which is reachable from `#[cfg(test)]` router tests that never touch
+/// the process-wide selection, and whose honest answer in that case is "no
+/// policy is known" rather than a panic or a fabricated value.
+pub(crate) fn current_path_if_set() -> Option<PathBuf> {
+    CURRENT
+        .get()
+        .map(|lock| lock.read().expect("CURRENT lock not poisoned").path.clone())
 }
 
 /// The mode the current selection is open in (ADR 0006/0007).
