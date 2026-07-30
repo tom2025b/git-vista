@@ -118,8 +118,10 @@ const RO_DIR_ACCESS: u64 = A_EXECUTE | A_READ_FILE | A_READ_DIR;
 /// bit is directory-only, and offering one for a regular file does not grant a
 /// subset — it makes the entire rule fail with `EINVAL`.
 ///
-/// Measured on this host 2026-07-29 (`/tmp/shimfix/llprobe.c`, ABI 8, one
-/// ruleset declaring `HANDLED_FS`, nine `landlock_add_rule` calls):
+/// Measured on this host 2026-07-29 (ABI 8, one ruleset declaring `HANDLED_FS`,
+/// nine `landlock_add_rule` calls). The first, third and sixth lines are
+/// re-measured on every run by `tests::the_kernel_rejects_directory_only_rights_on_a_regular_file`,
+/// so this table is a claim the build checks rather than a note someone took:
 ///
 /// ```text
 /// FILE + RO_DIR_ACCESS                     -> EINVAL   (READ_DIR is dir-only)

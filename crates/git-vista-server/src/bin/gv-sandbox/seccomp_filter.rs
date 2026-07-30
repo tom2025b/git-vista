@@ -34,8 +34,10 @@
 //! **whole map at once**: io_uring, `unshare`/`setns`, `seccomp` (the C1
 //! stacking denial), `ptrace`, and the AF_UNIX rules, all voided together.
 //!
-//! Measured 2026-07-29 with hand-built cBPF of exactly seccompiler's shape
-//! (`/tmp/shimfix/x32probe.c`, `x32probe2.c`), in a 64-bit process:
+//! Measured 2026-07-29 in a 64-bit process, under hand-assembled cBPF of exactly
+//! seccompiler's shape (`ld arch; jeq AUDIT_ARCH_X86_64 -> +1 else
+//! KILL_PROCESS; ld nr; jeq <key> -> ERRNO(EPERM); ret ALLOW`), run twice: once
+//! with a bare key and once with the same key OR'd with the bit:
 //!
 //! ```text
 //! bare key 425          : io_uring_setup()          EFAULT -> EPERM   (filter live)

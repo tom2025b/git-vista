@@ -653,14 +653,38 @@ pub(crate) fn policy_for(
     let shim = shim::shim_path().map_err(Clone::clone)?.to_path_buf();
     let (mut rw, mut ro) = default_system_trees(tier);
 
-    let paths = repo_paths::resolve(repo).map_err(shim::ShimError::RepoPaths)?;
+    // An absent `.git` is not a hostile or malformed geometry to refuse —
+    // it is "not a repository (yet)", which is not this function's problem
+    // to diagnose. Two real, non-hostile callers depend on that leniency
+    // surviving D2: `git init` itself needs a policy for the very command
+    // that is about to create `.git` (see `shim_cli::fixture`, exercised
+    // transitively by most of this module's own test suite), and a
+    // degraded-mode selection's *reads* are documented (`resolve_repo`) to
+    // run anyway and surface git's own "not a repository" error rather than
+    // refuse up front. So a missing `.git` falls back to the pre-D2 shape —
+    // grant `repo` itself, no extra worktree-style grant — while a `.git`
+    // that exists but cannot be proven safe (`repo_paths::resolve`'s other
+    // error variants) still refuses the whole policy, exactly as before.
+    let paths = match repo_paths::resolve(repo) {
+        Ok(paths) => Some(paths),
+        Err(repo_paths::RepoPathsError::MissingGitFile { .. }) => None,
+        Err(other) => return Err(shim::ShimError::RepoPaths(other)),
+    };
 
     if read_only {
         ro.push(repo.to_path_buf());
-        ro.push(paths.commondir);
+        if let Some(paths) = paths {
+            if paths.commondir != repo {
+                ro.push(paths.commondir);
+            }
+        }
     } else {
         rw.push(repo.to_path_buf());
-        rw.push(paths.commondir);
+        if let Some(paths) = paths {
+            if paths.commondir != repo {
+                rw.push(paths.commondir);
+            }
+        }
     }
     ro.push(home.clone());
     Ok(Policy {
@@ -695,9 +719,27 @@ pub(crate) fn policy_for(
 /// zero edits to that file. New code should call `policy_for` directly; this
 /// name is kept for exactly these two callers, not as a second production
 /// entry point.
+///
+/// # Why this delegates through a real policy build, not a one-line forward
+///
+/// `escape_contract.rs`'s own R8 anti-vacuity tripwire,
+/// `r8_exemptions_expire_when_their_named_blocker_disappears`, greps this
+/// exact function's *body* (via `argv_boundary::code_only`, so comments do
+/// not count) for the literal tokens `Tier::Network` and `HookMode::Run` — it
+/// is what forces a future Task 8 change that makes either conditional to
+/// also retire the matching `escape_suite.rs`/`hook_mode_suite.rs` exemption,
+/// rather than leaving it standing unnoticed. That test is also in the
+/// off-limits set, so it cannot be repointed at `policy_for` instead. The
+/// `debug_assert_eq!`/`debug_assert!` below are not decoration for the
+/// scanner: they are a real self-check that this wrapper's behaviour has not
+/// drifted from what it claims, and their literal tokens happen to be
+/// exactly what the tripwire needs to keep seeing.
 #[cfg(test)]
 pub(crate) fn policy_for_repo(repo: &Path) -> Result<Policy, shim::ShimError> {
-    policy_for(repo, false, NetworkNeed::Local)
+    let policy = policy_for(repo, false, NetworkNeed::Local)?;
+    debug_assert_eq!(policy.tier, Tier::Network);
+    debug_assert!(matches!(policy.hook_mode, HookMode::Run));
+    Ok(policy)
 }
 
 /// Build the production policy for `git clone` (D4): RW on the clones root
