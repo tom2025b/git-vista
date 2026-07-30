@@ -29,7 +29,16 @@ pub(crate) async fn rebase() -> (StatusCode, String) {
     if let Some(rejected) = reject_if_read_only() {
         return rejected;
     }
-    let repo = current().0;
+    // D2 (#66, Task 7): the validated resolution, replacing a raw
+    // `state::current()` call — see `state::resolve_target`'s doc comment.
+    // `rebase_status` below is a *read* (no `?repo=` selector either, same as
+    // this one, but reachable with no write gate) and deliberately keeps its
+    // own direct `current()` call — see "Read handlers wire it must NOT
+    // bypass what they do today" in the D2 implementation report.
+    let repo = match crate::state::resolve_target() {
+        Ok((repo, _entry)) => repo,
+        Err(rejected) => return rejected,
+    };
     let base = rebase_base(&repo).await;
     let base = RefName::new(base).expect("'origin/main' and 'main' are valid ref names");
     planner::plan_and_execute(GitOperation::RebaseOntoBase { base }).await
