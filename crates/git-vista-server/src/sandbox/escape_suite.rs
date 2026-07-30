@@ -164,9 +164,85 @@ const CASE_AF_UNIX_SOCKETPAIR_DENIED: EscapeCase = EscapeCase {
     git_port: GitPortUse::Unused,
 };
 
+/// The width guard on the AF_UNIX rule — the sibling of `high_bit_prctl_denied`,
+/// and the case M9 exists to kill.
+///
+/// Every other AF_UNIX case builds its family with libc's `socket()` wrapper,
+/// whose `int` parameter truncates the high bits *in userspace*, before the
+/// register seccomp compares ever carries them. Such a case cannot distinguish a
+/// `Dword` comparison from a `Qword` one, so the entire battery could stay green
+/// while the rule's width regressed — the exact defect this project already
+/// shipped once on `prctl`. This case's probe issues a raw
+/// `syscall(SYS_socket, AF_UNIX | 1<<32, …)` instead, so the hostile value
+/// survives into the kernel.
+///
+/// The baseline errno is 0 and it is not an oversight: outside the sandbox the
+/// kernel truncates the family itself and creates an ordinary AF_UNIX socket
+/// (measured: `rc=3`). That is what makes the inside leg's `EPERM` attributable
+/// to the filter and to nothing else.
+const CASE_HIGH_BIT_AF_UNIX_DENIED: EscapeCase = EscapeCase {
+    id: "high_bit_af_unix_denied",
+    class: Class::Containment,
+    tier: Tier::Strict,
+    hooks_blocked: false,
+    build_hook: harness::high_bit_af_unix_probe,
+    probe_tag: "HIGHUNIX",
+    expect_baseline: Errno(0),
+    expect_inside: Errno(1),
+    expect_granted: Errno(0),
+    expect_carrier_code: 0,
+    dies_under: &[MutantId::M9],
+    exemption: Exemption::NotProductionReachable {
+        blocker: "policy_for_repo hard-codes Tier::Network",
+    },
+    git_port: GitPortUse::Unused,
+};
+
+/// The x32 guard: an `__X32_SYSCALL_BIT`-numbered syscall must reach the
+/// denylist, not fall through it.
+///
+/// seccompiler keys rules on bare syscall numbers and its arch prologue reads
+/// `AUDIT_ARCH_X86_64` for an x32 call as well as an x86_64 one, so before the
+/// aliased keys landed an `nr` carrying `0x4000_0000` matched nothing and fell
+/// through to `mismatch_action` — Allow — taking the whole map with it, not one
+/// entry. See `seccomp_filter`'s module header for the cBPF measurement.
+///
+/// **This case needs no x32 ABI and therefore no skip**, which is the whole
+/// reason it can exist here: seccomp evaluates before the kernel's x64/x32
+/// dispatch split, so a normal 64-bit binary can issue a high-bit `nr` and see
+/// the filter's answer. The two legs differ for two independent reasons —
+/// outside, this host's kernel has `CONFIG_X86_X32_ABI` unset and answers
+/// `ENOSYS` (38); inside, the aliased key answers `EPERM` (1). Nothing but a
+/// live filter matching a high-bit key can turn 38 into 1.
+const CASE_HIGH_BIT_IO_URING_DENIED: EscapeCase = EscapeCase {
+    id: "high_bit_io_uring_denied",
+    class: Class::Containment,
+    tier: Tier::Network,
+    hooks_blocked: false,
+    build_hook: harness::high_bit_io_uring_probe,
+    probe_tag: "X32IOURING",
+    expect_baseline: Errno(38),
+    expect_inside: Errno(1),
+    expect_granted: Errno(0),
+    expect_carrier_code: 0,
+    dies_under: &[MutantId::M1],
+    exemption: Exemption::None,
+    git_port: GitPortUse::Unused,
+};
+
 #[test]
 fn secret_read_denied() {
     run_case(&CASE_SECRET_READ_DENIED);
+}
+
+#[test]
+fn high_bit_af_unix_denied() {
+    run_case(&CASE_HIGH_BIT_AF_UNIX_DENIED);
+}
+
+#[test]
+fn high_bit_io_uring_denied() {
+    run_case(&CASE_HIGH_BIT_IO_URING_DENIED);
 }
 
 #[test]
@@ -358,6 +434,108 @@ int main(void) {{
     printf("GVPROBE {nonce} BEGIN\n");
     printf("HIGHBIT rc=%ld errno=%d Seccomp: %d NoNewPrivs: %d\n",
            rc, saved, prctl(PR_GET_SECCOMP), prctl(PR_GET_NO_NEW_PRIVS));
+    int allowed = read_errno("{granted}");
+    printf("GRANTED rc=%d errno=%d\n", allowed ? -1 : 0, allowed);
+    printf("GVPROBE {nonce} END\n");
+    return 0;
+}}
+"#,
+                nonce = ctx.nonce,
+            ),
+        )
+    }
+
+    /// `socket(AF_UNIX | 1<<32)` through the **raw** `syscall()`, which is the
+    /// entire point of a separate probe.
+    ///
+    /// libc's `socket()` declares `int domain`, so passing the hostile value
+    /// through it truncates the high bits in userspace — before the register
+    /// seccomp compares ever holds them — and the resulting case would pass
+    /// identically against a `Dword` and a `Qword` comparison. That is a vacuous
+    /// case wearing the costume of a width guard, so this probe never touches the
+    /// wrapper for the denial leg.
+    ///
+    /// The paired positive is an ordinary `AF_INET` socket creation in the same
+    /// process under the same filter (the same positive the other AF_UNIX cases
+    /// use): without it, "the high-bit family was denied" would be
+    /// indistinguishable from "this filter denies `socket(2)` outright".
+    pub(super) fn high_bit_af_unix_probe(ctx: &HarnessCtx) -> String {
+        hook_for(
+            ctx,
+            format!(
+                r#"
+#include <errno.h>
+#include <stdio.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+int main(void) {{
+    errno = 0;
+    long high = syscall(SYS_socket, (long)AF_UNIX | 0x100000000L, SOCK_STREAM, 0);
+    int denied = high < 0 ? errno : 0;
+    if (high >= 0) close((int)high);
+    errno = 0;
+    long inet = syscall(SYS_socket, (long)AF_INET, SOCK_STREAM, 0);
+    int granted = inet < 0 ? errno : 0;
+    if (inet >= 0) close((int)inet);
+    printf("GVPROBE {nonce} BEGIN\n");
+    printf("HIGHUNIX rc=%ld errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           high, denied, prctl(PR_GET_SECCOMP), prctl(PR_GET_NO_NEW_PRIVS));
+    printf("GRANTED rc=%ld errno=%d\n", inet, granted);
+    printf("GVPROBE {nonce} END\n");
+    return 0;
+}}
+"#,
+                nonce = ctx.nonce,
+            ),
+        )
+    }
+
+    /// `io_uring_setup` under `__X32_SYSCALL_BIT`, from an ordinary 64-bit
+    /// binary.
+    ///
+    /// No x32 process is involved, and none is needed: seccomp runs in
+    /// `syscall_enter_from_user_mode()`, before the kernel's x64/x32 dispatch
+    /// split, so the filter sees `nr = 0x400001A9` and answers before anything
+    /// decides the call is not dispatchable. Outside the sandbox this host
+    /// answers `ENOSYS` (`CONFIG_X86_X32_ABI` is unset); inside, the aliased key
+    /// answers `EPERM`. The paired positive is a read of a granted file in the
+    /// repository, exactly as `io_uring_probe` does.
+    pub(super) fn high_bit_io_uring_probe(ctx: &HarnessCtx) -> String {
+        let granted = c_string(&granted_path(ctx));
+        hook_for(
+            ctx,
+            format!(
+                r#"
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/io_uring.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static int read_errno(const char *path) {{
+    errno = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return errno;
+    close(fd);
+    return 0;
+}}
+
+int main(void) {{
+    struct io_uring_params params;
+    memset(&params, 0, sizeof params);
+    errno = 0;
+    long ring = syscall(0x40000000L | __NR_io_uring_setup, 8, &params);
+    int saved = ring < 0 ? errno : 0;
+    if (ring >= 0) close((int)ring);
+    printf("GVPROBE {nonce} BEGIN\n");
+    printf("X32IOURING rc=%ld errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           ring, saved, prctl(PR_GET_SECCOMP), prctl(PR_GET_NO_NEW_PRIVS));
     int allowed = read_errno("{granted}");
     printf("GRANTED rc=%d errno=%d\n", allowed ? -1 : 0, allowed);
     printf("GVPROBE {nonce} END\n");
