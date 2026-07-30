@@ -6,8 +6,8 @@
 //! `SECURITY_MODEL.md:271` (the "Decide hook policy explicitly" bullet under
 //! Command Execution — cited by its opening words as well as its line, because
 //! that document has already moved this bullet twice) requires the UI to
-//! **report** the fact, present
-//! tense, for as long as it is true. A silently-applied hook policy is exactly
+//! **report** the fact, present tense, for as long as it is true. A
+//! silently-applied hook policy is exactly
 //! the failure the invariant exists to prevent, so the mapping below has one
 //! job: never produce a value that claims more than the tier dispatch actually
 //! delivers.

@@ -277,8 +277,12 @@ it did not itself register.
   drift from enforcement. `RepositoryDescriptor.hook_policy` and
   `SessionInfo.hook_policy` carry it to the client; `via_lan` has no bearing on the
   value reported (`session_hook_policy_for`, `crates/git-vista-server/src/handlers/
-  session.rs`) — see the ADR 0025 amendment. The frontend banner that renders this
-  is still the session-level, pre-#202 view; see ADR 0030 Consequences.)*
+  session.rs`) — see the ADR 0025 amendment. The client reports the
+  per-repository value on every picker row and on the mode screen where a
+  repository is opened (`hook_policy_disclosure.rs` + `picker.rs`, #208), with
+  an absent value shown as "not disclosed" and styled as a warning. The
+  separate **session**-level banner is still the pre-#202 view and its fixed
+  text is wrong for `Blocked` and `Network`; see ADR 0030 Consequences.)*
 - Apply timeouts, cancellation, stdout/stderr limits, process-group termination,
   and concurrency quotas.
 - Convert raw Git errors into structured safe errors; retain detailed stderr only
@@ -287,10 +291,10 @@ it did not itself register.
 ## Sandbox Mechanism Boundaries
 
 The Command Execution and Known Non-Goals sections state *what* is
-restricted and disclosed, and — as of this writing — that the enforcing
-shim is not built yet (ADR 0027). This section states what each mechanism
-actually covers once it does run, because a boundary that is silently
-narrower than it sounds is worse than one stated plainly. ADR 0027
+restricted and disclosed. The enforcing shim now ships and runs (ADR 0030);
+this section states what each mechanism actually covers when it does, because
+a boundary that is silently narrower than it sounds is worse than one stated
+plainly — and every limit below is a live limit, not a forecast. ADR 0027
 (filesystem) and ADR 0028 (network) are the durable record behind each item
 below.
 

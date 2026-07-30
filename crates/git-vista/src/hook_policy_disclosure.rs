@@ -179,6 +179,30 @@ mod tests {
         }
     }
 
+    /// `every_policy_state_reads_differently` proves the five texts are
+    /// distinct, but distinctness says nothing about *which* text landed on
+    /// which variant: swapping the `Network` and `Blocked` arms keeps all five
+    /// unique and keeps every warn polarity correct, while telling a user with
+    /// a network-sandboxed repository that its hooks do not run at all. This
+    /// binds the discriminating word of each arm to the variant it describes,
+    /// which is the only assertion that fails when two arms trade places.
+    #[test]
+    fn each_state_names_the_thing_that_makes_it_that_state() {
+        for (policy, needle) in [
+            (HookPolicy::Strict, "strict"),
+            (HookPolicy::Network, "network"),
+            (HookPolicy::Unsandboxed, "no sandbox at all"),
+            (HookPolicy::Blocked, "do not run"),
+        ] {
+            let d = for_repository(&descriptor(Some(policy)));
+            let text = format!("{} {}", d.label, d.detail).to_lowercase();
+            assert!(
+                text.contains(needle),
+                "{policy:?} never says {needle:?}: {text}"
+            );
+        }
+    }
+
     /// The unsandboxed tier is the one a user most needs to catch at a glance,
     /// so its badge must say so rather than hiding the fact in the detail line
     /// (picker rows show the badge; only the mode screen shows the detail).
