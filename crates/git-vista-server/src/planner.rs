@@ -584,14 +584,41 @@ async fn refs_digest_input(repo: &Path) -> Vec<(String, String)> {
 /// the blocking-thread version. Best-effort exactly as before — the git
 /// operation has already succeeded, so a failed join is dropped rather than
 /// turned into a failed response.
+///
+/// # `Obs`, not `Option`, for the two oids (D5, #66 Task 19)
+///
+/// The tips recorded here are read *after* the mutation succeeded, so an
+/// unreadable one is entirely possible (the sandbox policy can stop being
+/// buildable between two commands) and there is no undo path for it — the git
+/// work is already done. Taking `Obs` makes each executor state which of the
+/// three cases it is handing over instead of flattening two of them into
+/// `None`.
+///
+/// **The stored `ActivityEvent` is unchanged**, and deliberately so: its
+/// `old_oid`/`new_oid` are `Option<String>` in `git_vista_core`, that schema is
+/// shared with the on-disk JSONL every existing journal file is written in, and
+/// widening it is not this task's to do. So an `Unknown` still stores `None` —
+/// but it is never *silently* `None`: the summary carries an explicit note, so
+/// a reader of the feed can tell "there was no such tip" from "we could not
+/// read the tip", which is the distinction that was previously lost. The
+/// mechanical consequence — no restore point, no undo offered — is the
+/// fail-safe direction.
 async fn journal_app_event(
     repo: &Path,
     kind: ActivityKind,
     ref_name: Option<String>,
-    old_oid: Option<String>,
-    new_oid: Option<String>,
+    old_oid: Obs<String>,
+    new_oid: Obs<String>,
     summary: String,
 ) {
+    let summary = match (old_oid.is_unknown(), new_oid.is_unknown()) {
+        (false, false) => summary,
+        (true, false) => format!("{summary} (previous tip unknown — git could not be read)"),
+        (false, true) => format!("{summary} (resulting tip unknown — git could not be read)"),
+        (true, true) => format!("{summary} (tips unknown — git could not be read)"),
+    };
+    let old_oid = old_oid.known().cloned();
+    let new_oid = new_oid.known().cloned();
     let repo = repo.to_path_buf();
     let _ = tokio::task::spawn_blocking(move || {
         crate::handlers::journal_app_event(&repo, kind, ref_name, old_oid, new_oid, summary)
@@ -667,6 +694,7 @@ async fn enforce_fresh(
     // refusal would say "the repository changed", which is a claim about the
     // repository we are in no position to make. Say what actually happened.
     let unknown = observed.head_tip.is_unknown()
+        || observed.branch_tip.is_unknown()
         || observed.status.is_unknown()
         || live.head_tip.is_unknown()
         || live.status.is_unknown();
@@ -851,9 +879,14 @@ fn heads(branch: &BranchName) -> Option<RefName> {
     RefName::new(format!("refs/heads/{branch}")).ok()
 }
 
-/// Best-effort `CommitOid` from an observed string.
-fn oid_of(observed: &Option<String>) -> Option<CommitOid> {
-    observed.as_deref().and_then(|o| CommitOid::new(o).ok())
+/// Best-effort `CommitOid` from an observation. `Absent` and `Unknown` both
+/// yield `None` — correct here only because every caller uses it to *omit* a
+/// descriptive field rather than to assert one; see the `PushBranch` arm in
+/// [`shape`] for the one place where the distinction had to be made explicit.
+fn oid_of(observed: &Obs<String>) -> Option<CommitOid> {
+    observed
+        .known()
+        .and_then(|o| CommitOid::new(o.as_str()).ok())
 }
 
 /// The per-operation review shapes — risk, preconditions, expected ref
@@ -1022,15 +1055,22 @@ async fn shape(
             }));
             // The remote-tracking ref this push is expected to move.
             let tracking = RefName::new(format!("refs/remotes/{remote}/{branch}")).ok();
-            let remote_tip = rev_parse(repo, &format!("{remote}/{branch}")).await;
-            let local_tip = rev_parse(repo, branch.as_str()).await;
-            let changes = match (tracking, oid_of(&local_tip)) {
-                (Some(r), Some(local)) => vec![RefChange {
+            let remote_tip = Obs::from_read(rev_parse(repo, &format!("{remote}/{branch}")).await);
+            let local_tip = Obs::from_read(rev_parse(repo, branch.as_str()).await);
+            // D5: `before` is a *claim* about the remote-tracking ref shown to
+            // the user for review, so `Unknown` may not be rendered as
+            // `Absent` ("this ref does not exist yet"). An unreadable
+            // observation thins the plan instead — the documented posture for
+            // every other failed read in `build_plan`.
+            let before = match &remote_tip {
+                Obs::Known(_) => oid_of(&remote_tip).map(RefState::At),
+                Obs::Absent => Some(RefState::Absent),
+                Obs::Unknown => None,
+            };
+            let changes = match (tracking, oid_of(&local_tip), before) {
+                (Some(r), Some(local), Some(before)) => vec![RefChange {
                     ref_name: r,
-                    before: match oid_of(&remote_tip) {
-                        Some(o) => RefState::At(o),
-                        None => RefState::Absent,
-                    },
+                    before,
                     after: RefState::At(local),
                 }],
                 _ => Vec::new(),
@@ -1274,7 +1314,19 @@ async fn run_git(repo: &Path, need: NetworkNeed, args: &[&str]) -> std::io::Resu
 
 /// The uniform 500 for a git binary that couldn't be spawned, with the same
 /// per-endpoint log line the handlers printed.
-fn couldnt_run(endpoint: &str, e: &std::io::Error) -> (StatusCode, String) {
+///
+/// Generic over the reason since D5 (#66, Task 19): it takes the executors'
+/// `std::io::Error` exactly as before, and also
+/// [`ExecUnavailable`](crate::git_cmd::ExecUnavailable) from the gate sites,
+/// so **one** response shape covers every "git could not run" in the server.
+/// That single shape is what makes it distinguishable from a refusal: the
+/// gates that used to answer 400 ("no such branch", "not a valid object name")
+/// on this input now answer 500 here, and nothing else in the planner returns
+/// a 500 for a repository-state reason.
+pub(crate) fn couldnt_run<E: std::fmt::Display + ?Sized>(
+    endpoint: &str,
+    e: &E,
+) -> (StatusCode, String) {
     eprintln!("git-vista: {endpoint} couldn't run git: {e}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1357,12 +1409,12 @@ async fn exec_create_branch(
         println!("[/api/branch] created branch '{name}' at {at}");
         // Journal the creation with the resolved tip (the user may have given
         // an abbreviated or symbolic start point).
-        let tip = rev_parse(repo, name.as_str()).await;
+        let tip = Obs::from_read(rev_parse(repo, name.as_str()).await);
         journal_app_event(
             repo,
             ActivityKind::BranchCreated,
             Some(name.as_str().to_string()),
-            None,
+            Obs::Absent, // a created branch has no previous tip, by definition
             tip,
             format!("created branch ‘{name}’"),
         )
