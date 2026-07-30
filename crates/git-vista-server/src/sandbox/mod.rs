@@ -1026,13 +1026,19 @@ pub(crate) fn policy_for(
 /// tier, so this wrapper has to declare what it actually wants — and what its
 /// remaining caller wants is the **Network** tier.
 ///
-/// `escape_contract::policy_for_case` routes every battery case whose
-/// `exemption` is `Exemption::None` through this function, and all ten such
-/// cases declare `tier: Tier::Network` (`secret_read_denied`,
-/// `io_uring_denied`, `high_bit_prctl_denied`, `high_bit_io_uring_denied`,
-/// `write_home_denied`, `cgroup_tree_denied`, `no_new_privs_irrevocable`,
-/// `second_landlock_ruleset_denied`, `unshare_userns_denied`, and
-/// `hook_mode_suite`'s `blocked_hooks`). Each is a containment claim written
+/// `escape_contract::policy_for_case` routes the **nine** `Exemption::None`
+/// battery cases that declare `tier: Tier::Network` through this function
+/// (`secret_read_denied`, `io_uring_denied`, `high_bit_prctl_denied`,
+/// `high_bit_io_uring_denied`, `write_home_denied`, `cgroup_tree_denied`,
+/// `no_new_privs_irrevocable`, `second_landlock_ruleset_denied`,
+/// `unshare_userns_denied`). Since #206 that dispatch matches on `case.tier`:
+/// the seven `Tier::Strict` cases go to `policy_for(repo, false,
+/// NetworkNeed::Local)` directly, and `hook_mode_suite`'s `blocked_hooks` is
+/// the one remaining exemption and reaches neither. (This paragraph used to
+/// say "all ten such cases declare `Tier::Network`" and list `blocked_hooks`
+/// among them; that was wrong before #206 as well as after — an exempt case
+/// has never routed through here.)
+/// Each is a containment claim written
 /// *against that tier* — `unshare_userns_denied` in particular is only a
 /// meaningful claim where nothing has already unshared a user namespace, which
 /// bwrap does for us in Strict. Declaring `Local` here to make the wrapper
@@ -1050,12 +1056,21 @@ pub(crate) fn policy_for(
 ///
 /// # Why this delegates through a real policy build, not a one-line forward
 ///
-/// `escape_contract.rs`'s own R8 anti-vacuity tripwire,
-/// `r8_exemptions_expire_when_their_named_blocker_disappears`, greps this
-/// exact function's *body* (via `argv_boundary::code_only`, so comments do
-/// not count) for the literal tokens `Tier::Network` and `HookMode::Run`. The
-/// `debug_assert_eq!`/`debug_assert!` below are not decoration for the
-/// scanner: they are a real self-check that this wrapper's behaviour has not
+/// R8 **no longer reads this function at all.** It used to: the tripwire
+/// grepped this exact body for the literal tokens `Tier::Network` and
+/// `HookMode::Run`, because before #197 `policy_for` hard-coded both and the
+/// hard-codes *were* the declared blockers. #197 removed them, but the tokens
+/// survived inside the `debug_assert!`s below — so the grep went on passing
+/// while the condition it stood for no longer existed, and eight exemptions
+/// were reworded instead of retired. #206 re-anchored R8 onto a property of
+/// **production** source (no production `Policy` constructor may yield
+/// `HookMode::Blocked`) plus set-equality on the declared blocker strings. A
+/// tripwire pointed at a token in `#[cfg(test)]` code cannot expire, which is
+/// the one thing R8 exists to do.
+///
+/// The `debug_assert_eq!`/`debug_assert!` below therefore have no scanner
+/// reading them, and they stay anyway: they are a real self-check that this
+/// wrapper's behaviour has not
 /// drifted from what it claims — after Task 8 they are a genuinely load-bearing
 /// pin, because the tier is now *derived* rather than constant, and a future
 /// edit to `tier_for` or to `network_need_for_operation` that moved a remote
