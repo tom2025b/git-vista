@@ -265,7 +265,9 @@ fn boot_probe_fixture() -> std::io::Result<BootProbeFixture> {
         .arg(&repo)
         .status()?;
     if !status.success() {
-        return Err(std::io::Error::other("git init failed for the boot probe fixture"));
+        return Err(std::io::Error::other(
+            "git init failed for the boot probe fixture",
+        ));
     }
 
     let hooks_dir = repo.join(".git").join("hooks");
@@ -381,7 +383,10 @@ fn evaluate_observation(obs: &Observation) -> Result<(), Vec<String>> {
     // C3: a fresh procfs (bwrap's pid namespace) shows a handful of small
     // pids; the host's real procfs shows many more. Same threshold the
     // escape battery uses elsewhere in this crate.
-    match obs.get("procfs_max_pid").and_then(|v| v.parse::<i64>().ok()) {
+    match obs
+        .get("procfs_max_pid")
+        .and_then(|v| v.parse::<i64>().ok())
+    {
         Some(p) if p > 0 && p < 100 => {}
         Some(p) => failed.push(format!("procfs_max_pid={p} want<100")),
         None => failed.push("procfs_max_pid=<no marker>".to_string()),
