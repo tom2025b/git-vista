@@ -281,8 +281,10 @@ it did not itself register.
   per-repository value on every picker row and on the mode screen where a
   repository is opened (`hook_policy_disclosure.rs` + `picker.rs`, #208), with
   an absent value shown as "not disclosed" and styled as a warning. The
-  separate **session**-level banner is still the pre-#202 view and its fixed
-  text is wrong for `Blocked` and `Network`; see ADR 0030 Consequences.)*
+  separate **session**-level banner (`hook_policy_banner.rs`) also reports
+  the real policy now (#208): its text is
+  `hook_policy_disclosure::for_session(policy)`, an exhaustive per-variant
+  match, not the fixed pre-#202 sentence; see ADR 0030 Consequences.)*
 - Apply timeouts, cancellation, stdout/stderr limits, process-group termination,
   and concurrency quotas.
 - Convert raw Git errors into structured safe errors; retain detailed stderr only

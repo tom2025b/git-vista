@@ -33,6 +33,7 @@ use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
 use crate::api::{fetch_frame, fetch_page, fetch_protocol, HistoryFetchError};
 use crate::dialogs;
+use crate::features::a11y::core::GRAPH_REGION_LABEL;
 use crate::features::activity::signals::Activity;
 use crate::features::dialogs::core::Dialog;
 use crate::features::dialogs::signals::Dialogs;
@@ -646,7 +647,12 @@ pub fn App() -> impl IntoView {
             // the sign-in/protocol screens, over everything else.
             {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, dialogs_guard, graph)}
             {crate::picker::mode_view(mode_for, picker_open, graph)}
-            <section class="graph">
+            // M1.12 (#65): a bare <section> is not a landmark — it is only exposed as
+            // a `region` once it has an accessible name, so without this the graph is
+            // an anonymous container and VoiceOver's rotor has nothing to jump to. The
+            // name comes from `a11y::core` rather than a literal here so the markup and
+            // the tripwire that checks it cannot drift apart.
+            <section class="graph" aria-label=GRAPH_REGION_LABEL>
                 {move || {
                     // Read the icon set here, inside the reactive block, so the
                     // status lines re-render when the icon style is toggled.

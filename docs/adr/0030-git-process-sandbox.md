@@ -501,18 +501,21 @@ stateDiagram-v2
   because this crate has no `wasm-bindgen-test` harness and nobody has driven
   the UI in a browser.
 
-  What is *still* not landed: the **session**-level banner.
-  `crates/git-vista/src/hook_policy_banner.rs` carries its original M1.13a
-  text and `Allow`/`Restricted` framing. That is not merely stale wording —
-  `SessionCore::hook_policy_banner_visible` delegates to
-  `HookPolicy::requires_banner`, which is deliberately true for `Blocked` and
-  `Network`, while the banner's fixed text says "Repository hooks run
-  automatically for this session… execute with your permissions." For
-  `Blocked` that is the opposite of the truth, and for `Network` it omits the
-  sandbox. Both errors are in the over-warning direction, so this is a
-  credibility bug rather than a false-reassurance one, but the banner text
-  must become a function of the policy — as the per-repository disclosure
-  already is — before INV-15's session half can be called satisfied.
+  The **session**-level banner has since caught up too (#208).
+  `crates/git-vista/src/hook_policy_banner.rs` no longer carries the original
+  M1.13a `Allow`/`Restricted`-era fixed text — that text used to say
+  "Repository hooks run automatically for this session… execute with your
+  permissions" for every warning state, which for `Blocked` was the opposite
+  of the truth and for `Network` omitted the sandbox that was in fact
+  containing it. `SessionCore::hook_policy_banner_visible` still decides
+  *whether* the bar shows (`HookPolicy::requires_banner`, true for `Blocked`
+  and `Network`), but the words are now
+  [`crate::hook_policy_disclosure::for_session`], an exhaustive match on the
+  policy with no `_` arm — the same host-tested, per-variant-wording
+  discipline as the per-repository half. Both errors were in the
+  over-warning direction, so this was always a credibility bug rather than a
+  false-reassurance one, but INV-15's session half is now satisfied on the
+  same terms as its per-repository half.
 - **The anti-vacuity contract's own tripwires have rotted once, after
   landing.** R8's exemption-expiry check grepped `policy_for_repo`'s body for
   literal `Tier::Network`/`HookMode::Run`; when Task 8 removed that
@@ -567,8 +570,8 @@ stateDiagram-v2
   actually shows (#208): the pure wording map plus the row badge and the
   mode-screen sentence. Landed.
 - `crates/git-vista/src/hook_policy_banner.rs` — the session-level banner
-  from ADR 0025; **not yet updated** for the four-tier vocabulary, and its
-  text is factually wrong for `Blocked` and `Network` — see Consequences.
+  from ADR 0025, now updated for the four-tier vocabulary (#208): its text is
+  `hook_policy_disclosure::for_session(policy)`, not a constant. Landed.
 - `crates/git-vista-server/src/sandbox/escape_contract.rs`,
   `.../escape_suite.rs`, `.../hook_mode_suite.rs`,
   `.../documented_gaps.rs` — the escape battery and its anti-vacuity harness.
