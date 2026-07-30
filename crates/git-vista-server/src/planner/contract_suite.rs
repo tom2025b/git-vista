@@ -440,29 +440,25 @@ async fn push_branch_executes_through_the_pipeline() {
     // fixture serves the bare remote over git:// on loopback: 9418 is in
     // `DEFAULT_GIT_PORTS`, the Network tier's Landlock connect grant covers
     // it, and the daemon (spawned unsandboxed by the test) does the receiving.
-    // Port 9418 must be free, and two different things can hold it. A *stale*
-    // daemon (leaked when a run was SIGKILLed before the guard's Drop) would
-    // pass the readiness probe below while serving a dead base path, and every
-    // push would then fail with a baffling "connection reset". The other holder
-    // is inside this very test binary: `escape_suite::harness::
-    // strict_listener_probe` binds 127.0.0.1:9418 through a `OnceLock` and
-    // parks a thread in `accept()`, and under a *passing* denial case no
-    // connection ever arrives to unblock it — so that port is held for the rest
-    // of the process's life. Both tests genuinely need 9418 (it is the only
-    // unprivileged entry in `DEFAULT_GIT_PORTS`, so it is the only port a
-    // Network-tier Landlock connect grant covers), which makes them mutually
-    // exclusive in one binary. See handoff.md — the durable fix is to give the
-    // escape harness's listener a bounded lifetime and serialize the two behind
-    // a shared guard; until then this assertion names the collision instead of
-    // letting it surface as an unexplained transport error.
-    assert!(
-        std::net::TcpStream::connect(("127.0.0.1", 9418)).is_err(),
-        "port 9418 is already in use. Either a leaked `git daemon` from an \
-         earlier run (`pgrep -af git-daemon`, kill it, rerun), or \
-         `escape_suite::strict_listener_denied` ran first in this same binary \
-         and is parked on that port — the two cannot share it (see the comment \
-         above)."
-    );
+    //
+    // That one port is contended, and not only by other processes. It is the
+    // only unprivileged entry in `DEFAULT_GIT_PORTS`, so it is the only port a
+    // Network-tier Landlock connect grant covers, which means the sandbox
+    // escape battery in this same test binary cannot move off it either:
+    // `escape_suite::strict_listener_denied` needs a listener there and
+    // `strict_tcp_bind_denied` needs it unbound. `crate::test_ports` is the
+    // arbiter — a process-wide claim every holder takes, released only once its
+    // listener or daemon is really gone. Acquiring it here both excludes those
+    // tests and waits out a *stale* daemon leaked by a run that was SIGKILLed
+    // before the guard's `Drop` (such a daemon would otherwise pass the
+    // readiness probe below while serving a dead base path, and every push would
+    // fail with a baffling "connection reset"). The claim is taken before the
+    // daemon is spawned and dropped at the end of the test, after `DaemonGuard`
+    // has killed it.
+    let _port_claim = crate::test_ports::PortClaim::acquire();
+    // Read from the claim, never re-typed: a daemon on a different port than the
+    // one claimed would reintroduce exactly the collision the claim prevents.
+    let port = crate::test_ports::PortClaim::PORT;
     // `process_group(0)` — see `DaemonGuard`. Stdio all detached: an inherited
     // stdout pipe would keep any harness capturing this test's output alive
     // for as long as the daemon lives, turning a daemon leak into a hang.
@@ -473,7 +469,7 @@ async fn push_branch_executes_through_the_pipeline() {
                 "daemon",
                 "--reuseaddr",
                 "--listen=127.0.0.1",
-                "--port=9418",
+                &format!("--port={port}"),
                 "--export-all",
                 "--enable=receive-pack",
                 &format!("--base-path={}", dir.path().display()),
@@ -486,18 +482,23 @@ async fn push_branch_executes_through_the_pipeline() {
     };
     let _daemon = DaemonGuard(daemon);
     let ready = (0..50).any(|_| {
-        std::net::TcpStream::connect(("127.0.0.1", 9418))
+        std::net::TcpStream::connect(("127.0.0.1", port))
             .map(|_| true)
             .unwrap_or_else(|_| {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 false
             })
     });
-    assert!(ready, "git daemon never came up on 127.0.0.1:9418");
+    assert!(ready, "git daemon never came up on 127.0.0.1:{port}");
 
     run(
         &repo,
-        &["remote", "add", "origin", "git://127.0.0.1:9418/remote.git"],
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("git://127.0.0.1:{port}/remote.git"),
+        ],
     );
     let (status, body) = pipeline(
         &repo,
