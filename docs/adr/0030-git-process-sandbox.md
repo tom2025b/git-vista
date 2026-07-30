@@ -1,10 +1,9 @@
 # 0030 — The git-process sandbox: a pure argv boundary, tiers by declared intent, and tests that prove their own premise
 
 - **Status:** Accepted — core mechanism and INV-15 disclosure landed and tested
-  at the wire, and the per-repository policy now renders in the frontend picker
-  (#208, landed in parallel with this record). The *session*-level banner is
-  still the pre-#202 view and its text is wrong for two of the four policy
-  values; see Consequences.
+  at the wire, and both UI halves now render it: the per-repository policy in
+  the frontend picker and the session-level banner's text as a function of the
+  policy (#208, both landed). See Consequences.
 - **Date:** 2026-07-30
 - **Milestone / issue:** M1.13b — the git-process sandbox (#66). Written for issue
   #205 (Task 18, "the whole-sandbox ADR and security-model closure"), the record
@@ -478,8 +477,8 @@ stateDiagram-v2
   justified specifically because GitHub-hosted runners are single-job,
   ephemeral VMs with no "leaves the box weaker" concern. It is landed in
   `.github/workflows/ci.yml`.
-- **INV-15 disclosure (issue #202/Task 16) — landed at the wire; the UI has
-  not caught up.** `HookPolicy`'s four variants,
+- **INV-15 disclosure (issue #202/Task 16) — landed at the wire, and both UI
+  halves have caught up (#208).** `HookPolicy`'s four variants,
   `RepositoryDescriptor.hook_policy: Option<HookPolicy>`, and the wiring that
   makes a repository's real tier reach that field are committed, not merely
   drafted: `catalog.rs`'s `disclosed_hook_policy` and `handlers/session.rs`'s
