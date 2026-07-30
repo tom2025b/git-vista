@@ -61,6 +61,7 @@
     "kind": "linked_worktree",
     "read_only": true,
     "path": "/home/tom/repos/git-vista/.worktrees/linked",
-    "remote_web_url": "https://github.com/owner/repo"
+    "remote_web_url": "https://github.com/owner/repo",
+    "hook_policy": "unsandboxed"
   }
 }

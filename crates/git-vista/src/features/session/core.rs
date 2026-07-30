@@ -141,12 +141,16 @@ mod tests {
         s.apply(SessionEvent::Established {
             csrf: Some("abc".into()),
             via_lan,
-            // The two values `handlers::session::hook_policy_for(via_lan)`
-            // actually emits today, spelled in the tier vocabulary rather
-            // than through the `Restricted`/`Allow` transition aliases. That
-            // mapping is itself known-stale (#202 left it deliberately
-            // over-warning until Task 16.5 lands); this helper mirrors what
-            // the server sends, it does not endorse it.
+            // Two contrasting policies, one silent and one banner-flying, so
+            // the tests below exercise both sides of the banner rule.
+            //
+            // They are keyed off `via_lan` purely as a convenient switch in
+            // this helper — **the server no longer derives hook policy from
+            // `via_lan` at all** (#202: it discloses the measured
+            // per-repository policy, identically on both listeners). Nothing
+            // here should be read as mirroring a server mapping; a session's
+            // policy and its `via_lan` flag are independent values that arrive
+            // in the same event.
             hook_policy: if via_lan {
                 HookPolicy::Strict
             } else {

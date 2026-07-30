@@ -45,8 +45,9 @@
 //! `unreachable!` carrying its reason."* Neither of those two is used either,
 //! for a reason ADR 0029 also states: the refusal must reach the handler "as a
 //! proper refusal, not a panic reachable from a network request," and
-//! `hook_policy_for_repo`'s eventual caller (`catalog.rs`, building a
-//! `RepositoryDescriptor`) *is* reachable from a network request. So the third
+//! `hook_policy_for_repo`'s caller (`catalog.rs`, building a
+//! `RepositoryDescriptor` — wired up in #202, and no longer merely prospective)
+//! *is* reachable from a network request. So the third
 //! option is taken: a [`Result`], whose `Err` arm names the verdict and forces
 //! the caller to choose. There is no [`HookPolicy`] value that honestly means
 //! "operations on this repository will refuse to run" — inventing one would be
