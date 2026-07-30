@@ -291,6 +291,24 @@ below.
   all.** Only the strict tier's network namespace blocks UDP egress, by
   removing network access entirely; the network tier's Landlock port rules
   pass UDP and Unix-domain traffic through unmediated, in either direction.
+- **`AF_UNIX` in the strict tier is denied by seccomp, and by nothing else.**
+  *Implemented* (2026-07-29) in `seccomp_filter::af_unix_rule` as an
+  argument-scoped `EPERM` on `socket(2)`/`socketpair(2)` when the address family
+  is `AF_UNIX`, installed for `--net-deny` (strict) only. It is worth being
+  explicit about why every other layer misses this, because for a period the
+  design claimed the denial while the build did not have it (measured: both
+  entry points succeeded inside the full strict stack, identical to the bare
+  host, while a `ptrace` control in the same run returned `EPERM`).
+  `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` mediates *connecting* to an abstract
+  socket created outside the domain — not socket construction — and Landlock ABI
+  8 does not mediate **pathname** sockets at all; the IPC and network namespaces
+  do not cover `AF_UNIX` either. Without the seccomp rule a hostile hook in the
+  strict tier reached `/run/docker.sock`, `ssh-agent`, `gpg-agent` and the D-Bus
+  session bus. The **network tier deliberately still permits `AF_UNIX`**: git
+  over SSH wants an agent socket and the carve-out is deferred (issue #188), so
+  that tier's filter is unchanged. Proven by `af_unix_socket_denied` and
+  `af_unix_socketpair_denied` in the escape battery, which die under
+  `ci/mutants/M8-remove-af-unix-socket-rule.patch`.
 - **Landlock rules bind resolved inodes, not path strings.** A name excluded
   from a grant is only actually withheld if the enumeration that builds the
   grant set resolves symlinks and matches hard-link inodes before deciding
