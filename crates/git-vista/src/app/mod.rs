@@ -410,7 +410,10 @@ pub fn App() -> impl IntoView {
             {move || {
                 session
                     .get()
-                    .map(|_| hook_policy_banner_view(session_state::hook_policy_banner_visible()))
+                    .map(|_| hook_policy_banner_view(
+                            session_state::hook_policy_banner_visible(),
+                            session_state::hook_policy(),
+                        ))
             }}
             // M1.11 (#64): in-flight writes and their outcomes. Mounted in the shell,
             // not the canvas, so it keeps reporting across the epoch bump a completed
