@@ -609,14 +609,14 @@ fn enumerate(ruleset: i32, dir: &Path, root: &Path, access: u64, excludes: &[Pat
                 }
             }
         }
-        let mode = if md.is_dir() {
-            access
-        } else {
-            access & !(A_READ_DIR | A_EXECUTE)
-        };
-        if add_path_rule(ruleset, &path, mode) {
-            granted += 1;
-        }
+        // The right-masking that used to live here (`access & !(A_READ_DIR |
+        // A_EXECUTE)`) is now `add_path_rule`'s job, computed from an `fstat` of
+        // the descriptor the rule will carry. Two reasons it moved: the old mask
+        // was *wrong for a read-write tree* (it left `MAKE_*`/`REMOVE_*` set, so
+        // the kernel rejected every regular file in an enumerated `--rw` tree —
+        // see `ACCESS_FILE`), and having one mask here and none on the
+        // non-enumerated path is exactly how the two paths came to disagree.
+        granted += grant_one(ruleset, &path, access);
     }
     granted
 }
@@ -709,6 +709,202 @@ fn apply_landlock(a: &Args) {
 // is auto-discovered by Cargo as its *own* binary target and would be required
 // to have a `main` of its own.
 mod seccomp_filter;
+
+/// Landlock grant tests. They build a **real** ruleset and call the real
+/// `landlock_add_rule`, then throw the ruleset away without
+/// `landlock_restrict_self` — so nothing here restricts the test process, and
+/// nothing here is a re-implementation of the primitive under test. A test that
+/// asserted against a hand-rolled model of what the kernel accepts is precisely
+/// what let the file-grant no-op live: the header on this host declares a
+/// two-field `landlock_ruleset_attr` and no scopes, and reasoning from it is how
+/// four rounds of this design died.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ruleset that handles everything this shim handles in production. Never
+    /// restricted onto the test process — it is a bag of rules the kernel
+    /// validates, which is the only thing these tests need from it.
+    ///
+    /// Failure here is a hard failure, never a skip: the CI preflight
+    /// (`escape_contract::ci_preflight_host_meets_the_declared_minimum`) already
+    /// asserts this host meets the Landlock floor, so a ruleset that will not
+    /// create means the measurement below cannot be made — and a green test that
+    /// proved nothing is worse than a red one.
+    fn handled_ruleset() -> i32 {
+        let abi = abi_version();
+        assert!(
+            abi >= 6,
+            "Landlock ABI {abi} cannot demonstrate this test's premise; the CI preflight \
+             asserts the floor, so this is a host defect, not a reason to skip"
+        );
+        let attr = RulesetAttr {
+            handled_access_fs: HANDLED_FS,
+            handled_access_net: NET_CONNECT_TCP | NET_BIND_TCP,
+            scoped: LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL,
+        };
+        let rs = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_CREATE_RULESET,
+                &attr as *const _,
+                std::mem::size_of::<RulesetAttr>(),
+                0usize,
+            )
+        } as i32;
+        assert!(
+            rs >= 0,
+            "landlock_create_ruleset failed: {}",
+            std::io::Error::last_os_error()
+        );
+        rs
+    }
+
+    /// `landlock_add_rule` with no masking at all — the pre-fix code path,
+    /// preserved here as the *premise* of every assertion below. Returns the
+    /// raw errno.
+    fn add_rule_unmasked(ruleset: i32, path: &Path, access: u64) -> i32 {
+        let c = CString::new(path.as_os_str().as_bytes()).expect("no interior NUL");
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "O_PATH open of {} failed", path.display());
+        let attr = PathBeneathAttr {
+            allowed_access: access,
+            parent_fd: fd,
+        };
+        let rc = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_ADD_RULE,
+                ruleset,
+                LANDLOCK_RULE_PATH_BENEATH,
+                &attr as *const _,
+                0usize,
+            )
+        };
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(-1);
+        unsafe { libc::close(fd) };
+        if rc == 0 {
+            0
+        } else {
+            errno
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, PathBuf) {
+        let d = tempfile::tempdir().expect("tempdir");
+        let f = d.path().join("granted.txt");
+        std::fs::write(&f, "granted\n").expect("write fixture file");
+        (d, f)
+    }
+
+    /// The premise, measured rather than assumed: the kernel rejects a
+    /// directory-only right on a regular file, and it rejects it for the whole
+    /// rule — there is no partial grant. If this ever starts passing, the mask
+    /// in `rights_for_target` has stopped being load-bearing and every
+    /// assertion below is vacuous, so this test is what keeps them honest.
+    #[test]
+    fn the_kernel_rejects_directory_only_rights_on_a_regular_file() {
+        let rs = handled_ruleset();
+        let (_d, file) = fixture();
+
+        assert_eq!(
+            add_rule_unmasked(rs, &file, RO_DIR_ACCESS),
+            libc::EINVAL,
+            "READ_DIR on a regular file must be EINVAL — this is the rejection the \
+             pre-fix fast path mapped to `false` and then discarded"
+        );
+        assert_eq!(
+            add_rule_unmasked(rs, &file, RW_ACCESS),
+            libc::EINVAL,
+            "a read-write file grant must be EINVAL unmasked"
+        );
+        // The mask `enumerate` used to carry, on a read-write tree. Still
+        // rejected: MAKE_*/REMOVE_* are directory-only too, so the enumerated
+        // path was silently granting nothing for regular files under `--rw`.
+        assert_eq!(
+            add_rule_unmasked(rs, &file, RW_ACCESS & !(A_READ_DIR | A_EXECUTE)),
+            libc::EINVAL,
+            "the old `& !(READ_DIR|EXECUTE)` mask must still be rejected for a \
+             read-write tree; if not, this test's reason to exist has changed"
+        );
+        assert_eq!(
+            add_rule_unmasked(rs, &file, 0),
+            libc::ENOMSG,
+            "an empty access mask is not a rule"
+        );
+        unsafe { libc::close(rs) };
+    }
+
+    /// The fix: a policy entry naming a regular file is granted, at exactly the
+    /// rights a file can carry. This is the test that would have caught the
+    /// no-op — pre-fix, `add_path_rule` returned `false` here and `grant_tree`
+    /// answered `0 granted` with no error.
+    #[test]
+    fn a_grant_naming_a_regular_file_is_honoured_at_file_rights() {
+        let rs = handled_ruleset();
+        let (_d, file) = fixture();
+
+        assert_eq!(
+            add_path_rule(rs, &file, RO_DIR_ACCESS).expect("a read-only file grant must land"),
+            A_EXECUTE | A_READ_FILE,
+            "a read-only file grant keeps exactly the file-applicable rights"
+        );
+        assert_eq!(
+            add_path_rule(rs, &file, RW_ACCESS).expect("a read-write file grant must land"),
+            A_EXECUTE | A_WRITE_FILE | A_READ_FILE | A_TRUNCATE,
+            "a read-write file grant keeps exactly the file-applicable rights"
+        );
+        unsafe { libc::close(rs) };
+    }
+
+    /// A directory grant is untouched by the mask — the masking must not have
+    /// quietly narrowed the case that already worked.
+    #[test]
+    fn a_directory_grant_is_still_granted_whole() {
+        let rs = handled_ruleset();
+        let (dir, _file) = fixture();
+
+        assert_eq!(
+            add_path_rule(rs, dir.path(), RO_DIR_ACCESS).expect("a read-only tree grant lands"),
+            RO_DIR_ACCESS,
+        );
+        assert_eq!(
+            add_path_rule(rs, dir.path(), RW_ACCESS).expect("a read-write tree grant lands"),
+            RW_ACCESS,
+        );
+        assert_eq!(rights_for_target(RW_ACCESS, true), RW_ACCESS);
+        unsafe { libc::close(rs) };
+    }
+
+    /// The two failure shapes must stay distinguishable, because exactly one of
+    /// them is survivable: an absent path is a host that does not have
+    /// `/run/resolvconf`, while a rejected rule is a policy the shim cannot
+    /// honour and must refuse (`grant_one`).
+    #[test]
+    fn an_absent_path_is_distinguishable_from_a_refused_rule() {
+        let rs = handled_ruleset();
+        let (d, file) = fixture();
+
+        let absent = add_path_rule(rs, &d.path().join("no-such-entry"), RO_DIR_ACCESS)
+            .expect_err("an absent path cannot be granted");
+        assert!(
+            absent.is_absent(),
+            "an absent path must report as absent, not as a refused grant: {absent}"
+        );
+
+        // A dir-only right set on a regular file masks to nothing. Not merely
+        // "no rule added" — the policy asked for something the object cannot
+        // carry, and `grant_one` must be able to tell that apart from absence.
+        let empty = add_path_rule(rs, &file, A_READ_DIR | A_MAKE_DIR)
+            .expect_err("a directory-only grant on a file has nothing to add");
+        assert!(
+            !empty.is_absent(),
+            "a grant masked to nothing must NOT read as absence: {empty}"
+        );
+        assert_eq!(rights_for_target(A_READ_DIR | A_MAKE_DIR, false), 0);
+        unsafe { libc::close(rs) };
+    }
+}
 
 /// Install the terminal denylist. Applied **after** Landlock and immediately
 /// before the exec, so the ordering matches the layering: the filesystem
