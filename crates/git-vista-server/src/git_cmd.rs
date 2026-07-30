@@ -476,6 +476,29 @@ pub(crate) async fn git_ref_exists(
     Ok(out.status.success())
 }
 
+/// A directory git genuinely cannot be run against, for the D5 tests.
+///
+/// **Nothing is mocked and no function under test is stubbed.** `.git` is a
+/// regular file that is not a `gitdir:` pointer, which is a geometry
+/// `sandbox::worktree::linked_worktree_dirs` refuses to classify; that becomes
+/// `RepoPathsError::WorktreeGeometry`, which `sandbox::policy_for` returns as
+/// an error rather than a policy, so [`sandboxed`] has no command to hand back
+/// and no git process is ever spawned. That is a real production failure path
+/// (a hostile or corrupt `.git`), reached the way production reaches it.
+///
+/// Deliberately *not* an env-var override of the shim path: `shim::RESOLVED`
+/// is a process-wide `OnceLock`, so an override set by one test would leak
+/// into every other test in the binary and could be pre-empted by whichever
+/// test resolved the shim first.
+#[cfg(test)]
+pub(crate) fn unrunnable_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("hostile");
+    std::fs::create_dir_all(&repo).expect("create fixture dir");
+    std::fs::write(repo.join(".git"), "this is not a gitdir: pointer\n").expect("write .git");
+    (dir, repo)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
