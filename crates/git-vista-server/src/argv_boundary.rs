@@ -59,6 +59,11 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // (#66 Task 6); this entry now covers only its `#[cfg(test)]` fixtures.
     "src/handlers/read.rs",
     "src/catalog.rs", // static-arg read at registration
+    // D2 (#66, Task 7): `#[cfg(test)]` fixture setup only (`git init`, to
+    // build real repos for the hostile-geometry/managed-root tests) — no
+    // production spawn.
+    "src/sandbox/repo_paths.rs",
+    "src/sandbox/hostile.rs", // same: `#[cfg(test)]` fixture setup only
     "src/journal.rs", // #[cfg(test)] fixture setup
     // `git rev-parse --absolute-git-dir` (static args, read-only). The
     // production call (`absolute_git_dir`) now goes through
