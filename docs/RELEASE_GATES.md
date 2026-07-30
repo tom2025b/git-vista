@@ -485,6 +485,19 @@ authorized follow-up widens the battery with observations those mechanisms
 alone can kill. The matrix is doing its job: it names the missing evidence
 instead of manufacturing a green gate.
 
+**Status after tonight's AF_UNIX Dword-width work (M8, M9).** `ci/mutants/`
+now also has `M8-remove-af-unix-socket-rule.patch` and
+`M9-widen-af-unix-comparison.patch`, and `escape_suite.rs` gained the two
+cases that kill them, `high_bit_af_unix_denied` and `high_bit_io_uring_denied`
+(verified: both `id:` literals and both `#[test]` fns exist in
+`crates/git-vista-server/src/sandbox/escape_suite.rs`). **Neither case name is
+in `docs/sandbox/escape-census.txt` yet** — that file still lists only the
+nine older ids. Per R5/step 3 of the sandbox gate above (case-id set must
+equal the census in **both directions**), the gate would currently fail
+closed on this exact mismatch if run: not a false green, but not yet a clean
+run either. Fixing the census is a `docs/sandbox/*` edit, outside this
+document's ownership — flagged here, not fixed here.
+
 ---
 
 **Signed:** thomas2010 · 2026-07-28T01:37:53-04:00
@@ -492,3 +505,5 @@ instead of manufacturing a green gate.
 **Signed:** thomas2010 · 2026-07-29T11:30:00-04:00 (Part 3 addition, Task 25)
 
 **Signed:** claude_2010 · 2026-07-29 (Task 26 mutation-matrix evidence)
+
+**Signed:** claude_2010 · 2026-07-30 (M8/M9 census-gap note)
