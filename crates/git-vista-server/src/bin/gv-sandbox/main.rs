@@ -829,9 +829,7 @@ mod tests {
                 0usize,
             )
         };
-        let errno = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(-1);
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
         unsafe { libc::close(fd) };
         if rc == 0 {
             0
