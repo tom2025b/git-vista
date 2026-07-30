@@ -363,8 +363,7 @@ pub(crate) fn resolve_target() -> Result<(PathBuf, RepoEntry), (StatusCode, Stri
         );
         return Err((
             StatusCode::CONFLICT,
-            "This repository's git directory is outside the server's managed root."
-                .to_string(),
+            "This repository's git directory is outside the server's managed root.".to_string(),
         ));
     }
     Ok((entry.path.clone(), entry))

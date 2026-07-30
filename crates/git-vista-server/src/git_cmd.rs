@@ -172,8 +172,7 @@ fn sandboxed(
 ) -> Result<crate::sandbox::spawn::SandboxedCommand, String> {
     let read_only = crate::state::read_only_for_path(repo);
     let need = crate::sandbox::network_need(args);
-    let policy =
-        crate::sandbox::policy_for(repo, read_only, need).map_err(|e| e.to_string())?;
+    let policy = crate::sandbox::policy_for(repo, read_only, need).map_err(|e| e.to_string())?;
     Ok(crate::sandbox::spawn::command_async(&policy, repo, args))
 }
 
