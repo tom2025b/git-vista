@@ -39,6 +39,24 @@ pub(crate) enum ShimError {
     /// the INV-13 posture). Living on `ShimError` is a naming wart; D5's
     /// error rework is where policy-construction failures get their own type.
     RepoPaths(RepoPathsError),
+    /// **INV-13 / ADR 0029**: the dispatch selected `Tier::Strict` and this
+    /// host cannot supply it. `missing` names every absent capability, in the
+    /// same vocabulary [`super::probe::ProbeVerdict::CapabilityAbsent`] uses,
+    /// so the operator sees *which* knob to fix rather than "sandbox failed".
+    ///
+    /// # Why this is an error and not a fallback
+    ///
+    /// ADR 0029 names the two tempting alternatives and rejects both:
+    /// silently running the operation in the `Network` tier (a strictly weaker
+    /// sandbox than the one the dispatch chose, with outbound TCP on the git
+    /// ports the operation has no use for), and "degrade and block hooks"
+    /// (`HookMode::Blocked`), which reads like a mitigation but only removes
+    /// *one* of the escape routes the strict tier's namespaces close. A tier
+    /// the host cannot provide is not a weaker tier — it is a different and
+    /// undeclared one, and the only honest answer is to refuse the operation
+    /// with the reason attached. `sandbox::policy_for` therefore returns this
+    /// rather than rewriting `tier_for`'s answer.
+    StrictUnavailable { missing: Vec<&'static str> },
 }
 
 impl std::fmt::Display for ShimError {
@@ -61,6 +79,16 @@ impl std::fmt::Display for ShimError {
             Self::NoCurrentExe => write!(f, "current_exe() failed"),
             Self::NoHome => write!(f, "$HOME is unset; cannot build a sandbox policy"),
             Self::RepoPaths(e) => write!(f, "{e}"),
+            Self::StrictUnavailable { missing } => write!(
+                f,
+                "this operation runs in the strict sandbox tier and this host \
+                 cannot provide it (missing: {}). Per ADR 0029 the operation is \
+                 refused rather than run in a weaker tier — install `bwrap`, \
+                 enable unprivileged user namespaces, or run on a kernel with \
+                 Landlock ABI {} or later.",
+                missing.join(", "),
+                super::LANDLOCK_ABI_FLOOR,
+            ),
         }
     }
 }
