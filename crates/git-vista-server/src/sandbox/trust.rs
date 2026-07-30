@@ -173,4 +173,61 @@ mod tests {
         assert_eq!(marker_name(a), marker_name(a), "stable for one path");
         assert_ne!(marker_name(a), marker_name(b), "distinct across paths");
     }
+
+    /// The escalation this module's own doc claims is impossible, pinned.
+    ///
+    /// A marker is only unforgeable if a sandboxed repository cannot *write*
+    /// one. That rests on the trust store being outside every grant — but the
+    /// served repository is granted read-write, and nothing prevents an
+    /// operator from serving a path that contains the state directory (or from
+    /// pointing `XDG_STATE_HOME` inside a served tree). When that happens the
+    /// grant covers the store, a hostile hook can write its own marker, and the
+    /// *next* operation resolves `trusted = true` and lands on
+    /// `Tier::Unsandboxed` — a total bypass reached entirely through
+    /// sanctioned paths.
+    ///
+    /// The closing mechanism is the shim's exclude set, which outranks grants
+    /// rather than competing with them, so this asserts the trust directory is
+    /// actually in `secret_excludes` for a policy built over a repository that
+    /// contains it. Asserting on the constructed `Policy` (rather than on a
+    /// list of literals) is deliberate: the store's location follows
+    /// `XDG_STATE_HOME`, so a test that hard-codes `$HOME/.local/state/…`
+    /// would pass while protecting nothing on a host that sets it.
+    #[test]
+    fn the_trust_store_is_withheld_even_from_a_repo_that_contains_it() {
+        let trust_dir = crate::state::sandbox_trust_dir();
+        let home = std::env::var_os("HOME").expect("HOME set in tests");
+
+        // Serve the state directory's own parent — the shape that turns the
+        // repo's read-write grant into cover for the trust store.
+        let served = trust_dir
+            .parent()
+            .expect("the trust dir has a parent")
+            .to_path_buf();
+
+        let policy = super::super::policy_for(
+            &served,
+            false, // writable: the grant that creates the hazard
+            super::super::NetworkNeed::Local,
+        )
+        .expect("policy builds for a served path");
+
+        assert!(
+            policy.secret_excludes.iter().any(|e| *e == trust_dir),
+            "the trust store {} must be withheld from every grant, but the \
+             policy's excludes were {:?}. Without it, a hostile hook in a repo \
+             whose grant covers the store can forge its own marker and escalate \
+             the next operation to Tier::Unsandboxed.",
+            trust_dir.display(),
+            policy.secret_excludes
+        );
+        // And the hazard this guards is real: the served tree really is granted
+        // read-write, so the exclude is the only thing standing in the way.
+        assert!(
+            policy.rw_trees.iter().any(|p| *p == served),
+            "precondition: the served path is granted read-write, or this test \
+             is not exercising the escalation it claims to"
+        );
+        let _ = home;
+    }
 }
