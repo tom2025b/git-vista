@@ -101,28 +101,46 @@ pub(crate) async fn lock(repo: Option<RepositoryId>) -> OwnedMutexGuard<()> {
 /// dir cannot be resolved is left alone — the planner's own stages surface
 /// git's error for something that isn't a repository.
 pub(crate) async fn refuse_if_git_busy(repo: &Path) -> Option<(StatusCode, String)> {
-    let git_dir = absolute_git_dir(repo).await?;
-    git_dir.join("index.lock").exists().then(|| {
-        (
-            StatusCode::CONFLICT,
-            "Another git process is working in this repository — wait for it to \
-             finish and try again."
-                .to_string(),
-        )
-    })
+    match absolute_git_dir(repo).await {
+        // git could not be run (D5, #66 Task 19). This preflight had the same
+        // polarity bug as `Precondition::RefAbsent`: `absolute_git_dir`
+        // answered `None` both for "git ran and said this is not a
+        // repository" and for "git could not be run", `?` propagated that
+        // `None` straight out, and `None` from this function means **not
+        // busy** — so the one input that proves we know nothing about the
+        // repository read as a clean bill of health and the mutation went
+        // ahead. Nothing downstream re-checked it: the whole point of this
+        // function is that the lock it looks for is git's, not ours.
+        Err(e) => Some(crate::planner::couldnt_run(
+            "busy preflight",
+            &format!("couldn't resolve the git directory of {}: {e}", repo.display()),
+        )),
+        // git ran and this is not a repository. Left alone exactly as before —
+        // the planner's own stages surface git's error for it.
+        Ok(None) => None,
+        Ok(Some(git_dir)) => git_dir.join("index.lock").exists().then(|| {
+            (
+                StatusCode::CONFLICT,
+                "Another git process is working in this repository — wait for it to \
+                 finish and try again."
+                    .to_string(),
+            )
+        }),
+    }
 }
 
-/// This worktree's own git directory, absolute; `None` when git can't tell us
-/// (not a repository, or git couldn't run — both already handled downstream).
-async fn absolute_git_dir(repo: &Path) -> Option<PathBuf> {
-    let output = crate::git_cmd::git_output(repo, &["rev-parse", "--absolute-git-dir"])
-        .await
-        .ok()?;
+/// This worktree's own git directory, absolute.
+///
+/// `Ok(None)` is git's own answer that this path is not a repository (a
+/// non-zero exit, or an empty one) — a fact, handled downstream. `Err` is git
+/// not running at all, which is a fact about nothing; see [`refuse_if_git_busy`].
+async fn absolute_git_dir(repo: &Path) -> Result<Option<PathBuf>, std::io::Error> {
+    let output = crate::git_cmd::git_output(repo, &["rev-parse", "--absolute-git-dir"]).await?;
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!dir.is_empty()).then(|| PathBuf::from(dir))
+    Ok((!dir.is_empty()).then(|| PathBuf::from(dir)))
 }
 
 #[cfg(test)]

@@ -126,11 +126,27 @@ async fn commit_empty_on_branch(
         Err(rejected) => return rejected,
     };
     let refname = format!("refs/heads/{branch}");
-    let Some(tip) = rev_parse(&repo, &refname).await else {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("No local branch named ‘{branch}’ — refresh and try again."),
-        );
+    let tip = match rev_parse(&repo, &refname).await {
+        Ok(Some(tip)) => tip,
+        // git ran and the branch is not there: the menu the request came from
+        // is stale. 400, unchanged wording.
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("No local branch named ‘{branch}’ — refresh and try again."),
+            )
+        }
+        // D5 (#66, Task 19): git never ran. "No local branch named X" would be
+        // a claim about the repository, and this is the compare-and-swap pin
+        // for the whole operation — the one value the executor trusts to be a
+        // real observation of the branch tip. Refuse instead, with a status
+        // that says the fault is ours.
+        Err(e) => {
+            return planner::couldnt_run(
+                "/api/commit",
+                &format!("couldn't resolve ‘{refname}’ for the compare-and-swap: {e}"),
+            )
+        }
     };
     let (Ok(branch), Ok(expected_tip)) = (BranchName::new(branch), CommitOid::new(tip)) else {
         // Unreachable: the name passed the checks above and rev-parse returns
