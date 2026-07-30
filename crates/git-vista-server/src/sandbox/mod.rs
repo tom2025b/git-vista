@@ -1085,7 +1085,15 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
         bwrap: None,
         rw_trees: rw,
         ro_trees: ro,
-        secret_excludes: secret_excludes_for_home(&home),
+        // Same trust-store exclude as `policy_for`, and clone needs it at least
+        // as much: it is the one operation that fetches attacker-chosen
+        // content, so it must never be able to leave behind a marker that
+        // promotes the resulting repository on a later operation.
+        secret_excludes: {
+            let mut excludes = secret_excludes_for_home(&home);
+            excludes.push(crate::state::sandbox_trust_dir());
+            excludes
+        },
         net_ports: DEFAULT_GIT_PORTS.to_vec(),
         hook_mode: HookMode::Run,
     })
