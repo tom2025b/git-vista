@@ -38,6 +38,26 @@ const TARGET_ARCH: TargetArch = TargetArch::x86_64;
 #[cfg(target_arch = "aarch64")]
 const TARGET_ARCH: TargetArch = TargetArch::aarch64;
 
+/// Whether the tier this filter is being built for has network access — the one
+/// axis on which the filter differs between tiers.
+///
+/// Named rather than a bare `bool` because `build(true)` at the call site would
+/// not say *which* tier got the weaker filter, and the only rule that varies
+/// (AF_UNIX, below) is the one a reviewer most needs to attribute to a tier.
+/// The shim learns this from the `--net-deny` / `--net-allow` flag that
+/// `sandbox::shim_argv` already emits per tier, so nothing new travels in the
+/// argv: `--net-deny` is `Strict`, `--net-allow` is `Network`, and
+/// `Unsandboxed` never launches the shim at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetScope {
+    /// `--net-deny`: the Strict tier. bwrap has already put this process in its
+    /// own network namespace and Landlock carries no `connect` grant.
+    Denied,
+    /// `--net-allow`: the Network tier, the only one in which `git
+    /// push`/`fetch`/`clone` can work (F3).
+    Allowed,
+}
+
 /// Syscalls denied outright, with the reason each one is here.
 ///
 /// Every entry is an escape this design names. A syscall that is merely
