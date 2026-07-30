@@ -40,7 +40,7 @@ use git_vista_protocol::{
     IDEMPOTENCY_HEADER,
 };
 
-use crate::git_cmd::{git_ok, rev_parse};
+use crate::git_cmd::{git_ok, rev_parse, ExecUnavailable};
 use crate::journal;
 use crate::sandbox::{network_need_for_operation, NetworkNeed};
 use crate::state::{current_handle, reject_if_read_only};
@@ -293,15 +293,16 @@ pub(crate) async fn resolve_commit_oid(
 struct Observed {
     /// The checked-out branch's short name (`read_head_branch`), if any.
     head_branch: Option<String>,
-    /// What `HEAD` resolves to, if it resolves (unborn HEAD ⇒ `None`).
-    head_tip: Option<String>,
+    /// What `HEAD` resolves to (unborn HEAD ⇒ [`Obs::Absent`]; git unavailable
+    /// ⇒ [`Obs::Unknown`]).
+    head_tip: Obs<String>,
     /// The tip of the branch the operation names, for the operations that need
     /// it before executing (delete's journaled restore point, reset's CAS).
-    branch_tip: Option<String>,
+    branch_tip: Obs<String>,
     /// `git status --porcelain=v2` at observation time — a generation input
     /// (#145) so uncommitted-work changes count as the repository moving, and
     /// the live check behind [`Precondition::CleanWorktree`].
-    status: Option<String>,
+    status: Obs<String>,
     /// Which of the plan's preconditions actually *held* when it was built,
     /// index-aligned with `Plan::preconditions`. [`enforce_fresh`] re-verifies
     /// exactly these before executing: one that failed at build time flows on

@@ -165,6 +165,45 @@ fn git_error(endpoint: &str, stderr: &[u8]) -> (StatusCode, String) {
 ///
 /// See [`git_output`] and [`git_stdout_capped`] for where each of this crate's
 /// callers gets its declaration from.
+/// **git could not be run at all.**
+///
+/// The third answer that the three predicate-shaped helpers below
+/// ([`rev_parse`], [`is_ancestor`], [`git_ref_exists`]) used to have no way to
+/// give. Their old `Option`/`bool` returns had exactly two states — "git ran
+/// and the thing is there" and "git ran and it is not" — so a sandbox policy
+/// that could not be built, or a spawn that failed, was laundered into the
+/// *second* one. A missing shim then reached the user as "no such branch", and
+/// a failed read of a ref reached the staleness gate as a fact about the
+/// repository.
+///
+/// D5 (#66, Task 19) gives that case its own value. It is deliberately opaque
+/// — callers do not branch on *why* git could not run, only on *that* it could
+/// not — and it carries the underlying reason for the log line and the 500 body.
+///
+/// Two distinct failures are folded in here on purpose, because every caller
+/// treats them identically: the sandbox policy failing to build (a missing
+/// shim, an unset `$HOME`, a `.git` geometry D2 refuses) and the spawn/wait
+/// itself failing. Both mean the same thing to a gate — *we did not observe
+/// anything, so we may not act as though we did.*
+#[derive(Debug, Clone)]
+pub(crate) struct ExecUnavailable {
+    why: String,
+}
+
+impl ExecUnavailable {
+    pub(crate) fn new(why: impl Into<String>) -> Self {
+        Self { why: why.into() }
+    }
+}
+
+impl std::fmt::Display for ExecUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl std::error::Error for ExecUnavailable {}
+
 fn sandboxed(
     repo: &Path,
     args: &[&str],
@@ -334,12 +373,24 @@ pub(crate) async fn git_stdout(
         .map(|(bytes, _truncated)| bytes)
 }
 
-/// Resolve `rev` to a full commit id in `repo`, or `None` if it doesn't
-/// resolve. Used by the journal hooks to capture a ref's tip before/after an
+/// Resolve `rev` to a full commit id in `repo`.
+///
+/// Three answers, not two (D5, #66 Task 19):
+///
+/// * `Ok(Some(id))` — git ran and `rev` resolves to `id`;
+/// * `Ok(None)` — git ran and said `rev` does not resolve (`--verify --quiet`
+///   exits non-zero for exactly that). **A fact about the repository.**
+/// * `Err(ExecUnavailable)` — git did not run. Not a fact about anything.
+///
+/// The middle and last used to be the same `None`, and callers read it as the
+/// middle one. Used by the journal hooks to capture a ref's tip before/after an
 /// operation — e.g. a branch's tip *before* deleting it, which is the one
 /// piece of state git itself throws away (the branch's reflog dies with it)
 /// and exactly what "Restore branch" later needs.
-pub(crate) async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
+pub(crate) async fn rev_parse(
+    repo: &Path,
+    rev: &str,
+) -> Result<Option<String>, ExecUnavailable> {
     let spec = format!("{rev}^{{commit}}");
     // Local (D3): resolving a rev reads the object database, never a remote.
     let output = sandboxed(
@@ -347,33 +398,38 @@ pub(crate) async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
         &["rev-parse", "--verify", "--quiet", &spec],
         crate::sandbox::NetworkNeed::Local,
     )
-    .ok()?
+    .map_err(ExecUnavailable::new)?
     .output()
     .await
-    .ok()?;
+    .map_err(|e| ExecUnavailable::new(format!("couldn't run git rev-parse: {e}")))?;
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!id.is_empty()).then_some(id)
+    Ok((!id.is_empty()).then_some(id))
 }
 
 /// Whether `ancestor` is an ancestor of (or equal to) `rev` — `git merge-base
 /// --is-ancestor` exits 0 exactly then. "HEAD already contains the base tip" is
 /// the definition of "a rebase onto that base would change nothing".
-pub(crate) async fn is_ancestor(repo: &Path, ancestor: &str, rev: &str) -> bool {
+/// `Err` when git did not run (D5): "we could not tell" must not read as
+/// "no, it is not an ancestor", which is what the old bare `bool` said.
+pub(crate) async fn is_ancestor(
+    repo: &Path,
+    ancestor: &str,
+    rev: &str,
+) -> Result<bool, ExecUnavailable> {
     // Local (D3): `merge-base` walks the local object graph.
-    let Ok(cmd) = sandboxed(
+    let out = sandboxed(
         repo,
         &["merge-base", "--is-ancestor", ancestor, rev],
         crate::sandbox::NetworkNeed::Local,
-    ) else {
-        return false;
-    };
-    cmd.output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    )
+    .map_err(ExecUnavailable::new)?
+    .output()
+    .await
+    .map_err(|e| ExecUnavailable::new(format!("couldn't run git merge-base: {e}")))?;
+    Ok(out.status.success())
 }
 
 /// Run one `git -C <repo> <args…>` for the reset, mapping any failure to git's
@@ -400,19 +456,24 @@ pub(crate) async fn git_ok(repo: &Path, args: &[&str]) -> Result<(), String> {
 /// Whether `refname` resolves in `repo` (`git rev-parse --verify --quiet`): exit 0
 /// when the ref exists, non-zero otherwise. Used to prefer `origin/main` over the
 /// local `main` as a rebase base only when the remote-tracking ref is actually there.
-pub(crate) async fn git_ref_exists(repo: &Path, refname: &str) -> bool {
+/// `Err` when git did not run (D5): the old bare `bool` reported a missing
+/// shim as "the ref is not there", which then silently picked a *different*
+/// rebase base.
+pub(crate) async fn git_ref_exists(
+    repo: &Path,
+    refname: &str,
+) -> Result<bool, ExecUnavailable> {
     // Local (D3): a ref existence check reads `.git`, never a remote.
-    let Ok(cmd) = sandboxed(
+    let out = sandboxed(
         repo,
         &["rev-parse", "--verify", "--quiet", refname],
         crate::sandbox::NetworkNeed::Local,
-    ) else {
-        return false;
-    };
-    cmd.output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    )
+    .map_err(ExecUnavailable::new)?
+    .output()
+    .await
+    .map_err(|e| ExecUnavailable::new(format!("couldn't run git rev-parse: {e}")))?;
+    Ok(out.status.success())
 }
 
 #[cfg(test)]
