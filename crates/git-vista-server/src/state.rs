@@ -573,20 +573,41 @@ pub(crate) fn delete_clone(worktree: WorktreeId, clones_root: &Path) -> DeleteCl
     DeleteCloneOutcome::Deleted
 }
 
-/// Guard for the write endpoints: in Visualize mode (ADR 0006/0007) the current
-/// selection is look-only, so every mutation is refused with `403` and a clear
-/// reason. Returns `None` when writes are allowed (Active mode).
+/// Guard for the write endpoints: refuses with `403` and a clear reason when
+/// either of two independent things makes the current selection look-only.
+/// Returns `None` only when both agree writes are allowed.
+///
+/// 1. **Visualize mode** (ADR 0006/0007) — the operator's live, per-session
+///    choice.
+/// 2. **The catalog's `read_only` flag** (D2, #66 Task 7) — the entry's own
+///    registration-time fact, the same one `sandbox::policy_for` withholds the
+///    write grant for. Before D2 this flag was catalog/UI metadata only (what
+///    the picker keys Delete on); D2 wired it into the sandbox grant, which
+///    created a gap this closes: `POST /api/select` lets an operator reopen
+///    *any* registered entry in `RepoMode::Active` — including a read-only
+///    clone — with no check against the flag at all (`select_registered`
+///    trusts the caller's requested mode outright). Without this second check,
+///    that reselection would pass this guard (mode says Active) and only fail
+///    two layers down, inside the sandboxed git process, as a raw permission
+///    error instead of the same clean 403 every other look-only case gets.
 pub(crate) fn reject_if_read_only() -> Option<(StatusCode, String)> {
     if current_mode() == RepoMode::Visualize {
-        Some((
+        return Some((
             StatusCode::FORBIDDEN,
             "This repository is open in Visualize mode — look-only. Reopen it in \
              Active mode to make changes."
                 .to_string(),
-        ))
-    } else {
-        None
+        ));
     }
+    if read_only_for_path(¤t().0) {
+        return Some((
+            StatusCode::FORBIDDEN,
+            "This repository was registered as read-only and cannot be made \
+             writable by reselecting its mode."
+                .to_string(),
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
