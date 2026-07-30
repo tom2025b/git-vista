@@ -136,10 +136,14 @@ async fn landlock_does_not_mediate_chmod() {
         );
     }
 
-    let out = command_async(&policy, repo.path(), &["commit", "--allow-empty", "-m", "chmod"])
-        .output()
-        .await
-        .expect("launcher runs");
+    let out = command_async(
+        &policy,
+        repo.path(),
+        &["commit", "--allow-empty", "-m", "chmod"],
+    )
+    .output()
+    .await
+    .expect("launcher runs");
     assert!(
         out.status.success(),
         "the commit must land, so that a failure below is the hook's observation and not the \
@@ -152,7 +156,8 @@ async fn landlock_does_not_mediate_chmod() {
     // the run below proves nothing about mediation.
     let write_status = marker(repo.path(), "write-status");
     assert_ne!(
-        write_status, "0",
+        write_status,
+        "0",
         "the sandbox let a plain write reach {t}, a path outside every grant. That makes the \
          chmod result below meaningless — it would show only that nothing was being enforced. \
          Fix the sandbox before reading anything into F-NEW-3.",
