@@ -263,6 +263,36 @@ pub(crate) const DEFAULT_RW_TREES: &[&str] = &["/dev"];
 /// here — do **not** widen this to `/run`, and do not delete these entries as an
 /// unexplained grant: read the symlink first (`ls -l /etc/resolv.conf`).
 ///
+/// # Do not narrow this to the single file either — measured
+///
+/// The obvious next narrowing is to grant only the symlink's target,
+/// `/run/systemd/resolve/stub-resolv.conf`. It does not work, and it fails
+/// *silently*. Measured on this host, same shim binary, only the argv differing:
+///
+/// ```text
+/// --ro /run/systemd/resolve/stub-resolv.conf   Could not resolve host: github.com  (exit 128)
+/// --ro /run/systemd/resolve                    13c7afec…  HEAD                      (exit 0)
+/// --ro /run                                    13c7afec…  HEAD                      (exit 0)
+/// ```
+///
+/// The reason is in the shim, not in the resolver: `grant_tree`'s non-enumerated
+/// fast path calls `add_path_rule(tree, access)` with the full directory access
+/// mask, and Landlock rejects a `path_beneath` rule that carries a
+/// directory-only right (`LANDLOCK_ACCESS_FS_READ_DIR`) for a **regular file**.
+/// `add_path_rule` maps that rejection to `false` and `grant_tree` returns "0
+/// granted" with no error, so a policy naming a file gets *no rule and no
+/// diagnostic*. Confirmed independently of DNS: with `--ro <dir>/f` a sandboxed
+/// `git config -f <dir>/f --list` printed `Permission denied` and exited 128 —
+/// byte-identical to granting nothing at all — while `--ro <dir>` printed the
+/// value and exited 0. (`enumerate` masks `READ_DIR|EXECUTE` off for non-dirs,
+/// which is why grants *inside* an enumerated tree do not hit this.)
+///
+/// So a directory is the narrowest grant this shim can actually express today,
+/// and these three are the narrowest *directories*. If the shim's fast path is
+/// ever taught to mask file grants the way `enumerate` already does, this
+/// constant can shrink to the one file — but not before, and not on the strength
+/// of reading the code alone: measure it the way the table above was measured.
+///
 /// # Never in the strict tier
 ///
 /// The strict tier's whole posture is *no network* (`--net-deny`, plus bwrap's
