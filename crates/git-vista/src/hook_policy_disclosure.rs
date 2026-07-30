@@ -144,7 +144,10 @@ mod tests {
         let absent = for_repository(&descriptor(None));
         let strict = for_repository(&descriptor(Some(HookPolicy::Strict)));
 
-        assert!(absent.warn, "an undisclosed policy must not be styled quiet");
+        assert!(
+            absent.warn,
+            "an undisclosed policy must not be styled quiet"
+        );
         assert_ne!(absent.label, strict.label);
         assert_ne!(absent.detail, strict.detail);
         assert!(
