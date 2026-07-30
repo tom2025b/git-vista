@@ -107,29 +107,28 @@ pub(crate) async fn clone_repo(
     };
 
     println!("[/api/clone] cloning {url} → {}", dest.display());
-    // #66 Task 6 (plan step 6.7): the last raw production git spawn, and the one
-    // operation that fetches attacker-chosen content — until this migration it
-    // ran with no Landlock and no seccomp at all.
+    // D4 (#66, Task 7/D2): clone's own dedicated policy constructor, not the
+    // general-purpose `sandbox::policy_for` other git spawns go through.
     //
     // The policy is built from the **clones root**, not from a repository: the
-    // destination does not exist yet at policy time, and `policy_for_repo`
-    // grants RW on whatever path it is given, so `root` is what `git clone`
-    // needs to be able to write. That is a narrower grant than any existing
-    // repository would be, and it moves clone from *unsandboxed* to the Network
-    // tier (`policy_for_repo` is `Tier::Network` for now), which is the only
-    // direction that matters here.
+    // destination does not exist yet at policy time — `sandbox::policy_for`
+    // would refuse it outright (`repo_paths::resolve` requires an existing
+    // `.git`), which is exactly why this is a separate constructor rather than
+    // a call to that one. `policy_for_clone` grants RW on `root` (what `git
+    // clone` needs to be able to write) and pins `trusted = false`
+    // structurally — see that function's doc comment for why clone must never
+    // be reachable at the `Unsandboxed` tier even once per-repo operator trust
+    // exists, unlike every other repository operation.
     //
-    // `docs/sandbox/tier-dispatch-revised-design.md` D4 proposes replacing this
-    // with a dedicated `policy_for_clone(clones_root)` that pins
-    // `trusted = false` unconditionally, so clone can never be reachable at the
-    // unsandboxed tier even once per-repo operator trust exists. **D4 is still
-    // awaiting approval, so it is deliberately not implemented here.** The
-    // interim is nonetheless fail-safe: no repository is trusted today (the flag
-    // does not exist), so this path already cannot reach `Unsandboxed`.
+    // A prior comment here described a `policy_for_clone` "still awaiting
+    // approval" as the reason this went through the general policy path in
+    // the interim; D4 is now approved and implemented, so that interim is
+    // gone — this is the direct call the earlier comment anticipated.
     //
     // Also note this needs the resolver grant — see `NETWORK_ONLY_RO_TREES`:
     // sandboxed with only `/usr /bin /lib /lib64 /etc` readable, every clone of
-    // a named remote would fail `Could not resolve host`.
+    // a named remote would fail `Could not resolve host`. `policy_for_clone`
+    // gets it the same way `policy_for` does, via `default_system_trees`.
     //
     // `git clone` takes no `-C`, but the launcher's fixed `-C <root>` is
     // harmless (the clones root is a real directory, created just above) and
@@ -138,10 +137,24 @@ pub(crate) async fn clone_repo(
     let dest_str = dest.to_string_lossy();
     // `--` so the URL is never read as an option, even past validation.
     let args: [&str; 4] = ["clone", "--", url.as_str(), &dest_str];
-    let output = match crate::git_cmd::git_output(&root, &args).await {
-        Ok(o) => o,
+    let output = match crate::sandbox::policy_for_clone(&root) {
+        Ok(policy) => {
+            match crate::sandbox::spawn::command_async(&policy, &root, &args)
+                .output()
+                .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("git-vista: /api/clone couldn't run git: {e}");
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Couldn't run git: {e}"),
+                    ));
+                }
+            }
+        }
         Err(e) => {
-            eprintln!("git-vista: /api/clone couldn't run git: {e}");
+            eprintln!("git-vista: /api/clone couldn't build a sandbox policy: {e}");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Couldn't run git: {e}"),
