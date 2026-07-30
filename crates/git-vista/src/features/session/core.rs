@@ -14,9 +14,14 @@ use git_vista_protocol::{HookPolicy, RepoMode};
 use crate::features::core_traits::{Applied, FeatureCore};
 
 /// `#[derive(Default)]` gives `hook_policy: HookPolicy::default()`, which is
-/// `Restricted` (`git-vista-protocol`'s own fail-closed choice) — the right
+/// `Blocked` (`git-vista-protocol`'s own fail-closed choice) — the right
 /// answer before the first `Established` event: err conservative rather
 /// than assume permissive.
+///
+/// It said `Restricted` until #208; that name was deleted in #202 and the
+/// default was never it. `Blocked` is what the test below
+/// (`a_fresh_session_has_no_token_is_not_lan_and_has_no_known_mode`) has
+/// actually asserted all along.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SessionCore {
     csrf: Option<String>,

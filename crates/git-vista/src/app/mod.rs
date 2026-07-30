@@ -520,8 +520,20 @@ pub fn App() -> impl IntoView {
                                         // Synthesized from the Frame, which
                                         // carries no hook policy — so this is
                                         // "not disclosed", never a guessed
-                                        // value. The mode screen does not read
-                                        // it; the banner reads the session's.
+                                        // value.
+                                        //
+                                        // #208 made that visible: the mode
+                                        // screen now renders this field, so
+                                        // re-opening the mode screen from this
+                                        // badge says "not disclosed" even for a
+                                        // repository whose picker row said
+                                        // "sandboxed (strict)". That is the
+                                        // truthful reading of this path, which
+                                        // genuinely does not know, and it errs
+                                        // in the safe direction. Closing the
+                                        // gap means carrying the policy on the
+                                        // Frame — a protocol change, not a
+                                        // client-side guess.
                                         hook_policy: None,
                                     }));
                                 }

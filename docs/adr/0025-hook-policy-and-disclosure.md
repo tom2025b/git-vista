@@ -250,6 +250,39 @@ written.
    ADR 0029 rejects by name. `sandbox::hook_policy`'s own tests assert this
    directly (`capability_absent_refuses_and_never_becomes_blocked`).
 
+Two further decisions, from issue #202, landed after the above and are
+recorded here for the same reason — append-only, nothing above rewritten:
+
+3. **An undisclosed per-repository policy is the field's *absence*, never a
+   `HookPolicy` value.** `RepositoryDescriptor.hook_policy` is
+   `Option<HookPolicy>`, not `HookPolicy` (`git-vista-protocol/src/dto.rs`).
+   The `HookPolicyRefused` case from point 2 above, and every other case
+   where the server has not (yet) got a verdict for a repository, serializes
+   as an absent key — never `null`, never a fabricated value — and
+   `RepositoryDescriptor::hook_policy_requires_banner` folds `None` the same
+   way it folds every non-`Strict` variant: banner shown
+   (`self.hook_policy.is_none_or(HookPolicy::requires_banner)`). No refusal,
+   no ADR-0029 capability gap, and no not-yet-computed state can be laundered
+   into `Blocked` or any other named policy value — there is no `HookPolicy`
+   member that honestly means "refused" or "unknown," on purpose, for the
+   same reason point 2 gives.
+4. **`via_lan` has no bearing on the disclosed policy — this retires this
+   ADR's own "`via_lan` is a stand-in for Team mode" decision above, not
+   merely its Team-mode framing.** `hook_policy_for(via_lan)` is gone;
+   `handlers/session.rs`'s `session_hook_policy_for` takes no `via_lan`
+   parameter at all, and derives the session-level value from the same
+   per-repository tier dispatch (`sandbox::tier_for`) that governs
+   enforcement — identically on the loopback and LAN-view listeners, proved
+   by `security.rs`'s
+   `hook_policy_is_disclosed_over_the_wire_and_does_not_differ_by_router`. If
+   reduced LAN trust should ever narrow what a session can do, that belongs
+   in `sandbox::tier_for` — an input to *enforcement* — never as a separate
+   rule that changes only what gets *reported*. Reporting a stricter policy
+   than what actually runs would be the same lie in the other direction as
+   reporting a weaker one, and this ADR's original stand-in did exactly the
+   inverse of that mistake: it let a session-level flag decide the *disclosed*
+   value without the *enforced* one having any such input at all.
+
 See [0029](0029-strict-tier-hard-fail-when-unavailable.md) for the refusal
 decision in full and [0030](0030-git-process-sandbox.md) for the whole-sandbox
 record this amendment is a footnote to.
