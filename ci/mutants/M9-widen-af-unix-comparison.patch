@@ -1,0 +1,11 @@
+--- a/crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs
++++ b/crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs
+@@ -266,7 +266,7 @@
+ fn af_unix_rule() -> Result<SeccompRule, seccompiler::BackendError> {
+     SeccompRule::new(vec![SeccompCondition::new(
+         0, // socket(2)/socketpair(2) first argument, the address family
+-        SeccompCmpArgLen::Dword,
++        SeccompCmpArgLen::Qword,
+         SeccompCmpOp::Eq,
+         libc::AF_UNIX as u64,
+     )?])
