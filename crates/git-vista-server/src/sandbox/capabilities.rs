@@ -61,11 +61,63 @@ impl Capabilities {
         self.landlock_meets_floor() && self.bwrap_present && self.userns
     }
 
+    /// Every capability the **strict** tier needs and this host does not have,
+    /// named in the same vocabulary [`super::probe::ProbeVerdict`] uses.
+    /// Empty exactly when [`Self::strict_available`] is `true`.
+    ///
+    /// This exists so `sandbox::policy_for`'s INV-13 refusal can *name* what is
+    /// missing (ADR 0029) without duplicating the availability rule: the same
+    /// three conjuncts, in one place, returning words instead of a bool. A
+    /// second hand-rolled list is exactly how "strict is available" and "strict
+    /// is unavailable because X" drift apart until one of them is wrong.
+    ///
+    /// `seccomp_available` is deliberately **not** here: `strict_available`
+    /// does not include it, and a list that named a capability the availability
+    /// rule ignores would produce the impossible pair "unavailable, missing:
+    /// nothing-that-matters". The boot probe (`probe::missing_capabilities`)
+    /// does report seccomp, because it launches the composed launcher for real
+    /// and seccomp failure is visible there.
+    pub fn strict_missing(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if !self.landlock_meets_floor() {
+            missing.push("landlock_abi>=6");
+        }
+        if !self.bwrap_present {
+            missing.push("bwrap");
+        }
+        if !self.userns {
+            missing.push("user_namespaces");
+        }
+        missing
+    }
+
     /// Can the host provide the **network** tier? Landlock at the floor is
     /// enough — the network tier has no namespaces by design (F3).
     pub fn network_available(&self) -> bool {
         self.landlock_meets_floor()
     }
+}
+
+/// This host's capabilities, measured once and cached for the process lifetime.
+///
+/// # Why cached, and why that is safe
+///
+/// `policy_for` runs per git spawn, on the interactive read path; `probe()`
+/// costs a syscall plus three or four `/proc` reads, which is small but not
+/// free, and every value it measures is a property of the running kernel and
+/// the installed `bwrap` binary. Caching it also mirrors the reasoning
+/// `shim::shim_path` and `bwrap::bwrap_path` already document: the launcher and
+/// the capabilities it depends on must not be able to change identity between
+/// the moment a policy is built and the moment it is spawned.
+///
+/// This is **not** a second source of truth beside the boot probe
+/// (`sandbox::probe`). The boot probe answers a strictly harder question — does
+/// the composed launcher actually contain a hostile hook on this host — and
+/// gates startup on it. This answers the cheap factual half, and it answers it
+/// from the same `probe()` measurement the boot probe itself consumes.
+pub(crate) fn current() -> Capabilities {
+    static CACHED: std::sync::OnceLock<Capabilities> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(probe)
 }
 
 /// Measure the host's capabilities. Pure of side effects beyond reading kernel
