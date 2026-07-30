@@ -285,6 +285,114 @@ pub(crate) async fn resolve_commit_oid(
 // Build
 // ---------------------------------------------------------------------------
 
+/// One observation of the live repository that can fail to *be* an
+/// observation — D5 (#66, Task 19).
+///
+/// The planner used to hold every read as `Option<String>`, where `None` meant
+/// two incompatible things at once: "git ran and there is nothing there"
+/// (unborn HEAD, no such branch, no remote-tracking ref) and "git could not be
+/// run, so nothing was read". Every consumer picked the first reading, which
+/// is how a failed read became a fact about the repository — journaled as an
+/// absence, hashed into the freshness token as an empty string, and compared
+/// against another failed read as "nothing moved".
+///
+/// [`Absent`](Self::Absent) is the fact. [`Unknown`](Self::Unknown) is the
+/// absence of a fact, and it is deliberately awkward to consume: there is no
+/// `unwrap_or_default`, no `PartialEq`, and no `Option` conversion that
+/// silently flattens it.
+///
+/// # No `PartialEq`
+///
+/// Not an oversight — deriving it is the exact bug this type exists to
+/// prevent. `Unknown == Unknown` would be `true`, and the two places that
+/// compare a before-tip to an after-tip (`exec_merge`, `exec_rebase`) would
+/// then answer "HEAD did not move — already up to date" for a pair of reads
+/// that observed *nothing*. Comparison goes through
+/// [`same_observation`](Self::same_observation), which answers `false` unless
+/// something was actually observed on both sides.
+#[derive(Clone, Debug)]
+enum Obs<T> {
+    /// git ran and reported this value.
+    Known(T),
+    /// git ran and reported that there is nothing here.
+    Absent,
+    /// git could not be run. Nothing was observed; nothing may be concluded.
+    Unknown,
+}
+
+/// Distinguishes one `Unknown` from the next in the generation digest. A plain
+/// counter is enough: generation tokens are only ever compared for equality,
+/// and only ever within one process's lifetime.
+static UNKNOWN_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl<T> Obs<T> {
+    /// Lift a three-state git read into an observation. `Err` is the one thing
+    /// this type exists for; `Ok(None)` is a real, reportable absence.
+    fn from_read(read: Result<Option<T>, ExecUnavailable>) -> Self {
+        match read {
+            Ok(Some(v)) => Obs::Known(v),
+            Ok(None) => Obs::Absent,
+            Err(_) => Obs::Unknown,
+        }
+    }
+
+    /// The observed value, if anything was observed and it was there.
+    ///
+    /// Collapses `Absent` and `Unknown` together, so it is only correct where
+    /// the caller's *next* step is "if we have a value, describe it; otherwise
+    /// describe nothing" — i.e. where an omission is not itself an assertion.
+    /// Anywhere a decision is made, match on the variants instead.
+    fn known(&self) -> Option<&T> {
+        match self {
+            Obs::Known(v) => Some(v),
+            Obs::Absent | Obs::Unknown => None,
+        }
+    }
+
+    /// Whether git could not be run for this observation.
+    fn is_unknown(&self) -> bool {
+        matches!(self, Obs::Unknown)
+    }
+}
+
+impl<T: PartialEq> Obs<T> {
+    /// Whether these two observations say the same thing about the repository.
+    ///
+    /// **Two `Unknown`s are never "the same".** Nothing was observed on either
+    /// side, so there is no basis for concluding the repository did not move —
+    /// which is precisely the conclusion `exec_merge` and `exec_rebase` draw
+    /// from a `true` here ("Already up to date").
+    fn same_observation(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Obs::Known(a), Obs::Known(b)) => a == b,
+            (Obs::Absent, Obs::Absent) => true,
+            _ => false,
+        }
+    }
+}
+
+impl<T: std::fmt::Display> Obs<T> {
+    /// This observation's contribution to the generation digest (#145).
+    ///
+    /// Each variant carries its own tag, so an observed empty string can never
+    /// collide with an absence. `Unknown` goes further and carries a nonce: an
+    /// unknown observation must not merely hash *differently* from an absence,
+    /// it must hash differently **every time**. Without that, a repository git
+    /// cannot be run against produces the same token at plan-build and at
+    /// enforce-fresh, the two compare equal, and the staleness gate certifies
+    /// as unchanged a repository nobody ever looked at.
+    fn digest_field(&self) -> String {
+        match self {
+            Obs::Known(v) => format!("known:{v}"),
+            Obs::Absent => "absent".to_string(),
+            Obs::Unknown => format!(
+                "unknown:{}",
+                UNKNOWN_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+        }
+    }
+}
+
 /// Pre-execution observations of the live repository, captured while building
 /// the plan and reused by the executor — exactly the values the old handlers
 /// read before mutating (journal "before" oids, the compare-and-swap tip), so
@@ -324,12 +432,16 @@ async fn build_plan(
     tokens: (RepositoryToken, WorktreeToken),
 ) -> (Plan, Observed) {
     let head_branch = read_head_branch_blocking(repo).await;
-    let head_tip = rev_parse(repo, "HEAD").await;
+    let head_tip = Obs::from_read(rev_parse(repo, "HEAD").await);
     let branch_tip = match &operation {
         GitOperation::DeleteBranch { branch }
         | GitOperation::ForceDeleteBranch { branch }
-        | GitOperation::ResetBranch { branch, .. } => rev_parse(repo, branch.as_str()).await,
-        _ => None,
+        | GitOperation::ResetBranch { branch, .. } => {
+            Obs::from_read(rev_parse(repo, branch.as_str()).await)
+        }
+        // No branch named by this operation: not an unreadable observation,
+        // just one that was never taken.
+        _ => Obs::Absent,
     };
     let mut observed = Observed {
         head_branch,
@@ -401,18 +513,21 @@ fn selection_tokens() -> (RepositoryToken, WorktreeToken) {
 /// runs on a blocking thread instead of an async worker.
 async fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
     let mut inputs = GenerationInputs::new();
+    // D5: each observation contributes a *tagged* field, so "git said the ref
+    // is not there" and "git could not be asked" are different digests — and
+    // the latter is different every time. See `Obs::digest_field`.
     inputs.field(
         "head",
         format!(
             "{}\u{0}{}",
             observed.head_branch.as_deref().unwrap_or(""),
-            observed.head_tip.as_deref().unwrap_or("")
+            observed.head_tip.digest_field()
         ),
     );
     for (name, target) in refs_digest_input(repo).await {
         inputs.field(name, target);
     }
-    inputs.field("status", observed.status.clone().unwrap_or_default());
+    inputs.field("status", observed.status.digest_field());
     GenerationToken::new(inputs.generation().to_string())
         .expect("a RepositoryGeneration displays as non-empty decimal")
 }
@@ -490,17 +605,25 @@ async fn journal_clear_blocking(repo: &Path) {
     let _ = tokio::task::spawn_blocking(move || journal::clear(&repo)).await;
 }
 
-/// `git status --porcelain=v2` at this instant; `None` when git couldn't run
-/// or the path isn't a working tree — best-effort, like every observation.
-async fn worktree_status(repo: &Path) -> Option<String> {
+/// `git status --porcelain=v2` at this instant.
+///
+/// D5 keeps the two failure modes apart: [`Obs::Absent`] is "git ran and
+/// refused — the path isn't a working tree", [`Obs::Unknown`] is "git could
+/// not be run at all". The old `Option` collapsed both to `None`, which the
+/// generation digest then flattened to the empty string — i.e. to the exact
+/// value a *clean* worktree produces.
+async fn worktree_status(repo: &Path) -> Obs<String> {
     // An observation, not part of any operation: `status` reads the index and
     // the working tree, so it declares `Local` on its own behalf (D3).
-    let out = run_git(repo, NetworkNeed::Local, &["status", "--porcelain=v2"])
-        .await
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    let out = match run_git(repo, NetworkNeed::Local, &["status", "--porcelain=v2"]).await {
+        Ok(out) => out,
+        Err(_) => return Obs::Unknown,
+    };
+    if out.status.success() {
+        Obs::Known(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Obs::Absent
+    }
 }
 
 /// Fresh observations for the execution-time check (#145): same reads as
@@ -508,8 +631,8 @@ async fn worktree_status(repo: &Path) -> Option<String> {
 async fn observe_live(repo: &Path) -> Observed {
     Observed {
         head_branch: read_head_branch_blocking(repo).await,
-        head_tip: rev_parse(repo, "HEAD").await,
-        branch_tip: None,
+        head_tip: Obs::from_read(rev_parse(repo, "HEAD").await),
+        branch_tip: Obs::Absent,
         status: worktree_status(repo).await,
         held_at_build: Vec::new(),
     }
