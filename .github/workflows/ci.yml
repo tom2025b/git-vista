@@ -263,11 +263,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # Best-effort: gives the strict tier its two host dependencies before
-      # the preflight measures what is actually available. Does not touch any
-      # sysctl — apparmor_restrict_unprivileged_userns and friends are read,
-      # never written, by capabilities::probe(); a runner that restricts
-      # unprivileged userns stays restricted, and the preflight reports that
-      # honestly rather than the job silently working around it.
+      # the preflight measures what is actually available.
       - name: Best-effort host setup (bwrap, a C compiler)
         run: |
           sudo apt-get update -qq
