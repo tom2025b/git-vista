@@ -214,6 +214,69 @@ pub(crate) const DEFAULT_RO_TREES: &[&str] = &["/usr", "/bin", "/lib", "/lib64",
 /// or withheld by simply not granting it (network).
 pub(crate) const DEFAULT_RW_TREES: &[&str] = &["/dev"];
 
+/// Granted read+execute in **every tier except `Strict`** — the resolver state
+/// DNS needs, and nothing else.
+///
+/// # Why a `/run` grant is needed at all
+///
+/// On a systemd-resolved host `/etc/resolv.conf` is a **symlink into `/run`**
+/// (measured on this host: `/etc/resolv.conf ->
+/// ../run/systemd/resolve/stub-resolv.conf`). Landlock checks the resolved
+/// object, not the link name, so the `/etc` grant in `DEFAULT_RO_TREES` does
+/// **not** cover it: glibc's resolver cannot open its own configuration and
+/// every hostname lookup fails. Measured, network tier, before this constant
+/// existed:
+///
+/// ```text
+/// git ls-remote https://github.com/git/git HEAD
+/// fatal: unable to access 'https://github.com/git/git/':
+///        Could not resolve host: github.com          (exit 128)
+/// ```
+///
+/// and with `--ro /run/systemd/resolve` added, the same command printed the
+/// real `HEAD` oid and exited 0. So this is not a hypothetical hardening gap:
+/// without it `push`/`fetch`/`clone`/`ls-remote` against any *named* remote are
+/// broken outright. (The push test in this crate passes regardless because it
+/// uses a literal `git://127.0.0.1:9418` remote, which needs no resolver — a
+/// green test over a broken feature.)
+///
+/// # Why these paths and not `/run`
+///
+/// A recursive read grant on all of `/run` would work on every host layout, but
+/// it hands the network tier read access to the whole runtime directory
+/// (`/run/user/1000`, service state, anything a package drops there) to fix a
+/// single configuration file. These are the standard *resolver* runtime
+/// directories instead — the three documented targets an `/etc/resolv.conf`
+/// symlink has in practice:
+///
+/// * `/run/systemd/resolve` — systemd-resolved. **Measured working here**, and
+///   it also covers the `io.systemd.Resolve` varlink socket `nss-resolve` uses,
+///   which lives in the same directory.
+/// * `/run/resolvconf`, `/run/NetworkManager` — the other two standard layouts.
+///   Not measured (this host is systemd-resolved); included because a missing
+///   grant path is *silently skipped* by the shim (`add_path_rule` fails the
+///   `O_PATH` open and `grant_tree` returns 0 granted, no rule, no error), so an
+///   entry that does not exist costs nothing, while a host whose resolver lives
+///   in one of them would otherwise rediscover this exact bug.
+///
+/// If a future host resolves DNS from some other `/run` subdirectory, add it
+/// here — do **not** widen this to `/run`, and do not delete these entries as an
+/// unexplained grant: read the symlink first (`ls -l /etc/resolv.conf`).
+///
+/// # Never in the strict tier
+///
+/// The strict tier's whole posture is *no network* (`--net-deny`, plus bwrap's
+/// `--unshare-net`), so it has no business reading resolver state: there is
+/// nothing it could legitimately resolve. Granting it there would weaken the
+/// one tier the escape battery's containment cases are written against, in
+/// exchange for nothing.
+///
+/// The `--exclude` secret set applies to this grant exactly as it does to every
+/// other (`grant_tree` checks the excludes first), so nothing here can
+/// re-expose a path that `DEFAULT_SECRET_EXCLUDES` withholds.
+pub(crate) const NETWORK_ONLY_RO_TREES: &[&str] =
+    &["/run/systemd/resolve", "/run/resolvconf", "/run/NetworkManager"];
+
 /// Granted read+execute in the **strict tier only**. Landlock mediates procfs,
 /// so without a `/proc` grant the shim cannot open `/proc/self/ns/user`
 /// (INV-6 would report `NO_PROCFS` instead of `EACCES`), `open_fds()` would
@@ -327,6 +390,12 @@ pub(crate) fn default_system_trees(tier: Tier) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut ro: Vec<PathBuf> = DEFAULT_RO_TREES.iter().map(PathBuf::from).collect();
     if tier == Tier::Strict {
         ro.extend(STRICT_ONLY_RO_TREES.iter().map(PathBuf::from));
+    } else {
+        // Everything except Strict may resolve hostnames, and on a
+        // systemd-resolved host that means reading `/etc/resolv.conf`'s *target*
+        // under `/run` — see `NETWORK_ONLY_RO_TREES` for the measurement and for
+        // why the strict tier is excluded rather than merely not needing it.
+        ro.extend(NETWORK_ONLY_RO_TREES.iter().map(PathBuf::from));
     }
     (rw, ro)
 }
