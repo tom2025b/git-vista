@@ -6,7 +6,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/git-vista-mutation-matrix.XXXXXX")
 trap 'rm -rf -- "$work_root"' EXIT
 
-readonly -a mutants=(M1 M2 M3 M4 M5 M6 M7)
+readonly -a mutants=(M1 M2 M3 M4 M5 M6 M7 M8)
 declare -Ar mutant_patch=(
   [M1]="ci/mutants/M1-apply-seccomp-empty.patch"
   [M2]="ci/mutants/M2-skip-landlock-restrict-self.patch"
@@ -15,6 +15,7 @@ declare -Ar mutant_patch=(
   [M5]="ci/mutants/M5-strict-net-allow-default-ports.patch"
   [M6]="ci/mutants/M6-ignore-hooks-blocked-dir.patch"
   [M7]="ci/mutants/M7-widen-prctl-comparison.patch"
+  [M8]="ci/mutants/M8-remove-af-unix-socket-rule.patch"
 )
 
 failures=0
@@ -52,7 +53,7 @@ import pathlib
 import re
 import sys
 
-known = {f"M{i}" for i in range(1, 8)}
+known = {f"M{i}" for i in range(1, 9)}
 case_re = re.compile(
     r"const\s+CASE_[A-Z0-9_]+:\s*EscapeCase\s*=\s*EscapeCase\s*\{(.*?)\n\};",
     re.DOTALL,

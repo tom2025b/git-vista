@@ -65,6 +65,13 @@ pub(crate) enum MutantId {
     M5,
     M6,
     M7,
+    /// `ci/mutants/M8-remove-af-unix-socket-rule.patch` — removes *only* the
+    /// Strict tier's `socket`/`socketpair` AF_UNIX rules from
+    /// `seccomp_filter::rules_for`, leaving the rest of the filter installed.
+    /// M1 (whole filter emptied) would kill an AF_UNIX case too, but only M8
+    /// shows the case notices its **own** mechanism rather than the filter's
+    /// existence.
+    M8,
 }
 
 /// R8: a case whose configuration production cannot build yet carries the
