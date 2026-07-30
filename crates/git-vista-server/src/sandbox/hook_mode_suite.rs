@@ -1,6 +1,8 @@
 //! M1.13b (#66): declarative functional hook-mode case.
 
-use super::escape_contract::{run_case, Class, Errno, EscapeCase, Exemption, MutantId};
+use super::escape_contract::{
+    run_case, Class, Errno, EscapeCase, Exemption, GitPortUse, MutantId,
+};
 use super::Tier;
 
 const CASE_BLOCKED_HOOKS: EscapeCase = EscapeCase {
@@ -18,6 +20,8 @@ const CASE_BLOCKED_HOOKS: EscapeCase = EscapeCase {
     exemption: Exemption::NotProductionReachable {
         blocker: "policy_for_repo hard-codes HookMode::Run",
     },
+    // A shell probe that never touches the network.
+    git_port: GitPortUse::Unused,
 };
 
 #[test]
