@@ -36,6 +36,13 @@ pub(crate) struct Capabilities {
     /// Whether unprivileged user namespaces appear usable. Required for bwrap to
     /// create the strict tier's namespaces without privilege.
     pub userns: bool,
+    /// Whether the kernel exposes seccomp filtering at all — read from the
+    /// `/proc/sys/kernel/seccomp/actions_avail` knob, matching this struct's
+    /// "read a kernel fact, never attempt the primitive" discipline rather than
+    /// installing a filter just to see if it succeeds. Added for Task 9's boot
+    /// probe (`sandbox::probe`), which needs to name this specific capability
+    /// when the composed launcher's baseline leg fails to run at all.
+    pub seccomp_available: bool,
 }
 
 impl Capabilities {
@@ -68,6 +75,7 @@ pub(crate) fn probe() -> Capabilities {
         landlock_abi: landlock_abi(),
         bwrap_present: bwrap::bwrap_path().is_some(),
         userns: userns_usable(),
+        seccomp_available: Path::new("/proc/sys/kernel/seccomp/actions_avail").exists(),
     }
 }
 
@@ -148,6 +156,13 @@ mod tests {
             "this host is known to support Landlock; got abi={}",
             caps.landlock_abi
         );
+        // seccomp has shipped in every kernel this project targets (since
+        // Linux 3.17); unlike bwrap/userns it is not something a container or
+        // CI runner plausibly lacks, so this one is asserted absolutely.
+        assert!(
+            caps.seccomp_available,
+            "this host is known to expose /proc/sys/kernel/seccomp/actions_avail"
+        );
         // Don't assert bwrap/userns absolutely — CI or a container may lack
         // them. Assert only the relationship the logic depends on.
         assert_eq!(
@@ -165,6 +180,7 @@ mod tests {
             landlock_abi: 8,
             bwrap_present: true,
             userns: true,
+            seccomp_available: true,
         };
         assert!(full.strict_available());
         assert!(full.network_available());
@@ -218,6 +234,7 @@ mod tests {
             landlock_abi: LANDLOCK_ABI_FLOOR as i32,
             bwrap_present: true,
             userns: true,
+            seccomp_available: true,
         };
         assert!(at.landlock_meets_floor());
         assert!(at.strict_available());
