@@ -14,6 +14,14 @@ use super::Tier;
 /// pair `run_case`'s own two legs use — so a neighbouring battery's "same
 /// fixture as the escape battery" is a fact about one function, not a
 /// convention two files have to keep agreeing on.
+///
+/// `allow(unused_imports)` because the three consumers are not written yet and
+/// the lint cannot see a `pub(crate)` re-export's future callers. Same reason,
+/// and the same shape, as `escape_contract.rs`'s module-level
+/// `allow(dead_code)`: the name is landed ahead of its consumers deliberately,
+/// so that three lanes converge on one constructor instead of inventing three.
+/// Delete the attribute — not the re-export — once Task 12 lands.
+#[allow(unused_imports)]
 pub(crate) use super::escape_contract::hostile_hook_repo;
 
 const CASE_SECRET_READ_DENIED: EscapeCase = EscapeCase {
