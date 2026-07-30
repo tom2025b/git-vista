@@ -1529,3 +1529,33 @@ mod contract {
         }
     }
 }
+
+#[test]
+fn tmp_measure_submodule_policy() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let inner = hostile_hook_repo("exit 0");
+        let outer_d = hostile_hook_repo("exit 0");
+        let outer = outer_d.path().to_path_buf();
+        trust::grant(&outer.canonicalize().unwrap()).unwrap();
+        let p = policy_for(&outer, false, NetworkNeed::Local).unwrap();
+        assert_eq!(p.tier, Tier::Unsandboxed);
+        let url = inner.path().display().to_string();
+        let out = command_async(&p, &outer, &["-c","protocol.file.allow=always","submodule","add","-q",url.as_str(),"sub"])
+            .pinned_env_for_test(&production_env_profile()).output().await.unwrap();
+        println!("submodule add rc={:?} err={}", out.status.code(), String::from_utf8_lossy(&out.stderr));
+        let sub = outer.join("sub");
+        println!(".git file contents: {:?}", std::fs::read_to_string(sub.join(".git")));
+        println!("resolve(sub) = {:?}", repo_paths::resolve(&sub));
+        println!("policy_for(sub) = {:?}", policy_for(&sub, false, NetworkNeed::Local).map(|p| p.tier));
+        println!("policy_for(outer) = {:?}", policy_for(&outer, false, NetworkNeed::Local).map(|p| p.tier));
+        let _ = trust::revoke(&outer.canonicalize().unwrap());
+        // outer commit under strict
+        let strict = shim_cli::production_policy(&outer);
+        println!("outer strict tier = {:?}", strict.tier);
+        let c = command_async(&strict, &outer, &["commit","--allow-empty","-m","outer-with-submodule"])
+            .pinned_env_for_test(&production_env_profile()).output().await.unwrap();
+        println!("outer commit under strict rc={:?} out={} err={}", c.status.code(),
+            String::from_utf8_lossy(&c.stdout), String::from_utf8_lossy(&c.stderr));
+    });
+}
