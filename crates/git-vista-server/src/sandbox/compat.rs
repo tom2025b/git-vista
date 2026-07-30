@@ -87,8 +87,11 @@
 //!   `GV-COMPAT case=<id> result=… class=functional` line to `$GV_COMPAT_REPORT`
 //!   when that variable is set. See "The census" below for what actually gates.
 //! - **R6 (production seam)** — both legs spawn through
-//!   `sandbox::spawn::command_async`. This file contains no `Command::new(`
-//!   at all, no `Policy {` literal and no second policy constructor;
+//!   `sandbox::spawn::command_async`. This file constructs no `Command` at all
+//!   (not even in prose — `argv_boundary.rs`'s scan reads raw text, so the bare
+//!   `Command::new` + `(` pattern is never written here, the same discipline
+//!   that file applies to its own source), no `Policy {` literal and no second
+//!   policy constructor;
 //!   `contract::r6_every_leg_goes_through_the_production_seam` asserts it.
 //! - **R7 (one environment)** — every spawn, in both legs and in fixture setup,
 //!   uses `escape_contract::production_env_profile()`. This file contains no
@@ -247,9 +250,9 @@
 //!
 //! # Why the baseline leg is `Tier::Unsandboxed` and not a raw `git`
 //!
-//! The obvious baseline is `Command::new("git")`, which is what
-//! `escape_contract`'s own `run_git_outside` does. This file cannot: a
-//! `Command::new(` here would need a new entry in `argv_boundary.rs`'s
+//! The obvious baseline is a raw `std::process::Command` naming `git`, which is
+//! what `escape_contract`'s own `run_git_outside` does. This file cannot: a
+//! `Command` construction here would need a new entry in `argv_boundary.rs`'s
 //! `ALLOWED_SPAWN_SITES`, permanently widening the crate's strongest structural
 //! tripwire for a test convenience — and that file belongs to another lane.
 //!
