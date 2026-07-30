@@ -342,10 +342,27 @@ fn every_allowlist_entry_names_a_live_spawn_site() {
     let git_root = server_root.parent().unwrap().join("git-vista-git");
     let spawn = ["Command", "::new("].concat();
 
+    /// Why an entry is not a live spawn site, or `None` if it is. Factored out
+    /// of the loop so the same predicate can be pointed at deliberately bad
+    /// entries below: a guard that has never been shown to reject anything is
+    /// the kind of green test this milestone keeps having to disown.
+    fn why_dead(root: &Path, rel: &str, spawn: &str) -> Option<String> {
+        let path = root.join(rel);
+        if !path.is_file() {
+            return Some(format!("no such file under {}", root.display()));
+        }
+        let text = std::fs::read_to_string(&path).ok()?;
+        (!text.contains(spawn)).then(|| "constructs no Command".to_string())
+    }
+
     for (root, allowed) in [
         (&server_root, ALLOWED_SPAWN_SITES),
         (&git_root, ALLOWED_GIT_CRATE_SPAWN_SITES),
     ] {
+        assert!(
+            !allowed.is_empty(),
+            "an empty allowlist would make this test pass over nothing"
+        );
         for (i, rel) in allowed.iter().enumerate() {
             assert!(
                 !allowed[..i].contains(rel),
@@ -353,23 +370,36 @@ fn every_allowlist_entry_names_a_live_spawn_site() {
                  one file cannot disagree usefully, and a duplicate hides which \
                  comment is current"
             );
-            let path = root.join(rel);
-            assert!(
-                path.is_file(),
-                "{rel} is allowlisted for {root:?} but no such file exists. A \
-                 dead entry pre-authorises a spawn nobody has read — remove it, \
-                 or add it back when the file lands and has been reviewed."
-            );
-            let text = std::fs::read_to_string(&path).expect("readable source file");
-            assert!(
-                text.contains(&spawn),
-                "{rel} is allowlisted for {root:?} but constructs no Command. \
-                 Remove the entry rather than leaving it: the scan only consults \
-                 this list for files that spawn, so this one grants a permission \
-                 that is invisible until someone adds a raw spawn to that file."
+            assert_eq!(
+                why_dead(root, rel, &spawn),
+                None,
+                "{rel} is allowlisted for {root:?} but is not a live spawn site. \
+                 Remove the entry rather than leaving it: the scan above only \
+                 consults this list for files that already spawn, so a dead entry \
+                 grants a permission that stays invisible until someone adds a \
+                 raw spawn to that file."
             );
         }
     }
+
+    // The predicate rejects both failure modes it claims to. Without this, the
+    // loop above is only evidence that `why_dead` returns `None` a lot.
+    assert!(
+        why_dead(
+            &server_root,
+            "src/sandbox/a-file-that-does-not-exist.rs",
+            &spawn
+        )
+        .is_some(),
+        "an entry naming a nonexistent file must be rejected — this is what \
+         stops an allowlist entry being written ahead of the file it blesses"
+    );
+    assert!(
+        why_dead(&server_root, "src/main.rs", &spawn).is_some(),
+        "an entry naming a real file that constructs no Command must be \
+         rejected. (If `main.rs` ever starts spawning, this line will fail and \
+         it will be pointing at a genuine new spawn site, not at itself.)"
+    );
 
     // The launcher carve-out is a *narrowing* of the main list, never a way
     // around it: a file exempted from the literal-`git` rule that was not on
