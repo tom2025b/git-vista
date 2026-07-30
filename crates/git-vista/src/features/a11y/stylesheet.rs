@@ -97,7 +97,9 @@ fn parse_declarations(body: &str) -> Vec<Declaration> {
             let lowered = value.to_ascii_lowercase();
             let important = lowered.ends_with("!important");
             let value = if important {
-                value[..value.len() - "!important".len()].trim_end().to_string()
+                value[..value.len() - "!important".len()]
+                    .trim_end()
+                    .to_string()
             } else {
                 value
             };
@@ -252,7 +254,10 @@ mod tests {
         );
         assert_eq!(
             rules[0].declarations,
-            vec![decl("color", "red", false), decl("background", "blue", false)]
+            vec![
+                decl("color", "red", false),
+                decl("background", "blue", false)
+            ]
         );
         assert_eq!(rules[0].at_context, Vec::<String>::new());
     }

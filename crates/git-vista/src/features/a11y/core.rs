@@ -46,7 +46,10 @@ pub enum TargetVerdict {
     Meets,
     /// At least one axis is short. A shortfall of `0.0` on an axis means that axis is
     /// fine and the *other* one is what failed.
-    Undersized { short_by_x_px: f64, short_by_y_px: f64 },
+    Undersized {
+        short_by_x_px: f64,
+        short_by_y_px: f64,
+    },
 }
 
 impl TapTarget {
