@@ -76,12 +76,36 @@ pub(crate) enum Exemption {
     NotProductionReachable { blocker: &'static str },
 }
 
+/// How a case relates to TCP port 9418 — the one port a Network-tier Landlock
+/// connect grant covers (the only unprivileged entry in `DEFAULT_GIT_PORTS`),
+/// and therefore the one port several unrelated tests in this binary must
+/// share. The harness turns this into a `test_ports::PortClaim` held for
+/// exactly one `execute` call; a case never touches the port itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitPortUse {
+    /// The case never touches 9418.
+    Unused,
+    /// The case's probe needs 9418 to itself and binds nothing on the host
+    /// side — e.g. a baseline leg that proves a TCP bind is possible by
+    /// performing it. Claiming without binding is the point: a listener here
+    /// would make the baseline fail with `EADDRINUSE`, which `run_case` would
+    /// report as a silently-vacuous `CapabilityAbsent`.
+    Exclusive,
+    /// The case's probe connects to 9418, so the harness also holds a loopback
+    /// listener there for the duration of the baseline leg.
+    ExclusiveWithListener,
+}
+
 /// What `run_case` handed the case's `build_hook` function: everything it
 /// needs to produce a hook body and nothing it could use to bypass the
 /// harness (no policy, no shim path — those are the harness's job).
 pub(crate) struct HarnessCtx<'a> {
     pub repo: &'a Path,
     pub nonce: &'a str,
+    /// `Some` only for a `GitPortUse::ExclusiveWithListener` case: the port of
+    /// the harness-owned loopback listener the probe should connect to. The
+    /// harness binds and releases it, so no `build_hook` can outlive it.
+    pub listener_port: Option<u16>,
 }
 
 /// One battery case. Every field is written out per case (no `Default`, no
@@ -128,6 +152,12 @@ pub(crate) struct EscapeCase {
     /// R8: `Exemption::None` for a production-constructible configuration;
     /// otherwise the named, source-checked blocker.
     pub exemption: Exemption,
+    /// Whether this case needs exclusive use of TCP 9418, and whether the
+    /// harness must hold a listener there. Written out per case like every
+    /// other field (R1): a case that quietly inherited `Unused` while its probe
+    /// touched the port would race the other holders in this binary, and the
+    /// loser's symptom is a *passing* vacuous run, not a red test.
+    pub git_port: GitPortUse,
 }
 
 /// R4's non-panicking, non-early-return outcome. `run_case` always computes
