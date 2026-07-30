@@ -346,6 +346,14 @@ below.
   which is not failing closed — it is a weaker sandbox wearing the costume of a
   configured one. An unopenable path stays tolerated, because a host without
   `/run/resolvconf` is not a grant failure.
+- **Landlock (ABI 8, this host) does not mediate metadata operations —
+  `chmod`, `chown`, `utime`, `setxattr`, `flock`, `chdir`, `stat`, `access`.**
+  A sandboxed process can change the mode, owner, or timestamps of a file in
+  a tree the sandbox holds no right over at all; demonstrated first-party
+  during round-4 probing, where a hook's `chmod 777` against a file outside
+  every granted tree succeeded and followed the symlink. Accepted, documented
+  non-coverage, not an unstated gap — the blast radius has not been
+  enumerated by anyone.
 - **Landlock rules bind resolved inodes, not path strings.** A name excluded
   from a grant is only actually withheld if the enumeration that builds the
   grant set resolves symlinks and matches hard-link inodes before deciding
@@ -367,6 +375,12 @@ below.
   descriptor discipline, not by any network rule.** uid 1000's `docker`
   group membership makes that socket passwordless root once reached;
   nothing about Landlock's network mediation is what keeps it out of reach.
+- **A hook shares its uid with every other process on the host, and can act
+  on one of them through any writable file that process watches and treats
+  as instructions — a confused deputy over a deliberately writable object.**
+  Neither the AF_UNIX denial nor Landlock touches this, and no unprivileged
+  sandbox can. It is the reason "a hostile repository cannot harm you" is not
+  purchasable, and it is written here rather than engineered against.
 
 ```mermaid
 flowchart TD

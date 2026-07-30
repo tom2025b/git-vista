@@ -15,6 +15,9 @@
 #   dev signin            reprint the sign-in link(s) for the running server
 #   dev doctor            diagnose listener/session/tunnel state without secrets
 #   dev serve [path]      start the loopback-only server (delegates to ./gv)
+#   dev testbed <ref> [port]  isolated worktree + own port, for a HUMAN to drive
+#                          the real app at <ref> while work continues here —
+#                          proves it works, not just that tests pass
 #   dev handoff           open/print handoff.md (the running "what's done / next" note)
 #   dev report            at-a-glance repo health: branches, merge status, WIP
 #                          commits, lines of code by crate (rex-check pattern)
