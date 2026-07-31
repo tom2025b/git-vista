@@ -335,6 +335,20 @@ jobs:
             exit 1
           fi
 
+          # Set equality above is necessary but not sufficient: `sort -u` collapses
+          # duplicates, so a case that recorded twice — or a harness that replayed one
+          # — matches the census perfectly. R5's prose says the report's case-id
+          # MULTISET equals the census, and `run_case` writes exactly one record per
+          # case, so the counts must match exactly too. Found by audit: this half of
+          # R5 was specified and never built, the same shape as the census-drift miss.
+          got_records=$(grep -cE 'case=[^ ]+' "$report" || true)
+          want_records=$(grep -cE '^[^[:space:]]' "$census" || true)
+          if [ "${got_records:-0}" -ne "${want_records:-0}" ]; then
+            echo "::error::report has ${got_records} case record(s) but $census declares ${want_records}. The id SETS matched, so this is a duplicate or replayed record, not a rename — one case recorded more than once means the report is not a faithful log of what ran (R5: multiset equality, one record per case)."
+            grep -oE 'case=[^ ]+' "$report" | sed 's/^case=//' | sort | uniq -d | sed 's/^/  duplicated: /'
+            exit 1
+          fi
+
           absent=$(grep -c 'result=capability-absent' "$report" || true)
           if [ "${absent:-0}" -ne 0 ]; then
             echo "::error::${absent} case(s) recorded capability-absent on the gating runner — see the report:"
