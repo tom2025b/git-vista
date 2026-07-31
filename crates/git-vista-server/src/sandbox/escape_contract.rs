@@ -2227,6 +2227,14 @@ const HOST_SETUP_TOKENS: &[(&str, &str)] = &[
          battery's deliberately identity-free fixture repository cannot make its seed \
          commit and no invariant is ever exercised (#203)",
     ),
+    (
+        "known_hosts",
+        "materialises the path `secret_read_denied` uses as its SECRET. That case declares \
+         `expect_baseline: Errno(0)` — the file must be readable with no sandbox applied — \
+         so that a denial inside the sandbox is attributable to the policy rather than to \
+         the file never having existed. A runner has no ~/.ssh, so the baseline returned \
+         ENOENT and the case hard-failed having proved nothing",
+    ),
 ];
 
 /// The repository root: two levels above `server_root()`
@@ -2477,17 +2485,32 @@ fn job_uses_local_action(body: &str, action_dir: &str) -> bool {
 ///     constant the `uses:` comparison uses.
 ///  7. **The action is reduced to a stub** — a `uses:` that resolves to an empty
 ///     composite action provisions nothing while every job still "references the
-///     shared setup". Closed by requiring the action to be a composite action
-///     that still spells all three capabilities in `HOST_SETUP_TOKENS`, still
-///     writes the sysctl, still sets a `user.name`/`user.email` git identity, and
-///     still carries the `::error::` fail-loud posture — a step that unclamps and
-///     shrugs is indistinguishable from one that worked, which is the specific
-///     reason D6 Option A demands it.
+///     shared setup". Narrowed, **not closed**, by requiring the action to be a
+///     composite action whose comment-stripped text still spells every capability
+///     in `HOST_SETUP_TOKENS`, plus `sysctl`, a `user.name`/`user.email` git
+///     identity, and the `::error::` fail-loud posture.
 ///
-/// The one hole knowingly left open: this test cannot prove the action's steps
-/// *succeed* on the runner, only that they are declared. That is
-/// `ci_preflight_host_meets_the_declared_minimum`'s job, and it now runs in every
-/// job that needs it precisely because of the equality asserted here.
+///     Be precise about what that buys, because an earlier revision of this
+///     comment claimed more than the code delivers and an adversarial review
+///     caught it: the enforcement is `action.contains(token)`, a substring scan.
+///     It reliably catches **deletion** — the realistic regression, where someone
+///     trims a step they think is redundant. It does **not** catch a hollowed
+///     step, and this was demonstrated, not theorised: replacing the whole file
+///     with a stub whose only step is `run: echo "bubblewrap
+///     apparmor_restrict_unprivileged_userns user.email user.name sysctl git
+///     config ::error::"` leaves this test green. No static scan of a shell
+///     script can do better; proving a script *provisions* something requires
+///     running it.
+///
+/// The hole knowingly left open, and the mechanism that actually closes it: this
+/// test cannot prove the action's steps *succeed* on the runner — or that they do
+/// anything at all — only that they are declared. That is
+/// `ci_preflight_host_meets_the_declared_minimum`'s job. It measures the real
+/// host, fails with `::error::` naming each missing capability, and it now runs
+/// in every job that needs it precisely because of the equality asserted here.
+/// A stubbed action therefore still produces a red build; it just fails one step
+/// later, at the preflight, rather than here. Treat that preflight as the
+/// backstop and this test as the thing that keeps the preflight wired in.
 #[test]
 fn every_ci_job_that_runs_this_crates_tests_provisions_the_host_capabilities_they_need() {
     let yaml = read_repo_text(WORKFLOW_REL);
