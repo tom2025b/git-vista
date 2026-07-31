@@ -1183,6 +1183,7 @@ int main(void) {{
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -1235,11 +1236,15 @@ static int udp_bind_errno(void) {{
 }}
 
 int main(void) {{
+    int gv_seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int gv_no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
     int denied = host_round_trip_errno();
     int granted = udp_bind_errno();
     printf("GVPROBE {nonce} BEGIN\n");
-    printf("UDP_HOST rc=%d errno=%d\n", denied ? -1 : 0, denied);
-    printf("GRANTED rc=%d errno=%d\n", granted ? -1 : 0, granted);
+    printf("UDP_HOST rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           denied ? -1 : 0, denied, gv_seccomp, gv_no_new_privs);
+    printf("GRANTED rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           granted ? -1 : 0, granted, gv_seccomp, gv_no_new_privs);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
@@ -1263,6 +1268,7 @@ int main(void) {{
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -1303,11 +1309,15 @@ static int bind_errno(int type, unsigned short port, int reuse) {{
 }}
 
 int main(void) {{
+    int gv_seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int gv_no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
     int denied = bind_errno(SOCK_STREAM, {port}, 1);
     int granted = bind_errno(SOCK_DGRAM, 0, 0);
     printf("GVPROBE {nonce} BEGIN\n");
-    printf("TCP_BIND rc=%d errno=%d\n", denied ? -1 : 0, denied);
-    printf("GRANTED rc=%d errno=%d\n", granted ? -1 : 0, granted);
+    printf("TCP_BIND rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           denied ? -1 : 0, denied, gv_seccomp, gv_no_new_privs);
+    printf("GRANTED rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           granted ? -1 : 0, granted, gv_seccomp, gv_no_new_privs);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
@@ -1346,11 +1356,13 @@ int main(void) {{
     /// `EACCES` inside. A tree that cannot be read cannot be written.
     ///
     /// `Seccomp:`/`NoNewPrivs:` are read with all five `prctl` arguments
-    /// supplied. `prctl(PR_GET_NO_NEW_PRIVS)` with the variadic arguments
-    /// omitted returns `-1` on this host — whatever the call frame happened to
-    /// leave in `rdx`/`r10`/`r8` is not zero, and the kernel rejects the call —
-    /// so the older probes in this file print `-1` for both fields regardless of
-    /// the real state.
+    /// supplied. Measured on this host, the old bare
+    /// `prctl(PR_GET_SECCOMP)` form still returned the true `0`, because the
+    /// kernel ignores its trailing arguments. The old bare
+    /// `prctl(PR_GET_NO_NEW_PRIVS)` form returned `-1`/`EINVAL`, because that
+    /// operation validates all four trailing arguments. Treating both fields
+    /// as equally broken would hide a half-repair, so every case now asserts
+    /// both exact values independently.
     pub(super) fn fs_boundary_probe(ctx: &HarnessCtx) -> String {
         let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
         let pwned = c_string(&home.join(format!("gv-escape-write-{}", ctx.nonce)));
@@ -1388,15 +1400,18 @@ static int read_errno(const char *path) {{
 }}
 
 int main(void) {{
+    int gv_seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int gv_no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
     int home_write = write_errno("{pwned}");
     int cgroup = read_errno("/sys/fs/cgroup/cgroup.controllers");
     int granted = read_errno("{granted}");
     printf("GVPROBE {nonce} BEGIN\n");
     printf("WRITEHOME rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
-           home_write ? -1 : 0, home_write,
-           prctl(PR_GET_SECCOMP, 0, 0, 0, 0), prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0));
-    printf("CGROUPTREE rc=%d errno=%d\n", cgroup ? -1 : 0, cgroup);
-    printf("GRANTED rc=%d errno=%d\n", granted ? -1 : 0, granted);
+           home_write ? -1 : 0, home_write, gv_seccomp, gv_no_new_privs);
+    printf("CGROUPTREE rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           cgroup ? -1 : 0, cgroup, gv_seccomp, gv_no_new_privs);
+    printf("GRANTED rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           granted ? -1 : 0, granted, gv_seccomp, gv_no_new_privs);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
@@ -1530,18 +1545,23 @@ int main(void) {{
        legs and proves nothing. What is attributable is the state it failed to
        change, read back on the next line. */
     (void)prctl(PR_SET_NO_NEW_PRIVS, 0, 0, 0, 0);
-    int nnp_state = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) * 10
-                  + prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int gv_no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+    int gv_seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int nnp_state = gv_no_new_privs * 10 + gv_seccomp;
     int widened = widen_then_write_errno("{widen}");
     int granted = read_errno("{granted}");
     errno = 0;
     int un = unshare(CLONE_NEWUSER);
     int unshared = un < 0 ? errno : 0;
     printf("GVPROBE {nonce} BEGIN\n");
-    printf("NNPSTATE rc=%d errno=%d\n", nnp_state, nnp_state);
-    printf("LANDLOCK2 rc=%d errno=%d\n", widened ? -1 : 0, widened);
-    printf("UNSHARE rc=%d errno=%d\n", un, unshared);
-    printf("GRANTED rc=%d errno=%d\n", granted ? -1 : 0, granted);
+    printf("NNPSTATE rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           nnp_state, nnp_state, gv_seccomp, gv_no_new_privs);
+    printf("LANDLOCK2 rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           widened ? -1 : 0, widened, gv_seccomp, gv_no_new_privs);
+    printf("UNSHARE rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           un, unshared, gv_seccomp, gv_no_new_privs);
+    printf("GRANTED rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           granted ? -1 : 0, granted, gv_seccomp, gv_no_new_privs);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
@@ -1671,13 +1691,15 @@ static int uring_af_unix_errno(void) {{
 }}
 
 int main(void) {{
+    int gv_seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int gv_no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
     int denied = uring_af_unix_errno();
     int granted = read_errno("{granted}");
     printf("GVPROBE {nonce} BEGIN\n");
     printf("URINGSOCKET rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
-           denied ? -1 : 0, denied,
-           prctl(PR_GET_SECCOMP, 0, 0, 0, 0), prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0));
-    printf("GRANTED rc=%d errno=%d\n", granted ? -1 : 0, granted);
+           denied ? -1 : 0, denied, gv_seccomp, gv_no_new_privs);
+    printf("GRANTED rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           granted ? -1 : 0, granted, gv_seccomp, gv_no_new_privs);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
