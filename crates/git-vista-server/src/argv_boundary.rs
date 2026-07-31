@@ -464,6 +464,10 @@ fn sandbox_argv_is_one_of_inv16s_three_shapes_in_every_tier() {
         rw_trees: vec![PathBuf::from("/srv/repos/r")],
         ro_trees: vec![PathBuf::from("/usr"), PathBuf::from("/home/tom")],
         secret_excludes: vec![PathBuf::from("/home/tom/.ssh")],
+        // #188 is out of scope for this test (it pins the three INV-16
+        // argv shapes across every tier/hook-mode combination, not any one
+        // flag's contents) — empty in every tier here on purpose.
+        ro_carveouts: Vec::new(),
         net_ports: if tier == Tier::Network {
             DEFAULT_GIT_PORTS.to_vec()
         } else {
