@@ -54,10 +54,7 @@ pub(crate) struct Errno(pub i32);
 /// text for such a case is rejected rather than promoted to evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Provenance {
-    Kernel {
-        seccomp: i32,
-        no_new_privs: i32,
-    },
+    Kernel { seccomp: i32, no_new_privs: i32 },
     NotApplicable,
 }
 
@@ -319,11 +316,7 @@ pub(crate) fn parse_observation(
     })
 }
 
-fn parse_i32_field(
-    line: &str,
-    tag: &str,
-    field: &str,
-) -> Result<i32, MissingObservation> {
+fn parse_i32_field(line: &str, tag: &str, field: &str) -> Result<i32, MissingObservation> {
     let Some((_, tail)) = line.split_once(field) else {
         return Err(MissingObservation {
             detail: format!(
@@ -960,11 +953,11 @@ fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
             case.expect_inside_provenance,
         )
         .unwrap_or_else(|e| {
-                panic!(
-                    "{}: inside-leg `{}` observation missing: {}",
-                    case.id, case.probe_tag, e.detail
-                )
-            });
+            panic!(
+                "{}: inside-leg `{}` observation missing: {}",
+                case.id, case.probe_tag, e.detail
+            )
+        });
         let granted = parse_observation(
             &inside.combined,
             nonce,
@@ -972,11 +965,11 @@ fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
             case.expect_granted_provenance,
         )
         .unwrap_or_else(|e| {
-                panic!(
-                    "{}: inside-leg GRANTED observation missing (R3): {}",
-                    case.id, e.detail
-                )
-            });
+            panic!(
+                "{}: inside-leg GRANTED observation missing (R3): {}",
+                case.id, e.detail
+            )
+        });
         (observed, granted)
     };
 
@@ -987,9 +980,7 @@ fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
         case.expect_inside,
         case.expect_inside_provenance,
     ) {
-        return Outcome::Escaped {
-            detail,
-        };
+        return Outcome::Escaped { detail };
     }
     if let Some(detail) = observation_mismatch(
         "inside",
