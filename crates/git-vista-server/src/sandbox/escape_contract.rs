@@ -1101,6 +1101,10 @@ const RULES: &[(&str, &str)] = &[
         "R10-FLAG-ROUND-TRIP",
         "r10_every_flag_sandbox_argv_emits_has_a_shim_parser_arm",
     ),
+    (
+        "F-KERNEL-PROVENANCE",
+        "f_every_observation_requires_typed_kernel_provenance",
+    ),
 ];
 
 const BATTERY_FILES: &[&str] = &[
