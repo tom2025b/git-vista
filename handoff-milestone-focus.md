@@ -1,5 +1,68 @@
 # Handoff — M1.13b Close-Out + M2 Sub-Issue Kickoff (focused session)
 
+## ⚠ NEWEST — 2026-07-31 ~13:05. #188 DONE. CI green except gitleaks (fix pushed, unverified in CI).
+
+**#188 is genuinely finished and adversarially verified.** 173/173 sandbox tests pass. A
+skeptic independently confirmed: Strict tier still denies `known_hosts`, private keys stay
+denied in the Network tier, and the fix is real rather than test-shaped. The earlier
+"EACCES bug" in the block below was NOT a real defect — it was a half-built tree captured
+mid-flight by the 60s checkpointer, because the *previous* session's #188 workflow died at
+its implement stage on a quota limit. At current HEAD the mechanism traces cleanly end to
+end (`Policy::ro_carveouts` → `--ro-carveout` → `add_carveout_rule`).
+
+**Mutation matrix: PASS**, run locally in full. M11 (the new #188 mutant) kills ONLY
+`ssh_known_hosts_carveout` — narrow closure, so that case is load-bearing, not vacuous.
+
+**Two real CI failures found and fixed this stretch:**
+
+1. **Mutation matrix (R9) was red** — `ci/mutants/M3-empty-secret-excludes.patch` no longer
+   applied: #188's doc comments moved `secret_excludes_for_home` from line 193 to 252.
+   Regenerated the patch; all 11 mutants now apply under both `git apply` and `patch -p1`.
+   **Sandbox job is now green in CI.**
+
+2. **gitleaks was red** — `.github/actions/host-sandbox-setup/action.yml` wrote a placeholder
+   `~/.ssh/id_ed25519` whose first line was a literal `-----BEGIN OPENSSH PRIVATE KEY-----`.
+   Not a real secret (nothing parses it; generated on an ephemeral runner). Fixed in two parts:
+   reworded the placeholder so new commits don't re-trip it, and added `.gitleaks.toml`
+   because the scan is **full-history** and commit `8e2cec7` still carries the old text.
+
+   **READ `.gitleaks.toml`'s header before touching it.** Two allowlist shapes were tried and
+   both FAILED OPEN, measured against gitleaks 8.30.1: a `paths` entry, and `paths` + `commits`
+   with `matchCondition = "AND"`. In both, a freshly planted real PEM key at that path in a
+   brand-new commit went **undetected** — the file would have been blinded to real key material
+   permanently. Final config scopes by `commits` (one immutable historical commit) instead.
+   Verified with a paired test that must be re-run after any edit: (a) repo scan clean, and
+   (b) a real PEM planted at that same path in a *different* commit **is still caught**. Leg
+   (b) is the one that matters — it is what distinguishes a scoped suppression from a disarmed
+   scanner. gitleaks is NOT installed on this box; the pinned checksum-verified binary used for
+   these runs is at `<scratchpad>/gitleaks` (8.30.1, same SHA as CI).
+
+**CI status at handoff:** Core, Frontend, Lint, Contract, Security audit, **Sandbox** all pass.
+Gitleaks fix is pushed but its CI re-run had not reported yet — **confirm it before merging.**
+
+**TWO WORKFLOWS WERE STILL RUNNING** when this was written (they survive a compact; they only
+die if the session dies or quota exhausts):
+- `wf_bd2db6c5-46e` — merge-readiness audit for PR #207 / #66. Four read-only lenses (vacuous
+  tests, docs currency, issue bookkeeping, code diff), each finding then adversarially verified
+  by a second agent instructed to refute it. Returns confirmed vs refuted findings.
+- `wf_ce966f8c-60d` — M2 sub-issue breakdown for the parents with nothing filed yet (#71–#75,
+  #153, #170), ending in a synthesis pass that finds cross-issue shared-file conflicts and the
+  real critical path. **Drafts only — it does not create issues.**
+
+Read both results before merging #66; the audit exists specifically to catch what this
+session might have missed.
+
+**Deliverable for Tom:** `design-docs/2026-07-31-two-week-commit-graph.pdf` — a real commit
+graph (SVG lanes, curved branch/merge edges, colored nodes) styled like the app's own graph
+view. 195 commits, 45 merges, 5 lanes. Checkpoint commits are collapsed out but their edges
+are rewired to the nearest surviving ancestor, so the topology drawn is the true one.
+Generator: `<scratchpad>/build_svg_graph.py`.
+
+**Next steps, in order:** (1) confirm gitleaks green in CI; (2) read both workflow results and
+fold in anything confirmed; (3) Tom drives the iPad testbed on 8081 — #65's a11y work has never
+been human-verified and this milestone has produced six green-but-wrong findings; (4) mark PR
+#207 ready and merge; (5) close #66, which unblocks #67/#72/#73/#74.
+
 ## ⚠ NEWEST STATUS — 2026-07-31 ~12:15, session at 95%, resets in ~1hr, stopping per standing rule
 
 **PR #207 CI is green (all 7 checks)** — that part from the block below still holds.
