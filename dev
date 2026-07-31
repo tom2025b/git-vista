@@ -332,9 +332,30 @@ cmd_testbed() {
   sed -i "s/pub(crate) const PORT: u16 = 8080;/pub(crate) const PORT: u16 = $port;/" "$state"
   grep -q "const PORT: u16 = $port;" "$state" || die "could not retarget PORT in $state"
 
-  echo "dev: building (frontend first — this is the slow part)"
-  ( cd "$dir" && trunk build --release --config crates/git-vista/Trunk.toml )
-  ( cd "$dir" && cargo build -p git-vista-server )
+  # Build against the MAIN tree's target/ instead of a fresh empty one.
+  #
+  # This is the difference between ~95 seconds and several hours, measured on
+  # this box (4 cores, 7 GB RAM, spinning disk). A new worktree starts with an
+  # empty target/, so a --release build recompiles every dependency from
+  # scratch — and `git worktree remove` then deletes the result, so the next
+  # testbed pays the same cost again. Nothing was ever reused. Sharing the
+  # cache means only the crates that actually differ (the PORT const above, and
+  # whatever the ref changes) get rebuilt.
+  #
+  # Safe because cargo locks target/ and keys artifacts by the full compilation
+  # fingerprint: the retargeted PORT is part of that fingerprint, so the
+  # testbed's binaries never masquerade as the main tree's. The cost of sharing
+  # is that main and testbed builds evict each other's copy of the two crates
+  # that differ — seconds, against hours saved.
+  #
+  # Debug, not --release: this build exists to be driven by a human for a few
+  # minutes, not to be fast at runtime. Optimizing it is the tail wagging the dog.
+  local shared_target="$REPO/target"
+  echo "dev: building against the shared cache at $shared_target (debug)"
+  ( cd "$dir" && env CARGO_TARGET_DIR="$shared_target" \
+      trunk build --config crates/git-vista/Trunk.toml )
+  ( cd "$dir" && env CARGO_TARGET_DIR="$shared_target" \
+      cargo build -p git-vista-server )
 
   cat <<EOF
 
