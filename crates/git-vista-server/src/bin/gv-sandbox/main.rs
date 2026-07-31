@@ -724,9 +724,22 @@ fn enumerate(ruleset: i32, dir: &Path, root: &Path, access: u64, excludes: &[Pat
 /// process cannot prove what the exclude names, which is the real fail-open
 /// risk, and stays fatal.
 fn resolve_excludes(raw: &[PathBuf]) -> Vec<PathBuf> {
-    // MUTATION-TEST: canonicalize step disabled on purpose to confirm the
-    // regression test goes red without it. Restore before committing.
-    raw.to_vec()
+    raw.iter()
+        .filter_map(|e| match std::fs::canonicalize(e) {
+            Ok(p) => Some(p),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => die(
+                EXIT_LANDLOCK,
+                &format!(
+                    "cannot resolve --exclude `{}`: {err}. An exclude that cannot be \
+                     canonicalised for a reason other than not existing must not silently \
+                     match nothing — refusing to build a ruleset that would grant it by \
+                     accident.",
+                    e.display()
+                ),
+            ),
+        })
+        .collect()
 }
 
 fn apply_landlock(a: &Args) {
