@@ -132,11 +132,11 @@ tripwire rather than a comment: `the_sandboxed_command_exposes_no_way_to_change_
 
 ### 3. Three tiers, and `Unsandboxed` reachable only through persisted trust
 
-`Tier::{Strict, Network, Unsandboxed}` (`mod.rs:404-414`). Dispatch is two
+`Tier::{Strict, Network, Unsandboxed}` (`mod.rs`). Dispatch is two
 inputs, three outcomes, no wildcard on the untrusted side:
 
 ```rust
-// mod.rs:781-792
+// mod.rs's tier_for
 pub(crate) fn tier_for(need: NetworkNeed, trusted: bool) -> Tier {
     match (trusted, need) {
         (true, _) => Tier::Unsandboxed,
