@@ -224,7 +224,10 @@ const INTERACTIVE_CENSUS: &[(&str, bool)] = &[
     // Context-menu rows: 8px/10px padding, `width: 100%` (an ancestor's answer).
     (".ctx-item", false),
     (".reset-view", false),
-    // A bare utility class applied to graph text; carries no box of its own.
+    // GitHub-linked ref badges and commit messages (`render/labels.rs`). Applied to
+    // SVG `<rect>` / `<text>`, so like `.node-hit` the size is user units set in
+    // `render/`, scaled by the camera — the badge rect is `geometry::BADGE_HEIGHT`
+    // tall, and the `<text>` has only its glyph box.
     (".clickable", false),
     (".detail-close", false),
     (".detail-parent", false),
