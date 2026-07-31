@@ -953,6 +953,32 @@ button.detail-file:focus-visible .detail-file-path { color: var(--accent); }
 .viewer-btn:focus-visible { border-color: var(--accent); }
 .scale-btn:focus-visible { border-color: var(--accent); }
 
+/* #65 tap targets: every CSS-sized interactive control guarantees Apple's
+   44x44 CSS-pixel minimum on both axes, unconditionally — not behind
+   `@media (pointer: coarse)` — because docs/IPAD_DESIGN.md's External
+   Monitor section requires touch sizing even on big displays ("may still be
+   touch adjacent or controlled from the iPad"), and because the a11y audit's
+   guarantee predicate (features/a11y/audit.rs) deliberately reads the
+   stylesheet context-blind, so a conditional minimum would let the census
+   over-claim. `.node-hit` and `.clickable` are absent on purpose: they are
+   SVG shapes sized in `render/` user units and scaled by the camera — CSS
+   cannot guarantee their rendered extent; see INTERACTIVE_CENSUS. */
+.refresh,
+.ctx-item,
+.reset-view,
+.detail-close,
+.detail-parent,
+.act-refresh,
+.act-row,
+.act-undo,
+button.detail-file,
+.detail-expand,
+.viewer-btn,
+.scale-btn {
+  min-height: 44px;
+  min-width: 44px;
+}
+
 /* Respect the OS "reduce motion" setting. The near-zero duration (rather than
    `none`) is the conventional form: it keeps `transitionend` / `animationend`
    listeners firing, so a future component that waits on one does not hang for
