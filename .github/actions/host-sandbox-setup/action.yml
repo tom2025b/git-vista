@@ -184,7 +184,7 @@ runs:
         mkdir -p "$HOME/.ssh"
         chmod 700 "$HOME/.ssh"
         if [ ! -s "$HOME/.ssh/id_ed25519" ]; then
-          printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nplaceholder written by .github/actions/host-sandbox-setup — NOT a real\nkey. The escape battery needs this path to EXIST and be readable outside\nthe sandbox so that "denied inside" is attributable to the policy, not to\nthe file never having existed. Contents are never parsed as key material.\n-----END OPENSSH PRIVATE KEY-----\n' > "$HOME/.ssh/id_ed25519"
+          printf -- 'not-a-real-key placeholder written by .github/actions/host-sandbox-setup\nfor issue #188. The escape battery needs this path to EXIST and be\nreadable outside the sandbox so that "denied inside" is attributable to\nthe policy, not to the file never having existed. Contents are never\nparsed as key material, so this deliberately does NOT look like a PEM\nheader — a real-looking placeholder previously tripped gitleaks'"'"' private-key\nrule as a false positive (Finding on .github/actions/host-sandbox-setup/action.yml:179).\n' > "$HOME/.ssh/id_ed25519"
         fi
         chmod 600 "$HOME/.ssh/id_ed25519"
         if [ ! -r "$HOME/.ssh/id_ed25519" ] || [ ! -s "$HOME/.ssh/id_ed25519" ]; then
