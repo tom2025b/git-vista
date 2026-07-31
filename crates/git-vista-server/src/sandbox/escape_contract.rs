@@ -1386,17 +1386,18 @@ fn f_every_observation_requires_typed_kernel_provenance() {
     let escape = read_rs("src/sandbox/escape_suite.rs");
     assert_eq!(
         escape.matches("expect_baseline_provenance:").count(),
-        16,
+        // #188 added a 17th case (CASE_SSH_KNOWN_HOSTS_CARVEOUT), up from 16.
+        17,
         "F: every containment case must spell a baseline provenance expectation"
     );
     assert_eq!(
         escape.matches("expect_inside_provenance:").count(),
-        16,
+        17,
         "F: every containment case must spell an inside provenance expectation"
     );
     assert_eq!(
         escape.matches("expect_granted_provenance:").count(),
-        16,
+        17,
         "F: every containment case must spell a GRANTED provenance expectation"
     );
     let hooks = read_rs("src/sandbox/hook_mode_suite.rs");
