@@ -818,12 +818,15 @@ static int read_errno(const char *path) {{
 }}
 
 int main(void) {{
+    int gv_seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int gv_no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
     printf("GVPROBE {nonce} BEGIN\n");
     int denied = read_errno("{secret}");
     printf("SECRET rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
-           denied ? -1 : 0, denied, prctl(PR_GET_SECCOMP), prctl(PR_GET_NO_NEW_PRIVS));
+           denied ? -1 : 0, denied, gv_seccomp, gv_no_new_privs);
     int allowed = read_errno("{granted}");
-    printf("GRANTED rc=%d errno=%d\n", allowed ? -1 : 0, allowed);
+    printf("GRANTED rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           allowed ? -1 : 0, allowed, gv_seccomp, gv_no_new_privs);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
@@ -857,6 +860,8 @@ static int read_errno(const char *path) {{
 }}
 
 int main(void) {{
+    int gv_seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int gv_no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
     struct io_uring_params params;
     memset(&params, 0, sizeof params);
     errno = 0;
@@ -864,10 +869,11 @@ int main(void) {{
     int saved = ring < 0 ? errno : 0;
     printf("GVPROBE {nonce} BEGIN\n");
     printf("IOURING rc=%ld errno=%d Seccomp: %d NoNewPrivs: %d\n",
-           ring, saved, prctl(PR_GET_SECCOMP), prctl(PR_GET_NO_NEW_PRIVS));
+           ring, saved, gv_seccomp, gv_no_new_privs);
     if (ring >= 0) close((int)ring);
     int allowed = read_errno("{granted}");
-    printf("GRANTED rc=%d errno=%d\n", allowed ? -1 : 0, allowed);
+    printf("GRANTED rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           allowed ? -1 : 0, allowed, gv_seccomp, gv_no_new_privs);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
@@ -899,14 +905,17 @@ static int read_errno(const char *path) {{
 }}
 
 int main(void) {{
+    int gv_seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int gv_no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
     errno = 0;
     long rc = syscall(SYS_prctl, (long)PR_SET_SECCOMP | 0x100000000L, 2, 0, 0, 0);
     int saved = rc < 0 ? errno : 0;
     printf("GVPROBE {nonce} BEGIN\n");
     printf("HIGHBIT rc=%ld errno=%d Seccomp: %d NoNewPrivs: %d\n",
-           rc, saved, prctl(PR_GET_SECCOMP), prctl(PR_GET_NO_NEW_PRIVS));
+           rc, saved, gv_seccomp, gv_no_new_privs);
     int allowed = read_errno("{granted}");
-    printf("GRANTED rc=%d errno=%d\n", allowed ? -1 : 0, allowed);
+    printf("GRANTED rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           allowed ? -1 : 0, allowed, gv_seccomp, gv_no_new_privs);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
@@ -943,6 +952,8 @@ int main(void) {{
 #include <unistd.h>
 
 int main(void) {{
+    int gv_seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int gv_no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
     errno = 0;
     long high = syscall(SYS_socket, (long)AF_UNIX | 0x100000000L, SOCK_STREAM, 0);
     int denied = high < 0 ? errno : 0;
@@ -953,8 +964,9 @@ int main(void) {{
     if (inet >= 0) close((int)inet);
     printf("GVPROBE {nonce} BEGIN\n");
     printf("HIGHUNIX rc=%ld errno=%d Seccomp: %d NoNewPrivs: %d\n",
-           high, denied, prctl(PR_GET_SECCOMP), prctl(PR_GET_NO_NEW_PRIVS));
-    printf("GRANTED rc=%ld errno=%d\n", inet, granted);
+           high, denied, gv_seccomp, gv_no_new_privs);
+    printf("GRANTED rc=%ld errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           inet, granted, gv_seccomp, gv_no_new_privs);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
@@ -998,6 +1010,8 @@ static int read_errno(const char *path) {{
 }}
 
 int main(void) {{
+    int gv_seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int gv_no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
     struct io_uring_params params;
     memset(&params, 0, sizeof params);
     errno = 0;
@@ -1006,9 +1020,10 @@ int main(void) {{
     if (ring >= 0) close((int)ring);
     printf("GVPROBE {nonce} BEGIN\n");
     printf("X32IOURING rc=%ld errno=%d Seccomp: %d NoNewPrivs: %d\n",
-           ring, saved, prctl(PR_GET_SECCOMP), prctl(PR_GET_NO_NEW_PRIVS));
+           ring, saved, gv_seccomp, gv_no_new_privs);
     int allowed = read_errno("{granted}");
-    printf("GRANTED rc=%d errno=%d\n", allowed ? -1 : 0, allowed);
+    printf("GRANTED rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           allowed ? -1 : 0, allowed, gv_seccomp, gv_no_new_privs);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
@@ -1060,14 +1075,18 @@ static int socketpair_errno(void) {{
 }}
 
 int main(void) {{
+    int gv_seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int gv_no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
     int unix_sock = socket_errno(AF_UNIX);
     int unix_pair = socketpair_errno();
     int inet_sock = socket_errno(AF_INET);
     printf("GVPROBE {nonce} BEGIN\n");
     printf("UNIXSOCK rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
-           unix_sock ? -1 : 0, unix_sock, prctl(PR_GET_SECCOMP), prctl(PR_GET_NO_NEW_PRIVS));
-    printf("UNIXPAIR rc=%d errno=%d\n", unix_pair ? -1 : 0, unix_pair);
-    printf("GRANTED rc=%d errno=%d\n", inet_sock ? -1 : 0, inet_sock);
+           unix_sock ? -1 : 0, unix_sock, gv_seccomp, gv_no_new_privs);
+    printf("UNIXPAIR rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           unix_pair ? -1 : 0, unix_pair, gv_seccomp, gv_no_new_privs);
+    printf("GRANTED rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           inet_sock ? -1 : 0, inet_sock, gv_seccomp, gv_no_new_privs);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
@@ -1112,6 +1131,8 @@ static int read_errno(const char *path) {{
 }}
 
 int main(void) {{
+    int gv_seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int gv_no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     int rc = -1;
     int saved = fd < 0 ? errno : 0;
@@ -1128,9 +1149,10 @@ int main(void) {{
     }}
     printf("GVPROBE {nonce} BEGIN\n");
     printf("CONNECT rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
-           rc, saved, prctl(PR_GET_SECCOMP), prctl(PR_GET_NO_NEW_PRIVS));
+           rc, saved, gv_seccomp, gv_no_new_privs);
     int allowed = read_errno("{granted}");
-    printf("GRANTED rc=%d errno=%d\n", allowed ? -1 : 0, allowed);
+    printf("GRANTED rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           allowed ? -1 : 0, allowed, gv_seccomp, gv_no_new_privs);
     printf("GVPROBE {nonce} END\n");
     return 0;
 }}
