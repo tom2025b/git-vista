@@ -871,22 +871,50 @@ mod tests {
     /// the first (`OnceLock::set` returning `Err` is swallowed on purpose — see
     /// `record_boot_verdict`).
     ///
-    /// This shares the one process-wide `OnceLock` with the boot test above, so
-    /// it asserts only what is true regardless of ordering: after this function
-    /// has recorded something, *some* verdict is readable, and recording a
-    /// different one afterwards does not change it.
+    /// # Why a fresh cell, and not `BOOT_VERDICT`
+    ///
+    /// The previous version of this test recorded into the one process-wide
+    /// `BOOT_VERDICT`, which `run_at_startup_…` above may already have filled.
+    /// Its "recording a verdict makes it readable" assertion was then satisfied
+    /// by the *sibling's* write whenever the sibling won the race — a vacuity
+    /// window that opened and closed on thread scheduling. Two mutations lived
+    /// inside it:
+    ///
+    ///  * a recorder gutted to a no-op (the value read back was the sibling's);
+    ///  * a recorder that stored only `Contained` — the exact narrowing
+    ///    `record_boot_verdict`'s doc comment argues against — since the old
+    ///    test only ever recorded `Contained` first.
+    ///
+    /// Passing the cell in kills both, and does so independently of what else
+    /// ran: the first verdict written below is a *refusing* one, so a recorder
+    /// that quietly dropped non-green verdicts fails here rather than leaving
+    /// `boot_verdict()` reporting "the probe never ran" on a host where it ran
+    /// and found a hole.
+    ///
+    /// `record_boot_verdict`'s own wiring to `BOOT_VERDICT` is not skipped by
+    /// this — it is covered by `run_at_startup_…` above, which drives the real
+    /// boot path and reads the value back through the public `boot_verdict()`.
     #[test]
     fn the_recorded_verdict_is_write_once_and_readable() {
-        record_boot_verdict(&ProbeVerdict::Contained);
-        let first = boot_verdict()
-            .expect("recording a verdict makes it readable")
-            .clone();
+        let cell: OnceLock<ProbeVerdict> = OnceLock::new();
+        assert_eq!(cell.get(), None, "a fresh cell starts out unrecorded");
 
-        record_boot_verdict(&ProbeVerdict::FailOpen {
-            failed_checks: vec!["a later write must not clobber the boot value".to_string()],
-        });
+        let first = ProbeVerdict::FailOpen {
+            failed_checks: vec!["seccomp_mode=0 want=2".to_string()],
+        };
+        record_verdict_into(&cell, &first);
         assert_eq!(
-            boot_verdict(),
+            cell.get(),
+            Some(&first),
+            "recording a verdict must make it readable — and a refusing verdict \
+             must be recorded exactly like a green one, or the stored value would \
+             say `None` (\"the probe never ran\") for a host whose probe ran and \
+             found a hole"
+        );
+
+        record_verdict_into(&cell, &ProbeVerdict::Contained);
+        assert_eq!(
+            cell.get(),
             Some(&first),
             "the boot verdict is write-once: a later record must be a no-op, \
              not a way to overwrite what the gate acted on"
