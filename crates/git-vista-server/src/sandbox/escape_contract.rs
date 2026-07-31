@@ -2308,6 +2308,15 @@ const HOST_SETUP_TOKENS: &[(&str, &str)] = &[
          git spawn is refused rather than downgraded (ADR 0029)",
     ),
     (
+        "openssh-server",
+        "installs sshd (#188): sandbox::ssh_remote's fixture spawns a real, throwaway, \
+         loopback sshd to drive git ls-remote over ssh:// through the composed launcher. \
+         ubuntu-latest ships the openssh-client tools (ssh/ssh-keygen/ssh-agent, a base-image \
+         dependency for git itself) but not sshd, a separate package — without it every \
+         sandbox::ssh_remote test fails at spawning sshd with a bare ENOENT that has \
+         nothing to do with the sandbox",
+    ),
+    (
         "apparmor_restrict_unprivileged_userns",
         "unclamps unprivileged user namespaces (D6 Option A); ubuntu-latest ships the clamp \
          set to 1, under which bwrap cannot create its namespaces at all",
