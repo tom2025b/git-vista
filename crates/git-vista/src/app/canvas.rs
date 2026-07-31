@@ -35,6 +35,7 @@ use git_vista_core::model::RefKind;
 
 use crate::api::{fetch_commit_detail, fetch_page, HistoryFetchError};
 use crate::camera::Camera;
+use crate::features::a11y::focus::GraphFocus;
 use crate::features::graph::core::{
     should_prefetch, show_fixed_loading_overlay, PageLoadState, PageRequestKey, PageRetry,
     RenderCtx, DEFAULT_PAGE_LIMIT,
