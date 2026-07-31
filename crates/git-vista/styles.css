@@ -437,18 +437,34 @@ html, body {
   border-left: 1px solid #30363d;
   box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
   font-size: 0.85rem;
+  /* #65 safe-area: the panel is flush with the top, right and bottom edges,
+     so it absorbs those insets itself rather than letting the notch or home
+     indicator sit over its content. */
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 /* M1.12 (#65): the detail panel's existing fixed-right-edge docking already
-   matches Wide/UltraWide's intent, so those two modes need no override — this
-   confirms the pre-existing default rather than silently relying on it staying
-   correct by accident. Compact/Portrait get the full-width behavior the panel's
-   own comment above already documents ("On a narrow screen it spans the full
+   matches Wide/UltraWide's intent, so Wide needs no override — this confirms
+   the pre-existing default rather than silently relying on it staying correct
+   by accident. Compact/Portrait get the full-width behavior the panel's own
+   comment above already documents ("On a narrow screen it spans the full
    width so the content stays readable") — made explicit and mode-driven here
    instead of implicit in a fixed max-width. */
-.shell-wide .detail-panel,
-.shell-ultrawide .detail-panel {
+.shell-wide .detail-panel {
   width: min(420px, 100vw);
+}
+
+/* #65 external monitor: docs/IPAD_DESIGN.md's External Monitor section asks
+   for more information density, not scaled-up chrome. The one density win
+   available to pure CSS today is diff/detail room: at ≥1440px the panel earns
+   a third more width, so file diffs and commit bodies show more content per
+   screen while the graph still keeps well over half the viewport. Controls
+   deliberately keep their touch sizing — the same section warns the external
+   display "may still be touch adjacent". */
+.shell-ultrawide .detail-panel {
+  width: min(560px, 100vw);
 }
 
 .shell-compact .detail-panel,
@@ -692,6 +708,12 @@ button.detail-file:hover .detail-file-path { color: var(--accent); }
   display: flex;
   flex-direction: column;
   background: var(--bg);
+  /* #65 safe-area: full-screen surfaces own every edge, so they absorb all
+     four insets. */
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
 }
 .viewer-head {
   display: flex;
