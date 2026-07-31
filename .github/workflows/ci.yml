@@ -34,6 +34,20 @@
 #                battery itself, then three shell-level assertions over the
 #                report file it writes, none of which the tests decide for
 #                themselves
+#
+# core, contract and sandbox share ONE host-provisioning step,
+# .github/actions/host-sandbox-setup. M1.13b (#66) routed every production git
+# spawn through the sandbox chokepoint, so core's and contract's own suites now
+# construct the Strict tier too — not just sandbox's — and per ADR 0029 a host
+# that cannot provide that tier refuses the operation rather than downgrading
+# it. escape_contract.rs's fixture() additionally runs with no repo-local git
+# identity on purpose (#203), which only a global ~/.gitconfig on the runner can
+# satisfy. All three jobs therefore `uses: ./.github/actions/host-sandbox-setup`
+# right after checkout instead of hand-rolling the apt-get/sysctl/git-config
+# sequence per job: three independent copies of a security-relevant preflight is
+# precisely the drift that left core and contract red on their first real run
+# (run 30629854802) while sandbox alone was provisioned. That action's own file
+# says what it installs and why.
 name: CI
 
 on:
@@ -116,6 +130,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Shared host provisioning — bwrap, a C compiler, the D6 Option A userns
+      # unclamp, and the runner's global git identity (#203). It lives in one
+      # composite action so core, contract and sandbox cannot drift apart the
+      # way they did before PR #207; see
+      # .github/actions/host-sandbox-setup/action.yml for what each step does
+      # and why. Placed immediately after checkout because a local composite
+      # action is resolved out of the checked-out tree, and BEFORE the Rust
+      # toolchain/rust-cache steps below because none of the provisioning
+      # depends on Rust: a runner that cannot be provisioned should fail here,
+      # not after paying for a toolchain install and a cache restore that would
+      # just be thrown away. `cargo test --workspace` further down is what
+      # needs it — it constructs the Strict tier for every production git spawn.
+      - uses: ./.github/actions/host-sandbox-setup
+
       # #67 M1.14: the floor lives in exactly one place — the "## Git: X.Y or
       # later" heading in docs/SUPPORTED_VERSIONS.md — and this step parses it
       # out rather than duplicating the number, the same anti-drift pattern
@@ -184,6 +212,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Shared host provisioning — same action, same position, same reasoning
+      # as the `core` job above (see there for the full rationale). It applies
+      # here too: this job's suites go through the sandbox chokepoint, so they
+      # build the Strict tier and are refused outright without bwrap and
+      # unprivileged user namespaces. The identity step is not load-bearing for
+      # this job's own filters (contract_suite sets a repo-local identity), but
+      # the three jobs deliberately keep IDENTICAL host profiles — a per-job
+      # subset is how they drifted in the first place.
+      - uses: ./.github/actions/host-sandbox-setup
+
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
@@ -238,6 +276,25 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Shared host provisioning — see the `core` job above for the full
+      # rationale and .github/actions/host-sandbox-setup/action.yml for what it
+      # does. These two steps (bwrap + build-essential, and the D6 Option A
+      # userns unclamp) used to be written out inline HERE, and only here; that
+      # is the drift PR #207 is fixing, so they moved into the action verbatim
+      # rather than being copied into core and contract as well. They also moved
+      # up from after rust-cache to immediately after checkout, so all three
+      # jobs provision the host at the same point and a runner that cannot be
+      # provisioned fails before the toolchain install.
+      - uses: ./.github/actions/host-sandbox-setup
+
+      # Only this job needs these two, so they stay out of the shared action:
+      # ci/mutation-matrix.sh applies its mutants with `patch` and copies the
+      # tree with `rsync`. Nothing else in the workspace uses either.
+      - name: Sandbox-only packages (patch, rsync — for ci/mutation-matrix.sh)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends patch rsync
+
       - name: Decide whether this run requires the mutation matrix
         id: mutation_scope
         run: |
@@ -262,51 +319,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Best-effort: gives the strict tier its two host dependencies before
-      # the preflight measures what is actually available.
-      - name: Best-effort host setup (bwrap, a C compiler)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends bubblewrap build-essential patch rsync
-
-      # D6 Option A — decided by Tom 2026-07-29, re-confirmed 2026-07-30.
-      # Rationale in design-docs/2026-07-29-d6-sandbox-ci-preflight-decision.md
-      # and plan Global Constraint 11.
-      #
-      # GitHub's ubuntu-latest ships kernel.apparmor_restrict_unprivileged_userns=1.
-      # Under that clamp `bwrap` cannot create its namespaces, so the Strict tier
-      # cannot be constructed at all — and because a case that cannot demonstrate
-      # its own premise is now a HARD FAILURE rather than a skip, the escape
-      # battery would go red without ever testing a single invariant. Either way
-      # the 17 invariants this milestone exists to prove would never gate a merge.
-      #
-      # So the clamp is lifted here, deliberately and visibly, and the step FAILS
-      # LOUDLY if the write does not take — it never falls through to a degraded
-      # run. That distinction is the whole point: a silent workaround would be
-      # indistinguishable from a sandbox that works.
-      #
-      # Safe here specifically because GitHub-hosted runners are single-job,
-      # ephemeral VMs, destroyed after the run and never reused — there is no
-      # "left the box weaker" concern that would apply on a persistent host. Do
-      # NOT copy this step to a self-hosted or reused runner without revisiting
-      # that reasoning.
-      - name: Preflight — unclamp unprivileged user namespaces (D6 Option A)
-        run: |
-          set -euo pipefail
-          before="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 'absent')"
-          echo "apparmor_restrict_unprivileged_userns before: $before"
-          if [ "$before" = "absent" ]; then
-            echo "sysctl not present on this kernel — nothing to unclamp; the capability preflight below is the real check."
-            exit 0
-          fi
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          after="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
-          echo "apparmor_restrict_unprivileged_userns after: $after"
-          if [ "$after" != "0" ]; then
-            echo "::error::Failed to unclamp unprivileged user namespaces (still '$after'). Refusing to continue: without this the Strict tier cannot be built, so the escape battery would report capability-absent and prove nothing. Failing loudly is the decided posture (D6 Option A) — do not add a fallback that lets the job pass having tested nothing."
-            exit 1
-          fi
-
+      # bwrap, the C compiler, the userns unclamp and the global git identity
+      # were all provisioned by host-sandbox-setup right after checkout, above.
+      # This step does not provision anything — it MEASURES what actually
+      # landed, and fails with `::error::` naming each missing capability by
+      # name, so "this runner cannot provide the sandbox" is never mistaken for
+      # "the sandbox failed to contain something".
       - name: Sandbox preflight (host capability check)
         run: cargo test -p git-vista-server ci_preflight_host_meets_the_declared_minimum
 
