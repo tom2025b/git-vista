@@ -1,0 +1,13 @@
+--- a/crates/git-vista-server/src/sandbox/mod.rs
++++ b/crates/git-vista-server/src/sandbox/mod.rs
+@@ -272,8 +272,8 @@
+ /// refusal in `add_carveout_rule`) — so the soundness argument does not depend
+ /// on knowing every private key's name: `.ssh` stays wholly excluded, and this
+ /// is the one, single, explicitly-reviewed file re-admitted from inside it.
+-pub(crate) fn ssh_known_hosts_carveout(home: &std::path::Path) -> Vec<PathBuf> {
+-    vec![home.join(".ssh/known_hosts")]
++pub(crate) fn ssh_known_hosts_carveout(_home: &std::path::Path) -> Vec<PathBuf> {
++    Vec::new()
+ }
+ 
+ /// #188: the SSH agent socket to grant read-write in the **Network** tier —
