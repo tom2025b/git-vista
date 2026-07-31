@@ -209,3 +209,206 @@ fn the_confused_deputy_ceiling_is_documented_not_engineered_against() {
          will be read as claiming containment"
     );
 }
+
+// =========================================================================
+// A second, different kind of gap — read this before adding to it
+// =========================================================================
+//
+// Everything above is INV-17: a *proven* kernel non-mediation gap, evidenced
+// by a test that runs the attack and watches it succeed. What follows is not
+// that. `policy_for_clone` (#66/D4, `sandbox/mod.rs`) is an ordinary,
+// production-reachable, attacker-facing spawn site that nobody has written an
+// `EscapeCase` for yet — ordinary missing coverage, not a kernel limitation.
+// It is filed in this module anyway, for now, because this is the project's
+// one place for "here is what is NOT proven and why" and no better one exists
+// — see the module doc's INV-17 label on `mod documented_gaps;` in
+// `sandbox/mod.rs`, which this entry deliberately does not fit. Do not follow
+// this shape for a future gap of the same (missing-coverage) kind without
+// first asking whether it deserves its own module.
+//
+// # What `policy_for_clone` is, and why it is separate from `policy_for`
+//
+// `handlers/clone.rs:140`, inside `clone_repo` (`POST /api/clone`), is the
+// only production caller. It builds via `policy_for_clone(&root)` and spawns
+// through `sandbox::spawn::command_async` directly — the same chokepoint
+// every other sandboxed git spawn goes through, but reached without
+// `git_cmd.rs`'s `sandboxed()`/`policy_for()` wrapper, because the clone
+// destination does not exist yet at policy time and `policy_for`'s
+// `repo_paths::resolve` requires an existing `.git`. Its own doc comment
+// (`sandbox/mod.rs`, directly above the function) names the reason it exists
+// as a separate constructor rather than a `policy_for` variant: clone is "the
+// one operation that fetches attacker-chosen content by design" and must
+// never be reachable at `Tier::Unsandboxed` — so `tier` is a hard
+// `Tier::Network` constant and the function neither takes nor derives a trust
+// flag, structurally rather than by a check that could be edited away.
+//
+// # What IS verified today
+//
+// `policy_for_clone` composes a `Policy` from the exact same building blocks
+// as `policy_for(.., NetworkNeed::Remote)` — `default_system_trees(Tier::
+// Network)`, `secret_excludes_for_home` plus `sandbox_trust_dir()`,
+// `DEFAULT_GIT_PORTS`, `bwrap: None`, `HookMode::Run` — and both hand off to
+// the identical `sandbox::spawn::command_async` → `sandbox_argv` → shim
+// composition. That launcher (Landlock at the declared floor, the seccomp
+// filter, `NoNewPrivs`) is exercised, with kernel-level provenance checks, by
+// the nine `Tier::Network` cases already in `escape_suite.rs` (e.g.
+// `secret_read_denied`, `io_uring_denied`, `high_bit_prctl_denied`). Those
+// cases are evidence that the *launcher* contains a hostile process at
+// `Tier::Network` — a property of the composition, not of which production
+// call site built the policy that fed it.
+//
+// # What is NOT verified
+//
+// Nothing exercises `policy_for_clone` itself through a spawned, sandboxed
+// process — no `EscapeCase` names it, and it has zero references in
+// `escape_suite.rs`, `hook_mode_suite.rs`, or `docs/sandbox/escape-census.txt`
+// (grepped directly this session; confirmed empty in all three). Two
+// deltas from the covered `policy_for(.., Remote)` cases are consequently
+// untested by anything, not just by inference:
+//
+// 1. **Grant shape.** `policy_for_clone`'s read-write grant is the whole
+//    clones root, not one resolved repository path, and its read-only grant
+//    is bare `$HOME` with no `repo_paths` commondir push (there is nothing to
+//    resolve yet). Whether a hostile clone source can reach outside the
+//    clones root through this different — not smaller, not obviously larger
+//    — grant shape has not been tried.
+// 2. **The vehicle.** Every existing case's harness (`escape_contract.rs`'s
+//    `execute`) commits into a repository that already exists, with a
+//    pre-commit hook already installed by `install_hook` before the
+//    sandboxed process ever runs. A clone's destination does not exist until
+//    the sandboxed `git clone` itself creates it, so that vehicle cannot
+//    reach a clone at all — hostile content would have to arrive through the
+//    clone source (a `git clone --template=<dir>` populates
+//    `.git/hooks/post-checkout` before clone's own automatic post-clone
+//    checkout, which does fire it — confirmed by direct local reproduction
+//    this session, not merely reasoned) or through content fetched from a
+//    served remote. Building that is real, new harness plumbing: a
+//    clone-shaped arm in `escape_contract.rs`'s `policy_for_case` (which
+//    today dispatches only `Tier::Network → policy_for_repo(repo)` and
+//    `Tier::Strict → policy_for(repo, false, NetworkNeed::Local)`, both of
+//    which assume an existing repository path — `policy_for_clone` takes a
+//    clones root, not a repository, and fits neither arm), a
+//    `clone_inside`/`hostile_clone_source` pair analogous to `commit_inside`/
+//    `hostile_hook_repo`, and a new registered id in `escape-census.txt`
+//    (R5). None of that exists yet; inventing it under this session's time
+//    and risk budget, against the shared `execute()` chokepoint every other
+//    case depends on, was judged disproportionate to do without the review
+//    the rest of this battery's harness changes have had.
+//
+// # Residual risk, in plain terms
+//
+// If a hostile clone source (a malicious remote, or a local template an
+// attacker controls) can plant something that runs during `git clone`'s
+// implicit checkout — `post-checkout` is the demonstrated vehicle, and
+// nothing rules out others — the launcher composition shared with the nine
+// covered `Network`-tier cases is expected, by structural similarity, to
+// contain it the same way it contains a hostile pre-commit hook today. That
+// expectation is inference from a shared mechanism, not direct evidence: no
+// test has run a hostile clone through `policy_for_clone` and watched the
+// launcher hold. Should containment *not* hold here specifically — because
+// of the grant-shape delta above, or for a reason structural similarity does
+// not predict — the consequence is arbitrary code execution triggered by an
+// attacker-chosen clone URL, against the exact spawn site the function's own
+// doc comment names as the highest-risk one in the crate.
+//
+// # What would close this
+//
+// A real `EscapeCase` exercising `policy_for_clone` through
+// `sandbox::spawn::command_async` with a hostile clone source, registered in
+// `escape-census.txt`, per the plan sketched above. When that lands, delete
+// this section (the tripwire below will fail and say so) rather than leaving
+// it to describe a gap that no longer exists.
+
+/// Fails (loudly, on purpose) the day someone adds real coverage for clone,
+/// so this doc cannot silently outlive the gap it describes — the same
+/// "if this ever starts failing, that is good news" posture the INV-17
+/// tests above use, applied to a missing-coverage gap instead of a kernel
+/// one. Scans *source*, not the crate's public surface, to match this file's
+/// existing tripwire style (`escape_contract.rs`'s R-series does the same).
+#[test]
+fn clone_has_no_escape_battery_coverage_yet() {
+    let escape_suite = include_str!("escape_suite.rs");
+    let hook_mode_suite = include_str!("hook_mode_suite.rs");
+    let census = include_str!("../../../../docs/sandbox/escape-census.txt");
+    assert!(
+        !escape_suite.contains("policy_for_clone") && !escape_suite.contains("clone_inside"),
+        "escape_suite.rs now references clone — this doc's premise (no case exists) is stale. \
+         If a real EscapeCase for policy_for_clone was just added, delete the 'known missing \
+         coverage: clone' section above and this test; that is the intended outcome, not a bug."
+    );
+    assert!(
+        !hook_mode_suite.contains("policy_for_clone"),
+        "hook_mode_suite.rs now references policy_for_clone — same as above, update/delete \
+         this section rather than this assertion."
+    );
+    assert!(
+        !census.contains("clone"),
+        "docs/sandbox/escape-census.txt now has a clone-related entry — the coverage gap this \
+         section documents appears to be closed; delete the section and this test rather than \
+         widening the assertion."
+    );
+}
+
+/// A cheap regression guard on `policy_for_clone`'s shape, **not** containment
+/// evidence: it inspects the returned `Policy` struct's fields rather than
+/// observing an effect through a spawned, sandboxed process, which is exactly
+/// the flavor of check the anti-vacuity contract (R2/R3/R9) rules out as
+/// "real coverage." It exists only to catch an accidental field change (a
+/// dropped grant, a flipped tier) between now and whenever the real
+/// `EscapeCase` above gets built — never cite this test as evidence the gap
+/// above is closed.
+///
+/// Deliberately does not recompute the expected trees via
+/// `default_system_trees`/`secret_excludes_for_home` and compare — that would
+/// assert the mapping by calling the function that defines it, which proves
+/// nothing (a standing caution in this project). Every assertion below checks
+/// an independently-stated, minimal fact instead.
+#[test]
+fn policy_for_clone_shape_regression_guard() {
+    let clones_root = tempfile::tempdir().expect("clones root");
+    let policy = super::policy_for_clone(clones_root.path())
+        .expect("policy_for_clone must build on a host with HOME and a shim");
+
+    assert_eq!(
+        policy.tier,
+        super::Tier::Network,
+        "clone must never be built at any tier other than Network — that is the whole point of \
+         giving it a separate, trust-blind constructor"
+    );
+    assert_eq!(
+        policy.hook_mode,
+        super::HookMode::Run,
+        "policy_for_clone must not silently start blocking hooks — ADR 0029 rejects that \
+         posture, and this constructor never selects HookMode::Blocked"
+    );
+    assert!(
+        policy.bwrap.is_none(),
+        "Network tier launches no bwrap; a Some here would mean policy_for_clone drifted onto \
+         Strict's launcher shape"
+    );
+    assert!(
+        policy.rw_trees.iter().any(|p| p == clones_root.path()),
+        "the clones root itself must be a read-write grant, or `git clone` cannot write its \
+         destination"
+    );
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+    assert!(
+        policy.ro_trees.iter().any(|p| p == &home),
+        "$HOME must be a read-only grant (needed for e.g. credential helpers/config \
+         resolution), per policy_for_clone's own doc comment"
+    );
+    assert!(
+        policy
+            .secret_excludes
+            .iter()
+            .any(|p| p == &crate::state::sandbox_trust_dir()),
+        "the trust-store directory must stay excluded — clone is the operation that fetches \
+         attacker-chosen content, so it must never be able to leave behind a marker that \
+         promotes the resulting repository later"
+    );
+    assert!(
+        !policy.net_ports.is_empty(),
+        "Network tier must carry a non-empty net_ports set or clone cannot resolve/connect to \
+         any remote at all"
+    );
+}
