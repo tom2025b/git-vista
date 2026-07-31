@@ -131,10 +131,9 @@ pub fn parse(css: &str) -> Vec<Rule> {
     let mut prelude = String::new();
     let mut chars = css.chars();
 
-    // A `loop` + explicit `next()` rather than `while let`, because the inner
-    // declaration-block scan borrows the same iterator.
-    loop {
-        let Some(c) = chars.next() else { break };
+    // `while let` over an explicit `next()` rather than a `for`, because the inner
+    // declaration-block scan borrows the same iterator with `chars.by_ref()`.
+    while let Some(c) = chars.next() {
         match c {
             '{' => {
                 let head = normalize_whitespace(&prelude);
