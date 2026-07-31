@@ -19,6 +19,15 @@ fn policy(tier: Tier) -> Policy {
         rw_trees: vec![PathBuf::from("/srv/repos/r")],
         ro_trees: vec![PathBuf::from("/usr"), PathBuf::from("/home/tom")],
         secret_excludes: vec![PathBuf::from("/home/tom/.ssh")],
+        // #188: same per-tier shape as `net_ports` below — populated in
+        // Network, empty everywhere else. `known_hosts_carveout_is_network_tier_only_in_the_argv`
+        // is the test that exists specifically to check this fixture's
+        // Strict/Network difference reaches `sandbox_argv`'s output.
+        ro_carveouts: if tier == Tier::Network {
+            vec![PathBuf::from("/home/tom/.ssh/known_hosts")]
+        } else {
+            Vec::new()
+        },
         net_ports: if tier == Tier::Network {
             DEFAULT_GIT_PORTS.to_vec()
         } else {
