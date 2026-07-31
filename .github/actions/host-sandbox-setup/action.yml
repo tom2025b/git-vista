@@ -66,7 +66,22 @@ runs:
         before="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 'absent')"
         echo "apparmor_restrict_unprivileged_userns before: $before"
         if [ "$before" = "absent" ]; then
-          echo "sysctl not present on this kernel — nothing to unclamp; the capability preflight in the calling job is the real check."
+          # Not a fallthrough to a degraded run, and not an exception to D6
+          # Option A's fail-loud posture. A kernel without this sysctl never had
+          # the clamp, so there is nothing to lift — that is a different fact
+          # from "the write did not take", which is the case that exits 1 below.
+          #
+          # What makes exiting 0 here safe is that userns is still checked, by
+          # `ci_preflight_host_meets_the_declared_minimum`
+          # (crates/git-vista-server/src/sandbox/escape_contract.rs), which asserts
+          # `caps.userns` and fails with `::error::` naming the missing capability.
+          # It runs as its own named step BEFORE the battery, so a kernel that
+          # lacks the sysctl *and* cannot do unprivileged userns still stops the
+          # job loudly — it just stops one step later, and with a message about
+          # the capability rather than about the write. Do not weaken this into a
+          # blanket "sysctl missing is fine" without checking that test still runs
+          # first and still hard-fails.
+          echo "sysctl not present on this kernel — nothing to unclamp. userns itself is still gated by ci_preflight_host_meets_the_declared_minimum, which runs before the battery."
           exit 0
         fi
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
