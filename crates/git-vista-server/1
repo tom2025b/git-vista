@@ -2,3 +2,16 @@ GV-ESCAPE case=af_unix_socket_denied result=contained class=containment
 GV-ESCAPE case=cgroup_tree_denied result=contained class=containment
 GV-ESCAPE case=af_unix_socketpair_denied result=contained class=containment
 GV-ESCAPE case=high_bit_af_unix_denied result=contained class=containment
+GV-ESCAPE case=high_bit_io_uring_denied result=contained class=containment
+GV-ESCAPE case=high_bit_prctl_denied result=contained class=containment
+GV-ESCAPE case=io_uring_denied result=contained class=containment
+GV-ESCAPE case=no_new_privs_irrevocable result=contained class=containment
+GV-ESCAPE case=secret_read_denied result=contained class=containment
+GV-ESCAPE case=strict_listener_denied result=contained class=containment
+GV-ESCAPE case=second_landlock_ruleset_denied result=contained class=containment
+GV-ESCAPE case=unshare_userns_denied result=contained class=containment
+GV-ESCAPE case=strict_tcp_bind_denied result=contained class=containment
+GV-ESCAPE case=uring_socket_bypass_denied result=contained class=containment
+GV-ESCAPE case=blocked_hooks result=contained class=functional
+GV-ESCAPE case=write_home_denied result=contained class=containment
+GV-ESCAPE case=strict_udp_host_denied result=contained class=containment
