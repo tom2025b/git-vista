@@ -1293,8 +1293,8 @@ mod tests {
         let link = d.path().join("known_hosts");
         std::os::unix::fs::symlink(&secret, &link).expect("symlink fixture");
 
-        let err = add_carveout_rule(rs, &link)
-            .expect_err("a carve-out naming a symlink must be refused");
+        let err =
+            add_carveout_rule(rs, &link).expect_err("a carve-out naming a symlink must be refused");
         assert!(
             matches!(err, CarveoutError::Symlinked { .. }),
             "wrong refusal reason for a symlinked target: {err:?}"
