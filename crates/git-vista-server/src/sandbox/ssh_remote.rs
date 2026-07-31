@@ -361,6 +361,20 @@ impl SshFixture {
     }
 
     fn ls_remote_env(&self) -> Vec<(&'static str, String)> {
+        // OpenSSH resolves `~` in `UserKnownHostsFile`'s default
+        // (`~/.ssh/known_hosts`) through `getpwuid(getuid())`'s passwd-database
+        // home directory, **not** through the `$HOME` environment variable —
+        // a deliberate OpenSSH hardening against `$HOME` spoofing. Measured
+        // directly: with only `HOME` pinned to this fixture's tempdir, `ssh`
+        // still tried `/home/<real-user>/.ssh/known_hosts` and got a sandbox
+        // `Permission denied` there (that path is outside every grant this
+        // policy builds), never touching the fixture's own known_hosts at
+        // all. So `UserKnownHostsFile` is named explicitly here, pointed at
+        // the exact path `Policy::ro_carveouts` grants — the same
+        // `#[cfg(test)]` discipline as `command_async`'s other pinned-env
+        // tests, just with one more `-o` than usual because `ssh`, unlike
+        // `git`, does not trust `$HOME` for this.
+        let known_hosts = self.home.join(".ssh/known_hosts");
         vec![
             ("PATH", "/usr/bin:/bin".to_string()),
             ("HOME", self.home.to_string_lossy().into_owned()),
@@ -369,12 +383,13 @@ impl SshFixture {
                 self.agent_sock.to_string_lossy().into_owned(),
             ),
             ("GIT_TERMINAL_PROMPT", "0".to_string()),
-            // Belt and suspenders on top of a correctly pre-populated
-            // known_hosts: if host-key matching ever did fail, this makes
-            // the failure a clean, immediate exit rather than a hang
-            // waiting on interactive input that can never arrive under
-            // `cargo test`.
-            ("GIT_SSH_COMMAND", "ssh -o BatchMode=yes".to_string()),
+            (
+                "GIT_SSH_COMMAND",
+                format!(
+                    "ssh -o BatchMode=yes -o UserKnownHostsFile={} -o GlobalKnownHostsFile=/dev/null",
+                    known_hosts.display()
+                ),
+            ),
         ]
     }
 }

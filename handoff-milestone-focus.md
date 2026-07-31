@@ -1,6 +1,49 @@
 # Handoff — M1.13b Close-Out + M2 Sub-Issue Kickoff (focused session)
 
-## ⚠ FINAL STATUS — 2026-07-31 ~10:45, session at 96% context, stopping to compact
+## ⚠ NEWEST STATUS — 2026-07-31 ~12:15, session at 95%, resets in ~1hr, stopping per standing rule
+
+**PR #207 CI is green (all 7 checks)** — that part from the block below still holds.
+
+**#188 (SSH known_hosts + agent-socket carve-out, Network tier only) landed in code but
+is NOT green.** `cargo test -p git-vista-server sandbox::` = 163 passed, **3 failed**:
+
+1. `sandbox::escape_contract::f_every_observation_requires_typed_kernel_provenance` —
+   expects 17 typed-provenance entries, got 16. The new `ssh_known_hosts_carveout` case's
+   GRANTED positive was never registered in whatever table `escape_contract.rs` (~line
+   1387) counts.
+2. `sandbox::escape_contract::r5_census_names_exactly_the_declared_cases` — R5 census
+   mismatch: `ssh_known_hosts_carveout` exists as an `EscapeCase` in `escape_suite.rs` but
+   is missing from `docs/sandbox/escape-census.txt`.
+3. **The real bug**, `sandbox::escape_suite::ssh_known_hosts_carveout` —
+   `ESCAPED — inside GRANTED wanted errno 0 got 13 — R3's paired positive failed, the
+   policy denied more than the claim`. errno 13 = EACCES. The grant is constructed in
+   the Policy struct (`ssh_known_hosts_carveout()` at mod.rs:275-276, wired at two call
+   sites, mod.rs:1129 and mod.rs:1261) but is **not actually reaching kernel-level
+   enforcement** — either Landlock/bwrap never consumes that field, or a broader
+   `$HOME/.ssh` deny is applied with higher precedence and shadows it. Not diagnosed
+   further by hand — see workflow below.
+
+**A background workflow is running to fix this** (`wf_1d34c0f0-ea4`, launched ~12:10,
+model sonnet/effort xhigh per your direction this session): two parallel diagnosis
+agents (bookkeeping fix for #1/#2, root-cause trace for #3) → one apply agent → one
+skeptic verify agent that reruns tests, checks `git diff` for a real fix vs. a
+test-gaming hack, confirms Strict tier still can't reach known_hosts, and confirms
+private SSH key material is still denied (paired negative). **Check `/workflows` or
+wait for its completion notification before doing anything else with #188.** If this
+handoff is being read because the session that launched it died before the notification
+landed: read `journal.jsonl` in the workflow's transcript dir
+(`/home/tom/.claude/projects/-home-tom-projects-Git-Vista/b8ed43d5-a9b7-482a-8492-7aa1ff90454e/subagents/workflows/wf_1d34c0f0-ea4/`)
+for what each agent actually returned, then `git diff` / `cargo test` to see what
+landed for real — do not trust a stale summary.
+
+**Do NOT mark PR #207 ready or attempt to close #66 involving #188 until this workflow's
+verify stage confirms green + adversarially sound.** #66 itself does not depend on #188
+(SSH carve-out is issue #188, separate from #66's own closure per the block below), so
+#207/#66 closure can proceed independently if you want to defer #188 — but if #188's
+half-landed state is left as-is, `cargo test -p git-vista-server` will show 3 failures
+until someone finishes or reverts it.
+
+## ⚠ PRIOR STATUS — 2026-07-31 ~10:45, session at 96% context, stopping to compact
 
 **P1a and P1b are DONE and verified.** Do not redo them. What landed:
 
