@@ -175,9 +175,9 @@ pub fn build_node(
                 // A larger, invisible hit target on top so the small dot is easy
                 // to tap (especially on the iPad). `transparent` (not `none`) so
                 // it still receives the click. M1.13 (#65): also the one
-                // keyboard-reachable element per row — `role="button"` plus an
+                // keyboard-reachable element per row — a button role plus an
                 // accessible name (the same text the pointer tooltip carries),
-                // a roving `tabindex`, and the arrow/Home/End/Enter/Space
+                // a roving tabindex, and the arrow/Home/End/Enter/Space
                 // handling in `gestures::on_node_keydown`. `data-row-index` is
                 // how that handler's next-frame `.focus()` call finds this
                 // exact circle again after a move.
