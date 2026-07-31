@@ -116,6 +116,20 @@ pub(crate) enum MutantId {
     /// reach a socket io_uring creates on the process's behalf, so the io_uring
     /// denial, and not the AF_UNIX rule, is what closes that path.
     M10,
+    /// `ci/mutants/M11-empty-ssh-known-hosts-carveout.patch` (#188) — empties
+    /// *only* `sandbox::ssh_known_hosts_carveout`, leaving `secret_excludes`,
+    /// Landlock enforcement and every other mechanism untouched.
+    ///
+    /// M2 (Landlock never restricted) and M3 (`secret_excludes_for_home`
+    /// emptied) both also kill `ssh_known_hosts_carveout`'s case, but neither
+    /// is specific to the #188 grant: M2 breaks every containment case in the
+    /// battery, and M3 breaks every secret, not just `known_hosts`. M11 is
+    /// what makes the case's claim mechanical rather than editorial — with
+    /// `secret_excludes` and Landlock enforcement **demonstrably still
+    /// intact**, only the one function that computes the carve-out is gone,
+    /// and only a case whose `GRANTED` leg actually depends on that grant
+    /// (not merely on secrets-in-general staying excluded) notices.
+    M11,
 }
 
 /// R8: a case whose configuration production cannot build yet carries the

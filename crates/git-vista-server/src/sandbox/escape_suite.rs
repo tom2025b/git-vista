@@ -892,6 +892,57 @@ int main(void) {{
         )
     }
 
+    /// #188's own probe. Same C-probe shape as `secret_read_probe` above —
+    /// `open`+`read`, one line per tag, kernel provenance on each — but with
+    /// the tags' roles reversed: the denial (`SSHKEY`) is a private key, the
+    /// mandatory paired positive (`GRANTED`, R3) is `known_hosts` itself,
+    /// which is the acceptance claim this case exists to prove. Both paths
+    /// live under the same `~/.ssh`, satisfying R3's "sibling entry under the
+    /// SAME granted tree" in the same probe run.
+    pub(super) fn ssh_known_hosts_carveout_probe(ctx: &HarnessCtx) -> String {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+        let private_key = c_string(&home.join(".ssh/id_ed25519"));
+        let known_hosts = c_string(&home.join(".ssh/known_hosts"));
+        hook_for(
+            ctx,
+            format!(
+                r#"
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+
+static int read_errno(const char *path) {{
+    errno = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return errno;
+    char byte;
+    ssize_t n = read(fd, &byte, 1);
+    int saved = n < 0 ? errno : 0;
+    close(fd);
+    return saved;
+}}
+
+int main(void) {{
+    int gv_seccomp = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    int gv_no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+    printf("GVPROBE {nonce} BEGIN\n");
+    int denied = read_errno("{private_key}");
+    printf("SSHKEY rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           denied ? -1 : 0, denied, gv_seccomp, gv_no_new_privs);
+    int allowed = read_errno("{known_hosts}");
+    printf("GRANTED rc=%d errno=%d Seccomp: %d NoNewPrivs: %d\n",
+           allowed ? -1 : 0, allowed, gv_seccomp, gv_no_new_privs);
+    printf("GVPROBE {nonce} END\n");
+    return 0;
+}}
+"#,
+                nonce = ctx.nonce,
+            ),
+        )
+    }
+
     pub(super) fn io_uring_probe(ctx: &HarnessCtx) -> String {
         let granted = c_string(&granted_path(ctx));
         hook_for(
