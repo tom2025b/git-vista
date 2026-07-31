@@ -16,7 +16,7 @@ use git_vista_protocol::{
 };
 
 use crate::planner;
-use crate::state::{current, reject_if_read_only};
+use crate::state::reject_if_read_only;
 
 /// Create a branch in the served repository at a given commit (Issue #18):
 /// `git branch <name> <commit>` via [`GitOperation::CreateBranch`]. git does
@@ -47,10 +47,16 @@ pub(crate) async fn create_branch(Json(req): Json<CreateBranchRequest>) -> (Stat
         // Unreachable after the two checks above; kept total rather than panic.
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()),
     };
+    // D2 (#66, Task 7): the validated resolution, replacing a raw
+    // `state::current()` call — see `state::resolve_target`'s doc comment.
+    let repo = match crate::state::resolve_target() {
+        Ok((repo, _entry)) => repo,
+        Err(rejected) => return rejected,
+    };
     // The operation pins an exact commit id. The UI always sends the tapped
     // node's full oid (taken as-is); a symbolic or abbreviated start point in
     // a hand-crafted request is resolved first.
-    let at = match planner::resolve_commit_oid(&current().0, commit).await {
+    let at = match planner::resolve_commit_oid(&repo, commit).await {
         Ok(at) => at,
         Err(refused) => return refused,
     };
