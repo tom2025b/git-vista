@@ -114,3 +114,44 @@ runs:
           echo "::error::the global git identity did not read back what was just set (name '$name', email '$email'). Refusing to continue: without it, the tests that deliberately omit a repo-local identity (#203) have no ~/.gitconfig to resolve through, the seed commit fails with 'empty ident name', and the sandbox's read-only \$HOME grant goes untested."
           exit 1
         fi
+
+    # The escape battery's `secret_read_denied` case (escape_suite.rs, see
+    # `secret_read_probe`) opens `$HOME/.ssh/known_hosts` as its SECRET and
+    # `$HOME/.gitconfig` as its GRANTED path. Its baseline leg declares
+    # `expect_baseline: Errno(0)` — the secret must be readable with NO sandbox
+    # applied — precisely so that "denied inside" means the policy denied it,
+    # rather than the file having never existed. A runner has no ~/.ssh at all,
+    # so the baseline returned ENOENT (errno 2) and `run_case` hard-failed with
+    # "proved NOTHING — baseline SECRET wanted errno 0 got 2".
+    #
+    # That hard failure is the anti-vacuity contract working, not a bug: a case
+    # that cannot establish its own premise must never report containment. So
+    # the fix belongs here, at the CI-environment layer, exactly like the git
+    # identity above — NOT in the case, where relaxing the baseline would throw
+    # away the very comparison that makes the result meaningful.
+    #
+    # The file's CONTENT is irrelevant and deliberately fake: the probe opens it
+    # and reads one byte, and the assertion is about the errno, not the bytes.
+    # It must merely be non-empty and owner-readable. A real `ssh-keyscan` would
+    # add a network dependency and a flake mode to a step whose only job is to
+    # make a path exist. Nothing here is a credential — there is no private key,
+    # and known_hosts holds public host keys by definition.
+    #
+    # This ordering matters: root cause B (the missing identity) masked this
+    # one, because the sandbox job died inside `fixture()` before any case ran.
+    # With the seed commit working, the battery now reaches this case.
+    - name: Provision ~/.ssh/known_hosts for the secret-read baseline (#66)
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.ssh"
+        chmod 700 "$HOME/.ssh"
+        if [ ! -s "$HOME/.ssh/known_hosts" ]; then
+          printf '# placeholder written by .github/actions/host-sandbox-setup\n# The escape battery needs this path to EXIST and be readable outside the\n# sandbox so that "denied inside" is attributable to the policy. Contents\n# are never parsed and are not a credential.\n' > "$HOME/.ssh/known_hosts"
+        fi
+        chmod 600 "$HOME/.ssh/known_hosts"
+        if [ ! -r "$HOME/.ssh/known_hosts" ] || [ ! -s "$HOME/.ssh/known_hosts" ]; then
+          echo "::error::\$HOME/.ssh/known_hosts is missing, empty or unreadable after provisioning. Refusing to continue: the escape battery's secret_read_denied case declares expect_baseline Errno(0), so an absent file makes its baseline leg return ENOENT and the case hard-fails having proved nothing about containment."
+          exit 1
+        fi
+        echo "secret-read baseline path ready: $(wc -c < "$HOME/.ssh/known_hosts") bytes"
