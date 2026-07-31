@@ -330,15 +330,21 @@ fn clone_has_no_escape_battery_coverage_yet() {
     let escape_suite = include_str!("escape_suite.rs");
     let hook_mode_suite = include_str!("hook_mode_suite.rs");
     let census = include_str!("../../../../docs/sandbox/escape-census.txt");
+    // Call-shaped, not a bare substring: `hook_mode_suite.rs`'s module doc
+    // already *names* `policy_for_clone` in prose (alongside `policy_for` and
+    // `boot_probe_policy`, listing the three production constructors) without
+    // testing it at all — a bare-substring check would false-positive on that
+    // doc mention forever. `policy_for_clone(` only appears where the
+    // function is actually invoked.
     assert!(
-        !escape_suite.contains("policy_for_clone") && !escape_suite.contains("clone_inside"),
+        !escape_suite.contains("policy_for_clone(") && !escape_suite.contains("clone_inside"),
         "escape_suite.rs now references clone — this doc's premise (no case exists) is stale. \
          If a real EscapeCase for policy_for_clone was just added, delete the 'known missing \
          coverage: clone' section above and this test; that is the intended outcome, not a bug."
     );
     assert!(
-        !hook_mode_suite.contains("policy_for_clone"),
-        "hook_mode_suite.rs now references policy_for_clone — same as above, update/delete \
+        !hook_mode_suite.contains("policy_for_clone("),
+        "hook_mode_suite.rs now actually calls policy_for_clone — same as above, update/delete \
          this section rather than this assertion."
     );
     assert!(
