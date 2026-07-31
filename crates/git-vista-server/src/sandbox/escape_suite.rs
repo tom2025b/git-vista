@@ -103,6 +103,48 @@ const CASE_SECRET_READ_DENIED: EscapeCase = EscapeCase {
     git_port: GitPortUse::Unused,
 };
 
+/// #188: `~/.ssh/known_hosts` is granted read-only in the Network tier (git
+/// needs it to verify a remote's host key over SSH), while the rest of
+/// `~/.ssh` — private keys above all — stays withheld exactly as
+/// `secret_read_denied` above proves. R3's paired positive here is not a
+/// formality: it is the acceptance claim itself. `probe_tag` carries the
+/// denial (a private key, same target `secret_read_denied` now uses) and the
+/// mandatory `GRANTED` tag carries the new positive (`known_hosts`) — both
+/// under the same `~/.ssh` tree, satisfying R3's "sibling entry under the
+/// SAME granted tree" requirement in the same probe run.
+const CASE_SSH_KNOWN_HOSTS_CARVEOUT: EscapeCase = EscapeCase {
+    id: "ssh_known_hosts_carveout",
+    class: Class::Containment,
+    tier: Tier::Network,
+    hooks_blocked: false,
+    build_hook: harness::ssh_known_hosts_carveout_probe,
+    probe_tag: "SSHKEY",
+    expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
+    expect_inside: Errno(13),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
+    expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
+    expect_carrier_code: 0,
+    // M2 (Landlock never restricted) and M3 (secret_excludes emptied) both
+    // also make the SSHKEY leg readable, same as `secret_read_denied`. M11 is
+    // the mechanism-specific mutant: it empties `ssh_known_hosts_carveout`
+    // itself, which M2/M3 do not touch at all, so only a case that actually
+    // exercises the #188 grant — this one's GRANTED leg — notices it.
+    dies_under: &[MutantId::M2, MutantId::M3, MutantId::M11],
+    exemption: Exemption::None,
+    git_port: GitPortUse::Unused,
+};
+
 const CASE_IO_URING_DENIED: EscapeCase = EscapeCase {
     id: "io_uring_denied",
     class: Class::Containment,
@@ -707,6 +749,11 @@ fn secret_read_denied() {
 }
 
 #[test]
+fn ssh_known_hosts_carveout() {
+    run_case(&CASE_SSH_KNOWN_HOSTS_CARVEOUT);
+}
+
+#[test]
 fn high_bit_af_unix_denied() {
     run_case(&CASE_HIGH_BIT_AF_UNIX_DENIED);
 }
@@ -792,9 +839,18 @@ mod harness {
         format!("exec {}", probe.display())
     }
 
+    /// #188: this used to target `~/.ssh/known_hosts`. Once the narrow
+    /// carve-out landed (`ssh_known_hosts_carveout_probe`, below) that path
+    /// became legitimately readable in the Network tier, so a case still
+    /// asserting it denied would either fail for the wrong reason or get
+    /// "fixed" by loosening `expect_inside` — silently retiring this case's
+    /// actual claim (that a secret under `$HOME` stays denied) rather than
+    /// updating its target. `id_ed25519` is used instead: a private key must
+    /// never become readable in any tier, #188 included, so it is the more
+    /// durable choice regardless of what else changes under `~/.ssh`.
     pub(super) fn secret_read_probe(ctx: &HarnessCtx) -> String {
         let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
-        let secret = c_string(&home.join(".ssh/known_hosts"));
+        let secret = c_string(&home.join(".ssh/id_ed25519"));
         let granted = c_string(&home.join(".gitconfig"));
         hook_for(
             ctx,
