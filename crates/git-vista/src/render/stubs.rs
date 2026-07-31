@@ -6,6 +6,7 @@
 //! branch glyph beside each ring in the same toggleable layer as the node icons.
 
 use leptos::*;
+use wasm_bindgen::JsCast;
 
 use crate::features::shell::signals::Shell;
 use crate::geometry::{node_cx, stub_node_cy, stub_path, NODE_RADIUS};
@@ -126,18 +127,14 @@ pub fn stubs(ctx: StoredValue<RenderCtx>, shell: Shell, moved: StoredValue<bool>
             // The repo's GitHub base, for the menu's "Create Pull Request" link.
             let repo_url = c.frame.repo_url.clone();
             let remote_web_url = c.frame.remote_web_url.clone();
-            // Issue #139: pointerup, not click — same reasoning as the commit
-            // dots in nodes.rs (iPad DuckDuckGo click synthesis). Propagation
-            // stays live for the svg's gesture cleanup.
-            let open_menu = move |ev: web_sys::PointerEvent| {
-                if moved.get_value() {
-                    return;
-                }
+            // Coordinate-parameterised so the pointer and keyboard paths open
+            // the identical menu — same split as the commit dots in nodes.rs.
+            let open_menu_at = move |x: f64, y: f64| {
                 shell.open_menu(MenuData {
                     commit: commit_id.clone(),
                     header: header.clone(),
-                    x: ev.client_x() as f64,
-                    y: ev.client_y() as f64,
+                    x,
+                    y,
                     github_url: github_url.clone(),
                     github_label: "Open branch on GitHub",
                     create_label: "Create branch from this branch",
@@ -151,6 +148,39 @@ pub fn stubs(ctx: StoredValue<RenderCtx>, shell: Shell, moved: StoredValue<bool>
                     remote_web_url: remote_web_url.clone(),
                 });
             };
+            let open_menu_at_kb = open_menu_at.clone();
+            // Issue #139: pointerup, not click — same reasoning as the commit
+            // dots in nodes.rs (iPad DuckDuckGo click synthesis). Propagation
+            // stays live for the svg's gesture cleanup.
+            let open_menu = move |ev: web_sys::PointerEvent| {
+                if moved.get_value() {
+                    return;
+                }
+                open_menu_at(ev.client_x() as f64, ev.client_y() as f64);
+            };
+            // Enter/Space only (#65): a stub is not a commit row, so it takes
+            // plain tab order rather than joining `GraphFocus`'s roving
+            // arrow-key model — wiring it into row navigation would put a
+            // half-row entity in a by-row model and is a design change, not an
+            // accessibility retrofit. The bounding-rect centre supplies the
+            // coordinates a tap would have, exactly like
+            // `gestures::on_node_keydown`'s Enter arm.
+            let on_stub_keydown = move |ev: web_sys::KeyboardEvent| {
+                if !matches!(ev.key().as_str(), "Enter" | " ") {
+                    return;
+                }
+                ev.prevent_default();
+                let (x, y) = ev
+                    .target()
+                    .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                    .map(|el| {
+                        let r = el.get_bounding_client_rect();
+                        (r.left() + r.width() / 2.0, r.top() + r.height() / 2.0)
+                    })
+                    .unwrap_or((0.0, 0.0));
+                open_menu_at_kb(x, y);
+            };
+            let stub_aria_label = format!("{name} — new branch, no commits yet");
             view! {
                 // Hollow, clickable ring (Issue #28) — a stub branch owns no
                 // commits of its own yet, so it reads as an empty ring in the
@@ -175,14 +205,22 @@ pub fn stubs(ctx: StoredValue<RenderCtx>, shell: Shell, moved: StoredValue<bool>
                     {truncate(&s.stub.name, MAX_STUB_NAME_CHARS)}
                 </text>
                 // A larger, invisible hit target on top so the tip is easy to tap,
-                // exactly like the commit dots.
+                // exactly like the commit dots — and, like them, a keyboard-
+                // reachable button with an accessible name (#65). Plain
+                // `tabindex="0"`, not the rows' roving `-1`: see
+                // `on_stub_keydown` above for why stubs stay out of the
+                // arrow-key model.
                 <circle
                     cx=sx
                     cy=sy
                     r=NODE_RADIUS + 8
                     fill="transparent"
                     class="node-hit"
+                    role="button"
+                    aria-label=stub_aria_label
+                    tabindex="0"
                     on:pointerup=open_menu
+                    on:keydown=on_stub_keydown
                 />
             }
         })
