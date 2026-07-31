@@ -475,6 +475,97 @@ fn no_important_motion_declaration_escapes_the_reduced_motion_block() {
     }
 }
 
+// ── Text zoom (Dynamic Type parity) ──────────────────────────────────────────────
+//
+// iOS/iPadOS Safari's "Larger Text" accessibility setting (Dynamic Type) scales any
+// text sized in a unit relative to the root font size (`rem`, `em`, `%`); text set in
+// absolute `px` never moves no matter how far the user turns the system setting up.
+// The design doc's "Dynamic Type-like... without clipping" validation row therefore
+// depends on every piece of HTML chrome using a relative unit.
+//
+// The one deliberate exception is the handful of `<text>` labels drawn *inside* the
+// SVG graph canvas (commit labels, badge text, the per-node glyph): those are scaled
+// by the graph's own pinch-zoom camera (`geometry.rs` / `render/`), not by the page's
+// root font size, so `rem` would be the wrong unit for them. They get their own
+// accessible-zoom path — pinch — and are recorded here by name rather than silently
+// exempted, the same way `INTERACTIVE_CENSUS` records the SVG-sized tap targets above.
+
+/// Selectors that legitimately size text in `px` because the text they style is drawn
+/// inside the SVG graph canvas and scaled by the camera, not by the page's root font
+/// size. Anything *outside* this list that declares `font-size` in `px` is HTML chrome
+/// that Dynamic Type cannot reach.
+const SVG_TEXT_PX_FONT_SIZE_CENSUS: &[&str] = &[
+    ".node-icon",
+    ".label-msg",
+    ".label-meta",
+    ".stub-label",
+    ".badge-text",
+];
+
+/// One `(selector, font-size value)` pair per selector in `styles.css` that declares
+/// `font-size` — every selector in the file, not a hand-picked subset, so a new rule
+/// added anywhere is caught rather than silently missed by a fixed list of places to
+/// look.
+fn font_size_declarations(rules: &[Rule]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for rule in rules {
+        if let Some(d) = rule.value_of("font-size") {
+            for selector in &rule.selectors {
+                out.push((selector.clone(), d.value.clone()));
+            }
+        }
+    }
+    out
+}
+
+fn is_absolute_px(value: &str) -> bool {
+    value.trim().to_ascii_lowercase().ends_with("px")
+}
+
+/// Every `font-size` declaration in the stylesheet is either a relative unit (so
+/// Dynamic Type can scale it) or a recorded SVG exception. Checked over *all* rules the
+/// parser finds, so a new fixed-px label anywhere in the file — not just in the places
+/// this test's author thought to look — trips it.
+#[test]
+fn every_font_size_declaration_is_relative_or_a_recorded_svg_exception() {
+    let rules = stylesheet();
+    let declared = font_size_declarations(&rules);
+    assert!(
+        declared.len() >= 25,
+        "expected at least the 25 font-size declarations styles.css had when this \
+         tripwire was written, found {} — if the reader silently stopped finding \
+         them this check would pass over nothing",
+        declared.len()
+    );
+
+    let census: BTreeSet<&str> = SVG_TEXT_PX_FONT_SIZE_CENSUS.iter().copied().collect();
+    let mut seen_px: BTreeSet<&str> = BTreeSet::new();
+
+    for (selector, value) in &declared {
+        if is_absolute_px(value) {
+            assert!(
+                census.contains(selector.as_str()),
+                "`{selector}` sets `font-size: {value}` — an absolute px size that iOS \
+                 Dynamic Type / Safari's text-size setting cannot scale, so a user who \
+                 turns up their system text size sees no change here. Use `rem`/`em`/`%` \
+                 instead, or if this selector styles SVG graph text scaled by the pinch \
+                 camera rather than the page, add it to SVG_TEXT_PX_FONT_SIZE_CENSUS \
+                 with that reasoning recorded"
+            );
+            seen_px.insert(selector.as_str());
+        }
+    }
+
+    let stale: Vec<_> = census.difference(&seen_px).collect();
+    assert!(
+        stale.is_empty(),
+        "SVG_TEXT_PX_FONT_SIZE_CENSUS names selector(s) that no longer declare an \
+         absolute-px font-size: {stale:?} — the census has rotted, delete them (if they \
+         now use rem/em/%, nothing else needs to change; Dynamic Type already reaches \
+         them)"
+    );
+}
+
 // ── Landmarks ───────────────────────────────────────────────────────────────────
 
 /// The opening tag of the first element in `src` matching `needle`, i.e. `needle` up to
