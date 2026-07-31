@@ -103,7 +103,7 @@ fn is_trusted_in(trust_dir: &Path, canonical_repo: &Path) -> bool {
 /// to mint markers for — see the module doc's self-propagation section. Do
 /// not replace this gate with `allow(dead_code)`; the tripwire test below
 /// names the conditions under which it may come off.
-#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn grant(canonical_repo: &Path) -> std::io::Result<()> {
     grant_in(&sandbox_trust_dir(), canonical_repo)
 }
