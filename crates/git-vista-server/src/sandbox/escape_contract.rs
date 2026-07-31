@@ -1767,6 +1767,96 @@ fn r11_every_rule_names_a_test_that_still_exists() {
     }
 }
 
+/// Every `.rs` file under `src/sandbox/` is declared in `sandbox/mod.rs`, and every
+/// declaration names a file that exists — set equality, checked both directions.
+///
+/// **This closes the one miss of the six that no R-rule could see.** A module with
+/// tests but no `mod` declaration is dead source: it compiles nowhere, its tests never
+/// run, and no test count moves — the suite goes green having silently stopped checking
+/// whatever that file checked. Every R1–R11 tripwire scans *content* (`BATTERY_FILES`
+/// drives them through `read_rs`, which reads bytes off disk whether or not the
+/// compiler ever saw them), so content scans are exactly the wrong instrument: they
+/// pass happily on a file the build graph has dropped.
+///
+/// Membership, not content, is the property here, and the two sides are derived
+/// independently — the filesystem walk cannot see `mod.rs`, and the declaration parse
+/// cannot see the directory. A file added without a declaration fails the first
+/// assertion; a declaration whose file was deleted or renamed fails the second.
+///
+/// **What would make this pass while the mechanism was broken?** Three things, each
+/// handled: (a) an empty walk would make the first assertion vacuous, so the floor
+/// below fails if the walk stops finding files; (b) `#[path = "..."]` would let a
+/// declaration name a file outside this directory, so it is banned outright rather
+/// than modelled — there is none today and this keeps it that way; (c) this test lives
+/// in `escape_contract`, which is itself declared in `mod.rs`, so deleting *its*
+/// declaration would take the check with it — that specific case is caught elsewhere
+/// (`r8_exemptions_expire_when_their_named_blocker_disappears` asserts its derived
+/// test-only module set contains `escape_contract`, `escape_suite` and
+/// `hook_mode_suite` by name, so their declarations cannot vanish quietly). The live
+/// exposure this closes is the *other* modules — `compat`, `documented_gaps`,
+/// `hostile`, `lifecycle` and the rest — where deletion is silent today: no reference,
+/// no warning, no compile error.
+#[test]
+fn every_sandbox_module_file_is_declared_and_every_declaration_has_a_file() {
+    let dir = server_root().join("src/sandbox");
+    let mut paths = Vec::new();
+    crate::argv_boundary::rs_files(&dir, &mut paths);
+
+    let on_disk: BTreeSet<String> = paths
+        .iter()
+        .filter(|p| p.parent() == Some(dir.as_path()))
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()))
+        .filter(|stem| *stem != "mod")
+        .map(str::to_string)
+        .collect();
+
+    assert!(
+        on_disk.len() >= 15,
+        "only {} .rs files found under src/sandbox/ — the walk has lost the directory \
+         and this whole check is now vacuous",
+        on_disk.len()
+    );
+
+    let mod_rs = crate::argv_boundary::code_only(&read_rs("src/sandbox/mod.rs"));
+    assert!(
+        !mod_rs.contains("#[path"),
+        "sandbox/mod.rs uses `#[path]`, which lets a `mod` declaration name a file \
+         outside this directory — the stem-vs-declaration equality below would then \
+         compare two sets that no longer describe the same thing. If a `#[path]` is \
+         genuinely needed, this check must be taught about it deliberately"
+    );
+
+    let declared: BTreeSet<String> = mod_rs
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line
+                .strip_prefix("pub(crate) mod ")
+                .or_else(|| line.strip_prefix("pub mod "))
+                .or_else(|| line.strip_prefix("mod "))?;
+            rest.strip_suffix(';').map(str::to_string)
+        })
+        .collect();
+
+    let undeclared: Vec<_> = on_disk.difference(&declared).collect();
+    assert!(
+        undeclared.is_empty(),
+        "{undeclared:?} exist under src/sandbox/ but are declared in no `mod` statement \
+         in sandbox/mod.rs — dead source. Their tests do not run and no test count \
+         moves, so the suite goes green having stopped checking whatever they checked. \
+         That is exactly how a whole module's tests were lost once already (#199)."
+    );
+
+    let dangling: Vec<_> = declared.difference(&on_disk).collect();
+    assert!(
+        dangling.is_empty(),
+        "sandbox/mod.rs declares {dangling:?}, which no `.rs` file under src/sandbox/ \
+         provides — a stale declaration (this direction would normally fail the build, \
+         so if you are reading it, something is generating or conditionally including \
+         sources and this check needs to be taught about it)"
+    );
+}
+
 /// The CI gating job's preflight (contract, "Skip policy": "the job's first
 /// step is a preflight … failing with `::error::` naming the missing field,
 /// before any test runs"). Deliberately host-probing — that is its whole
