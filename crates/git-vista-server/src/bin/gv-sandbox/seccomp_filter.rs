@@ -206,7 +206,7 @@ fn denied_outright() -> Vec<(i64, &'static str)> {
 fn prctl_rule() -> Result<SeccompRule, seccompiler::BackendError> {
     SeccompRule::new(vec![SeccompCondition::new(
         0, // prctl's first argument, the option
-        SeccompCmpArgLen::Dword,
+        SeccompCmpArgLen::Qword,
         SeccompCmpOp::Eq,
         libc::PR_SET_SECCOMP as u64,
     )?])
