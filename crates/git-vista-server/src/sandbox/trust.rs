@@ -26,6 +26,25 @@
 //! filename) and *contains* the canonical path verbatim, so `is_trusted`
 //! re-checks the content and a hash collision cannot silently trust the wrong
 //! repository.
+//!
+//! # Why `grant` is compile-gated `#[cfg(test)]` — trust self-propagates
+//!
+//! The unforgeability story above holds for every **sandboxed** tier: the
+//! trust store sits in `secret_excludes`, which outranks grants (pinned by
+//! `the_trust_store_is_withheld_even_from_a_repo_that_contains_it` below).
+//! `Tier::Unsandboxed` is the absence of the shim — no Landlock, no exclude
+//! set — so a hook in one operator-trusted repository runs with the server's
+//! full uid powers and can write valid markers for **every other repository
+//! on the host**. One grant is transitively a grant for anything that
+//! repository's hooks choose. Signing markers does not close this: an
+//! unsandboxed hook can read any HMAC key the server can read.
+//!
+//! The hazard is latent only because nothing in production can call `grant`.
+//! The `#[cfg(test)]` gate makes that a compile-time fact, and the
+//! `grant_is_unreachable_from_production_until_self_propagation_is_addressed`
+//! tripwire fails with the full reasoning if the gate is removed — so wiring
+//! the operator-trust handler forces this paragraph to be confronted first.
+//! See `docs/SECURITY_MODEL.md` § Sandbox Mechanism Boundaries.
 
 use std::path::Path;
 
@@ -73,12 +92,18 @@ fn is_trusted_in(trust_dir: &Path, canonical_repo: &Path) -> bool {
     stored == canonical_repo.as_os_str().as_encoded_bytes()
 }
 
-/// Record that the operator has trusted `canonical_repo`. Called only from an
-/// explicit, authenticated operator action — never from request-handling that a
-/// repository could influence.
+/// Record that the operator has trusted `canonical_repo`.
 ///
 /// Writing the marker is the *only* way `is_trusted` can later return `true`.
-#[cfg_attr(not(test), allow(dead_code))] // wired to the operator-trust handler in a later task
+///
+/// **Deliberately unreachable from production.** No operator-trust handler
+/// exists yet, and the `#[cfg(test)]` gate turns that absence into a compile
+/// error for whoever wires one: an operator grant currently trusts not just
+/// the named repository but, transitively, every repository its hooks decide
+/// to mint markers for — see the module doc's self-propagation section. Do
+/// not replace this gate with `allow(dead_code)`; the tripwire test below
+/// names the conditions under which it may come off.
+#[cfg(test)]
 pub(crate) fn grant(canonical_repo: &Path) -> std::io::Result<()> {
     grant_in(&sandbox_trust_dir(), canonical_repo)
 }
