@@ -329,8 +329,16 @@ below.
   do not cover `AF_UNIX` either. Without the seccomp rule a hostile hook in the
   strict tier reached `/run/docker.sock`, `ssh-agent`, `gpg-agent` and the D-Bus
   session bus. The **network tier deliberately still permits `AF_UNIX`**: git
-  over SSH wants an agent socket and the carve-out is deferred (issue #188), so
-  that tier's filter is unchanged. Proven by `af_unix_socket_denied` and
+  over SSH wants an agent socket. *Implemented* (2026-07-31, ADR 0033, #188 —
+  `Policy`'s Network branch grants the path named by `$SSH_AUTH_SOCK`
+  read-write, alongside a narrow `known_hosts` carve-out through
+  `secret_excludes`, described below). Measured while building that carve-out:
+  the Landlock filesystem grant on the socket is not actually what makes it
+  reachable on this kernel — Landlock does not mediate `connect()` to a
+  **pathname** `AF_UNIX` socket at all (only the abstract-namespace scope
+  above), so this tier's filter being otherwise unchanged is what genuinely
+  leaves the socket reachable; the grant is added anyway for auditability and
+  in case a future Landlock ABI starts mediating it (ADR 0033 §3). Proven by `af_unix_socket_denied` and
   `af_unix_socketpair_denied` in the escape battery, which die under
   `ci/mutants/M8-remove-af-unix-socket-rule.patch`. The rule's `Dword`
   comparison width carries its own guard: `high_bit_af_unix_denied` issues a raw
@@ -410,7 +418,16 @@ below.
   The trust store is unforgeable from every *sandboxed* tier — it sits in
   `secret_excludes`, which outranks grants (pinned by
   `the_trust_store_is_withheld_even_from_a_repo_that_contains_it` in
-  `sandbox/trust.rs`) — but `Unsandboxed` is the absence of the shim, so a
+  `sandbox/trust.rs`) — with one narrow, tier-gated exception since #188
+  (*Implemented*, ADR 0033): `Policy::ro_carveouts` names individual files —
+  `~/.ssh/known_hosts` today, Network tier only — that bypass the exclude
+  check (`is_or_inside_exclude`) entirely rather than competing with it, on
+  the argument that a whole-directory exclude with no per-file override could
+  never let git read what it legitimately needs from `~/.ssh` at all. The
+  trust store is never such an exception: `sandbox_trust_dir()` is added to
+  `secret_excludes` in every `Policy` constructor and has no `ro_carveouts`
+  counterpart, so the self-propagation risk described below is unaffected by
+  this mechanism existing. But `Unsandboxed` is the absence of the shim, so a
   hook in one operator-trusted repository runs with the server's full uid
   powers and can mint valid markers for any other repository, which the next
   operation then resolves as trusted. Signing markers (HMAC) does not close
