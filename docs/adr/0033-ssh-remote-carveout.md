@@ -182,10 +182,10 @@ grant in this design already has. R10's flag-round-trip tripwire
 (`escape_contract.rs`) requires — and confirms — that the flag has both a
 `shim_argv` emitter and a `gv-sandbox::main::parse` arm.
 
-`ssh_known_hosts_carveout(home)` (`mod.rs:282`) is the one populated case:
+`ssh_known_hosts_carveout(home)` (`mod.rs`) is the one populated case:
 `vec![home.join(".ssh/known_hosts")]`, called from the Network branch of
 **both** independent production `Policy` constructors — `policy_for`
-(`mod.rs:1135`) and `policy_for_clone` (`mod.rs:1252`, hard-coded to
+(`mod.rs`) and `policy_for_clone` (`mod.rs`, hard-coded to
 `Tier::Network` and does not call `policy_for` at all). Missing either site
 was the single most likely way to ship this half-working: skipping
 `policy_for_clone` would leave `git clone git@host:…` broken while
@@ -209,7 +209,7 @@ individually re-excludes known key filenames (`id_rsa`, `id_ed25519`, …),
 letting everything else — including `known_hosts` — fall through, was
 considered and rejected as **unsound**. `~/.ssh` can hold a private key under
 any name at all (`~/.ssh/my_deploy_key`), and `DEFAULT_SECRET_EXCLUDES` is
-matched by exact path component, not by glob (`mod.rs:190`'s own doc) — no
+matched by exact path component, not by glob (`mod.rs`'s own doc) — no
 fixed filename list can guarantee every private key stays denied. Only the
 whole-directory-exclude-plus-explicit-override shape is sound for an
 arbitrary keyset, which is why `ro_carveouts` names exactly one file
@@ -225,7 +225,7 @@ not need to.
 ### 3. The agent socket — a grant that costs nothing and proves something unexpected
 
 `policy_for`/`policy_for_clone`'s Network branch also adds `$SSH_AUTH_SOCK`
-(when set) to `rw_trees` (`ssh_agent_socket_grant`, `mod.rs:338-...`). This
+(when set) to `rw_trees` (`ssh_agent_socket_grant`, `mod.rs`). This
 flows through the *ordinary* `rw_trees`/`grant_tree` path — `/tmp`, where an
 agent socket almost always lives, carries no entry in
 `DEFAULT_SECRET_EXCLUDES`, so there is no exclude here to bypass and
@@ -287,17 +287,17 @@ silencing — if a kernel upgrade ever flips that test red.
 
 ### 4. Tests: an EscapeCase, structural argv checks, and a real `sshd`
 
-`CASE_SSH_KNOWN_HOSTS_CARVEOUT` (`escape_suite.rs:115-133`, test fn at
-`:753`) is a real hostile-hook `EscapeCase`, through the same production
+`CASE_SSH_KNOWN_HOSTS_CARVEOUT` (`escape_suite.rs`, test fn
+`ssh_known_hosts_carveout`) is a real hostile-hook `EscapeCase`, through the same production
 `policy_for_repo` dispatch and kernel-provenance checks (`Seccomp:`,
 `NoNewPrivs:`) every other case in the battery uses. Its `probe_tag`
 (`"SSHKEY"`) reads `~/.ssh/id_ed25519` and asserts `EACCES`; its mandatory
 R3 paired positive (`"GRANTED"`) reads `~/.ssh/known_hosts` and asserts
 `Errno(0)` — both under the same `~/.ssh` tree, in the same probe run, per
 R3's literal requirement. `CASE_SECRET_READ_DENIED`
-(`escape_suite.rs:78-104`) — which targeted exactly `known_hosts` as its
+(`escape_suite.rs`) — which targeted exactly `known_hosts` as its
 "must stay denied" leg before this issue — is repointed to
-`~/.ssh/id_ed25519` (`secret_read_probe`, `:851`): its own claim (a secret
+`~/.ssh/id_ed25519` (`secret_read_probe`) : its own claim (a secret
 under `$HOME` stays denied) needed a target that stays true after #188, and
 a private key is the more durable choice regardless of what else changes
 under `~/.ssh`. Left unedited, that case would have started failing the
@@ -306,7 +306,7 @@ possible, side effect, fixed in the same diff as the mechanism that caused
 it.
 
 R9's mutation matrix gained `MutantId::M11`
-(`ci/mutants/M11-empty-ssh-known-hosts-carveout.patch`, `escape_contract.rs:119-132`),
+(`ci/mutants/M11-empty-ssh-known-hosts-carveout.patch`, `escape_contract.rs`),
 which empties *only* `ssh_known_hosts_carveout`, leaving `secret_excludes`
 and Landlock enforcement demonstrably intact. The two pre-existing mutants
 M2 (Landlock never restricted) and M3 (`secret_excludes_for_home` emptied)
@@ -390,7 +390,7 @@ alone proves the full claim; both together do.
   Rejected outright and by name in the issue: Strict is where hostile
   repository content actually runs, and neither grant is reachable from it
   in this design — `known_hosts` is absent from `ro_carveouts` in every
-  non-Network tier (`mod.rs:1135`), and Strict's seccomp filter denies
+  non-Network tier (`mod.rs`), and Strict's seccomp filter denies
   `AF_UNIX` `socket()`/`socketpair()` unconditionally regardless of any
   Landlock grant, so even a mistaken Landlock rule there would not reopen
   the socket.
@@ -447,7 +447,7 @@ alone proves the full claim; both together do.
   checked directly this session: `git ls-remote https://github.com/git/git
   HEAD`, through the real composed Network-tier launcher argv shape,
   resolved and returned the real `HEAD` oid (exit 0). This matches
-  `NETWORK_ONLY_RO_TREES`'s own measurement notes (`mod.rs:262-356`) and is
+  `NETWORK_ONLY_RO_TREES`'s own measurement notes (`mod.rs`) and is
   recorded here purely as a scope boundary — out of #188 either way, and
   not touched by this change.
 - **A pre-existing, unrelated defect was found and left unfixed, on
