@@ -1,0 +1,209 @@
+name: Host sandbox setup
+description: >
+  Shared host provisioning for any job that constructs the sandbox's Strict
+  tier (core, contract, sandbox) or whose tests commit into a repository with
+  no local git identity (#203). These steps used to live inside the `sandbox`
+  job alone; M1.13b (#66) routed every production git spawn through the
+  sandbox chokepoint, so `core` and `contract` began building the Strict tier
+  too and neither had the setup — 111 tests died with "this operation runs in
+  the strict sandbox tier and this host cannot provide it" on CI run
+  30629854802. The fix is one shared action rather than three hand-maintained
+  copies, because the defect being fixed IS drift between jobs that were
+  supposed to share one security-relevant preflight. See PR #207, ADR 0029,
+  and docs/sandbox/escape-battery-anti-vacuity-contract.md. The Rust tripwire
+  `every_ci_job_that_runs_this_crates_tests_provisions_the_host_capabilities_they_need`
+  (crates/git-vista-server/src/sandbox/escape_contract.rs) asserts that the
+  set of jobs running this crate's tests and the set of jobs referencing this
+  action stay equal, and that this file still names each capability below —
+  so hollowing a step out here is a red build, not a silent regression.
+runs:
+  using: composite
+  steps:
+    # Best-effort: gives the strict tier its two host dependencies before any
+    # preflight in the calling job measures what is actually available.
+    # `bubblewrap` is bwrap itself; `build-essential` is the `cc` the escape
+    # battery needs to compile its C probes (and which
+    # ci_preflight_host_meets_the_declared_minimum checks by name).
+    # `openssh-server` is #188's addition: `sandbox::ssh_remote`'s fixture
+    # spawns a real, throwaway, loopback `sshd` to drive `git ls-remote` over
+    # a genuine `ssh://` transport through the composed launcher.
+    # `ubuntu-latest` ships `ssh`/`ssh-keygen`/`ssh-agent` (openssh-client, a
+    # base-image dependency for git itself) but not `sshd` — that is a
+    # separate package, and without it every `sandbox::ssh_remote` test fails
+    # at `spawn ssh-agent`/`sshd` with a bare "No such file or directory"
+    # that has nothing to do with the sandbox.
+    - name: Best-effort host setup (bwrap, a C compiler, sshd)
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends bubblewrap build-essential openssh-server
+
+    # D6 Option A — decided by Tom 2026-07-29, re-confirmed 2026-07-30.
+    # Rationale in design-docs/2026-07-29-d6-sandbox-ci-preflight-decision.md
+    # and plan Global Constraint 11.
+    #
+    # GitHub's ubuntu-latest ships kernel.apparmor_restrict_unprivileged_userns=1.
+    # Under that clamp `bwrap` cannot create its namespaces, so the Strict tier
+    # cannot be constructed at all — and because a case that cannot demonstrate
+    # its own premise is now a HARD FAILURE rather than a skip, the escape
+    # battery would go red without ever testing a single invariant. Either way
+    # the 17 invariants this milestone exists to prove would never gate a merge.
+    #
+    # So the clamp is lifted here, deliberately and visibly, and the step FAILS
+    # LOUDLY if the write does not take — it never falls through to a degraded
+    # run. That distinction is the whole point: a silent workaround would be
+    # indistinguishable from a sandbox that works.
+    #
+    # Safe here specifically because GitHub-hosted runners are single-job,
+    # ephemeral VMs, destroyed after the run and never reused — there is no
+    # "left the box weaker" concern that would apply on a persistent host. Do
+    # NOT copy this step to a self-hosted or reused runner without revisiting
+    # that reasoning.
+    - name: Preflight — unclamp unprivileged user namespaces (D6 Option A)
+      shell: bash
+      run: |
+        set -euo pipefail
+        before="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 'absent')"
+        echo "apparmor_restrict_unprivileged_userns before: $before"
+        if [ "$before" = "absent" ]; then
+          # Not a fallthrough to a degraded run, and not an exception to D6
+          # Option A's fail-loud posture. A kernel without this sysctl never had
+          # the clamp, so there is nothing to lift — that is a different fact
+          # from "the write did not take", which is the case that exits 1 below.
+          #
+          # What makes exiting 0 here safe is that userns is still checked, by
+          # `ci_preflight_host_meets_the_declared_minimum`
+          # (crates/git-vista-server/src/sandbox/escape_contract.rs), which asserts
+          # `caps.userns` and fails with `::error::` naming the missing capability.
+          # It runs as its own named step BEFORE the battery, so a kernel that
+          # lacks the sysctl *and* cannot do unprivileged userns still stops the
+          # job loudly — it just stops one step later, and with a message about
+          # the capability rather than about the write. Do not weaken this into a
+          # blanket "sysctl missing is fine" without checking that test still runs
+          # first and still hard-fails.
+          echo "sysctl not present on this kernel — nothing to unclamp. userns itself is still gated by ci_preflight_host_meets_the_declared_minimum, which runs before the battery."
+          exit 0
+        fi
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        after="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+        echo "apparmor_restrict_unprivileged_userns after: $after"
+        if [ "$after" != "0" ]; then
+          echo "::error::Failed to unclamp unprivileged user namespaces (still '$after'). Refusing to continue: without this the Strict tier cannot be built, so the escape battery would report capability-absent and prove nothing. Failing loudly is the decided posture (D6 Option A) — do not add a fallback that lets the job pass having tested nothing."
+          exit 1
+        fi
+
+    # #203: crates/git-vista-server/src/sandbox/escape_contract.rs::fixture()
+    # (and the sibling fixtures in sandbox/spawn.rs and sandbox/shim_cli.rs)
+    # deliberately build their seed repository with `.env_clear()` and NO
+    # repo-local git identity — the doc comment says why: so a hook that needs
+    # an author must reach `~/.gitconfig` through the policy under test. That
+    # is the read-only $HOME grant being exercised, and it is exactly what
+    # `commit_without_repo_identity` in sandbox/compat.rs proves.
+    #
+    # On a developer's box ~/.gitconfig already carries an identity; a fresh
+    # Actions runner's /home/runner does not, so the seed commit died with
+    # "fatal: empty ident name … Please tell me who you are" before any
+    # sandbox invariant ran. The fix therefore belongs HERE, at the
+    # CI-environment layer — NOT in fixture(), where hard-coding an identity
+    # would defeat R7's pinned-environment-profile intent and destroy what
+    # commit_without_repo_identity proves.
+    #
+    # Both keys are set on purpose: git needs a resolvable user.name as well
+    # as a user.email, and a minimal runner has no useful passwd/GECOS
+    # fallback, so email alone does not clear "empty ident name". The address
+    # uses the RFC 2606 reserved `.invalid` TLD and the same `example.invalid`
+    # domain the repo's own fixtures use (`t@example.invalid`), so it can
+    # never route anywhere and never reads as a leaked real credential to the
+    # gitleaks job. Nothing in the suite asserts the literal value — compat.rs
+    # only checks non-emptiness and equality across its two legs, and
+    # shim_cli.rs only checks the address contains an '@' — so the choice is
+    # house style, not a contract. Writing it also creates ~/.gitconfig as a
+    # real file, which is what the escape battery's secret-read paired
+    # positive needs to observe Errno(0) rather than ENOENT.
+    #
+    # `git config --global` always writes $HOME/.gitconfig (the XDG path is a
+    # read-only fallback), and nothing in ci.yml overrides HOME, so this is
+    # the same file the fixtures pass through to their git subprocesses.
+    - name: Provision a global git identity for the runner (#203)
+      shell: bash
+      run: |
+        set -euo pipefail
+        git config --global user.name "git-vista-ci"
+        git config --global user.email "git-vista-ci@example.invalid"
+        name="$(git config --global user.name || true)"
+        email="$(git config --global user.email || true)"
+        echo "global git identity: $name <$email>"
+        if [ "$email" != "git-vista-ci@example.invalid" ] || [ -z "$name" ]; then
+          echo "::error::the global git identity did not read back what was just set (name '$name', email '$email'). Refusing to continue: without it, the tests that deliberately omit a repo-local identity (#203) have no ~/.gitconfig to resolve through, the seed commit fails with 'empty ident name', and the sandbox's read-only \$HOME grant goes untested."
+          exit 1
+        fi
+
+    # The escape battery's `secret_read_denied` case (escape_suite.rs, see
+    # `secret_read_probe`) opens `$HOME/.ssh/known_hosts` as its SECRET and
+    # `$HOME/.gitconfig` as its GRANTED path. Its baseline leg declares
+    # `expect_baseline: Errno(0)` — the secret must be readable with NO sandbox
+    # applied — precisely so that "denied inside" means the policy denied it,
+    # rather than the file having never existed. A runner has no ~/.ssh at all,
+    # so the baseline returned ENOENT (errno 2) and `run_case` hard-failed with
+    # "proved NOTHING — baseline SECRET wanted errno 0 got 2".
+    #
+    # That hard failure is the anti-vacuity contract working, not a bug: a case
+    # that cannot establish its own premise must never report containment. So
+    # the fix belongs here, at the CI-environment layer, exactly like the git
+    # identity above — NOT in the case, where relaxing the baseline would throw
+    # away the very comparison that makes the result meaningful.
+    #
+    # The file's CONTENT is irrelevant and deliberately fake: the probe opens it
+    # and reads one byte, and the assertion is about the errno, not the bytes.
+    # It must merely be non-empty and owner-readable. A real `ssh-keyscan` would
+    # add a network dependency and a flake mode to a step whose only job is to
+    # make a path exist. Nothing here is a credential — there is no private key,
+    # and known_hosts holds public host keys by definition.
+    #
+    # This ordering matters: root cause B (the missing identity) masked this
+    # one, because the sandbox job died inside `fixture()` before any case ran.
+    # With the seed commit working, the battery now reaches this case.
+    - name: Provision ~/.ssh/known_hosts for the secret-read baseline (#66)
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.ssh"
+        chmod 700 "$HOME/.ssh"
+        if [ ! -s "$HOME/.ssh/known_hosts" ]; then
+          printf '# placeholder written by .github/actions/host-sandbox-setup\n# The escape battery needs this path to EXIST and be readable outside the\n# sandbox so that "denied inside" is attributable to the policy. Contents\n# are never parsed and are not a credential.\n' > "$HOME/.ssh/known_hosts"
+        fi
+        chmod 600 "$HOME/.ssh/known_hosts"
+        if [ ! -r "$HOME/.ssh/known_hosts" ] || [ ! -s "$HOME/.ssh/known_hosts" ]; then
+          echo "::error::\$HOME/.ssh/known_hosts is missing, empty or unreadable after provisioning. Refusing to continue: the escape battery's ssh_known_hosts_carveout case (#188) declares expect_baseline Errno(0) for its GRANTED leg, so an absent file makes that leg return ENOENT and the case hard-fails having proved nothing about the carve-out."
+          exit 1
+        fi
+        echo "known_hosts baseline path ready: $(wc -c < "$HOME/.ssh/known_hosts") bytes"
+
+    # #188: `secret_read_denied` moved its SECRET off `known_hosts` once that
+    # path became legitimately readable in the Network tier (the carve-out
+    # this whole action's known_hosts step exists to exercise) — a private
+    # key is the one thing under ~/.ssh that must never become readable in
+    # any tier, so it is the more durable choice of denial target regardless
+    # of what else changes here. `ssh_known_hosts_carveout`'s own SSHKEY leg
+    # (the paired *denial*, alongside its GRANTED known_hosts leg above)
+    # reads the same path. Both declare `expect_baseline: Errno(0)`, so this
+    # follows the identical reasoning and shape as the known_hosts step: the
+    # runner needs the path to exist and be readable OUTSIDE the sandbox, or
+    # the baseline leg returns ENOENT and the case hard-fails having proved
+    # nothing. Content is fake and deliberately not a real key — nothing here
+    # parses it as OpenSSH key material, only opens and reads one byte.
+    - name: Provision ~/.ssh/id_ed25519 for the secret-read baseline (#188)
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.ssh"
+        chmod 700 "$HOME/.ssh"
+        if [ ! -s "$HOME/.ssh/id_ed25519" ]; then
+          printf -- 'not-a-real-key placeholder written by .github/actions/host-sandbox-setup\nfor issue #188. The escape battery needs this path to EXIST and be\nreadable outside the sandbox so that "denied inside" is attributable to\nthe policy, not to the file never having existed. Contents are never\nparsed as key material, so this deliberately does NOT look like a PEM\nheader — a real-looking placeholder previously tripped gitleaks'"'"' private-key\nrule as a false positive (Finding on .github/actions/host-sandbox-setup/action.yml:179).\n' > "$HOME/.ssh/id_ed25519"
+        fi
+        chmod 600 "$HOME/.ssh/id_ed25519"
+        if [ ! -r "$HOME/.ssh/id_ed25519" ] || [ ! -s "$HOME/.ssh/id_ed25519" ]; then
+          echo "::error::\$HOME/.ssh/id_ed25519 is missing, empty or unreadable after provisioning. Refusing to continue: secret_read_denied and ssh_known_hosts_carveout (#188) both declare expect_baseline Errno(0) for this path, so an absent file makes their baseline legs return ENOENT and both cases hard-fail having proved nothing about containment."
+          exit 1
+        fi
+        echo "id_ed25519 baseline path ready: $(wc -c < "$HOME/.ssh/id_ed25519") bytes"
