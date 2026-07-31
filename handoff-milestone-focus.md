@@ -1,6 +1,71 @@
 # Handoff — M1.13b Close-Out + M2 Sub-Issue Kickoff (focused session)
 
-## ⚠ NEWEST — 2026-07-31 ~13:05. #188 DONE. CI green except gitleaks (fix pushed, unverified in CI).
+## ⚠ NEWEST — 2026-07-31 ~13:45. Merge-readiness audit landed. One REAL security bug found and fixed.
+
+**Both big workflows finished.** 18-agent merge-readiness audit (13 findings confirmed,
+1 refuted) and 8-agent M2 breakdown (7 parents → 32 filable sub-issues).
+
+### The security bug — fixed, measured, documented
+
+`add_carveout_rule` (`bin/gv-sandbox/main.rs`) canonicalised its path **before** validating
+it. A Landlock rule lands on the resolved object, not the name — so a `~/.ssh/known_hosts`
+that was a **symlink to `~/.ssh/id_rsa` granted read access to the private key**, by its real
+path, while `--exclude ~/.ssh` still looked intact. This was in #188's code, landed this
+morning, and no test caught it.
+
+Fixed with a `symlink_metadata` check placed *before* `canonicalize` (canonicalising first
+destroys the evidence). A dangling symlink refuses too, rather than falling through to the
+tolerated `Absent` outcome. **Closure measured, not argued:** deleting the check fails exactly
+two tests and no others. Recorded as ADR 0033 §1a, with a `sequenceDiagram` of the attack.
+
+Note the class: `enumerate()` already guards this exact hazard (`real.starts_with(root)`), but
+containment could not be reused here — the dangerous target sits in the *same directory* as the
+legitimate one, so the carve-out's rule is stricter: the named path must **be** the file, never
+point at one.
+
+### Seventh green-but-wrong finding — and it was inside the contract itself
+
+R3 (`escape_contract.rs`) guarantees every case's paired positive is really asserted. Its check
+was `body.contains("expect_granted") && body.contains("\"GRANTED\"")` — but both substrings
+occur in `execute` for unrelated reasons (`expect_granted_provenance` contains the first, the
+second is a parse tag), so dropping the real comparison would have left it green. Now matches
+the *call*: one `observation_mismatch` taking both the GRANTED tag and `case.expect_granted,`
+(trailing comma discriminates it from the provenance field), with its result consumed. Added
+`call_args_in` — a paren-balanced call extractor — because substring checks cannot tell
+"both tokens appear" from "both tokens are arguments to the same call".
+
+### State
+
+- `./dev gate` **green**. 456 passed / 0 failed / 2 ignored. 174 sandbox tests.
+- 18 escape cases, 11 mutants, matrix `PASS`.
+- **gitleaks now passes in CI** — the two-part fix worked.
+- PR #207 body rewritten: now `Closes #66` **and** `Closes #188`, counts corrected
+  (401→456, 17→18 cases, 10→11 mutants), the symlink bug and the R3 vacuity written up.
+- #66's checklist fixed — the "Open" section had 10 closed items under it. Now only #203.
+
+### Next
+
+1. **#203 needs an operator decision, not code.** Its recorded D6 conflict: the plan says
+   sysctl-write-and-fail-loudly, `ci.yml` argues the opposite in a comment and has no such
+   write. The job itself has passed on this branch (run 30647723490). This is the only thing
+   #66 is blocked on.
+2. **Tom drives the app** — testbed on 8081. #65's a11y work has never been human-verified.
+3. Then mark #207 ready and merge.
+4. M2 breakdown saved to `design-docs/2026-07-31-m2-subissue-breakdown.md` (136 KB, 32
+   sub-issues with model/effort/sequencing). Nothing filed on GitHub yet — deliberate.
+
+### Still-unfixed audit findings (all non-blocking, all confirmed)
+
+- ADR 0030's line-number citations have rotted (5 verified wrong — one for `fn main()` lands
+  in symlink-handling code). A workflow is de-rotting these to symbol anchors.
+- ADR 0030 misquotes `trust.rs`'s `grant()` doc comment — presents a phrase as a direct quote
+  that is not in the source. Underlying fact (no production caller) is still true.
+- `blocked_hooks`' R3 paired positive restates a fact already asserted moments earlier, so it
+  cannot independently fail. Cosmetic; the case's real weight is the marker-file check.
+
+---
+
+## 2026-07-31 ~13:05. #188 DONE. CI green except gitleaks (fix pushed, unverified in CI).
 
 **#188 is genuinely finished and adversarially verified.** 173/173 sandbox tests pass. A
 skeptic independently confirmed: Strict tier still denies `known_hosts`, private keys stay
