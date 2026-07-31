@@ -44,3 +44,4 @@ it, and note the link in both.
 | [0030](0030-git-process-sandbox.md) | The git-process sandbox: a pure argv boundary, tiers by declared intent, and tests that prove their own premise | Accepted — core mechanism and INV-15 disclosure landed and tested |
 | [0031](0031-adr-format-alternatives-and-rejection-reasoning.md) | Every ADR records its alternatives and why they lost | Accepted |
 | [0032](0032-no-service-worker.md) | No service worker: offline is a failure to surface, not to mask | Accepted |
+| [0033](0033-ssh-remote-carveout.md) | SSH remotes under the sandbox: a narrow, explicit carve-out through `secret_excludes` | Accepted — implemented and tested |
