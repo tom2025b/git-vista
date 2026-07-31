@@ -685,6 +685,7 @@ name = "git-vista"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
+ "futures",
  "git-vista-core",
  "git-vista-protocol",
  "gloo-net 0.7.0",
