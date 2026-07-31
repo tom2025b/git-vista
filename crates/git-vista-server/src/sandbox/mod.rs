@@ -1236,6 +1236,13 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
     let (mut rw, mut ro) = default_system_trees(tier);
     rw.push(clones_root.to_path_buf());
     ro.push(home.clone());
+    // #188: identical carve-out and agent-socket grant to `policy_for`'s
+    // Network branch. This function is an **independent** `Policy`
+    // constructor, not a call into `policy_for` — skipping either grant here
+    // would leave `git clone git@host:…` broken while push/fetch on an
+    // already-cloned repository worked, since clone is the one operation
+    // that never reaches `policy_for` at all (see the doc comment above).
+    rw.extend(ssh_agent_socket_grant(tier));
     Ok(Policy {
         tier,
         shim,
@@ -1251,6 +1258,7 @@ pub(crate) fn policy_for_clone(clones_root: &Path) -> Result<Policy, shim::ShimE
             excludes.push(crate::state::sandbox_trust_dir());
             excludes
         },
+        ro_carveouts: ssh_known_hosts_carveout(&home),
         net_ports: DEFAULT_GIT_PORTS.to_vec(),
         hook_mode: HookMode::Run,
     })
@@ -1323,6 +1331,16 @@ fn shim_argv(policy: &Policy) -> Vec<OsString> {
     }
     for p in &policy.secret_excludes {
         argv.push(OsString::from("--exclude"));
+        argv.push(p.clone().into_os_string());
+    }
+    // #188: emitted after the excludes above so the argv reads left to
+    // right as a narrative — grants, then excludes, then the explicit,
+    // reviewed exception to an exclude. A distinct flag from `--ro` on
+    // purpose (`Policy::ro_carveouts`'s doc comment): a reviewer scanning
+    // this argv should see immediately which grants are the sanctioned
+    // exception rather than an ordinary tree grant.
+    for p in &policy.ro_carveouts {
+        argv.push(OsString::from("--ro-carveout"));
         argv.push(p.clone().into_os_string());
     }
     match &policy.hook_mode {
