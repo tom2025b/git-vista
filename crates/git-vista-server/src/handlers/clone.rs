@@ -153,9 +153,62 @@ pub(crate) async fn clone_repo(
             // trade one bug for a worse one. This bound exists to stop a wedged
             // clone living forever, not to enforce a latency budget.
             const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-            let spawned = crate::sandbox::spawn::command_async(&policy, &root, &args).output();
+
+            // # Why cleanup is a Drop guard and not just the timeout arm
+            //
+            // MEASURED 2026-07-31, not assumed: a standalone axum server was
+            // driven by a client that disconnected mid-request. Three flags,
+            // so no single one could be read vacuously — `started=true`
+            // (the handler ran), `dropped=true` (it unwound), and
+            // `timeout_arm=false` (the branch was skipped). The paired
+            // positive, a client that waits, showed `timeout_arm=true`, so
+            // the arm works; it simply does not run on disconnect.
+            //
+            // Axum drops the handler future when the client goes away, which
+            // skips **every** match arm including the timeout's. Cleanup
+            // written as a branch of a completion path only runs if that path
+            // is reached, and cancellation is the absence of all of them. So
+            // the half-written destination is removed by a value's lifetime
+            // instead, which cancellation cannot skip.
+            //
+            // This matters more once the client aborts on its own deadline
+            // (#216 follow-up): abort makes disconnect the *common* path, so a
+            // timeout-arm-only cleanup would have quietly stopped running just
+            // as it started being needed.
+            struct DestGuard<'a> {
+                dest: &'a std::path::Path,
+                keep: bool,
+            }
+            impl Drop for DestGuard<'_> {
+                fn drop(&mut self) {
+                    if !self.keep {
+                        // Best-effort: the destination is a fresh, uniquely
+                        // named directory this call created, so removing it
+                        // cannot touch anything the operator owns.
+                        let _ = std::fs::remove_dir_all(self.dest);
+                    }
+                }
+            }
+            let mut guard = DestGuard {
+                dest: &dest,
+                keep: false,
+            };
+
+            // `kill_on_drop`: without it a cancelled handler leaves the git
+            // child running, still writing into a directory the guard above
+            // has already removed. The orphan outlives the request that
+            // authorised it, which is precisely what this milestone's process
+            // lifecycle work (INV-8) exists to prevent.
+            let spawned = crate::sandbox::spawn::command_async(&policy, &root, &args)
+                .kill_on_drop(true)
+                .output();
             match tokio::time::timeout(CLONE_TIMEOUT, spawned).await {
-                Ok(Ok(o)) => o,
+                Ok(Ok(o)) => {
+                    // Survived: the destination is the caller's now. Anything
+                    // below that decides the clone failed re-arms the guard.
+                    guard.keep = true;
+                    o
+                }
                 Ok(Err(e)) => {
                     eprintln!("git-vista: /api/clone couldn't run git: {e}");
                     return Err((
@@ -164,10 +217,8 @@ pub(crate) async fn clone_repo(
                     ));
                 }
                 Err(_elapsed) => {
-                    // Leave nothing half-cloned behind: the destination is a
-                    // fresh, uniquely-named directory this call created, so
-                    // removing it cannot touch anything the operator owns.
-                    let _ = std::fs::remove_dir_all(&dest);
+                    // `guard` is still armed, so the destination is removed as
+                    // this scope unwinds — no explicit cleanup call here.
                     eprintln!(
                         "git-vista: /api/clone timed out after {}s cloning {url}",
                         CLONE_TIMEOUT.as_secs()
