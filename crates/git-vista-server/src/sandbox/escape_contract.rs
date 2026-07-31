@@ -1621,8 +1621,13 @@ fn the_r8_policy_scan_is_token_exact_and_brace_scoped() {
 
     // A real construction inside a function whose return type is also `Policy`:
     // exactly one body, and it is the literal's, not the function's.
-    let one = production_policy_literals("fn p() -> Policy { Policy { hook_mode: HookMode::Run } }");
-    assert_eq!(one.len(), 1, "expected exactly one construction, got {one:?}");
+    let one =
+        production_policy_literals("fn p() -> Policy { Policy { hook_mode: HookMode::Run } }");
+    assert_eq!(
+        one.len(),
+        1,
+        "expected exactly one construction, got {one:?}"
+    );
     assert_eq!(one[0].trim(), "hook_mode: HookMode::Run");
 
     // Brace-scoped: a `..base` construction must NOT be able to answer with the
