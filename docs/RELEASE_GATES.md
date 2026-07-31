@@ -363,6 +363,36 @@ laid out below).
 
 **Neither of the above has been run.** Applying either is Tom's call.
 
+> **2026-07-31 — decision and extraction.** Tom chose the **ruleset** variant, for
+> the `bypass_actors` reason specifically: this repo runs an automated checkpointer
+> committing every 60 seconds, and if that automation ever needs to push to `main`,
+> classic `enforce_admins=true` offers only "open the door for everyone" or "block
+> the bot", while a ruleset can name that one identity and nothing else.
+>
+> The body above is now extracted verbatim to
+> **`.github/main-release-gates.ruleset.json`** so it can be applied without
+> copy-pasting out of prose:
+>
+> ```fish
+> gh api -X POST repos/tom2025b/git-vista/rulesets --input .github/main-release-gates.ruleset.json
+> ```
+>
+> **One deliberate difference from the JSON printed above: the extracted file lists
+> SEVEN required checks, not six.** Both proposals in this document were written
+> before the `sandbox` job existed, so applying either verbatim would have left
+> `Sandbox (#66 escape-battery gate)` — the escape battery that M1.13b exists to
+> build — merely advisory, which is the precise opposite of this document's purpose.
+> `"Sandbox (#66 escape-battery gate)"` is therefore included.
+>
+> Two things to know before running it. First, a required check that never reports
+> leaves a PR permanently pending, so add a context only once that job has actually
+> run green on a PR at least once — as of this writing the sandbox job has completed
+> green on no run, because it is the slowest job and the 60-second checkpointer keeps
+> triggering `cancel-in-progress`. Second, every context string must match the job's
+> rendered `name:` in `.github/workflows/ci.yml` **exactly**; renaming a job silently
+> turns its gate off, which is the same drift class this milestone spent a day
+> fixing.
+
 ## Part 3 — closure checklist for #67
 
 - [x] **Formatting, clippy, workspace tests (as `-p` list), WASM build,
