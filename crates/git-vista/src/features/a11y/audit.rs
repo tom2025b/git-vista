@@ -502,20 +502,44 @@ const SVG_TEXT_PX_FONT_SIZE_CENSUS: &[&str] = &[
     ".badge-text",
 ];
 
-/// One `(selector, font-size value)` pair per selector in `styles.css` that declares
-/// `font-size` — every selector in the file, not a hand-picked subset, so a new rule
-/// added anywhere is caught rather than silently missed by a fixed list of places to
-/// look.
+/// One `(selector, font-size value)` pair per selector in `styles.css` that declares a
+/// font size — every selector in the file, not a hand-picked subset, so a new rule added
+/// anywhere is caught rather than silently missed by a fixed list of places to look.
+///
+/// **The `font:` shorthand counts.** `font: 14px sans-serif` sets a font size just as
+/// surely as `font-size: 14px` does, and a scan that reads only the longhand goes green
+/// on it — verified by measurement, not assumed: appending one shorthand rule left this
+/// tripwire passing before this function handled it. The shorthand's size is the first
+/// length-looking token; `font: inherit` (every current use in this file) declares no
+/// size of its own and is skipped.
 fn font_size_declarations(rules: &[Rule]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for rule in rules {
-        if let Some(d) = rule.value_of("font-size") {
+        let size = rule
+            .value_of("font-size")
+            .map(|d| d.value.clone())
+            .or_else(|| rule.value_of("font").and_then(|d| shorthand_size(&d.value)));
+        if let Some(size) = size {
             for selector in &rule.selectors {
-                out.push((selector.clone(), d.value.clone()));
+                out.push((selector.clone(), size.clone()));
             }
         }
     }
     out
+}
+
+/// The size component of a `font:` shorthand, if it declares one.
+///
+/// The shorthand's grammar puts the size after the optional style/variant/weight/stretch
+/// keywords and before an optional `/line-height`, so the first token that starts with a
+/// digit or `.` is the size. Keyword-only forms (`inherit`, `initial`, the system fonts
+/// like `menu`) declare no length and yield `None` — they inherit a size rather than
+/// pinning one, which is exactly what this module wants.
+fn shorthand_size(value: &str) -> Option<String> {
+    value
+        .split([' ', '\t'])
+        .find(|t| t.starts_with(|c: char| c.is_ascii_digit() || c == '.'))
+        .map(|t| t.split('/').next().unwrap_or(t).to_string())
 }
 
 fn is_absolute_px(value: &str) -> bool {
@@ -532,9 +556,9 @@ fn every_font_size_declaration_is_relative_or_a_recorded_svg_exception() {
     let declared = font_size_declarations(&rules);
     assert!(
         declared.len() >= 25,
-        "expected at least the 25 font-size declarations styles.css had when this \
-         tripwire was written, found {} — if the reader silently stopped finding \
-         them this check would pass over nothing",
+        "found only {} font-size declarations in styles.css — below the floor this \
+         tripwire was written against, so the reader has likely stopped finding them \
+         and this check would pass over nothing",
         declared.len()
     );
 
