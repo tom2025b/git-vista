@@ -51,9 +51,10 @@
 //! this ADR" section and says the mapping must go. INV-13 is *refuse*, not
 //! *degrade*.
 //!
-//! The plan itself agrees, at lines 3344-3352: *"Task 16 should either drop the
-//! arm (taking `ProbeVerdict::Contained` as a precondition) or keep it as an
-//! `unreachable!` carrying its reason."* Neither of those two is used either,
+//! The plan itself agrees, in its Task 9 "Consequence for Task 16" note: *"Task
+//! 16 should either drop the arm (taking `ProbeVerdict::Contained` as a
+//! precondition) or keep it as an `unreachable!` carrying its reason."* Neither
+//! of those two is used either,
 //! for a reason ADR 0029 also states: the refusal must reach the handler "as a
 //! proper refusal, not a panic reachable from a network request," and
 //! `hook_policy_for_repo`'s caller (`catalog.rs`, building a
@@ -138,16 +139,20 @@ impl std::fmt::Display for HookPolicyRefused {
 /// [`HookPolicy`] in its role as *the disclosed form of a [`Tier`]* — the
 /// return type of the seam below, and nothing else.
 ///
-/// The alias earns its keep twice. It names the role at the one place the two
-/// vocabularies meet, and it keeps a false positive out of a tripwire this
-/// change must not weaken: `sandbox::escape_contract`'s R8 check scans every
-/// production file under `src/sandbox/` for the text `Policy {`, treats each
-/// hit as a `Policy` struct literal, and panics with "the scan broke" when it
-/// cannot find a `hook_mode:` field inside. A function written `-> HookPolicy
-/// {` puts exactly that text in front of a brace. R8 is a deliberate text scan
-/// and lives in a file outside this change's ownership, so the seam names its
-/// own return type rather than the check being loosened to accommodate it. The
-/// brittleness is reported, not silently absorbed.
+/// The alias exists to name that role at the one place the two vocabularies
+/// meet.
+///
+/// It used to have a second, uglier reason, recorded here because the note that
+/// stated it has now stopped being true and a stale rationale is worse than
+/// none. `sandbox::escape_contract`'s R8 check scans production files under
+/// `src/sandbox/` for `Policy` constructions; it used to do so with a plain
+/// `str::find("Policy {")`, so a function written `-> HookPolicy {` was read as a
+/// `Policy` literal and R8 panicked with "the scan broke" for want of a
+/// `hook_mode` field. This alias was how that was dodged. R8's scanner is
+/// token-exact on the left now (`production_policy_literals`, tested by
+/// `the_r8_policy_scan_is_token_exact_and_brace_scoped`), so `-> HookPolicy {`
+/// is no longer a hit and nothing here needs to spell around it — the alias is
+/// kept on its naming merit alone, not as a workaround.
 pub(crate) type Disclosed = HookPolicy;
 
 /// Rename one internal [`Tier`] to the wire vocabulary. Exhaustive on purpose:
