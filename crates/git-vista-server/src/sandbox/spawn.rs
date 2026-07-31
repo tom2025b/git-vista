@@ -234,20 +234,39 @@ mod tests {
         );
 
         // A secret stays denied under the same production policy.
+        //
+        // The premise is ASSERTED, never skipped. This was previously
+        // `if Path::new(&secret).exists() { … }`, which meant that on any host
+        // without `~/.ssh/known_hosts` — a fresh CI runner, for one — the entire
+        // secret-denial assertion vanished and this test passed green having
+        // checked nothing about secrets at all. That is failure shape #1 from
+        // this milestone's own list ("a green test that proves nothing is worse
+        // than a red one"), and an adversarial review reproduced it by running
+        // the suite under a runner-shaped `$HOME`.
+        //
+        // The escape battery already takes this posture deliberately: a case
+        // that cannot demonstrate its own premise is a HARD FAILURE, not a skip
+        // (see `run_case` in escape_contract.rs). This now matches it. CI
+        // materialises the path in `.github/actions/host-sandbox-setup`.
         let home = std::env::var("HOME").unwrap();
         let secret = format!("{home}/.ssh/known_hosts");
-        if std::path::Path::new(&secret).exists() {
-            let out = command_async(&policy, repo.path(), &["config", "-f", &secret, "--list"])
-                .hermetic_env_for_test()
-                .output()
-                .await
-                .expect("git runs");
-            assert!(
-                !out.status.success(),
-                "the production policy let git read ~/.ssh: {}",
-                String::from_utf8_lossy(&out.stdout)
-            );
-        }
+        assert!(
+            std::path::Path::new(&secret).exists(),
+            "{secret} does not exist, so this test cannot show that the production policy \
+             denies it: git would fail to read an absent path for the wrong reason entirely, \
+             and a pass would mean nothing. Any non-empty owner-readable file will do — CI \
+             writes a placeholder in .github/actions/host-sandbox-setup."
+        );
+        let out = command_async(&policy, repo.path(), &["config", "-f", &secret, "--list"])
+            .hermetic_env_for_test()
+            .output()
+            .await
+            .expect("git runs");
+        assert!(
+            !out.status.success(),
+            "the production policy let git read ~/.ssh: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 
     /// C10 hazard #1, as a tripwire rather than a review convention.
