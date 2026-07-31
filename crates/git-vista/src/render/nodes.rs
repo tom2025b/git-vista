@@ -9,8 +9,11 @@ use leptos::*;
 
 use git_vista_core::model::RefKind;
 
+use crate::camera::Camera;
+use crate::features::a11y::focus::GraphFocus;
 use crate::features::shell::signals::Shell;
 use crate::geometry::{node_cx, node_cy, NODE_RADIUS};
+use crate::gestures;
 use crate::icons::icon_set;
 use crate::state::MenuData;
 use git_vista_core::color::branch_color;
