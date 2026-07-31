@@ -288,7 +288,9 @@ pub fn on_node_keydown(
         // arrow presses in a row) can select a row with no mounted `<circle>`
         // to call `.focus()` on yet. See `Camera::ensure_row_visible`.
         let target_y = f64::from(node_cy(next));
-        camera.update(|c| *c = c.ensure_row_visible(vp_h.get_untracked(), target_y, ROW_FOCUS_MARGIN_PX));
+        camera.update(|c| {
+            *c = c.ensure_row_visible(vp_h.get_untracked(), target_y, ROW_FOCUS_MARGIN_PX)
+        });
         focus_row_next_frame(next);
         return;
     }
@@ -315,7 +317,10 @@ pub fn on_node_keydown(
             // `GraphFocus::escape` only updates the model; real DOM focus has
             // to be moved off the element separately, or the ring stays
             // painted on a row the model no longer considers focused.
-            if let Some(el) = ev.target().and_then(|t| t.dyn_into::<web_sys::SvgElement>().ok()) {
+            if let Some(el) = ev
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::SvgElement>().ok())
+            {
                 let _ = el.blur();
             }
         }

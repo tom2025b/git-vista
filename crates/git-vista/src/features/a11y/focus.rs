@@ -231,7 +231,11 @@ mod tests {
         f.focus_entered();
         assert_eq!(f.focused_row(), Some(0));
         assert_eq!(f.mv(FocusMove::Prev), Some(0), "already at the top");
-        assert_eq!(f.mv(FocusMove::Prev), Some(0), "repeating it changes nothing");
+        assert_eq!(
+            f.mv(FocusMove::Prev),
+            Some(0),
+            "repeating it changes nothing"
+        );
     }
 
     #[test]
@@ -240,7 +244,11 @@ mod tests {
         f.mv(FocusMove::Last);
         assert_eq!(f.focused_row(), Some(2));
         assert_eq!(f.mv(FocusMove::Next), Some(2), "already at the bottom");
-        assert_eq!(f.mv(FocusMove::Next), Some(2), "repeating it changes nothing");
+        assert_eq!(
+            f.mv(FocusMove::Next),
+            Some(2),
+            "repeating it changes nothing"
+        );
     }
 
     #[test]
@@ -299,8 +307,16 @@ mod tests {
         let mut f = GraphFocus::new(10);
         f.mv(FocusMove::Last); // active = 9
         f.set_row_count(3);
-        assert_eq!(f.tabbable_row(), Some(2), "clamped into the new, smaller range");
-        assert_eq!(f.mv(FocusMove::Next), Some(2), "still clamped at the new last row");
+        assert_eq!(
+            f.tabbable_row(),
+            Some(2),
+            "clamped into the new, smaller range"
+        );
+        assert_eq!(
+            f.mv(FocusMove::Next),
+            Some(2),
+            "still clamped at the new last row"
+        );
     }
 
     #[test]
@@ -318,7 +334,11 @@ mod tests {
         let mut f = GraphFocus::new(3);
         f.mv(FocusMove::Next); // active = 1
         f.set_row_count(20);
-        assert_eq!(f.tabbable_row(), Some(1), "growth must not move an in-range row");
+        assert_eq!(
+            f.tabbable_row(),
+            Some(1),
+            "growth must not move an in-range row"
+        );
         assert_eq!(f.focused_row(), Some(1));
     }
 

@@ -220,7 +220,11 @@ mod tests {
         };
         // world y 10 -> screen y 10, short of the 50px top margin by 40px.
         let z = c.ensure_row_visible(800.0, 10.0, 50.0);
-        assert_eq!((z.ty, z.scale), (40.0, 1.0), "ty shifts by exactly the shortfall");
+        assert_eq!(
+            (z.ty, z.scale),
+            (40.0, 1.0),
+            "ty shifts by exactly the shortfall"
+        );
         // And the target now sits exactly on the margin.
         assert_eq!(z.ty + z.scale * 10.0, 50.0);
     }
@@ -252,7 +256,10 @@ mod tests {
         // world y 200 at 2x scale -> screen y 400, past a bottom margin line of
         // 250 (viewport 300, margin 50) by 150px.
         let z = c.ensure_row_visible(300.0, 200.0, 50.0);
-        assert_eq!(z.ty, -150.0, "the shift accounts for the 2x scale, not the raw world delta");
+        assert_eq!(
+            z.ty, -150.0,
+            "the shift accounts for the 2x scale, not the raw world delta"
+        );
         assert_eq!(z.scale, 2.0);
         assert_eq!(z.ty + z.scale * 200.0, 250.0);
     }
@@ -266,7 +273,10 @@ mod tests {
         };
         let z = c.ensure_row_visible(400.0, 5000.0, 50.0);
         assert_eq!(z.scale, 3.0);
-        assert_eq!(z.tx, 5.0, "tx (horizontal) is untouched by a vertical scroll");
+        assert_eq!(
+            z.tx, 5.0,
+            "tx (horizontal) is untouched by a vertical scroll"
+        );
     }
 
     #[test]
