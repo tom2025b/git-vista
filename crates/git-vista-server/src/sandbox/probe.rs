@@ -328,6 +328,9 @@ fn boot_probe_policy(scratch: &Path, markers: &Path) -> Result<Policy, &'static 
         rw_trees: rw,
         ro_trees: ro,
         secret_excludes: secret_excludes_for_home(&home),
+        // #188 is Network-tier only; the boot probe always builds Strict
+        // (see the doc comment above), so there is nothing to carve out here.
+        ro_carveouts: Vec::new(),
         net_ports: Vec::new(),
         hook_mode: HookMode::Run,
     })

@@ -649,6 +649,17 @@ fn policy_for_case(case: &EscapeCase, repo: &Path) -> Policy {
         rw_trees: rw,
         ro_trees: ro,
         secret_excludes: secret_excludes_for_home(&home),
+        // #188 is Network-tier only. The one case still built through this
+        // harness branch (`hook_mode_suite`'s `blocked_hooks`) is
+        // `Tier::Strict` — see this function's own doc comment — so there is
+        // nothing to carve out for any configuration this branch builds
+        // today; written as a real per-tier match rather than a bare
+        // `Vec::new()` so a future Network-tier exemption does not silently
+        // inherit an empty carve-out set the way a `..` default would.
+        ro_carveouts: match case.tier {
+            Tier::Network => ssh_known_hosts_carveout(&home),
+            Tier::Strict | Tier::Unsandboxed => Vec::new(),
+        },
         net_ports: if case.tier == Tier::Network {
             DEFAULT_GIT_PORTS.to_vec()
         } else {
