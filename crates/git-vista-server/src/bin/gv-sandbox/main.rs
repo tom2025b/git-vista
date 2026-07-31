@@ -553,14 +553,43 @@ fn is_ancestor_of_exclude(p: &Path, excludes: &[PathBuf]) -> bool {
 /// function used to do, silently, for every `--ro`/`--rw` file entry. See
 /// `ACCESS_FILE` for the measurement and `grant_one` for why the failure is now
 /// terminal.
+///
+/// # `tree` is resolved here too, not only inside `enumerate`
+///
+/// `excludes` arrives already canonicalised (`apply_landlock` does it once, up
+/// front). `is_or_inside_exclude`/`is_ancestor_of_exclude` are pure lexical
+/// `Path` comparisons — no stat, no symlink following — so comparing them
+/// against a still-unresolved `tree` would just move the same bug one call
+/// frame up: `$HOME` (the production caller of this function, via
+/// `policy_for`) is passed through verbatim from `std::env::var_os("HOME")`,
+/// never canonicalised, and a symlinked `$HOME` would make this function's own
+/// membership test fail exactly the way `enumerate`'s per-entry test used to.
+/// Worse than a re-run of the original bug, in fact: a mismatch *here* skips
+/// `enumerate` entirely and takes the non-enumerated fast path instead,
+/// granting the excluded secret's ancestor **whole** with a single rule —
+/// turning a symlink race into an unconditional bypass. So `tree` is resolved
+/// with the identical `std::fs::canonicalize` before either comparison runs,
+/// and the resolved path is what every downstream call (`grant_one`,
+/// `enumerate`'s `dir`/`root`) receives, keeping tree and excludes in the same
+/// namespace end to end.
+///
+/// An unresolvable `tree` is **not** fatal, unlike an unresolvable exclude:
+/// `DEFAULT_RO_TREES`/`NETWORK_ONLY_RO_TREES` name system paths that
+/// legitimately do not exist on every host, and a tree that is not there has
+/// nothing to grant or to leak either way — `grant_one` would reach the same
+/// "0 granted" outcome via `AddRuleError::Unopenable` a few lines later, this
+/// just gets there without a spurious lexical comparison in between.
 fn grant_tree(ruleset: i32, tree: &Path, access: u64, excludes: &[PathBuf]) -> usize {
-    if is_or_inside_exclude(tree, excludes) {
+    let Ok(real_tree) = std::fs::canonicalize(tree) else {
+        return 0;
+    };
+    if is_or_inside_exclude(&real_tree, excludes) {
         return 0;
     }
-    if !is_ancestor_of_exclude(tree, excludes) {
-        return grant_one(ruleset, tree, access);
+    if !is_ancestor_of_exclude(&real_tree, excludes) {
+        return grant_one(ruleset, &real_tree, access);
     }
-    enumerate(ruleset, tree, tree, access, excludes)
+    enumerate(ruleset, &real_tree, &real_tree, access, excludes)
 }
 
 /// The measured enumerate-and-skip walk. See `docs/adr/0027`.
@@ -621,6 +650,77 @@ fn enumerate(ruleset: i32, dir: &Path, root: &Path, access: u64, excludes: &[Pat
         granted += grant_one(ruleset, &path, access);
     }
     granted
+}
+
+/// Resolve every `--exclude` entry to the object it actually names, before any
+/// grant is built.
+///
+/// # Why this has to live here, in the shim, and not in the server
+///
+/// `secret_excludes_for_home` (server side, `sandbox/mod.rs`) builds the
+/// exclude list as plain string concatenation — `home.join(".ssh")` and
+/// friends — over whatever `$HOME` the server process inherited, and never
+/// canonicalises it. `enumerate`, below, resolves every entry it walks with
+/// `std::fs::canonicalize` before testing it against that list. If any
+/// component of `$HOME` (or of `XDG_STATE_HOME`, for the trust-store exclude)
+/// is a symlink, those two paths live in different string namespaces:
+/// `enumerate`'s `real` is the resolved object, the exclude is still the
+/// symlinked name, and `is_or_inside_exclude`'s `==`/`starts_with` — pure
+/// lexical comparison, no stat, no symlink awareness of its own — silently
+/// never matches. `$HOME` is granted read-only, so the practical effect of
+/// that silent miss is `~/.ssh`, `~/.gnupg`, `~/.git-credentials`, the trust
+/// store, and everything else in `DEFAULT_SECRET_EXCLUDES` becoming readable
+/// through the symlinked name — the one thing this whole file exists to
+/// prevent. Measured directly against this binary, 2026-07-30 (see the test
+/// module): a granted tree with a symlinked component and an unresolved
+/// exclude beneath it leaked a canary file in full.
+///
+/// The tempting fix is to canonicalise the excludes on the **server** side,
+/// before they ever reach this process's argv. That was considered and
+/// rejected: it still leaves a cross-process window — the server resolves the
+/// symlink at policy-build time, this shim resolves the *walked entry* at
+/// enumeration time, and nothing pins those two resolutions to the same
+/// instant. A symlink component swapped in between (even a static
+/// misconfiguration that just happens to differ from what the server saw, let
+/// alone an adversarial retarget) reopens the identical mismatch one process
+/// hop later. Resolving **here**, inside `apply_landlock`, immediately before
+/// the first `grant_tree` call and before any attacker-influenced code has had
+/// a chance to run, means the exclude list and every walked path are resolved
+/// in the *same* process, by the *same* `std::fs::canonicalize` call, close
+/// enough in time that there is no cross-process gap left to race. It does not
+/// close every theoretical window — a concurrent process with write access to
+/// a symlink component could still retarget it in the microseconds between
+/// this resolution and a later `open()` — but that residual is a TOCTOU no
+/// single-process design can close without atomic path resolution the kernel
+/// does not offer, and it is a different, far narrower claim than "any static
+/// symlink under `$HOME` defeats every exclude," which is what this closes
+/// unconditionally.
+///
+/// # Failure here is fatal, not a skip
+///
+/// An exclude that cannot be resolved must never quietly become "does not
+/// match anything" — that is the exact fail-open shape `enumerate`'s own
+/// `std::fs::read_dir` failure already has to guard against elsewhere in this
+/// file (an unreadable directory returns 0 granted rather than refusing), and
+/// letting it happen to the *secret list itself* would be worse: the operator
+/// asked for `~/.ssh` withheld, and a policy that cannot prove it withheld it
+/// must not proceed as though it had.
+fn resolve_excludes(raw: &[PathBuf]) -> Vec<PathBuf> {
+    raw.iter()
+        .map(|e| {
+            std::fs::canonicalize(e).unwrap_or_else(|err| {
+                die(
+                    EXIT_LANDLOCK,
+                    &format!(
+                        "cannot resolve --exclude `{}`: {err}. An exclude that cannot be \
+                         canonicalised must not silently match nothing — refusing to build \
+                         a ruleset that would grant it by accident.",
+                        e.display()
+                    ),
+                )
+            })
+        })
+        .collect()
 }
 
 fn apply_landlock(a: &Args) {
