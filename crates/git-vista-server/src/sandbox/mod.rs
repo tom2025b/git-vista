@@ -56,6 +56,12 @@ pub(crate) mod worktree;
 
 #[cfg(test)]
 mod argv;
+/// A real HTTPS clone through the production `policy_for_clone`. Separate from
+/// `documented_gaps` on purpose: that module records what is *not* proven,
+/// this one proves the most basic thing the clone path's missing coverage left
+/// unasked — that a clone through that policy succeeds at all.
+#[cfg(test)]
+mod clone_live;
 /// #66 / #200 (plan Task 14): the **compatibility** battery — the mirror of the
 /// escape battery. Every case is a real `git commit` run twice over one
 /// fixture, once at `Tier::Unsandboxed` and once at `Tier::Strict`, so a pass
@@ -76,8 +82,6 @@ mod dispatch;
 /// for ordinary missing-coverage gaps that are not INV-17 shaped — see that
 /// section's own header comment for why it lives here anyway.
 #[cfg(test)]
-#[cfg(test)]
-mod clone_live;
 mod documented_gaps;
 /// #66 Task 25, step 3: the anti-vacuity contract's tripwires and the
 /// EscapeCase/run_case harness step 5 rewrites the battery onto. Landed here
