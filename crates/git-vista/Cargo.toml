@@ -56,6 +56,12 @@ web-sys = { version = "0.3", features = [
     "MouseEvent",
     "PointerEvent",
     "WheelEvent",
+    # M1.13 (#65 keyboard-access gap): roving tabindex over the commit rows.
+    # `FocusEvent` — a Tab lands on the tabbable `.node-hit` circle.
+    # `SvgElement` — `.focus()`/`.blur()` (the HTMLOrSVGElement mixin) on the
+    # commit-dot hit circles, which are SVG, not HTML, elements.
+    "FocusEvent",
+    "SvgElement",
     # Issue #18: `window()` plus the native prompt()/alert() dialogs used to ask
     # for a branch name and report a failure.
     "Window",

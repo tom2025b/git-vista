@@ -14,9 +14,10 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::camera::{Camera, ZOOM_STEP};
+use crate::features::a11y::focus::{FocusMove, GraphFocus};
 use crate::features::graph::core::GraphCore;
 use crate::features::shell::signals::Shell;
-use crate::geometry::drag_threshold;
+use crate::geometry::{drag_threshold, node_cy};
 
 /// Current browser window inner height in CSS px, or a sane default when it can't
 /// be read. The window is always at least as tall as the SVG (the topbar sits
