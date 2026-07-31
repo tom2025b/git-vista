@@ -249,6 +249,33 @@ pub(crate) fn secret_excludes_for_home(home: &std::path::Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// #188: the `Policy::ro_carveouts` entry for a home directory — the one
+/// named exception to the `.ssh` entry in `DEFAULT_SECRET_EXCLUDES`.
+///
+/// A single-element `Vec` for the same reason `secret_excludes_for_home`
+/// returns one rather than a bare `PathBuf`: it is what `Policy::ro_carveouts`
+/// is typed as, and every production caller must go through one function
+/// rather than joining `home.join(".ssh/known_hosts")` by hand at each call
+/// site — the exact silent-miss shape `secret_excludes_for_home`'s own doc
+/// comment already records being bitten by once for the exclude side.
+///
+/// # Why only `known_hosts`, and why this is sound for an arbitrarily-named
+/// private key
+///
+/// `DEFAULT_SECRET_EXCLUDES` withholds `.ssh` as a **whole directory**, not by
+/// enumerating filenames inside it — `~/.ssh` can hold a private key under any
+/// name at all (`~/.ssh/my_deploy_key`, no `id_` prefix required), so no fixed
+/// allowlist of filenames could withhold every private key an operator might
+/// have. This function's return value is granted through `Policy::ro_carveouts`,
+/// which bypasses the exclude check for **exactly the paths named here** —
+/// never a directory (`Policy::ro_carveouts`'s doc comment, and the shim's own
+/// refusal in `add_carveout_rule`) — so the soundness argument does not depend
+/// on knowing every private key's name: `.ssh` stays wholly excluded, and this
+/// is the one, single, explicitly-reviewed file re-admitted from inside it.
+pub(crate) fn ssh_known_hosts_carveout(home: &std::path::Path) -> Vec<PathBuf> {
+    vec![home.join(".ssh/known_hosts")]
+}
+
 /// System trees granted read+execute in every tier.
 pub(crate) const DEFAULT_RO_TREES: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc"];
 
@@ -442,6 +469,20 @@ pub(crate) struct Policy {
     /// Absolute paths withheld from the grants above by enumerate-and-skip.
     /// See `DEFAULT_SECRET_EXCLUDES` for why this is not a deny rule.
     pub secret_excludes: Vec<PathBuf>,
+    /// #188: named, single-file exceptions to an entry in `secret_excludes` —
+    /// read-only, and checked against nothing but the file's own identity.
+    ///
+    /// This is **not** a general-purpose escape hatch and must stay narrow:
+    /// `grant_tree`'s exclude check (`is_or_inside_exclude`) is what makes
+    /// `secret_excludes` outrank a `--ro`/`--rw` grant everywhere else in this
+    /// design, and every entry here is a deliberate, reviewed exception to
+    /// that rule for one literal path — never a directory (the shim refuses
+    /// to grant one, `bin/gv-sandbox/main.rs`'s `add_carveout_rule`). As of
+    /// this writing the only populated case is `~/.ssh/known_hosts` in the
+    /// `Network` tier, via `ssh_known_hosts_carveout` — a git client needs it
+    /// to verify a remote's host key, while the rest of `~/.ssh` (private
+    /// keys above all) stays withheld by the ordinary exclude.
+    pub ro_carveouts: Vec<PathBuf>,
     /// TCP ports the network tier may `connect()` to. Empty in every other
     /// tier — the strict tier has no network at all (F3), and the unsandboxed
     /// tier has no ruleset to put them in.
