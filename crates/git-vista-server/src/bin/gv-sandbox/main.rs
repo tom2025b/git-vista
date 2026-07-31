@@ -765,15 +765,21 @@ fn apply_landlock(a: &Args) {
         );
     }
 
+    // Resolved once, here, and used for every membership test from this point
+    // on — never `a.excludes` again. See `resolve_excludes`'s doc comment for
+    // why this has to happen in this process, at this point, rather than on
+    // the server side that built the raw list.
+    let excludes = resolve_excludes(&a.excludes);
+
     for tree in &a.ro {
-        grant_tree(ruleset, tree, RO_DIR_ACCESS, &a.excludes);
+        grant_tree(ruleset, tree, RO_DIR_ACCESS, &excludes);
     }
     // Read-write trees are granted after the read-only ones so a repository
     // nested under a read-only ancestor still ends up writable. Rule *order*
     // does not matter to the kernel — measured — but reading them in this
     // order matches how the policy is described.
     for tree in &a.rw {
-        grant_tree(ruleset, tree, RW_ACCESS, &a.excludes);
+        grant_tree(ruleset, tree, RW_ACCESS, &excludes);
     }
     if net_allow {
         for port in &a.net_ports {

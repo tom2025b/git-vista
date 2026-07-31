@@ -8,6 +8,8 @@
 # (`dev resume`). Uncommitted work is the only work that gets lost.
 #
 #   dev gate              run the full CI gate (fmt, clippy x2, test, trunk build)
+#   dev verify            the sandbox checks gate does NOT run: escape report, census
+#                          both directions, mutants apply, no leaked daemon
 #   dev roadmap           print milestones + open issues, grouped by M-band
 #   dev start <issue#>    branch off fresh main for an issue (feature/mX.YY-slug)
 #   dev wip [message]     checkpoint: add + commit (as claude_2010) + push
@@ -60,6 +62,96 @@ cmd_gate() {
   echo "── trunk build ─────────────────────────────────────"
   trunk_build
   echo "dev: ✅ gate green"
+}
+
+# dev verify — the sandbox-specific checks `dev gate` does NOT run.
+#
+# `dev gate` proves the workspace builds and its tests pass. It does not prove the
+# escape battery actually *proved* anything: a case can report `capability-absent`,
+# the census can drift from the cases it mirrors, a mutant patch can stop applying,
+# and every one of those leaves `cargo test` green. Six times in M1.13b a test was
+# green while proving nothing; these are the checks that catch that class.
+#
+# Run this before closing a sandbox issue or marking a PR ready. Fail-closed
+# throughout: a missing file or an unreadable report is a FAIL, never a skip.
+cmd_verify() {
+  local fails=0
+  local report="${GV_ESCAPE_REPORT:-/tmp/gv-verify-report.txt}"
+  rm -f "$report"
+
+  echo "dev: sandbox verification (the checks gate does not run)…"
+
+  echo "── 1. escape battery + report ──────────────────────"
+  GV_ESCAPE_REPORT="$report" cargo test -p git-vista-server \
+    -- escape_suite hook_mode_suite escape_contract || { echo "  ✗ battery failed"; fails=$((fails+1)); }
+
+  echo "── 2. every case reported 'contained' ──────────────"
+  if [[ ! -s $report ]]; then
+    echo "  ✗ \$GV_ESCAPE_REPORT is missing or empty — no case ran, or the variable did"
+    echo "    not reach the test process. An unset variable must fail closed (R5)."
+    fails=$((fails+1))
+  else
+    local total contained
+    total=$(wc -l < "$report")
+    contained=$(grep -c 'result=contained' "$report" || true)
+    if [[ $total -eq $contained ]]; then
+      echo "  ✓ $contained/$total contained"
+    else
+      echo "  ✗ $contained/$total contained — the rest:"
+      grep -v 'result=contained' "$report" | sed 's/^/      /'
+      fails=$((fails+1))
+    fi
+  fi
+
+  echo "── 3. census == report, BOTH directions ────────────"
+  # Equality, not a floor: a renamed case must break the build rather than
+  # silently shrinking what the gate covers.
+  local census=docs/sandbox/escape-census.txt
+  if [[ -s $report && -f $census ]]; then
+    if diff <(grep -oE 'case=[^ ]+' "$report" | sed 's/^case=//' | sort -u) \
+            <(grep -v '^\s*#' "$census" | grep -v '^\s*$' | sort -u) > /tmp/gv-census.diff; then
+      echo "  ✓ census matches the report"
+    else
+      echo "  ✗ census and report disagree (< report only, > census only):"
+      sed 's/^/      /' /tmp/gv-census.diff
+      fails=$((fails+1))
+    fi
+  else
+    echo "  ✗ cannot compare — report or $census missing"; fails=$((fails+1))
+  fi
+
+  echo "── 4. mutants registered and applying ──────────────"
+  local n_files n_array
+  n_files=$(find ci/mutants -maxdepth 1 -name '*.patch' 2>/dev/null | wc -l)
+  n_array=$(grep -oP 'readonly -a mutants=\(\K[^)]*' ci/mutation-matrix.sh 2>/dev/null | wc -w)
+  if [[ $n_files -eq $n_array && $n_files -gt 0 ]]; then
+    echo "  ✓ $n_files patches == $n_array registered"
+  else
+    echo "  ✗ $n_files patch files vs $n_array in the mutants array"; fails=$((fails+1))
+  fi
+  local bad=0
+  for p in ci/mutants/*.patch; do
+    [[ -e $p ]] || continue
+    patch -p1 --forward --fuzz=0 --dry-run < "$p" > /dev/null 2>&1 || { echo "  ✗ does not apply: $p"; bad=1; }
+  done
+  [[ $bad -eq 0 ]] && echo "  ✓ all patches apply at --fuzz=0" || fails=$((fails+1))
+
+  echo "── 5. no leaked git daemon ─────────────────────────"
+  if pgrep -x git-daemon > /dev/null; then
+    echo "  ✗ a git-daemon survived a test run — it squats port 9418 and will"
+    echo "    poison the next run. Kill it BY PID (never 'pkill -f')."
+    fails=$((fails+1))
+  else
+    echo "  ✓ none"
+  fi
+
+  echo
+  if [[ $fails -eq 0 ]]; then
+    echo "dev: ✅ sandbox verification green"
+  else
+    echo "dev: ❌ $fails check(s) failed" >&2
+    exit 1
+  fi
 }
 
 cmd_roadmap() {
@@ -268,6 +360,7 @@ cmd_handoff() {
 
 case "${1:-}" in
   gate)    shift; cmd_gate "$@" ;;
+  verify)  shift; cmd_verify "$@" ;;
   roadmap) shift; cmd_roadmap "$@" ;;
   start)   shift; cmd_start "$@" ;;
   wip)     shift; cmd_wip "$@" ;;
