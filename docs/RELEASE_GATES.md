@@ -363,6 +363,36 @@ laid out below).
 
 **Neither of the above has been run.** Applying either is Tom's call.
 
+> **2026-07-31 — decision and extraction.** Tom chose the **ruleset** variant, for
+> the `bypass_actors` reason specifically: this repo runs an automated checkpointer
+> committing every 60 seconds, and if that automation ever needs to push to `main`,
+> classic `enforce_admins=true` offers only "open the door for everyone" or "block
+> the bot", while a ruleset can name that one identity and nothing else.
+>
+> The body above is now extracted verbatim to
+> **`.github/main-release-gates.ruleset.json`** so it can be applied without
+> copy-pasting out of prose:
+>
+> ```fish
+> gh api -X POST repos/tom2025b/git-vista/rulesets --input .github/main-release-gates.ruleset.json
+> ```
+>
+> **One deliberate difference from the JSON printed above: the extracted file lists
+> SEVEN required checks, not six.** Both proposals in this document were written
+> before the `sandbox` job existed, so applying either verbatim would have left
+> `Sandbox (#66 escape-battery gate)` — the escape battery that M1.13b exists to
+> build — merely advisory, which is the precise opposite of this document's purpose.
+> `"Sandbox (#66 escape-battery gate)"` is therefore included.
+>
+> Two things to know before running it. First, a required check that never reports
+> leaves a PR permanently pending, so add a context only once that job has actually
+> run green on a PR at least once — as of this writing the sandbox job has completed
+> green on no run, because it is the slowest job and the 60-second checkpointer keeps
+> triggering `cancel-in-progress`. Second, every context string must match the job's
+> rendered `name:` in `.github/workflows/ci.yml` **exactly**; renaming a job silently
+> turns its gate off, which is the same drift class this milestone spent a day
+> fixing.
+
 ## Part 3 — closure checklist for #67
 
 - [x] **Formatting, clippy, workspace tests (as `-p` list), WASM build,
@@ -420,4 +450,103 @@ his call to make, not a worker task's.
 
 ---
 
+## Part 3 — the sandbox gate (#66 M1.13b, added 2026-07-29)
+
+A seventh named check, `sandbox`, gates the escape battery — the test suite
+whose whole job is proving a hostile repository's hooks cannot escape
+Landlock/seccomp/bwrap containment. It exists because that battery has
+**failed twice**: an earlier audit (C8) found it vacuous, a competent
+rewrite followed, and a second audit (C11) found the same defect had
+"merely moved from the inside assertion to the baseline gate" rather than
+being removed. `docs/sandbox/escape-battery-anti-vacuity-contract.md`
+is the response — eleven numbered rules (R1–R11), each enforced by a source
+tripwire or a CI-shell assertion rather than trusted to a reviewer's
+judgement, on the theory that a standard living only in a report is not
+open during the next rewrite.
+
+**The job unclamps unprivileged user namespaces first (D6 Option A).**
+GitHub's `ubuntu-latest` ships `kernel.apparmor_restrict_unprivileged_userns=1`;
+under that clamp `bwrap` cannot create its namespaces, the Strict tier cannot be
+constructed, and — since a case that cannot demonstrate its own premise is a hard
+failure rather than a skip — the battery would go red without testing a single
+invariant. So the job writes the sysctl and **fails loudly if the write does not
+take**, never falling through to a degraded run: a silent workaround would be
+indistinguishable from a sandbox that works. Safe because GitHub-hosted runners
+are single-job ephemeral VMs, destroyed after the run; that reasoning does *not*
+transfer to a self-hosted or reused runner. Decision and alternatives:
+`design-docs/2026-07-29-d6-sandbox-ci-preflight-decision.md`; plan Global
+Constraint 11.
+
+**What the job actually asserts**, none of it decided by the Rust tests
+themselves (see the contract's "Skip policy"):
+
+1. A preflight names any missing host capability with `::error::` before any
+   test runs — a mis-provisioned runner is a *differently-named* red check
+   from a real containment failure, so nobody learns to click past the
+   security one.
+2. The battery runs, writing one record per case to a report file the test
+   process owns (immune to libtest's stdout/stderr capture on passing
+   tests — the channel the previous, since-condemned CI draft tried to
+   `grep` and could not have worked).
+3. Three shell-level assertions over that file: it exists; its case-id set
+   equals `docs/sandbox/escape-census.txt` in **both directions** (equality,
+   not a floor — a renamed module empties a floor-based gate silently);
+   zero records read `result=capability-absent`.
+4. On pull requests that touch
+   `crates/git-vista-server/src/sandbox/**` or
+   `crates/git-vista-server/src/bin/gv-sandbox/**`, and on the nightly
+   schedule, `ci/mutation-matrix.sh` copies the tree, applies M1–M9 one at a
+   time with exact-context `patch --forward`, rebuilds, runs every declared
+   case, prints a mutant × case grid, and asserts M0 all-pass, every declared
+   `dies_under` cell FAIL, and case↔mutant closure in both directions. A patch
+   that does not apply fails the job; it is never treated as a skipped mutant.
+   The case list is read out of the battery source, never hardcoded here — a
+   count in this document would go stale the first time a case is added, which
+   is exactly what happened to the "five cases" this sentence used to name.
+
+```mermaid
+flowchart LR
+    T[Sandbox-path PR or nightly] --> C[Copy clean tree]
+    C --> M[Apply one M1-M9 patch]
+    M --> B[Build and run every declared case]
+    B --> G[Emit mutant x case grid]
+    G --> A{M0 green, declared cells red,<br/>closure both ways?}
+    A -->|yes| P[Gate passes]
+    A -->|no| F[Gate fails with exact cell]
+```
+
+**Status after Task 26.** The contract tripwires are 10/10 and M0 is 5/5.
+The first host mutation run found the intended M4 discrepancy and one further
+survivor: both M4 and M5 leave `strict_listener_denied` green. M4 is redundant
+with Landlock's independent TCP denial. M5 grants only `DEFAULT_GIT_PORTS`,
+while the case deliberately binds an ephemeral port, so that observation also
+remains denied. The case's declaration was corrected from `[M4, M5]` to the
+observed `[M2]`; M2 removes Landlock and does kill it. M4 and M5 remain in the
+committed mutant set and are not falsely reported as killed. Consequently R9
+is intentionally red on mutant-to-case closure for M4 and M5 until an
+authorized follow-up widens the battery with observations those mechanisms
+alone can kill. The matrix is doing its job: it names the missing evidence
+instead of manufacturing a green gate.
+
+**Status after tonight's AF_UNIX Dword-width work (M8, M9).** `ci/mutants/`
+now also has `M8-remove-af-unix-socket-rule.patch` and
+`M9-widen-af-unix-comparison.patch`, and `escape_suite.rs` gained the two
+cases that kill them, `high_bit_af_unix_denied` and `high_bit_io_uring_denied`
+(verified: both `id:` literals and both `#[test]` fns exist in
+`crates/git-vista-server/src/sandbox/escape_suite.rs`). **Neither case name is
+in `docs/sandbox/escape-census.txt` yet** — that file still lists only the
+nine older ids. Per R5/step 3 of the sandbox gate above (case-id set must
+equal the census in **both directions**), the gate would currently fail
+closed on this exact mismatch if run: not a false green, but not yet a clean
+run either. Fixing the census is a `docs/sandbox/*` edit, outside this
+document's ownership — flagged here, not fixed here.
+
+---
+
 **Signed:** thomas2010 · 2026-07-28T01:37:53-04:00
+
+**Signed:** thomas2010 · 2026-07-29T11:30:00-04:00 (Part 3 addition, Task 25)
+
+**Signed:** claude_2010 · 2026-07-29 (Task 26 mutation-matrix evidence)
+
+**Signed:** claude_2010 · 2026-07-30 (M8/M9 census-gap note)
