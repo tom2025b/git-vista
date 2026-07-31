@@ -197,6 +197,10 @@ struct Args {
     rw: Vec<PathBuf>,
     ro: Vec<PathBuf>,
     excludes: Vec<PathBuf>,
+    /// #188: named, single-file exceptions to an `--exclude` above. See
+    /// `add_carveout_rule` for the mechanism and why it is a separate flag
+    /// rather than a `--ro` entry.
+    ro_carveouts: Vec<PathBuf>,
     net_ports: Vec<u16>,
     net_allow: Option<bool>,
     hooks_blocked_dir: Option<PathBuf>,
@@ -231,6 +235,12 @@ fn parse() -> Args {
             // A relative exclude silently matches nothing, and a secret set
             // that matches nothing is an empty secret set. Reject it loudly.
             "--exclude" => a.excludes.push(absolute(&value("--exclude"), "--exclude")),
+            // #188: distinct from `--ro` on purpose, so a reviewer scanning an
+            // argv can see immediately which grants are the sanctioned
+            // exception to an `--exclude` rather than an ordinary tree grant.
+            "--ro-carveout" => a
+                .ro_carveouts
+                .push(absolute(&value("--ro-carveout"), "--ro-carveout")),
             "--net-port" => {
                 let v = value("--net-port");
                 a.net_ports.push(
