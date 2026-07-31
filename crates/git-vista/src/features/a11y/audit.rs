@@ -338,6 +338,49 @@ fn commit_dot_hit_target_is_thirty_pixels_at_default_zoom() {
     );
 }
 
+// ── Keyboard reachability of the commit rows (M1.13) ──────────────────────────
+//
+// `core`/`focus`'s tests prove the *state machine* is correct in isolation. This
+// tripwire proves the render code actually wires that state machine to the DOM
+// element it is supposed to govern — the failure mode a pure-state-machine test
+// suite cannot see on its own: `GraphFocus` could be built, tested, imported, and
+// then never actually attached to `.node-hit`, and every test above would still
+// be green while the graph stayed exactly as pointer-only as it started.
+
+/// The commit-row hit circle carries what a roving-tabindex control needs: a
+/// reactive `tabindex`, `role="button"`, an accessible name, and the keydown
+/// handling that drives `GraphFocus`. Checked as source text — the only thing
+/// available without a browser — so it is honest about what it proves: that the
+/// wiring is present in the file the wasm build actually compiles, not that a
+/// screen reader announces it or that `.focus()` succeeds on a real device.
+#[test]
+fn the_commit_row_hit_circle_is_keyboard_reachable() {
+    assert!(
+        RENDER_NODES.contains("role=\"button\""),
+        "render/nodes.rs's `.node-hit` circle has no `role=\"button\"` — without it \
+         a screen reader has no reason to treat the commit dot as interactive at all \
+         (#65)"
+    );
+    assert!(
+        RENDER_NODES.contains("tabindex=tabindex"),
+        "render/nodes.rs's `.node-hit` circle is not wired to a reactive `tabindex` — \
+         the roving-tabindex pattern needs exactly one row's hit circle in the tab \
+         order at a time, and a static/absent tabindex can't do that (#65)"
+    );
+    assert!(
+        RENDER_NODES.contains("aria-label=title"),
+        "render/nodes.rs's `.node-hit` circle carries no accessible name — a \
+         keyboard/Switch Control user landing on it would hear nothing to say which \
+         commit it is (#65)"
+    );
+    assert!(
+        RENDER_NODES.contains("on:keydown=on_node_keydown"),
+        "render/nodes.rs's `.node-hit` circle no longer wires `gestures::on_node_keydown` \
+         — without it, focusing the circle does nothing: arrow keys, Home/End, and \
+         Enter/Space all fall through to the browser default (#65)"
+    );
+}
+
 /// `core::NODE_HIT_PADDING` mirrors a literal in two wasm-only modules that a host test
 /// cannot link. This is what keeps the mirror from rotting: change `+ 8` in either
 /// render module and the arithmetic above becomes a lie, and this fails.
