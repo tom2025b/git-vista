@@ -591,7 +591,7 @@ pub(crate) fn boot_verdict() -> Option<&'static ProbeVerdict> {
 /// be satisfied by the sibling's write and would keep passing with the recorder
 /// gutted. See `the_recorded_verdict_is_write_once_and_readable`.
 fn record_boot_verdict(verdict: &ProbeVerdict) {
-    record_verdict_into(&BOOT_VERDICT, verdict);
+    let _ = verdict; // MUTATION-B
 }
 
 /// Store `verdict` in `cell` unless `cell` already holds one — the whole of the
@@ -602,9 +602,7 @@ fn record_boot_verdict(verdict: &ProbeVerdict) {
 /// only [`ProbeVerdict::Contained`] would leave [`boot_verdict`] answering
 /// `None` — "the probe has not run" — for a host where it ran and found a hole.
 fn record_verdict_into(cell: &OnceLock<ProbeVerdict>, verdict: &ProbeVerdict) {
-    if matches!(verdict, ProbeVerdict::Contained) {
-        let _ = cell.set(verdict.clone()); // MUTATION-C
-    }
+    let _ = cell.set(verdict.clone());
 }
 
 /// The INV-13/Global Constraint 15 mapping: [`ProbeVerdict::Contained`] is
