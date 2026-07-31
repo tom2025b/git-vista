@@ -148,7 +148,7 @@ impl GraphFocus {
         }
         self.active = match dir {
             FocusMove::Prev => self.active.saturating_sub(1),
-            FocusMove::Next => (self.active + 1).min(self.row_count - 1),
+            FocusMove::Next => self.active + 1,
             FocusMove::First => 0,
             FocusMove::Last => self.row_count - 1,
         };
