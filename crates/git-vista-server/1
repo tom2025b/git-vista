@@ -1,0 +1,4 @@
+GV-ESCAPE case=af_unix_socket_denied result=contained class=containment
+GV-ESCAPE case=cgroup_tree_denied result=contained class=containment
+GV-ESCAPE case=af_unix_socketpair_denied result=contained class=containment
+GV-ESCAPE case=high_bit_af_unix_denied result=contained class=containment
