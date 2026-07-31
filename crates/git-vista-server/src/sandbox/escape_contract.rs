@@ -1492,12 +1492,13 @@ fn r3_every_case_declares_and_asserts_a_paired_positive() {
 /// call" — the distinction that makes `r3_every_case_declares_and_asserts_a_paired_positive`
 /// mean anything. Written by hand rather than pulled in as a parser dependency:
 /// the battery deliberately reads its own source with no build-time deps.
-fn call_args_in<'a>(src: &'a str, name: &str) -> Vec<&'a str> {
+fn call_args_in<'a>(src: &'a str, name: &str) -> Vec<(usize, &'a str)> {
     let mut out = Vec::new();
     let marker = format!("{name}(");
     let mut from = 0usize;
     while let Some(rel) = src[from..].find(&marker) {
-        let open = from + rel + marker.len();
+        let at = from + rel;
+        let open = at + marker.len();
         let mut depth = 1usize;
         for (i, ch) in src[open..].char_indices() {
             match ch {
@@ -1505,7 +1506,7 @@ fn call_args_in<'a>(src: &'a str, name: &str) -> Vec<&'a str> {
                 ')' => {
                     depth -= 1;
                     if depth == 0 {
-                        out.push(&src[open..open + i]);
+                        out.push((at, &src[open..open + i]));
                         break;
                     }
                 }
