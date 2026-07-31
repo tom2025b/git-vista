@@ -477,6 +477,43 @@ stateDiagram-v2
   justified specifically because GitHub-hosted runners are single-job,
   ephemeral VMs with no "leaves the box weaker" concern. It is landed in
   `.github/workflows/ci.yml`.
+
+  **Addendum, 2026-07-31 — that sentence was true of one job and silently
+  untrue of two others, and CI's first real run is what exposed it.** The
+  preflight originally lived inside the `sandbox` job alone. But the decision
+  recorded in this very ADR — routing *every* production git spawn through the
+  chokepoint — meant the `core` and `contract` jobs began constructing
+  `Tier::Strict` too, on runners that had none of the setup. Because
+  `CapabilityAbsent` is deliberately a hard refusal rather than a downgrade
+  (ADR 0029), it cascaded: **111 test failures in `core` and an outright
+  failure in `contract`** on run `30629854802`, in tests whose names have
+  nothing to do with the sandbox. Nobody could see the gap until the job ran,
+  because until that run the sandbox CI job had never executed at all (#203).
+
+  Two further host prerequisites surfaced behind it, each of the same shape —
+  a file the developer's box has and a fresh `/home/runner` does not:
+  `~/.gitconfig`, which the deliberately identity-free fixtures resolve their
+  author through, and `~/.ssh/known_hosts`, which `secret_read_denied` reads as
+  its SECRET under `expect_baseline: Errno(0)`. Each surfaced only once the
+  previous one was fixed, since the earlier failure aborted the run first.
+
+  The provisioning now lives in one composite action,
+  `.github/actions/host-sandbox-setup`, referenced by `core`, `contract` and
+  `sandbox` alike — because the defect was drift between jobs meant to share
+  one security-relevant preflight, and three hand-maintained copies would drift
+  again. Two structural guards keep it honest: the Rust tripwire
+  `every_ci_job_that_runs_this_crates_tests_provisions_the_host_capabilities_they_need`
+  asserts set *equality* between the jobs that run this crate's tests and the
+  jobs that reference the action (a job added to either set without the other
+  is a red build), and `ci_preflight_host_meets_the_declared_minimum` now
+  measures the `$HOME` prerequisites alongside Landlock, bwrap, userns,
+  io_uring and `cc`, so an unprovisioned runner is named at the preflight
+  rather than misdiagnosed as a containment failure three phases later.
+
+  The generalisable lesson, recorded because it cost a full CI cycle each time:
+  **centralising an execution path silently widens the set of environments that
+  must satisfy that path's preconditions.** The chokepoint decision was right;
+  what was missed is that it turned every test-running job into a sandbox host.
 - **INV-15 disclosure (issue #202/Task 16) — landed at the wire, and both UI
   halves have caught up (#208).** `HookPolicy`'s four variants,
   `RepositoryDescriptor.hook_policy: Option<HookPolicy>`, and the wiring that
