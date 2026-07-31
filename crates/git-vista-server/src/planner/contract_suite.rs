@@ -402,15 +402,103 @@ async fn merge_branch_executes_through_the_pipeline() {
     assert_eq!(out(&repo, &["status", "--porcelain"]), "");
 }
 
+/// Kills the fixture `git daemon` even when an assertion panics first — a
+/// leaked daemon would squat port 9418 and poison every later run.
+///
+/// It must kill the **process group**, not the child: `/usr/bin/git` forks
+/// `git-daemon` and exits (a live daemon shows PPID 1), so the `Child` this
+/// holds is only the short-lived wrapper and `Child::kill` would strike a
+/// corpse while the real daemon lives on. The spawn below puts the wrapper in
+/// its own group (`process_group(0)`), the daemon inherits it, and the
+/// wrapper's un-reaped zombie keeps the group id from being recycled until the
+/// `wait` here releases it.
+struct DaemonGuard(std::process::Child);
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+        }
+        let _ = self.0.wait();
+    }
+}
+
 #[tokio::test]
 async fn push_branch_executes_through_the_pipeline() {
     let (dir, repo) = seeded_repo();
     let remote = dir.path().join("remote.git");
     std::fs::create_dir_all(&remote).unwrap();
     run(&remote, &["init", "-q", "--bare"]);
+
+    // The push crosses a real network transport, not the filesystem. Under the
+    // sandbox (Task 6) a filesystem-path remote is dead twice over: a path
+    // outside the grant is denied outright, and even a *granted* path fails,
+    // because receive-pack's quarantine migration is a cross-directory rename
+    // and the shim deliberately withholds `LANDLOCK_ACCESS_FS_REFER` (the
+    // kernel then reports EXDEV, git says "unable to migrate objects"). That
+    // is the intended posture — production remotes are URLs, where
+    // receive-pack runs on the far side, outside the pusher's sandbox. So this
+    // fixture serves the bare remote over git:// on loopback: 9418 is in
+    // `DEFAULT_GIT_PORTS`, the Network tier's Landlock connect grant covers
+    // it, and the daemon (spawned unsandboxed by the test) does the receiving.
+    //
+    // That one port is contended, and not only by other processes. It is the
+    // only unprivileged entry in `DEFAULT_GIT_PORTS`, so it is the only port a
+    // Network-tier Landlock connect grant covers, which means the sandbox
+    // escape battery in this same test binary cannot move off it either:
+    // `escape_suite::strict_listener_denied` needs a listener there and
+    // `strict_tcp_bind_denied` needs it unbound. `crate::test_ports` is the
+    // arbiter — a process-wide claim every holder takes, released only once its
+    // listener or daemon is really gone. Acquiring it here both excludes those
+    // tests and waits out a *stale* daemon leaked by a run that was SIGKILLed
+    // before the guard's `Drop` (such a daemon would otherwise pass the
+    // readiness probe below while serving a dead base path, and every push would
+    // fail with a baffling "connection reset"). The claim is taken before the
+    // daemon is spawned and dropped at the end of the test, after `DaemonGuard`
+    // has killed it.
+    let _port_claim = crate::test_ports::PortClaim::acquire();
+    // Read from the claim, never re-typed: a daemon on a different port than the
+    // one claimed would reintroduce exactly the collision the claim prevents.
+    let port = crate::test_ports::PortClaim::PORT;
+    // `process_group(0)` — see `DaemonGuard`. Stdio all detached: an inherited
+    // stdout pipe would keep any harness capturing this test's output alive
+    // for as long as the daemon lives, turning a daemon leak into a hang.
+    let daemon = {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("git")
+            .args([
+                "daemon",
+                "--reuseaddr",
+                "--listen=127.0.0.1",
+                &format!("--port={port}"),
+                "--export-all",
+                "--enable=receive-pack",
+                &format!("--base-path={}", dir.path().display()),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("git daemon spawns")
+    };
+    let _daemon = DaemonGuard(daemon);
+    let ready = (0..50).any(|_| {
+        std::net::TcpStream::connect(("127.0.0.1", port))
+            .map(|_| true)
+            .unwrap_or_else(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            })
+    });
+    assert!(ready, "git daemon never came up on 127.0.0.1:{port}");
+
     run(
         &repo,
-        &["remote", "add", "origin", &remote.display().to_string()],
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("git://127.0.0.1:{port}/remote.git"),
+        ],
     );
     let (status, body) = pipeline(
         &repo,

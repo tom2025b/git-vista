@@ -714,6 +714,30 @@ pub fn show_fixed_loading_overlay(page_load: &PageLoadState) -> bool {
     matches!(page_load, PageLoadState::Loading { .. })
 }
 
+/// The Print Graph topbar button's label and tooltip for a given
+/// `history_complete` state (#217).
+///
+/// Before this, only the `title` attribute changed when the button disabled
+/// itself — CSS dimming plus a native tooltip that never surfaces on tap (the
+/// reported iPad case), so the button read as silently, unexplainably broken.
+/// The label now carries the same reason the tooltip does, so it is visible
+/// without hover/long-press. Pure so the two states are testable without a DOM:
+/// the view (wasm-only, `app/mod.rs`) supplies `complete` and renders both
+/// strings as-is.
+pub fn print_button_copy(complete: bool) -> (&'static str, &'static str) {
+    if complete {
+        (
+            "Print Graph",
+            "A clean, printable view of the whole graph — print it or save it as a PDF",
+        )
+    } else {
+        (
+            "Print Graph (loading history…)",
+            "Load all history before printing.",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1339,5 +1363,29 @@ mod tests {
             message: "400 Bad Request".into(),
             retry: PageRetry::Reseed,
         }));
+    }
+
+    // #217: the disabled Print Graph button's reason must be visible in the
+    // label itself, not only the `title` attribute — native tooltips don't
+    // surface on tap. Reverting `print_button_copy` to always return the plain
+    // "Print Graph" label (the pre-fix behaviour) fails the first assertion
+    // here, since the two labels would no longer differ.
+    #[test]
+    fn print_button_copy_surfaces_a_visible_reason_when_disabled() {
+        let (disabled_label, disabled_title) = print_button_copy(false);
+        let (ready_label, _) = print_button_copy(true);
+        assert_ne!(
+            disabled_label, ready_label,
+            "the disabled reason must show up in the label text — a title-only \
+             change never surfaces on a touch device"
+        );
+        assert_eq!(disabled_title, "Load all history before printing.");
+    }
+
+    #[test]
+    fn print_button_copy_is_plain_when_history_is_complete() {
+        let (label, title) = print_button_copy(true);
+        assert_eq!(label, "Print Graph");
+        assert!(!title.is_empty());
     }
 }

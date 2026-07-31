@@ -110,42 +110,133 @@ pub struct SessionRequest {
     pub token: String,
 }
 
-/// Whether repository hooks may run when this server spawns a git write
-/// (`SECURITY_MODEL.md:236`, #66/M1.13a, ADR 0025). Not a `bool`: a closed,
-/// named vocabulary can grow a third state later (e.g. an explicit allowlist
-/// of specific hooks) without a breaking wire-format change — the same
-/// reasoning this project already applies to [`crate::GitOperation`] (ADR
-/// 0015) rather than scattering booleans through the write path.
+/// The sandbox policy a repository's hooks actually run under
+/// (`SECURITY_MODEL.md:236`, #66 — declared by ADR 0025, made real by M1.13b's
+/// tier dispatch). Not a `bool`, for ADR 0015's reason: a closed, *named*
+/// vocabulary can grow without a breaking wire change, which is exactly what
+/// happened here.
 ///
-/// **This is a disclosed value, not yet an enforced one.** M1.13a (this ADR)
-/// is policy-and-disclosure only; no code path in `git-vista-server` or
-/// `git-vista-git` suppresses hooks today, so a session reporting
-/// `Restricted` currently still has its hooks run exactly like `Allow` would
-/// — the server simply hasn't been told to enforce it yet. Actual
-/// suppression (`core.hooksPath` override or equivalent, wired into the
-/// spawn chokepoint) is M1.13b, a separate, larger, not-yet-built piece. See
-/// ADR 0025 for the full reasoning; this comment exists so the gap is
-/// visible from the type itself, not only from a document a reader might
-/// not open.
+/// # These four names are the server's own `sandbox::Tier`, plus one
+///
+/// [`Strict`](Self::Strict), [`Network`](Self::Network) and
+/// [`Unsandboxed`](Self::Unsandboxed) are the three tiers
+/// `git-vista-server`'s `sandbox::tier_for` dispatches to, reported on the
+/// wire under the same names so the disclosed value and the enforced value
+/// cannot drift into two vocabularies. [`Blocked`](Self::Blocked) is the
+/// fourth: hooks suppressed outright.
+///
+/// # What changed from ADR 0025, and why it is not additive
+///
+/// ADR 0025 shipped two variants, `allow` / `restricted`, *session*-scoped and
+/// **declared, not enforced** — no code read them. INV-15 needs a per-repository
+/// value that names the tier the git-spawn chokepoint really uses, and the
+/// banner polarity inverts with it (ADR 0025 flew the banner on `allow`; INV-15
+/// flies it on anything that is **not** `strict` — see [`requires_banner`]).
+/// The old wire strings still *deserialize* (`restricted` → `Strict`, `allow` →
+/// `Unsandboxed`) so a stored older value is not a hard error, but they are
+/// never emitted again. This is a value-domain change, not an additive field:
+/// see the note in `dto_golden.rs` when its fixture is regenerated.
+///
+/// [`requires_banner`]: Self::requires_banner
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookPolicy {
-    /// Repository hooks run normally.
-    Allow,
-    /// Repository hooks are restricted — **declared, not yet enforced**; see
-    /// this type's own doc comment.
-    Restricted,
+    /// Landlock + seccomp inside a bwrap pid/net/ipc/uts/cgroup namespace
+    /// (`sandbox::Tier::Strict`). Hooks run, and they reach no network and no
+    /// unix socket.
+    ///
+    /// **This is not "confined to the repository."** The same policy also
+    /// grants read-only system trees, `$HOME` read-only minus the secret
+    /// exclusion set, and a private `/dev` read-write. What it guarantees is
+    /// narrower and stated in the server's own `sandbox` module docs: nothing
+    /// is *written* outside the declared read-write trees, and nothing is
+    /// *read* outside the declared read-only grants minus `secret_excludes`.
+    /// The banner is silent for this one variant only, so overstating it here
+    /// would be the one place a reader could be misled.
+    #[serde(alias = "restricted")]
+    Strict,
+    /// Landlock + seccomp with no network namespace (`sandbox::Tier::Network`)
+    /// — the only tier under which `git push`/`fetch`/`clone` can work, because
+    /// a network namespace breaks DNS resolution. Hooks run with `AF_INET`
+    /// reachable, which is why this flies the banner even though it is
+    /// sandboxed.
+    Network,
+    /// No sandbox at all (`sandbox::Tier::Unsandboxed`). Reachable only through
+    /// explicit, persisted, per-repository operator trust
+    /// (`sandbox::trust::grant`), and it flies a permanent banner.
+    ///
+    /// ADR 0025's `allow` deserializes here, and that is the truthful reading
+    /// rather than a convenient one: when M1.13a emitted `allow` there was no
+    /// sandbox anywhere in the server, so hooks really did run unconfined.
+    #[serde(alias = "allow")]
+    Unsandboxed,
+    /// Hooks do not run at all — `core.hooksPath` pointed at a server-owned
+    /// empty directory.
+    ///
+    /// **No production policy constructor yields this today**, and that is
+    /// checked, not merely asserted: `sandbox::escape_contract`'s R8 scan fails
+    /// if any production `Policy` literal in the server sets a blocked hook
+    /// mode. The variant exists because [`default`](Self::default) needs a
+    /// value meaning "hooks are not known to be running," and because ADR 0029
+    /// rules out the one mapping that would otherwise produce it: a host that
+    /// cannot supply the strict tier must **refuse the operation**, not run it
+    /// with hooks suppressed.
+    Blocked,
+}
+
+impl HookPolicy {
+    /// INV-15: a persistent, non-dismissible banner is required for anything
+    /// other than [`Strict`](Self::Strict).
+    ///
+    /// The polarity is inverted from ADR 0025 on purpose. ADR 0025's `Allow`
+    /// meant "hooks run unrestricted," so the banner marked the *permissive*
+    /// case; these four name tiers, so the banner marks everything that is not
+    /// the fullest isolation — including [`Blocked`](Self::Blocked), because
+    /// "your hooks silently did not run" is a surprise a user must be told
+    /// about just as much as "your hooks ran unsandboxed."
+    ///
+    /// Written as `!matches!(self, Strict)` rather than as an exhaustive match
+    /// so a variant added later flies the banner by default. That is the
+    /// fail-safe direction: a new tier no one has written banner text for
+    /// over-warns instead of going silent.
+    pub fn requires_banner(self) -> bool {
+        !matches!(self, HookPolicy::Strict)
+    }
 }
 
 impl Default for HookPolicy {
-    /// Fail-closed: if this field is ever missing on the wire (an older
-    /// server response deserialized by a newer client — see `SessionInfo`'s
-    /// `#[serde(default)]`), assume the more conservative value rather than
-    /// the more permissive one.
+    /// Fail-closed, and one notch stricter than ADR 0025's `Restricted`: if the
+    /// field is missing on the wire (an older server's response read by a newer
+    /// client, via `SessionInfo`'s / `RepositoryDescriptor`'s
+    /// `#[serde(default)]`), assume hooks are not running rather than assume
+    /// they are running under a guarantee nothing measured.
+    ///
+    /// [`Strict`](Self::Strict) would be the wrong default precisely because it
+    /// is the one variant that claims a guarantee *and* silences the banner —
+    /// defaulting to it would turn an absent field into an unearned green
+    /// light.
     fn default() -> Self {
-        HookPolicy::Restricted
+        HookPolicy::Blocked
     }
 }
+
+// The `#[doc(hidden)]` transition constants `HookPolicy::{Allow, Restricted}`
+// that stood here — a Rust-level migration shim so call sites written against
+// ADR 0025's two-variant vocabulary kept compiling while the enum widened —
+// are **deleted** (#202). Every call site now spells a tier name directly:
+// `git-vista-server/src/security.rs`, `git-vista/src/features/session/core.rs`
+// and `git-vista-protocol/tests/dto_golden.rs` were the three named holdouts,
+// and all three were migrated before the constants went.
+//
+// The `#[serde(alias = "restricted")]` / `#[serde(alias = "allow")]` on the
+// enum above **stay**, deliberately, and their deletion is not a follow-up.
+// The constants were a *source-compatibility* shim with no wire meaning; the
+// aliases are a *wire-compatibility* property — an `allow`/`restricted` string
+// written by an M1.13a build still parses instead of hard-erroring — pinned by
+// `adr_0025_wire_strings_still_deserialize_and_never_serialize` below. Dropping
+// them would narrow what this versioned contract accepts, which is a protocol
+// change and not something a cleanup task gets to do as a side effect. Nothing
+// re-emits those strings; the test proves that half too.
 
 /// Response of `GET`/`POST /api/session` (M1.04): whether the caller now has a
 /// live session and, when it does, the CSRF token to echo in the
@@ -247,6 +338,51 @@ pub struct RepositoryDescriptor {
     /// no usable remote. Optional on the wire (M1.02 contract rule).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub remote_web_url: Option<String>,
+    /// INV-15's **per-repository** hook-policy disclosure (#66 M1.13b, #202):
+    /// the sandbox tier a *local* operation on this repository actually runs
+    /// under, as computed by the server's own tier dispatch. Additive optional
+    /// field (M1.02 rule, same `skip_serializing_if`/`default` shape as
+    /// [`path`](Self::path) and [`remote_web_url`](Self::remote_web_url)), so an
+    /// older client that has never heard of it keeps parsing this object.
+    ///
+    /// # `None` means "not disclosed", and it is never a guarantee
+    ///
+    /// Three different situations all arrive as `None`, and a client must treat
+    /// every one of them the same way — as *unknown*, which
+    /// [`hook_policy_requires_banner`](Self::hook_policy_requires_banner) folds
+    /// to "fly the banner":
+    ///
+    /// * the response came from a server build predating this field;
+    /// * the server refuses operations on this repository altogether, because
+    ///   the host cannot supply the tier they require (INV-13 / ADR 0029 —
+    ///   there is deliberately **no** [`HookPolicy`] variant meaning "refused",
+    ///   since inventing one would be the degrade-and-block-hooks posture that
+    ///   ADR rejects by name);
+    /// * the server had not yet established a sandbox verdict when it built
+    ///   this descriptor.
+    ///
+    /// Note what this value is scoped to: a **local** operation. A `push` on the
+    /// same repository transiently runs under [`HookPolicy::Network`], which a
+    /// per-repository field cannot express — see the server's
+    /// `sandbox::hook_policy` module docs for why per-operation disclosure needs
+    /// a call site that knows the operation.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hook_policy: Option<HookPolicy>,
+}
+
+impl RepositoryDescriptor {
+    /// Whether INV-15's persistent banner must be shown for this repository.
+    ///
+    /// Fail-safe on both axes: an *absent* policy over-warns (see
+    /// [`hook_policy`](Self::hook_policy) — "not disclosed" is not a green
+    /// light), and a *present* one defers to
+    /// [`HookPolicy::requires_banner`], which itself over-warns for any variant
+    /// that is not [`Strict`](HookPolicy::Strict). There is no input to this
+    /// function that silences the banner without the server having positively
+    /// disclosed the one tier that earns silence.
+    pub fn hook_policy_requires_banner(&self) -> bool {
+        self.hook_policy.is_none_or(HookPolicy::requires_banner)
+    }
 }
 
 /// Validate a URL a user pasted to clone, before the server hands it to
@@ -410,17 +546,91 @@ mod tests {
             authenticated: true,
             csrf: Some("csrf-token".into()),
             via_lan: false,
-            hook_policy: HookPolicy::Allow,
+            hook_policy: HookPolicy::Unsandboxed,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert_eq!(serde_json::from_str::<SessionInfo>(&json).unwrap(), info);
         // csrf defaults to None when absent (the unauthenticated response omits it);
-        // hook_policy fails closed to Restricted per its own Default impl, the same
+        // hook_policy fails closed to `Blocked` per its own Default impl, the same
         // "an older/partial response still deserializes, safely" contract via_lan
         // already established.
         let back: SessionInfo = serde_json::from_str(r#"{"authenticated":false}"#).unwrap();
         assert_eq!(back.csrf, None);
-        assert_eq!(back.hook_policy, HookPolicy::Restricted);
+        assert_eq!(back.hook_policy, HookPolicy::Blocked);
+        assert!(
+            back.hook_policy.requires_banner(),
+            "an absent hook_policy must not silence the banner"
+        );
+    }
+
+    /// INV-15's wire half. Every variant is pinned to the exact string the
+    /// server's own `sandbox::Tier` names it by, in both directions, so a
+    /// rename on either side of the wire is a failing test rather than a
+    /// silently-misread policy.
+    #[test]
+    fn hook_policy_wire_names_match_the_sandbox_tier_names() {
+        for (variant, wire) in [
+            (HookPolicy::Strict, "strict"),
+            (HookPolicy::Network, "network"),
+            (HookPolicy::Unsandboxed, "unsandboxed"),
+            (HookPolicy::Blocked, "blocked"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&variant).unwrap(),
+                format!("\"{wire}\""),
+                "{variant:?} must serialize as {wire}"
+            );
+            assert_eq!(
+                serde_json::from_str::<HookPolicy>(&format!("\"{wire}\"")).unwrap(),
+                variant
+            );
+        }
+        // An unknown policy name is a hard error, never a silent default —
+        // `#[serde(default)]` governs an *absent* field, not a garbage one.
+        assert!(serde_json::from_str::<HookPolicy>("\"contained\"").is_err());
+    }
+
+    /// ADR 0025's two shipped wire strings still deserialize (a stored older
+    /// value must not be a hard error) and map to the tier that was actually
+    /// in force when they were written — but they are never emitted again.
+    #[test]
+    fn adr_0025_wire_strings_still_deserialize_and_never_serialize() {
+        assert_eq!(
+            serde_json::from_str::<HookPolicy>("\"restricted\"").unwrap(),
+            HookPolicy::Strict
+        );
+        assert_eq!(
+            serde_json::from_str::<HookPolicy>("\"allow\"").unwrap(),
+            HookPolicy::Unsandboxed
+        );
+        for v in [
+            HookPolicy::Strict,
+            HookPolicy::Network,
+            HookPolicy::Unsandboxed,
+            HookPolicy::Blocked,
+        ] {
+            let json = serde_json::to_string(&v).unwrap();
+            assert!(
+                json != "\"allow\"" && json != "\"restricted\"",
+                "{v:?} re-emitted a retired ADR 0025 wire string: {json}"
+            );
+        }
+    }
+
+    /// INV-15's banner half: the banner is silent for exactly one variant.
+    /// Written as a full enumeration rather than by calling `requires_banner`'s
+    /// own `!matches!`, so this would still fail if the implementation were
+    /// inverted.
+    #[test]
+    fn only_strict_silences_the_banner() {
+        assert!(!HookPolicy::Strict.requires_banner());
+        for p in [
+            HookPolicy::Network,
+            HookPolicy::Unsandboxed,
+            HookPolicy::Blocked,
+        ] {
+            assert!(p.requires_banner(), "{p:?} must fly the banner");
+        }
     }
 
     #[test]
@@ -445,6 +655,7 @@ mod tests {
             read_only: false,
             path: None,
             remote_web_url: None,
+            hook_policy: None,
         };
         let json = serde_json::to_string(&d).unwrap();
         // A `None` path is skipped entirely — the wire form never carries the key,
@@ -458,10 +669,81 @@ mod tests {
             !json.contains("remote_web_url"),
             "remote_web_url must be omitted when None: {json}"
         );
+        // And for INV-15's per-repository disclosure: an undisclosed policy is
+        // an *absent key*, never `"hook_policy": null` and — the part that
+        // matters — never a fabricated value. An older client's `"hook_policy"
+        // in obj` check must see exactly what a pre-#202 server sent.
+        assert!(
+            !json.contains("hook_policy"),
+            "hook_policy must be omitted when None: {json}"
+        );
         assert_eq!(
             serde_json::from_str::<RepositoryDescriptor>(&json).unwrap(),
             d
         );
+    }
+
+    /// INV-15's descriptor half: a disclosed policy reaches the wire under the
+    /// tier name, and an *undisclosed* one is unknown rather than green.
+    ///
+    /// The banner assertions are the point. `None` is what an older server, a
+    /// pre-verdict descriptor, and an ADR-0029 refusal all look like, and none
+    /// of the three is permitted to silence the banner — that would be the
+    /// "computed but never disclosed" failure INV-15 exists to prevent, wearing
+    /// an absent field instead of a wrong one.
+    #[test]
+    fn descriptor_hook_policy_reaches_the_wire_and_absence_never_silences_the_banner() {
+        let base = RepositoryDescriptor {
+            repository: "11111111-1111-5111-8111-111111111111".into(),
+            worktree: "22222222-2222-5222-8222-222222222222".into(),
+            name: "my-repo".into(),
+            kind: RepositoryKind::MainWorktree,
+            read_only: false,
+            path: None,
+            remote_web_url: None,
+            hook_policy: None,
+        };
+
+        assert!(
+            base.hook_policy_requires_banner(),
+            "an undisclosed policy must fly the banner, not silence it"
+        );
+
+        for (policy, wire, banner) in [
+            (HookPolicy::Strict, "strict", false),
+            (HookPolicy::Network, "network", true),
+            (HookPolicy::Unsandboxed, "unsandboxed", true),
+            (HookPolicy::Blocked, "blocked", true),
+        ] {
+            let d = RepositoryDescriptor {
+                hook_policy: Some(policy),
+                ..base.clone()
+            };
+            let json = serde_json::to_string(&d).unwrap();
+            assert!(
+                json.contains(&format!("\"hook_policy\":\"{wire}\"")),
+                "{policy:?} must reach the wire as {wire}: {json}"
+            );
+            assert_eq!(
+                serde_json::from_str::<RepositoryDescriptor>(&json).unwrap(),
+                d
+            );
+            assert_eq!(
+                d.hook_policy_requires_banner(),
+                banner,
+                "{policy:?} banner polarity"
+            );
+        }
+
+        // An older server's object — no key at all — still deserializes, and
+        // lands on the unknown/banner-flying side rather than defaulting into a
+        // policy nobody measured.
+        let older: RepositoryDescriptor = serde_json::from_str(
+            r#"{"repository":"r","worktree":"w","name":"n","kind":"main_worktree","read_only":false}"#,
+        )
+        .expect("a pre-#202 descriptor must still parse");
+        assert_eq!(older.hook_policy, None);
+        assert!(older.hook_policy_requires_banner());
     }
 
     #[test]
