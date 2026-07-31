@@ -696,7 +696,7 @@ fn enumerate(ruleset: i32, dir: &Path, root: &Path, access: u64, excludes: &[Pat
 /// symlink under `$HOME` defeats every exclude," which is what this closes
 /// unconditionally.
 ///
-/// # Failure here is fatal, not a skip
+/// # Fatal, not a skip — with exactly one tolerated exception
 ///
 /// An exclude that cannot be resolved must never quietly become "does not
 /// match anything" — that is the exact fail-open shape `enumerate`'s own
@@ -705,20 +705,39 @@ fn enumerate(ruleset: i32, dir: &Path, root: &Path, access: u64, excludes: &[Pat
 /// letting it happen to the *secret list itself* would be worse: the operator
 /// asked for `~/.ssh` withheld, and a policy that cannot prove it withheld it
 /// must not proceed as though it had.
+///
+/// The one exception is `NotFound`, and it is the same exception `grant_one`
+/// already carries for `--ro`/`--rw` entries (`AddRuleError::Unopenable`,
+/// "the one tolerated case"). `DEFAULT_SECRET_EXCLUDES` names fifteen
+/// candidate paths — `.aws`, `.docker`, `.kube`, `.gnupg`, `.mozilla` and more
+/// — and no real host has all of them: measured on this one, eight of fifteen
+/// are simply absent. An absent exclude is not a resolution *failure*, it is a
+/// fact ("this secret does not exist here"), and it is safe to drop: nothing
+/// `enumerate` walks can ever canonicalise to a target that is not on disk, so
+/// a dropped absent exclude matches exactly as much — nothing — resolved as
+/// it would unresolved. Treating `NotFound` as fatal was tried first and
+/// measured wrong immediately: it turned "this host doesn't happen to have a
+/// `~/.kube`" into "refuse to run git at all," failing closed against a
+/// condition that was never a security question to begin with. Every *other*
+/// error — permission denied resolving an ancestor component, a symlink loop,
+/// a component that is not a directory where one was expected — means this
+/// process cannot prove what the exclude names, which is the real fail-open
+/// risk, and stays fatal.
 fn resolve_excludes(raw: &[PathBuf]) -> Vec<PathBuf> {
     raw.iter()
-        .map(|e| {
-            std::fs::canonicalize(e).unwrap_or_else(|err| {
-                die(
-                    EXIT_LANDLOCK,
-                    &format!(
-                        "cannot resolve --exclude `{}`: {err}. An exclude that cannot be \
-                         canonicalised must not silently match nothing — refusing to build \
-                         a ruleset that would grant it by accident.",
-                        e.display()
-                    ),
-                )
-            })
+        .filter_map(|e| match std::fs::canonicalize(e) {
+            Ok(p) => Some(p),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => die(
+                EXIT_LANDLOCK,
+                &format!(
+                    "cannot resolve --exclude `{}`: {err}. An exclude that cannot be \
+                     canonicalised for a reason other than not existing must not silently \
+                     match nothing — refusing to build a ruleset that would grant it by \
+                     accident.",
+                    e.display()
+                ),
+            ),
         })
         .collect()
 }
