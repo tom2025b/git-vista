@@ -1,4 +1,56 @@
-# Handoff — M1.13b Close-Out + M2 Sub-Issue Kickoff (focused session)
+# Handoff — M1.13b Close-Out (focused session)
+
+## ⚠ NEWEST — 2026-07-31 ~18:00. NO CODE BLOCKERS. Waiting on the human drive.
+
+**Merge audit verdict: `mergeable: false`, but only two blockers and neither is code.**
+1. PR #207 is still a **draft** — one command: `gh pr ready 207`.
+2. **The human drive has not happened.** Checklist at
+   `design-docs/2026-07-31-premerge-test-checklist.pdf`.
+
+Testbed is LIVE on 8081, built from `788eb39` (has every fix). Serving the live repo
+`/home/tom/projects/Git-Vista`. Ground truth to check it against: newest `788eb39`
+"auto-checkpoint 605", Jul 31 5:33 PM, 789 commits, branch `feature/m1.13b-sandbox-plan`.
+
+### Landed today after the audit
+
+- **#216 clone hang** — client 60s timeout + retry; clone gets its own `CLONE_TIMEOUT_MS`
+  (570s) because it is **not operation-tracked** and so cannot be deduplicated by key.
+  Server: 600s `tokio::time::timeout`.
+- **#218 history** — reads got the timeout + one retry that only writes had.
+- **#217 print gate** — real find: **stage/unstage were calling `force_bump()`** for no
+  reason, discarding the whole loaded graph (and Print readiness) just to refresh a
+  status chip that was already epoch-keyed. Now `status.refetch()`. Button also shows a
+  visible disabled reason instead of a hover-only tooltip.
+- **Cancellation-safe cleanup in `handlers/clone.rs`** — MEASURED, not assumed: a
+  standalone axum experiment showed `started=true, timeout_arm=false, dropped=true` on
+  client disconnect, with a paired positive (`timeout_arm=true` when the client waits).
+  So axum drops the handler and **skips every match arm**. Cleanup moved to a `DestGuard`
+  Drop guard; `kill_on_drop(true)` added so a cancelled handler cannot orphan a git child
+  writing into a directory already removed.
+
+### The generalisable lesson from that
+
+**Cleanup written as a branch of a completion path only runs if that path is reached, and
+cancellation is the absence of all branches.** Any handler creating external state must
+attach cleanup to a value's lifetime, not to control flow. Worth grepping for others.
+
+### Still open (not blocking)
+
+- Clone is **not operation-tracked**, so two overlapping attempts really can run two
+  `git clone`s. `operations::admit` already handles this for tracked writes. The fix is
+  to track clone. Filed thinking is in #216's comments.
+- No test anywhere makes a timeout actually fire. The write path changed for every
+  mutation; only the human checklist covers it.
+- `menu.rs` stage/unstage fix has no automated coverage — wasm32-only module, gate runs
+  native tests only.
+- Paired positive missing for the Drop guard: confirm a client that waits past the
+  deadline still gets 504 **and** the directory gone.
+
+### Budget rule (Tom, 2026-07-31)
+
+**Stop all work when the week hits 5% remaining.** Was at 9% at ~18:00.
+
+---
 
 ## ⚠ NEWEST — 2026-07-31 ~13:45. Merge-readiness audit landed. One REAL security bug found and fixed.
 
