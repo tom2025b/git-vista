@@ -46,6 +46,27 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Errno(pub i32);
 
+/// Kernel state captured by the probe beside the operation's errno.
+///
+/// `NotApplicable` is a typed claim, not a parser default. It is reserved for
+/// the blocked-hooks functional case: the inside hook deliberately never runs,
+/// so no paired kernel observation exists. A line carrying provenance-looking
+/// text for such a case is rejected rather than promoted to evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Provenance {
+    Kernel {
+        seccomp: i32,
+        no_new_privs: i32,
+    },
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Observation {
+    errno: i32,
+    provenance: Provenance,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Class {
     Containment,
@@ -167,13 +188,23 @@ pub(crate) struct EscapeCase {
     /// baseline that misses this becomes `Outcome::CapabilityAbsent` — a
     /// return value, never a skip decided by the case.
     pub expect_baseline: Errno,
+    /// Acceptance evidence F, written as exact literals in every case rather
+    /// than derived from the producer. Applicable baseline probes must report
+    /// the unsandboxed kernel state (`Seccomp: 0`, `NoNewPrivs: 0`).
+    pub expect_baseline_provenance: Provenance,
     /// The errno the **inside** leg must observe for containment to hold.
     pub expect_inside: Errno,
+    /// Applicable inside probes must report the sandboxed kernel state
+    /// (`Seccomp: 2`, `NoNewPrivs: 1`).
+    pub expect_inside_provenance: Provenance,
     /// R3: the paired positive, mandatory on every case. A sibling operation,
     /// same run, same policy, same probe binary, that must still succeed —
     /// without this a denial claim is unattributable (see the contract's
     /// `enumerate()`-is-omission argument).
     pub expect_granted: Errno,
+    /// The paired positive is emitted by the same inside process and therefore
+    /// carries its own exact, mandatory provenance assertion.
+    pub expect_granted_provenance: Provenance,
     /// R2: the commit's own exit status, asserted in both legs. Distinguishes
     /// "the hook ran and observed something" from "the commit never reached
     /// hook discovery at all."
@@ -223,7 +254,8 @@ pub(crate) fn parse_observation(
     out: &str,
     nonce: &str,
     tag: &str,
-) -> Result<i32, MissingObservation> {
+    provenance: Provenance,
+) -> Result<Observation, MissingObservation> {
     let begin = format!("GVPROBE {nonce} BEGIN");
     let end = format!("GVPROBE {nonce} END");
     let Some(start) = out.find(&begin) else {
@@ -256,12 +288,56 @@ pub(crate) fn parse_observation(
         let Some(tok) = errno_part.split_whitespace().next() else {
             continue;
         };
-        if let Ok(v) = tok.parse::<i32>() {
-            return Ok(v);
-        }
+        let Ok(errno) = tok.parse::<i32>() else {
+            continue;
+        };
+        let provenance = match provenance {
+            Provenance::Kernel { .. } => {
+                let seccomp = parse_i32_field(line, tag, "Seccomp:")?;
+                let no_new_privs = parse_i32_field(line, tag, "NoNewPrivs:")?;
+                Provenance::Kernel {
+                    seccomp,
+                    no_new_privs,
+                }
+            }
+            Provenance::NotApplicable => {
+                if line.contains("Seccomp:") || line.contains("NoNewPrivs:") {
+                    return Err(MissingObservation {
+                        detail: format!(
+                            "`{tag}` declares Provenance::NotApplicable but its observation \
+                             contains provenance-looking text"
+                        ),
+                    });
+                }
+                Provenance::NotApplicable
+            }
+        };
+        return Ok(Observation { errno, provenance });
     }
     Err(MissingObservation {
         detail: format!("no `{tag} rc=.. errno=..` line inside the marked block"),
+    })
+}
+
+fn parse_i32_field(
+    line: &str,
+    tag: &str,
+    field: &str,
+) -> Result<i32, MissingObservation> {
+    let Some((_, tail)) = line.split_once(field) else {
+        return Err(MissingObservation {
+            detail: format!(
+                "`{tag}` observation is missing mandatory `{field} <n>` kernel provenance"
+            ),
+        });
+    };
+    let Some(token) = tail.split_whitespace().next() else {
+        return Err(MissingObservation {
+            detail: format!("`{tag}` observation has no value after mandatory `{field}`"),
+        });
+    };
+    token.parse::<i32>().map_err(|_| MissingObservation {
+        detail: format!("`{tag}` observation has non-integer `{field} {token}`"),
     })
 }
 
