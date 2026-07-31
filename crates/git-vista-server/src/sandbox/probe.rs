@@ -329,9 +329,7 @@ fn boot_probe_policy(scratch: &Path, markers: &Path) -> Result<Policy, &'static 
         ro_trees: ro,
         secret_excludes: secret_excludes_for_home(&home),
         net_ports: Vec::new(),
-        hook_mode: HookMode::Blocked {
-            empty_dir: PathBuf::new(),
-        }, // MUTATION-D
+        hook_mode: HookMode::Run,
     })
 }
 
