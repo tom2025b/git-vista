@@ -1319,6 +1319,102 @@ fn r7_both_legs_share_one_pinned_environment_profile() {
 /// of quietly re-labelling an exemption whose reason has changed.
 const CHECKED_BLOCKERS: &[&str] = &["no production policy constructor yields HookMode::Blocked"];
 
+/// The index of the `}` that closes the `{` at byte `open`, on source that has
+/// already been through [`crate::argv_boundary::code_only`] (so braces inside
+/// string, raw-string and char literals are blanked and cannot unbalance this).
+fn matching_brace(code: &str, open: usize) -> usize {
+    debug_assert_eq!(code.as_bytes().get(open), Some(&b'{'));
+    let mut depth = 0usize;
+    for (i, ch) in code[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return open + i;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("R8: unbalanced braces after byte {open} — the scan broke");
+}
+
+/// Every `Policy { … }` **construction** in already-`code_only`'d production
+/// source, each returned as the text between its own braces.
+///
+/// # Why this is not `find("Policy {")` any more
+///
+/// It was, and the shortcut had two defects — one that made the tripwire fire on
+/// innocent code, one that made it fail to fire on guilty code.
+///
+///  * **It matched any identifier *ending* in `Policy`.** `-> HookPolicy {` is
+///    `Policy {` as far as `str::find` is concerned; the scan then demanded a
+///    `hook_mode` field of it and panicked with "the scan broke" on finding
+///    none. Not hypothetical: `sandbox::hook_policy` introduced a `Disclosed`
+///    type alias for its return type largely so its source would not spell those
+///    two characters. A tripwire that makes production code contort around it
+///    teaches people to route around the tripwire, and the next `…Policy {`
+///    would have been a red build with a message accusing the scan rather than
+///    the code. The left edge is a token boundary now, so `HookPolicy` is what
+///    it actually is — a different type, with no `hook_mode` field to check.
+///  * **It searched the rest of the *file* for `hook_mode:`, not the literal.**
+///    A construction that omitted the field — `Policy { tier, ..base }`, whose
+///    hook mode comes from wherever `base` came from — would have silently
+///    borrowed the *next* literal's `hook_mode: HookMode::Run` and passed. That
+///    is R8 passing on a technicality, the failure mode this milestone has
+///    already caught it in once. Bodies are brace-matched here, so every
+///    construction is judged on its own text and a `..base` literal now reaches
+///    the caller's "no hook_mode field" arm instead of another literal's answer.
+///
+/// Nothing is skipped on a guess. Only contexts where `Policy {` provably is not
+/// a construction are passed over — a `struct`/`enum`/`union`/`trait`
+/// declaration, `impl … Policy {`, `… for Policy {`, and a `-> Policy {` return
+/// type (optionally path-qualified, e.g. `-> super::Policy {`) — and skipping a
+/// *signature* loses no coverage, because that function's body is ordinary code
+/// scanned like any other. Everything else is returned for the caller to judge;
+/// R8 must never silently skip something it cannot verify.
+fn production_policy_literals(prod: &str) -> Vec<&str> {
+    let needle = ["Policy", " {"].concat();
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = prod[from..].find(&needle) {
+        let at = from + rel;
+        // The `{` is the needle's last byte; both preceding chars are ASCII.
+        let open = at + needle.len() - 1;
+        from = open + 1;
+
+        let before = &prod[..at];
+        // Token boundary on the left: `HookPolicy {`, `SessionPolicy {` and
+        // friends name other types entirely.
+        if before
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        // The token that introduces it, looking through a `::` path prefix so
+        // `impl super::Policy {` is classified by `impl`, not by `super::`.
+        let mut tokens = before
+            .trim_end()
+            .rsplit(char::is_whitespace)
+            .filter(|t| !t.is_empty());
+        let mut lead = tokens.next().unwrap_or("");
+        if lead.ends_with("::") {
+            lead = tokens.next().unwrap_or("");
+        }
+        if matches!(
+            lead,
+            "struct" | "enum" | "union" | "trait" | "impl" | "for" | "->"
+        ) {
+            continue;
+        }
+        out.push(&prod[open + 1..matching_brace(prod, open)]);
+    }
+    out
+}
+
 /// R8: every exemption's named blocker must still be a true statement about
 /// production source — **and every blocker the battery names must be one this
 /// test knows how to check.**
@@ -1445,23 +1541,19 @@ fn r8_exemptions_expire_when_their_named_blocker_disappears() {
              blocked-hooks exemption in hook_mode_suite.rs must be retired, not left \
              standing"
         );
-        let literal = ["Policy", " {"].concat();
-        let mut rest = prod;
-        while let Some(at) = rest.find(&literal) {
-            let before = rest[..at].trim_end();
-            let tail = &rest[at..];
-            rest = &tail[literal.len()..];
-            // `struct Policy {` / `impl Policy {` are not constructions.
-            if before.ends_with("struct") || before.ends_with("impl") {
-                continue;
-            }
-            let field = ["hook_mode", ":"].concat();
-            let f = tail.find(&field).unwrap_or_else(|| {
+        let field = ["hook_mode", ":"].concat();
+        for body in production_policy_literals(prod) {
+            let f = body.find(&field).unwrap_or_else(|| {
                 panic!(
-                    "R8: a `Policy` literal in {stem}.rs has no hook_mode field — the scan broke"
+                    "R8: a `Policy` construction in {stem}.rs spells no `hook_mode` field \
+                     inside its own braces. R8 does not skip what it cannot verify, so \
+                     this is a hard failure rather than a silent pass: write the field \
+                     out literally. A `Policy {{ .., ..base }}` functional update hits \
+                     this on purpose — its hook mode comes from `base`, which is exactly \
+                     the indirection this check exists to refuse. Body was: `{body}`"
                 )
             });
-            let value = tail[f + field.len()..].trim_start();
+            let value = body[f + field.len()..].trim_start();
             assert!(
                 value.starts_with("HookMode::Run"),
                 "R8: a production `Policy` literal in {stem}.rs sets hook_mode to \
