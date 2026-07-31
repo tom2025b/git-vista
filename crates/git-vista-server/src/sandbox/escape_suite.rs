@@ -53,7 +53,9 @@
 //! `HookMode::Blocked` — which R8 checks across every production module under
 //! `src/sandbox` rather than by grepping one function.
 
-use super::escape_contract::{run_case, Class, Errno, EscapeCase, Exemption, GitPortUse, MutantId};
+use super::escape_contract::{
+    run_case, Class, Errno, EscapeCase, Exemption, GitPortUse, MutantId, Provenance,
+};
 use super::Tier;
 
 /// The one hostile-hook repository constructor, re-exported here because the
@@ -81,8 +83,20 @@ const CASE_SECRET_READ_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::secret_read_probe,
     probe_tag: "SECRET",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(13),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M2, MutantId::M3],
     exemption: Exemption::None,
@@ -97,8 +111,20 @@ const CASE_IO_URING_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::io_uring_probe,
     probe_tag: "IOURING",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(1),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M1],
     exemption: Exemption::None,
@@ -113,8 +139,20 @@ const CASE_HIGH_BIT_PRCTL_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::high_bit_prctl_probe,
     probe_tag: "HIGHBIT",
     expect_baseline: Errno(14),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(1),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M1, MutantId::M7],
     exemption: Exemption::None,
@@ -129,8 +167,20 @@ const CASE_STRICT_LISTENER_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::strict_listener_probe,
     probe_tag: "CONNECT",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(13),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M2, MutantId::M5],
     exemption: Exemption::None,
@@ -147,8 +197,20 @@ const CASE_STRICT_UDP_HOST_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::strict_udp_host_probe,
     probe_tag: "UDP_HOST",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(11),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M4],
     exemption: Exemption::None,
@@ -163,8 +225,20 @@ const CASE_STRICT_TCP_BIND_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::strict_tcp_bind_probe,
     probe_tag: "TCP_BIND",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(13),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M2],
     exemption: Exemption::None,
@@ -193,8 +267,20 @@ const CASE_AF_UNIX_SOCKET_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::af_unix_probe,
     probe_tag: "UNIXSOCK",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(1),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M1, MutantId::M8],
     exemption: Exemption::None,
@@ -212,8 +298,20 @@ const CASE_AF_UNIX_SOCKETPAIR_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::af_unix_probe,
     probe_tag: "UNIXPAIR",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(1),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M1, MutantId::M8],
     exemption: Exemption::None,
@@ -244,8 +342,20 @@ const CASE_HIGH_BIT_AF_UNIX_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::high_bit_af_unix_probe,
     probe_tag: "HIGHUNIX",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(1),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M9],
     exemption: Exemption::None,
@@ -276,8 +386,20 @@ const CASE_HIGH_BIT_IO_URING_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::high_bit_io_uring_probe,
     probe_tag: "X32IOURING",
     expect_baseline: Errno(38),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(1),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M1],
     exemption: Exemption::None,
@@ -304,8 +426,20 @@ const CASE_WRITE_HOME_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::fs_boundary_probe,
     probe_tag: "WRITEHOME",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(13),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M2],
     exemption: Exemption::None,
@@ -335,8 +469,20 @@ const CASE_CGROUP_TREE_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::fs_boundary_probe,
     probe_tag: "CGROUPTREE",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(13),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M2],
     exemption: Exemption::None,
@@ -372,8 +518,20 @@ const CASE_NO_NEW_PRIVS_IRREVOCABLE: EscapeCase = EscapeCase {
     build_hook: harness::irrevocability_probe,
     probe_tag: "NNPSTATE",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(12),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M1],
     exemption: Exemption::None,
@@ -405,8 +563,20 @@ const CASE_SECOND_LANDLOCK_RULESET_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::irrevocability_probe,
     probe_tag: "LANDLOCK2",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(13),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M2],
     exemption: Exemption::None,
@@ -431,8 +601,20 @@ const CASE_UNSHARE_USERNS_DENIED: EscapeCase = EscapeCase {
     build_hook: harness::irrevocability_probe,
     probe_tag: "UNSHARE",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(1),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M1],
     exemption: Exemption::None,
@@ -469,8 +651,20 @@ const CASE_URING_SOCKET_BYPASS: EscapeCase = EscapeCase {
     build_hook: harness::uring_socket_probe,
     probe_tag: "URINGSOCKET",
     expect_baseline: Errno(0),
+    expect_baseline_provenance: Provenance::Kernel {
+        seccomp: 0,
+        no_new_privs: 0,
+    },
     expect_inside: Errno(1),
+    expect_inside_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_granted: Errno(0),
+    expect_granted_provenance: Provenance::Kernel {
+        seccomp: 2,
+        no_new_privs: 1,
+    },
     expect_carrier_code: 0,
     dies_under: &[MutantId::M1, MutantId::M10],
     exemption: Exemption::None,
