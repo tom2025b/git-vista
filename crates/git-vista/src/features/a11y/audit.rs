@@ -203,41 +203,43 @@ fn interactive_selectors(rules: &[Rule]) -> BTreeSet<String> {
 }
 
 /// The recorded state of issue #65's 44x44 criterion, one entry per interactive
-/// selector, as of M1.12.
+/// selector.
 ///
-/// The `bool` is "does the stylesheet guarantee 44 px on **both** axes". Every entry is
-/// `false`: `styles.css` contains no `min-height`, `min-width`, or absolute `height` /
-/// `width` on any interactive control at all, so this is a documented gap, not a passing
-/// grade. It is written down rather than left implicit for two reasons — a new
-/// interactive control cannot be added without appearing here, and the moment somebody
-/// fixes one, this table forces the fix to be recorded instead of being unnoticed.
+/// The `bool` is "does the stylesheet guarantee 44 px on **both** axes". The
+/// CSS-sized controls are all `true` as of the #65 tap-target rule at the end of
+/// `styles.css` (`min-height`/`min-width: 44px`, unconditional — see that rule's
+/// comment for why it is not scoped to `pointer: coarse`). The table is written
+/// down rather than left implicit for two reasons — a new interactive control
+/// cannot be added without appearing here, and a fix or a regression must be
+/// recorded in the same change that moves the CSS instead of passing unnoticed.
 ///
-/// Sizes are not fixable from this lane: `styles.css` is shared with concurrent work and
-/// only the focus / reduced-motion rules are in scope here, and several of these
-/// controls live in modules another lane owns.
+/// The two `false` entries are SVG-sized and stay `false` honestly: CSS cannot
+/// guarantee the rendered extent of a shape whose size is user units scaled by
+/// the camera. Their coverage story lives elsewhere —
+/// `commit_dot_hit_target_is_thirty_pixels_at_default_zoom` pins the hit circle's
+/// geometry, and zooming out shrinks every target below any fixed threshold no
+/// matter what number is written here.
 const INTERACTIVE_CENSUS: &[(&str, bool)] = &[
-    // Topbar buttons: padding .4rem/.9rem on a .85rem font, no minimum.
-    (".refresh", false),
+    (".refresh", true),
     // Commit-dot and stub hit circles. Sized in SVG user units by `render/`, not by
     // CSS at all — see `commit_dot_hit_target_is_thirty_pixels_at_default_zoom`.
     (".node-hit", false),
-    // Context-menu rows: 8px/10px padding, `width: 100%` (an ancestor's answer).
-    (".ctx-item", false),
-    (".reset-view", false),
+    (".ctx-item", true),
+    (".reset-view", true),
     // GitHub-linked ref badges and commit messages (`render/labels.rs`). Applied to
     // SVG `<rect>` / `<text>`, so like `.node-hit` the size is user units set in
     // `render/`, scaled by the camera — the badge rect is `geometry::BADGE_HEIGHT`
     // tall, and the `<text>` has only its glyph box.
     (".clickable", false),
-    (".detail-close", false),
-    (".detail-parent", false),
-    (".act-refresh", false),
-    (".act-row", false),
-    (".act-undo", false),
-    ("button.detail-file", false),
-    (".detail-expand", false),
-    (".viewer-btn", false),
-    (".scale-btn", false),
+    (".detail-close", true),
+    (".detail-parent", true),
+    (".act-refresh", true),
+    (".act-row", true),
+    (".act-undo", true),
+    ("button.detail-file", true),
+    (".detail-expand", true),
+    (".viewer-btn", true),
+    (".scale-btn", true),
 ];
 
 #[test]
