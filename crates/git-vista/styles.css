@@ -48,6 +48,13 @@ html, body {
   align-items: baseline;
   gap: 0.75rem;
   padding: 0.75rem 1rem;
+  /* #65 safe-area: viewport-fit=cover hands us the notch/home-indicator
+     regions, so top chrome must add the inset itself. env() falls back to
+     0px on displays without insets; the shorthand above stays as the value
+     for browsers without env() support. */
+  padding-top: calc(0.75rem + env(safe-area-inset-top, 0px));
+  padding-left: calc(1rem + env(safe-area-inset-left, 0px));
+  padding-right: calc(1rem + env(safe-area-inset-right, 0px));
   border-bottom: 1px solid #21262d;
 }
 
@@ -56,6 +63,11 @@ html, body {
    narrowest windows, where every pixel of height matters more than on Portrait. */
 .shell-compact .topbar {
   padding: 0.5rem 0.75rem;
+  /* Same #65 safe-area additions as the base .topbar rule — the shorthand
+     above would otherwise reset them to inset-less values. */
+  padding-top: calc(0.5rem + env(safe-area-inset-top, 0px));
+  padding-left: calc(0.75rem + env(safe-area-inset-left, 0px));
+  padding-right: calc(0.75rem + env(safe-area-inset-right, 0px));
   gap: 0.5rem;
 }
 
@@ -330,8 +342,10 @@ html, body {
    the graph, but always tappable to recenter the camera. */
 .reset-view {
   position: fixed;
-  left: 12px;
-  bottom: 12px;
+  /* #65 safe-area: bottom-left corner chrome clears the home indicator and
+     a landscape notch's left inset. */
+  left: calc(12px + env(safe-area-inset-left, 0px));
+  bottom: calc(12px + env(safe-area-inset-bottom, 0px));
   z-index: 15;
   padding: 0.4rem 0.8rem;
   font: inherit;
@@ -364,7 +378,8 @@ html, body {
 .history-page-status {
   position: absolute;
   left: 50%;
-  bottom: 12px;
+  /* #65 safe-area: bottom-docked pill clears the home indicator. */
+  bottom: calc(12px + env(safe-area-inset-bottom, 0px));
   transform: translateX(-50%);
   z-index: 15;
   display: flex;
