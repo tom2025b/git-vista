@@ -182,7 +182,7 @@ grant in this design already has. R10's flag-round-trip tripwire
 (`escape_contract.rs`) requires — and confirms — that the flag has both a
 `shim_argv` emitter and a `gv-sandbox::main::parse` arm.
 
-`ssh_known_hosts_carveout(home)` (`mod.rs:282`) is the one populated case:
+`ssh_known_hosts_carveout(home)` (`mod.rs`) is the one populated case:
 `vec![home.join(".ssh/known_hosts")]`, called from the Network branch of
 **both** independent production `Policy` constructors — `policy_for`
 (`mod.rs:1135`) and `policy_for_clone` (`mod.rs:1252`, hard-coded to
