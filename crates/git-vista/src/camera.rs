@@ -98,6 +98,35 @@ impl Camera {
         }
         self.zoomed_at(cur_dist / prev_dist, mx, my)
     }
+
+    /// Pan (never zoom) so a content point at world-y `target_world_y` lands at
+    /// least `margin` px inside the top and bottom of a `viewport_h`-tall
+    /// screen, if it doesn't already (M1.13, #65 keyboard-access gap).
+    ///
+    /// Exists for exactly one caller: `gestures::on_node_keydown`. The commit
+    /// rows are virtualized (`viewport::visible_row_range` only mounts rows
+    /// within the viewport plus a small overscan), so a keyboard `Home`/`End`/
+    /// repeated-arrow move can select a row with no `<circle>` in the DOM to
+    /// call `.focus()` on. Bringing that row on screen *first* — before the
+    /// caller's next-frame DOM query — is what makes the target exist. Only
+    /// `ty` moves; `scale` is left alone, so a keyboard move never changes
+    /// zoom the way a pinch or wheel does.
+    pub fn ensure_row_visible(self, viewport_h: f64, target_world_y: f64, margin: f64) -> Self {
+        let screen_y = self.ty + self.scale * target_world_y;
+        if screen_y < margin {
+            Self {
+                ty: self.ty + (margin - screen_y),
+                ..self
+            }
+        } else if screen_y > viewport_h - margin {
+            Self {
+                ty: self.ty - (screen_y - (viewport_h - margin)),
+                ..self
+            }
+        } else {
+            self
+        }
+    }
 }
 
 #[cfg(test)]
