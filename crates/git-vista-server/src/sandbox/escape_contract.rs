@@ -1096,6 +1096,15 @@ const RULES: &[(&str, &str)] = &[
         "F-KERNEL-PROVENANCE",
         "f_every_observation_requires_typed_kernel_provenance",
     ),
+    // Not an R-rule from the contract document — the same shape as
+    // F-KERNEL-PROVENANCE above, an enforcement added after the fact and bound
+    // here so it cannot be deleted quietly. Without this entry the CI-
+    // environment tripwire is the one check in this file whose removal nothing
+    // notices, which is precisely the failure mode it was written to close.
+    (
+        "CI-HOST-PROVISIONING",
+        "every_ci_job_that_runs_this_crates_tests_provisions_the_host_capabilities_they_need",
+    ),
 ];
 
 const BATTERY_FILES: &[&str] = &[
@@ -2169,4 +2178,461 @@ fn ci_preflight_host_meets_the_declared_minimum() {
         "::error::sandbox CI preflight: host missing {missing:?} — the escape battery \
          cannot produce sound containment evidence on this runner"
     );
+}
+
+// =========================================================================
+// Part 3: the CI-environment tripwire
+// =========================================================================
+
+/// The workflow this tripwire reads, repo-root-relative.
+const WORKFLOW_REL: &str = ".github/workflows/ci.yml";
+
+/// The shared composite action every job that runs this crate's tests must
+/// reference, repo-root-relative and spelled exactly once: a job's `uses:`
+/// value is `./` + this, and the file on disk is this + `/action.yml`.
+///
+/// One constant, both halves, on purpose. Renaming or deleting the action
+/// directory has to fail this test — and it fails it twice over: the
+/// file-exists assertion stops matching the tree, and every job's `uses:`
+/// stops matching the workflow. A check that only read ci.yml would go on
+/// passing while the action it names had been deleted.
+const HOST_SETUP_ACTION_DIR: &str = ".github/actions/host-sandbox-setup";
+
+/// The three host capabilities the composite action exists to provide, each
+/// named by a token that must appear **in the action** and — deliberately, in
+/// the same test — **nowhere in ci.yml itself**.
+///
+/// Both directions are asserted because they are different claims. "The action
+/// does all three" is what stops it being hollowed out to a no-op while every
+/// job goes on referencing it and every job goes on being green. "ci.yml does
+/// none of the three" is what stops the opposite repair: someone meeting a red
+/// job and pasting the setup steps back inline. That inline copy is not
+/// hypothetical — it is the exact state this change is fixing, where `sandbox`
+/// carried the two setup steps, `core` and `contract` did not, and nothing in
+/// the tree could tell the difference until 111 tests failed at once.
+const HOST_SETUP_TOKENS: &[(&str, &str)] = &[
+    (
+        "bubblewrap",
+        "installs bwrap; without it the Strict tier cannot be built and every production \
+         git spawn is refused rather than downgraded (ADR 0029)",
+    ),
+    (
+        "apparmor_restrict_unprivileged_userns",
+        "unclamps unprivileged user namespaces (D6 Option A); ubuntu-latest ships the clamp \
+         set to 1, under which bwrap cannot create its namespaces at all",
+    ),
+    (
+        "user.email",
+        "gives the runner a global git identity; a fresh /home/runner has none, so the \
+         battery's deliberately identity-free fixture repository cannot make its seed \
+         commit and no invariant is ever exercised (#203)",
+    ),
+];
+
+/// The repository root: two levels above `server_root()`
+/// (`crates/git-vista-server`).
+fn repo_root_dir() -> PathBuf {
+    server_root().join("../..")
+}
+
+fn read_repo_text(rel: &str) -> String {
+    let path = repo_root_dir().join(rel);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: must be readable: {e}", path.display()))
+}
+
+/// Blank whole-line comments, keeping the line count intact.
+///
+/// Line-level rather than token-level because both file kinds scanned here —
+/// YAML and `#!/usr/bin/env bash` — use `#` to end-of-line, and because the
+/// only thing that must be excluded is *prose*: ci.yml's comment blocks discuss
+/// `cargo test`'s exit behaviour and name the apparmor sysctl, and neither
+/// mention is an invocation or a provisioning step. A trailing `#` inside a
+/// `run: |` body is shell, not YAML, so it is deliberately left alone; nothing
+/// below cares what follows a command on the same line.
+fn without_full_line_comments(text: &str) -> String {
+    text.lines()
+        .map(|l| {
+            if l.trim_start().starts_with('#') {
+                ""
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+/// Split ci.yml into `(job name, job body)` pairs, hand-rolled.
+///
+/// # The indentation contract, stated because everything below rests on it
+///
+///  * `jobs:` is a **column-0** key.
+///  * The jobs mapping runs to the next column-0 key, or to end of file.
+///  * Each job is a key at **exactly two spaces** of indent.
+///  * Everything belonging to a job is indented **deeper** than two spaces.
+///
+/// The last two are what make a block scalar unable to masquerade as a job key:
+/// YAML requires a `run: |` body to be indented deeper than its own key, and
+/// every key inside a job sits at four spaces or more, so no line of shell can
+/// land at exactly two. That is an argument about YAML's own rules, not a
+/// guess about this file's current contents.
+///
+/// A line at two spaces that is not `<identifier>:` therefore means the file's
+/// shape has changed out from under this parser, and it **panics** rather than
+/// dropping the line — silently finding fewer jobs is the one failure mode that
+/// would leave every assertion below trivially satisfied.
+fn workflow_jobs(yaml: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = yaml.lines().collect();
+    let jobs_at = lines
+        .iter()
+        .position(|l| l.trim_end() == "jobs:")
+        .unwrap_or_else(|| {
+            panic!(
+                "{WORKFLOW_REL} has no column-0 `jobs:` line. This parser is hand-rolled — \
+                 the workspace has no YAML crate and a tripwire must not be the reason one \
+                 gets added — so it fails here instead of returning an empty job list that \
+                 every assertion downstream would pass over vacuously."
+            )
+        });
+
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(jobs_at + 1)
+        .find(|(_, l)| {
+            !l.trim().is_empty()
+                && !l.starts_with(' ')
+                && !l.starts_with('\t')
+                && !l.starts_with('#')
+        })
+        .map_or(lines.len(), |(i, _)| i);
+
+    let mut keys: Vec<(usize, String)> = Vec::new();
+    for (i, line) in lines.iter().enumerate().take(end).skip(jobs_at + 1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.chars().take_while(|c| *c == ' ').count();
+        if indent != 2 {
+            continue;
+        }
+        let rest = line[indent..].trim_end();
+        if rest.starts_with('#') {
+            continue;
+        }
+        let name = rest.strip_suffix(':').unwrap_or_else(|| {
+            panic!(
+                "{WORKFLOW_REL}:{}: `{rest}` sits at exactly two spaces of indent inside \
+                 `jobs:` but is not a `<name>:` job key. Two-space indent meaning \"a job \
+                 starts here\" is this parser's whole contract (see its doc comment); if \
+                 the workflow's shape has genuinely changed, teach the parser deliberately \
+                 rather than letting it degrade into finding no jobs.",
+                i + 1
+            )
+        });
+        assert!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
+            "{WORKFLOW_REL}:{}: `{name}` is not a plain job identifier — the two-space \
+             indentation contract this parser depends on no longer describes the file",
+            i + 1
+        );
+        keys.push((i, name.to_string()));
+    }
+
+    keys.iter()
+        .enumerate()
+        .map(|(n, (at, name))| {
+            let stop = keys.get(n + 1).map_or(end, |(next, _)| *next);
+            (name.clone(), lines[*at..stop].join("\n"))
+        })
+        .collect()
+}
+
+/// Does this `cargo test` invocation reach `git-vista-server`'s tests?
+///
+/// Three shapes, and only three, because a fourth must not be guessed at:
+/// `--workspace` reaches every member and so reaches this crate; an explicit
+/// `-p git-vista-server` reaches it; an explicit `-p` list naming other crates
+/// does not. Anything else — a bare `cargo test`, `--all`, a cargo alias — is a
+/// shape this classifier has not been taught, and it fails loudly instead of
+/// picking a default. Defaulting to "no" would silently exempt a job from the
+/// entire check, which is the class of bug this test exists to prevent;
+/// defaulting to "yes" would be right today and wrong the first time someone
+/// runs a frontend-only suite. Neither is a call a scanner should make alone.
+fn cargo_test_line_reaches_server(origin: &str, line: &str) -> bool {
+    if line.contains("--workspace") {
+        return true;
+    }
+    if line.contains("-p git-vista-server") {
+        return true;
+    }
+    assert!(
+        line.contains("-p "),
+        "{origin}: `{}` runs cargo test in a shape this tripwire cannot classify — it \
+         names neither `--workspace` nor any `-p <crate>`, so whether it reaches \
+         git-vista-server's tests (and therefore needs the sandbox host capabilities) \
+         would be a guess. Teach `cargo_test_line_reaches_server` the new shape.",
+        line.trim()
+    );
+    false
+}
+
+/// Repo-relative shell scripts a job's steps actually run.
+///
+/// Without this the check has a hole with a name on it: `ci/mutation-matrix.sh`
+/// runs `cargo test -p git-vista-server` twice, so a job can reach this crate's
+/// tests without ci.yml containing the string `cargo test` at all. Scripts are
+/// resolved against the tree rather than pattern-matched, so a `.sh` token that
+/// names no file in this repository (a path on the runner, a value in a shell
+/// variable) is ignored instead of being read.
+fn referenced_repo_scripts(body: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for token in body.split_whitespace() {
+        let token = token.trim_matches(|c: char| !(c.is_alphanumeric() || "./_-".contains(c)));
+        if !token.ends_with(".sh") {
+            continue;
+        }
+        let rel = token.trim_start_matches("./");
+        if repo_root_dir().join(rel).is_file() {
+            out.insert(rel.to_string());
+        }
+    }
+    out
+}
+
+/// Whether a job body contains a `uses:` step naming exactly this local action.
+/// Value-exact, not a substring search over the body: a `uses:` naming a
+/// *different* local action whose path happens to contain this one's, or a
+/// comment quoting the path, must not count as provisioning.
+fn job_uses_local_action(body: &str, action_dir: &str) -> bool {
+    body.lines().any(|line| {
+        let line = line.trim();
+        let line = line.strip_prefix("- ").unwrap_or(line);
+        let Some(value) = line.strip_prefix("uses:") else {
+            return false;
+        };
+        let value = value.trim().trim_matches(|c: char| c == '"' || c == '\'');
+        value.trim_start_matches("./") == action_dir
+    })
+}
+
+/// **Every CI job that runs this crate's tests provisions the host capabilities
+/// those tests need.** The gap this closes cost a full red build: M1.13b routed
+/// every production git spawn through the sandbox chokepoint, so `core` and
+/// `contract` began constructing the Strict tier too — but the host setup lived
+/// as two hand-written steps inside the `sandbox` job only, and 111 tests died
+/// with "this operation runs in the strict sandbox tier and this host cannot
+/// provide it (missing: bwrap, user_namespaces)". Nothing in the tree could see
+/// that a test-running job and its provisioning had come apart.
+///
+/// The property is a set equation over ci.yml: the jobs whose steps reach
+/// `git-vista-server`'s tests are exactly the jobs that reference the shared
+/// host-setup composite action.
+///
+/// # Equality, not a subset
+///
+/// The bug only needed `needs_setup ⊆ has_setup` — every testing job provisioned.
+/// This asserts equality anyway, so a job that provisions without testing fails
+/// too, for two reasons. First, the action does not merely install a package: it
+/// writes `kernel.apparmor_restrict_unprivileged_userns=0`, deliberately
+/// weakening the runner, and a job with no reason to do that should not. Second
+/// and mainly, an unexplained extra on either side *is* the drift signal — the
+/// whole failure mode here was two sides of one relationship being maintained by
+/// hand and diverging unnoticed, and a subset relation only ever notices one
+/// direction of divergence. Widening to a subset should take a deliberate edit
+/// with a reason written next to it, not be the default.
+///
+/// # What would make this pass while the mechanism was broken?
+///
+/// Seven ways, each closed here:
+///
+///  1. **The parse finds no jobs** — every "for each testing job" assertion is
+///     then vacuously true. Closed twice: `workflow_jobs` panics if there is no
+///     column-0 `jobs:` key or if a two-space line is not a job key, and the
+///     floor below fails if fewer than five jobs come back (the workflow's own
+///     header documents seven).
+///  2. **The parse finds jobs but classifies none as test-running** — same
+///     vacuity one level down. Closed by two independent floors: at least four
+///     `cargo test` invocations must be seen across the workflow, and at least
+///     three jobs must classify as reaching this crate (`core`, `contract`,
+///     `sandbox` today).
+///  3. **A `cargo test` shape the classifier does not recognise is quietly
+///     treated as not reaching this crate** — closed by
+///     `cargo_test_line_reaches_server`, which fails loudly on an unclassifiable
+///     invocation instead of returning a default.
+///  4. **Tests reached through a shell script rather than a `cargo test` line in
+///     ci.yml** — `ci/mutation-matrix.sh` really does this. Closed by
+///     `referenced_repo_scripts`, which resolves `.sh` tokens against the tree
+///     and scans them too.
+///  5. **Prose counted as machinery** — ci.yml's comment blocks quote
+///     `cargo test` and name the apparmor sysctl. Closed by
+///     `without_full_line_comments`: every scan below runs on comment-stripped
+///     text, in both directions.
+///  6. **The action is renamed or deleted while ci.yml still names something** —
+///     closed by asserting `action.yml` exists at the exact path, from the same
+///     constant the `uses:` comparison uses.
+///  7. **The action is reduced to a stub** — a `uses:` that resolves to an empty
+///     composite action provisions nothing while every job still "references the
+///     shared setup". Closed by requiring the action to be a composite action
+///     that still spells all three capabilities in `HOST_SETUP_TOKENS`, still
+///     writes the sysctl, still sets a `user.name`/`user.email` git identity, and
+///     still carries the `::error::` fail-loud posture — a step that unclamps and
+///     shrugs is indistinguishable from one that worked, which is the specific
+///     reason D6 Option A demands it.
+///
+/// The one hole knowingly left open: this test cannot prove the action's steps
+/// *succeed* on the runner, only that they are declared. That is
+/// `ci_preflight_host_meets_the_declared_minimum`'s job, and it now runs in every
+/// job that needs it precisely because of the equality asserted here.
+#[test]
+fn every_ci_job_that_runs_this_crates_tests_provisions_the_host_capabilities_they_need() {
+    let yaml = read_repo_text(WORKFLOW_REL);
+    let jobs = workflow_jobs(&yaml);
+    assert!(
+        jobs.len() >= 5,
+        "only {} job(s) parsed out of {WORKFLOW_REL} — its own header documents seven, so \
+         the hand-rolled parser has lost the file's shape rather than CI having shrunk. \
+         Every assertion below would be vacuous on an empty or near-empty job list.",
+        jobs.len()
+    );
+
+    let mut needs_setup: BTreeSet<String> = BTreeSet::new();
+    let mut has_setup: BTreeSet<String> = BTreeSet::new();
+    let mut invocations = 0usize;
+
+    for (name, raw_body) in &jobs {
+        let body = without_full_line_comments(raw_body);
+
+        // The job's own steps, plus any repo script those steps run: a job can
+        // reach this crate's tests either way, and only one of them is visible
+        // in ci.yml.
+        let mut sources: Vec<(String, String)> =
+            vec![(format!("{WORKFLOW_REL} job `{name}`"), body.clone())];
+        for script in referenced_repo_scripts(&body) {
+            let text = without_full_line_comments(&read_repo_text(&script));
+            sources.push((format!("{script} (run by job `{name}`)"), text));
+        }
+
+        for (origin, text) in &sources {
+            for line in text.lines() {
+                if !line.contains("cargo test") {
+                    continue;
+                }
+                invocations += 1;
+                if cargo_test_line_reaches_server(origin, line) {
+                    needs_setup.insert(name.clone());
+                }
+            }
+        }
+
+        if job_uses_local_action(&body, HOST_SETUP_ACTION_DIR) {
+            has_setup.insert(name.clone());
+        }
+    }
+
+    assert!(
+        invocations >= 4,
+        "the scan saw only {invocations} `cargo test` invocation(s) across {WORKFLOW_REL} \
+         and the scripts it runs. There are at least four (core's workspace sweep, the \
+         contract suites, the sandbox preflight, the escape battery), so this is the scan \
+         breaking, not CI dropping its tests — and a scan that sees no invocations \
+         classifies no job as needing setup and passes having checked nothing."
+    );
+    assert!(
+        needs_setup.len() >= 3,
+        "only {} job(s) classified as running git-vista-server's tests ({needs_setup:?}). \
+         `core`, `contract` and `sandbox` all do, so fewer than three means the \
+         classification broke; with an empty set the equality below would be satisfied by \
+         a workflow that provisions nothing at all.",
+        needs_setup.len()
+    );
+
+    assert_eq!(
+        needs_setup,
+        has_setup,
+        "every {WORKFLOW_REL} job that runs git-vista-server's tests must reference the \
+         shared host-setup action `{HOST_SETUP_ACTION_DIR}`, and only those jobs may. \
+         Runs this crate's tests without provisioning the host: {:?} — those jobs \
+         construct the Strict tier, so every git spawn in them is refused rather than \
+         downgraded (ADR 0029) and their failures look like product bugs. Provisions the \
+         host without running this crate's tests: {:?} — the action weakens the runner \
+         (it clears kernel.apparmor_restrict_unprivileged_userns), so a job with no reason \
+         to need it should not carry it. Equality rather than a subset is deliberate: the \
+         defect being fixed was two hand-maintained sides of one relationship drifting, \
+         and a subset check only ever sees one direction of that.",
+        needs_setup.difference(&has_setup).collect::<Vec<_>>(),
+        has_setup.difference(&needs_setup).collect::<Vec<_>>(),
+    );
+
+    // The action itself: referenced by every testing job above, which proves
+    // nothing at all if the file is missing or has been emptied.
+    let action_rel = format!("{HOST_SETUP_ACTION_DIR}/action.yml");
+    assert!(
+        repo_root_dir().join(&action_rel).is_file(),
+        "{action_rel} does not exist, yet {has_setup:?} name it in a `uses:` step. A local \
+         composite action is resolved from the checked-out tree, so this is a workflow that \
+         cannot start — and if the directory was renamed, rename it in \
+         HOST_SETUP_ACTION_DIR too so both halves of this test move together."
+    );
+    let action = without_full_line_comments(&read_repo_text(&action_rel));
+    assert!(
+        action.contains("using:") && action.contains("composite"),
+        "{action_rel} does not declare `runs.using: composite`. Only a composite action can \
+         be referenced with `uses: ./...` from three jobs the way this one is; anything else \
+         means the jobs above reference something that will not run."
+    );
+    for (token, why) in HOST_SETUP_TOKENS {
+        assert!(
+            action.contains(token),
+            "{action_rel} no longer mentions `{token}` — the action {why}. Reducing the \
+             shared setup to a stub leaves every job's `uses:` in place and every check \
+             above green while the hosts go unprovisioned, which is exactly the state this \
+             test exists to make impossible."
+        );
+    }
+    for (token, why) in [
+        (
+            "sysctl",
+            "the userns unclamp has to actually write the sysctl",
+        ),
+        (
+            "git config",
+            "the git identity has to actually be configured",
+        ),
+        (
+            "user.name",
+            "git needs a name as well as an email to author a commit",
+        ),
+        (
+            "::error::",
+            "D6 Option A requires the unclamp to fail LOUDLY if the write does not take — a \
+             step that silently falls through to a degraded run is indistinguishable from \
+             one that worked, and would hand the battery back the vacuity it was built to \
+             remove",
+        ),
+    ] {
+        assert!(
+            action.contains(token),
+            "{action_rel} no longer contains `{token}`: {why}"
+        );
+    }
+
+    // The other direction: the provisioning lives in the action and only in the
+    // action. Re-inlining it into a job is how three copies of a
+    // security-relevant preflight drifted in the first place.
+    let workflow_steps = without_full_line_comments(&yaml);
+    for (token, why) in HOST_SETUP_TOKENS {
+        assert!(
+            !workflow_steps.contains(token),
+            "{WORKFLOW_REL} spells `{token}` in a step of its own — the action {why}, and it \
+             must be the only place that does. A per-job copy is what produced this bug: \
+             `sandbox` carried the setup, `core` and `contract` did not, and the three were \
+             supposed to share one preflight. Put it in {HOST_SETUP_ACTION_DIR} and reference \
+             it. (Prose is fine — this scan reads comment-stripped text.)"
+        );
+    }
 }
