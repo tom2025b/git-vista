@@ -1421,6 +1421,25 @@ fn f_every_observation_requires_typed_kernel_provenance() {
 
 /// R3: every case carries the mandatory paired-positive field, and `run_case`
 /// actually asserts it rather than merely storing it.
+///
+/// # Why this checks a whole call and not two substrings
+///
+/// This test used to assert `body.contains("expect_granted") &&
+/// body.contains("\"GRANTED\"")` over the whole `execute` body, which is not
+/// the property it claims. Both substrings occur in `execute` for reasons that
+/// have nothing to do with the assertion: `case.expect_granted_provenance`
+/// *contains* `expect_granted`, and the literal `"GRANTED"` is the parse tag
+/// handed to `parse_observation`. So an edit that kept the parse call — needed
+/// for provenance bookkeeping — while dropping the `observation_mismatch`
+/// comparison would silently turn R3's mandatory paired positive into a no-op,
+/// and this tripwire would have kept passing. That is the exact "green test
+/// that proves nothing" shape the whole contract exists to prevent, sitting
+/// inside the contract itself.
+///
+/// The check below is structural instead: some `observation_mismatch(…)` call
+/// must take **both** the `"GRANTED"` tag and `case.expect_granted` (trailing
+/// comma required, so the unrelated `case.expect_granted_provenance` field
+/// cannot satisfy it), and its result must be acted on rather than discarded.
 #[test]
 fn r3_every_case_declares_and_asserts_a_paired_positive() {
     let code = read_self_code_only();
@@ -1432,11 +1451,67 @@ fn r3_every_case_declares_and_asserts_a_paired_positive() {
     // checks for is itself a string literal, which `code_only` would blank.
     let comments_blanked = read_self_comments_only();
     let body = fn_body_in(&comments_blanked, "execute");
-    assert!(
-        body.contains("expect_granted") && body.contains("\"GRANTED\""),
-        "R3: expect_granted must be asserted inside the harness's per-case runner, \
-         against a paired-positive observation, not merely stored on the case"
+
+    let granted_calls: Vec<&str> = call_args_in(body, "observation_mismatch")
+        .into_iter()
+        .filter(|args| args.contains("\"GRANTED\"") && args.contains("case.expect_granted,"))
+        .collect();
+    assert_eq!(
+        granted_calls.len(),
+        1,
+        "R3: exactly one `observation_mismatch` call must compare the GRANTED observation \
+         against `case.expect_granted`; found {}. Zero means the mandatory paired positive is \
+         stored but never asserted (the failure this test exists to catch); more than one means \
+         the assertion has been duplicated and this test can no longer say which one is \
+         load-bearing.",
+        granted_calls.len()
     );
+
+    // The comparison must also be *consumed*. `observation_mismatch` returns
+    // `Option<String>`; a call whose result is dropped asserts nothing at all,
+    // and would otherwise satisfy every check above.
+    let at = body
+        .find("observation_mismatch")
+        .expect("the call was just located");
+    let preceding = body[..at].rsplit(';').next().unwrap_or("");
+    assert!(
+        preceding.contains("if let Some("),
+        "R3: the paired-positive comparison must be consumed by the caller (an \
+         `if let Some(detail) = …` that returns `Outcome::Escaped`); a bare call would \
+         compute the mismatch and throw it away"
+    );
+}
+
+/// Return the argument text of every call to `name` in `src`, paren-balanced.
+///
+/// Substring checks over a whole function body cannot tell "these two tokens
+/// both appear somewhere" from "these two tokens are arguments to the same
+/// call" — the distinction that makes `r3_every_case_declares_and_asserts_a_paired_positive`
+/// mean anything. Written by hand rather than pulled in as a parser dependency:
+/// the battery deliberately reads its own source with no build-time deps.
+fn call_args_in<'a>(src: &'a str, name: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let marker = format!("{name}(");
+    let mut from = 0usize;
+    while let Some(rel) = src[from..].find(&marker) {
+        let open = from + rel + marker.len();
+        let mut depth = 1usize;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        out.push(&src[open..open + i]);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        from = open;
+    }
+    out
 }
 
 /// R4: no host-capability probing appears outside `mod harness`, and the
