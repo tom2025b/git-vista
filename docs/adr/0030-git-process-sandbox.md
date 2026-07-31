@@ -382,20 +382,20 @@ stateDiagram-v2
    draft of `landlock_does_not_mediate_chmod` pushed its own target directory
    into `policy.rw_trees` and then observed chmod succeeding there — which a
    read-write grant is supposed to allow regardless of the mechanism under
-   test (`documented_gaps.rs:88-93`, F-NEW-3). Caught before landing; the
+   test (`documented_gaps.rs`, F-NEW-3). Caught before landing; the
    surviving test asserts the target lies under no grant at all.
 4. **A census silently drifted from the source it was meant to police.**
    `high_bit_af_unix_denied` and `high_bit_io_uring_denied` landed, both
    green, both writing report records the gating job would have diffed
    against a census that did not know about them — the gate would have gone
    red on the next CI run for a reason indistinguishable from a real
-   regression (`escape_contract.rs:1171-1177`).
+   regression (`escape_contract.rs`'s `r5_census_names_exactly_the_declared_cases`).
 5. **A push test passed over a literal IP while DNS inside the sandbox was
    dead.** Before the network tier's DNS-resolver grant existed, `git
    ls-remote https://github.com/...` failed to resolve any host from inside
    it — but the push test in this crate used `git://127.0.0.1:9418`, which
    needs no resolver, and passed regardless: a green test over a broken
-   feature (`mod.rs:275-283`).
+   feature (`mod.rs`'s `NETWORK_ONLY_RO_TREES`).
 6. **An AF_UNIX denial was claimed and enforced in neither of the places
    that claimed it.** Correction to the common retelling: it is one document
    making the claim twice (the M1.13b plan's Architecture section and its
@@ -451,13 +451,13 @@ stateDiagram-v2
   now runs inside a tier it never ran in before M1.13a/b — Strict or
   Network, never bare.** Verified directly: `git_cmd.rs`'s `sandboxed()`
   (the crate's sole production spawn seam) calls `sandbox::policy_for`, the
-  real dispatcher, not a hardcoded stand-in (`git_cmd.rs:207-215`).
+  real dispatcher, not a hardcoded stand-in.
   `Unsandboxed` exists and is reachable by rule, but `trust::grant` has no
   handler wired to it yet — a real security lever with the safety catch
   still on, not a decorative one.
 - **Extra latency on every sandboxed spawn, measured.** The strict-tier
   launcher (bwrap + Landlock + seccomp + network namespace) costs an extra
-  17–24 ms per git process spawned versus unsandboxed (`design-docs/2026-07-29-m1.13b-escape-battery-25b.md:209-211`)
+  17–24 ms per git process spawned versus unsandboxed (`design-docs/2026-07-29-m1.13b-escape-battery-25b.md`'s "The measured cost, so nobody has to guess")
   — roughly 2.5–3.5x a ~7 ms unsandboxed baseline. Not measured anywhere in
   this repository: bwrap's cost under the streaming/high-frequency call
   sites in `git_cmd.rs`, or Strict running a real `git log`/`cat-file`
@@ -558,7 +558,7 @@ stateDiagram-v2
   literal `Tier::Network`/`HookMode::Run`; when Task 8 removed that
   hard-code, the tokens survived by moving into `#[cfg(test)]`-only code, so
   the grep kept passing while the condition it stood for no longer existed
-  (`escape_contract.rs:1319-1340`). The same disease this whole contract
+  (`escape_contract.rs`'s `r8_exemptions_expire_when_their_named_blocker_disappears`). The same disease this whole contract
   exists to catch, recurring inside the machinery built to catch it — this
   needs ongoing vigilance, not a one-time fix, and is tracked as its own
   issue (#206).
