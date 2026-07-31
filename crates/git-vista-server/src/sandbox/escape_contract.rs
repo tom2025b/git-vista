@@ -1452,9 +1452,9 @@ fn r3_every_case_declares_and_asserts_a_paired_positive() {
     let comments_blanked = read_self_comments_only();
     let body = fn_body_in(&comments_blanked, "execute");
 
-    let granted_calls: Vec<&str> = call_args_in(body, "observation_mismatch")
+    let granted_calls: Vec<(usize, &str)> = call_args_in(body, "observation_mismatch")
         .into_iter()
-        .filter(|args| args.contains("\"GRANTED\"") && args.contains("case.expect_granted,"))
+        .filter(|(_, args)| args.contains("\"GRANTED\"") && args.contains("case.expect_granted,"))
         .collect();
     assert_eq!(
         granted_calls.len(),
@@ -1467,12 +1467,13 @@ fn r3_every_case_declares_and_asserts_a_paired_positive() {
         granted_calls.len()
     );
 
-    // The comparison must also be *consumed*. `observation_mismatch` returns
-    // `Option<String>`; a call whose result is dropped asserts nothing at all,
-    // and would otherwise satisfy every check above.
-    let at = body
-        .find("observation_mismatch")
-        .expect("the call was just located");
+    // The comparison must also be *consumed*, and it must be **that** call —
+    // `execute` makes three `observation_mismatch` calls and the first is a
+    // match arm, so searching for the first one would test the wrong site.
+    // `observation_mismatch` returns `Option<String>`; a call whose result is
+    // dropped asserts nothing at all and would otherwise satisfy every check
+    // above.
+    let (at, _) = granted_calls[0];
     let preceding = body[..at].rsplit(';').next().unwrap_or("");
     assert!(
         preceding.contains("if let Some("),
@@ -1482,7 +1483,9 @@ fn r3_every_case_declares_and_asserts_a_paired_positive() {
     );
 }
 
-/// Return the argument text of every call to `name` in `src`, paren-balanced.
+/// Return `(offset, argument text)` for every call to `name` in `src`,
+/// paren-balanced. The offset is where the call's name begins, so a caller can
+/// inspect the syntax the call sits in — whether its result is consumed, say.
 ///
 /// Substring checks over a whole function body cannot tell "these two tokens
 /// both appear somewhere" from "these two tokens are arguments to the same
