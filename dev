@@ -366,12 +366,31 @@ dev: testbed ready.
   port    $port
 
 Start it, then get the sign-in link:
-  cd $dir && ./target/debug/git-vista-server <repo-to-open> &
+  cd $dir && $shared_target/debug/git-vista-server <repo-to-open> &
   cd $dir && ./dev signin
+
+NOTE the binary path: this build used CARGO_TARGET_DIR=$shared_target (the
+main tree's cache — see the comment above for why), so there is no
+$dir/target/ at all. An earlier version of this message said
+"./target/debug/git-vista-server", which cannot work from here and sent a
+session hunting for a directory that was never created.
+
+That shared cache also means main-tree and testbed builds evict each other's
+copy of git-vista-server. If you run a build in the main tree after this, the
+binary at that path goes back to PORT 8080 — re-run 'dev testbed' (or rebuild
+from $dir) before driving the testbed again.
 
 Open the repo in VISUALIZE mode for a true read-only session.
 Tear down when finished:
-  git worktree remove $dir            # keeps the branch, per project rule
+  git worktree remove --force $dir
+  git branch -D $branch               # testbed branches only — see below
+
+The project's standing rule is that branches are NEVER deleted, so that the
+history of the codebase stays walkable. Tom carved testbed branches out of
+that rule explicitly (2026-07-31): "testbed repos dont matter they are temp by
+nature". They are dead ends by construction — a rewritten PORT const, never
+merged, never referenced. The carve-out is ONLY for testbed/* branches; every
+other branch in this repo is still permanent.
 EOF
 }
 cmd_handoff() {
