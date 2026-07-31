@@ -57,9 +57,13 @@ fn banner(message: &'static str) -> impl IntoView {
     view! {
         <div
             role="status"
+            // padding-top adds the safe-area inset (#65): this bar is flush
+            // with the top edge, above the topbar, so under viewport-fit=cover
+            // it would otherwise sit inside the notch region.
             style="position:fixed; top:0; left:0; right:0; z-index:900; \
                    display:flex; align-items:center; justify-content:center; \
                    gap:8px; padding:6px 12px; font-size:0.85em; \
+                   padding-top:calc(6px + env(safe-area-inset-top, 0px)); \
                    background:#3a2a0a; color:#f0c674; \
                    border-bottom:1px solid #5a4210;"
         >
