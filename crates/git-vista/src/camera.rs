@@ -200,6 +200,76 @@ mod tests {
     }
 
     #[test]
+    fn ensure_row_visible_is_a_noop_when_already_inside_the_margin() {
+        let c = Camera {
+            tx: 0.0,
+            ty: 0.0,
+            scale: 1.0,
+        };
+        // world y 400 lands at screen y 400, well inside [50, 750] for an
+        // 800px-tall viewport with a 50px margin.
+        assert_eq!(c.ensure_row_visible(800.0, 400.0, 50.0), c);
+    }
+
+    #[test]
+    fn ensure_row_visible_pans_down_when_the_target_is_above_the_top_margin() {
+        let c = Camera {
+            tx: 0.0,
+            ty: 0.0,
+            scale: 1.0,
+        };
+        // world y 10 -> screen y 10, short of the 50px top margin by 40px.
+        let z = c.ensure_row_visible(800.0, 10.0, 50.0);
+        assert_eq!((z.ty, z.scale), (40.0, 1.0), "ty shifts by exactly the shortfall");
+        // And the target now sits exactly on the margin.
+        assert_eq!(z.ty + z.scale * 10.0, 50.0);
+    }
+
+    #[test]
+    fn ensure_row_visible_pans_up_when_the_target_is_below_the_bottom_margin() {
+        let c = Camera {
+            tx: 0.0,
+            ty: 0.0,
+            scale: 1.0,
+        };
+        // world y 790 -> screen y 790, past the bottom margin (800 - 50 = 750) by 40px.
+        let z = c.ensure_row_visible(800.0, 790.0, 50.0);
+        assert_eq!(
+            (z.ty, z.scale),
+            (-40.0, 1.0),
+            "ty shifts by exactly the overshoot"
+        );
+        assert_eq!(z.ty + z.scale * 790.0, 750.0);
+    }
+
+    #[test]
+    fn ensure_row_visible_accounts_for_zoom_when_computing_screen_position() {
+        let c = Camera {
+            tx: 0.0,
+            ty: 0.0,
+            scale: 2.0,
+        };
+        // world y 200 at 2x scale -> screen y 400, past a bottom margin line of
+        // 250 (viewport 300, margin 50) by 150px.
+        let z = c.ensure_row_visible(300.0, 200.0, 50.0);
+        assert_eq!(z.ty, -150.0, "the shift accounts for the 2x scale, not the raw world delta");
+        assert_eq!(z.scale, 2.0);
+        assert_eq!(z.ty + z.scale * 200.0, 250.0);
+    }
+
+    #[test]
+    fn ensure_row_visible_never_touches_scale() {
+        let c = Camera {
+            tx: 5.0,
+            ty: 0.0,
+            scale: 3.0,
+        };
+        let z = c.ensure_row_visible(400.0, 5000.0, 50.0);
+        assert_eq!(z.scale, 3.0);
+        assert_eq!(z.tx, 5.0, "tx (horizontal) is untouched by a vertical scroll");
+    }
+
+    #[test]
     fn pinch_with_no_baseline_is_a_noop() {
         // The first move of a pinch has no previous distance yet.
         let c = Camera {
