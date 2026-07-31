@@ -8,6 +8,8 @@
 # (`dev resume`). Uncommitted work is the only work that gets lost.
 #
 #   dev gate              run the full CI gate (fmt, clippy x2, test, trunk build)
+#   dev verify            the sandbox checks gate does NOT run: escape report, census
+#                          both directions, mutants apply, no leaked daemon
 #   dev roadmap           print milestones + open issues, grouped by M-band
 #   dev start <issue#>    branch off fresh main for an issue (feature/mX.YY-slug)
 #   dev wip [message]     checkpoint: add + commit (as claude_2010) + push
@@ -15,6 +17,9 @@
 #   dev signin            reprint the sign-in link(s) for the running server
 #   dev doctor            diagnose listener/session/tunnel state without secrets
 #   dev serve [path]      start the loopback-only server (delegates to ./gv)
+#   dev testbed <ref> [port]  isolated worktree + own port, for a HUMAN to drive
+#                          the real app at <ref> while work continues here —
+#                          proves it works, not just that tests pass
 #   dev handoff           open/print handoff.md (the running "what's done / next" note)
 #   dev report            at-a-glance repo health: branches, merge status, WIP
 #                          commits, lines of code by crate (rex-check pattern)
@@ -57,6 +62,96 @@ cmd_gate() {
   echo "── trunk build ─────────────────────────────────────"
   trunk_build
   echo "dev: ✅ gate green"
+}
+
+# dev verify — the sandbox-specific checks `dev gate` does NOT run.
+#
+# `dev gate` proves the workspace builds and its tests pass. It does not prove the
+# escape battery actually *proved* anything: a case can report `capability-absent`,
+# the census can drift from the cases it mirrors, a mutant patch can stop applying,
+# and every one of those leaves `cargo test` green. Six times in M1.13b a test was
+# green while proving nothing; these are the checks that catch that class.
+#
+# Run this before closing a sandbox issue or marking a PR ready. Fail-closed
+# throughout: a missing file or an unreadable report is a FAIL, never a skip.
+cmd_verify() {
+  local fails=0
+  local report="${GV_ESCAPE_REPORT:-/tmp/gv-verify-report.txt}"
+  rm -f "$report"
+
+  echo "dev: sandbox verification (the checks gate does not run)…"
+
+  echo "── 1. escape battery + report ──────────────────────"
+  GV_ESCAPE_REPORT="$report" cargo test -p git-vista-server \
+    -- escape_suite hook_mode_suite escape_contract || { echo "  ✗ battery failed"; fails=$((fails+1)); }
+
+  echo "── 2. every case reported 'contained' ──────────────"
+  if [[ ! -s $report ]]; then
+    echo "  ✗ \$GV_ESCAPE_REPORT is missing or empty — no case ran, or the variable did"
+    echo "    not reach the test process. An unset variable must fail closed (R5)."
+    fails=$((fails+1))
+  else
+    local total contained
+    total=$(wc -l < "$report")
+    contained=$(grep -c 'result=contained' "$report" || true)
+    if [[ $total -eq $contained ]]; then
+      echo "  ✓ $contained/$total contained"
+    else
+      echo "  ✗ $contained/$total contained — the rest:"
+      grep -v 'result=contained' "$report" | sed 's/^/      /'
+      fails=$((fails+1))
+    fi
+  fi
+
+  echo "── 3. census == report, BOTH directions ────────────"
+  # Equality, not a floor: a renamed case must break the build rather than
+  # silently shrinking what the gate covers.
+  local census=docs/sandbox/escape-census.txt
+  if [[ -s $report && -f $census ]]; then
+    if diff <(grep -oE 'case=[^ ]+' "$report" | sed 's/^case=//' | sort -u) \
+            <(grep -v '^\s*#' "$census" | grep -v '^\s*$' | sort -u) > /tmp/gv-census.diff; then
+      echo "  ✓ census matches the report"
+    else
+      echo "  ✗ census and report disagree (< report only, > census only):"
+      sed 's/^/      /' /tmp/gv-census.diff
+      fails=$((fails+1))
+    fi
+  else
+    echo "  ✗ cannot compare — report or $census missing"; fails=$((fails+1))
+  fi
+
+  echo "── 4. mutants registered and applying ──────────────"
+  local n_files n_array
+  n_files=$(find ci/mutants -maxdepth 1 -name '*.patch' 2>/dev/null | wc -l)
+  n_array=$(grep -oP 'readonly -a mutants=\(\K[^)]*' ci/mutation-matrix.sh 2>/dev/null | wc -w)
+  if [[ $n_files -eq $n_array && $n_files -gt 0 ]]; then
+    echo "  ✓ $n_files patches == $n_array registered"
+  else
+    echo "  ✗ $n_files patch files vs $n_array in the mutants array"; fails=$((fails+1))
+  fi
+  local bad=0
+  for p in ci/mutants/*.patch; do
+    [[ -e $p ]] || continue
+    patch -p1 --forward --fuzz=0 --dry-run < "$p" > /dev/null 2>&1 || { echo "  ✗ does not apply: $p"; bad=1; }
+  done
+  [[ $bad -eq 0 ]] && echo "  ✓ all patches apply at --fuzz=0" || fails=$((fails+1))
+
+  echo "── 5. no leaked git daemon ─────────────────────────"
+  if pgrep -x git-daemon > /dev/null; then
+    echo "  ✗ a git-daemon survived a test run — it squats port 9418 and will"
+    echo "    poison the next run. Kill it BY PID (never 'pkill -f')."
+    fails=$((fails+1))
+  else
+    echo "  ✓ none"
+  fi
+
+  echo
+  if [[ $fails -eq 0 ]]; then
+    echo "dev: ✅ sandbox verification green"
+  else
+    echo "dev: ❌ $fails check(s) failed" >&2
+    exit 1
+  fi
 }
 
 cmd_roadmap() {
@@ -194,6 +289,110 @@ cmd_report() {
 cmd_signin() { ./gv --token; }
 cmd_doctor() { ./gv doctor; }
 cmd_serve()  { ./gv "$@"; }
+
+# dev testbed <ref> [port] — stand up an isolated, human-drivable copy of the app
+# at <ref>, on its own port, in its own worktree, without disturbing whatever is
+# already running.
+#
+# Why this exists: `dev gate` proves the tests pass. It does NOT prove the app
+# works — a green suite over a broken feature is a real failure mode this project
+# has already hit (a push test passed against a literal IP while DNS inside the
+# sandbox was dead). The only cure is a human driving the actual UI. This makes
+# that cheap enough to do before every merge instead of never.
+#
+# What it buys beyond "just test it": a NAMED, REPRODUCIBLE anchor. When
+# something breaks later, "it worked at <sha>, driven by hand on <date>" is the
+# difference between a five-minute bisect and an afternoon of archaeology.
+#
+# Isolation is by construction, not by discipline: separate worktree (own source,
+# own target/), separate port, separate branch. Nothing the main tree does can
+# reach it. That is why this is a worktree and not a container — the code is our
+# own at our own commit, so the only boundaries needed are filesystem and port,
+# both of which git and a const already give us.
+cmd_testbed() {
+  local ref="${1:-main}" port="${2:-8081}"
+  local dir="$REPO-testbed-$port"
+  local branch="testbed/$(echo "$ref" | tr '/' '-')-$(date +%Y%m%d-%H%M)"
+
+  [[ -e $dir ]] && die "$dir already exists — remove it or pick another port (dev testbed <ref> <port>)"
+  git rev-parse --verify "$ref" >/dev/null 2>&1 || die "unknown ref: $ref"
+  if ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .; then
+    die "port $port is already in use — pick another (dev testbed <ref> <port>)"
+  fi
+
+  local sha; sha="$(git rev-parse --short "$ref")"
+  echo "dev: testbed for $ref ($sha) on port $port"
+  git worktree add "$dir" -b "$branch" "$ref"
+
+  # The port is a compile-time const (state.rs) because the server is
+  # deliberately loopback-only — no env override exists, by design. Rewriting it
+  # here is safe precisely because this worktree is a dead end: its branch is
+  # never merged, so the edit cannot escape into main.
+  local state="$dir/crates/git-vista-server/src/state.rs"
+  sed -i "s/pub(crate) const PORT: u16 = 8080;/pub(crate) const PORT: u16 = $port;/" "$state"
+  grep -q "const PORT: u16 = $port;" "$state" || die "could not retarget PORT in $state"
+
+  # Build against the MAIN tree's target/ instead of a fresh empty one.
+  #
+  # This is the difference between ~95 seconds and several hours, measured on
+  # this box (4 cores, 7 GB RAM, spinning disk). A new worktree starts with an
+  # empty target/, so a --release build recompiles every dependency from
+  # scratch — and `git worktree remove` then deletes the result, so the next
+  # testbed pays the same cost again. Nothing was ever reused. Sharing the
+  # cache means only the crates that actually differ (the PORT const above, and
+  # whatever the ref changes) get rebuilt.
+  #
+  # Safe because cargo locks target/ and keys artifacts by the full compilation
+  # fingerprint: the retargeted PORT is part of that fingerprint, so the
+  # testbed's binaries never masquerade as the main tree's. The cost of sharing
+  # is that main and testbed builds evict each other's copy of the two crates
+  # that differ — seconds, against hours saved.
+  #
+  # Debug, not --release: this build exists to be driven by a human for a few
+  # minutes, not to be fast at runtime. Optimizing it is the tail wagging the dog.
+  local shared_target="$REPO/target"
+  echo "dev: building against the shared cache at $shared_target (debug)"
+  ( cd "$dir" && env CARGO_TARGET_DIR="$shared_target" \
+      trunk build --config crates/git-vista/Trunk.toml )
+  ( cd "$dir" && env CARGO_TARGET_DIR="$shared_target" \
+      cargo build -p git-vista-server )
+
+  cat <<EOF
+
+dev: testbed ready.
+  ref     $ref ($sha)
+  branch  $branch   (dead end — never merge this)
+  dir     $dir
+  port    $port
+
+Start it, then get the sign-in link:
+  cd $dir && $shared_target/debug/git-vista-server <repo-to-open> &
+  cd $dir && ./dev signin
+
+NOTE the binary path: this build used CARGO_TARGET_DIR=$shared_target (the
+main tree's cache — see the comment above for why), so there is no
+$dir/target/ at all. An earlier version of this message said
+"./target/debug/git-vista-server", which cannot work from here and sent a
+session hunting for a directory that was never created.
+
+That shared cache also means main-tree and testbed builds evict each other's
+copy of git-vista-server. If you run a build in the main tree after this, the
+binary at that path goes back to PORT 8080 — re-run 'dev testbed' (or rebuild
+from $dir) before driving the testbed again.
+
+Open the repo in VISUALIZE mode for a true read-only session.
+Tear down when finished:
+  git worktree remove --force $dir
+  git branch -D $branch               # testbed branches only — see below
+
+The project's standing rule is that branches are NEVER deleted, so that the
+history of the codebase stays walkable. Tom carved testbed branches out of
+that rule explicitly (2026-07-31): "testbed repos dont matter they are temp by
+nature". They are dead ends by construction — a rewritten PORT const, never
+merged, never referenced. The carve-out is ONLY for testbed/* branches; every
+other branch in this repo is still permanent.
+EOF
+}
 cmd_handoff() {
   [[ -f handoff.md ]] && { cat handoff.md; exit 0; }
   echo "dev: no handoff.md yet. Create it with: the goal, a [ ]/[x] checklist, and 'next step'."
@@ -201,6 +400,7 @@ cmd_handoff() {
 
 case "${1:-}" in
   gate)    shift; cmd_gate "$@" ;;
+  verify)  shift; cmd_verify "$@" ;;
   roadmap) shift; cmd_roadmap "$@" ;;
   start)   shift; cmd_start "$@" ;;
   wip)     shift; cmd_wip "$@" ;;
@@ -208,6 +408,7 @@ case "${1:-}" in
   signin)  shift; cmd_signin "$@" ;;
   doctor)  shift; cmd_doctor "$@" ;;
   serve)   shift; cmd_serve "$@" ;;
+  testbed) shift; cmd_testbed "$@" ;;
   handoff) shift; cmd_handoff "$@" ;;
   report)  shift; cmd_report "$@" ;;
   ""|-h|--help|help)
