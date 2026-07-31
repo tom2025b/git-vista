@@ -54,6 +54,19 @@ const MAX_PAGE_LIMIT: usize = 1_000;
 /// over a phone tether) and well below "the user has given up and reloaded".
 const REQUEST_TIMEOUT_MS: u64 = 60_000;
 
+/// The deadline for `POST /api/clone` alone.
+///
+/// Clone is the one write whose legitimate duration is unbounded by anything the
+/// client controls: a large repository over a slow link can genuinely take
+/// minutes. Applying [`REQUEST_TIMEOUT_MS`] to it would abandon a *working*
+/// transfer and then retry it — and because clone is not operation-tracked, that
+/// retry would start a second `git clone` rather than being deduplicated. So the
+/// bound is set just under the server's own 600s ceiling
+/// (`handlers/clone.rs::CLONE_TIMEOUT`): late enough never to interrupt a clone
+/// the server is still making progress on, early enough that the client still
+/// gives up before the server does and can report why.
+const CLONE_TIMEOUT_MS: u64 = 570_000;
+
 /// Resolve to `Some(v)` if `fut` finishes within `ms`, or `None` if the deadline
 /// wins.
 ///
@@ -192,7 +205,7 @@ async fn send_write(
     url: &str,
     body: Option<String>,
 ) -> Result<(gloo_net::http::Response, IdempotencyKey), String> {
-    send_write_with_key(url, body, new_idempotency_key()).await
+    send_write_with_key(url, body, new_idempotency_key(), REQUEST_TIMEOUT_MS).await
 }
 
 /// [`send_write`] under a key the *caller* minted.
@@ -205,6 +218,7 @@ async fn send_write_with_key(
     url: &str,
     body: Option<String>,
     key: IdempotencyKey,
+    timeout_ms: u64,
 ) -> Result<(gloo_net::http::Response, IdempotencyKey), String> {
     let attempt = || async {
         let builder = req_post(url).header(IDEMPOTENCY_HEADER, key.as_str());
@@ -223,11 +237,29 @@ async fn send_write_with_key(
         // #216: a hung request is not a slow request. Without this, a socket that
         // died silently mid-flight parks the caller's future forever and even the
         // retry below never runs — there is nothing to retry *after*, because the
-        // first attempt never finished. Retrying a timed-out write is safe here
-        // for the same reason retrying a failed one is: both attempts carry the
-        // same idempotency key, so a first attempt that did land is replayed from
-        // the server's record rather than run twice.
-        with_deadline(sent, REQUEST_TIMEOUT_MS)
+        // first attempt never finished.
+        //
+        // # Why retrying a *timed-out* write is safe — and the one case where it is not
+        //
+        // A timeout here does **not** cancel the request: there is no
+        // `AbortController`, so the first attempt may still be executing on the
+        // server when the second arrives. For **operation-tracked** writes that is
+        // handled server-side, and by design: `operations::admit` is "a single
+        // critical section over the maps, so two concurrent requests carrying the
+        // same key cannot both be admitted: the loser sees the winner's record and
+        // awaits it". Concurrency is the case it was built for, not an afterthought.
+        //
+        // **`/api/clone` is not operation-tracked** (nor are `select`, `rescan` and
+        // `delete-clone` — see [`WriteReceipt::operation`]). It never reaches
+        // `admit`, so the key it carries buys it nothing, and two overlapping
+        // attempts really would run two `git clone`s. That is why clone gets
+        // [`CLONE_TIMEOUT_MS`] instead of this bound: long enough that a working
+        // clone is never abandoned mid-transfer, so the retry does not fire while
+        // the first attempt is still going. Found by an outside review of this
+        // patch on 2026-07-31; the comment previously claimed the key made this
+        // safe for every write, which was false for exactly the endpoint the
+        // timeout was written for.
+        with_deadline(sent, timeout_ms)
             .await
             .unwrap_or_else(|| Err(timeout_error()))
     };
@@ -303,8 +335,20 @@ async fn write_json<T: serde::Serialize>(
     url: &str,
     body: &T,
 ) -> Result<(gloo_net::http::Response, IdempotencyKey), String> {
+    write_json_with_timeout(url, body, REQUEST_TIMEOUT_MS).await
+}
+
+/// [`write_json`] under a caller-chosen deadline.
+///
+/// Exists for `/api/clone`, which is the one write whose *legitimate* duration
+/// can exceed the ordinary bound — see [`CLONE_TIMEOUT_MS`].
+async fn write_json_with_timeout<T: serde::Serialize>(
+    url: &str,
+    body: &T,
+    timeout_ms: u64,
+) -> Result<(gloo_net::http::Response, IdempotencyKey), String> {
     let json = serde_json::to_string(body).map_err(|e| e.to_string())?;
-    send_write(url, Some(json)).await
+    send_write_with_key(url, Some(json), new_idempotency_key(), timeout_ms).await
 }
 
 /// [`send_write`] with no body — the bodyless writes (stage, unstage, rebase…).
@@ -524,7 +568,7 @@ pub async fn clone_request(url: &str) -> Result<RepositoryDescriptor, String> {
     let body = CloneRequest {
         url: url.to_string(),
     };
-    let (resp, _key) = write_json("/api/clone", &body).await?;
+    let (resp, _key) = write_json_with_timeout("/api/clone", &body, CLONE_TIMEOUT_MS).await?;
     if resp.ok() {
         resp.json::<RepositoryDescriptor>()
             .await
@@ -687,7 +731,8 @@ pub async fn undo_request(
 ) -> Result<WriteReceipt, String> {
     refuse_if_visualize()?;
     let json = serde_json::to_string(action).map_err(|e| e.to_string())?;
-    let (resp, _key) = send_write_with_key("/api/undo", Some(json), key).await?;
+    let (resp, _key) =
+        send_write_with_key("/api/undo", Some(json), key, REQUEST_TIMEOUT_MS).await?;
     Ok(receipt(resp).await)
 }
 
@@ -793,7 +838,7 @@ pub async fn fetch_rebase_status() -> Result<RebaseStatus, String> {
 /// is git's own error text (conflicts, detached HEAD, …), returned as `Err`.
 pub async fn rebase_request(key: IdempotencyKey) -> Result<WriteReceipt, String> {
     refuse_if_visualize()?;
-    let (resp, _key) = send_write_with_key("/api/rebase", None, key).await?;
+    let (resp, _key) = send_write_with_key("/api/rebase", None, key, REQUEST_TIMEOUT_MS).await?;
     Ok(receipt(resp).await)
 }
 
@@ -832,7 +877,7 @@ pub async fn branch_op_request(
         branch: branch.to_string(),
     };
     let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-    let (resp, _key) = send_write_with_key(path, Some(json), key).await?;
+    let (resp, _key) = send_write_with_key(path, Some(json), key, REQUEST_TIMEOUT_MS).await?;
     Ok(receipt(resp).await)
 }
 
