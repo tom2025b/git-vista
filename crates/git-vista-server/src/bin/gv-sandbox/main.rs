@@ -545,6 +545,29 @@ enum CarveoutError {
     /// unreviewed way to grant whatever `--exclude` was just told to
     /// withhold.
     NotAFile { real: PathBuf },
+    /// The named path's own final component is a symlink. **Never** tolerated,
+    /// and this is the second half of the safety property — `NotAFile` alone
+    /// only rules out *widening to a directory*, not *redirection to a
+    /// different file*.
+    ///
+    /// A Landlock `path_beneath` rule is anchored to the filesystem object
+    /// reached through the `O_PATH` descriptor `add_path_rule` opens, not to
+    /// the path string used to open it. So canonicalising first and granting
+    /// the resolved target — which is what this function did before #188's
+    /// review — means a `~/.ssh/known_hosts` that is a symlink to
+    /// `~/.ssh/id_rsa` grants read access to *the private key*, by its real
+    /// path, defeating the very `--exclude ~/.ssh` this carve-out exists to
+    /// preserve. Nothing inside any tier can create that symlink (`.ssh` is
+    /// excluded from every policy), but a dotfile manager or an earlier
+    /// compromise can, outside the sandbox, and the grant would then be silent.
+    ///
+    /// `enumerate()` already enforces the analogous rule for ordinary
+    /// `--ro`/`--rw` grants (`real.starts_with(root)`); containment cannot be
+    /// reused verbatim here, because the dangerous target (`~/.ssh/id_rsa`)
+    /// sits in the *same directory* as the legitimate one. So the carve-out's
+    /// rule is stricter than containment: the named path must **be** the file,
+    /// never point at one.
+    Symlinked { link: PathBuf },
     /// Resolved and confirmed a regular file, but it could not be stat'ed
     /// through the descriptor the rule would carry.
     Unstattable(std::io::Error),
@@ -569,6 +592,13 @@ impl std::fmt::Display for CarveoutError {
                  never a directory",
                 real.display()
             ),
+            CarveoutError::Symlinked { link } => write!(
+                f,
+                "`{}` is a symlink — --ro-carveout must name the file itself, never a link to \
+                 one, because the grant lands on the link's target and would re-expose whatever \
+                 --exclude was told to withhold",
+                link.display()
+            ),
             CarveoutError::Unstattable(e) => write!(f, "cannot stat the resolved path ({e})"),
             CarveoutError::Refused(e) => write!(f, "{e}"),
         }
@@ -585,12 +615,37 @@ impl std::fmt::Display for CarveoutError {
 /// It does not call `grant_tree`, and it takes no `excludes` parameter at
 /// all — bypassing the exclude check is this function's whole reason to
 /// exist (#188: `~/.ssh` stays wholly excluded, but `~/.ssh/known_hosts`
-/// must still be readable in the Network tier). The safety property that
-/// makes this acceptable is enforced here instead, structurally: the target
-/// must resolve to an existing regular file or the grant is refused
-/// (`NotAFile`) — never a directory, which is what would turn this into a
-/// second, unreviewed way to grant an entire excluded tree.
+/// must still be readable in the Network tier). Two checks, together, are the
+/// safety property that makes that acceptable — and **both** are load-bearing,
+/// because they close different holes:
+///
+/// 1. **Not a directory** (`NotAFile`) — otherwise `--ro-carveout ~/.ssh`
+///    would be a second, unreviewed way to grant an entire excluded tree.
+/// 2. **Not a symlink** (`Symlinked`) — otherwise `~/.ssh/known_hosts`
+///    pointing at `~/.ssh/id_rsa` would grant *the private key*, since the
+///    Landlock rule lands on the resolved object rather than on the name. See
+///    [`CarveoutError::Symlinked`] for why containment (`enumerate()`'s
+///    `real.starts_with(root)`) is not a usable check here.
+///
+/// The symlink check runs **before** `canonicalize`, which is the whole point:
+/// canonicalising first destroys the evidence, because `real` is then the
+/// target and looks like a perfectly ordinary regular file.
 fn add_carveout_rule(ruleset: i32, path: &Path) -> Result<u64, CarveoutError> {
+    // Deliberately `symlink_metadata`, not `metadata`: the question is what
+    // the *name* is, not what it leads to. A dangling symlink refuses here as
+    // `Symlinked` rather than being tolerated as `Absent` — "the redirection
+    // is currently broken" is not the same fact as "this host has no
+    // known_hosts yet", and only the latter is safe to wave through.
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(CarveoutError::Symlinked {
+                link: path.to_path_buf(),
+            });
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(CarveoutError::Absent),
+        Err(e) => return Err(CarveoutError::Unresolvable(e)),
+    }
     let real = match std::fs::canonicalize(path) {
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(CarveoutError::Absent),
