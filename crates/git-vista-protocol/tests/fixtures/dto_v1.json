@@ -33,13 +33,13 @@
     "authenticated": true,
     "csrf": "csrf-token-abc123",
     "via_lan": false,
-    "hook_policy": "restricted"
+    "hook_policy": "strict"
   },
   "session_info_unauthenticated": {
     "authenticated": false,
     "csrf": null,
     "via_lan": false,
-    "hook_policy": "allow"
+    "hook_policy": "unsandboxed"
   },
   "rebase_status": {
     "branch": "feature/idea",
@@ -61,6 +61,7 @@
     "kind": "linked_worktree",
     "read_only": true,
     "path": "/home/tom/repos/git-vista/.worktrees/linked",
-    "remote_web_url": "https://github.com/owner/repo"
+    "remote_web_url": "https://github.com/owner/repo",
+    "hook_policy": "unsandboxed"
   }
 }
