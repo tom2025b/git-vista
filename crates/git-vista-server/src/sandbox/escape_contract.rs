@@ -1450,6 +1450,14 @@ fn production_policy_literals(prod: &str) -> Vec<&str> {
 ///     assigning `HookMode::Blocked`. Give any constructor a route to `Blocked`
 ///     and this goes red, which is precisely when `hook_mode_suite`'s exemption
 ///     must be retired.
+///
+/// Finding the literals is [`production_policy_literals`], which is token-exact
+/// on the left (so a `-> HookPolicy {` signature is not mistaken for a `Policy`
+/// construction and does not fire a "the scan broke" panic at the next person to
+/// name a type that way) and brace-scoped on the right (so a construction that
+/// omits `hook_mode` cannot borrow a later literal's field and pass). It has its
+/// own tests — `the_r8_policy_scan_is_token_exact_and_brace_scoped` — because a
+/// scanner nobody scanned is how a tripwire ends up green on a technicality.
 #[test]
 fn r8_exemptions_expire_when_their_named_blocker_disappears() {
     // (1) Every blocker string the battery declares. String content must
@@ -1569,6 +1577,86 @@ fn r8_exemptions_expire_when_their_named_blocker_disappears() {
         "R8: found only {sites} production `Policy` construction sites under \
          src/sandbox — policy_for, policy_for_clone and probe::boot_probe_policy are \
          the three that must be there, so the scan broke rather than the code shrinking"
+    );
+}
+
+/// [`production_policy_literals`] on its own terms: what it must find, what it
+/// must not mistake for a construction, and — the half that matters — that each
+/// construction is judged on *its own* braces.
+///
+/// R8 rests entirely on this function, and R8's job is to notice when an
+/// exemption has outlived its blocker. A scanner that quietly finds nothing, or
+/// that answers a question about literal A using literal B's text, makes R8 pass
+/// for reasons unrelated to the property. Both were live defects in the previous
+/// `str::find`-based form; each has a case below.
+///
+/// The snippets are written as ordinary string literals rather than assembled
+/// from fragments: this module is `#[cfg(test)] mod escape_contract` (see
+/// `sandbox/mod.rs`), so R8's own file walk skips it, and every self-scan in
+/// this file reads through `code_only`, which blanks string-literal content.
+#[test]
+fn the_r8_policy_scan_is_token_exact_and_brace_scoped() {
+    // An identifier that merely ENDS in `Policy` is a different type. This is
+    // the false positive that made `sandbox::hook_policy` name its return type
+    // through an alias to avoid tripping the old scan.
+    assert!(
+        production_policy_literals("fn f(t: Tier) -> HookPolicy { HookPolicy::Strict }").is_empty(),
+        "`-> HookPolicy {{` is not a `Policy` construction"
+    );
+
+    // Declarations and impls are not constructions either — including through a
+    // path prefix and through `for`.
+    for src in [
+        "pub(crate) struct Policy { pub tier: Tier }",
+        "impl Policy { fn tier(&self) -> Tier { self.tier } }",
+        "impl std::fmt::Debug for Policy { }",
+        "impl super::Policy { }",
+        "fn build() -> super::Policy { unreachable!() }",
+    ] {
+        assert!(
+            production_policy_literals(src).is_empty(),
+            "not a construction, but the scan claimed one: {src}"
+        );
+    }
+
+    // A real construction inside a function whose return type is also `Policy`:
+    // exactly one body, and it is the literal's, not the function's.
+    let one = production_policy_literals("fn p() -> Policy { Policy { hook_mode: HookMode::Run } }");
+    assert_eq!(one.len(), 1, "expected exactly one construction, got {one:?}");
+    assert_eq!(one[0].trim(), "hook_mode: HookMode::Run");
+
+    // Brace-scoped: a `..base` construction must NOT be able to answer with the
+    // next literal's field. Under the old whole-file search the first body's
+    // missing `hook_mode` was silently supplied by the second.
+    let two = production_policy_literals(
+        "let a = Policy { tier, ..base }; let b = Policy { hook_mode: HookMode::Run };",
+    );
+    assert_eq!(two.len(), 2, "expected two constructions, got {two:?}");
+    assert!(
+        !two[0].contains("hook_mode"),
+        "a functional-update literal must not inherit the next literal's field: {:?}",
+        two[0]
+    );
+    assert!(two[1].contains("hook_mode: HookMode::Run"));
+
+    // Nested braces inside a body do not truncate it early.
+    let nested =
+        production_policy_literals("Policy { trees: Some(T { x }), hook_mode: HookMode::Run }");
+    assert_eq!(nested.len(), 1);
+    assert!(nested[0].contains("T { x }") && nested[0].contains("hook_mode: HookMode::Run"));
+
+    // And the scan is not vacuous against the real tree: production source must
+    // still yield the three known constructors.
+    let mut found = 0usize;
+    for rel in ["src/sandbox/mod.rs", "src/sandbox/probe.rs"] {
+        let code = crate::argv_boundary::code_only(&read_rs(rel));
+        found += production_policy_literals(&code).len();
+    }
+    assert!(
+        found >= 3,
+        "the scan found {found} production `Policy` constructions in mod.rs + probe.rs; \
+         policy_for, policy_for_clone and boot_probe_policy are the three that must be \
+         there"
     );
 }
 
