@@ -239,6 +239,85 @@ impl ShellMode {
     }
 }
 
+/// The decision half of the debounced resize listener: which resize checks are still
+/// current, and whether a check that *is* current actually changes anything (M1.12, #65).
+///
+/// This exists because the one thing nobody could confirm about M1.12's first slice was
+/// the thing that matters most — that the layout class **settles** under a Stage Manager
+/// drag rather than thrashing. That question used to be answerable only by watching a
+/// real browser, because the whole debounce lived inside a `#[cfg(target_arch = "wasm32")]`
+/// closure in `signals.rs` with `web_sys` and `set_timeout` braided through it. Splitting
+/// the *decision* out from the *scheduling* makes the settling property provable at the
+/// host level; what remains browser-only is that `resize` fires and that
+/// `gestures::viewport_size()` reports the width, neither of which is where the subtle
+/// behaviour was.
+///
+/// Two independent reasons a scheduled check publishes nothing:
+///
+/// 1. **It was superseded.** Each resize event takes a fresh token from
+///    [`Self::observe_resize`]; [`Self::settle`] ignores any token that is not the latest.
+///    A burst of a hundred drag events therefore produces at most one publication — the
+///    last one — and the ninety-nine stale timeouts are silent no-ops rather than
+///    something that has to be found and cancelled.
+/// 2. **Nothing changed.** Most resizes never leave the current band: dragging a window
+///    from 700px to 780px is still `Portrait`. Publishing there would notify every
+///    subscriber of the mode signal — Leptos's `set` fires on write, not on difference —
+///    so the class attribute would be rewritten on every settled drag that changed
+///    nothing. [`Self::settle`] returns `Some` only on an actual band change, which is
+///    what makes "settles rather than thrashes" true for a *reader* of the signal and not
+///    merely for the DOM.
+///
+/// Deliberately not a debouncer: it owns no clock and no timer. It cannot be, if it is to
+/// be testable off-target — and the timing half (150ms, one timeout per event) is the part
+/// that is genuinely uninteresting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeSettler {
+    current: ShellMode,
+    generation: u64,
+}
+
+impl ModeSettler {
+    /// Start from the width the window has right now, with no check outstanding.
+    pub fn new(initial_width: f64) -> Self {
+        Self {
+            current: ShellMode::for_width(initial_width),
+            generation: 0,
+        }
+    }
+
+    /// The mode last published — what the signal currently holds.
+    pub fn current(&self) -> ShellMode {
+        self.current
+    }
+
+    /// A resize event arrived. Returns the token the check scheduled for *this* event
+    /// must present to [`Self::settle`]; every token handed out before this one is now
+    /// stale.
+    pub fn observe_resize(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    /// A scheduled check fired. Returns the new mode to publish, or `None` — either
+    /// because a later resize superseded this check, or because `width` is still in the
+    /// band already current.
+    ///
+    /// Takes the width at the moment the check fires rather than the width at the moment
+    /// the event arrived, on purpose: the surviving check is the one that must reflect
+    /// where the drag actually stopped.
+    pub fn settle(&mut self, token: u64, width: f64) -> Option<ShellMode> {
+        if token != self.generation {
+            return None;
+        }
+        let next = ShellMode::for_width(width);
+        if next == self.current {
+            return None;
+        }
+        self.current = next;
+        Some(next)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +522,110 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(ShellMode::for_width(650.0), ShellMode::Portrait);
         }
+    }
+
+    #[test]
+    fn a_drag_that_crosses_bands_publishes_only_the_band_it_ended_in() {
+        // The property M1.12 shipped without being able to check: the layout class
+        // settles rather than thrashing. This is the shape a Stage Manager drag actually
+        // has — resize events keep arriving while earlier events' 150ms checks are firing,
+        // and each check reads the width at the moment it fires, which mid-drag is some
+        // intermediate width the user never rested at.
+        let mut s = ModeSettler::new(1200.0);
+        assert_eq!(s.current(), ShellMode::Wide);
+
+        // A drag from 1200 down to 500. Five events; the first three land before the
+        // first check fires.
+        let t1 = s.observe_resize();
+        let t2 = s.observe_resize();
+        let t3 = s.observe_resize();
+
+        // t1's check fires — but the drag is still moving and the window is 900px wide
+        // right now. 900 is Portrait, a genuinely different band from both where the drag
+        // started and where it ends, so a `None` here is not a coincidence of the widths:
+        assert_ne!(ShellMode::for_width(900.0), ShellMode::for_width(1200.0));
+        assert_ne!(ShellMode::for_width(900.0), ShellMode::for_width(500.0));
+        assert_eq!(
+            s.settle(t1, 900.0),
+            None,
+            "a superseded check must not publish the band the drag happened to be passing through"
+        );
+        assert_eq!(s.current(), ShellMode::Wide, "still where the drag started");
+
+        let t4 = s.observe_resize();
+        let t5 = s.observe_resize();
+
+        // The rest of the checks drain, all now reading the resting width.
+        let published: Vec<_> = [t2, t3, t4, t5]
+            .into_iter()
+            .filter_map(|t| s.settle(t, 500.0))
+            .collect();
+        assert_eq!(
+            published,
+            vec![ShellMode::Compact],
+            "exactly one publication, and it is the band the drag ended in"
+        );
+    }
+
+    #[test]
+    fn settling_inside_the_current_band_publishes_nothing() {
+        // Most resizes never leave the band: 700 -> 780 is Portrait either way. Leptos's
+        // `set` notifies on write rather than on difference, so publishing here would
+        // rewrite the class attribute and wake every subscriber for a layout that did not
+        // change. The current token is used, so staleness is not what makes this `None`.
+        let mut s = ModeSettler::new(700.0);
+        let t = s.observe_resize();
+        assert_eq!(ShellMode::for_width(780.0), ShellMode::Portrait);
+        assert_eq!(s.settle(t, 780.0), None);
+        assert_eq!(s.current(), ShellMode::Portrait);
+    }
+
+    #[test]
+    fn a_band_change_is_published_exactly_once_even_if_the_same_check_runs_again() {
+        let mut s = ModeSettler::new(700.0);
+        let t = s.observe_resize();
+        assert_eq!(s.settle(t, 1200.0), Some(ShellMode::Wide));
+        assert_eq!(
+            s.settle(t, 1200.0),
+            None,
+            "the band is now current, so re-running the same check publishes nothing"
+        );
+        assert_eq!(s.current(), ShellMode::Wide);
+    }
+
+    #[test]
+    fn a_check_older_than_the_latest_resize_is_always_stale() {
+        let mut s = ModeSettler::new(700.0);
+        let old = s.observe_resize();
+        let newer = s.observe_resize();
+        assert_ne!(old, newer, "each event must take its own token");
+        assert_eq!(s.settle(old, 1200.0), None);
+        assert_eq!(
+            s.current(),
+            ShellMode::Portrait,
+            "a stale check must not move the mode even when the width would"
+        );
+        assert_eq!(
+            s.settle(newer, 1200.0),
+            Some(ShellMode::Wide),
+            "the latest check still works after a stale one was rejected"
+        );
+    }
+
+    #[test]
+    fn the_initial_mode_comes_from_the_width_at_construction() {
+        assert_eq!(ModeSettler::new(834.0).current(), ShellMode::Portrait);
+        assert_eq!(ModeSettler::new(2560.0).current(), ShellMode::UltraWide);
+    }
+
+    #[test]
+    fn a_check_that_never_fired_does_not_block_later_ones() {
+        // A timeout can be dropped outright (the tab was backgrounded, the scope was
+        // disposed). Nothing in the settler waits on it, so a later burst still settles.
+        let mut s = ModeSettler::new(500.0);
+        let _abandoned = s.observe_resize();
+        let t = s.observe_resize();
+        assert_eq!(s.settle(t, 1500.0), Some(ShellMode::UltraWide));
     }
 
     #[test]

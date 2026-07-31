@@ -386,6 +386,9 @@ pub fn detail_panel_view(
                         <button
                             class="detail-close"
                             title="Close"
+                            // The visible content is one glyph; VoiceOver would
+                            // otherwise announce this as "multiplication sign" (#65).
+                            aria-label="Close commit details"
                             on:click=move |_| shell.close_detail()
                         >
                             "×"

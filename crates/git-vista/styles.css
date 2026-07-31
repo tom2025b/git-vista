@@ -48,6 +48,13 @@ html, body {
   align-items: baseline;
   gap: 0.75rem;
   padding: 0.75rem 1rem;
+  /* #65 safe-area: viewport-fit=cover hands us the notch/home-indicator
+     regions, so top chrome must add the inset itself. env() falls back to
+     0px on displays without insets; the shorthand above stays as the value
+     for browsers without env() support. */
+  padding-top: calc(0.75rem + env(safe-area-inset-top, 0px));
+  padding-left: calc(1rem + env(safe-area-inset-left, 0px));
+  padding-right: calc(1rem + env(safe-area-inset-right, 0px));
   border-bottom: 1px solid #21262d;
 }
 
@@ -56,6 +63,11 @@ html, body {
    narrowest windows, where every pixel of height matters more than on Portrait. */
 .shell-compact .topbar {
   padding: 0.5rem 0.75rem;
+  /* Same #65 safe-area additions as the base .topbar rule — the shorthand
+     above would otherwise reset them to inset-less values. */
+  padding-top: calc(0.5rem + env(safe-area-inset-top, 0px));
+  padding-left: calc(0.75rem + env(safe-area-inset-left, 0px));
+  padding-right: calc(0.75rem + env(safe-area-inset-right, 0px));
   gap: 0.5rem;
 }
 
@@ -330,8 +342,10 @@ html, body {
    the graph, but always tappable to recenter the camera. */
 .reset-view {
   position: fixed;
-  left: 12px;
-  bottom: 12px;
+  /* #65 safe-area: bottom-left corner chrome clears the home indicator and
+     a landscape notch's left inset. */
+  left: calc(12px + env(safe-area-inset-left, 0px));
+  bottom: calc(12px + env(safe-area-inset-bottom, 0px));
   z-index: 15;
   padding: 0.4rem 0.8rem;
   font: inherit;
@@ -364,7 +378,8 @@ html, body {
 .history-page-status {
   position: absolute;
   left: 50%;
-  bottom: 12px;
+  /* #65 safe-area: bottom-docked pill clears the home indicator. */
+  bottom: calc(12px + env(safe-area-inset-bottom, 0px));
   transform: translateX(-50%);
   z-index: 15;
   display: flex;
@@ -422,18 +437,34 @@ html, body {
   border-left: 1px solid #30363d;
   box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
   font-size: 0.85rem;
+  /* #65 safe-area: the panel is flush with the top, right and bottom edges,
+     so it absorbs those insets itself rather than letting the notch or home
+     indicator sit over its content. */
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 /* M1.12 (#65): the detail panel's existing fixed-right-edge docking already
-   matches Wide/UltraWide's intent, so those two modes need no override — this
-   confirms the pre-existing default rather than silently relying on it staying
-   correct by accident. Compact/Portrait get the full-width behavior the panel's
-   own comment above already documents ("On a narrow screen it spans the full
+   matches Wide/UltraWide's intent, so Wide needs no override — this confirms
+   the pre-existing default rather than silently relying on it staying correct
+   by accident. Compact/Portrait get the full-width behavior the panel's own
+   comment above already documents ("On a narrow screen it spans the full
    width so the content stays readable") — made explicit and mode-driven here
    instead of implicit in a fixed max-width. */
-.shell-wide .detail-panel,
-.shell-ultrawide .detail-panel {
+.shell-wide .detail-panel {
   width: min(420px, 100vw);
+}
+
+/* #65 external monitor: docs/IPAD_DESIGN.md's External Monitor section asks
+   for more information density, not scaled-up chrome. The one density win
+   available to pure CSS today is diff/detail room: at ≥1440px the panel earns
+   a third more width, so file diffs and commit bodies show more content per
+   screen while the graph still keeps well over half the viewport. Controls
+   deliberately keep their touch sizing — the same section warns the external
+   display "may still be touch adjacent". */
+.shell-ultrawide .detail-panel {
+  width: min(560px, 100vw);
 }
 
 .shell-compact .detail-panel,
@@ -677,6 +708,12 @@ button.detail-file:hover .detail-file-path { color: var(--accent); }
   display: flex;
   flex-direction: column;
   background: var(--bg);
+  /* #65 safe-area: full-screen surfaces own every edge, so they absorb all
+     four insets. */
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
 }
 .viewer-head {
   display: flex;
@@ -847,5 +884,112 @@ button.detail-file:hover .detail-file-path { color: var(--accent); }
     padding: 0;
     max-width: none;
     margin: 0;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   M1.12 (#65): keyboard focus, and motion the user asked not to see.
+
+   Two rules govern everything below, and both are enforced by the tripwires in
+   `features/a11y/audit.rs` rather than by review:
+
+   1. EVERY `:hover` selector has a `:focus-visible` twin declaring at least the
+      same properties. Before this section the app had none — a keyboard or
+      Switch Control user got the browser's default ring and none of the state
+      changes a mouse user sees, and on `.act-row` / `.ctx-item` (transparent,
+      borderless rows) that ring is the only thing distinguishing the focused
+      row from its neighbours. `:focus-visible` (not `:focus`) so a tap or a
+      click does not leave a ring behind on touch.
+   2. The reduced-motion block is a standing guarantee, not a reaction: this
+      stylesheet declares no transitions or animations today, and the tripwire
+      makes sure that if one is added it is already covered rather than
+      remembered later.
+
+   What this section does NOT establish: that the ring is legible against every
+   surface it lands on. Nobody on this project can see the rendered page, so
+   contrast is asserted nowhere — the accent is reused from the existing hover
+   affordance, which is the most defensible choice available without eyes on it.
+   ───────────────────────────────────────────────────────────────────────────── */
+
+/* The baseline ring, for every focusable element including the ones with no
+   hover styling of their own (inputs, the textarea in the commit dialog, links
+   inside the detail panel). `outline-offset` keeps it clear of the element's
+   own border so the two do not read as one thick edge. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Topbar buttons (.refresh and its variants). */
+.refresh:focus-visible { border-color: var(--accent); }
+.refresh:disabled:focus-visible { border-color: #30363d; }
+.refresh.danger:focus-visible { border-color: #f85149; }
+
+/* Context-menu items. */
+.ctx-item:focus-visible { background: #21262d; }
+.ctx-item.disabled:focus-visible,
+.ctx-item:disabled:focus-visible { background: transparent; }
+.ctx-item.danger:focus-visible { background: #2d1517; }
+
+/* The floating "Reset view" control: normally faded, so focus must also bring
+   it to full opacity or the ring lands on a half-transparent control. */
+.reset-view:focus-visible { opacity: 1; border-color: var(--accent); }
+
+/* Detail panel. */
+.detail-close:focus-visible { background: #21262d; color: var(--fg); }
+.detail-parent:focus-visible { border-color: var(--accent); }
+.detail-github:focus-visible { text-decoration: underline; }
+.detail-expand:focus-visible { border-color: var(--accent); }
+button.detail-file:focus-visible { background: #21262d; }
+button.detail-file:focus-visible .detail-file-path { color: var(--accent); }
+
+/* Activity feed. */
+.act-refresh:focus-visible { border-color: var(--accent); }
+.act-row:focus-visible { background: #21262d; }
+.act-row.act-row-static:focus-visible { background: transparent; }
+.act-undo:focus-visible { background: #21262d; }
+
+/* Full-screen viewer and the print-size controls. */
+.viewer-btn:focus-visible { border-color: var(--accent); }
+.scale-btn:focus-visible { border-color: var(--accent); }
+
+/* #65 tap targets: every CSS-sized interactive control guarantees Apple's
+   44x44 CSS-pixel minimum on both axes, unconditionally — not behind
+   `@media (pointer: coarse)` — because docs/IPAD_DESIGN.md's External
+   Monitor section requires touch sizing even on big displays ("may still be
+   touch adjacent or controlled from the iPad"), and because the a11y audit's
+   guarantee predicate (features/a11y/audit.rs) deliberately reads the
+   stylesheet context-blind, so a conditional minimum would let the census
+   over-claim. `.node-hit` and `.clickable` are absent on purpose: they are
+   SVG shapes sized in `render/` user units and scaled by the camera — CSS
+   cannot guarantee their rendered extent; see INTERACTIVE_CENSUS. */
+.refresh,
+.ctx-item,
+.reset-view,
+.detail-close,
+.detail-parent,
+.act-refresh,
+.act-row,
+.act-undo,
+button.detail-file,
+.detail-expand,
+.viewer-btn,
+.scale-btn {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+/* Respect the OS "reduce motion" setting. The near-zero duration (rather than
+   `none`) is the conventional form: it keeps `transitionend` / `animationend`
+   listeners firing, so a future component that waits on one does not hang for
+   exactly the users who asked for less movement. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }
