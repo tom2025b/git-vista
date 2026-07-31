@@ -1345,6 +1345,46 @@ fn r2_case_region_never_hand_writes_acceptance_conditions() {
     );
 }
 
+/// Acceptance evidence F is source-bound as well as parser-bound: every case
+/// writes all three leg expectations explicitly, and the one functional case
+/// opts out with a typed value rather than a fabricated kernel signature.
+#[test]
+fn f_every_observation_requires_typed_kernel_provenance() {
+    let escape = read_rs("src/sandbox/escape_suite.rs");
+    assert_eq!(
+        escape.matches("expect_baseline_provenance:").count(),
+        16,
+        "F: every containment case must spell a baseline provenance expectation"
+    );
+    assert_eq!(
+        escape.matches("expect_inside_provenance:").count(),
+        16,
+        "F: every containment case must spell an inside provenance expectation"
+    );
+    assert_eq!(
+        escape.matches("expect_granted_provenance:").count(),
+        16,
+        "F: every containment case must spell a GRANTED provenance expectation"
+    );
+    let hooks = read_rs("src/sandbox/hook_mode_suite.rs");
+    assert_eq!(
+        hooks.matches("Provenance::NotApplicable").count(),
+        3,
+        "F: blocked_hooks must explicitly exempt each of its three legs"
+    );
+    assert!(
+        !hooks.contains("Seccomp: 0 NoNewPrivs: 0"),
+        "F: blocked_hooks must not fabricate a kernel signature in printf"
+    );
+    let contract = read_self_code_only();
+    assert!(
+        contract.contains("parse_i32_field")
+            && contract.contains("Provenance::NotApplicable")
+            && contract.contains("Observation"),
+        "F: the shared parser must carry typed, mandatory provenance"
+    );
+}
+
 /// R3: every case carries the mandatory paired-positive field, and `run_case`
 /// actually asserts it rather than merely storing it.
 #[test]
