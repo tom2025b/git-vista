@@ -714,6 +714,30 @@ pub fn show_fixed_loading_overlay(page_load: &PageLoadState) -> bool {
     matches!(page_load, PageLoadState::Loading { .. })
 }
 
+/// The Print Graph topbar button's label and tooltip for a given
+/// `history_complete` state (#217).
+///
+/// Before this, only the `title` attribute changed when the button disabled
+/// itself — CSS dimming plus a native tooltip that never surfaces on tap (the
+/// reported iPad case), so the button read as silently, unexplainably broken.
+/// The label now carries the same reason the tooltip does, so it is visible
+/// without hover/long-press. Pure so the two states are testable without a DOM:
+/// the view (wasm-only, `app/mod.rs`) supplies `complete` and renders both
+/// strings as-is.
+pub fn print_button_copy(complete: bool) -> (&'static str, &'static str) {
+    if complete {
+        (
+            "Print Graph",
+            "A clean, printable view of the whole graph — print it or save it as a PDF",
+        )
+    } else {
+        (
+            "Print Graph (loading history…)",
+            "Load all history before printing.",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
