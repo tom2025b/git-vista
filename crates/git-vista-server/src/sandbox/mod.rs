@@ -76,6 +76,8 @@ mod dispatch;
 /// for ordinary missing-coverage gaps that are not INV-17 shaped — see that
 /// section's own header comment for why it lives here anyway.
 #[cfg(test)]
+#[cfg(test)]
+mod clone_live;
 mod documented_gaps;
 /// #66 Task 25, step 3: the anti-vacuity contract's tripwires and the
 /// EscapeCase/run_case harness step 5 rewrites the battery onto. Landed here
