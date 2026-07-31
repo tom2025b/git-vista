@@ -1,6 +1,11 @@
 # Git-Vista Security Model
 
-Status: proposed for V2
+Status: living document — the V1 model is largely implemented; sections marked
+*future* or *V2* are not. The per-item `*(Implemented: …)*` annotations and the
+ADRs they cite are authoritative for what has actually shipped. **This banner is
+not** — it said "proposed for V2" for the whole of M1.13b, while the body already
+recorded the sandbox enforcement as shipped (ADR 0030). Read the annotations, not
+the header.
 
 Git-Vista is local-first and primarily single-user, but it controls real Git
 repositories and can execute destructive operations. "Only for me" reduces the
