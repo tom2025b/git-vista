@@ -120,7 +120,7 @@ pub fn build_node(
                 <circle
                     cx=cx
                     cy=cy
-                    r=NODE_RADIUS + 8
+                    r=NODE_RADIUS + 4
                     fill="transparent"
                     class="node-hit"
                     on:pointerup=open_menu
