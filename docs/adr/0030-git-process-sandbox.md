@@ -28,7 +28,8 @@
 
 ## Context
 
-Before M1.13b, ADR 0025 shipped the *declared* half of `SECURITY_MODEL.md:236`:
+Before M1.13b, ADR 0025 shipped the *declared* half of `SECURITY_MODEL.md`'s
+"Decide hook policy explicitly" bullet (under `## Command Execution`):
 a `HookPolicy` value computed and disclosed, with the explicit, load-bearing
 caveat that "nothing in `git_cmd.rs` or `git-vista-git` reads this value or
 suppresses hooks accordingly" — every git process the server spawned ran with no seccomp, no
@@ -66,12 +67,13 @@ before landing the contract described below.
 ### 1. The sandbox is argv — a pure policy, one impure shim
 
 `sandbox/mod.rs` builds a `Policy` and turns it into a launcher `Vec<OsString>`
-(`sandbox_argv`) with **no syscall, no I/O, no async** (`mod.rs:1-8`). The two
+(`sandbox_argv`) with **no syscall, no I/O, no async** — the constraint is stated
+in `mod.rs`'s own module doc. The two
 genuinely impure steps — finding `bwrap` on disk, finding the `gv-sandbox`
 shim — are pulled into their own submodules (`bwrap`, `shim`) for exactly this
 reason: `sandbox_argv` stays a total function of its `Policy`. That purity is
 what let the sync and async spawn wrappers collapse into one function; per
-`spawn.rs:27-29`, "neither call style needs a `pre_exec` closure or a
+`spawn.rs`'s module doc, "neither call style needs a `pre_exec` closure or a
 `block_on`, because the sandbox is *argv*: the shim applies Landlock and
 seccomp in its own process, after this one has already exec'd it."
 
@@ -99,8 +101,9 @@ sequenceDiagram
 The shim's own `main()` is `parse → validate → close_inherited_fds →
 apply_landlock → apply_seccomp → exec("git")` (`bin/gv-sandbox/main.rs`)
 — Landlock before seccomp, one process, `.exec()` never `.spawn()`, so the
-shim never becomes a parent (enforced by a source tripwire on that same file,
-`main.rs:10-13`).
+shim never becomes a parent (enforced by a source tripwire named in `main.rs`'s
+own module doc: the file must contain `.exec()` and must not contain `.spawn()`,
+`.output()` or `.status()`).
 
 ### 2. A sealed argv — `SandboxedCommand` cannot be appended to
 
@@ -108,10 +111,10 @@ Purity upstream is not enough on its own: a bare `Command` returned from the
 chokepoint could still have `.args(...)` called on it after classification —
 this is exactly the shape the crate shipped before Task 5, where `sandboxed()`
 built an *empty*-arg `Command` and every caller appended the real subcommand
-afterward (spawn.rs:61-65). `SandboxedCommand` (`spawn.rs:77`) closes it by
+afterward. `SandboxedCommand` (`spawn.rs`) closes it by
 type: its public API is `stdin`/`stdout`/`stderr`/`kill_on_drop`/`output`/
 `spawn` — stdio configuration only. There is deliberately no `arg`, `args` or
-`env` (spawn.rs:69-73): `GIT_DIR`, `GIT_SSH_COMMAND` and `GIT_EXTERNAL_DIFF`
+`env`: `GIT_DIR`, `GIT_SSH_COMMAND` and `GIT_EXTERNAL_DIFF`
 redirect or execute, so an environment appended after classification is an
 argv change wearing a different hat.
 
@@ -125,7 +128,7 @@ flowchart TD
 
 Rust has no stable negative-impl assertion, so this is enforced as a source
 tripwire rather than a comment: `the_sandboxed_command_exposes_no_way_to_change_what_runs`
-(`spawn.rs:265-295`) `include_str!`s `spawn.rs` itself, isolates the
+(`spawn.rs`) `include_str!`s `spawn.rs` itself, isolates the
 `impl SandboxedCommand` block, and asserts no `pub(crate) fn` line contains
 `arg`, `args` or `env` — with one named, test-gated exception
 (`hermetic_env_for_test`) that production code cannot reach.
@@ -157,7 +160,7 @@ flowchart TD
 `(true, _)` uses a wildcard on purpose (trust is a property of the
 repository, not the operation); the `false` side has none, so a new
 `NetworkNeed` variant forces a new arm that cannot silently resolve to
-`Unsandboxed` without an edit a reviewer would see (`mod.rs:758-767`).
+`Unsandboxed` without an edit a reviewer would see (`tier_for`, `mod.rs`).
 `trusted` comes only from `repo_is_trusted → trust::is_trusted`, backed by a
 marker file under the server's own state directory
 (`state::sandbox_trust_dir()`, `$XDG_STATE_HOME/git-vista/trusted-repos` or
@@ -165,7 +168,7 @@ marker file under the server's own state directory
 `trust::grant`, whose module doc says trust "is granted only by `grant`, which is
 called from an explicit, authenticated operator action" (`trust.rs`, module doc comment). As of this writing `trust::grant` has no
 production (handler-reachable) caller — only test code exercises it
-(`sandbox/dispatch.rs:616,648`, `sandbox/compat.rs:471`) — so `Unsandboxed` is
+(test-only callers in `sandbox/dispatch.rs` and `sandbox/compat.rs`) — so `Unsandboxed` is
 reachable by rule, not yet by any operator-facing route.
 
 A read-only `$HOME` grant is not, by itself, what protects that marker:
@@ -174,14 +177,15 @@ serving a repository whose grant happens to cover
 would otherwise let a hostile hook write its own trust marker and promote
 itself to `Unsandboxed` on the next operation — a total bypass, named
 explicitly in source as the reason the fix is a hard exclude, not the RO
-grant (`mod.rs:984-1010`). `secret_excludes` always carries
-`sandbox_trust_dir()` in addition to the standard secret list
-(`mod.rs:1011-1015`), and the shim's grant-building functions check excludes
+grant. `secret_excludes` always carries
+`state::sandbox_trust_dir()` in addition to the standard secret list — pushed onto
+`excludes` by **both** production `Policy` constructors, `policy_for` and
+`policy_for_clone` (`mod.rs`) — and the shim's grant-building functions check excludes
 *before* deciding whether or how to grant a tree at all
-(`is_or_inside_exclude`/`is_ancestor_of_exclude`, `bin/gv-sandbox/main.rs:527-563`)
+(`is_or_inside_exclude`/`is_ancestor_of_exclude`, `bin/gv-sandbox/main.rs`)
 — the one mechanism in this sandbox that outranks a grant rather than
 competing with it, tested directly by forging exactly that scenario
-(`trust.rs:177-232`).
+(`the_trust_store_is_withheld_even_from_a_repo_that_contains_it`, `trust.rs`).
 
 ```mermaid
 flowchart TD
@@ -195,8 +199,8 @@ flowchart TD
 ### 4. Declared intent outranks argv sniffing
 
 `GitOperation` is a closed, data-carrying enum in `git-vista-protocol`
-(`plan.rs:143-153`, ADR 0015's vocabulary reused). `network_need_for_operation`
-is an exhaustive match over it with no wildcard arm (`mod.rs:593-621`) — a new
+(`GitOperation`, `plan.rs`; ADR 0015's vocabulary reused). `network_need_for_operation`
+is an exhaustive match over it with no wildcard arm (`mod.rs`) — a new
 operation variant fails the build until someone states what network it needs,
 rather than silently inheriting a default. The argv itself is also inspected
 (`network_need`, `mod.rs`), but only as a fail-closed cross-check: the
