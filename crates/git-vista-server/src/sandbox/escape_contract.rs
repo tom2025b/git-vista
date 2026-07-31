@@ -812,6 +812,49 @@ impl Drop for GitProtocolPort {
     }
 }
 
+fn observation_mismatch(
+    leg: &str,
+    tag: &str,
+    observed: Observation,
+    expect_errno: Errno,
+    expect_provenance: Provenance,
+) -> Option<String> {
+    if observed.errno != expect_errno.0 {
+        return Some(format!(
+            "{leg} {tag} wanted errno {} got {}",
+            expect_errno.0, observed.errno
+        ));
+    }
+    match (expect_provenance, observed.provenance) {
+        (
+            Provenance::Kernel {
+                seccomp: expected, ..
+            },
+            Provenance::Kernel {
+                seccomp: actual, ..
+            },
+        ) if expected != actual => Some(format!(
+            "{leg} {tag} wanted provenance field `Seccomp:` {expected} got {actual}"
+        )),
+        (
+            Provenance::Kernel {
+                no_new_privs: expected,
+                ..
+            },
+            Provenance::Kernel {
+                no_new_privs: actual,
+                ..
+            },
+        ) if expected != actual => Some(format!(
+            "{leg} {tag} wanted provenance field `NoNewPrivs:` {expected} got {actual}"
+        )),
+        (expected, actual) if expected != actual => Some(format!(
+            "{leg} {tag} wanted provenance {expected:?} got {actual:?}"
+        )),
+        _ => None,
+    }
+}
+
 fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
     // Held for the whole call — both `build_hook` invocations below bake the
     // port into their hook bodies, and both legs then run against it.
@@ -839,21 +882,29 @@ fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
     );
 
     let baseline = commit_outside(base_repo.path());
-    let base_obs = parse_observation(&baseline.combined, nonce, case.probe_tag);
-    let base_ok = matches!(base_obs, Ok(v) if v == case.expect_baseline.0);
-    if !base_ok {
+    let base_obs = parse_observation(
+        &baseline.combined,
+        nonce,
+        case.probe_tag,
+        case.expect_baseline_provenance,
+    );
+    let base_problem = match base_obs {
+        Ok(observed) => observation_mismatch(
+            "baseline",
+            case.probe_tag,
+            observed,
+            case.expect_baseline,
+            case.expect_baseline_provenance,
+        ),
+        Err(ref e) => Some(format!(
+            "baseline {} observation missing: {}",
+            case.probe_tag, e.detail
+        )),
+    };
+    if let Some(missing) = base_problem {
         return Outcome::CapabilityAbsent {
             case: case.id,
-            missing: match base_obs {
-                Ok(v) => format!(
-                    "baseline {} wanted errno {} got {v}",
-                    case.probe_tag, case.expect_baseline.0
-                ),
-                Err(e) => format!(
-                    "baseline {} observation missing: {}",
-                    case.probe_tag, e.detail
-                ),
-            },
+            missing,
         };
     }
     assert_eq!(
@@ -877,43 +928,79 @@ fn execute(case: &EscapeCase, nonce: &str) -> Outcome {
     // inside commit status is its paired positive: Git still completed under
     // the same policy even though hook execution was suppressed.
     let (inside_obs, granted_obs) = if case.hooks_blocked {
+        if case.expect_inside_provenance != Provenance::NotApplicable
+            || case.expect_granted_provenance != Provenance::NotApplicable
+        {
+            return Outcome::Escaped {
+                detail: "blocked hook cannot supply inside or GRANTED kernel provenance; \
+                         both declarations must be Provenance::NotApplicable"
+                    .to_string(),
+            };
+        }
         let marker = inside_repo.path().join(".git/gv_escape_hook_ran");
         let observed = match std::fs::metadata(marker) {
             Ok(_) => 0,
             Err(e) => e.raw_os_error().unwrap_or(-1),
         };
-        (observed, inside.commit_code)
+        (
+            Observation {
+                errno: observed,
+                provenance: Provenance::NotApplicable,
+            },
+            Observation {
+                errno: inside.commit_code,
+                provenance: Provenance::NotApplicable,
+            },
+        )
     } else {
-        let observed =
-            parse_observation(&inside.combined, nonce, case.probe_tag).unwrap_or_else(|e| {
+        let observed = parse_observation(
+            &inside.combined,
+            nonce,
+            case.probe_tag,
+            case.expect_inside_provenance,
+        )
+        .unwrap_or_else(|e| {
                 panic!(
                     "{}: inside-leg `{}` observation missing: {}",
                     case.id, case.probe_tag, e.detail
                 )
             });
-        let granted = parse_observation(&inside.combined, nonce, "GRANTED").unwrap_or_else(|e| {
-            panic!(
-                "{}: inside-leg GRANTED observation missing (R3): {}",
-                case.id, e.detail
-            )
-        });
+        let granted = parse_observation(
+            &inside.combined,
+            nonce,
+            "GRANTED",
+            case.expect_granted_provenance,
+        )
+        .unwrap_or_else(|e| {
+                panic!(
+                    "{}: inside-leg GRANTED observation missing (R3): {}",
+                    case.id, e.detail
+                )
+            });
         (observed, granted)
     };
 
-    if inside_obs != case.expect_inside.0 {
+    if let Some(detail) = observation_mismatch(
+        "inside",
+        case.probe_tag,
+        inside_obs,
+        case.expect_inside,
+        case.expect_inside_provenance,
+    ) {
         return Outcome::Escaped {
-            detail: format!(
-                "{}: wanted inside errno {} got {inside_obs}",
-                case.probe_tag, case.expect_inside.0
-            ),
+            detail,
         };
     }
-    if granted_obs != case.expect_granted.0 {
+    if let Some(detail) = observation_mismatch(
+        "inside",
+        "GRANTED",
+        granted_obs,
+        case.expect_granted,
+        case.expect_granted_provenance,
+    ) {
         return Outcome::Escaped {
             detail: format!(
-                "GRANTED: wanted errno {} got {granted_obs} — R3's paired positive failed, \
-                 the policy denied more than the claim",
-                case.expect_granted.0
+                "{detail} — R3's paired positive failed, the policy denied more than the claim"
             ),
         };
     }
