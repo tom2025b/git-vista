@@ -1,0 +1,61 @@
+<!-- Home-screen / install icon. Source of truth for the PNGs beside it
+     (icon-180/192/512.png), which are rendered from this file — see the
+     "Regenerating" note at the bottom.
+
+     This is deliberately NOT the same artwork as the inline favicon data URI in
+     index.html, even though it draws the same little branch graph:
+
+       * full-bleed square background, no `rx` rounding. iOS/iPadOS applies its
+         own squircle mask to a home-screen icon, so a pre-rounded source gets
+         masked twice and shows dark slivers in the corners. The favicon keeps
+         its rx=7 because nothing masks a browser-tab icon.
+       * the glyph is scaled to 0.85 and re-centred, so the artwork sits inside
+         the squircle's safe area instead of running to the edges.
+       * fully opaque. `apple-touch-icon` has no transparency support worth
+         relying on; a transparent PNG composites against black on some iOS
+         surfaces and looks broken. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <rect width="32" height="32" fill="#0d1117"/>
+  <!-- glyph bbox is x 8.8..25.2 (centre 17), y 3.3..28.7 (centre 16); this
+       transform centres that box on (16,16) and scales it to 85%. -->
+  <g transform="translate(16,16) scale(0.85) translate(-17,-16)">
+    <path d="M12 6 V26" stroke="#2f81f7" stroke-width="3" stroke-linecap="round"/>
+    <path d="M12 16 C12 11, 21 13, 22 9" stroke="#3fb950" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <circle cx="12" cy="6.5" r="3.2" fill="#2f81f7"/>
+    <circle cx="12" cy="16" r="3.2" fill="#2f81f7"/>
+    <circle cx="12" cy="25.5" r="3.2" fill="#2f81f7"/>
+    <circle cx="22" cy="8.5" r="3.2" fill="#3fb950"/>
+  </g>
+</svg>
+<!-- Regenerating (no SVG rasteriser is installed on this box — no rsvg-convert,
+     inkscape, ImageMagick or cairosvg; headless Chromium is the render path that
+     actually exists here).
+
+     The SVG markup MUST be inlined into the HTML. Referencing this file as a
+     subresource (`<img src="icon.svg">`) renders a blank WHITE 512x512 square:
+     Chromium screenshots before the file:// subresource has loaded, and exits 0
+     while doing it, so the failure is silent. That was verified, not assumed —
+     the <img> form was run and measured at 99.1% #ffffff. The recipe below was
+     run and its output is byte-for-byte identical to the committed icon-512.png.
+
+       cd crates/git-vista/assets
+       python3 - <<'PY'
+       import re
+       svg = open('icon.svg').read()
+       body = re.search(r'<svg.*?</svg>', svg, re.S).group(0)
+       open('/tmp/icon.html', 'w').write('<body style="margin:0">' + body)
+       PY
+       chromium --headless --disable-gpu --hide-scrollbars \
+                --force-device-scale-factor=16 --window-size=32,32 \
+                --screenshot=/tmp/icon-512.png /tmp/icon.html
+       # (viewBox is 32x32, so scale-factor 16 x window 32 = a 512x512 render.)
+       # then downscale 512 -> 192 and 180 with PIL/LANCZOS so all three sizes
+       # are guaranteed to be the same artwork.
+
+     Always CHECK THE PIXELS after rendering, never the exit code:
+       python3 -c "from PIL import Image; import collections; \
+         im=Image.open('/tmp/icon-512.png').convert('RGB'); \
+         c=collections.Counter(im.getdata()); \
+         print(c.most_common(3))"
+     A correct render is ~87.8% #0d1117 / 7.9% #2f81f7 / 3.7% #3fb950.
+-->

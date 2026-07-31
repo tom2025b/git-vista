@@ -22,6 +22,38 @@ use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
 
 use crate::api::{delete_clone_request, fetch_catalog, rescan_request, select_request};
+use crate::hook_policy_disclosure;
+
+/// Styling for the per-row hook-policy badge (INV-15, #208). Amber — the same
+/// palette as the session-wide `hook_policy_banner` — for anything the
+/// descriptor says needs the banner, muted grey for the one tier that earns
+/// quiet. Inline-styled like the rest of this file, which deliberately keeps
+/// out of `styles.css`.
+fn hook_policy_badge_style(warn: bool) -> &'static str {
+    if warn {
+        // Amber-on-brown, legible without being an alarm the user learns to
+        // ignore: until the strict tier is the norm most repositories will
+        // carry this badge, so it has to stay readable rather than shout.
+        "margin-top:6px; display:inline-block; font-size:0.78em; padding:2px 6px; \
+         border-radius:4px; background:#3a2a0a; color:#f0c674; border:1px solid #5a4210;"
+    } else {
+        "margin-top:6px; display:inline-block; font-size:0.78em; padding:2px 6px; \
+         border-radius:4px; background:#161b22; color:#8b949e; border:1px solid #30363d;"
+    }
+}
+
+/// The same disclosure at full length on the mode screen, where the user is one
+/// tap from opening the repository. Left-aligned inside a centred dialog on
+/// purpose — it is a sentence to read, not a caption.
+fn hook_policy_notice_style(warn: bool) -> &'static str {
+    if warn {
+        "margin:0 0 16px; padding:8px 10px; border-radius:6px; text-align:left; \
+         font-size:0.85em; background:#3a2a0a; color:#f0c674; border:1px solid #5a4210;"
+    } else {
+        "margin:0 0 16px; padding:8px 10px; border-radius:6px; text-align:left; \
+         font-size:0.85em; background:#0d1117; color:#8b949e; border:1px solid #30363d;"
+    }
+}
 
 /// The blocking repo list. `open` shows/hides it; picking a repo hands its
 /// descriptor to `mode_for` (the mode screen); "Clone URL…" opens the existing
@@ -84,6 +116,14 @@ pub fn picker_view(
                                 .into_iter()
                                 .map(|d| {
                                     let is_clone = d.read_only;
+                                    // INV-15 (#208): every row discloses the
+                                    // hook policy the server computed for that
+                                    // repository. Read before `d` is moved
+                                    // into `pick` below. The warn/quiet call is
+                                    // the descriptor's own — see
+                                    // `hook_policy_disclosure`'s module docs for
+                                    // why it is never re-derived here.
+                                    let disclosure = hook_policy_disclosure::for_repository(&d);
                                     let label = match d.kind {
                                         RepositoryKind::Bare => format!("{} (bare)", d.name),
                                         RepositoryKind::LinkedWorktree => {
@@ -150,7 +190,17 @@ pub fn picker_view(
                                                        border-radius:6px;"
                                                 on:click=pick
                                             >
-                                                {label}
+                                                <div>{label}</div>
+                                                // Visible text, never a tooltip
+                                                // or a `title=` attribute: a
+                                                // disclosure nobody notices is
+                                                // the failure INV-15 names.
+                                                <div style=hook_policy_badge_style(
+                                                    disclosure.warn,
+                                                )>
+                                                    {disclosure.warn.then_some("\u{26A0} ")}
+                                                    {disclosure.label}
+                                                </div>
                                             </button>
                                             // ADR 0005: no Delete on a LAN-view
                                             // session — the route doesn't even
@@ -263,6 +313,11 @@ pub fn mode_view(
     move || {
         mode_for.get().map(|d| {
             let name = d.name.clone();
+            // INV-15 (#208): the full sentence, at the point of commitment. The
+            // picker row's badge is a glance; this is where the user is about
+            // to hand a repository the ability to run its hooks, so the reason
+            // is spelled out rather than abbreviated.
+            let disclosure = hook_policy_disclosure::for_repository(&d);
             let choose = move |mode: RepoMode| {
                 let worktree = d.worktree.clone();
                 move |_| {
@@ -301,6 +356,13 @@ pub fn mode_view(
                                 border-radius:10px; color:var(--fg); text-align:center;">
                         <div style="font-weight:600; font-size:1.2em; margin-bottom:16px;">
                             {format!("Open ‘{name}’ as…")}
+                        </div>
+                        <div
+                            role="status"
+                            style=hook_policy_notice_style(disclosure.warn)
+                        >
+                            {disclosure.warn.then_some("\u{26A0} ")}
+                            {disclosure.detail}
                         </div>
                         <button
                             style="display:block; width:100%; padding:16px; margin:8px 0; \

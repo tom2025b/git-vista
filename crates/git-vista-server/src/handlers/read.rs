@@ -898,11 +898,7 @@ pub(crate) async fn worktree_status(
     Query(q): Query<RepoQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let repo = resolve_repo(q.repo.as_deref())?.0;
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(&repo)
-        .args(["status", "--porcelain=v2", "--branch"])
-        .output()
+    let output = crate::git_cmd::git_output(&repo, &["status", "--porcelain=v2", "--branch"])
         .await
         .map_err(|e| {
             eprintln!("git-vista: /api/status couldn't run git: {e}");

@@ -1,0 +1,9 @@
+--- a/crates/git-vista-server/src/sandbox/mod.rs
++++ b/crates/git-vista-server/src/sandbox/mod.rs
+@@ -250,6 +250,5 @@
+     "/dev/shm",
+     "--unshare-pid",
+-    "--unshare-net",
+     "--unshare-ipc",
+     "--unshare-uts",
+     "--unshare-cgroup",

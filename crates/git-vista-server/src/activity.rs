@@ -266,7 +266,12 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
     if let Some(rejected) = crate::state::reject_if_read_only() {
         return rejected;
     }
-    let repo = crate::state::current().0;
+    // D2 (#66, Task 7): the validated resolution, replacing a raw
+    // `state::current()` call — see `state::resolve_target`'s doc comment.
+    let repo = match crate::state::resolve_target() {
+        Ok((repo, _entry)) => repo,
+        Err(rejected) => return rejected,
+    };
     let op = match action {
         UndoAction::RestoreBranch { name, tip } => {
             let name = name.trim();
@@ -344,12 +349,21 @@ async fn undo_commit_oid(repo: &Path, given: &str) -> Result<CommitOid, (StatusC
         return Ok(oid);
     }
     match crate::git_cmd::rev_parse(repo, given).await {
-        Some(full) => CommitOid::new(full).map_err(|_| {
+        Ok(Some(full)) => CommitOid::new(full).map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "git rev-parse returned an unusable id.".to_string(),
             )
         }),
-        None => Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string())),
+        // git ran and rejected the id: the request is wrong.
+        Ok(None) => Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string())),
+        // D5 (#66, Task 19): git never ran, so it rejected nothing. "Not a
+        // commit id" here would be an assertion about the user's input made
+        // on no evidence — and this is an *undo* path, where the id usually
+        // came straight out of the app's own activity feed.
+        Err(e) => Err(crate::planner::couldnt_run(
+            "/api/undo",
+            &format!("couldn't resolve ‘{given}’: {e}"),
+        )),
     }
 }

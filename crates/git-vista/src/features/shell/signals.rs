@@ -25,7 +25,7 @@
 //! destroyed them. That is also what retires Task 6's deferred step — the signals leave
 //! canvas scope here rather than being moved twice.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -39,34 +39,50 @@ use wasm_bindgen::JsCast;
 use crate::gestures;
 
 use crate::features::activity::signals::Activity;
-use crate::features::shell::core::{Overlay, OverlayStack, ShellMode};
+use crate::features::shell::core::{ModeSettler, Overlay, OverlayStack, ShellMode};
 use crate::state::{CommitDialog, MenuData, PendingOp, ViewerDoc};
 
 /// Feeds a `ShellMode` signal from window width, debounced 150ms so a Stage
 /// Manager drag doesn't thrash the layout on every intermediate resize event.
 ///
-/// Debouncing here means "only the last event in a burst survives" — implemented
-/// with a generation counter rather than a cancellable JS timer handle: each
-/// resize bumps the counter and schedules a check; when that check's timeout
-/// fires, it only applies if no later resize has bumped the counter since. A
-/// stale, superseded timeout is a silent no-op rather than something that has to
-/// be found and cancelled.
+/// This function is now only the *scheduling* half: it listens, it waits 150ms,
+/// and it reads the width. Every decision — whether a check has been superseded,
+/// and whether the width that check sees actually changes the band — belongs to
+/// [`ModeSettler`], which is a plain host-testable type. That split is
+/// deliberate: the settling behaviour is the one thing M1.12 shipped without
+/// being able to verify (nobody could confirm the layout class settles rather
+/// than thrashes without a real browser), and it was unverifiable precisely
+/// because it was tangled up in this `web_sys` closure. See `ModeSettler`'s tests
+/// for the drag-crosses-bands case this used to only be able to assert by eye.
+///
+/// What is still browser-only, and is *not* covered by those tests: that a
+/// `resize` event fires at all, that `gestures::viewport_size()` reports the
+/// live width, and that 150ms is the right interval for a Stage Manager drag.
 ///
 /// No hysteresis: `ShellMode::for_width` never sees the previous mode, only the
 /// current width — see that function's doc comment for why.
 pub fn install_mode_signal() -> RwSignal<ShellMode> {
-    let mode = create_rw_signal(ShellMode::for_width(gestures::viewport_size().0));
+    let settler = Rc::new(RefCell::new(ModeSettler::new(gestures::viewport_size().0)));
+    let mode = create_rw_signal(settler.borrow().current());
 
     if let Some(win) = web_sys::window() {
-        let generation = Rc::new(Cell::new(0u64));
         let cb = Closure::<dyn FnMut()>::new(move || {
-            let this_generation = generation.get() + 1;
-            generation.set(this_generation);
-            let generation = generation.clone();
+            let token = settler.borrow_mut().observe_resize();
+            let settler = settler.clone();
             leptos::set_timeout(
                 move || {
-                    if generation.get() == this_generation {
-                        mode.set(ShellMode::for_width(gestures::viewport_size().0));
+                    // The borrow is released before touching the signal: `set` runs
+                    // subscribers synchronously, and a subscriber that resized the
+                    // window would re-enter this closure while the RefCell was held.
+                    let published = settler
+                        .borrow_mut()
+                        .settle(token, gestures::viewport_size().0);
+                    if let Some(next) = published {
+                        // `try_set`, not `set`, for the reason `Shell::present` uses
+                        // `try_update`: this timeout can outlive its scope by up to
+                        // 150ms after `on_cleanup` has pulled the listener, and a
+                        // disposed scope has no layout to relayout.
+                        let _ = mode.try_set(next);
                     }
                 },
                 Duration::from_millis(150),

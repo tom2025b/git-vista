@@ -35,6 +35,7 @@ use git_vista_core::model::RefKind;
 
 use crate::api::{fetch_commit_detail, fetch_page, HistoryFetchError};
 use crate::camera::Camera;
+use crate::features::a11y::focus::GraphFocus;
 use crate::features::graph::core::{
     should_prefetch, show_fixed_loading_overlay, PageLoadState, PageRequestKey, PageRetry,
     RenderCtx, DEFAULT_PAGE_LIMIT,
@@ -172,6 +173,17 @@ pub(super) fn graph_canvas(
     let stub_epoch = create_rw_signal(0u32);
     let page_load = create_rw_signal(PageLoadState::Idle);
     let home = create_rw_signal(Camera::home(initial_headroom));
+    // M1.13 (#65 keyboard-access gap): the roving-tabindex state for the
+    // commit rows — see `features::a11y::focus`. Kept in step with
+    // `row_count` by its own effect below rather than folded into the append
+    // loop's `row_count.set(rows)` call, so `GraphFocus` stays a plain
+    // consumer of the row count like every other signal here, not something
+    // the append loop has to remember to also touch.
+    let focus = create_rw_signal(GraphFocus::new(initial_rows));
+    create_effect(move |_| {
+        let n = row_count.get();
+        focus.update(|f| f.set_row_count(n));
+    });
 
     // Camera (pan/zoom) state, starting at the home position so a new branch
     // isn't born half-clipped above the top of the canvas.
@@ -462,7 +474,7 @@ pub(super) fn graph_canvas(
                         (s..e).map(|i| (i, le)).collect::<Vec<_>>()
                     }
                     key=|k| *k
-                    children=move |(i, _)| render::build_node(ctx, shell, moved, i)
+                    children=move |(i, _)| render::build_node(ctx, shell, moved, focus, camera, vp_h, i)
                 />
                 // Phase 9 (level of detail): the two label tiers, each hidden as the
                 // graph is zoomed out. The message tier (badges + message) drops

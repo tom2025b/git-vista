@@ -1,0 +1,83 @@
+# gitleaks configuration for Git-Vista.
+#
+# The CI job (`Secret scanning (gitleaks)`, .github/workflows/ci.yml) runs a
+# genuine FULL-HISTORY scan. That is deliberate: a credential committed once and
+# removed in the next commit is still a leaked credential, so scanning only the
+# tip would defeat the check's purpose.
+#
+# The consequence is that history is immutable input. A false positive that was
+# ever committed cannot be fixed by editing the working tree — the offending
+# blob still exists in the commit that introduced it. Rewriting published
+# history to erase it is not an option (a standing repo rule keeps history
+# walkable, and force-pushing a shared branch to silence a scanner is a cure
+# worse than the disease). So a false positive that reached history gets a
+# FINGERPRINT allowlist entry: the narrowest exception the tool offers.
+#
+# RULES FOR ADDING AN ENTRY HERE — read before you add one:
+#
+#   * Allowlist by FINGERPRINT. Not by path, not by rule, not by regex. A
+#     fingerprint is `commit:path:rule:line`, so it pins the exception to one
+#     finding in one commit; the same path is still scanned normally in every
+#     other commit.
+#
+#   * Do NOT use a `paths` allowlist, and do not "narrow" one by pairing it with
+#     `commits` and `matchCondition = "AND"`. Both were tried here and MEASURED
+#     on 2026-07-31 against gitleaks 8.30.1, and both failed open: a freshly
+#     planted PEM private key in the allowlisted path, at a brand-new commit
+#     unrelated to the allowlisted one, was NOT detected in either arrangement.
+#     A `paths` entry blinds this repo to real key material in that file
+#     permanently, which is precisely the outcome this check exists to prevent.
+#
+#   * A fingerprint entry is only ever correct for a PROVEN false positive. If
+#     the value was a real credential, the fix is to rotate it, not to allowlist
+#     it. Allowlisting a live secret converts a loud failure into silent
+#     exposure.
+#
+#   * Re-verify after any edit, with BOTH legs — a suppression that also
+#     suppresses real findings is worse than no suppression, and only the paired
+#     test can tell the two apart:
+#       1. `gitleaks detect --source . --exit-code 1` on this repo => no leaks.
+#       2. In a throwaway git repo, commit a real-shaped PEM block at the SAME
+#          path as an allowlisted finding but a DIFFERENT commit, scan it with
+#          this config => it MUST still be reported. If it is not, the entry is
+#          too wide; fix it before pushing.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+targetRules = ["private-key"]
+description = """
+False positive, commit 8e2cec7 only.
+
+The CI host-provisioning action (.github/actions/host-sandbox-setup) writes a
+placeholder file at $HOME/.ssh/id_ed25519 so that the escape battery's denial
+legs have a path which EXISTS outside the sandbox. Without it,
+`secret_read_denied` and `ssh_known_hosts_carveout` (#188) get ENOENT on their
+baseline leg and hard-fail having proved nothing about containment — the
+battery's anti-vacuity design treats "could not establish the premise" as a
+hard failure rather than a skip.
+
+That placeholder's first line was originally written to look like a real OpenSSH
+key header, which is what this rule matched. It is not key material: nothing
+parses it as a key, the probes only open the path and read one byte, and the
+file is generated fresh on an ephemeral GitHub-hosted runner rather than being
+committed to the repo. Nothing needs rotating.
+
+The working tree no longer contains the PEM-shaped text — the placeholder was
+reworded in 45de344 so that new commits do not re-trip the rule. This entry
+exists solely because the full-history scan still reaches commit 8e2cec7, which
+cannot be edited.
+"""
+# `commits` (not `paths`) is the narrowing dimension, and it is the only one
+# gitleaks 8.30.1 will accept here: a top-level [[allowlists]] block must carry
+# at least one of commits/paths/regexes/stopwords, so `fingerprints` alone will
+# not load. Scoping by commit is the safe choice of the four — commit 8e2cec7 is
+# a single immutable point in history, so this exception cannot grow, and the
+# action.yml path continues to be scanned normally in every other commit
+# including every future one. Scoping by path instead would have blinded that
+# file permanently (measured — see the header).
+commits = ["8e2cec76183ced717792ee84ca324fee519c88c1"]
+fingerprints = [
+  "8e2cec76183ced717792ee84ca324fee519c88c1:.github/actions/host-sandbox-setup/action.yml:private-key:179",
+]

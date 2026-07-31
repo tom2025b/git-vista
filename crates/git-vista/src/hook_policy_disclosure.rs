@@ -1,0 +1,353 @@
+//! Per-repository hook-policy disclosure text (INV-15, #66 M1.13b, #208).
+//!
+//! `RepositoryDescriptor::hook_policy` is computed server-side and shipped to
+//! the client, and until this module existed **nothing rendered it**. A policy
+//! that is computed, transmitted and then dropped on the floor is worse than no
+//! policy at all: it manufactures the appearance of a safety property that no
+//! user was ever told. INV-15 is a *disclosure* invariant, so the rendering is
+//! the invariant, not a nicety on top of it.
+//!
+//! This module is the pure half — descriptor in, the words a user reads out —
+//! so the mapping is host-testable (`cargo test -p git-vista`). The markup half
+//! lives in [`crate::picker`], which is `wasm32`-gated because it imports
+//! Leptos; that is the same core/view split the rest of this crate uses
+//! (`features/*/core.rs` vs `features/*/signals.rs`).
+//!
+//! # Relationship to [`crate::hook_policy_banner`]
+//!
+//! That module is the **session**-scoped banner from ADR 0025: one bar across
+//! the top of the app for `SessionInfo::hook_policy`. This one is
+//! **repository**-scoped: the tier a local operation on one catalog entry would
+//! actually run under, shown on that entry's row before the user commits to
+//! opening it. They answer different questions and can legitimately disagree,
+//! so neither replaces the other.
+//!
+//! # The one rule this module exists to hold
+//!
+//! The warn/quiet decision is taken **only** by
+//! [`RepositoryDescriptor::hook_policy_requires_banner`]. It is never
+//! re-derived here from the `Option`, because hand-rolling that per call site
+//! is precisely how "not disclosed" gets quietly treated as "fine": `None` has
+//! three causes (an older server, an ADR-0029 refusal, or no verdict yet) and
+//! not one of them is a guarantee. The descriptor's own method already folds
+//! all three to "fly the banner" at the type level, so the fail-safe direction
+//! is inherited rather than re-argued.
+//!
+//! The *wording* still matches on the policy exhaustively — no `_` arm — so a
+//! [`HookPolicy`] variant added later fails this crate's build until someone
+//! writes honest text for it, rather than silently inheriting a neighbour's.
+
+use git_vista_protocol::{HookPolicy, RepositoryDescriptor};
+
+/// What a user is told about one repository's hook policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HookPolicyDisclosure {
+    /// True when INV-15 requires the elevated-risk styling — straight from
+    /// [`RepositoryDescriptor::hook_policy_requires_banner`], never recomputed.
+    pub warn: bool,
+    /// The short badge, sized for a picker row.
+    pub label: &'static str,
+    /// One sentence, shown in full where the user commits to a repository.
+    /// Never a tooltip: a disclosure nobody notices is the failure INV-15 names.
+    pub detail: &'static str,
+}
+
+/// The disclosure for one catalog entry.
+pub fn for_repository(descriptor: &RepositoryDescriptor) -> HookPolicyDisclosure {
+    let (label, detail) = match descriptor.hook_policy {
+        // Deliberately *not* phrased as reassurance. All three causes of `None`
+        // land here, and the text has to be true for the worst of them.
+        None => (
+            "Hooks: not disclosed",
+            "This server disclosed no hook policy for this repository. \
+             Not disclosed is not a guarantee — treat this repository's hooks \
+             as able to run with your permissions.",
+        ),
+        // The only variant that earns quiet styling. The claim is kept as
+        // narrow as `HookPolicy::Strict`'s own docs make it: it is *not*
+        // "confined to the repository".
+        Some(HookPolicy::Strict) => (
+            "Hooks: sandboxed (strict)",
+            "Hooks run under the strict sandbox tier: no network, and no writes \
+             outside the trees the server declared.",
+        ),
+        Some(HookPolicy::Network) => (
+            "Hooks: sandboxed, network allowed",
+            "Hooks run sandboxed, but with the network reachable — this \
+             repository's hooks can talk to the outside world.",
+        ),
+        Some(HookPolicy::Unsandboxed) => (
+            "Hooks: NOT sandboxed",
+            "Hooks run with no sandbox at all. A malicious repository's hooks \
+             execute with your permissions.",
+        ),
+        // "Your hooks silently did not run" is a surprise too, which is why
+        // `requires_banner` warns on this one as well.
+        Some(HookPolicy::Blocked) => (
+            "Hooks: blocked",
+            "Hooks do not run for this repository, so a repository that relies \
+             on its hooks will behave differently here.",
+        ),
+    };
+    HookPolicyDisclosure {
+        warn: descriptor.hook_policy_requires_banner(),
+        label,
+        detail,
+    }
+}
+
+/// The sentence the **session** banner shows, for `SessionInfo::hook_policy`.
+///
+/// # Why this exists — the banner's text used to be a constant
+///
+/// [`crate::hook_policy_banner`] decided *whether* to show a bar by asking
+/// [`HookPolicy::requires_banner`] — correctly, a function of the policy — and
+/// then rendered **one fixed string** for every warning state: *"Repository
+/// hooks run automatically for this session. A malicious repository's hooks
+/// execute with your permissions."*
+///
+/// For [`HookPolicy::Blocked`] that is the **exact opposite of the truth**:
+/// hooks do not run at all. For [`HookPolicy::Network`] it omits the sandbox
+/// entirely, describing a sandboxed-but-networked session as though nothing
+/// contained it. The visibility predicate was a function of the policy while
+/// the words were a constant, so the two drifted apart the moment `HookPolicy`
+/// grew past two variants (#202 deleted `Allow`/`Restricted`, which is what
+/// surfaced it).
+///
+/// Both errors **over**-warn, so no user was ever given a false green light —
+/// the fail-safe direction held. That makes this a credibility bug rather than
+/// a safety one: a banner that cries wolf on a session where hooks are blocked
+/// teaches the reader to dismiss the same bar on a session where they are not.
+/// INV-15 is a disclosure invariant, and a disclosure nobody believes has
+/// already failed.
+///
+/// Session-scoped, not repository-scoped: this describes the policy the
+/// *current selection* would run under, and it can legitimately disagree with
+/// [`for_repository`] — see this module's header. It is also a snapshot:
+/// `POST /api/select` can move the selection without the client refetching
+/// `/api/session`, so the non-stale answer is always the per-repository one.
+/// That staleness is why the text below never claims more than the policy
+/// value itself supports.
+///
+/// Exhaustive, no `_` arm, for the same reason as [`for_repository`]: a new
+/// variant must fail the build until someone writes honest words for it.
+pub fn for_session(policy: HookPolicy) -> &'static str {
+    match policy {
+        HookPolicy::Strict => {
+            "Repository hooks run sandboxed for this session: no network, and no \
+             writes outside the trees the server declared."
+        }
+        HookPolicy::Network => {
+            "Repository hooks run sandboxed for this session, but with the network \
+             reachable — a malicious repository's hooks can talk to the outside world."
+        }
+        HookPolicy::Unsandboxed => {
+            "Repository hooks run with no sandbox for this session. A malicious \
+             repository's hooks execute with your permissions."
+        }
+        HookPolicy::Blocked => {
+            "Repository hooks do not run for this session, so a repository that \
+             relies on its hooks will behave differently here."
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use git_vista_protocol::RepositoryKind;
+
+    fn descriptor(hook_policy: Option<HookPolicy>) -> RepositoryDescriptor {
+        RepositoryDescriptor {
+            repository: "r".into(),
+            worktree: "w".into(),
+            name: "demo".into(),
+            kind: RepositoryKind::MainWorktree,
+            read_only: false,
+            path: None,
+            remote_web_url: None,
+            hook_policy,
+        }
+    }
+
+    /// Every input this function can receive, with the warn flag written out
+    /// literally rather than as `d.hook_policy_requires_banner()` — asserting
+    /// the mapping against the implementation it is supposed to check would
+    /// pass no matter which way the polarity ran.
+    #[test]
+    fn only_a_disclosed_strict_policy_is_quiet() {
+        let cases = [
+            (None, true),
+            (Some(HookPolicy::Strict), false),
+            (Some(HookPolicy::Network), true),
+            (Some(HookPolicy::Unsandboxed), true),
+            (Some(HookPolicy::Blocked), true),
+        ];
+        for (policy, expected_warn) in cases {
+            assert_eq!(
+                for_repository(&descriptor(policy)).warn,
+                expected_warn,
+                "wrong warn polarity for {policy:?}"
+            );
+        }
+    }
+
+    /// The failure mode this whole module exists for: an absent policy read as
+    /// a green light. It must warn, and its words must not be the words that
+    /// describe an actually-sandboxed repository.
+    #[test]
+    fn an_absent_policy_warns_and_never_borrows_strict_wording() {
+        let absent = for_repository(&descriptor(None));
+        let strict = for_repository(&descriptor(Some(HookPolicy::Strict)));
+
+        assert!(
+            absent.warn,
+            "an undisclosed policy must not be styled quiet"
+        );
+        assert_ne!(absent.label, strict.label);
+        assert_ne!(absent.detail, strict.detail);
+        assert!(
+            !absent.label.contains("sandbox") && !absent.detail.contains("sandbox"),
+            "the undisclosed text must not claim any sandbox: {absent:?}"
+        );
+    }
+
+    /// Each tier gets its own words. A copy-pasted arm would let two genuinely
+    /// different risk levels read identically on screen.
+    #[test]
+    fn every_policy_state_reads_differently() {
+        let states = [
+            None,
+            Some(HookPolicy::Strict),
+            Some(HookPolicy::Network),
+            Some(HookPolicy::Unsandboxed),
+            Some(HookPolicy::Blocked),
+        ];
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for policy in states {
+            let d = for_repository(&descriptor(policy));
+            assert!(!d.label.is_empty() && !d.detail.is_empty());
+            assert!(
+                !seen.contains(&(d.label, d.detail)),
+                "{policy:?} reuses another state's wording"
+            );
+            seen.push((d.label, d.detail));
+        }
+    }
+
+    /// `every_policy_state_reads_differently` proves the five texts are
+    /// distinct, but distinctness says nothing about *which* text landed on
+    /// which variant: swapping the `Network` and `Blocked` arms keeps all five
+    /// unique and keeps every warn polarity correct, while telling a user with
+    /// a network-sandboxed repository that its hooks do not run at all. This
+    /// binds the discriminating word of each arm to the variant it describes,
+    /// which is the only assertion that fails when two arms trade places.
+    #[test]
+    fn each_state_names_the_thing_that_makes_it_that_state() {
+        for (policy, needle) in [
+            (HookPolicy::Strict, "strict"),
+            (HookPolicy::Network, "network"),
+            (HookPolicy::Unsandboxed, "no sandbox at all"),
+            (HookPolicy::Blocked, "do not run"),
+        ] {
+            let d = for_repository(&descriptor(Some(policy)));
+            let text = format!("{} {}", d.label, d.detail).to_lowercase();
+            assert!(
+                text.contains(needle),
+                "{policy:?} never says {needle:?}: {text}"
+            );
+        }
+    }
+
+    /// The unsandboxed tier is the one a user most needs to catch at a glance,
+    /// so its badge must say so rather than hiding the fact in the detail line
+    /// (picker rows show the badge; only the mode screen shows the detail).
+    #[test]
+    fn the_unsandboxed_badge_says_so_on_its_own() {
+        let d = for_repository(&descriptor(Some(HookPolicy::Unsandboxed)));
+        assert!(d.label.contains("NOT sandboxed"), "{}", d.label);
+    }
+
+    /// The bug this function exists to fix, pinned so it cannot come back.
+    ///
+    /// The old banner told every warning state that hooks "run automatically".
+    /// For `Blocked` that is the exact opposite of the truth. Asserted on the
+    /// literal words a user reads, not on a property of the policy, because
+    /// the original defect was precisely that the text stopped tracking the
+    /// value.
+    #[test]
+    fn the_session_sentence_never_claims_hooks_run_when_they_are_blocked() {
+        let s = for_session(HookPolicy::Blocked);
+        assert!(
+            s.contains("do not run"),
+            "Blocked must say hooks do not run, got: {s}"
+        );
+        assert!(
+            !s.contains("execute with your permissions"),
+            "Blocked must not inherit the unsandboxed warning, got: {s}"
+        );
+    }
+
+    /// A sandboxed-but-networked session must not read as though nothing
+    /// contained it — the other half of the constant-text defect.
+    #[test]
+    fn the_session_sentence_mentions_the_sandbox_when_one_is_applied() {
+        for policy in [HookPolicy::Strict, HookPolicy::Network] {
+            let s = for_session(policy);
+            assert!(
+                s.contains("sandboxed"),
+                "{policy:?} runs sandboxed and must say so, got: {s}"
+            );
+        }
+        assert!(
+            for_session(HookPolicy::Network).contains("network"),
+            "Network must disclose the network specifically"
+        );
+        assert!(
+            !for_session(HookPolicy::Strict).contains("network reachable"),
+            "Strict must not inherit Network's warning"
+        );
+    }
+
+    /// Every state reads differently. Catches a copy-pasted arm making two
+    /// risk levels indistinguishable — which is the constant-text bug in its
+    /// smaller, partial form.
+    #[test]
+    fn every_session_state_reads_differently() {
+        let all = [
+            for_session(HookPolicy::Strict),
+            for_session(HookPolicy::Network),
+            for_session(HookPolicy::Unsandboxed),
+            for_session(HookPolicy::Blocked),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "two session states share wording: {a}");
+                }
+            }
+        }
+    }
+
+    /// Only `Unsandboxed` may carry the strongest claim. Written as literals
+    /// per state rather than by calling `requires_banner()`, because asserting
+    /// a mapping against the function that defines it passes whichever way the
+    /// polarity runs.
+    #[test]
+    fn only_the_unsandboxed_session_says_hooks_run_with_your_permissions() {
+        let expected = [
+            (HookPolicy::Strict, false),
+            (HookPolicy::Network, false),
+            (HookPolicy::Unsandboxed, true),
+            (HookPolicy::Blocked, false),
+        ];
+        for (policy, should_claim) in expected {
+            let s = for_session(policy);
+            assert_eq!(
+                s.contains("execute with your permissions"),
+                should_claim,
+                "{policy:?} got the wrong risk claim: {s}"
+            );
+        }
+    }
+}
