@@ -400,6 +400,23 @@ below.
   Neither the AF_UNIX denial nor Landlock touches this, and no unprivileged
   sandbox can. It is the reason "a hostile repository cannot harm you" is not
   purchasable, and it is written here rather than engineered against.
+- **Operator trust self-propagates: `Tier::Unsandboxed` has no exclude set,
+  so one grant is transitively a grant for every repository on the host.**
+  The trust store is unforgeable from every *sandboxed* tier — it sits in
+  `secret_excludes`, which outranks grants (pinned by
+  `the_trust_store_is_withheld_even_from_a_repo_that_contains_it` in
+  `sandbox/trust.rs`) — but `Unsandboxed` is the absence of the shim, so a
+  hook in one operator-trusted repository runs with the server's full uid
+  powers and can mint valid markers for any other repository, which the next
+  operation then resolves as trusted. Signing markers (HMAC) does not close
+  it: an unsandboxed hook reads any key the server can read. This is latent,
+  not live, and deliberately so: `trust::grant` has no production caller and
+  is compile-gated `#[cfg(test)]`, with a tripwire
+  (`grant_is_unreachable_from_production_until_self_propagation_is_addressed`)
+  that fails with this reasoning if the gate is removed. Wiring the
+  operator-trust handler therefore cannot happen without confronting the
+  choice this item records: either contain what a trusted repository's hooks
+  can write, or disclose "trust one, trust all" in the grant UI itself.
 
 ```mermaid
 flowchart TD

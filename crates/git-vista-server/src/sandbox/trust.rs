@@ -108,6 +108,7 @@ pub(crate) fn grant(canonical_repo: &Path) -> std::io::Result<()> {
     grant_in(&sandbox_trust_dir(), canonical_repo)
 }
 
+#[cfg(test)]
 fn grant_in(trust_dir: &Path, canonical_repo: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(trust_dir)?;
     let marker = trust_dir.join(marker_name(canonical_repo));
@@ -186,6 +187,55 @@ mod tests {
         assert!(
             !is_trusted_in(&dir, &repo),
             "a marker with a mismatched stored path must not confer trust"
+        );
+    }
+
+    /// The compile gate on `grant` is a security control, and this is its
+    /// tripwire: it fails, with the reasoning, if the gate is removed.
+    ///
+    /// Why the gate exists: `Tier::Unsandboxed` has no exclude set, so a hook
+    /// in one trusted repository can write valid trust markers for every
+    /// repository on the host — one grant self-propagates into all of them.
+    /// The sandboxed-tier exclude (tested below) does not help here, because
+    /// the whole point of `Unsandboxed` is that no policy applies. Signing
+    /// markers does not help either: an unsandboxed hook reads any key the
+    /// server can. The only reason this is not a live escalation is that
+    /// production cannot reach `grant` — which the `#[cfg(test)]` attribute
+    /// makes a compile-time fact rather than a habit.
+    ///
+    /// What would make this pass while the mechanism was broken: a
+    /// `#[cfg(test)]` appearing in a *doc comment* above `grant` while the
+    /// real attribute was gone. The scan below therefore ignores `///` lines
+    /// and reads only the contiguous attribute lines directly above the `fn`.
+    #[test]
+    fn grant_is_unreachable_from_production_until_self_propagation_is_addressed() {
+        let src = include_str!("trust.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let fn_line = lines
+            .iter()
+            .position(|l| l.starts_with("pub(crate) fn grant("))
+            .expect(
+                "trust.rs no longer defines `pub(crate) fn grant(` at the top level — \
+                 if grant moved or was renamed, move this tripwire with it; it guards \
+                 the compile gate that keeps trust self-propagation latent",
+            );
+        let attrs: Vec<&str> = lines[..fn_line]
+            .iter()
+            .rev()
+            .take_while(|l| l.trim_start().starts_with("#["))
+            .copied()
+            .collect();
+        assert!(
+            attrs.iter().any(|l| l.trim() == "#[cfg(test)]"),
+            "`trust::grant` has lost its `#[cfg(test)]` compile gate (attributes found: \
+             {attrs:?}). That gate is the ONLY thing keeping trust self-propagation \
+             latent: Tier::Unsandboxed has no exclude set, so a hook in one trusted \
+             repository can mint markers for every repository on the host, and an HMAC \
+             does not fix it. Before wiring a production caller, the grant flow must \
+             answer the self-propagation section in this module's doc and the matching \
+             item in docs/SECURITY_MODEL.md § Sandbox Mechanism Boundaries — either \
+             contain what a trusted repository's hooks can write, or disclose \
+             'trust one, trust all' to the operator in the grant UI itself."
         );
     }
 
