@@ -329,7 +329,9 @@ fn boot_probe_policy(scratch: &Path, markers: &Path) -> Result<Policy, &'static 
         ro_trees: ro,
         secret_excludes: secret_excludes_for_home(&home),
         net_ports: Vec::new(),
-        hook_mode: HookMode::Run,
+        hook_mode: HookMode::Blocked {
+            empty_dir: PathBuf::new(),
+        }, // MUTATION-D
     })
 }
 
@@ -591,7 +593,7 @@ pub(crate) fn boot_verdict() -> Option<&'static ProbeVerdict> {
 /// be satisfied by the sibling's write and would keep passing with the recorder
 /// gutted. See `the_recorded_verdict_is_write_once_and_readable`.
 fn record_boot_verdict(verdict: &ProbeVerdict) {
-    let _ = verdict; // MUTATION-B
+    record_verdict_into(&BOOT_VERDICT, verdict);
 }
 
 /// Store `verdict` in `cell` unless `cell` already holds one — the whole of the
