@@ -574,7 +574,8 @@ fn every_font_size_declaration_is_relative_or_a_recorded_svg_exception() {
                  turns up their system text size sees no change here. Use `rem`/`em`/`%` \
                  instead, or if this selector styles SVG graph text scaled by the pinch \
                  camera rather than the page, add it to SVG_TEXT_PX_FONT_SIZE_CENSUS \
-                 with that reasoning recorded"
+                 with that reasoning recorded (a `font:` shorthand carrying a px size \
+                 reads the same way here as the longhand — use a relative unit in it)"
             );
             seen_px.insert(selector.as_str());
         }
