@@ -9,6 +9,7 @@ io_uring_denied
 no_new_privs_irrevocable
 second_landlock_ruleset_denied
 secret_read_denied
+ssh_known_hosts_carveout
 strict_listener_denied
 strict_tcp_bind_denied
 strict_udp_host_denied
