@@ -582,8 +582,27 @@ pub(crate) fn boot_verdict() -> Option<&'static ProbeVerdict> {
 /// A second call is a no-op rather than a panic. Only `run_at_startup` calls
 /// this, and `main` calls that once; the tolerant `set` is for the test binary,
 /// where more than one test legitimately drives the real boot path.
+///
+/// The storage step itself is [`record_verdict_into`], which takes the cell as
+/// an argument. That indirection is not decoration — it is the only way the
+/// write-once contract can be *proved* instead of assumed. A test that drives
+/// this function writes into the one process-wide [`BOOT_VERDICT`], which a
+/// sibling test may already have filled, so "recording made it readable" would
+/// be satisfied by the sibling's write and would keep passing with the recorder
+/// gutted. See `the_recorded_verdict_is_write_once_and_readable`.
 fn record_boot_verdict(verdict: &ProbeVerdict) {
-    let _ = BOOT_VERDICT.set(verdict.clone());
+    record_verdict_into(&BOOT_VERDICT, verdict);
+}
+
+/// Store `verdict` in `cell` unless `cell` already holds one — the whole of the
+/// write-once contract, with the cell passed in so it can be exercised against a
+/// *fresh* one and therefore without depending on what else has run first.
+///
+/// Unconditional on the verdict's variant, deliberately: a version that stored
+/// only [`ProbeVerdict::Contained`] would leave [`boot_verdict`] answering
+/// `None` — "the probe has not run" — for a host where it ran and found a hole.
+fn record_verdict_into(cell: &OnceLock<ProbeVerdict>, verdict: &ProbeVerdict) {
+    let _ = cell.set(verdict.clone());
 }
 
 /// The INV-13/Global Constraint 15 mapping: [`ProbeVerdict::Contained`] is
