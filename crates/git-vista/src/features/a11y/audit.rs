@@ -266,8 +266,8 @@ fn the_interactive_control_census_matches_the_stylesheet() {
 }
 
 /// The census's verdicts are recomputed from the stylesheet, so an entry cannot become a
-/// stale claim. Today every one is `false`, and this test says so out loud: **no
-/// interactive control in this app is guaranteed by CSS to meet the 44x44 criterion.**
+/// stale claim: if the #65 tap-target rule is deleted or weakened, the `true` entries go
+/// red here, and if someone sizes the SVG targets from CSS, the `false` entries do.
 #[test]
 fn recorded_tap_target_verdicts_still_match_the_stylesheet() {
     let rules = stylesheet();
