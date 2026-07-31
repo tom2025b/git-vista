@@ -377,9 +377,7 @@ fn production_policy_for_carries_the_known_hosts_carveout_in_network_only() {
     assert!(
         w.contains(&(
             "--ro-carveout",
-            home.join(".ssh/known_hosts")
-                .to_str()
-                .expect("utf8 path")
+            home.join(".ssh/known_hosts").to_str().expect("utf8 path")
         )),
         "the composed Network argv must carry --ro-carveout <known_hosts>"
     );
@@ -450,7 +448,11 @@ fn policy_for_clone_carries_both_188_grants() {
     unsafe { std::env::set_var("SSH_AUTH_SOCK", &sock) };
 
     let policy = policy_for_clone(clones_root.path()).expect("policy_for_clone must build");
-    assert_eq!(policy.tier, Tier::Network, "clone is always NetworkNeed::Remote");
+    assert_eq!(
+        policy.tier,
+        Tier::Network,
+        "clone is always NetworkNeed::Remote"
+    );
 
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
     assert_eq!(
@@ -468,9 +470,7 @@ fn policy_for_clone_carries_both_188_grants() {
     let w = pairs(&argv);
     assert!(w.contains(&(
         "--ro-carveout",
-        home.join(".ssh/known_hosts")
-            .to_str()
-            .expect("utf8 path")
+        home.join(".ssh/known_hosts").to_str().expect("utf8 path")
     )));
     assert!(w.contains(&("--rw", sock.to_str().expect("utf8 path"))));
 
