@@ -71,7 +71,10 @@ mod dispatch;
 /// #66 / #199 (plan Task 13): INV-17, "documented non-coverage is tested as
 /// non-coverage". Its tests assert that attacks **succeed** — see its own
 /// module doc. Outside the `EscapeCase` harness on purpose: an inverted claim
-/// cannot be scored by `run_case`'s contained/escaped verdict.
+/// cannot be scored by `run_case`'s contained/escaped verdict. Also carries a
+/// second, clearly-delineated section (below the confused-deputy doc test)
+/// for ordinary missing-coverage gaps that are not INV-17 shaped — see that
+/// section's own header comment for why it lives here anyway.
 #[cfg(test)]
 mod documented_gaps;
 /// #66 Task 25, step 3: the anti-vacuity contract's tripwires and the
