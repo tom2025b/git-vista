@@ -24,6 +24,61 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="git-vista" />
+    <!-- M1.12 (#65): the home-screen icon. iOS/iPadOS does NOT read the web app
+         manifest's `icons` array for an add-to-home-screen launch — it reads
+         this link, and only PNG. Without it iOS uses a screenshot of the page
+         as the icon, which is what an already-`apple-mobile-web-app-capable`
+         app has been getting until now. Rendered from assets/icon.svg; see
+         that file for why it is not the same artwork as the favicon above.
+
+         All hrefs in this block are ROOT-ABSOLUTE on purpose. The server serves
+         the SPA via a fallback (main.rs `fallback_service`), so a relative
+         "manifest.webmanifest" requested from a deep route like /foo/bar would
+         resolve to /foo/manifest.webmanifest and be answered with index.html —
+         the manifest would silently parse as HTML and fail. -->
+    <link rel="apple-touch-icon" href="/icon-180.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <!-- Copy the manifest and the icon PNGs into dist/ (Trunk flattens
+         copy-file to the dist root, which is why the hrefs above have no
+         directory part). `.webmanifest` is served as `application/manifest+json`
+         by tower-http's ServeDir via mime_guess, so the `nosniff` header the
+         server sets on every response does not reject it. -->
+    <link data-trunk rel="copy-file" href="manifest.webmanifest" />
+    <link data-trunk rel="copy-file" href="assets/icon-180.png" />
+    <link data-trunk rel="copy-file" href="assets/icon-192.png" />
+    <link data-trunk rel="copy-file" href="assets/icon-512.png" />
+    <!-- M1.12 (#65): there is deliberately NO service worker, and adding one is
+         not a "finish the PWA" chore — it would make this app worse. If you are
+         here to add one, read this first:
+
+           1. Every byte the SPA needs is already served with `Cache-Control:
+              no-cache` (main.rs `build_app`) precisely so a rebuilt wasm hash is
+              picked up on the next load. A precaching worker exists to defeat
+              that revalidation, so it would fight the server on purpose.
+           2. The wasm and CSS filenames are content-hashed per build
+              (git-vista-ui-<hash>_bg.wasm). A hand-written precache list goes
+              stale on every single `trunk build`, so a worker here needs a
+              generated manifest — a build step this crate does not have.
+           3. NOTHING under /api may ever be cached. The app is a live view of a
+              working git repository; a stale /api/frame showing a branch that
+              has since moved, or a /api/status from before a commit, is far
+              worse than a visible error. The server already sends `no-store` on
+              the API, and no client-side cache may override it.
+           4. This app binds loopback by default and is reached from the iPad
+              over an SSH forward; the one exception is the opt-in LAN view
+              listener (`gv --lan-view`, ADR 0005 — bootstrap-token, view-scoped,
+              rate-limited). Under EITHER transport, "offline" almost always
+              means THE TUNNEL (or LAN path) DIED, not "the user walked into a
+              lift". A worker serving a cached shell over a dead tunnel turns a
+              diagnosable network failure into what looks like an app bug — a
+              failure mode that has already cost real debugging time on this
+              project. Failing loudly is the honest behaviour.
+
+         This is ADR 0032; features/shell/pwa_guard.rs trips if a registration
+         appears here or this comment is removed.
+
+         Standalone home-screen launch on iOS needs no worker — only the
+         apple-mobile-web-app-capable meta above — so nothing is lost by this. -->
     <!-- Build this crate's `git-vista-ui` binary to wasm. -->
     <link data-trunk rel="rust" data-bin="git-vista-ui" />
     <link data-trunk rel="css" href="styles.css" />

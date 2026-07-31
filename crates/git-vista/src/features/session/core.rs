@@ -14,9 +14,14 @@ use git_vista_protocol::{HookPolicy, RepoMode};
 use crate::features::core_traits::{Applied, FeatureCore};
 
 /// `#[derive(Default)]` gives `hook_policy: HookPolicy::default()`, which is
-/// `Restricted` (`git-vista-protocol`'s own fail-closed choice) — the right
+/// `Blocked` (`git-vista-protocol`'s own fail-closed choice) — the right
 /// answer before the first `Established` event: err conservative rather
 /// than assume permissive.
+///
+/// It said `Restricted` until #208; that name was deleted in #202 and the
+/// default was never it. `Blocked` is what the test below
+/// (`a_fresh_session_has_no_token_is_not_lan_and_has_no_known_mode`) has
+/// actually asserted all along.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SessionCore {
     csrf: Option<String>,
@@ -69,7 +74,7 @@ impl SessionCore {
     /// Leptos) and carries no test of its own, matching this crate's
     /// existing view-file convention.
     pub fn hook_policy_banner_visible(&self) -> bool {
-        matches!(self.hook_policy, HookPolicy::Allow)
+        self.hook_policy.requires_banner()
     }
 
     pub fn ui_mode(&self) -> Option<RepoMode> {
@@ -141,10 +146,20 @@ mod tests {
         s.apply(SessionEvent::Established {
             csrf: Some("abc".into()),
             via_lan,
+            // Two contrasting policies, one silent and one banner-flying, so
+            // the tests below exercise both sides of the banner rule.
+            //
+            // They are keyed off `via_lan` purely as a convenient switch in
+            // this helper — **the server no longer derives hook policy from
+            // `via_lan` at all** (#202: it discloses the measured
+            // per-repository policy, identically on both listeners). Nothing
+            // here should be read as mirroring a server mapping; a session's
+            // policy and its `via_lan` flag are independent values that arrive
+            // in the same event.
             hook_policy: if via_lan {
-                HookPolicy::Restricted
+                HookPolicy::Strict
             } else {
-                HookPolicy::Allow
+                HookPolicy::Unsandboxed
             },
         })
         .expect("establish is always accepted");
@@ -158,24 +173,55 @@ mod tests {
         assert!(!s.is_lan());
         assert_eq!(s.ui_mode(), None);
         // Fail-closed default, before any Established event — see this
-        // struct's own doc comment.
-        assert_eq!(s.hook_policy(), HookPolicy::Restricted);
+        // struct's own doc comment. `Blocked`, not `Strict`: an absent field
+        // must not become an unearned green light.
+        assert_eq!(s.hook_policy(), HookPolicy::Blocked);
     }
 
     #[test]
     fn establishing_a_session_records_the_hook_policy() {
-        assert_eq!(established(false).hook_policy(), HookPolicy::Allow);
-        assert_eq!(established(true).hook_policy(), HookPolicy::Restricted);
+        assert_eq!(established(false).hook_policy(), HookPolicy::Unsandboxed);
+        assert_eq!(established(true).hook_policy(), HookPolicy::Strict);
     }
 
+    /// INV-15's polarity, and the reason this is not the old
+    /// `the_banner_shows_only_for_allow`.
+    ///
+    /// When `HookPolicy` had two variants, `matches!(_, Allow)` and "not
+    /// `Strict`" were the same predicate. Widening it to the four tier names
+    /// split them apart, and the old expression kept the *narrow* half: it
+    /// went silent for `Network` (sandboxed, but hooks reach the network) and
+    /// for `Blocked` (hooks silently did not run) — under-warning on exactly
+    /// the two values that did not exist when it was written. Enumerated
+    /// explicitly here rather than by calling `requires_banner()`, so an
+    /// inverted implementation of that method would still fail this.
     #[test]
-    fn the_banner_shows_only_for_allow() {
-        assert!(established(false).hook_policy_banner_visible());
+    fn the_banner_shows_for_everything_except_strict() {
+        for policy in [
+            HookPolicy::Network,
+            HookPolicy::Unsandboxed,
+            HookPolicy::Blocked,
+        ] {
+            let mut s = SessionCore::default();
+            s.apply(SessionEvent::Established {
+                csrf: Some("abc".into()),
+                via_lan: false,
+                hook_policy: policy,
+            })
+            .expect("establish is always accepted");
+            assert!(
+                s.hook_policy_banner_visible(),
+                "{policy:?} is not the fullest isolation, so the user must be told"
+            );
+        }
         assert!(!established(true).hook_policy_banner_visible());
-        // The fail-closed default (Restricted) also shows no banner — a
-        // fresh, not-yet-established session should not flash a warning
-        // it hasn't actually confirmed.
-        assert!(!SessionCore::default().hook_policy_banner_visible());
+        assert!(established(false).hook_policy_banner_visible());
+        // The fail-closed default (`Blocked`) *does* fly the banner. This
+        // reverses the old comment here on purpose: a fresh, not-yet-
+        // established session has confirmed no guarantee, and the safe
+        // direction for a banner is to over-warn and then go quiet once the
+        // server discloses `strict` — not to stay silent on no evidence.
+        assert!(SessionCore::default().hook_policy_banner_visible());
     }
 
     /// A change in `hook_policy` alone (everything else identical) must still
@@ -188,11 +234,11 @@ mod tests {
             .apply(SessionEvent::Established {
                 csrf: Some("abc".into()),
                 via_lan: false,
-                hook_policy: HookPolicy::Restricted,
+                hook_policy: HookPolicy::Strict,
             })
             .unwrap();
         assert_eq!(applied, Applied::Committed);
-        assert_eq!(s.hook_policy(), HookPolicy::Restricted);
+        assert_eq!(s.hook_policy(), HookPolicy::Strict);
     }
 
     #[test]
@@ -270,7 +316,7 @@ mod tests {
             .apply(SessionEvent::Established {
                 csrf: Some("abc".into()),
                 via_lan: false,
-                hook_policy: HookPolicy::Allow,
+                hook_policy: HookPolicy::Unsandboxed,
             })
             .unwrap();
         assert_eq!(applied, Applied::NoChange);

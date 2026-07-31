@@ -33,11 +33,12 @@ use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
 use crate::api::{fetch_frame, fetch_page, fetch_protocol, HistoryFetchError};
 use crate::dialogs;
+use crate::features::a11y::core::GRAPH_REGION_LABEL;
 use crate::features::activity::signals::Activity;
 use crate::features::dialogs::core::Dialog;
 use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::{
-    Frame, GraphCore, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT,
+    print_button_copy, Frame, GraphCore, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT,
 };
 use crate::features::operations::core::OperationsCore;
 use crate::features::operations::signals::Operations;
@@ -410,7 +411,10 @@ pub fn App() -> impl IntoView {
             {move || {
                 session
                     .get()
-                    .map(|_| hook_policy_banner_view(session_state::hook_policy_banner_visible()))
+                    .map(|_| hook_policy_banner_view(
+                            session_state::hook_policy_banner_visible(),
+                            session_state::hook_policy(),
+                        ))
             }}
             // M1.11 (#64): in-flight writes and their outcomes. Mounted in the shell,
             // not the canvas, so it keeps reporting across the epoch bump a completed
@@ -517,6 +521,24 @@ pub fn App() -> impl IntoView {
                                         read_only: f.read_only,
                                         path: None,
                                         remote_web_url: f.remote_web_url.clone(),
+                                        // Synthesized from the Frame, which
+                                        // carries no hook policy — so this is
+                                        // "not disclosed", never a guessed
+                                        // value.
+                                        //
+                                        // #208 made that visible: the mode
+                                        // screen now renders this field, so
+                                        // re-opening the mode screen from this
+                                        // badge says "not disclosed" even for a
+                                        // repository whose picker row said
+                                        // "sandboxed (strict)". That is the
+                                        // truthful reading of this path, which
+                                        // genuinely does not know, and it errs
+                                        // in the safe direction. Closing the
+                                        // gap means carrying the policy on the
+                                        // Frame — a protocol change, not a
+                                        // client-side guess.
+                                        hook_policy: None,
                                     }));
                                 }
                             }
@@ -577,6 +599,12 @@ pub fn App() -> impl IntoView {
                 // re-reads `complete` regardless: the attribute is an
                 // affordance, not the guarantee. A drift reload can un-complete
                 // the history between the paint and the tap.
+                //
+                // #217: the disabled reason used to live only in `title` — CSS
+                // dimming plus a native tooltip that never surfaces on tap, so
+                // on iPad the button just went dead with no explanation. The
+                // label now carries the same reason (`print_button_copy`,
+                // host-tested), so it's visible without hover/long-press.
                 {move || frame().map(|_| view! {
                     <button
                         class="refresh"
@@ -586,14 +614,9 @@ pub fn App() -> impl IntoView {
                                 history_ui.print_open.set(true);
                             }
                         }
-                        title=move || if history_complete.get() {
-                            "A clean, printable view of the whole graph — \
-                             print it or save it as a PDF"
-                        } else {
-                            "Load all history before printing."
-                        }
+                        title=move || print_button_copy(history_complete.get()).1
                     >
-                        "Print Graph"
+                        {move || print_button_copy(history_complete.get()).0}
                     </button>
                 })}
                 // Only a repo explicitly seeded as a test repo (`gv --seed`)
@@ -625,7 +648,12 @@ pub fn App() -> impl IntoView {
             // the sign-in/protocol screens, over everything else.
             {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, dialogs_guard, graph)}
             {crate::picker::mode_view(mode_for, picker_open, graph)}
-            <section class="graph">
+            // M1.12 (#65): a bare <section> is not a landmark — it is only exposed as
+            // a `region` once it has an accessible name, so without this the graph is
+            // an anonymous container and VoiceOver's rotor has nothing to jump to. The
+            // name comes from `a11y::core` rather than a literal here so the markup and
+            // the tripwire that checks it cannot drift apart.
+            <section class="graph" aria-label=GRAPH_REGION_LABEL>
                 {move || {
                     // Read the icon set here, inside the reactive block, so the
                     // status lines re-render when the icon style is toggled.

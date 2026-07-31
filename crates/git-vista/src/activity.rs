@@ -208,6 +208,9 @@ pub fn activity_panel_view(
                             <button
                                 class="detail-close"
                                 title="Close"
+                                // The visible content is one glyph; VoiceOver would
+                                // otherwise announce this as "multiplication sign" (#65).
+                                aria-label="Close activity"
                                 on:click=move |_| shell.close_activity()
                             >
                                 "×"

@@ -34,6 +34,83 @@ use crate::features::session::signals as session_state;
 /// in step with `MAX_PAGE_LIMIT` in `git-vista-server`'s read handlers.
 const MAX_PAGE_LIMIT: usize = 1_000;
 
+/// How long any single HTTP attempt may hang before it is abandoned.
+///
+/// # Why a timeout has to exist at all (#216, #218)
+///
+/// `fetch()` has **no default timeout**, and a socket forwarded over SSH can die
+/// without an RST or FIN — the tunnel simply stops relaying. The browser is then
+/// waiting on a connection that will never answer, and the promise never settles.
+/// A future parked on that `.await` is never polled again, so *no* error branch
+/// runs, however carefully it was written. That is the exact shape of #216: the
+/// clone dialog clears its `Cloning…` flag on both the `Ok` and `Err` arms, and
+/// the button still stuck forever, because neither arm was ever reached.
+///
+/// Measured on a real iPad session on 2026-07-31: the SSH tunnel dropped
+/// repeatedly, and a clone hung indefinitely with no error while the server-side
+/// clone path was proven working by `sandbox::clone_live`.
+///
+/// 60s is chosen to sit well above a slow-but-real request (a large first page
+/// over a phone tether) and well below "the user has given up and reloaded".
+const REQUEST_TIMEOUT_MS: u64 = 60_000;
+
+/// The deadline for `POST /api/clone` alone.
+///
+/// Clone is the one write whose legitimate duration is unbounded by anything the
+/// client controls: a large repository over a slow link can genuinely take
+/// minutes. Applying [`REQUEST_TIMEOUT_MS`] to it would abandon a *working*
+/// transfer and then retry it — and because clone is not operation-tracked, that
+/// retry would start a second `git clone` rather than being deduplicated. So the
+/// bound is set just under the server's own 600s ceiling
+/// (`handlers/clone.rs::CLONE_TIMEOUT`): late enough never to interrupt a clone
+/// the server is still making progress on, early enough that the client still
+/// gives up before the server does and can report why.
+const CLONE_TIMEOUT_MS: u64 = 570_000;
+
+/// Resolve to `Some(v)` if `fut` finishes within `ms`, or `None` if the deadline
+/// wins.
+///
+/// Built from `leptos::set_timeout` and a oneshot channel rather than pulling in
+/// `gloo-timers`: `futures` is already in the dependency graph, `leptos` is
+/// already a direct dependency, and the whole timer is six lines. The loser of
+/// the race is dropped — for the request side that drops the `fetch` future,
+/// which is the only cancellation WASM offers without an `AbortController`.
+///
+/// Note what this does **not** do: it does not abort the in-flight HTTP request
+/// at the browser level, so the server may still complete the work. That is
+/// exactly why the retry above it is only safe on reads and on idempotency-keyed
+/// writes — see [`send_write_with_key`].
+async fn with_deadline<T>(fut: impl std::future::Future<Output = T>, ms: u64) -> Option<T> {
+    let (tx, rx) = futures::channel::oneshot::channel::<()>();
+    leptos::set_timeout(
+        move || {
+            // Err means the receiver was already dropped — the request won the
+            // race and this timer is a no-op. Not a failure.
+            let _ = tx.send(());
+        },
+        std::time::Duration::from_millis(ms),
+    );
+    let deadline = async move {
+        let _ = rx.await;
+    };
+    match futures::future::select(Box::pin(fut), Box::pin(deadline)).await {
+        futures::future::Either::Left((value, _)) => Some(value),
+        futures::future::Either::Right(((), _)) => None,
+    }
+}
+
+/// The message a caller sees when a request was abandoned rather than answered.
+///
+/// Deliberately names the tunnel: on this deployment a hung request is nearly
+/// always a dropped SSH forward, and "reconnect the tunnel" is the action that
+/// actually fixes it. A generic "network error" sends the user looking at the
+/// wrong thing.
+fn timeout_error() -> String {
+    "The server did not answer within 60 seconds. The SSH tunnel has most likely \
+     dropped — restart the port forward and try again."
+        .to_string()
+}
+
 /// The ADR 0005 client-side counterpart of the LAN listener's structural
 /// read-only-ness: clone/select/rescan/delete refuse up front on a LAN-view
 /// session with a clear reason, instead of surfacing the bare `405` the
@@ -128,7 +205,7 @@ async fn send_write(
     url: &str,
     body: Option<String>,
 ) -> Result<(gloo_net::http::Response, IdempotencyKey), String> {
-    send_write_with_key(url, body, new_idempotency_key()).await
+    send_write_with_key(url, body, new_idempotency_key(), REQUEST_TIMEOUT_MS).await
 }
 
 /// [`send_write`] under a key the *caller* minted.
@@ -141,24 +218,82 @@ async fn send_write_with_key(
     url: &str,
     body: Option<String>,
     key: IdempotencyKey,
+    timeout_ms: u64,
 ) -> Result<(gloo_net::http::Response, IdempotencyKey), String> {
     let attempt = || async {
         let builder = req_post(url).header(IDEMPOTENCY_HEADER, key.as_str());
-        match &body {
-            Some(json) => builder
-                .header("content-type", "application/json")
-                .body(json.clone())
-                .map_err(|e| e.to_string())?
-                .send()
-                .await
-                .map_err(network_error),
-            None => builder.send().await.map_err(network_error),
-        }
+        let sent = async {
+            match &body {
+                Some(json) => builder
+                    .header("content-type", "application/json")
+                    .body(json.clone())
+                    .map_err(|e| e.to_string())?
+                    .send()
+                    .await
+                    .map_err(network_error),
+                None => builder.send().await.map_err(network_error),
+            }
+        };
+        // #216: a hung request is not a slow request. Without this, a socket that
+        // died silently mid-flight parks the caller's future forever and even the
+        // retry below never runs — there is nothing to retry *after*, because the
+        // first attempt never finished.
+        //
+        // # Why retrying a *timed-out* write is safe — and the one case where it is not
+        //
+        // A timeout here does **not** cancel the request: there is no
+        // `AbortController`, so the first attempt may still be executing on the
+        // server when the second arrives. For **operation-tracked** writes that is
+        // handled server-side, and by design: `operations::admit` is "a single
+        // critical section over the maps, so two concurrent requests carrying the
+        // same key cannot both be admitted: the loser sees the winner's record and
+        // awaits it". Concurrency is the case it was built for, not an afterthought.
+        //
+        // **`/api/clone` is not operation-tracked** (nor are `select`, `rescan` and
+        // `delete-clone` — see [`WriteReceipt::operation`]). It never reaches
+        // `admit`, so the key it carries buys it nothing, and two overlapping
+        // attempts really would run two `git clone`s. That is why clone gets
+        // [`CLONE_TIMEOUT_MS`] instead of this bound: long enough that a working
+        // clone is never abandoned mid-transfer, so the retry does not fire while
+        // the first attempt is still going. Found by an outside review of this
+        // patch on 2026-07-31; the comment previously claimed the key made this
+        // safe for every write, which was false for exactly the endpoint the
+        // timeout was written for.
+        with_deadline(sent, timeout_ms)
+            .await
+            .unwrap_or_else(|| Err(timeout_error()))
     };
     match attempt().await {
         Ok(resp) => Ok((resp, key)),
         Err(_) => attempt().await.map(|resp| (resp, key)),
     }
+}
+
+/// One read attempt, bounded and retried once — the read-side counterpart of
+/// [`send_write_with_key`]'s retry (#218).
+///
+/// Reads had **neither** a timeout nor a retry, while writes had a retry. That
+/// asymmetry is what made a single dropped request during history loading
+/// unrecoverable without user action: the seed resource resolved to an error (or
+/// never resolved at all) and nothing tried again, so the view sat on whatever
+/// it had managed to draw. A read is naturally idempotent — no key needed, and
+/// no risk of duplicating work — so it gets the same one-shot retry on the same
+/// reasoning as the write path: the first attempt evicts a dead pooled socket,
+/// the second goes out on a fresh connection.
+async fn send_read(url: &str) -> Result<gloo_net::http::Response, HistoryFetchError> {
+    let attempt = || async {
+        with_deadline(req_get(url).send(), REQUEST_TIMEOUT_MS)
+            .await
+            .unwrap_or_else(|| Err(gloo_net::Error::GlooError(timeout_error())))
+    };
+    let first = attempt().await;
+    let resp = match first {
+        Ok(resp) => resp,
+        Err(_) => attempt()
+            .await
+            .map_err(|e| HistoryFetchError::Network(network_error(e)))?,
+    };
+    Ok(resp)
 }
 
 /// What a write answered with, beyond its body.
@@ -200,8 +335,20 @@ async fn write_json<T: serde::Serialize>(
     url: &str,
     body: &T,
 ) -> Result<(gloo_net::http::Response, IdempotencyKey), String> {
+    write_json_with_timeout(url, body, REQUEST_TIMEOUT_MS).await
+}
+
+/// [`write_json`] under a caller-chosen deadline.
+///
+/// Exists for `/api/clone`, which is the one write whose *legitimate* duration
+/// can exceed the ordinary bound — see [`CLONE_TIMEOUT_MS`].
+async fn write_json_with_timeout<T: serde::Serialize>(
+    url: &str,
+    body: &T,
+    timeout_ms: u64,
+) -> Result<(gloo_net::http::Response, IdempotencyKey), String> {
     let json = serde_json::to_string(body).map_err(|e| e.to_string())?;
-    send_write(url, Some(json)).await
+    send_write_with_key(url, Some(json), new_idempotency_key(), timeout_ms).await
 }
 
 /// [`send_write`] with no body — the bodyless writes (stage, unstage, rebase…).
@@ -357,10 +504,7 @@ async fn history_json<T: serde::de::DeserializeOwned>(
 /// [`Frame::worktree_id`](git_vista_protocol::HistoryFrame::worktree_id).
 pub async fn fetch_frame() -> Result<Frame, HistoryFetchError> {
     let url = format!("/api/frame?t={}", js_sys::Date::now());
-    let resp = req_get(&url)
-        .send()
-        .await
-        .map_err(|e| HistoryFetchError::Network(network_error(e)))?;
+    let resp = send_read(&url).await?;
     history_json(resp).await
 }
 
@@ -393,10 +537,7 @@ pub async fn fetch_page(
         limit.clamp(1, MAX_PAGE_LIMIT),
         js_sys::Date::now()
     ));
-    let resp = req_get(&url)
-        .send()
-        .await
-        .map_err(|e| HistoryFetchError::Network(network_error(e)))?;
+    let resp = send_read(&url).await?;
     history_json(resp).await
 }
 
@@ -427,7 +568,7 @@ pub async fn clone_request(url: &str) -> Result<RepositoryDescriptor, String> {
     let body = CloneRequest {
         url: url.to_string(),
     };
-    let (resp, _key) = write_json("/api/clone", &body).await?;
+    let (resp, _key) = write_json_with_timeout("/api/clone", &body, CLONE_TIMEOUT_MS).await?;
     if resp.ok() {
         resp.json::<RepositoryDescriptor>()
             .await
@@ -590,7 +731,8 @@ pub async fn undo_request(
 ) -> Result<WriteReceipt, String> {
     refuse_if_visualize()?;
     let json = serde_json::to_string(action).map_err(|e| e.to_string())?;
-    let (resp, _key) = send_write_with_key("/api/undo", Some(json), key).await?;
+    let (resp, _key) =
+        send_write_with_key("/api/undo", Some(json), key, REQUEST_TIMEOUT_MS).await?;
     Ok(receipt(resp).await)
 }
 
@@ -696,7 +838,7 @@ pub async fn fetch_rebase_status() -> Result<RebaseStatus, String> {
 /// is git's own error text (conflicts, detached HEAD, …), returned as `Err`.
 pub async fn rebase_request(key: IdempotencyKey) -> Result<WriteReceipt, String> {
     refuse_if_visualize()?;
-    let (resp, _key) = send_write_with_key("/api/rebase", None, key).await?;
+    let (resp, _key) = send_write_with_key("/api/rebase", None, key, REQUEST_TIMEOUT_MS).await?;
     Ok(receipt(resp).await)
 }
 
@@ -735,7 +877,7 @@ pub async fn branch_op_request(
         branch: branch.to_string(),
     };
     let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-    let (resp, _key) = send_write_with_key(path, Some(json), key).await?;
+    let (resp, _key) = send_write_with_key(path, Some(json), key, REQUEST_TIMEOUT_MS).await?;
     Ok(receipt(resp).await)
 }
 
