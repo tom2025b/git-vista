@@ -97,7 +97,7 @@ sequenceDiagram
 ```
 
 The shim's own `main()` is `parse → validate → close_inherited_fds →
-apply_landlock → apply_seccomp → exec("git")` (`bin/gv-sandbox/main.rs:735-762`)
+apply_landlock → apply_seccomp → exec("git")` (`bin/gv-sandbox/main.rs`)
 — Landlock before seccomp, one process, `.exec()` never `.spawn()`, so the
 shim never becomes a parent (enforced by a source tripwire on that same file,
 `main.rs:10-13`).
@@ -162,8 +162,8 @@ repository, not the operation); the `false` side has none, so a new
 marker file under the server's own state directory
 (`state::sandbox_trust_dir()`, `$XDG_STATE_HOME/git-vista/trusted-repos` or
 `~/.local/state/...`) — never inside a repository, and the only writer is
-`trust::grant`, documented as callable "only from an explicit, authenticated
-operator action" (`trust.rs:76-90`). As of this writing `trust::grant` has no
+`trust::grant`, whose module doc says trust "is granted only by `grant`, which is
+called from an explicit, authenticated operator action" (`trust.rs`, module doc comment). As of this writing `trust::grant` has no
 production (handler-reachable) caller — only test code exercises it
 (`sandbox/dispatch.rs:616,648`, `sandbox/compat.rs:471`) — so `Unsandboxed` is
 reachable by rule, not yet by any operator-facing route.
@@ -199,10 +199,10 @@ flowchart TD
 is an exhaustive match over it with no wildcard arm (`mod.rs:593-621`) — a new
 operation variant fails the build until someone states what network it needs,
 rather than silently inheriting a default. The argv itself is also inspected
-(`network_need`, `mod.rs:539-563`), but only as a fail-closed cross-check: the
+(`network_need`, `mod.rs`), but only as a fail-closed cross-check: the
 reconciler `reconcile_need` always returns the *declared* value, only ever
 logging/panicking-in-debug when the argv looks more remote than declared
-(`mod.rs:661-679`, `mod.rs:657-660`: "the argv can only ever *complain*, never
+(`reconcile_need`'s doc comment: "the argv can only ever *complain*, never
 decide").
 
 ```mermaid
@@ -227,7 +227,7 @@ sequenceDiagram
 
 Restated only for the whole picture — ADR 0029 is the detailed record.
 `policy_for` refuses *before* building any grant when `Strict` is selected
-and the host cannot supply it (`strict_launcher`, `mod.rs:704-726`,
+and the host cannot supply it (`strict_launcher`, `mod.rs`,
 `ShimError::StrictUnavailable`), never degrading to `Network` and never
 running with hooks suppressed. The disclosure seam makes the same refusal
 honest at the wire: `hook_policy_for_repo`/`hook_policy_for_trusted_repo`
@@ -235,7 +235,7 @@ maps `ProbeVerdict::CapabilityAbsent`/`FailOpen` to
 `Err(HookPolicyRefused::…)`, never to `HookPolicy::Blocked` — the exact
 mapping the M1.13b plan proposed and ADR 0029 rejected by name. This is
 checked, not merely documented: `capability_absent_refuses_and_never_becomes_blocked`
-(`hook_policy.rs:249-264`) asserts both `is_err()` and
+(`hook_policy.rs`) asserts both `is_err()` and
 `assert_ne!(got.ok(), Some(HookPolicy::Blocked))`.
 
 ```mermaid
@@ -253,12 +253,12 @@ stateDiagram-v2
 ```
 
 `HookPolicy` itself widened from ADR 0025's two variants to four
-(`git-vista-protocol/src/dto.rs:141-185`): `Strict`, `Network`, `Unsandboxed`
+(`git-vista-protocol/src/dto.rs`): `Strict`, `Network`, `Unsandboxed`
 name the three tiers directly; `Blocked` is wire-only ("hooks are not known
-to be running" — `HookPolicy::default()`, `dto.rs:207-220`) with **no
+to be running" — `HookPolicy::default()`, `dto.rs`) with **no
 production policy constructor emitting it**, checked by the escape
 contract's own R8 scan. `requires_banner()` is `!matches!(self, Strict)`
-(`dto.rs:202-204`) — INV-15's banner marks everything that is not the fullest
+(`dto.rs`) — INV-15's banner marks everything that is not the fullest
 isolation, `Blocked` included, since "your hooks silently did not run" is a
 surprise a user must be told about as much as "your hooks ran unsandboxed."
 ADR 0025's old wire strings (`allow`/`restricted`) still deserialize via
@@ -374,7 +374,7 @@ stateDiagram-v2
    bound a fixed port; a TIME-WAIT socket left by an unrelated earlier test
    made the bind fail with `EADDRINUSE`, the case reported `CapabilityAbsent`,
    and `cargo test` printed `ok` while asserting nothing about containment
-   (`escape_contract.rs:784-791`).
+   (`escape_contract.rs`'s `run_case`, its "Why `CapabilityAbsent` panics too" section).
 2. *(Reported elsewhere as "a module never compiled" — could not be confirmed
    against this repository's escape-battery material; see the Report at the
    end of this ADR.)*
