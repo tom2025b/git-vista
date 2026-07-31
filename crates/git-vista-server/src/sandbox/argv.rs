@@ -5,6 +5,48 @@
 use super::*;
 use std::path::PathBuf;
 
+/// The one owner of the `SSH_AUTH_SOCK` environment variable across this
+/// file's tests.
+///
+/// `std::env::set_var`/`remove_var` mutate process-wide state, and `cargo
+/// test` runs every test in this binary on separate threads of one process
+/// by default. Three tests in this file set this same key — without a
+/// rendezvous, two running concurrently silently clobber each other, and one
+/// reads back the *other's* socket path instead of its own. Measured: this
+/// is not hypothetical, it is exactly what happened the first time these
+/// tests ran without this guard (`production_policy_for_wires_the_agent_socket_grant_into_the_network_argv`
+/// observed `policy_for_clone_carries_both_188_grants`'s socket path).
+///
+/// Scoped to this file, not shared crate-wide the way `test_ports::PortClaim`
+/// covers TCP port 9418: nothing outside this file's tests touches
+/// `SSH_AUTH_SOCK` (checked by grep when these tests were written), so a
+/// claim covering only this file's own three callers is sufficient — a
+/// wider one would just be unused generality.
+static SSH_AUTH_SOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Set `SSH_AUTH_SOCK` to `value` (or clear it, for `None`), run `f`, then
+/// restore whatever the variable held before `f` ran — all inside one
+/// `SSH_AUTH_SOCK_LOCK` critical section, so no other test in this file can
+/// observe or clobber the value while `f` depends on it.
+fn with_ssh_auth_sock<T>(value: Option<&std::path::Path>, f: impl FnOnce() -> T) -> T {
+    let _guard = SSH_AUTH_SOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prior = std::env::var_os("SSH_AUTH_SOCK");
+    // SAFETY: `SSH_AUTH_SOCK_LOCK`, held for this whole function, is the only
+    // synchronization this key needs — it is this file's one writer of it
+    // (see the lock's own doc comment), so nothing outside this critical
+    // section can observe a torn read or a lost write.
+    match value {
+        Some(p) => unsafe { std::env::set_var("SSH_AUTH_SOCK", p) },
+        None => unsafe { std::env::remove_var("SSH_AUTH_SOCK") },
+    }
+    let result = f();
+    match prior {
+        Some(v) => unsafe { std::env::set_var("SSH_AUTH_SOCK", v) },
+        None => unsafe { std::env::remove_var("SSH_AUTH_SOCK") },
+    }
+    result
+}
+
 /// A fixed, fake bwrap path. Fake on purpose: these tests pin the *shape* of
 /// the argv, and pinning them to wherever bwrap really lives on the build host
 /// would make them pass or fail for reasons that have nothing to do with the
@@ -405,32 +447,22 @@ fn ssh_agent_socket_grant_is_network_tier_only_and_only_when_set() {
         "Unsandboxed installs no ruleset at all; nothing here should be granted through it either"
     );
 
-    let prior = std::env::var_os("SSH_AUTH_SOCK");
-    // SAFETY: no other test in this crate reads or sets SSH_AUTH_SOCK
-    // (grepped for both at the time this was written) — a key nothing else
-    // touches has nothing to race with on this one. Restored via the same
-    // setter, never merely removed, so a test order that runs this before
-    // something reading a real ambient value is not left with a poisoned
-    // environment.
-    unsafe { std::env::remove_var("SSH_AUTH_SOCK") };
-    assert_eq!(
-        ssh_agent_socket_grant(Tier::Network),
-        None,
-        "no agent running (SSH_AUTH_SOCK unset) must mean no grant, not an invented path"
-    );
+    with_ssh_auth_sock(None, || {
+        assert_eq!(
+            ssh_agent_socket_grant(Tier::Network),
+            None,
+            "no agent running (SSH_AUTH_SOCK unset) must mean no grant, not an invented path"
+        );
+    });
 
     let sock = PathBuf::from("/tmp/gv188-argv-test-agent.sock");
-    unsafe { std::env::set_var("SSH_AUTH_SOCK", &sock) };
-    assert_eq!(
-        ssh_agent_socket_grant(Tier::Network),
-        Some(sock),
-        "#188: Network tier must grant exactly the path SSH_AUTH_SOCK names"
-    );
-
-    match prior {
-        Some(v) => unsafe { std::env::set_var("SSH_AUTH_SOCK", v) },
-        None => unsafe { std::env::remove_var("SSH_AUTH_SOCK") },
-    }
+    with_ssh_auth_sock(Some(&sock), || {
+        assert_eq!(
+            ssh_agent_socket_grant(Tier::Network),
+            Some(sock.clone()),
+            "#188: Network tier must grant exactly the path SSH_AUTH_SOCK names"
+        );
+    });
 }
 
 /// `policy_for_clone` is an **independent** `Policy` constructor (it does not
@@ -443,41 +475,34 @@ fn ssh_agent_socket_grant_is_network_tier_only_and_only_when_set() {
 fn policy_for_clone_carries_both_188_grants() {
     let clones_root = tempfile::tempdir().expect("tempdir");
     let sock = PathBuf::from("/tmp/gv188-policy-for-clone-test-agent.sock");
-    let prior = std::env::var_os("SSH_AUTH_SOCK");
-    // SAFETY: see ssh_agent_socket_grant_is_network_tier_only_and_only_when_set.
-    unsafe { std::env::set_var("SSH_AUTH_SOCK", &sock) };
+    with_ssh_auth_sock(Some(&sock), || {
+        let policy = policy_for_clone(clones_root.path()).expect("policy_for_clone must build");
+        assert_eq!(
+            policy.tier,
+            Tier::Network,
+            "clone is always NetworkNeed::Remote"
+        );
 
-    let policy = policy_for_clone(clones_root.path()).expect("policy_for_clone must build");
-    assert_eq!(
-        policy.tier,
-        Tier::Network,
-        "clone is always NetworkNeed::Remote"
-    );
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+        assert_eq!(
+            policy.ro_carveouts,
+            vec![home.join(".ssh/known_hosts")],
+            "policy_for_clone must carry the same known_hosts carve-out as policy_for"
+        );
+        assert!(
+            policy.rw_trees.contains(&sock),
+            "policy_for_clone must carry the same agent-socket grant as policy_for, got {:?}",
+            policy.rw_trees
+        );
 
-    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
-    assert_eq!(
-        policy.ro_carveouts,
-        vec![home.join(".ssh/known_hosts")],
-        "policy_for_clone must carry the same known_hosts carve-out as policy_for"
-    );
-    assert!(
-        policy.rw_trees.contains(&sock),
-        "policy_for_clone must carry the same agent-socket grant as policy_for, got {:?}",
-        policy.rw_trees
-    );
-
-    let argv = strs(&sandbox_argv(&policy));
-    let w = pairs(&argv);
-    assert!(w.contains(&(
-        "--ro-carveout",
-        home.join(".ssh/known_hosts").to_str().expect("utf8 path")
-    )));
-    assert!(w.contains(&("--rw", sock.to_str().expect("utf8 path"))));
-
-    match prior {
-        Some(v) => unsafe { std::env::set_var("SSH_AUTH_SOCK", v) },
-        None => unsafe { std::env::remove_var("SSH_AUTH_SOCK") },
-    }
+        let argv = strs(&sandbox_argv(&policy));
+        let w = pairs(&argv);
+        assert!(w.contains(&(
+            "--ro-carveout",
+            home.join(".ssh/known_hosts").to_str().expect("utf8 path")
+        )));
+        assert!(w.contains(&("--rw", sock.to_str().expect("utf8 path"))));
+    });
 }
 
 /// The integration half: `policy_for` must actually wire
@@ -488,35 +513,28 @@ fn policy_for_clone_carries_both_188_grants() {
 fn production_policy_for_wires_the_agent_socket_grant_into_the_network_argv() {
     let repo = tempfile::tempdir().expect("tempdir");
     let sock = PathBuf::from("/tmp/gv188-policy-for-test-agent.sock");
-    let prior = std::env::var_os("SSH_AUTH_SOCK");
-    // SAFETY: see ssh_agent_socket_grant_is_network_tier_only_and_only_when_set.
-    unsafe { std::env::set_var("SSH_AUTH_SOCK", &sock) };
+    with_ssh_auth_sock(Some(&sock), || {
+        let network = policy_for(repo.path(), false, NetworkNeed::Remote)
+            .expect("a Network policy must build on this host");
+        assert!(
+            network.rw_trees.contains(&sock),
+            "policy_for must add the agent socket to rw_trees in the Network tier, got {:?}",
+            network.rw_trees
+        );
+        let argv = strs(&sandbox_argv(&network));
+        let w = pairs(&argv);
+        assert!(
+            w.contains(&("--rw", sock.to_str().expect("utf8 path"))),
+            "the composed Network argv must carry --rw <agent socket>"
+        );
 
-    let network = policy_for(repo.path(), false, NetworkNeed::Remote)
-        .expect("a Network policy must build on this host");
-    assert!(
-        network.rw_trees.contains(&sock),
-        "policy_for must add the agent socket to rw_trees in the Network tier, got {:?}",
-        network.rw_trees
-    );
-    let argv = strs(&sandbox_argv(&network));
-    let w = pairs(&argv);
-    assert!(
-        w.contains(&("--rw", sock.to_str().expect("utf8 path"))),
-        "the composed Network argv must carry --rw <agent socket>"
-    );
-
-    let strict = policy_for(repo.path(), false, NetworkNeed::Local)
-        .expect("a Strict policy must build on this host");
-    assert!(
-        !strict.rw_trees.contains(&sock),
-        "#188: Strict must never receive the agent socket grant even with \
-         SSH_AUTH_SOCK set, got {:?}",
-        strict.rw_trees
-    );
-
-    match prior {
-        Some(v) => unsafe { std::env::set_var("SSH_AUTH_SOCK", v) },
-        None => unsafe { std::env::remove_var("SSH_AUTH_SOCK") },
-    }
+        let strict = policy_for(repo.path(), false, NetworkNeed::Local)
+            .expect("a Strict policy must build on this host");
+        assert!(
+            !strict.rw_trees.contains(&sock),
+            "#188: Strict must never receive the agent socket grant even with \
+             SSH_AUTH_SOCK set, got {:?}",
+            strict.rw_trees
+        );
+    });
 }
