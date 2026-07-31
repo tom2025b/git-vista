@@ -105,7 +105,9 @@ impl Drop for KillOnDrop {
 }
 
 fn run(cmd: &mut Command, what: &str) {
-    let status = cmd.status().unwrap_or_else(|e| panic!("{what}: could not run: {e}"));
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("{what}: could not run: {e}"));
     assert!(status.success(), "{what}: exited with {status}");
 }
 
@@ -191,15 +193,28 @@ impl SshFixture {
         };
         let mut c = Command::new("git");
         git_env(&mut c);
-        run(c.args(["init", "-q", "-b", "main", scratch.to_str().unwrap()]), "git init");
+        run(
+            c.args(["init", "-q", "-b", "main", scratch.to_str().unwrap()]),
+            "git init",
+        );
         std::fs::write(scratch.join("f.txt"), "gv-vista #188 ssh fixture\n").expect("write f.txt");
         let mut c = Command::new("git");
         git_env(&mut c);
-        run(c.args(["-C", scratch.to_str().unwrap(), "add", "-A"]), "git add");
+        run(
+            c.args(["-C", scratch.to_str().unwrap(), "add", "-A"]),
+            "git add",
+        );
         let mut c = Command::new("git");
         git_env(&mut c);
         run(
-            c.args(["-C", scratch.to_str().unwrap(), "commit", "-q", "-m", "seed"]),
+            c.args([
+                "-C",
+                scratch.to_str().unwrap(),
+                "commit",
+                "-q",
+                "-m",
+                "seed",
+            ]),
             "git commit",
         );
         let mut c = Command::new("git");
@@ -280,7 +295,10 @@ impl SshFixture {
         let up = wait_until(Duration::from_secs(5), || {
             TcpStream::connect(("127.0.0.1", port)).is_ok()
         });
-        assert!(up, "sshd on 127.0.0.1:{port} never accepted a TCP connection");
+        assert!(
+            up,
+            "sshd on 127.0.0.1:{port} never accepted a TCP connection"
+        );
 
         // --- ssh-agent, foreground, at a chosen socket path -------------
         let agent_sock = work.path().join("agent.sock");
@@ -293,7 +311,10 @@ impl SshFixture {
             .unwrap_or_else(|e| panic!("spawn ssh-agent: {e}"));
         let agent = KillOnDrop(agent_child, "ssh-agent");
         let sock_up = wait_until(Duration::from_secs(5), || agent_sock.exists());
-        assert!(sock_up, "ssh-agent never created its socket at {agent_sock:?}");
+        assert!(
+            sock_up,
+            "ssh-agent never created its socket at {agent_sock:?}"
+        );
 
         let mut add = Command::new("/usr/bin/ssh-add");
         add.env_clear()
@@ -305,12 +326,12 @@ impl SshFixture {
         // --- known_hosts: the exact carve-out target, pre-populated -----
         // Bracketed host:port form (RFC-less but OpenSSH-standard) because
         // the port is non-default; a bare `127.0.0.1` line would not match.
-        let known_hosts_line = format!(
-            "[127.0.0.1]:{port} {}",
-            host_pub.trim()
-        );
-        std::fs::write(home_path.join(".ssh/known_hosts"), format!("{known_hosts_line}\n"))
-            .expect("write known_hosts");
+        let known_hosts_line = format!("[127.0.0.1]:{port} {}", host_pub.trim());
+        std::fs::write(
+            home_path.join(".ssh/known_hosts"),
+            format!("{known_hosts_line}\n"),
+        )
+        .expect("write known_hosts");
 
         let repo_url = format!("ssh://127.0.0.1:{port}{}", repo_git.display());
 
@@ -345,7 +366,9 @@ impl SshFixture {
         }
         Policy {
             tier: Tier::Network,
-            shim: shim::shim_path().expect("gv-sandbox must be built").to_path_buf(),
+            shim: shim::shim_path()
+                .expect("gv-sandbox must be built")
+                .to_path_buf(),
             bwrap: None,
             rw_trees: rw,
             ro_trees: ro,
