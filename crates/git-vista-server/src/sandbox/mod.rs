@@ -104,6 +104,13 @@ mod hostile;
 pub(crate) mod lifecycle;
 #[cfg(test)]
 mod shim_cli;
+/// #188: the one acceptance box that needs a real SSH server — a throwaway
+/// local `sshd` + `ssh-agent` + bare repository, driving a real `git
+/// ls-remote` over `ssh://` through the composed Network-tier launcher. See
+/// this module's own doc comment for why it builds its own `Policy` rather
+/// than routing through `policy_for`'s real-`$HOME`-reading path.
+#[cfg(test)]
+mod ssh_remote;
 
 /// Absolute paths the strict tier's outer launcher is looked for at, in order.
 ///
