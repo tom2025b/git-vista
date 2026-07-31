@@ -14,7 +14,7 @@
 //! of whatever git felt like printing (M1.10, #63).
 
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 
 use axum::http::StatusCode;
 use tokio::io::AsyncReadExt;
@@ -124,16 +124,160 @@ fn git_error(endpoint: &str, stderr: &[u8]) -> (StatusCode, String) {
 /// parsers handle that themselves. A cap hit is a *success*: the child is killed
 /// and reaped, and its (killed) exit status is deliberately not reinterpreted as
 /// a git error. Only the below-cap path inspects the exit status.
+/// Build a `git -C <repo> <args…>` command that runs **through the M1.13b
+/// sandbox** (#66, Task 5/6).
+///
+/// `args` is taken here, not appended by the caller, and that is the whole
+/// point. Until Task 5 this function passed an **empty** slice to
+/// `command_async` and handed back a bare `Command` that each caller then
+/// appended the real subcommand to — so the argv `sandbox_argv` classified was
+/// never the argv that ran (C10 hazard #1). The returned
+/// [`SandboxedCommand`](crate::sandbox::spawn::SandboxedCommand) has no `arg`,
+/// `args` or `env` method, so the classified argv is now the executed argv by
+/// construction rather than by convention.
+///
+/// This is the single seam that makes the sandbox load-bearing: every git the
+/// server runs goes through here, and `argv_boundary.rs` proves nothing else in
+/// the crate spawns git directly. A policy that cannot be built (a missing shim,
+/// an unset `$HOME`, a `.git` that fails D2's resolution/managed-root check) is
+/// a hard error rather than a silent fall-back to unsandboxed git — an
+/// unsandboxed spawn is exactly what this exists to prevent.
+///
+/// # `read_only` is derived here; `NetworkNeed` is **declared** by the caller
+///
+/// D2 (#66, Task 7) made `sandbox::policy_for` take `read_only` and `need`.
+/// `read_only` is still recovered right here — it comes from
+/// `state::read_only_for_path`, a catalog lookup keyed on `repo` itself. Every
+/// caller already resolved `repo` from either the catalog
+/// (`resolve_repo`/`resolve_target`) or a path with no catalog entry at all (an
+/// unregistered test fixture, a not-yet-registered clone destination, a
+/// degraded-mode selection) — the lookup returns `false` for the latter, which
+/// is the same "no restriction recorded" answer those paths already got before
+/// D2, so nothing already working changes shape.
+///
+/// `need` is different, and Task 8/D3 is what changed it. It used to be
+/// recovered here too, from `network_need(args)` — the argv classifier that
+/// function's own doc comment describes as "a fail-closed fallback, not the
+/// authoritative dispatch". That was harmless only because `policy_for`
+/// discarded it. Now that `need` picks the tier, the authority moves to the
+/// caller: `declared` is passed in, and `network_need(args)` is demoted to a
+/// cross-check (`sandbox::reconcile_need`) that may only tighten, never widen.
+///
+/// See [`git_output`] and [`git_stdout_capped`] for where each of this crate's
+/// callers gets its declaration from.
+/// **git could not be run at all.**
+///
+/// The third answer that the three predicate-shaped helpers below
+/// ([`rev_parse`], [`is_ancestor`], [`git_ref_exists`]) used to have no way to
+/// give. Their old `Option`/`bool` returns had exactly two states — "git ran
+/// and the thing is there" and "git ran and it is not" — so a sandbox policy
+/// that could not be built, or a spawn that failed, was laundered into the
+/// *second* one. A missing shim then reached the user as "no such branch", and
+/// a failed read of a ref reached the staleness gate as a fact about the
+/// repository.
+///
+/// D5 (#66, Task 19) gives that case its own value. It is deliberately opaque
+/// — callers do not branch on *why* git could not run, only on *that* it could
+/// not — and it carries the underlying reason for the log line and the 500 body.
+///
+/// Two distinct failures are folded in here on purpose, because every caller
+/// treats them identically: the sandbox policy failing to build (a missing
+/// shim, an unset `$HOME`, a `.git` geometry D2 refuses) and the spawn/wait
+/// itself failing. Both mean the same thing to a gate — *we did not observe
+/// anything, so we may not act as though we did.*
+#[derive(Debug, Clone)]
+pub(crate) struct ExecUnavailable {
+    why: String,
+}
+
+impl ExecUnavailable {
+    pub(crate) fn new(why: impl Into<String>) -> Self {
+        Self { why: why.into() }
+    }
+}
+
+impl std::fmt::Display for ExecUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl std::error::Error for ExecUnavailable {}
+
+fn sandboxed(
+    repo: &Path,
+    args: &[&str],
+    declared: crate::sandbox::NetworkNeed,
+) -> Result<crate::sandbox::spawn::SandboxedCommand, String> {
+    let read_only = crate::state::read_only_for_path(repo);
+    let need = crate::sandbox::reconcile_need(declared, args);
+    let policy = crate::sandbox::policy_for(repo, read_only, need).map_err(|e| e.to_string())?;
+    Ok(crate::sandbox::spawn::command_async(&policy, repo, args))
+}
+
+/// Run `git -C <repo> <args…>` through the sealed launcher and collect its
+/// full [`Output`] — the one path from "a module needs git's `Output`" to
+/// `sandboxed` above, for callers that want status/stdout/stderr together
+/// rather than the capped-stdout or bool/Option shapes the other helpers in
+/// this file return (#66, Task 6).
+///
+/// Folding "the sandbox policy couldn't be built" into the same `io::Error`
+/// as "the spawn itself failed" is a real conflation — it is exactly the one
+/// `docs/sandbox/tier-dispatch-revised-design.md`'s D5 exists to fix, by
+/// giving execution-unavailable its own value instead of erasing it into a
+/// generic IO failure. This helper does not do that work; it takes the
+/// erased shape on purpose. It is still fail-safe: every caller today already
+/// maps an `io::Error` from git to the same 500 it would map a "policy
+/// unavailable" error to, so the two failures land on the same response
+/// either way. And it is strictly better than what it replaces — the raw
+/// `Command::new("git")` spawns this collapses into itself ran with no
+/// sandbox at all.
+/// # Declares `NetworkNeed::Local` (D3)
+///
+/// Not a fallback and not a guess: this arity exists for the callers that have
+/// **no typed `GitOperation`** in scope, and every one of them is a local
+/// command by inspection —
+///
+/// * `coordinator::absolute_git_dir` — `rev-parse --absolute-git-dir`;
+/// * `durable::write_recovery_ref` — `update-ref <ref> <oid>`;
+/// * `handlers::read::worktree_status` — `status --porcelain=v2 --branch`.
+///
+/// None of them reaches a remote, so `Local` is the truthful declaration rather
+/// than a conservative default. The planner, which *does* have a typed
+/// operation, does not use this arity: it goes through [`git_output_for`] with
+/// the need `sandbox::network_need_for_operation` derived from the operation
+/// itself. If a future caller of this function ever needs a remote, it must use
+/// `git_output_for` — declaring `Remote` explicitly — because the cross-check
+/// in `sandboxed` will otherwise fire on it, which is the intended way to find
+/// out.
+pub(crate) async fn git_output(repo: &Path, args: &[&str]) -> std::io::Result<Output> {
+    git_output_for(repo, args, crate::sandbox::NetworkNeed::Local).await
+}
+
+/// [`git_output`] with the network need stated explicitly — the arity the
+/// planner uses, where the declaration comes from the typed `GitOperation`
+/// being executed rather than from this file's knowledge of its callers.
+pub(crate) async fn git_output_for(
+    repo: &Path,
+    args: &[&str],
+    declared: crate::sandbox::NetworkNeed,
+) -> std::io::Result<Output> {
+    let cmd = sandboxed(repo, args, declared).map_err(std::io::Error::other)?;
+    cmd.output().await
+}
+
+/// Declares `NetworkNeed::Local` for the same reason [`git_output`] does: all
+/// five production call sites are read endpoints (`/api/diff`'s three `diff`
+/// reads and `/api/file`'s two `show` reads), none of which can reach a remote.
 pub(crate) async fn git_stdout_capped(
     repo: &Path,
     args: &[String],
     endpoint: &str,
     cap: usize,
 ) -> Result<(Vec<u8>, bool), (StatusCode, String)> {
-    let child = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let child = sandboxed(repo, &borrowed, crate::sandbox::NetworkNeed::Local)
+        .map_err(|e| io_error(endpoint, std::io::Error::other(e)))?
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -229,48 +373,69 @@ pub(crate) async fn git_stdout(
         .map(|(bytes, _truncated)| bytes)
 }
 
-/// Resolve `rev` to a full commit id in `repo`, or `None` if it doesn't
-/// resolve. Used by the journal hooks to capture a ref's tip before/after an
+/// Resolve `rev` to a full commit id in `repo`.
+///
+/// Three answers, not two (D5, #66 Task 19):
+///
+/// * `Ok(Some(id))` — git ran and `rev` resolves to `id`;
+/// * `Ok(None)` — git ran and said `rev` does not resolve (`--verify --quiet`
+///   exits non-zero for exactly that). **A fact about the repository.**
+/// * `Err(ExecUnavailable)` — git did not run. Not a fact about anything.
+///
+/// The middle and last used to be the same `None`, and callers read it as the
+/// middle one. Used by the journal hooks to capture a ref's tip before/after an
 /// operation — e.g. a branch's tip *before* deleting it, which is the one
 /// piece of state git itself throws away (the branch's reflog dies with it)
 /// and exactly what "Restore branch" later needs.
-pub(crate) async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--verify", "--quiet"])
-        .arg(format!("{rev}^{{commit}}"))
-        .output()
-        .await
-        .ok()?;
+pub(crate) async fn rev_parse(repo: &Path, rev: &str) -> Result<Option<String>, ExecUnavailable> {
+    let spec = format!("{rev}^{{commit}}");
+    // Local (D3): resolving a rev reads the object database, never a remote.
+    let output = sandboxed(
+        repo,
+        &["rev-parse", "--verify", "--quiet", &spec],
+        crate::sandbox::NetworkNeed::Local,
+    )
+    .map_err(ExecUnavailable::new)?
+    .output()
+    .await
+    .map_err(|e| ExecUnavailable::new(format!("couldn't run git rev-parse: {e}")))?;
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!id.is_empty()).then_some(id)
+    Ok((!id.is_empty()).then_some(id))
 }
 
 /// Whether `ancestor` is an ancestor of (or equal to) `rev` — `git merge-base
 /// --is-ancestor` exits 0 exactly then. "HEAD already contains the base tip" is
 /// the definition of "a rebase onto that base would change nothing".
-pub(crate) async fn is_ancestor(repo: &Path, ancestor: &str, rev: &str) -> bool {
-    tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["merge-base", "--is-ancestor", ancestor, rev])
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// `Err` when git did not run (D5): "we could not tell" must not read as
+/// "no, it is not an ancestor", which is what the old bare `bool` said.
+pub(crate) async fn is_ancestor(
+    repo: &Path,
+    ancestor: &str,
+    rev: &str,
+) -> Result<bool, ExecUnavailable> {
+    // Local (D3): `merge-base` walks the local object graph.
+    let out = sandboxed(
+        repo,
+        &["merge-base", "--is-ancestor", ancestor, rev],
+        crate::sandbox::NetworkNeed::Local,
+    )
+    .map_err(ExecUnavailable::new)?
+    .output()
+    .await
+    .map_err(|e| ExecUnavailable::new(format!("couldn't run git merge-base: {e}")))?;
+    Ok(out.status.success())
 }
 
 /// Run one `git -C <repo> <args…>` for the reset, mapping any failure to git's
 /// own stderr so the response can say which exact step refused and why.
 pub(crate) async fn git_ok(repo: &Path, args: &[&str]) -> Result<(), String> {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
+    // Local (D3): every call site is a local step — the seed reset's
+    // `checkout`/`reset`/`clean`/`branch -D`, `bundle unbundle`, and
+    // `remote get-url`, which reads `.git/config` and opens no socket.
+    let output = sandboxed(repo, args, crate::sandbox::NetworkNeed::Local)?
         .output()
         .await
         .map_err(|e| format!("couldn't run git: {e}"))?;
@@ -288,18 +453,44 @@ pub(crate) async fn git_ok(repo: &Path, args: &[&str]) -> Result<(), String> {
 /// Whether `refname` resolves in `repo` (`git rev-parse --verify --quiet`): exit 0
 /// when the ref exists, non-zero otherwise. Used to prefer `origin/main` over the
 /// local `main` as a rebase base only when the remote-tracking ref is actually there.
-pub(crate) async fn git_ref_exists(repo: &Path, refname: &str) -> bool {
-    tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("rev-parse")
-        .arg("--verify")
-        .arg("--quiet")
-        .arg(refname)
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// `Err` when git did not run (D5): the old bare `bool` reported a missing
+/// shim as "the ref is not there", which then silently picked a *different*
+/// rebase base.
+pub(crate) async fn git_ref_exists(repo: &Path, refname: &str) -> Result<bool, ExecUnavailable> {
+    // Local (D3): a ref existence check reads `.git`, never a remote.
+    let out = sandboxed(
+        repo,
+        &["rev-parse", "--verify", "--quiet", refname],
+        crate::sandbox::NetworkNeed::Local,
+    )
+    .map_err(ExecUnavailable::new)?
+    .output()
+    .await
+    .map_err(|e| ExecUnavailable::new(format!("couldn't run git rev-parse: {e}")))?;
+    Ok(out.status.success())
+}
+
+/// A directory git genuinely cannot be run against, for the D5 tests.
+///
+/// **Nothing is mocked and no function under test is stubbed.** `.git` is a
+/// regular file that is not a `gitdir:` pointer, which is a geometry
+/// `sandbox::worktree::linked_worktree_dirs` refuses to classify; that becomes
+/// `RepoPathsError::WorktreeGeometry`, which `sandbox::policy_for` returns as
+/// an error rather than a policy, so [`sandboxed`] has no command to hand back
+/// and no git process is ever spawned. That is a real production failure path
+/// (a hostile or corrupt `.git`), reached the way production reaches it.
+///
+/// Deliberately *not* an env-var override of the shim path: `shim::RESOLVED`
+/// is a process-wide `OnceLock`, so an override set by one test would leak
+/// into every other test in the binary and could be pre-empted by whichever
+/// test resolved the shim first.
+#[cfg(test)]
+pub(crate) fn unrunnable_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("hostile");
+    std::fs::create_dir_all(&repo).expect("create fixture dir");
+    std::fs::write(repo.join(".git"), "this is not a gitdir: pointer\n").expect("write .git");
+    (dir, repo)
 }
 
 #[cfg(test)]
@@ -486,6 +677,78 @@ mod tests {
             "git's own stderr must survive the capped read: {msg}"
         );
         assert_ne!(msg, "git failed.", "the empty-stderr fallback is not a fit");
+    }
+
+    // --- D5 (#66, Task 19): execution-unavailable is its own value ----------
+
+    /// The fixture must actually be unrunnable, or every D5 test below is
+    /// vacuous — a `Some`/`None` assertion that passes because git quietly
+    /// worked. Pinned first, on its own, against a *control*: the same call
+    /// against a real repository must succeed, so the `Err` cannot be blamed
+    /// on the call itself being broken.
+    #[tokio::test]
+    async fn the_unrunnable_fixture_really_cannot_run_git() {
+        let (_dir, repo) = seeded_repo();
+        rev_parse(&repo, "HEAD")
+            .await
+            .expect("control: git runs in a real repository")
+            .expect("control: HEAD resolves");
+
+        let (_hostile_dir, hostile) = unrunnable_repo();
+        let err = rev_parse(&hostile, "HEAD")
+            .await
+            .expect_err("a `.git` the policy cannot resolve must not spawn git");
+        assert!(
+            !err.to_string().is_empty(),
+            "the reason must survive for the log line and the 500 body"
+        );
+    }
+
+    /// The three-way split, on all three helpers: "git ran and it is not
+    /// there" and "git could not run" are different values now. Before D5
+    /// both were `None`/`false`.
+    #[tokio::test]
+    async fn absent_and_unavailable_are_different_answers() {
+        let (_dir, repo) = seeded_repo();
+        let (_hostile_dir, hostile) = unrunnable_repo();
+
+        // rev_parse: a ref that genuinely does not exist.
+        assert!(
+            rev_parse(&repo, "refs/heads/no-such-branch")
+                .await
+                .expect("git ran")
+                .is_none(),
+            "a missing ref is Ok(None) — a fact"
+        );
+        assert!(rev_parse(&hostile, "refs/heads/no-such-branch")
+            .await
+            .is_err());
+
+        // git_ref_exists: same ref, bool shape.
+        assert!(
+            !git_ref_exists(&repo, "refs/heads/no-such-branch")
+                .await
+                .expect("git ran"),
+            "a missing ref is Ok(false) — a fact"
+        );
+        assert!(git_ref_exists(&hostile, "refs/heads/no-such-branch")
+            .await
+            .is_err());
+
+        // is_ancestor: a real negative needs two real commits, so make one.
+        run(&repo, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+        run(&repo, &["add", "b.txt"]);
+        run(&repo, &["commit", "-q", "-m", "side"]);
+        assert!(
+            !is_ancestor(&repo, "side", "main").await.expect("git ran"),
+            "`side` is not an ancestor of `main`: Ok(false), a fact"
+        );
+        assert!(
+            is_ancestor(&repo, "main", "side").await.expect("git ran"),
+            "and the positive direction still answers Ok(true)"
+        );
+        assert!(is_ancestor(&hostile, "main", "side").await.is_err());
     }
 
     /// Cancellation — a browser tab closing mid-diff — must reach the git

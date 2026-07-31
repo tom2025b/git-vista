@@ -123,7 +123,10 @@ async fn a_double_clicked_commit_creates_exactly_one_commit() {
 async fn concurrent_identical_branch_creates_leave_one_branch() {
     let (_dir, repo) = seeded_repo();
     let id = repo_id(&repo);
-    let at = rev_parse(&repo, "HEAD").await.expect("HEAD resolves");
+    let at = rev_parse(&repo, "HEAD")
+        .await
+        .expect("git runs in a fixture repo")
+        .expect("HEAD resolves");
 
     let mut tasks = Vec::new();
     for _ in 0..4 {
@@ -150,7 +153,10 @@ async fn concurrent_identical_branch_creates_leave_one_branch() {
     }
     assert_eq!(ok, 1, "exactly one create must succeed");
     assert!(
-        rev_parse(&repo, "feature").await.is_some(),
+        rev_parse(&repo, "feature")
+            .await
+            .expect("git runs in a fixture repo")
+            .is_some(),
         "the branch exists"
     );
 }
@@ -253,7 +259,10 @@ async fn concurrent_mutations_from_two_linked_worktrees_serialize() {
 
     let id = repo_id(&repo);
     assert_eq!(id, repo_id(&linked), "one repository, two worktrees");
-    let at = rev_parse(&repo, "HEAD").await.expect("HEAD resolves");
+    let at = rev_parse(&repo, "HEAD")
+        .await
+        .expect("git runs in a fixture repo")
+        .expect("HEAD resolves");
 
     // Each worktree creates its own branch in the shared ref store, at once.
     let (a, b) = tokio::join!(

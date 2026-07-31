@@ -40,9 +40,10 @@ use git_vista_protocol::{
     IDEMPOTENCY_HEADER,
 };
 
-use crate::git_cmd::{git_ok, rev_parse};
+use crate::git_cmd::{git_ok, rev_parse, ExecUnavailable};
 use crate::journal;
-use crate::state::{current, current_handle, reject_if_read_only};
+use crate::sandbox::{network_need_for_operation, NetworkNeed};
+use crate::state::{current_handle, reject_if_read_only};
 
 /// How long a freshly issued plan stays executable. Enforced by [`validate`]
 /// (#145); unreachable in practice while plans execute in the same request
@@ -76,8 +77,14 @@ pub(crate) async fn plan_and_execute(op: GitOperation) -> (StatusCode, String) {
             ),
         );
     };
-    let repo = current().0;
-    let repo_id = current_handle().map(|handle| handle.repository);
+    // D2 (#66, Task 7): the validated resolution — degraded-mode selections
+    // and hostile/out-of-managed-root `.git` geometries refuse here, before
+    // any mutating argv is built. See `state::resolve_target`'s doc comment.
+    let (repo, entry) = match crate::state::resolve_target() {
+        Ok(v) => v,
+        Err(rejected) => return rejected,
+    };
+    let repo_id = Some(entry.handle.repository);
     plan_and_execute_tracked(key, repo, repo_id, selection_tokens(), op).await
 }
 
@@ -261,15 +268,23 @@ pub(crate) async fn resolve_commit_oid(
         return Ok(oid);
     }
     match rev_parse(repo, given).await {
-        Some(full) => CommitOid::new(full).map_err(|e| {
+        Ok(Some(full)) => CommitOid::new(full).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("git rev-parse returned an unusable id: {e}"),
             )
         }),
-        None => Err((
+        // git ran and refused the name: the request is wrong. 400, git's words.
+        Ok(None) => Err((
             StatusCode::BAD_REQUEST,
             format!("fatal: not a valid object name: '{given}'"),
+        )),
+        // D5: git never ran, so nothing was refused. Telling the user their
+        // object name is invalid would be a claim we have no evidence for —
+        // and it would send them to fix a request that is probably fine.
+        Err(e) => Err(couldnt_run(
+            "resolve_commit_oid",
+            &format!("couldn't resolve ‘{given}’: {e}"),
         )),
     }
 }
@@ -277,6 +292,114 @@ pub(crate) async fn resolve_commit_oid(
 // ---------------------------------------------------------------------------
 // Build
 // ---------------------------------------------------------------------------
+
+/// One observation of the live repository that can fail to *be* an
+/// observation — D5 (#66, Task 19).
+///
+/// The planner used to hold every read as `Option<String>`, where `None` meant
+/// two incompatible things at once: "git ran and there is nothing there"
+/// (unborn HEAD, no such branch, no remote-tracking ref) and "git could not be
+/// run, so nothing was read". Every consumer picked the first reading, which
+/// is how a failed read became a fact about the repository — journaled as an
+/// absence, hashed into the freshness token as an empty string, and compared
+/// against another failed read as "nothing moved".
+///
+/// [`Absent`](Self::Absent) is the fact. [`Unknown`](Self::Unknown) is the
+/// absence of a fact, and it is deliberately awkward to consume: there is no
+/// `unwrap_or_default`, no `PartialEq`, and no `Option` conversion that
+/// silently flattens it.
+///
+/// # No `PartialEq`
+///
+/// Not an oversight — deriving it is the exact bug this type exists to
+/// prevent. `Unknown == Unknown` would be `true`, and the two places that
+/// compare a before-tip to an after-tip (`exec_merge`, `exec_rebase`) would
+/// then answer "HEAD did not move — already up to date" for a pair of reads
+/// that observed *nothing*. Comparison goes through
+/// [`same_observation`](Self::same_observation), which answers `false` unless
+/// something was actually observed on both sides.
+#[derive(Clone, Debug)]
+enum Obs<T> {
+    /// git ran and reported this value.
+    Known(T),
+    /// git ran and reported that there is nothing here.
+    Absent,
+    /// git could not be run. Nothing was observed; nothing may be concluded.
+    Unknown,
+}
+
+/// Distinguishes one `Unknown` from the next in the generation digest. A plain
+/// counter is enough: generation tokens are only ever compared for equality,
+/// and only ever within one process's lifetime.
+static UNKNOWN_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl<T> Obs<T> {
+    /// Lift a three-state git read into an observation. `Err` is the one thing
+    /// this type exists for; `Ok(None)` is a real, reportable absence.
+    fn from_read(read: Result<Option<T>, ExecUnavailable>) -> Self {
+        match read {
+            Ok(Some(v)) => Obs::Known(v),
+            Ok(None) => Obs::Absent,
+            Err(_) => Obs::Unknown,
+        }
+    }
+
+    /// The observed value, if anything was observed and it was there.
+    ///
+    /// Collapses `Absent` and `Unknown` together, so it is only correct where
+    /// the caller's *next* step is "if we have a value, describe it; otherwise
+    /// describe nothing" — i.e. where an omission is not itself an assertion.
+    /// Anywhere a decision is made, match on the variants instead.
+    fn known(&self) -> Option<&T> {
+        match self {
+            Obs::Known(v) => Some(v),
+            Obs::Absent | Obs::Unknown => None,
+        }
+    }
+
+    /// Whether git could not be run for this observation.
+    fn is_unknown(&self) -> bool {
+        matches!(self, Obs::Unknown)
+    }
+}
+
+impl<T: PartialEq> Obs<T> {
+    /// Whether these two observations say the same thing about the repository.
+    ///
+    /// **Two `Unknown`s are never "the same".** Nothing was observed on either
+    /// side, so there is no basis for concluding the repository did not move —
+    /// which is precisely the conclusion `exec_merge` and `exec_rebase` draw
+    /// from a `true` here ("Already up to date").
+    fn same_observation(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Obs::Known(a), Obs::Known(b)) => a == b,
+            (Obs::Absent, Obs::Absent) => true,
+            _ => false,
+        }
+    }
+}
+
+impl<T: std::fmt::Display> Obs<T> {
+    /// This observation's contribution to the generation digest (#145).
+    ///
+    /// Each variant carries its own tag, so an observed empty string can never
+    /// collide with an absence. `Unknown` goes further and carries a nonce: an
+    /// unknown observation must not merely hash *differently* from an absence,
+    /// it must hash differently **every time**. Without that, a repository git
+    /// cannot be run against produces the same token at plan-build and at
+    /// enforce-fresh, the two compare equal, and the staleness gate certifies
+    /// as unchanged a repository nobody ever looked at.
+    fn digest_field(&self) -> String {
+        match self {
+            Obs::Known(v) => format!("known:{v}"),
+            Obs::Absent => "absent".to_string(),
+            Obs::Unknown => format!(
+                "unknown:{}",
+                UNKNOWN_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+        }
+    }
+}
 
 /// Pre-execution observations of the live repository, captured while building
 /// the plan and reused by the executor — exactly the values the old handlers
@@ -286,15 +409,16 @@ pub(crate) async fn resolve_commit_oid(
 struct Observed {
     /// The checked-out branch's short name (`read_head_branch`), if any.
     head_branch: Option<String>,
-    /// What `HEAD` resolves to, if it resolves (unborn HEAD ⇒ `None`).
-    head_tip: Option<String>,
+    /// What `HEAD` resolves to (unborn HEAD ⇒ [`Obs::Absent`]; git unavailable
+    /// ⇒ [`Obs::Unknown`]).
+    head_tip: Obs<String>,
     /// The tip of the branch the operation names, for the operations that need
     /// it before executing (delete's journaled restore point, reset's CAS).
-    branch_tip: Option<String>,
+    branch_tip: Obs<String>,
     /// `git status --porcelain=v2` at observation time — a generation input
     /// (#145) so uncommitted-work changes count as the repository moving, and
     /// the live check behind [`Precondition::CleanWorktree`].
-    status: Option<String>,
+    status: Obs<String>,
     /// Which of the plan's preconditions actually *held* when it was built,
     /// index-aligned with `Plan::preconditions`. [`enforce_fresh`] re-verifies
     /// exactly these before executing: one that failed at build time flows on
@@ -316,12 +440,16 @@ async fn build_plan(
     tokens: (RepositoryToken, WorktreeToken),
 ) -> (Plan, Observed) {
     let head_branch = read_head_branch_blocking(repo).await;
-    let head_tip = rev_parse(repo, "HEAD").await;
+    let head_tip = Obs::from_read(rev_parse(repo, "HEAD").await);
     let branch_tip = match &operation {
         GitOperation::DeleteBranch { branch }
         | GitOperation::ForceDeleteBranch { branch }
-        | GitOperation::ResetBranch { branch, .. } => rev_parse(repo, branch.as_str()).await,
-        _ => None,
+        | GitOperation::ResetBranch { branch, .. } => {
+            Obs::from_read(rev_parse(repo, branch.as_str()).await)
+        }
+        // No branch named by this operation: not an unreadable observation,
+        // just one that was never taken.
+        _ => Obs::Absent,
     };
     let mut observed = Observed {
         head_branch,
@@ -393,18 +521,21 @@ fn selection_tokens() -> (RepositoryToken, WorktreeToken) {
 /// runs on a blocking thread instead of an async worker.
 async fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
     let mut inputs = GenerationInputs::new();
+    // D5: each observation contributes a *tagged* field, so "git said the ref
+    // is not there" and "git could not be asked" are different digests — and
+    // the latter is different every time. See `Obs::digest_field`.
     inputs.field(
         "head",
         format!(
             "{}\u{0}{}",
             observed.head_branch.as_deref().unwrap_or(""),
-            observed.head_tip.as_deref().unwrap_or("")
+            observed.head_tip.digest_field()
         ),
     );
     for (name, target) in refs_digest_input(repo).await {
         inputs.field(name, target);
     }
-    inputs.field("status", observed.status.clone().unwrap_or_default());
+    inputs.field("status", observed.status.digest_field());
     GenerationToken::new(inputs.generation().to_string())
         .expect("a RepositoryGeneration displays as non-empty decimal")
 }
@@ -453,14 +584,41 @@ async fn refs_digest_input(repo: &Path) -> Vec<(String, String)> {
 /// the blocking-thread version. Best-effort exactly as before — the git
 /// operation has already succeeded, so a failed join is dropped rather than
 /// turned into a failed response.
+///
+/// # `Obs`, not `Option`, for the two oids (D5, #66 Task 19)
+///
+/// The tips recorded here are read *after* the mutation succeeded, so an
+/// unreadable one is entirely possible (the sandbox policy can stop being
+/// buildable between two commands) and there is no undo path for it — the git
+/// work is already done. Taking `Obs` makes each executor state which of the
+/// three cases it is handing over instead of flattening two of them into
+/// `None`.
+///
+/// **The stored `ActivityEvent` is unchanged**, and deliberately so: its
+/// `old_oid`/`new_oid` are `Option<String>` in `git_vista_core`, that schema is
+/// shared with the on-disk JSONL every existing journal file is written in, and
+/// widening it is not this task's to do. So an `Unknown` still stores `None` —
+/// but it is never *silently* `None`: the summary carries an explicit note, so
+/// a reader of the feed can tell "there was no such tip" from "we could not
+/// read the tip", which is the distinction that was previously lost. The
+/// mechanical consequence — no restore point, no undo offered — is the
+/// fail-safe direction.
 async fn journal_app_event(
     repo: &Path,
     kind: ActivityKind,
     ref_name: Option<String>,
-    old_oid: Option<String>,
-    new_oid: Option<String>,
+    old_oid: Obs<String>,
+    new_oid: Obs<String>,
     summary: String,
 ) {
+    let summary = match (old_oid.is_unknown(), new_oid.is_unknown()) {
+        (false, false) => summary,
+        (true, false) => format!("{summary} (previous tip unknown — git could not be read)"),
+        (false, true) => format!("{summary} (resulting tip unknown — git could not be read)"),
+        (true, true) => format!("{summary} (tips unknown — git could not be read)"),
+    };
+    let old_oid = old_oid.known().cloned();
+    let new_oid = new_oid.known().cloned();
     let repo = repo.to_path_buf();
     let _ = tokio::task::spawn_blocking(move || {
         crate::handlers::journal_app_event(&repo, kind, ref_name, old_oid, new_oid, summary)
@@ -482,13 +640,25 @@ async fn journal_clear_blocking(repo: &Path) {
     let _ = tokio::task::spawn_blocking(move || journal::clear(&repo)).await;
 }
 
-/// `git status --porcelain=v2` at this instant; `None` when git couldn't run
-/// or the path isn't a working tree — best-effort, like every observation.
-async fn worktree_status(repo: &Path) -> Option<String> {
-    let out = run_git(repo, &["status", "--porcelain=v2"]).await.ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+/// `git status --porcelain=v2` at this instant.
+///
+/// D5 keeps the two failure modes apart: [`Obs::Absent`] is "git ran and
+/// refused — the path isn't a working tree", [`Obs::Unknown`] is "git could
+/// not be run at all". The old `Option` collapsed both to `None`, which the
+/// generation digest then flattened to the empty string — i.e. to the exact
+/// value a *clean* worktree produces.
+async fn worktree_status(repo: &Path) -> Obs<String> {
+    // An observation, not part of any operation: `status` reads the index and
+    // the working tree, so it declares `Local` on its own behalf (D3).
+    let out = match run_git(repo, NetworkNeed::Local, &["status", "--porcelain=v2"]).await {
+        Ok(out) => out,
+        Err(_) => return Obs::Unknown,
+    };
+    if out.status.success() {
+        Obs::Known(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Obs::Absent
+    }
 }
 
 /// Fresh observations for the execution-time check (#145): same reads as
@@ -496,8 +666,8 @@ async fn worktree_status(repo: &Path) -> Option<String> {
 async fn observe_live(repo: &Path) -> Observed {
     Observed {
         head_branch: read_head_branch_blocking(repo).await,
-        head_tip: rev_parse(repo, "HEAD").await,
-        branch_tip: None,
+        head_tip: Obs::from_read(rev_parse(repo, "HEAD").await),
+        branch_tip: Obs::Absent,
         status: worktree_status(repo).await,
         held_at_build: Vec::new(),
     }
@@ -518,6 +688,23 @@ async fn enforce_fresh(
     observed: &Observed,
 ) -> Result<(), (StatusCode, String)> {
     let live = observe_live(repo).await;
+    // D5: an observation that never happened cannot certify freshness. The
+    // generation digest already fails closed here — `Obs::Unknown` carries a
+    // nonce, so an unknown on either side makes the tokens differ — but that
+    // refusal would say "the repository changed", which is a claim about the
+    // repository we are in no position to make. Say what actually happened.
+    let unknown = observed.head_tip.is_unknown()
+        || observed.branch_tip.is_unknown()
+        || observed.status.is_unknown()
+        || live.head_tip.is_unknown()
+        || live.status.is_unknown();
+    if unknown {
+        return Err(couldnt_run(
+            "staleness gate",
+            &"couldn't read the repository's state, so this plan cannot be \
+              re-verified before executing",
+        ));
+    }
     if generation_token(repo, &live).await.as_str() != plan.generation.as_str() {
         return Err((
             StatusCode::CONFLICT,
@@ -535,45 +722,84 @@ async fn enforce_fresh(
 
 /// Check one [`Precondition`] against the live repository. `live` supplies the
 /// already-read HEAD and status; ref lookups go to git directly. Refusals are
-/// 409s that say what moved.
+/// 409s that say what moved — except the one D5 adds, below.
+///
+/// # "git could not run" is a refusal, not a satisfied precondition
+///
+/// Before D5 (#66, Task 19) `rev_parse` answered `None` both for "git ran and
+/// the ref does not resolve" and for "git could not be run", and the three
+/// ref-shaped arms below disagreed about what that meant:
+///
+/// | Arm | on `None` | fail-closed? |
+/// |---|---|---|
+/// | `RefAt` | refuse ("disappeared") | yes, by luck |
+/// | `RefExists` | refuse ("disappeared") | yes, by luck |
+/// | `RefAbsent` | **`Ok(())` — the gate passes** | **no** |
+///
+/// The first two are fail-closed only incidentally: they test for *presence*,
+/// so an unreadable ref reads as "not present" and refuses. `RefAbsent` tests
+/// for absence, so the identical unreadable answer reads as "absent" and the
+/// gate opens. `RefAbsent` is what stops `CreateBranch` and `RestoreBranch`
+/// from writing over a ref that already exists, so on a host where git cannot
+/// be launched every one of those plans passed its own guard.
+///
+/// A mechanical `Option` → `Result` rewrite would have preserved that
+/// asymmetry exactly, mapping `Err` onto each arm's existing `None` behaviour.
+/// All three now refuse on `Err`, with a 500 rather than the 409 they use for
+/// a ref that genuinely moved: the repository did nothing wrong.
 async fn verify_precondition(
     repo: &Path,
     precondition: &Precondition,
     live: &Observed,
 ) -> Result<(), (StatusCode, String)> {
     let refuse = |why: String| Err((StatusCode::CONFLICT, why));
+    // D5: git failing to run is never evidence about a ref. Every ref-shaped
+    // precondition below refuses on it — including `RefAbsent`, which is the
+    // one that used to be *satisfied* by it (see this function's doc comment).
+    let unreadable = |ref_name: &str, e: &ExecUnavailable| {
+        Err(couldnt_run(
+            &format!("precondition on ‘{ref_name}’"),
+            &format!("couldn't check ‘{ref_name}’, so this plan cannot be verified: {e}"),
+        ))
+    };
     match precondition {
         Precondition::RefAt { ref_name, oid } => match rev_parse(repo, ref_name.as_str()).await {
-            Some(at) if at == oid.as_str() => Ok(()),
-            Some(_) => refuse(format!(
+            Ok(Some(at)) if at == oid.as_str() => Ok(()),
+            Ok(Some(_)) => refuse(format!(
                 "‘{}’ moved while this plan was pending — refresh and try again.",
                 ref_name.as_str()
             )),
-            None => refuse(format!(
+            Ok(None) => refuse(format!(
                 "‘{}’ disappeared while this plan was pending — refresh and try again.",
                 ref_name.as_str()
             )),
+            Err(e) => unreadable(ref_name.as_str(), &e),
         },
-        Precondition::RefExists { ref_name } => {
-            if rev_parse(repo, ref_name.as_str()).await.is_some() {
-                Ok(())
-            } else {
-                refuse(format!(
-                    "‘{}’ disappeared while this plan was pending — refresh and try again.",
-                    ref_name.as_str()
-                ))
-            }
-        }
-        Precondition::RefAbsent { ref_name } => {
-            if rev_parse(repo, ref_name.as_str()).await.is_none() {
-                Ok(())
-            } else {
-                refuse(format!(
-                    "‘{}’ appeared while this plan was pending — refresh and try again.",
-                    ref_name.as_str()
-                ))
-            }
-        }
+        Precondition::RefExists { ref_name } => match rev_parse(repo, ref_name.as_str()).await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => refuse(format!(
+                "‘{}’ disappeared while this plan was pending — refresh and try again.",
+                ref_name.as_str()
+            )),
+            Err(e) => unreadable(ref_name.as_str(), &e),
+        },
+        Precondition::RefAbsent { ref_name } => match rev_parse(repo, ref_name.as_str()).await {
+            // git ran and said the ref does not resolve: genuinely absent.
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => refuse(format!(
+                "‘{}’ appeared while this plan was pending — refresh and try again.",
+                ref_name.as_str()
+            )),
+            // The polarity bug this arm used to have: `rev_parse` returned
+            // `None` both for "not there" and for "git could not run", and
+            // `is_none()` accepted *both* as proof of absence. So on a host
+            // where git could not be launched at all, every `RefAbsent`
+            // precondition passed — and `RefAbsent` is what guards
+            // `CreateBranch` and `RestoreBranch` from clobbering a ref that
+            // already exists. Its two siblings above happened to fail closed
+            // on the same input purely because they test for presence.
+            Err(e) => unreadable(ref_name.as_str(), &e),
+        },
         Precondition::BranchCheckedOut { branch } => {
             if live.head_branch.as_deref() == Some(branch.as_str()) {
                 Ok(())
@@ -594,18 +820,26 @@ async fn verify_precondition(
                 ))
             }
         }
-        Precondition::CleanWorktree => match live.status.as_deref() {
-            Some("") => Ok(()),
-            Some(_) => refuse(
+        Precondition::CleanWorktree => match &live.status {
+            Obs::Known(s) if s.is_empty() => Ok(()),
+            Obs::Known(_) => refuse(
                 "The working tree picked up uncommitted changes while this plan was \
                  pending — refresh and try again."
                     .to_string(),
             ),
-            // Unreadable state on a plan that requires a clean tree: refuse
-            // rather than guess (fail-closed).
-            None => refuse(
+            // git ran and refused (not a working tree) on a plan that requires
+            // a clean tree: refuse rather than guess (fail-closed). Unchanged
+            // wording — this arm's meaning is unchanged too.
+            Obs::Absent => refuse(
                 "Couldn't verify the working tree is clean — refusing to execute.".to_string(),
             ),
+            // D5: git could not be run. Same refusal *decision*, different
+            // status and different words, because the cause is ours, not the
+            // repository's.
+            Obs::Unknown => Err(couldnt_run(
+                "precondition CleanWorktree",
+                &"couldn't run git status, so the working tree cannot be verified",
+            )),
         },
         Precondition::RemoteConfigured { remote } => {
             if git_ok(repo, &["remote", "get-url", remote.as_str()])
@@ -643,9 +877,14 @@ fn heads(branch: &BranchName) -> Option<RefName> {
     RefName::new(format!("refs/heads/{branch}")).ok()
 }
 
-/// Best-effort `CommitOid` from an observed string.
-fn oid_of(observed: &Option<String>) -> Option<CommitOid> {
-    observed.as_deref().and_then(|o| CommitOid::new(o).ok())
+/// Best-effort `CommitOid` from an observation. `Absent` and `Unknown` both
+/// yield `None` — correct here only because every caller uses it to *omit* a
+/// descriptive field rather than to assert one; see the `PushBranch` arm in
+/// [`shape`] for the one place where the distinction had to be made explicit.
+fn oid_of(observed: &Obs<String>) -> Option<CommitOid> {
+    observed
+        .known()
+        .and_then(|o| CommitOid::new(o.as_str()).ok())
 }
 
 /// The per-operation review shapes — risk, preconditions, expected ref
@@ -814,15 +1053,22 @@ async fn shape(
             }));
             // The remote-tracking ref this push is expected to move.
             let tracking = RefName::new(format!("refs/remotes/{remote}/{branch}")).ok();
-            let remote_tip = rev_parse(repo, &format!("{remote}/{branch}")).await;
-            let local_tip = rev_parse(repo, branch.as_str()).await;
-            let changes = match (tracking, oid_of(&local_tip)) {
-                (Some(r), Some(local)) => vec![RefChange {
+            let remote_tip = Obs::from_read(rev_parse(repo, &format!("{remote}/{branch}")).await);
+            let local_tip = Obs::from_read(rev_parse(repo, branch.as_str()).await);
+            // D5: `before` is a *claim* about the remote-tracking ref shown to
+            // the user for review, so `Unknown` may not be rendered as
+            // `Absent` ("this ref does not exist yet"). An unreadable
+            // observation thins the plan instead — the documented posture for
+            // every other failed read in `build_plan`.
+            let before = match &remote_tip {
+                Obs::Known(_) => oid_of(&remote_tip).map(RefState::At),
+                Obs::Absent => Some(RefState::Absent),
+                Obs::Unknown => None,
+            };
+            let changes = match (tracking, oid_of(&local_tip), before) {
+                (Some(r), Some(local), Some(before)) => vec![RefChange {
                     ref_name: r,
-                    before: match oid_of(&remote_tip) {
-                        Some(o) => RefState::At(o),
-                        None => RefState::Absent,
-                    },
+                    before,
                     after: RefState::At(local),
                 }],
                 _ => Vec::new(),
@@ -997,35 +1243,58 @@ fn validate(plan: &Plan) -> Result<(), (StatusCode, String)> {
 /// handler's execution code moved here unchanged — same argv, same journaling,
 /// same responses.
 async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, String) {
+    // D3 (#66, Task 8): the sandbox tier is chosen from the *declared* network
+    // need of the typed operation, and this is the only place in the server
+    // where that operation's identity is still in scope. Derive it here, before
+    // the match consumes `plan.operation`, and thread it down through every
+    // `exec_*` to `run_git` → `git_cmd::git_output_for` → `sandbox::policy_for`.
+    //
+    // Threading it rather than re-deriving it further down is the whole point.
+    // By the time the argv exists, the operation is gone and only a string
+    // match on the subcommand is left — the classifier `network_need` itself
+    // documents as incomplete-by-construction. Passing the value keeps
+    // `network_need_for_operation`'s exhaustive, wildcard-free match *in the
+    // live data path*, so a new `GitOperation` variant cannot be added without
+    // stating its network need. A version of this that computed the need and
+    // discarded it would leave that match decorative and the guarantee empty.
+    let need = network_need_for_operation(&plan.operation);
     match plan.operation {
-        GitOperation::CreateBranch { name, at } => exec_create_branch(repo, &name, &at).await,
+        GitOperation::CreateBranch { name, at } => exec_create_branch(repo, need, &name, &at).await,
         GitOperation::CommitOnHead {
             message,
             allow_empty,
-        } => exec_commit_on_head(repo, &message, allow_empty, &observed).await,
+        } => exec_commit_on_head(repo, need, &message, allow_empty, &observed).await,
         GitOperation::EmptyCommitOnBranch {
             branch,
             message,
             expected_tip,
-        } => exec_empty_commit_on_branch(repo, &branch, &message, &expected_tip).await,
-        GitOperation::StageAll => exec_stage_all(repo).await,
-        GitOperation::UnstageAll => exec_unstage_all(repo).await,
-        GitOperation::CheckoutBranch { branch } => exec_checkout(repo, &branch, &observed).await,
-        GitOperation::MergeBranch { branch } => exec_merge(repo, &branch, &observed).await,
-        GitOperation::PushBranch { branch, remote } => exec_push(repo, &branch, &remote).await,
-        GitOperation::DeleteBranch { branch } => exec_delete(repo, &branch, &observed, false).await,
-        GitOperation::ForceDeleteBranch { branch } => {
-            exec_delete(repo, &branch, &observed, true).await
+        } => exec_empty_commit_on_branch(repo, need, &branch, &message, &expected_tip).await,
+        GitOperation::StageAll => exec_stage_all(repo, need).await,
+        GitOperation::UnstageAll => exec_unstage_all(repo, need).await,
+        GitOperation::CheckoutBranch { branch } => {
+            exec_checkout(repo, need, &branch, &observed).await
         }
-        GitOperation::RebaseOntoBase { base } => exec_rebase(repo, &base, &observed).await,
-        GitOperation::RestoreBranch { name, tip } => exec_restore_branch(repo, &name, &tip).await,
+        GitOperation::MergeBranch { branch } => exec_merge(repo, need, &branch, &observed).await,
+        GitOperation::PushBranch { branch, remote } => {
+            exec_push(repo, need, &branch, &remote).await
+        }
+        GitOperation::DeleteBranch { branch } => {
+            exec_delete(repo, need, &branch, &observed, false).await
+        }
+        GitOperation::ForceDeleteBranch { branch } => {
+            exec_delete(repo, need, &branch, &observed, true).await
+        }
+        GitOperation::RebaseOntoBase { base } => exec_rebase(repo, need, &base, &observed).await,
+        GitOperation::RestoreBranch { name, tip } => {
+            exec_restore_branch(repo, need, &name, &tip).await
+        }
         GitOperation::ResetBranch {
             branch,
             to,
             expected_tip,
-        } => exec_reset_branch(repo, &branch, &to, &expected_tip, &observed).await,
-        GitOperation::RevertCommit { commit } => exec_revert(repo, &commit, &observed).await,
-        GitOperation::ResetTestRepo => exec_reset_test_repo(repo).await,
+        } => exec_reset_branch(repo, need, &branch, &to, &expected_tip, &observed).await,
+        GitOperation::RevertCommit { commit } => exec_revert(repo, need, &commit, &observed).await,
+        GitOperation::ResetTestRepo => exec_reset_test_repo(repo, need).await,
     }
 }
 
@@ -1033,18 +1302,29 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
 
 /// Spawn `git -C <repo> <args…>` and collect its output; `Err` is the
 /// "couldn't run git at all" case every endpoint maps to a 500.
-async fn run_git(repo: &Path, args: &[&str]) -> std::io::Result<Output> {
-    tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .await
+///
+/// Goes through the sealed sandbox launcher (`crate::git_cmd::git_output`,
+/// #66 Task 6) rather than a raw `Command::new("git")` — this is the
+/// executor, where every client-requested mutation's argv actually runs.
+async fn run_git(repo: &Path, need: NetworkNeed, args: &[&str]) -> std::io::Result<Output> {
+    crate::git_cmd::git_output_for(repo, args, need).await
 }
 
 /// The uniform 500 for a git binary that couldn't be spawned, with the same
 /// per-endpoint log line the handlers printed.
-fn couldnt_run(endpoint: &str, e: &std::io::Error) -> (StatusCode, String) {
+///
+/// Generic over the reason since D5 (#66, Task 19): it takes the executors'
+/// `std::io::Error` exactly as before, and also
+/// [`ExecUnavailable`](crate::git_cmd::ExecUnavailable) from the gate sites,
+/// so **one** response shape covers every "git could not run" in the server.
+/// That single shape is what makes it distinguishable from a refusal: the
+/// gates that used to answer 400 ("no such branch", "not a valid object name")
+/// on this input now answer 500 here, and nothing else in the planner returns
+/// a 500 for a repository-state reason.
+pub(crate) fn couldnt_run<E: std::fmt::Display + ?Sized>(
+    endpoint: &str,
+    e: &E,
+) -> (StatusCode, String) {
     eprintln!("git-vista: {endpoint} couldn't run git: {e}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1081,8 +1361,8 @@ fn stderr_stdout_or(output: &Output, fallback: &str) -> String {
 /// Run one git command, mapping failure to git's own explanation (stderr, then
 /// stdout, then a generic line) — the undo executions' shared runner, moved
 /// from `crate::activity`.
-async fn git(repo: &Path, args: &[&str]) -> Result<(), String> {
-    let output = run_git(repo, args)
+async fn git(repo: &Path, need: NetworkNeed, args: &[&str]) -> Result<(), String> {
+    let output = run_git(repo, need, args)
         .await
         .map_err(|e| format!("Couldn't run git: {e}"))?;
     if output.status.success() {
@@ -1094,8 +1374,8 @@ async fn git(repo: &Path, args: &[&str]) -> Result<(), String> {
 /// Whether the working tree has any change at all (`git status --porcelain`
 /// non-empty): staged, unstaged, untracked or conflicted — any of them makes
 /// a hard reset unsafe. Moved from `crate::activity`.
-async fn worktree_dirty(repo: &Path) -> Result<bool, String> {
-    let output = run_git(repo, &["status", "--porcelain"])
+async fn worktree_dirty(repo: &Path, need: NetworkNeed) -> Result<bool, String> {
+    let output = run_git(repo, need, &["status", "--porcelain"])
         .await
         .map_err(|e| format!("Couldn't run git: {e}"))?;
     if !output.status.success() {
@@ -1115,10 +1395,11 @@ fn short(oid: &str) -> &str {
 /// name, refuses a duplicate, and its stderr is forwarded verbatim on failure.
 async fn exec_create_branch(
     repo: &Path,
+    need: NetworkNeed,
     name: &BranchName,
     at: &CommitOid,
 ) -> (StatusCode, String) {
-    let output = match run_git(repo, &["branch", name.as_str(), at.as_str()]).await {
+    let output = match run_git(repo, need, &["branch", name.as_str(), at.as_str()]).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/branch", &e),
     };
@@ -1126,12 +1407,12 @@ async fn exec_create_branch(
         println!("[/api/branch] created branch '{name}' at {at}");
         // Journal the creation with the resolved tip (the user may have given
         // an abbreviated or symbolic start point).
-        let tip = rev_parse(repo, name.as_str()).await;
+        let tip = Obs::from_read(rev_parse(repo, name.as_str()).await);
         journal_app_event(
             repo,
             ActivityKind::BranchCreated,
             Some(name.as_str().to_string()),
-            None,
+            Obs::Absent, // a created branch has no previous tip, by definition
             tip,
             format!("created branch ‘{name}’"),
         )
@@ -1147,13 +1428,14 @@ async fn exec_create_branch(
 /// `git commit [--allow-empty] -m <message>` on HEAD (`/api/commit`).
 async fn exec_commit_on_head(
     repo: &Path,
+    need: NetworkNeed,
     message: &CommitMessage,
     allow_empty: bool,
     observed: &Observed,
 ) -> (StatusCode, String) {
     // The pre-commit tip, captured for the journal before git moves anything.
-    // `None` on an unborn HEAD (first commit) — journaled as a creation-like
-    // event with no old state, which is exactly what it is.
+    // `Obs::Absent` on an unborn HEAD (first commit) — journaled as a
+    // creation-like event with no old state, which is exactly what it is.
     let old = observed.head_tip.clone();
 
     let mut args = vec!["commit"];
@@ -1163,13 +1445,13 @@ async fn exec_commit_on_head(
     args.push("-m");
     args.push(message.as_str());
 
-    let output = match run_git(repo, &args).await {
+    let output = match run_git(repo, need, &args).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/commit", &e),
     };
     if output.status.success() {
         println!("[/api/commit] created commit (allow_empty={allow_empty})");
-        let new = rev_parse(repo, "HEAD").await;
+        let new = Obs::from_read(rev_parse(repo, "HEAD").await);
         // The branch the commit landed on; "HEAD" when detached.
         let branch = read_head_branch_blocking(repo)
             .await
@@ -1197,6 +1479,7 @@ async fn exec_commit_on_head(
 /// untouched throughout.
 async fn exec_empty_commit_on_branch(
     repo: &Path,
+    need: NetworkNeed,
     branch: &BranchName,
     message: &CommitMessage,
     expected_tip: &CommitOid,
@@ -1207,6 +1490,7 @@ async fn exec_empty_commit_on_branch(
     // Write the commit object: the parent's own tree, so nothing changes.
     let output = match run_git(
         repo,
+        need,
         &[
             "commit-tree",
             &format!("{tip}^{{tree}}"),
@@ -1251,6 +1535,7 @@ async fn exec_empty_commit_on_branch(
         .to_string();
     let output = match run_git(
         repo,
+        need,
         &[
             "update-ref",
             "-m",
@@ -1287,8 +1572,11 @@ async fn exec_empty_commit_on_branch(
         repo,
         ActivityKind::Commit,
         Some(branch.as_str().to_string()),
-        Some(tip.to_string()),
-        Some(new),
+        // Both known first-hand: `tip` is the CAS pin this operation was built
+        // on, `new` is `commit-tree`'s own stdout. Neither is a read that
+        // could have come back unknown.
+        Obs::Known(tip.to_string()),
+        Obs::Known(new),
         summary,
     )
     .await;
@@ -1296,8 +1584,8 @@ async fn exec_empty_commit_on_branch(
 }
 
 /// `git add -A` (`/api/stage`).
-async fn exec_stage_all(repo: &Path) -> (StatusCode, String) {
-    let output = match run_git(repo, &["add", "-A"]).await {
+async fn exec_stage_all(repo: &Path, need: NetworkNeed) -> (StatusCode, String) {
+    let output = match run_git(repo, need, &["add", "-A"]).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/stage", &e),
     };
@@ -1313,8 +1601,8 @@ async fn exec_stage_all(repo: &Path) -> (StatusCode, String) {
 
 /// `git reset -q HEAD` (`/api/unstage`) — the exact inverse of stage-all; the
 /// working tree keeps every edit, so nothing is lost.
-async fn exec_unstage_all(repo: &Path) -> (StatusCode, String) {
-    let output = match run_git(repo, &["reset", "-q", "HEAD"]).await {
+async fn exec_unstage_all(repo: &Path, need: NetworkNeed) -> (StatusCode, String) {
+    let output = match run_git(repo, need, &["reset", "-q", "HEAD"]).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/unstage", &e),
     };
@@ -1332,6 +1620,7 @@ async fn exec_unstage_all(repo: &Path) -> (StatusCode, String) {
 /// (stderr, then stdout, then a generic line) — the old `run_branch_op` core.
 async fn run_branch_cmd(
     repo: &Path,
+    need: NetworkNeed,
     endpoint: &str,
     args: &[&str],
     branch: &BranchName,
@@ -1339,7 +1628,7 @@ async fn run_branch_cmd(
 ) -> (StatusCode, String) {
     let mut argv: Vec<&str> = args.to_vec();
     argv.push(branch.as_str());
-    let output = match run_git(repo, &argv).await {
+    let output = match run_git(repo, need, &argv).await {
         Ok(o) => o,
         Err(e) => return couldnt_run(endpoint, &e),
     };
@@ -1359,11 +1648,13 @@ async fn run_branch_cmd(
 /// feed's dedup collapses git's own reflog copy into it.
 async fn exec_checkout(
     repo: &Path,
+    need: NetworkNeed,
     branch: &BranchName,
     observed: &Observed,
 ) -> (StatusCode, String) {
     let resp = run_branch_cmd(
         repo,
+        need,
         "/api/checkout",
         &["checkout"],
         branch,
@@ -1377,7 +1668,7 @@ async fn exec_checkout(
                 format!("Already on ‘{branch}’ — it's the checked-out branch."),
             );
         }
-        let new = rev_parse(repo, "HEAD").await;
+        let new = Obs::from_read(rev_parse(repo, "HEAD").await);
         journal_app_event(
             repo,
             ActivityKind::Checkout,
@@ -1392,9 +1683,15 @@ async fn exec_checkout(
 }
 
 /// `git merge --no-edit <branch>` into the checked-out branch (`/api/merge`).
-async fn exec_merge(repo: &Path, branch: &BranchName, observed: &Observed) -> (StatusCode, String) {
+async fn exec_merge(
+    repo: &Path,
+    need: NetworkNeed,
+    branch: &BranchName,
+    observed: &Observed,
+) -> (StatusCode, String) {
     let resp = run_branch_cmd(
         repo,
+        need,
         "/api/merge",
         &["merge", "--no-edit"],
         branch,
@@ -1402,11 +1699,17 @@ async fn exec_merge(repo: &Path, branch: &BranchName, observed: &Observed) -> (S
     )
     .await;
     if resp.0 == StatusCode::OK {
-        let new = rev_parse(repo, "HEAD").await;
+        let new = Obs::from_read(rev_parse(repo, "HEAD").await);
         // git exits 0 with "Already up to date." when the branch brings
         // nothing in — HEAD hasn't moved. That's no merge: journalling one
         // would put an event in the Activity feed that never happened.
-        if new == observed.head_tip {
+        //
+        // D5: `same_observation`, not `==`. Both sides are reads that can come
+        // back `Unknown`, and `Unknown == Unknown` would report "already up to
+        // date" — a statement about where HEAD is — on the strength of two
+        // reads that never saw HEAD at all. `Obs` has no `PartialEq` precisely
+        // so this line cannot be written the wrong way.
+        if new.same_observation(&observed.head_tip) {
             return (
                 StatusCode::OK,
                 format!("Already up to date — ‘{branch}’ has no commits the current branch doesn’t already have."),
@@ -1429,9 +1732,22 @@ async fn exec_merge(repo: &Path, branch: &BranchName, observed: &Observed) -> (S
 }
 
 /// `git push <remote> <branch>` (`/api/push`).
-async fn exec_push(repo: &Path, branch: &BranchName, remote: &RemoteName) -> (StatusCode, String) {
+async fn exec_push(
+    repo: &Path,
+    need: NetworkNeed,
+    branch: &BranchName,
+    remote: &RemoteName,
+) -> (StatusCode, String) {
+    debug_assert_eq!(
+        need,
+        NetworkNeed::Remote,
+        "push is the one operation in the enum that reaches a remote; if it \
+         arrives here declared Local, `network_need_for_operation` is wrong and \
+         the sandbox will (correctly) deny the connect"
+    );
     let resp = run_branch_cmd(
         repo,
+        need,
         "/api/push",
         &["push", remote.as_str()],
         branch,
@@ -1439,12 +1755,12 @@ async fn exec_push(repo: &Path, branch: &BranchName, remote: &RemoteName) -> (St
     )
     .await;
     if resp.0 == StatusCode::OK {
-        let tip = rev_parse(repo, branch.as_str()).await;
+        let tip = Obs::from_read(rev_parse(repo, branch.as_str()).await);
         journal_app_event(
             repo,
             ActivityKind::Push,
             Some(branch.as_str().to_string()),
-            None,
+            Obs::Absent, // a push records only where the branch ended up
             tip,
             format!("pushed ‘{branch}’ to {remote}"),
         )
@@ -1460,6 +1776,7 @@ async fn exec_push(repo: &Path, branch: &BranchName, remote: &RemoteName) -> (St
 /// the ONLY path back to the commits (until gc).
 async fn exec_delete(
     repo: &Path,
+    need: NetworkNeed,
     branch: &BranchName,
     observed: &Observed,
     force: bool,
@@ -1471,6 +1788,7 @@ async fn exec_delete(
     };
     let resp = run_branch_cmd(
         repo,
+        need,
         endpoint,
         &["branch", flag],
         branch,
@@ -1483,7 +1801,7 @@ async fn exec_delete(
             ActivityKind::BranchDeleted,
             Some(branch.as_str().to_string()),
             observed.branch_tip.clone(),
-            None,
+            Obs::Absent, // the branch is gone: its new tip is a real absence
             format!("{verb} branch ‘{branch}’"),
         )
         .await;
@@ -1497,23 +1815,31 @@ async fn exec_delete(
 /// `git rebase <base>` of the checked-out branch (`/api/rebase`). A failed
 /// rebase (almost always conflicts) is `--abort`ed so a browser-only user is
 /// never left mid-rebase with no shell to fix it.
-async fn exec_rebase(repo: &Path, base: &RefName, observed: &Observed) -> (StatusCode, String) {
+async fn exec_rebase(
+    repo: &Path,
+    need: NetworkNeed,
+    base: &RefName,
+    observed: &Observed,
+) -> (StatusCode, String) {
     let old = observed.head_tip.clone();
     let base = base.as_str();
 
-    let output = match run_git(repo, &["rebase", base]).await {
+    let output = match run_git(repo, need, &["rebase", base]).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/rebase", &e),
     };
     if output.status.success() {
-        let new = rev_parse(repo, "HEAD").await;
+        let new = Obs::from_read(rev_parse(repo, "HEAD").await);
         let branch = read_head_branch_blocking(repo)
             .await
             .unwrap_or_else(|| "HEAD".into());
         // git exits 0 without moving HEAD when the branch is already based on
         // the base — that's no rebase, and journalling one would put a phantom
         // event in the Activity feed. Say what (didn't) happen instead.
-        if new == old {
+        //
+        // D5: same reasoning as `exec_merge` — two unreadable tips are not
+        // evidence that HEAD stayed put.
+        if new.same_observation(&old) {
             return (
                 StatusCode::OK,
                 format!("Already up to date — ‘{branch}’ is already based on {base}."),
@@ -1535,7 +1861,7 @@ async fn exec_rebase(repo: &Path, base: &RefName, observed: &Observed) -> (Statu
         // Best-effort: back out of the half-applied rebase so the working tree
         // isn't stuck mid-rebase. Harmless (exits non-zero, ignored) when none
         // is running.
-        let _ = run_git(repo, &["rebase", "--abort"]).await;
+        let _ = run_git(repo, need, &["rebase", "--abort"]).await;
         eprintln!("git-vista: /api/rebase failed (aborted): {msg}");
         (StatusCode::BAD_REQUEST, msg)
     }
@@ -1546,10 +1872,11 @@ async fn exec_rebase(repo: &Path, base: &RefName, observed: &Observed) -> (Statu
 /// fails by itself if the name came back into use since the hint.
 async fn exec_restore_branch(
     repo: &Path,
+    need: NetworkNeed,
     name: &BranchName,
     tip: &CommitOid,
 ) -> (StatusCode, String) {
-    match git(repo, &["branch", name.as_str(), tip.as_str()]).await {
+    match git(repo, need, &["branch", name.as_str(), tip.as_str()]).await {
         Ok(()) => {
             println!(
                 "[/api/undo] restored branch '{name}' at {}",
@@ -1559,8 +1886,8 @@ async fn exec_restore_branch(
                 repo,
                 ActivityKind::BranchCreated,
                 Some(name.as_str().to_string()),
-                None,
-                Some(tip.as_str().to_string()),
+                Obs::Absent, // restored from nothing: there was no branch here
+                Obs::Known(tip.as_str().to_string()),
                 format!("restored branch ‘{name}’ at {}", short(tip.as_str())),
             )
             .await;
@@ -1579,6 +1906,7 @@ async fn exec_restore_branch(
 /// can never reset away work that happened after it was shown.
 async fn exec_reset_branch(
     repo: &Path,
+    need: NetworkNeed,
     branch: &BranchName,
     to: &CommitOid,
     expected_tip: &CommitOid,
@@ -1587,7 +1915,9 @@ async fn exec_reset_branch(
     // Compare-and-swap: the hint was computed against `expected_tip`; if the
     // branch has moved since, this undo would discard newer work the user
     // never saw in the dialog — refuse instead.
-    if observed.branch_tip.as_deref() != Some(expected_tip.as_str()) {
+    // D5: `Obs::Unknown` fails this check, the same as a mismatch would — a
+    // compare-and-swap whose "compare" never read anything must not swap.
+    if observed.branch_tip.known().map(String::as_str) != Some(expected_tip.as_str()) {
         return (
             StatusCode::CONFLICT,
             format!("‘{branch}’ has moved since this undo was offered — refresh and try again."),
@@ -1597,7 +1927,7 @@ async fn exec_reset_branch(
     let result = if checked_out {
         // `git reset --hard` rewrites the working tree, so it runs only
         // against a fully clean one — never eat uncommitted work.
-        match worktree_dirty(repo).await {
+        match worktree_dirty(repo, need).await {
             Err(msg) => Err(msg),
             Ok(true) => {
                 return (
@@ -1607,11 +1937,11 @@ async fn exec_reset_branch(
                         .to_string(),
                 );
             }
-            Ok(false) => git(repo, &["reset", "--hard", to.as_str()]).await,
+            Ok(false) => git(repo, need, &["reset", "--hard", to.as_str()]).await,
         }
     } else {
         // Not checked out: move the ref alone, no worktree involved.
-        git(repo, &["branch", "-f", branch.as_str(), to.as_str()]).await
+        git(repo, need, &["branch", "-f", branch.as_str(), to.as_str()]).await
     };
     match result {
         Ok(()) => {
@@ -1623,8 +1953,9 @@ async fn exec_reset_branch(
                 repo,
                 ActivityKind::Reset,
                 Some(branch.as_str().to_string()),
-                Some(expected_tip.as_str().to_string()),
-                Some(to.as_str().to_string()),
+                // Both are exact ids from the request, not reads.
+                Obs::Known(expected_tip.as_str().to_string()),
+                Obs::Known(to.as_str().to_string()),
                 format!("undid — reset ‘{branch}’ to {}", short(to.as_str())),
             )
             .await;
@@ -1643,12 +1974,17 @@ async fn exec_reset_branch(
 /// `git revert --no-edit <commit>` (`/api/undo`) — the history-preserving
 /// undo; a conflicted revert is auto-aborted (like `/api/rebase`) so a
 /// browser-only user is never left mid-revert.
-async fn exec_revert(repo: &Path, commit: &CommitOid, observed: &Observed) -> (StatusCode, String) {
+async fn exec_revert(
+    repo: &Path,
+    need: NetworkNeed,
+    commit: &CommitOid,
+    observed: &Observed,
+) -> (StatusCode, String) {
     let commit = commit.as_str();
-    match git(repo, &["revert", "--no-edit", commit]).await {
+    match git(repo, need, &["revert", "--no-edit", commit]).await {
         Ok(()) => {
             println!("[/api/undo] reverted {}", short(commit));
-            let new = rev_parse(repo, "HEAD").await;
+            let new = Obs::from_read(rev_parse(repo, "HEAD").await);
             let branch = read_head_branch_blocking(repo)
                 .await
                 .unwrap_or_else(|| "HEAD".into());
@@ -1666,7 +2002,7 @@ async fn exec_revert(repo: &Path, commit: &CommitOid, observed: &Observed) -> (S
         Err(msg) => {
             // Back out of a conflicted half-applied revert so the tree isn't
             // stuck. Harmless when no revert is in progress.
-            let _ = git(repo, &["revert", "--abort"]).await;
+            let _ = git(repo, need, &["revert", "--abort"]).await;
             eprintln!("git-vista: /api/undo revert failed (aborted): {msg}");
             (StatusCode::BAD_REQUEST, msg)
         }
@@ -1688,7 +2024,13 @@ fn read_seed(repo: &Path) -> Option<Result<Seed, String>> {
 /// allowed nowhere else in git-vista — and wipe the app journal (its events
 /// describe history that no longer exists). Hard-gated: only a repo
 /// explicitly opted in with `gv --seed <path>` has seed files.
-async fn exec_reset_test_repo(repo: &Path) -> (StatusCode, String) {
+async fn exec_reset_test_repo(repo: &Path, need: NetworkNeed) -> (StatusCode, String) {
+    // `need` is threaded for the same reason every other `exec_*` threads it —
+    // so the declared value reaches `policy_for` — but this operation's git
+    // steps go through `git_cmd::git_ok`, which declares `Local` at its own
+    // seam (see its comment). Consume it explicitly so a future edit that adds
+    // a `run_git` step here has the right value already in scope.
+    let _ = need;
     let seed = match read_seed(repo) {
         None => {
             return (
@@ -1717,25 +2059,37 @@ async fn exec_reset_test_repo(repo: &Path) -> (StatusCode, String) {
         }
     }
     for r in &seed.refs {
-        if rev_parse(repo, &format!("{}^{{commit}}", r.oid))
-            .await
-            .is_none()
-        {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "Seed commit {} for ‘{}’ no longer exists in this repo — \
-                     re-record the seed with `gv --seed`.",
-                    &r.oid[..7],
-                    r.name
-                ),
-            );
+        match rev_parse(repo, &format!("{}^{{commit}}", r.oid)).await {
+            Ok(Some(_)) => {}
+            // git ran and could not find the object: a real, reportable
+            // problem with the seed.
+            Ok(None) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Seed commit {} for ‘{}’ no longer exists in this repo — \
+                         re-record the seed with `gv --seed`.",
+                        &r.oid[..7],
+                        r.name
+                    ),
+                )
+            }
+            // D5: git never ran. Telling the operator to re-record a seed that
+            // is probably intact would send them to destroy the one recovery
+            // point this endpoint restores from. Refuse without a diagnosis.
+            Err(e) => {
+                return couldnt_run(
+                    "/api/reset-test-repo",
+                    &format!("couldn't verify seed commit for ‘{}’: {e}", r.name),
+                )
+            }
         }
     }
 
     // What the repo looks like NOW, then the pure plan of moves + deletions.
     let current_refs = match run_git(
         repo,
+        need,
         &[
             "for-each-ref",
             "refs/heads",
@@ -1960,5 +2314,307 @@ mod tests {
         };
         let (plan, observed) = build_plan(&repo, op, tokens()).await;
         assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // D5 (#66, Task 19): ExecUnavailable propagates as its own value.
+    //
+    // Every test below drives a *real* unrunnable repository
+    // (`git_cmd::unrunnable_repo` — a `.git` whose geometry the sandbox policy
+    // refuses, so no git is ever spawned). Nothing here is stubbed, and none
+    // of it would pass if `rev_parse` had simply been made infallible.
+    // -----------------------------------------------------------------------
+
+    /// An `Observed` with no unreadable fields, for the precondition checks
+    /// that only consult `live.head_branch` / `live.status`.
+    fn live_observed() -> Observed {
+        Observed {
+            head_branch: Some("main".to_string()),
+            head_tip: Obs::Known("0".repeat(40)),
+            branch_tip: Obs::Absent,
+            status: Obs::Known(String::new()),
+            held_at_build: Vec::new(),
+        }
+    }
+
+    fn ref_name(s: &str) -> RefName {
+        RefName::new(s).expect("valid ref name")
+    }
+
+    /// **The gate criterion.** `resolve_commit_oid` is an id-resolution gate,
+    /// and before D5 it answered the *same* 400 "not a valid object name" for
+    /// "git rejected this name" and for "git never ran". Those are now
+    /// different statuses, and the git-unavailable one must not be a 4xx: the
+    /// request was fine.
+    #[tokio::test]
+    async fn a_gate_distinguishes_git_unavailable_from_a_ref_that_is_absent() {
+        let (_dir, repo) = seeded_repo();
+        let (_hostile_dir, hostile) = crate::git_cmd::unrunnable_repo();
+
+        // git ran and refused the name: the client's request is wrong.
+        let (absent_status, absent_why) = resolve_commit_oid(&repo, "no-such-rev")
+            .await
+            .expect_err("a bogus rev must be refused");
+        assert_eq!(absent_status, StatusCode::BAD_REQUEST);
+        assert!(
+            absent_why.contains("not a valid object name"),
+            "git's own wording is preserved for the real refusal: {absent_why}"
+        );
+
+        // git never ran: nothing was refused, so nothing may be blamed on the
+        // request.
+        let (unavailable_status, unavailable_why) = resolve_commit_oid(&hostile, "no-such-rev")
+            .await
+            .expect_err("an unrunnable repository must be refused");
+        assert_eq!(
+            unavailable_status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "‘git could not run’ is a server fault, never a 400"
+        );
+        assert!(
+            unavailable_why.contains("Couldn't run git"),
+            "{unavailable_why}"
+        );
+        assert!(
+            !unavailable_why.contains("not a valid object name"),
+            "the old text asserted the user's input was bad on no evidence: \
+             {unavailable_why}"
+        );
+        assert_ne!(
+            absent_status, unavailable_status,
+            "the two outcomes must be distinguishable by status alone"
+        );
+    }
+
+    /// **The polarity criterion.** `RefAbsent` used to be *satisfied* by an
+    /// unreadable ref, while its two siblings refused on the identical input.
+    ///
+    /// The first assertion reproduces the old expression verbatim against the
+    /// same fixture, so this is a regression pin and not merely a statement of
+    /// current behaviour: if `rev_parse` ever collapses back to a two-state
+    /// answer, that line is what the collapse would restore.
+    #[tokio::test]
+    async fn ref_absent_no_longer_treats_an_unreadable_ref_as_absent() {
+        let (_hostile_dir, hostile) = crate::git_cmd::unrunnable_repo();
+        let name = ref_name("refs/heads/feature");
+        let live = live_observed();
+
+        // The pre-D5 logic, written out: `rev_parse(...).await.is_none()`,
+        // where `None` meant either "absent" or "git could not run".
+        let pre_d5_said_absent = rev_parse(&hostile, name.as_str())
+            .await
+            .ok()
+            .flatten()
+            .is_none();
+        assert!(
+            pre_d5_said_absent,
+            "the fixture must be one where the old expression answered \
+             ‘absent’, or this test pins nothing"
+        );
+
+        let (status, why) = verify_precondition(
+            &hostile,
+            &Precondition::RefAbsent {
+                ref_name: name.clone(),
+            },
+            &live,
+        )
+        .await
+        .expect_err("an unreadable ref is not proof the ref is absent");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(why.contains("Couldn't run git"), "{why}");
+
+        // And its two siblings, on the identical input, agree — the asymmetry
+        // is gone rather than inverted.
+        for precondition in [
+            Precondition::RefExists {
+                ref_name: name.clone(),
+            },
+            Precondition::RefAt {
+                ref_name: name.clone(),
+                oid: CommitOid::new("0".repeat(40)).unwrap(),
+            },
+        ] {
+            let (status, _) = verify_precondition(&hostile, &precondition, &live)
+                .await
+                .expect_err("every ref precondition refuses on an unreadable ref");
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "and all three now use the *same* status for it"
+            );
+        }
+    }
+
+    /// The fix must not have been "refuse always": on a repository git can
+    /// run in, `RefAbsent` still passes for a branch that really is absent and
+    /// still refuses for one that exists. Without this, the test above would
+    /// pass against a `verify_precondition` that had been broken outright.
+    #[tokio::test]
+    async fn ref_absent_still_distinguishes_a_real_absence_from_a_real_ref() {
+        let (_dir, repo) = seeded_repo();
+        let live = live_observed();
+
+        verify_precondition(
+            &repo,
+            &Precondition::RefAbsent {
+                ref_name: ref_name("refs/heads/never-created"),
+            },
+            &live,
+        )
+        .await
+        .expect("a branch that does not exist satisfies RefAbsent");
+
+        let (status, why) = verify_precondition(
+            &repo,
+            &Precondition::RefAbsent {
+                ref_name: ref_name("refs/heads/main"),
+            },
+            &live,
+        )
+        .await
+        .expect_err("a branch that exists breaks RefAbsent");
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a ref that really is there is a 409 about the repository, \
+             not a 500 about us"
+        );
+        assert!(
+            why.contains("appeared while this plan was pending"),
+            "{why}"
+        );
+    }
+
+    /// **The freshness criterion.** Two `Unknown` observations must not
+    /// produce equal generation tokens, or the staleness gate compares two
+    /// non-observations, finds them "the same", and certifies as unchanged a
+    /// repository nobody read.
+    ///
+    /// The control in the middle is what makes this non-vacuous: two identical
+    /// *real* observations must still compare equal, so the property being
+    /// pinned is "unknown is uncomparable", not "the token is random".
+    #[tokio::test]
+    async fn two_unknown_observations_never_compare_equal() {
+        let (_dir, repo) = seeded_repo();
+
+        let unknown = || Observed {
+            head_branch: Some("main".to_string()),
+            head_tip: Obs::Unknown,
+            branch_tip: Obs::Absent,
+            status: Obs::Known(String::new()),
+            held_at_build: Vec::new(),
+        };
+        let known = || Observed {
+            head_branch: Some("main".to_string()),
+            head_tip: Obs::Known("abc123".to_string()),
+            branch_tip: Obs::Absent,
+            status: Obs::Known(String::new()),
+            held_at_build: Vec::new(),
+        };
+        let absent = || Observed {
+            head_branch: Some("main".to_string()),
+            head_tip: Obs::Absent,
+            branch_tip: Obs::Absent,
+            status: Obs::Known(String::new()),
+            held_at_build: Vec::new(),
+        };
+
+        // Control: two identical real observations DO compare equal. Without
+        // this the whole freshness gate would be broken, not fixed.
+        assert_eq!(
+            generation_token(&repo, &known()).await.as_str(),
+            generation_token(&repo, &known()).await.as_str(),
+            "a real observation must be reproducible, or nothing is ever fresh"
+        );
+        assert_eq!(
+            generation_token(&repo, &absent()).await.as_str(),
+            generation_token(&repo, &absent()).await.as_str(),
+        );
+
+        // The criterion: two unknowns do not.
+        assert_ne!(
+            generation_token(&repo, &unknown()).await.as_str(),
+            generation_token(&repo, &unknown()).await.as_str(),
+            "two failed reads must not certify each other as unchanged"
+        );
+
+        // And unknown is distinguishable from both of the real answers.
+        assert_ne!(
+            generation_token(&repo, &unknown()).await.as_str(),
+            generation_token(&repo, &absent()).await.as_str(),
+        );
+        assert_ne!(
+            generation_token(&repo, &unknown()).await.as_str(),
+            generation_token(&repo, &known()).await.as_str(),
+        );
+    }
+
+    /// The digest tags are load-bearing on their own: an observed empty status
+    /// (a *clean* worktree) must not hash the same as one that could not be
+    /// read. Pre-D5 both went in as `""` via `unwrap_or_default`.
+    #[tokio::test]
+    async fn a_clean_worktree_does_not_hash_like_an_unreadable_one() {
+        let (_dir, repo) = seeded_repo();
+        let with = |status| Observed {
+            head_branch: Some("main".to_string()),
+            head_tip: Obs::Known("abc123".to_string()),
+            branch_tip: Obs::Absent,
+            status,
+            held_at_build: Vec::new(),
+        };
+        assert_ne!(
+            generation_token(&repo, &with(Obs::Known(String::new())))
+                .await
+                .as_str(),
+            generation_token(&repo, &with(Obs::Absent)).await.as_str(),
+            "‘clean’ and ‘not a working tree’ are different states"
+        );
+    }
+
+    /// The gate is wired, not merely capable: a plan whose build-time
+    /// observation was `Unknown` is refused by `enforce_fresh` with the
+    /// git-unavailable status — and says so, rather than blaming the
+    /// repository for changing.
+    #[tokio::test]
+    async fn enforce_fresh_refuses_a_plan_built_on_an_unreadable_observation() {
+        let (_dir, repo) = seeded_repo();
+        let (plan, mut observed) = build_plan(&repo, GitOperation::StageAll, tokens()).await;
+        assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+
+        observed.head_tip = Obs::Unknown;
+        let (status, why) = enforce_fresh(&repo, &plan, &observed)
+            .await
+            .expect_err("an unreadable observation cannot certify freshness");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(why.contains("Couldn't run git"), "{why}");
+        assert!(
+            !why.contains("changed while this plan was pending"),
+            "we have no evidence the repository changed: {why}"
+        );
+    }
+
+    /// The comparison behind “Already up to date”. `exec_merge` and
+    /// `exec_rebase` decide whether HEAD moved by calling
+    /// [`Obs::same_observation`]; two unreadable tips must not answer "it
+    /// didn't".
+    ///
+    /// Note that `new == observed.head_tip` — what those two sites used to say
+    /// — no longer compiles at all: [`Obs`] deliberately has no `PartialEq`.
+    #[test]
+    fn two_unknown_tips_are_not_the_same_observation() {
+        let unknown: Obs<String> = Obs::Unknown;
+        assert!(
+            !unknown.same_observation(&Obs::Unknown),
+            "two reads that saw nothing are not evidence that nothing moved"
+        );
+        assert!(!unknown.same_observation(&Obs::Absent));
+        assert!(!unknown.same_observation(&Obs::Known("a".into())));
+        assert!(!Obs::Known("a".to_string()).same_observation(&Obs::Unknown));
+
+        // The real answers still compare the way the callers need.
+        assert!(Obs::Known("a".to_string()).same_observation(&Obs::Known("a".to_string())));
+        assert!(!Obs::Known("a".to_string()).same_observation(&Obs::Known("b".to_string())));
+        assert!(Obs::<String>::Absent.same_observation(&Obs::Absent));
     }
 }
