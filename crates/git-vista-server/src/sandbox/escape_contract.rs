@@ -1316,7 +1316,7 @@ fn r1_case_region_has_no_freeform_control_flow_or_assertions() {
 }
 
 /// R2: no hand-written acceptance predicate survives outside `mod harness`,
-/// and the shared parser is `Result`, never `Option<i32>`.
+/// and the shared parser is `Result`, never an optional/defaultable value.
 #[test]
 fn r2_case_region_never_hand_writes_acceptance_conditions() {
     for rel in BATTERY_FILES {
@@ -1331,8 +1331,9 @@ fn r2_case_region_never_hand_writes_acceptance_conditions() {
     }
     let code = read_self_code_only();
     assert!(
-        code.contains("fn parse_observation") && code.contains("Result<i32, MissingObservation>"),
-        "R2: the probe-output parser must be `-> Result<i32, MissingObservation>`"
+        code.contains("fn parse_observation")
+            && code.contains("Result<Observation, MissingObservation>"),
+        "R2: the probe-output parser must be `-> Result<Observation, MissingObservation>`"
     );
     assert!(
         !code.contains("-> Option<i32>"),
