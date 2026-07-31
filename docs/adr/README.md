@@ -41,5 +41,6 @@ it, and note the link in both.
 | [0027](0027-landlock-enumerate-and-skip.md) | Secrets inside a granted `$HOME` are withheld by enumerate-and-skip, not a deny rule | Accepted |
 | [0028](0028-network-tier-ports-not-hosts.md) | Accept that the network tier constrains ports, not hosts (Option A) | Accepted |
 | [0029](0029-strict-tier-hard-fail-when-unavailable.md) | INV-13: hard-fail when the Strict tier is selected but unavailable | Accepted — implementation pending |
-| [0030](0030-git-process-sandbox.md) | The git-process sandbox: a pure argv boundary, tiers by declared intent, and tests that prove their own premise | Accepted — core mechanism landed, disclosure wiring in flight |
+| [0030](0030-git-process-sandbox.md) | The git-process sandbox: a pure argv boundary, tiers by declared intent, and tests that prove their own premise | Accepted — core mechanism and INV-15 disclosure landed and tested |
 | [0031](0031-adr-format-alternatives-and-rejection-reasoning.md) | Every ADR records its alternatives and why they lost | Accepted |
+| [0032](0032-no-service-worker.md) | No service worker: offline is a failure to surface, not to mask | Accepted |

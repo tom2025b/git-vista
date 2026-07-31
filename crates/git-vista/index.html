@@ -64,13 +64,18 @@
               has since moved, or a /api/status from before a commit, is far
               worse than a visible error. The server already sends `no-store` on
               the API, and no client-side cache may override it.
-           4. This app is loopback-only (state.rs `parse_bind_addr` refuses any
-              non-loopback bind), reached from the iPad over an SSH forward. So
-              "offline" here almost always means THE TUNNEL DIED, not "the user
-              walked into a lift". A worker serving a cached shell over a dead
-              tunnel turns a diagnosable network failure into what looks like an
-              app bug — a failure mode that has already cost real debugging time
-              on this project. Failing loudly is the honest behaviour.
+           4. This app binds loopback by default and is reached from the iPad
+              over an SSH forward; the one exception is the opt-in LAN view
+              listener (`gv --lan-view`, ADR 0005 — bootstrap-token, view-scoped,
+              rate-limited). Under EITHER transport, "offline" almost always
+              means THE TUNNEL (or LAN path) DIED, not "the user walked into a
+              lift". A worker serving a cached shell over a dead tunnel turns a
+              diagnosable network failure into what looks like an app bug — a
+              failure mode that has already cost real debugging time on this
+              project. Failing loudly is the honest behaviour.
+
+         This is ADR 0032; features/shell/pwa_guard.rs trips if a registration
+         appears here or this comment is removed.
 
          Standalone home-screen launch on iOS needs no worker — only the
          apple-mobile-web-app-capable meta above — so nothing is lost by this. -->
