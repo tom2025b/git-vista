@@ -1,6 +1,6 @@
 # Handoff — M1.13b Close-Out + M2 Sub-Issue Kickoff (focused session)
 
-## ⚠ STATUS UPDATE — 2026-07-31 ~09:45, session throttled at 81% weekly quota
+## ⚠ FINAL STATUS — 2026-07-31 ~10:45, session at 96% context, stopping to compact
 
 **P1a and P1b are DONE and verified.** Do not redo them. What landed:
 
@@ -44,8 +44,18 @@ honest entry in `documented_gaps.rs`.
 M1 + M2 to sub-issue level with model/effort/duration. Note `#67` and `#74` ALSO
 depend on M1.13, so closing #66 unblocks four issues, not two.
 
-**Next step:** let one CI run complete untouched to confirm the sandbox job, then
-mark PR #207 ready (P2). Tom has 8 open decisions; recommendations given in-session.
+**COMPLETED THIS FULL SESSION:**
+- P1a/P1b: Host-provisioning action built, CI fully green (all 7 checks), triple-gap fix verified
+- Clone-coverage gap: Closed with honest `documented_gaps.rs` entry + tripwire
+- C11 review: Closed, 4/5 rows traced to real production path, residue resolved
+- Sub-issues: #209–#215 filed (7 issues, M2 slices for #68/#69/#70)
+- Milestone names: Fixed M2–M7 titles to match content
+- Testbed: Rebuilt at 8081, `dev` resume commands corrected
+- Ruleset: Extracted to `.github/main-release-gates.ruleset.json`, ready to apply
+- Progress report: `design-docs/2026-07-31-session-progress-report.pdf` (8pp, 7 diagrams, rendered clean)
+- In flight: Issue #188 SSH carve-out (research done, implement + 2 skeptics running)
+
+**Next step:** Wait for #188 workflow to complete, then mark PR #207 ready for review (CI is clean). Apply ruleset if desired. Continue M2 sub-issue work or #188 follow-up per your priorities.
 
 
 **Written:** 2026-07-31T08:12:12-04:00 · **Signed:** thomas2025 · 2026-07-31T08:12:12-04:00
