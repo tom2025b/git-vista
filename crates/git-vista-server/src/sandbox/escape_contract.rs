@@ -2320,11 +2320,20 @@ const HOST_SETUP_TOKENS: &[(&str, &str)] = &[
     ),
     (
         "known_hosts",
-        "materialises the path `secret_read_denied` uses as its SECRET. That case declares \
-         `expect_baseline: Errno(0)` — the file must be readable with no sandbox applied — \
-         so that a denial inside the sandbox is attributable to the policy rather than to \
-         the file never having existed. A runner has no ~/.ssh, so the baseline returned \
-         ENOENT and the case hard-failed having proved nothing",
+        "materialises the path `ssh_known_hosts_carveout`'s GRANTED leg reads (#188). That \
+         case's paired positive declares `expect_baseline: Errno(0)` — the file must be \
+         readable with no sandbox applied — so a runner with no ~/.ssh would otherwise \
+         return ENOENT for the baseline and the case would hard-fail having proved nothing \
+         about the carve-out's own claim",
+    ),
+    (
+        "id_ed25519",
+        "materialises the path `secret_read_denied` (#188: repointed off `known_hosts`, \
+         which became legitimately readable once the carve-out landed) and \
+         `ssh_known_hosts_carveout`'s SSHKEY leg both use as their SECRET. Same reasoning \
+         as `known_hosts` above: `expect_baseline: Errno(0)` requires the file to exist and \
+         be readable outside the sandbox, or the baseline leg returns ENOENT and both cases \
+         hard-fail having proved nothing",
     ),
 ];
 
