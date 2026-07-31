@@ -13,6 +13,11 @@
 //! - [`core`] is pure arithmetic and pure constants — the 44 px threshold, the
 //!   shortfall of a given target, and the camera scale at which the commit-dot hit
 //!   circle first reaches guidance. Inputs in, verdicts out, no DOM.
+//! - [`focus`] (M1.13) is the roving-tabindex state machine that closes the gap the
+//!   M1.12 lane's report named as the single largest remaining one: the commit graph
+//!   was pointer-only. Same shape as `core` — a plain state machine, host-tested, no
+//!   DOM — because "which row is focused and what arrow keys do to it" is exactly as
+//!   decidable off-device as the tap-target arithmetic is.
 //! - [`stylesheet`] is a small, fixture-tested CSS reader. It exists so the audits below
 //!   are statements about the *actual* `styles.css` rather than about a paraphrase of it.
 //! - [`audit`] is test-only and holds the tripwires: invariants over the real
@@ -31,6 +36,7 @@
 //! [`audit`] is the honest record of the gap, not a claim that the gap is closed.
 
 pub mod core;
+pub mod focus;
 pub mod stylesheet;
 
 #[cfg(test)]
