@@ -352,14 +352,17 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
             // every edit. Appears only while something is actually staged
             // (live `/api/status`, tracked read so the item pops in when the
             // fetch lands) and only on the HEAD commit, like staging.
+            //
+            // #217: same reasoning as "Stage Changes" above — an index-only
+            // change has no history to invalidate, so this refetches status
+            // instead of bumping the graph epoch (which would also have reset
+            // Print's `history_complete` for no reason).
             let unstage_changes = (is_head && staged_count.get().unwrap_or(0) > 0).then(|| {
                 let on_unstage = move |_| {
                     shell.close_menu();
                     spawn_local(async move {
                         match unstage_request().await {
-                            Ok(()) => graph.update(|g| {
-                                g.force_bump();
-                            }),
+                            Ok(()) => status.refetch(),
                             Err(e) => {
                                 if let Some(w) = web_sys::window() {
                                     let _ = w.alert_with_message(&format!(
