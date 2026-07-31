@@ -135,6 +135,14 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // — it never compiles or execs anything client-influenced. Also in
     // LAUNCHER_SPAWN_SITES for the same `cc` reason as escape_suite.rs above.
     "src/sandbox/escape_contract.rs",
+    // The live-clone check for `policy_for_clone`. `#[cfg(test)]` and
+    // `#[ignore]`d. It constructs exactly one `Command`: the **baseline** leg,
+    // a plain unsandboxed `git clone` of a hardcoded literal public HTTPS URL,
+    // which exists so that a failure of the sandboxed leg is attributable to
+    // the policy rather than to the network. The leg under test spawns through
+    // `spawn::command_async` like every other sandboxed git. Program is the
+    // literal `"git"`; no argument is client-influenced.
+    "src/sandbox/clone_live.rs",
     // Deliberately absent: `src/sandbox/documented_gaps.rs` and
     // `src/sandbox/lifecycle.rs`, the suites #66's Task 15 round adds beside
     // this one. `documented_gaps.rs` exists and constructs no `Command` at all,
