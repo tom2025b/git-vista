@@ -139,16 +139,46 @@ pub(crate) async fn clone_repo(
     let args: [&str; 4] = ["clone", "--", url.as_str(), &dest_str];
     let output = match crate::sandbox::policy_for_clone(&root) {
         Ok(policy) => {
-            match crate::sandbox::spawn::command_async(&policy, &root, &args)
-                .output()
-                .await
-            {
-                Ok(o) => o,
-                Err(e) => {
+            // #216: bound the child's lifetime. `git clone` against a remote that
+            // stops answering mid-transfer does not fail — it *waits*, and this
+            // handler waits with it, holding the request open forever. The client
+            // now times out at 60s (`api.rs::REQUEST_TIMEOUT_MS`), but a client
+            // timeout does not reap the child: without this the server keeps a
+            // wedged git and a half-written destination directory indefinitely,
+            // and the next attempt collides with the leftover.
+            //
+            // Ten minutes, not the client's sixty seconds, and deliberately so:
+            // a large repository over a slow link is a *legitimately* long clone,
+            // and killing a working transfer because a phone tether is slow would
+            // trade one bug for a worse one. This bound exists to stop a wedged
+            // clone living forever, not to enforce a latency budget.
+            const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+            let spawned = crate::sandbox::spawn::command_async(&policy, &root, &args).output();
+            match tokio::time::timeout(CLONE_TIMEOUT, spawned).await {
+                Ok(Ok(o)) => o,
+                Ok(Err(e)) => {
                     eprintln!("git-vista: /api/clone couldn't run git: {e}");
                     return Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Couldn't run git: {e}"),
+                    ));
+                }
+                Err(_elapsed) => {
+                    // Leave nothing half-cloned behind: the destination is a
+                    // fresh, uniquely-named directory this call created, so
+                    // removing it cannot touch anything the operator owns.
+                    let _ = std::fs::remove_dir_all(&dest);
+                    eprintln!(
+                        "git-vista: /api/clone timed out after {}s cloning {url}",
+                        CLONE_TIMEOUT.as_secs()
+                    );
+                    return Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        format!(
+                            "The clone did not finish within {} minutes and was stopped. \
+                             The remote may be unreachable or the repository very large.",
+                            CLONE_TIMEOUT.as_secs() / 60
+                        ),
                     ));
                 }
             }
