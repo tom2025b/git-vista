@@ -38,7 +38,7 @@ use crate::features::activity::signals::Activity;
 use crate::features::dialogs::core::Dialog;
 use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::{
-    Frame, GraphCore, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT,
+    print_button_copy, Frame, GraphCore, HistoryInvariantError, LoadedHistory, DEFAULT_PAGE_LIMIT,
 };
 use crate::features::operations::core::OperationsCore;
 use crate::features::operations::signals::Operations;
@@ -599,6 +599,12 @@ pub fn App() -> impl IntoView {
                 // re-reads `complete` regardless: the attribute is an
                 // affordance, not the guarantee. A drift reload can un-complete
                 // the history between the paint and the tap.
+                //
+                // #217: the disabled reason used to live only in `title` — CSS
+                // dimming plus a native tooltip that never surfaces on tap, so
+                // on iPad the button just went dead with no explanation. The
+                // label now carries the same reason (`print_button_copy`,
+                // host-tested), so it's visible without hover/long-press.
                 {move || frame().map(|_| view! {
                     <button
                         class="refresh"
@@ -608,14 +614,9 @@ pub fn App() -> impl IntoView {
                                 history_ui.print_open.set(true);
                             }
                         }
-                        title=move || if history_complete.get() {
-                            "A clean, printable view of the whole graph — \
-                             print it or save it as a PDF"
-                        } else {
-                            "Load all history before printing."
-                        }
+                        title=move || print_button_copy(history_complete.get()).1
                     >
-                        "Print Graph"
+                        {move || print_button_copy(history_complete.get()).0}
                     </button>
                 })}
                 // Only a repo explicitly seeded as a test repo (`gv --seed`)
