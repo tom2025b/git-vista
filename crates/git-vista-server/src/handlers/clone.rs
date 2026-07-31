@@ -107,18 +107,135 @@ pub(crate) async fn clone_repo(
     };
 
     println!("[/api/clone] cloning {url} → {}", dest.display());
-    let output = match tokio::process::Command::new("git")
-        .arg("clone")
-        // `--` so the URL is never read as an option, even past validation.
-        .arg("--")
-        .arg(&url)
-        .arg(&dest)
-        .output()
-        .await
-    {
-        Ok(o) => o,
+    // D4 (#66, Task 7/D2): clone's own dedicated policy constructor, not the
+    // general-purpose `sandbox::policy_for` other git spawns go through.
+    //
+    // The policy is built from the **clones root**, not from a repository: the
+    // destination does not exist yet at policy time — `sandbox::policy_for`
+    // would refuse it outright (`repo_paths::resolve` requires an existing
+    // `.git`), which is exactly why this is a separate constructor rather than
+    // a call to that one. `policy_for_clone` grants RW on `root` (what `git
+    // clone` needs to be able to write) and pins `trusted = false`
+    // structurally — see that function's doc comment for why clone must never
+    // be reachable at the `Unsandboxed` tier even once per-repo operator trust
+    // exists, unlike every other repository operation.
+    //
+    // A prior comment here described a `policy_for_clone` "still awaiting
+    // approval" as the reason this went through the general policy path in
+    // the interim; D4 is now approved and implemented, so that interim is
+    // gone — this is the direct call the earlier comment anticipated.
+    //
+    // Also note this needs the resolver grant — see `NETWORK_ONLY_RO_TREES`:
+    // sandboxed with only `/usr /bin /lib /lib64 /etc` readable, every clone of
+    // a named remote would fail `Could not resolve host`. `policy_for_clone`
+    // gets it the same way `policy_for` does, via `default_system_trees`.
+    //
+    // `git clone` takes no `-C`, but the launcher's fixed `-C <root>` is
+    // harmless (the clones root is a real directory, created just above) and
+    // keeps one argv shape for every spawn site. The URL still travels as its
+    // own argv entry, after `validate_clone_url`, behind `--`.
+    let dest_str = dest.to_string_lossy();
+    // `--` so the URL is never read as an option, even past validation.
+    let args: [&str; 4] = ["clone", "--", url.as_str(), &dest_str];
+    let output = match crate::sandbox::policy_for_clone(&root) {
+        Ok(policy) => {
+            // #216: bound the child's lifetime. `git clone` against a remote that
+            // stops answering mid-transfer does not fail — it *waits*, and this
+            // handler waits with it, holding the request open forever. The client
+            // now times out at 60s (`api.rs::REQUEST_TIMEOUT_MS`), but a client
+            // timeout does not reap the child: without this the server keeps a
+            // wedged git and a half-written destination directory indefinitely,
+            // and the next attempt collides with the leftover.
+            //
+            // Ten minutes, not the client's sixty seconds, and deliberately so:
+            // a large repository over a slow link is a *legitimately* long clone,
+            // and killing a working transfer because a phone tether is slow would
+            // trade one bug for a worse one. This bound exists to stop a wedged
+            // clone living forever, not to enforce a latency budget.
+            const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+            // # Why cleanup is a Drop guard and not just the timeout arm
+            //
+            // MEASURED 2026-07-31, not assumed: a standalone axum server was
+            // driven by a client that disconnected mid-request. Three flags,
+            // so no single one could be read vacuously — `started=true`
+            // (the handler ran), `dropped=true` (it unwound), and
+            // `timeout_arm=false` (the branch was skipped). The paired
+            // positive, a client that waits, showed `timeout_arm=true`, so
+            // the arm works; it simply does not run on disconnect.
+            //
+            // Axum drops the handler future when the client goes away, which
+            // skips **every** match arm including the timeout's. Cleanup
+            // written as a branch of a completion path only runs if that path
+            // is reached, and cancellation is the absence of all of them. So
+            // the half-written destination is removed by a value's lifetime
+            // instead, which cancellation cannot skip.
+            //
+            // This matters more once the client aborts on its own deadline
+            // (#216 follow-up): abort makes disconnect the *common* path, so a
+            // timeout-arm-only cleanup would have quietly stopped running just
+            // as it started being needed.
+            struct DestGuard<'a> {
+                dest: &'a std::path::Path,
+                keep: bool,
+            }
+            impl Drop for DestGuard<'_> {
+                fn drop(&mut self) {
+                    if !self.keep {
+                        // Best-effort: the destination is a fresh, uniquely
+                        // named directory this call created, so removing it
+                        // cannot touch anything the operator owns.
+                        let _ = std::fs::remove_dir_all(self.dest);
+                    }
+                }
+            }
+            let mut guard = DestGuard {
+                dest: &dest,
+                keep: false,
+            };
+
+            // `kill_on_drop`: without it a cancelled handler leaves the git
+            // child running, still writing into a directory the guard above
+            // has already removed. The orphan outlives the request that
+            // authorised it, which is precisely what this milestone's process
+            // lifecycle work (INV-8) exists to prevent.
+            let spawned = crate::sandbox::spawn::command_async(&policy, &root, &args)
+                .kill_on_drop(true)
+                .output();
+            match tokio::time::timeout(CLONE_TIMEOUT, spawned).await {
+                Ok(Ok(o)) => {
+                    // Survived: the destination is the caller's now. Anything
+                    // below that decides the clone failed re-arms the guard.
+                    guard.keep = true;
+                    o
+                }
+                Ok(Err(e)) => {
+                    eprintln!("git-vista: /api/clone couldn't run git: {e}");
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Couldn't run git: {e}"),
+                    ));
+                }
+                Err(_elapsed) => {
+                    // `guard` is still armed, so the destination is removed as
+                    // this scope unwinds — no explicit cleanup call here.
+                    eprintln!(
+                        "git-vista: /api/clone timed out after {}s cloning {url}",
+                        CLONE_TIMEOUT.as_secs()
+                    );
+                    return Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        format!(
+                            "The clone did not finish within {} minutes and was stopped. \
+                             The remote may be unreachable or the repository very large.",
+                            CLONE_TIMEOUT.as_secs() / 60
+                        ),
+                    ));
+                }
+            }
+        }
         Err(e) => {
-            eprintln!("git-vista: /api/clone couldn't run git: {e}");
+            eprintln!("git-vista: /api/clone couldn't build a sandbox policy: {e}");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Couldn't run git: {e}"),
