@@ -120,6 +120,14 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // shim_cli, and separately runs the C compiler to build the adversarial
     // probes it feeds in as hostile hooks. Also in LAUNCHER_SPAWN_SITES.
     "src/sandbox/escape_suite.rs",
+    // #188: the real-SSH end-to-end fixture. `#[cfg(test)]` only. It spawns
+    // `ssh-keygen`, `sshd`, `ssh-agent`, `ssh-add` and plain `git` to build a
+    // throwaway loopback SSH server and drive a real `ls-remote` against it
+    // — every one of those, unsandboxed setup, never the thing under test
+    // (which spawns through `spawn::command_async` like everything else).
+    // Also in LAUNCHER_SPAWN_SITES, for the same reason `cc` is carved out
+    // for escape_suite.rs above: none of the five is a shell.
+    "src/sandbox/ssh_remote.rs",
     // #66 Task 25 (step 3): the anti-vacuity contract's harness. Its baseline
     // leg spawns plain `git` outside the sandbox (literal), and its CI
     // preflight (`ci_preflight_host_meets_the_declared_minimum`) runs `cc
@@ -184,10 +192,11 @@ const ALLOWED_GIT_CRATE_SPAWN_SITES: &[&str] = &[
 /// non-literal program, but it must never name a shell or interpreter.
 ///
 /// Keep this list as short as possible. Every addition widens the only hole in
-/// the tripwire. It stands at three: one production chokepoint (`spawn.rs`) and
-/// two `#[cfg(test)]` harnesses that need `cc`. (This doc used to say "keep
-/// this list at one entry", written when it held one; leaving that in while the
-/// list grew to three turned a live budget into a slogan nobody could act on.)
+/// the tripwire. It stands at four: one production chokepoint (`spawn.rs`) and
+/// three `#[cfg(test)]` harnesses that need a non-git external tool. (This doc
+/// used to say "keep this list at one entry", written when it held one;
+/// leaving that in while the list grew turned a live budget into a slogan
+/// nobody could act on.)
 const LAUNCHER_SPAWN_SITES: &[&str] = &[
     // (As in `ALLOWED_SPAWN_SITES` above, an orphaned paragraph about
     // `shim_cli.rs` was left here when that entry was removed. It is gone: the
@@ -204,6 +213,14 @@ const LAUNCHER_SPAWN_SITES: &[&str] = &[
     // but built inside `spawn.rs`, not by a `Command::new(` in this file, so
     // it does not itself need this carve-out for that path.
     "src/sandbox/escape_contract.rs",
+    // #188's real-SSH fixture. `ssh-keygen`, `sshd`, `ssh-agent` and `ssh-add`
+    // are each a fixed-purpose tool that does not reinterpret an argument as a
+    // second command the way a shell does — `sshd`'s own path is chosen from
+    // a small, fixed, reviewed candidate list at runtime
+    // (`["/usr/sbin/sshd", "/usr/bin/sshd"]`), the identical pattern
+    // `BWRAP_CANDIDATES` already uses for the strict tier's launcher, never
+    // resolved through `PATH`.
+    "src/sandbox/ssh_remote.rs",
     // The Task 5 spawn chokepoint. Its `Command::new` program is
     // `sandbox_argv(policy)[0]` — the resolved shim, or bare `git` in the
     // unsandboxed tier — a value this crate produced, never a runtime string.
