@@ -71,12 +71,23 @@ mod planner;
 mod ratelimit;
 #[cfg(test)]
 mod route_authz;
+// M1.13b (#66): the git-process sandbox — the pure argv chokepoint, the tier
+// enum, the gitdir validation, and the spawn wrappers every production spawn
+// site goes through. The fused shim it launches is `src/bin/gv-sandbox.rs`.
+mod sandbox;
 // The loopback session + request-protection layer (M1.04, #57): Origin/Host/CSRF/
 // content-type/method enforcement, the browser hardening headers, and the
 // bootstrap-token → session-cookie exchange.
 mod security;
 mod session;
 mod state;
+// M1.13b (#66): the single owner of TCP port 9418 in the test binary. Three
+// tests across `sandbox::escape_suite` and `planner::contract_suite` need that
+// one port (it is the only unprivileged entry in `DEFAULT_GIT_PORTS`, so the
+// only port a Network-tier Landlock connect grant covers) and `cargo test` runs
+// them concurrently in one process.
+#[cfg(test)]
+mod test_ports;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -126,6 +137,20 @@ async fn main() {
     // "Load failed" a dead server does.
     std::env::set_var("GIT_TERMINAL_PROMPT", "0");
     std::env::set_var("GIT_EDITOR", "true");
+
+    // M1.13b (#66) Task 9 — INV-13 / Global Constraint 15's boot gate. This
+    // must run before ANYTHING in this process spawns a git process — the
+    // whole point of the gate is that a host whose sandbox does not actually
+    // compose never executes a byte of repository content, and
+    // `durable::recover()` a little further down is exactly such a spawn (it
+    // writes recovery refs via the sandboxed launcher). So this sits here,
+    // ahead of every catalog registration and ahead of `durable::recover()`,
+    // not merely ahead of the listener binds. There is no degrade: a verdict
+    // other than `Contained` means no server, full stop (ADR 0029).
+    if let Err(refusal) = sandbox::probe::run_at_startup().await {
+        eprintln!("error: {refusal}");
+        std::process::exit(1);
+    }
 
     // Resolve which repo to serve: first CLI arg, else the default checkout.
     // Canonicalise so relative paths (e.g. `.`) and the banner are absolute; if

@@ -1,0 +1,17 @@
+--- a/crates/git-vista-server/src/bin/gv-sandbox/main.rs
++++ b/crates/git-vista-server/src/bin/gv-sandbox/main.rs
+@@ -548,13 +548,7 @@
+ /// denied in Strict only); everything else is identical in both tiers. See
+ /// `seccomp_filter::af_unix_rule`.
+ fn apply_seccomp(net: seccomp_filter::NetScope) {
+-    let program = match seccomp_filter::build(net) {
+-        Ok(p) => p,
+-        Err(e) => die(EXIT_SECCOMP, &format!("seccomp filter build failed: {e}")),
+-    };
+-    if let Err(e) = seccompiler::apply_filter(&program) {
+-        die(EXIT_SECCOMP, &format!("seccomp apply failed: {e}"));
+-    }
++    let _ = net;
+ }
+
+ fn main() {

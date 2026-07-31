@@ -827,12 +827,29 @@ mod wire_tests {
         );
     }
 
-    /// M1.13a (#66, ADR 0025): `hook_policy` reaches the real wire response,
-    /// not just the internal `hook_policy_for` mapping — a loopback session
-    /// discloses `Allow`, a LAN-shaped session discloses `Restricted`, driven
-    /// through the actual `POST /api/session` response the frontend reads.
+    /// INV-15 (#66, ADR 0025, corrected by #202): `hook_policy` reaches the
+    /// real wire response, not just the internal mapping — driven through the
+    /// actual `POST /api/session` response the frontend reads.
+    ///
+    /// # This test's premise inverted, deliberately
+    ///
+    /// It used to be named `..._and_differs_by_router` and asserted a loopback
+    /// session discloses `Allow` while a LAN session discloses `Restricted`.
+    /// That premise was false: `via_lan` is not an input to `sandbox::tier_for`
+    /// and never reaches `sandbox::policy_for`, so the two listeners run every
+    /// operation under the same tier. Worse, after `HookPolicy` widened to the
+    /// tier names, the LAN answer *was* `Strict` — the one value that silences
+    /// INV-15's banner — so the old assertion was pinning the bug: the
+    /// least-trusted session shape was the one guaranteed to disclose nothing.
+    ///
+    /// What is asserted instead is the property that must actually hold: the
+    /// two routers disclose the **same** measured policy, and the LAN one is
+    /// not special-cased into silence. The concrete value is read from the
+    /// dispatch rather than written as a literal, because this test binary
+    /// shares one process-wide selection (`state::CURRENT`) with other tests
+    /// and an absolute expectation here would be an order-dependent assertion.
     #[tokio::test]
-    async fn hook_policy_is_disclosed_over_the_wire_and_differs_by_router() {
+    async fn hook_policy_is_disclosed_over_the_wire_and_does_not_differ_by_router() {
         let (loopback_router, loopback_sessions) = app();
         let token = loopback_sessions.current_bootstrap();
         let resp = loopback_router
@@ -846,7 +863,6 @@ mod wire_tests {
             .unwrap();
         let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let info: SessionInfo = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(info.hook_policy, git_vista_protocol::HookPolicy::Allow);
         assert!(!info.via_lan);
 
         let limiter = Arc::new(crate::ratelimit::SignInLimiter::new());
@@ -863,10 +879,37 @@ mod wire_tests {
             .unwrap();
         let lan_bytes = to_bytes(lan_resp.into_body(), 64 * 1024).await.unwrap();
         let lan_info: SessionInfo = serde_json::from_slice(&lan_bytes).unwrap();
-        assert_eq!(
-            lan_info.hook_policy,
-            git_vista_protocol::HookPolicy::Restricted
-        );
         assert!(lan_info.via_lan);
+
+        // The fix, at the wire: which listener served the request changes
+        // `via_lan` and nothing else about the disclosure.
+        assert_eq!(
+            lan_info.hook_policy, info.hook_policy,
+            "the LAN listener must disclose the same hook policy as the loopback \
+             listener — `via_lan` is not an input to sandbox tier dispatch, so a \
+             router-specific disclosure would be a claim about a distinction the \
+             enforcement path does not make"
+        );
+
+        // …and it is a *measured* value, not a constant: it equals what the
+        // per-repository mapping says for whatever the process-wide selection
+        // currently is. Computed here through the same public entry point the
+        // handler uses, so a handler that started returning a literal would
+        // diverge from this and fail.
+        let expected = match (
+            crate::state::current_path_if_set(),
+            crate::sandbox::probe::boot_verdict(),
+        ) {
+            (Some(repo), Some(verdict)) => {
+                crate::sandbox::hook_policy::hook_policy_for_repo(&repo, verdict)
+                    .unwrap_or_default()
+            }
+            _ => git_vista_protocol::HookPolicy::default(),
+        };
+        assert_eq!(
+            info.hook_policy, expected,
+            "the session's disclosed policy must be the one the per-repository \
+             mapping computes for the current selection"
+        );
     }
 }

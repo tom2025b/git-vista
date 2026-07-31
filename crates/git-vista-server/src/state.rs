@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use git_vista_core::identity::{RepositoryHandle, WorktreeId};
 use git_vista_protocol::{RepoMode, RepositoryDescriptor};
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, RepoEntry};
 
 // Which repository to visualise *initially*. Taken from the first CLI argument
 // (`git-vista-server <path>`), falling back to the current working directory (`.`,
@@ -204,20 +204,27 @@ pub(crate) fn scan_clones_root() -> (usize, usize) {
 /// The capability view of the catalog for `GET /api/catalog`: the servable
 /// repositories addressed by opaque id, with absolute paths included only when
 /// the operator opted in ([`expose_paths`]).
+/// INV-15 (#66, #202): each descriptor also carries the hook policy that
+/// repository's local operations actually run under, computed from the boot
+/// sandbox verdict and the repository's own operator-trust state. The verdict is
+/// read here — one process-global read at the production seam — rather than
+/// inside [`Catalog::descriptors`], so the catalog's own unit tests are not
+/// order-dependent on whether the boot probe happened to have run.
 pub(crate) fn catalog_descriptors() -> Vec<RepositoryDescriptor> {
     catalog()
         .read()
         .expect("catalog lock")
-        .descriptors(expose_paths())
+        .descriptors(expose_paths(), crate::sandbox::probe::boot_verdict())
 }
 
 /// The capability descriptor for one registered worktree — the clone handler's
 /// success body (ADR 0008) — or `None` for an id the catalog does not hold.
 pub(crate) fn descriptor_for(worktree: WorktreeId) -> Option<RepositoryDescriptor> {
-    catalog()
-        .read()
-        .expect("catalog lock")
-        .descriptor_of(worktree, expose_paths())
+    catalog().read().expect("catalog lock").descriptor_of(
+        worktree,
+        expose_paths(),
+        crate::sandbox::probe::boot_verdict(),
+    )
 }
 
 /// The repository the server is currently serving *by default* — the selection a
@@ -263,6 +270,22 @@ pub(crate) fn current() -> (PathBuf, bool) {
     (g.path.clone(), g.mode == RepoMode::Visualize)
 }
 
+/// The current selection's path, or `None` when nothing has been selected yet.
+///
+/// The non-panicking sibling of [`current`]. [`current`] is right for the
+/// request handlers — by the time a request is served, `main` has long since
+/// called [`set_current`], and a panic there would mean a broken invariant, not
+/// a case to handle. This one exists for a caller that must produce an answer
+/// even before startup has run: the session handler's INV-15 disclosure
+/// (#202), which is reachable from `#[cfg(test)]` router tests that never touch
+/// the process-wide selection, and whose honest answer in that case is "no
+/// policy is known" rather than a panic or a fabricated value.
+pub(crate) fn current_path_if_set() -> Option<PathBuf> {
+    CURRENT
+        .get()
+        .map(|lock| lock.read().expect("CURRENT lock not poisoned").path.clone())
+}
+
 /// The mode the current selection is open in (ADR 0006/0007).
 pub(crate) fn current_mode() -> RepoMode {
     CURRENT
@@ -282,6 +305,129 @@ pub(crate) fn current_handle() -> Option<RepositoryHandle> {
         .read()
         .expect("CURRENT lock not poisoned")
         .handle
+}
+
+/// D2 (#66, Task 7): whether `path` should get the sandbox's write grant
+/// withheld — the signal `sandbox::policy_for` uses.
+///
+/// **Decision 2026-07-30 (design-docs/2026-07-30-read-only-vs-mode-conflict.md,
+/// Option A):** this must agree with [`reject_if_read_only`], not diverge from
+/// it. An earlier version of this function answered from the catalog's
+/// static, registration-time `read_only` flag instead — reasoned as "defense
+/// in depth" against a hypothetical bug in the app-level gate, but it silently
+/// reintroduced exactly the always-read-only-clone posture ADR 0007 already
+/// considered and rejected: *"a clone opened in active mode accepts local
+/// writes... `RepoEntry.read_only` is superseded."* The visible bug that
+/// exposed the divergence: reselecting a clone into Active mode passed
+/// `reject_if_read_only` (mode says Active) and then failed writes two layers
+/// down with a raw sandbox permission error, because this function still said
+/// read-only. Mode is the single source of truth; there must be only one.
+///
+/// For `path` equal to the current selection **at the moment this is called**,
+/// this is exactly `current_mode() == Visualize` — the same value [`current`]'s
+/// compat bool already returns. For any other path (including when `CURRENT`
+/// has not been initialized at all — most of this crate's ~40 spawn-focused
+/// unit tests deliberately run git against their own throwaway `tempdir()`
+/// with no `set_current`/catalog registration whatsoever, by design; see
+/// `sandbox::policy_for`'s doc comment), this falls back to the catalog's
+/// record, same as before D2. The grant only matters for writes, and reads
+/// don't care whether they get an `rw_trees` or `ro_trees` grant.
+///
+/// **Known residual gap, not closed by this function alone (adversarial
+/// review, 2026-07-30):** this reads `CURRENT` fresh at call time, not at the
+/// moment a write request's target was resolved. Between
+/// `state::resolve_target()` capturing "repo B, Active" for an in-flight
+/// mutation and that mutation's eventual `git_cmd::sandboxed` spawn — real
+/// `.await` points sit in between (durable persistence, task admission) — a
+/// *different* request can reselect `CURRENT` to repo C. The in-flight write
+/// to B then finds `CURRENT.path != B` here, falls through to the catalog,
+/// and can get spuriously denied by a stale flag even though B was
+/// legitimately Active when the write was authorized. This is **fail-closed
+/// only** (a legitimate write can be wrongly refused; nothing insecure can
+/// succeed) — same-path mode flips, the case this fix targets and the
+/// regression test proves, are unaffected. Closing it properly means
+/// `resolve_target` capturing `read_only` alongside the path and threading
+/// that snapshot through to `sandbox::policy_for` instead of re-deriving it
+/// here at spawn time; not done tonight — named so it isn't silently lost.
+pub(crate) fn read_only_for_path(path: &Path) -> bool {
+    if let Some(lock) = CURRENT.get() {
+        let g = lock.read().expect("CURRENT lock not poisoned");
+        if g.path == path {
+            return g.mode == RepoMode::Visualize;
+        }
+    }
+    catalog()
+        .read()
+        .expect("catalog lock")
+        .read_only_for_path(path)
+        .unwrap_or(false)
+}
+
+/// D2 (#66, Task 7): the single validated resolution every write handler and
+/// the planner's execution entry point use in place of a raw
+/// `current()`/`current_handle()` call.
+///
+/// Mutation endpoints take no `?repo=` selector — they always act on the
+/// current default selection (unlike the read endpoints' `resolve_repo`,
+/// which additionally accepts an explicit id) — so this resolves exactly
+/// that selection, but does two things a bare `current()` never did:
+///
+/// 1. **Fails closed on degraded mode.** A selection with no catalog entry
+///    (the path never classified as a git repository) refuses here rather
+///    than handing back a raw, unvalidated path a mutating git argv would
+///    then be built against. This is a deliberate asymmetry with the read
+///    side: `resolve_repo`'s doc comment records that a degraded selection's
+///    *reads* run and surface git's own "not a repository" error, and that
+///    established, lenient read-side posture is untouched by this function —
+///    a mutation simply has no legitimate reason to run against a directory
+///    that was never a repository in the first place.
+/// 2. **Re-validates the selection's `.git` geometry** via
+///    `sandbox::repo_paths::resolve`, composed with the catalog's own
+///    multi-root `path_is_allowed` exactly the way `sandbox::policy_for`'s
+///    doc comment describes doing at the *request-resolution* layer rather
+///    than inside policy construction itself (see that doc comment for why).
+///    A hostile `.git` gitfile written since the selection was last read is
+///    refused here, before any mutating argv is built — not merely when the
+///    eventual git spawn's own policy gets around to it.
+///
+/// Returns the entry's own canonical path (not whatever spelling the
+/// in-memory selection happened to hold) alongside the full [`RepoEntry`], so
+/// a caller that needs `read_only`/`kind`/the handle has it without a second
+/// lookup.
+pub(crate) fn resolve_target() -> Result<(PathBuf, RepoEntry), (StatusCode, String)> {
+    let handle = current_handle().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "The current selection isn't a recognised repository.".to_string(),
+        )
+    })?;
+    let entry = catalog()
+        .read()
+        .expect("catalog lock")
+        .resolve(handle.worktree)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                "The current selection is no longer registered.".to_string(),
+            )
+        })?;
+    let paths = crate::sandbox::repo_paths::resolve(&entry.path).map_err(|e| {
+        eprintln!("git-vista: resolve_target refused a mutation target: {e}");
+        (StatusCode::CONFLICT, e.to_string())
+    })?;
+    if !path_is_allowed(&paths.gitdir) || !path_is_allowed(&paths.commondir) {
+        eprintln!(
+            "git-vista: resolve_target refused {} — its git directory resolves outside \
+             the server's managed root",
+            entry.path.display()
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            "This repository's git directory is outside the server's managed root.".to_string(),
+        ));
+    }
+    Ok((entry.path.clone(), entry))
 }
 
 /// Point the server at a new repository (startup, or after a clone), registering
@@ -399,6 +545,16 @@ pub(crate) fn bootstrap_token_path() -> PathBuf {
     state_dir().join("bootstrap.token")
 }
 
+/// Directory holding the per-repository sandbox trust markers (M1.13b, #66,
+/// Task 7). It lives under the server's own state directory *on purpose*: a
+/// sandboxed repository is granted `$HOME` read-only, so it can *read* this path
+/// but cannot *write* a marker to grant itself trust — which is the property
+/// that keeps the `Unsandboxed` tier reachable only by an explicit operator
+/// action, never by a hostile hook. See `sandbox::trust`.
+pub(crate) fn sandbox_trust_dir() -> PathBuf {
+    state_dir().join("trusted-repos")
+}
+
 /// Where the durable operation journal's SQLite file lives (M1.09, #62).
 /// Process-wide rather than per-repository: the operation registry already
 /// addresses repositories by opaque token, not path, and one file keeps
@@ -501,9 +657,12 @@ mod tests {
 
     /// One test fn drives the CURRENT/CATALOG globals end-to-end — keeping every
     /// global mutation in a single test means parallel test threads never fight
-    /// over the process-wide selection (no other test touches it).
-    #[test]
-    fn selection_flow_carries_mode_and_gates_writes() {
+    /// over the process-wide selection (no other test touches it). `async` (a
+    /// `tokio::test` rather than a plain `#[test]`) so the D2 section at the
+    /// end can call the real async handler `crate::handlers::rebase::rebase`
+    /// directly — see that section's own comment for why.
+    #[tokio::test]
+    async fn selection_flow_carries_mode_and_gates_writes() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("project");
         std::fs::create_dir_all(&repo).unwrap();
@@ -548,6 +707,22 @@ mod tests {
         set_current(&clone_dir, RepoMode::Visualize); // registers, like /api/clone
         let clone_wt = current_handle().expect("clone registered").worktree;
 
+        // --- 2026-07-30 (design-docs/2026-07-30-read-only-vs-mode-conflict.md, ---
+        // --- Option A): reselecting a clone into Active mode must actually ------
+        // --- make it writable — ADR 0007, not a stale catalog snapshot. --------
+        assert!(
+            read_only_for_path(&clone_dir),
+            "a clone just registered in Visualize mode reads read-only"
+        );
+        assert!(select_registered(clone_wt, RepoMode::Active));
+        assert!(
+            !read_only_for_path(&clone_dir),
+            "reselecting the SAME clone into Active mode must lift the sandbox's \
+             write grant, not silently keep it read-only underneath a gate that \
+             already says writes are allowed"
+        );
+        assert!(select_registered(clone_wt, RepoMode::Visualize)); // restore for the flow below
+
         // The currently open clone is not deletable (the server would be
         // serving a removed directory).
         assert_eq!(
@@ -564,6 +739,84 @@ mod tests {
         assert_eq!(
             delete_clone(clone_wt, &clones),
             DeleteCloneOutcome::NotFound
+        );
+
+        // --- D2 (#66, Task 7): the real handler refuses an out-of-managed- --
+        // --- root linked worktree, end to end -------------------------------
+        //
+        // Everything above already leaves the selection on `repo` (Active,
+        // writable) — reused rather than building a third throwaway repo.
+        // This section proves the managed-root check at the actual
+        // request-shaped seam (a real handler function), not merely as a
+        // unit test of `sandbox::repo_paths::resolve_and_validate` in
+        // isolation: a REAL linked worktree (built with actual `git worktree
+        // add`, not hand-rolled files) whose main repository sits entirely
+        // outside the managed root satisfies `worktree.rs`'s own containment
+        // rule completely — that module alone would grant it — and is
+        // refused only because `state::resolve_target` additionally checks
+        // containment against the catalog's allowed roots.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let main = elsewhere.path().join("main-repo");
+        std::fs::create_dir_all(&main).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@example.invalid"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "-q", "--allow-empty", "-m", "seed"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&main)
+                .status()
+                .unwrap()
+                .success());
+        }
+        // `linked` lands under the same `root` this test's other fixtures use
+        // (no root needs pre-allowing here: `set_current` below allows the
+        // linked worktree's own canonical directory the same way it already
+        // did for `repo` and `clone_dir` above — that is what makes the
+        // scenario realistic). `main` sits in a wholly separate `elsewhere`
+        // tempdir that nothing in this test ever allows.
+        let linked = root.path().join("linked-worktree");
+        assert!(std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ])
+            .current_dir(&main)
+            .status()
+            .unwrap()
+            .success());
+
+        set_current(&linked, RepoMode::Active);
+        assert_eq!(
+            current_mode(),
+            RepoMode::Active,
+            "fixture invariant: the write gate must be open, so only the D2 \
+             managed-root check can be what refuses this"
+        );
+        // Sanity: `worktree.rs`'s own rule alone sees nothing wrong here —
+        // proving the managed-root check is what does the refusing below,
+        // not a rule that already existed before D2.
+        assert!(crate::sandbox::worktree::linked_worktree_dirs(&linked)
+            .expect("the geometry is a real, valid linked worktree")
+            .is_some());
+
+        // The real production handler — `POST /api/rebase`'s actual body.
+        let (status, msg) = crate::handlers::rebase::rebase().await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a mutation against a repo whose linked-worktree main lives \
+             outside the managed root must be refused, not executed: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("managed root"),
+            "the refusal should name why: {msg}"
         );
     }
 

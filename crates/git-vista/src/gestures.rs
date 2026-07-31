@@ -14,9 +14,10 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::camera::{Camera, ZOOM_STEP};
+use crate::features::a11y::focus::{FocusMove, GraphFocus};
 use crate::features::graph::core::GraphCore;
 use crate::features::shell::signals::Shell;
-use crate::geometry::drag_threshold;
+use crate::geometry::{drag_threshold, node_cy};
 
 /// Current browser window inner height in CSS px, or a sane default when it can't
 /// be read. The window is always at least as tall as the SVG (the topbar sits
@@ -226,6 +227,130 @@ pub fn on_wheel(camera: RwSignal<Camera>, ev: web_sys::WheelEvent) {
     };
     let (sx, sy) = (ev.offset_x() as f64, ev.offset_y() as f64);
     camera.update(|c| *c = c.zoomed_at(factor, sx, sy));
+}
+
+/// Screen-px clearance kept between a keyboard-focused row and the viewport
+/// edge (M1.13, #65 keyboard-access gap). Loosely modelled on the overscan
+/// rows (`OVERSCAN_ROWS` in `canvas.rs`) rather than tied to them exactly: this
+/// only needs to be "comfortably more than zero" so the freshly-panned-to row
+/// is not sitting flush against the edge, not to match the virtualizer's own
+/// margin.
+const ROW_FOCUS_MARGIN_PX: f64 = 60.0;
+
+/// Roving-tabindex keyboard handling for one commit row's hit circle (M1.13,
+/// #65 keyboard-access gap) — see `features::a11y::focus` for the state
+/// machine this drives and why it is shaped the way it is.
+///
+/// Called from `render::nodes::build_node`'s own `on:keydown`, i.e. once per
+/// row's `<circle class="node-hit">`, not once for the whole graph. That is
+/// deliberate, not an oversight: a keydown can only reach this handler by
+/// firing on an element that currently holds real DOM focus, and the only
+/// focusable elements inside the canvas are the `.node-hit` circles — so
+/// whichever row's closure receives the event *is* the focused row, with no
+/// need to ask `GraphFocus` which row that was. `activate` is that row's own
+/// "open my context menu at (x, y)" closure, already holding that row's
+/// commit data — reusing it here (rather than re-deriving `MenuData` from a
+/// row index in a second place) is what keeps the pointer and keyboard paths
+/// agreeing about what "activating" a commit means by construction.
+///
+/// **What this cannot prove by itself.** That `tabindex="-1"` circles are
+/// reliably focusable via `.focus()` on iPad Safari, that a `keydown` fired on
+/// an SVG `<circle>` actually reaches this closure the way it does on an HTML
+/// button, and that the `:focus-visible` ring painted by `styles.css` is
+/// legible once it lands here. All three need a real device — see the task
+/// report's `unverified` list.
+pub fn on_node_keydown(
+    focus: RwSignal<GraphFocus>,
+    camera: RwSignal<Camera>,
+    vp_h: RwSignal<f64>,
+    ev: web_sys::KeyboardEvent,
+    activate: &impl Fn(f64, f64),
+) {
+    let dir = match ev.key().as_str() {
+        "ArrowDown" => Some(FocusMove::Next),
+        "ArrowUp" => Some(FocusMove::Prev),
+        "Home" => Some(FocusMove::First),
+        "End" => Some(FocusMove::Last),
+        _ => None,
+    };
+    if let Some(dir) = dir {
+        // Don't let the arrow keys additionally scroll the page (there is no
+        // scrollable ancestor here, but Home/End on some browsers act on the
+        // document by default regardless).
+        ev.prevent_default();
+        let Some(next) = focus.try_update(|f| f.mv(dir)).flatten() else {
+            // An empty graph: nothing to move to, nothing to focus.
+            return;
+        };
+        // Bring the destination row on screen *before* the next frame's DOM
+        // query below — the row list is virtualized
+        // (`viewport::visible_row_range`), so a `Home`/`End` jump (or several
+        // arrow presses in a row) can select a row with no mounted `<circle>`
+        // to call `.focus()` on yet. See `Camera::ensure_row_visible`.
+        let target_y = f64::from(node_cy(next));
+        camera.update(|c| {
+            *c = c.ensure_row_visible(vp_h.get_untracked(), target_y, ROW_FOCUS_MARGIN_PX)
+        });
+        focus_row_next_frame(next);
+        return;
+    }
+
+    match ev.key().as_str() {
+        "Enter" | " " => {
+            ev.prevent_default();
+            // The event's own target — this row's hit circle, since that is
+            // the only thing that can have been focused — supplies the
+            // screen coordinates a tap would have, so the menu opens in the
+            // same place either way.
+            let (x, y) = ev
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                .map(|el| {
+                    let r = el.get_bounding_client_rect();
+                    (r.left() + r.width() / 2.0, r.top() + r.height() / 2.0)
+                })
+                .unwrap_or((0.0, 0.0));
+            activate(x, y);
+        }
+        "Escape" => {
+            focus.update(|f| f.escape());
+            // `GraphFocus::escape` only updates the model; real DOM focus has
+            // to be moved off the element separately, or the ring stays
+            // painted on a row the model no longer considers focused.
+            if let Some(el) = ev
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::SvgElement>().ok())
+            {
+                let _ = el.blur();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Query for row `i`'s hit circle and move DOM focus onto it, one animation
+/// frame from now.
+///
+/// The delay is required, not a nicety: `camera.update(...)` in
+/// [`on_node_keydown`] changes a *signal*, and Leptos applies the DOM update
+/// that mounts a newly-visible row asynchronously relative to the signal
+/// write, not inside it. Calling `.focus()` synchronously would race that
+/// update and, for a jump onto a currently-unmounted row, find nothing to
+/// focus. One `request_animation_frame` — the same deferral
+/// `on_pointer_up` uses to clear `moved` — gives the reactive system a paint
+/// to catch up in first.
+fn focus_row_next_frame(row: usize) {
+    request_animation_frame(move || {
+        let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        let selector = format!(".node-hit[data-row-index=\"{row}\"]");
+        if let Ok(Some(el)) = doc.query_selector(&selector) {
+            if let Ok(el) = el.dyn_into::<web_sys::SvgElement>() {
+                let _ = el.focus();
+            }
+        }
+    });
 }
 
 /// Refresh the viewport height on window resize (rotate the iPad, resize the

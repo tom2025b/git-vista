@@ -26,6 +26,12 @@ mod geometry;
 // `cfg_attr(not(any(target_arch = "wasm32", test)), …)` form once the wiring is done.
 #[allow(dead_code)]
 mod features;
+// INV-15 (#66 M1.13b, #208): the per-repository hook-policy disclosure text.
+// NOT wasm-gated, on purpose — the descriptor-to-wording mapping is pure, and
+// the one decision that matters ("does this repository warn?") must be tested
+// on the host. `picker.rs` renders what this returns.
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+mod hook_policy_disclosure;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod icons;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]

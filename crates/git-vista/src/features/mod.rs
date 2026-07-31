@@ -6,6 +6,7 @@
 
 pub mod core_traits;
 
+pub mod a11y;
 pub mod activity;
 pub mod dialogs;
 pub mod diff;

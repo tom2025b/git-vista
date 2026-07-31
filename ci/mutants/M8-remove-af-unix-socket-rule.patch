@@ -1,0 +1,16 @@
+--- a/crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs
++++ b/crates/git-vista-server/src/bin/gv-sandbox/seccomp_filter.rs
+@@ -228,13 +228,6 @@
+         rules.insert(nr, vec![]);
+     }
+     rules.insert(libc::SYS_prctl, vec![prctl_rule()?]);
+-
+-    // Strict only — see `af_unix_rule` for the measurement that motivates the
+-    // rule and for why the Network tier is deliberately left alone (#188).
+-    if net == NetScope::Denied {
+-        rules.insert(libc::SYS_socket, vec![af_unix_rule()?]);
+-        rules.insert(libc::SYS_socketpair, vec![af_unix_rule()?]);
+-    }
+
+     Ok(rules)
+ }
