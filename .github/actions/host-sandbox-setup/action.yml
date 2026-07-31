@@ -1,0 +1,116 @@
+name: Host sandbox setup
+description: >
+  Shared host provisioning for any job that constructs the sandbox's Strict
+  tier (core, contract, sandbox) or whose tests commit into a repository with
+  no local git identity (#203). These steps used to live inside the `sandbox`
+  job alone; M1.13b (#66) routed every production git spawn through the
+  sandbox chokepoint, so `core` and `contract` began building the Strict tier
+  too and neither had the setup — 111 tests died with "this operation runs in
+  the strict sandbox tier and this host cannot provide it" on CI run
+  30629854802. The fix is one shared action rather than three hand-maintained
+  copies, because the defect being fixed IS drift between jobs that were
+  supposed to share one security-relevant preflight. See PR #207, ADR 0029,
+  and docs/sandbox/escape-battery-anti-vacuity-contract.md. The Rust tripwire
+  `every_ci_job_that_runs_this_crates_tests_provisions_the_host_capabilities_they_need`
+  (crates/git-vista-server/src/sandbox/escape_contract.rs) asserts that the
+  set of jobs running this crate's tests and the set of jobs referencing this
+  action stay equal, and that this file still names each capability below —
+  so hollowing a step out here is a red build, not a silent regression.
+runs:
+  using: composite
+  steps:
+    # Best-effort: gives the strict tier its two host dependencies before any
+    # preflight in the calling job measures what is actually available.
+    # `bubblewrap` is bwrap itself; `build-essential` is the `cc` the escape
+    # battery needs to compile its C probes (and which
+    # ci_preflight_host_meets_the_declared_minimum checks by name).
+    - name: Best-effort host setup (bwrap, a C compiler)
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends bubblewrap build-essential
+
+    # D6 Option A — decided by Tom 2026-07-29, re-confirmed 2026-07-30.
+    # Rationale in design-docs/2026-07-29-d6-sandbox-ci-preflight-decision.md
+    # and plan Global Constraint 11.
+    #
+    # GitHub's ubuntu-latest ships kernel.apparmor_restrict_unprivileged_userns=1.
+    # Under that clamp `bwrap` cannot create its namespaces, so the Strict tier
+    # cannot be constructed at all — and because a case that cannot demonstrate
+    # its own premise is now a HARD FAILURE rather than a skip, the escape
+    # battery would go red without ever testing a single invariant. Either way
+    # the 17 invariants this milestone exists to prove would never gate a merge.
+    #
+    # So the clamp is lifted here, deliberately and visibly, and the step FAILS
+    # LOUDLY if the write does not take — it never falls through to a degraded
+    # run. That distinction is the whole point: a silent workaround would be
+    # indistinguishable from a sandbox that works.
+    #
+    # Safe here specifically because GitHub-hosted runners are single-job,
+    # ephemeral VMs, destroyed after the run and never reused — there is no
+    # "left the box weaker" concern that would apply on a persistent host. Do
+    # NOT copy this step to a self-hosted or reused runner without revisiting
+    # that reasoning.
+    - name: Preflight — unclamp unprivileged user namespaces (D6 Option A)
+      shell: bash
+      run: |
+        set -euo pipefail
+        before="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 'absent')"
+        echo "apparmor_restrict_unprivileged_userns before: $before"
+        if [ "$before" = "absent" ]; then
+          echo "sysctl not present on this kernel — nothing to unclamp; the capability preflight in the calling job is the real check."
+          exit 0
+        fi
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        after="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+        echo "apparmor_restrict_unprivileged_userns after: $after"
+        if [ "$after" != "0" ]; then
+          echo "::error::Failed to unclamp unprivileged user namespaces (still '$after'). Refusing to continue: without this the Strict tier cannot be built, so the escape battery would report capability-absent and prove nothing. Failing loudly is the decided posture (D6 Option A) — do not add a fallback that lets the job pass having tested nothing."
+          exit 1
+        fi
+
+    # #203: crates/git-vista-server/src/sandbox/escape_contract.rs::fixture()
+    # (and the sibling fixtures in sandbox/spawn.rs and sandbox/shim_cli.rs)
+    # deliberately build their seed repository with `.env_clear()` and NO
+    # repo-local git identity — the doc comment says why: so a hook that needs
+    # an author must reach `~/.gitconfig` through the policy under test. That
+    # is the read-only $HOME grant being exercised, and it is exactly what
+    # `commit_without_repo_identity` in sandbox/compat.rs proves.
+    #
+    # On a developer's box ~/.gitconfig already carries an identity; a fresh
+    # Actions runner's /home/runner does not, so the seed commit died with
+    # "fatal: empty ident name … Please tell me who you are" before any
+    # sandbox invariant ran. The fix therefore belongs HERE, at the
+    # CI-environment layer — NOT in fixture(), where hard-coding an identity
+    # would defeat R7's pinned-environment-profile intent and destroy what
+    # commit_without_repo_identity proves.
+    #
+    # Both keys are set on purpose: git needs a resolvable user.name as well
+    # as a user.email, and a minimal runner has no useful passwd/GECOS
+    # fallback, so email alone does not clear "empty ident name". The address
+    # uses the RFC 2606 reserved `.invalid` TLD and the same `example.invalid`
+    # domain the repo's own fixtures use (`t@example.invalid`), so it can
+    # never route anywhere and never reads as a leaked real credential to the
+    # gitleaks job. Nothing in the suite asserts the literal value — compat.rs
+    # only checks non-emptiness and equality across its two legs, and
+    # shim_cli.rs only checks the address contains an '@' — so the choice is
+    # house style, not a contract. Writing it also creates ~/.gitconfig as a
+    # real file, which is what the escape battery's secret-read paired
+    # positive needs to observe Errno(0) rather than ENOENT.
+    #
+    # `git config --global` always writes $HOME/.gitconfig (the XDG path is a
+    # read-only fallback), and nothing in ci.yml overrides HOME, so this is
+    # the same file the fixtures pass through to their git subprocesses.
+    - name: Provision a global git identity for the runner (#203)
+      shell: bash
+      run: |
+        set -euo pipefail
+        git config --global user.name "git-vista-ci"
+        git config --global user.email "git-vista-ci@example.invalid"
+        name="$(git config --global user.name || true)"
+        email="$(git config --global user.email || true)"
+        echo "global git identity: $name <$email>"
+        if [ "$email" != "git-vista-ci@example.invalid" ] || [ -z "$name" ]; then
+          echo "::error::the global git identity did not read back what was just set (name '$name', email '$email'). Refusing to continue: without it, the tests that deliberately omit a repo-local identity (#203) have no ~/.gitconfig to resolve through, the seed commit fails with 'empty ident name', and the sandbox's read-only \$HOME grant goes untested."
+          exit 1
+        fi
