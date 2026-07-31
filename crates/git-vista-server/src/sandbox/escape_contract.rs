@@ -1345,8 +1345,9 @@ fn matching_brace(code: &str, open: usize) -> usize {
 ///
 /// # Why this is not `find("Policy {")` any more
 ///
-/// It was, and the shortcut had two defects — one that made the tripwire fire on
-/// innocent code, one that made it fail to fire on guilty code.
+/// It was, and the shortcut had two defects — one that fires on innocent code
+/// (and has already made production code contort to avoid it), one that would
+/// have let guilty code through.
 ///
 ///  * **It matched any identifier *ending* in `Policy`.** `-> HookPolicy {` is
 ///    `Policy {` as far as `str::find` is concerned; the scan then demanded a
@@ -1361,9 +1362,9 @@ fn matching_brace(code: &str, open: usize) -> usize {
 ///  * **It searched the rest of the *file* for `hook_mode:`, not the literal.**
 ///    A construction that omitted the field — `Policy { tier, ..base }`, whose
 ///    hook mode comes from wherever `base` came from — would have silently
-///    borrowed the *next* literal's `hook_mode: HookMode::Run` and passed. That
-///    is R8 passing on a technicality, the failure mode this milestone has
-///    already caught it in once. Bodies are brace-matched here, so every
+///    borrowed the *next* literal's `hook_mode: HookMode::Run` and passed —
+///    green for a reason unrelated to the property, which is the same shape of
+///    failure #206 caught R8 in once already. Bodies are brace-matched here, so every
 ///    construction is judged on its own text and a `..base` literal now reaches
 ///    the caller's "no hook_mode field" arm instead of another literal's answer.
 ///
