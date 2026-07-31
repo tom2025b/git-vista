@@ -1274,6 +1274,81 @@ mod tests {
         unsafe { libc::close(rs) };
     }
 
+    /// The other half of the safety property, and the one that `NotAFile`
+    /// does **not** cover: a carve-out whose named path is a symlink must be
+    /// refused, because the Landlock rule would land on the link's *target*.
+    /// Concretely, this is `~/.ssh/known_hosts -> ~/.ssh/id_rsa` handing out
+    /// read access to the private key while `--exclude ~/.ssh` looks intact.
+    ///
+    /// The paired positive is what makes this non-vacuous: the very same
+    /// target file, named directly, **is** granted in the same ruleset. So a
+    /// refusal here can only be attributable to the path being a symlink — it
+    /// cannot be a file that was unusable for some unrelated reason (wrong
+    /// permissions, a ruleset that refuses everything, a fixture that never
+    /// got written).
+    #[test]
+    fn a_carveout_refuses_a_symlink_but_grants_its_target_named_directly() {
+        let rs = handled_ruleset();
+        let (d, secret) = fixture();
+        let link = d.path().join("known_hosts");
+        std::os::unix::fs::symlink(&secret, &link).expect("symlink fixture");
+
+        let err = add_carveout_rule(rs, &link)
+            .expect_err("a carve-out naming a symlink must be refused");
+        assert!(
+            matches!(err, CarveoutError::Symlinked { .. }),
+            "wrong refusal reason for a symlinked target: {err:?}"
+        );
+        assert!(
+            !err.is_absent(),
+            "a symlink that resolves must never be reported as merely absent — that outcome \
+             is *tolerated*, so mis-classifying it would turn this refusal into a silent \
+             carry-on: {err}"
+        );
+
+        // Paired positive, same ruleset, same file, same run: named directly
+        // it grants. Without this leg the refusal above proves nothing about
+        // symlinks specifically.
+        assert_eq!(
+            add_carveout_rule(rs, &secret)
+                .expect("the symlink's target, named directly, must still be grantable"),
+            A_EXECUTE | A_READ_FILE,
+            "the paired positive must be an ordinary read-only file grant; if this ever fails, \
+             the refusal above stops being attributable to the symlink"
+        );
+        unsafe { libc::close(rs) };
+    }
+
+    /// A *dangling* symlink must refuse as `Symlinked`, not tolerate as
+    /// `Absent`. The two are one `is_absent()` apart and the consequences
+    /// diverge completely: `Absent` waves the launch through, so classifying a
+    /// broken redirection as "this host simply has no known_hosts yet" would
+    /// let an attacker-placed link become live later with no second check.
+    /// This test exists because `canonicalize` reports exactly `NotFound` for
+    /// a dangling link — i.e. the naive ordering (canonicalise, then look) is
+    /// indistinguishable from the genuinely-absent case.
+    #[test]
+    fn a_carveout_refuses_a_dangling_symlink_rather_than_tolerating_it() {
+        let rs = handled_ruleset();
+        let (d, _file) = fixture();
+        let link = d.path().join("known_hosts");
+        std::os::unix::fs::symlink(d.path().join("no-such-target"), &link)
+            .expect("dangling symlink fixture");
+
+        let err = add_carveout_rule(rs, &link)
+            .expect_err("a carve-out naming a dangling symlink must be refused");
+        assert!(
+            matches!(err, CarveoutError::Symlinked { .. }),
+            "a dangling symlink must refuse as Symlinked, not as some other shape: {err:?}"
+        );
+        assert!(
+            !err.is_absent(),
+            "a dangling symlink must not be tolerated as an absent path — that is the exact \
+             mis-classification this test exists to catch: {err}"
+        );
+        unsafe { libc::close(rs) };
+    }
+
     /// The one tolerated outcome, matching `--ro`/`--rw`'s existing posture
     /// for a path that legitimately varies by host: a fresh `$HOME` with no
     /// SSH connections yet has no `known_hosts`, and that must not refuse the
