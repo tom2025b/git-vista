@@ -602,7 +602,9 @@ fn record_boot_verdict(verdict: &ProbeVerdict) {
 /// only [`ProbeVerdict::Contained`] would leave [`boot_verdict`] answering
 /// `None` — "the probe has not run" — for a host where it ran and found a hole.
 fn record_verdict_into(cell: &OnceLock<ProbeVerdict>, verdict: &ProbeVerdict) {
-    let _ = cell.set(verdict.clone());
+    if matches!(verdict, ProbeVerdict::Contained) {
+        let _ = cell.set(verdict.clone()); // MUTATION-C
+    }
 }
 
 /// The INV-13/Global Constraint 15 mapping: [`ProbeVerdict::Contained`] is
