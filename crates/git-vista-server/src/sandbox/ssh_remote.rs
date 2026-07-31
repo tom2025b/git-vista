@@ -441,16 +441,41 @@ async fn ls_remote_fails_without_the_known_hosts_carveout() {
     );
 }
 
-/// Negative control 2/2: keep the known_hosts carve-out, drop the agent
-/// socket grant. Must fail — proves the socket grant is load-bearing too.
+/// Not a negative control, deliberately — see why below. Same shape as
+/// `ls_remote_fails_without_the_known_hosts_carveout`, but the **opposite**
+/// expectation, and the difference between the two is the actual finding.
+///
+/// #188's agent-socket `rw` grant is not what gates connectivity on *this*
+/// kernel — measured directly (`ssh_agent_socket_grant`'s doc comment in
+/// `mod.rs`): a raw Landlock probe against a real `AF_UNIX` `SOCK_STREAM`
+/// listener, under a live ruleset proven live by a same-run control read
+/// that correctly returned `EACCES`, showed `connect()` to a **pathname**
+/// socket succeeding identically whether the socket carried no rule at all,
+/// a read-only rule, or a read-write one. This test is that same
+/// measurement one layer up, through the real launcher instead of a raw
+/// probe: dropping the socket grant from an otherwise-identical policy must
+/// **not** break `ls-remote`, because nothing in this stack is actually
+/// enforcing it today — the seccomp `AF_UNIX` denial that genuinely does
+/// gate the socket is Strict-tier-only, and Strict has no network access at
+/// all, so it cannot be exercised in this same end-to-end shape.
+///
+/// What this guards is the measurement itself, not a security property: if
+/// a future Landlock ABI starts mediating pathname `AF_UNIX` sockets, this
+/// assertion flips from pass to fail — the signal that the socket grant has
+/// become load-bearing and this comment (and `ssh_agent_socket_grant`'s)
+/// needs updating, not silencing.
 #[tokio::test]
-async fn ls_remote_fails_without_the_agent_socket_grant() {
+async fn ls_remote_still_succeeds_without_the_agent_socket_grant_on_this_kernel() {
     let fixture = SshFixture::build();
     let policy = fixture.policy(true, false);
     let out = ls_remote(&fixture, &policy).await;
     assert!(
-        !out.status.success(),
-        "ls-remote succeeded with no agent-socket grant — this control is supposed to \
-         fail, or it proves nothing about that grant being necessary"
+        out.status.success(),
+        "ls-remote failed with the agent-socket grant withheld: stdout={} stderr={}. If \
+         this is a genuine regression rather than a kernel/Landlock behaviour change, \
+         #188's SSH_AUTH_SOCK rw grant has become load-bearing and this test's premise \
+         (and ssh_agent_socket_grant's doc comment) needs revisiting, not silencing.",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }

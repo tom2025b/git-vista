@@ -24,11 +24,19 @@ runs:
     # `bubblewrap` is bwrap itself; `build-essential` is the `cc` the escape
     # battery needs to compile its C probes (and which
     # ci_preflight_host_meets_the_declared_minimum checks by name).
-    - name: Best-effort host setup (bwrap, a C compiler)
+    # `openssh-server` is #188's addition: `sandbox::ssh_remote`'s fixture
+    # spawns a real, throwaway, loopback `sshd` to drive `git ls-remote` over
+    # a genuine `ssh://` transport through the composed launcher.
+    # `ubuntu-latest` ships `ssh`/`ssh-keygen`/`ssh-agent` (openssh-client, a
+    # base-image dependency for git itself) but not `sshd` — that is a
+    # separate package, and without it every `sandbox::ssh_remote` test fails
+    # at `spawn ssh-agent`/`sshd` with a bare "No such file or directory"
+    # that has nothing to do with the sandbox.
+    - name: Best-effort host setup (bwrap, a C compiler, sshd)
       shell: bash
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends bubblewrap build-essential
+        sudo apt-get install -y --no-install-recommends bubblewrap build-essential openssh-server
 
     # D6 Option A — decided by Tom 2026-07-29, re-confirmed 2026-07-30.
     # Rationale in design-docs/2026-07-29-d6-sandbox-ci-preflight-decision.md
