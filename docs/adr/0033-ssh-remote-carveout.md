@@ -76,10 +76,10 @@ So a new field, `Policy::ro_carveouts: Vec<PathBuf>` (`mod.rs:523-551`),
 carries named, single-file exceptions that bypass `is_or_inside_exclude` and
 `is_ancestor_of_exclude` entirely — not by special-casing them inside
 `grant_tree`, but by never calling it. The shim's `add_carveout_rule`
-(`bin/gv-sandbox/main.rs:593-611`) resolves the path, confirms via
-`std::fs::metadata` that it is a regular file (refusing — `die()`, never a
-silent no-op — if it is anything else, a directory above all), and calls
-`add_path_rule` directly. `grant_carveout` (`main.rs:612-622`) is the
+(`bin/gv-sandbox/main.rs`) refuses — `die()`, never a silent no-op — unless
+the named path passes **both** checks in §1a: its final component is not a
+symlink, and it resolves to a regular file rather than a directory. Only then
+does it call `add_path_rule` directly. `grant_carveout` (`main.rs`) is the
 `die()`-wrapping caller, mirroring `grant_one`'s existing shape exactly: an
 absent path is tolerated (a fresh `$HOME` with no SSH connections yet has no
 `known_hosts`), any other failure refuses the launch rather than silently
@@ -87,16 +87,90 @@ granting nothing.
 
 ```mermaid
 flowchart TD
-  Ro["--ro <path>"] --> GT["grant_tree"]
+  Ro["--ro path"] --> GT["grant_tree"]
   GT --> Check{"is_or_inside_exclude?"}
   Check -->|"yes"| Zero["0 granted, no error —<br/>the silent no-op"]
   Check -->|"no"| Grant1["grant_one"]
 
-  Carveout["--ro-carveout <path>"] --> ACR["add_carveout_rule"]
-  ACR --> IsFile{"metadata: regular file?"}
-  IsFile -->|"no (e.g. a directory)"| Die["die() — refuse the launch"]
+  Carveout["--ro-carveout path"] --> ACR["add_carveout_rule"]
+  ACR --> IsLink{"symlink_metadata:<br/>is the NAME a symlink?"}
+  IsLink -->|"yes"| Die1["die() — Symlinked"]
+  IsLink -->|"no"| IsFile{"metadata: regular file?"}
+  IsFile -->|"no, e.g. a directory"| Die2["die() — NotAFile"]
   IsFile -->|"yes"| Grant2["grant_one — NO exclude check at all"]
 ```
+
+#### 1a. Two refusals, not one — the symlink guard
+
+`NotAFile` alone is **not** a sufficient safety property, and the first
+version of this ADR said it was. That version canonicalised the path first
+and then asked only "is the result a regular file?", which rules out
+*widening to a directory* but says nothing about *redirection to a different
+file*. A Landlock `path_beneath` rule is anchored to the filesystem object
+reached through the `O_PATH` descriptor `add_path_rule` opens — not to the
+path string used to open it. So a `~/.ssh/known_hosts` that is a symlink to
+`~/.ssh/id_rsa` passed every check and granted read access to **the private
+key**, by its real path, while `--exclude ~/.ssh` still looked intact.
+
+```mermaid
+sequenceDiagram
+  participant P as Policy (server)
+  participant S as gv-sandbox shim
+  participant K as kernel
+  participant G as git (sandboxed)
+  P->>S: --ro-carveout ~/.ssh/known_hosts
+  Note over S: BEFORE the fix: canonicalize() first
+  S->>K: canonicalize -> ~/.ssh/id_rsa
+  S->>K: metadata -> regular file, OK
+  S->>K: add_path_rule on the RESOLVED dentry
+  K-->>S: rule accepted
+  G->>K: open ~/.ssh/id_rsa
+  K-->>G: allowed — the exclude is defeated
+```
+
+The fix is one check, placed **before** `canonicalize`, because canonicalising
+first destroys the evidence: `real` is then the target and looks like a
+perfectly ordinary regular file. `add_carveout_rule` now calls
+`symlink_metadata` on the named path and refuses with a distinct
+`CarveoutError::Symlinked` if the final component is a link.
+
+Two things about the shape of that rule are deliberate:
+
+- **It is stricter than containment.** `enumerate()` already guards the
+  ordinary `--ro`/`--rw` tree walk with `real.starts_with(root)`, but that
+  check cannot be reused here: the dangerous target (`~/.ssh/id_rsa`) sits in
+  the *same directory* as the legitimate one, so containment would pass it.
+  The carve-out's rule is that the named path must **be** the file, never
+  point at one.
+- **A dangling symlink refuses too**, rather than falling through to the
+  tolerated `Absent` outcome. `canonicalize` reports exactly `NotFound` for a
+  broken link, making the naive ordering indistinguishable from a host that
+  genuinely has no `known_hosts` yet — and `Absent` waves the launch through.
+  "The redirection is currently broken" is not the same fact as "this host
+  has never connected over SSH", and only the second is safe to ignore.
+
+Nothing inside any tier can create such a symlink — `.ssh` is excluded from
+every policy — so the precondition is a link established outside the sandbox:
+a dotfile manager that symlinks `~/.ssh/known_hosts` into a managed
+repository, or an earlier compromise. The first is common enough that the
+refusal is a real behaviour change: a `stow`/`chezmoi` user with a symlinked
+`known_hosts` will now see the SSH clone refuse to launch, with a message
+naming the link. That is the intended trade — a loud refusal is recoverable,
+a silent key grant is not.
+
+Closure is measured, not argued: deleting the `symlink_metadata` check makes
+exactly two tests fail (`a_carveout_refuses_a_symlink_but_grants_its_target_named_directly`
+and `a_carveout_refuses_a_dangling_symlink_rather_than_tolerating_it`) and no
+others — the same narrow-kill shape M11 has for the carve-out itself. The
+first of those carries its paired positive in-test: the very same target
+file, named directly, is still granted in the same ruleset, so the refusal is
+attributable to the symlink and not to an unusable fixture.
+
+There is deliberately **no escape-battery case** for this. The battery
+observes a sandboxed process's syscall outcomes, and `grant_carveout` refuses
+the *launch* on a non-absent error — there is no process to observe. The
+harness cannot express "the sandbox correctly declined to start", so a case
+here would have to assert something weaker than the unit test already does.
 
 A new argv flag, `--ro-carveout`, deliberately distinct from `--ro`
 (`mod.rs`'s `shim_argv`, emitted after the `--exclude` loop so the argv reads
@@ -334,7 +408,7 @@ alone proves the full claim; both together do.
 
 ## Consequences
 
-- **`SECURITY_MODEL.md:411`'s "secret_excludes … outranks grants" is no
+- **`SECURITY_MODEL.md`'s "secret_excludes … outranks grants" is no
   longer exceptionless.** Annotated in place with the one, narrow, tier-gated
   exception this ADR records, rather than left to read as an absolute a
   future reader could be surprised by.
@@ -346,6 +420,19 @@ alone proves the full claim; both together do.
   either — each addition should carry the same "measured, narrow, reviewed"
   bar this one did, not be treated as a general escape hatch now that the
   plumbing exists.
+- **A carve-out is a *name*, not a path to a file.** §1a's symlink refusal is
+  the price of the mechanism being safe at all, and it binds every future
+  caller: a carve-out target that a dotfile manager symlinks will refuse the
+  launch. Anyone adding a second `ro_carveouts` entry inherits that constraint
+  and should say so in the same breath, because the failure it produces
+  (a refused clone naming the link) looks like a bug until you know it is a
+  deliberate guard.
+- **Reviewing "resolve, then check" is now a house pattern with a known
+  trap.** This bug and `enumerate()`'s `real.starts_with(root)` guard are the
+  same class: canonicalising before validating discards the fact you needed
+  to validate. Any future code that calls `canonicalize` on an
+  operator-supplied path and then grants something based on the result should
+  be read with that question first.
 - **The agent-socket grant is currently inert at the Landlock layer, and
   that is now a tracked, tested fact, not a silent assumption.** A future
   kernel or Landlock ABI upgrade that starts mediating pathname `AF_UNIX`
