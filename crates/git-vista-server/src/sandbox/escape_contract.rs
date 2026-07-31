@@ -1036,10 +1036,18 @@ pub(crate) fn run_case(case: &EscapeCase) -> Outcome {
     match &outcome {
         Outcome::Escaped { detail } => panic!("{}: ESCAPED — {detail}", case.id),
         Outcome::CapabilityAbsent { missing, .. } => panic!(
-            "{}: proved NOTHING — {missing}.\nThe CI preflight already asserts this host \
-             supplies every capability the battery needs, so this is a harness defect, not \
-             a host limitation. Fix the harness; do not silence this. (See run_case's doc \
-             comment for why this is a hard failure rather than a skip.)",
+            "{}: proved NOTHING — {missing}.\nCheck `ci_preflight_host_meets_the_declared \
+             _minimum` first: if it PASSED in this same run, the host supplied every \
+             prerequisite the preflight knows to demand (Landlock ABI, bwrap, userns, \
+             io_uring, cc, and the $HOME paths the fixtures read), and this is a harness \
+             defect. If the preflight FAILED, read its message instead — this case is \
+             downstream of an unprovisioned runner and fixing the harness would be fixing \
+             the wrong thing.\nThat distinction is the whole point, and it has been got \
+             wrong once: on run 30633319726 this message claimed the preflight already \
+             covered everything while the runner simply had no ~/.ssh/known_hosts. If the \
+             cause turns out to be a prerequisite the preflight does not yet name, add it \
+             THERE — do not silence this. (See run_case's doc comment for why this is a \
+             hard failure rather than a skip.)",
             case.id
         ),
         Outcome::Contained => {}
@@ -2173,6 +2181,64 @@ fn ci_preflight_host_meets_the_declared_minimum() {
     if !cc_ok {
         missing.push("cc not runnable".to_string());
     }
+
+    // The $HOME prerequisites, which are host provisioning exactly as much as
+    // bwrap is — and which this preflight did not check until they bit.
+    //
+    // Why this is here rather than left to the cases: on CI run 30633319726 this
+    // preflight PASSED and `secret_read_denied` then died with "proved NOTHING —
+    // baseline SECRET wanted errno 0 got 2", whose own text tells the reader
+    // "the CI preflight already asserts this host supplies every capability the
+    // battery needs, so this is a harness defect, not a host limitation." That
+    // sentence was false, and it pointed the next debugger at the harness when
+    // the real answer was an unprovisioned runner path (a fresh /home/runner has
+    // no ~/.ssh at all). Naming a missing FILE here, before any case runs, is
+    // the same distinction D6 draws for capabilities: "this runner was not set
+    // up" must never arrive disguised as "the sandbox failed to contain
+    // something".
+    //
+    // `fixture()` passes $HOME through to its git subprocesses deliberately, so
+    // the identity must resolve from ~/.gitconfig (#203); `secret_read_probe`
+    // opens ~/.ssh/known_hosts as its SECRET and ~/.gitconfig as its GRANTED
+    // path, and declares `expect_baseline: Errno(0)` for both — a path that does
+    // not exist returns ENOENT and the case can prove nothing either way. CI
+    // provisions both in .github/actions/host-sandbox-setup; the tripwire
+    // `every_ci_job_that_runs_this_crates_tests_provisions_the_host_capabilities_they_need`
+    // keeps that action wired into every job that runs these tests.
+    match std::env::var_os("HOME").map(PathBuf::from) {
+        None => missing.push(
+            "HOME is unset, so no $HOME-relative prerequisite can be \
+                              resolved at all"
+                .to_string(),
+        ),
+        Some(home) => {
+            for (rel, why) in [
+                (
+                    ".gitconfig",
+                    "the identity-free fixture repositories resolve their author through it (#203)",
+                ),
+                (
+                    ".ssh/known_hosts",
+                    "secret_read_denied reads it as its SECRET and declares expect_baseline \
+                     Errno(0), so it must exist and be readable with no sandbox applied",
+                ),
+            ] {
+                let path = home.join(rel);
+                // Read a byte rather than stat: the baseline leg's `open` +
+                // `read` is what must succeed, and an existing-but-unreadable or
+                // empty file would satisfy `exists()` while still failing the
+                // case. Probe the property the cases actually depend on.
+                let readable = std::fs::read(&path).map(|b| !b.is_empty()).unwrap_or(false);
+                if !readable {
+                    missing.push(format!(
+                        "{} is missing, empty or unreadable — {why}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
     assert!(
         missing.is_empty(),
         "::error::sandbox CI preflight: host missing {missing:?} — the escape battery \
