@@ -27,14 +27,35 @@
     <circle cx="22" cy="8.5" r="3.2" fill="#3fb950"/>
   </g>
 </svg>
-<!-- Regenerating (no SVG rasteriser is installed on this box; headless Chromium
-     is the render path that actually exists here):
+<!-- Regenerating (no SVG rasteriser is installed on this box — no rsvg-convert,
+     inkscape, ImageMagick or cairosvg; headless Chromium is the render path that
+     actually exists here).
+
+     The SVG markup MUST be inlined into the HTML. Referencing this file as a
+     subresource (`<img src="icon.svg">`) renders a blank WHITE 512x512 square:
+     Chromium screenshots before the file:// subresource has loaded, and exits 0
+     while doing it, so the failure is silent. That was verified, not assumed —
+     the <img> form was run and measured at 99.1% #ffffff. The recipe below was
+     run and its output is byte-for-byte identical to the committed icon-512.png.
 
        cd crates/git-vista/assets
-       printf '<body style="margin:0"><img src="icon.svg" width="512" height="512">' > /tmp/i.html
+       python3 - <<'PY'
+       import re
+       svg = open('icon.svg').read()
+       body = re.search(r'<svg.*?</svg>', svg, re.S).group(0)
+       open('/tmp/icon.html', 'w').write('<body style="margin:0">' + body)
+       PY
        chromium --headless --disable-gpu --hide-scrollbars \
-                --force-device-scale-factor=1 --window-size=512,512 \
-                --screenshot=/tmp/icon-512.png /tmp/i.html
+                --force-device-scale-factor=16 --window-size=32,32 \
+                --screenshot=/tmp/icon-512.png /tmp/icon.html
+       # (viewBox is 32x32, so scale-factor 16 x window 32 = a 512x512 render.)
        # then downscale 512 -> 192 and 180 with PIL/LANCZOS so all three sizes
        # are guaranteed to be the same artwork.
+
+     Always CHECK THE PIXELS after rendering, never the exit code:
+       python3 -c "from PIL import Image; import collections; \
+         im=Image.open('/tmp/icon-512.png').convert('RGB'); \
+         c=collections.Counter(im.getdata()); \
+         print(c.most_common(3))"
+     A correct render is ~87.8% #0d1117 / 7.9% #2f81f7 / 3.7% #3fb950.
 -->
