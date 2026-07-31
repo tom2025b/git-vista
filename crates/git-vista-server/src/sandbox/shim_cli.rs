@@ -200,20 +200,32 @@ async fn secrets_stay_denied_while_the_same_policy_serves_git() {
         String::from_utf8_lossy(&out.stderr)
     );
 
+    // Asserted, not skipped — see the identical note in `sandbox::spawn`'s
+    // `the_production_policy_runs_real_git_and_denies_secrets`. Guarding this
+    // block with `if Path::new(&secret).exists()` silently deleted the whole
+    // secret-denial check on any host lacking the file, which an adversarial
+    // review reproduced under a runner-shaped `$HOME`. A missing premise is a
+    // hard failure here, exactly as it is inside the escape battery.
     let secret = format!("{home}/.ssh/known_hosts");
-    if std::path::Path::new(&secret).exists() {
-        let out = spawn::command_async(&policy, repo.path(), &["config", "-f", &secret, "--list"])
-            .output()
-            .await
-            .expect("git config runs through the production seam");
-        assert!(
-            !out.status.success(),
-            "~/.ssh must not be readable through the sandbox"
-        );
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("Permission denied"),
-            "it must fail with EACCES, not for some unrelated reason: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    assert!(
+        std::path::Path::new(&secret).exists(),
+        "{secret} does not exist, so this test cannot show the sandbox denies it — the read \
+         would fail because the path is absent, not because the policy refused, and the \
+         EACCES assertion below would be checking the wrong thing. Any non-empty \
+         owner-readable file will do; CI writes a placeholder in \
+         .github/actions/host-sandbox-setup."
+    );
+    let out = spawn::command_async(&policy, repo.path(), &["config", "-f", &secret, "--list"])
+        .output()
+        .await
+        .expect("git config runs through the production seam");
+    assert!(
+        !out.status.success(),
+        "~/.ssh must not be readable through the sandbox"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Permission denied"),
+        "it must fail with EACCES, not for some unrelated reason: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
