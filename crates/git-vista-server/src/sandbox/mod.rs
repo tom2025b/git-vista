@@ -276,6 +276,65 @@ pub(crate) fn ssh_known_hosts_carveout(home: &std::path::Path) -> Vec<PathBuf> {
     vec![home.join(".ssh/known_hosts")]
 }
 
+/// #188: the SSH agent socket to grant read-write in the **Network** tier —
+/// the one tier `git push`/`fetch`/`clone`/`ls-remote` can reach a remote
+/// from, and therefore the only tier an SSH agent has any business being
+/// reachable from at all. `None` when `$SSH_AUTH_SOCK` is unset (no agent
+/// running — nothing to grant) or outside the Network tier.
+///
+/// This flows through the ordinary `rw_trees`/`grant_tree` path, not
+/// `ro_carveouts`: `/tmp`, where an agent socket almost always lives, is not
+/// in `DEFAULT_SECRET_EXCLUDES`, so there is no exclude here to bypass — see
+/// `Policy::ro_carveouts` for why that mechanism exists at all and why this
+/// grant does not need it.
+///
+/// # What this grant is, and is not, load-bearing for — measured, not assumed
+///
+/// `$SSH_AUTH_SOCK` already reaches every sandboxed git process's environment
+/// unchanged, in **every** tier, with no code change at all:
+/// `spawn::command_async`'s doc comment states plainly that production never
+/// touches the environment, so a variable set in the server's own process is
+/// inherited verbatim by every child it spawns. What was actually missing was
+/// never the environment value — it was whether the *socket path itself* is
+/// reachable under the sandbox, which is this function's job.
+///
+/// Measured directly (a live Landlock ruleset — `HANDLED_FS` declared,
+/// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL` set,
+/// byte-identical to what `apply_landlock` installs — against a real
+/// `AF_UNIX` `SOCK_STREAM` listener, `connect()` attempted under
+/// `restrict_self`, with a same-run `/etc/hostname` open as a live-ruleset
+/// control): `connect()` to a **pathname** `AF_UNIX` socket succeeds
+/// identically whether the socket carries no Landlock rule at all, a
+/// read-only rule, or a read-write one. This matches `seccomp_filter.rs`'s own
+/// note that "Landlock ABI 8 does not mediate **pathname** sockets at all" —
+/// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` covers only the *abstract* namespace,
+/// which `ssh-agent`'s filesystem socket is not.
+///
+/// So, today, on this kernel, what actually makes the agent socket reachable
+/// in the Network tier is the pre-existing **seccomp** exemption
+/// (`seccomp_filter::af_unix_rule` is Strict-only, landed already anticipating
+/// this issue) plus the automatic env inheritance above — **not** this
+/// Landlock grant. This function still adds one, for three reasons that all
+/// survive that fact: it costs nothing (the kernel accepts the rule
+/// regardless of whether it is presently consulted); it keeps the property
+/// this design otherwise holds everywhere else, that what the sandbox permits
+/// is auditable from the argv alone (D5 Option B) — an agent socket the
+/// process can reach with nothing about it visible in the launcher command
+/// line is exactly the silent-widening shape this design avoids elsewhere;
+/// and it keeps this working unchanged if a future Landlock ABI starts
+/// mediating pathname `AF_UNIX` sockets, rather than depending on kernel
+/// behaviour this project does not control. Strict must never receive this
+/// regardless of any of the above: it denies `AF_UNIX` at the seccomp layer
+/// unconditionally, and a Landlock grant there would only contradict that
+/// denial in the one place — the argv — a reviewer is supposed to be able to
+/// trust.
+fn ssh_agent_socket_grant(tier: Tier) -> Option<PathBuf> {
+    if tier != Tier::Network {
+        return None;
+    }
+    std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from)
+}
+
 /// System trees granted read+execute in every tier.
 pub(crate) const DEFAULT_RO_TREES: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc"];
 
@@ -1013,6 +1072,10 @@ pub(crate) fn policy_for(
         }
     }
     ro.push(home.clone());
+    // #188: Network tier only. See `ssh_agent_socket_grant`'s doc comment for
+    // why this is added despite not being what currently makes the socket
+    // reachable at the Landlock layer.
+    rw.extend(ssh_agent_socket_grant(tier));
     Ok(Policy {
         tier,
         shim,
@@ -1056,6 +1119,15 @@ pub(crate) fn policy_for(
             let mut excludes = secret_excludes_for_home(&home);
             excludes.push(crate::state::sandbox_trust_dir());
             excludes
+        },
+        // #188: the one named exception to the exclude above. Network tier
+        // only — Strict must never see `known_hosts`, and it denies the
+        // agent socket's own `connect()` at the seccomp layer regardless of
+        // any filesystem grant, so there is nothing this tier legitimately
+        // reads under `~/.ssh` at all.
+        ro_carveouts: match tier {
+            Tier::Network => ssh_known_hosts_carveout(&home),
+            Tier::Strict | Tier::Unsandboxed => Vec::new(),
         },
         // Ports are a Network-tier ruleset entry. Strict denies the network
         // outright (`--net-deny`, plus bwrap's `--unshare-net`) and
