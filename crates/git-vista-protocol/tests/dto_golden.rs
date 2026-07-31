@@ -89,23 +89,31 @@ fn golden_set() -> DtoGoldenSet {
             token: "bootstrap-token-deadbeef".to_string(),
         },
         // `csrf` present — the authenticated shape a client actually acts on.
-        // `hook_policy: Restricted` here (a LAN-style session) so both
-        // HookPolicy variants appear somewhere in this fixture set, the
-        // authenticated one carrying the "something to disclose" value.
+        // `hook_policy: Strict` here: the one variant that silences INV-15's
+        // banner, so it is the value most worth pinning on the wire.
+        //
+        // The committed fixture used to spell these `restricted`/`allow`
+        // (ADR 0025's two-variant vocabulary). #202 widened `HookPolicy` to
+        // the server's own `sandbox::Tier` names, which is a **value-domain**
+        // change, not an additive field — hence the regeneration. The old
+        // strings still deserialize via `#[serde(alias)]`, and the fact that
+        // the *deserialize* half of this test kept passing against the older
+        // committed fixture is what proved those aliases work on real stored
+        // data; only the re-serialize half needed updating.
         session_info_authenticated: SessionInfo {
             authenticated: true,
             csrf: Some("csrf-token-abc123".to_string()),
             via_lan: false,
-            hook_policy: HookPolicy::Restricted,
+            hook_policy: HookPolicy::Strict,
         },
         // `csrf` absent — the unauthenticated shape; `via_lan` also exercises
         // its `#[serde(default)]` additive-field posture at `false`.
-        // `hook_policy: Allow` covers the other variant.
+        // `hook_policy: Unsandboxed` covers a banner-flying variant.
         session_info_unauthenticated: SessionInfo {
             authenticated: false,
             csrf: None,
             via_lan: false,
-            hook_policy: HookPolicy::Allow,
+            hook_policy: HookPolicy::Unsandboxed,
         },
         rebase_status: RebaseStatus {
             branch: Some("feature/idea".to_string()),
@@ -113,8 +121,9 @@ fn golden_set() -> DtoGoldenSet {
             base_exists: true,
             up_to_date: false,
         },
-        // `path` and `remote_web_url` both absent — the default capability
-        // report shape, which must never leak the server's filesystem.
+        // `path`, `remote_web_url` and `hook_policy` all absent — the default
+        // capability report shape, which must never leak the server's
+        // filesystem, and the shape a pre-#202 server emitted.
         repository_descriptor_minimal: RepositoryDescriptor {
             repository: "11111111-1111-5111-8111-111111111111".to_string(),
             worktree: "22222222-2222-5222-8222-222222222222".to_string(),
@@ -123,8 +132,9 @@ fn golden_set() -> DtoGoldenSet {
             read_only: false,
             path: None,
             remote_web_url: None,
+            hook_policy: None,
         },
-        // Both optional fields present — the `GIT_VISTA_EXPOSE_PATHS` shape,
+        // Every optional field present — the `GIT_VISTA_EXPOSE_PATHS` shape,
         // and a `LinkedWorktree` kind so all three `RepositoryKind` variants
         // appear somewhere in this fixture set (`Bare` on its own doesn't get
         // a full descriptor here since `dto.rs`'s own
@@ -140,6 +150,13 @@ fn golden_set() -> DtoGoldenSet {
             read_only: true,
             path: Some("/home/tom/repos/git-vista/.worktrees/linked".to_string()),
             remote_web_url: Some("https://github.com/owner/repo".to_string()),
+            // INV-15's per-repository disclosure, present. `Unsandboxed` on
+            // purpose rather than `Strict`: it is the value an operator-trusted
+            // repository discloses, the one this field exists to surface, and a
+            // banner-flying variant — so the fixture pins the interesting case
+            // rather than the quiet one. The minimal descriptor above pins the
+            // absent case.
+            hook_policy: Some(HookPolicy::Unsandboxed),
         },
     }
 }
@@ -235,5 +252,27 @@ fn dto_v1_golden() {
             .get("remote_web_url")
             .is_none(),
         "repository_descriptor_minimal must omit `remote_web_url` entirely, not null it"
+    );
+    // INV-15's per-repository field (#202). Same omit-don't-null posture as the
+    // two above, and for a sharper reason: an absent `hook_policy` is what a
+    // pre-#202 server sends and what an ADR-0029 refusal sends, and the client
+    // must be able to tell "the server said nothing" from "the server said
+    // something" with `"hook_policy" in obj` — which a null would defeat.
+    assert!(
+        obj["repository_descriptor_minimal"]
+            .as_object()
+            .unwrap()
+            .get("hook_policy")
+            .is_none(),
+        "repository_descriptor_minimal must omit `hook_policy` entirely, not null it"
+    );
+    assert_eq!(
+        obj["repository_descriptor_with_path_and_remote"]
+            .as_object()
+            .unwrap()
+            .get("hook_policy")
+            .and_then(|v| v.as_str()),
+        Some("unsandboxed"),
+        "a disclosed policy must reach the wire under the server's own tier name"
     );
 }
