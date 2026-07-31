@@ -27,32 +27,48 @@
 //! elevated-risk case," but not yet backed by real suppression. That gap is
 //! M1.13b's, not this banner's to close.
 
+use git_vista_protocol::HookPolicy;
 use leptos::*;
 
-/// The banner, or nothing. `visible` is
+/// The banner, or nothing.
+///
+/// `visible` is
 /// [`SessionCore::hook_policy_banner_visible`](crate::features::session::core::SessionCore::hook_policy_banner_visible)'s
-/// answer — the actual `Allow`-vs-`Restricted` decision is tested there, on
-/// the host, since `impl IntoView` is an opaque return type a host test
-/// can't inspect. This function only turns "yes" into markup.
-pub fn hook_policy_banner_view(visible: bool) -> impl IntoView {
-    visible.then(banner)
+/// answer; `policy` is the session's own [`HookPolicy`], and it decides the
+/// **words**. Both come from the same value on purpose.
+///
+/// Until #208 this took only `visible` and rendered one fixed sentence for
+/// every warning state — so `Blocked` was told hooks "run automatically",
+/// which is the exact opposite of the truth, and `Network` was told nothing
+/// about the sandbox that was in fact containing it. The predicate tracked the
+/// policy while the text did not. Both errors over-warned, so nothing was ever
+/// falsely reassured, but a bar that cries wolf on a blocked session is a bar
+/// nobody reads on an unsandboxed one.
+///
+/// The wording itself lives in
+/// [`crate::hook_policy_disclosure::for_session`] so it is host-testable —
+/// `impl IntoView` is opaque, so any text left in this file can only be
+/// checked by eye.
+pub fn hook_policy_banner_view(visible: bool, policy: HookPolicy) -> impl IntoView {
+    visible.then(move || banner(crate::hook_policy_disclosure::for_session(policy)))
 }
 
-fn banner() -> impl IntoView {
+fn banner(message: &'static str) -> impl IntoView {
     view! {
         <div
             role="status"
+            // padding-top adds the safe-area inset (#65): this bar is flush
+            // with the top edge, above the topbar, so under viewport-fit=cover
+            // it would otherwise sit inside the notch region.
             style="position:fixed; top:0; left:0; right:0; z-index:900; \
                    display:flex; align-items:center; justify-content:center; \
                    gap:8px; padding:6px 12px; font-size:0.85em; \
+                   padding-top:calc(6px + env(safe-area-inset-top, 0px)); \
                    background:#3a2a0a; color:#f0c674; \
                    border-bottom:1px solid #5a4210;"
         >
             <span aria-hidden="true">"\u{26A0}"</span>
-            <span>
-                "Repository hooks run automatically for this session. "
-                "A malicious repository's hooks execute with your permissions."
-            </span>
+            <span>{message}</span>
         </div>
     }
 }

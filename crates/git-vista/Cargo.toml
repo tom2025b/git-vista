@@ -30,6 +30,9 @@ console_error_panic_hook = "0.1"
 wasm-bindgen = "0.2"
 # The JS `Date`, used to format commit timestamps in the viewer's local timezone.
 js-sys = "0.3"
+# #216/#218: `select` + `oneshot`, to bound a fetch that would otherwise hang
+# forever on a dead SSH-forwarded socket. Already in the lock transitively.
+futures = { version = "0.3", default-features = false, features = ["std"] }
 # Event types used by the pan/zoom handlers. Leptos pulls web-sys in already;
 # we list the exact features we call so the build doesn't rely on its defaults.
 web-sys = { version = "0.3", features = [
@@ -56,6 +59,12 @@ web-sys = { version = "0.3", features = [
     "MouseEvent",
     "PointerEvent",
     "WheelEvent",
+    # M1.13 (#65 keyboard-access gap): roving tabindex over the commit rows.
+    # `FocusEvent` — a Tab lands on the tabbable `.node-hit` circle.
+    # `SvgElement` — `.focus()`/`.blur()` (the HTMLOrSVGElement mixin) on the
+    # commit-dot hit circles, which are SVG, not HTML, elements.
+    "FocusEvent",
+    "SvgElement",
     # Issue #18: `window()` plus the native prompt()/alert() dialogs used to ask
     # for a branch name and report a failure.
     "Window",

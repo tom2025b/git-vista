@@ -50,3 +50,11 @@ pub fn ui_mode() -> Option<RepoMode> {
 pub fn hook_policy_banner_visible() -> bool {
     SESSION.with(|s| s.borrow().hook_policy_banner_visible())
 }
+
+/// The current session's [`HookPolicy`] — what the banner's *words* are
+/// derived from (#208). Paired with [`hook_policy_banner_visible`] rather than
+/// folded into it: the banner used to take only the boolean and render one
+/// fixed sentence, so its text could not track the policy it was disclosing.
+pub fn hook_policy() -> git_vista_protocol::HookPolicy {
+    SESSION.with(|s| s.borrow().hook_policy())
+}
