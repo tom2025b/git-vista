@@ -3,14 +3,21 @@
 //! [`git_vista_protocol::HookPolicy`] a client actually sees.
 //!
 //! INV-15 is *"the hook policy is always disclosed, not only when degraded."*
-//! `SECURITY_MODEL.md:271` (the "Decide hook policy explicitly" bullet under
-//! Command Execution — cited by its opening words as well as its line, because
-//! that document has already moved this bullet twice) requires the UI to
+//! `docs/SECURITY_MODEL.md`'s **"Decide hook policy explicitly"** bullet, under
+//! the *Command Execution* heading — *"Running repository hooks may execute
+//! arbitrary local code; local mode may allow them, but the UI must report that
+//! fact"* — requires the UI to
 //! **report** the fact, present tense, for as long as it is true. A
 //! silently-applied hook policy is exactly
 //! the failure the invariant exists to prevent, so the mapping below has one
 //! job: never produce a value that claims more than the tier dispatch actually
 //! delivers.
+//!
+//! That citation names a heading and quotes the bullet's own words, and gives no
+//! line number, deliberately: the bullet has already moved twice in that
+//! document, and a citation that points at a line is a claim that goes silently
+//! false the next time somebody inserts a paragraph above it. Quoted text can be
+//! re-found; a stale line number reads as fact and is not.
 //!
 //! # This file does not decide anything — it translates
 //!
@@ -26,8 +33,9 @@
 //!
 //! # ADR 0029: the plan's `CapabilityAbsent → Blocked` mapping is REJECTED
 //!
-//! Plan Task 16.6
-//! (`docs/superpowers/plans/2026-07-28-m1.13b-sandbox.md:4915-4923`) writes:
+//! Plan Task 16.6 (`docs/superpowers/plans/2026-07-28-m1.13b-sandbox.md`, in the
+//! `hook_policy_for_repo` sketch — quoted, not line-cited, for the reason given
+//! above) writes:
 //!
 //! ```text
 //! ProbeVerdict::CapabilityAbsent { .. } | ProbeVerdict::FailOpen { .. } => HookPolicy::Blocked,
