@@ -151,7 +151,36 @@ runs:
         fi
         chmod 600 "$HOME/.ssh/known_hosts"
         if [ ! -r "$HOME/.ssh/known_hosts" ] || [ ! -s "$HOME/.ssh/known_hosts" ]; then
-          echo "::error::\$HOME/.ssh/known_hosts is missing, empty or unreadable after provisioning. Refusing to continue: the escape battery's secret_read_denied case declares expect_baseline Errno(0), so an absent file makes its baseline leg return ENOENT and the case hard-fails having proved nothing about containment."
+          echo "::error::\$HOME/.ssh/known_hosts is missing, empty or unreadable after provisioning. Refusing to continue: the escape battery's ssh_known_hosts_carveout case (#188) declares expect_baseline Errno(0) for its GRANTED leg, so an absent file makes that leg return ENOENT and the case hard-fails having proved nothing about the carve-out."
           exit 1
         fi
-        echo "secret-read baseline path ready: $(wc -c < "$HOME/.ssh/known_hosts") bytes"
+        echo "known_hosts baseline path ready: $(wc -c < "$HOME/.ssh/known_hosts") bytes"
+
+    # #188: `secret_read_denied` moved its SECRET off `known_hosts` once that
+    # path became legitimately readable in the Network tier (the carve-out
+    # this whole action's known_hosts step exists to exercise) — a private
+    # key is the one thing under ~/.ssh that must never become readable in
+    # any tier, so it is the more durable choice of denial target regardless
+    # of what else changes here. `ssh_known_hosts_carveout`'s own SSHKEY leg
+    # (the paired *denial*, alongside its GRANTED known_hosts leg above)
+    # reads the same path. Both declare `expect_baseline: Errno(0)`, so this
+    # follows the identical reasoning and shape as the known_hosts step: the
+    # runner needs the path to exist and be readable OUTSIDE the sandbox, or
+    # the baseline leg returns ENOENT and the case hard-fails having proved
+    # nothing. Content is fake and deliberately not a real key — nothing here
+    # parses it as OpenSSH key material, only opens and reads one byte.
+    - name: Provision ~/.ssh/id_ed25519 for the secret-read baseline (#188)
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.ssh"
+        chmod 700 "$HOME/.ssh"
+        if [ ! -s "$HOME/.ssh/id_ed25519" ]; then
+          printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nplaceholder written by .github/actions/host-sandbox-setup — NOT a real\nkey. The escape battery needs this path to EXIST and be readable outside\nthe sandbox so that "denied inside" is attributable to the policy, not to\nthe file never having existed. Contents are never parsed as key material.\n-----END OPENSSH PRIVATE KEY-----\n' > "$HOME/.ssh/id_ed25519"
+        fi
+        chmod 600 "$HOME/.ssh/id_ed25519"
+        if [ ! -r "$HOME/.ssh/id_ed25519" ] || [ ! -s "$HOME/.ssh/id_ed25519" ]; then
+          echo "::error::\$HOME/.ssh/id_ed25519 is missing, empty or unreadable after provisioning. Refusing to continue: secret_read_denied and ssh_known_hosts_carveout (#188) both declare expect_baseline Errno(0) for this path, so an absent file makes their baseline legs return ENOENT and both cases hard-fail having proved nothing about containment."
+          exit 1
+        fi
+        echo "id_ed25519 baseline path ready: $(wc -c < "$HOME/.ssh/id_ed25519") bytes"
