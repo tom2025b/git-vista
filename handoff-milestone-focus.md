@@ -1,5 +1,53 @@
 # Handoff — M1.13b Close-Out + M2 Sub-Issue Kickoff (focused session)
 
+## ⚠ STATUS UPDATE — 2026-07-31 ~09:45, session throttled at 81% weekly quota
+
+**P1a and P1b are DONE and verified.** Do not redo them. What landed:
+
+- `.github/actions/host-sandbox-setup/action.yml` (new composite action) provisions
+  bwrap + build-essential, the userns unclamp (D6 Option A, moved verbatim out of the
+  `sandbox` job), a global git identity (#203), and `~/.ssh/known_hosts`. `core`,
+  `contract` and `sandbox` all `uses:` it right after checkout.
+- **Three** host gaps, not two — each masked the next. The third,
+  `~/.ssh/known_hosts`, is what `secret_read_denied` reads as its SECRET under
+  `expect_baseline: Errno(0)`; without it the baseline returns ENOENT and the case
+  hard-fails with "proved NOTHING".
+- New tripwire `every_ci_job_that_runs_this_crates_tests_provisions_the_host_capabilities_they_need`
+  in `escape_contract.rs` asserts set equality between "jobs running this crate's
+  tests" and "jobs referencing the action". Bite-tested with 7 mutations.
+- `ci_preflight_host_meets_the_declared_minimum` now also checks the `$HOME`
+  prerequisites, so an unprovisioned runner is named at the preflight.
+- Fixed two tests that silently deleted their own assertions via
+  `if Path::new(&secret).exists()` — `sandbox/spawn.rs` and `sandbox/shim_cli.rs`.
+- Corrected the tripwire doc comment that overclaimed hole 7 as closed (it is a
+  substring scan; a stub that echoes the tokens passes — demonstrated).
+
+**CI result: Core went 111 failures → green. Contract → green. Lint/Frontend/Audit/
+Secrets green.** The `sandbox` job has NOT yet completed a full run — it is the
+slowest job and the 60s checkpointer keeps triggering `cancel-in-progress`. **To get
+a clean sandbox result: stop editing tracked files and let one run finish.** Verified
+locally instead — under a runner-shaped `$HOME` containing only what the action
+provisions, `cargo test -p git-vista-server` is 446 passed / 0 failed, and removing
+`known_hosts` reproduces the exact CI failure.
+
+**Also done:** P5 in full (SECURITY_MODEL.md banner, #66's stale `#208` checkbox,
+ADR 0030 addendum). P3 testbed rebuilt at 8081 — Tom carved testbed branches out of
+the never-delete rule ("temp by nature"), and `dev`'s printed resume command was
+wrong (no `$dir/target/`); both fixed in `dev`.
+
+**P6 (C11): closed with live residue.** See `.claude/parallel/claude-result-C11-closure.md`.
+The central charge is dead. Residue worth acting on before closing #66:
+`policy_for_clone` has ZERO escape-battery coverage — either cover it or give it an
+honest entry in `documented_gaps.rs`.
+
+**Deliverable:** `design-docs/2026-07-31-milestone-next-steps.md` + `.pdf` (27pp) —
+M1 + M2 to sub-issue level with model/effort/duration. Note `#67` and `#74` ALSO
+depend on M1.13, so closing #66 unblocks four issues, not two.
+
+**Next step:** let one CI run complete untouched to confirm the sandbox job, then
+mark PR #207 ready (P2). Tom has 8 open decisions; recommendations given in-session.
+
+
 **Written:** 2026-07-31T08:12:12-04:00 · **Signed:** thomas2025 · 2026-07-31T08:12:12-04:00
 
 > This file is for a **brand-new Claude Code session** opening in
