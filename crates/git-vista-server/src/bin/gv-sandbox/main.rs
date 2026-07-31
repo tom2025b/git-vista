@@ -516,6 +516,110 @@ fn grant_one(ruleset: i32, path: &Path, declared: u64) -> usize {
     }
 }
 
+/// Why one `--ro-carveout` rule could not be added.
+///
+/// Deliberately not [`AddRuleError`]: two of these variants (`Unresolvable`,
+/// `NotAFile`) have no analogue there, because a plain `--ro`/`--rw` entry is
+/// never asked to reach inside an excluded directory and never needs to prove
+/// it named a *file* rather than a directory. Conflating the two would either
+/// weaken `--ro`/`--rw`'s existing tolerance or narrow it in a way nothing
+/// asks for.
+#[derive(Debug)]
+enum CarveoutError {
+    /// The path does not exist. Tolerated — the same posture `--ro`/`--rw`
+    /// already have for a path that legitimately varies by host
+    /// (`AddRuleError::Unopenable`): a fresh `$HOME` with no SSH connections
+    /// yet has no `known_hosts`.
+    Absent,
+    /// The path exists but could not be fully canonicalised (a symlink loop,
+    /// a component that is not searchable). **Never** tolerated, for the same
+    /// reason `resolve_excludes` never tolerates it for an `--exclude`
+    /// entry: this path lives inside a directory `--exclude` withholds, so a
+    /// resolution this process cannot complete must not silently become "0
+    /// granted, carry on" — that reads identically to an operator who simply
+    /// forgot to grant it.
+    Unresolvable(std::io::Error),
+    /// The resolved path is not a regular file. **Never** tolerated: this
+    /// flag's one safety property is "one named file, never a directory"
+    /// (#188) — accepting anything else would make `--ro-carveout` a second,
+    /// unreviewed way to grant whatever `--exclude` was just told to
+    /// withhold.
+    NotAFile { real: PathBuf },
+    /// Resolved and confirmed a regular file, but it could not be stat'ed
+    /// through the descriptor the rule would carry.
+    Unstattable(std::io::Error),
+    /// The kernel refused the rule.
+    Refused(AddRuleError),
+}
+
+impl CarveoutError {
+    fn is_absent(&self) -> bool {
+        matches!(self, CarveoutError::Absent)
+    }
+}
+
+impl std::fmt::Display for CarveoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CarveoutError::Absent => write!(f, "the path does not exist"),
+            CarveoutError::Unresolvable(e) => write!(f, "cannot resolve the path ({e})"),
+            CarveoutError::NotAFile { real } => write!(
+                f,
+                "`{}` is not a regular file — --ro-carveout may only name a single file, \
+                 never a directory",
+                real.display()
+            ),
+            CarveoutError::Unstattable(e) => write!(f, "cannot stat the resolved path ({e})"),
+            CarveoutError::Refused(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Resolve, validate and grant one `--ro-carveout` target — the pure-ish half
+/// (still does real syscalls, but returns rather than dying), so tests can
+/// exercise every branch including the refusals without risking a `die()`
+/// inside the test process.
+///
+/// # Why this bypasses `is_or_inside_exclude`/`is_ancestor_of_exclude` entirely
+///
+/// It does not call `grant_tree`, and it takes no `excludes` parameter at
+/// all — bypassing the exclude check is this function's whole reason to
+/// exist (#188: `~/.ssh` stays wholly excluded, but `~/.ssh/known_hosts`
+/// must still be readable in the Network tier). The safety property that
+/// makes this acceptable is enforced here instead, structurally: the target
+/// must resolve to an existing regular file or the grant is refused
+/// (`NotAFile`) — never a directory, which is what would turn this into a
+/// second, unreviewed way to grant an entire excluded tree.
+fn add_carveout_rule(ruleset: i32, path: &Path) -> Result<u64, CarveoutError> {
+    let real = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(CarveoutError::Absent),
+        Err(e) => return Err(CarveoutError::Unresolvable(e)),
+    };
+    match std::fs::metadata(&real) {
+        Ok(md) if md.is_file() => {}
+        Ok(_) => return Err(CarveoutError::NotAFile { real }),
+        Err(e) => return Err(CarveoutError::Unstattable(e)),
+    }
+    add_path_rule(ruleset, &real, RO_DIR_ACCESS).map_err(CarveoutError::Refused)
+}
+
+/// Add one `--ro-carveout` rule, or **refuse the launch** — same posture as
+/// [`grant_one`], for the same reason: a carve-out that silently grants
+/// nothing while claiming to have granted something is a weaker sandbox
+/// wearing the costume of a configured one. The one tolerated outcome is an
+/// absent path, exactly as it is for `--ro`/`--rw`.
+fn grant_carveout(ruleset: i32, path: &Path) -> usize {
+    match add_carveout_rule(ruleset, path) {
+        Ok(_) => 1,
+        Err(e) if e.is_absent() => 0,
+        Err(e) => die(
+            EXIT_LANDLOCK,
+            &format!("cannot grant --ro-carveout `{}`: {e}", path.display()),
+        ),
+    }
+}
+
 fn add_net_rule(ruleset: i32, port: u16) -> bool {
     let attr = NetPortAttr {
         allowed_access: NET_CONNECT_TCP,
@@ -810,6 +914,13 @@ fn apply_landlock(a: &Args) {
     for tree in &a.rw {
         grant_tree(ruleset, tree, RW_ACCESS, &excludes);
     }
+    // #188: named, single-file exceptions to an `--exclude` above. Granted
+    // last among the filesystem rules and never consulted against
+    // `excludes` — see `add_carveout_rule` for why that bypass is the
+    // point, not an oversight.
+    for path in &a.ro_carveouts {
+        grant_carveout(ruleset, path);
+    }
     if net_allow {
         for port in &a.net_ports {
             if !add_net_rule(ruleset, *port) {
@@ -1058,6 +1169,71 @@ mod tests {
             RW_ACCESS,
         );
         assert_eq!(rights_for_target(RW_ACCESS, true), RW_ACCESS);
+        unsafe { libc::close(rs) };
+    }
+
+    /// #188's load-bearing property: a carve-out must grant its file even
+    /// though **nothing** granted its parent directory — not merely "the
+    /// parent was granted but had an exclude nested under it" (that is
+    /// `grant_tree`'s enumerate-and-skip case, unrelated), but "the parent
+    /// carries no rule of any kind." This is what a real `--exclude .ssh`
+    /// looks like from `add_carveout_rule`'s point of view: it never
+    /// consults `excludes` at all, so an excluded parent and an ungranted
+    /// parent are indistinguishable to it, which is exactly the bypass #188
+    /// needs.
+    #[test]
+    fn a_carveout_grants_a_file_with_no_grant_on_its_parent_at_all() {
+        let rs = handled_ruleset();
+        let (_d, file) = fixture();
+
+        assert_eq!(
+            add_carveout_rule(rs, &file).expect("a carve-out on a bare file must be granted"),
+            A_EXECUTE | A_READ_FILE,
+            "a carve-out is read-only and file-masked, identical to an ordinary \
+             --ro grant on a regular file"
+        );
+        unsafe { libc::close(rs) };
+    }
+
+    /// The enforced safety property behind "read-only, that single file, not
+    /// the directory" (#188's own words): pointing `--ro-carveout` at a
+    /// directory must be refused, never silently granted. Without this check
+    /// the flag would be a second, unreviewed way to re-grant an entire
+    /// excluded tree — `--ro-carveout ~/.ssh` would defeat `--exclude ~/.ssh`
+    /// outright.
+    #[test]
+    fn a_carveout_refuses_a_directory() {
+        let rs = handled_ruleset();
+        let (dir, _file) = fixture();
+
+        let err = add_carveout_rule(rs, dir.path())
+            .expect_err("a carve-out naming a directory must be refused");
+        assert!(
+            matches!(err, CarveoutError::NotAFile { .. }),
+            "wrong refusal reason for a directory target: {err:?}"
+        );
+        assert!(
+            !err.is_absent(),
+            "a directory that exists must never be reported as merely absent: {err}"
+        );
+        unsafe { libc::close(rs) };
+    }
+
+    /// The one tolerated outcome, matching `--ro`/`--rw`'s existing posture
+    /// for a path that legitimately varies by host: a fresh `$HOME` with no
+    /// SSH connections yet has no `known_hosts`, and that must not refuse the
+    /// launch.
+    #[test]
+    fn a_carveout_tolerates_an_absent_path() {
+        let rs = handled_ruleset();
+        let (d, _file) = fixture();
+
+        let err = add_carveout_rule(rs, &d.path().join("no-such-file"))
+            .expect_err("an absent carve-out target cannot be granted");
+        assert!(
+            err.is_absent(),
+            "an absent path must report as absent, not as some other refusal: {err}"
+        );
         unsafe { libc::close(rs) };
     }
 
