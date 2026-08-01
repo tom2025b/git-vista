@@ -104,14 +104,44 @@ pub enum HistoryPhase {
     SeedError { epoch: u64 },
 }
 
-/// The three history signals the App owns and the canvas drives: which phase the
-/// panel is in, whether the whole history is loaded (Print needs all of it), and
-/// whether the print overlay is open (any epoch change closes it).
+/// The history signals the App owns and the canvas drives: which phase the
+/// panel is in, whether the whole history is loaded (Print needs all of it),
+/// whether the print overlay is open (any epoch change closes it), and whether
+/// the append loop should chase completeness in the background regardless of
+/// scroll position.
 #[derive(Clone, Copy)]
 pub struct HistoryUiSignals {
     pub phase: RwSignal<HistoryPhase>,
     pub complete: RwSignal<bool>,
     pub print_open: RwSignal<bool>,
+    /// #217: the `worktree_id` of the repository whose history the user has
+    /// already driven to completeness — `None` until that first happens.
+    /// Unlike `complete` and `print_open` it is deliberately left out of the
+    /// epoch-reset effect below, so it survives every later
+    /// Refresh/settle/drift bump. An epoch bump always remounts the canvas
+    /// from page 1 (`seed_for_epoch`), which genuinely does drop completeness
+    /// — pages are pinned to a generation, so the old ones can't just be kept
+    /// — but a user who has already scrolled (or waited) their way to a
+    /// complete history once has demonstrated they want the whole thing. This
+    /// is what lets the new epoch's append loop (`canvas.rs`) resume
+    /// pagination toward completion on its own — `should_prefetch`'s `eager`
+    /// parameter — instead of leaving Print Graph dark until the user
+    /// manually re-scrolls through however many pages the repository has,
+    /// with the camera reset to the top by the very same remount.
+    ///
+    /// **An id, not a bool** (review finding): `graph.force_bump()` is the
+    /// same primitive behind a mere reload *and* behind switching to a
+    /// genuinely different repository (`picker.rs`'s select, `open_url.rs`'s
+    /// clone-settle). A tab-lifetime bool therefore leaked: complete one
+    /// repo's history, then open an unrelated — possibly enormous — repo, and
+    /// its canvas would mount with `eager` already true and silently
+    /// paginate that repo's entire history with no user signal at all. That
+    /// is the same class of unexplained behavior #217 exists to remove, just
+    /// pointed the other way. Storing *which* repo earned the latch makes the
+    /// comparison at the point of use (`canvas.rs`) authoritative, rather
+    /// than depending on someone remembering to clear a bool at every present
+    /// and future bump site.
+    pub want_full_history: RwSignal<Option<String>>,
 }
 
 /// Fetch one epoch's seed, tagged with the epoch it was fetched for.
@@ -186,10 +216,15 @@ pub fn App() -> impl IntoView {
     let history_phase = create_rw_signal(HistoryPhase::SeedLoading { epoch: 0 });
     let history_complete = create_rw_signal(false);
     let print_graph_open = create_rw_signal(false);
+    // #217: `None` until some repository's history is first driven to
+    // completeness, then that repository's own `worktree_id` — see the field
+    // doc on `HistoryUiSignals` for why an id and not a bool.
+    let want_full_history = create_rw_signal(None::<String>);
     let history_ui = HistoryUiSignals {
         phase: history_phase,
         complete: history_complete,
         print_open: print_graph_open,
+        want_full_history,
     };
 
     // Frame + page 1, keyed on the epoch. `create_local_resource` because the
@@ -200,6 +235,13 @@ pub fn App() -> impl IntoView {
     // the mounted history. Print can't span two generations and "complete" must
     // not survive into a graph that hasn't loaded a page yet, so both are reset
     // here rather than at each of the several places that bump `reload`.
+    //
+    // #217: `want_full_history` is deliberately NOT reset here, unlike
+    // `complete` and `print_open`. It is the one history flag meant to survive
+    // the epoch churn, so the new epoch's append loop knows to chase
+    // completeness in the background (`should_prefetch`'s `eager`) instead of
+    // leaving Print Graph disabled until the user re-scrolls through however
+    // much history the repository has.
     create_effect(move |_| {
         let epoch = graph.get().epoch();
         history_ui.print_open.set(false);
@@ -216,9 +258,18 @@ pub fn App() -> impl IntoView {
     // keeps its previous value while the next load runs, and an out-of-order
     // completion would otherwise mark a live reload Ready with retired data.
     create_effect(move |_| {
-        let Some((epoch, complete)) = seed
-            .map(|(epoch, result)| (*epoch, result.as_ref().ok().map(|s| s.loaded.is_complete())))
-        else {
+        let Some((epoch, complete, worktree)) = seed.map(|(epoch, result)| {
+            (
+                *epoch,
+                result.as_ref().ok().map(|s| s.loaded.is_complete()),
+                // #217: pulled from the same seed read, so the latch below can
+                // only ever name the repository this very seed belongs to.
+                result
+                    .as_ref()
+                    .ok()
+                    .and_then(|s| s.frame.worktree_id.clone()),
+            )
+        }) else {
             return;
         };
         if epoch != graph.get_untracked().epoch() {
@@ -227,6 +278,14 @@ pub fn App() -> impl IntoView {
         match complete {
             Some(complete) => {
                 history_ui.complete.set(complete);
+                // #217: a repository small enough to be complete on page 1
+                // still counts as "the user has a complete history" — latch
+                // `want_full_history` here too, not only in the append loop's
+                // multi-page case in `canvas.rs`. Latched to *this* seed's own
+                // worktree, so it can never speak for a different repository.
+                if complete {
+                    history_ui.want_full_history.set(worktree.clone());
+                }
                 history_ui.phase.set(HistoryPhase::Ready { epoch });
             }
             None => history_ui.phase.set(HistoryPhase::SeedError { epoch }),
