@@ -43,6 +43,7 @@ use crate::features::graph::core::{
 use crate::features::operations::core::OperationsCore;
 use crate::features::operations::signals::Operations;
 use crate::features::operations::view::operations_status_view;
+use crate::features::session::core::session_retry_delay_ms;
 use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
 use crate::features::shell::signals::{
@@ -52,7 +53,7 @@ use crate::features::status::signals as status_seam;
 use crate::hook_policy_banner::hook_policy_banner_view;
 use crate::icons::icon_set;
 use crate::prefs::{load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref};
-use crate::session::{establish_session, not_connected_view};
+use crate::session::{establish_session, not_connected_view, recheck_session};
 use crate::state::{Features, Settings};
 use crate::update_required::update_required_view;
 
@@ -248,7 +249,42 @@ pub fn App() -> impl IntoView {
     // checks an existing one. `Some(Ok(false))` — no session and nothing to make
     // one from — drives the blocking sign-in overlay; a network `Err` falls through
     // to the normal load-error path (an unreachable server isn't a sign-in problem).
-    let session = create_local_resource(|| (), |_| establish_session());
+    // #218: keyed on an attempt counter rather than `()`, so a transport
+    // failure can be retried. Attempt 0 is the real bootstrap (may redeem a
+    // `#s=` token); every retry is `recheck_session`, a GET that neither
+    // re-spends the single-use token nor consumes the LAN listener's
+    // sign-in rate budget — see that function's doc comment.
+    let session_attempt = create_rw_signal(0u32);
+    let session = create_local_resource(
+        move || session_attempt.get(),
+        |attempt| async move {
+            if attempt == 0 {
+                establish_session().await
+            } else {
+                recheck_session().await
+            }
+        },
+    );
+    // #218: nothing in the reactive graph used to react to `Err`, so a
+    // transport failure during the first load left the app permanently
+    // stuck — every later read 401ing with no cookie ever set, recoverable
+    // only by a full browser reload. That matches the reported symptom
+    // (history rendering as a single status line until a manual retry).
+    // Bounded and backed off; `session_retry_delay_ms` owns the policy and
+    // is host-tested.
+    create_effect(move |_| {
+        if !matches!(session.get(), Some(Err(_))) {
+            return;
+        }
+        let made = session_attempt.get_untracked();
+        let Some(delay) = session_retry_delay_ms(made) else {
+            return; // Budget spent: stop rather than storm a dead server.
+        };
+        set_timeout(
+            move || session_attempt.update(|a| *a += 1),
+            std::time::Duration::from_millis(delay as u64),
+        );
+    });
     let needs_sign_in = move || matches!(session.get(), Some(Ok(false)));
     // The history/status reads fired at load without a cookie and 401'd; once the
     // session lands, bump `reload` once so they refetch authenticated.
