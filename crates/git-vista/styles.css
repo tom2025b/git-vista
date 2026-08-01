@@ -472,6 +472,54 @@ html, body {
   width: 100vw;
 }
 
+.shell-compact.inspector-sheet .detail-panel:not(.activity-panel),
+.shell-portrait.inspector-sheet .detail-panel:not(.activity-panel) {
+  top: auto;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  width: 100vw;
+  height: var(--sheet-full-height);
+  border-left: 0;
+  border-top: 1px solid #30363d;
+  border-radius: 14px 14px 0 0;
+  padding-left: env(safe-area-inset-left, 0px);
+  transform: translateY(calc(var(--sheet-rest-offset) + var(--sheet-drag-offset)));
+  transition: transform 180ms ease-out;
+  will-change: transform;
+}
+
+.shell-compact.sheet-dragging .detail-panel:not(.activity-panel),
+.shell-portrait.sheet-dragging .detail-panel:not(.activity-panel) {
+  transition: none;
+}
+
+.sheet-grab-zone {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--sheet-full-height) - 36px);
+  z-index: 21;
+  width: 96px;
+  height: 36px;
+  transform: translateX(-50%)
+    translateY(calc(var(--sheet-rest-offset) + var(--sheet-drag-offset)));
+  transition: transform 180ms ease-out;
+  touch-action: none;
+  user-select: none;
+  cursor: ns-resize;
+}
+
+.sheet-dragging .sheet-grab-zone { transition: none; }
+
+.sheet-grab-pill {
+  display: block;
+  width: 42px;
+  height: 5px;
+  margin: 8px auto 0;
+  border-radius: 999px;
+  background: #8b949e;
+}
+
 .detail-head {
   display: flex;
   align-items: center;

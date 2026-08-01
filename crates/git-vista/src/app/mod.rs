@@ -410,7 +410,27 @@ pub fn App() -> impl IntoView {
     });
 
     view! {
-        <main class=move || format!("app {}", mode.get().css_class())>
+        <main
+            class=move || {
+                let mut classes = format!("app {}", mode.get().css_class());
+                if sheet.placement().is_sheet() {
+                    classes.push_str(" inspector-sheet");
+                }
+                if sheet.is_dragging() {
+                    classes.push_str(" sheet-dragging");
+                }
+                classes
+            }
+            style=move || match sheet.render_metrics() {
+                Some(metrics) => format!(
+                    "--sheet-full-height:{}dvh;--sheet-rest-offset:{}dvh;--sheet-drag-offset:{}px",
+                    metrics.full_height_vh,
+                    metrics.rest_offset_vh,
+                    sheet.drag_offset_px(),
+                ),
+                None => String::new(),
+            }
+        >
             // M1.02: the blocking "Update Required" screen, shown (over everything
             // else) only when this client's protocol is incompatible with the server.
             {move || protocol_gate().map(|(info, verdict)| update_required_view(info, verdict))}
@@ -665,6 +685,20 @@ pub fn App() -> impl IntoView {
             // the sign-in/protocol screens, over everything else.
             {crate::picker::picker_view(picker_open, mode_for, open_url, clone_url, dialogs_guard, graph)}
             {crate::picker::mode_view(mode_for, picker_open, graph)}
+            {move || {
+                (shell.detail_id().is_some() && sheet.placement().is_sheet()).then(|| view! {
+                    <div
+                        class="sheet-grab-zone"
+                        aria-hidden="true"
+                        on:pointerdown=move |ev| sheet.pointer_down(ev)
+                        on:pointermove=move |ev| sheet.pointer_move(ev)
+                        on:pointerup=move |ev| sheet.pointer_up(ev)
+                        on:pointercancel=move |ev| sheet.pointer_up(ev)
+                    >
+                        <span class="sheet-grab-pill"></span>
+                    </div>
+                })
+            }}
             // M1.12 (#65): a bare <section> is not a landmark — it is only exposed as
             // a `region` once it has an accessible name, so without this the graph is
             // an anonymous container and VoiceOver's rotor has nothing to jump to. The
