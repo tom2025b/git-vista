@@ -178,11 +178,19 @@ html, body {
   padding: 6px 0;
 }
 .diff-hunk:focus-visible { background: #10233d; }
+/* Combined (`@@@`) merge headers are NOT navigation stops (core.rs skips
+   them on purpose), so they only share the header colour — none of the
+   interactive treatment above, or an inert line would look tappable. */
+.diff-hunk-combined { color: #2f81f7; }
 .diff-meta { color: var(--muted); }
 
 /* Screen-reader-only text (M2.16e, #210): spoken prefixes on added/removed
    diff lines. `position: absolute` takes the span out of flow, so the <pre>'s
-   visible text layout is unchanged. */
+   visible text layout is unchanged. `user-select: none` keeps the prefixes
+   out of selection ranges too — clipped absolute text is still selectable
+   DOM, and a copied patch must stay byte-exact (the same constraint that
+   picked `display: block` for .diff-hunk); assistive tech ignores
+   user-select, so the prefixes are still spoken. */
 .sr-only {
   position: absolute;
   width: 1px;
@@ -193,6 +201,8 @@ html, body {
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 /* The graph panel. `position: relative` (M1.10, #63) makes it the containing
@@ -992,7 +1002,16 @@ button.detail-file:hover .detail-file-path { color: var(--accent); }
   html[data-print] .detail-muted { color: #57606a; }
   html[data-print] .diff-add { color: #116329; }
   html[data-print] .diff-del { color: #a40e26; }
-  html[data-print] .diff-hunk { color: #0550ae; }
+  /* Reset the screen-side 44px tap-target band: on paper a hunk header is
+     just a line of the patch, and the padding would chop the printout up. */
+  html[data-print] .diff-hunk {
+    color: #0550ae;
+    min-height: 0;
+    min-width: 0;
+    padding: 0;
+    cursor: auto;
+  }
+  html[data-print] .diff-hunk-combined { color: #0550ae; }
   html[data-print] .diff-meta { color: #57606a; }
   html[data-print] .file-added { color: #116329; }
   html[data-print] .file-modified { color: #7d4e00; }
