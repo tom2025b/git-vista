@@ -526,5 +526,28 @@
     "recovery": {
       "strategy": "irrecoverable"
     }
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "operation": {
+      "op": "stage_selection",
+      "direction": "stage",
+      "expected_diff_generation": "diff-v1:12345678901234567890",
+      "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n context\n+added\n",
+      "whole_files": [
+        "assets/logo.png"
+      ]
+    },
+    "operation_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "issued_at": 1753300000,
+    "expires_at": 1753300300,
+    "risk": "safe",
+    "preconditions": [],
+    "expected_ref_changes": [],
+    "recovery": {
+      "strategy": "not_needed"
+    }
   }
 ]

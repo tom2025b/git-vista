@@ -119,6 +119,7 @@ use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
 use handlers::select::{rescan, select_repo};
 use handlers::session::{create_session, revoke_session, session_status, SessionState};
+use handlers::staging::{staging_apply, staging_diff, staging_preview};
 use history::CursorCodec;
 use ratelimit::SignInLimiter;
 use security::{AuthState, HostPolicy};
@@ -433,6 +434,13 @@ fn api_router(
             .route("/api/commit", post(create_commit))
             // Stage the working tree (`git add -A`) so the UI can stage, then commit.
             .route("/api/stage", post(stage_all))
+            // The staging-selection surface (M2.17b, #213). All three under
+            // full_routes on purpose — the diff read exists only to feed the
+            // write surface, and a LAN visualize session never sees
+            // uncommitted worktree contents (ADR 0005).
+            .route("/api/staging/diff", get(staging_diff))
+            .route("/api/staging/preview", post(staging_preview))
+            .route("/api/staging/apply", post(staging_apply))
             // …and unstage it again (`git reset HEAD`) — the exact inverse, offered
             // by the menu while anything is staged.
             .route("/api/unstage", post(unstage_all))

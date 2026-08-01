@@ -41,6 +41,7 @@ pub(crate) mod read;
 pub(crate) mod rebase;
 pub(crate) mod reset;
 pub(crate) mod select;
+pub(crate) mod staging;
 // M1.04 (#57): establish / check / revoke a loopback session.
 pub(crate) mod session;
 
