@@ -45,3 +45,4 @@ it, and note the link in both.
 | [0031](0031-adr-format-alternatives-and-rejection-reasoning.md) | Every ADR records its alternatives and why they lost | Accepted |
 | [0032](0032-no-service-worker.md) | No service worker: offline is a failure to surface, not to mask | Accepted |
 | [0033](0033-ssh-remote-carveout.md) | SSH remotes under the sandbox: a narrow, explicit carve-out through `secret_excludes` | Accepted — implemented and tested |
+| [0034](0034-cat-file-batch-single-spawn-reads.md) | File-at-commit reads go through one long-lived `cat-file --batch` process | Accepted — implemented and tested |
