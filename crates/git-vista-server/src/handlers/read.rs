@@ -1032,7 +1032,15 @@ pub(crate) async fn staging_diff_for_repo(
         git_stdout_capped(repo, &args, "/api/staging/diff", DIFF_PATCH_CAP_FULL).await?;
     let mut patch = String::from_utf8_lossy(&bytes).into_owned();
     if over_cap {
+        // Unlike the display diff, this text is *addressable* — a hunk cut
+        // mid-body would parse, be selectable, preview, and then always
+        // refuse at apply (its header counts exceed its body). Cut at the
+        // last complete file section instead, so everything served is
+        // genuinely appliable; the truncation flag still discloses the cut.
         truncate_at_line(&mut patch, DIFF_PATCH_CAP_FULL);
+        if let Some(last_file) = patch.rfind("\ndiff --git ") {
+            patch.truncate(last_file);
+        }
     }
 
     let mut inputs = git_vista_git::read_generation_inputs(repo).map_err(|e| {

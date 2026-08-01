@@ -227,6 +227,14 @@ pub enum GitOperation {
     /// plan by `patch_build::build_selected_patch`.
     StageSelection {
         direction: crate::patch_plan::StageDirection,
+        /// The `diff-v1:` token of the base diff the selection was verified
+        /// against at the gate. The executor re-mints and re-compares this
+        /// **inside the coordinator lock** before running `git apply`: the
+        /// handler's gate runs outside the lock, and `git apply` alone is a
+        /// soft backstop (it applies mid-file hunks at drifted offsets when
+        /// the context still matches). Carried in the operation so the hash
+        /// binds it.
+        expected_diff_generation: GenerationToken,
         patch: String,
         whole_files: Vec<String>,
     },

@@ -225,6 +225,8 @@ fn every_operation_kind_names_a_distinct_pipeline_test() {
         GitOperation::ResetTestRepo,
         GitOperation::StageSelection {
             direction: git_vista_protocol::StageDirection::Stage,
+            expected_diff_generation: git_vista_protocol::GenerationToken::new("diff-v1:x")
+                .unwrap(),
             patch: String::new(),
             whole_files: vec!["a.txt".to_string()],
         },
@@ -373,10 +375,17 @@ async fn stage_selection_executes_through_the_pipeline() {
         .unwrap();
     assert!(patch_out.status.success());
     let patch = String::from_utf8(patch_out.stdout).unwrap();
+    let live = crate::handlers::read::staging_diff_for_repo(
+        &repo,
+        git_vista_protocol::StageDirection::Stage,
+    )
+    .await
+    .unwrap();
     let (status, body) = pipeline(
         &repo,
         GitOperation::StageSelection {
             direction: git_vista_protocol::StageDirection::Stage,
+            expected_diff_generation: live.generation,
             patch,
             whole_files: vec!["a.txt".to_string()],
         },
@@ -860,8 +869,8 @@ fn every_git_write_route_reaches_the_planner() {
         // reach the planner (funnel row below). Preview is deliberately not
         // one — it builds the same bytes but mutates nothing and never mints
         // a plan; its refusals (400/409) happen before any operation exists.
-        ("/api/staging/preview", "handlers::staging::staging_preview"),
-        ("/api/staging/apply", "handlers::staging::staging_apply"),
+        ("/api/staging/preview", "staging_preview"),
+        ("/api/staging/apply", "staging_apply"),
         ("/api/unstage", "unstage_all"),
         ("/api/undo", "activity::undo"),
         ("/api/merge", "merge_branch"),

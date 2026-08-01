@@ -261,15 +261,24 @@ pub fn parse_unified_diff(text: &str) -> ParsedPatch {
     let mut files = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
+    // `diff --cc <path>` is the conflicted-file form of a combined diff —
+    // `git diff` during a merge emits it (where `show` on a merge commit
+    // emits `diff --combined`). Same opacity, same handling; missing it
+    // would absorb a conflicted file's block into the preceding section.
+    fn section_start(line: &str) -> bool {
+        line.starts_with("diff --git ")
+            || line.starts_with("diff --combined ")
+            || line.starts_with("diff --cc ")
+    }
     while i < lines.len() {
-        if lines[i].starts_with("diff --combined ") {
-            let path = lines[i]["diff --combined ".len()..].to_string();
+        let combined_path = lines[i]
+            .strip_prefix("diff --combined ")
+            .or_else(|| lines[i].strip_prefix("diff --cc "));
+        if let Some(path) = combined_path {
+            let path = path.to_string();
             let start = i;
             i += 1;
-            while i < lines.len()
-                && !lines[i].starts_with("diff --git ")
-                && !lines[i].starts_with("diff --combined ")
-            {
+            while i < lines.len() && !section_start(lines[i]) {
                 i += 1;
             }
             files.push(FileDiff::Combined {
@@ -279,10 +288,7 @@ pub fn parse_unified_diff(text: &str) -> ParsedPatch {
         } else if lines[i].starts_with("diff --git ") {
             let start = i;
             i += 1;
-            while i < lines.len()
-                && !lines[i].starts_with("diff --git ")
-                && !lines[i].starts_with("diff --combined ")
-            {
+            while i < lines.len() && !section_start(lines[i]) {
                 i += 1;
             }
             if let Some(file) = parse_file_section(&lines[start..i]) {
@@ -307,12 +313,71 @@ fn strip_ab_prefix(path: &str) -> &str {
 
 /// `None` for `/dev/null` (a new or deleted file's missing side), `Some` of
 /// the prefix-stripped path otherwise.
+///
+/// Two git quoting behaviours are undone here, both verified against real
+/// output: a path containing spaces is terminated by a **trailing tab**
+/// (`--- a/sp ace.txt\t`), and a path with bytes outside git's safe set
+/// (`"`, `\`, control bytes — plus all non-ASCII under the default
+/// `core.quotePath`) is printed **C-quoted**, quotes and octal escapes
+/// included (`"caf\303\251.txt"`). Stored verbatim, either form poisons
+/// every consumer: pathspecs that match nothing and reconstructed patches
+/// git refuses. The stored path is always the real name.
 fn path_or_dev_null(path: &str) -> Option<String> {
+    let path = path.strip_suffix('\t').unwrap_or(path);
     if path == "/dev/null" {
-        None
-    } else {
-        Some(strip_ab_prefix(path).to_string())
+        return None;
     }
+    let unquoted = unquote_c_style(path);
+    Some(strip_ab_prefix(&unquoted).to_string())
+}
+
+/// Undo git's C-style path quoting: `"..."` with `\"`, `\\`, `\t`, `\n`,
+/// `\r` and 1-3 digit octal escapes. A string that isn't quoted (or whose
+/// quoting is malformed) is returned as-is — undercount-not-failure, like
+/// the rest of this parser. Octal escapes are decoded as raw bytes and the
+/// result re-read as UTF-8 (lossily for genuinely non-UTF-8 names — those
+/// can't ride a `String` DTO either way).
+fn unquote_c_style(path: &str) -> String {
+    let Some(inner) = path
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return path.to_string();
+    };
+    let mut bytes = Vec::with_capacity(inner.len());
+    let mut chars = inner.bytes().peekable();
+    while let Some(b) = chars.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        match chars.next() {
+            Some(b'n') => bytes.push(b'\n'),
+            Some(b't') => bytes.push(b'\t'),
+            Some(b'r') => bytes.push(b'\r'),
+            Some(b'"') => bytes.push(b'"'),
+            Some(b'\\') => bytes.push(b'\\'),
+            Some(d @ b'0'..=b'7') => {
+                let mut v = (d - b'0') as u32;
+                for _ in 0..2 {
+                    match chars.peek() {
+                        Some(&n @ b'0'..=b'7') => {
+                            v = v * 8 + (n - b'0') as u32;
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                bytes.push(v as u8);
+            }
+            Some(other) => {
+                bytes.push(b'\\');
+                bytes.push(other);
+            }
+            None => bytes.push(b'\\'),
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Recover a file's path from its `diff --git a/X b/Y` header line — the
@@ -610,6 +675,75 @@ index c2f2e5e,5909b84..084d8dd
  -e
  +E
 ";
+
+    #[test]
+    fn quoted_and_spaced_paths_come_back_as_real_names() {
+        // Real git output shapes (verified): space -> trailing tab
+        // terminator; non-ASCII under default core.quotePath -> C-quoted
+        // with octal escapes.
+        let diff = "\
+diff --git a/sp ace.txt b/sp ace.txt
+index 111..222 100644
+--- a/sp ace.txt\t
++++ b/sp ace.txt\t
+@@ -1,1 +1,1 @@
+-x
++y
+diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"
+index 333..444 100644
+--- \"a/caf\\303\\251.txt\"
++++ \"b/caf\\303\\251.txt\"
+@@ -1,1 +1,1 @@
+-a
++b
+";
+        let parsed = parse_unified_diff(diff);
+        assert_eq!(parsed.files.len(), 2);
+        let FileDiff::Hunks { new_path, .. } = &parsed.files[0] else {
+            panic!("expected hunks");
+        };
+        assert_eq!(new_path.as_deref(), Some("sp ace.txt"));
+        let FileDiff::Hunks { new_path, .. } = &parsed.files[1] else {
+            panic!("expected hunks");
+        };
+        assert_eq!(new_path.as_deref(), Some("caf\u{e9}.txt"));
+    }
+
+    #[test]
+    fn a_conflicted_diff_cc_section_is_combined_not_absorbed() {
+        // `git diff` during a merge emits `diff --cc` for the conflicted
+        // file; missing it absorbed the block into the preceding section's
+        // last hunk as bogus lines.
+        let diff = "\
+diff --git a/clean.txt b/clean.txt
+index 111..222 100644
+--- a/clean.txt
++++ b/clean.txt
+@@ -1,1 +1,1 @@
+-x
++y
+diff --cc conflicted.txt
+index 333,444..555
+--- a/conflicted.txt
++++ b/conflicted.txt
+@@@ -1,1 -1,1 +1,5 @@@
+++<<<<<<< HEAD
+ +ours
+++=======
++ theirs
+++>>>>>>> other
+";
+        let parsed = parse_unified_diff(diff);
+        assert_eq!(parsed.files.len(), 2);
+        let FileDiff::Hunks { hunks, .. } = &parsed.files[0] else {
+            panic!("expected hunks");
+        };
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].lines.len(), 2, "no absorbed conflict lines");
+        assert!(
+            matches!(&parsed.files[1], FileDiff::Combined { path, .. } if path == "conflicted.txt")
+        );
+    }
 
     #[test]
     fn ordinary_edit_has_line_level_old_new_numbers() {

@@ -37,6 +37,14 @@ use crate::patch_plan::{FileSelection, PatchPlan, SelectionShape};
 /// The executable form of one plan: patch text for the hunk-level part (empty
 /// when only whole files were selected) and canonical paths for the
 /// entire-file part (empty when only hunks were selected).
+///
+/// Known divergence (recorded, not hidden): a mode change accompanying
+/// content hunks (`old mode`/`new mode` on a chmod'd, edited file) rides
+/// only the **entire-file** route — the parser keeps no mode fields on
+/// hunk-shaped diffs, so selecting every hunk stages content only and the
+/// mode flip stays unstaged (a later diff still shows it; nothing is lost).
+/// Carrying modes through the DTO so a client can steer is follow-up work
+/// filed on #215.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedPatch {
     /// Unified-diff text for `git apply --cached` — exactly what a preview
@@ -164,16 +172,16 @@ fn append_file_patch(
     };
     match old_path {
         Some(p) => {
-            patch.push_str("--- a/");
-            patch.push_str(p);
+            patch.push_str("--- ");
+            push_quoted_path(patch, "a/", p);
         }
         None => patch.push_str("--- /dev/null"),
     }
     patch.push('\n');
     match new_path {
         Some(p) => {
-            patch.push_str("+++ b/");
-            patch.push_str(p);
+            patch.push_str("+++ ");
+            push_quoted_path(patch, "b/", p);
         }
         None => patch.push_str("+++ /dev/null"),
     }
@@ -195,6 +203,39 @@ fn append_file_patch(
         append_hunk(patch, hunk);
     }
     Ok(())
+}
+
+/// Emit `prefix/path`, C-quoting the whole thing the way git does whenever
+/// the path carries a byte outside git's safe set — the parser stores real
+/// names (`diff::path_or_dev_null` unquotes), so the reconstruction must
+/// re-quote or `git apply` mis-reads the header. Quoting when git wouldn't
+/// have (e.g. non-ASCII with `core.quotePath=false`) is harmless: `git
+/// apply` always accepts the quoted form.
+fn push_quoted_path(patch: &mut String, prefix: &str, path: &str) {
+    let needs_quoting = path
+        .bytes()
+        .any(|b| b == b'"' || b == b'\\' || b < 0x20 || b == 0x7f || b >= 0x80);
+    if !needs_quoting {
+        patch.push_str(prefix);
+        patch.push_str(path);
+        return;
+    }
+    patch.push('"');
+    for b in prefix.bytes().chain(path.bytes()) {
+        match b {
+            b'"' => patch.push_str("\\\""),
+            b'\\' => patch.push_str("\\\\"),
+            b'\n' => patch.push_str("\\n"),
+            b'\t' => patch.push_str("\\t"),
+            b'\r' => patch.push_str("\\r"),
+            0x20..=0x7e => patch.push(b as char),
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(patch, "\\{b:03o}");
+            }
+        }
+    }
+    patch.push('"');
 }
 
 fn append_hunk(patch: &mut String, hunk: &Hunk) {
