@@ -327,6 +327,17 @@ html, body {
 }
 .ctx-item.disabled:hover,
 .ctx-item:disabled:hover { background: transparent; }
+/* #65: a disabled item's reason used to live only in `title`, which never
+   surfaces on a touch device — a finger has no hover. Shown here as a second
+   line inside the item itself, so the reason is visible on tap the same way
+   #217's Print Graph fix made its disabled state visible. `title` stays too,
+   for a mouse user who genuinely does hover. */
+.ctx-item-reason {
+  display: block;
+  font-size: 0.7rem;
+  color: var(--muted);
+  margin-top: 2px;
+}
 /* Issue #33 follow-up: the destructive "Delete branch" item reads red so it's
    distinct from the safe operations above it in the menu. */
 .ctx-item.danger { color: #f85149; }

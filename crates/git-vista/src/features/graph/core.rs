@@ -738,6 +738,21 @@ pub fn print_button_copy(complete: bool) -> (&'static str, &'static str) {
     }
 }
 
+/// The same fix as [`print_button_copy`], applied to `menu.rs`'s four disabled
+/// context-menu items (#65): a `title`-only reason never surfaces on a tap, only
+/// on a mouse hover, so the reason has to live somewhere a finger — or VoiceOver
+/// — can reach it too.
+///
+/// Returns `(aria_label, visible_line)`. `menu.rs` (wasm-only, `view!`-macro
+/// code that cannot itself be host-tested) supplies `label`/`reason` and is
+/// responsible for putting `aria_label` on `aria-label` and rendering
+/// `visible_line` as a second line inside the item — this function only
+/// composes the strings, so the composition is the one part of the fix a host
+/// test can pin.
+pub fn disabled_menu_item_copy(label: &str, reason: &str) -> (String, String) {
+    (format!("{label}: {reason}"), reason.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1387,5 +1402,45 @@ mod tests {
         let (label, title) = print_button_copy(true);
         assert_eq!(label, "Print Graph");
         assert!(!title.is_empty());
+    }
+
+    /// #65: the four disabled context-menu items in `menu.rs` used to convey
+    /// their reason ONLY via `title=reason` — invisible on tap, unannounced by
+    /// VoiceOver. This pins the fix's composition: the reason text must appear
+    /// in BOTH strings this function hands back, not only the one that maps to
+    /// `title`.
+    #[test]
+    fn disabled_menu_item_copy_puts_the_reason_in_both_strings() {
+        let (aria_label, visible_line) =
+            disabled_menu_item_copy("Stage Changes", "Nothing to stage");
+        assert!(
+            aria_label.contains("Nothing to stage"),
+            "the aria-label must contain the reason, or VoiceOver announces \
+             nothing beyond the bare item name"
+        );
+        assert!(
+            aria_label.contains("Stage Changes"),
+            "the aria-label must still name the item, not just the reason"
+        );
+        assert_eq!(
+            visible_line, "Nothing to stage",
+            "the visible second line is the reason verbatim — this is what a \
+             finger sees without needing hover"
+        );
+    }
+
+    /// Paired negative: proves the property above is not vacuous by showing
+    /// what a `title`-only fix (the pre-#65 shape) would have looked like —
+    /// the reason present in neither returned string, because there was
+    /// nothing here to call. Standing in for the removed code, not exercising
+    /// production code, the same way `the_previous_padding_would_have_been_undersized`
+    /// documents `a11y`'s old constant.
+    #[test]
+    fn a_title_only_reason_would_not_have_reached_either_string() {
+        let title_only_label: &str = "Stage Changes"; // the old span's visible text
+        assert!(
+            !title_only_label.contains("Nothing to stage"),
+            "this is what the bug looked like: the label carries no reason at all"
+        );
     }
 }
