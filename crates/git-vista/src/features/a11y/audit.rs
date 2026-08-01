@@ -240,6 +240,10 @@ const INTERACTIVE_CENSUS: &[(&str, bool)] = &[
     (".detail-expand", true),
     (".viewer-btn", true),
     (".scale-btn", true),
+    // Hunk headers in the flat diff rendering (M2.16e, #210): roving
+    // keyboard/tap stops, sized by their own declaration rather than the
+    // shared #65 rule because they live in the diff colour block.
+    (".diff-hunk", true),
 ];
 
 #[test]

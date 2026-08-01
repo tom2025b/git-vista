@@ -18,7 +18,8 @@ use leptos::*;
 use git_vista_core::diff::{CommitDiff, FileContent};
 
 use crate::api::{fetch_diff_full, fetch_file};
-use crate::detail::{diff_line_class, file_change_marker};
+use crate::detail::{accessible_patch_view, file_change_marker};
+use crate::features::a11y::focus::GraphFocus;
 use crate::features::shell::signals::Shell;
 use crate::icons::icon_set;
 use crate::state::{Settings, ViewerDoc};
@@ -49,6 +50,11 @@ fn print_now() {
 /// and closes via its own visible button.
 pub fn viewer_view(shell: Shell, settings: Settings) -> impl IntoView {
     let nerd_icons = settings.nerd_icons;
+    // The full-screen patch's roving hunk focus (M2.16e, #210) — its own
+    // model, distinct from the detail panel's, because both surfaces can be
+    // mounted at once. Created above the render closures for the same
+    // reason as the detail panel's: a re-render must not reset the position.
+    let hunk_focus = create_rw_signal(GraphFocus::new(0));
     // One resource for either document kind: the key carries the enum, the
     // fetch picks the endpoint. A stale response is ignored via the id/path
     // echo, same rule as the detail panel's fetches.
@@ -88,7 +94,7 @@ pub fn viewer_view(shell: Shell, settings: Settings) -> impl IntoView {
                     if !matches!(&which, ViewerDoc::Diff { id } if *id == d.id) {
                         return view! { <p class="detail-status">"Loading…"</p> }.into_view();
                     }
-                    diff_body(&d, nerd_icons.get())
+                    diff_body(&d, nerd_icons.get(), hunk_focus)
                 }
                 Some(DocResult::File(Ok(f))) => {
                     if !matches!(&which, ViewerDoc::File { id, path }
@@ -143,7 +149,7 @@ enum DocResult {
 /// The full-diff document: the per-file stat list, then the whole unified
 /// patch coloured line by line — the detail panel's Changes section, at
 /// full-screen scale and without the panel's patch cap.
-fn diff_body(d: &CommitDiff, nerd: bool) -> View {
+fn diff_body(d: &CommitDiff, nerd: bool, hunk_focus: RwSignal<GraphFocus>) -> View {
     let ic = icon_set(nerd);
     let (adds, dels) = d.totals();
     let files = d
@@ -172,15 +178,9 @@ fn diff_body(d: &CommitDiff, nerd: bool) -> View {
             }
         })
         .collect_view();
-    let patch = d
-        .patch
-        .lines()
-        .map(|l| {
-            let class = diff_line_class(l);
-            let text = format!("{l}\n");
-            view! { <span class=class>{text}</span> }
-        })
-        .collect_view();
+    // Same accessible flat rendering as the detail panel (M2.16e, #210),
+    // under its own scope so DOM focus queries can't cross surfaces.
+    let patch = accessible_patch_view(&d.patch, hunk_focus, "viewer");
     let truncated_note = d.truncated.then(|| {
         view! {
             <p class="detail-status">
