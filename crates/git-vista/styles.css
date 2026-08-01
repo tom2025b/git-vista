@@ -161,8 +161,39 @@ html, body {
 }
 .diff-add { color: #3fb950; }
 .diff-del { color: #f85149; }
-.diff-hunk { color: #2f81f7; }
+/* M2.16e (#210): hunk headers are roving keyboard/tap navigation stops, so
+   they are block-level 44px targets (the #65 tap-target rule, applied at the
+   declaration since these live outside the shared rule's selector list).
+   `display: block`, not flex: the span's text keeps its trailing newline so
+   a copied patch stays byte-exact, and a flex container would turn that
+   newline into a stray anonymous item. The band doubles as a visual hunk
+   separator. */
+.diff-hunk {
+  color: #2f81f7;
+  cursor: pointer;
+  display: block;
+  box-sizing: border-box;
+  min-height: 44px;
+  min-width: 44px;
+  padding: 6px 0;
+}
+.diff-hunk:focus-visible { background: #10233d; }
 .diff-meta { color: var(--muted); }
+
+/* Screen-reader-only text (M2.16e, #210): spoken prefixes on added/removed
+   diff lines. `position: absolute` takes the span out of flow, so the <pre>'s
+   visible text layout is unchanged. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 
 /* The graph panel. `position: relative` (M1.10, #63) makes it the containing
    block for the paging affordance below, which must sit at a fixed spot over
