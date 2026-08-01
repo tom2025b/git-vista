@@ -44,7 +44,12 @@ pub fn bootstrap_token_path() -> PathBuf {
 
 /// An authenticated session: the cookie pair the server set, and the CSRF
 /// token writes must echo. Memory only.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented by hand and **redacts both secrets** — a derived
+/// impl would put the live cookie one `format!("{session:?}")` away from
+/// landing in a tool-error string on stdout, and this crate's whole promise
+/// is that the secrets live in memory and nowhere else.
+#[derive(Clone)]
 pub struct Session {
     /// The `gv_session=<id>` pair, exactly as it must appear in a `Cookie`
     /// header. Extracted from the exchange response's `Set-Cookie`.
@@ -54,6 +59,15 @@ pub struct Session {
     /// slices (#248/#249) inherit a complete session, not a partial one.
     #[allow(dead_code)] // read by the coming write slices; kept whole per #245's scope
     pub csrf: String,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("cookie", &"gv_session=<redacted>")
+            .field("csrf", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Read the current bootstrap token and exchange it for a session.
@@ -105,16 +119,19 @@ pub fn authenticate() -> Result<Session, String> {
 }
 
 /// Pull the `gv_session=<value>` pair out of the exchange response's
-/// `Set-Cookie` header, dropping the attributes (`HttpOnly; SameSite=Strict;
+/// `Set-Cookie` headers, dropping the attributes (`HttpOnly; SameSite=Strict;
 /// Path=/` and friends) that belong to the response, not to our next request.
+/// Every `set-cookie` header is scanned, not just the first — today the
+/// server sets exactly one, but ordering must never be able to break auth.
 fn session_cookie_pair(resp: &HttpResponse) -> Option<String> {
-    let set_cookie = resp.header("set-cookie")?;
-    let pair = set_cookie.split(';').next()?.trim();
-    if pair.starts_with("gv_session=") && pair.len() > "gv_session=".len() {
-        Some(pair.to_string())
-    } else {
-        None
-    }
+    resp.headers
+        .iter()
+        .filter(|(n, _)| n == "set-cookie")
+        .find_map(|(_, v)| {
+            let pair = v.split(';').next()?.trim();
+            (pair.starts_with("gv_session=") && pair.len() > "gv_session=".len())
+                .then(|| pair.to_string())
+        })
 }
 
 #[cfg(test)]
@@ -127,21 +144,70 @@ mod tests {
     /// between parallel test threads.
     #[test]
     fn token_path_follows_the_servers_xdg_resolution() {
+        // Env mutations are restored on every exit path so a future
+        // env-reading test can't inherit this one's fake HOME and fail
+        // nondeterministically by thread schedule.
+        let orig_xdg = std::env::var_os("XDG_STATE_HOME");
+        let orig_home = std::env::var_os("HOME");
+
         // Explicit XDG_STATE_HOME wins.
         std::env::set_var("XDG_STATE_HOME", "/tmp/xdg-test-state");
-        assert_eq!(
-            bootstrap_token_path(),
-            PathBuf::from("/tmp/xdg-test-state/git-vista/bootstrap.token")
-        );
+        let with_xdg = bootstrap_token_path();
         // Empty XDG_STATE_HOME falls back to ~/.local/state, like the server's
         // `.filter(|p| !p.as_os_str().is_empty())`.
         std::env::set_var("XDG_STATE_HOME", "");
         std::env::set_var("HOME", "/tmp/home-test");
+        let with_home = bootstrap_token_path();
+
+        match orig_xdg {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        match orig_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
         assert_eq!(
-            bootstrap_token_path(),
+            with_xdg,
+            PathBuf::from("/tmp/xdg-test-state/git-vista/bootstrap.token")
+        );
+        assert_eq!(
+            with_home,
             PathBuf::from("/tmp/home-test/.local/state/git-vista/bootstrap.token")
         );
-        std::env::remove_var("XDG_STATE_HOME");
+    }
+
+    /// The #245 acceptance criterion — the token never lands in argv, env, or
+    /// any file this crate writes — held structurally, not just by prose: the
+    /// production half of every source file must stay free of the APIs that
+    /// could violate it. A future slice adding one fails this named test and
+    /// forces conscious review instead of slipping through.
+    #[test]
+    fn production_code_never_writes_files_env_or_spawns_processes() {
+        let sources = [
+            ("main.rs", include_str!("main.rs")),
+            ("auth.rs", include_str!("auth.rs")),
+            ("http.rs", include_str!("http.rs")),
+            ("tools.rs", include_str!("tools.rs")),
+        ];
+        let forbidden = [
+            "fs::write",
+            "File::create",
+            "OpenOptions",
+            "env::set_var",
+            "Command::new",
+        ];
+        for (name, src) in sources {
+            let production = src.split("#[cfg(test)]").next().unwrap();
+            for needle in forbidden {
+                assert!(
+                    !production.contains(needle),
+                    "{name}: production code now contains `{needle}` — the #245 \
+                     token-hygiene criterion needs re-review before this lands"
+                );
+            }
+        }
     }
 
     #[test]
