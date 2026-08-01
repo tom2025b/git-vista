@@ -206,6 +206,30 @@ Every release candidate should cover:
 - VoiceOver, text zoom, reduced motion, and increased contrast.
 - 200 ms latency through an SSH tunnel and a mid-operation disconnect.
 - A large repository with long history, large diffs, and binary files.
+- Offline (browser reports no network, or the tunnel dies mid-session): the
+  browser's own network error surfaces (`network_error_text`), 22a's write
+  guard refuses mutations before they hit the wire, and 22b's banner and
+  disabled controls appear. Per ADR 0032, this is a test that the app **fails
+  loudly** — not a test of a cached or offline-readable view, which the ADR
+  rejects outright.
+
+> **Note on #75's cache criteria.** #75's original acceptance criteria "Private
+> diffs are not cached by default" and "Cache clear and export controls exist"
+> are satisfied *vacuously* here: the frontend has no client-side cache of
+> `/api` data to clear or export in the first place. Verified against
+> `crates/git-vista/src` (2026-07-31): the only client-side storage is two
+> `localStorage` UI-preference booleans in `prefs.rs` (icon style, per-node
+> icons); `grep -rn "IndexedDb\|caches\.\|Blob\|localStorage" crates/git-vista/src`
+> turns up nothing else. ADR 0032 forbids adding a cache of `/api` data, so this
+> is expected to stay true, not a gap to close.
+>
+> This is the narrower, ADR-consistent reading: ADR 0032 rules out a service
+> worker and any "make offline look normal" outcome, but it does not
+> unambiguously rule out every possible non-service-worker, application-level
+> store. Whoever closes #75 (22d) should treat this as an explicit invitation to
+> override — if the original intent behind those two criteria was such a store,
+> say so and reopen the question rather than letting this reading stand by
+> default.
 
 ## Reference
 
