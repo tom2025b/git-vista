@@ -5,7 +5,9 @@ use leptos::*;
 use git_vista_protocol::RepositoryDescriptor;
 
 use crate::api::clone_request;
-use crate::features::dialogs::core::Dialog;
+use crate::features::dialogs::core::{
+    clone_dialog_may_dismiss, clone_settlement, CloneSettlement, Dialog,
+};
 use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::GraphCore;
 
@@ -33,23 +35,43 @@ pub fn open_url_view(
         }
         cloning.set(true);
         spawn_local(async move {
-            match clone_request(&url).await {
-                Ok(descriptor) => {
-                    cloning.set(false);
-                    open_url.set(false);
-                    clone_url.set(String::new());
-                    // The server opened the clone look-only; the reload shows
-                    // it, and the mode screen asks Visualize/Active (ADR 0008).
-                    graph.update(|g| {
-                        g.force_bump();
-                    });
-                    mode_for.set(Some(descriptor));
-                }
-                Err(e) => {
-                    cloning.set(false);
-                    if let Some(w) = web_sys::window() {
-                        let _ = w.alert_with_message(&format!("Couldn't clone:\n{e}"));
-                    }
+            // The settlement rules live host-tested in `dialogs/core.rs` (#260);
+            // exhaustive destructuring (no `..`) so a new rule refuses to
+            // compile until this view applies it. Epoch bump happens on BOTH
+            // arms: a timed-out response does not mean the clone failed, and
+            // the server may already be pointing at it (`set_current` runs
+            // before the reply) — bumping makes a completed-but-lost clone
+            // appear instead of staying silently absent.
+            let CloneSettlement {
+                clear_busy,
+                close_dialog,
+                clear_url,
+                bump_epoch,
+                mode_screen_for,
+                alert,
+            } = clone_settlement(clone_request(&url).await);
+            if clear_busy {
+                cloning.set(false);
+            }
+            if close_dialog {
+                open_url.set(false);
+            }
+            if clear_url {
+                clone_url.set(String::new());
+            }
+            if bump_epoch {
+                // The server opened the clone look-only; the reload shows it,
+                // and the mode screen asks Visualize/Active (ADR 0008).
+                graph.update(|g| {
+                    g.force_bump();
+                });
+            }
+            if let Some(descriptor) = mode_screen_for {
+                mode_for.set(Some(descriptor));
+            }
+            if let Some(msg) = alert {
+                if let Some(w) = web_sys::window() {
+                    let _ = w.alert_with_message(&msg);
                 }
             }
         });
@@ -61,7 +83,16 @@ pub fn open_url_view(
                    z-index:910; display:flex; align-items:center; \
                    justify-content:center; background:rgba(1,4,9,0.6);"
             on:click=move |_| {
-                if dialogs.may_dismiss() {
+                // A clone in flight pins the dialog open (#260): dismissing it
+                // wouldn't cancel the request, it would only make the app look
+                // idle while a clone is still running — the "acted like it
+                // worked" half of that bug. Composes with the ghost-click
+                // guard rather than replacing it. Worst-case pin is
+                // 2×CLONE_TIMEOUT_MS (~19 min, hung tunnel + blind retry) —
+                // an accepted trade for a single-operator tool; the
+                // hide-don't-cancel + settlement-toast alternative is noted
+                // in #263 if this ever grates.
+                if clone_dialog_may_dismiss(cloning.get_untracked(), dialogs.may_dismiss()) {
                     dialogs.close(Dialog::OpenUrl);
                     open_url.set(false);
                 }
@@ -93,7 +124,19 @@ pub fn open_url_view(
                         style="padding:6px 14px; font:inherit; color:var(--fg); \
                                background:#21262d; border:1px solid #30363d; \
                                border-radius:6px;"
-                        on:click=move |_| open_url.set(false)
+                        // Same #260 pin as the backdrop: no dismissal while a
+                        // clone is in flight. Disabled is the visible signal;
+                        // the handler guard backs it in case a click lands
+                        // between render and state change. `true` for the
+                        // ghost-click leg: explicit buttons skip that guard
+                        // (it protects backdrops from synthesized taps), but
+                        // the pin itself lives in one host-tested place.
+                        prop:disabled=move || cloning.get()
+                        on:click=move |_| {
+                            if clone_dialog_may_dismiss(cloning.get_untracked(), true) {
+                                open_url.set(false);
+                            }
+                        }
                     >
                         "Cancel"
                     </button>
