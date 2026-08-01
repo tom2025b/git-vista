@@ -322,14 +322,35 @@ fn the_guarantee_predicate_can_say_yes() {
 /// exactly, because it is arithmetic rather than a rendered font box — and it is the
 /// target the whole app is built around tapping.
 ///
-/// 2 * (NODE_RADIUS + 8) = 30 CSS pixels at the default zoom: 14 px short on both axes,
-/// and only compliant from about 1.47x zoom upward. Recorded here, next to the census,
-/// because "the graph's primary tap target is undersized at default zoom" is the single
-/// most consequential #65 fact in this crate and it belongs in a test, not a comment.
+/// 2 * (NODE_RADIUS + 15) = 44 CSS pixels at the default zoom — meets the 44x44
+/// guidance exactly, at 1.0x, with no zoom required. This test used to pin a 14px
+/// shortfall (padding was 8, giving 30px); #65's audit flagged that as the single
+/// most consequential undersized target in the app, so the padding moved rather
+/// than the test being left to document a known gap. Recorded here, next to the
+/// census, because whether the app's primary tap target actually meets guidance
+/// belongs in a test, not a comment.
+///
+/// The larger circle does not collide with a neighbour: same-lane rows are
+/// `ROW_HEIGHT` (56px) apart and the nearest cross-lane neighbour is
+/// `sqrt(ROW_HEIGHT^2 + LANE_WIDTH^2)` (~65.5px) apart — both comfortably clear
+/// of two 44px circles needing 44px of separation.
 #[test]
-fn commit_dot_hit_target_is_thirty_pixels_at_default_zoom() {
+fn commit_dot_hit_target_meets_guidance_at_default_zoom() {
     let radius = f64::from(crate::geometry::NODE_RADIUS);
     let side = node_hit_extent_px(radius, NODE_HIT_PADDING, 1.0);
+    assert_eq!(side, 44.0);
+    assert_eq!(TapTarget::square(side).verdict(), TargetVerdict::Meets);
+}
+
+/// Paired negative for the test above: this is what the OLD constant would still
+/// report, so a reader can see the shortfall this fix closed without having to
+/// find the removed commit. Not exercising production code — a fixed literal,
+/// standing in for the value `NODE_HIT_PADDING` used to be.
+#[test]
+fn the_previous_padding_would_have_been_undersized() {
+    let radius = f64::from(crate::geometry::NODE_RADIUS);
+    let old_padding = 8.0;
+    let side = node_hit_extent_px(radius, old_padding, 1.0);
     assert_eq!(side, 30.0);
     assert_eq!(
         TapTarget::square(side).verdict(),
