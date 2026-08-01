@@ -721,7 +721,6 @@ name = "git-vista-mcp"
 version = "0.1.0"
 dependencies = [
  "git-vista-protocol",
- "serde",
  "serde_json",
 ]
 

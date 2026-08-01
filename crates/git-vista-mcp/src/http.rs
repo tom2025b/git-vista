@@ -34,20 +34,45 @@ use git_vista_protocol::{PROTOCOL_HEADER, PROTOCOL_VERSION};
 /// no env override) — so a mirror here is stable, not fragile.
 const SERVER: &str = "127.0.0.1:8080";
 
-/// Every request gets one bounded wait, not forever: a wedged server should
-/// surface as a tool-call error the MCP client can show, not a hung bridge.
+/// A per-read-syscall bound (`SO_RCVTIMEO`), honestly named: `read_to_end`
+/// restarts this clock on every chunk, so it bounds a *dead* peer, not a
+/// slow-dripping one. Acceptable here because the peer is this box's own
+/// loopback server (a slow-drip adversary is not in the threat model) and the
+/// MCP client above the bridge carries its own tool-call timeout.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A parsed response: status, lower-cased header pairs, raw body bytes.
-#[derive(Debug)]
+///
+/// `Debug` is implemented by hand and shows status, header *names* and body
+/// length only: responses from `/api/session` carry the live session cookie
+/// in `set-cookie`, and a derived impl would put it one `{resp:?}` away from
+/// stdout. Same reasoning as [`crate::auth::Session`]'s redacted impl.
 pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
+impl std::fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+
 impl HttpResponse {
     /// First header with this (already lower-case) name, if any.
+    #[allow(dead_code)] // exercised by tests today; the write slices (#248/#249) read it next
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
