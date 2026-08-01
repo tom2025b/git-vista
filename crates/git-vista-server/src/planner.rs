@@ -1304,9 +1304,20 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         GitOperation::ResetTestRepo => exec_reset_test_repo(repo, need).await,
         GitOperation::StageSelection {
             direction,
+            expected_diff_generation,
             patch,
             whole_files,
-        } => exec_stage_selection(repo, need, direction, &patch, &whole_files).await,
+        } => {
+            exec_stage_selection(
+                repo,
+                need,
+                direction,
+                &expected_diff_generation,
+                &patch,
+                &whole_files,
+            )
+            .await
+        }
     }
 }
 
@@ -1626,10 +1637,28 @@ async fn exec_stage_selection(
     repo: &Path,
     need: NetworkNeed,
     direction: git_vista_protocol::StageDirection,
+    expected_diff_generation: &git_vista_protocol::GenerationToken,
     patch: &str,
     whole_files: &[String],
 ) -> (StatusCode, String) {
     use git_vista_protocol::StageDirection;
+    // The gate, re-run INSIDE the coordinator lock (the handler's ran
+    // outside it): re-mint the diff-v1 token and refuse if the base diff
+    // moved between gate and execution. Without this, a concurrent write in
+    // that window could shift file content and `git apply` would still
+    // apply mid-file hunks at drifted offsets — silently staging content
+    // the user never previewed.
+    match crate::handlers::read::staging_diff_for_repo(repo, direction).await {
+        Ok(live) => {
+            if let Err(refused) = crate::staging::require_current_selection_token(
+                expected_diff_generation,
+                &live.generation,
+            ) {
+                return refused;
+            }
+        }
+        Err(e) => return e,
+    }
     let mut done: Vec<String> = Vec::new();
     if !patch.is_empty() {
         let args: &[&str] = match direction {
@@ -1642,7 +1671,16 @@ async fn exec_stage_selection(
                 Err(e) => return couldnt_run("/api/staging/apply", &e),
             };
         if !output.status.success() {
-            let msg = stderr_or(&output, "git apply failed.");
+            let mut msg = stderr_or(&output, "git apply failed.");
+            // A replacement character in the patch means the file is not
+            // valid UTF-8 — the lossy read can never byte-match the blob,
+            // so git's "does not apply" is misleading without this.
+            if patch.contains('\u{fffd}') {
+                msg.push_str(
+                    " (the file does not appear to be valid UTF-8 — hunk \
+                     staging cannot address it; stage the entire file instead)",
+                );
+            }
             eprintln!("git-vista: /api/staging/apply patch leg failed: {msg}");
             // Nothing staged: apply is atomic, and the pathspec leg never ran.
             return (StatusCode::BAD_REQUEST, msg);
@@ -1650,6 +1688,30 @@ async fn exec_stage_selection(
         done.push("applied the selected hunks".to_string());
     }
     if !whole_files.is_empty() {
+        // `git reset -q HEAD -- <path>` exits 0 even when the pathspec
+        // matches nothing — a silent false success on a write surface. The
+        // stage leg needs no twin check: `git add` of a nonexistent path
+        // fails loudly on its own.
+        if matches!(direction, StageDirection::Unstage) {
+            let mut check: Vec<&str> = vec!["diff", "--cached", "--name-only", "-z", "--"];
+            check.extend(whole_files.iter().map(String::as_str));
+            let listed = match run_git(repo, need, &check).await {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+                Ok(o) => {
+                    let msg = stderr_or(&o, "pathspec check failed.");
+                    return (StatusCode::BAD_REQUEST, msg);
+                }
+                Err(e) => return couldnt_run("/api/staging/apply", &e),
+            };
+            let matched: std::collections::HashSet<&str> =
+                listed.split('\0').filter(|p| !p.is_empty()).collect();
+            if let Some(missing) = whole_files.iter().find(|p| !matched.contains(p.as_str())) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("nothing is staged at {missing}, so there is nothing to unstage"),
+                );
+            }
+        }
         let mut args: Vec<&str> = match direction {
             StageDirection::Stage => vec!["add", "--"],
             StageDirection::Unstage => vec!["reset", "-q", "HEAD", "--"],
@@ -2407,10 +2469,17 @@ mod tests {
         assert!(built.patch.contains("line 2 changed"));
         assert!(!built.patch.contains("line 18 changed"));
 
+        let live = crate::handlers::read::staging_diff_for_repo(
+            &repo,
+            git_vista_protocol::StageDirection::Stage,
+        )
+        .await
+        .unwrap();
         let (status, msg) = exec_stage_selection(
             &repo,
             NetworkNeed::Local,
             git_vista_protocol::StageDirection::Stage,
+            &live.generation,
             &built.patch,
             &[],
         )
@@ -2437,10 +2506,17 @@ mod tests {
         let plan = plan_for_hunk(&parsed, 0, git_vista_protocol::StageDirection::Unstage);
         let built = git_vista_protocol::build_selected_patch(&parsed, &plan).unwrap();
 
+        let live = crate::handlers::read::staging_diff_for_repo(
+            &repo,
+            git_vista_protocol::StageDirection::Unstage,
+        )
+        .await
+        .unwrap();
         let (status, msg) = exec_stage_selection(
             &repo,
             NetworkNeed::Local,
             git_vista_protocol::StageDirection::Unstage,
+            &live.generation,
             &built.patch,
             &[],
         )
@@ -2465,10 +2541,17 @@ mod tests {
         std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
         std::fs::write(repo.join("c.txt"), "c changed\n").unwrap();
 
+        let live = crate::handlers::read::staging_diff_for_repo(
+            &repo,
+            git_vista_protocol::StageDirection::Stage,
+        )
+        .await
+        .unwrap();
         let (status, msg) = exec_stage_selection(
             &repo,
             NetworkNeed::Local,
             git_vista_protocol::StageDirection::Stage,
+            &live.generation,
             "",
             &["c.txt".to_string()],
         )
