@@ -3,23 +3,46 @@
   "target": "branch",
   "enforcement": "active",
   "conditions": {
-    "ref_name": { "include": ["refs/heads/main"], "exclude": [] }
+    "ref_name": {
+      "include": [
+        "refs/heads/main"
+      ],
+      "exclude": []
+    }
   },
   "rules": [
-    { "type": "deletion" },
-    { "type": "non_fast_forward" },
+    {
+      "type": "deletion"
+    },
+    {
+      "type": "non_fast_forward"
+    },
     {
       "type": "required_status_checks",
       "parameters": {
         "strict_required_status_checks_policy": true,
         "required_status_checks": [
-          { "context": "Lint (fmt + clippy)" },
-          { "context": "Core (check + test)" },
-          { "context": "M1.06 write contract + #67 route authorization (planner + argv boundary + staleness + route authz)" },
-          { "context": "Frontend (Trunk / WASM)" },
-          { "context": "Security audit (cargo audit)" },
-          { "context": "Secret scanning (gitleaks)" },
-          { "context": "Sandbox (#66 escape-battery gate)" }
+          {
+            "context": "Lint (fmt + clippy)"
+          },
+          {
+            "context": "Core (check + test)"
+          },
+          {
+            "context": "M1.06 write contract +"
+          },
+          {
+            "context": "Frontend (Trunk / WASM)"
+          },
+          {
+            "context": "Security audit (cargo audit)"
+          },
+          {
+            "context": "Secret scanning (gitleaks)"
+          },
+          {
+            "context": "Sandbox (#66 escape-battery gate)"
+          }
         ]
       }
     }
