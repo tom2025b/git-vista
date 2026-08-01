@@ -45,7 +45,7 @@ use crate::features::operations::signals::Operations;
 use crate::features::operations::view::operations_status_view;
 use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
-use crate::features::shell::signals::{install_mode_signal, Shell};
+use crate::features::shell::signals::{install_connectivity_signal, install_mode_signal, Shell};
 use crate::features::status::signals as status_seam;
 use crate::hook_policy_banner::hook_policy_banner_view;
 use crate::icons::icon_set;
@@ -304,6 +304,14 @@ pub fn App() -> impl IntoView {
     // graph_canvas, for the same reason `shell` is: an epoch bump's rebuild must
     // not tear down and reinstall the resize listener mid-session.
     let mode = install_mode_signal();
+
+    // The browser's own connectivity report (M2.22a, #241). Installed here, not
+    // in `graph_canvas`, for the same reason `mode` is: an epoch bump's rebuild
+    // must not tear down and reinstall the online/offline listeners mid-session.
+    // `api.rs`'s `refuse_if_offline()` reads the plain accessor this seeds
+    // (`shell::signals::is_online`), not this signal — the signal itself is for
+    // M2.22b's UI, not yet consumed here.
+    let _connectivity = install_connectivity_signal();
 
     // The live working-tree status: the topbar chip (Activity/Undo step 1) and the
     // Activity panel's own status section both read THIS one resource — until M1.11
