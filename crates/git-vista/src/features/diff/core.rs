@@ -23,6 +23,20 @@
 //! protocol parser leaves combined diffs deliberately opaque, and a label
 //! this walk can't back up would be worse than the plain colored line the
 //! view already shows. Only ordinary `@@ -a,b +c,d @@` headers qualify.
+//!
+//! ## Truncated patches
+//!
+//! The server caps patches at a **line boundary** (`read.rs`,
+//! `truncate_at_line`), so a cap that lands mid-hunk simply runs the
+//! `old_len`/`new_len` countdown out at end of input: no phantom stops, every
+//! header before the cut keeps its stop, and headers after the cut don't
+//! exist in the text at all. What the cut *can* do is leave the final hunk's
+//! counted added/removed lines short of what its header declared — so when
+//! the walk ends with the countdown unexhausted, the final label says
+//! `, truncated` rather than stating an undercount as fact. The rendering's
+//! separate truncation note discloses that the patch as a whole is cut.
+
+use std::collections::HashMap;
 
 /// One keyboard-navigable hunk header in the rendered patch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,28 +124,56 @@ pub fn hunk_nav(patch: &str) -> Vec<HunkNavEntry> {
         }
     }
 
-    // Per-file ordinals need the per-file totals, hence the second pass.
+    // A countdown still owed lines at end of input means the cap cut the
+    // final hunk's body short — its counted added/removed understate what
+    // the header declared, so its label must say so (module doc).
+    let cut_mid_hunk = old_left > 0 || new_left > 0;
+
+    // Per-file ordinals need the per-file totals first; both passes are O(n)
+    // — a 5 MB refactor diff can carry tens of thousands of hunks, and a
+    // rescan-per-hunk would stall the iPad's main thread before first paint.
+    let mut totals: HashMap<&str, u32> = HashMap::new();
+    for h in &pending {
+        *totals.entry(h.file.as_str()).or_insert(0) += 1;
+    }
+    let mut seen: HashMap<&str, u32> = HashMap::new();
+    let last_idx = pending.len().checked_sub(1);
     let mut entries = Vec::with_capacity(pending.len());
     for (idx, h) in pending.iter().enumerate() {
-        let ordinal = pending[..=idx].iter().filter(|p| p.file == h.file).count();
-        let total = pending.iter().filter(|p| p.file == h.file).count();
+        let ordinal = {
+            let c = seen.entry(h.file.as_str()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        let total = totals[h.file.as_str()];
         let range = match h.new_len {
             // A pure deletion has no new-side lines; "at line N" places it
             // without claiming a range that doesn't exist.
             0 => format!("at line {}", h.new_start),
             1 => format!("line {}", h.new_start),
-            n => format!("lines {}\u{2013}{}", h.new_start, h.new_start + n - 1),
+            // Saturating: a crafted `+4294967295,2` header must not panic a
+            // debug build; real git output never gets near the edge.
+            n => format!(
+                "lines {}\u{2013}{}",
+                h.new_start,
+                h.new_start.saturating_add(n - 1)
+            ),
         };
         let heading = if h.heading.is_empty() {
             String::new()
         } else {
             format!(", in {}", h.heading)
         };
+        let truncated = if cut_mid_hunk && Some(idx) == last_idx {
+            ", truncated"
+        } else {
+            ""
+        };
         entries.push(HunkNavEntry {
             line_index: h.line_index,
             label: format!(
-                "{}, hunk {} of {}: {}, {} added, {} removed{}",
-                h.file, ordinal, total, range, h.added, h.removed, heading
+                "{}, hunk {} of {}: {}, {} added, {} removed{}{}",
+                h.file, ordinal, total, range, h.added, h.removed, heading, truncated
             ),
         });
     }
@@ -274,6 +316,35 @@ diff --git a/bar.txt b/bar.txt
         assert_eq!(
             nav[0].label,
             "gone.rs, hunk 1 of 1: at line 0, 0 added, 2 removed"
+        );
+    }
+
+    #[test]
+    fn a_patch_cut_mid_hunk_keeps_prior_stops_and_flags_the_last_label() {
+        // The second header declares a 20/22-line body but the cap cut it
+        // after two body lines — the countdown runs out at EOF (no phantom
+        // stops), and the final label admits the undercount instead of
+        // stating "1 added, 0 removed" as fact.
+        let patch = "\
+--- a/x
++++ b/x
+@@ -1,2 +1,2 @@
+ context
+-old
++new
+@@ -10,20 +10,22 @@
+ context
++added one
+";
+        let nav = hunk_nav(patch);
+        assert_eq!(nav.len(), 2);
+        assert_eq!(
+            nav[0].label,
+            "x, hunk 1 of 2: lines 1\u{2013}2, 1 added, 1 removed"
+        );
+        assert_eq!(
+            nav[1].label,
+            "x, hunk 2 of 2: lines 10\u{2013}31, 1 added, 0 removed, truncated"
         );
     }
 

@@ -64,10 +64,21 @@ pub(crate) fn diff_line_class(line: &str) -> &'static str {
 /// get a screen-reader-only prefix so VoiceOver's touch exploration says what
 /// changed instead of a bare "plus"/"minus".
 ///
-/// The header spans deliberately carry **no `role`**: they navigate, they do
-/// not activate — hunk *selection* is staging's business (M2.17), and
-/// `role="button"` would promise an action that does not exist yet. A
-/// focusable element's `aria-label` is announced on focus regardless.
+/// The header spans carry `role="group"`, not `role="button"`: they navigate,
+/// they do not activate — hunk *selection* is staging's business (M2.17), and
+/// a button role would promise an action that does not exist yet. `group` is
+/// a naming-permitted, non-interactive role, which a bare `<span>` is not: a
+/// role-less span computes to `generic`, where ARIA 1.2 prohibits
+/// `aria-label`, and WebKit is known to drop prohibited names. Whether
+/// VoiceOver actually speaks the label on focus is *expected, not verified
+/// from this box* — it is on the iPad testbed list.
+///
+/// Known keyboard-continuity gap (honest limit): if the patch re-renders
+/// while DOM focus sits on a hunk header (walking to a parent commit), the
+/// focused span unmounts and browser focus drops to `<body>`; the model's
+/// clamped position survives, but the user re-enters the patch with Tab from
+/// the top. Deliberate — restoring focus across a render needs the RAF dance
+/// the graph uses, and #69e's structural rendering replaces this wiring.
 ///
 /// `scope` keeps the detail panel's stops and the full-screen viewer's stops
 /// distinct in DOM queries — both can be mounted at once.
@@ -100,8 +111,16 @@ pub(crate) fn accessible_patch_view(
             let text = format!("{l}\n");
             match nav_at.remove(&i) {
                 Some((idx, label)) => hunk_header_span(class, text, idx, label, focus, scope),
-                // The sr-only prefix is position:absolute, so the visible
-                // text layout inside the <pre> is byte-identical.
+                // An `@@` line that is not a navigation stop is a combined
+                // (`@@@`) merge header — header-coloured but inert, so it
+                // must not wear .diff-hunk's interactive styling (pointer
+                // cursor, 44px band) and look tappable.
+                None if class == "diff-hunk" => {
+                    view! { <span class="diff-hunk-combined">{text}</span> }.into_view()
+                }
+                // The sr-only prefix is position:absolute and
+                // user-select:none, so the visible text layout inside the
+                // <pre> — and a selected-and-copied patch — is byte-identical.
                 None if class == "diff-add" => view! {
                     <span class=class>
                         <span class="sr-only">"added line: "</span>
@@ -141,6 +160,12 @@ fn hunk_header_span(
         }
     };
     let on_keydown = move |ev: web_sys::KeyboardEvent| {
+        // Leave modified chords (Cmd+ArrowDown scroll-to-end, Shift+Home
+        // selection, …) to the browser — same posture as the window shortcut
+        // handler in gestures.rs.
+        if ev.alt_key() || ev.ctrl_key() || ev.meta_key() || ev.shift_key() {
+            return;
+        }
         let dir = match ev.key().as_str() {
             "ArrowDown" => FocusMove::Next,
             "ArrowUp" => FocusMove::Prev,
@@ -148,9 +173,17 @@ fn hunk_header_span(
             "End" => FocusMove::Last,
             "Escape" => {
                 // Leave hunk navigation without closing anything: disengage
-                // the model and move DOM focus off the header. Stopped here
-                // so the window Esc handler doesn't also dismiss the panel —
-                // a second Escape, with focus elsewhere, still does.
+                // the model and move DOM focus off the header. Two-part
+                // contract with the window Esc handler (gestures.rs): this
+                // handler is attached *undelegated* — the listener sits on
+                // the span itself, so `stop_propagation` genuinely halts the
+                // event before it reaches the window (Leptos's default
+                // delegation would run it AT the window, where sibling
+                // listeners are immune to stop_propagation) — and the window
+                // handler additionally skips `dismiss_top` when
+                // `default_prevented` is set, so the panel stays open even
+                // if delegation details shift. A second Escape, with focus
+                // elsewhere, still closes it.
                 ev.prevent_default();
                 ev.stop_propagation();
                 focus.update(|f| f.escape());
@@ -184,11 +217,12 @@ fn hunk_header_span(
     view! {
         <span
             class=class
+            role="group"
             data-hunk-scope=scope
             data-hunk-index=idx.to_string()
             tabindex=tabindex
             aria-label=label
-            on:keydown=on_keydown
+            on:keydown:undelegated=on_keydown
             on:click=on_click
             on:focus=on_focus
         >
