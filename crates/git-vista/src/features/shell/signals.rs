@@ -38,11 +38,135 @@ use wasm_bindgen::JsCast;
 
 use crate::gestures;
 
+use super::sheet::{InspectorPlacement, SheetGeometry, SheetState};
+use super::{sheet_render_metrics, SheetDrag, SheetRenderMetrics};
 use crate::features::activity::signals::Activity;
 use crate::features::shell::core::{
     ConnectivityCore, ModeSettler, Overlay, OverlayStack, ShellMode,
 };
 use crate::state::{CommitDialog, MenuData, PendingOp, ViewerDoc};
+
+/// The reactive browser-side half of the bottom-sheet model.
+///
+/// [`SheetState`] is created once by [`Self::new`] above graph epochs; pointer
+/// events only publish transient render motion until a matching release resolves
+/// the model's remembered detent.
+#[derive(Clone, Copy)]
+pub(crate) struct SheetController {
+    state: RwSignal<SheetState>,
+    geometry: SheetGeometry,
+    drag: StoredValue<Option<SheetDrag>>,
+    drag_offset_px: RwSignal<Option<f64>>,
+}
+
+impl SheetController {
+    pub(crate) fn new(mode: ShellMode) -> Self {
+        Self {
+            state: create_rw_signal(SheetState::new(mode)),
+            geometry: SheetGeometry::default(),
+            drag: store_value(None),
+            drag_offset_px: create_rw_signal(None),
+        }
+    }
+
+    pub(crate) fn placement(&self) -> InspectorPlacement {
+        self.state.get().placement()
+    }
+
+    pub(crate) fn placement_untracked(&self) -> InspectorPlacement {
+        self.state.get_untracked().placement()
+    }
+
+    pub(crate) fn render_metrics(&self) -> Option<SheetRenderMetrics> {
+        sheet_render_metrics(&self.geometry, self.placement())
+    }
+
+    pub(crate) fn drag_offset_px(&self) -> f64 {
+        self.drag_offset_px.get().unwrap_or(0.0)
+    }
+
+    pub(crate) fn is_dragging(&self) -> bool {
+        self.drag_offset_px.get().is_some()
+    }
+
+    pub(crate) fn on_mode_change(&self, to: ShellMode) {
+        self.cancel_drag();
+        self.state.update(|state| {
+            state.on_mode_change(to);
+        });
+    }
+
+    pub(crate) fn cancel_drag(&self) {
+        self.drag.set_value(None);
+        self.drag_offset_px.set(None);
+    }
+
+    pub(crate) fn pointer_down(&self, ev: web_sys::PointerEvent) {
+        let Some(detent) = self.placement_untracked().detent() else {
+            return;
+        };
+        let Some(drag) = SheetDrag::new(
+            ev.pointer_id(),
+            ev.client_y() as f64,
+            ev.time_stamp(),
+            gestures::viewport_size().1,
+            self.geometry.fraction(detent),
+        ) else {
+            return;
+        };
+
+        if let Some(target) = ev.current_target() {
+            if let Ok(element) = target.dyn_into::<web_sys::Element>() {
+                let _ = element.set_pointer_capture(ev.pointer_id());
+            }
+        }
+        self.drag.set_value(Some(drag));
+        self.drag_offset_px.set(Some(0.0));
+        ev.prevent_default();
+    }
+
+    pub(crate) fn pointer_move(&self, ev: web_sys::PointerEvent) {
+        self.drag.update_value(|drag| {
+            if let Some(frame) = drag.as_mut().and_then(|drag| {
+                drag.sample(ev.pointer_id(), ev.client_y() as f64, ev.time_stamp())
+            }) {
+                self.drag_offset_px.set(Some(frame.translate_y_px));
+            }
+        });
+    }
+
+    pub(crate) fn pointer_up(&self, ev: web_sys::PointerEvent) {
+        let drag = self
+            .drag
+            .try_update_value(|drag| {
+                drag.as_ref()
+                    .is_some_and(|drag| drag.pointer_id() == ev.pointer_id())
+                    .then(|| drag.take())
+                    .flatten()
+            })
+            .flatten();
+        let Some(mut drag) = drag else {
+            return;
+        };
+
+        let frame = drag
+            .sample(ev.pointer_id(), ev.client_y() as f64, ev.time_stamp())
+            .unwrap_or_else(|| drag.frame());
+        self.state.update(|state| {
+            state.drag_released(
+                &self.geometry,
+                frame.released_fraction,
+                frame.velocity_fraction_per_second,
+            );
+        });
+        self.drag_offset_px.set(None);
+        if let Some(target) = ev.current_target() {
+            if let Ok(element) = target.dyn_into::<web_sys::Element>() {
+                let _ = element.release_pointer_capture(ev.pointer_id());
+            }
+        }
+    }
+}
 
 /// Feeds a `ShellMode` signal from window width, debounced 150ms so a Stage
 /// Manager drag doesn't thrash the layout on every intermediate resize event.

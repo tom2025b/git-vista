@@ -45,7 +45,9 @@ use crate::features::operations::signals::Operations;
 use crate::features::operations::view::operations_status_view;
 use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
-use crate::features::shell::signals::{install_connectivity_signal, install_mode_signal, Shell};
+use crate::features::shell::signals::{
+    install_connectivity_signal, install_mode_signal, SheetController, Shell,
+};
 use crate::features::status::signals as status_seam;
 use crate::hook_policy_banner::hook_policy_banner_view;
 use crate::icons::icon_set;
@@ -304,6 +306,13 @@ pub fn App() -> impl IntoView {
     // graph_canvas, for the same reason `shell` is: an epoch bump's rebuild must
     // not tear down and reinstall the resize listener mid-session.
     let mode = install_mode_signal();
+    let sheet = SheetController::new(mode.get_untracked());
+    create_effect(move |_| sheet.on_mode_change(mode.get()));
+    create_effect(move |_| {
+        if shell.detail_id().is_none() {
+            sheet.cancel_drag();
+        }
+    });
 
     // The browser's own connectivity report (M2.22a, #241). Installed here, not
     // in `graph_canvas`, for the same reason `mode` is: an epoch bump's rebuild
