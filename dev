@@ -276,6 +276,33 @@ cmd_report() {
   printf '  %-22s %6d\n' "total" "$grand"
   echo
 
+  echo "── main, by ISO week, from day 1 ────────────────────"
+  # Single `git log --numstat` pass, not one invocation per week: a commit
+  # line ('@@'-prefixed) sets the current week, and every numstat line that
+  # follows it (until the next '@@') belongs to that commit — the same
+  # interleaving `git log --numstat --pretty=format:...` always produces, so
+  # this needs no per-commit lookups. Reversed then printed high-to-low so
+  # the accumulation is oldest-first but the report reads newest-first.
+  git log main --reverse --pretty=format:'@@%x09%ad%x09%s' --date=format:'%G-W%V' --numstat | awk -F'\t' '
+    /^@@/ {
+      wk = $2
+      is_wip = ($3 ~ /^wip\(/) ? 1 : 0
+      if (!(wk in seen)) { seen[wk] = 1; order[++n] = wk }
+      commits[wk]++
+      if (!is_wip) real[wk]++
+      next
+    }
+    NF == 3 { ins[wk] += ($1 == "-" ? 0 : $1); del[wk] += ($2 == "-" ? 0 : $2) }
+    END {
+      for (i = n; i >= 1; i--) {
+        w = order[i]
+        printf "  %-9s %4d commits (%3d real)   +%-6d -%-5d\n", \
+          w, commits[w], real[w], ins[w] + 0, del[w] + 0
+      }
+    }
+  '
+  echo
+
   echo "── merged PRs, last 7 days ──────────────────────────"
   if command -v gh >/dev/null; then
     gh pr list --state merged --limit 60 --json number,title,mergedAt \
