@@ -10,12 +10,17 @@
 //! fetched lazily from `/api/diff/{id}` alongside the detail. The menu's
 //! "Show diff" item opens this same panel with the section scrolled into view.
 
+use std::collections::HashMap;
+
 use leptos::*;
+use wasm_bindgen::JsCast;
 
 use git_vista_core::status::ChangeKind;
 
 use crate::api::fetch_diff;
 use crate::datetime::local_timestamp;
+use crate::features::a11y::focus::{FocusMove, GraphFocus};
+use crate::features::diff::core::hunk_nav;
 use crate::features::graph::core::RenderCtx;
 use crate::icons::{icon_set, GitIcons};
 use crate::state::{DetailResource, Features, Settings, ViewerDoc};
@@ -47,6 +52,199 @@ pub(crate) fn diff_line_class(line: &str) -> &'static str {
         "diff-del"
     } else {
         ""
+    }
+}
+
+/// The coloured patch with accessible hunk navigation (M2.16e, #210) — the
+/// flat per-line rendering both diff surfaces use, with every ordinary hunk
+/// header a roving-tabindex stop: one `Tab` stop for the whole patch,
+/// ArrowUp/Down move between hunks, Home/End jump, Escape leaves the patch
+/// without closing anything, and a finger/Pencil tap on any header moves the
+/// roving position there ([`GraphFocus::focus_landed`]). Added/removed lines
+/// get a screen-reader-only prefix so VoiceOver's touch exploration says what
+/// changed instead of a bare "plus"/"minus".
+///
+/// The header spans carry `role="group"`, not `role="button"`: they navigate,
+/// they do not activate — hunk *selection* is staging's business (M2.17), and
+/// a button role would promise an action that does not exist yet. `group` is
+/// a naming-permitted, non-interactive role, which a bare `<span>` is not: a
+/// role-less span computes to `generic`, where ARIA 1.2 prohibits
+/// `aria-label`, and WebKit is known to drop prohibited names. Whether
+/// VoiceOver actually speaks the label on focus is *expected, not verified
+/// from this box* — it is on the iPad testbed list.
+///
+/// Known keyboard-continuity gap (honest limit): if the patch re-renders
+/// while DOM focus sits on a hunk header (walking to a parent commit), the
+/// focused span unmounts and browser focus drops to `<body>`; the model's
+/// clamped position survives, but the user re-enters the patch with Tab from
+/// the top. Deliberate — restoring focus across a render needs the RAF dance
+/// the graph uses, and #69e's structural rendering replaces this wiring.
+///
+/// `scope` keeps the detail panel's stops and the full-screen viewer's stops
+/// distinct in DOM queries — both can be mounted at once.
+///
+/// This is the flat-rendering wiring; when #69e renders `ParsedPatch`
+/// structurally (and virtualizes, at which point moving focus needs the
+/// scroll-into-view-then-focus dance the graph's `focus_row_next_frame`
+/// already does), the index-based focus model transfers and this function is
+/// replaced. Scope note argued on #210.
+pub(crate) fn accessible_patch_view(
+    patch: &str,
+    focus: RwSignal<GraphFocus>,
+    scope: &'static str,
+) -> View {
+    let nav = hunk_nav(patch);
+    // `update_untracked`: this runs while a render closure is already
+    // executing; the tabindex closures created below read the fresh count
+    // when they first run, so nothing needs the notification.
+    focus.update_untracked(|f| f.set_row_count(nav.len()));
+    let mut nav_at: HashMap<usize, (usize, String)> = nav
+        .into_iter()
+        .enumerate()
+        .map(|(idx, e)| (e.line_index, (idx, e.label)))
+        .collect();
+    patch
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            let class = diff_line_class(l);
+            let text = format!("{l}\n");
+            match nav_at.remove(&i) {
+                Some((idx, label)) => hunk_header_span(class, text, idx, label, focus, scope),
+                // An `@@` line that is not a navigation stop is a combined
+                // (`@@@`) merge header — header-coloured but inert, so it
+                // must not wear .diff-hunk's interactive styling (pointer
+                // cursor, 44px band) and look tappable.
+                None if class == "diff-hunk" => {
+                    view! { <span class="diff-hunk-combined">{text}</span> }.into_view()
+                }
+                // The sr-only prefix is position:absolute and
+                // user-select:none, so the visible text layout inside the
+                // <pre> — and a selected-and-copied patch — is byte-identical.
+                None if class == "diff-add" => view! {
+                    <span class=class>
+                        <span class="sr-only">"added line: "</span>
+                        {text}
+                    </span>
+                }
+                .into_view(),
+                None if class == "diff-del" => view! {
+                    <span class=class>
+                        <span class="sr-only">"removed line: "</span>
+                        {text}
+                    </span>
+                }
+                .into_view(),
+                None => view! { <span class=class>{text}</span> }.into_view(),
+            }
+        })
+        .collect_view()
+}
+
+/// One navigable hunk header span — see [`accessible_patch_view`].
+fn hunk_header_span(
+    class: &'static str,
+    text: String,
+    idx: usize,
+    label: String,
+    focus: RwSignal<GraphFocus>,
+    scope: &'static str,
+) -> View {
+    // Exactly one header carries `tabindex="0"` — the roving stop. Reactive,
+    // so every keydown/tap that moves the model retargets the tab stop.
+    let tabindex = move || {
+        if focus.with(|f| f.tabbable_row()) == Some(idx) {
+            "0"
+        } else {
+            "-1"
+        }
+    };
+    let on_keydown = move |ev: web_sys::KeyboardEvent| {
+        // Leave modified chords (Cmd+ArrowDown scroll-to-end, Shift+Home
+        // selection, …) to the browser — same posture as the window shortcut
+        // handler in gestures.rs.
+        if ev.alt_key() || ev.ctrl_key() || ev.meta_key() || ev.shift_key() {
+            return;
+        }
+        let dir = match ev.key().as_str() {
+            "ArrowDown" => FocusMove::Next,
+            "ArrowUp" => FocusMove::Prev,
+            "Home" => FocusMove::First,
+            "End" => FocusMove::Last,
+            "Escape" => {
+                // Leave hunk navigation without closing anything: disengage
+                // the model and move DOM focus off the header. Two-part
+                // contract with the window Esc handler (gestures.rs): this
+                // handler is attached *undelegated* — the listener sits on
+                // the span itself, so `stop_propagation` genuinely halts the
+                // event before it reaches the window (Leptos's default
+                // delegation would run it AT the window, where sibling
+                // listeners are immune to stop_propagation) — and the window
+                // handler additionally skips `dismiss_top` when
+                // `default_prevented` is set, so the panel stays open even
+                // if delegation details shift. A second Escape, with focus
+                // elsewhere, still closes it.
+                ev.prevent_default();
+                ev.stop_propagation();
+                focus.update(|f| f.escape());
+                if let Some(el) = ev
+                    .target()
+                    .and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok())
+                {
+                    let _ = el.blur();
+                }
+                return;
+            }
+            _ => return,
+        };
+        // Arrows must move hunk focus, not scroll the pane — scrolling still
+        // follows the focused element via the browser's own focus handling.
+        ev.prevent_default();
+        ev.stop_propagation();
+        if let Some(next) = focus.try_update(|f| f.mv(dir)).flatten() {
+            focus_hunk(scope, next);
+        }
+    };
+    // Tap parity: iOS Safari does not reliably focus a tabindexed span on
+    // tap, so the click handler focuses it explicitly; `focus_landed` in the
+    // focus handler then moves the roving position (idempotent when both
+    // fire).
+    let on_click = move |_| {
+        focus.update(|f| f.focus_landed(idx));
+        focus_hunk(scope, idx);
+    };
+    let on_focus = move |_| focus.update(|f| f.focus_landed(idx));
+    view! {
+        <span
+            class=class
+            role="group"
+            data-hunk-scope=scope
+            data-hunk-index=idx.to_string()
+            tabindex=tabindex
+            aria-label=label
+            on:keydown:undelegated=on_keydown
+            on:click=on_click
+            on:focus=on_focus
+        >
+            {text}
+        </span>
+    }
+    .into_view()
+}
+
+/// Move DOM focus to hunk `idx` in `scope`. Every line of the flat rendering
+/// is mounted, so this is a direct query + focus — no scroll-then-RAF dance
+/// like the virtualized graph needs (`gestures::focus_row_next_frame`).
+fn focus_hunk(scope: &str, idx: usize) {
+    if let Some(el) = document()
+        .query_selector(&format!(
+            "[data-hunk-scope=\"{scope}\"][data-hunk-index=\"{idx}\"]"
+        ))
+        .ok()
+        .flatten()
+        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+    {
+        let _ = el.focus();
     }
 }
 
@@ -86,6 +284,11 @@ pub fn detail_panel_view(
             }
         },
     );
+    // The patch's roving hunk focus (M2.16e, #210) — created here, above the
+    // render closures, so an icon toggle's re-render doesn't reset which hunk
+    // the keyboard was on. Walking to a parent re-renders the patch, and
+    // `accessible_patch_view` re-clamps the model to the new hunk count.
+    let hunk_focus = create_rw_signal(GraphFocus::new(0));
     move || {
         shell.detail_id().map(|open_id| {
             // Tracked read, like the menu: the panel re-renders live if the icon
@@ -300,18 +503,10 @@ pub fn detail_panel_view(
                                 }
                             })
                             .collect_view();
-                        // The patch, coloured line by line off its prefix. Each
-                        // line keeps its own trailing newline so the <pre>
-                        // preserves the exact text layout.
-                        let patch = d
-                            .patch
-                            .lines()
-                            .map(|l| {
-                                let class = diff_line_class(l);
-                                let text = format!("{l}\n");
-                                view! { <span class=class>{text}</span> }
-                            })
-                            .collect_view();
+                        // The patch, coloured line by line off its prefix, with
+                        // hunk headers as roving keyboard/tap stops (M2.16e,
+                        // #210 — see `accessible_patch_view`).
+                        let patch = accessible_patch_view(&d.patch, hunk_focus, "detail");
                         let truncated_note = d.truncated.then(|| {
                             view! {
                                 <p class="detail-status">
