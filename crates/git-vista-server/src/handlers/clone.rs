@@ -3,8 +3,10 @@
 //! store and hand its descriptor back so the browser can offer the mode
 //! picker; delete a clone again on request, guarded to the clones root.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
@@ -12,7 +14,7 @@ use axum::Json;
 
 use git_vista_core::identity::WorktreeId;
 use git_vista_protocol::{
-    validate_clone_url, CloneRequest, DeleteCloneRequest, RepositoryDescriptor,
+    validate_clone_url, CloneRequest, DeleteCloneRequest, IdempotencyKey, RepositoryDescriptor,
 };
 
 use crate::state::{
@@ -57,6 +59,160 @@ fn unique_dest(root: &Path, name: &str) -> PathBuf {
         .expect("some numeric suffix is free")
 }
 
+/// How [`run_guarded`] resolved when it did **not** hand back a value: either
+/// the deadline won, or `fut` itself resolved to `Err` before the deadline.
+/// Kept as an enum rather than folded into a single error type so the caller
+/// can give each case its own HTTP status and message.
+enum GuardedOutcome<E> {
+    Failed(E),
+    TimedOut,
+}
+
+/// Await `fut` under `timeout`, removing `dest` unless `fut` resolves to `Ok`
+/// before the deadline fires.
+///
+/// # Why cleanup is a Drop guard and not a branch of the match below
+///
+/// MEASURED 2026-07-31, not assumed: a standalone axum server was driven by a
+/// client that disconnected mid-request. Three flags, so no single one could
+/// be read vacuously — `started=true` (the handler ran), `dropped=true` (it
+/// unwound), and `timeout_arm=false` (the branch was skipped). The paired
+/// positive, a client that waits, showed `timeout_arm=true`, so the arm
+/// works; it simply does not run on disconnect.
+///
+/// Axum drops the handler future when the client goes away, which skips
+/// **every** match arm including the timeout's. Cleanup written as a branch of
+/// a completion path only runs if that path is reached, and cancellation is
+/// the absence of all of them. So the half-written destination is removed by
+/// a value's lifetime instead, which cancellation cannot skip.
+///
+/// This matters more once the client aborts on its own deadline (#216
+/// follow-up): abort makes disconnect the *common* path, so a
+/// timeout-arm-only cleanup would have quietly stopped running just as it
+/// started being needed.
+///
+/// Extracted to its own function (rather than left inline in [`clone_repo`])
+/// specifically so `guarded_timeout_removes_the_destination` and
+/// `guarded_success_keeps_the_destination` below can drive the mechanism
+/// directly, with an injectable deadline, instead of only through a full
+/// clone over HTTP.
+async fn run_guarded<T, E>(
+    dest: &Path,
+    timeout: std::time::Duration,
+    fut: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, GuardedOutcome<E>> {
+    struct DestGuard<'a> {
+        dest: &'a Path,
+        keep: bool,
+    }
+    impl Drop for DestGuard<'_> {
+        fn drop(&mut self) {
+            if !self.keep {
+                // Best-effort: the destination is a fresh, uniquely named
+                // directory the caller created, so removing it cannot touch
+                // anything the operator owns.
+                let _ = std::fs::remove_dir_all(self.dest);
+            }
+        }
+    }
+    let mut guard = DestGuard { dest, keep: false };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(value)) => {
+            // Survived: the destination is the caller's now.
+            guard.keep = true;
+            Ok(value)
+        }
+        Ok(Err(e)) => Err(GuardedOutcome::Failed(e)),
+        // `guard` is still armed here, so the destination is removed as this
+        // scope unwinds — no explicit cleanup call needed.
+        Err(_elapsed) => Err(GuardedOutcome::TimedOut),
+    }
+}
+
+/// #216 follow-up: the process-wide set of idempotency keys with a clone
+/// currently running under them.
+///
+/// Deliberately **not** `operations::admit` (out of scope: that funnel, and
+/// its `GitOperation`/planner plumbing, are reserved for M2's queued
+/// sub-issues starting imminently — see this issue's task notes). It also
+/// would not fit cleanly: `admit` requires a `RepositoryToken`/
+/// `WorktreeToken`, and neither exists yet at the point a clone must be
+/// deduplicated — the destination directory hasn't been created, let alone
+/// classified as a repository.
+///
+/// A `HashSet`, not a `HashMap`, on purpose: unlike `operations::Record` this
+/// guard caches no replayable result. It only remembers "busy right now" and
+/// forgets the key the instant the clone ends, one way or another — see
+/// [`InProgressGuard`]. That is the smaller, more honest shape for what the
+/// client's retry actually needs: the client already sets
+/// `CLONE_TIMEOUT_MS` (570s) just under the server's own `CLONE_TIMEOUT`
+/// (600s, above) specifically so a retry practically never arrives while the
+/// first attempt is still genuinely running — see `crates/git-vista/src/
+/// api.rs`. A retry that does arrive early is refused outright rather than
+/// parked to await the first attempt's result; building the "await and
+/// replay" half of `admit` for clone alone would mean re-deriving
+/// `operations::Record`'s watch-channel machinery for one endpoint, which is
+/// exactly the general operation-tracking mechanism this fix is scoped to
+/// avoid building.
+static CLONES_IN_PROGRESS: OnceLock<StdMutex<HashSet<IdempotencyKey>>> = OnceLock::new();
+
+fn clones_in_progress() -> &'static StdMutex<HashSet<IdempotencyKey>> {
+    CLONES_IN_PROGRESS.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+/// RAII release for [`claim_in_progress`]: whatever key was claimed is
+/// removed from [`CLONES_IN_PROGRESS`] when this guard drops — on the
+/// function's normal return, an early `return Err(...)`, or an unwind — so a
+/// finished clone (successful or not) never leaves its key stuck "busy" and
+/// blocking a later, genuinely new attempt that happens to reuse it.
+#[derive(Debug)]
+struct InProgressGuard(Option<IdempotencyKey>);
+
+impl Drop for InProgressGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            if let Ok(mut set) = clones_in_progress().lock() {
+                set.remove(&key);
+            }
+        }
+    }
+}
+
+/// Claim `key` as "a clone is running under this key right now", or refuse
+/// cleanly if one already is.
+///
+/// `key` is `None` when the request carries no idempotency key at all — a
+/// direct call outside the middleware's task-local scope (the unit tests
+/// below), or, in principle, a client that omitted the header. Without a key
+/// there is no "same attempt" to compare against, so this can't dedupe and
+/// doesn't try: it returns `Ok(None)`, meaning nothing is held and nothing
+/// needs releasing.
+///
+/// This is the single critical section: the check-and-insert happens under
+/// one lock acquisition, so two concurrent calls for the same key cannot both
+/// observe "not present" and both proceed — exactly the property
+/// `operations::admit`'s doc comment names for its own map, applied here to
+/// clone's narrower one.
+fn claim_in_progress(
+    key: Option<IdempotencyKey>,
+) -> Result<Option<InProgressGuard>, (StatusCode, String)> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    let mut set = clones_in_progress()
+        .lock()
+        .expect("clones-in-progress lock");
+    if !set.insert(key.clone()) {
+        return Err((
+            StatusCode::CONFLICT,
+            "A clone for this request is already in progress. Wait for it to finish \
+             before retrying."
+                .to_string(),
+        ));
+    }
+    Ok(Some(InProgressGuard(Some(key))))
+}
+
 /// Clone a public repository from a pasted URL into the persistent clones
 /// store (ADR 0008) and open it look-only pending the operator's mode choice.
 ///
@@ -67,9 +223,24 @@ fn unique_dest(root: &Path, name: &str) -> PathBuf {
 /// a shell line. A full clone is made (history is bounded downstream by
 /// `HISTORY_LIMIT`); clones persist under the clones root (ADR 0008) until
 /// deleted via `/api/delete-clone`.
+///
+/// #216 follow-up: unlike every other write, this handler is **not**
+/// operation-tracked, so the idempotency key the client already sends buys it
+/// nothing by default — the key reaches this task-local scope regardless (the
+/// M1.08 `idempotency` middleware wraps every `/api/*` route, clone included),
+/// but nothing here used to read it. [`claim_in_progress`] is the narrow fix:
+/// it claims the key for the duration of this handler so a retry that
+/// overlaps a still-running first attempt is refused before either can reach
+/// [`unique_dest`] — the actual race, since two concurrent calls can both see
+/// the same destination path as free before either creates it.
 pub(crate) async fn clone_repo(
     Json(req): Json<CloneRequest>,
 ) -> Result<Json<RepositoryDescriptor>, (StatusCode, String)> {
+    // Held for the rest of this function (dropped — and the key released —
+    // on every return path, success or failure) so no other request carrying
+    // the same key can be admitted while this one is still running.
+    let _in_progress = claim_in_progress(crate::operations::current_key())?;
+
     let url = match validate_clone_url(&req.url) {
         Ok(u) => u,
         Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
@@ -154,71 +325,24 @@ pub(crate) async fn clone_repo(
             // clone living forever, not to enforce a latency budget.
             const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
-            // # Why cleanup is a Drop guard and not just the timeout arm
-            //
-            // MEASURED 2026-07-31, not assumed: a standalone axum server was
-            // driven by a client that disconnected mid-request. Three flags,
-            // so no single one could be read vacuously — `started=true`
-            // (the handler ran), `dropped=true` (it unwound), and
-            // `timeout_arm=false` (the branch was skipped). The paired
-            // positive, a client that waits, showed `timeout_arm=true`, so
-            // the arm works; it simply does not run on disconnect.
-            //
-            // Axum drops the handler future when the client goes away, which
-            // skips **every** match arm including the timeout's. Cleanup
-            // written as a branch of a completion path only runs if that path
-            // is reached, and cancellation is the absence of all of them. So
-            // the half-written destination is removed by a value's lifetime
-            // instead, which cancellation cannot skip.
-            //
-            // This matters more once the client aborts on its own deadline
-            // (#216 follow-up): abort makes disconnect the *common* path, so a
-            // timeout-arm-only cleanup would have quietly stopped running just
-            // as it started being needed.
-            struct DestGuard<'a> {
-                dest: &'a std::path::Path,
-                keep: bool,
-            }
-            impl Drop for DestGuard<'_> {
-                fn drop(&mut self) {
-                    if !self.keep {
-                        // Best-effort: the destination is a fresh, uniquely
-                        // named directory this call created, so removing it
-                        // cannot touch anything the operator owns.
-                        let _ = std::fs::remove_dir_all(self.dest);
-                    }
-                }
-            }
-            let mut guard = DestGuard {
-                dest: &dest,
-                keep: false,
-            };
-
             // `kill_on_drop`: without it a cancelled handler leaves the git
-            // child running, still writing into a directory the guard above
-            // has already removed. The orphan outlives the request that
+            // child running, still writing into a directory `run_guarded`
+            // below has already removed. The orphan outlives the request that
             // authorised it, which is precisely what this milestone's process
             // lifecycle work (INV-8) exists to prevent.
             let spawned = crate::sandbox::spawn::command_async(&policy, &root, &args)
                 .kill_on_drop(true)
                 .output();
-            match tokio::time::timeout(CLONE_TIMEOUT, spawned).await {
-                Ok(Ok(o)) => {
-                    // Survived: the destination is the caller's now. Anything
-                    // below that decides the clone failed re-arms the guard.
-                    guard.keep = true;
-                    o
-                }
-                Ok(Err(e)) => {
+            match run_guarded(&dest, CLONE_TIMEOUT, spawned).await {
+                Ok(o) => o,
+                Err(GuardedOutcome::Failed(e)) => {
                     eprintln!("git-vista: /api/clone couldn't run git: {e}");
                     return Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Couldn't run git: {e}"),
                     ));
                 }
-                Err(_elapsed) => {
-                    // `guard` is still armed, so the destination is removed as
-                    // this scope unwinds — no explicit cleanup call here.
+                Err(GuardedOutcome::TimedOut) => {
                     eprintln!(
                         "git-vista: /api/clone timed out after {}s cloning {url}",
                         CLONE_TIMEOUT.as_secs()
@@ -371,6 +495,67 @@ mod tests {
         assert_eq!(unique_dest(root.path(), "repo"), root.path().join("repo-3"));
     }
 
+    /// The missing paired positive for #216's Drop-guard fix: the earlier
+    /// standalone axum experiment proved the mechanism (`timeout_arm=false`
+    /// on client disconnect, with a client-waits leg showing `true`), but
+    /// never proved `run_guarded` itself removes the directory when its own
+    /// `tokio::time::timeout` — not a client disconnect — is what fires.
+    /// Without this leg, "the guard cleans up" was argued, not measured.
+    #[tokio::test]
+    async fn guarded_timeout_removes_the_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("half-cloned");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("partial-file"), b"partial").unwrap();
+        assert!(
+            dest.exists(),
+            "premise: the directory exists before the run"
+        );
+
+        let never_finishes = std::future::pending::<Result<(), std::io::Error>>();
+        let result = run_guarded(&dest, std::time::Duration::from_millis(20), never_finishes).await;
+
+        assert!(
+            matches!(result, Err(GuardedOutcome::TimedOut)),
+            "expected TimedOut for a future that never resolves"
+        );
+        assert!(
+            !dest.exists(),
+            "the destination must be removed when the deadline wins, not left as a \
+             half-cloned directory the next attempt collides with"
+        );
+    }
+
+    /// The paired negative: a fast, successful future must NOT have its
+    /// destination removed. Without this leg, `guarded_timeout_removes_the_destination`
+    /// would be equally consistent with `run_guarded` always deleting `dest`
+    /// regardless of outcome — a "cleanup" that destroys every real clone too.
+    #[tokio::test]
+    async fn guarded_success_keeps_the_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("real-clone");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("real-file"), b"real").unwrap();
+
+        let resolves_immediately = std::future::ready(Ok::<_, std::io::Error>(42u32));
+        let result = run_guarded(
+            &dest,
+            std::time::Duration::from_secs(60),
+            resolves_immediately,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(42)),
+            "the value must pass through unchanged"
+        );
+        assert!(
+            dest.exists() && dest.join("real-file").exists(),
+            "a successful clone's destination must survive — this is the failure mode \
+             a naive 'always clean up' implementation would introduce"
+        );
+    }
+
     #[tokio::test]
     async fn delete_clone_refuses_a_malformed_and_an_unknown_id() {
         let (status, _) = delete_clone_repo(axum::Json(DeleteCloneRequest {
@@ -386,5 +571,110 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(msg, "No such repository.");
+    }
+
+    /// #216 follow-up: proves the in-progress guard that stops two concurrent
+    /// `/api/clone` requests for the same idempotency key from both spawning
+    /// `git clone`.
+    ///
+    /// Modeled at the level of [`claim_in_progress`] rather than the full HTTP
+    /// handler, for the same reason `guarded_timeout_removes_the_destination`
+    /// above drives `run_guarded` directly instead of through a real clone:
+    /// `claim_in_progress` is the very first thing `clone_repo` does, gating
+    /// its *entire* body — a call refused here never reaches [`unique_dest`]
+    /// (the actual TOCTOU: two concurrent calls can both see the same
+    /// destination path as free before either creates it) or spawns git at
+    /// all. Exercising this through a real concurrent HTTP clone would need
+    /// either the public internet (this crate's one network test,
+    /// `sandbox::clone_live`, is `#[ignore]`d for exactly that reason and does
+    /// not run in `./dev gate`) or a local git-over-HTTP fixture server —
+    /// infrastructure this property doesn't need in order to be proven.
+    ///
+    /// The two attempts are made to genuinely overlap — the second is not
+    /// attempted until the first has already claimed the key and is
+    /// deliberately held "still running" — via oneshot channels, rather than
+    /// hoping the tokio scheduler interleaves them. `spawned` stands in for
+    /// "reached the point `clone_repo` would call `unique_dest`/spawn `git
+    /// clone`": only the winner may increment it.
+    ///
+    /// **Before the fix** (`clone_repo` calling nothing before `unique_dest`,
+    /// which is what this repository looked like before this change): this
+    /// test's premise — that a second overlapping attempt for the same key is
+    /// refused — has nothing to assert against, because there was no
+    /// `claim_in_progress` to call; the equivalent of "both attempts run"
+    /// was proven manually while developing this fix by temporarily making
+    /// [`claim_in_progress`] always admit (skipping the `set.insert` check),
+    /// which reproduces the pre-fix behaviour and fails this test's `spawned
+    /// == 1` assertion with `spawned == 2`. Restoring the real check is what
+    /// turns that failure back into a pass — the failing-then-passing result
+    /// asked for.
+    #[tokio::test]
+    async fn overlapping_clone_attempts_for_the_same_key_are_not_both_admitted() {
+        let key = IdempotencyKey::new("test-clone-overlap-216").unwrap();
+        let spawned = std::sync::Arc::new(AtomicU64::new(0));
+
+        let (first_claimed_tx, first_claimed_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+
+        let first = {
+            let key = key.clone();
+            let spawned = std::sync::Arc::clone(&spawned);
+            tokio::spawn(async move {
+                let guard =
+                    claim_in_progress(Some(key)).expect("the first attempt must be admitted");
+                // Stand-in for "spawned git clone" — the real handler's next
+                // steps (`unique_dest`, then `command_async(...).output()`)
+                // after this guard, before either has actually run.
+                spawned.fetch_add(1, Ordering::SeqCst);
+                let _ = first_claimed_tx.send(());
+                // Held "in progress" — deliberately not dropped — until the
+                // second attempt has had its chance to race it. This *is*
+                // the overlap: the second call below happens while this
+                // guard is still alive, not after it.
+                let _ = release_first_rx.await;
+                drop(guard);
+            })
+        };
+
+        first_claimed_rx
+            .await
+            .expect("the first attempt must claim before the second is tried");
+
+        // The second attempt, made while the first is still holding its
+        // guard: genuinely overlapping, not sequential.
+        let second_result = claim_in_progress(Some(key.clone()));
+
+        let _ = release_first_tx.send(());
+        first.await.expect("the first task must not panic");
+
+        assert!(
+            matches!(second_result, Err((StatusCode::CONFLICT, _))),
+            "a second request for a key already in progress must be refused, not admitted"
+        );
+        assert_eq!(
+            spawned.load(Ordering::SeqCst),
+            1,
+            "only the admitted attempt may reach the point clone_repo would spawn git \
+             clone — a second admission here is exactly the race that let two concurrent \
+             `git clone`s target the same destination directory"
+        );
+
+        // The key is released once the winner finishes, so a *later*,
+        // non-overlapping attempt is free to proceed — the guard must not
+        // leak past the request that held it.
+        let third = claim_in_progress(Some(key));
+        assert!(
+            matches!(third, Ok(Some(_))),
+            "the key must be released once the in-progress attempt finishes: {third:?}"
+        );
+    }
+
+    /// A request with no idempotency key at all (a direct call outside the
+    /// middleware's task-local scope, as every test above already is) is
+    /// waved through rather than refused: there is no "same attempt" to
+    /// compare against, so the guard can't dedupe and doesn't try.
+    #[test]
+    fn claim_in_progress_is_a_no_op_without_a_key() {
+        assert!(matches!(claim_in_progress(None), Ok(None)));
     }
 }
