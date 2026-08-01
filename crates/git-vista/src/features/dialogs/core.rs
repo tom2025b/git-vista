@@ -179,6 +179,49 @@ pub fn clone_dialog_may_dismiss(cloning: bool, guard_allows: bool) -> bool {
     !cloning && guard_allows
 }
 
+/// The sessionStorage key holding the commit-message draft for one repository
+/// (#226). Keyed by the Frame's `worktree_id` so a draft typed against one
+/// repository can never surface in another's commit dialog.
+pub fn commit_draft_key(worktree_id: &str) -> String {
+    format!("gv-commit-draft:{worktree_id}")
+}
+
+/// What the draft signal should do when the served repository (the draft
+/// *scope*) is observed again (#226).
+///
+/// The scope is re-observed on **every** epoch reload — Refresh, a settled
+/// write, drift — almost always with the same repository. Reseeding from
+/// storage on those would clobber whatever the user has typed since the last
+/// persist tick, so the rule is: reseed **only when the repository actually
+/// changed**. That decision lives here, host-tested, because the signal
+/// wiring around it is wasm-only and untestable in this repo.
+///
+/// Losing the scope (`new` is `None`) also keeps the signal. A `None` frame
+/// is not only genuine degraded mode — it is what an *errored* seed reload
+/// looks like, and over this deployment's flaky tunnel a Refresh during a
+/// drop is routine. Blanking the open dialog's textarea on that would lose
+/// exactly the work this feature exists to protect. Freezing instead means
+/// the scope keeps its last-known repository, per-keystroke persistence
+/// continues under that key, and recovery to the same repository is then the
+/// same-scope no-op above — nothing clobbered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftScopeAction {
+    /// Same repository as before, or the repository is momentarily unknown —
+    /// leave the live signal (and the last-known scope) alone.
+    KeepSignal,
+    /// A different repository (or the first one seen) — replace the signal
+    /// with that repository's persisted draft, or blank if none.
+    SeedFromStorage,
+}
+
+pub fn draft_scope_action(old: Option<&str>, new: Option<&str>) -> DraftScopeAction {
+    if new.is_none() || old == new {
+        DraftScopeAction::KeepSignal
+    } else {
+        DraftScopeAction::SeedFromStorage
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +349,56 @@ mod tests {
     fn an_idle_dialog_defers_to_the_ghost_click_guard() {
         assert!(clone_dialog_may_dismiss(false, true));
         assert!(!clone_dialog_may_dismiss(false, false));
+    }
+
+    #[test]
+    fn draft_keys_are_distinct_per_repository() {
+        // The scoping acceptance criterion of #226, at the key level: two
+        // repositories can never share a draft slot.
+        let a = commit_draft_key("5e1a4510-aaaa");
+        let b = commit_draft_key("f9f44ccb-bbbb");
+        assert_ne!(a, b);
+        assert!(a.contains("5e1a4510-aaaa"));
+        assert!(a.starts_with("gv-commit-draft:"));
+    }
+
+    #[test]
+    fn reobserving_the_same_repository_keeps_the_live_signal() {
+        // The clobber trap: the scope is re-observed on EVERY epoch reload
+        // (Refresh, settled writes, drift), almost always with the same repo.
+        // Reseeding then would overwrite keystrokes typed since the last
+        // persist tick.
+        assert_eq!(
+            draft_scope_action(Some("same"), Some("same")),
+            DraftScopeAction::KeepSignal
+        );
+        assert_eq!(draft_scope_action(None, None), DraftScopeAction::KeepSignal);
+    }
+
+    #[test]
+    fn losing_the_scope_freezes_the_draft_instead_of_blanking_it() {
+        // A None frame is what an ERRORED seed reload looks like (Refresh
+        // during a tunnel drop), not only genuine degraded mode. Reseeding
+        // here would set the open dialog's textarea to blank mid-draft.
+        // Keeping the signal — and, by the caller's early return, the
+        // last-known scope — means typing during the outage still persists
+        // under the last-known repository, and recovery to that repository
+        // is the same-scope no-op.
+        assert_eq!(
+            draft_scope_action(Some("old"), None),
+            DraftScopeAction::KeepSignal
+        );
+    }
+
+    #[test]
+    fn a_changed_or_first_repository_seeds_from_storage() {
+        assert_eq!(
+            draft_scope_action(None, Some("first")),
+            DraftScopeAction::SeedFromStorage
+        );
+        assert_eq!(
+            draft_scope_action(Some("old"), Some("new")),
+            DraftScopeAction::SeedFromStorage
+        );
     }
 }
