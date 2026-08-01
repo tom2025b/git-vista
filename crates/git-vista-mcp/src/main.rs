@@ -99,7 +99,9 @@ fn handle_line(line: &str, session: &mut Option<auth::Session>) -> Option<serde_
                 .pointer("/params/name")
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
-            return Some(match tools::call_tool(name, session) {
+            let empty = serde_json::json!({});
+            let arguments = msg.pointer("/params/arguments").unwrap_or(&empty);
+            return Some(match tools::call_tool(name, arguments, session) {
                 Ok(value) => result_reply(
                     id,
                     serde_json::json!({
