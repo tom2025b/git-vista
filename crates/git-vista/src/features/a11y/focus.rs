@@ -135,6 +135,20 @@ impl GraphFocus {
         }
     }
 
+    /// Focus landed directly on row `row` — a finger/Pencil tap on an element
+    /// that is not the current tab stop (M2.16e, #210: every diff hunk header
+    /// is tappable, not only the tabbable one). The roving position follows
+    /// the tap, so the next arrow key moves from where the user actually is,
+    /// not from where keyboard focus last was. Clamped like every other
+    /// transition; a no-op on an empty list for [`focus_entered`]'s reason.
+    pub fn focus_landed(&mut self, row: usize) {
+        if self.row_count == 0 {
+            return;
+        }
+        self.active = row.min(self.row_count - 1);
+        self.engaged = true;
+    }
+
     /// Move the roving focus by `dir`. Returns the row to call `.focus()` on
     /// in the DOM, or `None` on an empty graph (nothing to move to). Always
     /// clamps rather than wraps at either end — `ArrowUp` on the first row and
@@ -213,6 +227,28 @@ mod tests {
         let mut f = GraphFocus::new(0);
         f.focus_entered();
         assert_eq!(f.focused_row(), None, "nothing exists to receive focus");
+    }
+
+    #[test]
+    fn a_tap_moves_the_roving_position_to_the_tapped_row() {
+        let mut f = GraphFocus::new(5);
+        f.focus_landed(3);
+        assert_eq!(f.focused_row(), Some(3));
+        assert_eq!(f.tabbable_row(), Some(3), "the tab stop follows the tap");
+        // The next arrow moves from the tapped row, not from the old stop.
+        assert_eq!(f.mv(FocusMove::Next), Some(4));
+    }
+
+    #[test]
+    fn a_tap_past_the_end_clamps_and_an_empty_list_ignores_it() {
+        let mut f = GraphFocus::new(3);
+        f.focus_landed(99);
+        assert_eq!(f.focused_row(), Some(2), "clamped to the last row");
+
+        let mut empty = GraphFocus::new(0);
+        empty.focus_landed(0);
+        assert_eq!(empty.focused_row(), None, "nothing exists to receive focus");
+        assert_eq!(empty.tabbable_row(), None);
     }
 
     #[test]
