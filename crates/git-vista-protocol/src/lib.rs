@@ -62,6 +62,7 @@ pub mod dto;
 pub mod error;
 pub mod history;
 pub mod operation;
+pub mod patch_build;
 pub mod patch_plan;
 pub mod plan;
 pub mod status;
@@ -81,8 +82,10 @@ pub use operation::{
     IdempotencyKey, OperationId, OperationStage, OperationState, OperationStatus, ProgressEvent,
     MAX_IDEMPOTENCY_KEY_LEN, MAX_OPERATION_ID_LEN, PROGRESS_EVENT, RESULT_EVENT,
 };
+pub use patch_build::{build_selected_patch, canonical_path, SelectedPatch, SelectionMismatch};
 pub use patch_plan::{
-    FileSelection, HunkLines, HunkRef, PatchPlan, PatchPlanError, SelectionShape, StageDirection,
+    FileSelection, HunkLines, HunkRef, PatchPlan, PatchPlanError, PatchPreview, SelectionShape,
+    StageDirection, StagingDiff,
 };
 pub use plan::{
     BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, OperationHash, Plan,
