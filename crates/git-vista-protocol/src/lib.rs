@@ -62,6 +62,7 @@ pub mod dto;
 pub mod error;
 pub mod history;
 pub mod operation;
+pub mod patch_plan;
 pub mod plan;
 pub mod status;
 pub mod version;
@@ -79,6 +80,9 @@ pub use history::{HistoryFrame, HistoryPage};
 pub use operation::{
     IdempotencyKey, OperationId, OperationStage, OperationState, OperationStatus, ProgressEvent,
     MAX_IDEMPOTENCY_KEY_LEN, MAX_OPERATION_ID_LEN, PROGRESS_EVENT, RESULT_EVENT,
+};
+pub use patch_plan::{
+    FileSelection, HunkLines, HunkRef, PatchPlan, PatchPlanError, SelectionShape, StageDirection,
 };
 pub use plan::{
     BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, OperationHash, Plan,

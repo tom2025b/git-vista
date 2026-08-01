@@ -1,0 +1,126 @@
+[
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "direction": "stage",
+    "files": [
+      {
+        "path": "assets/logo.png",
+        "selection": {
+          "select": "entire_file"
+        }
+      }
+    ]
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "direction": "stage",
+    "files": [
+      {
+        "path": "src/lib.rs",
+        "selection": {
+          "select": "hunks",
+          "hunks": [
+            {
+              "index": 0,
+              "old_start": 10,
+              "new_start": 10
+            },
+            {
+              "index": 2,
+              "old_start": 91,
+              "new_start": 94
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "direction": "unstage",
+    "files": [
+      {
+        "path": "src/net.rs",
+        "selection": {
+          "select": "lines",
+          "hunks": [
+            {
+              "hunk": {
+                "index": 1,
+                "old_start": 40,
+                "new_start": 42
+              },
+              "lines": [
+                1,
+                2
+              ]
+            },
+            {
+              "hunk": {
+                "index": 3,
+                "old_start": 200,
+                "new_start": 205
+              },
+              "lines": [
+                0,
+                4,
+                5
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "repository": "11111111-1111-5111-8111-111111111111",
+    "worktree": "22222222-2222-5222-8222-222222222222",
+    "generation": "12345678901234567890",
+    "direction": "stage",
+    "files": [
+      {
+        "path": "Cargo.toml",
+        "selection": {
+          "select": "entire_file"
+        }
+      },
+      {
+        "path": "src/main.rs",
+        "selection": {
+          "select": "hunks",
+          "hunks": [
+            {
+              "index": 1,
+              "old_start": 55,
+              "new_start": 61
+            }
+          ]
+        }
+      },
+      {
+        "path": "src/planner.rs",
+        "selection": {
+          "select": "lines",
+          "hunks": [
+            {
+              "hunk": {
+                "index": 0,
+                "old_start": 7,
+                "new_start": 7
+              },
+              "lines": [
+                2
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  }
+]
