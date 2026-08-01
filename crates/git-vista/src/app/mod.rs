@@ -442,6 +442,11 @@ pub fn App() -> impl IntoView {
     let open_url = create_rw_signal(false);
     let clone_url = create_rw_signal(String::new());
     let cloning = create_rw_signal(false);
+    // #278: true only while `clone_request` has fallen back to polling
+    // `GET /api/clone-status/{key}` after a lost/timed-out/"already in
+    // progress" `POST /api/clone` response — see `dialogs::open_url_view`'s
+    // doc comment. `cloning` alone still governs the dismiss pin.
+    let checking_clone_status = create_rw_signal(false);
 
     // "Reset Test Repo" (iPad-testing follow-up): the button appears only when
     // the Frame says this repo carries a seed (`gv --seed`); the confirm modal
@@ -762,7 +767,15 @@ pub fn App() -> impl IntoView {
             // real boundary is `api.rs`'s `refuse_if_offline()` either way.
             {crate::offline_banner::offline_banner_view(online)}
             // The "Open URL" modal (Phase 12), factored into `dialogs`.
-            {dialogs::open_url_view(open_url, clone_url, cloning, dialogs_guard, graph, mode_for)}
+            {dialogs::open_url_view(
+                open_url,
+                clone_url,
+                cloning,
+                checking_clone_status,
+                dialogs_guard,
+                graph,
+                mode_for,
+            )}
             // The "Reset Test Repo" confirmation (only reachable via the gated
             // topbar button above).
             {dialogs::reset_repo_view(reset_open, dialogs_guard, graph)}
