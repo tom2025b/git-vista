@@ -27,9 +27,48 @@ pub fn network_error_text(raw: &str) -> String {
     )
 }
 
+/// The message `git-vista`'s `api.rs::refuse_if_offline()` guard shows when
+/// `navigator.onLine` reports the device is offline (M2.22a, #241).
+///
+/// Deliberately attributes itself to the device's own report, not to the
+/// server or the tunnel: `navigator.onLine` reflects only the network
+/// *adapter*, and on this deployment the SSH tunnel is what actually drops —
+/// the adapter can read "up" while the tunnel is dead underneath it. Wording
+/// this as "the server is unreachable" (like [`network_error_text`] above, for
+/// a request that actually went out and failed) would be a claim this signal
+/// cannot back up, since it never touched the network at all. Kept as a pure
+/// function, like `network_error_text`, so the exact wording is pinned by a
+/// host test even though the guard that shows it (`api.rs`) is wasm-only and
+/// cannot itself run under `cargo test --workspace`.
+pub fn offline_refusal_text() -> String {
+    "Your device reports it is offline. Reconnect to the network, then try again.".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_refusal_names_the_devices_own_report_not_the_server() {
+        let msg = offline_refusal_text();
+        assert!(
+            msg.contains("device reports it is offline"),
+            "must attribute itself to the device's own signal — {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("server"),
+            "must not claim anything about server reachability, which this \
+             signal cannot back up — {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("unreachable"),
+            "must not overclaim reachability — {msg}"
+        );
+        assert!(
+            msg.contains("try again"),
+            "actionable: suggests a retry — {msg}"
+        );
+    }
 
     #[test]
     fn the_message_says_what_to_check_and_keeps_the_raw_error() {
