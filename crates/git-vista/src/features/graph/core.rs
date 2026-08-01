@@ -692,6 +692,22 @@ impl PageRequestKey {
 /// The lookahead is measured in *viewports*, not rows, so it means the same
 /// thing zoomed in or out — at a smaller scale a screen shows more rows, so more
 /// rows must already be loaded before the user reaches the bottom.
+///
+/// `eager` (#217) bypasses the viewport-proximity check entirely — still
+/// single-flight (`Idle`) and still stops the moment `has_cursor` goes false,
+/// but no longer waits for the camera to scroll near the loaded edge. An epoch
+/// bump (Refresh, a settled write, a 409 drift reload) always remounts the
+/// canvas from page 1 (`seed_for_epoch`), so a history that was ever driven to
+/// completion in an earlier epoch loses that completeness the instant the new
+/// one mounts — genuinely, not spuriously: pages are pinned to a generation and
+/// a fresh aggregate has only page 1. Without `eager`, recovering it demands
+/// scrolling all the way back down through however many pages the repository
+/// has, with the camera reset to the top by the same remount (`canvas.rs`'s
+/// `home` camera). `eager` is how the App resumes that pagination itself in
+/// the background once the user has demonstrated they want the whole history
+/// (`HistoryUiSignals::want_full_history`, set the first time `complete` goes
+/// true and never reset by the epoch effect), so Print Graph re-enables on its
+/// own instead of staying dark until a full manual re-scroll.
 pub fn should_prefetch(
     visible_end: usize,
     row_count: usize,
@@ -699,13 +715,14 @@ pub fn should_prefetch(
     scale: f64,
     page_load: &PageLoadState,
     has_cursor: bool,
+    eager: bool,
 ) -> bool {
     let lookahead_rows = (PREFETCH_VIEWPORTS * viewport_h
         / (scale.max(f64::EPSILON) * f64::from(ROW_HEIGHT)))
     .ceil() as usize;
     matches!(page_load, PageLoadState::Idle)
         && has_cursor
-        && visible_end.saturating_add(lookahead_rows) >= row_count
+        && (eager || visible_end.saturating_add(lookahead_rows) >= row_count)
 }
 
 /// Whether the fixed in-canvas "loading" affordance is shown. Only a request
@@ -1266,13 +1283,21 @@ mod tests {
         let idle = PageLoadState::Idle;
 
         // 15 rows of lookahead at scale 1: 85 + 15 reaches 100, 84 + 15 doesn't.
-        assert!(should_prefetch(85, 100, VIEWPORT_H, 1.0, &idle, true));
-        assert!(!should_prefetch(84, 100, VIEWPORT_H, 1.0, &idle, true));
+        assert!(should_prefetch(
+            85, 100, VIEWPORT_H, 1.0, &idle, true, false
+        ));
+        assert!(!should_prefetch(
+            84, 100, VIEWPORT_H, 1.0, &idle, true, false
+        ));
         // Zoomed out, a viewport covers more rows, so the lookahead grows with 1/scale.
-        assert!(should_prefetch(70, 100, VIEWPORT_H, 0.5, &idle, true));
-        assert!(!should_prefetch(69, 100, VIEWPORT_H, 0.5, &idle, true));
+        assert!(should_prefetch(
+            70, 100, VIEWPORT_H, 0.5, &idle, true, false
+        ));
+        assert!(!should_prefetch(
+            69, 100, VIEWPORT_H, 0.5, &idle, true, false
+        ));
         // A degenerate scale must saturate, not divide by zero.
-        assert!(should_prefetch(0, 100, VIEWPORT_H, 0.0, &idle, true));
+        assert!(should_prefetch(0, 100, VIEWPORT_H, 0.0, &idle, true, false));
 
         // Single flight: a request already in the air blocks another.
         assert!(!should_prefetch(
@@ -1283,7 +1308,8 @@ mod tests {
             &PageLoadState::Loading {
                 cursor: "c1".into()
             },
-            true
+            true,
+            false
         ));
         assert!(!should_prefetch(
             85,
@@ -1295,17 +1321,104 @@ mod tests {
                 message: "boom".into(),
                 retry: PageRetry::SameCursor,
             },
-            true
+            true,
+            false
         ));
         // A complete history has no cursor to follow.
-        assert!(!should_prefetch(85, 100, VIEWPORT_H, 1.0, &idle, false));
+        assert!(!should_prefetch(
+            85, 100, VIEWPORT_H, 1.0, &idle, false, false
+        ));
+    }
+
+    #[test]
+    fn eager_prefetch_ignores_viewport_proximity_but_still_respects_flight_and_cursor() {
+        // #217: once `want_full_history` is set, the App drives pagination back
+        // to completion after an epoch bump regardless of where the camera
+        // sits — the whole point is that the camera is back at the top
+        // (`home`) and nowhere near the loaded edge yet.
+        let idle = PageLoadState::Idle;
+        assert!(
+            should_prefetch(0, 100, VIEWPORT_H, 1.0, &idle, true, true),
+            "eager bypasses the viewport lookahead check"
+        );
+
+        // Still single-flight: a request already in the air blocks another,
+        // eager or not — eager must never stack concurrent requests.
+        assert!(!should_prefetch(
+            0,
+            100,
+            VIEWPORT_H,
+            1.0,
+            &PageLoadState::Loading {
+                cursor: "c1".into()
+            },
+            true,
+            true
+        ));
+        // Still stops the instant there is nothing left to fetch — eager keeps
+        // asking for the next page, it doesn't invent one.
+        assert!(
+            !should_prefetch(0, 100, VIEWPORT_H, 1.0, &idle, false, true),
+            "a complete history has no cursor left to chase, eager or not"
+        );
+        // Still doesn't retry a failed page on its own — the same "the user
+        // asks" rule `page_error_blocks_prefetch_until_explicit_retry` pins.
+        assert!(!should_prefetch(
+            0,
+            100,
+            VIEWPORT_H,
+            1.0,
+            &PageLoadState::Error {
+                cursor: "c1".into(),
+                message: "boom".into(),
+                retry: PageRetry::SameCursor,
+            },
+            true,
+            true
+        ));
+    }
+
+    /// #217 (review finding): the whole fix rests on one invariant the pure
+    /// function above cannot see — `app/mod.rs`'s epoch-reset effect resets
+    /// `complete` and `print_open` but must NOT touch `want_full_history`,
+    /// since that latch surviving the bump is exactly what lets a fresh epoch
+    /// resume pagination instead of leaving Print Graph dark. That wiring is
+    /// wasm-only and unreachable from a host test, so pin it at the source
+    /// level — the same thing `features/a11y/audit.rs` does for DOM
+    /// invariants it cannot mount. Without this, folding the third field in
+    /// beside its two siblings (three lines away) silently reintroduces the
+    /// original bug with `cargo test` fully green.
+    #[test]
+    fn the_epoch_reset_effect_does_not_clear_the_full_history_latch() {
+        const APP_MOD: &str = include_str!("../../app/mod.rs");
+        let after = APP_MOD
+            .split_once("let epoch = graph.get().epoch();")
+            .expect("app/mod.rs no longer contains the epoch-reset effect")
+            .1;
+        let body = &after[..after
+            .find("    });")
+            .expect("the epoch-reset effect is no longer a closed block")];
+        assert!(
+            body.contains("print_open.set(false)") && body.contains("complete.set(false)"),
+            "the epoch-reset effect no longer resets the two flags it must reset — \
+             this test's anchor has drifted and its guarantee is now vacuous"
+        );
+        assert!(
+            !body.contains("want_full_history"),
+            "the epoch-reset effect now touches `want_full_history`. Clearing it \
+             there reintroduces #217: Print Graph goes dark after every Refresh / \
+             write-settle / drift reload and stays dark until the user manually \
+             re-scrolls the entire history. Repository-switch leakage is handled by \
+             comparing the latched worktree id at the point of use in canvas.rs, \
+             not by clearing the latch here. Effect body was:\n{body}"
+        );
     }
 
     #[test]
     fn page_error_blocks_prefetch_until_explicit_retry() {
         // Same camera boundary throughout: only the load state differs.
         let at_boundary =
-            |state: &PageLoadState| should_prefetch(85, 100, VIEWPORT_H, 1.0, state, true);
+            |state: &PageLoadState| should_prefetch(85, 100, VIEWPORT_H, 1.0, state, true, false);
 
         let failed = PageLoadState::Error {
             cursor: "c1".into(),
@@ -1330,7 +1443,7 @@ mod tests {
             retry: PageRetry::Reseed,
         };
         assert!(
-            !should_prefetch(85, 100, VIEWPORT_H, 1.0, &rejected, true),
+            !should_prefetch(85, 100, VIEWPORT_H, 1.0, &rejected, true, false),
             "the rejected cursor is never fetched again automatically"
         );
 
@@ -1355,7 +1468,8 @@ mod tests {
             VIEWPORT_H,
             1.0,
             &PageLoadState::Idle,
-            true
+            true,
+            false
         ));
     }
 
