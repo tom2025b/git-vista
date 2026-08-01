@@ -44,6 +44,22 @@ pub fn offline_refusal_text() -> String {
     "Your device reports it is offline. Reconnect to the network, then try again.".to_string()
 }
 
+/// The persistent offline banner's wording (M2.22b, #242), shown while the
+/// browser's connectivity signal reports offline.
+///
+/// Same attribution rule as [`offline_refusal_text`] above, and for the same
+/// reason: `navigator.onLine` speaks for the device's network adapter only, so
+/// the banner must not claim anything about the server. It also names the
+/// *consequence* (write actions are put away — the same controls M2.22b hides
+/// or disables from the menu, picker, and Activity panel) and the *recovery*
+/// (reconnect), because a bar that only says "offline" leaves the user to
+/// guess why Commit just vanished. Pure text so the wording is pinned by a
+/// host test; the banner view that shows it is wasm-only.
+pub fn offline_banner_text() -> String {
+    "This device reports it is offline — write actions are put away until the network returns."
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +83,30 @@ mod tests {
         assert!(
             msg.contains("try again"),
             "actionable: suggests a retry — {msg}"
+        );
+    }
+
+    #[test]
+    fn the_banner_names_the_device_the_consequence_and_the_recovery() {
+        let msg = offline_banner_text();
+        assert!(
+            msg.contains("device reports it is offline"),
+            "must attribute itself to the device's own signal, like the \
+             refusal text — {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("server") && !msg.to_lowercase().contains("unreachable"),
+            "must not claim server reachability, which navigator.onLine \
+             cannot back up — {msg}"
+        );
+        assert!(
+            msg.contains("write actions"),
+            "must say what changed in the UI, so the vanished controls are \
+             explained — {msg}"
+        );
+        assert!(
+            msg.contains("network returns"),
+            "must name the recovery — {msg}"
         );
     }
 
