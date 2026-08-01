@@ -257,9 +257,46 @@ pub fn diff_spec_argv(spec: &DiffSpec) -> Vec<String> {
 /// format is git's own and versioned, so something unrecognised is more
 /// likely a future git addition than malformed input, and the worst outcome
 /// of skipping is a missing file in the result, never a failed parse.
+/// Split unified-diff text into lines the way this parser needs — on `\n`
+/// only, **without** `str::lines()`'s extra behavior of also treating a `\r`
+/// immediately before that `\n` as part of the line *terminator* and
+/// dropping it.
+///
+/// That extra behavior is wrong for this input. Verified against real `git
+/// diff` output on a CRLF file (see `patch_build.rs`'s and `planner.rs`'s
+/// CRLF tests): a CRLF file's content lines are printed by git as `<marker>
+/// <text>\r\n` — the `\r` is the **file's own content**, byte-identical to
+/// what's in the blob, with git's own `\n` record separator following it.
+/// `str::lines()` on `" one\r\n"` yields `" one"`, silently discarding that
+/// `\r` — indistinguishable, from that point on, from an LF-only file. Once
+/// [`DiffLine::text`] has lost the byte, nothing downstream can recover it:
+/// [`crate::patch_build`]'s reconstruction re-emits the line with a bare
+/// `\n`, which is no longer byte-identical to the working tree's own CRLF
+/// content, and `git apply`'s exact context/line matching then refuses the
+/// patch outright (confirmed empirically, not assumed).
+///
+/// Splitting on `\n` alone keeps the `\r` as the last byte of the *previous*
+/// line, which is exactly what's needed: every downstream consumer that
+/// slices off a single leading marker byte (`&line[1..]`) still gets the
+/// rest of the line, `\r` included, verbatim.
+///
+/// Mirrors `str::lines()` in every other respect — no trailing empty element
+/// for a final `\n`, and an empty input yields no lines — since the
+/// structural line-matching this parser does elsewhere (`diff --git ...`,
+/// `@@ ... @@`, etc.) depends on that shape and none of those lines ever
+/// carry an embedded `\r` (git generates them itself, not sourced from
+/// repository content).
+fn split_diff_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    text.split('\n').collect()
+}
+
 pub fn parse_unified_diff(text: &str) -> ParsedPatch {
     let mut files = Vec::new();
-    let lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<&str> = split_diff_lines(text);
     let mut i = 0;
     // `diff --cc <path>` is the conflicted-file form of a combined diff —
     // `git diff` during a merge emits it (where `show` on a merge commit
@@ -675,6 +712,64 @@ index c2f2e5e,5909b84..084d8dd
  -e
  +E
 ";
+
+    // #214, Task 3: the root-cause CRLF fix. str::lines() would have
+    // silently dropped the \r; split_diff_lines must not.
+    #[test]
+    fn crlf_content_lines_keep_their_carriage_return() {
+        // Byte-for-byte what real `git diff --no-color` prints for a CRLF
+        // file (verified empirically — see the module's split_diff_lines
+        // doc): each content line is `<marker><text>\r\n`.
+        let diff = "diff --git a/c.txt b/c.txt\nindex 111..222 100644\n--- a/c.txt\n+++ b/c.txt\n@@ -1,2 +1,2 @@\n one\r\n-two\r\n+TWO\r\n";
+        let parsed = parse_unified_diff(diff);
+        let FileDiff::Hunks { hunks, .. } = &parsed.files[0] else {
+            panic!("expected Hunks");
+        };
+        assert_eq!(
+            hunks[0].lines,
+            vec![
+                DiffLine {
+                    kind: LineKind::Context,
+                    text: "one\r".into(),
+                    no_newline_at_eof: false,
+                },
+                DiffLine {
+                    kind: LineKind::Removed,
+                    text: "two\r".into(),
+                    no_newline_at_eof: false,
+                },
+                DiffLine {
+                    kind: LineKind::Added,
+                    text: "TWO\r".into(),
+                    no_newline_at_eof: false,
+                },
+            ],
+            "the trailing \\r is real file content, not a line terminator to strip"
+        );
+    }
+
+    #[test]
+    fn split_diff_lines_matches_str_lines_when_there_is_no_carriage_return() {
+        for text in ["", "a", "a\n", "a\nb", "a\nb\n", "a\n\nb", "\n"] {
+            assert_eq!(
+                split_diff_lines(text),
+                text.lines().collect::<Vec<_>>(),
+                "diverged from str::lines() for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_diff_lines_keeps_a_lone_trailing_cr_str_lines_would_drop() {
+        assert_eq!(
+            split_diff_lines(" one\r\n-two\r\n"),
+            vec![" one\r", "-two\r"]
+        );
+        // A bare \r with no following \n is ordinary content either way —
+        // str::lines() agrees here (only \r *immediately before* \n is ever
+        // its concern).
+        assert_eq!(split_diff_lines("a\rb\n"), vec!["a\rb"]);
+    }
 
     #[test]
     fn quoted_and_spaced_paths_come_back_as_real_names() {
