@@ -597,14 +597,23 @@ pub async fn clone_request(url: &str) -> Result<RepositoryDescriptor, String> {
         url: url.to_string(),
     };
     let (resp, _key) = write_json_with_timeout("/api/clone", &body, CLONE_TIMEOUT_MS).await?;
+    // Body reads bounded too (#260): `write_json_with_timeout` deadlines only
+    // the send, so a connection that stalls after headers would otherwise park
+    // this future forever — and the clone dialog now pins itself open until
+    // this settles, which turns "future never resolves" into "modal never
+    // closes". The bodies here are tiny; `REQUEST_TIMEOUT_MS` is generous.
     if resp.ok() {
-        resp.json::<RepositoryDescriptor>()
-            .await
-            .map_err(|e| e.to_string())
+        match with_deadline(resp.json::<RepositoryDescriptor>(), REQUEST_TIMEOUT_MS).await {
+            Some(parsed) => parsed.map_err(|e| e.to_string()),
+            None => Err(timeout_error()),
+        }
     } else {
         // `response_error` (not raw body text): an empty error body — the
         // LAN listener's bare 405, say — must still say *something*.
-        Err(response_error(resp).await)
+        match with_deadline(response_error(resp), REQUEST_TIMEOUT_MS).await {
+            Some(msg) => Err(msg),
+            None => Err(timeout_error()),
+        }
     }
 }
 
