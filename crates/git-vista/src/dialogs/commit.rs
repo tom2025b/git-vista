@@ -29,12 +29,23 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
         if message.is_empty() {
             return; // Keep the dialog open; the Commit button is disabled anyway.
         }
+        // Captured NOW, not read in the callback: the served repository can
+        // change while the POST is in flight, and the clear must target the
+        // repository this message was submitted against (#226).
+        let submitted_scope = dialogs.draft_scope_snapshot();
         shell.close_commit_dialog();
         spawn_local(async move {
             match create_commit_request(&message, allow_empty, branch.as_deref()).await {
-                Ok(()) => graph.update(|g| {
-                    g.force_bump();
-                }),
+                Ok(()) => {
+                    // The message is consumed — discard the draft, signal and
+                    // persisted copy both (#226). This is the clear the opener
+                    // used to do; moved here so a suspension-recovered draft
+                    // survives reopening but a submitted one never resurrects.
+                    dialogs.clear_commit_msg_for(submitted_scope.as_deref());
+                    graph.update(|g| {
+                        g.force_bump();
+                    });
+                }
                 Err(e) => {
                     if let Some(w) = web_sys::window() {
                         let _ = w.alert_with_message(&format!("Couldn't create commit:\n{e}"));
