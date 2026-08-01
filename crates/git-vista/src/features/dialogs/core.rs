@@ -195,9 +195,19 @@ pub fn commit_draft_key(worktree_id: &str) -> String {
 /// persist tick, so the rule is: reseed **only when the repository actually
 /// changed**. That decision lives here, host-tested, because the signal
 /// wiring around it is wasm-only and untestable in this repo.
+///
+/// Losing the scope (`new` is `None`) also keeps the signal. A `None` frame
+/// is not only genuine degraded mode — it is what an *errored* seed reload
+/// looks like, and over this deployment's flaky tunnel a Refresh during a
+/// drop is routine. Blanking the open dialog's textarea on that would lose
+/// exactly the work this feature exists to protect. Freezing instead means
+/// the scope keeps its last-known repository, per-keystroke persistence
+/// continues under that key, and recovery to the same repository is then the
+/// same-scope no-op above — nothing clobbered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DraftScopeAction {
-    /// Same repository as before — leave the live signal alone.
+    /// Same repository as before, or the repository is momentarily unknown —
+    /// leave the live signal (and the last-known scope) alone.
     KeepSignal,
     /// A different repository (or the first one seen) — replace the signal
     /// with that repository's persisted draft, or blank if none.
@@ -205,7 +215,7 @@ pub enum DraftScopeAction {
 }
 
 pub fn draft_scope_action(old: Option<&str>, new: Option<&str>) -> DraftScopeAction {
-    if old == new {
+    if new.is_none() || old == new {
         DraftScopeAction::KeepSignal
     } else {
         DraftScopeAction::SeedFromStorage
@@ -366,6 +376,21 @@ mod tests {
     }
 
     #[test]
+    fn losing_the_scope_freezes_the_draft_instead_of_blanking_it() {
+        // A None frame is what an ERRORED seed reload looks like (Refresh
+        // during a tunnel drop), not only genuine degraded mode. Reseeding
+        // here would set the open dialog's textarea to blank mid-draft.
+        // Keeping the signal — and, by the caller's early return, the
+        // last-known scope — means typing during the outage still persists
+        // under the last-known repository, and recovery to that repository
+        // is the same-scope no-op.
+        assert_eq!(
+            draft_scope_action(Some("old"), None),
+            DraftScopeAction::KeepSignal
+        );
+    }
+
+    #[test]
     fn a_changed_or_first_repository_seeds_from_storage() {
         assert_eq!(
             draft_scope_action(None, Some("first")),
@@ -373,12 +398,6 @@ mod tests {
         );
         assert_eq!(
             draft_scope_action(Some("old"), Some("new")),
-            DraftScopeAction::SeedFromStorage
-        );
-        // Losing the repo entirely (degraded frame) also reseeds — to blank,
-        // since a None scope persists nothing.
-        assert_eq!(
-            draft_scope_action(Some("old"), None),
             DraftScopeAction::SeedFromStorage
         );
     }

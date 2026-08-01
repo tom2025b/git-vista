@@ -33,6 +33,28 @@ fn session_storage() -> Option<web_sys::Storage> {
     web_sys::window().and_then(|w| w.session_storage().ok().flatten())
 }
 
+/// One console breadcrumb, first time a draft persist is refused (quota,
+/// private-mode revocation). The draft then lives in-memory-only — visible
+/// and submittable, but gone on suspension — and without this line a later
+/// stale restore is indistinguishable from broken restore logic during the
+/// iPad testbed pass. Once, not per keystroke: a refusing storage refuses
+/// every write, and the console shouldn't scroll for it.
+fn warn_persist_failed_once() {
+    use std::cell::Cell;
+    thread_local! {
+        static WARNED: Cell<bool> = const { Cell::new(false) };
+    }
+    WARNED.with(|w| {
+        if !w.replace(true) {
+            web_sys::console::warn_1(
+                &"git-vista: sessionStorage refused the commit draft; \
+                  drafts are in-memory-only this session (#226)"
+                    .into(),
+            );
+        }
+    });
+}
+
 /// The app's one ghost-click guard, and the commit modal's message draft.
 #[derive(Clone, Copy)]
 pub struct Dialogs {
@@ -47,10 +69,13 @@ pub struct Dialogs {
     /// discarded.
     commit_msg: RwSignal<String>,
     /// Which repository the draft belongs to (#226): the accepted Frame's
-    /// `worktree_id`, observed by an `App` effect. `None` until the first
-    /// Frame lands (or on a degraded Frame), during which drafts stay
-    /// in-memory-only — nothing persists under an anonymous scope, so one
-    /// repository's draft can never be misfiled under another.
+    /// `worktree_id`, observed by an `App` effect. `None` only before the
+    /// first Frame lands, during which drafts stay in-memory-only — nothing
+    /// persists under an anonymous scope, so one repository's draft can
+    /// never be misfiled under another. Once known, the scope survives a
+    /// frame going `None` (errored reload over a dropped tunnel): the
+    /// clobber rule maps that to `KeepSignal` and the early return below
+    /// leaves this value at the last-known repository.
     draft_scope: StoredValue<Option<String>>,
 }
 
@@ -105,24 +130,40 @@ impl Dialogs {
     pub fn set_commit_msg(&self, msg: String) {
         self.draft_scope.with_value(|scope| {
             if let (Some(id), Some(storage)) = (scope.as_deref(), session_storage()) {
-                let _ = storage.set_item(&commit_draft_key(id), &msg);
+                if storage.set_item(&commit_draft_key(id), &msg).is_err() {
+                    warn_persist_failed_once();
+                }
             }
         });
         self.commit_msg.set(msg);
     }
 
-    /// Discard the draft — signal AND persisted copy (#226), so a submitted
-    /// or deliberately-cleared message can't resurrect as a stale draft.
-    /// Called on successful commit submit; the dialog *opener* deliberately
-    /// does not call this any more, because opening is how a suspension-
-    /// recovered draft comes back.
-    pub fn clear_commit_msg(&self) {
-        self.draft_scope.with_value(|scope| {
-            if let (Some(id), Some(storage)) = (scope.as_deref(), session_storage()) {
-                let _ = storage.remove_item(&commit_draft_key(id));
-            }
-        });
-        self.commit_msg.set(String::new());
+    /// The scope the draft belongs to right now — captured by the commit
+    /// dialog's submit handler *before* the request is spawned, so the clear
+    /// on success targets the repository that was actually submitted.
+    pub fn draft_scope_snapshot(&self) -> Option<String> {
+        self.draft_scope.with_value(|s| s.clone())
+    }
+
+    /// Discard the draft submitted under `submitted_scope` — persisted copy
+    /// unconditionally, live signal only if that repository is still the one
+    /// being served (#226). The distinction matters because this runs in the
+    /// commit request's completion callback, not at submit time: if the
+    /// served repository changed while the POST was in flight, clearing
+    /// "the current draft" would delete the *new* repository's draft and
+    /// leave the submitted one to resurrect from storage later. The dialog
+    /// *opener* deliberately calls no clear at all, because opening is how a
+    /// suspension-recovered draft comes back.
+    pub fn clear_commit_msg_for(&self, submitted_scope: Option<&str>) {
+        if let (Some(id), Some(storage)) = (submitted_scope, session_storage()) {
+            let _ = storage.remove_item(&commit_draft_key(id));
+        }
+        let still_current = self
+            .draft_scope
+            .with_value(|s| s.as_deref() == submitted_scope);
+        if still_current {
+            self.commit_msg.set(String::new());
+        }
     }
 
     /// Record that `d` is opening now, and start its guard window.
