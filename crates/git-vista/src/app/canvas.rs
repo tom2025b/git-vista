@@ -595,7 +595,7 @@ pub(super) fn graph_canvas(
             {dialogs::confirm_modal_view(features)}
             {detail::detail_panel_view(features, settings, detail, ctx)}
             {activity::activity_panel_view(features, settings, read_only)}
-            {viewer::viewer_view(shell, settings)}
+            {viewer::viewer_view(features, settings, ctx)}
         </div>
     }
 }
