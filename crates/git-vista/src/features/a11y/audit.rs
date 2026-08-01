@@ -244,6 +244,12 @@ const INTERACTIVE_CENSUS: &[(&str, bool)] = &[
     // keyboard/tap stops, sized by their own declaration rather than the
     // shared #65 rule because they live in the diff colour block.
     (".diff-hunk", true),
+    // The staging selection view's hunk row (M2.17d, #215): the header
+    // text (roving keyboard/tap stop, mirrors `.diff-hunk`) and its own
+    // adjacent selection checkbox — two separate 44px targets, see
+    // `features::diff::selection`'s module doc for why they're split.
+    (".stage-hunk-text", true),
+    (".stage-hunk-check", true),
 ];
 
 #[test]
