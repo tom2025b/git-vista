@@ -80,6 +80,7 @@ mod sandbox;
 // bootstrap-token → session-cookie exchange.
 mod security;
 mod session;
+mod staging;
 mod state;
 // M1.13b (#66): the single owner of TCP port 9418 in the test binary. Three
 // tests across `sandbox::escape_suite` and `planner::contract_suite` need that
