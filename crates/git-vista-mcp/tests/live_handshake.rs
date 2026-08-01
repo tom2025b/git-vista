@@ -18,6 +18,16 @@
 //! self-replacing — the server mints a fresh one into the same file the moment
 //! one is spent — so a human's next `gv --token` link still works. The only
 //! side effect is rotation.
+//!
+//! Every test below this point is a pure read with no side effect on the
+//! shared server — **except `select_repository_round_trips_against_the_real_catalog`**,
+//! which changes the server's live current-selection state and does not
+//! restore it (review finding, #246: no read endpoint exposes the
+//! previously-selected worktree/mode to restore *to*, so a faithful
+//! save-and-restore isn't cleanly achievable without new server API — out of
+//! this test's scope). Running the whole file with `--ignored` off-hours
+//! will leave whatever repository/mode that one test selected as the
+//! server's current selection afterward.
 
 use std::process::{Command, Stdio};
 
@@ -104,6 +114,228 @@ fn the_full_handshake_lists_the_same_catalog_the_http_api_returns() {
     assert!(status.success(), "the bridge exited non-zero");
 }
 
+/// The #246 baseline-then-bridge cases: one per new read tool, extending the
+/// #245 pattern above rather than replacing it. Each fetches the same
+/// endpoint two ways — direct HTTP (the oracle) and through the compiled
+/// bridge binary over stdio MCP — and asserts the JSON matches. See the
+/// module doc above (and `tools.rs`) for why `get_commit_detail` and
+/// `get_commit_diff` are separate tools, and why `get_graph` returns exactly
+/// one page.
+///
+/// `#[ignore]` for the same reason as the #245 case: needs the real
+/// `git-vista-server` on `127.0.0.1:8080`. **Never run these with
+/// `--ignored`** against the box's live server — that server is serving a
+/// real iPad session; these are written and ready for a human to run
+/// explicitly, later, off-hours.
+mod read_tools {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    use super::git_vista_mcp_test_support as support;
+
+    /// Spawn the bridge, complete `initialize`/`notifications/initialized`,
+    /// and return a live stdin/stdout pair ready for `tools/call`. Shared by
+    /// every case below so each test is just "call one tool, compare."
+    struct Bridge {
+        stdin: std::process::ChildStdin,
+        lines: std::io::Lines<BufReader<std::process::ChildStdout>>,
+        child: std::process::Child,
+    }
+
+    impl Bridge {
+        fn spawn() -> Self {
+            let exe = env!("CARGO_BIN_EXE_git-vista-mcp");
+            let mut child = Command::new(exe)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("could not spawn the bridge binary");
+            let mut stdin = child.stdin.take().unwrap();
+            let stdout = BufReader::new(child.stdout.take().unwrap());
+            let mut lines = stdout.lines();
+
+            let send = |stdin: &mut std::process::ChildStdin, msg: &str| {
+                stdin.write_all(msg.as_bytes()).unwrap();
+                stdin.write_all(b"\n").unwrap();
+                stdin.flush().unwrap();
+            };
+            send(
+                &mut stdin,
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            );
+            let _init = lines.next().unwrap().unwrap();
+            send(
+                &mut stdin,
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            );
+            Bridge {
+                stdin,
+                lines,
+                child,
+            }
+        }
+
+        /// One `tools/call`, returning the parsed `result.content[0].text`
+        /// JSON on success — panics with the tool's own error text
+        /// otherwise, so a failing assertion in a test using this shows
+        /// *why* the bridge failed, not just that it did.
+        fn call(&mut self, id: u64, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            });
+            self.stdin.write_all(msg.to_string().as_bytes()).unwrap();
+            self.stdin.write_all(b"\n").unwrap();
+            self.stdin.flush().unwrap();
+            let line = self.lines.next().unwrap().unwrap();
+            let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                reply["result"]["isError"], false,
+                "{name} failed: {}",
+                reply["result"]["content"][0]["text"]
+            );
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap_or_else(|e| panic!("{name}'s payload was not JSON: {e}"))
+        }
+
+        fn finish(mut self) {
+            drop(self.stdin);
+            let status = self.child.wait().expect("bridge did not exit");
+            assert!(status.success(), "the bridge exited non-zero");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the real git-vista-server running on 127.0.0.1:8080; run with --ignored"]
+    fn get_graph_matches_frame_and_first_commits_page() {
+        let session = support::authenticate_for_test()
+            .expect("baseline: could not authenticate — is the server running?");
+        let frame_baseline =
+            support::get_json(&session, "/api/frame").expect("baseline: GET /api/frame failed");
+        let page_baseline =
+            support::get_json(&session, "/api/commits").expect("baseline: GET /api/commits failed");
+
+        let mut bridge = Bridge::spawn();
+        let via_bridge = bridge.call(2, "get_graph", serde_json::json!({}));
+        bridge.finish();
+
+        assert_eq!(via_bridge["frame"], frame_baseline, "frame half mismatched");
+        assert_eq!(via_bridge["page"], page_baseline, "page half mismatched");
+    }
+
+    #[test]
+    #[ignore = "needs the real git-vista-server running on 127.0.0.1:8080; run with --ignored"]
+    fn get_commit_detail_and_get_commit_diff_match_their_direct_endpoints() {
+        let session = support::authenticate_for_test()
+            .expect("baseline: could not authenticate — is the server running?");
+        let page =
+            support::get_json(&session, "/api/commits").expect("baseline: GET /api/commits failed");
+        let id = page["rows"][0]["commit"]["id"]
+            .as_str()
+            .expect("baseline: /api/commits returned no rows to pick a commit id from")
+            .to_string();
+
+        let detail_baseline = support::get_json(&session, &format!("/api/commit/{id}"))
+            .expect("baseline: GET /api/commit/{id} failed");
+        let diff_baseline = support::get_json(&session, &format!("/api/diff/{id}"))
+            .expect("baseline: GET /api/diff/{id} failed");
+
+        let mut bridge = Bridge::spawn();
+        let detail_via_bridge =
+            bridge.call(2, "get_commit_detail", serde_json::json!({ "id": id }));
+        let diff_via_bridge = bridge.call(3, "get_commit_diff", serde_json::json!({ "id": id }));
+        bridge.finish();
+
+        assert_eq!(detail_via_bridge, detail_baseline);
+        assert_eq!(diff_via_bridge, diff_baseline);
+    }
+
+    #[test]
+    #[ignore = "needs the real git-vista-server running on 127.0.0.1:8080; run with --ignored"]
+    fn get_status_matches_the_v2_endpoint_not_v1() {
+        let session = support::authenticate_for_test()
+            .expect("baseline: could not authenticate — is the server running?");
+        let v2_baseline = support::get_json(&session, "/api/status/v2")
+            .expect("baseline: GET /api/status/v2 failed");
+        // The v1 shape the tool must NOT match — asserted distinct so a
+        // regression that wires get_status to v1 by mistake fails loudly
+        // rather than passing by coincidence (v1 and v2 do share some field
+        // names).
+        let v1_baseline = support::get_json(&session, "/api/status")
+            .expect("baseline: GET /api/status (v1) failed");
+
+        let mut bridge = Bridge::spawn();
+        let via_bridge = bridge.call(2, "get_status", serde_json::json!({}));
+        bridge.finish();
+
+        assert_eq!(via_bridge, v2_baseline);
+        assert!(
+            via_bridge.get("generation").is_some(),
+            "get_status must return the generation-tagged v2 shape"
+        );
+        assert_ne!(
+            via_bridge, v1_baseline,
+            "get_status returned the legacy v1 shape, not v2"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs the real git-vista-server running on 127.0.0.1:8080; run with --ignored"]
+    fn get_activity_matches_the_direct_endpoint() {
+        let session = support::authenticate_for_test()
+            .expect("baseline: could not authenticate — is the server running?");
+        let baseline = support::get_json(&session, "/api/activity")
+            .expect("baseline: GET /api/activity failed");
+
+        let mut bridge = Bridge::spawn();
+        let via_bridge = bridge.call(2, "get_activity", serde_json::json!({}));
+        bridge.finish();
+
+        assert_eq!(via_bridge, baseline);
+    }
+
+    #[test]
+    #[ignore = "needs the real git-vista-server running on 127.0.0.1:8080; run with --ignored. \
+                STATE-CHANGING (unlike this file's other tests): moves the server's live \
+                current selection to the catalog's first repository in visualize mode, and \
+                does not restore whatever was selected before — see the module doc."]
+    fn select_repository_round_trips_against_the_real_catalog() {
+        let session = support::authenticate_for_test()
+            .expect("baseline: could not authenticate — is the server running?");
+        let catalog =
+            support::get_json(&session, "/api/catalog").expect("baseline: GET /api/catalog failed");
+        let entry = catalog
+            .as_array()
+            .and_then(|a| a.first())
+            .expect("baseline: /api/catalog returned no repositories to select");
+        let worktree = entry["worktree_id"]
+            .as_str()
+            .or_else(|| entry["id"].as_str())
+            .expect("baseline: catalog entry had no worktree/id field to select by")
+            .to_string();
+
+        let baseline_body = support::post_text(
+            &session,
+            "/api/select",
+            &serde_json::json!({ "worktree": worktree, "mode": "visualize" }),
+        )
+        .expect("baseline: POST /api/select failed");
+
+        let mut bridge = Bridge::spawn();
+        let via_bridge = bridge.call(
+            2,
+            "select_repository",
+            serde_json::json!({ "worktree": worktree, "mode": "visualize" }),
+        );
+        bridge.finish();
+
+        // Both legs select the same repository in the same mode, so both
+        // get the server's same confirmation text back.
+        assert_eq!(via_bridge.as_str(), Some(baseline_body.as_str()));
+    }
+}
+
 /// Direct-HTTP support for the baseline leg, compiled only for this test.
 /// Lives here, not in src/, so the shipped binary carries no test surface.
 mod git_vista_mcp_test_support {
@@ -112,6 +344,7 @@ mod git_vista_mcp_test_support {
 
     pub struct Session {
         pub cookie: String,
+        pub csrf: String,
     }
 
     pub fn authenticate_for_test() -> Result<Session, String> {
@@ -128,7 +361,7 @@ mod git_vista_mcp_test_support {
         // lowercase hex, but the baseline leg must never silently send
         // malformed JSON if the token format ever changes.
         let body = serde_json::json!({ "token": token.trim() }).to_string();
-        let resp = raw("POST", "/api/session", Some(&body), None)?;
+        let resp = raw("POST", "/api/session", Some(&body), None, None)?;
         let cookie = resp
             .1
             .iter()
@@ -136,12 +369,53 @@ mod git_vista_mcp_test_support {
             .and_then(|(_, v)| v.split(';').next())
             .ok_or("no session cookie")?
             .to_string();
-        Ok(Session { cookie })
+        let info: serde_json::Value =
+            serde_json::from_slice(&resp.2).map_err(|e| format!("{e}"))?;
+        let csrf = info
+            .get("csrf")
+            .and_then(|c| c.as_str())
+            .ok_or("session response carried no csrf token")?
+            .to_string();
+        Ok(Session { cookie, csrf })
     }
 
     pub fn get_catalog(s: &Session) -> Result<serde_json::Value, String> {
-        let resp = raw("GET", "/api/catalog", None, Some(&s.cookie))?;
+        get_json(s, "/api/catalog")
+    }
+
+    /// `GET path` with the session cookie, parsed as JSON — the shared
+    /// baseline-leg fetch every #246 read case above uses.
+    pub fn get_json(s: &Session, path: &str) -> Result<serde_json::Value, String> {
+        let resp = raw("GET", path, None, Some(&s.cookie), None)?;
+        if resp.0 != 200 {
+            return Err(format!(
+                "GET {path} answered {}: {}",
+                resp.0,
+                String::from_utf8_lossy(&resp.2)
+            ));
+        }
         serde_json::from_slice(&resp.2).map_err(|e| format!("{e}"))
+    }
+
+    /// `POST path` with the session cookie AND csrf token, returning the raw
+    /// response text (not JSON — `/api/select`'s own response is plain
+    /// confirmation text, same as `tools::select_repository` documents).
+    pub fn post_text(s: &Session, path: &str, body: &serde_json::Value) -> Result<String, String> {
+        let resp = raw(
+            "POST",
+            path,
+            Some(&body.to_string()),
+            Some(&s.cookie),
+            Some(&s.csrf),
+        )?;
+        if resp.0 != 200 {
+            return Err(format!(
+                "POST {path} answered {}: {}",
+                resp.0,
+                String::from_utf8_lossy(&resp.2)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&resp.2).into_owned())
     }
 
     #[allow(clippy::type_complexity)]
@@ -150,6 +424,7 @@ mod git_vista_mcp_test_support {
         path: &str,
         body: Option<&str>,
         cookie: Option<&str>,
+        csrf: Option<&str>,
     ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
         let mut s = TcpStream::connect("127.0.0.1:8080").map_err(|e| format!("{e}"))?;
         let mut req = format!(
@@ -159,6 +434,9 @@ mod git_vista_mcp_test_support {
         );
         if let Some(c) = cookie {
             req.push_str(&format!("Cookie: {c}\r\n"));
+        }
+        if let Some(t) = csrf {
+            req.push_str(&format!("{}: {t}\r\n", git_vista_protocol::CSRF_HEADER));
         }
         if let Some(b) = body {
             req.push_str(&format!(
