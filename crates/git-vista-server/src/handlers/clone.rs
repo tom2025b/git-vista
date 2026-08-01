@@ -2,15 +2,39 @@
 //! 0008): clone a public repo from a pasted URL into the persistent clones
 //! store and hand its descriptor back so the browser can offer the mode
 //! picker; delete a clone again on request, guarded to the clones root.
+//!
+//! `GET /api/clone-status/{key}` (#263) answers the same question a lost
+//! `POST /api/clone` response would have: what happened to the attempt
+//! admitted under this idempotency key. [`admit_clone`] is the registry
+//! behind both routes — it also closes #264's server-side half, replaying a
+//! *finished* attempt's recorded result instead of running a second `git
+//! clone` for a key reused after completion.
+//!
+//! **#263 is only server-side complete as of this module** (review finding
+//! — flagged rather than silently overclaimed, and checked directly against
+//! `crates/git-vista/src/api.rs`'s `clone_request`, not assumed): `clone-status`
+//! is built, authz-classified, and unit-tested, but the wasm client mints a
+//! **fresh** idempotency key on every `POST /api/clone` call
+//! (`write_json`/`write_json_with_timeout`'s own per-call key, no retry loop
+//! in `clone_request` at all) and never polls this endpoint. A client that
+//! loses the `POST /api/clone` response today still has no code path that
+//! ever learns the clone finished, and even a manual retry would run under a
+//! *different* key — the #260 symptom this issue exists for still
+//! reproduces until the client is wired to (a) retain the key it sent and
+//! (b) poll `clone-status` with it after a lost/failed response. Tracked as
+//! a separate follow-up rather than expanded into this change.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::extract::Path as PathParam;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use serde::Serialize;
 
 use git_vista_core::identity::WorktreeId;
 use git_vista_protocol::{
@@ -129,88 +153,364 @@ async fn run_guarded<T, E>(
     }
 }
 
-/// #216 follow-up: the process-wide set of idempotency keys with a clone
-/// currently running under them.
+/// #216/#263/#264: the process-wide registry of clone attempts keyed by their
+/// idempotency key — the same key's whole lifecycle, from "running" through
+/// "finished", not just the in-flight window #216 originally covered.
 ///
 /// Deliberately **not** `operations::admit` (out of scope: that funnel, and
 /// its `GitOperation`/planner plumbing, are reserved for M2's queued
 /// sub-issues starting imminently — see this issue's task notes). It also
-/// would not fit cleanly: `admit` requires a `RepositoryToken`/
-/// `WorktreeToken`, and neither exists yet at the point a clone must be
-/// deduplicated — the destination directory hasn't been created, let alone
-/// classified as a repository.
+/// would not fit cleanly: `admit` requires a `GitOperation` (clone is
+/// cataloging/filesystem work, not a write the planner drives — it is not in
+/// the closed `GitOperation` enum and has no plan/hash to admit against) and a
+/// `RepositoryToken`/`WorktreeToken`, neither of which exists yet at the point
+/// a clone must be deduplicated — the destination directory hasn't been
+/// created, let alone classified as a repository. Reusing `operations::Record`
+/// verbatim would mean shoehorning clone into a shape built for something else
+/// (and dragging in `OperationHandle`'s watch-channel/SSE machinery this
+/// endpoint doesn't need — polling `GET`, not a live stream, is what #263
+/// actually asks for); a small **structurally parallel** tracker — same
+/// admit/replay shape, its own types — is the more honest fit.
 ///
-/// A `HashSet`, not a `HashMap`, on purpose: unlike `operations::Record` this
-/// guard caches no replayable result. It only remembers "busy right now" and
-/// forgets the key the instant the clone ends, one way or another — see
-/// [`InProgressGuard`]. That is the smaller, more honest shape for what the
-/// client's retry actually needs: the client already sets
-/// `CLONE_TIMEOUT_MS` (570s) just under the server's own `CLONE_TIMEOUT`
-/// (600s, above) specifically so a retry practically never arrives while the
-/// first attempt is still genuinely running — see `crates/git-vista/src/
-/// api.rs`. A retry that does arrive early is refused outright rather than
-/// parked to await the first attempt's result; building the "await and
-/// replay" half of `admit` for clone alone would mean re-deriving
-/// `operations::Record`'s watch-channel machinery for one endpoint, which is
-/// exactly the general operation-tracking mechanism this fix is scoped to
-/// avoid building.
-static CLONES_IN_PROGRESS: OnceLock<StdMutex<HashSet<IdempotencyKey>>> = OnceLock::new();
+/// A `HashMap`, not a `HashSet` (unlike the #216-era version of this static):
+/// #264 requires remembering more than "busy right now" — a *finished*
+/// attempt's outcome must be replayable too, so a second `POST /api/clone`
+/// under the same key answers from the record instead of running a second
+/// `git clone`. [`CloneRecord::outcome`] is `None` while running and `Some`
+/// once terminal, so one map now covers both windows [`admit_clone`] used to
+/// need a `HashSet` and an implicit "not in the set" for.
+///
+/// **In-memory only, deliberately not durable** (review finding) — unlike
+/// `operations.rs`'s registry, which survives a restart via
+/// `operations::rehydrate()` reading `crate::durable::recover()`'s journal
+/// rows. A server restart wipes every clone record instantly, including one
+/// still `Running` at the moment of restart. This is a real, acknowledged
+/// gap, not parity with `operations.rs`: #263 covers the scenario it was
+/// filed for — a *client*-side interruption (dropped SSH tunnel, a suspended
+/// iOS tab, a dismissed modal) while the server keeps running — not a
+/// server restart coinciding with an in-flight clone. Extending this to the
+/// same durable-journal/rehydrate mechanism `operations.rs` uses is real,
+/// separable follow-up work if that gap ever matters in practice, not
+/// something this fix silently promises.
+static CLONE_RECORDS: OnceLock<StdMutex<HashMap<IdempotencyKey, CloneRecord>>> = OnceLock::new();
 
-fn clones_in_progress() -> &'static StdMutex<HashSet<IdempotencyKey>> {
-    CLONES_IN_PROGRESS.get_or_init(|| StdMutex::new(HashSet::new()))
+fn clone_records() -> &'static StdMutex<HashMap<IdempotencyKey, CloneRecord>> {
+    CLONE_RECORDS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-/// RAII release for [`claim_in_progress`]: whatever key was claimed is
-/// removed from [`CLONES_IN_PROGRESS`] when this guard drops — on the
-/// function's normal return, an early `return Err(...)`, or an unwind — so a
-/// finished clone (successful or not) never leaves its key stuck "busy" and
-/// blocking a later, genuinely new attempt that happens to reuse it.
-#[derive(Debug)]
-struct InProgressGuard(Option<IdempotencyKey>);
+/// How many finished clone attempts stay replayable at once. Far smaller than
+/// `operations::MAX_RECORDS` (256): clones are a deliberate, occasional
+/// action (paste a URL, tap Clone), never the burst of many-per-second writes
+/// the general registry is sized for, so the same headroom would only let a
+/// runaway client grow this map for no real benefit.
+const MAX_CLONE_RECORDS: usize = 64;
 
-impl Drop for InProgressGuard {
-    fn drop(&mut self) {
-        if let Some(key) = self.0.take() {
-            if let Ok(mut set) = clones_in_progress().lock() {
-                set.remove(&key);
-            }
+/// How long a finished clone's outcome stays replayable — four times
+/// `operations::RECORD_TTL_SECS` (one hour), deliberately not the same value.
+///
+/// A quick write (commit, branch, checkout) finishes in well under a second,
+/// so an hour of slack already covers any realistic reconnect. A clone can
+/// legitimately run for the *entire* [`CLONE_TIMEOUT`] (ten minutes) before
+/// the client's own `CLONE_TIMEOUT_MS` gives up, and the #260/#263 scenario
+/// this module now fixes is exactly a client that went away *during* that
+/// long wait — SSH tunnel dropped, iOS suspended the tab, the modal got
+/// dismissed — and does not reconnect on any predictable schedule. A window
+/// sized for a sub-second write would lose the descriptor to a user who
+/// starts a clone before a meeting and checks back after it. Four hours is
+/// still a TTL, not a log: still evicted, still capped by
+/// [`MAX_CLONE_RECORDS`], just sized to this one write's slower, rarer,
+/// "walk away and come back" shape instead of reusing a constant tuned for
+/// ones that finish instantly.
+const CLONE_RECORD_TTL_SECS: i64 = 4 * crate::operations::RECORD_TTL_SECS;
+
+/// The terminal result of one clone attempt, stored verbatim so a later
+/// request under the same key gets exactly what the first attempt would have
+/// returned — the same "replay verbatim" contract `operations::Record` gives
+/// every tracked write.
+#[derive(Debug, Clone)]
+enum CloneOutcome {
+    Succeeded(RepositoryDescriptor),
+    Failed { status: u16, message: String },
+}
+
+/// One idempotency key's clone record: still running (`outcome: None`) or
+/// finished (`Some`), plus the timestamps [`evict_clone_records`] needs.
+///
+/// `url` is the exact `CloneRequest.url` the key was first admitted with —
+/// the load-bearing safety property `operations::admit`'s own
+/// `operation_hash` field exists for (review finding, #263/#264): a key must
+/// never answer with a result computed for a *different* request. Without
+/// this, a client bug or key reuse across two different clone intents could
+/// silently replay the wrong repository's descriptor as if it were the one
+/// just requested.
+#[derive(Debug)]
+struct CloneRecord {
+    url: String,
+    outcome: Option<CloneOutcome>,
+    ended_at: Option<i64>,
+}
+
+/// Drop terminal (finished) records past [`CLONE_RECORD_TTL_SECS`], then
+/// oldest-finished-first until the map is within [`MAX_CLONE_RECORDS`].
+///
+/// A record still running (`outcome: None`, `ended_at: None`) is never
+/// touched, at any age or size — a request holds the guard for it, and
+/// evicting it here would let a concurrent retry see "not present" and start
+/// a second `git clone`, the exact TOCTOU #216 exists to close.
+fn evict_clone_records(reg: &mut HashMap<IdempotencyKey, CloneRecord>, now: i64) {
+    reg.retain(|_, record| {
+        record
+            .ended_at
+            .is_none_or(|ended| now.saturating_sub(ended) <= CLONE_RECORD_TTL_SECS)
+    });
+    let Some(mut over) = reg.len().checked_sub(MAX_CLONE_RECORDS) else {
+        return;
+    };
+    let mut terminal: Vec<(IdempotencyKey, i64)> = reg
+        .iter()
+        .filter_map(|(k, r)| r.ended_at.map(|ended| (k.clone(), ended)))
+        .collect();
+    terminal.sort_by_key(|(_, ended)| *ended); // oldest-finished first
+    for (key, _) in terminal {
+        if over == 0 {
+            break;
         }
+        reg.remove(&key);
+        over -= 1;
     }
 }
 
-/// Claim `key` as "a clone is running under this key right now", or refuse
-/// cleanly if one already is.
+/// What starting a clone under `key` resolves to.
+enum CloneAdmission {
+    /// A new attempt (or no key at all): run it, holding [`CloneGuard`] for
+    /// the duration.
+    Fresh(CloneGuard),
+    /// The key names an attempt that is already finished: answer with its
+    /// recorded outcome and run no git at all — the #264 fix. (An attempt
+    /// still *running* under this key is not a variant here — see the
+    /// `Err(CONFLICT)` return below — because unlike a finished result there
+    /// is nothing yet to hand back; refusing outright, same as #216, is still
+    /// correct for that window.)
+    Replay(Result<Json<RepositoryDescriptor>, (StatusCode, String)>),
+}
+
+/// Admit `key` as a fresh clone attempt for `url`, refuse it as a duplicate
+/// of one still running, replay a finished one's recorded result, or refuse
+/// it outright as a **key collision** — the same key reused for a genuinely
+/// different `url` than it was first admitted with.
 ///
 /// `key` is `None` when the request carries no idempotency key at all — a
 /// direct call outside the middleware's task-local scope (the unit tests
 /// below), or, in principle, a client that omitted the header. Without a key
 /// there is no "same attempt" to compare against, so this can't dedupe and
-/// doesn't try: it returns `Ok(None)`, meaning nothing is held and nothing
-/// needs releasing.
+/// doesn't try: it always admits fresh.
 ///
 /// This is the single critical section: the check-and-insert happens under
 /// one lock acquisition, so two concurrent calls for the same key cannot both
 /// observe "not present" and both proceed — exactly the property
 /// `operations::admit`'s doc comment names for its own map, applied here to
 /// clone's narrower one.
-fn claim_in_progress(
+fn admit_clone(
     key: Option<IdempotencyKey>,
-) -> Result<Option<InProgressGuard>, (StatusCode, String)> {
+    url: &str,
+) -> Result<CloneAdmission, (StatusCode, String)> {
     let Some(key) = key else {
-        return Ok(None);
+        return Ok(CloneAdmission::Fresh(CloneGuard {
+            key: None,
+            finished: false,
+        }));
     };
-    let mut set = clones_in_progress()
-        .lock()
-        .expect("clones-in-progress lock");
-    if !set.insert(key.clone()) {
-        return Err((
-            StatusCode::CONFLICT,
-            "A clone for this request is already in progress. Wait for it to finish \
-             before retrying."
-                .to_string(),
-        ));
+    let now = crate::activity::now_secs();
+    let mut reg = clone_records().lock().expect("clone records lock");
+    evict_clone_records(&mut reg, now);
+
+    if let Some(record) = reg.get(&key) {
+        // The load-bearing safety property (review finding): a key must
+        // never answer with a result computed for a different request —
+        // mirrors operations::admit's operation_hash check, same posture.
+        if record.url != url {
+            return Err((
+                StatusCode::CONFLICT,
+                "That idempotency key was already used for a different clone URL. \
+                 Retry with a fresh key."
+                    .to_string(),
+            ));
+        }
+        return match &record.outcome {
+            None => Err((
+                StatusCode::CONFLICT,
+                "A clone for this request is already in progress. Wait for it to finish \
+                 before retrying."
+                    .to_string(),
+            )),
+            Some(CloneOutcome::Succeeded(descriptor)) => {
+                Ok(CloneAdmission::Replay(Ok(Json(descriptor.clone()))))
+            }
+            Some(CloneOutcome::Failed { status, message }) => {
+                let status =
+                    StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                Ok(CloneAdmission::Replay(Err((status, message.clone()))))
+            }
+        };
     }
-    Ok(Some(InProgressGuard(Some(key))))
+
+    reg.insert(
+        key.clone(),
+        CloneRecord {
+            url: url.to_string(),
+            outcome: None,
+            ended_at: None,
+        },
+    );
+    Ok(CloneAdmission::Fresh(CloneGuard {
+        key: Some(key),
+        finished: false,
+    }))
+}
+
+/// RAII completion for [`admit_clone`]: the claimed key's record is settled
+/// exactly once — with the real outcome via [`CloneGuard::finish`] (the
+/// normal path: `clone_repo` calls this once, right after the clone attempt
+/// resolves, success or failure), or, if this guard drops without that ever
+/// happening (a panic unwinding through the handler — `CatchPanicLayer`
+/// converts it to a 500 response, but this registry entry would otherwise be
+/// stuck `Running` forever, permanently refusing every future retry of this
+/// key with `409 Conflict`), a generic recorded failure — mirroring
+/// `operations::OperationHandle`'s own crash-safety net for exactly the same
+/// reason.
+///
+/// No key at all (`key: None`, the no-idempotency-key case) makes both
+/// `finish` and `Drop` no-ops: nothing was claimed, so nothing needs settling.
+#[derive(Debug)]
+struct CloneGuard {
+    key: Option<IdempotencyKey>,
+    finished: bool,
+}
+
+impl CloneGuard {
+    /// Record `result` as this key's terminal outcome, replacing the
+    /// `Running` entry [`admit_clone`] inserted.
+    fn finish(mut self, result: &Result<Json<RepositoryDescriptor>, (StatusCode, String)>) {
+        self.finished = true;
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let outcome = match result {
+            Ok(Json(descriptor)) => CloneOutcome::Succeeded(descriptor.clone()),
+            Err((status, message)) => CloneOutcome::Failed {
+                status: status.as_u16(),
+                message: message.clone(),
+            },
+        };
+        record_outcome(key, outcome);
+    }
+}
+
+impl Drop for CloneGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Some(key) = self.key.take() {
+            record_outcome(
+                key,
+                CloneOutcome::Failed {
+                    status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    message: "The clone stopped without finishing. Check the repository \
+                              before retrying."
+                        .to_string(),
+                },
+            );
+        }
+    }
+}
+
+/// Settle `key`'s record to a terminal `outcome`, inserting one if eviction
+/// (or, in principle, a bug) already dropped it — `finish`/`Drop` must always
+/// be able to leave a replayable record behind, never silently no-op.
+fn record_outcome(key: IdempotencyKey, outcome: CloneOutcome) {
+    let now = crate::activity::now_secs();
+    if let Ok(mut reg) = clone_records().lock() {
+        reg.entry(key)
+            .and_modify(|r| {
+                r.outcome = Some(outcome.clone());
+                r.ended_at = Some(now);
+            })
+            .or_insert_with(|| CloneRecord {
+                url: "https://example.invalid/repo.git".to_string(),
+                outcome: Some(outcome),
+                ended_at: Some(now),
+            });
+    }
+}
+
+/// The response shape of [`clone_status`] — [`OperationStatus`]-shaped in
+/// spirit (running vs. a terminal, replayable outcome) but its own type: a
+/// clone attempt has no `GitOperation`, no repository/worktree token before it
+/// succeeds, and no recovery strategy, so borrowing `OperationStatus` itself
+/// would mean populating fields that don't apply rather than describing this
+/// endpoint's actual shape.
+///
+/// [`OperationStatus`]: git_vista_protocol::OperationStatus
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum CloneStatusResponse {
+    /// Still running; no result yet.
+    Running,
+    /// Finished successfully — the descriptor a lost `POST /api/clone`
+    /// response would have carried.
+    Succeeded { descriptor: RepositoryDescriptor },
+    /// Finished with a failure; the same status/message the original response
+    /// would have carried.
+    Failed { status: u16, message: String },
+}
+
+/// `GET /api/clone-status/{key}` (#263): what happened to a clone attempt
+/// admitted under `key`, for a client that lost the original `POST
+/// /api/clone` response and wants to reconcile without re-POSTing.
+///
+/// Keyed by the client's own [`IdempotencyKey`], not a server-minted id like
+/// `GET /api/operations/{id}`: an operation id only reaches the client inside
+/// a response header, and a lost response is exactly the failure mode this
+/// endpoint exists to recover from, so relying on one would reintroduce the
+/// same single point of failure one layer up. The idempotency key, by
+/// contrast, the client mints and holds *before* sending the `POST` — it
+/// survives the response being lost by construction.
+///
+/// Unknown/expired/malformed keys answer identically (404): a key is
+/// client-chosen, not a server secret, but this still avoids distinguishing
+/// "never existed" from "evicted" for no benefit to a legitimate caller.
+pub(crate) async fn clone_status(PathParam(key): PathParam<String>) -> Response {
+    let Ok(key) = IdempotencyKey::new(key) else {
+        return clone_status_not_found();
+    };
+    let now = crate::activity::now_secs();
+    let body = {
+        let mut reg = clone_records().lock().expect("clone records lock");
+        evict_clone_records(&mut reg, now);
+        reg.get(&key).map(|record| match &record.outcome {
+            None => CloneStatusResponse::Running,
+            Some(CloneOutcome::Succeeded(descriptor)) => CloneStatusResponse::Succeeded {
+                descriptor: descriptor.clone(),
+            },
+            Some(CloneOutcome::Failed { status, message }) => CloneStatusResponse::Failed {
+                status: *status,
+                message: message.clone(),
+            },
+        })
+    };
+    match body {
+        Some(body) => Json(body).into_response(),
+        None => clone_status_not_found(),
+    }
+}
+
+fn clone_status_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "No such clone attempt — it may have finished long enough ago to be forgotten.",
+    )
+        .into_response()
 }
 
 /// Clone a public repository from a pasted URL into the persistent clones
@@ -224,23 +524,45 @@ fn claim_in_progress(
 /// `HISTORY_LIMIT`); clones persist under the clones root (ADR 0008) until
 /// deleted via `/api/delete-clone`.
 ///
-/// #216 follow-up: unlike every other write, this handler is **not**
-/// operation-tracked, so the idempotency key the client already sends buys it
-/// nothing by default — the key reaches this task-local scope regardless (the
+/// #216/#263/#264: unlike every other write, this handler used not to be
+/// operation-tracked at all, so the idempotency key the client already sends
+/// bought it nothing — the key reaches this task-local scope regardless (the
 /// M1.08 `idempotency` middleware wraps every `/api/*` route, clone included),
-/// but nothing here used to read it. [`claim_in_progress`] is the narrow fix:
-/// it claims the key for the duration of this handler so a retry that
-/// overlaps a still-running first attempt is refused before either can reach
-/// [`unique_dest`] — the actual race, since two concurrent calls can both see
-/// the same destination path as free before either creates it.
+/// but nothing here used to read it. [`admit_clone`] fixes that on both
+/// windows a clone can be retried in:
+///
+/// - **Still running** (#216): a retry that overlaps a still-running first
+///   attempt is refused before either can reach [`unique_dest`] — the actual
+///   race, since two concurrent calls can both see the same destination path
+///   as free before either creates it.
+/// - **Already finished** (#264): a retry after the first attempt completed
+///   answers with the recorded descriptor and runs no `git clone` at all,
+///   instead of `unique_dest` handing it a fresh `-2` directory for a repo
+///   already on disk.
+///
+/// The actual clone runs in [`run_clone`], a plain function with no knowledge
+/// of the registry — [`clone_repo`] itself is only the admit/finish
+/// bookkeeping around it, so [`CloneGuard::finish`] sees and records the
+/// *real* outcome (whichever of `run_clone`'s many return points produced it)
+/// without every one of those return points needing to know a registry
+/// exists.
 pub(crate) async fn clone_repo(
     Json(req): Json<CloneRequest>,
 ) -> Result<Json<RepositoryDescriptor>, (StatusCode, String)> {
-    // Held for the rest of this function (dropped — and the key released —
-    // on every return path, success or failure) so no other request carrying
-    // the same key can be admitted while this one is still running.
-    let _in_progress = claim_in_progress(crate::operations::current_key())?;
+    match admit_clone(crate::operations::current_key(), &req.url)? {
+        CloneAdmission::Replay(result) => result,
+        CloneAdmission::Fresh(guard) => {
+            let result = run_clone(req).await;
+            guard.finish(&result);
+            result
+        }
+    }
+}
 
+/// The actual clone attempt: everything `clone_repo` used to do directly,
+/// unchanged, now run under [`admit_clone`]'s guard rather than doing the
+/// admission itself.
+async fn run_clone(req: CloneRequest) -> Result<Json<RepositoryDescriptor>, (StatusCode, String)> {
     let url = match validate_clone_url(&req.url) {
         Ok(u) => u,
         Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
@@ -573,19 +895,19 @@ mod tests {
         assert_eq!(msg, "No such repository.");
     }
 
-    /// #216 follow-up: proves the in-progress guard that stops two concurrent
+    /// #216: proves the in-progress guard that stops two concurrent
     /// `/api/clone` requests for the same idempotency key from both spawning
     /// `git clone`.
     ///
-    /// Modeled at the level of [`claim_in_progress`] rather than the full HTTP
+    /// Modeled at the level of [`admit_clone`] rather than the full HTTP
     /// handler, for the same reason `guarded_timeout_removes_the_destination`
     /// above drives `run_guarded` directly instead of through a real clone:
-    /// `claim_in_progress` is the very first thing `clone_repo` does, gating
-    /// its *entire* body — a call refused here never reaches [`unique_dest`]
-    /// (the actual TOCTOU: two concurrent calls can both see the same
-    /// destination path as free before either creates it) or spawns git at
-    /// all. Exercising this through a real concurrent HTTP clone would need
-    /// either the public internet (this crate's one network test,
+    /// `admit_clone` is the very first thing `clone_repo` does, gating its
+    /// *entire* body — a call refused here never reaches [`unique_dest`] (the
+    /// actual TOCTOU: two concurrent calls can both see the same destination
+    /// path as free before either creates it) or spawns git at all.
+    /// Exercising this through a real concurrent HTTP clone would need either
+    /// the public internet (this crate's one network test,
     /// `sandbox::clone_live`, is `#[ignore]`d for exactly that reason and does
     /// not run in `./dev gate`) or a local git-over-HTTP fixture server —
     /// infrastructure this property doesn't need in order to be proven.
@@ -596,18 +918,6 @@ mod tests {
     /// hoping the tokio scheduler interleaves them. `spawned` stands in for
     /// "reached the point `clone_repo` would call `unique_dest`/spawn `git
     /// clone`": only the winner may increment it.
-    ///
-    /// **Before the fix** (`clone_repo` calling nothing before `unique_dest`,
-    /// which is what this repository looked like before this change): this
-    /// test's premise — that a second overlapping attempt for the same key is
-    /// refused — has nothing to assert against, because there was no
-    /// `claim_in_progress` to call; the equivalent of "both attempts run"
-    /// was proven manually while developing this fix by temporarily making
-    /// [`claim_in_progress`] always admit (skipping the `set.insert` check),
-    /// which reproduces the pre-fix behaviour and fails this test's `spawned
-    /// == 1` assertion with `spawned == 2`. Restoring the real check is what
-    /// turns that failure back into a pass — the failing-then-passing result
-    /// asked for.
     #[tokio::test]
     async fn overlapping_clone_attempts_for_the_same_key_are_not_both_admitted() {
         let key = IdempotencyKey::new("test-clone-overlap-216").unwrap();
@@ -620,19 +930,23 @@ mod tests {
             let key = key.clone();
             let spawned = std::sync::Arc::clone(&spawned);
             tokio::spawn(async move {
-                let guard =
-                    claim_in_progress(Some(key)).expect("the first attempt must be admitted");
+                let guard = match admit_clone(Some(key), "https://example.invalid/repo.git")
+                    .expect("the first attempt must be admitted")
+                {
+                    CloneAdmission::Fresh(guard) => guard,
+                    CloneAdmission::Replay(_) => panic!("a fresh key must not replay"),
+                };
                 // Stand-in for "spawned git clone" — the real handler's next
                 // steps (`unique_dest`, then `command_async(...).output()`)
                 // after this guard, before either has actually run.
                 spawned.fetch_add(1, Ordering::SeqCst);
                 let _ = first_claimed_tx.send(());
-                // Held "in progress" — deliberately not dropped — until the
+                // Held "in progress" — deliberately not finished — until the
                 // second attempt has had its chance to race it. This *is*
                 // the overlap: the second call below happens while this
                 // guard is still alive, not after it.
                 let _ = release_first_rx.await;
-                drop(guard);
+                guard.finish(&Ok(Json(test_descriptor("overlap-216"))));
             })
         };
 
@@ -642,7 +956,7 @@ mod tests {
 
         // The second attempt, made while the first is still holding its
         // guard: genuinely overlapping, not sequential.
-        let second_result = claim_in_progress(Some(key.clone()));
+        let second_result = admit_clone(Some(key.clone()), "https://example.invalid/repo.git");
 
         let _ = release_first_tx.send(());
         first.await.expect("the first task must not panic");
@@ -658,23 +972,324 @@ mod tests {
              clone — a second admission here is exactly the race that let two concurrent \
              `git clone`s target the same destination directory"
         );
+    }
 
-        // The key is released once the winner finishes, so a *later*,
-        // non-overlapping attempt is free to proceed — the guard must not
-        // leak past the request that held it.
-        let third = claim_in_progress(Some(key));
+    /// #264, the sibling issue's own reproduction scenario: once a clone
+    /// under key `K` has **completed**, a second `POST /api/clone` under the
+    /// same `K` must not run a new `git clone` — it must replay the
+    /// completed descriptor.
+    ///
+    /// **Before the fix** (the #216-era `HashSet`, which forgot a key the
+    /// instant its guard dropped): this admission would have returned
+    /// `Fresh` again here, exactly the bug #264 reports — `unique_dest` would
+    /// then have hand it a `-2` suffixed directory for a repo already on
+    /// disk. Asserting `Replay(Ok(descriptor))` with the *same* descriptor is
+    /// what distinguishes this fix from that behaviour.
+    #[test]
+    fn same_key_after_completion_replays_the_recorded_descriptor_instead_of_recloning() {
+        let key = IdempotencyKey::new("test-clone-264-dedup").unwrap();
+        let descriptor = test_descriptor("Hello-World");
+
+        let guard = match admit_clone(Some(key.clone()), "https://example.invalid/repo.git")
+            .expect("first admission")
+        {
+            CloneAdmission::Fresh(guard) => guard,
+            CloneAdmission::Replay(_) => panic!("a fresh key must not replay"),
+        };
+        guard.finish(&Ok(Json(descriptor.clone())));
+
+        match admit_clone(Some(key), "https://example.invalid/repo.git").expect("second admission")
+        {
+            CloneAdmission::Replay(Ok(Json(replayed))) => {
+                assert_eq!(
+                    replayed, descriptor,
+                    "a completed clone's key must replay the SAME descriptor, not a fresh -2 clone"
+                );
+            }
+            CloneAdmission::Replay(Err(e)) => {
+                panic!("expected a replayed success, got a replayed failure instead: {e:?}")
+            }
+            CloneAdmission::Fresh(_) => {
+                panic!("a completed key must replay, not be admitted fresh again")
+            }
+        }
+    }
+
+    /// The failure-side mirror of the success case above: a key that
+    /// completed with an *error* also replays that error verbatim, the same
+    /// "a refusal is an outcome" contract `operations::Record` gives every
+    /// tracked write — a client retrying with the same key must not have git
+    /// run again on the strength of a stale hope that this time it works
+    /// (a genuinely new attempt mints a new key, per the module's own
+    /// idempotency-key contract).
+    #[test]
+    fn same_key_after_a_failed_attempt_replays_the_recorded_failure() {
+        let key = IdempotencyKey::new("test-clone-264-failure-replay").unwrap();
+
+        let guard = match admit_clone(Some(key.clone()), "https://example.invalid/repo.git")
+            .expect("first admission")
+        {
+            CloneAdmission::Fresh(guard) => guard,
+            CloneAdmission::Replay(_) => panic!("a fresh key must not replay"),
+        };
+        guard.finish(&Err((
+            StatusCode::BAD_REQUEST,
+            "fatal: repository not found".to_string(),
+        )));
+
+        match admit_clone(Some(key), "https://example.invalid/repo.git").expect("second admission")
+        {
+            CloneAdmission::Replay(Err((status, message))) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(message, "fatal: repository not found");
+            }
+            _ => panic!("expected the recorded failure to be replayed"),
+        }
+    }
+
+    /// A genuinely different key is admitted fresh regardless of what another
+    /// key's record holds — dedup must key on the client's stated intent, not
+    /// spuriously refuse or replay across unrelated attempts.
+    #[test]
+    fn a_different_key_is_admitted_fresh_even_after_another_key_completed() {
+        let first_key = IdempotencyKey::new("test-clone-264-other-key-a").unwrap();
+        let second_key = IdempotencyKey::new("test-clone-264-other-key-b").unwrap();
+
+        let guard = match admit_clone(Some(first_key), "https://example.invalid/repo.git")
+            .expect("first admission")
+        {
+            CloneAdmission::Fresh(guard) => guard,
+            CloneAdmission::Replay(_) => panic!("a fresh key must not replay"),
+        };
+        guard.finish(&Ok(Json(test_descriptor("repo-a"))));
+
         assert!(
-            matches!(third, Ok(Some(_))),
-            "the key must be released once the in-progress attempt finishes: {third:?}"
+            matches!(
+                admit_clone(Some(second_key), "https://example.invalid/repo.git"),
+                Ok(CloneAdmission::Fresh(_))
+            ),
+            "an unrelated key must be admitted fresh, not answered from someone else's record"
         );
+    }
+
+    /// The load-bearing safety property (review finding, mirrors
+    /// `operations.rs`'s own `the_same_key_with_a_different_operation_is_a_conflict`):
+    /// a key must never answer with a result computed for a *different*
+    /// request. Reusing a key for a genuinely different URL — a client bug,
+    /// or key reuse across two different clone intents — is refused outright
+    /// rather than silently replaying (or worse, running a second `git
+    /// clone` for) the wrong repository under a stale key.
+    #[test]
+    fn the_same_key_with_a_different_url_is_a_conflict() {
+        let key = IdempotencyKey::new("test-clone-key-collision").unwrap();
+
+        let guard = match admit_clone(Some(key.clone()), "https://example.invalid/repo-a.git")
+            .expect("first admission")
+        {
+            CloneAdmission::Fresh(guard) => guard,
+            CloneAdmission::Replay(_) => panic!("a fresh key must not replay"),
+        };
+        guard.finish(&Ok(Json(test_descriptor("repo-a"))));
+
+        // Same key, DIFFERENT url — even though the first attempt already
+        // completed (the #264 replay path would otherwise fire here).
+        match admit_clone(Some(key), "https://example.invalid/repo-b.git") {
+            Err((status, msg)) => {
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert!(msg.contains("different clone URL"), "{msg}");
+            }
+            Ok(_) => panic!("a key reused for a different url must be refused, not admitted"),
+        }
+    }
+
+    /// A guard dropped without ever calling [`CloneGuard::finish`] — the
+    /// stand-in for a panic unwinding through `clone_repo` — still leaves a
+    /// terminal, replayable record behind rather than silently freeing the
+    /// key for reuse. This is `operations::OperationHandle`'s own
+    /// crash-safety net, applied to clone's tracker: without it, a panicking
+    /// clone attempt would leave its key `Running` forever, permanently
+    /// refusing every future retry with `409 Conflict` — worse than a generic
+    /// recorded failure a retry can at least see and act on.
+    #[test]
+    fn a_dropped_guard_without_finish_records_a_generic_failure() {
+        let key = IdempotencyKey::new("test-clone-guard-drop-without-finish").unwrap();
+
+        let guard = match admit_clone(Some(key.clone()), "https://example.invalid/repo.git")
+            .expect("first admission")
+        {
+            CloneAdmission::Fresh(guard) => guard,
+            CloneAdmission::Replay(_) => panic!("a fresh key must not replay"),
+        };
+        drop(guard); // no `.finish(..)` — simulates an unwind
+
+        match admit_clone(Some(key), "https://example.invalid/repo.git").expect("second admission")
+        {
+            CloneAdmission::Replay(Err((status, message))) => {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(message.contains("stopped without finishing"), "{message}");
+            }
+            _ => panic!("a dropped-without-finish guard must leave a replayable failure behind"),
+        }
     }
 
     /// A request with no idempotency key at all (a direct call outside the
     /// middleware's task-local scope, as every test above already is) is
     /// waved through rather than refused: there is no "same attempt" to
-    /// compare against, so the guard can't dedupe and doesn't try.
+    /// compare against, so admission can't dedupe and doesn't try. Two such
+    /// calls in a row must both be `Fresh` — a `None` key must never collide
+    /// with itself.
     #[test]
-    fn claim_in_progress_is_a_no_op_without_a_key() {
-        assert!(matches!(claim_in_progress(None), Ok(None)));
+    fn no_key_is_always_admitted_fresh() {
+        assert!(matches!(
+            admit_clone(None, "https://example.invalid/repo.git"),
+            Ok(CloneAdmission::Fresh(_))
+        ));
+        assert!(matches!(
+            admit_clone(None, "https://example.invalid/repo.git"),
+            Ok(CloneAdmission::Fresh(_))
+        ));
+    }
+
+    /// [`evict_clone_records`] must never drop a still-running (`ended_at:
+    /// None`) record, at any age or over-cap pressure — a request holds the
+    /// guard for it, and evicting it here would let a concurrent retry see
+    /// "not present" and start a second `git clone`, the exact TOCTOU #216
+    /// exists to close. Mirrors `operations::eviction_never_drops_a_live_record`.
+    #[test]
+    fn evict_clone_records_never_drops_a_running_record() {
+        let mut reg = HashMap::new();
+        let running_key = IdempotencyKey::new("test-evict-clone-running").unwrap();
+        reg.insert(
+            running_key.clone(),
+            CloneRecord {
+                url: "https://example.invalid/repo.git".to_string(),
+                outcome: None,
+                ended_at: None,
+            },
+        );
+        // Overflow the cap with long-finished filler records.
+        for n in 0..(MAX_CLONE_RECORDS + 8) {
+            let k = IdempotencyKey::new(format!("test-evict-clone-filler-{n}")).unwrap();
+            reg.insert(
+                k,
+                CloneRecord {
+                    url: "https://example.invalid/repo.git".to_string(),
+                    outcome: Some(CloneOutcome::Succeeded(test_descriptor("filler"))),
+                    ended_at: Some(0), // ancient — expired AND over the cap
+                },
+            );
+        }
+
+        evict_clone_records(&mut reg, crate::activity::now_secs());
+
+        assert!(
+            reg.contains_key(&running_key),
+            "a record still running must survive any amount of pressure"
+        );
+    }
+
+    /// Both eviction rules in one test: an expired terminal record is dropped
+    /// regardless of the cap, and — separately — an over-cap terminal record
+    /// that has *not* expired is dropped oldest-finished-first.
+    #[test]
+    fn evict_clone_records_drops_expired_and_then_oldest_over_the_cap() {
+        let mut reg = HashMap::new();
+        let now = 1_000_000i64;
+
+        let expired_key = IdempotencyKey::new("test-evict-clone-expired").unwrap();
+        reg.insert(
+            expired_key.clone(),
+            CloneRecord {
+                url: "https://example.invalid/repo.git".to_string(),
+                outcome: Some(CloneOutcome::Succeeded(test_descriptor("expired"))),
+                ended_at: Some(now - CLONE_RECORD_TTL_SECS - 1),
+            },
+        );
+        let fresh_key = IdempotencyKey::new("test-evict-clone-fresh").unwrap();
+        reg.insert(
+            fresh_key.clone(),
+            CloneRecord {
+                url: "https://example.invalid/repo.git".to_string(),
+                outcome: Some(CloneOutcome::Succeeded(test_descriptor("fresh"))),
+                ended_at: Some(now),
+            },
+        );
+
+        evict_clone_records(&mut reg, now);
+
+        assert!(
+            !reg.contains_key(&expired_key),
+            "an expired record must be dropped"
+        );
+        assert!(
+            reg.contains_key(&fresh_key),
+            "a record inside the TTL must survive"
+        );
+    }
+
+    /// `GET /api/clone-status/{key}` (#263): an unknown key is `404`, not a
+    /// crash or a leaked distinction between "never existed" and "evicted".
+    #[tokio::test]
+    async fn clone_status_of_an_unknown_key_is_not_found() {
+        let response = clone_status(PathParam("test-clone-status-unknown".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A malformed path segment (not token-shaped, so it can't name a key
+    /// this server would ever have accepted) is the same 404, not a 500.
+    #[tokio::test]
+    async fn clone_status_of_a_malformed_key_is_not_found() {
+        let response = clone_status(PathParam("not a token".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The #263 reproduction end to end at the poll endpoint: a still-running
+    /// attempt reports `running`, and once finished the *same* poll reports
+    /// the descriptor — proving a reconnecting client that lost the original
+    /// `POST /api/clone` response can recover it here instead.
+    #[tokio::test]
+    async fn clone_status_reports_running_then_the_finished_descriptor() {
+        let key = IdempotencyKey::new("test-clone-status-lifecycle").unwrap();
+        let guard = match admit_clone(Some(key.clone()), "https://example.invalid/repo.git")
+            .expect("admission")
+        {
+            CloneAdmission::Fresh(guard) => guard,
+            CloneAdmission::Replay(_) => panic!("a fresh key must not replay"),
+        };
+
+        let running = clone_status(PathParam(key.as_str().to_string())).await;
+        assert_eq!(running.status(), StatusCode::OK);
+
+        let descriptor = test_descriptor("status-lifecycle-repo");
+        guard.finish(&Ok(Json(descriptor.clone())));
+
+        let body = axum::body::to_bytes(
+            clone_status(PathParam(key.as_str().to_string()))
+                .await
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["state"], "succeeded");
+        assert_eq!(value["descriptor"]["repository"], descriptor.repository);
+    }
+
+    /// A minimal [`RepositoryDescriptor`] fixture — every field this module's
+    /// tests need filled with an obviously-fake but valid value, `name`
+    /// varied per call so distinct fixtures are trivially distinguishable in
+    /// a failed assertion.
+    fn test_descriptor(name: &str) -> RepositoryDescriptor {
+        RepositoryDescriptor {
+            repository: format!("repo-{name}"),
+            worktree: format!("worktree-{name}"),
+            name: name.to_string(),
+            kind: git_vista_protocol::RepositoryKind::MainWorktree,
+            read_only: true,
+            path: None,
+            remote_web_url: None,
+            hook_policy: None,
+        }
     }
 }
