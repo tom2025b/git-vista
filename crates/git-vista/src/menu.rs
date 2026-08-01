@@ -20,7 +20,7 @@ use crate::features::core_traits::RequestTarget;
 use crate::features::dialogs::core::Dialog;
 use crate::features::graph::core::disabled_menu_item_copy;
 use crate::features::operations::core::PendingIntent;
-use crate::features::shell::signals::Shell;
+use crate::features::shell::signals::{self as shell_state, Shell};
 use crate::geometry::menu_placement;
 use crate::gestures::viewport_size;
 use crate::icons::icon_set;
@@ -716,7 +716,18 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
             // On a read-only clone (Phase 12) the menu is just the header + the
             // GitHub link: no branch/commit/merge/push/delete/undo. Otherwise
             // show the full set of write actions.
-            let write_items = (!read_only).then(|| {
+            //
+            // M2.22b (#242): while the device reports offline, the write set is
+            // gated the same way — one conditional at the section's chokepoint,
+            // not eleven per-item checks — with a single disabled row below
+            // naming why, so the menu doesn't silently shrink. The tracked
+            // `online_signal` read means a connectivity flip re-renders an
+            // OPEN menu (`shell.menu()` is already tracked by this closure).
+            // `navigator.onLine` can read true over a dead tunnel — this
+            // gating is a UX nicety; `api.rs`'s `refuse_if_offline()` guard
+            // (M2.22a) is what actually prevents the write.
+            let online = shell_state::online_signal().get();
+            let write_items = (!read_only && online).then(|| {
                 view! {
                     {undo_items}
                     <button class="ctx-item" on:click=on_branch>
@@ -730,6 +741,25 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     {commit_empty}
                     {branch_items}
                     {rebase_item}
+                }
+            });
+            // The one disabled row standing in for the whole write set while
+            // offline. Same attribution rule as `offline_refusal_text`: this
+            // speaks for the device's adapter, never for the server.
+            let offline_notice = (!read_only && !online).then(|| {
+                const REASON: &str = "This device reports it is offline";
+                let (aria_label, visible_reason) = disabled_menu_item_copy("Write actions", REASON);
+                view! {
+                    <span
+                        class="ctx-item disabled"
+                        title=REASON
+                        aria-disabled="true"
+                        aria-label=aria_label
+                    >
+                        <span class="nf ctx-icon">{ic.commit}</span>
+                        "Write actions"
+                        <span class="ctx-item-reason">{visible_reason}</span>
+                    </span>
                 }
             });
             // Clamp the menu inside the *visual* viewport (iPad fix): a tap in
@@ -753,6 +783,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     {diff_item}
                     {open_github}
                     {write_items}
+                    {offline_notice}
                 </div>
             }
         })

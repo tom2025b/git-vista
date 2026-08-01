@@ -327,9 +327,10 @@ pub fn App() -> impl IntoView {
     // in `graph_canvas`, for the same reason `mode` is: an epoch bump's rebuild
     // must not tear down and reinstall the online/offline listeners mid-session.
     // `api.rs`'s `refuse_if_offline()` reads the plain accessor this seeds
-    // (`shell::signals::is_online`), not this signal — the signal itself is for
-    // M2.22b's UI, not yet consumed here.
-    let _connectivity = install_connectivity_signal();
+    // (`shell::signals::is_online`), not this signal — the signal drives
+    // M2.22b's UI (#242): the offline banner below, and the write controls the
+    // menu/picker/Activity views gate through `shell_state::online_signal()`.
+    let online = install_connectivity_signal();
 
     // The live working-tree status: the topbar chip (Activity/Undo step 1) and the
     // Activity panel's own status section both read THIS one resource — until M1.11
@@ -685,6 +686,12 @@ pub fn App() -> impl IntoView {
                         </button>
                     })}
             </header>
+            // M2.22b (#242): the offline strip, directly under the topbar in
+            // normal flow (see `offline_banner`'s module docs for why it is
+            // not a second fixed bar). Purely a disclosure — the write
+            // controls it explains are gated where they render, and the real
+            // boundary is `api.rs`'s `refuse_if_offline()` either way.
+            {move || (!online.get()).then(crate::offline_banner::offline_banner_view)}
             // The "Open URL" modal (Phase 12), factored into `dialogs`.
             {dialogs::open_url_view(open_url, clone_url, cloning, dialogs_guard, graph, mode_for)}
             // The "Reset Test Repo" confirmation (only reachable via the gated

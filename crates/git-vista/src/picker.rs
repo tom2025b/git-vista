@@ -20,6 +20,7 @@ use crate::features::operations::core::{result_is_newest, IntentSeq};
 use crate::features::operations::signals as ops;
 use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
+use crate::features::shell::signals as shell_state;
 
 use crate::api::{delete_clone_request, fetch_catalog, rescan_request, select_request};
 use crate::hook_policy_disclosure;
@@ -208,7 +209,18 @@ pub fn picker_view(
                                             // re-render post-session (catalog is
                                             // keyed on `reload`), so the flag is
                                             // settled by the time it's read.
-                                            {(is_clone && !session_state::is_lan()).then(|| view! {
+                                            // M2.22b (#242): hidden offline too —
+                                            // the tracked `online_signal` read
+                                            // re-renders this row list when
+                                            // connectivity flips, and the banner
+                                            // above the graph says why it went.
+                                            // `navigator.onLine` can read true
+                                            // over a dead tunnel; the write
+                                            // boundary stays `api.rs`'s guard.
+                                            {(is_clone
+                                                && !session_state::is_lan()
+                                                && shell_state::online_signal().get())
+                                            .then(|| view! {
                                                 <button
                                                     style="padding:12px; font:inherit; \
                                                            color:#f85149; background:#0d1117; \
@@ -231,9 +243,13 @@ pub fn picker_view(
                             // on `reload` so the buttons re-evaluate once the
                             // session (and its via_lan flag) lands, the same
                             // recovery the catalog fetch above uses.
+                            // M2.22b (#242): hidden offline too, reactively —
+                            // both trigger writes (`/api/clone`, `/api/rescan`)
+                            // that the offline guard would only refuse.
                             {move || {
                                 graph.get().epoch();
-                                (!session_state::is_lan()).then(|| view! {
+                                (!session_state::is_lan() && shell_state::online_signal().get())
+                                    .then(|| view! {
                                     <button
                                         style="padding:8px 16px; font:inherit; color:var(--fg); \
                                                background:#21262d; border:1px solid #30363d; \

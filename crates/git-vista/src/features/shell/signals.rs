@@ -25,7 +25,7 @@
 //! destroyed them. That is also what retires Task 6's deferred step — the signals leave
 //! canvas scope here rather than being moved twice.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -258,6 +258,37 @@ pub fn is_online() -> bool {
     CONNECTIVITY.with(|c| c.borrow().is_online())
 }
 
+thread_local! {
+    /// The reactive twin of [`CONNECTIVITY`], stored by
+    /// [`install_connectivity_signal`] so views far from `App`'s prop chain
+    /// (the context menu, the picker, the Activity panel) can subscribe
+    /// without threading one more parameter through every layer — the same
+    /// distribution shape `session::signals::is_lan()` uses for its
+    /// per-session facts, applied to a signal instead of a plain read.
+    static ONLINE_SIGNAL: Cell<Option<RwSignal<bool>>> = const { Cell::new(None) };
+}
+
+/// The reactive connectivity signal for UI gating (M2.22b, #242).
+///
+/// What this reflects is `navigator.onLine` — the network *adapter*, which can
+/// happily read `true` over a dead SSH tunnel. Everything rendered from this
+/// signal (the offline banner, hidden/disabled write controls) is therefore a
+/// UX nicety layered on top of the real boundary: `api.rs`'s
+/// `refuse_if_offline()` guard, which reads the plain [`is_online`] accessor
+/// and refuses the write before it touches the wire. A control this signal
+/// failed to hide still cannot write while offline.
+///
+/// Before [`install_connectivity_signal`] has run there is nothing to return,
+/// so this hands back a fresh always-`true` signal — fail *open*, matching
+/// [`is_online`]'s own default and for the same reason. In practice `App`
+/// installs before any view that calls this mounts, so that branch is a
+/// non-browser/startup safety net, not a code path.
+pub fn online_signal() -> RwSignal<bool> {
+    ONLINE_SIGNAL
+        .with(|s| s.get())
+        .unwrap_or_else(|| create_rw_signal(true))
+}
+
 /// Seed the connectivity read from `navigator.onLine` and keep it current via
 /// the window's `online`/`offline` events — the exact listener/cleanup shape
 /// of [`install_mode_signal`] above, applied to a boolean instead of a resize.
@@ -274,6 +305,8 @@ pub fn install_connectivity_signal() -> RwSignal<bool> {
         .unwrap_or(true);
     CONNECTIVITY.with(|c| c.replace(ConnectivityCore::new(initial)));
     let online = create_rw_signal(initial);
+    // Published for [`online_signal`]'s far-flung readers (M2.22b, #242).
+    ONLINE_SIGNAL.with(|s| s.set(Some(online)));
 
     if let Some(win) = web_sys::window() {
         let online_for_on = online;
