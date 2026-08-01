@@ -433,6 +433,16 @@ fn api_router(
             .route("/api/commit", post(create_commit))
             // Stage the working tree (`git add -A`) so the UI can stage, then commit.
             .route("/api/stage", post(stage_all))
+            // The staging-selection surface (M2.17b, #213). All three under
+            // full_routes on purpose — the diff read exists only to feed the
+            // write surface, and a LAN visualize session never sees
+            // uncommitted worktree contents (ADR 0005).
+            .route("/api/staging/diff", get(handlers::staging::staging_diff))
+            .route(
+                "/api/staging/preview",
+                post(handlers::staging::staging_preview),
+            )
+            .route("/api/staging/apply", post(handlers::staging::staging_apply))
             // …and unstage it again (`git reset HEAD`) — the exact inverse, offered
             // by the menu while anything is staged.
             .route("/api/unstage", post(unstage_all))

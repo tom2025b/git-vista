@@ -996,7 +996,14 @@ async fn shape(
             };
             (RiskLevel::Reversible, preconditions, changes, recovery)
         }
-        GitOperation::StageAll | GitOperation::UnstageAll => (
+        GitOperation::StageAll
+        | GitOperation::UnstageAll
+        // A staging selection is index-only like its -All siblings: the
+        // working tree keeps every edit whichever way it goes, so nothing
+        // can be lost and no recovery is needed. Its real admission gate is
+        // the diff-generation check in the handler (staging.rs), which runs
+        // before a plan is ever minted.
+        | GitOperation::StageSelection { .. } => (
             RiskLevel::Safe,
             Vec::new(),
             Vec::new(),
@@ -1295,6 +1302,11 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         } => exec_reset_branch(repo, need, &branch, &to, &expected_tip, &observed).await,
         GitOperation::RevertCommit { commit } => exec_revert(repo, need, &commit, &observed).await,
         GitOperation::ResetTestRepo => exec_reset_test_repo(repo, need).await,
+        GitOperation::StageSelection {
+            direction,
+            patch,
+            whole_files,
+        } => exec_stage_selection(repo, need, direction, &patch, &whole_files).await,
     }
 }
 
@@ -1597,6 +1609,77 @@ async fn exec_stage_all(repo: &Path, need: NetworkNeed) -> (StatusCode, String) 
         eprintln!("git-vista: /api/stage failed: {msg}");
         (StatusCode::BAD_REQUEST, msg)
     }
+}
+
+/// `git apply --cached` of a built selection, then pathspec staging of the
+/// whole-file part (M2.17b, #213; `/api/staging/apply`).
+///
+/// Order is deliberate: the patch leg runs first because it is the leg that
+/// can fail (a hunk that no longer applies), and `git apply` is atomic — it
+/// refuses the whole patch rather than applying half. The pathspec leg
+/// (`git add --` / `git reset -q HEAD --`) after it is near-infallible, so
+/// a failure almost always leaves the index wholly untouched. The residual
+/// window — patch applied, pathspec then failing — is reported exactly as
+/// what happened rather than papered over; the working tree is untouched in
+/// every outcome, which is what makes this Safe-risk.
+async fn exec_stage_selection(
+    repo: &Path,
+    need: NetworkNeed,
+    direction: git_vista_protocol::StageDirection,
+    patch: &str,
+    whole_files: &[String],
+) -> (StatusCode, String) {
+    use git_vista_protocol::StageDirection;
+    let mut done: Vec<String> = Vec::new();
+    if !patch.is_empty() {
+        let args: &[&str] = match direction {
+            StageDirection::Stage => &["apply", "--cached", "--whitespace=nowarn"],
+            StageDirection::Unstage => &["apply", "--cached", "--reverse", "--whitespace=nowarn"],
+        };
+        let output =
+            match crate::git_cmd::git_output_with_stdin(repo, args, need, patch.as_bytes()).await {
+                Ok(o) => o,
+                Err(e) => return couldnt_run("/api/staging/apply", &e),
+            };
+        if !output.status.success() {
+            let msg = stderr_or(&output, "git apply failed.");
+            eprintln!("git-vista: /api/staging/apply patch leg failed: {msg}");
+            // Nothing staged: apply is atomic, and the pathspec leg never ran.
+            return (StatusCode::BAD_REQUEST, msg);
+        }
+        done.push("applied the selected hunks".to_string());
+    }
+    if !whole_files.is_empty() {
+        let mut args: Vec<&str> = match direction {
+            StageDirection::Stage => vec!["add", "--"],
+            StageDirection::Unstage => vec!["reset", "-q", "HEAD", "--"],
+        };
+        args.extend(whole_files.iter().map(String::as_str));
+        let output = match run_git(repo, need, &args).await {
+            Ok(o) => o,
+            Err(e) => return couldnt_run("/api/staging/apply", &e),
+        };
+        if !output.status.success() {
+            let msg = stderr_or(&output, "pathspec staging failed.");
+            eprintln!("git-vista: /api/staging/apply pathspec leg failed: {msg}");
+            let and_yet = if done.is_empty() {
+                String::new()
+            } else {
+                // The residual non-atomic window, reported as fact.
+                " The selected hunks were already applied to the index; \
+                 the whole-file part was not."
+                    .to_string()
+            };
+            return (StatusCode::BAD_REQUEST, format!("{msg}{and_yet}"));
+        }
+        done.push(format!("staged {} file(s) whole", whole_files.len()));
+    }
+    let verb = match direction {
+        StageDirection::Stage => "Staged selection",
+        StageDirection::Unstage => "Unstaged selection",
+    };
+    println!("[/api/staging/apply] {verb}: {}", done.join(", "));
+    (StatusCode::OK, format!("{verb}."))
 }
 
 /// `git reset -q HEAD` (`/api/unstage`) — the exact inverse of stage-all; the
@@ -2252,6 +2335,150 @@ mod tests {
         let (status, why) = enforce_fresh(&repo, &plan, &observed).await.unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(why.contains("changed while this plan was pending"), "{why}");
+    }
+
+    /// Capture one git command's stdout in a fixture repo.
+    fn run_out(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed in {repo:?}");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// A committed 20-line file plus edits at both ends — far enough apart
+    /// that `git diff` emits two hunks.
+    fn repo_with_two_hunks() -> (tempfile::TempDir, PathBuf) {
+        let (dir, repo) = seeded_repo();
+        let body: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(repo.join("a.txt"), &body).unwrap();
+        run(&repo, &["add", "a.txt"]);
+        run(&repo, &["commit", "-q", "-m", "twenty lines"]);
+        let edited = body
+            .replace("line 2\n", "line 2 changed\n")
+            .replace("line 18\n", "line 18 changed\n");
+        std::fs::write(repo.join("a.txt"), edited).unwrap();
+        (dir, repo)
+    }
+
+    /// The wire plan for "hunk `index` of a.txt", anchored from the parsed
+    /// diff itself (the same way a client copies anchors out of the served
+    /// diff).
+    fn plan_for_hunk(
+        parsed: &git_vista_protocol::ParsedPatch,
+        index: u32,
+        direction: git_vista_protocol::StageDirection,
+    ) -> git_vista_protocol::PatchPlan {
+        let git_vista_protocol::FileDiff::Hunks { hunks, .. } = &parsed.files[0] else {
+            panic!("expected a hunks-shaped file");
+        };
+        let h = &hunks[index as usize];
+        git_vista_protocol::PatchPlan {
+            repository: RepositoryToken::new("test-repo").unwrap(),
+            worktree: WorktreeToken::new("test-worktree").unwrap(),
+            generation: GenerationToken::new("diff-v1:test").unwrap(),
+            direction,
+            files: vec![git_vista_protocol::FileSelection {
+                path: "a.txt".to_string(),
+                selection: git_vista_protocol::SelectionShape::Hunks {
+                    hunks: vec![git_vista_protocol::HunkRef {
+                        index,
+                        old_start: h.old_start,
+                        new_start: h.new_start,
+                    }],
+                },
+            }],
+        }
+    }
+
+    /// M2.17b acceptance, the mechanism end to end on a real repository:
+    /// building the selected patch from git's own diff and applying it
+    /// `--cached` stages exactly the selected hunk — the other hunk stays a
+    /// worktree-only edit.
+    #[tokio::test]
+    async fn a_selected_hunk_stages_alone_and_the_rest_stays_unstaged() {
+        let (_dir, repo) = repo_with_two_hunks();
+        let diff = run_out(&repo, &["diff", "--no-color", "--no-textconv"]);
+        let parsed = git_vista_protocol::parse_unified_diff(&diff);
+        let plan = plan_for_hunk(&parsed, 0, git_vista_protocol::StageDirection::Stage);
+        let built = git_vista_protocol::build_selected_patch(&parsed, &plan).unwrap();
+        assert!(built.patch.contains("line 2 changed"));
+        assert!(!built.patch.contains("line 18 changed"));
+
+        let (status, msg) = exec_stage_selection(
+            &repo,
+            NetworkNeed::Local,
+            git_vista_protocol::StageDirection::Stage,
+            &built.patch,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{msg}");
+
+        let cached = run_out(&repo, &["diff", "--cached", "--no-color"]);
+        assert!(cached.contains("line 2 changed"), "{cached}");
+        assert!(!cached.contains("line 18 changed"), "{cached}");
+        let worktree = run_out(&repo, &["diff", "--no-color"]);
+        assert!(worktree.contains("line 18 changed"), "{worktree}");
+        assert!(!worktree.contains("line 2 changed"), "{worktree}");
+    }
+
+    /// The reverse leg: with both hunks staged, unstaging one (built from
+    /// the index-vs-HEAD base per the direction contract) moves exactly it
+    /// back to worktree-only.
+    #[tokio::test]
+    async fn unstaging_a_selected_hunk_reverses_only_it() {
+        let (_dir, repo) = repo_with_two_hunks();
+        run(&repo, &["add", "a.txt"]);
+        let diff = run_out(&repo, &["diff", "--cached", "--no-color", "--no-textconv"]);
+        let parsed = git_vista_protocol::parse_unified_diff(&diff);
+        let plan = plan_for_hunk(&parsed, 0, git_vista_protocol::StageDirection::Unstage);
+        let built = git_vista_protocol::build_selected_patch(&parsed, &plan).unwrap();
+
+        let (status, msg) = exec_stage_selection(
+            &repo,
+            NetworkNeed::Local,
+            git_vista_protocol::StageDirection::Unstage,
+            &built.patch,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{msg}");
+
+        let cached = run_out(&repo, &["diff", "--cached", "--no-color"]);
+        assert!(!cached.contains("line 2 changed"), "{cached}");
+        assert!(cached.contains("line 18 changed"), "{cached}");
+        let worktree = run_out(&repo, &["diff", "--no-color"]);
+        assert!(worktree.contains("line 2 changed"), "{worktree}");
+    }
+
+    /// The pathspec leg: an entire-file selection stages its file whole and
+    /// leaves other modified files untouched.
+    #[tokio::test]
+    async fn an_entire_file_selection_stages_only_its_pathspec() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("c.txt"), "c\n").unwrap();
+        run(&repo, &["add", "c.txt"]);
+        run(&repo, &["commit", "-q", "-m", "second file"]);
+        std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+        std::fs::write(repo.join("c.txt"), "c changed\n").unwrap();
+
+        let (status, msg) = exec_stage_selection(
+            &repo,
+            NetworkNeed::Local,
+            git_vista_protocol::StageDirection::Stage,
+            "",
+            &["c.txt".to_string()],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{msg}");
+
+        let cached = run_out(&repo, &["diff", "--cached", "--name-only"]);
+        assert_eq!(cached.trim(), "c.txt");
+        let worktree = run_out(&repo, &["diff", "--name-only"]);
+        assert_eq!(worktree.trim(), "a.txt");
     }
 
     /// #145 acceptance 2: a plan whose operation no longer matches its

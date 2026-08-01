@@ -229,6 +229,41 @@ pub struct PatchPlan {
     pub files: Vec<FileSelection>,
 }
 
+/// The staging-base diff read (`/api/staging/diff`, #213): the diff a
+/// selection is made against, with the generation token the selection must
+/// carry back. `generation` is `diff-v1:`-namespaced and minted from these
+/// exact patch bytes (provenance contract — see [`PatchPlan::generation`]);
+/// the client copies it into the plan verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagingDiff {
+    /// The `diff-v1:` token this diff was pinned under.
+    pub generation: GenerationToken,
+    /// The unified diff text — worktree-vs-index for stage, index-vs-HEAD
+    /// for unstage (the direction→base mapping in the module doc).
+    pub patch: String,
+    /// True when the patch was cut at the server's cap; selections only
+    /// address what was served.
+    pub truncated: bool,
+}
+
+/// The preview response (`/api/staging/preview`, #213): the exact bytes an
+/// apply of the same plan would execute — same builder, same pinned diff, so
+/// preview-vs-apply divergence is structurally impossible while the
+/// generation holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchPreview {
+    /// The generation the preview was computed under (echoed from the plan).
+    pub generation: GenerationToken,
+    /// Unified-diff text for the hunk-level part — what `git apply --cached`
+    /// would receive; empty when only whole files are selected.
+    pub patch: String,
+    /// Canonical paths the entire-file part would stage/unstage via
+    /// pathspec (`git add --`/`git reset -q HEAD --`).
+    pub whole_files: Vec<String>,
+}
+
 /// Why a [`PatchPlan`] is structurally malformed — the 400 class of failure,
 /// checkable without a repository (staleness, the 409 class, is the server
 /// gate's job). Typed so #213's endpoint reports which selection is broken
