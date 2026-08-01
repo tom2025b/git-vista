@@ -100,12 +100,15 @@ pub(crate) async fn staging_preview(
 /// `enforce_fresh`, the sealed argv path — all inherited, none reimplemented
 /// here).
 pub(crate) async fn staging_apply(Json(plan): Json<PatchPlan>) -> (StatusCode, String) {
-    let (built, _live) = match checked_build(&plan).await {
+    let (built, live) = match checked_build(&plan).await {
         Ok(v) => v,
         Err(rejected) => return rejected,
     };
     crate::planner::plan_and_execute(GitOperation::StageSelection {
         direction: plan.direction,
+        // The gate-time token: the executor re-mints and re-compares it
+        // inside the coordinator lock, closing the gate→execute window.
+        expected_diff_generation: live.generation,
         patch: built.patch,
         whole_files: built.whole_files,
     })

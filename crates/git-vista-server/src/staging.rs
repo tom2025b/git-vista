@@ -41,7 +41,17 @@ pub(crate) fn require_current_selection(
     plan: &PatchPlan,
     live: &GenerationToken,
 ) -> Result<(), (StatusCode, String)> {
-    if plan.generation == *live {
+    require_current_selection_token(&plan.generation, live)
+}
+
+/// The same gate, token-vs-token — the arity the executor uses to re-verify
+/// **inside the coordinator lock** (`exec_stage_selection`), where there is
+/// no wire plan in scope, only the gate-time token the operation carries.
+pub(crate) fn require_current_selection_token(
+    expected: &GenerationToken,
+    live: &GenerationToken,
+) -> Result<(), (StatusCode, String)> {
+    if expected == live {
         Ok(())
     } else {
         Err((

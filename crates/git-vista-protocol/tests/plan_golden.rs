@@ -349,6 +349,8 @@ fn golden_plans() -> Vec<Plan> {
             'd',
             GitOperation::StageSelection {
                 direction: StageDirection::Stage,
+                expected_diff_generation: GenerationToken::new("diff-v1:12345678901234567890")
+                    .unwrap(),
                 patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n context\n+added\n"
                     .to_string(),
                 whole_files: vec!["assets/logo.png".to_string()],
