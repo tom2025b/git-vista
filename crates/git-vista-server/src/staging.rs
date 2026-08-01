@@ -23,6 +23,17 @@ use git_vista_protocol::{GenerationToken, PatchPlan};
 /// Refuse a selection whose diff no longer exists — the worktree moved
 /// between the user viewing the diff and submitting the selection.
 ///
+/// **Provenance contract, the half equality alone cannot pin**: `live` must
+/// be minted by the *same recipe and namespace* that tagged the diff read
+/// the selection was made from. Three incompatible producers already exist —
+/// `planner::generation_token` (bare decimal digest),
+/// `history.rs` (`history-v1:` prefixed), and `/api/status/v2`
+/// (`status-v1:` prefixed, folding in the porcelain bytes) — and comparing a
+/// token from one against a token from another 409s forever, never admits.
+/// #213's diff read therefore serves its own namespaced token (`diff-v1:`
+/// per the `status.rs` precedent), and this gate recomputes with exactly
+/// that recipe. See `status.rs`'s module doc for the namespacing rationale.
+///
 /// Not consumed yet: #213's preview and apply handlers both call this
 /// before building any patch (seeded here by #212 so the staleness
 /// contract lands with the DTO, not with the endpoint).
