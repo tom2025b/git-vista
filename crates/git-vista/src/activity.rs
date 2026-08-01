@@ -288,10 +288,14 @@ fn activity_row(
     // M2.22b (#242): hidden while the device reports offline, too. A closure,
     // not a value, because a row renders once per feed read — a plain
     // `.then()` here would leave the button up until the next refresh, while
-    // this tracked read hides it the moment connectivity flips. Removal from
-    // the DOM leaves no focus trap: the row underneath is what holds focus.
-    // `navigator.onLine` can read true over a dead tunnel — hiding is the UX
-    // nicety, `api.rs`'s `refuse_if_offline()` guard is the boundary.
+    // this tracked read hides it the moment connectivity flips. If the button
+    // held focus at that moment, focus falls to <body> (the row is a plain
+    // div, not focusable) — a focus *loss*, not a trap; the keyboard user
+    // re-enters from the top. Accepted for a rare transition rather than
+    // adding focus-management code no host test can exercise; the iPad
+    // testbed pass drives it. `navigator.onLine` can read true over a dead
+    // tunnel — hiding is the UX nicety, `api.rs`'s `refuse_if_offline()`
+    // guard is the boundary.
     let undo_hint = event.undo.clone();
     let undo_btn = move || {
         (!read_only && shell_state::online_signal().get())
