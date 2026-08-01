@@ -1,0 +1,14 @@
+{
+  "staging_diff": {
+    "generation": "diff-v1:12345678901234567890",
+    "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n context\n+added\n",
+    "truncated": false
+  },
+  "patch_preview": {
+    "generation": "diff-v1:12345678901234567890",
+    "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n context\n+added\n",
+    "whole_files": [
+      "assets/logo.png"
+    ]
+  }
+}
