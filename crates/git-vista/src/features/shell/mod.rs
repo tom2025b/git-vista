@@ -78,6 +78,10 @@ impl SheetDrag {
         }
     }
 
+    pub(crate) fn cancel_matching(active: &mut Option<Self>, pointer_id: i32) -> bool {
+        Self::take_matching(active, pointer_id).is_some()
+    }
+
     pub(crate) fn sample(
         &mut self,
         pointer_id: i32,
@@ -223,6 +227,18 @@ mod wiring_tests {
 
         assert!(SheetDrag::admit(&mut active, second));
         assert_eq!(active.as_ref().unwrap().pointer_id(), 8);
+    }
+
+    #[test]
+    fn cancel_discards_only_the_matching_pointer() {
+        let first = SheetDrag::new(7, 600.0, 0.0, 1_000.0, 0.5).unwrap();
+        let mut active = Some(first);
+
+        assert!(!SheetDrag::cancel_matching(&mut active, 8));
+        assert_eq!(active.as_ref().unwrap().pointer_id(), 7);
+
+        assert!(SheetDrag::cancel_matching(&mut active, 7));
+        assert!(active.is_none());
     }
 
     #[test]

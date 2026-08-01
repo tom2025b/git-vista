@@ -693,7 +693,7 @@ pub fn App() -> impl IntoView {
                         on:pointerdown=move |ev| sheet.pointer_down(ev)
                         on:pointermove=move |ev| sheet.pointer_move(ev)
                         on:pointerup=move |ev| sheet.pointer_up(ev)
-                        on:pointercancel=move |ev| sheet.pointer_up(ev)
+                        on:pointercancel=move |ev| sheet.pointer_cancel(ev)
                     >
                         <span class="sheet-grab-pill"></span>
                     </div>

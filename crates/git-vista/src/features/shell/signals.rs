@@ -167,6 +167,16 @@ impl SheetController {
             }
         }
     }
+
+    pub(crate) fn pointer_cancel(&self, ev: web_sys::PointerEvent) {
+        let cancelled = self
+            .drag
+            .try_update_value(|active| SheetDrag::cancel_matching(active, ev.pointer_id()))
+            .unwrap_or(false);
+        if cancelled {
+            self.drag_offset_px.set(None);
+        }
+    }
 }
 
 /// Feeds a `ShellMode` signal from window width, debounced 150ms so a Stage
