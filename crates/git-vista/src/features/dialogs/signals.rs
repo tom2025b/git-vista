@@ -16,7 +16,22 @@ use leptos::{
     create_rw_signal, store_value, RwSignal, SignalGet, SignalGetUntracked, SignalSet, StoredValue,
 };
 
-use crate::features::dialogs::core::{Dialog, DialogsCore};
+use crate::features::dialogs::core::{
+    commit_draft_key, draft_scope_action, Dialog, DialogsCore, DraftScopeAction,
+};
+
+/// Best-effort handle on the tab's `sessionStorage`, the `prefs.rs`
+/// convention: private browsing can refuse storage, in which case drafts
+/// simply stay in-memory-only — degraded, never broken.
+///
+/// `sessionStorage`, not `localStorage`, on purpose (#226): the failure being
+/// survived is iOS Safari suspending and rebuilding THIS tab's WASM module.
+/// A draft is tab-scoped work in progress, not a durable preference — closing
+/// the tab discarding it is the expected outcome, a draft resurfacing days
+/// later in a fresh tab is not.
+fn session_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.session_storage().ok().flatten())
+}
 
 /// The app's one ghost-click guard, and the commit modal's message draft.
 #[derive(Clone, Copy)]
@@ -31,14 +46,46 @@ pub struct Dialogs {
     /// now survives the canvas rebuild an epoch bump causes, where before it was silently
     /// discarded.
     commit_msg: RwSignal<String>,
+    /// Which repository the draft belongs to (#226): the accepted Frame's
+    /// `worktree_id`, observed by an `App` effect. `None` until the first
+    /// Frame lands (or on a degraded Frame), during which drafts stay
+    /// in-memory-only — nothing persists under an anonymous scope, so one
+    /// repository's draft can never be misfiled under another.
+    draft_scope: StoredValue<Option<String>>,
 }
 
 impl Dialogs {
     pub fn new() -> Self {
         Self {
             core: store_value(DialogsCore::default()),
+            // Blank, not seeded: the scope isn't known until the first Frame
+            // lands, and seeding happens in `set_draft_scope` when it does.
             commit_msg: create_rw_signal(String::new()),
+            draft_scope: store_value(None),
         }
+    }
+
+    /// Observe the served repository (#226). Called by an `App` effect with
+    /// every accepted Frame's `worktree_id` — which re-fires on every epoch
+    /// reload, so the same-repo case MUST leave the live signal alone (the
+    /// clobber rule is [`draft_scope_action`], host-tested). A genuinely new
+    /// repository swaps the signal for that repository's persisted draft:
+    /// this is both the suspension-recovery path (fresh WASM module, first
+    /// Frame lands, draft comes back) and the repo-switch path (each repo's
+    /// draft stays its own).
+    pub fn set_draft_scope(&self, worktree_id: Option<String>) {
+        let action = self
+            .draft_scope
+            .with_value(|old| draft_scope_action(old.as_deref(), worktree_id.as_deref()));
+        if action == DraftScopeAction::KeepSignal {
+            return;
+        }
+        let restored = worktree_id
+            .as_deref()
+            .and_then(|id| session_storage()?.get_item(&commit_draft_key(id)).ok()?)
+            .unwrap_or_default();
+        self.draft_scope.set_value(worktree_id);
+        self.commit_msg.set(restored);
     }
 
     /// A tracked read — the modal's `<textarea>` and its Commit button both render from it.
@@ -51,12 +98,30 @@ impl Dialogs {
         self.commit_msg.get_untracked()
     }
 
+    /// Update the draft, persisting every change (#226): unbounced on
+    /// purpose — a commit message is small, `sessionStorage` writes are
+    /// synchronous and cheap, and a debounce window is exactly the keystrokes
+    /// an iOS suspension would eat.
     pub fn set_commit_msg(&self, msg: String) {
+        self.draft_scope.with_value(|scope| {
+            if let (Some(id), Some(storage)) = (scope.as_deref(), session_storage()) {
+                let _ = storage.set_item(&commit_draft_key(id), &msg);
+            }
+        });
         self.commit_msg.set(msg);
     }
 
-    /// Blank the draft, for an opener starting a fresh message.
+    /// Discard the draft — signal AND persisted copy (#226), so a submitted
+    /// or deliberately-cleared message can't resurrect as a stale draft.
+    /// Called on successful commit submit; the dialog *opener* deliberately
+    /// does not call this any more, because opening is how a suspension-
+    /// recovered draft comes back.
     pub fn clear_commit_msg(&self) {
+        self.draft_scope.with_value(|scope| {
+            if let (Some(id), Some(storage)) = (scope.as_deref(), session_storage()) {
+                let _ = storage.remove_item(&commit_draft_key(id));
+            }
+        });
         self.commit_msg.set(String::new());
     }
 

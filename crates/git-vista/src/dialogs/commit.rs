@@ -32,9 +32,16 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
         shell.close_commit_dialog();
         spawn_local(async move {
             match create_commit_request(&message, allow_empty, branch.as_deref()).await {
-                Ok(()) => graph.update(|g| {
-                    g.force_bump();
-                }),
+                Ok(()) => {
+                    // The message is consumed — discard the draft, signal and
+                    // persisted copy both (#226). This is the clear the opener
+                    // used to do; moved here so a suspension-recovered draft
+                    // survives reopening but a submitted one never resurrects.
+                    dialogs.clear_commit_msg();
+                    graph.update(|g| {
+                        g.force_bump();
+                    });
+                }
                 Err(e) => {
                     if let Some(w) = web_sys::window() {
                         let _ = w.alert_with_message(&format!("Couldn't create commit:\n{e}"));
