@@ -1,8 +1,8 @@
 //! The persistent offline banner (M2.22b, #242) — wasm only.
 //!
-//! Rendered by `App` whenever the reactive connectivity signal
-//! (`features::shell::signals::online_signal`, M2.22a's `navigator.onLine`
-//! mirror) reports offline. A normal-flow strip directly under the topbar, not
+//! Mounted by `App` unconditionally; shows its strip whenever the reactive
+//! connectivity signal (`features::shell::signals::online_signal`, M2.22a's
+//! `navigator.onLine` mirror) reports offline. In flow directly under the topbar, not
 //! a `position:fixed` bar like `hook_policy_banner`: that one owns the top
 //! edge (safe-area inset and all), and stacking a second fixed bar under it
 //! would mean the two coordinating about each other's height. In-flow, this
@@ -22,24 +22,37 @@
 
 use leptos::*;
 
-/// The offline strip. The caller decides visibility (reactively, from
-/// `online_signal()`); this is markup only, like `hook_policy_banner_view`'s
-/// inner `banner`.
-pub fn offline_banner_view() -> impl IntoView {
+/// The offline strip: a permanently-mounted `role="status"` live region whose
+/// *content* toggles with the signal.
+///
+/// Permanently mounted on purpose: a live region only reliably announces
+/// content that *changes inside* a region the accessibility tree already
+/// knows about — iOS VoiceOver in particular often stays silent for a
+/// `role="status"` element inserted into the DOM pre-populated. Here the
+/// wrapper exists from mount, empty and zero-height, and the styled strip
+/// appears inside it when connectivity drops — which is exactly the mutation
+/// VoiceOver announces. The transition is the whole point of this banner
+/// (the write controls vanish in the same tick), so it must be heard, not
+/// only seen. (`hook_policy_banner` renders on-demand instead, defensibly:
+/// it appears once at session start, not on a mid-session flip.)
+///
+/// Not interactive, so it needs no touch target and cannot trap focus when
+/// its content empties.
+pub fn offline_banner_view(online: RwSignal<bool>) -> impl IntoView {
     view! {
-        <div
-            // `role="status"`: a polite live region, so VoiceOver announces the
-            // transition without stealing focus — the same role the
-            // hook-policy bar uses. Not interactive, so it needs no touch
-            // target and cannot trap focus when it disappears.
-            role="status"
-            style="display:flex; align-items:center; justify-content:center; \
-                   gap:8px; padding:6px 12px; font-size:0.85em; \
-                   background:#3a2a0a; color:#f0c674; \
-                   border-bottom:1px solid #5a4210;"
-        >
-            <span aria-hidden="true">"\u{26A0}"</span>
-            <span>{git_vista_core::net::offline_banner_text()}</span>
+        <div role="status">
+            {move || {
+                (!online.get()).then(|| view! {
+                    <div style="display:flex; align-items:center; \
+                                justify-content:center; gap:8px; \
+                                padding:6px 12px; font-size:0.85em; \
+                                background:#3a2a0a; color:#f0c674; \
+                                border-bottom:1px solid #5a4210;">
+                        <span aria-hidden="true">"\u{26A0}"</span>
+                        <span>{git_vista_core::net::offline_banner_text()}</span>
+                    </div>
+                })
+            }}
         </div>
     }
 }
