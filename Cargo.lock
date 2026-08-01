@@ -717,6 +717,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-vista-mcp"
+version = "0.1.0"
+dependencies = [
+ "git-vista-protocol",
+ "serde_json",
+]
+
+[[package]]
 name = "git-vista-protocol"
 version = "0.1.0"
 dependencies = [
