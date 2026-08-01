@@ -55,6 +55,19 @@ pub struct BranchRequest {
     pub branch: String,
 }
 
+/// Body of `POST /api/discard-tracked-paths` / `POST /api/delete-untracked-paths`
+/// (#219, M2.18a): the working-tree paths to discard uncommitted changes to,
+/// or delete outright. `paths` must be non-empty (the backend rejects an
+/// empty list); each element is validated into a `WorktreePath` before it
+/// ever reaches an argv — never absolute, never carrying a `..` component,
+/// never option-shaped. Shared by both endpoints because the request shape
+/// is identical; the two `GitOperation` variants it builds into are not (#71).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreePathsRequest {
+    pub paths: Vec<String>,
+}
+
 /// Body of a `POST /api/clone` request (Phase 12): clone the public repository at
 /// `url` into the persistent clones store (ADR 0008) and open it look-only
 /// pending the operator's mode choice. `url` is a git-cloneable URL (typically
@@ -462,6 +475,22 @@ mod tests {
         };
         let json = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<CloneRequest>(&json).unwrap(), c);
+    }
+
+    #[test]
+    fn worktree_paths_request_roundtrips_and_rejects_unknown_fields() {
+        let req = WorktreePathsRequest {
+            paths: vec!["a.txt".into(), "dir/b.txt".into()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorktreePathsRequest>(&json).unwrap(),
+            req
+        );
+        assert!(serde_json::from_str::<WorktreePathsRequest>(
+            r#"{"paths":["a.txt"],"repo":"/etc"}"#
+        )
+        .is_err());
     }
 
     #[test]

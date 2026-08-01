@@ -35,6 +35,8 @@
 //! | `POST /api/undo` (reset) | `git reset --hard` / `git branch -f` (CAS) | [`GitOperation::ResetBranch`] |
 //! | `POST /api/undo` (revert) | `git revert --no-edit <commit>` | [`GitOperation::RevertCommit`] |
 //! | `POST /api/reset-test-repo` | seeded composite restore | [`GitOperation::ResetTestRepo`] |
+//! | `POST /api/discard-tracked-paths` | `git checkout -- <paths>` | [`GitOperation::DiscardTrackedPaths`] |
+//! | `POST /api/delete-untracked-paths` | `git clean -f -- <paths>` | [`GitOperation::DeleteUntrackedPaths`] |
 //!
 //! `POST /api/clone`, `/api/delete-clone`, `/api/select` and `/api/rescan` are
 //! deliberately **not** operations: they manage the catalog / app session (which
@@ -45,7 +47,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::newtype::{require_git_safe, require_hex, require_non_empty};
+use crate::newtype::{
+    require_git_safe, require_hex, require_non_empty, require_worktree_relative_path,
+};
 
 /// Why a plan field failed validation — see
 /// [`newtype::PlanFieldError`](crate::newtype::PlanFieldError), re-exported
@@ -128,6 +132,21 @@ validated_string!(
     /// push handler addresses). Non-empty and not option-shaped.
     RemoteName,
     |v| require_git_safe(v, "remote name")
+);
+
+validated_string!(
+    /// A path relative to the worktree root, naming one file a discard/delete
+    /// operation targets (#219, M2.18a): non-empty, not option-shaped (the
+    /// same argv-injection defense every other name in this file gets), never
+    /// absolute, never carrying a `..` component, never embedding a NUL byte.
+    /// See [`newtype::require_worktree_relative_path`](crate::newtype::require_worktree_relative_path)
+    /// for the exact rule and — this matters — for why it is *necessary but
+    /// not sufficient*: a symlinked path component or final entry can still
+    /// resolve outside the worktree with no `..` anywhere in the string, which
+    /// is why the executor re-checks the live filesystem immediately before
+    /// running (`git-vista-server`'s `planner::symlink_containment_guard`).
+    WorktreePath,
+    |v| require_worktree_relative_path(v, "path")
 );
 
 /// A moment as Unix seconds (UTC) — the clock [`Plan::issued_at`] and
@@ -238,6 +257,41 @@ pub enum GitOperation {
         patch: String,
         whole_files: Vec<String>,
     },
+    /// `git checkout -- <paths>` — discard uncommitted changes to
+    /// already-tracked paths, restoring each to its checked-out (index, else
+    /// HEAD) version (`POST /api/discard-tracked-paths`, #219/#71). A
+    /// **separate** variant from [`GitOperation::DeleteUntrackedPaths`] below
+    /// — never the same operation parameterised by a bool — so each carries
+    /// its own risk and recovery story in this table and in the golden
+    /// fixture.
+    ///
+    /// # Recovery is honest, not optimistic
+    ///
+    /// If a path's discarded content was staged (index differs from HEAD)
+    /// *before* this ran, that content's blob is still reachable in the
+    /// object database until the next `git gc` — but git-vista offers no
+    /// built-in "undo" button for this operation: no ref moved, no reflog
+    /// entry exists, and there is nothing in this app's own journal to
+    /// replay. A worktree-only edit (never staged) has no fallback at all —
+    /// its only copy was the file this operation just overwrote.
+    /// [`RecoveryStrategy::Irrecoverable`] is therefore what the plan
+    /// declares (the honest "git-vista itself offers no undo" reading); the
+    /// executor's response/journal text spells out the staged-until-gc
+    /// nuance in words, rather than letting the strategy tag imply either
+    /// more or less recoverability than that.
+    DiscardTrackedPaths { paths: Vec<WorktreePath> },
+    /// `git clean -f -- <paths>` — delete untracked paths from the working
+    /// tree outright (`POST /api/delete-untracked-paths`, #219/#71). **No
+    /// journal-backed undo exists for this at all**: an untracked path was
+    /// never written to git's object database in the first place, so there
+    /// is nothing anywhere in the repository to reset back to.
+    /// [`RecoveryStrategy::Irrecoverable`] here is a literal fact about the
+    /// repository, not merely "git-vista has no button for it" the way it is
+    /// for [`GitOperation::DiscardTrackedPaths`] above — this is the first
+    /// genuinely irreversible operation in the vocabulary (plan.rs:328's
+    /// `Irrecoverable`, previously used only by push and test-repo-reset,
+    /// applies here for a stronger reason than either of those).
+    DeleteUntrackedPaths { paths: Vec<WorktreePath> },
 }
 
 // ---------------------------------------------------------------------------
@@ -343,9 +397,26 @@ pub enum RecoveryStrategy {
     /// Revert the commit the operation lands (history-preserving recovery for
     /// an already-shared result).
     RevertCommit { commit: CommitOid },
-    /// No recovery exists inside git-vista: the effect left the machine
-    /// (push — the remote is ahead and we never force-push) or the discarded
-    /// state was never journaled (test-repo reset wipes the journal).
+    /// No git-vista-driven undo, but the content may still exist as a
+    /// dangling blob in git's object database until the next `git gc` —
+    /// true exactly when the discarded content was `git add`ed at some point
+    /// before this ran (`discard-tracked-paths`, #219). Distinct from
+    /// [`Irrecoverable`](Self::Irrecoverable): whether recovery is even
+    /// *possible* differs by the repository's actual history, not just by
+    /// what git-vista chooses to offer — a caller that needs to distinguish
+    /// "gone forever" from "maybe still in the object store" must not treat
+    /// this the same as `Irrecoverable` (the review finding this variant
+    /// exists to fix: both operations previously shared one tag, defeating
+    /// the point of a typed field a future reader is expected to switch on
+    /// rather than re-derive by also matching on [`GitOperation`]).
+    RecoverableIfStaged,
+    /// No recovery exists inside git-vista, and none is possible regardless:
+    /// the effect left the machine (push — the remote is ahead and we never
+    /// force-push), the discarded state was never journaled (test-repo reset
+    /// wipes the journal), or the discarded state was never in git's object
+    /// database to begin with (delete-untracked-paths, #219 — the one case
+    /// where "irrecoverable" is a fact about the repository, not just about
+    /// what git-vista offers).
     Irrecoverable,
 }
 
@@ -404,6 +475,7 @@ mod tests {
         assert!(RefName::new("HEAD").is_ok());
         assert!(CommitOid::new("a".repeat(40)).is_ok());
         assert!(CommitOid::new("0".repeat(64)).is_ok());
+        assert!(WorktreePath::new("src/lib.rs").is_ok());
         assert!(OperationHash::new("b".repeat(64)).is_ok());
         assert!(GenerationToken::new("1234567890").is_ok());
         assert!(RemoteName::new("origin").is_ok());
@@ -435,6 +507,12 @@ mod tests {
         assert!(CommitOid::new("A".repeat(40)).is_err());
         assert!(OperationHash::new("g".repeat(64)).is_err());
         assert!(OperationHash::new("c".repeat(63)).is_err());
+        // WorktreePath (#219): absolute and `..`-carrying paths are refused —
+        // the exhaustive rule set lives in newtype.rs's own tests; this pins
+        // that the newtype actually wires it in.
+        assert!(WorktreePath::new("/etc/passwd").is_err());
+        assert!(WorktreePath::new("../outside.txt").is_err());
+        assert!(WorktreePath::new("-rf").is_err());
     }
 
     #[test]
@@ -467,6 +545,20 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&del).unwrap(),
             r#"{"op":"force_delete_branch","branch":"wip"}"#
+        );
+        let discard = GitOperation::DiscardTrackedPaths {
+            paths: vec![WorktreePath::new("a.txt").unwrap()],
+        };
+        assert_eq!(
+            serde_json::to_string(&discard).unwrap(),
+            r#"{"op":"discard_tracked_paths","paths":["a.txt"]}"#
+        );
+        let delete = GitOperation::DeleteUntrackedPaths {
+            paths: vec![WorktreePath::new("scratch/tmp.log").unwrap()],
+        };
+        assert_eq!(
+            serde_json::to_string(&delete).unwrap(),
+            r#"{"op":"delete_untracked_paths","paths":["scratch/tmp.log"]}"#
         );
     }
 
