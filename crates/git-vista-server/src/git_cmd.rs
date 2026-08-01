@@ -12,12 +12,18 @@
 //! the cap is full. A repository with a 5 GiB blob or a pathological diff can
 //! therefore cost the server a bounded allocation and a bounded lifetime instead
 //! of whatever git felt like printing (M1.10, #63).
+//!
+//! `git_cat_file_batch` is the same posture for a request that needs up to two
+//! answers from one commit's tree (a spec, and its `^` parent-fallback): one
+//! `git cat-file --batch` process is held open across both, and the type each
+//! answer resolves to is read from the protocol's own header field — before
+//! any content byte is read — rather than from a second spawn (#221).
 
 use std::path::Path;
 use std::process::{Output, Stdio};
 
 use axum::http::StatusCode;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 /// The fail-safe ceiling behind the uncapped [`git_stdout`] wrapper: a caller
 /// that does not think about size still cannot make git allocate more than this.
@@ -267,8 +273,11 @@ pub(crate) async fn git_output_for(
 }
 
 /// Declares `NetworkNeed::Local` for the same reason [`git_output`] does: all
-/// five production call sites are read endpoints (`/api/diff`'s three `diff`
-/// reads and `/api/file`'s two `show` reads), none of which can reach a remote.
+/// three production call sites are `/api/diff`'s `diff` reads
+/// (`--name-status`, `--numstat`, `--patch`), none of which can reach a
+/// remote. `/api/file` used to be two more (`cat-file -t` then `git show`)
+/// until #221 folded them into [`git_cat_file_batch`]'s single held-open
+/// process.
 pub(crate) async fn git_stdout_capped(
     repo: &Path,
     args: &[String],
@@ -350,6 +359,372 @@ async fn collect_child_stdout_capped(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// `git cat-file --batch`: one spawn, up to two queries (#221)
+//
+// `/api/file/{id}/{*path}` used to run two spawns per request — `cat-file -t
+// <spec>` to check the object's type, then (only when it was a blob) `git
+// show <spec>` for its content — and, when the id's own tree missed, that
+// whole pair again against `<id>^:<path>` for the parent-fallback. The batch
+// protocol answers both questions (type *and* size) from one header line per
+// query, and the process the query runs against stays open across the
+// fallback, so the same two answers now cost at most one spawn and two
+// stdin lines instead of up to four spawns.
+
+/// Bound on one `cat-file --batch` response *header* line: `<oid> SP <type>
+/// SP <size> LF` on a hit, or `<query> SP missing LF` on a miss, where
+/// `<query>` echoes back whatever we wrote — including, on a miss, the full
+/// requested path. Real hit headers are under 100 bytes; the miss case is the
+/// one that grows with client input, so this is sized generously past
+/// anything this server's own `{*path}` route segment realistically carries,
+/// not tuned to the common case.
+const BATCH_HEADER_CAP: usize = 16 * 1024;
+
+/// The outcome of resolving one `<rev>:<path>` spec (falling back to
+/// `<rev>^:<path>` when the first is missing) against a single, still-open
+/// `git cat-file --batch` process.
+#[derive(Debug)]
+pub(crate) enum BatchFileRead {
+    /// The winning spec named a blob. `bytes` holds its first
+    /// `min(size, cap)` bytes; `truncated` is `true` exactly when the
+    /// header's own `size` field exceeded `cap` — decided before a single
+    /// content byte was read, never by reading past the cap and noticing.
+    Blob { bytes: Vec<u8>, truncated: bool },
+    /// The winning spec resolved, but not to a blob. `kind` is git's own
+    /// type word (`tree`, `commit`, `tag`, …) taken verbatim from the
+    /// header — never inferred from, or confused with, any content byte.
+    NotABlob { kind: String },
+}
+
+/// Resolve `<id>:<path>` (falling back to `<id>^:<path>`) through exactly one
+/// `git cat-file --batch` spawn, reading the content only when the winning
+/// spec resolves to a blob (#221). Replaces the #168/#169 pair of spawns
+/// (`cat-file -t` then `git show`) `file_at_commit_for_repo` used to run: the
+/// type this endpoint must check before ever serving content now arrives as
+/// the batch protocol's own header field, read and checked before the
+/// content bytes that follow it in the very same stream — so "type resolved
+/// before content, on every attempt including the fallback" (#168's security
+/// property) is enforced by the order fields appear on the wire, not by which
+/// of two separate child processes was allowed to run. See
+/// [`batch_lookup_with_fallback`] and [`parse_batch_header`] for where that
+/// property actually lives, in a form a unit test can drive without spawning
+/// git at all.
+///
+/// `path` is refused before anything is spawned if it contains a `\n`: the
+/// wire protocol is one query per stdin **line** (`<spec>\n`), so an embedded
+/// newline would not be an illegal byte inside one argv element (as it was
+/// for the old per-attempt `cat-file -t <spec>` spawn) — it would silently
+/// become *two* query lines, and whatever the second line happened to
+/// resolve to could be read back as though it answered the first.
+pub(crate) async fn git_cat_file_batch(
+    repo: &Path,
+    id: &str,
+    path: &str,
+    cap: usize,
+    endpoint: &str,
+) -> Result<BatchFileRead, (StatusCode, String)> {
+    if path.contains('\n') {
+        return Err(io_error(
+            endpoint,
+            std::io::Error::other("path contains an embedded newline"),
+        ));
+    }
+
+    let mut child = sandboxed(
+        repo,
+        &["cat-file", "--batch"],
+        crate::sandbox::NetworkNeed::Local,
+    )
+    .map_err(|e| io_error(endpoint, std::io::Error::other(e)))?
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true)
+    .spawn()
+    .map_err(|e| io_error(endpoint, e))?;
+
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(io_error(
+            endpoint,
+            std::io::Error::other("git stdin was not piped"),
+        ));
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return Err(io_error(
+            endpoint,
+            std::io::Error::other("git stdout was not piped"),
+        ));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return Err(io_error(
+            endpoint,
+            std::io::Error::other("git stderr was not piped"),
+        ));
+    };
+    // Same ordering discipline as `collect_child_stdout_capped`: the drain
+    // starts before anything reads stdout, so neither pipe can wedge the
+    // other.
+    let stderr_task = tokio::spawn(drain_stderr(stderr));
+    let mut reader = tokio::io::BufReader::new(stdout);
+
+    let outcome = batch_lookup_with_fallback(&mut stdin, &mut reader, id, path, cap).await;
+
+    // This process exists for exactly one request's worth of queries (one or
+    // two) and is never reused: always terminate it here, whatever the
+    // outcome. `kill`/`wait` on an already-exited child (the fatal-crash
+    // case below) are harmless no-ops.
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
+
+    match outcome {
+        Ok(found) => Ok(found),
+        Err(BatchLookupError::Io(e)) => Err(io_error(endpoint, e)),
+        Err(BatchLookupError::ProcessEnded) => Err(git_error(endpoint, &stderr_bytes)),
+        Err(BatchLookupError::Protocol(msg)) => Err(io_error(endpoint, std::io::Error::other(msg))),
+        Err(BatchLookupError::BothMissing) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("'{path}' does not exist at {id} or its parent."),
+        )),
+    }
+}
+
+/// Why [`batch_lookup_with_fallback`] (and the [`batch_query`] it drives)
+/// could not produce a [`BatchFileRead`].
+#[derive(Debug)]
+enum BatchLookupError {
+    /// The batch process's stdout ended before a complete header line
+    /// arrived — the signature of the child itself exiting (typically a
+    /// fatal top-level git error, e.g. a path that resolves outside the
+    /// repository, which `cat-file --batch` treats as fatal rather than as
+    /// an ordinary per-query `missing`). The real reason lives in the
+    /// stderr the caller already drained.
+    ProcessEnded,
+    /// A write or read against the child's pipes failed outright.
+    Io(std::io::Error),
+    /// A header line was read in full but matched neither of
+    /// `cat-file --batch`'s two documented shapes. Not reachable through any
+    /// input this server accepts today — a defensive backstop, not a case
+    /// any test drives.
+    Protocol(String),
+    /// Both the direct spec and the `^` parent-fallback spec reported
+    /// `missing`.
+    BothMissing,
+}
+
+/// Resolve `<id>:<path>`, retrying `<id>^:<path>` on the same still-open
+/// process when — and only when — the first spec is reported `missing`,
+/// never on a type mismatch, which is a resolved, *existing* answer, not a
+/// miss (the same distinction #168's two-spawn code drew between an `Err`
+/// from `cat-file -t` and an `Ok(kind)` that simply wasn't `"blob"`: a
+/// directory that replaced a file must be rejected as itself, never as a
+/// route to the parent's file of the same name).
+///
+/// Generic over the reader/writer so this — the actual fallback decision —
+/// is testable against a synthetic in-memory stream, with no real `git`
+/// process anywhere in the test.
+async fn batch_lookup_with_fallback<W, R>(
+    stdin: &mut W,
+    reader: &mut R,
+    id: &str,
+    path: &str,
+    cap: usize,
+) -> Result<BatchFileRead, BatchLookupError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    match batch_query(stdin, reader, &format!("{id}:{path}"), cap).await? {
+        BatchQueryOutcome::Found(found) => Ok(found),
+        BatchQueryOutcome::Missing => {
+            match batch_query(stdin, reader, &format!("{id}^:{path}"), cap).await? {
+                BatchQueryOutcome::Found(found) => Ok(found),
+                BatchQueryOutcome::Missing => Err(BatchLookupError::BothMissing),
+            }
+        }
+    }
+}
+
+/// What one [`batch_query`] round-trip resolved to.
+#[derive(Debug)]
+enum BatchQueryOutcome {
+    Found(BatchFileRead),
+    Missing,
+}
+
+/// One query/answer round-trip on an already-open `cat-file --batch`
+/// process: write `<spec>\n`, read its header, and — only when the header
+/// says `blob` — read the content that immediately follows. Nothing here
+/// spawns or terminates a process; it only speaks the protocol over whatever
+/// reader/writer it is given, which is what makes it callable twice against
+/// the same process (the fallback) and directly against a synthetic
+/// in-memory stream in tests, with identical logic either way — the type
+/// check has nowhere else to hide a shortcut.
+async fn batch_query<W, R>(
+    stdin: &mut W,
+    reader: &mut R,
+    spec: &str,
+    cap: usize,
+) -> Result<BatchQueryOutcome, BatchLookupError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    stdin
+        .write_all(spec.as_bytes())
+        .await
+        .map_err(BatchLookupError::Io)?;
+    stdin.write_all(b"\n").await.map_err(BatchLookupError::Io)?;
+    stdin.flush().await.map_err(BatchLookupError::Io)?;
+
+    let Some(line) = read_batch_header_line(reader, BATCH_HEADER_CAP)
+        .await
+        .map_err(BatchLookupError::Io)?
+    else {
+        return Err(BatchLookupError::ProcessEnded);
+    };
+
+    match parse_batch_header(&line).map_err(BatchLookupError::Protocol)? {
+        BatchHeader::Missing => Ok(BatchQueryOutcome::Missing),
+        BatchHeader::Found { kind, .. } if kind != "blob" => {
+            Ok(BatchQueryOutcome::Found(BatchFileRead::NotABlob { kind }))
+        }
+        BatchHeader::Found { size, .. } => {
+            let (bytes, truncated) = read_batch_content(reader, size, cap)
+                .await
+                .map_err(BatchLookupError::Io)?;
+            Ok(BatchQueryOutcome::Found(BatchFileRead::Blob {
+                bytes,
+                truncated,
+            }))
+        }
+    }
+}
+
+/// One parsed `cat-file --batch` response header — the pure, spawn-free unit
+/// the #221 security property (type checked from the wire, before content,
+/// on every attempt) is provable against directly (see the `parse_batch_*`
+/// tests below).
+#[derive(Debug, PartialEq, Eq)]
+enum BatchHeader {
+    /// `<oid> SP <type> SP <size> LF`. `size` is the exact byte length of the
+    /// content that immediately follows in the stream, before its own
+    /// trailing LF.
+    Found { kind: String, size: usize },
+    /// `<query> SP missing LF` — nothing is read after this line for this
+    /// query.
+    Missing,
+}
+
+/// Parse one already-read, LF-stripped `cat-file --batch` header line.
+///
+/// A `missing` line's echoed `<query>` is whatever the caller wrote — not
+/// re-validated here, and not needed: the type/size shape is what
+/// distinguishes the two grammars, not the query text. A "hit" line's type
+/// field is always a fixed word (`blob`/`tree`/`commit`/`tag`) and its size
+/// field is always decimal digits, so it can never itself end in the literal
+/// six bytes `missing` preceded by a space — that suffix unambiguously means
+/// the miss shape, whatever the echoed query contains (including a path
+/// component that happens to spell "missing").
+fn parse_batch_header(line: &[u8]) -> Result<BatchHeader, String> {
+    if line.ends_with(b" missing") {
+        return Ok(BatchHeader::Missing);
+    }
+    let text = std::str::from_utf8(line)
+        .map_err(|_| format!("non-UTF-8 batch header ({} bytes)", line.len()))?;
+    let mut fields = text.splitn(3, ' ');
+    let (Some(oid), Some(kind), Some(size)) = (fields.next(), fields.next(), fields.next()) else {
+        return Err(format!("malformed batch header: {text:?}"));
+    };
+    if oid.is_empty() || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("malformed batch header oid: {text:?}"));
+    }
+    let size: usize = size
+        .parse()
+        .map_err(|_| format!("malformed batch header size: {text:?}"))?;
+    Ok(BatchHeader::Found {
+        kind: kind.to_string(),
+        size,
+    })
+}
+
+/// Read one `cat-file --batch` header line from `reader`, up to and
+/// excluding its terminating LF, bounded to `cap` bytes.
+///
+/// `Ok(None)` means the stream ended before any LF arrived — indistinguishable
+/// at this layer between "wrote nothing" and "wrote a partial line then
+/// died", and the caller treats both the same way: stop trusting this
+/// process's stdout and go read its exit status and stderr instead. An `Err`
+/// means a line's worth of bytes was seen but exceeded `cap` without a
+/// terminating LF — a distinct, and today unreachable through any input this
+/// server accepts, failure from a clean EOF.
+async fn read_batch_header_line<R>(reader: &mut R, cap: usize) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            if line.len() + pos > cap {
+                reader.consume(pos + 1);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "batch header line exceeded the cap",
+                ));
+            }
+            line.extend_from_slice(&buf[..pos]);
+            reader.consume(pos + 1);
+            return Ok(Some(line));
+        }
+        let take = buf.len();
+        if line.len() + take > cap {
+            reader.consume(take);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "batch header line exceeded the cap",
+            ));
+        }
+        line.extend_from_slice(buf);
+        reader.consume(take);
+    }
+}
+
+/// Read a blob's content, capped from the header's own `size` field before a
+/// single content byte is read — never by streaming past a limit and
+/// noticing (#221's requirement, and the same "refuse from the header"
+/// posture the type check above already gets for free from the wire order).
+///
+/// `size <= cap`: reads the whole object, then its frame's own trailing LF
+/// (best-effort — a failure here changes nothing about the content already
+/// read, and this process is about to be killed regardless).
+/// `size > cap`: reads exactly `cap` bytes — a genuine prefix of the object,
+/// not an empty "refused" answer — and stops; the remaining bytes and the
+/// frame's LF are deliberately left undrained, since the caller kills this
+/// process immediately after and nothing will ever read them.
+async fn read_batch_content<R>(
+    reader: &mut R,
+    size: usize,
+    cap: usize,
+) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    if size > cap {
+        let mut bytes = vec![0u8; cap];
+        reader.read_exact(&mut bytes).await?;
+        return Ok((bytes, true));
+    }
+    let mut bytes = vec![0u8; size];
+    reader.read_exact(&mut bytes).await?;
+    let mut lf = [0u8; 1];
+    let _ = reader.read_exact(&mut lf).await;
+    Ok((bytes, false))
 }
 
 /// Run `git -C <repo> <args…>` and return its stdout bytes, mapping both spawn
@@ -823,5 +1198,480 @@ mod tests {
         );
         // Only dropped now: the assertions above all held with the writer open.
         drop(stdin);
+    }
+
+    // --- #221: the stdin-framed batch parser, proved without spawning git ---
+    //
+    // These drive `parse_batch_header`, `read_batch_header_line`,
+    // `read_batch_content`, `batch_query` and `batch_lookup_with_fallback`
+    // directly against synthetic bytes — no real `cat-file --batch` process
+    // anywhere below. That is the point: the #168 security property (type
+    // resolved from the header, before any content byte is read, on every
+    // attempt including the fallback) has to hold as a fact about this parser,
+    // not merely as an emergent property of two integration tests against a
+    // real repository.
+
+    /// A synthetic `cat-file --batch` **hit** frame: `<oid> SP <type> SP
+    /// <size> LF` followed by exactly `content.len()` bytes and the frame's
+    /// own trailing LF — byte-for-byte the shape confirmed against real git
+    /// (`git cat-file --batch`, git 2.43).
+    fn hit_frame(oid: &str, kind: &str, content: &[u8]) -> Vec<u8> {
+        let mut frame = format!("{oid} {kind} {}\n", content.len()).into_bytes();
+        frame.extend_from_slice(content);
+        frame.push(b'\n');
+        frame
+    }
+
+    /// A synthetic `cat-file --batch` **miss** frame: `<query> SP missing LF`.
+    fn miss_frame(query: &str) -> Vec<u8> {
+        format!("{query} missing\n").into_bytes()
+    }
+
+    #[test]
+    fn parse_batch_header_reads_a_hit_line() {
+        let oid = "a".repeat(40);
+        let header = parse_batch_header(format!("{oid} blob 12").as_bytes()).unwrap();
+        assert_eq!(
+            header,
+            BatchHeader::Found {
+                kind: "blob".to_string(),
+                size: 12
+            }
+        );
+    }
+
+    #[test]
+    fn parse_batch_header_reads_a_tree_and_commit_line() {
+        let oid = "b".repeat(40);
+        assert_eq!(
+            parse_batch_header(format!("{oid} tree 68").as_bytes()).unwrap(),
+            BatchHeader::Found {
+                kind: "tree".to_string(),
+                size: 68
+            }
+        );
+        assert_eq!(
+            parse_batch_header(format!("{oid} commit 147").as_bytes()).unwrap(),
+            BatchHeader::Found {
+                kind: "commit".to_string(),
+                size: 147
+            }
+        );
+    }
+
+    #[test]
+    fn parse_batch_header_reads_a_miss_line() {
+        assert_eq!(
+            parse_batch_header(b"deadbeef:some/path missing").unwrap(),
+            BatchHeader::Missing
+        );
+    }
+
+    /// The discriminator is the line's trailing shape, not a scan for the
+    /// substring "missing" anywhere in it: a path that itself ends in the
+    /// word "missing" produces a miss line that still ends " missing" (the
+    /// literal git appends), and must still parse as a miss, not as a
+    /// malformed hit.
+    #[test]
+    fn parse_batch_header_a_path_named_missing_is_still_a_clean_miss() {
+        assert_eq!(
+            parse_batch_header(b"cafef00d:sub/missing missing").unwrap(),
+            BatchHeader::Missing
+        );
+    }
+
+    #[test]
+    fn parse_batch_header_rejects_garbage() {
+        assert!(parse_batch_header(b"not a real header").is_err());
+        assert!(parse_batch_header(b"").is_err());
+        // Right shape, non-numeric size.
+        let oid = "c".repeat(40);
+        assert!(parse_batch_header(format!("{oid} blob not-a-number").as_bytes()).is_err());
+    }
+
+    #[tokio::test]
+    async fn read_batch_header_line_reads_two_lines_off_one_stream_in_order() {
+        let data = b"first line\nsecond line\n".to_vec();
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let first = read_batch_header_line(&mut reader, 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, b"first line");
+        // The reader must be left positioned exactly after the LF — proving
+        // `consume` was told the right amount, not "the whole chunk".
+        let second = read_batch_header_line(&mut reader, 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second, b"second line");
+    }
+
+    #[tokio::test]
+    async fn read_batch_header_line_returns_none_on_clean_eof() {
+        let data: Vec<u8> = Vec::new();
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        assert!(read_batch_header_line(&mut reader, 1024)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Bytes arrived but the stream ended before their LF — the shape a
+    /// fatally-crashed `cat-file --batch` can never actually produce (it
+    /// writes nothing before dying), but the reader treats it identically to
+    /// a totally empty stream regardless, rather than fabricating a header
+    /// out of a partial line.
+    #[tokio::test]
+    async fn read_batch_header_line_treats_a_partial_line_at_eof_as_none() {
+        let data = b"partial, no newline".to_vec();
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        assert!(read_batch_header_line(&mut reader, 1024)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn read_batch_header_line_errors_when_a_line_exceeds_the_cap() {
+        let data = b"way more than the cap allows\n".to_vec();
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let err = read_batch_header_line(&mut reader, 4).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_batch_content_reads_two_frames_back_to_back() {
+        // Two hit frames concatenated, exactly as they would arrive answering
+        // the direct spec then the `^` fallback on one held-open process.
+        let mut data = hit_frame(&"a".repeat(40), "blob", b"first\n");
+        data.extend(hit_frame(&"b".repeat(40), "blob", b"second"));
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+
+        let h1 = read_batch_header_line(&mut reader, BATCH_HEADER_CAP)
+            .await
+            .unwrap()
+            .unwrap();
+        let (kind1, size1) = match parse_batch_header(&h1).unwrap() {
+            BatchHeader::Found { kind, size } => (kind, size),
+            BatchHeader::Missing => panic!("expected a hit"),
+        };
+        assert_eq!(kind1, "blob");
+        let (bytes1, truncated1) = read_batch_content(&mut reader, size1, 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(bytes1, b"first\n");
+        assert!(!truncated1);
+
+        let h2 = read_batch_header_line(&mut reader, BATCH_HEADER_CAP)
+            .await
+            .unwrap()
+            .unwrap();
+        let size2 = match parse_batch_header(&h2).unwrap() {
+            BatchHeader::Found { size, .. } => size,
+            BatchHeader::Missing => panic!("expected a hit"),
+        };
+        let (bytes2, truncated2) = read_batch_content(&mut reader, size2, 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(bytes2, b"second");
+        assert!(!truncated2);
+    }
+
+    /// The cap is enforced from the parsed `size`, not from how much of the
+    /// stream actually gets read: even when the true object is far larger
+    /// than the cap, exactly `cap` bytes come back and no more.
+    #[tokio::test]
+    async fn read_batch_content_caps_without_reading_past_it() {
+        let full = vec![b'x'; 10_000];
+        let data = hit_frame(&"d".repeat(40), "blob", &full);
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let header = read_batch_header_line(&mut reader, BATCH_HEADER_CAP)
+            .await
+            .unwrap()
+            .unwrap();
+        let size = match parse_batch_header(&header).unwrap() {
+            BatchHeader::Found { size, .. } => size,
+            BatchHeader::Missing => panic!("expected a hit"),
+        };
+        assert_eq!(size, 10_000);
+
+        let (bytes, truncated) = read_batch_content(&mut reader, size, 128).await.unwrap();
+        assert_eq!(bytes.len(), 128);
+        assert_eq!(bytes, full[..128]);
+        assert!(truncated);
+    }
+
+    /// The security property itself, isolated: a spec that resolves to a
+    /// **tree** must come back as `NotABlob` without a single content byte
+    /// being read. Proved structurally, not just by absence of a wrong
+    /// answer — the synthetic stream contains *nothing* after the header, so
+    /// if `batch_query` ever tried to read content for a non-blob, the read
+    /// would hit EOF and this test would fail with an `Io` error instead of
+    /// the expected `NotABlob`.
+    #[tokio::test]
+    async fn batch_query_rejects_a_tree_without_touching_any_content_byte() {
+        let mut stdin: Vec<u8> = Vec::new();
+        let header_only = format!("{} tree 68\n", "e".repeat(40)).into_bytes();
+        let mut reader = tokio::io::BufReader::new(&header_only[..]);
+
+        let outcome = batch_query(&mut stdin, &mut reader, "deadbeef:sub", 1_000_000)
+            .await
+            .expect("a resolved-but-wrong-type answer is not an error");
+        match outcome {
+            BatchQueryOutcome::Found(BatchFileRead::NotABlob { kind }) => {
+                assert_eq!(kind, "tree");
+            }
+            other => panic!("expected NotABlob, got {other:?}"),
+        }
+        assert_eq!(
+            stdin, b"deadbeef:sub\n",
+            "exactly one query line is written"
+        );
+    }
+
+    /// The same property for a **submodule gitlink** (`commit`-typed tree
+    /// entry): rejected the same way, from the header alone.
+    #[tokio::test]
+    async fn batch_query_rejects_a_commit_type_without_touching_any_content_byte() {
+        let mut stdin: Vec<u8> = Vec::new();
+        let header_only = format!("{} commit 147\n", "f".repeat(40)).into_bytes();
+        let mut reader = tokio::io::BufReader::new(&header_only[..]);
+
+        let outcome = batch_query(&mut stdin, &mut reader, "deadbeef:vendor/lib", 1_000_000)
+            .await
+            .unwrap();
+        match outcome {
+            BatchQueryOutcome::Found(BatchFileRead::NotABlob { kind }) => {
+                assert_eq!(kind, "commit");
+            }
+            other => panic!("expected NotABlob, got {other:?}"),
+        }
+    }
+
+    /// A hit on the **first** attempt never writes or reads a second query —
+    /// the fallback ladder must not fire on a resolved-but-wrong-type answer,
+    /// only on a genuine `missing`.
+    #[tokio::test]
+    async fn fallback_does_not_fire_when_the_first_attempt_resolves_to_a_tree() {
+        let mut stdin: Vec<u8> = Vec::new();
+        let data = hit_frame(&"1".repeat(40), "tree", b"unused-tree-listing-bytes");
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+
+        let result = batch_lookup_with_fallback(&mut stdin, &mut reader, "deadbeef", "sub", 4096)
+            .await
+            .unwrap();
+        match result {
+            BatchFileRead::NotABlob { kind } => assert_eq!(kind, "tree"),
+            other => panic!("expected NotABlob, got {other:?}"),
+        }
+        assert_eq!(
+            stdin, b"deadbeef:sub\n",
+            "a resolved (if wrong-typed) first answer must not trigger the ^ fallback"
+        );
+    }
+
+    /// A `missing` first answer *does* trigger exactly one fallback query,
+    /// against `<id>^:<path>`, on the same stream — and when that resolves to
+    /// a blob, its content is what comes back.
+    #[tokio::test]
+    async fn fallback_fires_on_missing_and_reads_the_parents_blob() {
+        let mut stdin: Vec<u8> = Vec::new();
+        let mut data = miss_frame("deadbeef:sub/link.txt");
+        data.extend(hit_frame(&"2".repeat(40), "blob", b"file.txt"));
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+
+        let result = batch_lookup_with_fallback(
+            &mut stdin,
+            &mut reader,
+            "deadbeef",
+            "sub/link.txt",
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        match result {
+            BatchFileRead::Blob { bytes, truncated } => {
+                assert_eq!(bytes, b"file.txt");
+                assert!(!truncated);
+            }
+            other => panic!("expected Blob, got {other:?}"),
+        }
+        assert_eq!(
+            stdin, b"deadbeef:sub/link.txt\ndeadbeef^:sub/link.txt\n",
+            "exactly the direct spec then the ^ fallback, in order"
+        );
+    }
+
+    /// The trap #168 exists to close, at the parser level: if the *parent's*
+    /// answer is a tree, the fallback must reject it too — never silently
+    /// serve the parent's tree listing as if it were file content.
+    #[tokio::test]
+    async fn fallback_rejects_a_tree_found_through_the_parent_too() {
+        let mut stdin: Vec<u8> = Vec::new();
+        let mut data = miss_frame("deadbeef:sub");
+        data.extend(hit_frame(
+            &"3".repeat(40),
+            "tree",
+            b"unused-tree-listing-bytes",
+        ));
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+
+        let result = batch_lookup_with_fallback(&mut stdin, &mut reader, "deadbeef", "sub", 4096)
+            .await
+            .unwrap();
+        match result {
+            BatchFileRead::NotABlob { kind } => assert_eq!(kind, "tree"),
+            other => panic!("expected NotABlob, got {other:?}"),
+        }
+    }
+
+    /// Both the direct spec and the parent miss: a distinct terminal error,
+    /// never a fabricated third attempt.
+    #[tokio::test]
+    async fn both_missing_is_a_distinct_terminal_outcome() {
+        let mut stdin: Vec<u8> = Vec::new();
+        let mut data = miss_frame("deadbeef:nope");
+        data.extend(miss_frame("deadbeef^:nope"));
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+
+        let err = batch_lookup_with_fallback(&mut stdin, &mut reader, "deadbeef", "nope", 4096)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BatchLookupError::BothMissing),
+            "expected BothMissing, got {err:?}"
+        );
+    }
+
+    /// A batch child that dies before writing anything (the real shape of a
+    /// fatal top-level error, e.g. a traversal outside the repository) reads
+    /// back as a clean EOF — `ProcessEnded` — never as `missing`, so the
+    /// caller knows to consult the process's exit status and stderr instead
+    /// of trying a fallback against a process that no longer exists.
+    #[tokio::test]
+    async fn a_dead_process_before_any_header_is_process_ended_not_missing() {
+        let mut stdin: Vec<u8> = Vec::new();
+        let empty: Vec<u8> = Vec::new();
+        let mut reader = tokio::io::BufReader::new(&empty[..]);
+
+        let err =
+            batch_lookup_with_fallback(&mut stdin, &mut reader, "deadbeef", "../secret.txt", 4096)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err, BatchLookupError::ProcessEnded),
+            "expected ProcessEnded, got {err:?}"
+        );
+        assert_eq!(
+            stdin, b"deadbeef:../secret.txt\n",
+            "exactly one query is written before the dead stream is discovered; \
+             a dead process gets no fallback attempt"
+        );
+    }
+
+    // --- #221 integration: the real `cat-file --batch` process ---------------
+
+    #[tokio::test]
+    async fn git_cat_file_batch_reads_a_blob_directly() {
+        let (_dir, repo) = seeded_repo();
+        let id = out(&repo, &["rev-parse", "HEAD"]);
+
+        let result = git_cat_file_batch(&repo, &id, "a.txt", 1_000_000, "test")
+            .await
+            .unwrap();
+        match result {
+            BatchFileRead::Blob { bytes, truncated } => {
+                assert_eq!(bytes, b"a\n");
+                assert!(!truncated);
+            }
+            other => panic!("expected Blob, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn git_cat_file_batch_falls_back_to_the_parent_on_a_real_repo() {
+        let (_dir, repo) = seeded_repo();
+        let parent_id = out(&repo, &["rev-parse", "HEAD"]);
+        run(&repo, &["rm", "-q", "a.txt"]);
+        run(&repo, &["commit", "-q", "-m", "delete a.txt"]);
+        let child_id = out(&repo, &["rev-parse", "HEAD"]);
+        assert_ne!(child_id, parent_id);
+
+        let result = git_cat_file_batch(&repo, &child_id, "a.txt", 1_000_000, "test")
+            .await
+            .unwrap();
+        match result {
+            BatchFileRead::Blob { bytes, .. } => assert_eq!(bytes, b"a\n"),
+            other => panic!("expected the parent's blob, got {other:?}"),
+        }
+    }
+
+    /// One spawn total, real process: the type check and the content read
+    /// for a deleted-then-recreated-as-a-directory path both run against the
+    /// same still-open `cat-file --batch`, and the rejection carries the
+    /// real `kind`.
+    #[tokio::test]
+    async fn git_cat_file_batch_rejects_a_real_tree_through_the_fallback() {
+        let (_dir, repo) = path_battery_git_cmd_fixture();
+        let parent_id = out(&repo, &["rev-parse", "HEAD"]);
+        run(&repo, &["rm", "-q", "-r", "sub"]);
+        run(&repo, &["commit", "-q", "-m", "delete sub"]);
+        let child_id = out(&repo, &["rev-parse", "HEAD"]);
+        assert_ne!(child_id, parent_id);
+
+        let result = git_cat_file_batch(&repo, &child_id, "sub", 1_000_000, "test")
+            .await
+            .unwrap();
+        match result {
+            BatchFileRead::NotABlob { kind } => assert_eq!(kind, "tree"),
+            other => panic!("expected NotABlob(tree), got {other:?}"),
+        }
+    }
+
+    /// A traversal path that escapes the repository crashes the real batch
+    /// process fatally (confirmed against real git 2.43: `cat-file --batch`
+    /// treats this as a top-level fatal error, not a per-query `missing`),
+    /// and this must still surface as git's own "outside repository" message,
+    /// not a generic failure.
+    #[tokio::test]
+    async fn git_cat_file_batch_surfaces_git_own_traversal_error() {
+        let (_dir, repo) = seeded_repo();
+        let id = out(&repo, &["rev-parse", "HEAD"]);
+
+        let (status, msg) = git_cat_file_batch(&repo, &id, "../secret.txt", 1_000_000, "test")
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            msg.contains("outside repository"),
+            "git's own stderr must survive: {msg}"
+        );
+    }
+
+    /// A `\n` inside `path` is refused before anything is spawned — the
+    /// framing hazard: writing it verbatim into a `<spec>\n` stdin line would
+    /// silently split into two protocol queries.
+    #[tokio::test]
+    async fn git_cat_file_batch_refuses_an_embedded_newline_before_spawning() {
+        let (_dir, repo) = seeded_repo();
+        let id = out(&repo, &["rev-parse", "HEAD"]);
+
+        let (status, _msg) = git_cat_file_batch(&repo, &id, "a.txt\nsecret.txt", 1_000_000, "test")
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A repository shaped like `handlers/read.rs`'s own `path_battery_repo`
+    /// fixture, duplicated here (rather than shared across crates) because
+    /// that helper is private to its own test module.
+    fn path_battery_git_cmd_fixture() -> (tempfile::TempDir, PathBuf) {
+        let (dir, repo) = seeded_repo();
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::fs::write(repo.join("sub/file.txt"), "sub-file\n").unwrap();
+        run(&repo, &["add", "-A"]);
+        run(&repo, &["commit", "-q", "-m", "path battery fixture"]);
+        (dir, repo)
     }
 }
