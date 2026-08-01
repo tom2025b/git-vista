@@ -483,9 +483,7 @@ pub(crate) async fn git_cat_file_batch(
         Ok(found) => Ok(found),
         Err(BatchLookupError::Io(e)) => Err(io_error(endpoint, e)),
         Err(BatchLookupError::ProcessEnded) => Err(git_error(endpoint, &stderr_bytes)),
-        Err(BatchLookupError::Protocol(msg)) => {
-            Err(io_error(endpoint, std::io::Error::other(msg)))
-        }
+        Err(BatchLookupError::Protocol(msg)) => Err(io_error(endpoint, std::io::Error::other(msg))),
         Err(BatchLookupError::BothMissing) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("'{path}' does not exist at {id} or its parent."),
@@ -637,8 +635,7 @@ fn parse_batch_header(line: &[u8]) -> Result<BatchHeader, String> {
     let text = std::str::from_utf8(line)
         .map_err(|_| format!("non-UTF-8 batch header ({} bytes)", line.len()))?;
     let mut fields = text.splitn(3, ' ');
-    let (Some(oid), Some(kind), Some(size)) = (fields.next(), fields.next(), fields.next())
-    else {
+    let (Some(oid), Some(kind), Some(size)) = (fields.next(), fields.next(), fields.next()) else {
         return Err(format!("malformed batch header: {text:?}"));
     };
     if oid.is_empty() || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1427,7 +1424,10 @@ mod tests {
             }
             other => panic!("expected NotABlob, got {other:?}"),
         }
-        assert_eq!(stdin, b"deadbeef:sub\n", "exactly one query line is written");
+        assert_eq!(
+            stdin, b"deadbeef:sub\n",
+            "exactly one query line is written"
+        );
     }
 
     /// The same property for a **submodule gitlink** (`commit`-typed tree
@@ -1498,8 +1498,7 @@ mod tests {
             other => panic!("expected Blob, got {other:?}"),
         }
         assert_eq!(
-            stdin,
-            b"deadbeef:sub/link.txt\ndeadbeef^:sub/link.txt\n",
+            stdin, b"deadbeef:sub/link.txt\ndeadbeef^:sub/link.txt\n",
             "exactly the direct spec then the ^ fallback, in order"
         );
     }
@@ -1511,7 +1510,11 @@ mod tests {
     async fn fallback_rejects_a_tree_found_through_the_parent_too() {
         let mut stdin: Vec<u8> = Vec::new();
         let mut data = miss_frame("deadbeef:sub");
-        data.extend(hit_frame(&"3".repeat(40), "tree", b"unused-tree-listing-bytes"));
+        data.extend(hit_frame(
+            &"3".repeat(40),
+            "tree",
+            b"unused-tree-listing-bytes",
+        ));
         let mut reader = tokio::io::BufReader::new(&data[..]);
 
         let result = batch_lookup_with_fallback(&mut stdin, &mut reader, "deadbeef", "sub", 4096)
@@ -1532,10 +1535,9 @@ mod tests {
         data.extend(miss_frame("deadbeef^:nope"));
         let mut reader = tokio::io::BufReader::new(&data[..]);
 
-        let err =
-            batch_lookup_with_fallback(&mut stdin, &mut reader, "deadbeef", "nope", 4096)
-                .await
-                .unwrap_err();
+        let err = batch_lookup_with_fallback(&mut stdin, &mut reader, "deadbeef", "nope", 4096)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, BatchLookupError::BothMissing),
             "expected BothMissing, got {err:?}"
@@ -1655,10 +1657,9 @@ mod tests {
         let (_dir, repo) = seeded_repo();
         let id = out(&repo, &["rev-parse", "HEAD"]);
 
-        let (status, _msg) =
-            git_cat_file_batch(&repo, &id, "a.txt\nsecret.txt", 1_000_000, "test")
-                .await
-                .unwrap_err();
+        let (status, _msg) = git_cat_file_batch(&repo, &id, "a.txt\nsecret.txt", 1_000_000, "test")
+            .await
+            .unwrap_err();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 

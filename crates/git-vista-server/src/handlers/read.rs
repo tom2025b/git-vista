@@ -810,8 +810,8 @@ async fn file_at_commit_for_repo(
         return Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string()));
     }
 
-    let found = crate::git_cmd::git_cat_file_batch(repo, id, path, FILE_CONTENT_CAP, "/api/file")
-        .await?;
+    let found =
+        crate::git_cmd::git_cat_file_batch(repo, id, path, FILE_CONTENT_CAP, "/api/file").await?;
     let (bytes, truncated) = match found {
         crate::git_cmd::BatchFileRead::NotABlob { kind } => {
             return Err((
