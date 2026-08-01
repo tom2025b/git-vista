@@ -15,9 +15,10 @@
 //! review the diff, and record the protocol implications (M1.02 rules).
 
 use git_vista_protocol::{
-    FileSelection, GenerationToken, HunkLines, HunkRef, PatchPlan, RepositoryToken, SelectionShape,
-    StageDirection, WorktreeToken,
+    FileSelection, GenerationToken, HunkLines, HunkRef, PatchPlan, PatchPreview, RepositoryToken,
+    SelectionShape, StageDirection, StagingDiff, WorktreeToken,
 };
+use serde::{Deserialize, Serialize};
 
 const FIXTURE: &str = include_str!("fixtures/patch_plan_v1.json");
 const FIXTURE_PATH: &str = concat!(
@@ -197,4 +198,65 @@ fn every_golden_plan_is_canonically_valid() {
     for (i, p) in golden_patch_plans().iter().enumerate() {
         assert_eq!(p.validate(), Ok(()), "golden plan {i} is not canonical");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The staging response DTOs (#213) — same golden discipline, second fixture.
+// ---------------------------------------------------------------------------
+
+const RESPONSES_FIXTURE: &str = include_str!("fixtures/staging_responses_v1.json");
+const RESPONSES_FIXTURE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/staging_responses_v1.json"
+);
+
+/// One bundle holding each staging response DTO once, so the committed file
+/// pins both wire shapes — the `DtoGoldenSet` pattern from `dto_golden.rs`.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StagingResponsesGoldenSet {
+    staging_diff: StagingDiff,
+    patch_preview: PatchPreview,
+}
+
+fn golden_responses() -> StagingResponsesGoldenSet {
+    StagingResponsesGoldenSet {
+        staging_diff: StagingDiff {
+            generation: GenerationToken::new("diff-v1:12345678901234567890").unwrap(),
+            patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n context\n+added\n"
+                .to_string(),
+            truncated: false,
+        },
+        patch_preview: PatchPreview {
+            generation: GenerationToken::new("diff-v1:12345678901234567890").unwrap(),
+            patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n context\n+added\n"
+                .to_string(),
+            whole_files: vec!["assets/logo.png".to_string()],
+        },
+    }
+}
+
+#[test]
+fn staging_response_fixture_round_trips_losslessly() {
+    let set = golden_responses();
+    if std::env::var("REGEN_GOLDEN").is_ok() {
+        let mut pretty = serde_json::to_string_pretty(&set).unwrap();
+        pretty.push('\n');
+        std::fs::write(RESPONSES_FIXTURE_PATH, &pretty).unwrap();
+    }
+    let fixture = if std::env::var("REGEN_GOLDEN").is_ok() {
+        std::fs::read_to_string(RESPONSES_FIXTURE_PATH).unwrap()
+    } else {
+        RESPONSES_FIXTURE.to_string()
+    };
+    let parsed: StagingResponsesGoldenSet =
+        serde_json::from_str(&fixture).expect("fixture must deserialize");
+    assert_eq!(parsed, set, "fixture and in-code golden responses diverged");
+    let mut reserialized = serde_json::to_string_pretty(&parsed).unwrap();
+    reserialized.push('\n');
+    assert_eq!(
+        reserialized, fixture,
+        "re-serialized staging responses no longer match the committed fixture — \
+         if this wire change is deliberate, regenerate with REGEN_GOLDEN=1 \
+         and review the diff"
+    );
 }

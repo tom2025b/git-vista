@@ -217,6 +217,27 @@ pub enum GitOperation {
     /// a repo explicitly opted in with `gv --seed`; the whole composite is
     /// computed server-side from the seed, so the operation carries no fields.
     ResetTestRepo,
+    /// Apply a partial staging selection (M2.17b, #213; `/api/staging/apply`):
+    /// `git apply --cached` of `patch` (`--reverse` when `direction` is
+    /// unstage), then `git add -- <paths>` / `git reset -q HEAD -- <paths>`
+    /// for `whole_files`. The fields are the *built* selection, not the
+    /// [`crate::PatchPlan`] wire form — the operation hash binds the exact
+    /// patch bytes and pathspecs that execute, so what was previewed is
+    /// provably what applies. Both are constructed server-side from the same
+    /// plan by `patch_build::build_selected_patch`.
+    StageSelection {
+        direction: crate::patch_plan::StageDirection,
+        /// The `diff-v1:` token of the base diff the selection was verified
+        /// against at the gate. The executor re-mints and re-compares this
+        /// **inside the coordinator lock** before running `git apply`: the
+        /// handler's gate runs outside the lock, and `git apply` alone is a
+        /// soft backstop (it applies mid-file hunks at drifted offsets when
+        /// the context still matches). Carried in the operation so the hash
+        /// binds it.
+        expected_diff_generation: GenerationToken,
+        patch: String,
+        whole_files: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------

@@ -272,6 +272,45 @@ pub(crate) async fn git_output_for(
     cmd.output().await
 }
 
+/// [`git_output_for`] with `input` written to the child's stdin first — the
+/// arity `git apply --cached` needs (M2.17b, #213): the patch travels as
+/// process input, never as an argv element or a temp file. Same sealed
+/// launcher; stdin is written in full and closed (dropped) before the output
+/// is collected, the same write-then-close discipline
+/// [`git_cat_file_batch`]'s protocol uses, minus the interleaved reads a
+/// one-shot filter like `apply` doesn't need. `output()` on the wait side
+/// drains stdout/stderr concurrently, so a chatty child cannot wedge.
+pub(crate) async fn git_output_with_stdin(
+    repo: &Path,
+    args: &[&str],
+    declared: crate::sandbox::NetworkNeed,
+    input: &[u8],
+) -> std::io::Result<Output> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = sandboxed(repo, args, declared)
+        .map_err(std::io::Error::other)?
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(std::io::Error::other("git stdin was not piped"));
+    };
+    // The write runs concurrently with the output collection: if the child
+    // ever produced output faster than it drained stdin, a sequential
+    // write-then-wait could deadlock on full pipe buffers. `apply` is quiet,
+    // but the shape should not depend on that.
+    let bytes = input.to_vec();
+    let writer = tokio::spawn(async move {
+        let _ = stdin.write_all(&bytes).await;
+        let _ = stdin.shutdown().await;
+    });
+    let output = child.wait_with_output().await;
+    let _ = writer.await;
+    output
+}
+
 /// Declares `NetworkNeed::Local` for the same reason [`git_output`] does: all
 /// three production call sites are `/api/diff`'s `diff` reads
 /// (`--name-status`, `--numstat`, `--patch`), none of which can reach a
