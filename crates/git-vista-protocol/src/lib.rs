@@ -74,7 +74,7 @@ pub use diff::{
 pub use dto::{
     validate_clone_url, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
     DeleteCloneRequest, HookPolicy, RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind,
-    SelectRequest, SessionInfo, SessionRequest,
+    SelectRequest, SessionInfo, SessionRequest, WorktreePathsRequest,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use history::{HistoryFrame, HistoryPage};
@@ -90,7 +90,7 @@ pub use patch_plan::{
 pub use plan::{
     BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, OperationHash, Plan,
     PlanFieldError, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
-    RepositoryToken, RiskLevel, UnixSeconds, WorktreeToken,
+    RepositoryToken, RiskLevel, UnixSeconds, WorktreePath, WorktreeToken,
 };
 pub use status::{
     parse_porcelain_v2_z, ChangeKind, ChangeSides, ConflictKind, ParsedStatus, StatusEntry,

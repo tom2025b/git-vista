@@ -110,6 +110,18 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     ),
     ("/api/rebase", Method::POST, Authz::SessionAndCsrf),
     ("/api/reset-test-repo", Method::POST, Authz::SessionAndCsrf),
+    // #219 (M2.18a): discard/delete of working-tree paths — destructive
+    // writes, same posture as every other mutation above.
+    (
+        "/api/discard-tracked-paths",
+        Method::POST,
+        Authz::SessionAndCsrf,
+    ),
+    (
+        "/api/delete-untracked-paths",
+        Method::POST,
+        Authz::SessionAndCsrf,
+    ),
     ("/api/operations/{id}", Method::GET, Authz::SessionRequired),
     (
         "/api/operations/{id}/events",
@@ -123,7 +135,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 37;
+const EXPECTED_ROUTE_COUNT: usize = 39;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

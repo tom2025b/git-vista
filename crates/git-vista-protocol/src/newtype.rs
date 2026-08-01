@@ -35,6 +35,9 @@ pub enum PlanFieldError {
     /// The value carries something outside the field's allowed character set
     /// (ASCII letters, digits, `-` and `_` for the token-shaped fields).
     NotToken(&'static str),
+    /// The value is not a path relative to the worktree root: it is absolute,
+    /// carries a `..` component, or embeds a NUL byte (#219).
+    NotWorktreeRelative(&'static str),
 }
 
 impl fmt::Display for PlanFieldError {
@@ -50,6 +53,13 @@ impl fmt::Display for PlanFieldError {
             }
             PlanFieldError::NotToken(field) => {
                 write!(f, "{field} may only contain letters, digits, '-' and '_'")
+            }
+            PlanFieldError::NotWorktreeRelative(field) => {
+                write!(
+                    f,
+                    "{field} must be relative to the worktree root — no leading '/' and \
+                     no '..' component"
+                )
             }
         }
     }
@@ -90,6 +100,49 @@ pub(crate) fn require_hex(
     } else {
         Err(PlanFieldError::NotHex { field, expected })
     }
+}
+
+/// The wire-boundary gate for a path a discard/delete operation names (#219,
+/// M2.18a): [`require_git_safe`]'s non-empty/not-option-shaped check (the same
+/// argv-injection defense every other name gets — a path can never be read by
+/// git as a flag), plus three checks specific to a *path*: no embedded NUL (a
+/// path containing one can never name a real filesystem entry, and a NUL in a
+/// Rust `String` handed to a process argv is itself a spawn-time error
+/// waiting to happen), no leading `/` (never absolute), and no `..` path
+/// component (never able to walk out of the worktree lexically).
+///
+/// **Necessary but not sufficient.** A relative, `..`-free, NUL-free path can
+/// still resolve outside the worktree through a symlinked component or a
+/// symlinked final entry — no lexical check can see that, because a symlink's
+/// target is not spelled in the path string at all. That is caught
+/// separately, at execution time, by re-resolving the live filesystem with
+/// `std::fs::canonicalize` — see `git-vista-server`'s
+/// `planner::symlink_containment_guard`, which reuses the exact
+/// canonicalize-and-compare pattern `bin/gv-sandbox/main.rs`'s
+/// `resolve_excludes` already established for the same reason.
+pub(crate) fn require_worktree_relative_path(
+    value: &str,
+    field: &'static str,
+) -> Result<(), PlanFieldError> {
+    require_git_safe(value, field)?;
+    if value.contains('\0') || value.starts_with('/') {
+        return Err(PlanFieldError::NotWorktreeRelative(field));
+    }
+    // `..` names the parent, `.` names the worktree root itself — neither is
+    // a single file/entry this type may point at. Rejected here as the
+    // newtype's own guarantee (review finding): today the execution-time
+    // status re-check happens to refuse `.` too, since `git status` never
+    // emits it as an entry path — but that is a coincidence of git's output
+    // shape, not something this type should depend on a downstream check to
+    // enforce, the same belt-and-braces posture `require_git_safe` documents
+    // for itself.
+    if value
+        .split('/')
+        .any(|component| component == ".." || component == ".")
+    {
+        return Err(PlanFieldError::NotWorktreeRelative(field));
+    }
+    Ok(())
 }
 
 /// A bounded, opaque token: non-empty, at most `max` characters, and made only
@@ -184,5 +237,54 @@ mod tests {
                 "should have been refused: {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn worktree_relative_path_accepts_ordinary_relative_paths() {
+        assert!(require_worktree_relative_path("a.txt", "path").is_ok());
+        assert!(require_worktree_relative_path("dir/sub/file.rs", "path").is_ok());
+        // A leading dot component (not "..") is a perfectly normal filename.
+        assert!(require_worktree_relative_path(".env", "path").is_ok());
+    }
+
+    #[test]
+    fn worktree_relative_path_rejects_absolute_and_traversal_and_argv_injection() {
+        assert_eq!(
+            require_worktree_relative_path("/etc/passwd", "path"),
+            Err(PlanFieldError::NotWorktreeRelative("path"))
+        );
+        assert_eq!(
+            require_worktree_relative_path("../outside.txt", "path"),
+            Err(PlanFieldError::NotWorktreeRelative("path"))
+        );
+        assert_eq!(
+            require_worktree_relative_path("dir/../../outside.txt", "path"),
+            Err(PlanFieldError::NotWorktreeRelative("path"))
+        );
+        assert_eq!(
+            require_worktree_relative_path("a\0b", "path"),
+            Err(PlanFieldError::NotWorktreeRelative("path"))
+        );
+        // A bare "." names the worktree root itself, not a single entry —
+        // review finding: this must be the newtype's own guarantee, not
+        // something left for a downstream re-check to happen to catch.
+        assert_eq!(
+            require_worktree_relative_path(".", "path"),
+            Err(PlanFieldError::NotWorktreeRelative("path"))
+        );
+        assert_eq!(
+            require_worktree_relative_path("dir/.", "path"),
+            Err(PlanFieldError::NotWorktreeRelative("path"))
+        );
+        // Same argv-injection defense every other name gets — a path that
+        // starts with '-' could be read by git as a flag.
+        assert_eq!(
+            require_worktree_relative_path("-rf", "path"),
+            Err(PlanFieldError::OptionShaped("path"))
+        );
+        assert_eq!(
+            require_worktree_relative_path("", "path"),
+            Err(PlanFieldError::Empty("path"))
+        );
     }
 }

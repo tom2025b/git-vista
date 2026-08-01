@@ -735,6 +735,10 @@ pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         // `git apply --cached` + pathspec add/reset: index-only, local.
         GitOperation::StageSelection { .. } => NetworkNeed::Local,
         GitOperation::ResetTestRepo => NetworkNeed::Local,
+        // #219: `git checkout --`/`git clean -f` against named working-tree
+        // paths — index/worktree only, never a remote.
+        GitOperation::DiscardTrackedPaths { .. } => NetworkNeed::Local,
+        GitOperation::DeleteUntrackedPaths { .. } => NetworkNeed::Local,
     }
 }
 

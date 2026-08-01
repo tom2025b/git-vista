@@ -110,6 +110,7 @@ use handlers::branch::{
 };
 use handlers::clone::{clone_repo, delete_clone_repo};
 use handlers::commit::{create_commit, stage_all, unstage_all};
+use handlers::discard::{delete_untracked_paths, discard_tracked_paths};
 use handlers::protocol::protocol_info;
 use handlers::read::{
     commit_detail, commit_diff, commits, file_at_commit, frame, head_branch, worktree_status,
@@ -459,6 +460,12 @@ fn api_router(
             // iPad-testing follow-up: restore a seeded *test repo* to its recorded
             // state (gated on the seed files `gv --seed` writes).
             .route("/api/reset-test-repo", post(reset_test_repo))
+            // #219 (M2.18a): discard uncommitted changes to tracked paths
+            // (`git checkout -- <paths>`), or delete untracked paths outright
+            // (`git clean -f -- <paths>`) — two separate operations (#71),
+            // the second with no journal-backed undo at all.
+            .route("/api/discard-tracked-paths", post(discard_tracked_paths))
+            .route("/api/delete-untracked-paths", post(delete_untracked_paths))
             // M1.08 (#61): what happened to one write, and its live progress.
             // Registered with the writes, not the reads — these describe write
             // outcomes, so the LAN router must never see them either (ADR 0005).
