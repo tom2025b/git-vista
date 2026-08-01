@@ -55,9 +55,11 @@ pub struct Session {
     /// header. Extracted from the exchange response's `Set-Cookie`.
     pub cookie: String,
     /// The per-session CSRF token (`x-git-vista-csrf` on state-changing
-    /// requests). Carried even though this slice is read-only, so the write
-    /// slices (#248/#249) inherit a complete session, not a partial one.
-    #[allow(dead_code)] // read by the coming write slices; kept whole per #245's scope
+    /// requests). #245 carried it unused, ahead of need; #246's
+    /// `select_repository` tool is the first consumer (`/api/select` sits
+    /// behind the full write auth gate even though it's non-mutating — see
+    /// `tools::select_repository`'s doc comment), and the write slices
+    /// (#248/#249) reuse it after.
     pub csrf: String,
 }
 
