@@ -12,12 +12,18 @@
 //! the cap is full. A repository with a 5 GiB blob or a pathological diff can
 //! therefore cost the server a bounded allocation and a bounded lifetime instead
 //! of whatever git felt like printing (M1.10, #63).
+//!
+//! `git_cat_file_batch` is the same posture for a request that needs up to two
+//! answers from one commit's tree (a spec, and its `^` parent-fallback): one
+//! `git cat-file --batch` process is held open across both, and the type each
+//! answer resolves to is read from the protocol's own header field — before
+//! any content byte is read — rather than from a second spawn (#221).
 
 use std::path::Path;
 use std::process::{Output, Stdio};
 
 use axum::http::StatusCode;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 /// The fail-safe ceiling behind the uncapped [`git_stdout`] wrapper: a caller
 /// that does not think about size still cannot make git allocate more than this.
@@ -267,8 +273,11 @@ pub(crate) async fn git_output_for(
 }
 
 /// Declares `NetworkNeed::Local` for the same reason [`git_output`] does: all
-/// five production call sites are read endpoints (`/api/diff`'s three `diff`
-/// reads and `/api/file`'s two `show` reads), none of which can reach a remote.
+/// three production call sites are `/api/diff`'s `diff` reads
+/// (`--name-status`, `--numstat`, `--patch`), none of which can reach a
+/// remote. `/api/file` used to be two more (`cat-file -t` then `git show`)
+/// until #221 folded them into [`git_cat_file_batch`]'s single held-open
+/// process.
 pub(crate) async fn git_stdout_capped(
     repo: &Path,
     args: &[String],
