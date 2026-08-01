@@ -70,6 +70,16 @@ fn handle_line(line: &str, session: &mut Option<auth::Session>) -> Option<serde_
         // uses id null.
         Err(_) => return Some(error_reply(serde_json::Value::Null, -32700, "parse error")),
     };
+    // Valid JSON that isn't a request object at all (a bare string, a batch
+    // array — MCP 2024-11-05 has no batching, an object with no method) is
+    // Invalid Request, not a notification to swallow.
+    if !msg.is_object() || !msg.get("method").is_some_and(|m| m.is_string()) {
+        return Some(error_reply(
+            serde_json::Value::Null,
+            -32600,
+            "invalid request",
+        ));
+    }
     let id = msg.get("id").cloned();
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
@@ -103,10 +113,15 @@ fn handle_line(line: &str, session: &mut Option<auth::Session>) -> Option<serde_
                         "isError": false
                     }),
                 ),
-                // Tool failures are still successful JSON-RPC responses,
-                // flagged via isError — MCP's shape, so clients show the
+                // The MCP error taxonomy, kept apart on purpose: asking for a
+                // tool that doesn't exist (or omitting the name) is a PROTOCOL
+                // error — JSON-RPC -32602 — while a real tool failing is an
+                // EXECUTION result flagged isError, so clients show the
                 // message instead of dropping the call.
-                Err(e) => result_reply(
+                Err(tools::ToolError::Unknown(name)) => {
+                    error_reply(id, -32602, &format!("Unknown tool: {name}"))
+                }
+                Err(tools::ToolError::Execution(e)) => result_reply(
                     id,
                     serde_json::json!({
                         "content": [{ "type": "text", "text": e }],
@@ -172,12 +187,16 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_tool_call_is_an_is_error_result_not_a_transport_error() {
+    fn an_unknown_tool_is_a_protocol_error_not_an_execution_result() {
+        // MCP separates "no such tool" (JSON-RPC -32602) from "a real tool
+        // ran and failed" (isError result). This dispatcher is the template
+        // the #153 chain copies, so the taxonomy is locked by test.
         let r =
             dispatch(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"nope"}}"#)
                 .unwrap();
-        assert_eq!(r["result"]["isError"], true);
-        assert!(r["error"].is_null());
+        assert_eq!(r["error"]["code"], -32602);
+        assert!(r["error"]["message"].as_str().unwrap().contains("nope"));
+        assert!(r["result"].is_null());
     }
 
     #[test]
@@ -185,5 +204,13 @@ mod tests {
         let r = dispatch("this is not json").unwrap();
         assert_eq!(r["error"]["code"], -32700);
         assert!(r["id"].is_null());
+    }
+
+    #[test]
+    fn valid_json_that_is_not_a_request_object_is_invalid_request() {
+        for junk in [r#""just a string""#, r#"[1,2,3]"#, r#"{"id":9}"#] {
+            let r = dispatch(junk).unwrap();
+            assert_eq!(r["error"]["code"], -32600, "input: {junk}");
+        }
     }
 }

@@ -82,13 +82,22 @@ fn the_full_handshake_lists_the_same_catalog_the_http_api_returns() {
             .expect("the bridge's catalog payload was not JSON");
 
     // The acceptance criterion verbatim: the tool returns the same catalog
-    // JSON GET /api/catalog would return directly. Repository sets are
-    // compared (both legs authenticated seconds apart), not raw bytes —
-    // pretty-printing differs by construction.
-    assert_eq!(
-        via_bridge, baseline,
-        "the bridge's catalog differs from the direct HTTP catalog"
-    );
+    // JSON GET /api/catalog would return directly. Full JSON-value equality,
+    // order included — deterministic because the server serves the catalog in
+    // stable registration order. The catalog CAN legitimately move between
+    // the two legs (this is the live server; another client may clone or
+    // select mid-test), so on mismatch the baseline is fetched once more:
+    // "catalog moved" must read as exactly that, never as "bridge broken".
+    if via_bridge != baseline {
+        let refreshed = git_vista_mcp_test_support::get_catalog(&session)
+            .expect("re-baseline: GET /api/catalog failed");
+        assert_eq!(
+            via_bridge, refreshed,
+            "the bridge's catalog differs from the direct HTTP catalog even \
+             after re-fetching the baseline — this is the bridge, not a \
+             mid-test catalog change"
+        );
+    }
 
     drop(stdin); // close its stdin so the loop exits...
     let status = child.wait().expect("bridge did not exit");
@@ -115,7 +124,10 @@ mod git_vista_mcp_test_support {
             .ok_or("no HOME")?
             .join("git-vista/bootstrap.token");
         let token = std::fs::read_to_string(&path).map_err(|e| format!("{e}"))?;
-        let body = format!(r#"{{"token":"{}"}}"#, token.trim());
+        // Real JSON encoding, not string interpolation: today's tokens are
+        // lowercase hex, but the baseline leg must never silently send
+        // malformed JSON if the token format ever changes.
+        let body = serde_json::json!({ "token": token.trim() }).to_string();
         let resp = raw("POST", "/api/session", Some(&body), None)?;
         let cookie = resp
             .1
