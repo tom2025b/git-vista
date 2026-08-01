@@ -9,8 +9,14 @@
 # (docs/NATIVE_DEPENDENCIES.md) would then have to carry forever.
 #
 # This crate links git-vista-protocol (the shared wire contract — headers,
-# DTOs) and NOT git-vista-server: the token-path resolution is a small
-# mirrored function, per #245's scope.
+# DTOs) and git-vista-core (the *pure*, wasm-safe domain-model crate the
+# generic HistoryFrame/HistoryPage envelopes are instantiated over — GitRef,
+# GraphRow, Edge, FrameStub, CommitDetail, CommitDiff, ActivityEvent) — but
+# deliberately, structurally NOT git-vista-server: the token-path resolution
+# is a small mirrored function (#245's scope), and #246's dependency-graph
+# test (tests/no_write_dependency.rs) proves this crate's whole transitive
+# dependency graph never reaches git-vista-server, so no write handler is
+# ever reachable code, not merely unrouted.
 [package]
 name = "git-vista-mcp"
 version.workspace = true
@@ -20,5 +26,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+git-vista-core = { workspace = true }
 git-vista-protocol = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
