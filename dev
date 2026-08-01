@@ -172,7 +172,14 @@ cmd_start() {
   command -v gh >/dev/null || die "gh CLI not found"
   local title mnum rest slug branch
   title="$(gh issue view "$issue" --json title --jq .title)" || die "no issue #$issue"
-  mnum="$(grep -oiE 'M[0-9]+\.[0-9]+' <<<"$title" | head -1 | tr '[:upper:]' '[:lower:]')"
+  # `|| true`: under `set -e`, a title with no M-number (e.g. "170a — ..." or
+  # "153a — ...", both real titles among the M2 sub-issues filed 2026-07-31)
+  # makes `grep` exit 1 with no match, which kills the script here before it
+  # ever reaches the `${mnum:-issue-$issue}` fallback three lines down — the
+  # fallback that was clearly meant to handle exactly this case. `mnum` ends
+  # up empty either way; only the *script surviving* to use that fallback was
+  # broken.
+  mnum="$(grep -oiE 'M[0-9]+\.[0-9]+' <<<"$title" | head -1 | tr '[:upper:]' '[:lower:]' || true)"
   rest="$(sed -E 's/^M[0-9]+\.[0-9]+ *//I' <<<"$title")"
   slug="$(tr '[:upper:]' '[:lower:]' <<<"$rest" | tr -cs '[:lower:]0-9' '-' | sed 's/^-//; s/-$//' | cut -c1-40 | sed 's/-$//')"
   branch="feature/${mnum:-issue-$issue}-${slug}"
