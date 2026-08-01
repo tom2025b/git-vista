@@ -42,6 +42,76 @@
 //! `&a.excludes` again instead of the resolved list) makes this test fail:
 //! the canary read succeeds and prints its contents instead of being denied.
 //! Confirmed 2026-07-30; the call is restored in the committed source.
+//!
+//! # Why `run_shim_against` pins `current_dir` (issue #276)
+//!
+//! Neither `run_shim_against` nor the `git config -f <target> --list` probe it
+//! runs ever names an enclosing repository — the whole point of this test is
+//! the `--exclude`/`--ro` grants, not git's own repository-discovery walk. But
+//! `Command` with no `.current_dir()` inherits the *test harness's* ambient
+//! cwd (the package directory `cargo test` starts child processes in), and
+//! `git config -f <file> --list` still runs full repository discovery from
+//! that cwd before touching `-f`'s target: it walks upward looking for `.git`,
+//! and if it finds one, opens files inside it to actually resolve the
+//! repository, even though `-f` means it will never read from it.
+//!
+//! That discovery is invisible in a plain `git clone` checkout — its `.git` is
+//! a plain directory, and an unreadable `.git/HEAD` under a not-fully-granted
+//! Landlock ruleset is treated as "not a repository here, keep searching
+//! upward", a soft failure. It is **not** invisible in a `git worktree
+//! add`-created checkout: that checkout's `.git` is a one-line *pointer file*
+//! (`gitdir: <main-repo>/.git/worktrees/<name>`), and git treats a pointer
+//! file it cannot open as fatal rather than "no repository here" — confirmed
+//! by `strace`-ing the compiled shim directly from both kinds of cwd:
+//!
+//! ```text
+//! # cwd = a plain clone, .git is a directory:
+//! newfstatat(…, ".git/HEAD", …)                  = 0
+//! openat(…, ".git/HEAD", O_RDONLY)                = -1 EACCES   <- gentle, discovery continues upward
+//! … (search continues to /, finds nothing, git proceeds with no repo)
+//!
+//! # cwd = a worktree checkout, .git is a `gitdir:` pointer file:
+//! newfstatat(…, ".git", …)                        = 0
+//! openat(…, ".git", O_RDONLY)                     = -1 EACCES   <- fatal: `fatal: error opening '.git': Permission denied`, exit 128
+//! ```
+//!
+//! Both are equally denied by Landlock — cwd is not, and was never meant to
+//! be, one of this test's granted trees — the difference is entirely in how
+//! git's own discovery code treats an unreadable plain directory vs. an
+//! unreadable pointer file. `a_sibling_in_the_same_symlinked_tree_remains_readable`
+//! asserts the overall command *succeeds*, so it surfaces that fatal exit as a
+//! spurious failure; `a_secret_excluded_through_a_symlinked_component_is_not_readable`
+//! only asserts the command does *not* leak the secret and does *not* exit 0,
+//! so it happened to keep passing for the wrong reason (a permission error
+//! that has nothing to do with the exclude mechanism under test) — that latent
+//! false-positive is exactly the shape the module doc above already warns
+//! against for `assert_host_can_run_this`.
+//!
+//! The fix pins `current_dir` to `fx.linked_tree` — already one of the
+//! explicitly `--ro`-granted trees, and (being a fresh `tempfile::tempdir()`
+//! subdirectory) free of any `.git` in its ancestry under the default
+//! temp-dir location. Reintroducing the ambient dependency would take
+//! `TMPDIR` itself pointed inside a git checkout — `tempfile` honours it,
+//! and `run_shim_against`'s `.env_clear()` scrubs only the spawned shim's
+//! environment, not the harness's. Nothing in this repo's tooling does that
+//! (`gv`, `ci/mutation-matrix.sh` and the docs only ever use `TMPDIR` as
+//! scratch space), so it is a caveat worth naming rather than a live hazard.
+//! That
+//! makes the probe's outcome depend only on the exclude/grant machinery this
+//! file exists to test, never on whatever ambient checkout happens to contain
+//! the process that runs the test — a plain clone, a linked worktree, or any
+//! other layout.
+//!
+//! This is a **test-only** fix. Production is not exposed to this failure
+//! mode at all, for two independent reasons — see
+//! `sandbox::spawn::full_argv` (every production git invocation is spawned
+//! with an explicit `-C <repo>`, never relying on inherited cwd) and
+//! `sandbox::mod::policy_for` together with `sandbox::repo_paths::resolve` /
+//! `sandbox::worktree::linked_worktree_dirs` (when `repo` itself is a linked
+//! worktree, its real gitdir and commondir are resolved and explicitly folded
+//! into the granted RO/RW trees before the ruleset is built — this test's
+//! hand-built grant list, by contrast, never attempted that resolution at
+//! all, because doing so is not what this file is testing).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -137,6 +207,15 @@ fn run_shim_against(fx: &Fixture, target: &std::path::Path) -> std::process::Out
         .arg("--list")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
+        // See the module doc comment ("Why `run_shim_against` pins
+        // `current_dir`", issue #276): without this, the child inherits the
+        // test harness's own ambient cwd, and `git config -f … --list` still
+        // runs repository discovery from there before touching `-f`'s target
+        // — coupling this test's outcome to whatever checkout happens to
+        // contain the process running it. `fx.linked_tree` is already granted
+        // `--ro` above and carries no `.git` in its ancestry (see the module
+        // doc for the one `TMPDIR` caveat that could change that).
+        .current_dir(&fx.linked_tree)
         .output()
         .expect("gv-sandbox runs")
 }
