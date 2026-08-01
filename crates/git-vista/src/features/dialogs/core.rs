@@ -179,6 +179,39 @@ pub fn clone_dialog_may_dismiss(cloning: bool, guard_allows: bool) -> bool {
     !cloning && guard_allows
 }
 
+/// The sessionStorage key holding the commit-message draft for one repository
+/// (#226). Keyed by the Frame's `worktree_id` so a draft typed against one
+/// repository can never surface in another's commit dialog.
+pub fn commit_draft_key(worktree_id: &str) -> String {
+    format!("gv-commit-draft:{worktree_id}")
+}
+
+/// What the draft signal should do when the served repository (the draft
+/// *scope*) is observed again (#226).
+///
+/// The scope is re-observed on **every** epoch reload — Refresh, a settled
+/// write, drift — almost always with the same repository. Reseeding from
+/// storage on those would clobber whatever the user has typed since the last
+/// persist tick, so the rule is: reseed **only when the repository actually
+/// changed**. That decision lives here, host-tested, because the signal
+/// wiring around it is wasm-only and untestable in this repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftScopeAction {
+    /// Same repository as before — leave the live signal alone.
+    KeepSignal,
+    /// A different repository (or the first one seen) — replace the signal
+    /// with that repository's persisted draft, or blank if none.
+    SeedFromStorage,
+}
+
+pub fn draft_scope_action(old: Option<&str>, new: Option<&str>) -> DraftScopeAction {
+    if old == new {
+        DraftScopeAction::KeepSignal
+    } else {
+        DraftScopeAction::SeedFromStorage
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +339,47 @@ mod tests {
     fn an_idle_dialog_defers_to_the_ghost_click_guard() {
         assert!(clone_dialog_may_dismiss(false, true));
         assert!(!clone_dialog_may_dismiss(false, false));
+    }
+
+    #[test]
+    fn draft_keys_are_distinct_per_repository() {
+        // The scoping acceptance criterion of #226, at the key level: two
+        // repositories can never share a draft slot.
+        let a = commit_draft_key("5e1a4510-aaaa");
+        let b = commit_draft_key("f9f44ccb-bbbb");
+        assert_ne!(a, b);
+        assert!(a.contains("5e1a4510-aaaa"));
+        assert!(a.starts_with("gv-commit-draft:"));
+    }
+
+    #[test]
+    fn reobserving_the_same_repository_keeps_the_live_signal() {
+        // The clobber trap: the scope is re-observed on EVERY epoch reload
+        // (Refresh, settled writes, drift), almost always with the same repo.
+        // Reseeding then would overwrite keystrokes typed since the last
+        // persist tick.
+        assert_eq!(
+            draft_scope_action(Some("same"), Some("same")),
+            DraftScopeAction::KeepSignal
+        );
+        assert_eq!(draft_scope_action(None, None), DraftScopeAction::KeepSignal);
+    }
+
+    #[test]
+    fn a_changed_or_first_repository_seeds_from_storage() {
+        assert_eq!(
+            draft_scope_action(None, Some("first")),
+            DraftScopeAction::SeedFromStorage
+        );
+        assert_eq!(
+            draft_scope_action(Some("old"), Some("new")),
+            DraftScopeAction::SeedFromStorage
+        );
+        // Losing the repo entirely (degraded frame) also reseeds — to blank,
+        // since a None scope persists nothing.
+        assert_eq!(
+            draft_scope_action(Some("old"), None),
+            DraftScopeAction::SeedFromStorage
+        );
     }
 }

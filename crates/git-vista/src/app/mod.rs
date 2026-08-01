@@ -288,6 +288,15 @@ pub fn App() -> impl IntoView {
     // `dialogs_guard` because the `dialogs` *module* is in scope here too.
     let dialogs_guard = Dialogs::new();
 
+    // #226: keep the commit-draft scope tracking the served repository, so a
+    // draft persists per repo and survives an iOS tab suspension (the first
+    // Frame after the rebuild restores it). Re-fires on every epoch reload;
+    // `set_draft_scope`'s same-repo no-op (host-tested in dialogs/core.rs)
+    // is what makes that safe for in-flight typing.
+    create_effect(move |_| {
+        dialogs_guard.set_draft_scope(frame().and_then(|f| f.worktree_id));
+    });
+
     // The Activity panel's visibility (Activity/Undo feature). Lives here — not in
     // graph_canvas — because its button sits in the topbar, which exists even while the
     // graph is still loading; threaded into the overlays bundle inside graph_canvas.
