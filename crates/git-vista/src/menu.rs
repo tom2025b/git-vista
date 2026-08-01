@@ -408,6 +408,41 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     </button>
                 }
             });
+            // "Select Changes to Stage…" / "…Unstage…" (M2.17d, #215): open
+            // the finger/keyboard hunk-selection view (`viewer.rs`,
+            // `ViewerDoc::Staging`) instead of acting on everything the way
+            // "Stage/Unstage Changes" above do. Same HEAD/staged-count gating
+            // as their whole-tree counterparts — a selection view over a
+            // stub's or a non-HEAD commit's changes has nothing to select
+            // from, same reasoning as the plain actions above.
+            let select_stage = is_head.then(|| {
+                let on = move |_| {
+                    shell.close_menu();
+                    shell.open_viewer(crate::state::ViewerDoc::Staging {
+                        direction: git_vista_protocol::StageDirection::Stage,
+                    });
+                };
+                view! {
+                    <button class="ctx-item" on:click=on>
+                        <span class="nf ctx-icon">{ic.added}</span>
+                        "Select Changes to Stage…"
+                    </button>
+                }
+            });
+            let select_unstage = (is_head && staged_count.get().unwrap_or(0) > 0).then(|| {
+                let on = move |_| {
+                    shell.close_menu();
+                    shell.open_viewer(crate::state::ViewerDoc::Staging {
+                        direction: git_vista_protocol::StageDirection::Unstage,
+                    });
+                };
+                view! {
+                    <button class="ctx-item" on:click=on>
+                        <span class="nf ctx-icon">{ic.undo}</span>
+                        "Select Changes to Unstage…"
+                    </button>
+                }
+            });
             // The branch operations (Issue #33 follow-up): merge / push / delete, one
             // set per local branch living at this target. Each opens the confirm modal
             // rather than acting immediately — the actual POST + refresh happens there.
@@ -737,6 +772,8 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     </button>
                     {stage_changes}
                     {unstage_changes}
+                    {select_stage}
+                    {select_unstage}
                     {commit_changes}
                     {commit_empty}
                     {branch_items}
