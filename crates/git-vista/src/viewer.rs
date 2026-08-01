@@ -16,13 +16,16 @@
 use leptos::*;
 
 use git_vista_core::diff::{CommitDiff, FileContent};
+use git_vista_protocol::{PatchPlan, PatchPreview, StageDirection, StagingDiff};
 
-use crate::api::{fetch_diff_full, fetch_file};
+use crate::api::{fetch_diff_full, fetch_file, staging_diff_request};
 use crate::detail::{accessible_patch_view, file_change_marker};
 use crate::features::a11y::focus::GraphFocus;
-use crate::features::shell::signals::Shell;
+use crate::features::diff::selection::DiffSelection;
+use crate::features::diff::staging_view::staging_body;
+use crate::features::graph::core::RenderCtx;
 use crate::icons::icon_set;
-use crate::state::{Settings, ViewerDoc};
+use crate::state::{Features, Settings, ViewerDoc};
 
 /// Stamp (or clear) the `data-print` attribute on `<html>`. The print styles
 /// key off it, so a plain browser print with no viewer open still prints the
@@ -48,24 +51,56 @@ fn print_now() {
 /// The full-screen viewer overlay. Renders while the shell holds a viewer document;
 /// fetches its document lazily (keyed on the open doc, like the detail panel),
 /// and closes via its own visible button.
-pub fn viewer_view(shell: Shell, settings: Settings) -> impl IntoView {
+///
+/// `ctx` (M2.17d, #215) is only used by the `Staging` document — the
+/// repository/worktree identity a [`git_vista_protocol::PatchPlan`] needs —
+/// but is threaded in alongside `features` rather than fetched separately,
+/// mirroring `detail::detail_panel_view`'s signature.
+pub fn viewer_view(
+    features: Features,
+    settings: Settings,
+    ctx: StoredValue<RenderCtx>,
+) -> impl IntoView {
+    let Features { shell, status, .. } = features;
     let nerd_icons = settings.nerd_icons;
     // The full-screen patch's roving hunk focus (M2.16e, #210) — its own
     // model, distinct from the detail panel's, because both surfaces can be
     // mounted at once. Created above the render closures for the same
     // reason as the detail panel's: a re-render must not reset the position.
     let hunk_focus = create_rw_signal(GraphFocus::new(0));
-    // One resource for either document kind: the key carries the enum, the
+    // The staging selection's own state (M2.17d, #215) — created here, not
+    // inside the render closure, for the same reason: a re-render (e.g. the
+    // selection itself changing) must not reset the model. Cleared whenever
+    // a *fresh* staging fetch starts (see the resource below), so reopening
+    // — or switching Stage↔Unstage — never carries over a selection made
+    // against a different, possibly now-stale, diff.
+    let staging_selection = create_rw_signal(DiffSelection::new());
+    let staging_preview = create_rw_signal(None::<Result<PatchPreview, String>>);
+    // The exact plan `staging_preview` was built from (review finding,
+    // #215): without this, changing the selection after a preview leaves
+    // the OLD preview text on screen with nothing to say it no longer
+    // matches. `staging_body` hides the preview panel once the current
+    // selection's plan diverges from this, rather than showing stale
+    // content — see its own comment at the point of use.
+    let staging_previewed_plan = create_rw_signal(None::<PatchPlan>);
+    let staging_busy = create_rw_signal(false);
+    // One resource for every document kind: the key carries the enum, the
     // fetch picks the endpoint. A stale response is ignored via the id/path
     // echo, same rule as the detail panel's fetches.
     let doc = create_local_resource(
         move || shell.viewer_doc(),
-        |doc| async move {
+        move |doc| async move {
             match doc {
                 None => None,
                 Some(ViewerDoc::Diff { id }) => Some(DocResult::Diff(fetch_diff_full(&id).await)),
                 Some(ViewerDoc::File { id, path }) => {
                     Some(DocResult::File(fetch_file(&id, &path).await))
+                }
+                Some(ViewerDoc::Staging { direction }) => {
+                    staging_selection.update(|s| s.clear());
+                    staging_preview.set(None);
+                    staging_previewed_plan.set(None);
+                    Some(DocResult::Staging(staging_diff_request(direction).await))
                 }
             }
         },
@@ -82,27 +117,51 @@ pub fn viewer_view(shell: Shell, settings: Settings) -> impl IntoView {
                 ViewerDoc::File { id, path } => {
                     format!("{path} @ {}", &id[..id.len().min(7)])
                 }
+                ViewerDoc::Staging { direction } => match direction {
+                    StageDirection::Stage => "Stage selected changes".to_string(),
+                    StageDirection::Unstage => "Unstage selected changes".to_string(),
+                },
             };
+            let which_for_body = which.clone();
             let body = move || match doc.get().flatten() {
                 None => view! { <p class="detail-status">"Loading…"</p> }.into_view(),
-                Some(DocResult::Diff(Err(e))) | Some(DocResult::File(Err(e))) => view! {
+                Some(DocResult::Diff(Err(e)))
+                | Some(DocResult::File(Err(e)))
+                | Some(DocResult::Staging(Err(e))) => view! {
                     <p class="detail-status detail-error">{format!("Couldn't load: {e}")}</p>
                 }
                 .into_view(),
                 Some(DocResult::Diff(Ok(d))) => {
                     // Ignore a stale diff after switching documents.
-                    if !matches!(&which, ViewerDoc::Diff { id } if *id == d.id) {
+                    if !matches!(&which_for_body, ViewerDoc::Diff { id } if *id == d.id) {
                         return view! { <p class="detail-status">"Loading…"</p> }.into_view();
                     }
                     diff_body(&d, nerd_icons.get(), hunk_focus)
                 }
                 Some(DocResult::File(Ok(f))) => {
-                    if !matches!(&which, ViewerDoc::File { id, path }
+                    if !matches!(&which_for_body, ViewerDoc::File { id, path }
                                  if *id == f.id && *path == f.path)
                     {
                         return view! { <p class="detail-status">"Loading…"</p> }.into_view();
                     }
                     file_body(&f)
+                }
+                Some(DocResult::Staging(Ok(d))) => {
+                    let ViewerDoc::Staging { direction } = which_for_body else {
+                        return view! { <p class="detail-status">"Loading…"</p> }.into_view();
+                    };
+                    staging_body(
+                        &d,
+                        direction,
+                        hunk_focus,
+                        staging_selection,
+                        staging_preview,
+                        staging_previewed_plan,
+                        staging_busy,
+                        ctx,
+                        status,
+                        shell,
+                    )
                 }
             };
             view! {
@@ -144,6 +203,7 @@ pub fn viewer_view(shell: Shell, settings: Settings) -> impl IntoView {
 enum DocResult {
     Diff(Result<CommitDiff, String>),
     File(Result<FileContent, String>),
+    Staging(Result<StagingDiff, String>),
 }
 
 /// The full-diff document: the per-file stat list, then the whole unified

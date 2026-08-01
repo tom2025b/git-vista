@@ -21,9 +21,9 @@ use git_vista_core::status::RepoStatus;
 use git_vista_protocol::operation::{IdempotencyKey, OperationId};
 use git_vista_protocol::{
     ApiError, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
-    DeleteCloneRequest, ProtocolInfo, RebaseStatus, RepoMode, RepositoryDescriptor, SelectRequest,
-    SessionInfo, SessionRequest, CSRF_HEADER, IDEMPOTENCY_HEADER, OPERATION_HEADER,
-    PROTOCOL_HEADER, PROTOCOL_VERSION,
+    DeleteCloneRequest, PatchPlan, PatchPreview, ProtocolInfo, RebaseStatus, RepoMode,
+    RepositoryDescriptor, SelectRequest, SessionInfo, SessionRequest, StageDirection, StagingDiff,
+    CSRF_HEADER, IDEMPOTENCY_HEADER, OPERATION_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
 use crate::features::graph::core::{Frame, Page};
@@ -996,6 +996,59 @@ pub async fn delete_clone_request(worktree: &str) -> Result<String, String> {
     let (resp, _key) = write_json("/api/delete-clone", &body).await?;
     if resp.ok() {
         Ok(resp.text().await.unwrap_or_default())
+    } else {
+        Err(response_error(resp).await)
+    }
+}
+
+/// Fetch the staging base diff (`GET /api/staging/diff?direction=stage|unstage`,
+/// M2.17d, #215) — the pinned diff a hunk/line selection is made against, and
+/// the `diff-v1:` generation token the resulting [`PatchPlan`] must carry
+/// back verbatim. A read, like [`fetch_status`]/[`fetch_rebase_status`], so no
+/// offline/visualize guard here — those gate only the two writes below.
+pub async fn staging_diff_request(direction: StageDirection) -> Result<StagingDiff, String> {
+    let dir = match direction {
+        StageDirection::Stage => "stage",
+        StageDirection::Unstage => "unstage",
+    };
+    let url = format!(
+        "/api/staging/diff?direction={dir}&t={}",
+        js_sys::Date::now()
+    );
+    let resp = req_get(&url).send().await.map_err(network_error)?;
+    if resp.ok() {
+        resp.json::<StagingDiff>().await.map_err(|e| e.to_string())
+    } else {
+        Err(response_error(resp).await)
+    }
+}
+
+/// Ask the backend what applying `plan` would do, without doing it
+/// (`POST /api/staging/preview`, M2.17d, #215) — the exact bytes
+/// `staging_apply_request` would execute while the plan's generation still
+/// holds. A non-2xx body is the server's reason (stale generation, malformed
+/// selection), returned as `Err` for the caller to show.
+pub async fn staging_preview_request(plan: &PatchPlan) -> Result<PatchPreview, String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let (resp, _key) = write_json("/api/staging/preview", plan).await?;
+    if resp.ok() {
+        resp.json::<PatchPreview>().await.map_err(|e| e.to_string())
+    } else {
+        Err(response_error(resp).await)
+    }
+}
+
+/// Ask the backend to execute `plan` (`POST /api/staging/apply`, M2.17d,
+/// #215) — stage or unstage exactly the selected hunks/lines, through the
+/// same build-and-check pipeline [`staging_preview_request`] ran. A non-2xx
+/// body is the server's reason, returned as `Err` for the caller to show.
+pub async fn staging_apply_request(plan: &PatchPlan) -> Result<(), String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let (resp, _key) = write_json("/api/staging/apply", plan).await?;
+    if resp.ok() {
+        Ok(())
     } else {
         Err(response_error(resp).await)
     }
