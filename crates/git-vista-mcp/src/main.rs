@@ -74,10 +74,7 @@ fn handle_line(line: &str, session: &mut Option<auth::Session>) -> Option<serde_
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
     // Notifications (no id) get no reply, per JSON-RPC 2.0.
-    let id = match id {
-        Some(id) => id,
-        None => return None,
-    };
+    let id = id?;
 
     let reply = match method {
         "initialize" => serde_json::json!({
