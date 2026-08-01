@@ -168,15 +168,153 @@ pub fn clone_settlement<T>(outcome: Result<T, String>) -> CloneSettlement<T> {
     }
 }
 
-/// Whether the Open-URL dialog may be dismissed right now (#260).
+/// Whether the Open-URL dialog may be dismissed right now (#260, #278).
 ///
 /// A clone in flight pins the dialog open: dismissing it doesn't cancel the
 /// request, it just makes the app *look* idle while a clone is still running —
 /// the "acted like it worked" half of #260. `guard_allows` is the existing
 /// iOS ghost-click verdict ([`DialogsCore::may_confirm`]); this composes with
 /// it rather than replacing it.
-pub fn clone_dialog_may_dismiss(cloning: bool, guard_allows: bool) -> bool {
-    !cloning && guard_allows
+///
+/// **`checking` re-opens the exit during the #278 polling phase** (review
+/// finding). The pin was sized against a worst case of `2×CLONE_TIMEOUT_MS`
+/// (~19 minutes); #278's poll budget stacks up to ~120 iterations of
+/// interval-plus-two-deadlines on top of that, pushing the worst case past an
+/// hour. Pinning someone inside a modal that long is its own version of
+/// "the app looks broken" — the very complaint #260 exists to fix.
+///
+/// Re-opening it *specifically* during polling is safe in a way it is not
+/// during the POST: the poll is a read-only `GET /api/clone-status/{key}`
+/// loop, so abandoning it cannot leave a half-done mutation, and the
+/// authoritative record lives server-side under the retained key either way.
+/// The clone's real outcome remains discoverable in the repository picker,
+/// which is exactly what the exhausted-poll copy already tells the user to
+/// check. What is still pinned is the window where the `POST` itself is in
+/// flight and its fate genuinely unknown to everyone.
+pub fn clone_dialog_may_dismiss(cloning: bool, checking: bool, guard_allows: bool) -> bool {
+    (!cloning || checking) && guard_allows
+}
+
+/// Whether a definite (non-2xx) `POST /api/clone` response still leaves the
+/// outcome open enough to poll `GET /api/clone-status/{key}` (#278) for a
+/// later answer, rather than reporting the response itself as final.
+///
+/// Every other non-2xx clone response is already **terminal**:
+/// `handlers/clone.rs::admit_clone` either ran the clone to completion and
+/// recorded its real result, or replayed one already recorded, so polling
+/// would only ever reach the exact conclusion the response already carries.
+/// The one exception is `409 Conflict` with the "already in progress"
+/// message — `admit_clone`'s `Err((CONFLICT, ...))` arm for an attempt that
+/// is still *running*, not yet resolved. That response is a snapshot of a
+/// clone in flight, not its outcome — and this client's own single in-flight
+/// retry (`send_write_with_key`, #216/#218) is exactly what can produce it:
+/// the first `POST`'s response was lost, the second raced in while the first
+/// was still executing server-side.
+///
+/// Matched on the message text, not the bare status code: the same `409`
+/// also answers a genuinely different, and genuinely terminal, refusal — a
+/// key reused for a different clone URL (`admit_clone`'s key-collision
+/// check) — which must NOT be polled, since polling that one would just
+/// replay the same refusal forever.
+pub fn clone_response_should_poll(status: u16, message: &str) -> bool {
+    status == 409 && message.contains("already in progress")
+}
+
+/// One `GET /api/clone-status/{key}` poll's outcome — the pure decision
+/// input for [`clone_poll_step`]. Generic over the descriptor type `T` for
+/// the same reason [`CloneSettlement`] is: this module carries no wasm/HTTP
+/// dependency, so the caller (`api.rs`, wasm-only) supplies the real
+/// `RepositoryDescriptor` while the tests below use a plain string.
+///
+/// Shaped directly from `handlers/clone.rs::CloneStatusResponse` (checked
+/// against that enum, not guessed) plus the two cases that response can
+/// never itself represent: the key not existing at all (`404`), and the poll
+/// request itself failing before any server answer was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClonePollOutcome<T> {
+    /// `{"state": "running"}` — no result yet.
+    Running,
+    /// `{"state": "succeeded", "descriptor": ...}` — the descriptor a lost
+    /// `POST /api/clone` response would have carried.
+    Succeeded(T),
+    /// `{"state": "failed", "message": ...}` — the same message the original
+    /// response would have carried.
+    Failed(String),
+    /// `404` — the key was never admitted, was evicted past its TTL, or the
+    /// original `POST` never reached the server at all. Indistinguishable
+    /// from here; see [`clone_poll_step`]'s doc comment for why that's
+    /// treated as retryable rather than a hard stop.
+    Unknown,
+    /// The poll attempt itself failed at the network level — no server
+    /// answer was read at all. Distinct from every variant above, all three
+    /// of which mean a response *was* read.
+    PollError(String),
+}
+
+/// What to do after one poll: settle the whole `clone_request` call, or wait
+/// and try again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClonePollStep<T> {
+    Resolved(Result<T, String>),
+    KeepPolling,
+}
+
+/// The pure decision behind #278's poll loop: given one poll's outcome and
+/// how many attempts have been spent against the bounded budget, decide
+/// whether to settle the original `clone_request` call or wait and poll
+/// again.
+///
+/// Only [`ClonePollOutcome::Succeeded`]/[`ClonePollOutcome::Failed`] are
+/// treated as a real answer — the server said so definitively. Every other
+/// variant is retried within budget:
+///
+/// - `Running` is retried by definition — that's the whole point of polling.
+/// - `Unknown` (404) is retried too, not treated as an immediate give-up: a
+///   lost `POST /api/clone` response does not guarantee the request ever
+///   reached the server's `admit_clone` at all (`with_deadline`'s losing
+///   future is dropped client-side, but does not abort the browser's
+///   in-flight fetch — see `api.rs::with_deadline`'s doc comment), so the
+///   record this key names may simply not exist *yet*, over a tunnel slow
+///   enough that the original request is still arriving.
+/// - `PollError` is retried too — it is exactly the flaky-tunnel condition
+///   this whole feature exists to ride out; one lost poll must not give up
+///   on an attempt that is still running server-side.
+///
+/// `lost_reason` is folded into the final message only once the budget is
+/// exhausted, so the user sees why polling started in the first place, not
+/// just that it gave up.
+pub fn clone_poll_step<T>(
+    outcome: ClonePollOutcome<T>,
+    attempts_made: u32,
+    max_attempts: u32,
+    lost_reason: &str,
+) -> ClonePollStep<T> {
+    match outcome {
+        ClonePollOutcome::Succeeded(descriptor) => ClonePollStep::Resolved(Ok(descriptor)),
+        ClonePollOutcome::Failed(message) => ClonePollStep::Resolved(Err(message)),
+        ClonePollOutcome::Running | ClonePollOutcome::Unknown | ClonePollOutcome::PollError(_) => {
+            if attempts_made >= max_attempts {
+                ClonePollStep::Resolved(Err(clone_poll_exhausted_message(lost_reason)))
+            } else {
+                ClonePollStep::KeepPolling
+            }
+        }
+    }
+}
+
+/// The message shown when the poll budget runs out without ever reading a
+/// definitive `Succeeded`/`Failed` from the server.
+fn clone_poll_exhausted_message(lost_reason: &str) -> String {
+    // Detail only, deliberately unframed (review finding): every string this
+    // returns reaches the user through `clone_settlement`'s `Err` arm, which
+    // is the single place that adds the "Couldn't clone:" heading — exactly
+    // as it already does for every other error `clone_request` can produce.
+    // Framing here too produced the heading twice in one alert.
+    format!(
+        "{lost_reason}\n\nPolled the server for the outcome but never got a definitive \
+         answer. The clone may still be running — check the repository picker in a few \
+         minutes before retrying; a retry now can create a duplicate clone."
+    )
 }
 
 /// The sessionStorage key holding the commit-message draft for one repository
@@ -341,14 +479,148 @@ mod tests {
 
     #[test]
     fn a_dialog_with_a_clone_in_flight_refuses_dismissal_regardless_of_the_guard() {
-        assert!(!clone_dialog_may_dismiss(true, true));
-        assert!(!clone_dialog_may_dismiss(true, false));
+        // Still POSTing: fate genuinely unknown to everyone, stay pinned.
+        assert!(!clone_dialog_may_dismiss(true, false, true));
+        assert!(!clone_dialog_may_dismiss(true, false, false));
     }
 
     #[test]
     fn an_idle_dialog_defers_to_the_ghost_click_guard() {
-        assert!(clone_dialog_may_dismiss(false, true));
-        assert!(!clone_dialog_may_dismiss(false, false));
+        assert!(clone_dialog_may_dismiss(false, false, true));
+        assert!(!clone_dialog_may_dismiss(false, false, false));
+    }
+
+    /// #278 review finding: the poll phase re-opens the exit. Polling is a
+    /// read-only GET loop whose budget can run to roughly an hour on top of
+    /// the POST's own worst case — pinning someone in a modal that long is
+    /// the same "app looks broken" complaint #260 exists to fix, and
+    /// abandoning a read cannot strand a half-done mutation.
+    #[test]
+    fn the_polling_phase_can_be_dismissed_but_still_respects_the_ghost_click_guard() {
+        assert!(clone_dialog_may_dismiss(true, true, true));
+        // The iOS ghost-click guard still has the final say — re-opening the
+        // exit must not also re-open the stray-tap hole it was closing.
+        assert!(!clone_dialog_may_dismiss(true, true, false));
+    }
+
+    #[test]
+    fn a_still_in_progress_conflict_is_pollable() {
+        assert!(clone_response_should_poll(
+            409,
+            "A clone for this request is already in progress. Wait for it to finish \
+             before retrying."
+        ));
+    }
+
+    #[test]
+    fn a_different_url_conflict_is_not_pollable() {
+        // The other 409: a key collision with a genuinely different clone
+        // URL. Polling this one would just replay the same refusal forever.
+        assert!(!clone_response_should_poll(
+            409,
+            "That idempotency key was already used for a different clone URL. \
+             Retry with a fresh key."
+        ));
+    }
+
+    #[test]
+    fn a_bad_url_or_server_error_is_not_pollable() {
+        // Both already terminal, already answered — polling would learn
+        // nothing new.
+        assert!(!clone_response_should_poll(
+            400,
+            "fatal: repository not found"
+        ));
+        assert!(!clone_response_should_poll(500, "Couldn't run git: boom"));
+        assert!(!clone_response_should_poll(
+            504,
+            "The clone did not finish within 10 minutes and was stopped."
+        ));
+    }
+
+    #[test]
+    fn a_succeeded_poll_resolves_ok_with_the_descriptor() {
+        let step = clone_poll_step(
+            ClonePollOutcome::Succeeded("descriptor"),
+            1,
+            120,
+            "timed out",
+        );
+        assert_eq!(step, ClonePollStep::Resolved(Ok("descriptor")));
+    }
+
+    #[test]
+    fn a_failed_poll_resolves_err_with_the_recorded_message() {
+        let step = clone_poll_step::<&str>(
+            ClonePollOutcome::Failed("fatal: repository not found".into()),
+            1,
+            120,
+            "timed out",
+        );
+        assert_eq!(
+            step,
+            ClonePollStep::Resolved(Err("fatal: repository not found".into()))
+        );
+    }
+
+    #[test]
+    fn a_running_poll_under_budget_keeps_polling() {
+        let step = clone_poll_step::<&str>(ClonePollOutcome::Running, 1, 120, "timed out");
+        assert_eq!(step, ClonePollStep::KeepPolling);
+    }
+
+    #[test]
+    fn an_unknown_key_under_budget_keeps_polling_rather_than_giving_up_immediately() {
+        // The record may simply not exist YET — the original POST could
+        // still be arriving over a slow tunnel. See the doc comment on why
+        // this is not treated as an instant "no such attempt".
+        let step = clone_poll_step::<&str>(ClonePollOutcome::Unknown, 1, 120, "timed out");
+        assert_eq!(step, ClonePollStep::KeepPolling);
+    }
+
+    #[test]
+    fn a_poll_error_under_budget_keeps_polling() {
+        // The flaky-tunnel condition this feature exists to ride out — one
+        // lost poll must not give up on an attempt that is still running.
+        let step = clone_poll_step::<&str>(
+            ClonePollOutcome::PollError("network error".into()),
+            1,
+            120,
+            "timed out",
+        );
+        assert_eq!(step, ClonePollStep::KeepPolling);
+    }
+
+    #[test]
+    fn a_running_poll_at_the_budget_gives_up_with_the_lost_reason_folded_in() {
+        let step = clone_poll_step::<&str>(
+            ClonePollOutcome::Running,
+            120,
+            120,
+            "The server did not answer within 60 seconds.",
+        );
+        match step {
+            ClonePollStep::Resolved(Err(message)) => {
+                assert!(message.contains("The server did not answer within 60 seconds."));
+                assert!(message.contains("may still be running"));
+                assert!(message.contains("duplicate"));
+            }
+            other => panic!("expected a resolved give-up, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_attempt_short_of_budget_still_keeps_polling() {
+        // Off-by-one guard: the budget is exhausted only once attempts_made
+        // reaches max_attempts, never one short of it.
+        let step = clone_poll_step::<&str>(ClonePollOutcome::Running, 119, 120, "timed out");
+        assert_eq!(step, ClonePollStep::KeepPolling);
+    }
+
+    #[test]
+    fn an_unknown_key_at_the_budget_also_gives_up() {
+        let step = clone_poll_step::<&str>(ClonePollOutcome::Unknown, 5, 5, "network error");
+        assert!(matches!(step, ClonePollStep::Resolved(Err(_))));
     }
 
     #[test]
