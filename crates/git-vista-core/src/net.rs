@@ -50,13 +50,16 @@ pub fn offline_refusal_text() -> String {
 /// Same attribution rule as [`offline_refusal_text`] above, and for the same
 /// reason: `navigator.onLine` speaks for the device's network adapter only, so
 /// the banner must not claim anything about the server. It also names the
-/// *consequence* (write actions are put away — the same controls M2.22b hides
-/// or disables from the menu, picker, and Activity panel) and the *recovery*
-/// (reconnect), because a bar that only says "offline" leaves the user to
-/// guess why Commit just vanished. Pure text so the wording is pinned by a
-/// host test; the banner view that shows it is wasm-only.
+/// *consequence* ("write actions are hidden" — the controls M2.22b removes
+/// from the menu, picker, topbar, and Activity panel) and the *recovery* as a
+/// user action ("reconnect", the refusal text's own verb), because a bar that
+/// only says "offline" leaves the user to guess why Commit just vanished.
+/// Plain words over idiom on purpose: this is heard once through VoiceOver
+/// with no scan-back. Pure text so the wording is pinned by a host test; the
+/// banner view that shows it is wasm-only.
 pub fn offline_banner_text() -> String {
-    "This device reports it is offline — write actions are put away until the network returns."
+    "This device reports it is offline. Write actions are hidden until you reconnect to the \
+     network."
         .to_string()
 }
 
@@ -100,13 +103,15 @@ mod tests {
              cannot back up — {msg}"
         );
         assert!(
-            msg.contains("write actions"),
-            "must say what changed in the UI, so the vanished controls are \
+            msg.contains("Write actions are hidden"),
+            "must say what changed in the UI, in plain words (no idiom — this \
+             is heard once via VoiceOver), so the vanished controls are \
              explained — {msg}"
         );
         assert!(
-            msg.contains("network returns"),
-            "must name the recovery — {msg}"
+            msg.contains("reconnect"),
+            "must name the recovery as a user action, the refusal text's own \
+             verb — {msg}"
         );
     }
 

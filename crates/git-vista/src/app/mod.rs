@@ -598,9 +598,15 @@ pub fn App() -> impl IntoView {
                 // doesn't exist on the LAN listener. Keyed on the session
                 // resource so the button re-evaluates once `establish_session`
                 // lands (it records via_lan before resolving).
+                // M2.22b (#242): hidden offline too — this is the same
+                // `/api/clone` entry point as the picker's Clone URL…, and
+                // gating one twin but not the other would walk the user into
+                // a dialog whose submit can only be refused. `navigator.onLine`
+                // can read true over a dead tunnel; `api.rs`'s guard stays the
+                // boundary.
                 {move || {
                     session.get();
-                    (!session_state::is_lan()).then(|| view! {
+                    (!session_state::is_lan() && online.get()).then(|| view! {
                         <button
                             class="refresh"
                             on:click=move |_| {
@@ -669,8 +675,11 @@ pub fn App() -> impl IntoView {
                 // Only a repo explicitly seeded as a test repo (`gv --seed`)
                 // gets this; everything since the seed is discarded on reset,
                 // so it's confirmed in its own modal and styled as a hazard.
+                // M2.22b (#242): hidden offline like the rest of the write
+                // set — a destructive control whose confirm flow could only
+                // dead-end on `api.rs`'s offline guard.
                 {move || frame()
-                    .filter(|f| f.resettable)
+                    .filter(|f| f.resettable && online.get())
                     .map(|_| view! {
                         <button
                             class="refresh danger"
@@ -688,10 +697,11 @@ pub fn App() -> impl IntoView {
             </header>
             // M2.22b (#242): the offline strip, directly under the topbar in
             // normal flow (see `offline_banner`'s module docs for why it is
-            // not a second fixed bar). Purely a disclosure — the write
-            // controls it explains are gated where they render, and the real
-            // boundary is `api.rs`'s `refuse_if_offline()` either way.
-            {move || (!online.get()).then(crate::offline_banner::offline_banner_view)}
+            // not a second fixed bar, and why the live region mounts
+            // permanently rather than on demand). Purely a disclosure — the
+            // write controls it explains are gated where they render, and the
+            // real boundary is `api.rs`'s `refuse_if_offline()` either way.
+            {crate::offline_banner::offline_banner_view(online)}
             // The "Open URL" modal (Phase 12), factored into `dialogs`.
             {dialogs::open_url_view(open_url, clone_url, cloning, dialogs_guard, graph, mode_for)}
             // The "Reset Test Repo" confirmation (only reachable via the gated

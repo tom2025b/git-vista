@@ -212,8 +212,11 @@ pub fn picker_view(
                                             // M2.22b (#242): hidden offline too —
                                             // the tracked `online_signal` read
                                             // re-renders this row list when
-                                            // connectivity flips, and the banner
-                                            // above the graph says why it went.
+                                            // connectivity flips. The picker's
+                                            // own offline notice (below the
+                                            // action row) says why: this modal
+                                            // covers the app's banner, which
+                                            // cannot disclose through it.
                                             // `navigator.onLine` can read true
                                             // over a dead tunnel; the write
                                             // boundary stays `api.rs`'s guard.
@@ -309,6 +312,26 @@ pub fn picker_view(
                                 }
                             })
                         }}
+                        // M2.22b (#242): the picker's own offline disclosure.
+                        // This modal is a full-viewport overlay that covers the
+                        // app's offline banner, so when Delete/Clone URL…/
+                        // Rescan vanish above, THIS is the only thing on screen
+                        // that can say why. Same permanently-mounted live-
+                        // region shape as the app banner (`offline_banner`'s
+                        // module docs): the `role="status"` wrapper pre-exists
+                        // the flip so VoiceOver announces the text arriving.
+                        <div role="status">
+                            {move || {
+                                (!shell_state::online_signal().get()).then(|| view! {
+                                    <div style="margin-top:8px; padding:6px 10px; \
+                                                font-size:0.85em; border-radius:6px; \
+                                                background:#3a2a0a; color:#f0c674; \
+                                                border:1px solid #5a4210;">
+                                        {git_vista_core::net::offline_banner_text()}
+                                    </div>
+                                })
+                            }}
+                        </div>
                     </div>
                 </div>
             }
