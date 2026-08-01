@@ -902,23 +902,33 @@ fn production_body<'a>(code: &'a str, name: &str) -> &'a str {
     panic!("unbalanced braces while extracting `{marker}`");
 }
 
-/// Layer 1b (M1.10, #63): the *streaming* source boundary. Every git read the
-/// two bounded read handlers perform must go through the capped, killable
-/// primitive — proved structurally, on the source, not inferred from the size
-/// of a returned buffer.
+/// Layer 1b (M1.10, #63; collapsed to one file spawn in #221): the
+/// *streaming* source boundary. Every git read the two bounded read handlers
+/// perform must go through a primitive that owns its child process end to
+/// end and bounds what it reads — proved structurally, on the source, not
+/// inferred from the size of a returned buffer.
 ///
 /// Exactly one production body is extracted for each of `commit_diff_for_repo`
 /// and `file_at_commit_for_repo`; across only those two bodies there must be
-/// exactly five `git_stdout_capped(` call sites (three diff reads, two file
-/// reads) and no escape hatch — no uncapped `git_stdout(`, no `.output()`, no
-/// `.wait_with_output()`, no direct `Command` construction, each of which would
-/// buffer whatever git chose to print.
+/// exactly four such calls: three `git_stdout_capped(` (the diff's
+/// `--name-status`, `--numstat` and `--patch` reads) plus exactly one
+/// `git_cat_file_batch(` (#221: the file read's single `cat-file --batch`
+/// spawn, which does the #168 type check and, when it resolves to a blob,
+/// the content read, on the one still-open process — including through the
+/// `<id>^:<path>` parent-fallback). And no escape hatch — no uncapped
+/// `git_stdout(`, no `.output()`, no `.wait_with_output()`, no direct
+/// `Command` construction, each of which would buffer whatever git chose to
+/// print.
 ///
-/// `file_at_commit_for_repo` went from one call site to two in #168: a
-/// `git cat-file -t <spec>` type check now runs — through the same capped
-/// primitive, so this file's guarantee still holds — *before* the `git show`
-/// content read, so a tree or submodule entry is rejected without ever
-/// reading (or serving) its git-show output. See that function's doc comment.
+/// `file_at_commit_for_repo` went from one call site to two in #168 (a
+/// `git cat-file -t <spec>` type check, through the same capped primitive,
+/// ran before the `git show` content read) and from two back down to *one*
+/// in #221: the type check and the content read are now two possible facts
+/// read off one `cat-file --batch` response stream, so a tree or submodule
+/// entry is still rejected without ever reading (or serving) content bytes —
+/// enforced by the wire's own field order rather than by two separate
+/// spawns. See that function's doc comment, and `git_cat_file_batch`'s in
+/// `git_cmd.rs`.
 ///
 /// The scope is deliberately narrow. The unrelated `worktree_status` read in
 /// the very same file legitimately buffers a whole (tiny, static-arg) git
@@ -927,12 +937,13 @@ fn production_body<'a>(code: &'a str, name: &str) -> &'a str {
 /// contains that call while the two extracted *bodies* do not is what proves
 /// the extractor cut where it claims to, instead of quietly matching nothing.
 #[test]
-fn bounded_read_source_boundary_is_streaming_and_exactly_five() {
+fn bounded_read_source_boundary_is_streaming_and_exactly_four() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/read.rs");
     let src = std::fs::read_to_string(&path).expect("readable handlers/read.rs");
     let code = code_only(&src);
 
     let capped = ["git_stdout", "_capped("].concat();
+    let batched = ["git_cat_file", "_batch("].concat();
     let uncapped = ["git_stdout", "("].concat();
     // Assembled at runtime, like the spawn scan above, so this file's own source
     // never contains the bare patterns it forbids.
@@ -964,21 +975,32 @@ fn bounded_read_source_boundary_is_streaming_and_exactly_five() {
     );
 
     let diff_calls = diff_body.matches(&capped).count();
-    let file_calls = file_body.matches(&capped).count();
     assert_eq!(
         diff_calls, 3,
         "commit_diff_for_repo must perform exactly three bounded reads \
          (--name-status -z, --numstat -z, --patch), found {diff_calls}"
     );
+
+    let file_capped_calls = file_body.matches(&capped).count();
     assert_eq!(
-        file_calls, 2,
-        "file_at_commit_for_repo must perform exactly two bounded reads \
-         (the cat-file -t type check, then the show content read), found {file_calls}"
+        file_capped_calls, 0,
+        "file_at_commit_for_repo must no longer call the two-spawn \
+         git_stdout_capped primitive at all — #221 folded its reads into the \
+         single-spawn batch primitive below, found {file_capped_calls}"
     );
+    let file_batch_calls = file_body.matches(&batched).count();
     assert_eq!(
-        diff_calls + file_calls,
-        5,
-        "exactly five target callers cross the capped boundary"
+        file_batch_calls, 1,
+        "file_at_commit_for_repo must perform exactly one batched read (the \
+         #168 type check and, when applicable, the content read, both off \
+         one still-open `cat-file --batch` process, including through the \
+         parent-fallback), found {file_batch_calls}"
+    );
+
+    assert_eq!(
+        diff_calls + file_batch_calls,
+        4,
+        "exactly four target callers cross the capped/batched boundary"
     );
 
     for (what, body) in [

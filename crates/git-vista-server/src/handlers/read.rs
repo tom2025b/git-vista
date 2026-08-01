@@ -761,32 +761,28 @@ pub(crate) async fn file_at_commit(
     Ok((no_store, Json(file)))
 }
 
-/// Bound on `git cat-file -t <spec>`'s output: the real answers (`blob`,
-/// `tree`, `commit`, `tag`) are all under 8 bytes. Generous headroom, not a
-/// meaningful cap — this call can never legitimately produce much output.
-const OBJECT_TYPE_CAP: usize = 64;
-
 /// [`file_at_commit`] against an explicit repository — split out for the same
 /// reason as [`commit_diff_for_repo`]: the handler's repository comes from the
 /// process-wide `CURRENT` selection, which no test can set.
 ///
 /// The read is bounded at [`FILE_CONTENT_CAP`], and a cap hit is a *success*:
-/// `Ok((bytes, true))` means "this file exists and is bigger than we will
+/// `truncated: true` means "this file exists and is bigger than we will
 /// serve", which is a truncated 200 and emphatically **not** the missing-object
-/// case. Only a genuine error retries `<id>^:<path>` — that retry exists for a
-/// file this commit deleted, and answering a cap with the parent's older
-/// content would be a wrong answer wearing a 200 (M1.10, #63).
+/// case. Only a genuinely missing spec retries `<id>^:<path>` — that retry
+/// exists for a file this commit deleted, and answering a cap with the
+/// parent's older content would be a wrong answer wearing a 200 (M1.10, #63).
 ///
 /// Only a **blob** may answer this endpoint (#168). `git show <rev>:<path>`
-/// happily "succeeds" on a tree (prints a directory listing) or a commit
-/// entry — a submodule gitlink — (prints the referenced commit's log), and
-/// both would otherwise come back as a `200 FileContent` with git's
-/// human-facing output sitting in `content`, wearing a shape that promises
-/// real file bytes. A tree is a different resource, not a different
-/// representation of this one — the honest fix for tree browsing is a
-/// dedicated endpoint, not a discriminator bolted onto this DTO (which would
-/// also force a wire-format bump for a capability nothing currently uses) —
-/// so the decision here is reject, not describe.
+/// (and, since #221, `git cat-file --batch`'s own content read) happily
+/// "succeeds" on a tree (prints a directory listing) or a commit entry — a
+/// submodule gitlink — (prints the referenced commit's log), and both would
+/// otherwise come back as a `200 FileContent` with git's human-facing output
+/// sitting in `content`, wearing a shape that promises real file bytes. A
+/// tree is a different resource, not a different representation of this one
+/// — the honest fix for tree browsing is a dedicated endpoint, not a
+/// discriminator bolted onto this DTO (which would also force a wire-format
+/// bump for a capability nothing currently uses) — so the decision here is
+/// reject, not describe.
 ///
 /// The type is resolved *before* any content is read, and the `<id>^:<path>`
 /// retry ladder is built out of type resolutions, not content reads: the
@@ -795,56 +791,36 @@ const OBJECT_TYPE_CAP: usize = 64;
 /// **directory** in this commit would resolve as "not found" on the first
 /// attempt, fall through to the parent, and come back as a `200` with real
 /// file bytes from the wrong commit — the same failure mode `FileContent`'s
-/// cap logic was written to avoid (see above), one layer up. Once a spec
-/// resolves to `blob`, exactly one `git show` runs, against that exact spec —
-/// blob reads are otherwise byte-for-byte what they were before this change.
+/// cap logic was written to avoid (see above), one layer up. #221 moved both
+/// the type check and the content read onto one `git cat-file --batch`
+/// process (`crate::git_cmd::git_cat_file_batch`), including through the
+/// fallback: the batch protocol's own header field (type, then size) always
+/// precedes the content bytes it describes, so "type resolved before
+/// content, on every attempt" is now a fact about the order fields appear on
+/// the wire, not an invariant this function has to maintain by hand across
+/// two separate spawns.
 async fn file_at_commit_for_repo(
     repo: &Path,
     id: &str,
     path: &str,
 ) -> Result<git_vista_core::diff::FileContent, (StatusCode, String)> {
     // Same belt-and-braces as the diff: real ids are hex, and the id leads the
-    // `<id>:<path>` argument, so neither half can ever read as an option.
+    // `<id>:<path>` spec, so neither half can ever read as an option.
     if id.len() < 4 || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string()));
     }
 
-    let type_of = |spec: String| async move {
-        git_stdout_capped(
-            repo,
-            &["cat-file".to_string(), "-t".to_string(), spec],
-            "/api/file",
-            OBJECT_TYPE_CAP,
-        )
-        .await
-        .map(|(bytes, _truncated)| String::from_utf8_lossy(&bytes).trim().to_string())
-    };
-    let (spec, kind) = match type_of(format!("{id}:{path}")).await {
-        Ok(kind) => (format!("{id}:{path}"), kind),
-        // Not in this commit's tree — a file this commit deleted, a path
-        // this commit never had, or (M1.10, #63's original case) a file
-        // whose content should be shown from where it last existed. Resolve
-        // the *type* against the parent before deciding anything.
-        Err(first) => {
-            let spec = format!("{id}^:{path}");
-            let kind = type_of(spec.clone()).await.map_err(|_| first)?;
-            (spec, kind)
+    let found = crate::git_cmd::git_cat_file_batch(repo, id, path, FILE_CONTENT_CAP, "/api/file")
+        .await?;
+    let (bytes, truncated) = match found {
+        crate::git_cmd::BatchFileRead::NotABlob { kind } => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("'{path}' is a {kind}, not a file."),
+            ));
         }
+        crate::git_cmd::BatchFileRead::Blob { bytes, truncated } => (bytes, truncated),
     };
-    if kind != "blob" {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("'{path}' is a {kind}, not a file."),
-        ));
-    }
-
-    let (bytes, truncated) = git_stdout_capped(
-        repo,
-        &["show".to_string(), spec],
-        "/api/file",
-        FILE_CONTENT_CAP,
-    )
-    .await?;
 
     // Binary sniff, the way git itself does it: a NUL in the first 8000 bytes.
     // The cap always retains far more than that, so bounding the read cannot
