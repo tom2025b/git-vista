@@ -34,15 +34,24 @@ use git_vista_protocol::{GenerationToken, PatchPlan};
 /// per the `status.rs` precedent), and this gate recomputes with exactly
 /// that recipe. See `status.rs`'s module doc for the namespacing rationale.
 ///
-/// Not consumed yet: #213's preview and apply handlers both call this
-/// before building any patch (seeded here by #212 so the staleness
-/// contract lands with the DTO, not with the endpoint).
-#[allow(dead_code)]
+/// Both of #213's handlers (`handlers::staging::staging_preview` /
+/// `staging_apply`) call this before building any patch — seeded by #212 so
+/// the staleness contract landed with the DTO, consumed by #213 as planned.
 pub(crate) fn require_current_selection(
     plan: &PatchPlan,
     live: &GenerationToken,
 ) -> Result<(), (StatusCode, String)> {
-    if plan.generation == *live {
+    require_current_selection_token(&plan.generation, live)
+}
+
+/// The same gate, token-vs-token — the arity the executor uses to re-verify
+/// **inside the coordinator lock** (`exec_stage_selection`), where there is
+/// no wire plan in scope, only the gate-time token the operation carries.
+pub(crate) fn require_current_selection_token(
+    expected: &GenerationToken,
+    live: &GenerationToken,
+) -> Result<(), (StatusCode, String)> {
+    if expected == live {
         Ok(())
     } else {
         Err((

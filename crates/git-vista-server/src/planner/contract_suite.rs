@@ -165,6 +165,7 @@ fn covered_by(op: &GitOperation) -> &'static str {
         GitOperation::ResetBranch { .. } => "reset_branch_executes_through_the_pipeline",
         GitOperation::RevertCommit { .. } => "revert_commit_executes_through_the_pipeline",
         GitOperation::ResetTestRepo => "reset_test_repo_executes_through_the_pipeline",
+        GitOperation::StageSelection { .. } => "stage_selection_executes_through_the_pipeline",
     }
 }
 
@@ -222,6 +223,13 @@ fn every_operation_kind_names_a_distinct_pipeline_test() {
             commit: oid(&zeros),
         },
         GitOperation::ResetTestRepo,
+        GitOperation::StageSelection {
+            direction: git_vista_protocol::StageDirection::Stage,
+            expected_diff_generation: git_vista_protocol::GenerationToken::new("diff-v1:x")
+                .unwrap(),
+            patch: String::new(),
+            whole_files: vec!["a.txt".to_string()],
+        },
     ];
     let names: Vec<&str> = samples.iter().map(covered_by).collect();
     let mut deduped = names.clone();
@@ -346,6 +354,47 @@ async fn stage_all_executes_through_the_pipeline() {
     let (status, body) = pipeline(&repo, GitOperation::StageAll).await;
     assert_ok(status, &body);
     assert_eq!(out(&repo, &["diff", "--cached", "--name-only"]), "b.txt");
+}
+
+#[tokio::test]
+async fn stage_selection_executes_through_the_pipeline() {
+    // The built form (patch text + pathspecs) rides the full production
+    // pipeline — plan build, mutation guard, staleness gate, executor. The
+    // hunk-precision proof lives in `planner::tests`; this is the funnel leg.
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("c.txt"), "c\n").unwrap();
+    run(&repo, &["add", "c.txt"]);
+    run(&repo, &["commit", "-q", "-m", "second file"]);
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    std::fs::write(repo.join("c.txt"), "c changed\n").unwrap();
+    // Untrimmed capture: a unified diff's final newline is load-bearing.
+    let patch_out = std::process::Command::new("git")
+        .args(["diff", "--no-color", "--no-textconv", "--", "c.txt"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(patch_out.status.success());
+    let patch = String::from_utf8(patch_out.stdout).unwrap();
+    let live = crate::handlers::read::staging_diff_for_repo(
+        &repo,
+        git_vista_protocol::StageDirection::Stage,
+    )
+    .await
+    .unwrap();
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::StageSelection {
+            direction: git_vista_protocol::StageDirection::Stage,
+            expected_diff_generation: live.generation,
+            patch,
+            whole_files: vec!["a.txt".to_string()],
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+    let staged = out(&repo, &["diff", "--cached", "--name-only"]);
+    assert!(staged.contains("a.txt"), "{staged}");
+    assert!(staged.contains("c.txt"), "{staged}");
 }
 
 #[tokio::test]
@@ -816,6 +865,12 @@ fn every_git_write_route_reaches_the_planner() {
         ("/api/branch", "create_branch"),
         ("/api/commit", "create_commit"),
         ("/api/stage", "stage_all"),
+        // Staging selections (M2.17b, #213): apply is a git write and MUST
+        // reach the planner (funnel row below). Preview is deliberately not
+        // one — it builds the same bytes but mutates nothing and never mints
+        // a plan; its refusals (400/409) happen before any operation exists.
+        ("/api/staging/preview", "staging_preview"),
+        ("/api/staging/apply", "staging_apply"),
         ("/api/unstage", "unstage_all"),
         ("/api/undo", "activity::undo"),
         ("/api/merge", "merge_branch"),
@@ -904,6 +959,7 @@ fn every_git_write_route_reaches_the_planner() {
         ("src/handlers/rebase.rs", "rebase", None),
         ("src/handlers/reset.rs", "reset_test_repo", None),
         ("src/activity.rs", "undo", None),
+        ("src/handlers/staging.rs", "staging_apply", None),
     ];
     for (file, handler, helper) in funnel {
         let src = source(file);

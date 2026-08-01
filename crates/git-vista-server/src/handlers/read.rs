@@ -992,6 +992,83 @@ async fn worktree_status_v2_for_repo(
     Ok(parsed.into_worktree_status(token))
 }
 
+/// The staging-base diff (M2.17b, #213): the patch text a [`PatchPlan`]
+/// selects from, plus the `diff-v1:` generation it is pinned under. Lives
+/// here — the diff-argv home — so `handlers::staging` never builds git argv
+/// of its own (the #66 single-funnel posture, same reason the executor owns
+/// the apply argv).
+///
+/// The base follows the direction→diff contract `patch_plan`'s module doc
+/// pins: `stage` reads `git diff` (worktree-vs-index), `unstage` reads
+/// `git diff --cached` (index-vs-HEAD). Same hardening as `diff_argv`:
+/// `--no-textconv`, no `--binary`, `--no-color`; capped at
+/// [`DIFF_PATCH_CAP_FULL`] and cut at a line boundary with the truncation
+/// reported, so selections can only ever address what was actually served.
+///
+/// The token mirrors `worktree_status_v2_for_repo`'s recipe exactly (HEAD +
+/// refs + index inputs, worktree slot = digest of the bytes this read
+/// observed) with two deliberate differences: the digest is of *these patch
+/// bytes*, and the direction is folded in before the bytes — the two base
+/// diffs are different documents even when their text happens to match, and
+/// a token minted for one must never admit a selection made against the
+/// other. Namespace `diff-v1:` per the `status-v1:`/`history-v1:` precedent.
+///
+/// [`PatchPlan`]: git_vista_protocol::PatchPlan
+pub(crate) async fn staging_diff_for_repo(
+    repo: &Path,
+    direction: git_vista_protocol::StageDirection,
+) -> Result<git_vista_protocol::StagingDiff, (StatusCode, String)> {
+    use git_vista_protocol::StageDirection;
+    let mut args = vec!["diff".to_string()];
+    if matches!(direction, StageDirection::Unstage) {
+        args.push("--cached".to_string());
+    }
+    args.extend(
+        ["--patch", "--no-color", "--no-textconv"]
+            .into_iter()
+            .map(String::from),
+    );
+    let (bytes, over_cap) =
+        git_stdout_capped(repo, &args, "/api/staging/diff", DIFF_PATCH_CAP_FULL).await?;
+    let mut patch = String::from_utf8_lossy(&bytes).into_owned();
+    if over_cap {
+        // Unlike the display diff, this text is *addressable* — a hunk cut
+        // mid-body would parse, be selectable, preview, and then always
+        // refuse at apply (its header counts exceed its body). Cut at the
+        // last complete file section instead, so everything served is
+        // genuinely appliable; the truncation flag still discloses the cut.
+        truncate_at_line(&mut patch, DIFF_PATCH_CAP_FULL);
+        if let Some(last_file) = patch.rfind("\ndiff --git ") {
+            patch.truncate(last_file);
+        }
+    }
+
+    let mut inputs = git_vista_git::read_generation_inputs(repo).map_err(|e| {
+        eprintln!("git-vista: /api/staging/diff couldn't read generation inputs: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(match direction {
+            StageDirection::Stage => b"staging-base:worktree-vs-index\0".as_slice(),
+            StageDirection::Unstage => b"staging-base:index-vs-head\0".as_slice(),
+        });
+        hasher.update(patch.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    inputs.worktree(&digest);
+    let generation = inputs.generation();
+    let token = git_vista_protocol::GenerationToken::new(format!("diff-v1:{generation}"))
+        .expect("a formatted digest is always non-empty");
+
+    Ok(git_vista_protocol::StagingDiff {
+        generation: token,
+        patch,
+        truncated: over_cap,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

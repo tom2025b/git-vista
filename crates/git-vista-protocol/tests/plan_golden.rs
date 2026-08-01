@@ -1,6 +1,6 @@
 //! Golden-fixture test for the [`Plan`] wire contract (M1.06a, #142).
 //!
-//! `tests/fixtures/plan_v1.json` is the **committed** wire form of fifteen
+//! `tests/fixtures/plan_v1.json` is the **committed** wire form of sixteen
 //! plans — one per [`GitOperation`] variant, together exercising every
 //! [`RiskLevel`], [`Precondition`], [`RefState`] and [`RecoveryStrategy`]
 //! variant. The test proves the contract is lossless in both directions:
@@ -16,7 +16,7 @@
 use git_vista_protocol::{
     BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, OperationHash, Plan,
     Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName, RepositoryToken,
-    RiskLevel, UnixSeconds, WorktreeToken,
+    RiskLevel, StageDirection, UnixSeconds, WorktreeToken,
 };
 
 const FIXTURE: &str = include_str!("fixtures/plan_v1.json");
@@ -345,6 +345,21 @@ fn golden_plans() -> Vec<Plan> {
             }],
             RecoveryStrategy::Irrecoverable,
         ),
+        plan(
+            'd',
+            GitOperation::StageSelection {
+                direction: StageDirection::Stage,
+                expected_diff_generation: GenerationToken::new("diff-v1:12345678901234567890")
+                    .unwrap(),
+                patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n context\n+added\n"
+                    .to_string(),
+                whole_files: vec!["assets/logo.png".to_string()],
+            },
+            RiskLevel::Safe,
+            Vec::new(),
+            Vec::new(),
+            RecoveryStrategy::NotNeeded,
+        ),
     ]
 }
 
@@ -418,6 +433,7 @@ fn golden_set_covers_every_operation_variant() {
         "reset_branch",
         "revert_commit",
         "reset_test_repo",
+        "stage_selection",
     ]
     .into_iter()
     .map(String::from)

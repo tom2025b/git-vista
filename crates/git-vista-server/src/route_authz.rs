@@ -91,6 +91,12 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     ("/api/branch", Method::POST, Authz::SessionAndCsrf),
     ("/api/commit", Method::POST, Authz::SessionAndCsrf),
     ("/api/stage", Method::POST, Authz::SessionAndCsrf),
+    // Staging selections (M2.17b, #213). The diff read is GET (no CSRF
+    // surface) but still full_routes-only — it feeds the write surface and
+    // shows uncommitted worktree contents, so the LAN router never sees it.
+    ("/api/staging/diff", Method::GET, Authz::SessionRequired),
+    ("/api/staging/preview", Method::POST, Authz::SessionAndCsrf),
+    ("/api/staging/apply", Method::POST, Authz::SessionAndCsrf),
     ("/api/unstage", Method::POST, Authz::SessionAndCsrf),
     ("/api/undo", Method::POST, Authz::SessionAndCsrf),
     ("/api/merge", Method::POST, Authz::SessionAndCsrf),
@@ -117,7 +123,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 34;
+const EXPECTED_ROUTE_COUNT: usize = 37;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in
