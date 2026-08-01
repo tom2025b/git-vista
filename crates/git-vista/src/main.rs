@@ -67,6 +67,10 @@ mod gestures;
 mod hook_policy_banner;
 #[cfg(target_arch = "wasm32")]
 mod menu;
+// M2.22b (#242): the persistent offline banner shown while the browser
+// reports no network — the UI face of M2.22a's connectivity signal.
+#[cfg(target_arch = "wasm32")]
+mod offline_banner;
 // The repo picker + Visualize/Active mode screens (ADR 0006/0009).
 #[cfg(target_arch = "wasm32")]
 mod picker;
