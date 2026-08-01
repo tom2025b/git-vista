@@ -22,6 +22,7 @@
 use leptos::{Resource, RwSignal};
 
 use git_vista_core::model::CommitDetail;
+use git_vista_protocol::StageDirection;
 
 /// State for the per-commit context menu (Issue #18): which commit was tapped,
 /// where to draw the menu (client/viewport px, since it's an HTML overlay, not
@@ -114,6 +115,12 @@ pub enum ViewerDoc {
     Diff { id: String },
     /// One file's content at one commit.
     File { id: String, path: String },
+    /// The staging selection view (M2.17d, #215): the live worktree-vs-index
+    /// (`Stage`) or index-vs-HEAD (`Unstage`) diff, with finger/keyboard
+    /// hunk selection and a Preview/Apply flow through `/api/staging/*`.
+    /// Reuses this overlay rather than a new one — same close/Escape/print
+    /// suppression wiring the other two variants already have.
+    Staging { direction: StageDirection },
 }
 
 /// The persisted display settings, shared into every icon-drawing view so a
