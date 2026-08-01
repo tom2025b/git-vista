@@ -102,6 +102,83 @@ impl DialogsCore {
     }
 }
 
+/// What the Open-URL dialog must do once its clone request settles (#260).
+///
+/// Extracted pure so the settlement rules are host-tested — `dialogs/open_url.rs`
+/// is wasm-only and this crate has no wasm harness, the same gap that motivated
+/// `print_button_copy`. The view consumes this by exhaustive destructuring (no
+/// `..`), so adding a field here refuses to compile until the view handles it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneSettlement<T> {
+    /// Clear the `cloning` busy flag. Both arms: the request is over either way.
+    pub clear_busy: bool,
+    /// Close the dialog. Success only — an error keeps it up so the URL and the
+    /// user's context survive for a retry.
+    pub close_dialog: bool,
+    /// Clear the URL field. Success only, same reasoning as `close_dialog`.
+    pub clear_url: bool,
+    /// Re-read the graph. **Both arms — this is #260's recovery.** A timeout or
+    /// dropped-tunnel error does not mean the clone failed: the server may have
+    /// finished and already moved its current selection (`clone.rs` runs
+    /// `set_current` before replying). The frame request follows the server's
+    /// current selection, so bumping on the error arm makes a
+    /// completed-but-lost clone appear instead of staying silently absent.
+    ///
+    /// Deliberately uniform: it also fires for definite failures (bad URL,
+    /// offline pre-flight refusal), where the extra refetch is harmless noise.
+    /// Splitting the arms needs a typed error out of `clone_request`, which
+    /// belongs to #263's operation-tracking work, not here.
+    pub bump_epoch: bool,
+    /// Hand this descriptor to the Visualize/Active mode screen. Success only.
+    pub mode_screen_for: Option<T>,
+    /// Show this to the user. Error only.
+    pub alert: Option<String>,
+}
+
+/// The settlement rules for a finished clone request, both arms.
+pub fn clone_settlement<T>(outcome: Result<T, String>) -> CloneSettlement<T> {
+    match outcome {
+        Ok(descriptor) => CloneSettlement {
+            clear_busy: true,
+            close_dialog: true,
+            clear_url: true,
+            bump_epoch: true,
+            mode_screen_for: Some(descriptor),
+            alert: None,
+        },
+        Err(e) => CloneSettlement {
+            clear_busy: true,
+            close_dialog: false,
+            clear_url: false,
+            bump_epoch: true,
+            mode_screen_for: None,
+            // Self-qualifying on purpose: `clone_request` collapses every
+            // failure into one string, so this can't tell a timeout (clone may
+            // have finished) from a bad URL (it definitely didn't). "If this
+            // was a network drop or timeout" lets the user apply the error
+            // they can see; an unconditional "it may have finished" would
+            // steer them wrong on definite failures.
+            alert: Some(format!(
+                "Couldn't clone:\n{e}\n\nIf this was a network drop or timeout, \
+                 the clone may still have finished — check the repository \
+                 picker before retrying, or a retry can create a duplicate \
+                 clone."
+            )),
+        },
+    }
+}
+
+/// Whether the Open-URL dialog may be dismissed right now (#260).
+///
+/// A clone in flight pins the dialog open: dismissing it doesn't cancel the
+/// request, it just makes the app *look* idle while a clone is still running —
+/// the "acted like it worked" half of #260. `guard_allows` is the existing
+/// iOS ghost-click verdict ([`DialogsCore::may_confirm`]); this composes with
+/// it rather than replacing it.
+pub fn clone_dialog_may_dismiss(cloning: bool, guard_allows: bool) -> bool {
+    !cloning && guard_allows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +244,67 @@ mod tests {
         );
         d.close(Dialog::Confirm);
         assert_eq!(d.open_dialog(), None);
+    }
+
+    #[test]
+    fn a_settled_clone_success_updates_everything_and_shows_the_mode_screen() {
+        let s = clone_settlement(Ok("descriptor"));
+        assert_eq!(
+            s,
+            CloneSettlement {
+                clear_busy: true,
+                close_dialog: true,
+                clear_url: true,
+                bump_epoch: true,
+                mode_screen_for: Some("descriptor"),
+                alert: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_settled_clone_error_still_bumps_the_epoch() {
+        // THE #260 regression test: the server may have finished the clone and
+        // moved its current selection even though this client's response died
+        // (tunnel drop, timeout). Reverting the error-arm bump resurrects the
+        // exact reported failure — clone completed, graph never updates.
+        let s = clone_settlement::<()>(Err("timed out".into()));
+        assert!(s.bump_epoch);
+    }
+
+    #[test]
+    fn a_settled_clone_error_keeps_the_dialog_and_url_for_a_retry() {
+        let s = clone_settlement::<()>(Err("boom".into()));
+        assert!(!s.close_dialog);
+        assert!(!s.clear_url);
+        assert!(s.clear_busy);
+        assert_eq!(s.mode_screen_for, None);
+        let alert = s.alert.expect("an error must reach the user");
+        assert!(alert.contains("boom"));
+        // The alert must warn about the completed-anyway case, or the natural
+        // reaction to it (retry) silently duplicates the clone (#264).
+        assert!(alert.contains("duplicate"));
+    }
+
+    #[test]
+    fn both_arms_bump_the_epoch_never_only_the_success_one() {
+        // Documents that the bump is arm-independent by construction. The
+        // pre-#260 code bumped only on success, which is precisely the shape
+        // that dropped a completed-but-lost clone on the floor. Asserted as
+        // two trues, not equality — equality would also pass with both false.
+        assert!(clone_settlement(Ok(())).bump_epoch);
+        assert!(clone_settlement::<()>(Err(String::new())).bump_epoch);
+    }
+
+    #[test]
+    fn a_dialog_with_a_clone_in_flight_refuses_dismissal_regardless_of_the_guard() {
+        assert!(!clone_dialog_may_dismiss(true, true));
+        assert!(!clone_dialog_may_dismiss(true, false));
+    }
+
+    #[test]
+    fn an_idle_dialog_defers_to_the_ghost_click_guard() {
+        assert!(clone_dialog_may_dismiss(false, true));
+        assert!(!clone_dialog_may_dismiss(false, false));
     }
 }
