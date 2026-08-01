@@ -114,13 +114,19 @@ impl SheetController {
         ) else {
             return;
         };
+        let admitted = self
+            .drag
+            .try_update_value(|active| SheetDrag::admit(active, drag))
+            .unwrap_or(false);
+        if !admitted {
+            return;
+        }
 
         if let Some(target) = ev.current_target() {
             if let Ok(element) = target.dyn_into::<web_sys::Element>() {
                 let _ = element.set_pointer_capture(ev.pointer_id());
             }
         }
-        self.drag.set_value(Some(drag));
         self.drag_offset_px.set(Some(0.0));
         ev.prevent_default();
     }
@@ -138,12 +144,7 @@ impl SheetController {
     pub(crate) fn pointer_up(&self, ev: web_sys::PointerEvent) {
         let drag = self
             .drag
-            .try_update_value(|drag| {
-                drag.as_ref()
-                    .is_some_and(|drag| drag.pointer_id() == ev.pointer_id())
-                    .then(|| drag.take())
-                    .flatten()
-            })
+            .try_update_value(|active| SheetDrag::take_matching(active, ev.pointer_id()))
             .flatten();
         let Some(mut drag) = drag else {
             return;

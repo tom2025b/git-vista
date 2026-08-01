@@ -59,6 +59,25 @@ impl SheetDrag {
         })
     }
 
+    pub(crate) fn admit(active: &mut Option<Self>, candidate: Self) -> bool {
+        if active.is_some() {
+            return false;
+        }
+        *active = Some(candidate);
+        true
+    }
+
+    pub(crate) fn take_matching(active: &mut Option<Self>, pointer_id: i32) -> Option<Self> {
+        if active
+            .as_ref()
+            .is_some_and(|drag| drag.pointer_id == pointer_id)
+        {
+            active.take()
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn sample(
         &mut self,
         pointer_id: i32,
@@ -179,6 +198,31 @@ mod wiring_tests {
         assert_eq!(drag, before);
         assert!(drag.sample(1, f64::NAN, 20.0).is_none());
         assert_eq!(drag, before);
+    }
+
+    #[test]
+    fn active_pointer_owns_the_drag_until_its_matching_take() {
+        let mut active = None;
+        let mut first = SheetDrag::new(7, 600.0, 0.0, 1_000.0, 0.5).unwrap();
+        let first_frame = first.sample(7, 500.0, 100.0).unwrap();
+        let second = SheetDrag::new(8, 400.0, 200.0, 1_000.0, 0.25).unwrap();
+
+        assert!(SheetDrag::admit(&mut active, first));
+        assert!(!SheetDrag::admit(&mut active, second));
+        assert_eq!(active.as_ref().unwrap().pointer_id(), 7);
+        assert_eq!(active.as_ref().unwrap().frame(), first_frame);
+
+        assert_eq!(SheetDrag::take_matching(&mut active, 8), None);
+        assert_eq!(active.as_ref().unwrap().pointer_id(), 7);
+        assert_eq!(active.as_ref().unwrap().frame(), first_frame);
+
+        let taken = SheetDrag::take_matching(&mut active, 7).unwrap();
+        assert_eq!(taken.pointer_id(), 7);
+        assert_eq!(taken.frame(), first_frame);
+        assert!(active.is_none());
+
+        assert!(SheetDrag::admit(&mut active, second));
+        assert_eq!(active.as_ref().unwrap().pointer_id(), 8);
     }
 
     #[test]
