@@ -155,7 +155,8 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 // No GitHub page for this target (no github remote, or unpushed):
                 // show the option but disabled, with a reason on hover.
                 None => {
-                    const REASON: &str = "No GitHub page (no github.com remote, or it isn't pushed)";
+                    const REASON: &str =
+                        "No GitHub page (no github.com remote, or it isn't pushed)";
                     let (aria_label, visible_reason) = disabled_menu_item_copy(label, REASON);
                     view! {
                         <span
@@ -630,7 +631,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     }
                 });
                 if let Some(reason) = reason {
-                    let (aria_label, visible_reason) = disabled_menu_item_copy(&label, reason);
+                    let (aria_label, visible_reason) = disabled_menu_item_copy(&label, &reason);
                     return view! {
                         <span
                             class="ctx-item disabled"
