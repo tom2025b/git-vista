@@ -399,6 +399,16 @@ pub fn install_key_listener(
         let cb =
             Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
                 if ev.key() == "Escape" {
+                    // A handler closer to the event may have consumed this Escape —
+                    // the diff's hunk navigation calls `prevent_default` when Escape
+                    // disengages it (detail.rs), and that consumption must not ALSO
+                    // dismiss the overlay the user is still inside. stop_propagation
+                    // alone can't protect it here: this listener and Leptos's
+                    // delegated handlers share the window target, and same-target
+                    // listeners all run regardless of stop_propagation.
+                    if ev.default_prevented() {
+                        return;
+                    }
                     // Topmost first, and "topmost" is now a fact the shell holds rather
                     // than an `if/else if` chain this handler had to keep in step with the
                     // overlay set. That chain is the bug this replaces: it covered five of
