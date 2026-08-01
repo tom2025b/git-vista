@@ -318,6 +318,45 @@ impl ModeSettler {
     }
 }
 
+/// Whether the browser last reported the network adapter as up (M2.22a, #241).
+///
+/// Framework-free, like [`OverlayStack`] and [`ModeSettler`] above: the only
+/// thing worth testing off-target is that a sequence of online/offline
+/// transitions lands where it should, so that behaviour is split out from
+/// `signals.rs::install_connectivity_signal()`'s `web_sys` event-listener
+/// wiring the same way `ModeSettler` is split from the resize listener. What
+/// stays browser-only is that `online`/`offline` actually fire and that
+/// `navigator.onLine` reports the adapter truthfully — neither of those is
+/// where a transition bug would hide.
+///
+/// Seeded from `navigator.onLine` at startup rather than defaulting to a
+/// fixed value: an app opened while already offline (airplane mode, a dead
+/// tunnel before the first request) must refuse writes from the first paint,
+/// not only after the first `offline` event it happens to observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectivityCore {
+    online: bool,
+}
+
+impl ConnectivityCore {
+    /// `online` is the seed read from `navigator.onLine` (or from a test).
+    pub fn new(online: bool) -> Self {
+        Self { online }
+    }
+
+    /// The plain, synchronous read `api.rs`'s `refuse_if_offline()` guard
+    /// checks — no reactive subscription, so a write function can call it
+    /// inline the same way `session::signals::is_lan()` is called inline.
+    pub fn is_online(&self) -> bool {
+        self.online
+    }
+
+    /// Apply a window `online` or `offline` event.
+    pub fn set_online(&mut self, online: bool) {
+        self.online = online;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,5 +680,43 @@ mod tests {
         }
         let unique: std::collections::HashSet<_> = classes.iter().collect();
         assert_eq!(unique.len(), 4, "classes must be pairwise distinct");
+    }
+
+    #[test]
+    fn connectivity_seeds_from_the_constructor_argument() {
+        assert!(ConnectivityCore::new(true).is_online());
+        assert!(!ConnectivityCore::new(false).is_online());
+    }
+
+    #[test]
+    fn connectivity_transitions_offline_then_back_online() {
+        let mut c = ConnectivityCore::new(true);
+        assert!(c.is_online());
+        c.set_online(false);
+        assert!(!c.is_online(), "an offline event must flip the read");
+        c.set_online(true);
+        assert!(c.is_online(), "a later online event must flip it back");
+    }
+
+    #[test]
+    fn connectivity_can_start_offline_and_come_online() {
+        // The app can be opened while already offline (airplane mode, a dead
+        // tunnel before the first paint) — the seed must reflect that, not
+        // assume online until proven otherwise.
+        let mut c = ConnectivityCore::new(false);
+        assert!(!c.is_online());
+        c.set_online(true);
+        assert!(c.is_online());
+    }
+
+    #[test]
+    fn repeated_identical_events_are_harmless() {
+        let mut c = ConnectivityCore::new(true);
+        c.set_online(true);
+        c.set_online(true);
+        assert!(c.is_online(), "duplicate online events change nothing");
+        c.set_online(false);
+        c.set_online(false);
+        assert!(!c.is_online(), "duplicate offline events change nothing");
     }
 }

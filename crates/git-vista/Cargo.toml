@@ -54,6 +54,8 @@ web-sys = { version = "0.3", features = [
     # M1.04 session bootstrap: window.history().replace_state_with_url(…) to strip
     # the one-time `#s=<token>` from the URL the moment it's exchanged.
     "History",
+    # M2.22a (#241): navigator.onLine, seeding the connectivity guard.
+    "Navigator",
     # Phase 13: keyboard shortcuts (Esc / +/-/0 / r) via a window keydown listener.
     "KeyboardEvent",
     "MouseEvent",

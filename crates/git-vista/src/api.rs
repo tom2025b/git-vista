@@ -16,7 +16,7 @@ use gloo_net::http::{Request, RequestBuilder};
 use git_vista_core::activity::{ActivityEvent, UndoAction, Undoable};
 use git_vista_core::diff::{CommitDiff, FileContent};
 use git_vista_core::model::CommitDetail;
-use git_vista_core::net::network_error_text;
+use git_vista_core::net::{network_error_text, offline_refusal_text};
 use git_vista_core::status::RepoStatus;
 use git_vista_protocol::operation::{IdempotencyKey, OperationId};
 use git_vista_protocol::{
@@ -28,6 +28,7 @@ use git_vista_protocol::{
 
 use crate::features::graph::core::{Frame, Page};
 use crate::features::session::signals as session_state;
+use crate::features::shell::signals as shell_state;
 
 /// The largest page the server will mint, mirrored here so a caller's request is
 /// clamped before it goes out rather than silently rewritten server-side. Kept
@@ -134,6 +135,32 @@ fn refuse_if_visualize() -> Result<(), String> {
         Err("This repository is open in Visualize mode — look-only.".to_string())
     } else {
         Ok(())
+    }
+}
+
+/// The M2.22a client-side offline guard: every write function calls this
+/// first, before `refuse_if_lan_view`/`refuse_if_visualize`, so a write
+/// attempted while the browser reports no network fails immediately with an
+/// honest message instead of going out to hang on `REQUEST_TIMEOUT_MS`
+/// (or `CLONE_TIMEOUT_MS`) and die on a socket `navigator.onLine` already
+/// knows is down.
+///
+/// This is prevention layered *on top of* `send_write_with_key`'s existing
+/// single in-flight retry (#216/#218) — it does not change that retry, nor
+/// `with_deadline`, nor either per-endpoint timeout constant. A write that
+/// starts while online and then loses connectivity mid-flight is untouched by
+/// this guard and still relies on the timeout/retry machinery already in
+/// place; this only stops a write from being *attempted* when the browser
+/// already knows, at the moment of the call, that it has no network.
+///
+/// The message deliberately does not claim the server or tunnel is
+/// unreachable — see [`offline_refusal_text`]'s doc comment in
+/// `git-vista-core` for why, and its host test for the exact wording pinned.
+fn refuse_if_offline() -> Result<(), String> {
+    if shell_state::is_online() {
+        Ok(())
+    } else {
+        Err(offline_refusal_text())
     }
 }
 
@@ -564,6 +591,7 @@ pub async fn fetch_commit_detail(id: &str) -> Result<CommitDetail, String> {
 /// a non-2xx response the body is the server's / git's own error text (bad
 /// URL, repo not found, …), returned as `Err`.
 pub async fn clone_request(url: &str) -> Result<RepositoryDescriptor, String> {
+    refuse_if_offline()?;
     refuse_if_lan_view()?;
     let body = CloneRequest {
         url: url.to_string(),
@@ -588,6 +616,7 @@ pub async fn clone_request(url: &str) -> Result<RepositoryDescriptor, String> {
 /// for every write rather than only this one: since M1.08 both attempts carry
 /// the same idempotency key, so a duplicate is replayed rather than re-run.
 pub async fn create_branch_request(name: &str, commit: &str) -> Result<(), String> {
+    refuse_if_offline()?;
     refuse_if_visualize()?;
     let body = CreateBranchRequest {
         name: name.to_string(),
@@ -615,6 +644,7 @@ pub async fn create_commit_request(
     allow_empty: bool,
     branch: Option<&str>,
 ) -> Result<(), String> {
+    refuse_if_offline()?;
     refuse_if_visualize()?;
     let body = CreateCommitRequest {
         message: message.to_string(),
@@ -637,6 +667,7 @@ pub async fn create_commit_request(
 /// then be committed. Bodyless, like the rebase request; a non-2xx body is git's
 /// own error text, returned as `Err` for the caller to show.
 pub async fn stage_request() -> Result<(), String> {
+    refuse_if_offline()?;
     refuse_if_visualize()?;
     let (resp, _key) = write_empty("/api/stage").await?;
     if resp.ok() {
@@ -654,6 +685,7 @@ pub async fn stage_request() -> Result<(), String> {
 /// back to HEAD, the working tree keeps every edit. Same bodyless shape and
 /// error posture as staging.
 pub async fn unstage_request() -> Result<(), String> {
+    refuse_if_offline()?;
     refuse_if_visualize()?;
     let (resp, _key) = write_empty("/api/unstage").await?;
     if resp.ok() {
@@ -729,6 +761,7 @@ pub async fn undo_request(
     action: &UndoAction,
     key: IdempotencyKey,
 ) -> Result<WriteReceipt, String> {
+    refuse_if_offline()?;
     refuse_if_visualize()?;
     let json = serde_json::to_string(action).map_err(|e| e.to_string())?;
     let (resp, _key) =
@@ -837,6 +870,7 @@ pub async fn fetch_rebase_status() -> Result<RebaseStatus, String> {
 /// "Already up to date" no-op (a raced click from a stale menu). A non-2xx body
 /// is git's own error text (conflicts, detached HEAD, …), returned as `Err`.
 pub async fn rebase_request(key: IdempotencyKey) -> Result<WriteReceipt, String> {
+    refuse_if_offline()?;
     refuse_if_visualize()?;
     let (resp, _key) = send_write_with_key("/api/rebase", None, key, REQUEST_TIMEOUT_MS).await?;
     Ok(receipt(resp).await)
@@ -848,7 +882,20 @@ pub async fn rebase_request(key: IdempotencyKey) -> Result<WriteReceipt, String>
 /// server's summary line ("… 2 branches restored, 1 deleted, HEAD → ‘main’");
 /// a non-2xx body is the server's reason (not a test repo, corrupt seed, or
 /// the exact git step that refused), returned as `Err` for the dialog to show.
+///
+/// **M2.22a decision (#241):** this function was write-shaped but not in that
+/// issue's enumerated list of 11 write functions — flagged there as an open
+/// question rather than silently included or excluded. Decided **in**: it is
+/// a real `POST` that mutates the repo (restores/deletes branches, moves
+/// HEAD) over the exact same socket as every other write here, so it is
+/// exposed to the exact same failure this guard exists to prevent — a write
+/// going out and hanging/dying on a dropped SSH tunnel while the browser
+/// already knew it had no network. "Test-repo-only" describes when the UI
+/// *offers* this action (`resettable` graphs only, gated by `gv --seed`), not
+/// whether the write itself is safe to attempt while offline; those are
+/// independent facts, and only the second one is this guard's business.
 pub async fn reset_test_repo_request() -> Result<String, String> {
+    refuse_if_offline()?;
     refuse_if_visualize()?;
     let (resp, _key) = write_empty("/api/reset-test-repo").await?;
     if resp.ok() {
@@ -872,6 +919,7 @@ pub async fn branch_op_request(
     branch: &str,
     key: IdempotencyKey,
 ) -> Result<WriteReceipt, String> {
+    refuse_if_offline()?;
     refuse_if_visualize()?;
     let body = BranchRequest {
         branch: branch.to_string(),
@@ -900,6 +948,7 @@ pub async fn fetch_catalog() -> Result<Vec<RepositoryDescriptor>, String> {
 /// A forged/unknown id comes back 404 from the fail-closed catalog; the picker
 /// shows the server's reason.
 pub async fn select_request(worktree: &str, mode: RepoMode) -> Result<(), String> {
+    refuse_if_offline()?;
     refuse_if_lan_view()?;
     let body = SelectRequest {
         worktree: worktree.to_string(),
@@ -916,6 +965,7 @@ pub async fn select_request(worktree: &str, mode: RepoMode) -> Result<(), String
 /// Re-scan the configured repo root (`POST /api/rescan`, ADR 0009). `Ok` carries
 /// the server's one-line summary for the picker to show.
 pub async fn rescan_request() -> Result<String, String> {
+    refuse_if_offline()?;
     refuse_if_lan_view()?;
     let (resp, _key) = write_empty("/api/rescan").await?;
     if resp.ok() {
@@ -929,6 +979,7 @@ pub async fn rescan_request() -> Result<String, String> {
 /// carries the server's confirmation line for the picker; refusals (not a
 /// clone, currently open, unknown id) come back as `Err` with the reason.
 pub async fn delete_clone_request(worktree: &str) -> Result<String, String> {
+    refuse_if_offline()?;
     refuse_if_lan_view()?;
     let body = DeleteCloneRequest {
         worktree: worktree.to_string(),
