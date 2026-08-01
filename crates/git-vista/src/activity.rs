@@ -26,6 +26,7 @@ use crate::api::fetch_activity;
 use crate::datetime::time_ago;
 use crate::features::activity::core::{event_commit, kind_glyph, kind_label};
 use crate::features::dialogs::core::Dialog;
+use crate::features::shell::signals as shell_state;
 use crate::features::status::signals as status_seam;
 use crate::icons::icon_set;
 use crate::menu;
@@ -283,25 +284,43 @@ fn activity_row(
     // `reload` bump refreshes this very feed in place.
     // In Visualize mode the button is absent entirely (ADR 0007 gating audit):
     // the api.rs chokepoint and the server 403 back this up in depth.
-    let undo_btn = (!read_only).then(|| event.undo.clone()).flatten().map(|u| {
-        let title = u.label.clone();
-        let on = move |ev: web_sys::MouseEvent| {
-            // The row underneath opens the context menu — this tap shouldn't.
-            ev.stop_propagation();
-            // Opens the shared confirm modal; it is that modal's own Confirm button that
-            // dispatches the undo. Deliberately NOT `operations.dispatch(…)` directly:
-            // this is a destructive action reachable from two places, and the graph
-            // menu's identical item confirms first.
-            dialogs.open(Dialog::Confirm);
-            shell.open_confirm(PendingOp::Undo(u.clone()));
-        };
-        view! {
-            <button class="act-undo" title=title on:click=on>
-                <span class="nf">{ic.undo}</span>
-                " Undo"
-            </button>
-        }
-    });
+    //
+    // M2.22b (#242): hidden while the device reports offline, too. A closure,
+    // not a value, because a row renders once per feed read — a plain
+    // `.then()` here would leave the button up until the next refresh, while
+    // this tracked read hides it the moment connectivity flips. If the button
+    // held focus at that moment, focus falls to <body> (the row is a plain
+    // div, not focusable) — a focus *loss*, not a trap; the keyboard user
+    // re-enters from the top. Accepted for a rare transition rather than
+    // adding focus-management code no host test can exercise; the iPad
+    // testbed pass drives it. `navigator.onLine` can read true over a dead
+    // tunnel — hiding is the UX nicety, `api.rs`'s `refuse_if_offline()`
+    // guard is the boundary.
+    let undo_hint = event.undo.clone();
+    let undo_btn = move || {
+        (!read_only && shell_state::online_signal().get())
+            .then(|| undo_hint.clone())
+            .flatten()
+            .map(|u| {
+                let title = u.label.clone();
+                let on = move |ev: web_sys::MouseEvent| {
+                    // The row underneath opens the context menu — this tap shouldn't.
+                    ev.stop_propagation();
+                    // Opens the shared confirm modal; it is that modal's own Confirm button
+                    // that dispatches the undo. Deliberately NOT `operations.dispatch(…)`
+                    // directly: this is a destructive action reachable from two places, and
+                    // the graph menu's identical item confirms first.
+                    dialogs.open(Dialog::Confirm);
+                    shell.open_confirm(PendingOp::Undo(u.clone()));
+                };
+                view! {
+                    <button class="act-undo" title=title on:click=on>
+                        <span class="nf">{ic.undo}</span>
+                        " Undo"
+                    </button>
+                }
+            })
+    };
 
     let row_body = view! {
         <span class="nf ctx-icon act-glyph">{glyph}</span>
