@@ -10,6 +10,8 @@
 #   - git-vista-git      : native-only git reading via gix. Kept apart from core so
 #                          gix never reaches the wasm/browser build.
 #   - git-vista-server   : the axum HTTP backend — serves the SPA + the /api/* routes.
+#   - git-vista-mcp      : the MCP stdio bridge — agents drive git-vista through
+#                          the same HTTP API (and later the same planner) the browser uses.
 #   - git-vista          : the Leptos frontend GUI, built to wasm by Trunk (the app
 #                          you interact with in the browser).
 [workspace]
@@ -20,6 +22,7 @@ members = [
     "crates/git-vista-git",
     "crates/git-vista-server",
     "crates/git-vista",
+    "crates/git-vista-mcp",
 ]
 
 [workspace.package]

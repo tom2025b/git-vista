@@ -1,0 +1,25 @@
+# git-vista-mcp — the MCP stdio bridge (M2.23a, #245).
+#
+# Deliberately tiny dependency surface: the MCP framing is hand-rolled
+# newline-delimited JSON-RPC 2.0 (see main.rs for why), and the HTTP client is
+# a minimal hand-rolled HTTP/1.1-over-TcpStream implementation (see http.rs) —
+# the server is loopback-only on one fixed port, both endpoints this crate
+# calls return small Content-Length JSON bodies, and pulling reqwest/hyper as
+# a *client* would add a dependency tree the reviewed-dependency discipline
+# (docs/NATIVE_DEPENDENCIES.md) would then have to carry forever.
+#
+# This crate links git-vista-protocol (the shared wire contract — headers,
+# DTOs) and NOT git-vista-server: the token-path resolution is a small
+# mirrored function, per #245's scope.
+[package]
+name = "git-vista-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+git-vista-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
