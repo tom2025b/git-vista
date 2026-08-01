@@ -184,7 +184,7 @@ pub fn build_node(
                 <circle
                     cx=cx
                     cy=cy
-                    r=NODE_RADIUS + 8
+                    r=NODE_RADIUS + 15
                     fill="transparent"
                     class="node-hit"
                     data-row-index=i

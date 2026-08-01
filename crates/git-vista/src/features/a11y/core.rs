@@ -27,7 +27,7 @@ pub const GRAPH_REGION_LABEL: &str = "Commit history graph";
 /// wasm-only and cannot be linked into a host test. `audit`'s
 /// `node_hit_padding_still_matches_the_render_code` tripwire is what keeps the mirror
 /// honest: change the literal in either render module and that test fails.
-pub const NODE_HIT_PADDING: f64 = 8.0;
+pub const NODE_HIT_PADDING: f64 = 15.0;
 
 /// A rendered interactive target's size in CSS pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]

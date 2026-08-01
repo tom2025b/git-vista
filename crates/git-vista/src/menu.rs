@@ -18,6 +18,7 @@ use crate::api::{
 };
 use crate::features::core_traits::RequestTarget;
 use crate::features::dialogs::core::Dialog;
+use crate::features::graph::core::disabled_menu_item_copy;
 use crate::features::operations::core::PendingIntent;
 use crate::features::shell::signals::Shell;
 use crate::geometry::menu_placement;
@@ -153,16 +154,24 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 .into_view(),
                 // No GitHub page for this target (no github remote, or unpushed):
                 // show the option but disabled, with a reason on hover.
-                None => view! {
-                    <span
-                        class="ctx-item disabled"
-                        title="No GitHub page (no github.com remote, or it isn't pushed)"
-                    >
-                        <span class="nf ctx-icon">{ic.github}</span>
-                        {label}
-                    </span>
+                None => {
+                    const REASON: &str =
+                        "No GitHub page (no github.com remote, or it isn't pushed)";
+                    let (aria_label, visible_reason) = disabled_menu_item_copy(label, REASON);
+                    view! {
+                        <span
+                            class="ctx-item disabled"
+                            title=REASON
+                            aria-disabled="true"
+                            aria-label=aria_label
+                        >
+                            <span class="nf ctx-icon">{ic.github}</span>
+                            {label}
+                            <span class="ctx-item-reason">{visible_reason}</span>
+                        </span>
+                    }
+                    .into_view()
                 }
-                .into_view(),
             };
             // "View details" (Phase 10): open the side panel for this commit. A
             // read, so it's shown for read-only clones too. Set `detail_id` before
@@ -265,10 +274,17 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         } else {
                             "Only available on the current HEAD commit"
                         };
+                        let (aria_label, visible_reason) = disabled_menu_item_copy(label, reason);
                         return view! {
-                            <span class="ctx-item disabled" title=reason>
+                            <span
+                                class="ctx-item disabled"
+                                title=reason
+                                aria-disabled="true"
+                                aria-label=aria_label
+                            >
                                 <span class="nf ctx-icon">{icon}</span>
                                 {label}
+                                <span class="ctx-item-reason">{visible_reason}</span>
                             </span>
                         }
                         .into_view();
@@ -339,10 +355,17 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 } else {
                     "Only available on the current HEAD commit"
                 };
+                let (aria_label, visible_reason) = disabled_menu_item_copy("Stage Changes", reason);
                 view! {
-                    <span class="ctx-item disabled" title=reason>
+                    <span
+                        class="ctx-item disabled"
+                        title=reason
+                        aria-disabled="true"
+                        aria-label=aria_label
+                    >
                         <span class="nf ctx-icon">{ic.added}</span>
                         "Stage Changes"
+                        <span class="ctx-item-reason">{visible_reason}</span>
                     </span>
                 }
                 .into_view()
@@ -608,10 +631,17 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     }
                 });
                 if let Some(reason) = reason {
+                    let (aria_label, visible_reason) = disabled_menu_item_copy(&label, &reason);
                     return view! {
-                        <span class="ctx-item disabled" title=reason>
+                        <span
+                            class="ctx-item disabled"
+                            title=reason
+                            aria-disabled="true"
+                            aria-label=aria_label
+                        >
                             <span class="nf ctx-icon">{ic.merge}</span>
                             {label}
+                            <span class="ctx-item-reason">{visible_reason}</span>
                         </span>
                     }
                     .into_view();
