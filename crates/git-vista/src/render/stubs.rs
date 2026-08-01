@@ -213,7 +213,7 @@ pub fn stubs(ctx: StoredValue<RenderCtx>, shell: Shell, moved: StoredValue<bool>
                 <circle
                     cx=sx
                     cy=sy
-                    r=NODE_RADIUS + 8
+                    r=NODE_RADIUS + 15
                     fill="transparent"
                     class="node-hit"
                     role="button"
