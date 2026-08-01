@@ -1,103 +1,91 @@
-# Work queue — for the OTHER Claude account (new week Sat 6pm)
+# Work queue — for Codex and thomas2010, while thomas2025 is out ~2 days
 
-This account (thomas2025) is out of budget until **Tue 11:59pm**. Everything below is
-ready to start. M1.13b is **merged and closed** — do not reopen it.
+This account is out until Tue night. **Written 2026-08-01, verified against the live
+repo right before writing** — this file was overwritten mid-session once already by a
+branch checkout race; if you find a copy contradicting this one, trust `git log -1 --
+NEXT-SESSION.md` for the real latest, and trust the live repo over any handoff doc.
 
-**Signed:** thomas2025 · 2026-07-31
+**Signed:** thomas2025 · 2026-08-01
 
 ---
 
-## Read these first, in this order
+## Read first
 
-1. `handoff-milestone-focus.md` — full state of today's session.
-2. `design-docs/2026-07-31-premerge-test-checklist.pdf` — section 3 was never driven.
+1. `handoff.md` (repo root) — tonight's session in full, what's verified vs. just claimed.
+2. `docs/adr/0035-inspector-bottom-sheet-wiring.md` — the sheet decision, just merged.
 3. This file.
 
-## Ground rules that bit us today
+## Ground rules, each earned tonight, not theoretical
 
-- **The 60s checkpointer is the SOLE git writer.** Kill it before any git write of your
-  own (`pgrep -af autocheckpoint`), restart it after, continuing the number series.
-- **Never delete a branch.** Testbed branches (`testbed/*`) are the only carve-out.
-- **A green test that proves nothing is worse than a red one.** This milestone found
-  *seven* green-but-wrong results. Before trusting a pass, ask what would make it pass
-  while the mechanism was broken. Write the paired negative.
-- **Verify every citation.** Six incidents of docs naming code that did not exist.
-
----
-
-## Start here — first wave, verified conflict-free in parallel
-
-These five do **not** touch the write funnel, which is why they can run at once. ADR 0016
-routes every `GitOperation` variant through `plan.rs`, `planner.rs`,
-`sandbox/mod.rs::network_need_for_operation` and `planner/contract_suite.rs` — so the
-vocabulary slices (#219, #227, #232, #239, #247) collide with each other and must be
-serialised. That is the single most important scheduling fact in M2.
-
-| Issue | Model / effort | What |
-|---|---|---|
-| **#243** | sonnet / low | Align `docs/IPAD_DESIGN.md` with ADR 0032. Docs only — **do this first** as a cheap check that tooling and budget are healthy before spending on #221. |
-| **#221** | sonnet / xhigh | Batch cat-file: collapse file-at-commit to one spawn. The only real thinking task in the wave. |
-| **#226** | sonnet / low-med | Commit draft persistence across tab suspension. |
-| **#241** | sonnet / medium | Connectivity signal + `refuse_if_offline`, mirroring the existing `refuse_if_lan_view` / `refuse_if_visualize` pattern. |
-| **#245** | sonnet / medium | MCP crate scaffold. Scaffolds a whole new crate — review it before anything builds on it. |
-
-Full set is **#219–#250** (32 sub-issues, 7 parents). Each body carries its own
-verification note recorded against the code *as merged*.
+- **The 60s checkpointer is the sole git writer.** `pgrep -af autocheckpoint` — restart
+  if dead. Continue the `auto-checkpoint N` series from `git log --all`, **not**
+  `git log --oneline -200` (undercounts past a merge).
+- **Never delete a branch.**
+- **A green test that proves nothing is worse than a red one.**
+- **A ruleset protects `main`** (`20171903`, all 7 checks required, active). Every PR
+  now needs to be up-to-date against `main` before merge, so expect one extra CI wait
+  on merge — not a hang.
 
 ---
 
-## Unfinished from today — higher value than new features
+## Top priority — a real bug found in live testing tonight, NOT root-caused
 
-### 1. #216 — clone can still double-spawn (real correctness gap, shipped to main)
+**#260 — clone appears to succeed but history/graph never updates.** Reported live by
+Tom. `sandbox::clone_live`'s test proves the sandboxed git spawn works and produces a
+real `.git` — it does NOT prove the HTTP response reaches the frontend or that the
+frontend reacts (reload/select/epoch-bump). That's the leading suspect. A real clone
+through the actual HTTP handler, end to end, has not been driven since tonight's
+#216/#221 changes to `handlers/clone.rs`. **This may mean clone is currently broken for
+real use** despite every existing test passing — start here before anything else.
 
-`/api/clone` is **not operation-tracked**. It never reaches `operations::admit`, so the
-idempotency key it carries buys it nothing, and two overlapping attempts really can run
-two `git clone`s. `admit` already solves this for tracked writes — its own doc says "two
-concurrent requests carrying the same key cannot both be admitted: the loser sees the
-winner's record and awaits it."
+## M1 status: 39/40
 
-**Fix:** make clone operation-tracked, or give it an equivalent in-progress guard.
-Mitigated but not solved by `CLONE_TIMEOUT_MS = 570s`, which only makes the retry
-unlikely to fire while the first attempt is still running.
+Only #65 remains open, and it's down to **verification, not code** now. All three code
+gaps are fixed and merged tonight:
+- `#258` — ARIA on 4 disabled menu items, 44px commit-dot hit target.
+- `#259` / ADR 0035 — the inspector bottom sheet wired to `ShellMode`, drag follows the
+  finger and resolves via `SheetState` on release. Built by Codex (recovered mid-session
+  after it lost its own resume state), independently verified, merged.
 
-### 2. Section 3 of the test checklist — ten write paths, zero automated coverage
+**#65 does not close until a human drives it on the iPad.** Nothing about the sheet's
+drag feel or on-screen correctness has been verified — that step is Tom's alone. If he's
+available, that's the highest-value single action left in M1.
 
-`send_write_with_key` gained a timeout parameter and four call sites changed. **No test
-anywhere makes a timeout actually fire.** Every mutation in the app goes through it:
-branch, commit, stage, unstage, merge, checkout, delete, rebase, push, undo. This is on
-`main` now.
+## M2 — 29 of 32 open (3 closed tonight: #221, #241, #243)
 
-### 3. Paired positive missing for the clone Drop guard
+### The one scheduling fact that matters most
 
-Cleanup moved into a `DestGuard` because a cancelled handler skips every match arm
-(measured: `started=true, timeout_arm=false, dropped=true` on client disconnect, with the
-paired positive showing `timeout_arm=true` when the client waits). What is **not** proven
-is that the timeout path still removes the directory. Needs a test with an injectable
-budget rather than a 600-second wait.
+ADR 0016's write funnel — `git-vista-protocol/src/plan.rs`, `planner.rs`,
+`sandbox/mod.rs::network_need_for_operation`, `planner/contract_suite.rs` — is touched
+by nearly every "typed operation vocabulary" issue below. **Two agents editing any of
+these four files at once will collide.** Serialize those; parallelize everything else.
 
-### 4. `menu.rs` stage/unstage fix has no coverage
+### Genuinely parallel right now
 
-#217's fix stopped stage/unstage calling `force_bump()` — they were discarding the whole
-loaded graph to refresh a status chip. `menu.rs` is wasm32-only and the gate runs native
-tests only, so it was verified by reading. **Drive it on the testbed.**
+| Issue | What |
+|---|---|
+| #226 | Commit draft persistence across tab suspension |
+| #245 | MCP crate scaffold + loopback auth handshake — **new crate, review before anything builds on it** |
+| #242 | Wire offline state into mutation UI — depends on #241, now closed, so unblocked |
 
----
+### Funnel-touching — serialize, one owner at a time
 
-## The lesson worth carrying forward
+#219/#220 (discard), #222–225 (amend), #227–233 (remote ops), #235–240 (tags),
+#247–249 (MCP write path). Each parent's `a` slice (vocabulary) lands before its
+siblings — read each issue's own `Depends on` line.
 
-**Cleanup written as a branch of a completion path only runs if that path is reached, and
-cancellation is the absence of all branches.** Any handler creating external state — a
-directory, a child process, a lock, a temp file — must attach cleanup to a value's
-lifetime, not to control flow. Measured today against axum, not assumed. Worth grepping
-for other instances.
+### Close-out issues — do last
 
----
+#234, #244, #250 verify their parent's acceptance criteria against what actually
+shipped. Starting these before the real work is done produces nothing.
 
-## Server
+## Known debt, not blocking
 
-A systemd user service (`git-vista.service`, port 8080) should be running from `main`.
-`systemctl --user status git-vista`. Linger is enabled, so it survives logout and
-restarts on failure.
-
-**The SSH tunnel is client-side and will still drop** — that is iOS suspending Blink, not
-a server fault. Restarting the tunnel and refreshing is the correct fix, not a bug.
+- `crates/git-vista/src/api.rs` and `menu.rs`-adjacent code: zero executed test
+  coverage, structurally (`#[cfg(target_arch = "wasm32")]`-gated, no wasm harness in
+  this repo). Bit real work twice tonight.
+- Print Graph builds the whole loaded history into one unvirtualized SVG — plausible
+  cause of an iPad memory lockup tonight, never confirmed.
+- `linux-ops-suite#96` — generalize `rex-check`/`gv-report` into an opsmcp
+  `repo_report` tool. Prompt already committed there. Different repo, zero collision
+  risk with anything above.
