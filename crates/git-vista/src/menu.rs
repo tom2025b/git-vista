@@ -293,7 +293,11 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         // Open the dialog *before* closing the menu: `shell.close_menu()`
                         // synchronously disposes this handler's own reactive owner, so
                         // any signal write after it is unreliable. Set the dialog first.
-                        dialogs.clear_commit_msg();
+                        //
+                        // No `clear_commit_msg()` here any more (#226): opening is how a
+                        // suspension-recovered draft comes back, so the opener must not
+                        // wipe it. The draft clears on successful submit instead
+                        // (`dialogs/commit.rs`), which is what actually consumes it.
                         dialogs.open(Dialog::Commit);
                         shell.open_commit_dialog(CommitDialog {
                             allow_empty,
