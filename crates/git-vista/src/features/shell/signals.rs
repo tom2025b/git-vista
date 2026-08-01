@@ -39,7 +39,9 @@ use wasm_bindgen::JsCast;
 use crate::gestures;
 
 use crate::features::activity::signals::Activity;
-use crate::features::shell::core::{ModeSettler, Overlay, OverlayStack, ShellMode};
+use crate::features::shell::core::{
+    ConnectivityCore, ModeSettler, Overlay, OverlayStack, ShellMode,
+};
 use crate::state::{CommitDialog, MenuData, PendingOp, ViewerDoc};
 
 /// Feeds a `ShellMode` signal from window width, debounced 150ms so a Stage
@@ -96,6 +98,78 @@ pub fn install_mode_signal() -> RwSignal<ShellMode> {
     }
 
     mode
+}
+
+thread_local! {
+    /// Backs [`is_online`] — a `thread_local`, not a signal, for the same reason
+    /// `session::signals::SESSION` is one: `api.rs`'s write guards need a plain
+    /// synchronous read that works even from a call site with no reactive
+    /// subscription, and wasm is single-threaded so a `thread_local` is a
+    /// process-wide holder here.
+    static CONNECTIVITY: RefCell<ConnectivityCore> = RefCell::new(ConnectivityCore::new(true));
+}
+
+/// Whether the browser last reported the network adapter as up (M2.22a, #241).
+///
+/// The plain, synchronous read `api.rs`'s `refuse_if_offline()` guard checks —
+/// mirrors `session::signals::is_lan()`'s shape exactly. Reads whatever
+/// [`install_connectivity_signal`] last wrote; before that function has run
+/// (there is no window to seed from, e.g. a non-browser host build) this
+/// defaults to `true` — fail *open* on the read itself, since refusing every
+/// write because connectivity was never wired up would be a worse failure
+/// mode than occasionally letting a write reach the existing network-timeout
+/// handling in `api.rs`.
+pub fn is_online() -> bool {
+    CONNECTIVITY.with(|c| c.borrow().is_online())
+}
+
+/// Seed the connectivity read from `navigator.onLine` and keep it current via
+/// the window's `online`/`offline` events — the exact listener/cleanup shape
+/// of [`install_mode_signal`] above, applied to a boolean instead of a resize.
+///
+/// Returns a reactive `RwSignal<bool>` for the UI to read (M2.22b); the plain
+/// [`is_online`] accessor is what the write guard reads, so a write can be
+/// refused even from a context that must not create a reactive subscription.
+/// Both are kept in step by every event this function's listeners handle.
+pub fn install_connectivity_signal() -> RwSignal<bool> {
+    let initial = web_sys::window()
+        .map(|w| w.navigator().on_line())
+        // No `window` at all only happens off-browser; `true` here matches
+        // `is_online`'s own fail-open default for the same reason.
+        .unwrap_or(true);
+    CONNECTIVITY.with(|c| c.replace(ConnectivityCore::new(initial)));
+    let online = create_rw_signal(initial);
+
+    if let Some(win) = web_sys::window() {
+        let online_for_on = online;
+        let cb_online = Closure::<dyn FnMut()>::new(move || {
+            CONNECTIVITY.with(|c| c.borrow_mut().set_online(true));
+            // `try_set`, not `set`, for the reason `install_mode_signal` uses it:
+            // this listener can outlive the scope that created the signal.
+            let _ = online_for_on.try_set(true);
+        });
+        let _ = win.add_event_listener_with_callback("online", cb_online.as_ref().unchecked_ref());
+
+        let online_for_off = online;
+        let cb_offline = Closure::<dyn FnMut()>::new(move || {
+            CONNECTIVITY.with(|c| c.borrow_mut().set_online(false));
+            let _ = online_for_off.try_set(false);
+        });
+        let _ =
+            win.add_event_listener_with_callback("offline", cb_offline.as_ref().unchecked_ref());
+
+        let win2 = win.clone();
+        on_cleanup(move || {
+            let _ = win2
+                .remove_event_listener_with_callback("online", cb_online.as_ref().unchecked_ref());
+            let _ = win2.remove_event_listener_with_callback(
+                "offline",
+                cb_offline.as_ref().unchecked_ref(),
+            );
+        });
+    }
+
+    online
 }
 
 /// Every overlay the app can put on screen, and the order they were raised in.
