@@ -28,6 +28,8 @@
 //! | `POST /api/checkout` | `git checkout <branch>` | [`GitOperation::CheckoutBranch`] |
 //! | `POST /api/merge` | `git merge --no-edit <branch>` | [`GitOperation::MergeBranch`] |
 //! | `POST /api/push` | `git push origin <branch>` | [`GitOperation::PushBranch`] |
+//! | *(planned, #229)* | `git fetch <remote>` | [`GitOperation::FetchRemote`] |
+//! | *(planned, #230)* | `git pull --no-rebase\|--rebase` | [`GitOperation::PullBranch`] |
 //! | `POST /api/delete-branch` | `git branch -d <branch>` | [`GitOperation::DeleteBranch`] |
 //! | `POST /api/force-delete-branch` | `git branch -D <branch>` | [`GitOperation::ForceDeleteBranch`] |
 //! | `POST /api/rebase` | `git rebase <base>` (abort on failure) | [`GitOperation::RebaseOntoBase`] |
@@ -39,14 +41,20 @@
 //! | `POST /api/delete-untracked-paths` | `git clean -f -- <paths>` | [`GitOperation::DeleteUntrackedPaths`] |
 //! | *(planned, #223)* | `git commit --amend [--allow-empty] -m` | [`GitOperation::AmendCommit`] |
 //!
-//! [`GitOperation::AmendCommit`] is a deliberate exception to "one variant
-//! per real mutation found by auditing the write handlers": M2.19a (#222)
-//! lands the typed contract — the variant, its plan-building wiring in
-//! `git-vista-server`'s `planner::shape`, and the golden fixture — ahead of
-//! any handler that could build one, so that the history-rewriting
-//! execution (M2.19b, #223) is reviewed as its own slice. See the variant's
-//! own doc comment for the full reasoning; every other row in this table
-//! already had a live handler when its variant landed.
+//! The last three rows are deliberate exceptions to "one variant per real
+//! mutation found by auditing the write handlers": M2.19a (#222) and M2.20a
+//! (#227) land the typed contract — the variant, its plan-building wiring in
+//! `git-vista-server`'s `planner::shape`, its `sandbox` network
+//! classification, and the golden fixture — ahead of any handler that could
+//! build one, so the dangerous part of each (rewriting history; opening a
+//! socket with credentials on it) is reviewed as its own slice. See each
+//! variant's own doc comment for the full reasoning; every other row in this
+//! table already had a live handler when its variant landed.
+//!
+//! [`GitOperation::PushBranch`] is the one row that already had a handler and
+//! was **widened** anyway (M2.20a, #227: `set_upstream` and `force`). Its
+//! pre-existing combination still executes exactly as before; the new ones
+//! are refused with `501` until M2.20g (#231).
 //!
 //! `POST /api/clone`, `/api/delete-clone`, `/api/select` and `/api/rescan` are
 //! deliberately **not** operations: they manage the catalog / app session (which
@@ -169,6 +177,96 @@ pub struct UnixSeconds(pub i64);
 // The closed operation vocabulary
 // ---------------------------------------------------------------------------
 
+/// How a [`GitOperation::PullBranch`] integrates the fetched commits into the
+/// checked-out branch (M2.20a, #227).
+///
+/// # There is deliberately no third variant, and no `Default`
+///
+/// `git pull` picks between merge and rebase from `pull.rebase` /
+/// `branch.<name>.rebase` config when the caller says nothing — a *silent*
+/// choice whose answer lives in a file this app never shows the user. Two
+/// people running "Pull" on the same branch can therefore get two different
+/// histories, and neither reviewed which. This enum has no `Auto`/`Default`
+/// variant and derives no [`Default`] impl, and the field that holds it
+/// carries no `#[serde(default)]`, so:
+///
+///   * a request body that omits `strategy` is a **deserialize error** (a 400
+///     at the wire boundary), never a value some config file chose, and
+///   * nothing in Rust can construct a `PullBranch` without naming one —
+///     it is a compile error, not a lint.
+///
+/// The plan a user approves therefore always *says* which integration it is,
+/// which is the entire point of putting it in the reviewed vocabulary rather
+/// than resolving it inside the executor (#230 owns the execution).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeStrategy {
+    /// `git pull --no-rebase` — a merge commit when the histories diverged.
+    /// The checked-out branch's old tip stays reachable as a parent.
+    Merge,
+    /// `git pull --rebase` — replay the local-only commits on top of the
+    /// fetched tip. The pre-pull commits are rewritten, so the old tip
+    /// survives only in the reflog.
+    Rebase,
+}
+
+/// Whether a [`GitOperation::PushBranch`] may overwrite what the remote
+/// already has, and under what guard (M2.20a, #227).
+///
+/// # There is no bare-force variant, on purpose
+///
+/// A plain `git push --force` overwrites the remote branch with no regard for
+/// what arrived there since the pusher last looked — it is how a teammate's
+/// commits get silently destroyed. This enum makes that **structurally
+/// unrepresentable**: there is no variant that means "force, unconditionally",
+/// so no handler, no future refactor and no deserializable request body can
+/// ask for one. The only force available is
+/// [`ForcePublish::WithLease`], which carries the remote tip the user
+/// reviewed and turns the push into a compare-and-swap.
+///
+/// This is the same posture as the rest of the file — see the module docs'
+/// "no catch-all variant" note. A capability that must never exist is best
+/// expressed as a type that cannot name it, rather than as a `bool` plus a
+/// convention that everyone remembers to check.
+///
+/// Wire form: internally tagged on `"mode"` (`{"mode": "none"}` /
+/// `{"mode": "with_lease", "expected_remote_tip": "<oid>"}`), the same
+/// internally-tagged shape [`Precondition`] and [`RecoveryStrategy`] use.
+///
+/// `deny_unknown_fields` is on, but note serde only enforces it for the
+/// **struct** variant of an internally-tagged enum: a stray key beside
+/// `{"mode": "with_lease", …}` is a hard error (so a misspelled
+/// `expected_remote_tip` cannot become a lease that pins nothing), while one
+/// beside `{"mode": "none"}` is ignored. That asymmetry lands on the safe
+/// side — the ignored case still yields [`ForcePublish::None`] — and
+/// `plan_golden.rs`'s `no_wire_body_can_request_an_unguarded_force_push`
+/// pins both halves so neither can drift.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ForcePublish {
+    /// A fast-forward-only push: `git push <remote> <branch>`, exactly what
+    /// git-vista has always done. Git itself refuses a non-fast-forward.
+    None,
+    /// `git push --force-with-lease=<branch>:<expected_remote_tip>` — force,
+    /// but only while the remote branch still points where the reviewer saw
+    /// it. If anything landed there in between, git refuses and nothing is
+    /// lost.
+    ///
+    /// The oid is carried in the operation (and therefore bound by the plan's
+    /// [`OperationHash`]) rather than re-read at execution time on purpose: a
+    /// lease re-derived from a fresh `git ls-remote` would leave the race
+    /// wide open — it would assert "the remote is where it was a millisecond
+    /// ago", which is always true and protects nobody. The value that makes
+    /// the lease mean anything is the one the *user reviewed*.
+    WithLease {
+        /// The remote-tracking tip the plan was reviewed against — the
+        /// `<expect>` half of `--force-with-lease=<ref>:<expect>`, and the
+        /// oid `shape` turns into a [`Precondition::RefAt`] on
+        /// `refs/remotes/<remote>/<branch>`.
+        expected_remote_tip: CommitOid,
+    },
+}
+
 /// Every Git mutation git-vista can perform against the served repository —
 /// the **closed** vocabulary (M1.06a, #142). One variant per real mutation the
 /// write-handler audit found; there is deliberately no catch-all/"generic"
@@ -208,11 +306,45 @@ pub enum GitOperation {
     /// `git merge --no-edit <branch>` into the checked-out branch
     /// (`/api/merge`).
     MergeBranch { branch: BranchName },
-    /// `git push <remote> <branch>` (`/api/push`; the handler pushes to
-    /// `origin`).
+    /// `git push [--set-upstream] [--force-with-lease=…] <remote> <branch>`
+    /// (`/api/push`; the handler pushes to `origin`).
+    ///
+    /// # M2.20a (#227) widened this variant rather than adding a sibling
+    ///
+    /// `set_upstream` and `force` are new here. A second "publish" variant
+    /// would have left two ways to spell a push in a vocabulary whose whole
+    /// premise is one variant per mutation — and worse, the *plain* one would
+    /// have stayed the path of least resistance, so the safety this adds
+    /// would have been opt-in. Widening makes every caller state both
+    /// answers.
+    ///
+    /// Only the pre-existing combination — `set_upstream: false`,
+    /// [`ForcePublish::None`] — executes today; that is exactly the argv
+    /// `/api/push` has always run. `planner::execute` refuses the other
+    /// combinations with `501` until M2.20g (#231) wires them, so this slice
+    /// changes the *vocabulary* without changing what any live endpoint does.
+    ///
+    /// # Recovery is [`RecoveryStrategy::Irrecoverable`] for both force modes
+    ///
+    /// Not "we did not build an undo button": the effect **left the
+    /// machine**. Once the remote has the objects, no local command can
+    /// recall them from whoever has already fetched. With
+    /// [`ForcePublish::WithLease`] it is stronger still — commits that were
+    /// on the remote branch are no longer referenced there, and this app has
+    /// no copy of a remote's reflog to offer back.
     PushBranch {
         branch: BranchName,
         remote: RemoteName,
+        /// `--set-upstream`: also record `<remote>/<branch>` as this
+        /// branch's upstream. A config write, not a history change, and the
+        /// only field here that does not affect [`RiskLevel`].
+        set_upstream: bool,
+        /// Whether this push may overwrite the remote branch, and under what
+        /// guard. [`ForcePublish::WithLease`] raises the plan's risk from
+        /// [`RiskLevel::Remote`] to [`RiskLevel::Destructive`] and adds the
+        /// lease's compare-and-swap [`Precondition`] — see
+        /// [`ForcePublish`] for why no third, unguarded option exists.
+        force: ForcePublish,
     },
     /// `git branch -d <branch>` — the safe delete; git refuses an unmerged
     /// branch (`/api/delete-branch`).
@@ -386,6 +518,94 @@ pub enum GitOperation {
         expected_tip: CommitOid,
         allow_empty: bool,
     },
+    /// `git fetch <remote>` — download the remote's objects and update its
+    /// remote-tracking refs (`refs/remotes/<remote>/*`), touching no local
+    /// branch, no index and no working tree (planned `POST /api/fetch`,
+    /// M2.20, #73/#229).
+    ///
+    /// # Contract only (M2.20a, #227)
+    ///
+    /// No handler builds this yet and `planner::execute` refuses it — the
+    /// same staging #222 used for `AmendCommit`, so the vocabulary and the
+    /// network classification land and get reviewed before any code opens a
+    /// socket.
+    ///
+    /// # `RiskLevel::Safe`, and why that is not complacency
+    ///
+    /// Fetch is the only network operation in this vocabulary that risks
+    /// nothing a user owns. It **adds** objects and rewrites refs under
+    /// `refs/remotes/`, which are a cache of what the remote said — nothing
+    /// under `refs/heads/`, nothing staged, nothing in the working tree. If
+    /// the remote force-pushed, the old remote-tracking value is indeed
+    /// replaced, but that value was never local work; it was this app's
+    /// record of somebody else's branch, and it is re-derivable by fetching
+    /// again.
+    ///
+    /// # Recovery is [`RecoveryStrategy::NotNeeded`], not `Irrecoverable`
+    ///
+    /// Reaching for `Irrecoverable` here because "it is a network
+    /// operation" would be picking the closest-looking tag by reflex, and it
+    /// would be wrong in the direction that matters: it would tell a UI to
+    /// warn a user about an operation that cannot lose their work, training
+    /// them to click through the warnings that *do* matter (push, pull).
+    /// `Irrecoverable` is reserved for effects that left the machine or
+    /// state that was never journaled — fetch is neither.
+    ///
+    /// # Why it still declares `NetworkNeed::Remote`
+    ///
+    /// Low *risk* and high *reach* are independent axes. Fetch opens a
+    /// socket, so it needs the network tier — and, once #229 executes it,
+    /// the credential handling that tier brings. See
+    /// `sandbox::network_need_for_operation`.
+    FetchRemote { remote: RemoteName },
+    /// `git pull --no-rebase|--rebase <remote> <branch>` — fetch, then
+    /// integrate the fetched tip into the **checked-out** branch (planned
+    /// `POST /api/pull`, M2.20, #73/#230).
+    ///
+    /// # Contract only (M2.20a, #227)
+    ///
+    /// As with [`GitOperation::FetchRemote`] above: typed and classified
+    /// here, executed by #230.
+    ///
+    /// # `strategy` is mandatory, and that is the point
+    ///
+    /// See [`MergeStrategy`]: there is no `Auto` variant and no
+    /// `#[serde(default)]` on this field, so a pull whose integration nobody
+    /// chose cannot be constructed in Rust *or* deserialized off the wire.
+    /// Leaving it optional would have let `pull.rebase` config decide — a
+    /// value the reviewer never saw, in a file this app never shows.
+    ///
+    /// # `branch` is the remote's branch, not the local one
+    ///
+    /// It is the refspec argument (`git pull origin main` ⇒ `main` on
+    /// `origin`). The *destination* is always whatever branch is checked
+    /// out, exactly as for [`GitOperation::MergeBranch`] and
+    /// [`GitOperation::RebaseOntoBase`] — this app never integrates into a
+    /// branch that is not checked out.
+    ///
+    /// # `RiskLevel::Reversible` and `ResetRef` recovery
+    ///
+    /// A pull is a fetch (risk-free, above) plus an integration that moves
+    /// one local ref. Moving that ref back to the tip the plan observed
+    /// restores the pre-pull state completely, whichever strategy ran: after
+    /// `Merge` the old tip is a parent of the merge commit, and after
+    /// `Rebase` it is in the reflog. That is the same `ResetRef` story
+    /// [`GitOperation::MergeBranch`] and [`GitOperation::RebaseOntoBase`]
+    /// already have, and `shape` builds it with the same `head_moves`
+    /// helper rather than a parallel copy.
+    ///
+    /// Deliberately *not* [`RecoveryStrategy::Irrecoverable`], which
+    /// [`GitOperation::PushBranch`] has for a reason that does not apply
+    /// here: a pull's effect never left this machine. The fetched objects
+    /// are additive and the moved ref is local. The two operations sit on
+    /// opposite sides of that line even though both talk to the same remote,
+    /// which is precisely why collapsing them onto one tag would defeat the
+    /// typed field.
+    PullBranch {
+        remote: RemoteName,
+        branch: BranchName,
+        strategy: MergeStrategy,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -399,16 +619,31 @@ pub enum GitOperation {
 pub enum RiskLevel {
     /// Nothing can be lost: the operation only adds or re-arranges state that
     /// remains reachable (stage, unstage, checkout — git refuses a clobbering
-    /// checkout itself).
+    /// checkout itself; fetch, which only adds objects and rewrites the
+    /// remote-tracking cache under `refs/remotes/`).
     Safe,
     /// State moves but a journaled local undo exists (commit, merge, rebase,
     /// branch create/restore, safe delete of a merged branch).
     Reversible,
     /// Commits or working-tree state can become unreachable (force-delete,
-    /// hard reset, revert conflicts aside, test-repo reset).
+    /// hard reset, revert conflicts aside, test-repo reset), **or** commits
+    /// on a remote branch can (a [`ForcePublish::WithLease`] push, M2.20a).
+    ///
+    /// That last case is why a lease-force push is `Destructive` and not
+    /// [`RiskLevel::Remote`]. The two tags describe different axes — how far
+    /// the effect reaches vs. whether anything is destroyed — and this is
+    /// one scalar, so the ranking has to pick. It picks the one that scales
+    /// the UI's confirmation ceremony *up*: an ordinary push adds to the
+    /// remote and can be followed by another commit, while a lease-force can
+    /// leave a colleague's commits referenced by nothing.
     Destructive,
-    /// The effect leaves this machine (push) — no local undo can recall it,
-    /// and git-vista never force-pushes.
+    /// The effect leaves this machine and adds to it (a fast-forward push,
+    /// [`ForcePublish::None`]) — no local undo can recall what the remote
+    /// and its other clients already have.
+    ///
+    /// A force push is *not* this tag: `git-vista` cannot express an
+    /// unguarded force at all (see [`ForcePublish`]), and the one guarded
+    /// form it can express is ranked [`RiskLevel::Destructive`] above.
     Remote,
 }
 

@@ -181,6 +181,8 @@ fn covered_by(op: &GitOperation) -> &'static str {
             "delete_untracked_paths_executes_through_the_pipeline"
         }
         GitOperation::AmendCommit { .. } => "amend_commit_executes_through_the_pipeline",
+        GitOperation::FetchRemote { .. } => "fetch_remote_executes_through_the_pipeline",
+        GitOperation::PullBranch { .. } => "pull_branch_executes_through_the_pipeline",
     }
 }
 
@@ -215,6 +217,8 @@ fn every_operation_kind_names_a_distinct_pipeline_test() {
         GitOperation::PushBranch {
             branch: branch("b"),
             remote: RemoteName::new("origin").unwrap(),
+            set_upstream: false,
+            force: ForcePublish::None,
         },
         GitOperation::DeleteBranch {
             branch: branch("b"),
@@ -255,6 +259,14 @@ fn every_operation_kind_names_a_distinct_pipeline_test() {
             message: message("m"),
             expected_tip: oid(&zeros),
             allow_empty: false,
+        },
+        GitOperation::FetchRemote {
+            remote: RemoteName::new("origin").unwrap(),
+        },
+        GitOperation::PullBranch {
+            remote: RemoteName::new("origin").unwrap(),
+            branch: branch("b"),
+            strategy: git_vista_protocol::MergeStrategy::Merge,
         },
     ];
     let names: Vec<&str> = samples.iter().map(covered_by).collect();
@@ -580,6 +592,8 @@ async fn push_branch_executes_through_the_pipeline() {
         GitOperation::PushBranch {
             branch: branch("main"),
             remote: RemoteName::new("origin").unwrap(),
+            set_upstream: false,
+            force: ForcePublish::None,
         },
     )
     .await;
@@ -1940,6 +1954,8 @@ async fn a_broken_precondition_is_refused_end_to_end() {
         GitOperation::PushBranch {
             branch: branch("main"),
             remote: RemoteName::new("origin").unwrap(),
+            set_upstream: false,
+            force: ForcePublish::None,
         },
         tokens(),
     )
@@ -1994,4 +2010,256 @@ async fn amend_commit_executes_through_the_pipeline() {
         "seed",
         "the stub must never create a new commit"
     );
+}
+
+// --- #227 (M2.20a): typed remote vocabulary, execution not yet wired -------
+
+/// Everything a fetch, pull or push could change about a repository, in one
+/// comparable string — the inertness assertion for the contract-only stubs
+/// below.
+///
+/// Checking HEAD alone (which is all the `AmendCommit` stub above needed)
+/// would be far too weak here: a fetch that ran would move refs under
+/// `refs/remotes/`, write `FETCH_HEAD`, and add objects while leaving HEAD
+/// exactly where it was, so a HEAD-only assertion would pass with the network
+/// operation having fully executed. `--set-upstream` writes only config, and
+/// would be invisible to every ref check. So this covers all five surfaces:
+/// every ref, `FETCH_HEAD`, the object store, local config, and the
+/// index/worktree.
+///
+/// [`repo_fingerprint_detects_every_change_it_claims_to_watch`] below proves
+/// this is capable of failing on each of them, rather than being a constant
+/// that makes its callers vacuously green.
+fn repo_fingerprint(repo: &Path) -> String {
+    let refs = out(repo, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let head = out(repo, &["rev-parse", "HEAD"]);
+    let status = out(repo, &["status", "--porcelain=v2", "--branch"]);
+    let objects = out(repo, &["count-objects", "-v"]);
+    let config = {
+        let mut lines: Vec<String> = out(repo, &["config", "--local", "--list"])
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines.sort();
+        lines.join("\n")
+    };
+    let fetch_head = repo.join(".git/FETCH_HEAD").exists();
+    format!(
+        "refs:\n{refs}\nhead:{head}\nstatus:\n{status}\nobjects:\n{objects}\n\
+         config:\n{config}\nfetch_head:{fetch_head}"
+    )
+}
+
+/// The anti-vacuity proof for [`repo_fingerprint`]: each mutation a fetch,
+/// pull or push would make must change the fingerprint.
+///
+/// Without this, `fetch_remote_executes_through_the_pipeline` and
+/// `pull_branch_executes_through_the_pipeline` below would be exactly the
+/// kind of test this repository has been bitten by six times — asserting
+/// "nothing changed" against a helper that could not have noticed if
+/// everything had. Each case is driven with plain `git`, so the helper is
+/// tested against real repository mutations rather than against itself.
+/// One simulated mutation: what a real fetch/pull/push would do, and how to
+/// reproduce it with plain `git`.
+type FingerprintCase = (&'static str, &'static dyn Fn(&Path));
+
+#[test]
+fn repo_fingerprint_detects_every_change_it_claims_to_watch() {
+    let cases: &[FingerprintCase] = &[
+        ("a fetch moving a remote-tracking ref", &|repo: &Path| {
+            run(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+        }),
+        ("a fetch writing FETCH_HEAD", &|repo: &Path| {
+            std::fs::write(repo.join(".git/FETCH_HEAD"), "").unwrap()
+        }),
+        (
+            // Deliberately isolated to the object store: the source file is
+            // written inside `.git`, which `git status` ignores, so this case
+            // fails unless `count-objects` is genuinely part of the
+            // fingerprint. A blob added under the worktree would have changed
+            // the status line too and let an objects-blind fingerprint pass.
+            "a fetch adding objects and nothing else",
+            &|repo: &Path| {
+                let src = repo.join(".git/fetched-blob-source");
+                std::fs::write(&src, "fetched\n").unwrap();
+                run(repo, &["hash-object", "-w", ".git/fetched-blob-source"]);
+            },
+        ),
+        ("a pull moving the checked-out branch", &|repo: &Path| {
+            run(repo, &["commit", "-q", "--allow-empty", "-m", "pulled"])
+        }),
+        ("--set-upstream writing branch config", &|repo: &Path| {
+            run(repo, &["config", "branch.main.remote", "origin"])
+        }),
+    ];
+    for (what, mutate) in cases {
+        let (_dir, repo) = seeded_repo();
+        let before = repo_fingerprint(&repo);
+        mutate(&repo);
+        assert_ne!(
+            before,
+            repo_fingerprint(&repo),
+            "repo_fingerprint must notice {what}; it did not, so every \
+             inertness assertion built on it is vacuous"
+        );
+    }
+}
+
+/// [`GitOperation::FetchRemote`] proves its *shape* end-to-end through the
+/// real pipeline (build → validate → enforce_fresh), but M2.20a ships no
+/// execution — #229's to add.
+///
+/// The status code is the weaker half of this test. The half that matters is
+/// [`repo_fingerprint`]: a stub that answered `501` *after* running `git
+/// fetch` would pass a status-only assertion while having opened a socket,
+/// contacted a real remote with whatever credentials the environment offered,
+/// and written objects and refs. The remote here is configured and reachable
+/// (a bare repo on disk with a commit the fetch would pull), so "nothing
+/// changed" is a claim about an operation that genuinely *could* have
+/// changed something.
+#[tokio::test]
+async fn fetch_remote_executes_through_the_pipeline() {
+    let (dir, repo) = seeded_repo();
+
+    // A real, reachable remote holding a commit this repo does not have — so
+    // a fetch that actually ran would demonstrably move refs and add objects.
+    let remote = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote).unwrap();
+    run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    run(
+        &repo,
+        &["remote", "add", "origin", &remote.display().to_string()],
+    );
+    run(&repo, &["push", "-q", "origin", "main"]);
+    run(&repo, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
+    run(&repo, &["push", "-q", "origin", "main"]);
+    run(&repo, &["update-ref", "-d", "refs/remotes/origin/main"]);
+
+    let before = repo_fingerprint(&repo);
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::FetchRemote {
+            remote: RemoteName::new("origin").unwrap(),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(
+        repo_fingerprint(&repo),
+        before,
+        "the stub must leave the repository byte-identical — M2.20a ships no \
+         fetch execution (#229)"
+    );
+}
+
+/// [`GitOperation::PullBranch`], same contract-only staging as fetch above
+/// (#230 owns execution), and the same inertness proof.
+///
+/// Both strategies are driven: a stub that refused `Merge` and quietly ran
+/// `Rebase` would otherwise be invisible here, and the whole reason
+/// `MergeStrategy` is mandatory is that the two do different things to
+/// history.
+#[tokio::test]
+async fn pull_branch_executes_through_the_pipeline() {
+    for strategy in [
+        git_vista_protocol::MergeStrategy::Merge,
+        git_vista_protocol::MergeStrategy::Rebase,
+    ] {
+        let (dir, repo) = seeded_repo();
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        run(
+            &repo,
+            &["remote", "add", "origin", &remote.display().to_string()],
+        );
+        run(&repo, &["push", "-q", "origin", "main"]);
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
+        run(&repo, &["push", "-q", "origin", "main"]);
+        run(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+        run(&repo, &["update-ref", "-d", "refs/remotes/origin/main"]);
+
+        let before = repo_fingerprint(&repo);
+        let (status, body) = pipeline(
+            &repo,
+            GitOperation::PullBranch {
+                remote: RemoteName::new("origin").unwrap(),
+                branch: branch("main"),
+                strategy,
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{strategy:?}: {body}");
+        assert_eq!(
+            repo_fingerprint(&repo),
+            before,
+            "the {strategy:?} stub must leave the repository byte-identical — \
+             M2.20a ships no pull execution (#230)"
+        );
+    }
+}
+
+/// The widened `PushBranch` combinations that M2.20a does **not** execute are
+/// refused, and refused inertly — nothing reaches the remote.
+///
+/// This is the case that most needed writing down, because unlike fetch and
+/// pull, `PushBranch` has a *live* executor sitting right next to the stub.
+/// An arm that ignored the new fields would have run a perfectly ordinary
+/// push — succeeding, mutating the remote, and reporting success for an
+/// operation nobody approved. The remote's ref listing being empty afterwards
+/// is what rules that out; the status code alone could not.
+#[tokio::test]
+async fn the_unwired_push_combinations_are_refused_without_touching_the_remote() {
+    for force in [
+        ForcePublish::None,
+        ForcePublish::WithLease {
+            expected_remote_tip: oid(&"0".repeat(40)),
+        },
+    ] {
+        for set_upstream in [true, false] {
+            if !set_upstream && force == ForcePublish::None {
+                // The one combination that *does* execute — covered by
+                // `push_branch_executes_through_the_pipeline` above, which
+                // asserts the push really reaches the remote.
+                continue;
+            }
+            let (dir, repo) = seeded_repo();
+            let remote = dir.path().join("remote.git");
+            std::fs::create_dir_all(&remote).unwrap();
+            run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+            run(
+                &repo,
+                &["remote", "add", "origin", &remote.display().to_string()],
+            );
+
+            let before = repo_fingerprint(&repo);
+            let (status, body) = pipeline(
+                &repo,
+                GitOperation::PushBranch {
+                    branch: branch("main"),
+                    remote: RemoteName::new("origin").unwrap(),
+                    set_upstream,
+                    force: force.clone(),
+                },
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_IMPLEMENTED,
+                "set_upstream={set_upstream} force={force:?}: {body}"
+            );
+            assert_eq!(
+                out(&remote, &["for-each-ref", "refs/heads"]),
+                "",
+                "nothing may reach the remote for an unwired push combination \
+                 (set_upstream={set_upstream} force={force:?})"
+            );
+            assert_eq!(
+                repo_fingerprint(&repo),
+                before,
+                "the refusal must also leave the local repository untouched \
+                 (set_upstream={set_upstream} force={force:?})"
+            );
+        }
+    }
 }
