@@ -180,20 +180,132 @@ pub fn hunk_nav(patch: &str) -> Vec<HunkNavEntry> {
     entries
 }
 
-/// The path from one side of a `---`/`+++` header, `None` for `/dev/null`.
-/// Strips git's `a/`/`b/` prefixes; quoted/escaped paths are passed through
-/// as printed rather than unescaped — a spoken label with a literal escape in
-/// it is still identifiable, and unescaping here would duplicate protocol
-/// parser territory this walk deliberately stays out of.
-fn parse_file_side(rest: &str) -> Option<String> {
-    if rest == "/dev/null" {
-        return None;
+/// One selectable hunk header, addressed the way `git_vista_protocol`'s
+/// `HunkRef`/`FileSelection` need it (M2.17d, #215): canonical file path,
+/// 0-based per-file ordinal, and the header's own declared anchors.
+///
+/// A second raw-text walk alongside [`hunk_nav`], deliberately — the staging
+/// selection UI renders the exact same flat `patch.lines()` text `hunk_nav`
+/// already maps for keyboard navigation, so it needs the same line-index
+/// coordinate space `hunk_nav` uses, not the structured parser's. `hunk_nav`
+/// itself is #210's tested contract and is not touched here; this is an
+/// independent function that happens to share its two small parsing helpers
+/// ([`parse_hunk_header`], [`parse_file_side`]). See `hunk_nav`'s module doc
+/// for why a raw-text walk is the right (and deliberately temporary) choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectableHunk {
+    /// Index into `patch.lines()` of this hunk's `@@` header — the same
+    /// enumeration [`hunk_nav`]'s entries use, so a caller can pair the two
+    /// walks up by `line_index` (both visit ordinary headers in the same
+    /// order, skipping combined `@@@` headers identically).
+    pub line_index: usize,
+    /// The file this hunk belongs to, addressed the canonical way
+    /// (`git_vista_protocol::patch_build::canonical_path`'s rule: new-side
+    /// name when the header pair has one).
+    pub file: String,
+    /// 0-based index into *this file's own* hunk list — the ordinal
+    /// `HunkRef::index` needs. Distinct from `hunk_nav`'s 1-based
+    /// "hunk N of M" spoken ordinal.
+    pub ordinal: u32,
+    /// The hunk header's declared old-side start — `HunkRef::old_start`.
+    pub old_start: u32,
+    /// The hunk header's declared new-side start — `HunkRef::new_start`.
+    pub new_start: u32,
+}
+
+/// Every selectable (ordinary, non-combined) hunk header in `patch`, in
+/// rendering order — see [`SelectableHunk`].
+pub fn selectable_hunks(patch: &str) -> Vec<SelectableHunk> {
+    struct Pending {
+        line_index: usize,
+        file: String,
+        old_start: u32,
+        new_start: u32,
     }
-    let rest = rest
-        .strip_prefix("a/")
-        .or_else(|| rest.strip_prefix("b/"))
-        .unwrap_or(rest);
-    Some(rest.to_string())
+    let mut pending: Vec<Pending> = Vec::new();
+    let (mut old_left, mut new_left) = (0u32, 0u32);
+    let (mut minus_file, mut plus_file) = (None::<String>, None::<String>);
+
+    for (i, line) in patch.lines().enumerate() {
+        if old_left > 0 || new_left > 0 {
+            match line.as_bytes().first() {
+                Some(b'+') => new_left = new_left.saturating_sub(1),
+                Some(b'-') => old_left = old_left.saturating_sub(1),
+                Some(b'\\') => {}
+                _ => {
+                    old_left = old_left.saturating_sub(1);
+                    new_left = new_left.saturating_sub(1);
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("--- ") {
+            minus_file = parse_file_side(rest);
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            plus_file = parse_file_side(rest);
+        } else if let Some((old_len, new_start, new_len, _heading)) = parse_hunk_header(line) {
+            // New-side name when present, else old-side — the same
+            // canonical-path rule `patch_build::canonical_path` applies to
+            // parsed `FileDiff`s, applied here to the raw header pair.
+            let file = plus_file
+                .clone()
+                .or_else(|| minus_file.clone())
+                .unwrap_or_else(|| "unknown file".to_string());
+            let old_start = line
+                .strip_prefix("@@ -")
+                .and_then(|rest| rest.split_once(" +"))
+                .and_then(|(old, _)| parse_range(old))
+                .map(|(start, _)| start)
+                .unwrap_or(0);
+            pending.push(Pending {
+                line_index: i,
+                file,
+                old_start,
+                new_start,
+            });
+            old_left = old_len;
+            new_left = new_len;
+        }
+    }
+
+    let mut seen: HashMap<&str, u32> = HashMap::new();
+    pending
+        .iter()
+        .map(|h| {
+            let ordinal = {
+                let c = seen.entry(h.file.as_str()).or_insert(0);
+                let ord = *c;
+                *c += 1;
+                ord
+            };
+            SelectableHunk {
+                line_index: h.line_index,
+                file: h.file.clone(),
+                ordinal,
+                old_start: h.old_start,
+                new_start: h.new_start,
+            }
+        })
+        .collect()
+}
+
+/// The path from one side of a `---`/`+++` header, `None` for `/dev/null`.
+///
+/// Delegates to [`git_vista_protocol::path_or_dev_null`] — the same
+/// unquoting the server-side parser uses (trailing-tab space termination,
+/// C-style quote/octal-escape undoing) — rather than a second, approximate
+/// re-derivation. This walk previously stripped only the `a/`/`b/` prefix
+/// and left quoting untouched, reasoning that a spoken hunk label doesn't
+/// need exactness; `selectable_hunks` (#215) then reused that same
+/// approximate path as `FileSelection.path` on the wire, where it does —
+/// and a file with a space or non-ASCII byte in its name would silently
+/// fail to stage (`SelectionMismatch::UnknownPath` on the server, since its
+/// canonical path never matched this walk's quoted-looking one). Sharing
+/// the one correct implementation is what keeps that from recurring, and
+/// costs `hunk_nav`'s labels nothing — a correctly unescaped name is a
+/// strictly better spoken label, not a worse one.
+fn parse_file_side(rest: &str) -> Option<String> {
+    git_vista_protocol::path_or_dev_null(rest)
 }
 
 /// `@@ -old_start[,old_len] +new_start[,new_len] @@[ heading]` →
@@ -352,5 +464,77 @@ diff --git a/bar.txt b/bar.txt
     fn an_empty_or_headerless_patch_yields_no_stops() {
         assert_eq!(hunk_nav(""), Vec::new());
         assert_eq!(hunk_nav("Binary files a/x and b/x differ\n"), Vec::new());
+    }
+
+    // ---- selectable_hunks (M2.17d, #215) ------------------------------
+
+    #[test]
+    fn selectable_hunks_carry_per_file_ordinals_and_anchors() {
+        let hunks = selectable_hunks(PATCH);
+        assert_eq!(
+            hunks,
+            vec![
+                SelectableHunk {
+                    line_index: 4,
+                    file: "src/foo.rs".into(),
+                    ordinal: 0,
+                    old_start: 10,
+                    new_start: 10,
+                },
+                SelectableHunk {
+                    line_index: 10,
+                    file: "src/foo.rs".into(),
+                    ordinal: 1,
+                    old_start: 30,
+                    new_start: 31,
+                },
+                SelectableHunk {
+                    line_index: 17,
+                    file: "bar.txt".into(),
+                    ordinal: 0,
+                    old_start: 1,
+                    new_start: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn selectable_hunks_line_indices_match_hunk_nav_exactly() {
+        // Both walks must agree on which lines are navigation stops, and in
+        // what order — the staging UI pairs them up by `line_index`.
+        let nav_lines: Vec<usize> = hunk_nav(PATCH).iter().map(|e| e.line_index).collect();
+        let sel_lines: Vec<usize> = selectable_hunks(PATCH)
+            .iter()
+            .map(|h| h.line_index)
+            .collect();
+        assert_eq!(nav_lines, sel_lines);
+    }
+
+    #[test]
+    fn selectable_hunks_skip_combined_merge_headers() {
+        let patch = "\
+--- a/x
++++ b/x
+@@@ -1,2 -1,2 +1,2 @@@
+ whatever
+";
+        assert_eq!(selectable_hunks(patch), Vec::new());
+    }
+
+    #[test]
+    fn selectable_hunks_names_a_deleted_file_by_its_old_side() {
+        let patch = "\
+--- a/gone.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-line one
+-line two
+";
+        let hunks = selectable_hunks(patch);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].file, "gone.rs");
+        assert_eq!(hunks[0].old_start, 1);
+        assert_eq!(hunks[0].new_start, 0);
     }
 }

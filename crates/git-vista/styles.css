@@ -205,6 +205,61 @@ html, body {
   -webkit-user-select: none;
 }
 
+/* M2.17d (#215): the staging selection view's hunk row — a checkbox tap
+   target (finger selection) beside the same roving-tabindex hunk header
+   #210 already built, deliberately two separate targets rather than one tap
+   meaning both "move keyboard focus" and "toggle selection" (see
+   `features::diff::selection`'s module doc). `.stage-hunk` is the flex row
+   both live in; `.stage-hunk-check` and `.stage-hunk-text` are each their
+   own #65-compliant 44px target. */
+.stage-hunk {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.stage-hunk-check {
+  cursor: pointer;
+  box-sizing: border-box;
+  min-height: 44px;
+  min-width: 44px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: #2f81f7;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  font: inherit;
+}
+.stage-hunk-check[aria-pressed="true"] {
+  background: #1f6feb;
+  border-color: #1f6feb;
+  color: #fff;
+}
+.stage-hunk-text {
+  color: #2f81f7;
+  cursor: pointer;
+  display: block;
+  box-sizing: border-box;
+  min-height: 44px;
+  min-width: 44px;
+  flex: 1;
+  padding: 6px 0;
+}
+.stage-hunk-text:focus-visible { background: #10233d; }
+.stage-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0.75rem 0;
+}
+.stage-preview {
+  margin: 0.5rem 0;
+  border-top: 1px solid #21262d;
+  padding-top: 0.5rem;
+}
+
 /* The graph panel. `position: relative` (M1.10, #63) makes it the containing
    block for the paging affordance below, which must sit at a fixed spot over
    the canvas rather than travel with the camera. Still `overflow: hidden`: the

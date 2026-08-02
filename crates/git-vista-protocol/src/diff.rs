@@ -359,7 +359,17 @@ fn strip_ab_prefix(path: &str) -> &str {
 /// included (`"caf\303\251.txt"`). Stored verbatim, either form poisons
 /// every consumer: pathspecs that match nothing and reconstructed patches
 /// git refuses. The stored path is always the real name.
-fn path_or_dev_null(path: &str) -> Option<String> {
+///
+/// `pub`, not crate-private: the wasm client's own raw-text hunk walk
+/// (`git_vista::features::diff::core::selectable_hunks`, #215) parses the
+/// same `---`/`+++` header lines to build selection UI state, and must
+/// resolve the identical canonical path `build_selected_patch` will later
+/// match against server-side — a second, re-derived implementation is
+/// exactly how the two silently drift apart (found by #215's own review,
+/// the same quoting-fidelity class of bug #213's review caught here).
+/// Sharing this function is what makes that drift structurally impossible
+/// instead of a discipline the two call sites have to maintain by hand.
+pub fn path_or_dev_null(path: &str) -> Option<String> {
     let path = path.strip_suffix('\t').unwrap_or(path);
     if path == "/dev/null" {
         return None;
