@@ -11,6 +11,7 @@
 #   dev verify            the sandbox checks gate does NOT run: escape report, census
 #                          both directions, mutants apply, no leaked daemon
 #   dev roadmap           print milestones + open issues, grouped by M-band
+#   dev roadmap-page      regenerate design-docs/roadmap.html from live GitHub data
 #   dev start <issue#>    branch off fresh main for an issue (feature/mX.YY-slug)
 #   dev wip [message]     checkpoint: add + commit (as claude_2010) + push
 #   dev resume [issue#]   show branch state, WIP commits, and handoff.md
@@ -164,6 +165,16 @@ cmd_roadmap() {
   gh api "repos/{owner}/{repo}/issues?state=open&per_page=100" \
     --jq 'map(select(.pull_request == null)) | sort_by(.number) | .[] | "  #\(.number)  \(.title)"' \
     | head -20
+}
+
+# dev roadmap-page — regenerate design-docs/roadmap.html (a self-contained
+# HTML page, not a git-tracked file) from live GitHub milestone + merged-PR
+# data. The generator (tools/roadmap_page.py) is the tracked artifact; its
+# output is disposable — rerun any time for a fresh snapshot with a new
+# timestamp. See `python3 tools/roadmap_page.py --help` for flags
+# (--open, --out, --review, --selftest).
+cmd_roadmap_page() {
+  python3 tools/roadmap_page.py "$@"
 }
 
 cmd_start() {
@@ -436,6 +447,7 @@ case "${1:-}" in
   gate)    shift; cmd_gate "$@" ;;
   verify)  shift; cmd_verify "$@" ;;
   roadmap) shift; cmd_roadmap "$@" ;;
+  roadmap-page) shift; cmd_roadmap_page "$@" ;;
   start)   shift; cmd_start "$@" ;;
   wip)     shift; cmd_wip "$@" ;;
   resume)  shift; cmd_resume "$@" ;;
@@ -446,7 +458,7 @@ case "${1:-}" in
   handoff) shift; cmd_handoff "$@" ;;
   report)  shift; cmd_report "$@" ;;
   ""|-h|--help|help)
-    sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1 (try: dev help)" ;;
 esac
