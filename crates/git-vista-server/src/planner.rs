@@ -18,11 +18,14 @@
 //!     success/failure texts and status codes (this migration is a refactor,
 //!     not a behavior change).
 //!
-//! A plan is built and executed inside a single request for now — there is no
-//! client review roundtrip yet — so the build/validate seam looks trivial.
-//! It is deliberate: #144 closes the browser's ad-hoc-request escape hatch and
-//! #145 makes the validation load-bearing, both on top of exactly this
-//! pipeline.
+//! A plan is built and executed inside a single request for now — no *route*
+//! offers a client review roundtrip yet — but since M2.23c (#247) the seam is
+//! real code, not just a seam-shaped spot in one function: [`build_plan_only`]
+//! is the build stage alone (no guard, no execution) and [`submit_plan`] is
+//! everything from the guard on (`validate → enforce_fresh → execute`),
+//! composing the exact same stage functions [`plan_and_execute_in`] composes.
+//! #144 closed the browser's ad-hoc-request escape hatch and #145 made the
+//! validation load-bearing; #248/#249 put MCP routes on the two stages.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -257,6 +260,103 @@ pub(crate) async fn plan_and_execute_in(
     // `_guard` drops here: the next queued mutation of this repository proceeds.
 }
 
+/// The build stage alone (M2.23c, #247): observe the live repository and
+/// return the reviewable [`Plan`] — nothing else. Touches neither the
+/// per-worktree mutation guard nor [`execute`]; the repository is byte-for-byte
+/// unchanged afterwards (the contract suite proves both, the first by holding
+/// the guard elsewhere for the whole call).
+///
+/// This is the half of [`plan_and_execute_in`] a client-review roundtrip
+/// (#248's MCP plan tool) calls to *see* a plan without committing to it. The
+/// plan it returns carries the observed generation and the operation's hash,
+/// so [`submit_plan`] can later refuse it if the repository has moved on —
+/// that refusal, not any lock, is what makes handing a plan across a review
+/// roundtrip safe. Deliberately guard-free for the same reason the composed
+/// path builds before locking: building only *reads*, and a concurrent review
+/// must not serialize behind (or block) a running mutation.
+#[cfg_attr(not(test), allow(dead_code))] // routed by #248; contract-suite-only until then
+pub(crate) async fn build_plan_only(
+    repo: &Path,
+    op: GitOperation,
+    tokens: (RepositoryToken, WorktreeToken),
+) -> Plan {
+    build_plan(repo, op, tokens).await.0
+}
+
+/// The submit stage (M2.23c, #247): everything [`plan_and_execute_in`] does
+/// from the guard on, for a [`Plan`] that arrives from outside instead of from
+/// a `build_plan` call three lines up — take the same per-worktree guard, then
+/// `validate → enforce_fresh → execute`, same stage functions, same refusal
+/// texts. A new-variant drift between the two compositions is pinned off by
+/// the contract suite's ordered-needle test for each.
+///
+/// Two things differ from the composed path, both forced by the plan being
+/// the only thing the submitter holds:
+///
+/// - **The selection is re-checked.** `tokens` is the submitting request's
+///   live selection; a plan built for a different repository or worktree is
+///   refused before anything is observed. The generation token cannot carry
+///   this check: it digests HEAD/refs/status only, so two clones of the same
+///   repository at the same commit share a generation, and a plan built
+///   against one would pass `enforce_fresh` against the other.
+/// - **The observation is re-derived.** `plan_and_execute_in` hands `execute`
+///   the reads it took while building (journal before-oids, delete's restore
+///   point, the CAS tip). A submitted plan carries no observation, so the same
+///   reads are taken again through [`observe_for_submission`] — with the same
+///   eyes `build_plan` used, [`observe_operation`], so the per-operation
+///   `branch_tip` (a delete's recovery point) is never silently dropped.
+///   Re-observing is safe *because* `enforce_fresh` anchors on the plan's
+///   build-time generation: any drift between build and the guard refuses
+///   execution, so whenever `execute` runs, the re-derived observation
+///   describes the same repository state the plan was built against.
+///   `held_at_build` is re-derived too, which reads a precondition that
+///   silently broke during the review window (possible only for the
+///   generation-invisible pair, `RemoteConfigured`/`SeedRecorded`) as
+///   built-stale: it flows to the executor's own legacy refusal instead of
+///   `enforce_fresh`'s — from the submitter's seat the two cases are
+///   genuinely indistinguishable, and both fail closed.
+#[cfg_attr(not(test), allow(dead_code))] // routed by #249; contract-suite-only until then
+pub(crate) async fn submit_plan(
+    repo: &Path,
+    repo_id: Option<RepositoryId>,
+    tokens: (RepositoryToken, WorktreeToken),
+    plan: Plan,
+) -> (StatusCode, String) {
+    let (repository, worktree) = tokens;
+    if plan.repository != repository || plan.worktree != worktree {
+        return (
+            StatusCode::CONFLICT,
+            "This plan was built for a different repository or worktree — \
+             rebuild it against the current selection."
+                .to_string(),
+        );
+    }
+    // Observed *before* the guard, mirroring the composed path's deliberate
+    // build-before-lock ordering (see `plan_and_execute_in`): observation only
+    // reads, and any drift between this read and execution is refused by
+    // `enforce_fresh` against the plan's build-time generation.
+    let observed = observe_for_submission(repo, &plan).await;
+    crate::operations::note_recovery(&plan.recovery);
+
+    crate::operations::stage(OperationStage::Waiting);
+    let _guard = crate::coordinator::lock(repo_id).await;
+
+    if let Some(refused) = crate::coordinator::refuse_if_git_busy(repo).await {
+        return refused;
+    }
+
+    crate::operations::stage(OperationStage::Checking);
+    if let Err(refused) = validate(&plan) {
+        return refused;
+    }
+    if let Err(refused) = enforce_fresh(repo, &plan, &observed).await {
+        return refused;
+    }
+    crate::operations::stage(OperationStage::Executing);
+    execute(repo, plan, observed).await
+    // `_guard` drops here, exactly as in `plan_and_execute_in`.
+}
+
 /// Resolve arbitrary request input to an exact [`CommitOid`]. A full 40/64
 /// lowercase-hex id — what the UI always sends — is taken as-is; anything else
 /// (a hand-crafted symbolic or abbreviated start point) is resolved through
@@ -447,9 +547,47 @@ async fn build_plan(
     operation: GitOperation,
     tokens: (RepositoryToken, WorktreeToken),
 ) -> (Plan, Observed) {
+    let mut observed = observe_operation(repo, &operation).await;
+
+    let (risk, preconditions, expected_ref_changes, recovery) =
+        shape(repo, &operation, &observed).await;
+
+    // Record which preconditions hold right now (#145): enforce_fresh only
+    // re-verifies these, so a precondition that was already unmet reaches the
+    // executor's legacy guard unchanged.
+    observed.held_at_build = held_now(repo, &preconditions, &observed).await;
+
+    let (repository, worktree) = tokens;
+    let operation_hash = operation_hash(&operation);
+    let generation = generation_token(repo, &observed).await;
+    let now = crate::activity::now_secs();
+
+    let plan = Plan {
+        repository,
+        worktree,
+        generation,
+        operation,
+        operation_hash,
+        issued_at: UnixSeconds(now),
+        expires_at: UnixSeconds(now + PLAN_TTL_SECS),
+        risk,
+        preconditions,
+        expected_ref_changes,
+        recovery,
+    };
+    (plan, observed)
+}
+
+/// One pre-execution observation of the live repository, shaped for
+/// `operation` — the reads `build_plan` has always taken, factored out
+/// (M2.23c, #247) so [`observe_for_submission`] re-observes with **the same
+/// eyes** rather than a copy that could drift. Order and content are the
+/// build path's exactly: HEAD's branch, HEAD's tip, the per-operation
+/// `branch_tip`, then status.
+async fn observe_operation(repo: &Path, operation: &GitOperation) -> Observed {
     let head_branch = read_head_branch_blocking(repo).await;
     let head_tip = Obs::from_read(rev_parse(repo, "HEAD").await);
-    let branch_tip = match &operation {
+    let branch_tip = match operation {
         GitOperation::DeleteBranch { branch }
         | GitOperation::ForceDeleteBranch { branch }
         | GitOperation::ResetBranch { branch, .. } => {
@@ -472,46 +610,43 @@ async fn build_plan(
         // just one that was never taken.
         _ => Obs::Absent,
     };
-    let mut observed = Observed {
+    Observed {
         head_branch,
         head_tip,
         branch_tip,
         status: worktree_status(repo).await,
         held_at_build: Vec::new(),
-    };
-
-    let (risk, preconditions, expected_ref_changes, recovery) =
-        shape(repo, &operation, &observed).await;
-
-    // Record which preconditions hold right now (#145): enforce_fresh only
-    // re-verifies these, so a precondition that was already unmet reaches the
-    // executor's legacy guard unchanged.
-    for precondition in &preconditions {
-        let held = verify_precondition(repo, precondition, &observed)
-            .await
-            .is_ok();
-        observed.held_at_build.push(held);
     }
+}
 
-    let (repository, worktree) = tokens;
-    let operation_hash = operation_hash(&operation);
-    let generation = generation_token(repo, &observed).await;
-    let now = crate::activity::now_secs();
+/// Which of `preconditions` hold against `observed` right now, index-aligned —
+/// the build-time census `enforce_fresh` gates its re-verification on. Shared
+/// verbatim by `build_plan` and [`observe_for_submission`] (M2.23c, #247).
+async fn held_now(repo: &Path, preconditions: &[Precondition], observed: &Observed) -> Vec<bool> {
+    let mut held = Vec::with_capacity(preconditions.len());
+    for precondition in preconditions {
+        held.push(
+            verify_precondition(repo, precondition, observed)
+                .await
+                .is_ok(),
+        );
+    }
+    held
+}
 
-    let plan = Plan {
-        repository,
-        worktree,
-        generation,
-        operation,
-        operation_hash,
-        issued_at: UnixSeconds(now),
-        expires_at: UnixSeconds(now + PLAN_TTL_SECS),
-        risk,
-        preconditions,
-        expected_ref_changes,
-        recovery,
-    };
-    (plan, observed)
+/// Re-derive, for a plan submitted from outside the request that built it
+/// (M2.23c, #247), the [`Observed`] that `plan_and_execute_in` would have
+/// carried from its own `build_plan` call: the same per-operation reads via
+/// [`observe_operation`], and `held_at_build` re-derived against the plan's
+/// own precondition list via [`held_now`]. See [`submit_plan`]'s doc for why
+/// re-observation is safe (the plan's build-time generation, not this read,
+/// is what `enforce_fresh` anchors staleness on) and for the one semantic
+/// wrinkle (`RemoteConfigured`/`SeedRecorded` drift reads as built-stale).
+#[cfg_attr(not(test), allow(dead_code))] // routed by #249; contract-suite-only until then
+async fn observe_for_submission(repo: &Path, plan: &Plan) -> Observed {
+    let mut observed = observe_operation(repo, &plan.operation).await;
+    observed.held_at_build = held_now(repo, &plan.preconditions, &observed).await;
+    observed
 }
 
 /// The current selection's opaque id tokens. In degraded mode (the served path
