@@ -217,7 +217,7 @@ pub fn clone_dialog_may_dismiss(cloning: bool, checking: bool, guard_allows: boo
 /// check) — which must NOT be polled, since polling that one would just
 /// replay the same refusal forever.
 pub fn clone_response_should_poll(status: u16, message: &str) -> bool {
-    status == 409 && message.contains("already in progress")
+    status == 409 && message.contains(git_vista_protocol::CLONE_IN_PROGRESS_SENTINEL)
 }
 
 /// One `GET /api/clone-status/{key}` poll's outcome — the pure decision
@@ -702,11 +702,14 @@ mod tests {
 
     #[test]
     fn a_still_in_progress_conflict_is_pollable() {
-        assert!(clone_response_should_poll(
-            409,
-            "A clone for this request is already in progress. Wait for it to finish \
-             before retrying."
-        ));
+        // #289: built around the shared sentinel, not a hand-copied string —
+        // otherwise this test only proves the matcher agrees with its own
+        // private copy of the server's wording, not with the server.
+        let message = format!(
+            "A clone for this request is {}. Wait for it to finish before retrying.",
+            git_vista_protocol::CLONE_IN_PROGRESS_SENTINEL
+        );
+        assert!(clone_response_should_poll(409, &message));
     }
 
     #[test]
