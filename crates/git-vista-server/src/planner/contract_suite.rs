@@ -194,13 +194,59 @@ fn covered_by(op: &GitOperation) -> &'static str {
     }
 }
 
-/// One sample per variant, each mapped through [`covered_by`]: the mapping
-/// stays total (compile-time) and injective (here) — no two variants may
-/// share a pipeline test.
-#[test]
-fn every_operation_kind_names_a_distinct_pipeline_test() {
+/// [`covered_by`]'s split-path sibling (M2.23c, #247): every variant names
+/// the live test proving the `build_plan_only → submit_plan` staging covers
+/// it too. **No wildcard arm, on purpose** — a new `GitOperation` variant
+/// fails to compile here as well as in [`covered_by`], so it cannot land
+/// covered on only one of the two paths.
+///
+/// Unlike [`covered_by`], the mapping is *not* injective: the split path
+/// shares every executor with the single-shot path (same `execute`, same
+/// argv, same texts), so what is new per variant is only *equivalence* — and
+/// one sweep, [`the_split_path_is_byte_identical_to_the_single_shot_path`],
+/// proves it for the whole [`samples`] census at once. A future variant whose
+/// split behaviour genuinely diverges (none may, today) would get its own arm
+/// pointing at its own test.
+fn covered_on_split_path(op: &GitOperation) -> &'static str {
+    match op {
+        GitOperation::CreateBranch { .. }
+        | GitOperation::CommitOnHead { .. }
+        | GitOperation::EmptyCommitOnBranch { .. }
+        | GitOperation::StageAll
+        | GitOperation::UnstageAll
+        | GitOperation::CheckoutBranch { .. }
+        | GitOperation::MergeBranch { .. }
+        | GitOperation::PushBranch { .. }
+        | GitOperation::DeleteBranch { .. }
+        | GitOperation::ForceDeleteBranch { .. }
+        | GitOperation::RebaseOntoBase { .. }
+        | GitOperation::RestoreBranch { .. }
+        | GitOperation::ResetBranch { .. }
+        | GitOperation::RevertCommit { .. }
+        | GitOperation::ResetTestRepo
+        | GitOperation::StageSelection { .. }
+        | GitOperation::DiscardTrackedPaths { .. }
+        | GitOperation::DeleteUntrackedPaths { .. }
+        | GitOperation::AmendCommit { .. }
+        | GitOperation::FetchRemote { .. }
+        | GitOperation::PullBranch { .. }
+        | GitOperation::CreateTag { .. }
+        | GitOperation::DeleteLocalTag { .. }
+        | GitOperation::DeleteRemoteTag { .. }
+        | GitOperation::PushTag { .. } => {
+            "the_split_path_is_byte_identical_to_the_single_shot_path"
+        }
+    }
+}
+
+/// One canonical sample per [`GitOperation`] variant — the census input for
+/// the single-shot coverage test below and, since M2.23c (#247), for the
+/// split-path census and the byte-identity sweep
+/// ([`the_split_path_is_byte_identical_to_the_single_shot_path`]): one list,
+/// so the two paths can never quietly census different vocabularies.
+fn samples() -> Vec<GitOperation> {
     let zeros = "0".repeat(40);
-    let samples = vec![
+    vec![
         GitOperation::CreateBranch {
             name: branch("b"),
             at: oid(&zeros),
@@ -292,7 +338,15 @@ fn every_operation_kind_names_a_distinct_pipeline_test() {
             name: TagName::new("v1").unwrap(),
             remote: RemoteName::new("origin").unwrap(),
         },
-    ];
+    ]
+}
+
+/// One sample per variant, each mapped through [`covered_by`]: the mapping
+/// stays total (compile-time) and injective (here) — no two variants may
+/// share a pipeline test.
+#[test]
+fn every_operation_kind_names_a_distinct_pipeline_test() {
+    let samples = samples();
     let names: Vec<&str> = samples.iter().map(covered_by).collect();
     let mut deduped = names.clone();
     deduped.sort_unstable();
@@ -3020,5 +3074,557 @@ async fn push_tag_executes_through_the_pipeline() {
         repo_fingerprint(&repo),
         before,
         "the stub must leave the local repository byte-identical too"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// --- #247 (M2.23c): the build-only / submit-approved-plan seam. -------------
+// --- `build_plan_only` must touch neither the guard nor `execute`; ----------
+// --- `submit_plan` must take the same guard and refuse tampered/expired/ ----
+// --- stale plans with the single-shot path's exact words; and the two -------
+// --- paths must be byte-identical for every operation kind. -----------------
+// ---------------------------------------------------------------------------
+
+/// `git <args…>` with author/committer dates pinned, so two identically
+/// seeded repositories get **identical commit oids** — what lets
+/// [`the_split_path_is_byte_identical_to_the_single_shot_path`] compare
+/// response bytes (some refusals embed the seed tip) across twin repos.
+fn run_dated(repo: &Path, args: &[&str]) {
+    assert!(
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_DATE", "2026-01-02T03:04:05Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-02T03:04:05Z")
+            .status()
+            .unwrap()
+            .success(),
+        "git {args:?} failed in {repo:?}"
+    );
+}
+
+/// [`seeded_repo`] with the seed commit's dates pinned via [`run_dated`]:
+/// every call yields a repository in the byte-identical state — same tree,
+/// same tip oid, same generation inputs — so a pair of them are true twins.
+fn seeded_repo_dated() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    run(&repo, &["init", "-q", "-b", "main"]);
+    run(&repo, &["config", "user.email", "t@example.invalid"]);
+    run(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    run(&repo, &["add", "a.txt"]);
+    run_dated(&repo, &["commit", "-q", "-m", "seed"]);
+    (dir, repo)
+}
+
+/// The split-path census (M2.23c, #247): every [`GitOperation`] variant maps
+/// through [`covered_on_split_path`] to a **live** `#[tokio::test]`, and the
+/// sweep that table vouches for must itself iterate [`samples`] — the same
+/// census list — or the table would point at a test that quietly stopped
+/// sweeping. Compile-time totality (no wildcard arm in the table) plus these
+/// two source checks are what "a new variant cannot land covered on only one
+/// path" means mechanically.
+#[test]
+fn every_operation_kind_is_covered_on_the_split_path() {
+    let src = source("src/planner/contract_suite.rs");
+    for op in samples() {
+        let name = covered_on_split_path(&op);
+        assert!(
+            src.contains(&format!("#[tokio::test]\nasync fn {name}(")),
+            "covered_on_split_path names ‘{name}’ but no live #[tokio::test] with \
+             that name exists"
+        );
+    }
+    let sweep = fn_body(
+        &src,
+        "the_split_path_is_byte_identical_to_the_single_shot_path",
+    );
+    assert!(
+        sweep.contains("samples()"),
+        "the split-path sweep no longer iterates the samples() census — \
+         covered_on_split_path's per-variant claim just went vacuous"
+    );
+}
+
+/// [`the_production_entry_point_composes_the_tested_stages_in_order`]'s
+/// sibling for the submit stage: `submit_plan`'s body must re-observe through
+/// the shared eyes, then compose guard → busy-check → validate →
+/// enforce_fresh → execute — the same stage functions, in the same order, as
+/// `plan_and_execute_in`. The existing pin test forces the composed path to
+/// keep its stages inline, so the two compositions are necessarily separate
+/// function bodies; this pin is what keeps them from drifting apart.
+#[test]
+fn the_submit_stage_composes_the_same_guarded_stages_in_order() {
+    let src = source("src/planner.rs");
+    let body = fn_body(&src, "submit_plan");
+    let mut from = 0;
+    for stage in [
+        "observe_for_submission(",
+        "coordinator::lock(",
+        "coordinator::refuse_if_git_busy(",
+        "validate(",
+        "enforce_fresh(",
+        "execute(",
+    ] {
+        match body[from..].find(stage) {
+            Some(at) => from += at + stage.len(),
+            None => panic!(
+                "submit_plan no longer calls {stage} after the previous stage — \
+                 the re-observe → guard → validate → enforce_fresh → execute \
+                 composition is broken"
+            ),
+        }
+    }
+}
+
+/// #247 acceptance 1, both halves, with the vacuity trap closed on each:
+///
+/// - **Build takes no guard.** Proven by *holding* the pipeline's own
+///   mutation guard for the entire `build_plan_only` call: if building ever
+///   acquires it, the call blocks against our held guard and the timeout
+///   fails the test. And building mutates nothing — the full
+///   [`repo_fingerprint`] (refs, HEAD, status, object count, config) and the
+///   live generation token are unchanged after the call.
+/// - **The held guard is the real one.** A test that holds an unrelated lock
+///   would pass vacuously, so the same test proves `submit_plan` *does* queue
+///   on exactly this guard: polled for two full seconds it stays pending and
+///   the branch it would create stays absent (an unguarded submit finishes in
+///   well under that), and the moment the guard drops it completes and the
+///   branch exists.
+#[tokio::test]
+async fn building_a_plan_takes_no_guard_and_submitting_takes_the_real_one() {
+    let (_dir, repo) = seeded_repo();
+    let at = tip(&repo, "HEAD");
+    let op = GitOperation::CreateBranch {
+        name: branch("seam"),
+        at: oid(&at),
+    };
+
+    let fingerprint_before = repo_fingerprint(&repo);
+    let generation_before = generation_token(&repo, &observe_live(&repo).await).await;
+
+    // Hold the exact guard the pipeline serializes on (repo_id None ⇒ the
+    // Unregistered bucket, the one every injected-token suite drive uses).
+    let held = crate::coordinator::lock(None).await;
+
+    let plan = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        build_plan_only(&repo, op, tokens()),
+    )
+    .await
+    .expect("build_plan_only blocked on the mutation guard — building must never lock");
+
+    assert_eq!(
+        repo_fingerprint(&repo),
+        fingerprint_before,
+        "build_plan_only must leave the repository byte-identical"
+    );
+    let generation_after = generation_token(&repo, &observe_live(&repo).await).await;
+    assert_eq!(
+        generation_after.as_str(),
+        generation_before.as_str(),
+        "build_plan_only must not move the repository's generation"
+    );
+
+    // The paired positive: submitting the same plan queues on the guard we
+    // hold. Two seconds is ~20× an unguarded submit's runtime here, so a
+    // submit that stopped taking the guard would finish (and create the
+    // branch) well inside the window and fail both assertions.
+    let submit = submit_plan(&repo, None, tokens(), plan);
+    tokio::pin!(submit);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), submit.as_mut())
+            .await
+            .is_err(),
+        "submit_plan completed while the mutation guard was held elsewhere — \
+         it no longer takes the guard"
+    );
+    assert_eq!(
+        out(&repo, &["branch", "--list", "seam"]),
+        "",
+        "nothing may execute while the guard is held elsewhere"
+    );
+
+    drop(held);
+    let (status, body) = submit.await;
+    assert_ok(status, &body);
+    assert_eq!(tip(&repo, "seam"), at, "the released submit must execute");
+}
+
+/// #247 acceptance 2: for **every** operation kind, `build_plan_only` then
+/// `submit_plan` produces output byte-identical to the single-shot
+/// `plan_and_execute_in` — same status, same body — proven against twin
+/// repositories seeded into byte-identical states ([`seeded_repo_dated`], so
+/// even refusals that embed the seed tip compare equal). This sweep is the
+/// test [`covered_on_split_path`] vouches with; it iterates [`samples`], the
+/// same census the single-shot coverage test uses.
+#[tokio::test]
+async fn the_split_path_is_byte_identical_to_the_single_shot_path() {
+    for op in samples() {
+        let (_dir_single, repo_single) = seeded_repo_dated();
+        let (_dir_split, repo_split) = seeded_repo_dated();
+
+        let single_shot = pipeline(&repo_single, op.clone()).await;
+
+        let plan = build_plan_only(&repo_split, op.clone(), tokens()).await;
+        let split = submit_plan(&repo_split, None, tokens(), plan).await;
+
+        assert_eq!(
+            single_shot, split,
+            "the split path diverged from the single-shot path for {op:?}"
+        );
+    }
+}
+
+/// #247 acceptance 3, the staleness leg — the property that makes a client
+/// review roundtrip safe at all: the repository moves between build and
+/// submit (the review window), and `submit_plan` refuses with
+/// `enforce_fresh`'s exact single-shot words and mutates nothing. The paired
+/// positive: a plan rebuilt against the moved repository submits and
+/// executes.
+#[tokio::test]
+async fn a_stale_plan_is_refused_at_submit_and_mutates_nothing() {
+    let (_dir, repo) = seeded_repo();
+    let at = tip(&repo, "HEAD");
+    let plan = build_plan_only(
+        &repo,
+        GitOperation::CreateBranch {
+            name: branch("late"),
+            at: oid(&at),
+        },
+        tokens(),
+    )
+    .await;
+
+    // The review window: the repository moves while the plan is out for
+    // approval.
+    std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+    run(&repo, &["add", "b.txt"]);
+    run(&repo, &["commit", "-q", "-m", "moved during review"]);
+
+    let (status, why) = submit_plan(&repo, None, tokens(), plan).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}");
+    assert!(why.contains("changed while this plan was pending"), "{why}");
+    assert_eq!(
+        out(&repo, &["branch", "--list", "late"]),
+        "",
+        "the refused stale plan must not have created the branch"
+    );
+
+    // Rebuilt against the live state, the same intent goes through.
+    let fresh_at = tip(&repo, "HEAD");
+    let plan = build_plan_only(
+        &repo,
+        GitOperation::CreateBranch {
+            name: branch("fresh"),
+            at: oid(&fresh_at),
+        },
+        tokens(),
+    )
+    .await;
+    let (status, body) = submit_plan(&repo, None, tokens(), plan).await;
+    assert_ok(status, &body);
+    assert_eq!(tip(&repo, "fresh"), fresh_at);
+}
+
+/// #247 acceptance 3, the tamper leg: an operation swapped under its hash
+/// after `build_plan_only` is refused by `submit_plan` at `validate`, with
+/// the single-shot path's exact words, and the smuggled operation never runs.
+#[tokio::test]
+async fn a_tampered_plan_is_refused_at_submit_and_mutates_nothing() {
+    let (_dir, repo) = seeded_repo();
+    run(&repo, &["branch", "side"]);
+    let mut plan = build_plan_only(&repo, GitOperation::StageAll, tokens()).await;
+    plan.operation = GitOperation::ForceDeleteBranch {
+        branch: branch("side"),
+    };
+    let (status, why) = submit_plan(&repo, None, tokens(), plan).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}");
+    assert!(why.contains("doesn't match"), "{why}");
+    assert_ne!(
+        out(&repo, &["branch", "--list", "side"]),
+        "",
+        "the smuggled force-delete must not have run"
+    );
+}
+
+/// #247 acceptance 3, the expiry leg: a plan past `PLAN_TTL_SECS` is refused
+/// by `submit_plan` with the single-shot path's exact words and the approved
+/// commit is never written.
+#[tokio::test]
+async fn an_expired_plan_is_refused_at_submit_and_mutates_nothing() {
+    let (_dir, repo) = seeded_repo();
+    let before = tip(&repo, "HEAD");
+    std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+    run(&repo, &["add", "b.txt"]);
+    let mut plan = build_plan_only(
+        &repo,
+        GitOperation::CommitOnHead {
+            message: message("too late"),
+            allow_empty: false,
+        },
+        tokens(),
+    )
+    .await;
+    plan.expires_at = UnixSeconds(crate::activity::now_secs() - 1);
+    let (status, why) = submit_plan(&repo, None, tokens(), plan).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}");
+    assert!(why.contains("expired"), "{why}");
+    assert_eq!(
+        tip(&repo, "HEAD"),
+        before,
+        "the expired commit must not land"
+    );
+}
+
+/// The cross-selection guard, with its vacuity trap sprung on purpose: a plan
+/// built for one selection may not submit against another, **and the
+/// generation token provably cannot be the thing that stops it** — twin
+/// repositories in byte-identical states share a generation (it digests
+/// HEAD/refs/status, nothing identifying the repository), so the control leg
+/// shows the same foreign plan *executing* once the tokens are made to
+/// match. The token check is load-bearing, not decorative.
+#[tokio::test]
+async fn a_plan_built_for_another_selection_is_refused_at_submit() {
+    let (_dir_a, repo_a) = seeded_repo_dated();
+    let (_dir_b, repo_b) = seeded_repo_dated();
+    let at = tip(&repo_a, "HEAD");
+    assert_eq!(at, tip(&repo_b, "HEAD"), "twins must share their seed tip");
+
+    let plan = build_plan_only(
+        &repo_a,
+        GitOperation::CreateBranch {
+            name: branch("crossed"),
+            at: oid(&at),
+        },
+        tokens(),
+    )
+    .await;
+
+    // Submitted against repo_b under a *different* selection: refused before
+    // anything is observed or locked.
+    let other = (
+        RepositoryToken::new("other-repo").unwrap(),
+        WorktreeToken::new("other-worktree").unwrap(),
+    );
+    let (status, why) = submit_plan(&repo_b, None, other, plan.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}");
+    assert!(why.contains("different repository or worktree"), "{why}");
+    assert_eq!(
+        out(&repo_b, &["branch", "--list", "crossed"]),
+        "",
+        "the cross-selection submit must not have executed"
+    );
+
+    // The control: with the tokens matching, the same foreign plan sails
+    // through `enforce_fresh` against the twin — its generation matches —
+    // and executes. This is the leg that proves the refusal above came from
+    // the token check and could not have come from the generation.
+    let (status, body) = submit_plan(&repo_b, None, tokens(), plan).await;
+    assert_ok(status, &body);
+    assert_eq!(
+        tip(&repo_b, "crossed"),
+        at,
+        "with matching tokens the twin's generation admits the foreign plan — \
+         the token check above is the only thing standing between selections"
+    );
+}
+
+/// `observe_for_submission`'s `held_at_build` re-derivation is load-bearing,
+/// not decorative — the mutation `observed.held_at_build = Vec::new()` after
+/// the re-observe passed this entire suite before this test existed. The
+/// re-derived census is what arms `enforce_fresh`'s per-precondition live
+/// recheck on the split path, and the one window where that recheck is the
+/// *only* defence is a **generation-invisible** break (`RemoteConfigured`:
+/// remotes live in config, which no generation input digests) landing between
+/// `submit_plan`'s pre-guard observation and its post-guard gate.
+///
+/// The test makes that window deterministic the same way
+/// [`building_a_plan_takes_no_guard_and_submitting_takes_the_real_one`] does:
+/// hold the real mutation guard, start the submit (it observes — remote still
+/// configured, so the re-derived census reads *held* — then queues on our
+/// guard), break the precondition while it queues, release the guard. The
+/// gate's live recheck must refuse with `verify_precondition`'s own 409. If
+/// the re-derivation is ever dropped or emptied, `enforce_fresh` skips the
+/// recheck, the push reaches `exec_push`, and git's 400 with different words
+/// fails both assertions.
+#[tokio::test]
+async fn a_generation_invisible_break_while_queued_is_refused_by_the_gates_live_recheck() {
+    let (_dir, repo) = seeded_repo();
+    run(&repo, &["remote", "add", "origin", "/nowhere/upstream.git"]);
+    let op = GitOperation::PushBranch {
+        branch: branch("main"),
+        remote: RemoteName::new("origin").unwrap(),
+        set_upstream: false,
+        force: ForcePublish::None,
+    };
+    let plan = build_plan_only(&repo, op, tokens()).await;
+    // Sanity: the shape still pins the remote — without this precondition the
+    // scenario below would silently stop testing the recheck at all.
+    assert!(
+        plan.preconditions
+            .iter()
+            .any(|p| matches!(p, Precondition::RemoteConfigured { .. })),
+        "PushBranch no longer carries RemoteConfigured — this test's premise is gone"
+    );
+
+    let held = crate::coordinator::lock(None).await;
+    let submit = submit_plan(&repo, None, tokens(), plan);
+    tokio::pin!(submit);
+    // Two seconds is ~20× an unguarded submit's runtime (see the guard test
+    // above): by the time this times out, `observe_for_submission` has read
+    // the still-configured remote and the future is queued on the held guard.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), submit.as_mut())
+            .await
+            .is_err(),
+        "submit_plan completed while the mutation guard was held elsewhere"
+    );
+
+    // The break lands inside the guarded window, and it is generation-
+    // invisible: removing a never-fetched remote touches only .git/config —
+    // no ref, no HEAD, no status input moves.
+    run(&repo, &["remote", "remove", "origin"]);
+
+    drop(held);
+    let (status, why) = submit.await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the gate's live recheck must refuse the vanished remote, not let the \
+         executor stumble over it: {why}"
+    );
+    assert!(
+        why.contains("no longer configured"),
+        "expected verify_precondition's own refusal, got: {why}"
+    );
+}
+
+/// The review-window half of the same corner, and the exact claim
+/// `submit_plan`'s doc and ADR 0042 §3 make in prose: a `RemoteConfigured`
+/// precondition that held at build and silently broke **before** submit is
+/// re-derived as never-held (the census is re-read at submission), skipped by
+/// `enforce_fresh`, and flows to the executor's legacy refusal — "from the
+/// submitter's seat the two cases are genuinely indistinguishable, and both
+/// fail closed". Proven, not asserted: twin repositories, one running the
+/// single-shot path with the remote *never* configured, one running the split
+/// path with the remote removed during the review window, must refuse with
+/// byte-identical status and body — and refuse, full stop.
+#[tokio::test]
+async fn review_window_remote_drift_fails_closed_with_the_never_configured_refusal() {
+    let push = || GitOperation::PushBranch {
+        branch: branch("main"),
+        remote: RemoteName::new("origin").unwrap(),
+        set_upstream: false,
+        force: ForcePublish::None,
+    };
+
+    // Twin A: the single-shot path with the precondition never held — the
+    // executor's legacy refusal in its own words.
+    let (_dir_a, repo_a) = seeded_repo_dated();
+    let single_shot = pipeline(&repo_a, push()).await;
+    assert!(
+        !single_shot.0.is_success(),
+        "a push with no remote configured must fail: {}",
+        single_shot.1
+    );
+
+    // Twin B: the split path, precondition held at build, broken during the
+    // review window (generation-invisible — config only, see the guarded-
+    // window test above).
+    let (_dir_b, repo_b) = seeded_repo_dated();
+    run(
+        &repo_b,
+        &["remote", "add", "origin", "/nowhere/upstream.git"],
+    );
+    let plan = build_plan_only(&repo_b, push(), tokens()).await;
+    assert!(
+        plan.preconditions
+            .iter()
+            .any(|p| matches!(p, Precondition::RemoteConfigured { .. })),
+        "PushBranch no longer carries RemoteConfigured — this test's premise is gone"
+    );
+    run(&repo_b, &["remote", "remove", "origin"]);
+    let fingerprint = repo_fingerprint(&repo_b);
+
+    let split = submit_plan(&repo_b, None, tokens(), plan).await;
+    assert!(
+        !split.0.is_success(),
+        "review-window remote drift must fail closed on the split path: {}",
+        split.1
+    );
+    assert_eq!(
+        single_shot, split,
+        "drift during the review window must be indistinguishable from a \
+         precondition that never held — same status, same words"
+    );
+    assert_eq!(
+        repo_fingerprint(&repo_b),
+        fingerprint,
+        "the refused push must leave the repository byte-identical"
+    );
+}
+
+/// [`review_window_remote_drift_fails_closed_with_the_never_configured_refusal`]'s
+/// sibling for the *other* generation-invisible precondition, `SeedRecorded`
+/// (seed files live under `.git/git-vista/`, outside every generation input).
+/// The executor's independent re-read of the seed is the legacy guard the ADR
+/// leans on; this pins that it actually refuses — and that the repository the
+/// reset would have rewound stays untouched, which is the assertion with
+/// teeth: the repo is deliberately drifted past its seed, so a reset that
+/// wrongly ran would move `main` and delete the stray branch.
+#[tokio::test]
+async fn review_window_seed_drift_fails_closed_with_the_never_recorded_refusal() {
+    // Twin A: single-shot, no seed ever recorded — the executor's 404.
+    let (_dir_a, repo_a) = seeded_repo();
+    let single_shot = pipeline(&repo_a, GitOperation::ResetTestRepo).await;
+    assert_eq!(
+        single_shot.0,
+        StatusCode::NOT_FOUND,
+        "a reset with no recorded seed must 404: {}",
+        single_shot.1
+    );
+
+    // Twin B: seed recorded, repo drifted past it, plan built (SeedRecorded
+    // holds), then the seed vanishes during the review window.
+    let (_dir_b, repo_b) = seeded_repo();
+    let seeded = tip(&repo_b, "HEAD");
+    let state = repo_b.join(".git/git-vista");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("seed-refs"), format!("{seeded} main\n")).unwrap();
+    std::fs::write(state.join("seed-head"), "main\n").unwrap();
+    std::fs::write(repo_b.join("junk.txt"), "j\n").unwrap();
+    run(&repo_b, &["add", "junk.txt"]);
+    run(&repo_b, &["commit", "-q", "-m", "past the seed"]);
+    run(&repo_b, &["branch", "stray"]);
+
+    let plan = build_plan_only(&repo_b, GitOperation::ResetTestRepo, tokens()).await;
+    assert!(
+        plan.preconditions
+            .iter()
+            .any(|p| matches!(p, Precondition::SeedRecorded)),
+        "ResetTestRepo no longer carries SeedRecorded — this test's premise is gone"
+    );
+    let drifted = tip(&repo_b, "HEAD");
+    std::fs::remove_file(state.join("seed-refs")).unwrap();
+    std::fs::remove_file(state.join("seed-head")).unwrap();
+
+    let split = submit_plan(&repo_b, None, tokens(), plan).await;
+    assert_eq!(
+        single_shot, split,
+        "seed drift during the review window must be indistinguishable from a \
+         seed that was never recorded — same status, same words"
+    );
+    assert_eq!(
+        tip(&repo_b, "main"),
+        drifted,
+        "the refused reset must not have rewound the branch to its seed"
+    );
+    assert_ne!(
+        out(&repo_b, &["branch", "--list", "stray"]),
+        "",
+        "the refused reset must not have deleted the stray branch"
     );
 }
