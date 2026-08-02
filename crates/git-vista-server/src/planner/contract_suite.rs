@@ -2138,11 +2138,16 @@ async fn the_amend_runs_repository_hooks_inside_the_pipelines_own_spawn() {
 /// prints nothing of its own for a hook rejection (verified against git
 /// 2.43), so an implementation that "classified" by matching some
 /// hook-related stderr text would pass a chatty-hook test and misclassify
-/// every quiet real-world hook. Both rejectable hook points this argv has
-/// are driven. The repository must be untouched afterward.
+/// every quiet real-world hook. All three rejectable hook points this argv
+/// has are driven — the same three `rejectable_hook_present` probes for
+/// (`pre-commit`, `prepare-commit-msg`, `commit-msg`; `git commit --amend
+/// -m` runs `prepare-commit-msg` even with `-m`, and a silent exit-1 there
+/// fails the amend with the same empty-stderr signature) — so trimming the
+/// planner's hook list or regressing any one point turns this red. The
+/// repository must be untouched afterward.
 #[tokio::test]
 async fn a_hook_rejection_is_classified_as_hook_rejected() {
-    for hook in ["pre-commit", "commit-msg"] {
+    for hook in ["pre-commit", "prepare-commit-msg", "commit-msg"] {
         let (_dir, repo) = seeded_repo();
         let before = tip(&repo, "HEAD");
         std::fs::write(
