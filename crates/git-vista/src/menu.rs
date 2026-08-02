@@ -406,6 +406,19 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         shell.open_commit_dialog(CommitIntent::Amend {
                             expected_tip: tip.clone(),
                         });
+                        // Hold the confirm button until the read below answers
+                        // whether this commit is already on a remote (#225).
+                        // Opening is synchronous and the read is not, so
+                        // without this the dialog spends the whole request
+                        // showing an *enabled* Amend button over a pre-flight
+                        // that has nothing to read — and `amend_preflight`
+                        // sends on "nothing read". Two ordering constraints,
+                        // both pinned by `features::a11y::audit` because
+                        // nothing here compiles under `cargo test`: after
+                        // `dialogs.open` (which resets the phase), and before
+                        // `shell.close_menu()` (which disposes this handler's
+                        // reactive owner, after which writes are unreliable).
+                        dialogs.begin_publication_read(&tip);
                         status.refetch();
                         shell.close_menu();
                         // Pre-fill with the tip's *whole* message (summary and body), not
@@ -429,6 +442,12 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                                 dialogs.record_amend_detail(&tip, detail.on_remote);
                                 dialogs.seed_amend_msg(&detail.message);
                             }
+                            // Outside the `Ok` arm on purpose: a failed read
+                            // has to release the button too, or one bad GET
+                            // would make amend permanently unreachable. That
+                            // lands on the documented `Unknown` ⇒ send path,
+                            // which is a stated gap rather than a new one.
+                            dialogs.finish_publication_read(&tip);
                         });
                     };
                     view! {
