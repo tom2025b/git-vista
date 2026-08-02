@@ -22,7 +22,12 @@
 //!    `exec_merge` or `exec_rebase` — the live executors behind `/api/merge`
 //!    and `/api/rebase` — rather than re-deriving `git merge`/`git rebase`.
 //!    Nothing here reads `pull.rebase`, and nothing here has a fallback to
-//!    read it into.
+//!    read it into. **Reusing those executors includes reusing their sandbox
+//!    tier**: the integration half declares [`INTEGRATION_NEED`]
+//!    (`NetworkNeed::Local`, so `Tier::Strict`), never the pull operation's own
+//!    `Remote`, because `need` is what picks the tier and hooks run in every
+//!    tier. See that constant's doc for the escalation that would otherwise be
+//!    reachable through this endpoint alone.
 //!
 //! # A conflict is an outcome, not a server error
 //!
@@ -59,6 +64,46 @@ use super::*;
 
 /// The endpoint name in log lines, matching every other executor here.
 const ENDPOINT: &str = "/api/pull";
+
+/// The network need every **non-fetch** spawn in this module declares.
+///
+/// # Why a pull's second half is `Local` even though a pull is `Remote`
+///
+/// `network_need_for_operation(PullBranch)` is `NetworkNeed::Remote`, and it
+/// has to be: the fetch half opens a socket. But that answer is about the
+/// operation as a whole, and this module runs **two** kinds of command under
+/// it. Threading the operation-level need into both was the obvious thing to
+/// write and it is wrong, because `need` is not a label — it *chooses the
+/// sandbox tier*:
+///
+/// ```text
+/// tier_for(Remote, untrusted) => Tier::Network   // no bwrap, AF_INET allowed,
+///                                                // DEFAULT_GIT_PORTS reachable
+/// tier_for(Local,  untrusted) => Tier::Strict    // bwrap --unshare-net, --net-deny
+/// ```
+///
+/// and `policy_for` sets `HookMode::Run` in **both**. So `git merge` /
+/// `git rebase` spawned under the pull's own `Remote` need would run any
+/// `post-merge`, `post-checkout` or `post-rewrite` hook the repository carries
+/// with outbound TCP on 22/443/80/9418 — a capability the byte-identical
+/// command is denied when the same user asks for it through `POST /api/merge`
+/// or `POST /api/rebase`, which declare `NetworkNeed::Local` and land in
+/// `Tier::Strict`. Two routes to the same git command must not differ in what
+/// a hostile repository can do from inside it; the pull route being the
+/// *wider* one is the direction that matters, because a pull is exactly the
+/// operation an untrusted clone's hooks are waiting for.
+///
+/// The declaration is truthful, not merely conservative: `git merge`,
+/// `git rebase`, their `--abort`s and `git ls-files --unmerged` reach no
+/// remote. Everything the wire touches is behind [`super::fetch::run_fetch`],
+/// which keeps the operation's `Remote` need and with it #228's askpass
+/// hardening and credential redaction — this constant must never reach that
+/// call, and `exec_pull` is the only place both appear.
+///
+/// `reconcile_need` is happy with it too: it only ever complains about the
+/// *other* direction (declared `Local`, argv looks remote), and none of these
+/// argvs starts with a `REMOTE_SUBCOMMANDS` token.
+const INTEGRATION_NEED: NetworkNeed = NetworkNeed::Local;
 
 // ---------------------------------------------------------------------------
 // Naming the ref a pull integrates
@@ -152,8 +197,12 @@ fn looks_like_conflict(text: &str) -> bool {
 /// `Err` is "we could not observe", never silently "there are none" — the same
 /// posture `fetch::remote_tracking_refs` takes, and for the same reason: this
 /// read is half the evidence for telling a user their working tree is fine.
-async fn unmerged_paths(repo: &Path, need: NetworkNeed) -> Result<usize, String> {
-    let output = run_git(repo, need, &["ls-files", "--unmerged"])
+///
+/// Declares [`INTEGRATION_NEED`] rather than taking a need from its caller:
+/// listing the index reaches no remote, and a parameter here would be one more
+/// place the pull's `Remote` need could be threaded into a local spawn.
+async fn unmerged_paths(repo: &Path) -> Result<usize, String> {
+    let output = run_git(repo, INTEGRATION_NEED, &["ls-files", "--unmerged"])
         .await
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
@@ -176,9 +225,9 @@ async fn unmerged_paths(repo: &Path, need: NetworkNeed) -> Result<usize, String>
 /// strength of a read that never happened is precisely D5's failure mode. Not
 /// being able to confirm the repository is fine is, for this field's purpose,
 /// the same as it not being fine.
-async fn restored(repo: &Path, need: NetworkNeed, before: &Obs<String>) -> bool {
+async fn restored(repo: &Path, before: &Obs<String>) -> bool {
     let after = Obs::from_read(rev_parse(repo, "HEAD").await);
-    after.same_observation(before) && matches!(unmerged_paths(repo, need).await, Ok(0))
+    after.same_observation(before) && matches!(unmerged_paths(repo).await, Ok(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +250,9 @@ async fn restored(repo: &Path, need: NetworkNeed, before: &Obs<String>) -> bool 
 ///    either exists after the fetch or it does not, and that is a listing, not
 ///    an error message to parse.
 /// 4. **Integrate, through the existing executor** for the caller's stated
-///    strategy.
+///    strategy, under [`INTEGRATION_NEED`] — so the second half runs in the
+///    same sandbox tier `POST /api/merge` and `POST /api/rebase` run it in,
+///    and a pull is not a wider door into the same git command.
 /// 5. **On failure, abort and observe**, per the module docs.
 /// 6. **Report what moved**, with `advanced` taken from the branch tip before
 ///    and after — not from git's prose and not from the sub-executor's
@@ -322,11 +373,18 @@ pub(super) async fn exec_pull(
     }
 
     // --- half two: the integration, by the existing executors ---------------
+    //
+    // `INTEGRATION_NEED`, **not** `need`. See that constant's doc: `need`
+    // picks the sandbox tier, and running `git merge`/`git rebase` under the
+    // pull's operation-level `Remote` would hand this repository's hooks the
+    // Network tier — outbound TCP the same command is denied through
+    // `/api/merge` and `/api/rebase`. `need` is used exactly once in this
+    // function, by the fetch above.
     let (status, git_said) = match strategy {
         MergeStrategy::Merge => {
             exec_merge(
                 repo,
-                need,
+                INTEGRATION_NEED,
                 &target,
                 observed,
                 IntegrationCaller::Pull(strategy),
@@ -336,7 +394,7 @@ pub(super) async fn exec_pull(
         MergeStrategy::Rebase => {
             exec_rebase(
                 repo,
-                need,
+                INTEGRATION_NEED,
                 &target,
                 observed,
                 IntegrationCaller::Pull(strategy),
@@ -348,7 +406,6 @@ pub(super) async fn exec_pull(
     if status != StatusCode::OK {
         return integration_failed(
             repo,
-            need,
             remote,
             branch,
             strategy,
@@ -409,7 +466,6 @@ pub(super) async fn exec_pull(
 #[allow(clippy::too_many_arguments)]
 async fn integration_failed(
     repo: &Path,
-    need: NetworkNeed,
     remote: &RemoteName,
     branch: &BranchName,
     strategy: MergeStrategy,
@@ -428,10 +484,14 @@ async fn integration_failed(
         MergeStrategy::Merge => ["merge", "--abort"],
         MergeStrategy::Rebase => ["rebase", "--abort"],
     };
-    let _ = run_git(repo, need, &abort).await;
+    //
+    // `INTEGRATION_NEED` for the same reason the integration itself uses it:
+    // an abort is a local command, and it runs hooks of its own
+    // (`post-checkout` on a `rebase --abort`).
+    let _ = run_git(repo, INTEGRATION_NEED, &abort).await;
 
     // Whether that worked is observed, never assumed.
-    let worktree_restored = restored(repo, need, head_before).await;
+    let worktree_restored = restored(repo, head_before).await;
 
     // The advisory half. `looks_like_conflict` is the only heuristic in this
     // module and it never decides anything a user acts on alone: the state of
