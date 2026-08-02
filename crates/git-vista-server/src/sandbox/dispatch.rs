@@ -236,7 +236,8 @@ fn the_production_policy_is_never_unsandboxed_today() {
 
 use git_vista_protocol::{
     BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
-    MergeStrategy, RefName, RemoteName, StageDirection, WorktreePath,
+    MergeStrategy, RefName, RemoteName, StageDirection, TagAnnotation, TagMessage, TagName,
+    WorktreePath,
 };
 
 fn branch(s: &str) -> BranchName {
@@ -306,6 +307,10 @@ fn variant_name(op: &GitOperation) -> &'static str {
         GitOperation::AmendCommit { .. } => "AmendCommit",
         GitOperation::FetchRemote { .. } => "FetchRemote",
         GitOperation::PullBranch { .. } => "PullBranch",
+        GitOperation::CreateTag { .. } => "CreateTag",
+        GitOperation::DeleteLocalTag { .. } => "DeleteLocalTag",
+        GitOperation::DeleteRemoteTag { .. } => "DeleteRemoteTag",
+        GitOperation::PushTag { .. } => "PushTag",
     }
 }
 
@@ -446,6 +451,29 @@ fn every_operation() -> Vec<GitOperation> {
             branch: branch("main"),
             strategy: MergeStrategy::Merge,
         },
+        // M2.21a (#235): the annotated sample, so the classification below is
+        // exercised with an annotation present; `CreateTag`'s kind cannot
+        // change the answer (both write only local objects and refs) and the
+        // lightweight form is one field of this value set to `None`.
+        GitOperation::CreateTag {
+            name: TagName::new("v1.0.0").expect("valid tag name"),
+            target: oid("1111111111111111111111111111111111111111"),
+            annotation: Some(TagAnnotation {
+                message: TagMessage::new("v1.0.0").expect("valid tag message"),
+                sign: false,
+            }),
+        },
+        GitOperation::DeleteLocalTag {
+            name: TagName::new("v1.0.0").expect("valid tag name"),
+        },
+        GitOperation::DeleteRemoteTag {
+            name: TagName::new("v1.0.0").expect("valid tag name"),
+            remote: RemoteName::new("origin").expect("valid remote"),
+        },
+        GitOperation::PushTag {
+            name: TagName::new("v1.0.0").expect("valid tag name"),
+            remote: RemoteName::new("origin").expect("valid remote"),
+        },
     ]
 }
 
@@ -471,7 +499,7 @@ fn lease_force_push() -> GitOperation {
 /// let `AmendCommit` ship with a zero-coverage `NetworkNeed` classification in
 /// M2.19a, #222): every value `every_operation()` returns is tagged through
 /// [`variant_name`]'s compile-enforced match, and the resulting name set must
-/// be the full 21 with none missing and none doubled.
+/// be the full 25 with none missing and none doubled.
 #[test]
 fn every_operation_declares_every_variant() {
     let names: std::collections::BTreeSet<&str> =
@@ -503,6 +531,10 @@ fn every_operation_declares_every_variant() {
         "AmendCommit",
         "FetchRemote",
         "PullBranch",
+        "CreateTag",
+        "DeleteLocalTag",
+        "DeleteRemoteTag",
+        "PushTag",
     ]
     .into_iter()
     .collect();
@@ -596,7 +628,7 @@ fn the_completeness_guard_catches_a_variant_dropped_from_the_census() {
 fn the_serde_variant_census_is_actually_harvesting_names() {
     let harvested = variant_names_the_enum_declares();
     assert!(
-        harvested.len() >= 21,
+        harvested.len() >= 25,
         "serde's variant census came back implausibly short ({}): the \
          unknown-variant message parse has probably broken — {harvested:?}",
         harvested.len()
@@ -618,29 +650,34 @@ fn the_serde_variant_census_is_actually_harvesting_names() {
     );
 }
 
-/// Exactly three operations in the enum reach a remote, and they are
-/// `PushBranch`, `FetchRemote` and `PullBranch` (M2.20a, #227 — it was one,
-/// `PushBranch`, until fetch and pull joined it).
+/// Exactly five operations in the enum reach a remote: `PushBranch`,
+/// `FetchRemote`, `PullBranch` (M2.20a, #227) and the two tag operations
+/// M2.21a (#235) added, `DeleteRemoteTag` and `PushTag` — both pushes under
+/// the hood.
 ///
-/// The **negative half is what matters**: the other eighteen must be `Local`,
+/// The **negative half is what matters**: the other twenty must be `Local`,
 /// so a future edit that classified, say, `MergeBranch` as `Remote` to "be
 /// safe" is caught here. Widening is not safe — it moves an operation from
 /// the no-network Strict tier into a tier with outbound TCP on four ports.
+/// The mirror-image negative matters just as much for #235: `CreateTag` and
+/// `DeleteLocalTag` sitting in the Local set is what pins that the tag
+/// *local/remote split across four variants* did not quietly give the local
+/// pair a socket.
 ///
 /// Asserting the whole *set* (rather than a count plus a spot-check on one
 /// name) is deliberate: a count alone would let a swap through — reclassify
 /// `FetchRemote` down to `Local` and `MergeBranch` up to `Remote` and the
-/// total is still three. The names come from [`variant_name`]'s
+/// total is still five. The names come from [`variant_name`]'s
 /// compile-enforced match rather than from `format!("{op:?}")`, so the
 /// comparison is over typed provenance and a variant renamed in `plan.rs`
 /// cannot quietly keep matching a stale `Debug` prefix.
 #[test]
-fn exactly_the_three_remote_operations_declare_a_network_need() {
+fn exactly_the_five_remote_operations_declare_a_network_need() {
     let ops = every_operation();
     assert_eq!(
         ops.len(),
-        21,
-        "every_operation() must list every GitOperation variant; the enum has 21 \
+        25,
+        "every_operation() must list every GitOperation variant; the enum has 25 \
          (this literal is a tripwire, not the enforcement — \
          every_operation_covers_every_variant_the_enum_declares is what checks \
          the census against the enum itself and cannot be left stale with it)"
@@ -653,17 +690,23 @@ fn exactly_the_three_remote_operations_declare_a_network_need() {
             NetworkNeed::Local => local.insert(variant_name(op)),
         };
     }
-    let expected: std::collections::BTreeSet<&str> = ["PushBranch", "FetchRemote", "PullBranch"]
-        .into_iter()
-        .collect();
+    let expected: std::collections::BTreeSet<&str> = [
+        "PushBranch",
+        "FetchRemote",
+        "PullBranch",
+        "DeleteRemoteTag",
+        "PushTag",
+    ]
+    .into_iter()
+    .collect();
     assert_eq!(
         remote, expected,
         "the set of network-reaching operations changed; declared Remote: {remote:?}"
     );
     assert_eq!(
         local.len(),
-        18,
-        "the other eighteen operations must stay Local; declared Local: {local:?}"
+        20,
+        "the other twenty operations must stay Local; declared Local: {local:?}"
     );
 }
 

@@ -38,7 +38,8 @@ use git_vista_protocol::{
     AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitMessage, CommitOid,
     ForcePublish, GenerationToken, GitOperation, IdempotencyKey, OperationHash, OperationStage,
     Plan, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
-    RepositoryToken, RiskLevel, UnixSeconds, WorktreePath, WorktreeToken, IDEMPOTENCY_HEADER,
+    RepositoryToken, RiskLevel, TagName, UnixSeconds, WorktreePath, WorktreeToken,
+    IDEMPOTENCY_HEADER,
 };
 
 use crate::git_cmd::{git_ok, rev_parse, ExecUnavailable};
@@ -413,8 +414,14 @@ struct Observed {
     /// What `HEAD` resolves to (unborn HEAD ⇒ [`Obs::Absent`]; git unavailable
     /// ⇒ [`Obs::Unknown`]).
     head_tip: Obs<String>,
-    /// The tip of the branch the operation names, for the operations that need
-    /// it before executing (delete's journaled restore point, reset's CAS).
+    /// The tip of the branch — or, for [`GitOperation::DeleteLocalTag`], the
+    /// **unpeeled** value of the tag ref — the operation names, for the
+    /// operations that need it before executing (delete's journaled restore
+    /// point, reset's CAS). Unpeeled matters for the tag case: an annotated
+    /// tag's ref value is its tag *object*, and that oid is what
+    /// [`RecoveryStrategy::RecreateTag`] must carry for the recovery to
+    /// restore the original tag rather than a look-alike (see that variant's
+    /// doc in `plan.rs`).
     branch_tip: Obs<String>,
     /// `git status --porcelain=v2` at observation time — a generation input
     /// (#145) so uncommitted-work changes count as the repository moving, and
@@ -447,6 +454,19 @@ async fn build_plan(
         | GitOperation::ForceDeleteBranch { branch }
         | GitOperation::ResetBranch { branch, .. } => {
             Obs::from_read(rev_parse(repo, branch.as_str()).await)
+        }
+        // M2.21a (#235): the tag delete's restore point. Fully qualified so a
+        // same-named branch can never win the ambiguity, and read through
+        // [`rev_parse_ref_unpeeled`] rather than `rev_parse` — that helper
+        // peels (`^{commit}`), which is right for every commit-shaped caller
+        // and exactly wrong here: for an annotated tag the restore point is
+        // the tag *object's* oid — the value `git tag -d` prints as `(was
+        // <oid>)` and the one oid from which the tag can be restored
+        // byte-identically. (Caught by the contract suite's paired negative
+        // `delete_local_tag_recovery_carries_the_unpeeled_tag_object`, which
+        // failed against the peeling helper before this arm switched.)
+        GitOperation::DeleteLocalTag { name } => {
+            Obs::from_read(rev_parse_ref_unpeeled(repo, &format!("refs/tags/{name}")).await)
         }
         // No branch named by this operation: not an unreadable observation,
         // just one that was never taken.
@@ -763,44 +783,58 @@ async fn verify_precondition(
             &format!("couldn't check ‘{ref_name}’, so this plan cannot be verified: {e}"),
         ))
     };
+    // The three ref-shaped checks resolve the ref **unpeeled** (M2.21a,
+    // #235): a `RefAt` asserts what the ref itself holds, and for an
+    // annotated tag ref that is a tag object — `rev_parse`'s `^{commit}`
+    // peel would compare the plan's pinned tag-object oid against the peeled
+    // commit and refuse every honest tag CAS as "moved". For every ref this
+    // function checked before tags existed (branches, remote-tracking refs,
+    // HEAD), the ref's value *is* a commit, so unpeeled and peeled are the
+    // same bytes and this is not a behaviour change for them.
     match precondition {
-        Precondition::RefAt { ref_name, oid } => match rev_parse(repo, ref_name.as_str()).await {
-            Ok(Some(at)) if at == oid.as_str() => Ok(()),
-            Ok(Some(_)) => refuse(format!(
-                "‘{}’ moved while this plan was pending — refresh and try again.",
-                ref_name.as_str()
-            )),
-            Ok(None) => refuse(format!(
-                "‘{}’ disappeared while this plan was pending — refresh and try again.",
-                ref_name.as_str()
-            )),
-            Err(e) => unreadable(ref_name.as_str(), &e),
-        },
-        Precondition::RefExists { ref_name } => match rev_parse(repo, ref_name.as_str()).await {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => refuse(format!(
-                "‘{}’ disappeared while this plan was pending — refresh and try again.",
-                ref_name.as_str()
-            )),
-            Err(e) => unreadable(ref_name.as_str(), &e),
-        },
-        Precondition::RefAbsent { ref_name } => match rev_parse(repo, ref_name.as_str()).await {
-            // git ran and said the ref does not resolve: genuinely absent.
-            Ok(None) => Ok(()),
-            Ok(Some(_)) => refuse(format!(
-                "‘{}’ appeared while this plan was pending — refresh and try again.",
-                ref_name.as_str()
-            )),
-            // The polarity bug this arm used to have: `rev_parse` returned
-            // `None` both for "not there" and for "git could not run", and
-            // `is_none()` accepted *both* as proof of absence. So on a host
-            // where git could not be launched at all, every `RefAbsent`
-            // precondition passed — and `RefAbsent` is what guards
-            // `CreateBranch` and `RestoreBranch` from clobbering a ref that
-            // already exists. Its two siblings above happened to fail closed
-            // on the same input purely because they test for presence.
-            Err(e) => unreadable(ref_name.as_str(), &e),
-        },
+        Precondition::RefAt { ref_name, oid } => {
+            match rev_parse_ref_unpeeled(repo, ref_name.as_str()).await {
+                Ok(Some(at)) if at == oid.as_str() => Ok(()),
+                Ok(Some(_)) => refuse(format!(
+                    "‘{}’ moved while this plan was pending — refresh and try again.",
+                    ref_name.as_str()
+                )),
+                Ok(None) => refuse(format!(
+                    "‘{}’ disappeared while this plan was pending — refresh and try again.",
+                    ref_name.as_str()
+                )),
+                Err(e) => unreadable(ref_name.as_str(), &e),
+            }
+        }
+        Precondition::RefExists { ref_name } => {
+            match rev_parse_ref_unpeeled(repo, ref_name.as_str()).await {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => refuse(format!(
+                    "‘{}’ disappeared while this plan was pending — refresh and try again.",
+                    ref_name.as_str()
+                )),
+                Err(e) => unreadable(ref_name.as_str(), &e),
+            }
+        }
+        Precondition::RefAbsent { ref_name } => {
+            match rev_parse_ref_unpeeled(repo, ref_name.as_str()).await {
+                // git ran and said the ref does not resolve: genuinely absent.
+                Ok(None) => Ok(()),
+                Ok(Some(_)) => refuse(format!(
+                    "‘{}’ appeared while this plan was pending — refresh and try again.",
+                    ref_name.as_str()
+                )),
+                // The polarity bug this arm used to have: `rev_parse` returned
+                // `None` both for "not there" and for "git could not run", and
+                // `is_none()` accepted *both* as proof of absence. So on a host
+                // where git could not be launched at all, every `RefAbsent`
+                // precondition passed — and `RefAbsent` is what guards
+                // `CreateBranch` and `RestoreBranch` from clobbering a ref that
+                // already exists. Its two siblings above happened to fail closed
+                // on the same input purely because they test for presence.
+                Err(e) => unreadable(ref_name.as_str(), &e),
+            }
+        }
         Precondition::BranchCheckedOut { branch } => {
             if live.head_branch.as_deref() == Some(branch.as_str()) {
                 Ok(())
@@ -876,6 +910,39 @@ fn operation_hash(operation: &GitOperation) -> OperationHash {
 /// The full ref name of a local branch.
 fn heads(branch: &BranchName) -> Option<RefName> {
     RefName::new(format!("refs/heads/{branch}")).ok()
+}
+
+/// The full ref name of a tag — [`heads`]' sibling for `refs/tags/` (M2.21a,
+/// #235).
+fn tags(tag: &TagName) -> Option<RefName> {
+    RefName::new(format!("refs/tags/{tag}")).ok()
+}
+
+/// Resolve a ref to its **unpeeled** value — what the ref itself points at,
+/// with the same three-state honesty as [`rev_parse`] (D5: `Ok(None)` is a
+/// fact about the repository, `Err` means git did not run and is a fact about
+/// nothing).
+///
+/// A sibling rather than a flag on `rev_parse` because the two must never be
+/// confused at a call site: `rev_parse` appends `^{commit}` and *peels*,
+/// which every commit-shaped caller wants — and which, applied to an
+/// annotated tag's ref, silently swaps the tag object for its target commit.
+/// [`GitOperation::DeleteLocalTag`]'s observation is (so far) the one reader
+/// for which that swap corrupts the answer: its `RecreateTag` recovery must
+/// carry the value the ref actually held. See `build_plan`'s observation arm.
+async fn rev_parse_ref_unpeeled(
+    repo: &Path,
+    ref_name: &str,
+) -> Result<Option<String>, ExecUnavailable> {
+    // Local (D3): resolving a ref reads the object database, never a remote.
+    let output = crate::git_cmd::git_output(repo, &["rev-parse", "--verify", "--quiet", ref_name])
+        .await
+        .map_err(|e| ExecUnavailable::new(format!("couldn't run git rev-parse: {e}")))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!id.is_empty()).then_some(id))
 }
 
 /// Best-effort `CommitOid` from an observation. `Absent` and `Unknown` both
@@ -1371,6 +1438,117 @@ async fn shape(
             preconditions.extend(extra);
             (RiskLevel::Reversible, preconditions, changes, recovery)
         }
+        // M2.21a (#235, ADR 0041): contract only — the four tag shapes below
+        // are pinned by the golden fixture; execution belongs to the later
+        // M2.21 slices of #74 and `execute` refuses all four today.
+        //
+        // Create follows `CreateBranch`'s pattern (RefAbsent + delete-created
+        // recovery), with one difference the annotation forces: a lightweight
+        // tag ref will point exactly at `target`, but an annotated tag ref
+        // points at a tag *object* the operation itself creates — a value
+        // unknowable at review time, so `RefState::Computed`, the same
+        // honesty `CommitOnHead` applies to its own new commit.
+        GitOperation::CreateTag {
+            name,
+            target,
+            annotation,
+        } => {
+            let tag_ref = tags(name);
+            let preconditions = tag_ref
+                .iter()
+                .map(|r| Precondition::RefAbsent {
+                    ref_name: r.clone(),
+                })
+                .collect();
+            let after = match annotation {
+                None => RefState::At(target.clone()),
+                Some(_) => RefState::Computed,
+            };
+            let changes = tag_ref
+                .iter()
+                .map(|r| RefChange {
+                    ref_name: r.clone(),
+                    before: RefState::Absent,
+                    after: after.clone(),
+                })
+                .collect();
+            (
+                RiskLevel::Reversible,
+                preconditions,
+                changes,
+                RecoveryStrategy::DeleteCreatedTag { name: name.clone() },
+            )
+        }
+        // Delete-local follows `ForceDeleteBranch`'s pattern, deliberately
+        // not `DeleteBranch`'s: `git tag -d` has no `-d`-vs-`-D` safety
+        // split — it deletes whether or not the tagged commit is reachable
+        // from anything else, and tag refs keep no reflog, so this is the
+        // unguarded delete and ranks `Destructive`. The observed value (and
+        // therefore the CAS precondition and the recovery's `at`) is the
+        // **unpeeled** ref value — see `build_plan`'s observation arm and
+        // `RecreateTag`'s doc for why that one choice is what makes the
+        // recovery an exact restoration instead of a re-authored look-alike.
+        GitOperation::DeleteLocalTag { name } => {
+            let tag_ref = tags(name);
+            let value = oid_of(&observed.branch_tip);
+            let preconditions = match (&tag_ref, &value) {
+                (Some(r), Some(o)) => vec![Precondition::RefAt {
+                    ref_name: r.clone(),
+                    oid: o.clone(),
+                }],
+                (Some(r), None) => vec![Precondition::RefExists {
+                    ref_name: r.clone(),
+                }],
+                _ => Vec::new(),
+            };
+            let changes = match (&tag_ref, &value) {
+                (Some(r), Some(o)) => vec![RefChange {
+                    ref_name: r.clone(),
+                    before: RefState::At(o.clone()),
+                    after: RefState::Absent,
+                }],
+                _ => Vec::new(),
+            };
+            let recovery = match value {
+                Some(at) => RecoveryStrategy::RecreateTag {
+                    name: name.clone(),
+                    at,
+                },
+                // No observed value means no tag to delete — execution will
+                // surface git's own refusal, exactly the branch-delete
+                // degradation above.
+                None => RecoveryStrategy::NotNeeded,
+            };
+            (RiskLevel::Destructive, preconditions, changes, recovery)
+        }
+        // The two remote-reaching tag operations list no ref change: a
+        // remote tag has no local remote-tracking ref (tags fetch straight
+        // into `refs/tags/`), so there is nothing honest to show a reviewer
+        // moving — the same D5 posture as `FetchRemote` above. Risk and
+        // recovery follow the push family: the effect leaves the machine
+        // (`Irrecoverable`), destructively so for the remote delete
+        // (commits on the remote can lose their last ref there), additively
+        // for the tag push (`Remote`, like a fast-forward branch push).
+        GitOperation::DeleteRemoteTag { remote, .. } => (
+            RiskLevel::Destructive,
+            vec![Precondition::RemoteConfigured {
+                remote: remote.clone(),
+            }],
+            Vec::new(),
+            RecoveryStrategy::Irrecoverable,
+        ),
+        GitOperation::PushTag { name, remote } => {
+            let mut preconditions = vec![Precondition::RemoteConfigured {
+                remote: remote.clone(),
+            }];
+            preconditions.extend(tags(name).map(|r| Precondition::RefExists { ref_name: r }));
+            (
+                RiskLevel::Remote,
+                preconditions,
+                Vec::new(),
+                RecoveryStrategy::Irrecoverable,
+            )
+        }
     }
 }
 
@@ -1532,6 +1710,40 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
             StatusCode::NOT_IMPLEMENTED,
             "Pulling from a remote is not yet wired for execution (tracked by \
              #230) — this plan's contract exists, but nothing executed it."
+                .to_string(),
+        ),
+        // M2.21a (#235, ADR 0041) ships the typed tag contract only — the
+        // same staging as fetch/pull above. Execution belongs to the later
+        // M2.21 slices (#74): create/delete are their own slices, and the
+        // two remote-reaching operations are the first tag code that would
+        // open a socket with credentials on it, which earns a review of its
+        // own. These arms exist because this match must stay exhaustive over
+        // the closed vocabulary (#142); reached, they refuse rather than
+        // no-op silently or improvise a git command.
+        GitOperation::CreateTag { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "Creating a tag is not yet wired for execution (M2.21, tracked \
+             under #74) — this plan's contract exists, but nothing executed it."
+                .to_string(),
+        ),
+        GitOperation::DeleteLocalTag { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "Deleting a local tag is not yet wired for execution (M2.21, \
+             tracked under #74) — this plan's contract exists, but nothing \
+             executed it."
+                .to_string(),
+        ),
+        GitOperation::DeleteRemoteTag { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "Deleting a remote tag is not yet wired for execution (M2.21, \
+             tracked under #74) — this plan's contract exists, but nothing \
+             executed it."
+                .to_string(),
+        ),
+        GitOperation::PushTag { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "Pushing a tag is not yet wired for execution (M2.21, tracked \
+             under #74) — this plan's contract exists, but nothing executed it."
                 .to_string(),
         ),
     }

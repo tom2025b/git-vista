@@ -145,6 +145,24 @@ pub(crate) fn require_worktree_relative_path(
     Ok(())
 }
 
+/// Non-empty after trimming and at most `max` bytes — the gate for a free-text
+/// field whose *contents* the client chooses but whose *size* must not be able
+/// to grow server-side state without bound (M2.21a, #235: `TagMessage`). The
+/// same two rules as [`require_non_empty`] plus [`require_token`]'s length cap,
+/// without the character-set restriction — a tag message is prose, not a token,
+/// and never travels in a header, URL, or log line unescaped.
+pub(crate) fn require_non_empty_bounded(
+    value: &str,
+    field: &'static str,
+    max: usize,
+) -> Result<(), PlanFieldError> {
+    require_non_empty(value, field)?;
+    if value.len() > max {
+        return Err(PlanFieldError::TooLong { field, max });
+    }
+    Ok(())
+}
+
 /// A bounded, opaque token: non-empty, at most `max` characters, and made only
 /// of ASCII letters, digits, `-` and `_`.
 ///
@@ -237,6 +255,36 @@ mod tests {
                 "should have been refused: {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn non_empty_bounded_enforces_both_rules_and_nothing_else() {
+        assert!(require_non_empty_bounded("release notes\n\nwith prose.", "msg", 64).is_ok());
+        // Prose characters a token would refuse are fine here.
+        assert!(require_non_empty_bounded("v1.0 — stable (see #74)", "msg", 64).is_ok());
+        assert_eq!(
+            require_non_empty_bounded("", "msg", 64),
+            Err(PlanFieldError::Empty("msg"))
+        );
+        assert_eq!(
+            require_non_empty_bounded("   \n ", "msg", 64),
+            Err(PlanFieldError::Empty("msg"))
+        );
+        assert_eq!(
+            require_non_empty_bounded(&"a".repeat(65), "msg", 64),
+            Err(PlanFieldError::TooLong {
+                field: "msg",
+                max: 64
+            })
+        );
+        // The cap is in bytes, not chars: multi-byte text can't sneak past it.
+        assert_eq!(
+            require_non_empty_bounded(&"é".repeat(33), "msg", 64),
+            Err(PlanFieldError::TooLong {
+                field: "msg",
+                max: 64
+            })
+        );
     }
 
     #[test]
