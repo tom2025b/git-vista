@@ -17,6 +17,9 @@
 //!   * [`discard`] — discard uncommitted changes to tracked paths, or delete
 //!     untracked paths outright (#219).
 //!   * [`operations`] — one write's recorded lifecycle, and its progress stream.
+//!   * [`plan`] — `POST /api/plan` (#248): build a reviewable `Plan` and hand
+//!     it back unexecuted — the only endpoint that mints a plan without
+//!     running it, and the one the MCP `plan_*` tools sit on.
 //!
 //! Since M1.06b (#143) the write handlers don't run git themselves: each
 //! validates its request, builds one typed `GitOperation` (#142), and hands it
@@ -40,6 +43,8 @@ pub(crate) mod commit;
 pub(crate) mod discard;
 // M1.08 (#61): what happened to an operation, and watching one happen.
 pub(crate) mod operations;
+// M2.23d (#248, ADR 0046): build one reviewable Plan and return it, run nothing.
+pub(crate) mod plan;
 pub(crate) mod protocol;
 pub(crate) mod read;
 pub(crate) mod rebase;

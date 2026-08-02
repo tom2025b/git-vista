@@ -132,6 +132,15 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
         Method::POST,
         Authz::SessionAndCsrf,
     ),
+    // M2.23d (#248, ADR 0046): build a reviewable Plan and hand it back,
+    // executing nothing. Classified `SessionAndCsrf` — the full write
+    // posture — even though it mutates nothing: `security.rs`'s gate keys on
+    // HTTP method, so a POST needs CSRF regardless, and the classification
+    // should say what the route *is* rather than what it currently runs. A
+    // plan carries an `OperationHash` that #249's submit stage accepts as
+    // approval for exactly that mutation, so minting one is the front half of
+    // a write and belongs at the write posture, on the loopback router only.
+    ("/api/plan", Method::POST, Authz::SessionAndCsrf),
     ("/api/operations/{id}", Method::GET, Authz::SessionRequired),
     (
         "/api/operations/{id}/events",
@@ -145,7 +154,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 41;
+const EXPECTED_ROUTE_COUNT: usize = 42;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in
