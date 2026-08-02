@@ -17,7 +17,8 @@ use leptos::{
 };
 
 use crate::features::dialogs::commit::{
-    adopt_seed, message_buffer, persist_key, AmendPhase, CommitIntent, MessageBuffer,
+    adopt_seed, message_buffer, persist_key, seed_outcome, AmendPhase, CommitIntent, MessageBuffer,
+    SeedOutcome,
 };
 use crate::features::dialogs::core::{draft_scope_action, Dialog, DialogsCore, DraftScopeAction};
 
@@ -212,16 +213,23 @@ impl Dialogs {
     /// pre-fill can land whenever it lands — including after the user has
     /// started writing, or after the guided re-check has retargeted the
     /// dialog at a different tip — without ever eating their words.
-    pub fn seed_amend_msg(&self, incoming: &str) {
+    /// Returns what it did to the box. The guided re-check announces the
+    /// retarget in a banner that speaks about the box's contents, and it can
+    /// only be honest about them if it is told: an untouched pre-fill *is*
+    /// replaced here, so a banner that assumed otherwise would vouch for text
+    /// this call had just thrown away.
+    pub fn seed_amend_msg(&self, incoming: &str) -> SeedOutcome {
         let current = self.amend_msg.get_untracked();
         let seed = self.amend_seed.with_value(|s| s.clone());
-        if let Some(next) = adopt_seed(&current, &seed, incoming) {
-            self.amend_msg.set(next);
+        let adopted = adopt_seed(&current, &seed, incoming);
+        if let Some(next) = &adopted {
+            self.amend_msg.set(next.clone());
         }
         // The seed is recorded either way: it is the baseline the *next*
         // pre-fill compares against, and a rejected seed still means "this is
         // what the tip says", not "nothing was offered".
         self.amend_seed.set_value(incoming.to_string());
+        seed_outcome(adopted.as_ref())
     }
 
     /// The amend attempt's phase — a tracked read; the banner, the confirm

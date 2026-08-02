@@ -889,6 +889,90 @@ fn the_button_base_census_can_spot_an_unfloored_button() {
     assert!(button_base_uses("no buttons here").is_empty());
 }
 
+// ── The amend seams (M2.19c, #224) ──────────────────────────────────────────────
+//
+// `dialogs/commit.rs` and `menu.rs` are wasm-only: `cargo test --workspace` never
+// compiles them, and this crate has no wasm-bindgen-test harness, so nothing
+// *executes* a line of either. Two decisions used to live in them anyway — which
+// endpoint the confirm button reaches, and whether "Amend last commit" is offered
+// — and both were reachable-only-by-hand. They now come from host-tested
+// functions in `features::dialogs::commit`. These tripwires are the half that
+// notices if a later edit stops asking and starts deciding again; the tests over
+// the functions themselves are in that module.
+//
+// What they cannot prove: that the returned answer is rendered correctly. Only
+// that the answer is the one being consulted.
+
+/// Whether the guided re-check fills the message box before it announces what
+/// the box holds.
+///
+/// Fail-closed on a missing subject: if either landmark is gone this returns
+/// false rather than quietly passing, because a census with nothing to census
+/// is the vacuous-green shape this file exists to avoid.
+fn seeds_before_it_announces(src: &str) -> bool {
+    match (src.find("seed_amend_msg("), src.find("Recheck::Retargeted")) {
+        (Some(seed), Some(announce)) => seed < announce,
+        _ => false,
+    }
+}
+
+#[test]
+fn the_amend_seams_are_decided_in_the_host_tested_core() {
+    assert!(
+        COMMIT_MODAL.contains("submit_path("),
+        "the commit modal no longer asks `submit_path` which endpoint a press \
+         reaches, so the plain-commit / amend dispatch is being decided in a file \
+         no test compiles. An amend routed to the plain-commit closure writes a \
+         second commit instead of rewriting the tip."
+    );
+    assert!(
+        MENU.contains("amend_offer("),
+        "menu.rs no longer asks `amend_offer` whether to offer \"Amend last \
+         commit\", so the gate is a condition in a file no test compiles"
+    );
+    // The hand-rolled form, named so a revert is caught rather than merely
+    // becoming un-asserted.
+    assert!(
+        !MENU.contains("is_head && !is_stub"),
+        "the amend gate has been inlined back into menu.rs; inverting or dropping \
+         it there would offer an amend on every stub with nothing going red"
+    );
+}
+
+/// The ordering bug the M2.19c review found: the retarget banner claimed "your
+/// message below is unchanged" and the next statement re-seeded the box from the
+/// new tip, replacing exactly the text it had just vouched for.
+#[test]
+fn the_recheck_seeds_the_box_before_it_announces_what_the_box_holds() {
+    assert!(
+        seeds_before_it_announces(COMMIT_MODAL),
+        "dialogs/commit.rs sets Recheck::Retargeted before it calls \
+         seed_amend_msg. The banner speaks about the message box; seeding can \
+         replace the message box. Announcing first is a claim the next line can \
+         contradict, and the user's next act is to press Amend."
+    );
+}
+
+/// Both answers, against fixture source — a predicate that only ever returned
+/// true would satisfy the tripwire above perfectly.
+#[test]
+fn the_seed_ordering_census_can_spot_the_shape_that_shipped() {
+    let fixed = "let seeded = dialogs.seed_amend_msg(&d.message); \
+                 set(Recheck::Retargeted { new_tip, summary, message: seeded })";
+    assert!(seeds_before_it_announces(fixed));
+
+    // The paired negative: the pre-fix order.
+    let broken = "set(Recheck::Retargeted { new_tip, summary }); \
+                  dialogs.seed_amend_msg(&d.message);";
+    assert!(!seeds_before_it_announces(broken));
+
+    // And a source with no subject at all must not read as a pass.
+    assert!(!seeds_before_it_announces("nothing to see"));
+    assert!(!seeds_before_it_announces(
+        "dialogs.seed_amend_msg(&d.message);"
+    ));
+}
+
 /// The stylesheet already dresses the focused-but-disabled item, so making these
 /// focusable needs no CSS change — but that only holds while the rule is there.
 #[test]

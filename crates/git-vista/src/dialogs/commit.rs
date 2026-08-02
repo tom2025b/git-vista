@@ -12,8 +12,9 @@ use leptos::*;
 
 use crate::api::{amend_commit_request, create_commit_request, fetch_commit_detail, fetch_frame};
 use crate::features::dialogs::commit::{
-    dialog_copy, head_tip, phase_view, published_advisory, scope_review, AmendOutcome, AmendPhase,
-    CommitIntent, DialogCopy, Recheck, ScopeLine, ScopeReview,
+    dialog_copy, head_tip, phase_view, published_advisory, scope_review, submit_path, AmendOutcome,
+    AmendPhase, AmendTarget, CommitIntent, DialogCopy, PlainCommit, Recheck, ScopeLine,
+    ScopeReview, SubmitPath,
 };
 use crate::features::dialogs::core::{Dialog, PATH_LIST_LIMIT, TOUCH_TARGET_STYLE};
 use crate::features::status::signals as status_state;
@@ -67,7 +68,15 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
 
     // The plain-commit / empty-commit path, unchanged since #226 except that it
     // reads its message through the intent-aware buffer.
-    let submit_commit = move |intent: CommitIntent| {
+    //
+    // It takes a `PlainCommit`, not a `CommitIntent`, and that is deliberate:
+    // `PlainCommit` has a private field and only `submit_path` builds one, so
+    // there is no way to hand an amend to this closure. The dispatch below used
+    // to be a match on `CommitIntent` in this wasm-only file, where sending
+    // `Amend` here would have compiled, passed every test, and quietly written a
+    // second commit instead of rewriting the tip.
+    let submit_commit = move |plain: PlainCommit| {
+        let intent = plain.into_intent();
         let message = dialogs.message_untracked(&intent).trim().to_string();
         if message.is_empty() {
             return; // Keep the dialog open; the confirm button is inert anyway.
@@ -109,10 +118,9 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
     //    (`AmendPhase::Stale`), which keeps the confirm button inert until a
     //    fresh tip has been read and shown. That is what the compare-and-swap is
     //    for: retrying blind would rewrite a commit nobody reviewed.
-    let submit_amend = move |expected_tip: String| {
-        let intent = CommitIntent::Amend {
-            expected_tip: expected_tip.clone(),
-        };
+    let submit_amend = move |target: AmendTarget| {
+        let expected_tip = target.expected_tip().to_string();
+        let intent = target.intent();
         let message = dialogs.message_untracked(&intent).trim().to_string();
         if message.is_empty() {
             return;
@@ -200,11 +208,25 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
             shell.open_commit_dialog(CommitIntent::Amend {
                 expected_tip: new_tip.clone(),
             });
-            dialogs.set_amend_phase(stale(Recheck::Retargeted { new_tip, summary }));
             // Offer the new tip's message — adopted only if the user has not
             // typed since the last seed, so a re-check never eats a message
             // written for the previous tip.
-            dialogs.seed_amend_msg(&detail.message);
+            //
+            // This runs BEFORE the banner is set, and the order is the fix for a
+            // real contradiction: the banner speaks about what the box holds,
+            // and seeding can replace what the box holds. Announcing first meant
+            // the banner said "your message below is unchanged" and then this
+            // line changed it — for the commonest amend of all, the one where
+            // the user only folds in staged files and never touches the
+            // pre-filled text. `seed_amend_msg` reports what it actually did and
+            // the phase carries that, so the banner states a fact rather than a
+            // prediction.
+            let seeded = dialogs.seed_amend_msg(&detail.message);
+            dialogs.set_amend_phase(stale(Recheck::Retargeted {
+                new_tip,
+                summary,
+                message: seeded,
+            }));
         });
     };
 
@@ -393,11 +415,15 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
                                     {
                                         return;
                                     }
-                                    match &confirm_intent {
-                                        CommitIntent::Amend { expected_tip } => {
-                                            submit_amend(expected_tip.clone())
-                                        }
-                                        other => submit_commit(other.clone()),
+                                    // Which endpoint this press reaches is
+                                    // decided in the host-tested core, and the
+                                    // two arms carry types the other closure
+                                    // cannot accept — swapping them here is a
+                                    // compile error, not a silent rewrite of
+                                    // history.
+                                    match submit_path(&confirm_intent) {
+                                        SubmitPath::Amend(target) => submit_amend(target),
+                                        SubmitPath::Commit(plain) => submit_commit(plain),
                                     }
                                 }
                             >
