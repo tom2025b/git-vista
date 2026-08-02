@@ -445,9 +445,16 @@ pub(crate) fn plan_tool_catalog() -> Vec<serde_json::Value> {
 }
 
 /// One catalog entry, with the two things every schema here must have:
-/// `type: object` and `additionalProperties: false` (so a misspelled argument
-/// is refused rather than silently ignored — `tools.rs`'s
-/// `every_tool_schema_is_a_closed_object` pins that across the whole surface).
+/// `type: object` and `additionalProperties: false`, so a misspelled argument
+/// is refused rather than silently ignored.
+///
+/// That last clause is a *behavioural* promise, not just advertised text:
+/// `tools.rs`'s `every_tool_schema_is_a_closed_object` pins the declaration
+/// across the whole surface, and `tools::reject_undeclared_arguments` — run at
+/// the top of every `call_tool`, nested objects included — is what makes it
+/// true at call time. Without that enforcement the declaration was decorative,
+/// and a misspelled *optional* field (`anotation`, `curser`) was dropped
+/// silently while the call proceeded as if it had never been given.
 fn tool(
     name: &str,
     description: &str,

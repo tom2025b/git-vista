@@ -210,7 +210,67 @@ stateDiagram-v2
     Refused --> [*]: repository unchanged
 ```
 
-### 8. What proves "build-only", and where
+### 8. `additionalProperties: false` is enforced at call time, not merely advertised
+
+Every schema in §3's catalog declares a closed object, and a test pinned that declaration.
+Nothing enforced it. Between an MCP client and this dispatcher there is no validator: the
+client sends an arguments object, and each tool body then reads only the keys it knows
+about (`args.get("cursor")`, `annotation_arg(args, "annotation")`). Anything else was
+dropped in silence.
+
+A misspelled **required** key was caught incidentally, by then being "missing". A
+misspelled **optional** key was not caught at all, and that is the dangerous half, because
+the call proceeds *as if the argument had never been given*:
+
+| Call | What the caller asked for | What was built | What said so |
+|---|---|---|---|
+| `plan_create_tag` with `"anotation"` | a GPG-signed annotated tag | a bare **lightweight** tag — no message, no signature | nothing; the review digest reads `delete_created_tag` for either kind |
+| `get_graph` with `"curser"` | page *n* | page 1, for ever | nothing |
+| anything with a typo inside `force` | a leased force-push | caught only because `force_arg` hand-cross-checks its two known spellings | that one check, by luck of it existing |
+
+So `tools::reject_undeclared_arguments` now runs at the top of **every** `call_tool`,
+before any argument is read and long before anything authenticates. It walks the tool's
+own advertised `inputSchema` — the same JSON `tools/list` returns, nested `force` and
+`annotation` objects included — and refuses any key the schema does not declare, naming
+the key, the path (`plan_push_branch.force`) and the accepted names. Unknown *tool* names
+pass through untouched: those are `ToolError::Unknown`'s business (JSON-RPC `-32602`), not
+a schema complaint.
+
+```mermaid
+flowchart TD
+    A[tools/call arguments] --> B{name in the catalog}
+    B -->|no| U[Unknown tool, -32602]
+    B -->|yes| C[walk the advertised inputSchema]
+    C --> D{every key declared}
+    D -->|no| R[Execution error naming the key and its path]
+    D -->|yes, recurse into force and annotation| E[typed extraction, newtypes validate]
+    E --> F[POST /api/plan]
+```
+
+The schema stays the single source: nothing is re-declared in Rust, so a field added to a
+catalog entry is accepted by the checker the same moment it is advertised. Two tests hold
+the pair — every advertised tool refuses `gv_not_a_real_argument`, and every tool's own
+declared arguments (nested objects filled out) still pass.
+
+### 8a. The dispatch seam itself is now covered
+
+`call_tool`'s wildcard arm is the only place production code joins the JSON-RPC
+dispatcher to the plan-tool implementation — `main.rs` → `tools::call_tool` → that arm →
+`plan_tools::call_plan_tool_live`. Nothing exercised it. Every `plan_tools` unit test
+calls the *injectable* `call_plan_tool` directly, and the one integration test that would
+have caught a severed arm is `#[ignore]`d behind a live server.
+
+Proven by mutation: making `call_plan_tool_live` return `None` unconditionally — the
+real-world shape of a bad merge or a mis-swapped helper — left **all 47 tests green**
+while every one of the 23 `plan_*` tools would have answered "Unknown tool" to Claude
+Code. `every_plan_tool_is_reachable_through_call_tools_dispatcher` now calls each plan
+tool through the real dispatcher with **no arguments**, so the refusal is local and
+unconditional: a reachable tool answers `Execution("missing required argument …")`, a
+severed one answers `Unknown`. The two argument-free tools (`plan_stage_all`,
+`plan_unstage_all`) cannot be probed that way and are pinned by name instead, so a tool
+that silently *lost* its arguments lands in that assertion rather than going unexercised.
+
+### 9. What proves "build-only", and where
 
 | Claim | Proof | Where it runs |
 |---|---|---|
@@ -219,6 +279,10 @@ stateDiagram-v2
 | The route's handler cannot execute | `every_git_write_route_reaches_the_planner` classifies `/api/plan` as a build-only row and scans the handler through `argv_boundary::code_only` for the forbidden names `plan_and_execute`, `submit_plan`, `planner::execute`, plus required `build_plan_only(`/`plan_only_in(` | CI |
 | A LAN session cannot reach it | `the_lan_router_has_no_write_routes` (404) with `the_loopback_router_still_has_write_routes_registered` (405) as the paired positive | CI |
 | Nothing runs against a real repository | `every_plan_tool_leaves_the_repositorys_generation_unchanged` sweeps all 23 tools through the compiled binary against the live server and compares `get_status`'s generation before and after | `--ignored`, human-run |
+| The plan tools are reachable from `tools/call` at all | `every_plan_tool_is_reachable_through_call_tools_dispatcher` (Decision §8a) — severing `call_plan_tool_live` turns it red instead of leaving 47 tests green | CI |
+| A misspelled argument is refused, not dropped | `every_advertised_tool_refuses_an_undeclared_argument` plus its paired positive, and two end-to-end cases through `call_tool` (`anotation`, `idd`) that stay local refusals either way — so removing the enforcement fails the test rather than firing a live request | CI |
+| No tool error carries a secret | `a_failed_request_never_leaks_the_session_cookie_or_csrf_into_its_error`, plus `debugging_a_session_prints_neither_the_cookie_nor_the_csrf_token` and its `HttpResponse` twin; both `Debug` impls now destructure, so a new field is a compile error until someone decides whether it may print | CI |
+| The token-hygiene scan covers the whole crate | `production_code_never_writes_files_env_or_spawns_processes` enumerates `src/*.rs` from disk instead of a hand-written `include_str!` list, with `the_source_census_really_sees_every_file_in_the_crate` as its anti-vacuity floor | CI |
 
 The last row is `#[ignore]`d for the reason every live test in that file is: the server's
 port is a compile-time constant, so a test cannot spawn a private instance. It is #248's
@@ -233,6 +297,9 @@ carry the weight day to day.
 | Expose `StageSelection` by having the tool call `/api/staging/preview` first, then plan | Two round trips through a gate whose whole job is to bind a *diff generation* the client is holding, wrapped in a tool that would silently re-derive it. That is a staging-selection design, not a plan-tool design; doing it inside this slice would smuggle a second contract in under the first. |
 | Generate the tool catalog from `exposure_of` | Kills the census. One source generating the other means they cannot disagree, which is exactly the property the census exists to check — and the schemas are hand-written anyway (each has different fields, descriptions and required sets). |
 | Make `exposure_of` `#[cfg(test)]` (or `allow(dead_code)`) as a pure compile-time guard | The repository's own precedent (`build_plan_only` under `cfg_attr`) is for code awaiting its router, not for a guard that can have a live job. Re-checking the classification per call makes a future rogue dispatch arm a runtime refusal as well as a census failure, and removes a "tested but unreachable" symbol. |
+| Leave `additionalProperties: false` as advertised text only, and let the server reject | The server never sees the dropped key — the tool builds a `GitOperation` that is *valid*, just not the one asked for, and `POST /api/plan` happily plans it. A lightweight tag where a signed annotated one was requested is a well-formed operation. There is nothing downstream that could notice. |
+| Validate arguments with a JSON Schema crate | A dependency tree carried forever (`docs/NATIVE_DEPENDENCIES.md`) for one keyword. The surface uses `type`, `enum`, `required`, `minItems` and `additionalProperties`; `required` and the value rules are already enforced, better, by the protocol newtypes, which give errors naming the field and the rule. Only closedness was missing, and it is a recursive key-set check. |
+| Re-declare each tool's accepted keys in Rust, beside the extractors | Two lists to keep in step, and the drift would be silent in the direction that matters — a field added to a schema but not to the list would be advertised and then refused. Walking the advertised schema means the checker cannot disagree with what `tools/list` returned. |
 | One `plan_operation` tool taking `{ "op": "...", ... }` | Collapses 23 typed schemas into one that must accept a union — so the boundary can no longer reject a wrong-shaped argument, and an agent loses per-tool descriptions naming the risk. The whole point is that the *tool list itself* is the vocabulary. |
 | A `PlanRequest { operation }` wrapper DTO on the wire | Adds a wire shape to pin in the golden fixture for no second field. `GitOperation` is already an internally-tagged, fully-validating request body; wrapping it is ceremony, and the `Plan`-in/`Plan`-out symmetry with #249 is cleaner without it. |
 | Return only the raw `Plan`, no review digest | Fails the criterion that risk and recovery be readable "not just embedded JSON it has to parse blind": `{"strategy":"recoverable_if_staged"}` tells an agent nothing about the staged-until-gc nuance that variant exists to express. |
@@ -265,6 +332,17 @@ carry the weight day to day.
   the same function `plan_and_execute` does. A parallel derivation would be the one way
   `/api/plan` could hand back a plan `submit_plan` then refuses as "built for a different
   repository or worktree" — a bug visible only across two slices.
+- **The advertised schema is now a contract, not documentation.** A client that used to
+  get away with an extra key gets an `isError` result naming it. That is a deliberate
+  behaviour change for the whole tool surface, reads included, and it is the only way the
+  `additionalProperties: false` in `tools/list` can mean anything. The cost is that a
+  future field must be added to the schema *before* any caller may send it — which is the
+  same order the schema already implied.
+- **Argument extraction stays hand-written on purpose.** The closed-schema check answers
+  "is this key declared"; the protocol newtypes answer "is this value legal", and they do
+  it better than a schema keyword could (`WorktreePath` refuses `..`, `CommitOid` refuses
+  non-hex, `CommitMessage` deliberately allows a leading `-`). The two are complementary
+  and neither is trying to become the other.
 - `docs/SECURITY_MODEL.md` needs no new claim: no boundary moved. A new loopback-only,
   session+CSRF-gated POST was added inside the existing write surface, and it is the first
   route whose handler is *proven* not to reach the executor.
@@ -272,3 +350,6 @@ carry the weight day to day.
 ---
 
 **Signed:** thomas2025 · 2026-08-02T18:04:55-04:00
+**Amended:** thomas2025 · 2026-08-02T19:22:49-04:00 — Decision §8 (runtime enforcement of
+the closed schema) and §8a (the dispatch seam), added after five review lenses found the
+`additionalProperties: false` promise unenforced and the wildcard arm uncovered.
