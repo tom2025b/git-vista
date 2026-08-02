@@ -30,6 +30,10 @@ const MENU: &str = include_str!("../../menu.rs");
 /// controls — this file's own bytes are the only place its tap targets can be
 /// checked.
 const COMMIT_MODAL: &str = include_str!("../../dialogs/commit.rs");
+/// The dialogs feature's signal holder — `#[cfg(target_arch = "wasm32")]`, so
+/// `cargo test --workspace` never compiles a line of it either. It owns the
+/// amend state that #225's ceremony rests on.
+const DIALOG_SIGNALS: &str = include_str!("../dialogs/signals.rs");
 
 fn stylesheet() -> Vec<Rule> {
     parse(STYLES)
@@ -971,6 +975,130 @@ fn the_seed_ordering_census_can_spot_the_shape_that_shipped() {
     assert!(!seeds_before_it_announces(
         "dialogs.seed_amend_msg(&d.message);"
     ));
+}
+
+// ── The published-history ceremony's seams (M2.19d, #225) ───────────────────────
+//
+// Same shape as the #224 tripwires above and the same limitation: these prove
+// which function is consulted and in what order, never that its answer is drawn
+// correctly. Both wasm-only files are the subject.
+
+/// Whether the amend submit path consults the pre-flight gate **before** it
+/// reaches the network.
+///
+/// Fail-closed on a missing subject, like `seeds_before_it_announces`: a source
+/// with no gate call and no request call is not a passing source, it is a
+/// source that no longer contains the thing being checked.
+fn gates_before_it_sends(src: &str) -> bool {
+    match (
+        src.find("amend_preflight("),
+        src.find("amend_commit_request("),
+    ) {
+        (Some(gate), Some(send)) => gate < send,
+        _ => false,
+    }
+}
+
+/// Whether `Dialogs::reset_amend` clears the pre-flight knowledge along with
+/// everything else it clears.
+///
+/// Scoped to that one function's body — from its `fn` line to the next method —
+/// rather than to the whole file, so a mention of the field anywhere else
+/// cannot stand in for the reset.
+fn reset_amend_clears_preflight(src: &str) -> bool {
+    let Some(start) = src.find("fn reset_amend(") else {
+        return false;
+    };
+    let body = &src[start..];
+    let end = body[1..]
+        .find("\n    pub fn ")
+        .map(|i| i + 1)
+        .unwrap_or(body.len());
+    body[..end].contains("amend_preflight")
+}
+
+/// The gate has to be in front of the POST, not behind it.
+///
+/// What it is guarding against is not a hypothetical: `submit_amend` is a
+/// closure in a file `cargo test --workspace` never compiles, so moving the
+/// pre-flight below `amend_commit_request` — or deleting it — would leave every
+/// test in the suite green while an amend of pushed history went out with no
+/// warning shown at all. ADR 0040 records that the server will not stop it.
+#[test]
+fn the_published_history_ceremony_runs_before_the_request_does() {
+    assert!(
+        gates_before_it_sends(COMMIT_MODAL),
+        "dialogs/commit.rs no longer consults `amend_preflight` before calling \
+         `amend_commit_request`. The server deliberately does not block an amend \
+         of pushed history (ADR 0040) — this gate is the only thing that asks."
+    );
+    assert!(
+        COMMIT_MODAL.contains("AwaitingPublishedConfirm"),
+        "the ceremony's phase is gone from the modal, so `Preflight::Confirm` has \
+         nowhere to land and the warning it decides on is never rendered"
+    );
+    assert!(
+        MENU.contains("record_amend_detail("),
+        "menu.rs no longer records `CommitDetail::on_remote` when it opens amend \
+         mode, so the pre-flight gate has nothing to read and every amend looks \
+         unpublished to it"
+    );
+    assert!(
+        COMMIT_MODAL.contains("record_amend_detail("),
+        "the guided re-check no longer records the retargeted commit's own \
+         published answer, so amending after a stale tip is gated on the previous \
+         commit's flag or on nothing"
+    );
+}
+
+/// Both answers, against fixture source — a predicate that always returned true
+/// would satisfy the tripwire above perfectly.
+#[test]
+fn the_gate_ordering_census_can_spot_a_gate_behind_the_send() {
+    let gated = "match amend_preflight(target, &k) { … }; amend_commit_request(&m, &t).await";
+    assert!(gates_before_it_sends(gated));
+
+    // The shape that would ship the bug: the request goes out and the gate is
+    // consulted afterwards (or in a later, unrelated branch).
+    let ungated = "amend_commit_request(&m, &t).await; amend_preflight(target, &k)";
+    assert!(!gates_before_it_sends(ungated));
+
+    // No gate at all, and no subject at all, both read as failures.
+    assert!(!gates_before_it_sends("amend_commit_request(&m, &t).await"));
+    assert!(!gates_before_it_sends("nothing to see here"));
+}
+
+/// A fresh dialog must not inherit the previous amend's consent.
+///
+/// `PreflightKnowledge` is tip-scoped, so a leak needs *two* mistakes — a
+/// forgotten reset and a second amend of the same commit id — but the second is
+/// ordinary (open the amend dialog, cancel, open it again on the same tip), and
+/// the reset lives in a wasm-only file no test executes.
+#[test]
+fn opening_a_dialog_forgets_what_the_last_amend_agreed_to() {
+    assert!(
+        reset_amend_clears_preflight(DIALOG_SIGNALS),
+        "Dialogs::reset_amend no longer clears the pre-flight knowledge. It runs \
+         on every `Dialogs::open`, which is what stops one amend's agreement to \
+         rewrite published history being spent on the next one."
+    );
+}
+
+#[test]
+fn the_reset_census_reads_only_the_function_it_names() {
+    let clears = "fn reset_amend(&self) {\n        self.amend_msg.set(String::new());\n        \
+                  self.amend_preflight.set_value(PreflightKnowledge::default());\n    }\n";
+    assert!(reset_amend_clears_preflight(clears));
+
+    // The paired negative that matters: the field is mentioned in the file, but
+    // in a *different* method, so a whole-file `contains` would pass here.
+    let elsewhere = "fn reset_amend(&self) {\n        self.amend_msg.set(String::new());\n    }\n\
+                     \n    pub fn amend_knowledge(&self) -> PreflightKnowledge {\n        \
+                     self.amend_preflight.with_value(|k| k.clone())\n    }\n";
+    assert!(!reset_amend_clears_preflight(elsewhere));
+
+    // And a source with no such function is not a pass.
+    assert!(!reset_amend_clears_preflight("fn something_else() {}"));
 }
 
 /// The stylesheet already dresses the focused-but-disabled item, so making these

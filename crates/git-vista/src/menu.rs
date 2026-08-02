@@ -414,8 +414,19 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         // the body of every commit amended from here. A failed read leaves
                         // the box empty and the confirm button disabled, which is the safe
                         // direction — the dialog never invents a message.
+                        //
+                        // The same read answers two questions (#225): the
+                        // pre-fill, and whether this commit is already on a
+                        // remote — `CommitDetail::on_remote`, an exact
+                        // per-commit walk rather than membership of whatever
+                        // page is loaded. Recorded against `tip` so it can only
+                        // ever gate an amend of this commit. A failed read
+                        // records nothing, and `amend_preflight` treats "not
+                        // read" as unknown; see its doc comment for why unknown
+                        // sends rather than escalates.
                         spawn_local(async move {
                             if let Ok(detail) = fetch_commit_detail(&tip).await {
+                                dialogs.record_amend_detail(&tip, detail.on_remote);
                                 dialogs.seed_amend_msg(&detail.message);
                             }
                         });
