@@ -139,7 +139,17 @@ one. Three choices make that safe rather than sloppy:
   status-shaped break moves the generation and refuses). It flows to the executor's own
   legacy refusal instead of `enforce_fresh`'s 409. Accepted: both directions fail
   closed, and the alternative (§Alternatives, "re-verify everything") changes
-  single-shot-identical behavior for plans that were built stale.
+  single-shot-identical behavior for plans that were built stale. Both halves of
+  that acceptance are pinned by tests, not prose (added after adversarial review
+  found the original slice asserted them prose-only):
+  `review_window_remote_drift_fails_closed_with_the_never_configured_refusal` and
+  `review_window_seed_drift_fails_closed_with_the_never_recorded_refusal` prove the
+  executor's independent refusal — byte-identical to the never-held case — for each
+  generation-invisible precondition, and
+  `a_generation_invisible_break_while_queued_is_refused_by_the_gates_live_recheck`
+  proves the re-derivation arms the gate at all: the mutation
+  `held_at_build = Vec::new()` after the re-observe passed the entire pre-review
+  suite, and now fails that test.
 
 ```mermaid
 stateDiagram-v2
@@ -205,6 +215,16 @@ sentence.
 carry `#[cfg_attr(not(test), allow(dead_code))]` markers naming the routing issues —
 the markers are the to-do list, and removing them is the first diff line of #249.
 
+This is a **re-scope of #247, recorded on the issues, not just here** (adversarial
+review caught the first version of this section doing it silently). Four #247 bullets
+transfer, verbatim, to the issues that now own them — #248 takes `POST /api/plan` and
+#249 takes `POST /api/execute-plan`, in each case including the loopback-only
+`full_routes` registration and the extension of `the_lan_router_has_no_write_routes`
+(or an equivalent) to cover the new route. Both issues' texts predate this split and
+say they "call 153c's endpoint"; read that as "register and call" — the endpoints do
+not exist until they do it. Cross-linking comments on #247, #248 and #249 carry the
+same transfer so closing #247 cannot silently drop the criteria from tracking.
+
 ## Alternatives considered
 
 | Alternative | Why it lost |
@@ -230,8 +250,11 @@ the markers are the to-do list, and removing them is the first diff line of #249
   existing source pin — deliberately not done here.
 - The review-window corner for generation-invisible precondition drift
   (`RemoteConfigured`/`SeedRecorded`) refuses with the executor's words rather than the
-  gate's. Documented in `submit_plan`'s doc; revisit only if a future precondition is
-  both generation-invisible and dangerous to let reach its executor.
+  gate's. Documented in `submit_plan`'s doc and pinned by the contract suite's
+  `review_window_*_drift_fails_closed_*` pair (§3); revisit only if a future
+  precondition is both generation-invisible and dangerous to let reach its executor —
+  the tripwire being that a new generation-invisible precondition has no such paired
+  test until someone writes it.
 - `docs/SECURITY_MODEL.md` needs no annotation yet: no security boundary moved — the
   stages are unreachable from any route until #248/#249, which own the loopback-only
   routing decision this seam was shaped for.
@@ -239,3 +262,4 @@ the markers are the to-do list, and removing them is the first diff line of #249
 ---
 
 **Signed:** thomas2025 · 2026-08-02T06:52:31-04:00
+**Revised (review findings: drift tests + re-scope made explicit):** thomas2025 · 2026-08-02T07:11:47-04:00
