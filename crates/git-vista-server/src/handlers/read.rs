@@ -41,14 +41,14 @@ use crate::state::{current, current_handle, repo_label, resolve_worktree};
 #[derive(Deserialize)]
 pub(crate) struct RepoQuery {
     #[serde(default)]
-    repo: Option<String>,
+    pub(crate) repo: Option<String>,
 }
 
 /// Resolve the `?repo=` selector to a concrete repository, failing closed. A
 /// malformed id is a `400`; an id the catalog does not hold is a `404` — the
 /// server only ever resolves an id it itself registered, never a path from the
 /// request. An absent selector falls back to the current default selection.
-fn resolve_repo(
+pub(crate) fn resolve_repo(
     repo: Option<&str>,
 ) -> Result<(PathBuf, bool, Option<RepositoryHandle>), (StatusCode, String)> {
     match repo {

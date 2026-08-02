@@ -17,6 +17,7 @@
 //! - [`history`]  — walking commit history and finding commits present on a remote.
 //! - [`identity`] — deriving stable repository/worktree ids and generations.
 //! - [`refs`]     — reading HEAD, branches and tags, and the checked-out branch.
+//! - [`tags`]     — reading tags in full: lightweight vs annotated, tagger, message.
 //! - [`reflog`]   — reading every ref's reflog, for the activity feed.
 //! - [`github`]   — turning the `origin` remote URL into a GitHub web base URL.
 //!
@@ -31,6 +32,7 @@ pub mod history;
 pub mod identity;
 pub mod reflog;
 pub mod refs;
+pub mod tags;
 
 pub use github::{github_web_base, remote_web_base};
 pub use history::{
@@ -41,6 +43,7 @@ pub use identity::{
 };
 pub use reflog::read_reflogs;
 pub use refs::{read_head_branch, read_history_materials, read_refs, HistoryMaterials};
+pub use tags::{read_tags, TagRecord, MAX_TAG_MESSAGE_BYTES};
 
 #[derive(Debug, Error)]
 pub enum RepoError {
