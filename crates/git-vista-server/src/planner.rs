@@ -2721,50 +2721,79 @@ async fn exec_discard_tracked_paths(
     )
 }
 
-/// Compare what `git clean -f`'s own stdout says it actually removed
-/// ("Removing <path>" per entry) against the full `requested` set, and build
-/// an honest partial-result message if any requested path is missing —
-/// `None` when every requested path was reported removed. Pure: takes
-/// `git clean`'s stdout text directly, no repository access, so the
-/// mismatch-detection and message-building logic is testable with a
-/// hand-built stdout string, independent of ever triggering the real race
-/// this exists to report on (see [`exec_delete_untracked_paths`]'s doc
-/// comment for why the race itself can't be a deterministic permanent test).
-fn partial_delete_report(requested: &[&str], clean_stdout: &str) -> Option<String> {
-    let removed: std::collections::HashSet<&str> = clean_stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix("Removing "))
-        .collect();
-    let missing: Vec<&str> = requested
+/// After `git clean -f -- <paths>` has run, ask the **filesystem** which of
+/// `requested` is actually gone, and build an honest partial-result message
+/// naming any that survived — `None` when every requested path really was
+/// removed.
+///
+/// **Why the filesystem and not `git clean`'s stdout (#284).** Until #284
+/// this parsed `git clean`'s own output for `Removing <path>`. That string is
+/// passed through gettext in git's source, so it is translated whenever a
+/// `git.mo` catalog is installed and `LANG`/`LC_MESSAGES` names a non-English
+/// locale — and production spawns inherit the server's environment in full,
+/// because `sandbox::spawn`'s `env_clear`/`env` are `#[cfg(test)]`-only *by
+/// design* (argv and env cannot change after policy classification). Under
+/// `LANG=fr_FR.UTF-8` with translations installed, three successfully deleted
+/// files matched no prefix, all three looked un-deleted, and the endpoint
+/// returned 409 telling the user their files had survived — after they were
+/// irreversibly gone. That is the exact inversion of the property this
+/// function exists to provide, so the parse is gone: a dirent that is still
+/// there was not deleted, in every language.
+///
+/// **`symlink_metadata`, not `Path::exists`.** `exists()` follows the link, so
+/// a *dangling* symlink — one whose target is already gone — reports as
+/// absent while its dirent is still sitting in the worktree. `git clean` can
+/// and does delete dangling symlinks, so both "clean removed it" and "clean
+/// skipped it" would look identical to `exists()`, reintroducing a false
+/// success in the narrow case. `symlink_metadata` stats the entry itself and
+/// tells the two apart. (Same reason `symlink_containment_guard` uses it.)
+///
+/// **What this can still get wrong, stated plainly.** If something *else*
+/// deleted a requested path in the same window, this reports it as deleted.
+/// That overstates our own blast radius by one entry — but it can never do
+/// the thing #284 was filed about, which is claim a destroyed file survived.
+/// Only the second failure mode leads a user to stop looking for data that
+/// is gone for good, so that is the one this is biased against.
+///
+/// A stat error other than "not found" (an unreadable parent directory, say)
+/// likewise counts as gone, for the same reason: presence is the claim that
+/// has to be *proved* here, and an error proves nothing.
+///
+/// Synchronous `stat` calls in an async fn, deliberately: one per requested
+/// path, bounded by the request, on entries `symlink_containment_guard` and
+/// `verify_path_states` stat'd microseconds earlier — not worth a
+/// `spawn_blocking` hop and the join-error branch that comes with it.
+fn partial_delete_report(repo: &Path, requested: &[&str]) -> Option<String> {
+    let survived: Vec<&str> = requested
         .iter()
         .copied()
-        .filter(|p| !removed.contains(p))
+        .filter(|p| std::fs::symlink_metadata(repo.join(p)).is_ok())
         .collect();
-    if missing.is_empty() {
+    if survived.is_empty() {
         return None;
     }
     // Some of the batch is already, irreversibly gone — that cannot be
     // undone by refusing now. What this can still do is refuse to claim
     // full success: name exactly what happened instead of a count that
     // doesn't match reality.
-    let removed_list = requested
+    let deleted_list = requested
         .iter()
         .copied()
-        .filter(|p| removed.contains(p))
+        .filter(|p| !survived.contains(p))
         .collect::<Vec<_>>()
         .join(", ");
-    let missing_list = missing.join(", ");
+    let survived_list = survived.join(", ");
     Some(format!(
-        "Partial result: {removed_list} {} deleted permanently, but {missing_list} \
+        "Partial result: {deleted_list} {} deleted permanently, but {survived_list} \
          {} not — its state changed (likely became tracked) in the instant between \
          the pre-flight check and this running. Nothing further was applied for \
-         {missing_list}; re-check its status before retrying.",
-        if removed_list.is_empty() {
+         {survived_list}; re-check its status before retrying.",
+        if deleted_list.is_empty() {
             "was"
         } else {
             "were"
         },
-        if missing.len() == 1 { "was" } else { "were" }
+        if survived.len() == 1 { "was" } else { "were" }
     ))
 }
 
@@ -2815,16 +2844,15 @@ async fn exec_delete_untracked_paths(
     // rest of the batch — verified directly against real git. Locking out
     // the whole race window needs a repo-wide exclusive lock this endpoint
     // doesn't hold; what's tractable and load-bearing without one is never
-    // reporting success that isn't true: `git clean`'s own stdout names
-    // exactly what it removed, so that is compared against the full
-    // requested set before this returns 200 (`partial_delete_report`, pure
-    // and directly tested against a hand-built mismatch — the timing race
-    // itself isn't something a permanent test can trigger deterministically,
-    // but the honesty property this exists for doesn't depend on how a
-    // mismatch arose).
-    let stdout_text = String::from_utf8_lossy(&output.stdout).into_owned();
+    // reporting success that isn't true: every requested path is re-stat'd
+    // before this returns 200, and one still on disk was not deleted
+    // (`partial_delete_report`; #284 replaced an English-only parse of `git
+    // clean`'s stdout with that check — see its doc comment). The timing
+    // race itself isn't something a permanent test can trigger
+    // deterministically, but the honesty property this exists for doesn't
+    // depend on how a mismatch arose.
     let requested: Vec<&str> = paths.iter().map(WorktreePath::as_str).collect();
-    if let Some(msg) = partial_delete_report(&requested, &stdout_text) {
+    if let Some(msg) = partial_delete_report(repo, &requested) {
         eprintln!("git-vista: /api/delete-untracked-paths partial: {msg}");
         journal_app_event(
             repo,

@@ -1150,22 +1150,23 @@ async fn discard_tracked_paths_refuses_a_directory_target() {
     assert_eq!(status, StatusCode::CONFLICT, "{why}");
 }
 
-/// The pure logic [`partial_delete_report`] exists for (review finding):
-/// `git clean`'s own stdout is the ground truth for what actually got
-/// removed, and a requested path missing from it must never be silently
-/// folded into a claimed full success. Tested directly against a hand-built
-/// stdout string — the real race that produces this exact mismatch can't be
-/// deterministically timed in a permanent test (the review that found this
-/// bug used an empirical microsecond-scale stagger to land inside the
-/// window), but the honesty property under test here doesn't depend on how
-/// the mismatch arose, only on whether it's reported truthfully.
+/// The logic [`partial_delete_report`] exists for (review finding):
+/// a requested path that `git clean` silently skipped must never be folded
+/// into a claimed full success. Driven against a real worktree — the real
+/// race that produces this exact mismatch can't be deterministically timed in
+/// a permanent test (the review that found this bug used an empirical
+/// microsecond-scale stagger to land inside the window), but the honesty
+/// property under test here doesn't depend on how the mismatch arose, only on
+/// whether it's reported truthfully.
 #[test]
 fn partial_delete_report_flags_any_requested_path_git_clean_silently_skipped() {
     // The exact scenario the review demonstrated: 3 requested, one silently
-    // skipped (since-tracked), git still exits as if fully successful.
-    let stdout = "Removing x.txt\nRemoving z.txt\n";
-    let msg = partial_delete_report(&["x.txt", "y.txt", "z.txt"], stdout)
-        .expect("a missing requested path must never be silently folded into success");
+    // skipped (since-tracked), git still exits as if fully successful. Here
+    // that end state is built directly: x and z gone, y still on disk.
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("y.txt"), "skipped\n").unwrap();
+    let msg = partial_delete_report(&repo, &["x.txt", "y.txt", "z.txt"])
+        .expect("a surviving requested path must never be silently folded into success");
     assert!(msg.contains("x.txt"), "{msg}");
     assert!(msg.contains("z.txt"), "{msg}");
     assert!(msg.contains("y.txt"), "{msg}");
@@ -1178,10 +1179,177 @@ fn partial_delete_report_flags_any_requested_path_git_clean_silently_skipped() {
     );
 }
 
+/// #284 defect 1: the report must be silent when the files really are gone,
+/// **in any locale**. `git clean`'s `Removing %s` goes through gettext, and
+/// production spawns inherit the server's `LANG` (`sandbox::spawn`'s
+/// `env_clear` is `#[cfg(test)]`-only by design), so the pre-#284 parse
+/// inverted itself under a translated git: three deleted files matched no
+/// prefix, all three looked un-deleted, and the endpoint answered 409 —
+/// "your files survived" — about files that were already gone for good.
+///
+/// The positive leg runs a **real** `git clean` and asserts silence. The
+/// paired negative re-implements the pre-#284 parse inline and pins that it
+/// would have got the same end state wrong, so the positive leg is proven
+/// capable of failing rather than merely green.
 #[test]
-fn partial_delete_report_is_silent_when_every_requested_path_was_removed() {
-    let stdout = "Removing a.txt\nRemoving b.txt\n";
-    assert_eq!(partial_delete_report(&["a.txt", "b.txt"], stdout), None);
+fn partial_delete_report_reads_the_worktree_so_a_translated_git_cannot_invert_it() {
+    let (_dir, repo) = seeded_repo();
+    for p in ["x.txt", "y.txt", "z.txt"] {
+        std::fs::write(repo.join(p), "junk\n").unwrap();
+    }
+    // Really deleted, by real git.
+    run(&repo, &["clean", "-f", "--", "x.txt", "y.txt", "z.txt"]);
+    for p in ["x.txt", "y.txt", "z.txt"] {
+        assert!(
+            std::fs::symlink_metadata(repo.join(p)).is_err(),
+            "{p} should be gone before the report is asked anything"
+        );
+    }
+    assert_eq!(
+        partial_delete_report(&repo, &["x.txt", "y.txt", "z.txt"]),
+        None,
+        "every requested path is gone from disk — claiming a partial result here \
+         is the 409-after-destruction inversion #284 was filed about"
+    );
+
+    // Paired negative: the pre-#284 decision, re-implemented here in full and
+    // run against the SAME end state, so "the old code would have got this
+    // wrong" is demonstrated rather than asserted. `translated_stdout` is what
+    // git 2.43 prints for these three deletions under `LANG=fr_FR.UTF-8` with
+    // its message catalogs installed; production spawns inherit the server's
+    // locale, because `sandbox::spawn`'s `env_clear` is `#[cfg(test)]`-only by
+    // design (argv and env cannot change after policy classification), so
+    // widening that boundary was never the fix available here.
+    let translated_stdout = "Suppression de x.txt\nSuppression de y.txt\nSuppression de z.txt\n";
+    let old_verdict_survivors: Vec<&str> = {
+        let removed: std::collections::HashSet<&str> = translated_stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("Removing "))
+            .collect();
+        ["x.txt", "y.txt", "z.txt"]
+            .into_iter()
+            .filter(|p| !removed.contains(p))
+            .collect()
+    };
+    assert_eq!(
+        old_verdict_survivors,
+        ["x.txt", "y.txt", "z.txt"],
+        "the old stdout parse called all three destroyed files survivors, so the \
+         endpoint answered 409 — 'your files were NOT deleted' — after they were \
+         irreversibly gone. That verdict is what the assertion above must not \
+         reproduce."
+    );
+}
+
+/// #284, the trap in the fix the issue proposed. `Path::exists()` follows a
+/// symlink, so a **dangling** symlink — dirent present, target gone —
+/// reports as absent. `git clean` can delete dangling symlinks, so an
+/// `exists()`-based check cannot tell "clean removed the link" from "clean
+/// skipped the link, and the link's target happened to be missing already":
+/// both read as deleted, and the second is a false success.
+/// `symlink_metadata` stats the entry itself and separates them.
+///
+/// Both legs run against the same real dangling symlink: skipped (survivor,
+/// must be named) and then actually removed by real `git clean` (must be
+/// silent).
+#[test]
+fn partial_delete_report_tells_a_surviving_dangling_symlink_from_a_deleted_one() {
+    let (_dir, repo) = seeded_repo();
+    let link = repo.join("dangling");
+    std::os::unix::fs::symlink(repo.join("no-such-target"), &link).unwrap();
+
+    // Paired negative on the naive fix: `exists()` already says "gone" for
+    // this entry, which is still sitting in the worktree.
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok(),
+        "the dirent is there"
+    );
+    assert!(
+        !link.exists(),
+        "`exists()` follows the link and reports absent — an `exists()`-based \
+         check would call this survivor deleted"
+    );
+
+    let msg = partial_delete_report(&repo, &["dangling"])
+        .expect("an entry still in the worktree was not deleted, whatever it points at");
+    assert!(msg.contains("dangling"), "{msg}");
+
+    // Paired positive: once real `git clean` removes the same entry — which
+    // it does, dangling target and all — the report goes silent.
+    run(&repo, &["clean", "-f", "--", "dangling"]);
+    assert!(std::fs::symlink_metadata(&link).is_err());
+    assert_eq!(partial_delete_report(&repo, &["dangling"]), None);
+}
+
+/// #284 defect 2, end to end through the two production functions that own
+/// the count: `handlers::discard::validate_paths` (where the dedupe lives)
+/// composed with the executor whose message says `paths.len()`. The
+/// assertion that matters is the last one — the number in the response
+/// equals the number of files that actually left the disk.
+#[tokio::test]
+async fn a_duplicated_delete_request_reports_the_count_that_really_happened() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("scratch.txt"), "junk\n").unwrap();
+    std::fs::write(repo.join("other.txt"), "junk\n").unwrap();
+
+    let paths =
+        crate::handlers::discard::validate_paths(git_vista_protocol::WorktreePathsRequest {
+            paths: vec![
+                "scratch.txt".to_string(),
+                "other.txt".to_string(),
+                "scratch.txt".to_string(),
+            ],
+        })
+        .expect("a repeated path is client sloppiness, not a wire error");
+
+    let (status, body) = exec_delete_untracked_paths(&repo, NetworkNeed::Local, &paths).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Ground truth first: exactly two files actually left the disk, nothing
+    // else was touched, and the working tree is clean.
+    assert!(std::fs::symlink_metadata(repo.join("scratch.txt")).is_err());
+    assert!(std::fs::symlink_metadata(repo.join("other.txt")).is_err());
+    assert_eq!(out(&repo, &["status", "--porcelain"]), "");
+    // The load-bearing assertion, and the one that fails against the pre-#284
+    // shape: without the dedupe `paths` held 3 entries, `git clean` still
+    // removed the same 2 files, the survivor check still found nothing left
+    // behind, and `paths.len()` put "Deleted 3 untracked paths permanently"
+    // in the response — an overstated blast radius in the one operation with
+    // no undo, where the count is the user's only record of what is gone.
+    assert!(
+        body.contains("Deleted 2 untracked paths"),
+        "the reported count must be the 2 files that actually left the disk, not \
+         the 3 entries the client happened to type: {body}"
+    );
+    assert_eq!(paths.len(), 2, "the repeat must not survive validation");
+}
+
+/// The discard-side twin of the count fix: same `validate_paths`, same
+/// `paths.len()` message, so a repeated path must not inflate that count
+/// either.
+#[tokio::test]
+async fn a_duplicated_discard_request_reports_the_count_that_really_happened() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
+
+    let paths =
+        crate::handlers::discard::validate_paths(git_vista_protocol::WorktreePathsRequest {
+            paths: vec!["a.txt".to_string(), "a.txt".to_string()],
+        })
+        .expect("a repeated path is client sloppiness, not a wire error");
+
+    let (status, body) = exec_discard_tracked_paths(&repo, NetworkNeed::Local, &paths).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Ground truth: one file, reverted to HEAD, working tree clean.
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(out(&repo, &["status", "--porcelain"]), "");
+    // The pre-#284 shape said "2 tracked paths" here for the one file it
+    // discarded.
+    assert!(
+        body.contains("1 tracked path.") && !body.contains('2'),
+        "one path was discarded, so the response must say 1: {body}"
+    );
+    assert_eq!(paths.len(), 1, "the repeat must not survive validation");
 }
 
 // ---------------------------------------------------------------------------
