@@ -17,6 +17,8 @@
 //!   * [`discard`] — discard uncommitted changes to tracked paths, or delete
 //!     untracked paths outright (#219).
 //!   * [`operations`] — one write's recorded lifecycle, and its progress stream.
+//!   * [`tags`]    — `GET /api/tags`, every tag with its kind, target, tagger
+//!     and message (M2.21b, #236).
 //!
 //! Since M1.06b (#143) the write handlers don't run git themselves: each
 //! validates its request, builds one typed `GitOperation` (#142), and hands it
@@ -46,6 +48,8 @@ pub(crate) mod rebase;
 pub(crate) mod reset;
 pub(crate) mod select;
 pub(crate) mod staging;
+// M2.21b (#236): `GET /api/tags`, the tag listing with type/target/tagger/message.
+pub(crate) mod tags;
 // M1.04 (#57): establish / check / revoke a loopback session.
 pub(crate) mod session;
 
