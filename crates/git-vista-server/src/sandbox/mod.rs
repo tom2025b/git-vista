@@ -778,10 +778,10 @@ pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         // socket. Whether the *amended-away* commit had already been pushed
         // (and so now diverges from a remote-tracking ref) is a fact about
         // history, not about what this operation asks git to do over the
-        // wire; see `GitOperation::AmendCommit`'s doc comment for why that
-        // question is left to #223's execution slice rather than answered
-        // here. This variant also has no execution wired yet (#223) — this
-        // arm exists purely to keep this match total.
+        // wire — #223's execution answers it with a walk of the local
+        // `refs/remotes/*` cache (`planner::amended_commit_is_published`),
+        // which opens no socket either, so `Local` stayed the truthful
+        // declaration when execution landed (M2.19b, ADR 0040).
         GitOperation::AmendCommit { .. } => NetworkNeed::Local,
     }
 }

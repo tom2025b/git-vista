@@ -44,9 +44,8 @@ pub struct CreateCommitRequest {
     pub branch: Option<String>,
 }
 
-/// Body of the planned `POST /api/amend-commit` request (M2.19, #72;
-/// contract-only for now — no handler builds this into a
-/// [`crate::GitOperation::AmendCommit`] yet, that is M2.19b, #223).
+/// Body of a `POST /api/amend-commit` request (M2.19, #72; contract landed
+/// with M2.19a #222, execution wired by M2.19b #223 — see ADR 0040).
 ///
 /// `expected_tip` is the compare-and-swap: the full hex commit id the client
 /// last saw as the checked-out branch's tip, matching
@@ -65,6 +64,85 @@ pub struct AmendCommitRequest {
     pub message: String,
     pub allow_empty: bool,
     pub expected_tip: String,
+}
+
+/// Why a `POST /api/amend-commit` execution failed, as a typed tag the client
+/// can branch on (M2.19b, #223) — the whole point is that the frontend
+/// (M2.19d) renders each case distinctly *without* regex-sniffing git's
+/// stderr, which is gettext-translated and version-dependent. The server owns
+/// the (documented, tested) classification heuristics; the wire carries only
+/// this tag.
+///
+/// Wire values are `snake_case` strings. The classification is honest about
+/// its limits: git prints **nothing of its own** when a hook rejects a commit
+/// (verified against git 2.43 — a silently-failing `pre-commit` produces
+/// exit 1 with empty stderr and stdout), so `HookRejected` is a documented
+/// heuristic (see `planner::classify_amend_failure`), not a certainty, and a
+/// hook that fakes git's own `fatal:` wording lands in `Other` — the safe
+/// direction, since `Other` promises nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AmendFailureKind {
+    /// The compare-and-swap refused: HEAD is not at `expected_tip`, so the
+    /// commit the reviewer approved rewriting is not the commit that would
+    /// be rewritten. The client's remedy is refresh-and-re-review, never
+    /// retry-as-is.
+    StaleTip,
+    /// A repository hook (`pre-commit`, `prepare-commit-msg`, `commit-msg`)
+    /// exited non-zero. Actionable: the hook's own output (if any) is in
+    /// `message`, and the user fixes whatever the hook checks.
+    HookRejected,
+    /// Commit signing was configured and the signer failed (`gpg failed to
+    /// sign the data`, an unloadable ssh signing key, …). Actionable: a
+    /// signing-setup problem, not a content problem.
+    SigningFailed,
+    /// Everything else, reported with git's own words in `message`.
+    Other,
+}
+
+/// Body of a **failed** `POST /api/amend-commit` (status 400): the typed
+/// classification plus git's own explanation. Every 400 this endpoint
+/// returns carries this JSON shape — handler-level validation refusals
+/// included — so a client can always parse a 400 body as this type. Other
+/// statuses (403/409/5xx) keep the server-wide prose contract; they are the
+/// shared refusals (auth, staleness, busy, git-couldn't-run) every endpoint
+/// answers identically and the client already handles generically.
+///
+/// A response DTO, so no `deny_unknown_fields`: a future server may add
+/// fields, and an older client must keep parsing (M1.02 additive rule).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmendCommitError {
+    pub kind: AmendFailureKind,
+    pub message: String,
+}
+
+/// Body of a **successful** `POST /api/amend-commit` (status 200).
+///
+/// `old_tip` is the amended-away commit (the request's own `expected_tip`,
+/// echoed so the response is self-contained); `new_tip` is the rewritten
+/// tip, `None` only if git could not be re-read after the amend succeeded
+/// (the amend still happened — same posture as the journal's
+/// "resulting tip unknown" note).
+///
+/// `amended_published_commit` is the published-history guard (#223):
+/// `Some(true)` means the amended-away commit was reachable from a
+/// remote-tracking ref, so local and remote history have now diverged and a
+/// plain push will be refused — the client should warn. `Some(false)` means
+/// the walk ran and found nothing. `None` means the walk itself failed, so
+/// the server honestly does not know — distinct from `false` on purpose, the
+/// same three-state honesty `Obs` gives observations server-side. The flag
+/// is **advisory, deliberately**: the server never blocks an amend of
+/// published history (the user may be doing exactly that, knowingly — the
+/// pre-flight ceremony is the client's, M2.19d); this is defense in depth
+/// and after-the-fact truth, per ADR 0040.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmendCommitSuccess {
+    pub message: String,
+    pub old_tip: String,
+    #[serde(default)]
+    pub new_tip: Option<String>,
+    #[serde(default)]
+    pub amended_published_commit: Option<bool>,
 }
 
 /// Body of the branch-operation requests (Issue #33 follow-up): merge

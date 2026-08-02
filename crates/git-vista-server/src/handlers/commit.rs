@@ -1,6 +1,7 @@
 //! `POST /api/commit` (Issue #33): create a commit — either a plain commit on
 //! HEAD, or (the branch-stub path) an empty commit written directly onto a
-//! branch that isn't checked out — plus `POST /api/stage` / `POST /api/unstage`.
+//! branch that isn't checked out — plus `POST /api/amend-commit` (M2.19b,
+//! #223) and `POST /api/stage` / `POST /api/unstage`.
 //!
 //! Since M1.06b (#143) these handlers validate the request (unchanged
 //! wording), build the matching [`GitOperation`], and hand it to
@@ -10,7 +11,10 @@
 use axum::http::StatusCode;
 use axum::Json;
 
-use git_vista_protocol::{BranchName, CommitMessage, CommitOid, CreateCommitRequest, GitOperation};
+use git_vista_protocol::{
+    AmendCommitRequest, AmendFailureKind, BranchName, CommitMessage, CommitOid,
+    CreateCommitRequest, GitOperation,
+};
 
 use crate::git_cmd::rev_parse;
 use crate::planner;
@@ -61,6 +65,68 @@ pub(crate) async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (Stat
 
     planner::plan_and_execute(GitOperation::CommitOnHead {
         message,
+        allow_empty: req.allow_empty,
+    })
+    .await
+}
+
+/// Rewrite the checked-out branch's tip commit (`POST /api/amend-commit`,
+/// M2.19b #223, ADR 0040): validate the request the same way [`create_commit`]
+/// does (read-only rejection, non-empty message), require `expected_tip` to be
+/// a **full** hex commit id, and hand [`GitOperation::AmendCommit`] to the
+/// planner. All execution — the compare-and-swap against `expected_tip`, the
+/// published-history flag, the hook/signing failure classification — lives in
+/// `planner::exec_amend_commit`.
+///
+/// A deliberately *separate* route from `POST /api/commit`, not a widened
+/// `CreateCommitRequest`: an amend sent to a pre-#223 server must fail
+/// loudly (404), never be quietly accepted as a plain commit. Folding the
+/// amend fields into the commit body would make exactly that downgrade
+/// possible — an older server ignoring (or, with `deny_unknown_fields`,
+/// rejecting) `expected_tip` — and "created a second commit instead of
+/// rewriting the first" is a silent wrong outcome on a history-rewriting
+/// request. ADR 0040 records the choice.
+///
+/// The two validation refusals here answer with the same
+/// [`git_vista_protocol::AmendCommitError`] JSON shape the executor's
+/// classified failures use (via the shared [`planner::amend_refusal`]
+/// constructor), so the endpoint's contract stays simple for M2.19d:
+/// **every** 400 body from this route parses as `AmendCommitError`.
+pub(crate) async fn amend_commit(Json(req): Json<AmendCommitRequest>) -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    let message = req.message.trim();
+    if message.is_empty() {
+        // [`AmendFailureKind::Other`] for both handler-level refusals: these
+        // are request-shape problems the UI never produces, not git
+        // outcomes, so no finer kind applies.
+        return planner::amend_refusal(AmendFailureKind::Other, "Commit message can't be empty.");
+    }
+    let message = match CommitMessage::new(message) {
+        Ok(message) => message,
+        // Unreachable after the emptiness check above; kept total.
+        Err(e) => return planner::amend_refusal(AmendFailureKind::Other, &e.to_string()),
+    };
+    // The CAS pin. A full hex id only — never resolved through rev-parse:
+    // `expected_tip` is the tip the client *reviewed*, and resolving a
+    // symbolic name here would re-read the live repository and pin the swap
+    // to whatever the tip is *now*, which asserts nothing (the same
+    // reviewed-value-or-no-lease posture `PushBranch`'s lease takes).
+    let expected_tip = match CommitOid::new(req.expected_tip.trim()) {
+        Ok(tip) => tip,
+        Err(e) => {
+            return planner::amend_refusal(
+                AmendFailureKind::Other,
+                &format!(
+                    "expected_tip must be the full commit id the amend was reviewed against: {e}"
+                ),
+            )
+        }
+    };
+    planner::plan_and_execute(GitOperation::AmendCommit {
+        message,
+        expected_tip,
         allow_empty: req.allow_empty,
     })
     .await

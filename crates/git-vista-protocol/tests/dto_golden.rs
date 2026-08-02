@@ -26,9 +26,10 @@
 //! review the diff, and record the protocol implications (M1.02 rules).
 
 use git_vista_protocol::{
-    AmendCommitRequest, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
-    DeleteCloneRequest, HookPolicy, RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind,
-    SelectRequest, SessionInfo, SessionRequest,
+    AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind, BranchRequest,
+    CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest, HookPolicy,
+    RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo,
+    SessionRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +44,9 @@ struct DtoGoldenSet {
     create_commit_request_on_head: CreateCommitRequest,
     create_commit_request_with_branch: CreateCommitRequest,
     amend_commit_request: AmendCommitRequest,
+    amend_commit_success_published: AmendCommitSuccess,
+    amend_commit_success_unknown_reach: AmendCommitSuccess,
+    amend_commit_error_hook_rejected: AmendCommitError,
     branch_request: BranchRequest,
     clone_request: CloneRequest,
     select_request: SelectRequest,
@@ -74,12 +78,39 @@ fn golden_set() -> DtoGoldenSet {
             branch: Some("feature/idea".to_string()),
         },
         // M2.19a (#222): the DTO the issue's own acceptance criteria asked
-        // for, added contract-only alongside `GitOperation::AmendCommit` —
-        // no handler builds this yet (M2.19b, #223).
+        // for, added contract-only alongside `GitOperation::AmendCommit`;
+        // M2.19b (#223) wired the handler that builds it.
         amend_commit_request: AmendCommitRequest {
             message: "fix: correct the typo".to_string(),
             allow_empty: false,
             expected_tip: "5555555555555555555555555555555555555555".to_string(),
+        },
+        // M2.19b (#223): the amend response contract, both bodies. The
+        // published flag is deliberately three-state — `Some(true)` here
+        // (the case the flag exists for), `None` below (the walk failed;
+        // "unknown" must stay distinct from "not published" on the wire, so
+        // this fixture pins that `None` serializes as an explicit null and
+        // not as an absent-therefore-false key).
+        amend_commit_success_published: AmendCommitSuccess {
+            message: "Amended commit.".to_string(),
+            old_tip: "5555555555555555555555555555555555555555".to_string(),
+            new_tip: Some("6666666666666666666666666666666666666666".to_string()),
+            amended_published_commit: Some(true),
+        },
+        amend_commit_success_unknown_reach: AmendCommitSuccess {
+            message: "Amended commit.".to_string(),
+            old_tip: "5555555555555555555555555555555555555555".to_string(),
+            new_tip: None,
+            amended_published_commit: None,
+        },
+        // The typed failure body: `kind` is the tag M2.19d branches on
+        // instead of regex-sniffing stderr; `message` stays git's (or the
+        // hook's) own words. `hook_rejected` is the variant pinned because
+        // it is the one whose wire spelling a client is most likely to
+        // hard-code a match on.
+        amend_commit_error_hook_rejected: AmendCommitError {
+            kind: AmendFailureKind::HookRejected,
+            message: "pre-commit: trailing whitespace on line 3".to_string(),
         },
         branch_request: BranchRequest {
             branch: "main".to_string(),
@@ -283,5 +314,38 @@ fn dto_v1_golden() {
             .and_then(|v| v.as_str()),
         Some("unsandboxed"),
         "a disclosed policy must reach the wire under the server's own tier name"
+    );
+    // M2.19b (#223): the amend success body's two optionals are
+    // present-but-null when absent (only #[serde(default)], no
+    // skip_serializing_if) — deliberately, because for
+    // `amended_published_commit` the null IS the payload: "the walk failed,
+    // reachability unknown" must stay distinguishable from `false` ("the
+    // walk ran and found nothing") for the client's warning to be honest.
+    // Omitting the key would make an old-fixture-shaped parse read unknown
+    // as not-published, the exact fail-open collapse `Obs` exists to
+    // prevent server-side.
+    let unknown_reach = obj["amend_commit_success_unknown_reach"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        unknown_reach.get("amended_published_commit"),
+        Some(&serde_json::Value::Null),
+        "amended_published_commit must be present-but-null when unknown — \
+         null is the honest 'walk failed' answer, distinct from false"
+    );
+    assert_eq!(
+        unknown_reach.get("new_tip"),
+        Some(&serde_json::Value::Null),
+        "new_tip must be present-but-null when the post-amend re-read failed"
+    );
+    assert_eq!(
+        obj["amend_commit_error_hook_rejected"]
+            .as_object()
+            .unwrap()
+            .get("kind")
+            .and_then(|v| v.as_str()),
+        Some("hook_rejected"),
+        "AmendFailureKind must reach the wire as snake_case strings — \
+         M2.19d branches on these exact spellings"
     );
 }
