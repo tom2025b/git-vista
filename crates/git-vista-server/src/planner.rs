@@ -659,7 +659,13 @@ async fn observe_for_submission(repo: &Path, plan: &Plan) -> Observed {
 /// wouldn't classify as a repository, so it has no catalog entry) a fixed
 /// placeholder keeps the plan well-formed; execution then fails with git's own
 /// error exactly as the un-migrated handlers did.
-fn selection_tokens() -> (RepositoryToken, WorktreeToken) {
+///
+/// `pub(crate)` since M2.23d (#248) so `handlers::plan` mints a plan's tokens
+/// through the *same* function [`plan_and_execute`] does. A second, parallel
+/// derivation would be the one way `/api/plan` could hand back a plan whose
+/// tokens `submit_plan` (#249) then refuses as "built for a different
+/// repository or worktree" — a bug visible only across two slices.
+pub(crate) fn selection_tokens() -> (RepositoryToken, WorktreeToken) {
     match current_handle() {
         Some(handle) => (
             RepositoryToken::new(handle.repository.to_string())

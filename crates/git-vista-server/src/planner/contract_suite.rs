@@ -1756,6 +1756,11 @@ fn every_git_write_route_reaches_the_planner() {
         // #219 (M2.18a): discard/delete of working-tree paths.
         ("/api/discard-tracked-paths", "discard_tracked_paths"),
         ("/api/delete-untracked-paths", "delete_untracked_paths"),
+        // M2.23d (#248, ADR 0046): build a reviewable Plan and hand it back.
+        // Deliberately NOT a funnel row below — it must never reach
+        // `plan_and_execute`. The `build_only` block after the funnel loop
+        // states the inverse requirement and checks it.
+        ("/api/plan", "plan_operation"),
     ];
     assert_eq!(
         posts.len(),
@@ -1857,6 +1862,55 @@ fn every_git_write_route_reaches_the_planner() {
              every git write must flow through the shared planner (ADR 0016)"
         );
     }
+
+    // The build-only rows (M2.23d, #248): the inverse of the funnel above.
+    // `/api/plan` exists to hand a reviewable plan back *unexecuted*, so its
+    // handler must reach `build_plan_only` and must NOT reach any execution
+    // entry point. Stated as a required-name plus a forbidden-name set so
+    // both failure directions are caught: wiring the plan endpoint to the
+    // executor (it would execute) and quietly dropping the `build_plan_only`
+    // call (it would stop building) each fail here.
+    //
+    // **Scanned through `argv_boundary::code_only`**, which blanks comments
+    // and string contents. Two reasons, one of them found by mutating this
+    // very check: `fn_body`'s slice for one function runs up to the *next*
+    // `fn` keyword and therefore swallows that next function's doc comment,
+    // and these doc comments legitimately discuss `plan_and_execute_in` in
+    // prose — so a raw text scan would false-positive.
+    //
+    // The forbidden names carry **no trailing `(`**, also learned by
+    // mutation: `plan_and_execute_in(` does not contain the substring
+    // `plan_and_execute(`, so a paren-anchored needle let a handler that
+    // called the composed pipeline sail straight through this guard.
+    let plan_src = crate::argv_boundary::code_only(&source("src/handlers/plan.rs"));
+    for handler in ["plan_operation", "plan_only_in"] {
+        let body = fn_body(&plan_src, handler);
+        for forbidden in ["plan_and_execute", "submit_plan", "planner::execute"] {
+            assert!(
+                !body.contains(forbidden),
+                "src/handlers/plan.rs::{handler} calls {forbidden} — POST /api/plan \
+                 is build-only (#248); executing an approved plan is #249's own \
+                 endpoint"
+            );
+        }
+    }
+    assert!(
+        fn_body(&plan_src, "plan_only_in").contains("build_plan_only("),
+        "src/handlers/plan.rs::plan_only_in no longer calls build_plan_only — \
+         POST /api/plan must build its plan through the planner's own build \
+         stage, not a parallel derivation"
+    );
+    assert!(
+        fn_body(&plan_src, "plan_operation").contains("plan_only_in("),
+        "src/handlers/plan.rs::plan_operation no longer goes through \
+         plan_only_in — the seam the guard-held build test drives must be the \
+         one the route actually uses"
+    );
+    // The blanking above must not have blanked away what is being looked for:
+    // if `code_only` ever stopped preserving code, every `!contains` above
+    // would pass vacuously. The two positive `contains` assertions just made
+    // are that proof — they read real call sites out of the same blanked
+    // string the negatives are checked against.
 }
 
 /// The production composition itself: [`plan_and_execute`]'s body must call
@@ -3251,6 +3305,70 @@ async fn building_a_plan_takes_no_guard_and_submitting_takes_the_real_one() {
     let (status, body) = submit.await;
     assert_ok(status, &body);
     assert_eq!(tip(&repo, "seam"), at, "the released submit must execute");
+}
+
+/// #248's build-only proof, at the seam `POST /api/plan` actually uses and
+/// for **every** operation kind — the census version of the single-operation
+/// test above.
+///
+/// [`crate::handlers::plan::plan_only_in`] is the exact function
+/// `plan_operation` (the route handler) calls once it has resolved the
+/// repository; `every_git_write_route_reaches_the_planner` pins that, so this
+/// is not a lookalike seam. Driving it here, rather than the route, is
+/// deliberate: the route reads the process-global `CURRENT` selection, which
+/// is set-once per process and owned by `state`'s own test in this binary.
+///
+/// Two claims, both across the whole [`samples`] census:
+///
+///  - **The plan endpoint takes no guard.** The pipeline's real mutation
+///    guard is held for the entire call; if building ever acquired it the
+///    call would block and the timeout would fail the test. This is what
+///    makes a client-review roundtrip safe — an agent can ask "what would
+///    this do?" for any operation while an unrelated mutation is running,
+///    and neither blocks the other.
+///  - **It executes nothing.** The full [`repo_fingerprint`] (refs, HEAD,
+///    status, object count, config, FETCH_HEAD) is unchanged after all 25
+///    calls, against a repository whose fingerprint is itself proven
+///    change-detecting by
+///    [`repo_fingerprint_detects_every_change_it_claims_to_watch`].
+///
+/// The anti-vacuity leg is the surrounding test above: it proves this exact
+/// guard is the one `submit_plan` queues on, so "held" here is not a lock
+/// nothing cares about.
+#[tokio::test]
+async fn every_plan_tool_operation_builds_while_the_mutation_guard_is_held() {
+    let (_dir, repo) = seeded_repo();
+    let before = repo_fingerprint(&repo);
+
+    let held = crate::coordinator::lock(None).await;
+    for op in samples() {
+        let label = serde_json::to_value(&op).unwrap()["op"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let plan = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            crate::handlers::plan::plan_only_in(&repo, tokens(), op.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "POST /api/plan's seam blocked on the mutation guard for ‘{label}’ — \
+                 building must never lock"
+            )
+        });
+        // The plan describes the operation asked for, not some other one:
+        // a seam that silently substituted an operation would still return
+        // a Plan and still leave the repository untouched.
+        assert_eq!(plan.operation, op, "‘{label}’ built a plan for another op");
+    }
+    drop(held);
+
+    assert_eq!(
+        repo_fingerprint(&repo),
+        before,
+        "POST /api/plan's seam mutated the repository — it must build only"
+    );
 }
 
 /// #247 acceptance 2: for **every** operation kind, `build_plan_only` then

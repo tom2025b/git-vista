@@ -54,3 +54,4 @@ it, and note the link in both.
 | [0040](0040-amend-execution.md) | Amend execution: its own route, an executor-level CAS, an advisory published-history flag, and typed failure kinds | Accepted — implemented and tested |
 | [0041](0041-tag-operation-vocabulary.md) | The typed tag vocabulary: four variants, and an undo that restores the exact tag object | Accepted — typed contract implemented and tested; execution not yet wired (M2.21 slices of #74) |
 | [0042](0042-planner-build-submit-split.md) | The planner's build / submit seam: two stages, one set of stage functions | Accepted — implemented and tested; not routed until #248/#249 |
+| [0046](0046-mcp-plan-tool-surface.md) | The MCP plan-tool surface: 23 build-only tools, one endpoint, and a variant that cannot be exposed | Accepted — implemented and tested |

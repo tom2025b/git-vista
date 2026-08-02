@@ -56,8 +56,22 @@ pub enum ToolError {
     Execution(String),
 }
 
-/// The catalog of tools this bridge advertises to `tools/list`.
+/// The catalog of tools this bridge advertises to `tools/list` — the
+/// read-only surface here, then M2.23d's (#248) `plan_*` build-only tools
+/// appended from [`crate::plan_tools`].
 pub fn tool_catalog() -> serde_json::Value {
+    let mut catalog = read_tool_catalog();
+    catalog
+        .as_array_mut()
+        .expect("the read catalog is a JSON array")
+        .extend(crate::plan_tools::plan_tool_catalog());
+    catalog
+}
+
+/// The read-only six (#245/#246), kept as their own function so
+/// [`tool_catalog`] above reads as "reads, then plans" rather than one
+/// 500-line literal.
+fn read_tool_catalog() -> serde_json::Value {
     serde_json::json!([
         {
             "name": "list_repositories",
@@ -242,7 +256,14 @@ pub fn call_tool(
             let path = format!("/api/activity{qs}");
             get_json::<Vec<git_vista_core::activity::ActivityEvent>>(&path, session)
         }
-        other => Err(ToolError::Unknown(other.to_string())),
+        // M2.23d (#248): the `plan_*` build-only surface. Tried *after* the
+        // read tools and before the unknown-tool refusal, so a plan tool's
+        // name can never shadow a read tool's, and an unrecognised name is
+        // still `Unknown` rather than silently swallowed.
+        other => match crate::plan_tools::call_plan_tool_live(other, arguments, session) {
+            Some(result) => result,
+            None => Err(ToolError::Unknown(other.to_string())),
+        },
     }
 }
 
@@ -519,9 +540,10 @@ fn authed_fetch(
 /// `authed_post`'s injected POST closure: `(path, body, cookie, csrf) ->
 /// response`. Named so the signature below reads, rather than clippy's
 /// `type_complexity` firing on it inline.
-type PostFn<'a> = dyn FnMut(&str, &[u8], &str, &str) -> Result<HttpResponse, String> + 'a;
+pub(crate) type PostFn<'a> =
+    dyn FnMut(&str, &[u8], &str, &str) -> Result<HttpResponse, String> + 'a;
 
-fn authed_post(
+pub(crate) fn authed_post(
     path: &str,
     body: &[u8],
     session: &mut Option<Session>,
@@ -587,6 +609,11 @@ mod tests {
 
     #[test]
     fn the_tool_catalog_lists_exactly_the_six_read_tools() {
+        // #248 appended the `plan_*` surface after these, so the read tools
+        // are now a *prefix* of the catalog rather than the whole of it —
+        // still pinned in order, and still pinned to exactly these names, so
+        // a read tool silently added, removed or renamed fails here as
+        // before. `plan_tools`'s own census owns the rest of the catalog.
         let cat = tool_catalog();
         let names: Vec<&str> = cat
             .as_array()
@@ -594,18 +621,31 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            names,
-            [
-                "list_repositories",
-                "select_repository",
-                "get_graph",
-                "get_commit_detail",
-                "get_commit_diff",
-                "get_status",
-                "get_activity",
-            ]
+        let expected_reads = [
+            "list_repositories",
+            "select_repository",
+            "get_graph",
+            "get_commit_detail",
+            "get_commit_diff",
+            "get_status",
+            "get_activity",
+        ];
+        assert_eq!(names[..expected_reads.len()], expected_reads);
+        assert!(
+            names[expected_reads.len()..]
+                .iter()
+                .all(|n| n.starts_with("plan_")),
+            "a non-read, non-plan tool appeared in the catalog: {names:?}"
         );
+        // Nothing after the reads may be a *write*: this crate's whole
+        // premise is that the only mutation surface is a reviewable plan.
+        for forbidden in ["execute", "submit", "apply", "run"] {
+            assert!(
+                !names.iter().any(|n| n.contains(forbidden)),
+                "‘{forbidden}’ appears in a tool name — #248 ships no execution \
+                 capability; that is #249's slice"
+            );
+        }
     }
 
     #[test]

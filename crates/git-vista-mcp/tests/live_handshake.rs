@@ -136,14 +136,14 @@ mod read_tools {
     /// Spawn the bridge, complete `initialize`/`notifications/initialized`,
     /// and return a live stdin/stdout pair ready for `tools/call`. Shared by
     /// every case below so each test is just "call one tool, compare."
-    struct Bridge {
+    pub struct Bridge {
         stdin: std::process::ChildStdin,
         lines: std::io::Lines<BufReader<std::process::ChildStdout>>,
         child: std::process::Child,
     }
 
     impl Bridge {
-        fn spawn() -> Self {
+        pub fn spawn() -> Self {
             let exe = env!("CARGO_BIN_EXE_git-vista-mcp");
             let mut child = Command::new(exe)
                 .stdin(Stdio::piped())
@@ -180,16 +180,13 @@ mod read_tools {
         /// JSON on success — panics with the tool's own error text
         /// otherwise, so a failing assertion in a test using this shows
         /// *why* the bridge failed, not just that it did.
-        fn call(&mut self, id: u64, name: &str, arguments: serde_json::Value) -> serde_json::Value {
-            let msg = serde_json::json!({
-                "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                "params": { "name": name, "arguments": arguments }
-            });
-            self.stdin.write_all(msg.to_string().as_bytes()).unwrap();
-            self.stdin.write_all(b"\n").unwrap();
-            self.stdin.flush().unwrap();
-            let line = self.lines.next().unwrap().unwrap();
-            let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+        pub fn call(
+            &mut self,
+            id: u64,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> serde_json::Value {
+            let reply = self.raw_call(id, name, arguments);
             assert_eq!(
                 reply["result"]["isError"], false,
                 "{name} failed: {}",
@@ -199,7 +196,52 @@ mod read_tools {
                 .unwrap_or_else(|e| panic!("{name}'s payload was not JSON: {e}"))
         }
 
-        fn finish(mut self) {
+        /// [`Self::call`]'s tolerant sibling (#248): `None` when the tool ran
+        /// and *refused*, rather than a panic. Only for the plan sweep, where
+        /// a refusal is a legitimate outcome (a precondition the live
+        /// repository doesn't meet) and the property under test is that
+        /// nothing mutated either way. A protocol-level error — an unknown
+        /// tool, a malformed reply — still panics, because that is the bridge
+        /// being broken, not the repository saying no.
+        pub fn try_call(
+            &mut self,
+            id: u64,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Option<serde_json::Value> {
+            let reply = self.raw_call(id, name, arguments);
+            assert!(
+                reply.get("error").is_none(),
+                "{name} was a protocol error, not a refusal: {}",
+                reply["error"]
+            );
+            if reply["result"]["isError"] == serde_json::json!(true) {
+                return None;
+            }
+            Some(
+                serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap_or_else(|e| panic!("{name}'s payload was not JSON: {e}")),
+            )
+        }
+
+        fn raw_call(
+            &mut self,
+            id: u64,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> serde_json::Value {
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            });
+            self.stdin.write_all(msg.to_string().as_bytes()).unwrap();
+            self.stdin.write_all(b"\n").unwrap();
+            self.stdin.flush().unwrap();
+            let line = self.lines.next().unwrap().unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+
+        pub fn finish(mut self) {
             drop(self.stdin);
             let status = self.child.wait().expect("bridge did not exit");
             assert!(status.success(), "the bridge exited non-zero");
@@ -333,6 +375,184 @@ mod read_tools {
         // Both legs select the same repository in the same mode, so both
         // get the server's same confirmation text back.
         assert_eq!(via_bridge.as_str(), Some(baseline_body.as_str()));
+    }
+}
+
+/// #248's literal acceptance criterion, against a real repository: calling
+/// **every** `plan_*` tool leaves the repository's generation unchanged.
+///
+/// `#[ignore]` for the same reason as every case above — the server's port is
+/// a compile-time constant, so this needs the real `git-vista-server` on
+/// `127.0.0.1:8080`. Written and ready for a human to run off-hours; **never**
+/// run it against the box's live server while an iPad session is using it.
+///
+/// The non-ignored proof of the same property lives where CI can reach it:
+/// `git-vista-server`'s
+/// `contract_suite::every_plan_tool_operation_builds_while_the_mutation_guard_is_held`
+/// drives `/api/plan`'s own seam for every operation kind against a throwaway
+/// repository, holding the pipeline's real mutation guard, and asserts the
+/// full repository fingerprint is unchanged. This case is the end-to-end
+/// version — real binary, real MCP framing, real HTTP, real server.
+mod plan_tools_change_nothing {
+    use super::git_vista_mcp_test_support as support;
+    use super::read_tools::Bridge;
+
+    /// A minimal valid argument set per plan tool, addressed at whatever the
+    /// server's current selection is. Values that must exist in the live repo
+    /// (a commit id, the checked-out branch) are filled in from real reads.
+    fn arguments(head_oid: &str, branch: &str) -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            (
+                "plan_create_branch",
+                serde_json::json!({ "name": "gv-mcp-probe", "at": head_oid }),
+            ),
+            (
+                "plan_commit_on_head",
+                serde_json::json!({ "message": "probe", "allow_empty": true }),
+            ),
+            (
+                "plan_empty_commit_on_branch",
+                serde_json::json!({
+                    "branch": branch, "message": "probe", "expected_tip": head_oid
+                }),
+            ),
+            ("plan_stage_all", serde_json::json!({})),
+            ("plan_unstage_all", serde_json::json!({})),
+            (
+                "plan_checkout_branch",
+                serde_json::json!({ "branch": branch }),
+            ),
+            ("plan_merge_branch", serde_json::json!({ "branch": branch })),
+            (
+                "plan_push_branch",
+                serde_json::json!({
+                    "branch": branch, "remote": "origin",
+                    "set_upstream": false, "force": { "mode": "none" }
+                }),
+            ),
+            (
+                "plan_delete_branch",
+                serde_json::json!({ "branch": branch }),
+            ),
+            (
+                "plan_force_delete_branch",
+                serde_json::json!({ "branch": branch }),
+            ),
+            (
+                "plan_rebase_onto_base",
+                serde_json::json!({ "base": "main" }),
+            ),
+            (
+                "plan_restore_branch",
+                serde_json::json!({ "name": "gv-mcp-probe", "tip": head_oid }),
+            ),
+            (
+                "plan_reset_branch",
+                serde_json::json!({
+                    "branch": branch, "to": head_oid, "expected_tip": head_oid
+                }),
+            ),
+            (
+                "plan_revert_commit",
+                serde_json::json!({ "commit": head_oid }),
+            ),
+            (
+                "plan_discard_tracked_paths",
+                serde_json::json!({ "paths": ["README.md"] }),
+            ),
+            (
+                "plan_delete_untracked_paths",
+                serde_json::json!({ "paths": ["gv-mcp-probe.tmp"] }),
+            ),
+            (
+                "plan_amend_commit",
+                serde_json::json!({
+                    "message": "probe", "expected_tip": head_oid, "allow_empty": true
+                }),
+            ),
+            (
+                "plan_fetch_remote",
+                serde_json::json!({ "remote": "origin" }),
+            ),
+            (
+                "plan_pull_branch",
+                serde_json::json!({
+                    "remote": "origin", "branch": branch, "strategy": "merge"
+                }),
+            ),
+            (
+                "plan_create_tag",
+                serde_json::json!({ "name": "gv-mcp-probe", "target": head_oid }),
+            ),
+            (
+                "plan_delete_local_tag",
+                serde_json::json!({ "name": "gv-mcp-probe" }),
+            ),
+            (
+                "plan_delete_remote_tag",
+                serde_json::json!({ "name": "gv-mcp-probe", "remote": "origin" }),
+            ),
+            (
+                "plan_push_tag",
+                serde_json::json!({ "name": "gv-mcp-probe", "remote": "origin" }),
+            ),
+        ]
+    }
+
+    #[test]
+    #[ignore = "needs the real git-vista-server running on 127.0.0.1:8080; run with --ignored. \
+                Builds a plan for every mutation the vocabulary has — and executes none of \
+                them, which is exactly what it asserts."]
+    fn every_plan_tool_leaves_the_repositorys_generation_unchanged() {
+        let session = support::authenticate_for_test()
+            .expect("baseline: could not authenticate — is the server running?");
+        let before = support::get_json(&session, "/api/status/v2")
+            .expect("baseline: GET /api/status/v2 failed");
+        let generation_before = before["generation"]
+            .as_str()
+            .expect("baseline: v2 status carried no generation")
+            .to_string();
+        let branch = before["branch"].as_str().unwrap_or("main").to_string();
+        let page =
+            support::get_json(&session, "/api/commits").expect("baseline: GET /api/commits failed");
+        let head_oid = page["rows"][0]["commit"]["id"]
+            .as_str()
+            .expect("baseline: no commits to address a plan at")
+            .to_string();
+
+        let mut bridge = Bridge::spawn();
+        let mut planned = 0usize;
+        for (id, (name, args)) in arguments(&head_oid, &branch).into_iter().enumerate() {
+            // A plan CAN legitimately be refused (a precondition the live
+            // repository doesn't meet — no `origin`, a branch that isn't
+            // checked out). What must never happen is a mutation, so a
+            // refusal is tolerated and a *changed generation* is not.
+            if let Some(value) = bridge.try_call(id as u64 + 100, name, args) {
+                assert!(
+                    value.get("plan").is_some(),
+                    "{name} returned no plan: {value}"
+                );
+                assert!(
+                    value["review"]["risk"].is_string(),
+                    "{name}'s review carried no readable risk"
+                );
+                planned += 1;
+            }
+        }
+        bridge.finish();
+        assert!(
+            planned > 0,
+            "every plan tool was refused — nothing proved the no-mutation claim"
+        );
+
+        let after = support::get_json(&session, "/api/status/v2")
+            .expect("GET /api/status/v2 failed after the plan sweep");
+        assert_eq!(
+            after["generation"].as_str(),
+            Some(generation_before.as_str()),
+            "the repository's generation moved across a sweep of build-only \
+             plan tools — something executed"
+        );
     }
 }
 
