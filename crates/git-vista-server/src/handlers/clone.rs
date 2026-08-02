@@ -520,9 +520,12 @@ fn clone_status_not_found() -> Response {
 /// git's own error text (bad host, repo not found, …) verbatim. The URL is
 /// validated by [`validate_clone_url`] — only `http(s)://`/`git://`, so a pasted
 /// SSH URL can't trigger a key prompt — and is passed as its own argv entry, never
-/// a shell line. A full clone is made (history is bounded downstream by
-/// `HISTORY_LIMIT`); clones persist under the clones root (ADR 0008) until
-/// deleted via `/api/delete-clone`.
+/// a shell line. A full clone is made; the graph view's paged history walk
+/// (`walk_history_topo`, `handlers/read.rs`) has no `HISTORY_LIMIT` cap and is
+/// not bounded by anything downstream of this handler — `HISTORY_LIMIT` only
+/// caps the Activity panel's separate remote-commit read (`activity.rs`). Found
+/// misleading during the #218 investigation. Clones persist under the clones
+/// root (ADR 0008) until deleted via `/api/delete-clone`.
 ///
 /// #216/#263/#264: unlike every other write, this handler used not to be
 /// operation-tracked at all, so the idempotency key the client already sends

@@ -195,7 +195,18 @@ fn content_type_ok_for_write(headers: &header::HeaderMap) -> bool {
 /// the request id and a code derived from the status — so auth refusals answer in
 /// the same shape as every other failure. Carries `no-store` like every other API
 /// response, so a refusal is never cached either.
-fn deny(status: StatusCode, message: &str) -> Response {
+///
+/// #218: also logs the refusal. Before this there was no per-request record of
+/// *any* `require_auth` refusal — the exact gap that issue's own investigation
+/// named as the reason its diagnosis could only be rated `plausible`: a 401 on
+/// the initial-load reads leaves nothing server-side to confirm it actually
+/// fired. Logs only the route, method and status, plus the fixed, non-secret
+/// reason string every call site already passes a literal for — never a
+/// header, cookie, CSRF token or query string, so nothing here can leak a
+/// credential (same posture as [`crate::durable::redact_operation`]: log the
+/// category of what happened, never the payload).
+fn deny(method: &Method, path: &str, status: StatusCode, message: &str) -> Response {
+    eprintln!("git-vista: refused {method} {path}: {status} — {message}");
     (
         status,
         [(header::CACHE_CONTROL, "no-store")],
@@ -217,6 +228,8 @@ pub(crate) async fn require_auth(
     // 1. Method allowlist.
     if !is_allowed_method(&method) {
         return deny(
+            &method,
+            &path,
             StatusCode::METHOD_NOT_ALLOWED,
             "This method is not allowed.",
         );
@@ -230,6 +243,8 @@ pub(crate) async fn require_auth(
         .is_some_and(|h| state.hosts.host_allowed(h));
     if !host_ok {
         return deny(
+            &method,
+            &path,
             StatusCode::FORBIDDEN,
             "Request rejected: unexpected Host. git-vista only answers on localhost.",
         );
@@ -240,6 +255,8 @@ pub(crate) async fn require_auth(
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()) {
         if !state.hosts.origin_allowed(origin) {
             return deny(
+                &method,
+                &path,
                 StatusCode::FORBIDDEN,
                 "Request rejected: cross-origin request to a local-only service.",
             );
@@ -249,6 +266,8 @@ pub(crate) async fn require_auth(
     // 4. Content type on writes — blocks the form-encoded CSRF vector.
     if is_state_changing(&method) && !content_type_ok_for_write(headers) {
         return deny(
+            &method,
+            &path,
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "Request rejected: state-changing requests must send JSON.",
         );
@@ -263,12 +282,21 @@ pub(crate) async fn require_auth(
             // Writes need a live session *and* the matching CSRF header.
             let expected = match cookie.and_then(|id| state.manager.validate(id)) {
                 Some(csrf) => csrf,
-                None => return deny(StatusCode::UNAUTHORIZED, "No active session. Reconnect."),
+                None => {
+                    return deny(
+                        &method,
+                        &path,
+                        StatusCode::UNAUTHORIZED,
+                        "No active session. Reconnect.",
+                    )
+                }
             };
             let presented = headers.get(CSRF_HEADER).and_then(|c| c.to_str().ok());
             let csrf_ok = presented.is_some_and(|c| ct_eq(expected.as_bytes(), c.as_bytes()));
             if !csrf_ok {
                 return deny(
+                    &method,
+                    &path,
                     StatusCode::FORBIDDEN,
                     "Request rejected: missing or invalid CSRF token.",
                 );
@@ -276,7 +304,12 @@ pub(crate) async fn require_auth(
         } else {
             // Reads need only a live session.
             if cookie.and_then(|id| state.manager.validate(id)).is_none() {
-                return deny(StatusCode::UNAUTHORIZED, "No active session. Reconnect.");
+                return deny(
+                    &method,
+                    &path,
+                    StatusCode::UNAUTHORIZED,
+                    "No active session. Reconnect.",
+                );
             }
         }
     }
