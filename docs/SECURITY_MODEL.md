@@ -523,6 +523,26 @@ generation/idempotency fields arrive with the review roundtrip, M2+.)*
 | Remote visible | Push, PR create/comment | Explicit target and identity confirmation |
 | Remote destructive | Force-push, remote branch delete | Strong warning, lease/CAS, re-auth option |
 
+*(Worktree destructive — implemented: ADR 0037, #219 + #220. **Preview:** the confirmation
+modal names every affected path (capped at twelve, with the overflow counted, so a truncated
+list never understates the count) — there is no glob and no blind "discard all". **Typed
+file impact:** two separate `GitOperation` variants, `DiscardTrackedPaths` and
+`DeleteUntrackedPaths`, each carrying an explicit `Vec<WorktreePath>` — a newtype that
+refuses absolute paths, `..` components, NUL bytes and option-shaped values at the wire
+boundary; every path is re-verified as still-tracked-dirty / still-untracked against a fresh
+`git status` immediately before the destructive call, and a path resolving outside the
+worktree through a symlink, or to a directory, is refused. **Safety checkpoint:** partial,
+and deliberately so. A discard is `RecoveryStrategy::RecoverableIfStaged` — the content
+survives as a dangling blob until the next `git gc` exactly when it was staged at some
+point. A delete of untracked files is `RecoveryStrategy::Irrecoverable` and **no checkpoint
+is possible**: the content was never in the object database, so there is nothing to
+checkpoint from. ADR 0037 records why manufacturing one (stash/temporary commit) was
+rejected, and what stands in its place — a two-step arming ceremony and copy that never says
+"undo", "restore" or "recover". One window stays open: `git clean` is not atomic across a
+multi-path pathspec, so a concurrent `git add` can produce a partial delete; that is detected
+by comparing git's own removal list against the request and reported as a `409`, never as
+success.)*
+
 No gesture, pressure threshold, swipe, or double-tap directly executes a destructive
 operation. Touch gestures may select or open a plan; final confirmation is explicit.
 
