@@ -26,9 +26,9 @@
 //! review the diff, and record the protocol implications (M1.02 rules).
 
 use git_vista_protocol::{
-    BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
-    HookPolicy, RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest,
-    SessionInfo, SessionRequest,
+    AmendCommitRequest, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
+    DeleteCloneRequest, HookPolicy, RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind,
+    SelectRequest, SessionInfo, SessionRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +42,7 @@ struct DtoGoldenSet {
     create_branch_request: CreateBranchRequest,
     create_commit_request_on_head: CreateCommitRequest,
     create_commit_request_with_branch: CreateCommitRequest,
+    amend_commit_request: AmendCommitRequest,
     branch_request: BranchRequest,
     clone_request: CloneRequest,
     select_request: SelectRequest,
@@ -71,6 +72,14 @@ fn golden_set() -> DtoGoldenSet {
             message: "chore: start the branch".to_string(),
             allow_empty: true,
             branch: Some("feature/idea".to_string()),
+        },
+        // M2.19a (#222): the DTO the issue's own acceptance criteria asked
+        // for, added contract-only alongside `GitOperation::AmendCommit` —
+        // no handler builds this yet (M2.19b, #223).
+        amend_commit_request: AmendCommitRequest {
+            message: "fix: correct the typo".to_string(),
+            allow_empty: false,
+            expected_tip: "5555555555555555555555555555555555555555".to_string(),
         },
         branch_request: BranchRequest {
             branch: "main".to_string(),

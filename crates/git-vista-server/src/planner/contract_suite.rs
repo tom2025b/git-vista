@@ -8,8 +8,12 @@
 //!  1. **Pipeline integration** — one test per [`GitOperation`] variant runs
 //!     the real `build_plan → validate → enforce_fresh → execute` composition
 //!     against a real temporary repository and asserts the mutation landed.
-//!     [`covered_by`] matches exhaustively over the enum, so adding a
-//!     sixteenth variant refuses to compile until it gets a pipeline test.
+//!     [`covered_by`] matches exhaustively over the enum, so adding a new
+//!     variant refuses to compile until it gets a pipeline test. (One
+//!     exception so far: `AmendCommit`, M2.19a #222, ships no execution —
+//!     its pipeline test asserts the *stub's* refusal and that the
+//!     repository stayed untouched, the honest version of this layer's
+//!     claim until #223 wires real execution in.)
 //!  2. **Single-funnel proof** — a source-level test walks the router's POST
 //!     table and every git-write handler, asserting each one reaches
 //!     [`plan_and_execute`] (directly or through its named local helper) and
@@ -176,6 +180,7 @@ fn covered_by(op: &GitOperation) -> &'static str {
         GitOperation::DeleteUntrackedPaths { .. } => {
             "delete_untracked_paths_executes_through_the_pipeline"
         }
+        GitOperation::AmendCommit { .. } => "amend_commit_executes_through_the_pipeline",
     }
 }
 
@@ -245,6 +250,11 @@ fn every_operation_kind_names_a_distinct_pipeline_test() {
         },
         GitOperation::DeleteUntrackedPaths {
             paths: vec![wpath("a.txt")],
+        },
+        GitOperation::AmendCommit {
+            message: message("m"),
+            expected_tip: oid(&zeros),
+            allow_empty: false,
         },
     ];
     let names: Vec<&str> = samples.iter().map(covered_by).collect();
@@ -1549,5 +1559,43 @@ async fn a_broken_precondition_is_refused_end_to_end() {
         out(&remote, &["for-each-ref", "refs/heads"]),
         "",
         "nothing may have been pushed to the deconfigured remote"
+    );
+}
+
+// --- #222 (M2.19a): typed AmendCommit contract, execution not yet wired ---
+
+/// [`GitOperation::AmendCommit`] proves its *shape* end-to-end through the
+/// real pipeline (build → validate → enforce_fresh), but M2.19a ships no
+/// execution — #223's to add. So unlike every other pipeline test in this
+/// file, this one asserts the operation is refused with `NOT_IMPLEMENTED`
+/// and, more importantly, that the repository is completely untouched: HEAD
+/// is exactly the commit it was before. A test that only checked the status
+/// code would pass just as well if the stub silently mutated the repo and
+/// then reported failure anyway — the tip assertion is what actually proves
+/// "no execution happened," and it is what forces #223 to touch this exact
+/// test when real execution replaces the stub.
+#[tokio::test]
+async fn amend_commit_executes_through_the_pipeline() {
+    let (_dir, repo) = seeded_repo();
+    let before = tip(&repo, "HEAD");
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::AmendCommit {
+            message: message("amended message"),
+            expected_tip: oid(&before),
+            allow_empty: false,
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(
+        tip(&repo, "HEAD"),
+        before,
+        "the stub must never move HEAD — M2.19a ships no execution"
+    );
+    assert_eq!(
+        out(&repo, &["log", "-1", "--format=%s"]),
+        "seed",
+        "the stub must never create a new commit"
     );
 }
