@@ -314,7 +314,13 @@ pub(crate) async fn build_plan_only(
 ///   generation-invisible pair, `RemoteConfigured`/`SeedRecorded`) as
 ///   built-stale: it flows to the executor's own legacy refusal instead of
 ///   `enforce_fresh`'s — from the submitter's seat the two cases are
-///   genuinely indistinguishable, and both fail closed.
+///   genuinely indistinguishable, and both fail closed. Not just prose: the
+///   contract suite's two `review_window_*_drift_fails_closed_*` tests prove
+///   the refusal (and its byte-identity with the never-held case) for both
+///   generation-invisible preconditions, and
+///   `a_generation_invisible_break_while_queued_is_refused_by_the_gates_live_recheck`
+///   proves the re-derivation itself is load-bearing (emptying it passed the
+///   whole suite before that test existed).
 #[cfg_attr(not(test), allow(dead_code))] // routed by #249; contract-suite-only until then
 pub(crate) async fn submit_plan(
     repo: &Path,

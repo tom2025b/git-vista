@@ -3431,3 +3431,200 @@ async fn a_plan_built_for_another_selection_is_refused_at_submit() {
          the token check above is the only thing standing between selections"
     );
 }
+
+/// `observe_for_submission`'s `held_at_build` re-derivation is load-bearing,
+/// not decorative — the mutation `observed.held_at_build = Vec::new()` after
+/// the re-observe passed this entire suite before this test existed. The
+/// re-derived census is what arms `enforce_fresh`'s per-precondition live
+/// recheck on the split path, and the one window where that recheck is the
+/// *only* defence is a **generation-invisible** break (`RemoteConfigured`:
+/// remotes live in config, which no generation input digests) landing between
+/// `submit_plan`'s pre-guard observation and its post-guard gate.
+///
+/// The test makes that window deterministic the same way
+/// [`building_a_plan_takes_no_guard_and_submitting_takes_the_real_one`] does:
+/// hold the real mutation guard, start the submit (it observes — remote still
+/// configured, so the re-derived census reads *held* — then queues on our
+/// guard), break the precondition while it queues, release the guard. The
+/// gate's live recheck must refuse with `verify_precondition`'s own 409. If
+/// the re-derivation is ever dropped or emptied, `enforce_fresh` skips the
+/// recheck, the push reaches `exec_push`, and git's 400 with different words
+/// fails both assertions.
+#[tokio::test]
+async fn a_generation_invisible_break_while_queued_is_refused_by_the_gates_live_recheck() {
+    let (_dir, repo) = seeded_repo();
+    run(&repo, &["remote", "add", "origin", "/nowhere/upstream.git"]);
+    let op = GitOperation::PushBranch {
+        branch: branch("main"),
+        remote: RemoteName::new("origin").unwrap(),
+        set_upstream: false,
+        force: ForcePublish::None,
+    };
+    let plan = build_plan_only(&repo, op, tokens()).await;
+    // Sanity: the shape still pins the remote — without this precondition the
+    // scenario below would silently stop testing the recheck at all.
+    assert!(
+        plan.preconditions
+            .iter()
+            .any(|p| matches!(p, Precondition::RemoteConfigured { .. })),
+        "PushBranch no longer carries RemoteConfigured — this test's premise is gone"
+    );
+
+    let held = crate::coordinator::lock(None).await;
+    let submit = submit_plan(&repo, None, tokens(), plan);
+    tokio::pin!(submit);
+    // Two seconds is ~20× an unguarded submit's runtime (see the guard test
+    // above): by the time this times out, `observe_for_submission` has read
+    // the still-configured remote and the future is queued on the held guard.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), submit.as_mut())
+            .await
+            .is_err(),
+        "submit_plan completed while the mutation guard was held elsewhere"
+    );
+
+    // The break lands inside the guarded window, and it is generation-
+    // invisible: removing a never-fetched remote touches only .git/config —
+    // no ref, no HEAD, no status input moves.
+    run(&repo, &["remote", "remove", "origin"]);
+
+    drop(held);
+    let (status, why) = submit.await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the gate's live recheck must refuse the vanished remote, not let the \
+         executor stumble over it: {why}"
+    );
+    assert!(
+        why.contains("no longer configured"),
+        "expected verify_precondition's own refusal, got: {why}"
+    );
+}
+
+/// The review-window half of the same corner, and the exact claim
+/// `submit_plan`'s doc and ADR 0042 §3 make in prose: a `RemoteConfigured`
+/// precondition that held at build and silently broke **before** submit is
+/// re-derived as never-held (the census is re-read at submission), skipped by
+/// `enforce_fresh`, and flows to the executor's legacy refusal — "from the
+/// submitter's seat the two cases are genuinely indistinguishable, and both
+/// fail closed". Proven, not asserted: twin repositories, one running the
+/// single-shot path with the remote *never* configured, one running the split
+/// path with the remote removed during the review window, must refuse with
+/// byte-identical status and body — and refuse, full stop.
+#[tokio::test]
+async fn review_window_remote_drift_fails_closed_with_the_never_configured_refusal() {
+    let push = || GitOperation::PushBranch {
+        branch: branch("main"),
+        remote: RemoteName::new("origin").unwrap(),
+        set_upstream: false,
+        force: ForcePublish::None,
+    };
+
+    // Twin A: the single-shot path with the precondition never held — the
+    // executor's legacy refusal in its own words.
+    let (_dir_a, repo_a) = seeded_repo_dated();
+    let single_shot = pipeline(&repo_a, push()).await;
+    assert!(
+        !single_shot.0.is_success(),
+        "a push with no remote configured must fail: {}",
+        single_shot.1
+    );
+
+    // Twin B: the split path, precondition held at build, broken during the
+    // review window (generation-invisible — config only, see the guarded-
+    // window test above).
+    let (_dir_b, repo_b) = seeded_repo_dated();
+    run(
+        &repo_b,
+        &["remote", "add", "origin", "/nowhere/upstream.git"],
+    );
+    let plan = build_plan_only(&repo_b, push(), tokens()).await;
+    assert!(
+        plan.preconditions
+            .iter()
+            .any(|p| matches!(p, Precondition::RemoteConfigured { .. })),
+        "PushBranch no longer carries RemoteConfigured — this test's premise is gone"
+    );
+    run(&repo_b, &["remote", "remove", "origin"]);
+    let fingerprint = repo_fingerprint(&repo_b);
+
+    let split = submit_plan(&repo_b, None, tokens(), plan).await;
+    assert!(
+        !split.0.is_success(),
+        "review-window remote drift must fail closed on the split path: {}",
+        split.1
+    );
+    assert_eq!(
+        single_shot, split,
+        "drift during the review window must be indistinguishable from a \
+         precondition that never held — same status, same words"
+    );
+    assert_eq!(
+        repo_fingerprint(&repo_b),
+        fingerprint,
+        "the refused push must leave the repository byte-identical"
+    );
+}
+
+/// [`review_window_remote_drift_fails_closed_with_the_never_configured_refusal`]'s
+/// sibling for the *other* generation-invisible precondition, `SeedRecorded`
+/// (seed files live under `.git/git-vista/`, outside every generation input).
+/// The executor's independent re-read of the seed is the legacy guard the ADR
+/// leans on; this pins that it actually refuses — and that the repository the
+/// reset would have rewound stays untouched, which is the assertion with
+/// teeth: the repo is deliberately drifted past its seed, so a reset that
+/// wrongly ran would move `main` and delete the stray branch.
+#[tokio::test]
+async fn review_window_seed_drift_fails_closed_with_the_never_recorded_refusal() {
+    // Twin A: single-shot, no seed ever recorded — the executor's 404.
+    let (_dir_a, repo_a) = seeded_repo();
+    let single_shot = pipeline(&repo_a, GitOperation::ResetTestRepo).await;
+    assert_eq!(
+        single_shot.0,
+        StatusCode::NOT_FOUND,
+        "a reset with no recorded seed must 404: {}",
+        single_shot.1
+    );
+
+    // Twin B: seed recorded, repo drifted past it, plan built (SeedRecorded
+    // holds), then the seed vanishes during the review window.
+    let (_dir_b, repo_b) = seeded_repo();
+    let seeded = tip(&repo_b, "HEAD");
+    let state = repo_b.join(".git/git-vista");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("seed-refs"), format!("{seeded} main\n")).unwrap();
+    std::fs::write(state.join("seed-head"), "main\n").unwrap();
+    std::fs::write(repo_b.join("junk.txt"), "j\n").unwrap();
+    run(&repo_b, &["add", "junk.txt"]);
+    run(&repo_b, &["commit", "-q", "-m", "past the seed"]);
+    run(&repo_b, &["branch", "stray"]);
+
+    let plan = build_plan_only(&repo_b, GitOperation::ResetTestRepo, tokens()).await;
+    assert!(
+        plan.preconditions
+            .iter()
+            .any(|p| matches!(p, Precondition::SeedRecorded)),
+        "ResetTestRepo no longer carries SeedRecorded — this test's premise is gone"
+    );
+    let drifted = tip(&repo_b, "HEAD");
+    std::fs::remove_file(state.join("seed-refs")).unwrap();
+    std::fs::remove_file(state.join("seed-head")).unwrap();
+
+    let split = submit_plan(&repo_b, None, tokens(), plan).await;
+    assert_eq!(
+        single_shot, split,
+        "seed drift during the review window must be indistinguishable from a \
+         seed that was never recorded — same status, same words"
+    );
+    assert_eq!(
+        tip(&repo_b, "main"),
+        drifted,
+        "the refused reset must not have rewound the branch to its seed"
+    );
+    assert_ne!(
+        out(&repo_b, &["branch", "--list", "stray"]),
+        "",
+        "the refused reset must not have deleted the stray branch"
+    );
+}
