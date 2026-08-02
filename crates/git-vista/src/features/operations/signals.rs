@@ -243,6 +243,15 @@ async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt,
         }
         OperationKind::Rebase { .. } => api::rebase_request(key).await,
         OperationKind::Undo(u) => api::undo_request(&u.action, key).await,
+        // Two arms, not one parameterised by a bool — mirroring the two
+        // separate `GitOperation` variants and the two separate endpoints
+        // behind them (#71, M2.18a/#219, wired by M2.18b/#220).
+        OperationKind::DiscardTrackedPaths { paths } => {
+            api::discard_tracked_paths_request(paths.clone(), key).await
+        }
+        OperationKind::DeleteUntrackedPaths { paths } => {
+            api::delete_untracked_paths_request(paths.clone(), key).await
+        }
     }
 }
 
