@@ -100,7 +100,20 @@ still catching an actual regression (e.g. the generation derivation's ref
 walk becoming accidentally quadratic, which would show up as a
 multi-second stall at a mere 1,000 files, nowhere close to this budget).
 
-## `hunk_nav` — diff view hunk-navigation walk (#211, M2.16f)
+## `hunk_nav` — diff view hunk-navigation walk (partial progress on #211, M2.16f)
+
+**Status: partial delivery, #211 stays open.** This section covers 1 of
+#211's 4 scope items (a regression test) against a *substitute* target, not
+the one the issue names. It does **not** measure "the virtualized diff view
+(69c)" (still stale — see below), is not the "real measurement... not a
+synthetic microbenchmark" the issue asks for (the generator below is exactly
+that synthetic microbenchmark, by design — see "What this does NOT cover"),
+and was not landed after 69e as the issue recommends (69e hasn't landed;
+there is no such issue/PR in this repo as of this writing). Do not treat
+this section, its heading, or its commit (`ad7fba9`) as closing #211 — the
+issue tracks the remaining three items and should stay open until a future
+change wires `CumulativeHeights` into the render path and this budget is
+redone against that real shape.
 
 **Stale premise in #211's own text, corrected here rather than silently
 worked around.** The issue asks to measure "the virtualized diff view
