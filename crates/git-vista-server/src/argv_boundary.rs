@@ -99,6 +99,13 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // *unsandboxed* `git fetch` that asserts the redaction test's premise (the
     // fixture really does leak a credential when nothing redacts it).
     "src/planner/fetch_suite.rs",
+    // #[cfg(test)] git fixtures for the M2.20d (#230) pull suite: the diverged
+    // and conflicting repositories plus their in-tree bare remote, and the
+    // read-only `rev-parse`/`rev-list`/`merge-base`/`ls-files` calls that make
+    // the *repository* the referee for what a pull did — deliberately plain
+    // git, outside the harness under test, so an assertion can never be
+    // satisfied by the same code it is checking.
+    "src/planner/pull_suite.rs",
     "src/state.rs",         // #[cfg(test)] fixture setup
     "src/argv_boundary.rs", // this file (the scan reads its own source)
     // The M1.13b spawn chokepoint (#66, Task 5). It builds a git Command from

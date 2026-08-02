@@ -18,6 +18,8 @@
 //!     untracked paths outright (#219).
 //!   * [`fetch`] — fetch from a configured remote (M2.20c, #229): the first
 //!     long-running network write, with streamed progress and cancellation.
+//!   * [`pull`] — fetch and then integrate (M2.20d, #230), with the
+//!     merge-or-rebase choice required on the wire and never defaulted.
 //!   * [`operations`] — one write's recorded lifecycle, its progress stream,
 //!     and (since #229) cancelling one that is still running.
 //!
@@ -43,6 +45,8 @@ pub(crate) mod commit;
 pub(crate) mod discard;
 // M2.20c (#229): fetch from a configured remote.
 pub(crate) mod fetch;
+// M2.20d (#230): fetch and integrate, with a mandatory merge/rebase strategy.
+pub(crate) mod pull;
 // M1.08 (#61): what happened to an operation, and watching one happen.
 pub(crate) mod operations;
 pub(crate) mod protocol;

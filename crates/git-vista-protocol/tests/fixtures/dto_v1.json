@@ -77,6 +77,62 @@
       }
     ]
   },
+  "pull_request_merge": {
+    "remote": "origin",
+    "branch": "main",
+    "strategy": "merge"
+  },
+  "pull_request_rebase": {
+    "remote": "upstream",
+    "branch": "release/2026-08",
+    "strategy": "rebase"
+  },
+  "pull_success_advanced": {
+    "remote": "origin",
+    "branch": "main",
+    "strategy": "rebase",
+    "message": "Pulled ‘main’ from ‘origin’ into the checked-out branch (rebase strategy).",
+    "updated_refs": [
+      {
+        "ref_name": "refs/remotes/origin/main",
+        "old_oid": "1111111111111111111111111111111111111111",
+        "new_oid": "2222222222222222222222222222222222222222"
+      }
+    ],
+    "advanced": true
+  },
+  "pull_success_already_up_to_date": {
+    "remote": "origin",
+    "branch": "main",
+    "strategy": "merge",
+    "message": "Already up to date — ‘main’ on ‘origin’ has nothing the checked-out branch doesn’t already have.",
+    "updated_refs": [],
+    "advanced": false
+  },
+  "pull_error_strategy_required": {
+    "kind": "strategy_required",
+    "message": "A pull must say how to integrate what it fetches: send \"strategy\": \"merge\" or \"strategy\": \"rebase\".",
+    "updated_refs": [],
+    "worktree_restored": true
+  },
+  "pull_error_conflict_restored": {
+    "kind": "conflict",
+    "message": "Pulling ‘main’ from ‘origin’ (merge strategy) failed: CONFLICT (content): Merge conflict in a.txt The merge was aborted and the checked-out branch is back where it started.",
+    "updated_refs": [
+      {
+        "ref_name": "refs/remotes/origin/main",
+        "old_oid": "1111111111111111111111111111111111111111",
+        "new_oid": "2222222222222222222222222222222222222222"
+      }
+    ],
+    "worktree_restored": true
+  },
+  "pull_error_conflict_left_in_progress": {
+    "kind": "conflict_left_in_progress",
+    "message": "Pulling ‘main’ from ‘origin’ (rebase strategy) failed: error: could not apply 1a2b3c4 The rebase could not be aborted cleanly.",
+    "updated_refs": [],
+    "worktree_restored": false
+  },
   "clone_request": {
     "url": "https://github.com/owner/repo.git"
   },

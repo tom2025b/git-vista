@@ -9,18 +9,19 @@
 //!     the real `build_plan → validate → enforce_fresh → execute` composition
 //!     against a real temporary repository and asserts the mutation landed.
 //!     [`covered_by`] matches exhaustively over the enum, so adding a new
-//!     variant refuses to compile until it gets a pipeline test. (Five
-//!     exceptions today: `PullBranch` (M2.20a #227) and the four tag
-//!     operations (M2.21a #235) ship no execution — their pipeline tests
-//!     assert the *stubs'* refusal and that the repository stayed
-//!     byte-identical, the honest version of this layer's claim until #230
-//!     and the later M2.21 slices of #74 wire real execution in.
-//!     `AmendCommit` was staged the same way by #222 and graduated to a real
-//!     execution test when #223 wired `exec_amend_commit`; `FetchRemote`
+//!     variant refuses to compile until it gets a pipeline test. (Four
+//!     exceptions today: the four tag operations (M2.21a #235) ship no
+//!     execution — their pipeline tests assert the *stubs'* refusal and that
+//!     the repository stayed byte-identical, the honest version of this
+//!     layer's claim until the later M2.21 slices of #74 wire real execution
+//!     in. `AmendCommit` was staged the same way by #222 and graduated to a
+//!     real execution test when #223 wired `exec_amend_commit`; `FetchRemote`
 //!     graduated the same way when M2.20c #229 wired `planner::fetch`, and
-//!     its heavier behavioural coverage — live progress, a cancel that kills
-//!     the child, the dropped-connection replay, redaction on the streaming
-//!     path — lives in the sibling [`super::fetch_suite`].)
+//!     `PullBranch` when M2.20d #230 wired `planner::pull`. Their heavier
+//!     behavioural coverage — live progress, a cancel that kills the child,
+//!     the dropped-connection replay, redaction on the streaming path, the
+//!     merge-vs-rebase history difference, the conflict abort — lives in the
+//!     siblings [`super::fetch_suite`] and [`super::pull_suite`].)
 //!  2. **Single-funnel proof** — a source-level test walks the router's POST
 //!     table and every git-write handler, asserting each one reaches
 //!     [`plan_and_execute`] (directly or through its named local helper) and
@@ -1794,6 +1795,8 @@ fn every_git_write_route_reaches_the_planner() {
         ("/api/push", "push_branch"),
         // M2.20c (#229): fetch — a git write, funnel row below.
         ("/api/fetch", "fetch_remote"),
+        // M2.20d (#230): pull — a git write, funnel row below.
+        ("/api/pull", "pull_branch"),
         ("/api/delete-branch", "delete_branch"),
         ("/api/checkout", "checkout_branch"),
         ("/api/force-delete-branch", "force_delete_branch"),
@@ -1890,6 +1893,14 @@ fn every_git_write_route_reaches_the_planner() {
         ("src/handlers/commit.rs", "amend_commit", None),
         ("src/handlers/commit.rs", "stage_all", None),
         ("src/handlers/commit.rs", "unstage_all", None),
+        // M2.20c (#229) and M2.20d (#230): the two remote-reaching writes.
+        // Fetch's row was missing until #230 added it — the POST table above
+        // has said "funnel row below" for it since #229, and there was none,
+        // so `fetch_remote` could have stopped calling the planner without
+        // this test noticing. A census that names a row it does not have is
+        // the same vacuity as a test that asserts nothing.
+        ("src/handlers/fetch.rs", "fetch_remote", None),
+        ("src/handlers/pull.rs", "pull_branch", None),
         ("src/handlers/rebase.rs", "rebase", None),
         ("src/handlers/reset.rs", "reset_test_repo", None),
         ("src/activity.rs", "undo", None),
@@ -2924,7 +2935,7 @@ fn without_fetch_head(fingerprint: &str) -> String {
 }
 
 /// The census of operations that claim to be cancellable is exactly
-/// `{FetchRemote}` (M2.20c, #229).
+/// `{FetchRemote, PullBranch}` (M2.20c #229, widened by M2.20d #230).
 ///
 /// `planner::honours_cancellation` is answered to an operator by
 /// `POST /api/operations/{id}/cancel`: a `true` there is a promise that the
@@ -2934,10 +2945,25 @@ fn without_fetch_head(fingerprint: &str) -> String {
 /// to back it — so the `true` set is pinned here, and widening it is a
 /// deliberate edit to this list.
 ///
-/// The second half is the anti-vacuity leg: the executor that `FetchRemote`
-/// dispatches to must actually take a cancel signal. A `honours_cancellation`
-/// that answered `true` for an executor which ignored the latch would be the
-/// exact "tested but does nothing" shape this suite exists to catch.
+/// The second half is the anti-vacuity leg: the executors those two dispatch
+/// to must actually take a cancel signal. A `honours_cancellation` that
+/// answered `true` for an executor which ignored the latch would be the exact
+/// "tested but does nothing" shape this suite exists to catch.
+///
+/// Pull's promise is narrower than fetch's and the source check says so: its
+/// fetch half runs through `planner::fetch`'s cancellable spawn, and
+/// `planner::pull` reads the latch itself once more between the halves.
+///
+/// The *behavioural* proof that a cancelled pull does not integrate is
+/// `pull_suite::a_cancelled_pull_does_not_integrate`, which drives the real
+/// endpoint and then checks the repository. What the source assertion below
+/// adds is narrower and worth being precise about: it pins that the
+/// between-halves read exists at all. That read is defense in depth and is
+/// **not** covered behaviourally — reaching it needs a cancel inside the
+/// window between `git fetch` exiting and `git merge` spawning, and every way
+/// to arrange that is a timing race. Deleting it leaves this whole suite
+/// green; that is stated in `planner::pull` and in ADR 0044 rather than left
+/// for a reader to discover.
 #[test]
 fn only_operations_with_a_real_cancellation_point_claim_to_be_cancellable() {
     let samples = samples();
@@ -2947,16 +2973,23 @@ fn only_operations_with_a_real_cancellation_point_claim_to_be_cancellable() {
         .collect();
     assert_eq!(
         cancellable.len(),
-        1,
+        2,
         "the cancellable census changed — every `true` arm in \
          planner::honours_cancellation promises an executor that watches the \
          cancellation latch, so adding one means adding that executor too: \
          {cancellable:?}"
     );
     assert!(
-        matches!(cancellable[0], GitOperation::FetchRemote { .. }),
-        "only FetchRemote has a cancellation point today, got {:?}",
-        cancellable[0]
+        cancellable
+            .iter()
+            .any(|op| matches!(op, GitOperation::FetchRemote { .. })),
+        "FetchRemote must stay cancellable, got {cancellable:?}"
+    );
+    assert!(
+        cancellable
+            .iter()
+            .any(|op| matches!(op, GitOperation::PullBranch { .. })),
+        "PullBranch is cancellable during its fetch half (#230), got {cancellable:?}"
     );
 
     let src = source("src/planner/fetch.rs");
@@ -2970,23 +3003,51 @@ fn only_operations_with_a_real_cancellation_point_claim_to_be_cancellable() {
         "planner::fetch must run its git through the streaming, cancellable \
          runner — the collecting `run_git` cannot be interrupted"
     );
+
+    let pull_src = source("src/planner/pull.rs");
+    assert!(
+        pull_src.contains("run_fetch("),
+        "planner::pull must reach the remote through planner::fetch's own \
+         cancellable spawn, not a second one of its own (#230, ADR 0044)"
+    );
+    assert!(
+        pull_src.contains("crate::operations::cancel_signal()"),
+        "planner::pull must re-read the cancellation latch between the fetch \
+         and the integration — honours_cancellation(PullBranch) promises a \
+         cancel stops the local mutation, not merely the transfer"
+    );
+    assert!(
+        !pull_src.contains("git_streamed_for(") && !pull_src.contains("\"fetch\""),
+        "planner::pull must not spawn a fetch of its own — one `git fetch` in \
+         this server (ADR 0044 D1), or the askpass hardening and redaction of \
+         ADR 0036 have two places to drift apart in"
+    );
 }
 
-/// [`GitOperation::PullBranch`], same contract-only staging as fetch above
-/// (#230 owns execution), and the same inertness proof.
+/// [`GitOperation::PullBranch`] executes end-to-end through the pipeline
+/// (M2.20d, #230): the fetch lands the remote's commits and the integration
+/// moves the checked-out branch onto them.
 ///
-/// Both strategies are driven: a stub that refused `Merge` and quietly ran
-/// `Rebase` would otherwise be invisible here, and the whole reason
-/// `MergeStrategy` is mandatory is that the two do different things to
-/// history.
+/// Both strategies are driven, because the whole reason `MergeStrategy` is
+/// mandatory is that the two do different things to history — an executor
+/// that ran one arm for both inputs would satisfy a single-strategy test. What
+/// they do *differently* is the sibling suite's
+/// `merge_and_rebase_pulls_of_one_diverged_history_produce_different_histories`;
+/// this test's job is the pipeline leg: build → validate → enforce_fresh →
+/// execute, with the repository as referee.
 #[tokio::test]
 async fn pull_branch_executes_through_the_pipeline() {
     for strategy in [
         git_vista_protocol::MergeStrategy::Merge,
         git_vista_protocol::MergeStrategy::Rebase,
     ] {
-        let (dir, repo) = seeded_repo();
-        let remote = dir.path().join("remote.git");
+        // The bare remote lives *inside* the served tree: #66 Task 6 grants the
+        // served repository and the system trees and nothing else, so a remote
+        // in a sibling tempdir is denied by the sandbox and every fetch fails
+        // for a reason that has nothing to do with what is under test. Same
+        // fixture shape as `planner::fetch_suite`.
+        let (_dir, repo) = seeded_repo();
+        let remote = repo.join("upstream.git");
         std::fs::create_dir_all(&remote).unwrap();
         run(&remote, &["init", "-q", "--bare", "-b", "main"]);
         run(
@@ -2999,7 +3060,14 @@ async fn pull_branch_executes_through_the_pipeline() {
         run(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
         run(&repo, &["update-ref", "-d", "refs/remotes/origin/main"]);
 
-        let before = repo_fingerprint(&repo);
+        let behind = tip(&repo, "HEAD");
+        let wanted = out(&remote, &["rev-parse", "main"]);
+        assert_ne!(
+            behind, wanted,
+            "the fixture must actually be behind, or a pull that did nothing \
+             would pass"
+        );
+
         let (status, body) = pipeline(
             &repo,
             GitOperation::PullBranch {
@@ -3009,13 +3077,24 @@ async fn pull_branch_executes_through_the_pipeline() {
             },
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{strategy:?}: {body}");
+        assert_eq!(status, StatusCode::OK, "{strategy:?}: {body}");
+
+        // The repository is the referee, not the response body.
         assert_eq!(
-            repo_fingerprint(&repo),
-            before,
-            "the {strategy:?} stub must leave the repository byte-identical — \
-             M2.20a ships no pull execution (#230)"
+            tip(&repo, "HEAD"),
+            wanted,
+            "{strategy:?}: the pull must move the checked-out branch onto what \
+             the remote had"
         );
+        assert_eq!(
+            tip(&repo, "refs/remotes/origin/main"),
+            wanted,
+            "{strategy:?}: the fetch half must have created the tracking ref"
+        );
+
+        let success: git_vista_protocol::PullSuccess = serde_json::from_str(&body).unwrap();
+        assert_eq!(success.strategy, strategy, "the response echoes what ran");
+        assert!(success.advanced, "{strategy:?}: {body}");
     }
 }
 

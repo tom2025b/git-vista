@@ -117,6 +117,13 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // mutation: a cross-origin page that could trigger this would be making
     // *this server's* credentials talk to a remote.
     ("/api/fetch", Method::POST, Authz::SessionAndCsrf),
+    // M2.20d (#230): pull is fetch's classification plus a local mutation —
+    // it moves the checked-out branch and rewrites the working tree. Both
+    // halves of the reasoning above apply, and the second one harder: a
+    // cross-origin page that could trigger this would not merely make this
+    // server's credentials talk to a remote, it would land whatever came back
+    // on the user's branch.
+    ("/api/pull", Method::POST, Authz::SessionAndCsrf),
     ("/api/delete-branch", Method::POST, Authz::SessionAndCsrf),
     ("/api/checkout", Method::POST, Authz::SessionAndCsrf),
     (
@@ -159,7 +166,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 43;
+const EXPECTED_ROUTE_COUNT: usize = 44;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in
