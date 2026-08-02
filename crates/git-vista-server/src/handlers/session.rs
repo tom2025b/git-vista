@@ -186,11 +186,22 @@ pub(crate) async fn create_session(
         // The one auth failure a normal client recovers from — the contract layer
         // maps this 401 to the `unauthenticated` code the SPA keys its bootstrap
         // screen on.
-        None => (
-            StatusCode::UNAUTHORIZED,
-            "That setup link is invalid or has expired. Get a fresh one from `gv`.",
-        )
-            .into_response(),
+        //
+        // #218: logged, for the same reason `security::deny` now is — this is
+        // the other silent refusal on the initial-load path, and it sits
+        // upstream of every `require_auth` check (a session doesn't exist yet
+        // to gate on). Never logs the token itself, only that one was
+        // presented and rejected.
+        None => {
+            eprintln!(
+                "git-vista: refused POST /api/session: 401 — invalid or expired bootstrap token"
+            );
+            (
+                StatusCode::UNAUTHORIZED,
+                "That setup link is invalid or has expired. Get a fresh one from `gv`.",
+            )
+                .into_response()
+        }
     }
 }
 

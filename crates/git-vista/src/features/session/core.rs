@@ -137,8 +137,56 @@ impl FeatureCore for SessionCore {
     }
 }
 
+/// How long to wait before re-checking a session bootstrap that failed at the
+/// transport level (#218), or `None` once the budget is spent.
+///
+/// `attempt` is the number of attempts already made: `0` means the initial
+/// `establish_session` has just failed and the first retry is being scheduled.
+///
+/// # Why retrying at all, and why bounded
+///
+/// The session resource is created with a constant source, so it runs once and
+/// never re-runs on its own. Before this, an `Err` — the transport failing
+/// during the very first load, exactly what a flaky SSH tunnel to an iPad
+/// produces — left the app permanently stuck: every subsequent read 401s with
+/// no cookie ever set, nothing in the reactive graph reacts to `Err`, and only
+/// a full browser reload recovers. That is consistent with the symptom #218
+/// reports (history rendering as a single status line until a manual retry).
+/// Bounded because an unbounded retry against a genuinely down server is a
+/// request storm, and the codebase already refuses that pattern elsewhere
+/// (see the graph's page-fetch loop, which never auto-retries an error).
+///
+/// # Why the backoff is spaced the way it is
+///
+/// Deliberately slower than a tight loop: a tunnel that dropped mid-handshake
+/// usually needs seconds, not milliseconds, to come back. The total (~12s
+/// across three tries) is well inside the window a user would still perceive
+/// as "loading" rather than "broken", while leaving the server alone if it is
+/// genuinely gone.
+pub fn session_retry_delay_ms(attempt: u32) -> Option<u32> {
+    const BACKOFF_MS: [u32; 3] = [1_000, 3_000, 8_000];
+    BACKOFF_MS.get(attempt as usize).copied()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_session_retry_budget_backs_off_and_then_gives_up() {
+        // Spaced, not a tight loop — a dropped tunnel needs seconds.
+        assert_eq!(super::session_retry_delay_ms(0), Some(1_000));
+        assert_eq!(super::session_retry_delay_ms(1), Some(3_000));
+        assert_eq!(super::session_retry_delay_ms(2), Some(8_000));
+        // Bounded: an exhausted budget must stop, never wrap or repeat —
+        // an unbounded retry against a genuinely down server is a request
+        // storm, which this codebase refuses elsewhere too.
+        assert_eq!(super::session_retry_delay_ms(3), None);
+        assert_eq!(super::session_retry_delay_ms(99), None);
+        // Strictly increasing, so a longer outage is not hammered at the
+        // same rate as a momentary blip.
+        let d: Vec<u32> = (0..3).filter_map(super::session_retry_delay_ms).collect();
+        assert!(d.windows(2).all(|w| w[0] < w[1]), "{d:?}");
+    }
+
     use super::*;
 
     fn established(via_lan: bool) -> SessionCore {
