@@ -27,10 +27,11 @@
 
 use git_vista_protocol::{
     AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind, BranchRequest,
-    CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest, FetchError,
-    FetchFailureKind, FetchRequest, FetchSuccess, HookPolicy, MergeStrategy, PullError,
-    PullFailureKind, PullRequest, PullSuccess, RebaseStatus, RemoteRefUpdate, RepoMode,
-    RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo, SessionRequest,
+    CloneRequest, CommitOid, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
+    FetchError, FetchFailureKind, FetchRequest, FetchSuccess, ForcePublish, HookPolicy,
+    MergeStrategy, PullError, PullFailureKind, PullRequest, PullSuccess, PushRequest, RebaseStatus,
+    RemoteRefUpdate, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo,
+    SessionRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,8 @@ struct DtoGoldenSet {
     pull_error_strategy_required: PullError,
     pull_error_conflict_restored: PullError,
     pull_error_conflict_left_in_progress: PullError,
+    push_request_plain: PushRequest,
+    push_request_upstream_and_lease: PushRequest,
     clone_request: CloneRequest,
     select_request: SelectRequest,
     delete_clone_request: DeleteCloneRequest,
@@ -257,6 +260,27 @@ fn golden_set() -> DtoGoldenSet {
                 .to_string(),
             updated_refs: Vec::new(),
             worktree_restored: false,
+        },
+        // M2.20e (#231). Both ends of `PushRequest`'s range, because the two
+        // pin different things. The plain one is what every client written
+        // before this slice sends — including the live frontend — and its
+        // fixture bytes are what a reviewer checks when asking "did the
+        // defaults stay the *safe* end?". The full one pins the lease's wire
+        // shape reaching this endpoint: `{"mode": "with_lease",
+        // "expected_remote_tip": …}`, the same internally-tagged encoding
+        // `plan_golden` pins inside the operation, so a client cannot be
+        // correct against one and wrong against the other.
+        push_request_plain: PushRequest {
+            branch: "main".to_string(),
+            set_upstream: false,
+            force: None,
+        },
+        push_request_upstream_and_lease: PushRequest {
+            branch: "feature/x".to_string(),
+            set_upstream: true,
+            force: Some(ForcePublish::WithLease {
+                expected_remote_tip: CommitOid::new("4".repeat(40)).unwrap(),
+            }),
         },
         clone_request: CloneRequest {
             url: "https://github.com/owner/repo.git".to_string(),
@@ -490,5 +514,61 @@ fn dto_v1_golden() {
         Some("hook_rejected"),
         "AmendFailureKind must reach the wire as snake_case strings — \
          M2.19d branches on these exact spellings"
+    );
+}
+
+/// **The backward-compatibility guarantee `/api/push` makes** (M2.20e, #231):
+/// a body that says only `{"branch": …}` still parses, and parses to the *safe*
+/// end of both new axes.
+///
+/// This is the one property in this file that protects a live client rather
+/// than a future one. The frontend on Tom's iPad sends exactly that body; if
+/// `set_upstream` or `force` ever lost its `#[serde(default)]`, every push from
+/// it would become a `422` about serde — a whole-app regression whose cause
+/// would be invisible from the UI.
+///
+/// The golden fixture pins the *serialized* shape; this pins the **parse** of a
+/// body the fixture does not contain, which is a different question. Both legs
+/// are here: absent means safe, and present means honoured — so a
+/// `PushRequest` that ignored `force` entirely (defaulting it away on the way
+/// in) would fail the second leg rather than quietly downgrading every
+/// force-publish to a fast-forward.
+#[test]
+fn a_push_body_from_before_this_slice_still_parses_and_defaults_to_the_safe_end() {
+    for raw in [
+        r#"{"branch":"main"}"#,
+        r#"{"branch":"main","set_upstream":false}"#,
+        r#"{"branch":"main","force":null}"#,
+    ] {
+        let parsed: PushRequest =
+            serde_json::from_str(raw).unwrap_or_else(|e| panic!("{raw} must still parse: {e}"));
+        assert_eq!(parsed.branch, "main");
+        assert!(
+            !parsed.set_upstream,
+            "an omitted set_upstream must mean *no* upstream write: {raw}"
+        );
+        assert_eq!(
+            parsed.force, None,
+            "an omitted force must mean *no* force — a default may only ever \
+             point at less capability: {raw}"
+        );
+    }
+
+    // The paired positive: a body that *does* say force is honoured, so the
+    // legs above are proving a default rather than a field being ignored.
+    let leased: PushRequest = serde_json::from_str(
+        r#"{"branch":"main","set_upstream":true,"force":{"mode":"with_lease",
+            "expected_remote_tip":"4444444444444444444444444444444444444444"}}"#,
+    )
+    .expect("a full push body must parse");
+    assert!(leased.set_upstream);
+    assert!(matches!(leased.force, Some(ForcePublish::WithLease { .. })));
+
+    // And `deny_unknown_fields` still holds: a stray key is a hard error, not a
+    // silently-ignored value that a client could believe the server acted on.
+    assert!(
+        serde_json::from_str::<PushRequest>(r#"{"branch":"main","remote":"evil"}"#).is_err(),
+        "a push body may not smuggle a field this endpoint does not have — \
+         above all not a remote"
     );
 }
