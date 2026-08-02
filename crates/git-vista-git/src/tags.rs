@@ -496,6 +496,71 @@ mod tests {
         assert_eq!(annotation_message(b""), (None, false));
     }
 
+    /// `(None, true)` is a real answer, not a theoretical one, and the two
+    /// halves of it disagree: nothing was retained *and* bytes were dropped.
+    ///
+    /// This is the pair `handlers::tags::fit_message` exists to handle (#236
+    /// review). The mapping there used to read
+    /// `record.message.as_deref().and_then(|m| fit_message(m, ..))`, which
+    /// short-circuits on the `None` and never looks at the flag — so a tag
+    /// carrying arbitrarily much content past the cap went out on the wire as
+    /// `message: null`, byte-identical to a tag with no annotation at all.
+    ///
+    /// Both legs are here on purpose. The pure leg pins the contract; the
+    /// repository leg is the one that makes it a *reachable* contract rather
+    /// than a shape only a unit test can construct — and it needs no
+    /// `mktag`, only `git tag -a --cleanup=verbatim -F`, which preserves
+    /// leading whitespace that the default `strip` cleanup would remove.
+    #[test]
+    fn an_annotation_that_is_all_whitespace_up_to_the_cap_reports_nothing_kept_but_cut() {
+        // The pure rule.
+        let mut raw = vec![b' '; MAX_TAG_MESSAGE_BYTES + 1];
+        raw.extend_from_slice(b"CONTENT PAST THE CUTOFF\n");
+        assert_eq!(
+            annotation_message(&raw),
+            (None, true),
+            "nothing survived the cap, but the cut is still a fact"
+        );
+
+        // …and the same shape read back out of a real repository.
+        let dir = repo();
+        let p = dir.path();
+        let body = " ".repeat(MAX_TAG_MESSAGE_BYTES + 1) + "CONTENT PAST THE CUTOFF\n";
+        let message_file = p.join("annotation.txt");
+        std::fs::write(&message_file, &body).expect("write the annotation body");
+        let status = std::process::Command::new("git")
+            .args(["tag", "-a", "--cleanup=verbatim", "-F"])
+            .arg(&message_file)
+            .args(["v-whitespace", "HEAD"])
+            .current_dir(p)
+            .env("GIT_COMMITTER_NAME", "Ada Lovelace")
+            .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_DATE", "@1753300000 +0000")
+            .status()
+            .expect("git should be runnable");
+        assert!(status.success(), "git tag -a --cleanup=verbatim failed");
+        // The fixture is only interesting if git really kept the whitespace —
+        // a cleanup mode that stripped it would make this test vacuous.
+        let stored = git_out(p, &["cat-file", "tag", "v-whitespace"]);
+        assert!(
+            stored.contains("CONTENT PAST THE CUTOFF"),
+            "the payload past the cap must be in the object"
+        );
+
+        let tags = read_tags(p).unwrap();
+        let tag = tags.iter().find(|t| t.name == "v-whitespace").unwrap();
+        assert!(tag.annotated);
+        assert_eq!(
+            tag.message, None,
+            "nothing in the first 16 KiB was worth keeping"
+        );
+        assert!(
+            tag.message_truncated,
+            "…but the record must still carry the fact that content was cut, \
+             or the server has nothing left to be honest with"
+        );
+    }
+
     #[test]
     fn a_message_is_capped_on_a_character_boundary_and_says_it_was_cut() {
         // Under the cap: kept whole, not flagged.

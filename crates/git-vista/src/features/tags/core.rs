@@ -127,6 +127,108 @@ pub fn tag_rows(tags: &[TagDetail]) -> Vec<TagRow> {
 /// silently become an empty panel that looks like a failed fetch.
 pub const NO_TAGS: &str = "No tags in this repository yet.";
 
+/// The in-flight line, shown while the fetch has not answered yet. Distinct
+/// from [`NO_TAGS`] on purpose: "we have not asked yet" and "we asked and
+/// there are none" are different facts, and collapsing them would tell a user
+/// with tags that they have none.
+pub const LOADING_TAGS: &str = "Loading tags…";
+
+/// Everything the Tags section can be showing, with the decision already made.
+///
+/// # Why this enum exists rather than a `match` in the view
+///
+/// The view lives in `activity.rs`, which is `#[cfg(target_arch = "wasm32")]`
+/// — it is never compiled by `cargo test --workspace` and there is no
+/// wasm-side test harness, so anything decided there is checked by nothing but
+/// the compiler. A `match` on `Option<Result<Vec<TagDetail>, String>>` written
+/// in the view could swap two arms (every populated list rendered as the empty
+/// state, say) and still build, lint and pass the whole suite. Classifying
+/// here instead leaves the view a one-to-one variant→element mapping with no
+/// branch of its own to get wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagListView {
+    /// The fetch has not answered yet — show [`LOADING_TAGS`].
+    Loading,
+    /// The fetch failed. The payload is the finished user-facing line, so the
+    /// view does no formatting either.
+    Failed(String),
+    /// The repository answered, with no tags — show [`NO_TAGS`].
+    Empty,
+    /// One row per tag, in the server's order.
+    Rows(Vec<TagRow>),
+}
+
+/// Classify what the tag resource currently holds.
+///
+/// `state` is the Activity panel's resource after `.flatten()`: `None` while
+/// the panel's fetch is unresolved (or the panel is shut), `Some(Err)` for a
+/// failed fetch, `Some(Ok)` for an answer.
+pub fn tag_list_view(state: Option<Result<Vec<TagDetail>, String>>) -> TagListView {
+    match state {
+        None => TagListView::Loading,
+        Some(Err(e)) => TagListView::Failed(format!("Couldn't load tags: {e}")),
+        Some(Ok(tags)) if tags.is_empty() => TagListView::Empty,
+        Some(Ok(tags)) => TagListView::Rows(tag_rows(&tags)),
+    }
+}
+
+/// One line rendered *under* a tag's headline row, already decided.
+///
+/// The variant is what the line means; the view only picks an element and a
+/// class for it. Crucially there is no `Option` left for the view to unwrap:
+/// a line that should not appear is simply not in the vector, which is what
+/// makes "a lightweight tag shows no tagger line" a host-testable fact instead
+/// of a comment next to an `Option::map` no test ever runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagRowLine {
+    /// The tagger line, verbatim from git. Annotated tags only.
+    Tagger(String),
+    /// The message preview.
+    Message(String),
+    /// The stand-in for a message an annotated tag does not have.
+    Absent(&'static str),
+}
+
+impl TagRowLine {
+    /// The text to render.
+    pub fn text(&self) -> &str {
+        match self {
+            TagRowLine::Tagger(t) => t,
+            TagRowLine::Message(m) => m,
+            TagRowLine::Absent(n) => n,
+        }
+    }
+
+    /// Whether the line is secondary (rendered muted). The message itself is
+    /// the content; the tagger and the absence note are annotations on it.
+    pub fn muted(&self) -> bool {
+        match self {
+            TagRowLine::Message(_) => false,
+            TagRowLine::Tagger(_) | TagRowLine::Absent(_) => true,
+        }
+    }
+}
+
+/// The lines under one tag's headline, in render order.
+///
+/// Every absent field yields **no line at all** — never an empty one. That is
+/// the whole point of `TagDetail` modelling absence as `null`: an empty
+/// "Tagger" line on screen claims a tag with a blank tagger, which is a
+/// different and false statement from "this kind of tag has no tagger".
+pub fn tag_row_lines(row: &TagRow) -> Vec<TagRowLine> {
+    let mut lines = Vec::new();
+    if let Some(tagger) = &row.tagger {
+        lines.push(TagRowLine::Tagger(tagger.clone()));
+    }
+    if let Some(message) = &row.message {
+        lines.push(TagRowLine::Message(message.clone()));
+    }
+    if let Some(note) = row.message_absent_note {
+        lines.push(TagRowLine::Absent(note));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +326,98 @@ mod tests {
         assert!(
             !unverifiable.contains("valid"),
             "nor as a valid one — {unverifiable:?}"
+        );
+    }
+
+    /// The four states must stay four states. Written as a table so a mutation
+    /// that collapses two arms (the classic: an unresolved fetch rendering as
+    /// "no tags", telling a user with tags that they have none) fails on the
+    /// pair rather than on one case that happened to be checked.
+    #[test]
+    fn each_fetch_state_classifies_to_its_own_view() {
+        assert_eq!(tag_list_view(None), TagListView::Loading);
+
+        assert_eq!(
+            tag_list_view(Some(Err("HTTP 500".to_string()))),
+            TagListView::Failed("Couldn't load tags: HTTP 500".to_string()),
+            "the error text has to reach the line, or every failure reads alike"
+        );
+
+        assert_eq!(tag_list_view(Some(Ok(Vec::new()))), TagListView::Empty);
+
+        let one = vec![detail("v1.0", TagKind::Annotated)];
+        match tag_list_view(Some(Ok(one))) {
+            TagListView::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].name, "v1.0");
+            }
+            other => panic!("a populated answer must render rows, got {other:?}"),
+        }
+
+        // The pairs that must never be conflated, stated as inequalities so
+        // the intent survives a rename of any single variant.
+        assert_ne!(
+            tag_list_view(None),
+            tag_list_view(Some(Ok(Vec::new()))),
+            "'not asked yet' and 'asked, none' are different facts"
+        );
+        assert_ne!(
+            tag_list_view(Some(Err("boom".to_string()))),
+            tag_list_view(Some(Ok(Vec::new()))),
+            "a failed fetch must never look like an empty repository"
+        );
+        assert_ne!(
+            LOADING_TAGS, NO_TAGS,
+            "…and their wording must differ too, or the enum split buys nothing"
+        );
+    }
+
+    /// The regression the whole `None`-vs-`""` design exists to prevent, moved
+    /// somewhere a test can actually run: a lightweight tag contributes **no**
+    /// sub-lines, so nothing can render as a blank tagger.
+    #[test]
+    fn a_lightweight_tag_contributes_no_lines_at_all() {
+        let row = tag_row(&detail("tip-marker", TagKind::Lightweight));
+        assert_eq!(
+            tag_row_lines(&row),
+            Vec::new(),
+            "an absent field must produce no element, never an empty one"
+        );
+    }
+
+    #[test]
+    fn an_annotated_tag_lines_up_tagger_then_message() {
+        let mut d = detail("v1.0", TagKind::Annotated);
+        d.tagger = Some("Ada Lovelace <ada@example.com> 1753300000 +0000".to_string());
+        d.message = Some(TagMessage::new("first stable release\n\nnotes").unwrap());
+        let lines = tag_row_lines(&tag_row(&d));
+        assert_eq!(
+            lines,
+            vec![
+                TagRowLine::Tagger("Ada Lovelace <ada@example.com> 1753300000 +0000".to_string()),
+                TagRowLine::Message("first stable release".to_string()),
+            ]
+        );
+        assert!(
+            !lines[1].muted(),
+            "the message is the content, not an aside"
+        );
+        assert!(lines[0].muted());
+        assert_eq!(lines[1].text(), "first stable release");
+    }
+
+    #[test]
+    fn an_annotated_tag_with_no_message_shows_the_note_in_its_place() {
+        let mut d = detail("v1.0", TagKind::Annotated);
+        d.tagger = Some("Ada Lovelace <ada@example.com> 1753300000 +0000".to_string());
+        let lines = tag_row_lines(&tag_row(&d));
+        assert_eq!(lines.len(), 2, "tagger and the note — {lines:?}");
+        assert_eq!(lines[1], TagRowLine::Absent(NO_MESSAGE));
+        // Never both: a note *in place of* a message, not beside one.
+        assert!(
+            !lines.iter().any(|l| matches!(l, TagRowLine::Message(_))),
+            "the note stands in for the message; showing both would be a \
+             blank line followed by an explanation of it"
         );
     }
 
