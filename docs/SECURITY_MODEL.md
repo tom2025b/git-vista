@@ -466,6 +466,30 @@ previously state.
 
 See [GitHub's app authentication guidance](https://docs.github.com/en/enterprise-cloud%40latest/apps/oauth-apps/building-oauth-apps/differences-between-github-apps-and-oauth-apps).
 
+### Implemented vs. aspirational (as of #228, M2.20b)
+
+The bullets above are the target shape; this table says which of them a real
+request actually gets today, so a reader doesn't have to infer "shipped" from
+"described."
+
+| Bullet | Status | Where |
+|---|---|---|
+| Existing Git credential helpers / SSH agent reuse | **Implemented** | #188's carve-out (`sandbox/ssh_remote.rs`, ADR 0033) — `~/.ssh/known_hosts` and `$SSH_AUTH_SOCK` are reachable on every Network-tier spawn; private keys stay `EACCES`. |
+| No browser-uploaded SSH keys | **Implemented** | Structural: the browser never has a private-key upload path at all. |
+| `core.askpass` never runs (M1.13 finding I5) | **Implemented** | `sandbox/network_exec.rs`'s `network_command` forces `-c core.askpass=` on every Network-tier spawn; `git_cmd.rs`'s `sandboxed()` routes every `NetworkNeed::Remote` call through it, so this reaches production (`exec_push` today), not only this module's own tests. |
+| Redact URL userinfo from logs/operation records | **Implemented, narrower than the bullet reads** | `network_exec::redact_url_userinfo`/`redact_output` strip `user[:pass]@` from every `<scheme>://…` substring in a spawn's captured stdout/stderr, wired into `git_output_for` for every `Remote`-declared call. |
+| Redact HTTP `Authorization` header text and query-string tokens | **Not implemented** | Only URL userinfo is redacted. A credential surfaced as `?access_token=…` or in `Authorization: Bearer …`-shaped text would currently appear verbatim in a redacted `Output`. No test in this area exercises that shape. |
+| Redact credential-helper output | **Partially implemented** | A credential helper's stderr passes through the same `redact_output` as everything else, so a *userinfo-shaped* leak in it is caught (proven against a real credential helper: `network_exec_redacts_a_real_credential_helpers_leaked_url`) — but a helper leaking a bare token or an `Authorization`-shaped string is not, for the same reason as the row above. |
+| Redact command-line argv (not just captured output) | **Not implemented, primitive exists** | `network_exec::redact_args` exists as a redaction primitive for callers that log/journal "ran: git \<args…\>" diagnostics, but nothing currently calls it — no such diagnostic path exists yet in this crate. |
+| OS keyring / encrypted local store for forge tokens | **Aspirational** | No token storage of any kind exists yet; #228 explicitly does not build it (see its issue text). |
+| Fine-grained, short-lived provider credentials (GitHub Apps) | **Aspirational** | No forge-app integration exists yet. |
+| Provider scopes shown before authorization | **Aspirational** | No authorization UI exists yet. |
+| Provider logout revokes/deletes local credentials | **Aspirational** | No logout flow exists yet (nothing is stored to revoke). |
+
+The three "Not implemented" / "Aspirational" gaps above are open scope for a
+future slice, not silent regressions of this one — #228's own scope explicitly
+reads "strip userinfo from URLs **at minimum**."
+
 ## Request Integrity
 
 Every mutation request contains:
