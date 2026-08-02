@@ -48,3 +48,4 @@ it, and note the link in both.
 | [0034](0034-cat-file-batch-single-spawn-reads.md) | File-at-commit reads go through one long-lived `cat-file --batch` process | Accepted — implemented and tested |
 | [0035](0035-inspector-bottom-sheet-wiring.md) | The inspector bottom sheet is wired to `ShellMode`, following the finger during drag | Accepted — implemented and tested |
 | [0036](0036-network-tier-exec-harness-askpass-and-redaction.md) | The Network-tier exec harness: forced askpass hardening, byte-level redaction, and what stays open | Accepted — implemented and tested |
+| [0037](0037-worktree-destructive-operations.md) | Worktree-destructive operations: typed per-path impact, a preview that names every file, and one required control that cannot exist | Accepted — implemented and tested |

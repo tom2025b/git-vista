@@ -7,6 +7,32 @@
 //! `shell.close_menu()`, because closing the menu synchronously disposes the
 //! handler's own reactive owner, after which a further signal write is
 //! unreliable. The "Commit …" and merge/push/delete items all follow it.
+//!
+//! **Disabled items are `<button>`s that are never `disabled`.** Every item
+//! this menu greys out carries a reason built by
+//! [`disabled_menu_item_copy`], and that reason exists for the keyboard and
+//! screen-reader user #65 was about. Two things have to be true for it to
+//! actually reach them, and a `<span>` gets both wrong:
+//!
+//! 1. `aria-label` and `aria-disabled` are only honoured on an element whose
+//!    role supports them. A bare `<span>` is `role="generic"`, so both
+//!    attributes are dropped on the floor — the accessible name reverts to the
+//!    element's text and nothing announces the item as unavailable.
+//! 2. A `<span>` is not focusable, so Tab walks straight past it. Its enabled
+//!    siblings are `<button>`s and *are* tab stops, which means the item a
+//!    keyboard user most needs an explanation for is the one item they can
+//!    never land on.
+//!
+//! So these render as `<button>` with `aria-disabled="true"` and **no**
+//! `prop:disabled` — a genuinely disabled button leaves the tab order and
+//! takes its own explanation with it. The button has no `on:click`, so it is
+//! inert by construction rather than by the browser's grace. This is the same
+//! reasoning `dialogs/confirm.rs` writes out for the confirm button that
+//! carries a `blocked_reason`, and `features::a11y::audit`'s
+//! `every_disabled_context_menu_item_is_focusable` holds the line over this
+//! file's bytes. `styles.css` already dresses both forms
+//! (`.ctx-item.disabled` and `.ctx-item.disabled:focus-visible`), so nothing
+//! there changes.
 
 use leptos::*;
 
@@ -186,7 +212,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         "No GitHub page (no github.com remote, or it isn't pushed)";
                     let (aria_label, visible_reason) = disabled_menu_item_copy(label, REASON);
                     view! {
-                        <span
+                        <button
                             class="ctx-item disabled"
                             title=REASON
                             aria-disabled="true"
@@ -195,7 +221,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                             <span class="nf ctx-icon">{ic.github}</span>
                             {label}
                             <span class="ctx-item-reason">{visible_reason}</span>
-                        </span>
+                        </button>
                     }
                     .into_view()
                 }
@@ -303,7 +329,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         };
                         let (aria_label, visible_reason) = disabled_menu_item_copy(label, reason);
                         return view! {
-                            <span
+                            <button
                                 class="ctx-item disabled"
                                 title=reason
                                 aria-disabled="true"
@@ -312,7 +338,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                                 <span class="nf ctx-icon">{icon}</span>
                                 {label}
                                 <span class="ctx-item-reason">{visible_reason}</span>
-                            </span>
+                            </button>
                         }
                         .into_view();
                     }
@@ -388,7 +414,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 };
                 let (aria_label, visible_reason) = disabled_menu_item_copy("Stage Changes", reason);
                 view! {
-                    <span
+                    <button
                         class="ctx-item disabled"
                         title=reason
                         aria-disabled="true"
@@ -397,7 +423,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         <span class="nf ctx-icon">{ic.added}</span>
                         "Stage Changes"
                         <span class="ctx-item-reason">{visible_reason}</span>
-                    </span>
+                    </button>
                 }
                 .into_view()
             };
@@ -500,7 +526,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     let (aria_label, visible_reason) =
                         disabled_menu_item_copy("Discard Changes…", reason);
                     view! {
-                        <span
+                        <button
                             class="ctx-item disabled"
                             title=reason
                             aria-disabled="true"
@@ -509,7 +535,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                             <span class="nf ctx-icon">{ic.undo}</span>
                             "Discard Changes…"
                             <span class="ctx-item-reason">{visible_reason}</span>
-                        </span>
+                        </button>
                     }
                     .into_view()
                 } else {
@@ -546,7 +572,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     let (aria_label, visible_reason) =
                         disabled_menu_item_copy("Delete Untracked Files…", reason);
                     view! {
-                        <span
+                        <button
                             class="ctx-item disabled"
                             title=reason
                             aria-disabled="true"
@@ -555,7 +581,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                             <span class="nf ctx-icon">{ic.deleted}</span>
                             "Delete Untracked Files…"
                             <span class="ctx-item-reason">{visible_reason}</span>
-                        </span>
+                        </button>
                     }
                     .into_view()
                 } else {
@@ -804,7 +830,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 if let Some(reason) = reason {
                     let (aria_label, visible_reason) = disabled_menu_item_copy(&label, &reason);
                     return view! {
-                        <span
+                        <button
                             class="ctx-item disabled"
                             title=reason
                             aria-disabled="true"
@@ -813,7 +839,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                             <span class="nf ctx-icon">{ic.merge}</span>
                             {label}
                             <span class="ctx-item-reason">{visible_reason}</span>
-                        </span>
+                        </button>
                     }
                     .into_view();
                 }
@@ -921,7 +947,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 const REASON: &str = "This device reports it is offline";
                 let (aria_label, visible_reason) = disabled_menu_item_copy("Write actions", REASON);
                 view! {
-                    <span
+                    <button
                         class="ctx-item disabled"
                         title=REASON
                         aria-disabled="true"
@@ -930,7 +956,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         <span class="nf ctx-icon">{ic.commit}</span>
                         "Write actions"
                         <span class="ctx-item-reason">{visible_reason}</span>
-                    </span>
+                    </button>
                 }
             });
             // Clamp the menu inside the *visual* viewport (iPad fix): a tap in
