@@ -557,14 +557,23 @@ pub(crate) async fn write_recovery_ref(
     }
 }
 
-/// The commit a recovery strategy would restore, if it names one directly.
+/// The object a recovery strategy would restore, if it names one directly.
 fn recovery_oid(recovery: &RecoveryStrategy) -> Option<&CommitOid> {
     match recovery {
         RecoveryStrategy::ResetRef { to, .. } => Some(to),
         RecoveryStrategy::RecreateBranch { at, .. } => Some(at),
+        // M2.21a (#235): for a deleted *annotated* tag `at` is the tag
+        // object, not a commit — and pinning it here is load-bearing, not
+        // incidental: the recovery ref keeps that now-dangling tag object
+        // *reachable*, so git gc cannot prune the only exact copy of the
+        // tag (message, tagger, signature) while the pin exists. See
+        // `RecreateTag`'s doc in plan.rs — this pin is half the reason the
+        // variant carries an oid instead of a message.
+        RecoveryStrategy::RecreateTag { at, .. } => Some(at),
         RecoveryStrategy::RevertCommit { commit } => Some(commit),
         RecoveryStrategy::NotNeeded
         | RecoveryStrategy::DeleteCreatedBranch { .. }
+        | RecoveryStrategy::DeleteCreatedTag { .. }
         | RecoveryStrategy::CheckoutPrevious { .. }
         // A dangling blob (if any) isn't a commit a ref can point at — this
         // function only ever writes a ref naming a commit.
@@ -747,11 +756,26 @@ mod tests {
             to: CommitOid::new("c".repeat(40)).unwrap(),
         };
         assert!(recovery_oid(&with).is_some());
+        // M2.21a (#235): `RecreateTag` names the pre-delete ref value, and
+        // the pin *must* exist — it is what keeps a deleted annotated tag's
+        // dangling tag object alive against gc (see recovery_oid's comment).
+        let recreate_tag = RecoveryStrategy::RecreateTag {
+            name: git_vista_protocol::TagName::new("v1.0.0").unwrap(),
+            at: CommitOid::new("d".repeat(40)).unwrap(),
+        };
+        assert_eq!(
+            recovery_oid(&recreate_tag).map(CommitOid::as_str),
+            Some("d".repeat(40).as_str()),
+            "RecreateTag's pin must be the carried pre-delete oid itself"
+        );
 
         for without in [
             RecoveryStrategy::NotNeeded,
             RecoveryStrategy::DeleteCreatedBranch {
                 name: BranchName::new("x").unwrap(),
+            },
+            RecoveryStrategy::DeleteCreatedTag {
+                name: git_vista_protocol::TagName::new("v1.0.0").unwrap(),
             },
             RecoveryStrategy::CheckoutPrevious {
                 branch: BranchName::new("x").unwrap(),

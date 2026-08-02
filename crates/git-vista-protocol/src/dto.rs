@@ -513,6 +513,95 @@ impl RepositoryDescriptor {
     }
 }
 
+/// Which of git's two kinds of tag a [`TagDetail`] describes (M2.21a, #235,
+/// ADR 0041). Shapes only in this slice — the read endpoint that produces
+/// `TagDetail`s is a later M2.21 slice of #74.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TagKind {
+    /// A bare ref under `refs/tags/` pointing straight at a commit — no tag
+    /// object, so no message, no tagger, and nothing to sign.
+    Lightweight,
+    /// A real tag *object* (message, tagger, date, optionally a GPG
+    /// signature) that the ref points at, which in turn points at the
+    /// tagged commit.
+    Annotated,
+}
+
+/// What is known about an annotated tag's GPG signature (M2.21a, #235).
+///
+/// **Shapes only** — no verification logic exists in this crate or, yet, in
+/// the server; M2.21c (#74) owns running the actual verification. The
+/// vocabulary is closed and deliberately keeps "we could not check" apart
+/// from "we checked and it failed": collapsing those two is how a UI ends up
+/// calling an unverifiable signature invalid (alarming users over a missing
+/// keyring) or, worse, valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureStatus {
+    /// The tag carries no signature at all (every lightweight tag, and any
+    /// unsigned annotated tag).
+    Unsigned,
+    /// A signature is present and verified against a known key.
+    Valid,
+    /// A signature is present and verification *ran* and *failed* — the
+    /// bytes do not check out against the key that claims to have made them.
+    Invalid,
+    /// A signature is present but the key that made it is not in the
+    /// verifying keyring — nothing can be said about the bytes either way.
+    UnknownKey,
+    /// A signature is present but verification could not run at all (no gpg
+    /// on the host, config broken). Distinct from [`UnknownKey`]: there the
+    /// machinery worked and lacked one key; here the machinery itself was
+    /// unavailable — the same "could not be asked" honesty the server's
+    /// `Obs::Unknown` keeps for observations.
+    ///
+    /// [`UnknownKey`]: Self::UnknownKey
+    Unverifiable,
+}
+
+/// One tag, fully described — the read DTO every M2.21 tag-listing/detail
+/// slice serves (M2.21a, #235, ADR 0041; shape modelled on #212's pattern of
+/// landing the wire contract with a golden pin before its producer).
+///
+/// # `deny_unknown_fields` on a read DTO — deliberate, and cheap to relax
+///
+/// The crate's response DTOs usually omit `deny_unknown_fields` so an older
+/// client keeps parsing when a newer server adds a field (M1.02 additive
+/// rule; see [`AmendCommitError`]). `TagDetail` starts strict anyway because
+/// it lands *before its producer exists*: until the M2.21 read slice ships,
+/// every `TagDetail` a test or fixture constructs is hand-written, and
+/// strictness turns a misspelled key in one of those into a loud error
+/// instead of a silently-ignored field. Loosening later (dropping the
+/// attribute when the additive rule first needs to apply) widens what the
+/// contract accepts — a compatible change — while the reverse, tightening
+/// after clients exist, would not be.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TagDetail {
+    /// The tag's short name (`v1.0.0`).
+    pub name: crate::plan::TagName,
+    /// Lightweight or annotated — see [`TagKind`].
+    pub kind: TagKind,
+    /// The tagged **commit** — always the peeled target (`refs/tags/<name>^{}`),
+    /// whichever kind the tag is, so a consumer never re-derives peeling.
+    pub target: crate::plan::CommitOid,
+    /// The tag *object's* own oid — `Some` exactly when
+    /// [`kind`](Self::kind) is [`TagKind::Annotated`] (a lightweight tag has
+    /// no object). This is the value [`RecoveryStrategy::RecreateTag`] wants
+    /// as `at` should this tag be deleted.
+    ///
+    /// [`RecoveryStrategy::RecreateTag`]: crate::plan::RecoveryStrategy::RecreateTag
+    pub tag_object: Option<crate::plan::CommitOid>,
+    /// The tagger line's name/email/date as git renders it — annotated tags
+    /// only, and plain display text (never parsed back).
+    pub tagger: Option<String>,
+    /// The annotation message — annotated tags only.
+    pub message: Option<crate::plan::TagMessage>,
+    /// What is known about the tag's signature — see [`SignatureStatus`].
+    pub signature: SignatureStatus,
+}
+
 /// Validate a URL a user pasted to clone, before the server hands it to
 /// `git clone` (Phase 12). This is a *gate*, not a parser: it accepts only the
 /// public, read-oriented transports (`https://`, `http://`, `git://`) and rejects

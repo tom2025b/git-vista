@@ -577,6 +577,29 @@ history knowingly is legitimate; failures reach the client as typed kinds
 and rebase members of this row predate the plan machinery's client-review roundtrip,
 which lands with M2+.)*
 
+*(Tag operations typed, not yet executable: ADR 0041, #235 — four new class members,
+staged contract-first exactly as ADR 0039 staged fetch/pull. **Local reversible:**
+`GitOperation::CreateTag` — writes a ref (and, annotated, one tag object) into the local
+repository only, undone by the typed `RecoveryStrategy::DeleteCreatedTag`. **Remote
+visible:** `PushTag`. **Remote destructive:** `DeleteRemoteTag` — a push under the hood
+(`git push <remote> --delete refs/tags/<name>`), so "remote branch delete" in this row
+now has a tag sibling; both remote-reaching variants declare `NetworkNeed::Remote` in
+`sandbox::network_need_for_operation`'s wildcard-free match today, binding the ADR 0036
+askpass-hardening and credential-redaction tier in the type before any execution exists,
+and the dispatch census pins the remote set at exactly five operations. **`DeleteLocalTag`
+ranks `Destructive` despite never leaving the machine** — the "Local reversible" row does
+not fit it: `git tag -d` has no unmerged-work guard (the guard that lets `git branch -d`
+rank reversible), tag refs keep no reflog, and a tag can be the last ref keeping a commit
+alive — so it is `-D`-shaped and classified with `ForceDeleteBranch`. Its recovery control
+is the shape of the undo: `RecoveryStrategy::RecreateTag` carries the **unpeeled**
+pre-delete ref value — for an annotated tag, the tag object's own oid — so restoration via
+`update-ref` is byte-identical (message, tagger, GPG signature included), and
+`durable::recovery_oid` pins that oid under `refs/git-vista/recovery/<operation-id>`,
+keeping the dangling tag object reachable so `git gc` cannot prune the only exact copy
+while the pin exists. This is the typed **contract** only: `planner::execute` refuses all
+four operations with `501`, proven inert by the contract suite against real repositories
+and real on-disk remotes.)*
+
 No gesture, pressure threshold, swipe, or double-tap directly executes a destructive
 operation. Touch gestures may select or open a plan; final confirmation is explicit.
 
