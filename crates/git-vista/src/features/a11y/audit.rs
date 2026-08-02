@@ -25,6 +25,11 @@ const APP_MOD: &str = include_str!("../../app/mod.rs");
 const RENDER_NODES: &str = include_str!("../../render/nodes.rs");
 const RENDER_STUBS: &str = include_str!("../../render/stubs.rs");
 const MENU: &str = include_str!("../../menu.rs");
+/// The commit modal (M2.19c, #224 widened it to three modes). Inline-styled end
+/// to end, so the stylesheet census below cannot see a single one of its
+/// controls — this file's own bytes are the only place its tap targets can be
+/// checked.
+const COMMIT_MODAL: &str = include_str!("../../dialogs/commit.rs");
 
 fn stylesheet() -> Vec<Rule> {
     parse(STYLES)
@@ -727,10 +732,11 @@ fn every_disabled_context_menu_item_is_focusable() {
     // Anti-vacuity floor. "Every tag is a button" is trivially true of an empty
     // list, so if this census ever stopped finding the items — file moved, markup
     // reshaped, class renamed — the assertions below would go green while checking
-    // nothing. Seven is what menu.rs has today (GitHub link, two commit items,
-    // Stage Changes, Discard Changes, Delete Untracked Files, the offline notice).
+    // nothing. Eight is what menu.rs has today (GitHub link, two commit items,
+    // "Amend last commit" since M2.19c/#224, Stage Changes, Discard Changes,
+    // Delete Untracked Files, the offline notice).
     assert!(
-        tags.len() >= 7,
+        tags.len() >= 8,
         "only {} `.ctx-item.disabled` item(s) found in menu.rs — this census has \
          lost its subject and every assertion below it is now vacuous. If items \
          were genuinely removed, lower this floor deliberately rather than \
@@ -786,6 +792,101 @@ fn the_disabled_item_census_can_tell_a_span_from_a_button() {
     let native = "<button class=\"ctx-item disabled\" prop:disabled=true>";
     assert!(disabled_ctx_item_tags(native)[0].contains("prop:disabled"));
     assert!(disabled_ctx_item_tags("no menu items here").is_empty());
+}
+
+// ── The commit modal's tap targets (M2.19c, #224) ───────────────────────────────
+//
+// This modal is inline-styled (see `dialogs/mod.rs` for the iPad-proven recipe it
+// follows), which puts every one of its controls outside the stylesheet census
+// above: `INTERACTIVE_CENSUS` reads CSS selectors, and there are none to read.
+// `dialogs/confirm.rs` hit the same gap in M2.18b and answered it by naming the
+// 44x44 floor once, as `TOUCH_TARGET_STYLE`, and pairing it with the button base
+// style at every site. #224 rewrote this modal — three modes, a scope review, a
+// re-check banner — and brought its buttons onto the same pairing; before that
+// they were `padding:6px 14px` on a 13px font, roughly 30px tall, under the floor
+// the rest of the app was raised to in #65.
+//
+// The tripwire is over that pairing rather than over rendered geometry, because
+// the pairing is the part that exists in this repository. What it cannot prove is
+// that the button is 44px on a real device — no test here can.
+
+/// Every place the modal's button base style is used, with what follows it.
+///
+/// Returns one entry per `{BUTTON_BASE}` occurrence, so a floor over the count is
+/// what stops the assertions going vacuous if the constant is renamed away.
+fn button_base_uses(src: &str) -> Vec<&str> {
+    const NEEDLE: &str = "{BUTTON_BASE}";
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(NEEDLE) {
+        let at = from + rel + NEEDLE.len();
+        from = at;
+        out.push(&src[at..src.len().min(at + NEEDLE.len() + 24)]);
+    }
+    out
+}
+
+#[test]
+fn every_commit_modal_button_carries_the_44px_floor() {
+    let uses = button_base_uses(COMMIT_MODAL);
+    // Anti-vacuity floor. Four is what the modal has today: Cancel, the confirm
+    // button's two style branches, and the re-check banner's action. "Every use
+    // is paired" is trivially true of no uses at all, so a rename that made this
+    // census find nothing would otherwise pass silently.
+    assert!(
+        uses.len() >= 4,
+        "only {} `{{BUTTON_BASE}}` use(s) found in dialogs/commit.rs — this census \
+         has lost its subject and the assertion below it is now vacuous. If buttons \
+         were genuinely removed, lower this floor deliberately.",
+        uses.len()
+    );
+    for tail in &uses {
+        assert!(
+            tail.starts_with("{TOUCH_TARGET_STYLE}"),
+            "a commit-modal button styles itself from BUTTON_BASE without the 44x44 \
+             floor beside it, so it inherits only the padding — the exact shape #65 \
+             found undersized. Follows BUTTON_BASE here: {tail:?}"
+        );
+    }
+
+    // The pre-#224 shape, named so a revert is caught rather than merely becoming
+    // un-asserted: a `style="padding:…"` literal is a control styled without going
+    // through `BUTTON_BASE` at all, which is how the old `padding:6px 14px`
+    // buttons (~30px tall on this font) escaped every check there was. Matched on
+    // the attribute rather than on the declaration alone, so the prose above and
+    // in `dialogs/commit.rs` may keep quoting the old value.
+    assert!(
+        !COMMIT_MODAL.contains("style=\"padding:"),
+        "a commit-modal control declares its own padding instead of building on \
+         BUTTON_BASE + TOUCH_TARGET_STYLE, so nothing holds it to the 44px floor"
+    );
+
+    // And the floor itself is still a floor. `TOUCH_TARGET_STYLE`'s own value is
+    // asserted where it is defined; this is the half that would notice the
+    // constant being pointed somewhere else.
+    assert!(
+        crate::features::dialogs::core::TOUCH_TARGET_STYLE.contains("min-height:44px"),
+        "TOUCH_TARGET_STYLE no longer declares the 44px floor the pairing above \
+         relies on"
+    );
+}
+
+/// The census helper is proved on both answers, against fixture source — otherwise
+/// a helper that returned an empty list would satisfy the loop above perfectly.
+#[test]
+fn the_button_base_census_can_spot_an_unfloored_button() {
+    let floored = r#"style=format!("{BUTTON_BASE}{TOUCH_TARGET_STYLE}color:#fff;")"#;
+    let uses = button_base_uses(floored);
+    assert_eq!(uses.len(), 1);
+    assert!(uses[0].starts_with("{TOUCH_TARGET_STYLE}"));
+
+    // The shape this modal actually shipped before #224 — the paired negative.
+    let unfloored = r#"style=format!("{BUTTON_BASE}color:#fff;")"#;
+    let uses = button_base_uses(unfloored);
+    assert_eq!(uses.len(), 1);
+    assert!(!uses[0].starts_with("{TOUCH_TARGET_STYLE}"));
+
+    assert!(button_base_uses("no buttons here").is_empty());
 }
 
 /// The stylesheet already dresses the focused-but-disabled item, so making these
