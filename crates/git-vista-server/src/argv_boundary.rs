@@ -143,6 +143,14 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // `spawn::command_async` like every other sandboxed git. Program is the
     // literal `"git"`; no argument is client-influenced.
     "src/sandbox/clone_live.rs",
+    // #228 (M2.20b): the shared Network-tier exec harness. Its production
+    // functions (`network_command`, `run_network_git`) build no `Command` of
+    // their own — they call `spawn::command_async`, the same chokepoint
+    // every other spawn site in this crate already goes through. The only
+    // `Command::new` literal in this file is `#[cfg(test)]` fixture setup
+    // (`run()`, `git init`/`git config` for the askpass/credential-helper
+    // fixtures) — same posture as `repo_paths.rs`/`hostile.rs` above.
+    "src/sandbox/network_exec.rs",
     // Deliberately absent: `src/sandbox/documented_gaps.rs` and
     // `src/sandbox/lifecycle.rs`, the suites #66's Task 15 round adds beside
     // this one. `documented_gaps.rs` exists and constructs no `Command` at all,
