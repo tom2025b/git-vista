@@ -59,6 +59,7 @@
 //! special-casing of `22`, so a rule proven here for an arbitrary port
 //! exercises the identical mechanism production uses for `22`.
 
+use super::network_exec;
 use super::*;
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -134,6 +135,11 @@ struct SshFixture {
     port: u16,
     agent_sock: PathBuf,
     repo_url: String,
+    /// The bare repository's real filesystem path (what `repo_url` names
+    /// over `ssh://`) — #228's push test reads this directly, unsandboxed,
+    /// to verify a push actually moved the remote's ref rather than trusting
+    /// the push's own exit code.
+    repo_git: PathBuf,
     /// The exact ref line seeded into the bare repository, asserted present
     /// in `ls-remote`'s real stdout — evidence the transport actually
     /// completed a real exchange, not merely that the process exited 0.
@@ -241,14 +247,39 @@ impl SshFixture {
             "git clone --bare",
         );
 
-        // --- authorized_keys: force git-upload-pack, nothing else -------
+        // --- authorized_keys: force a dispatcher that allows only
+        // upload-pack (fetch/ls-remote) or receive-pack (push) against this
+        // fixture's own bare repo, whatever the client actually asked for
+        // via `$SSH_ORIGINAL_COMMAND` — nothing else. #228 needs both: the
+        // original #188 fixture only ever needed upload-pack for
+        // `ls-remote`, but this file now also proves a real `git push`
+        // through the harness (`network_exec_ssh_suite` below), which sends
+        // `git-receive-pack`. `eval` here is safe precisely because it only
+        // ever runs after the `case` has matched one of the two exact,
+        // fixture-generated literals below — never arbitrary client input.
+        let dispatch = work.path().join("dispatch.sh");
+        std::fs::write(
+            &dispatch,
+            format!(
+                "#!/bin/sh\ncase \"$SSH_ORIGINAL_COMMAND\" in\n  \
+                 \"git-upload-pack '{repo}'\"|\"git-receive-pack '{repo}'\")\n    \
+                 eval \"$SSH_ORIGINAL_COMMAND\"\n    ;;\n  \
+                 *)\n    echo \"refused: $SSH_ORIGINAL_COMMAND\" >&2\n    exit 1\n    ;;\nesac\n",
+                repo = repo_git.display(),
+            ),
+        )
+        .expect("write dispatch.sh");
+        let mut perm = std::fs::metadata(&dispatch).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&dispatch, perm).unwrap();
+
         let authorized_keys = work.path().join("authorized_keys");
         std::fs::write(
             &authorized_keys,
             format!(
-                "command=\"git-upload-pack '{}'\",no-port-forwarding,no-X11-forwarding,\
+                "command=\"{}\",no-port-forwarding,no-X11-forwarding,\
                  no-agent-forwarding,no-pty {}",
-                repo_git.display(),
+                dispatch.display(),
                 client_pub.trim()
             ),
         )
@@ -345,6 +376,7 @@ impl SshFixture {
             port,
             agent_sock,
             repo_url,
+            repo_git,
             seeded_ref,
         }
     }
@@ -500,5 +532,190 @@ async fn ls_remote_still_succeeds_without_the_agent_socket_grant_on_this_kernel(
          (and ssh_agent_socket_grant's doc comment) needs revisiting, not silencing.",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// --- #228: the shared Network-tier exec harness, proven over the same real
+// SSH transport this file already proves for `ls-remote` -------------------
+//
+// Everything above this point proves #188's carve-out machinery works
+// through the bare launcher (`spawn::command_async`). These two tests prove
+// the *harness* (`network_exec::network_command`, which adds `-c
+// core.askpass=` ahead of the subcommand) does not break that machinery, and
+// that a real `git fetch` and a real `git push` through it succeed with
+// **verifiable effects** on the bare remote — not just exit code 0. Push
+// needs the dispatcher change above (`git-receive-pack`, not just
+// `git-upload-pack`), which is why it lives beside `ls_remote` rather than
+// in a separate file: it is the same fixture, extended.
+
+/// The seeded commit's oid, parsed out of `SshFixture::seeded_ref`
+/// (`"<oid>\trefs/heads/main"`) — used to assert a fetch actually landed the
+/// right object, not merely that git exited 0.
+fn seeded_oid(fixture: &SshFixture) -> &str {
+    fixture
+        .seeded_ref
+        .split('\t')
+        .next()
+        .expect("seeded_ref is `<oid>\\trefs/heads/main`")
+}
+
+/// `git rev-parse <rev>` in `dir`, run **unsandboxed** — fixture-verification
+/// only, the same posture `SshFixture::build`'s own setup already uses
+/// throughout this file, never the claim under test.
+fn rev_parse_unsandboxed(dir: &std::path::Path, rev: &str) -> String {
+    let out = Command::new("git")
+        .args(["-C", dir.to_str().unwrap(), "rev-parse", rev])
+        .output()
+        .unwrap_or_else(|e| panic!("git rev-parse: could not run: {e}"));
+    assert!(
+        out.status.success(),
+        "git -C {dir:?} rev-parse {rev} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A real `git fetch` over `ssh://`, through `network_exec::network_command`
+/// (askpass hardening included) rather than the bare launcher, landing the
+/// seeded commit into a **fresh, empty** local repository. The effect is
+/// checked directly against the object the fixture seeded — the same
+/// non-vacuity discipline `a_real_ssh_ls_remote_succeeds_through_the_composed_launcher`
+/// already applies to its own stdout assertion, one level up (a real ref
+/// update, not just a process exit code).
+#[tokio::test]
+async fn a_real_fetch_succeeds_through_the_network_exec_harness_over_ssh() {
+    let fixture = SshFixture::build();
+
+    let dst = tempfile::tempdir().expect("dst tempdir");
+    run(
+        Command::new("git").args(["init", "-q", "-b", "main", dst.path().to_str().unwrap()]),
+        "git init (fetch destination)",
+    );
+
+    // `fixture.policy()` only ever grants what `ls-remote` against an
+    // explicit URL needs — no local repository read/write, since ls-remote
+    // touches none. `fetch` (unlike `ls-remote`) writes FETCH_HEAD and
+    // updates refs in the local `-C` target, so this test additionally
+    // grants the fetch destination rw — `Policy`'s fields are plain `pub`
+    // exactly so a test can extend a fixture's policy this way without a new
+    // constructor for every combination of grants.
+    let mut policy = fixture.policy(true, true);
+    policy.rw_trees.push(dst.path().to_path_buf());
+
+    let out = network_exec::network_command(
+        &policy,
+        dst.path(),
+        &[
+            "fetch",
+            &fixture.repo_url,
+            "refs/heads/main:refs/remotes/origin/main",
+        ],
+    )
+    .pinned_env_for_test(&fixture.ls_remote_env())
+    .output()
+    .await
+    .expect("the composed launcher spawns");
+    assert!(
+        out.status.success(),
+        "fetch failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let landed = rev_parse_unsandboxed(dst.path(), "refs/remotes/origin/main");
+    assert_eq!(
+        landed,
+        seeded_oid(&fixture),
+        "fetch reported success but refs/remotes/origin/main does not point at the \
+         seeded commit — a real effect check, not just exit code 0"
+    );
+}
+
+/// A real `git push` over `ssh://`, through `network_exec::network_command`,
+/// landing a brand-new commit onto the bare remote's `refs/heads/main`. The
+/// effect is checked by reading the bare repository's ref directly
+/// (unsandboxed — fixture verification, same posture as `rev_parse_unsandboxed`
+/// above), not by trusting the push's own exit code.
+#[tokio::test]
+async fn a_real_push_succeeds_through_the_network_exec_harness_over_ssh() {
+    let fixture = SshFixture::build();
+
+    // A local clone of the *pre-bare* scratch repo (same history the bare
+    // remote was cloned from), so the new commit below is a genuine
+    // fast-forward the remote will accept.
+    let work_repo = tempfile::tempdir().expect("work_repo tempdir");
+    run(
+        Command::new("git").args([
+            "clone",
+            "-q",
+            fixture.cwd.to_str().unwrap(),
+            work_repo.path().to_str().unwrap(),
+        ]),
+        "git clone (push work repo)",
+    );
+
+    // Same grant extension as the fetch test above: push reads/writes the
+    // local `-C` target (its object database, at minimum), which
+    // `fixture.policy()`'s ls-remote-only grants don't include.
+    let mut policy = fixture.policy(true, true);
+    policy.rw_trees.push(work_repo.path().to_path_buf());
+    let git_env = |cmd: &mut Command| {
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &fixture.home)
+            .env("GIT_AUTHOR_NAME", "gv-ssh-fixture")
+            .env("GIT_AUTHOR_EMAIL", "gv-ssh-fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "gv-ssh-fixture")
+            .env("GIT_COMMITTER_EMAIL", "gv-ssh-fixture@example.invalid");
+    };
+    std::fs::write(work_repo.path().join("pushed.txt"), "#228 push e2e\n")
+        .expect("write pushed.txt");
+    let mut c = Command::new("git");
+    git_env(&mut c);
+    run(
+        c.args(["-C", work_repo.path().to_str().unwrap(), "add", "-A"]),
+        "git add",
+    );
+    let mut c = Command::new("git");
+    git_env(&mut c);
+    run(
+        c.args([
+            "-C",
+            work_repo.path().to_str().unwrap(),
+            "commit",
+            "-q",
+            "-m",
+            "#228 push e2e",
+        ]),
+        "git commit",
+    );
+    let new_oid = rev_parse_unsandboxed(work_repo.path(), "HEAD");
+    assert_ne!(
+        new_oid,
+        seeded_oid(&fixture),
+        "test setup: the pushed commit must be new, not the seed"
+    );
+
+    let out = network_exec::network_command(
+        &policy,
+        work_repo.path(),
+        &["push", &fixture.repo_url, "HEAD:refs/heads/main"],
+    )
+    .pinned_env_for_test(&fixture.ls_remote_env())
+    .output()
+    .await
+    .expect("the composed launcher spawns");
+    assert!(
+        out.status.success(),
+        "push failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let remote_tip = rev_parse_unsandboxed(&fixture.repo_git, "refs/heads/main");
+    assert_eq!(
+        remote_tip, new_oid,
+        "push reported success but the bare remote's refs/heads/main did not move \
+         to the pushed commit — a real effect check, not just exit code 0"
     );
 }
