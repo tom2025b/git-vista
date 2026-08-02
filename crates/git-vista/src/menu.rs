@@ -43,6 +43,7 @@ use crate::api::{
     fetch_status, fetch_undoables, fetch_worktree_status, stage_request, unstage_request,
 };
 use crate::features::core_traits::RequestTarget;
+use crate::features::dialogs::commit::{amend_offer, AmendOffer};
 use crate::features::dialogs::core::Dialog;
 use crate::features::graph::core::disabled_menu_item_copy;
 use crate::features::operations::core::PendingIntent;
@@ -391,56 +392,59 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
             // submit time: it is the commit the user was looking at when they chose to
             // rewrite it, and the server refuses if the tip has moved since — which the
             // dialog then turns into a guided re-check rather than an error.
+            //
+            // The gate itself is `amend_offer`, in the host-tested core, not a
+            // condition spelled out here: this file is wasm-only, so an inverted
+            // or dropped condition would put "Amend last commit" on every stub —
+            // or take it away everywhere — with nothing in the suite going red.
             let amend_tip = m.commit.clone();
-            let amend_item = if is_head && !is_stub {
-                let on_amend = move |_| {
-                    let tip = amend_tip.clone();
-                    dialogs.open(Dialog::Commit);
-                    shell.open_commit_dialog(CommitIntent::Amend {
-                        expected_tip: tip.clone(),
-                    });
-                    status.refetch();
-                    shell.close_menu();
-                    // Pre-fill with the tip's *whole* message (summary and body), not
-                    // the graph row's first line: `git commit --amend -m` replaces the
-                    // message outright, so seeding from a summary would silently drop
-                    // the body of every commit amended from here. A failed read leaves
-                    // the box empty and the confirm button disabled, which is the safe
-                    // direction — the dialog never invents a message.
-                    spawn_local(async move {
-                        if let Ok(detail) = fetch_commit_detail(&tip).await {
-                            dialogs.seed_amend_msg(&detail.message);
-                        }
-                    });
-                };
-                view! {
-                    <button class="ctx-item" on:click=on_amend>
-                        <span class="nf ctx-icon">{ic.commit}</span>
-                        "Amend last commit"
-                    </button>
+            let amend_item = match amend_offer(is_head, is_stub) {
+                AmendOffer::Offered => {
+                    let on_amend = move |_| {
+                        let tip = amend_tip.clone();
+                        dialogs.open(Dialog::Commit);
+                        shell.open_commit_dialog(CommitIntent::Amend {
+                            expected_tip: tip.clone(),
+                        });
+                        status.refetch();
+                        shell.close_menu();
+                        // Pre-fill with the tip's *whole* message (summary and body), not
+                        // the graph row's first line: `git commit --amend -m` replaces the
+                        // message outright, so seeding from a summary would silently drop
+                        // the body of every commit amended from here. A failed read leaves
+                        // the box empty and the confirm button disabled, which is the safe
+                        // direction — the dialog never invents a message.
+                        spawn_local(async move {
+                            if let Ok(detail) = fetch_commit_detail(&tip).await {
+                                dialogs.seed_amend_msg(&detail.message);
+                            }
+                        });
+                    };
+                    view! {
+                        <button class="ctx-item" on:click=on_amend>
+                            <span class="nf ctx-icon">{ic.commit}</span>
+                            "Amend last commit"
+                        </button>
+                    }
+                    .into_view()
                 }
-                .into_view()
-            } else {
-                let reason = if is_stub {
-                    "Amending rewrites the checked-out branch's tip, not a stub"
-                } else {
-                    "Only the commit at HEAD can be amended"
-                };
-                let (aria_label, visible_reason) =
-                    disabled_menu_item_copy("Amend last commit", reason);
-                view! {
-                    <button
-                        class="ctx-item disabled"
-                        title=reason
-                        aria-disabled="true"
-                        aria-label=aria_label
-                    >
-                        <span class="nf ctx-icon">{ic.commit}</span>
-                        "Amend last commit"
-                        <span class="ctx-item-reason">{visible_reason}</span>
-                    </button>
+                AmendOffer::Blocked(reason) => {
+                    let (aria_label, visible_reason) =
+                        disabled_menu_item_copy("Amend last commit", reason);
+                    view! {
+                        <button
+                            class="ctx-item disabled"
+                            title=reason
+                            aria-disabled="true"
+                            aria-label=aria_label
+                        >
+                            <span class="nf ctx-icon">{ic.commit}</span>
+                            "Amend last commit"
+                            <span class="ctx-item-reason">{visible_reason}</span>
+                        </button>
+                    }
+                    .into_view()
                 }
-                .into_view()
             };
             // "Stage Changes" (git add -A): move the working-tree changes into the
             // index so they can be committed. Like committing, it acts on the

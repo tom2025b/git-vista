@@ -105,6 +105,130 @@ impl CommitIntent {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Which submit path the confirm button takes
+// ---------------------------------------------------------------------------
+
+/// A [`CommitIntent`] that is **statically not an amend**.
+///
+/// The field is private and this module has no public constructor for it, so
+/// the only way to obtain one is [`submit_path`]. That is the whole point: the
+/// confirm button used to choose between the two submit closures with a match
+/// written in `dialogs/commit.rs`, which is wasm-only and therefore never
+/// compiled by `cargo test`. A copy-paste that sent `CommitIntent::Amend` to
+/// the plain-commit closure compiled cleanly, passed every test, and turned
+/// "amend the tip" into "write a second commit" — a rewritten-history bug with
+/// nothing but a manual walkthrough standing in front of it.
+///
+/// With the two closures taking `PlainCommit` and [`AmendTarget`], that
+/// mis-dispatch is a type error rather than a discipline lapse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainCommit(CommitIntent);
+
+impl PlainCommit {
+    /// The intent this path commits — never `CommitIntent::Amend`.
+    pub fn intent(&self) -> &CommitIntent {
+        &self.0
+    }
+
+    /// Consume the wrapper; the submit closure needs the intent by value for
+    /// the buffer read and the draft clear.
+    pub fn into_intent(self) -> CommitIntent {
+        self.0
+    }
+}
+
+/// The reviewed tip an amend is compare-and-swapped against, already extracted.
+///
+/// The twin of [`PlainCommit`]: a value the amend closure can accept and the
+/// plain-commit closure cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmendTarget(String);
+
+impl AmendTarget {
+    /// The compare-and-swap pin, verbatim — never shortened, since it is what
+    /// the request carries.
+    pub fn expected_tip(&self) -> &str {
+        &self.0
+    }
+
+    /// The intent this path amends, for the buffer read (`message_buffer`
+    /// routes an amend to its own non-persisted buffer).
+    pub fn intent(&self) -> CommitIntent {
+        CommitIntent::Amend {
+            expected_tip: self.0.clone(),
+        }
+    }
+}
+
+/// Which of the dialog's two submit paths an intent takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitPath {
+    /// `POST /api/commit` — the plain and empty modes.
+    Commit(PlainCommit),
+    /// `POST /api/amend-commit` — the compare-and-swapped rewrite.
+    Amend(AmendTarget),
+}
+
+/// The confirm button's dispatch, decided here rather than in the view.
+///
+/// Two modes collapse onto one path and one mode onto the other, which is
+/// exactly why this is worth naming: `Staged` and `Empty` differ in what they
+/// *send* (`allow_empty`, `branch`) but not in which endpoint they reach,
+/// while `Amend` reaches a different endpoint with a different failure
+/// vocabulary and a different buffer.
+pub fn submit_path(intent: &CommitIntent) -> SubmitPath {
+    match intent {
+        CommitIntent::Amend { expected_tip } => {
+            SubmitPath::Amend(AmendTarget(expected_tip.clone()))
+        }
+        CommitIntent::Staged | CommitIntent::Empty { .. } => {
+            SubmitPath::Commit(PlainCommit(intent.clone()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The context menu's amend gate
+// ---------------------------------------------------------------------------
+
+/// Whether the context menu offers "Amend last commit" on the tapped row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmendOffer {
+    /// Enabled: this row is the commit an amend would rewrite.
+    Offered,
+    /// Disabled, carrying the reason the item must show — #65's rule is that a
+    /// disabled control states why, on screen, not only in a `title=`.
+    Blocked(&'static str),
+}
+
+/// The gate for the "Amend last commit" menu item.
+///
+/// `is_head` — the tapped row is the commit HEAD resolves to. `is_stub` — the
+/// row is a branch stub rather than a commit dot.
+///
+/// Both conditions are load-bearing and neither implies the other. HEAD is
+/// required because `git commit --amend` rewrites the checked-out branch's own
+/// tip and nothing else, so offering it on any other dot would rewrite a
+/// commit the user did not tap. The stub exclusion is separate:
+/// `GitOperation::AmendCommit` has no branch field at all, so there is no
+/// "amend that stub" for the server to honour — and the stub case is checked
+/// first so that a row which is somehow both gets the accurate reason rather
+/// than the HEAD one.
+///
+/// Lives here, and not as a condition inlined in `menu.rs`, because that file
+/// is wasm-only: an inverted or dropped condition there would put the item on
+/// every stub (or take it away everywhere) without a single test going red.
+pub fn amend_offer(is_head: bool, is_stub: bool) -> AmendOffer {
+    if is_stub {
+        return AmendOffer::Blocked("Amending rewrites the checked-out branch's tip, not a stub");
+    }
+    if !is_head {
+        return AmendOffer::Blocked("Only the commit at HEAD can be amended");
+    }
+    AmendOffer::Offered
+}
+
 /// The body of `POST /api/amend-commit`, built from the reviewed tip and the
 /// message.
 ///
@@ -191,6 +315,42 @@ pub fn adopt_seed(current: &str, seed: &str, incoming: &str) -> Option<String> {
         return None;
     }
     Some(incoming.to_string())
+}
+
+/// What a pre-fill actually did to the message box.
+///
+/// The guided re-check has to *say* which of these happened, and it used to
+/// guess: the banner announced "Your message below is unchanged" and the very
+/// next statement called `seed_amend_msg`, which — when the box still held the
+/// old tip's pre-fill verbatim, the common case for an amend that only folds in
+/// staged files — replaced the text the banner had just vouched for. A user who
+/// trusts the banner and presses Amend without re-reading the box is then
+/// committing a message they never saw.
+///
+/// Reporting it instead of predicting it is what keeps the two honest:
+/// `Dialogs::seed_amend_msg` returns this, and [`Recheck::Retargeted`] carries
+/// it, so the banner renders from what happened rather than from an assumption
+/// about what would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedOutcome {
+    /// The box was left alone — the user had typed their own message, or the
+    /// incoming message is already what is in there.
+    Kept,
+    /// The box was replaced with the incoming message.
+    Replaced,
+}
+
+/// [`adopt_seed`]'s answer restated as the fact the banner reports.
+///
+/// A thin wrapper on purpose: the *decision* stays in `adopt_seed` (one rule,
+/// one place), and this is only the classification of its outcome, so the two
+/// cannot drift apart into a box that says one thing and a banner that says
+/// another.
+pub fn seed_outcome(adopted: Option<&String>) -> SeedOutcome {
+    match adopted {
+        Some(_) => SeedOutcome::Replaced,
+        None => SeedOutcome::Kept,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -648,7 +808,17 @@ pub enum Recheck {
     /// Reading the current tip.
     Checking,
     /// The current tip is known and shown; the dialog now targets it.
-    Retargeted { new_tip: String, summary: String },
+    ///
+    /// `message` is what the retarget did to the box — reported by
+    /// `Dialogs::seed_amend_msg`, never assumed. Retargeting offers the new
+    /// tip's message as a pre-fill, and that offer is *accepted* whenever the
+    /// user had not edited the old tip's pre-fill, so the banner cannot state
+    /// the box is untouched without being told.
+    Retargeted {
+        new_tip: String,
+        summary: String,
+        message: SeedOutcome,
+    },
     /// The re-check itself failed (the read, not the amend).
     Unavailable(String),
 }
@@ -742,11 +912,29 @@ pub fn phase_view(phase: &AmendPhase) -> PhaseView {
                     false,
                 ),
                 Recheck::Checking => ("Reading the current tip…".to_string(), None, false),
-                Recheck::Retargeted { new_tip, summary } => (
+                Recheck::Retargeted {
+                    new_tip,
+                    summary,
+                    message,
+                } => (
                     format!(
-                        "The tip is now {} — “{summary}”. Your message below is unchanged. \
-                         Amend that commit instead?",
+                        "The tip is now {} — “{summary}”. {} Amend that commit instead?",
                         short_tip(new_tip),
+                        match message {
+                            // Said only when it is true. The box holds what the
+                            // user put there — either their own words, or a
+                            // pre-fill identical to the new tip's message.
+                            SeedOutcome::Kept => "Your message below is unchanged.",
+                            // The box was still holding the *old* tip's
+                            // pre-fill, untouched, so it has been replaced with
+                            // this commit's message — read it before you
+                            // confirm, because confirming replaces this
+                            // commit's message with whatever is in the box.
+                            SeedOutcome::Replaced =>
+                                "The message below has been replaced with that commit's own \
+                                 message — you hadn't edited the old one. Read it before you \
+                                 confirm.",
+                        },
                     ),
                     Some("Check again"),
                     true,
@@ -906,6 +1094,135 @@ mod tests {
             Some(TIP)
         );
         assert_eq!(CommitIntent::Staged.expected_tip(), None);
+    }
+
+    // -----------------------------------------------------------------
+    // The confirm button's dispatch
+    // -----------------------------------------------------------------
+
+    /// The seam the M2.19c review flagged: which endpoint the confirm button
+    /// reaches used to be chosen by a match in `dialogs/commit.rs`, a wasm-only
+    /// file `cargo test` never compiles. The mapping is stated here against
+    /// literals, so a reordered or copy-pasted arm is a red test rather than a
+    /// commit the user never asked for.
+    #[test]
+    fn every_intent_reaches_the_endpoint_its_mode_names() {
+        // The two commit modes: same endpoint, and the intent survives intact
+        // so the submit closure can still read `allow_empty` and `branch`.
+        let staged = submit_path(&CommitIntent::Staged);
+        assert_eq!(
+            staged,
+            SubmitPath::Commit(PlainCommit(CommitIntent::Staged)),
+            "a staged commit is a plain commit"
+        );
+        let empty = CommitIntent::Empty {
+            branch: Some("wip".into()),
+        };
+        assert_eq!(
+            submit_path(&empty),
+            SubmitPath::Commit(PlainCommit(empty.clone())),
+            "an empty commit on a stub is still the plain-commit endpoint, and \
+             it must keep its branch target"
+        );
+
+        // Amend is the other endpoint, and it arrives carrying the reviewed
+        // tip verbatim — the compare-and-swap pin, which a shortened or
+        // trimmed copy would break.
+        let SubmitPath::Amend(target) = submit_path(&CommitIntent::Amend {
+            expected_tip: TIP.into(),
+        }) else {
+            panic!("an amend intent must not reach the plain-commit endpoint");
+        };
+        assert_eq!(target.expected_tip(), TIP);
+        assert_eq!(
+            target.intent(),
+            CommitIntent::Amend {
+                expected_tip: TIP.into()
+            },
+            "the buffer read on the amend path must resolve to the amend buffer"
+        );
+    }
+
+    /// The invariant `PlainCommit`'s private field exists to hold: whatever is
+    /// fed in, the plain-commit path never carries an amend. `submit_path` is
+    /// the only constructor, so this is a statement about every `PlainCommit`
+    /// that can exist, not only the three built here.
+    #[test]
+    fn the_plain_commit_path_can_never_carry_an_amend() {
+        let intents = [
+            CommitIntent::Staged,
+            CommitIntent::Empty { branch: None },
+            CommitIntent::Empty {
+                branch: Some("wip".into()),
+            },
+            CommitIntent::Amend {
+                expected_tip: TIP.into(),
+            },
+            CommitIntent::Amend {
+                expected_tip: String::new(),
+            },
+        ];
+        let mut amends = 0;
+        for intent in &intents {
+            match submit_path(intent) {
+                SubmitPath::Commit(plain) => {
+                    assert_eq!(
+                        plain.intent().expected_tip(),
+                        None,
+                        "an intent with a compare-and-swap pin was routed to the \
+                         endpoint that ignores it: {intent:?}"
+                    );
+                }
+                SubmitPath::Amend(target) => {
+                    amends += 1;
+                    assert_eq!(
+                        Some(target.expected_tip()),
+                        intent.expected_tip(),
+                        "the amend path must carry the tip the user reviewed, \
+                         unaltered: {intent:?}"
+                    );
+                }
+            }
+        }
+        // Paired positive: the loop above is only meaningful if the amend arm
+        // was actually taken. Both amend intents must have reached it.
+        assert_eq!(amends, 2, "the amend arm was never exercised");
+    }
+
+    // -----------------------------------------------------------------
+    // The context menu's amend gate
+    // -----------------------------------------------------------------
+
+    /// All four (is_head, is_stub) combinations, with the reasons as literals.
+    /// The condition used to be spelled out in `menu.rs`, which is wasm-only:
+    /// inverting it would have offered "Amend last commit" on every stub and
+    /// non-HEAD dot with nothing in the suite to notice.
+    #[test]
+    fn the_amend_item_is_offered_only_on_a_head_commit_that_is_not_a_stub() {
+        assert_eq!(amend_offer(true, false), AmendOffer::Offered);
+
+        // A non-HEAD dot: amending rewrites the checked-out branch's tip, so
+        // acting on any other commit would rewrite one the user did not tap.
+        assert_eq!(
+            amend_offer(false, false),
+            AmendOffer::Blocked("Only the commit at HEAD can be amended")
+        );
+        // A stub — and a stub that also claims HEAD. Both get the stub reason,
+        // because `AmendCommit` has no branch target for a stub to be.
+        assert_eq!(
+            amend_offer(false, true),
+            AmendOffer::Blocked("Amending rewrites the checked-out branch's tip, not a stub")
+        );
+        assert_eq!(
+            amend_offer(true, true),
+            AmendOffer::Blocked("Amending rewrites the checked-out branch's tip, not a stub"),
+            "a stub is excluded even when it is HEAD's own ref: there is still \
+             no commit dot under it to rewrite"
+        );
+
+        // The two refusals never read the same, so the disabled item's visible
+        // reason always tells the user which rule stopped them.
+        assert_ne!(amend_offer(false, false), amend_offer(false, true));
     }
 
     /// The request body is the server's own struct, which carries
@@ -1413,6 +1730,7 @@ mod tests {
         let retargeted = stale(Recheck::Retargeted {
             new_tip: NEW_TIP.to_string(),
             summary: "fix: the other thing".to_string(),
+            message: SeedOutcome::Kept,
         });
         let view = phase_view(&retargeted);
         assert!(
@@ -1438,6 +1756,12 @@ mod tests {
             Recheck::Retargeted {
                 new_tip: NEW_TIP.into(),
                 summary: "s".into(),
+                message: SeedOutcome::Kept,
+            },
+            Recheck::Retargeted {
+                new_tip: NEW_TIP.into(),
+                summary: "s".into(),
+                message: SeedOutcome::Replaced,
             },
             Recheck::Unavailable("why".into()),
         ] {
@@ -1458,6 +1782,87 @@ mod tests {
         let checking = phase_view(&stale(Recheck::Checking));
         assert!(checking.notice.unwrap().action.is_none());
         assert!(checking.busy);
+    }
+
+    /// The retarget banner may only claim the box is untouched when it is.
+    ///
+    /// The bug this pins: the banner said "Your message below is unchanged"
+    /// unconditionally, and the retarget's very next step re-seeded the box from
+    /// the *new* tip's message — which is adopted precisely when the user has
+    /// not edited the old pre-fill, the commonest amend there is (fold in a
+    /// staged file, leave the message alone). A user who trusts the banner and
+    /// confirms without re-reading is committing a message they never saw.
+    #[test]
+    fn the_retarget_banner_only_claims_the_box_is_untouched_when_it_is() {
+        let kept = phase_view(&stale(Recheck::Retargeted {
+            new_tip: NEW_TIP.into(),
+            summary: "fix: the other thing".into(),
+            message: SeedOutcome::Kept,
+        }))
+        .notice
+        .expect("a retarget is always explained")
+        .body;
+        assert!(
+            kept.contains("unchanged"),
+            "when the box really was left alone, saying so is the reassurance \
+             the user needs: {kept}"
+        );
+
+        let replaced = phase_view(&stale(Recheck::Retargeted {
+            new_tip: NEW_TIP.into(),
+            summary: "fix: the other thing".into(),
+            message: SeedOutcome::Replaced,
+        }))
+        .notice
+        .expect("a retarget is always explained")
+        .body;
+        assert!(
+            !replaced.contains("unchanged"),
+            "the box was rewritten from under the user — claiming otherwise is \
+             how an unread message gets committed: {replaced}"
+        );
+        assert!(
+            replaced.contains("replaced") && replaced.contains("Read it"),
+            "a replaced box must say so and send the user back to it: {replaced}"
+        );
+
+        // Both still name the commit being retargeted at: the outcome changes
+        // what is said about the box, nothing else.
+        for body in [&kept, &replaced] {
+            assert!(body.contains(short_tip(NEW_TIP)), "{body}");
+            assert!(body.contains("fix: the other thing"), "{body}");
+        }
+        assert_ne!(kept, replaced);
+    }
+
+    /// The end of the same rope: the outcome the banner renders from is derived
+    /// from `adopt_seed`, not asserted independently of it, so the box and the
+    /// banner cannot disagree.
+    ///
+    /// Walks the reported scenario in the pure core — the box holds tip A's
+    /// pre-fill verbatim, tip B's message arrives — and the paired case where
+    /// the user did type.
+    #[test]
+    fn the_reported_outcome_is_whatever_the_seed_rule_actually_did() {
+        let a = "fix: the thing\n\nwith a body the summary would have dropped.";
+        let b = "chore: something else entirely";
+
+        // Untouched pre-fill: adopted, so the banner must not say "unchanged".
+        let adopted = adopt_seed(a, a, b);
+        assert_eq!(adopted.as_deref(), Some(b));
+        assert_eq!(seed_outcome(adopted.as_ref()), SeedOutcome::Replaced);
+
+        // The user typed: their words win, and the banner may reassure them.
+        let typed = "my own words";
+        let untouched = adopt_seed(typed, a, b);
+        assert_eq!(untouched, None);
+        assert_eq!(seed_outcome(untouched.as_ref()), SeedOutcome::Kept);
+
+        // The new tip's message is already what is in the box: nothing moves,
+        // so "unchanged" is true even though a seed was offered.
+        let same = adopt_seed(b, b, b);
+        assert_eq!(same, None);
+        assert_eq!(seed_outcome(same.as_ref()), SeedOutcome::Kept);
     }
 
     #[test]
