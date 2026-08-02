@@ -35,10 +35,10 @@ use git_vista_core::activity::ActivityKind;
 use git_vista_core::identity::{GenerationInputs, RepositoryId};
 use git_vista_core::seed::{parse_seed, reset_plan, Seed};
 use git_vista_protocol::{
-    BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, IdempotencyKey,
-    OperationHash, OperationStage, Plan, Precondition, RecoveryStrategy, RefChange, RefName,
-    RefState, RemoteName, RepositoryToken, RiskLevel, UnixSeconds, WorktreePath, WorktreeToken,
-    IDEMPOTENCY_HEADER,
+    BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
+    IdempotencyKey, OperationHash, OperationStage, Plan, Precondition, RecoveryStrategy, RefChange,
+    RefName, RefState, RemoteName, RepositoryToken, RiskLevel, UnixSeconds, WorktreePath,
+    WorktreeToken, IDEMPOTENCY_HEADER,
 };
 
 use crate::git_cmd::{git_ok, rev_parse, ExecUnavailable};
@@ -1051,7 +1051,12 @@ async fn shape(
             let (preconditions, changes, recovery) = head_moves(extra);
             (RiskLevel::Reversible, preconditions, changes, recovery)
         }
-        GitOperation::PushBranch { branch, remote } => {
+        GitOperation::PushBranch {
+            branch,
+            remote,
+            force,
+            ..
+        } => {
             let mut preconditions = vec![Precondition::RemoteConfigured {
                 remote: remote.clone(),
             }];
@@ -1061,6 +1066,36 @@ async fn shape(
             }));
             // The remote-tracking ref this push is expected to move.
             let tracking = RefName::new(format!("refs/remotes/{remote}/{branch}")).ok();
+            // M2.20a (#227): the lease *is* a compare-and-swap, so it becomes
+            // one — a `Precondition::RefAt` on the remote-tracking ref, the
+            // same machinery `ResetBranch`/`AmendCommit` use on local refs.
+            //
+            // Two things this deliberately does not do. It does not re-read
+            // the remote to fill the oid in: the value that makes a lease
+            // mean anything is the one the *user reviewed*, and a freshly
+            // read one would assert only that the remote has not moved since
+            // a millisecond ago. And it does not fall back to some
+            // observation when the ref is unnameable — a lease with no
+            // precondition would be a force push with a reassuring label,
+            // which is the one outcome `ForcePublish` exists to prevent, so
+            // an unnameable tracking ref yields no lease precondition *and*
+            // no execution (see `execute`'s refusal below).
+            //
+            // A `match` rather than an `if let`: should `ForcePublish` ever
+            // grow a third variant, this stops compiling instead of silently
+            // treating the new mode as unleased.
+            let lease = match force {
+                ForcePublish::None => None,
+                ForcePublish::WithLease {
+                    expected_remote_tip,
+                } => Some(expected_remote_tip),
+            };
+            if let (Some(oid), Some(r)) = (lease, &tracking) {
+                preconditions.push(Precondition::RefAt {
+                    ref_name: r.clone(),
+                    oid: oid.clone(),
+                });
+            }
             let remote_tip = Obs::from_read(rev_parse(repo, &format!("{remote}/{branch}")).await);
             let local_tip = Obs::from_read(rev_parse(repo, branch.as_str()).await);
             // D5: `before` is a *claim* about the remote-tracking ref shown to
@@ -1081,8 +1116,17 @@ async fn shape(
                 }],
                 _ => Vec::new(),
             };
+            // A lease-force can leave commits on the remote branch referenced
+            // by nothing, which an ordinary fast-forward push cannot — see
+            // `RiskLevel::Destructive`'s doc for why one scalar has to rank
+            // that above `Remote`. Recovery stays `Irrecoverable` for both:
+            // the effect left the machine either way.
+            let risk = match force {
+                ForcePublish::None => RiskLevel::Remote,
+                ForcePublish::WithLease { .. } => RiskLevel::Destructive,
+            };
             (
-                RiskLevel::Remote,
+                risk,
                 preconditions,
                 changes,
                 RecoveryStrategy::Irrecoverable,
@@ -1281,6 +1325,51 @@ async fn shape(
             };
             (RiskLevel::Destructive, preconditions, changes, recovery)
         }
+        // M2.20a (#227): contract only — see each variant's doc comment in
+        // `plan.rs` for the reasoning behind every choice below. Execution is
+        // #229's and #230's; `execute` refuses both today.
+        //
+        // A fetch moves only `refs/remotes/<remote>/*`, and *which* of them
+        // is not knowable until git has spoken to the remote — so there is no
+        // honest `RefChange` to list here, and listing a guessed one would be
+        // a claim shown to a reviewer that the operation may not honour (the
+        // same D5 posture the push arm above takes with `Obs::Unknown`). The
+        // one thing that must hold is that the remote is configured.
+        GitOperation::FetchRemote { remote } => (
+            RiskLevel::Safe,
+            vec![Precondition::RemoteConfigured {
+                remote: remote.clone(),
+            }],
+            Vec::new(),
+            RecoveryStrategy::NotNeeded,
+        ),
+        // A pull is a fetch (nothing to describe, above) plus an integration
+        // that moves exactly one local ref: the checked-out branch. That is
+        // precisely `head_moves`' shape, and it is reused rather than
+        // re-derived so pull, merge and rebase cannot drift apart —
+        // `MergeBranch` above passes the same `RefAt` extra for the same
+        // reason.
+        //
+        // The CAS is on the *local* branch, not the remote one. A pull's
+        // danger is that the local branch moved under the reviewer between
+        // plan and execution (someone committed, or another pull landed);
+        // where the remote sits is what the fetch half is for, and pinning it
+        // would refuse pulls for the ordinary reason that the remote received
+        // a new commit — the very thing being pulled.
+        GitOperation::PullBranch { remote, .. } => {
+            let mut extra = vec![Precondition::RemoteConfigured {
+                remote: remote.clone(),
+            }];
+            if let (Some(r), Some(o)) = (&head_ref, &head_oid) {
+                extra.push(Precondition::RefAt {
+                    ref_name: r.clone(),
+                    oid: o.clone(),
+                });
+            }
+            let (mut preconditions, changes, recovery) = head_moves(None);
+            preconditions.extend(extra);
+            (RiskLevel::Reversible, preconditions, changes, recovery)
+        }
     }
 }
 
@@ -1349,9 +1438,31 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
             exec_checkout(repo, need, &branch, &observed).await
         }
         GitOperation::MergeBranch { branch } => exec_merge(repo, need, &branch, &observed).await,
-        GitOperation::PushBranch { branch, remote } => {
-            exec_push(repo, need, &branch, &remote).await
-        }
+        // M2.20a (#227) widened `PushBranch` with `set_upstream` and `force`.
+        // Only the combination that existed before — no upstream write, no
+        // force — executes; it runs the byte-identical argv `/api/push` has
+        // always run, so this slice changes no live behaviour.
+        //
+        // The other combinations refuse. Not because a `501` is tidy, but
+        // because the alternative is worse in a specific way: an arm that
+        // ignored the new fields and ran a plain push would execute an
+        // operation the user did *not* approve — they asked for
+        // `--force-with-lease` and would silently get a fast-forward push
+        // whose failure they would then be tempted to resolve by hand. The
+        // plan's hash binds `force`; execution has to honour it or refuse.
+        GitOperation::PushBranch {
+            branch,
+            remote,
+            set_upstream: false,
+            force: ForcePublish::None,
+        } => exec_push(repo, need, &branch, &remote).await,
+        GitOperation::PushBranch { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "Pushing with --set-upstream or --force-with-lease is not yet wired \
+             for execution (tracked by #231) — this plan's contract exists, but \
+             nothing executed it."
+                .to_string(),
+        ),
         GitOperation::DeleteBranch { branch } => {
             exec_delete(repo, need, &branch, &observed, false).await
         }
@@ -1405,6 +1516,29 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
             StatusCode::NOT_IMPLEMENTED,
             "Amending a commit is not yet wired for execution (tracked by #223) — \
              this plan's contract exists, but nothing executed it."
+                .to_string(),
+        ),
+        // M2.20a (#227) ships the typed contract for fetch and pull only —
+        // see their doc comments in `plan.rs`. Execution belongs to #229 and
+        // #230, deliberately, so that the first code in this server to open a
+        // socket with a user's credentials on it gets a review of its own
+        // rather than riding in on a vocabulary change.
+        //
+        // These arms exist because `execute`'s match must stay exhaustive
+        // over the closed vocabulary (#142). Nothing builds either operation
+        // today, so in practice they are unreachable — but reached, they must
+        // refuse rather than no-op silently or run a placeholder git command
+        // against a real repository and a real remote.
+        GitOperation::FetchRemote { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "Fetching from a remote is not yet wired for execution (tracked by \
+             #229) — this plan's contract exists, but nothing executed it."
+                .to_string(),
+        ),
+        GitOperation::PullBranch { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "Pulling from a remote is not yet wired for execution (tracked by \
+             #230) — this plan's contract exists, but nothing executed it."
                 .to_string(),
         ),
     }
@@ -4010,6 +4144,8 @@ mod tests {
         let op = GitOperation::PushBranch {
             branch: BranchName::new("main").unwrap(),
             remote: RemoteName::new("origin").unwrap(),
+            set_upstream: false,
+            force: ForcePublish::None,
         };
         let (plan, observed) = build_plan(&repo, op, tokens()).await;
         assert!(
@@ -4033,6 +4169,8 @@ mod tests {
         let op = GitOperation::PushBranch {
             branch: BranchName::new("main").unwrap(),
             remote: RemoteName::new("origin").unwrap(), // never configured
+            set_upstream: false,
+            force: ForcePublish::None,
         };
         let (plan, observed) = build_plan(&repo, op, tokens()).await;
         assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
@@ -4138,6 +4276,234 @@ mod tests {
         let (status, why) = enforce_fresh(&repo, &plan, &observed).await.unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(why.contains("repository changed"), "{why}");
+    }
+
+    // -----------------------------------------------------------------------
+    // M2.20a (#227): `FetchRemote` / `PullBranch` / the widened `PushBranch`
+    // in `shape` — contract only, no execution (see each variant's doc
+    // comment in `plan.rs` and `planner::execute`'s stub arms).
+    // -----------------------------------------------------------------------
+
+    /// A repository with a real, configured `origin` on disk — several shape
+    /// tests below need `RemoteConfigured` to actually hold, so that
+    /// `held_at_build` proving the preconditions are satisfiable means
+    /// something.
+    async fn seeded_repo_with_remote() -> (tempfile::TempDir, PathBuf) {
+        let (dir, repo) = seeded_repo();
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        run(
+            &repo,
+            &["remote", "add", "origin", &remote.display().to_string()],
+        );
+        (dir, repo)
+    }
+
+    /// Fetch is `Safe` with `NotNeeded` recovery, one `RemoteConfigured`
+    /// precondition, and **no** expected ref change.
+    ///
+    /// The negative assertions are the point. `Safe`/`NotNeeded` is an
+    /// unusual pairing for a network operation, and the plausible wrong
+    /// answers are exactly the ones a later edit would reach for by reflex:
+    /// `RiskLevel::Remote` (because it talks to a remote) or
+    /// `RecoveryStrategy::Irrecoverable` (because push has it). Both are
+    /// pinned as *not* the answer, with the reasoning in the variant's doc
+    /// comment — a fetch cannot lose anything a user owns.
+    #[tokio::test]
+    async fn fetch_remote_shape_is_safe_with_nothing_to_recover() {
+        let (_dir, repo) = seeded_repo_with_remote().await;
+        let op = GitOperation::FetchRemote {
+            remote: RemoteName::new("origin").unwrap(),
+        };
+        let (plan, observed) = build_plan(&repo, op, tokens()).await;
+
+        assert_eq!(plan.risk, RiskLevel::Safe);
+        assert_ne!(
+            plan.risk,
+            RiskLevel::Remote,
+            "reach and risk are independent axes — see the variant's doc"
+        );
+        assert_eq!(
+            plan.preconditions,
+            vec![Precondition::RemoteConfigured {
+                remote: RemoteName::new("origin").unwrap(),
+            }]
+        );
+        assert!(
+            plan.expected_ref_changes.is_empty(),
+            "which refs/remotes/* move is unknowable before git speaks to the \
+             remote; a guessed RefChange would be a claim shown to a reviewer"
+        );
+        assert_eq!(plan.recovery, RecoveryStrategy::NotNeeded);
+        assert_ne!(plan.recovery, RecoveryStrategy::Irrecoverable);
+        assert!(
+            observed.held_at_build.iter().all(|&h| h),
+            "the remote is configured, so the one precondition must hold — \
+             otherwise this test would pass against an unsatisfiable shape"
+        );
+    }
+
+    /// Pull is `Reversible` with a CAS on the **local** branch and `ResetRef`
+    /// recovery back to the tip the plan observed — the same story merge and
+    /// rebase have, because a pull is a fetch plus one of those.
+    ///
+    /// Two negatives carry the reasoning: it must not be `Irrecoverable`
+    /// (that is push's tag, for an effect that left the machine — a pull's
+    /// did not), and its `RefAt` must name `refs/heads/main`, not
+    /// `refs/remotes/origin/main`. Pinning the remote tip would refuse a pull
+    /// for the ordinary reason that the remote received a commit, i.e. for
+    /// the very thing being pulled.
+    #[tokio::test]
+    async fn pull_branch_shape_is_reversible_with_a_local_cas_and_reset_recovery() {
+        let (_dir, repo) = seeded_repo_with_remote().await;
+        let head_oid = CommitOid::new(git_rev_parse_head(&repo).await).unwrap();
+        let main = RefName::new("refs/heads/main").unwrap();
+
+        for strategy in [
+            git_vista_protocol::MergeStrategy::Merge,
+            git_vista_protocol::MergeStrategy::Rebase,
+        ] {
+            let op = GitOperation::PullBranch {
+                remote: RemoteName::new("origin").unwrap(),
+                branch: BranchName::new("main").unwrap(),
+                strategy,
+            };
+            let (plan, observed) = build_plan(&repo, op, tokens()).await;
+
+            assert_eq!(plan.risk, RiskLevel::Reversible, "{strategy:?}");
+            assert_eq!(
+                plan.preconditions,
+                vec![
+                    Precondition::BranchCheckedOut {
+                        branch: BranchName::new("main").unwrap(),
+                    },
+                    Precondition::RemoteConfigured {
+                        remote: RemoteName::new("origin").unwrap(),
+                    },
+                    Precondition::RefAt {
+                        ref_name: main.clone(),
+                        oid: head_oid.clone(),
+                    },
+                ],
+                "{strategy:?}"
+            );
+            assert!(
+                !plan.preconditions.iter().any(|p| matches!(
+                    p,
+                    Precondition::RefAt { ref_name, .. }
+                        if ref_name.as_str().starts_with("refs/remotes/")
+                )),
+                "{strategy:?}: a pull must not pin the remote tip — that would \
+                 refuse the pull for the reason it exists"
+            );
+            assert_eq!(
+                plan.expected_ref_changes,
+                vec![RefChange {
+                    ref_name: main.clone(),
+                    before: RefState::At(head_oid.clone()),
+                    after: RefState::Computed,
+                }],
+                "{strategy:?}"
+            );
+            assert_eq!(
+                plan.recovery,
+                RecoveryStrategy::ResetRef {
+                    ref_name: main.clone(),
+                    to: head_oid.clone(),
+                },
+                "{strategy:?}"
+            );
+            assert_ne!(
+                plan.recovery,
+                RecoveryStrategy::Irrecoverable,
+                "{strategy:?}: a pull's effect never left this machine"
+            );
+            assert!(observed.held_at_build.iter().all(|&h| h), "{strategy:?}");
+        }
+    }
+
+    /// The lease is a compare-and-swap on the **remote-tracking** ref, and it
+    /// exists only when a lease was actually asked for.
+    ///
+    /// Both halves run against the same repository, so the difference is
+    /// attributable to `force` and nothing else. Without the negative half a
+    /// `shape` that emitted the lease precondition unconditionally would pass
+    /// — and an unconditional precondition on `refs/remotes/origin/main`
+    /// would refuse ordinary pushes whenever the remote had moved, which is
+    /// most of the time.
+    #[tokio::test]
+    async fn only_a_lease_force_push_pins_the_remote_tracking_ref() {
+        let (_dir, repo) = seeded_repo_with_remote().await;
+        let tracking = RefName::new("refs/remotes/origin/main").unwrap();
+        let lease_tip = CommitOid::new("4".repeat(40)).unwrap();
+
+        let lease_precondition = |plan: &Plan| {
+            plan.preconditions
+                .iter()
+                .find(
+                    |p| matches!(p, Precondition::RefAt { ref_name, .. } if *ref_name == tracking),
+                )
+                .cloned()
+        };
+
+        let (plain, _) = build_plan(
+            &repo,
+            GitOperation::PushBranch {
+                branch: BranchName::new("main").unwrap(),
+                remote: RemoteName::new("origin").unwrap(),
+                set_upstream: false,
+                force: ForcePublish::None,
+            },
+            tokens(),
+        )
+        .await;
+        assert_eq!(plain.risk, RiskLevel::Remote);
+        assert_eq!(
+            lease_precondition(&plain),
+            None,
+            "a fast-forward push must not pin the remote tip"
+        );
+
+        let (leased, _) = build_plan(
+            &repo,
+            GitOperation::PushBranch {
+                branch: BranchName::new("main").unwrap(),
+                remote: RemoteName::new("origin").unwrap(),
+                set_upstream: false,
+                force: ForcePublish::WithLease {
+                    expected_remote_tip: lease_tip.clone(),
+                },
+            },
+            tokens(),
+        )
+        .await;
+        assert_eq!(
+            leased.risk,
+            RiskLevel::Destructive,
+            "a lease-force can leave remote commits referenced by nothing"
+        );
+        assert_eq!(
+            lease_precondition(&leased),
+            Some(Precondition::RefAt {
+                ref_name: tracking,
+                oid: lease_tip.clone(),
+            }),
+            "the lease must become a live compare-and-swap on the tracking ref"
+        );
+        // The oid must be the *reviewed* one, not one re-read from the repo.
+        // A lease re-derived at plan time would assert only that the remote
+        // has not moved since a millisecond ago, and would protect nobody.
+        assert_ne!(
+            lease_tip.as_str(),
+            git_rev_parse_head(&repo).await,
+            "the fixture's lease oid must differ from anything in the repo, or \
+             this test could not tell a carried oid from a re-read one"
+        );
+        // Recovery is unchanged by the force mode: the effect left the machine
+        // either way.
+        assert_eq!(plain.recovery, RecoveryStrategy::Irrecoverable);
+        assert_eq!(leased.recovery, RecoveryStrategy::Irrecoverable);
     }
 
     // -----------------------------------------------------------------------
