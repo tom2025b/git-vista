@@ -12,9 +12,9 @@ use leptos::*;
 
 use crate::api::{amend_commit_request, create_commit_request, fetch_commit_detail, fetch_frame};
 use crate::features::dialogs::commit::{
-    dialog_copy, head_tip, phase_view, published_advisory, scope_review, submit_path, AmendOutcome,
-    AmendPhase, AmendTarget, CommitIntent, DialogCopy, PlainCommit, Recheck, ScopeLine,
-    ScopeReview, SubmitPath,
+    amend_preflight, dialog_copy, head_tip, phase_view, published_advisory, scope_review,
+    submit_path, AmendOutcome, AmendPhase, AmendTarget, CommitIntent, DialogCopy, PlainCommit,
+    Preflight, Recheck, ScopeLine, ScopeReview, SubmitPath,
 };
 use crate::features::dialogs::core::{Dialog, PATH_LIST_LIMIT, TOUCH_TARGET_STYLE};
 use crate::features::status::signals as status_state;
@@ -119,12 +119,24 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
     //    fresh tip has been read and shown. That is what the compare-and-swap is
     //    for: retrying blind would rewrite a commit nobody reviewed.
     let submit_amend = move |target: AmendTarget| {
-        let expected_tip = target.expected_tip().to_string();
         let intent = target.intent();
         let message = dialogs.message_untracked(&intent).trim().to_string();
         if message.is_empty() {
             return;
         }
+        // The pre-flight published-history ceremony (#225, ADR 0040). The gate
+        // is here — before the POST, not after it — and it is decided in the
+        // host-tested core: this file never compiles under `cargo test`, so a
+        // gate spelled out here would be a gate nothing checks. `Confirm` sends
+        // nothing at all; the banner it raises carries the only way on.
+        let target = match amend_preflight(target, &dialogs.amend_knowledge()) {
+            Preflight::Send(target) => target,
+            Preflight::Confirm(target) => {
+                dialogs.set_amend_phase(AmendPhase::AwaitingPublishedConfirm { target });
+                return;
+            }
+        };
+        let expected_tip = target.expected_tip().to_string();
         let submitted_scope = dialogs.draft_scope_snapshot();
         dialogs.set_amend_phase(AmendPhase::InFlight);
         spawn_local(async move {
@@ -157,6 +169,21 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
                 }
             }
         });
+    };
+
+    // The ceremony's second step (#225): the user has read the warning and
+    // agreed to rewrite a commit that is already on a remote.
+    //
+    // Recording the agreement and re-submitting are one closure so they cannot
+    // drift apart, and the agreement is recorded against the target's own tip —
+    // never "the current tip" — so a dialog retargeted between the warning and
+    // the press cannot inherit consent given for a different commit. Forgetting
+    // the record would fail safe rather than silently: `amend_preflight` would
+    // answer `Confirm` again and the button would simply re-raise the same
+    // banner.
+    let confirm_published = move |target: AmendTarget| {
+        dialogs.confirm_amend_target(target.expected_tip());
+        submit_amend(target);
     };
 
     // The guided re-check: read what the tip is *now*, show it, and point the
@@ -221,6 +248,14 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
             // pre-filled text. `seed_amend_msg` reports what it actually did and
             // the phase carries that, so the banner states a fact rather than a
             // prediction.
+            //
+            // The pre-flight's input for the commit the dialog now points at
+            // (#225). The same read that supplies the pre-fill supplies this,
+            // so retargeting never leaves the gate answering for the old tip —
+            // and because `PreflightKnowledge` is tip-scoped, the moment the
+            // dialog retargets, a confirmation given for the previous commit
+            // stops counting whether this read lands or not.
+            dialogs.record_amend_detail(&new_tip, detail.on_remote);
             let seeded = dialogs.seed_amend_msg(&detail.message);
             dialogs.set_amend_phase(stale(Recheck::Retargeted {
                 new_tip,
@@ -252,8 +287,14 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
             let busy = is_amend && phase_state.busy;
             let notice = if is_amend { phase_state.notice } else { None };
 
-            // The banner's own button, when the phase offers one — the re-check
-            // step after a stale tip.
+            // The banner's own button, when the phase offers one: the re-check
+            // step after a stale tip, and the published-history ceremony's
+            // second step (#225). Both are deliberately *not* the green confirm
+            // button — each carries its own words for its own act.
+            let banner_button_style = format!(
+                "{BUTTON_BASE}{TOUCH_TARGET_STYLE}margin-top:10px; \
+                 color:var(--fg); background:#21262d; border:1px solid #30363d;"
+            );
             let notice_action = match (&phase, &notice) {
                 (
                     AmendPhase::Stale {
@@ -267,17 +308,26 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
                     let message = message.clone();
                     view! {
                         <button
-                            style=format!(
-                                "{BUTTON_BASE}{TOUCH_TARGET_STYLE}margin-top:10px; \
-                                 color:var(--fg); background:#21262d; \
-                                 border:1px solid #30363d;"
-                            )
+                            style=banner_button_style.clone()
                             on:click=move |_| recheck(reviewed_tip.clone(), message.clone())
                         >
                             {label}
                         </button>
                     }
                 }),
+                (AmendPhase::AwaitingPublishedConfirm { target }, Some(n)) => {
+                    n.action.map(|label| {
+                        let target = target.clone();
+                        view! {
+                            <button
+                                style=banner_button_style.clone()
+                                on:click=move |_| confirm_published(target.clone())
+                            >
+                                {label}
+                            </button>
+                        }
+                    })
+                }
                 _ => None,
             };
 
