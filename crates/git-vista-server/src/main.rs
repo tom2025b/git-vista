@@ -109,7 +109,7 @@ use handlers::branch::{
     checkout_branch, create_branch, delete_branch, force_delete_branch, merge_branch, push_branch,
 };
 use handlers::clone::{clone_repo, clone_status, delete_clone_repo};
-use handlers::commit::{create_commit, stage_all, unstage_all};
+use handlers::commit::{amend_commit, create_commit, stage_all, unstage_all};
 use handlers::discard::{delete_untracked_paths, discard_tracked_paths};
 use handlers::protocol::protocol_info;
 use handlers::read::{
@@ -441,6 +441,12 @@ fn api_router(
             .route("/api/branch", post(create_branch))
             // Issue #33: create a commit on top of HEAD (shells out to `git commit`).
             .route("/api/commit", post(create_commit))
+            // M2.19b (#223, ADR 0040): rewrite the tip commit in place
+            // (`git commit --amend`, compare-and-swapped on the tip the
+            // client reviewed). Its own route, deliberately — see
+            // `handlers::commit::amend_commit` for why this must never be a
+            // widened `/api/commit` body.
+            .route("/api/amend-commit", post(amend_commit))
             // Stage the working tree (`git add -A`) so the UI can stage, then commit.
             .route("/api/stage", post(stage_all))
             // The staging-selection surface (M2.17b, #213). All three under

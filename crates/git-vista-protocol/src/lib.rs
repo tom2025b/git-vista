@@ -73,10 +73,10 @@ pub use diff::{
     LineKind, ParsedPatch,
 };
 pub use dto::{
-    validate_clone_url, AmendCommitRequest, BranchRequest, CloneRequest, CreateBranchRequest,
-    CreateCommitRequest, DeleteCloneRequest, HookPolicy, RebaseStatus, RepoMode,
-    RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo, SessionRequest,
-    WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
+    validate_clone_url, AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind,
+    BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
+    HookPolicy, RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest,
+    SessionInfo, SessionRequest, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use history::{HistoryFrame, HistoryPage};

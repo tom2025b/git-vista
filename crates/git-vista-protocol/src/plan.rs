@@ -39,17 +39,19 @@
 //! | `POST /api/reset-test-repo` | seeded composite restore | [`GitOperation::ResetTestRepo`] |
 //! | `POST /api/discard-tracked-paths` | `git checkout -- <paths>` | [`GitOperation::DiscardTrackedPaths`] |
 //! | `POST /api/delete-untracked-paths` | `git clean -f -- <paths>` | [`GitOperation::DeleteUntrackedPaths`] |
-//! | *(planned, #223)* | `git commit --amend [--allow-empty] -m` | [`GitOperation::AmendCommit`] |
+//! | `POST /api/amend-commit` | `git commit --amend [--allow-empty] -m` | [`GitOperation::AmendCommit`] |
 //!
-//! The last three rows are deliberate exceptions to "one variant per real
-//! mutation found by auditing the write handlers": M2.19a (#222) and M2.20a
-//! (#227) land the typed contract — the variant, its plan-building wiring in
-//! `git-vista-server`'s `planner::shape`, its `sandbox` network
+//! The two *(planned)* rows are deliberate exceptions to "one variant per
+//! real mutation found by auditing the write handlers": M2.19a (#222) and
+//! M2.20a (#227) land the typed contract — the variant, its plan-building
+//! wiring in `git-vista-server`'s `planner::shape`, its `sandbox` network
 //! classification, and the golden fixture — ahead of any handler that could
 //! build one, so the dangerous part of each (rewriting history; opening a
 //! socket with credentials on it) is reviewed as its own slice. See each
 //! variant's own doc comment for the full reasoning; every other row in this
 //! table already had a live handler when its variant landed.
+//! [`GitOperation::AmendCommit`] went through exactly that staging and
+//! graduated: #222 landed the contract, #223 (ADR 0040) the execution.
 //!
 //! [`GitOperation::PushBranch`] is the one row that already had a handler and
 //! was **widened** anyway (M2.20a, #227: `set_upstream` and `force`). Its
@@ -437,17 +439,19 @@ pub enum GitOperation {
     /// `git commit --amend [--allow-empty] -m <message>` — rewrite the
     /// checked-out branch's tip commit in place (a new message, and,
     /// with `allow_empty` when nothing is staged, an otherwise-empty
-    /// commit) rather than adding a new commit on top of it (planned
-    /// `POST /api/amend-commit`, M2.19, #72).
+    /// commit) rather than adding a new commit on top of it
+    /// (`POST /api/amend-commit`, M2.19, #72).
     ///
-    /// # Contract only (M2.19a, #222) — see the module docs' table note
+    /// # Staged in two reviewed slices — see the module docs' table note
     ///
-    /// No handler builds this variant yet; it exists so the typed
+    /// M2.19a (#222) landed this variant contract-only: the typed
     /// vocabulary, `git-vista-server`'s `planner::shape` wiring, and the
-    /// golden fixture are settled and reviewed *before* M2.19b (#223) adds
-    /// the actual `git commit --amend` invocation — a history-rewriting
-    /// operation that earns a review of its own rather than riding in on
-    /// this one.
+    /// golden fixture, settled and reviewed *before* any git ran. M2.19b
+    /// (#223, ADR 0040) then wired the actual `git commit --amend`
+    /// execution (`planner::exec_amend_commit`, built from
+    /// `handlers::commit::amend_commit`) — a history-rewriting operation
+    /// that earned a review of its own rather than riding in on the
+    /// vocabulary change.
     ///
     /// # No `branch` field
     ///
@@ -499,19 +503,22 @@ pub enum GitOperation {
     /// same property would single it out inconsistently rather than fix a
     /// real gap.
     ///
-    /// # Divergence from an already-pushed tip is out of scope here
+    /// # Divergence from an already-pushed tip: flagged, never blocked
     ///
     /// Amending a commit that has already been pushed makes the local and
-    /// remote branch diverge — a real consequence, but not one this
-    /// contract slice models: `shape`'s `Precondition::RefAt` only ever
+    /// remote branch diverge — a real consequence this contract does not
+    /// model in the *plan*: `shape`'s `Precondition::RefAt` only ever
     /// checks the **local** ref (matching every other CAS precondition in
     /// this file), and this variant carries no remote/tracking-ref field.
-    /// Whether execution should warn, refuse, or require an explicit
-    /// force-push acknowledgment when the checked-out branch has a
-    /// remote-tracking ref ahead of `expected_tip` is an execution-time
-    /// decision — #223's to make, once it also owns the git invocation and
-    /// can decide what UX the danger deserves. Network need is unaffected
-    /// either way: amending never itself talks to a remote (see
+    /// #223 (ADR 0040) made the execution-time decision: the server checks
+    /// whether the amended-away commit is reachable from any
+    /// remote-tracking ref and reports it as the advisory
+    /// `amended_published_commit` flag on the success response
+    /// (`AmendCommitSuccess` in `dto.rs`) — it never refuses on it, since
+    /// amending published history knowingly is legitimate and the
+    /// pre-flight ceremony is the client's (M2.19d). Network need is
+    /// unaffected: amending never itself talks to a remote (the
+    /// reachability check walks local `refs/remotes/*`; see
     /// `sandbox::network_need_for_operation`).
     AmendCommit {
         message: CommitMessage,
