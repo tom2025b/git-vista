@@ -722,7 +722,7 @@ pub(crate) fn network_need(args: &[&str]) -> NetworkNeed {
 /// breaks loudly rather than quietly gaining a socket.
 pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
     match op {
-        // The three operations in the enum that talk to a remote. `remote` is
+        // The five operations in the enum that talk to a remote. `remote` is
         // part of each one's argv, but that is not why they are classified
         // here — they are classified here because reaching a remote is what
         // the server decided to do.
@@ -746,6 +746,19 @@ pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         // settles this. Neither `MergeStrategy` changes the answer — merge
         // and rebase differ only in what happens after the objects arrive.
         GitOperation::PullBranch { .. } => NetworkNeed::Remote,
+        // M2.21a (#235): both tag operations that reach a remote are pushes
+        // under the hood — `git push <remote> refs/tags/<name>` and
+        // `git push <remote> --delete refs/tags/<name>`. Contract-only today
+        // (no execution until the later M2.21 slices of #74), classified
+        // `Remote` now for exactly the reason the M2.20a comment above spells
+        // out: the declaration is what picks the tier for the spawn, so a
+        // `Local` placeholder would be a wrong answer waiting in the live
+        // data path for execution to arrive. That `DeleteRemoteTag` never
+        // says "push" in its name changes nothing — this match keys on what
+        // the server decided to do, and deleting a ref *on a remote* is a
+        // network round trip with credentials on it.
+        GitOperation::DeleteRemoteTag { .. } => NetworkNeed::Remote,
+        GitOperation::PushTag { .. } => NetworkNeed::Remote,
 
         // Everything below manipulates refs, the index, the working tree or
         // the object database, all of it local. None of them opens a socket in
@@ -783,6 +796,15 @@ pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         // which opens no socket either, so `Local` stayed the truthful
         // declaration when execution landed (M2.19b, ADR 0040).
         GitOperation::AmendCommit { .. } => NetworkNeed::Local,
+        // M2.21a (#235): `git tag [-a|-s]` writes a ref (and, annotated, one
+        // tag object) into the local repository; `git tag -d` deletes a
+        // local ref. Neither opens a socket in any configuration this server
+        // constructs. Their remote-reaching siblings are classified
+        // `Remote` above — the local/remote split across four variants
+        // instead of a "where" flag on two is deliberate (see
+        // `DeleteRemoteTag`'s doc in plan.rs).
+        GitOperation::CreateTag { .. } => NetworkNeed::Local,
+        GitOperation::DeleteLocalTag { .. } => NetworkNeed::Local,
     }
 }
 

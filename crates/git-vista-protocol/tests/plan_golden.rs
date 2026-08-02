@@ -1,6 +1,6 @@
 //! Golden-fixture test for the [`Plan`] wire contract (M1.06a, #142).
 //!
-//! `tests/fixtures/plan_v1.json` is the **committed** wire form of twenty-one
+//! `tests/fixtures/plan_v1.json` is the **committed** wire form of twenty-five
 //! plans — one per [`GitOperation`] variant, together exercising every
 //! [`RiskLevel`], [`Precondition`], [`RefState`] and [`RecoveryStrategy`]
 //! variant. The test proves the contract is lossless in both directions:
@@ -16,7 +16,8 @@
 use git_vista_protocol::{
     BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
     MergeStrategy, OperationHash, Plan, Precondition, RecoveryStrategy, RefChange, RefName,
-    RefState, RemoteName, RepositoryToken, RiskLevel, StageDirection, UnixSeconds, WorktreePath,
+    RefState, RemoteName, RepositoryToken, RiskLevel, SignatureStatus, StageDirection,
+    TagAnnotation, TagDetail, TagKind, TagMessage, TagName, UnixSeconds, WorktreePath,
     WorktreeToken,
 };
 
@@ -37,6 +38,10 @@ fn rname(name: &str) -> RefName {
 
 fn wpath(path: &str) -> WorktreePath {
     WorktreePath::new(path).unwrap()
+}
+
+fn tag(name: &str) -> TagName {
+    TagName::new(name).unwrap()
 }
 
 /// One plan, with the boilerplate identity/window fields filled in and the
@@ -473,6 +478,102 @@ fn golden_plans() -> Vec<Plan> {
                 to: oid('2'),
             },
         ),
+        // #235 (M2.21a, ADR 0041): contract only, the same staging as
+        // `amend_commit` / `fetch_remote` above — the four tag operations'
+        // wire shapes land and are pinned before any handler can build one
+        // or any execution exists (`planner::execute` refuses all four).
+        //
+        // The golden `create_tag` is the *annotated* form so the fixture
+        // carries a `TagAnnotation`; the lightweight form (annotation null)
+        // is pinned by `plan.rs`'s wire-name unit test and by the paired
+        // positives in `no_wire_body_can_request_a_signed_lightweight_tag`
+        // below, since this set allows only one plan per `op` tag. The ref
+        // change's `after` is `Computed`: an annotated tag ref points at a
+        // tag *object* the operation itself creates, so the value is
+        // unknowable at review time — exactly `commit_on_head`'s posture.
+        plan(
+            'd',
+            GitOperation::CreateTag {
+                name: tag("v1.0.0"),
+                target: oid('2'),
+                annotation: Some(TagAnnotation {
+                    message: TagMessage::new("v1.0.0 — first stable release").unwrap(),
+                    sign: false,
+                }),
+            },
+            RiskLevel::Reversible,
+            vec![Precondition::RefAbsent {
+                ref_name: rname("refs/tags/v1.0.0"),
+            }],
+            vec![RefChange {
+                ref_name: rname("refs/tags/v1.0.0"),
+                before: RefState::Absent,
+                after: RefState::Computed,
+            }],
+            RecoveryStrategy::DeleteCreatedTag {
+                name: tag("v1.0.0"),
+            },
+        ),
+        // `delete_local_tag`'s pinned oids are the decision under test: the
+        // precondition and the recovery both carry the **unpeeled** ref value
+        // ('8'…, standing in for an annotated tag's tag-object oid), so the
+        // recovery restores the original tag object — signature and all —
+        // rather than minting a look-alike. See `RecreateTag`'s doc.
+        plan(
+            'e',
+            GitOperation::DeleteLocalTag {
+                name: tag("v1.0.0"),
+            },
+            RiskLevel::Destructive,
+            vec![Precondition::RefAt {
+                ref_name: rname("refs/tags/v1.0.0"),
+                oid: oid('8'),
+            }],
+            vec![RefChange {
+                ref_name: rname("refs/tags/v1.0.0"),
+                before: RefState::At(oid('8')),
+                after: RefState::Absent,
+            }],
+            RecoveryStrategy::RecreateTag {
+                name: tag("v1.0.0"),
+                at: oid('8'),
+            },
+        ),
+        // `delete_remote_tag` and `push_tag` list no ref change: a remote tag
+        // has no local remote-tracking ref (tags fetch straight into
+        // `refs/tags/`), so there is no honest local `RefChange` to show a
+        // reviewer — the same D5 posture as `fetch_remote` above.
+        plan(
+            'f',
+            GitOperation::DeleteRemoteTag {
+                name: tag("v1.0.0"),
+                remote: RemoteName::new("origin").unwrap(),
+            },
+            RiskLevel::Destructive,
+            vec![Precondition::RemoteConfigured {
+                remote: RemoteName::new("origin").unwrap(),
+            }],
+            Vec::new(),
+            RecoveryStrategy::Irrecoverable,
+        ),
+        plan(
+            'a',
+            GitOperation::PushTag {
+                name: tag("v1.0.0"),
+                remote: RemoteName::new("origin").unwrap(),
+            },
+            RiskLevel::Remote,
+            vec![
+                Precondition::RemoteConfigured {
+                    remote: RemoteName::new("origin").unwrap(),
+                },
+                Precondition::RefExists {
+                    ref_name: rname("refs/tags/v1.0.0"),
+                },
+            ],
+            Vec::new(),
+            RecoveryStrategy::Irrecoverable,
+        ),
     ]
 }
 
@@ -681,6 +782,199 @@ fn a_pull_without_a_strategy_is_a_deserialize_error() {
     }
 }
 
+/// No wire body can ask for a **signed lightweight tag** (#235, ADR 0041) —
+/// the state [`TagAnnotation`]'s nesting exists to make unrepresentable.
+///
+/// Like `no_wire_body_can_request_an_unguarded_force_push` above, this is
+/// really a test that no serde attribute has quietly made the impossible
+/// state reachable: `sign` lives only inside the annotation, so every
+/// spelling that tries to sign without a message must be a hard deserialize
+/// error. The paired positives prove the rejections are about the shape, not
+/// about `create_tag` being broken outright.
+#[test]
+fn no_wire_body_can_request_a_signed_lightweight_tag() {
+    let target = "2".repeat(40);
+    for (what, annotation) in [
+        // The flat shape #235 sketched: sign with no message to carry it.
+        (
+            "a sign-only annotation",
+            serde_json::json!({ "sign": true }),
+        ),
+        // A message-less annotation, unsigned — still not an annotated tag.
+        ("an empty annotation", serde_json::json!({})),
+        // `sign` omitted: no silent unsigned default (no #[serde(default)]).
+        (
+            "an annotation that never says whether to sign",
+            serde_json::json!({ "message": "v1" }),
+        ),
+        // deny_unknown_fields: a misspelled key cannot be silently dropped.
+        (
+            "an annotation with a stray key",
+            serde_json::json!({ "message": "v1", "sign": true, "force": true }),
+        ),
+        // A top-level `sign` beside a null annotation — the flat spelling.
+        (
+            "a boolean where the annotation goes",
+            serde_json::json!(true),
+        ),
+    ] {
+        let body = serde_json::json!({
+            "op": "create_tag",
+            "name": "v1.0.0",
+            "target": target,
+            "annotation": annotation,
+        });
+        assert!(
+            serde_json::from_value::<GitOperation>(body).is_err(),
+            "{what} must not deserialize into a CreateTag"
+        );
+    }
+
+    // Paired positives: both real kinds deserialize, and to the right values.
+    let lightweight = serde_json::json!({
+        "op": "create_tag",
+        "name": "v1.0.0",
+        "target": target,
+        "annotation": null,
+    });
+    assert_eq!(
+        serde_json::from_value::<GitOperation>(lightweight).unwrap(),
+        GitOperation::CreateTag {
+            name: tag("v1.0.0"),
+            target: oid('2'),
+            annotation: None,
+        }
+    );
+    // An *omitted* annotation is also lightweight (serde's Option-field
+    // convention) — pinned so a future `default`-related change cannot turn
+    // absence into an error or, worse, into some annotated default.
+    let omitted = serde_json::json!({
+        "op": "create_tag",
+        "name": "v1.0.0",
+        "target": target,
+    });
+    assert_eq!(
+        serde_json::from_value::<GitOperation>(omitted).unwrap(),
+        GitOperation::CreateTag {
+            name: tag("v1.0.0"),
+            target: oid('2'),
+            annotation: None,
+        }
+    );
+    let signed = serde_json::json!({
+        "op": "create_tag",
+        "name": "v1.0.0",
+        "target": target,
+        "annotation": { "message": "v1.0.0", "sign": true },
+    });
+    assert_eq!(
+        serde_json::from_value::<GitOperation>(signed).unwrap(),
+        GitOperation::CreateTag {
+            name: tag("v1.0.0"),
+            target: oid('2'),
+            annotation: Some(TagAnnotation {
+                message: TagMessage::new("v1.0.0").unwrap(),
+                sign: true,
+            }),
+        }
+    );
+}
+
+/// [`TagDetail`]'s exact wire bytes, pinned against literals in both
+/// directions and for both kinds (#235) — the same posture as
+/// `a_lease_force_push_pins_its_own_wire_shape` above: a round trip alone
+/// would bless any self-consistent encoding, so the JSON is written by hand.
+///
+/// The DTO ships **before its producer** (the M2.21 read slice of #74), so
+/// this pin is what stops that slice from quietly reshaping the contract
+/// while wiring the endpoint in.
+#[test]
+fn tag_detail_pins_its_wire_shape_for_both_kinds() {
+    let annotated = TagDetail {
+        name: tag("v1.0.0"),
+        kind: TagKind::Annotated,
+        target: oid('2'),
+        tag_object: Some(oid('8')),
+        tagger: Some("Example Tagger <tagger@example.invalid> 1753300000 +0000".to_string()),
+        message: Some(TagMessage::new("v1.0.0 — first stable release").unwrap()),
+        signature: SignatureStatus::UnknownKey,
+    };
+    let annotated_wire = serde_json::json!({
+        "name": "v1.0.0",
+        "kind": "annotated",
+        "target": "2".repeat(40),
+        "tag_object": "8".repeat(40),
+        "tagger": "Example Tagger <tagger@example.invalid> 1753300000 +0000",
+        "message": "v1.0.0 — first stable release",
+        "signature": "unknown_key",
+    });
+    assert_eq!(serde_json::to_value(&annotated).unwrap(), annotated_wire);
+    assert_eq!(
+        serde_json::from_value::<TagDetail>(annotated_wire).unwrap(),
+        annotated
+    );
+
+    // A lightweight tag: no object, no tagger, no message, nothing signed —
+    // `target` is the commit itself.
+    let lightweight = TagDetail {
+        name: tag("tip-marker"),
+        kind: TagKind::Lightweight,
+        target: oid('2'),
+        tag_object: None,
+        tagger: None,
+        message: None,
+        signature: SignatureStatus::Unsigned,
+    };
+    let lightweight_wire = serde_json::json!({
+        "name": "tip-marker",
+        "kind": "lightweight",
+        "target": "2".repeat(40),
+        "tag_object": null,
+        "tagger": null,
+        "message": null,
+        "signature": "unsigned",
+    });
+    assert_eq!(
+        serde_json::to_value(&lightweight).unwrap(),
+        lightweight_wire
+    );
+    assert_eq!(
+        serde_json::from_value::<TagDetail>(lightweight_wire).unwrap(),
+        lightweight
+    );
+
+    // deny_unknown_fields is live (see TagDetail's doc for why a *read* DTO
+    // starts strict): a stray key is a hard error, not an ignored field.
+    let stray = serde_json::json!({
+        "name": "v1.0.0",
+        "kind": "lightweight",
+        "target": "2".repeat(40),
+        "tag_object": null,
+        "tagger": null,
+        "message": null,
+        "signature": "unsigned",
+        "verified": true,
+    });
+    assert!(serde_json::from_value::<TagDetail>(stray).is_err());
+
+    // And the signature vocabulary is closed: every declared status has a
+    // pinned wire name, and an invented one is refused — "unverifiable" and
+    // "invalid" must never collapse into each other by rename.
+    for (status, wire) in [
+        (SignatureStatus::Unsigned, "unsigned"),
+        (SignatureStatus::Valid, "valid"),
+        (SignatureStatus::Invalid, "invalid"),
+        (SignatureStatus::UnknownKey, "unknown_key"),
+        (SignatureStatus::Unverifiable, "unverifiable"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!(wire)
+        );
+    }
+    assert!(serde_json::from_value::<SignatureStatus>(serde_json::json!("verified")).is_err());
+}
+
 #[test]
 fn golden_fixture_round_trips_losslessly() {
     let plans = golden_plans();
@@ -757,6 +1051,10 @@ fn golden_set_covers_every_operation_variant() {
         "amend_commit",
         "fetch_remote",
         "pull_branch",
+        "create_tag",
+        "delete_local_tag",
+        "delete_remote_tag",
+        "push_tag",
     ]
     .into_iter()
     .map(String::from)
