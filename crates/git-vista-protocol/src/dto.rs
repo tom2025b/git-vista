@@ -169,6 +169,118 @@ pub struct WorktreePathsRequest {
     pub paths: Vec<String>,
 }
 
+/// Body of a `POST /api/fetch` request (M2.20c, #229): fetch from the named
+/// configured remote.
+///
+/// A remote *name*, never a URL — the server resolves it through the
+/// repository's own configuration and the plan's
+/// [`Precondition::RemoteConfigured`](crate::plan::Precondition::RemoteConfigured)
+/// gate. That is the whole point of the field being what it is: a request
+/// that could name a URL would let a client point this server's credentials
+/// at a host of its choosing, which is the same class of hazard as a request
+/// naming a repository path.
+///
+/// There is deliberately no `refspec`, no `--prune`, no `--tags` and no
+/// `--depth`. Each of those changes what a fetch *does* to local refs, and
+/// [`GitOperation::FetchRemote`](crate::plan::GitOperation::FetchRemote) — the
+/// typed vocabulary #227 fixed — has no field for any of them. A body field
+/// with nowhere to land in the operation would be a field the reviewer of a
+/// plan never sees.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FetchRequest {
+    pub remote: String,
+}
+
+/// One remote-tracking ref that moved during a fetch (M2.20c, #229).
+///
+/// **Observed, never parsed from git's prose.** The server lists
+/// `refs/remotes/<remote>/*` before and after the fetch and diffs the two
+/// listings, so this is true regardless of git's locale, version, or which
+/// of its "From …/  a1b2c3..d4e5f6  main -> origin/main" summary lines it
+/// chose to print — the lesson #284 wrote down for branch deletion, applied
+/// to the one question a cancelled fetch has to answer honestly.
+///
+/// `old_oid` is `None` for a ref that did not exist before (a new branch on
+/// the remote); `new_oid` is `None` for one that is gone afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteRefUpdate {
+    /// Full ref name, e.g. `refs/remotes/origin/main`.
+    pub ref_name: String,
+    pub old_oid: Option<String>,
+    pub new_oid: Option<String>,
+}
+
+/// Why a `POST /api/fetch` execution failed, as a typed tag the client can
+/// branch on (M2.20c, #229) — the same contract, and the same honesty about
+/// its limits, as [`AmendFailureKind`] above.
+///
+/// Two of these are **observed facts**, not heuristics: [`Self::Cancelled`]
+/// is set because *this server* killed the child on an operator's cancel
+/// request, and it is never inferred from output. The remaining three are
+/// classified from git's stderr against a documented marker set (see
+/// `planner::fetch::classify_failure`), which is gettext-translated under a
+/// non-English locale and version-dependent — so a failure that does not
+/// match any marker lands in [`Self::Other`] rather than being forced into
+/// the nearest-looking box. In every case git's own words are forwarded in
+/// `message`; the tag is an addition to them, never a replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchFailureKind {
+    /// The remote demanded credentials this server could not supply
+    /// (HTTP 401, or a rejected SSH key). Actionable: the user configures a
+    /// credential helper or an SSH agent on the host — this server never
+    /// prompts, and since #228 it cannot be made to (`-c core.askpass=`).
+    AuthenticationFailed,
+    /// The remote could not be reached at all: connection refused, no route,
+    /// DNS failure, timeout. Actionable: a network problem, not a repository
+    /// one — retrying later is the remedy.
+    RemoteUnreachable,
+    /// The remote answered and refused: no such repository, access denied to
+    /// an authenticated user, upload-pack disabled. Actionable: the remote's
+    /// configuration or the user's access to it, not the local repository.
+    RemoteRejected,
+    /// An operator cancelled the operation and the server terminated the
+    /// running `git fetch`. `updated_refs` on the error body says whether
+    /// anything had already moved.
+    Cancelled,
+    /// Everything else, reported with git's own words in `message`.
+    Other,
+}
+
+/// Body of a **failed** `POST /api/fetch` (status 400, or 409 for a cancel):
+/// the typed classification, git's own explanation, and — the part that
+/// matters for a cancel — exactly which remote-tracking refs had already
+/// moved when it stopped.
+///
+/// A response DTO, so no `deny_unknown_fields` (M1.02 additive rule).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchError {
+    pub kind: FetchFailureKind,
+    pub message: String,
+    /// Remote-tracking refs that moved before the failure. Empty is the
+    /// common case and the reassuring one: nothing local changed.
+    #[serde(default)]
+    pub updated_refs: Vec<RemoteRefUpdate>,
+}
+
+/// Body of a **successful** `POST /api/fetch` (status 200).
+///
+/// `updated_refs` is the observed before/after diff of
+/// `refs/remotes/<remote>/*` — empty when the fetch was a no-op ("already up
+/// to date"), which is a success, not a failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchSuccess {
+    /// The remote fetched from, echoed so the response is self-contained.
+    pub remote: String,
+    /// A short human sentence for the UI; git's own summary is not reused
+    /// here because it is prose the server would then be promising the shape
+    /// of. The machine-readable answer is `updated_refs`.
+    pub message: String,
+    #[serde(default)]
+    pub updated_refs: Vec<RemoteRefUpdate>,
+}
+
 /// Body of a `POST /api/clone` request (Phase 12): clone the public repository at
 /// `url` into the persistent clones store (ADR 0008) and open it look-only
 /// pending the operator's mode choice. `url` is a git-cloneable URL (typically

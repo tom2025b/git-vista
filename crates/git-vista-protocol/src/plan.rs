@@ -28,7 +28,7 @@
 //! | `POST /api/checkout` | `git checkout <branch>` | [`GitOperation::CheckoutBranch`] |
 //! | `POST /api/merge` | `git merge --no-edit <branch>` | [`GitOperation::MergeBranch`] |
 //! | `POST /api/push` | `git push origin <branch>` | [`GitOperation::PushBranch`] |
-//! | *(planned, #229)* | `git fetch <remote>` | [`GitOperation::FetchRemote`] |
+//! | `POST /api/fetch` | `git fetch --progress <remote>` | [`GitOperation::FetchRemote`] |
 //! | *(planned, #230)* | `git pull --no-rebase\|--rebase` | [`GitOperation::PullBranch`] |
 //! | `POST /api/delete-branch` | `git branch -d <branch>` | [`GitOperation::DeleteBranch`] |
 //! | `POST /api/force-delete-branch` | `git branch -D <branch>` | [`GitOperation::ForceDeleteBranch`] |
@@ -607,17 +607,21 @@ pub enum GitOperation {
         expected_tip: CommitOid,
         allow_empty: bool,
     },
-    /// `git fetch <remote>` — download the remote's objects and update its
-    /// remote-tracking refs (`refs/remotes/<remote>/*`), touching no local
-    /// branch, no index and no working tree (planned `POST /api/fetch`,
+    /// `git fetch --progress <remote>` — download the remote's objects and
+    /// update its remote-tracking refs (`refs/remotes/<remote>/*`), touching
+    /// no local branch, no index and no working tree (`POST /api/fetch`,
     /// M2.20, #73/#229).
     ///
-    /// # Contract only (M2.20a, #227)
+    /// # Staged in two slices (M2.20a #227, then M2.20c #229)
     ///
-    /// No handler builds this yet and `planner::execute` refuses it — the
-    /// same staging #222 used for `AmendCommit`, so the vocabulary and the
-    /// network classification land and get reviewed before any code opens a
-    /// socket.
+    /// The vocabulary and the network classification landed first, with
+    /// `planner::execute` refusing the variant — the same staging #222 used
+    /// for `AmendCommit`, so both got reviewed before any code opened a
+    /// socket. M2.20c (#229, ADR 0043) wired execution: streamed
+    /// [`TransferProgress`](crate::operation::TransferProgress) on the
+    /// operation's own record, a cancel that terminates the child process,
+    /// and a typed failure taxonomy
+    /// ([`FetchFailureKind`](crate::dto::FetchFailureKind)).
     ///
     /// # `RiskLevel::Safe`, and why that is not complacency
     ///
@@ -643,8 +647,9 @@ pub enum GitOperation {
     /// # Why it still declares `NetworkNeed::Remote`
     ///
     /// Low *risk* and high *reach* are independent axes. Fetch opens a
-    /// socket, so it needs the network tier — and, once #229 executes it,
-    /// the credential handling that tier brings. See
+    /// socket, so it needs the network tier — and, since #229 executes it,
+    /// the credential handling that tier brings (#228's forced
+    /// `core.askpass=` and output redaction). See
     /// `sandbox::network_need_for_operation`.
     FetchRemote { remote: RemoteName },
     /// `git pull --no-rebase|--rebase <remote> <branch>` — fetch, then

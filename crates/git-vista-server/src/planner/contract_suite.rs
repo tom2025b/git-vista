@@ -9,15 +9,18 @@
 //!     the real `build_plan → validate → enforce_fresh → execute` composition
 //!     against a real temporary repository and asserts the mutation landed.
 //!     [`covered_by`] matches exhaustively over the enum, so adding a new
-//!     variant refuses to compile until it gets a pipeline test. (Six
-//!     exceptions today: `FetchRemote` and `PullBranch` (M2.20a #227) and
-//!     the four tag operations (M2.21a #235) ship no execution — their
-//!     pipeline tests assert the *stubs'* refusal and that the repository
-//!     stayed byte-identical, the honest version of this layer's claim
-//!     until #229/#230 and the later M2.21 slices of #74 wire real
-//!     execution in. `AmendCommit` was staged the same way by #222 and
-//!     graduated to a real execution test when #223 wired
-//!     `exec_amend_commit`.)
+//!     variant refuses to compile until it gets a pipeline test. (Five
+//!     exceptions today: `PullBranch` (M2.20a #227) and the four tag
+//!     operations (M2.21a #235) ship no execution — their pipeline tests
+//!     assert the *stubs'* refusal and that the repository stayed
+//!     byte-identical, the honest version of this layer's claim until #230
+//!     and the later M2.21 slices of #74 wire real execution in.
+//!     `AmendCommit` was staged the same way by #222 and graduated to a real
+//!     execution test when #223 wired `exec_amend_commit`; `FetchRemote`
+//!     graduated the same way when M2.20c #229 wired `planner::fetch`, and
+//!     its heavier behavioural coverage — live progress, a cancel that kills
+//!     the child, the dropped-connection replay, redaction on the streaming
+//!     path — lives in the sibling [`super::fetch_suite`].)
 //!  2. **Single-funnel proof** — a source-level test walks the router's POST
 //!     table and every git-write handler, asserting each one reaches
 //!     [`plan_and_execute`] (directly or through its named local helper) and
@@ -1706,6 +1709,41 @@ fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
     &rest[..end]
 }
 
+/// The argument list of every `.route(…)` call in `src`, whitespace-collapsed
+/// so a registration rustfmt wrapped across lines reads exactly like a
+/// one-liner.
+///
+/// Balanced parens rather than "up to the next `.route(`": a naive split
+/// would fold each call's span into its successor's, so one route's handler
+/// would satisfy a check about a different route's.
+fn route_call_spans(src: &str) -> Vec<String> {
+    let flat = src.split_whitespace().collect::<Vec<_>>().join(" ");
+    let needle = ".route(";
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = flat[from..].find(needle) {
+        let start = from + rel + needle.len();
+        let mut depth = 1usize;
+        let mut end = flat.len();
+        for (offset, ch) in flat[start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push(flat[start..end].to_string());
+        from = end + 1;
+    }
+    out
+}
+
 /// The single-funnel proof: the router's POST table is exactly the known
 /// write surface, and every **git-mutating** route's handler reaches
 /// [`plan_and_execute`] — directly or through the one named local helper it
@@ -1716,14 +1754,20 @@ fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
 fn every_git_write_route_reaches_the_planner() {
     let main_src = source("src/main.rs");
 
-    // Every POST route in the router, in order. Repo-management writes
+    // Every POST route in the router. Repo-management writes
     // (clone/select/rescan/delete-clone) manage the catalog rather than
     // mutating the selected repository's git state; they are listed so a new
     // route *must* be classified here, on purpose, not silently.
-    let posts: Vec<&str> = main_src
-        .lines()
-        .filter(|l| l.contains("post("))
-        .map(str::trim)
+    //
+    // Extracted as balanced-paren `.route(` **spans**, not lines. rustfmt
+    // wraps any call whose argument list exceeds `fn_call_width` (60 by
+    // default), which several registrations here do — a per-line scan sees
+    // only the `post(handler)` fragment of a wrapped one, never the route it
+    // belongs to, so a route could be added in wrapped form and satisfy
+    // nothing. `route_authz.rs` extracts the same way, for the same reason.
+    let posts: Vec<String> = route_call_spans(&main_src)
+        .into_iter()
+        .filter(|span| span.contains("post("))
         .collect();
     let expected: &[(&str, &str)] = &[
         // Session bootstrap (`POST /session` behind the sign-in token) — an
@@ -1748,6 +1792,8 @@ fn every_git_write_route_reaches_the_planner() {
         ("/api/undo", "activity::undo"),
         ("/api/merge", "merge_branch"),
         ("/api/push", "push_branch"),
+        // M2.20c (#229): fetch — a git write, funnel row below.
+        ("/api/fetch", "fetch_remote"),
         ("/api/delete-branch", "delete_branch"),
         ("/api/checkout", "checkout_branch"),
         ("/api/force-delete-branch", "force_delete_branch"),
@@ -1756,6 +1802,15 @@ fn every_git_write_route_reaches_the_planner() {
         // #219 (M2.18a): discard/delete of working-tree paths.
         ("/api/discard-tracked-paths", "discard_tracked_paths"),
         ("/api/delete-untracked-paths", "delete_untracked_paths"),
+        // M2.20c (#229): cancelling a running operation. A POST, and a write
+        // in the "changes what the server is doing" sense — it kills a child
+        // process — but **not** a git write: it constructs no argv and mints
+        // no plan, so it has no funnel row below. It is classified here, on
+        // purpose, rather than being allowed to slip past the tally.
+        (
+            "/api/operations/{id}/cancel",
+            "handlers::operations::cancel_operation",
+        ),
     ];
     assert_eq!(
         posts.len(),
@@ -2649,25 +2704,34 @@ fn repo_fingerprint_detects_every_change_it_claims_to_watch() {
     }
 }
 
-/// [`GitOperation::FetchRemote`] proves its *shape* end-to-end through the
-/// real pipeline (build → validate → enforce_fresh), but M2.20a ships no
-/// execution — #229's to add.
+/// A repository with `origin` pointing at a bare remote that is **one commit
+/// ahead** of the local `refs/remotes/origin/*`, so a fetch that really runs
+/// has something to move and a fetch that does not is visibly inert.
 ///
-/// The status code is the weaker half of this test. The half that matters is
-/// [`repo_fingerprint`]: a stub that answered `501` *after* running `git
-/// fetch` would pass a status-only assertion while having opened a socket,
-/// contacted a real remote with whatever credentials the environment offered,
-/// and written objects and refs. The remote here is configured and reachable
-/// (a bare repo on disk with a commit the fetch would pull), so "nothing
-/// changed" is a claim about an operation that genuinely *could* have
-/// changed something.
-#[tokio::test]
-async fn fetch_remote_executes_through_the_pipeline() {
+/// # Why the remote lives *inside* the repository
+///
+/// The sandbox (#66 Task 6) grants the served repository's tree and the system
+/// trees, and nothing else — a bare remote in a sibling tempdir is denied
+/// outright, and the fetch fails with git's "does not appear to be a git
+/// repository" for a reason that has nothing to do with fetching. A remote
+/// under the repository's own granted tree is readable, and `upload-pack` runs
+/// there read-only, so a *fetch* works where the push fixture's equivalent
+/// cannot (see `push_branch_executes_through_the_pipeline`: receive-pack's
+/// quarantine migration is a cross-directory rename and the shim withholds
+/// `LANDLOCK_ACCESS_FS_REFER`).
+///
+/// This is a **local transport**, so it does not exercise a socket. That is
+/// deliberate here: this test's subject is the pipeline and the reported
+/// outcome, and the real-socket half of the Network tier already has its own
+/// coverage (`sandbox::network_exec`'s `https_suite`, and the push fixture's
+/// `git daemon` on the arbitrated port). Classification is by *typed
+/// operation*, not by URL (#66's D3), so this still runs through the Network
+/// tier, #228's forced `-c core.askpass=`, and the redaction chokepoint.
+///
+/// Returns `(tempdir, repo, the oid the remote is at)`.
+fn repo_behind_its_remote() -> (tempfile::TempDir, PathBuf, String) {
     let (dir, repo) = seeded_repo();
-
-    // A real, reachable remote holding a commit this repo does not have — so
-    // a fetch that actually ran would demonstrably move refs and add objects.
-    let remote = dir.path().join("remote.git");
+    let remote = repo.join("upstream.git");
     std::fs::create_dir_all(&remote).unwrap();
     run(&remote, &["init", "-q", "--bare", "-b", "main"]);
     run(
@@ -2677,7 +2741,122 @@ async fn fetch_remote_executes_through_the_pipeline() {
     run(&repo, &["push", "-q", "origin", "main"]);
     run(&repo, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
     run(&repo, &["push", "-q", "origin", "main"]);
+    let ahead = tip(&repo, "HEAD");
+    // Rewind the local remote-tracking ref so the fetch has work to do, and
+    // rewind HEAD too so the *local* history is genuinely behind.
     run(&repo, &["update-ref", "-d", "refs/remotes/origin/main"]);
+    run(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+    (dir, repo, ahead)
+}
+
+/// [`GitOperation::FetchRemote`] runs for real through the whole pipeline
+/// (M2.20c, #229): build → validate → enforce_fresh → execute, against a
+/// configured remote holding a commit this repository does not have.
+///
+/// Three assertions, and the *second* is the one that matters:
+///
+/// 1. The response is a `200` carrying a parseable [`FetchSuccess`].
+/// 2. `refs/remotes/origin/main` actually points at the remote's tip
+///    afterwards — read out of the repository, not out of the response. A
+///    handler that returned a well-formed success body without fetching
+///    anything passes (1) and fails this.
+/// 3. The reported `updated_refs` matches what the repository shows, so the
+///    wire answer and the observed answer cannot drift apart.
+#[tokio::test]
+async fn fetch_remote_executes_through_the_pipeline() {
+    let (_dir, repo, ahead) = repo_behind_its_remote();
+    assert!(
+        !std::path::Path::new(&repo)
+            .join(".git/refs/remotes/origin/main")
+            .exists(),
+        "the fixture must start with no remote-tracking ref, or 'the fetch \
+         created it' proves nothing"
+    );
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::FetchRemote {
+            remote: RemoteName::new("origin").unwrap(),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let observed = out(&repo, &["rev-parse", "refs/remotes/origin/main"]);
+    assert_eq!(
+        observed, ahead,
+        "the fetch must have moved the remote-tracking ref to the remote's tip"
+    );
+
+    let success: git_vista_protocol::FetchSuccess =
+        serde_json::from_str(&body).expect("a 200 from /api/fetch is a FetchSuccess");
+    assert_eq!(success.remote, "origin");
+    assert_eq!(
+        success.updated_refs,
+        vec![git_vista_protocol::RemoteRefUpdate {
+            ref_name: "refs/remotes/origin/main".to_string(),
+            old_oid: None,
+            new_oid: Some(ahead),
+        }],
+        "the reported update must be the one the repository actually shows"
+    );
+}
+
+/// The paired no-op leg: a second fetch, with nothing new on the remote,
+/// still succeeds and reports **no** updates.
+///
+/// This is what stops `updated_refs` from being a rubber stamp. A
+/// implementation that reported every remote-tracking ref it could see —
+/// rather than the before/after difference — would pass the test above and
+/// fail here, and a client would show "1 ref updated" every time a user
+/// pressed Fetch on an up-to-date repository.
+#[tokio::test]
+async fn a_fetch_with_nothing_new_succeeds_and_reports_no_updates() {
+    let (_dir, repo, _ahead) = repo_behind_its_remote();
+    let op = || GitOperation::FetchRemote {
+        remote: RemoteName::new("origin").unwrap(),
+    };
+
+    let (status, body) = pipeline(&repo, op()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let before = repo_fingerprint(&repo);
+    let (status, body) = pipeline(&repo, op()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let success: git_vista_protocol::FetchSuccess = serde_json::from_str(&body).unwrap();
+    assert!(
+        success.updated_refs.is_empty(),
+        "an up-to-date fetch must report nothing moved, got {:?}",
+        success.updated_refs
+    );
+    assert!(
+        success.message.contains("already up to date"),
+        "{}",
+        success.message
+    );
+    assert_eq!(
+        repo_fingerprint(&repo),
+        before,
+        "a no-op fetch must leave the repository byte-identical"
+    );
+}
+
+/// A fetch from a remote whose URL points at nothing fails with the typed
+/// taxonomy rather than a bare 500 or an opaque message, and leaves the
+/// repository untouched.
+///
+/// The remote is *configured* (so the plan's `RemoteConfigured` precondition
+/// holds and execution is really reached) but its URL names a directory that
+/// does not exist, which is a genuine transport failure git reports in its
+/// own words.
+#[tokio::test]
+async fn a_fetch_from_a_broken_remote_is_classified_and_changes_nothing() {
+    let (_dir, repo) = seeded_repo();
+    let nowhere = repo.join("no-such-remote.git");
+    run(
+        &repo,
+        &["remote", "add", "origin", &nowhere.display().to_string()],
+    );
 
     let before = repo_fingerprint(&repo);
     let (status, body) = pipeline(
@@ -2687,12 +2866,109 @@ async fn fetch_remote_executes_through_the_pipeline() {
         },
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let error: git_vista_protocol::FetchError =
+        serde_json::from_str(&body).expect("a failed /api/fetch is a FetchError");
     assert_eq!(
-        repo_fingerprint(&repo),
-        before,
-        "the stub must leave the repository byte-identical — M2.20a ships no \
-         fetch execution (#229)"
+        error.kind,
+        git_vista_protocol::FetchFailureKind::RemoteRejected,
+        "git's own words were: {}",
+        error.message
+    );
+    assert!(
+        error.updated_refs.is_empty(),
+        "a fetch that never reached a remote cannot have moved a ref"
+    );
+    assert!(
+        !error.message.is_empty(),
+        "git's own explanation must be forwarded, whatever the tag says"
+    );
+    assert_eq!(
+        without_fetch_head(&repo_fingerprint(&repo)),
+        without_fetch_head(&before),
+        "a failed fetch must move no ref and add no object"
+    );
+    assert_eq!(
+        out(
+            &repo,
+            &["for-each-ref", "--format=%(refname)", "refs/remotes/"]
+        ),
+        "",
+        "a fetch that never reached a remote must have created no \
+         remote-tracking ref"
+    );
+}
+
+/// [`repo_fingerprint`] with its `fetch_head:` line dropped.
+///
+/// Measured against git 2.43.0: a `git fetch` that **fails** — the remote is
+/// unreadable, nothing is negotiated, no object arrives — still creates
+/// `.git/FETCH_HEAD` on its way to discovering that. That file names no ref,
+/// holds no object, and nothing in this server reads it, so treating its
+/// appearance as "the repository was mutated" would fail the inertness
+/// assertion for a reason that has nothing to do with the repository's
+/// contents.
+///
+/// Dropped only here, and only for the *failure* case. Every other use of the
+/// fingerprint keeps the line — `repo_fingerprint_detects_every_change_it_
+/// claims_to_watch` has a dedicated case proving it is load-bearing there —
+/// and this test compensates by additionally asserting, directly, that no
+/// remote-tracking ref exists afterwards.
+fn without_fetch_head(fingerprint: &str) -> String {
+    fingerprint
+        .lines()
+        .filter(|l| !l.starts_with("fetch_head:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The census of operations that claim to be cancellable is exactly
+/// `{FetchRemote}` (M2.20c, #229).
+///
+/// `planner::honours_cancellation` is answered to an operator by
+/// `POST /api/operations/{id}/cancel`: a `true` there is a promise that the
+/// executor watches the latch. The match itself is exhaustive (a new variant
+/// will not compile without an arm), but nothing in the compiler stops
+/// someone from putting a new variant on the `true` side without an executor
+/// to back it — so the `true` set is pinned here, and widening it is a
+/// deliberate edit to this list.
+///
+/// The second half is the anti-vacuity leg: the executor that `FetchRemote`
+/// dispatches to must actually take a cancel signal. A `honours_cancellation`
+/// that answered `true` for an executor which ignored the latch would be the
+/// exact "tested but does nothing" shape this suite exists to catch.
+#[test]
+fn only_operations_with_a_real_cancellation_point_claim_to_be_cancellable() {
+    let samples = samples();
+    let cancellable: Vec<&GitOperation> = samples
+        .iter()
+        .filter(|op| super::honours_cancellation(op))
+        .collect();
+    assert_eq!(
+        cancellable.len(),
+        1,
+        "the cancellable census changed — every `true` arm in \
+         planner::honours_cancellation promises an executor that watches the \
+         cancellation latch, so adding one means adding that executor too: \
+         {cancellable:?}"
+    );
+    assert!(
+        matches!(cancellable[0], GitOperation::FetchRemote { .. }),
+        "only FetchRemote has a cancellation point today, got {:?}",
+        cancellable[0]
+    );
+
+    let src = source("src/planner/fetch.rs");
+    assert!(
+        src.contains("crate::operations::cancel_signal()"),
+        "planner::fetch must take the operation's cancellation latch — \
+         honours_cancellation(FetchRemote) promises it does"
+    );
+    assert!(
+        src.contains("git_streamed_for("),
+        "planner::fetch must run its git through the streaming, cancellable \
+         runner — the collecting `run_git` cannot be interrupted"
     );
 }
 

@@ -111,6 +111,12 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     ("/api/undo", Method::POST, Authz::SessionAndCsrf),
     ("/api/merge", Method::POST, Authz::SessionAndCsrf),
     ("/api/push", Method::POST, Authz::SessionAndCsrf),
+    // M2.20c (#229): fetch from a configured remote. A git write that opens a
+    // socket with whatever credentials the host offers, which makes the CSRF
+    // half of this classification load-bearing in a way it is not for a local
+    // mutation: a cross-origin page that could trigger this would be making
+    // *this server's* credentials talk to a remote.
+    ("/api/fetch", Method::POST, Authz::SessionAndCsrf),
     ("/api/delete-branch", Method::POST, Authz::SessionAndCsrf),
     ("/api/checkout", Method::POST, Authz::SessionAndCsrf),
     (
@@ -138,6 +144,14 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
         Method::GET,
         Authz::SessionRequired,
     ),
+    // M2.20c (#229): cancelling a running operation changes what the server
+    // does — it kills a child process — so it is a write, not a read of a
+    // write's outcome like the two routes above it. Full write posture.
+    (
+        "/api/operations/{id}/cancel",
+        Method::POST,
+        Authz::SessionAndCsrf,
+    ),
 ];
 
 /// The total number of `(path, method)` pairs `api_router` should register
@@ -145,7 +159,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 41;
+const EXPECTED_ROUTE_COUNT: usize = 43;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

@@ -75,15 +75,17 @@ pub use diff::{
 pub use dto::{
     validate_clone_url, AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind,
     BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
-    HookPolicy, RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest,
-    SessionInfo, SessionRequest, SignatureStatus, TagDetail, TagKind, WorktreePathsRequest,
+    FetchError, FetchFailureKind, FetchRequest, FetchSuccess, HookPolicy, RebaseStatus,
+    RemoteRefUpdate, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo,
+    SessionRequest, SignatureStatus, TagDetail, TagKind, WorktreePathsRequest,
     CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use history::{HistoryFrame, HistoryPage};
 pub use operation::{
     IdempotencyKey, OperationId, OperationStage, OperationState, OperationStatus, ProgressEvent,
-    MAX_IDEMPOTENCY_KEY_LEN, MAX_OPERATION_ID_LEN, PROGRESS_EVENT, RESULT_EVENT,
+    TransferPhase, TransferProgress, MAX_IDEMPOTENCY_KEY_LEN, MAX_OPERATION_ID_LEN, PROGRESS_EVENT,
+    RESULT_EVENT,
 };
 pub use patch_build::{build_selected_patch, canonical_path, SelectedPatch, SelectionMismatch};
 pub use patch_plan::{
