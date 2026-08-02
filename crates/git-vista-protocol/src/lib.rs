@@ -77,6 +77,7 @@ pub use dto::{
     BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
     HookPolicy, RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest,
     SessionInfo, SessionRequest, SignatureStatus, TagDetail, TagKind, WorktreePathsRequest,
+    CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use history::{HistoryFrame, HistoryPage};
