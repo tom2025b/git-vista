@@ -9,11 +9,13 @@
 //!     the real `build_plan → validate → enforce_fresh → execute` composition
 //!     against a real temporary repository and asserts the mutation landed.
 //!     [`covered_by`] matches exhaustively over the enum, so adding a new
-//!     variant refuses to compile until it gets a pipeline test. (One
-//!     exception so far: `AmendCommit`, M2.19a #222, ships no execution —
-//!     its pipeline test asserts the *stub's* refusal and that the
-//!     repository stayed untouched, the honest version of this layer's
-//!     claim until #223 wires real execution in.)
+//!     variant refuses to compile until it gets a pipeline test. (Two
+//!     exceptions today: `FetchRemote` and `PullBranch`, M2.20a #227, ship
+//!     no execution — their pipeline tests assert the *stubs'* refusal and
+//!     that the repository stayed byte-identical, the honest version of
+//!     this layer's claim until #229/#230 wire real execution in.
+//!     `AmendCommit` was staged the same way by #222 and graduated to a
+//!     real execution test when #223 wired `exec_amend_commit`.)
 //!  2. **Single-funnel proof** — a source-level test walks the router's POST
 //!     table and every git-write handler, asserting each one reaches
 //!     [`plan_and_execute`] (directly or through its named local helper) and
@@ -1657,6 +1659,8 @@ fn every_git_write_route_reaches_the_planner() {
         ("/api/rescan", "rescan"),
         ("/api/branch", "create_branch"),
         ("/api/commit", "create_commit"),
+        // M2.19b (#223): amend — a git write, funnel row below.
+        ("/api/amend-commit", "amend_commit"),
         ("/api/stage", "stage_all"),
         // Staging selections (M2.17b, #213): apply is a git write and MUST
         // reach the planner (funnel row below). Preview is deliberately not
@@ -1750,6 +1754,9 @@ fn every_git_write_route_reaches_the_planner() {
             "create_commit",
             Some("commit_empty_on_branch"),
         ),
+        // M2.19b (#223): the amend handler builds `AmendCommit` and calls
+        // the planner directly.
+        ("src/handlers/commit.rs", "amend_commit", None),
         ("src/handlers/commit.rs", "stage_all", None),
         ("src/handlers/commit.rs", "unstage_all", None),
         ("src/handlers/rebase.rs", "rebase", None),
@@ -1974,22 +1981,38 @@ async fn a_broken_precondition_is_refused_end_to_end() {
     );
 }
 
-// --- #222 (M2.19a): typed AmendCommit contract, execution not yet wired ---
+// --- #223 (M2.19b): AmendCommit execution — CAS, published flag, ------------
+// --- hook/signing classification, journal evidence. #222 staged the ---------
+// --- typed contract; the inertness test that pinned its stub did its job ----
+// --- and was deliberately replaced by the battery below. --------------------
 
-/// [`GitOperation::AmendCommit`] proves its *shape* end-to-end through the
-/// real pipeline (build → validate → enforce_fresh), but M2.19a ships no
-/// execution — #223's to add. So unlike every other pipeline test in this
-/// file, this one asserts the operation is refused with `NOT_IMPLEMENTED`
-/// and, more importantly, that the repository is completely untouched: HEAD
-/// is exactly the commit it was before. A test that only checked the status
-/// code would pass just as well if the stub silently mutated the repo and
-/// then reported failure anyway — the tip assertion is what actually proves
-/// "no execution happened," and it is what forces #223 to touch this exact
-/// test when real execution replaces the stub.
+/// The parsed 400 body every amend refusal carries
+/// ([`git_vista_protocol::AmendCommitError`]): the typed `kind` plus git's
+/// (or the hook's) own message.
+fn amend_error(status: StatusCode, body: &str) -> git_vista_protocol::AmendCommitError {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    serde_json::from_str(body).unwrap_or_else(|e| {
+        panic!("a 400 from the amend path must parse as AmendCommitError, got {e}: {body}")
+    })
+}
+
+/// [`GitOperation::AmendCommit`] executes for real through the pipeline
+/// (M2.19b, #223): the tip commit is rewritten in place — new message, new
+/// staged content, **same commit count** — and the response is the
+/// structured [`git_vista_protocol::AmendCommitSuccess`] body carrying the
+/// old/new tips and the published-history flag (`Some(false)` here: no
+/// remote is configured, and the walk genuinely ran — the paired positive
+/// lives in `amending_a_published_commit_is_flagged_in_the_response`).
+///
+/// The commit-count assertion is the one that distinguishes a real amend
+/// from the cheapest broken implementation (a plain `git commit` would move
+/// HEAD and change the subject too — but it would leave two commits).
 #[tokio::test]
 async fn amend_commit_executes_through_the_pipeline() {
     let (_dir, repo) = seeded_repo();
     let before = tip(&repo, "HEAD");
+    std::fs::write(repo.join("a.txt"), "amended content\n").unwrap();
+    run(&repo, &["add", "a.txt"]);
     let (status, body) = pipeline(
         &repo,
         GitOperation::AmendCommit {
@@ -1999,17 +2022,453 @@ async fn amend_commit_executes_through_the_pipeline() {
         },
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_ok(status, &body);
+    let after = tip(&repo, "HEAD");
+    assert_ne!(
+        after, before,
+        "an amend rewrites the tip to a new commit id"
+    );
+    assert_eq!(out(&repo, &["log", "-1", "--format=%s"]), "amended message");
+    assert_eq!(
+        out(&repo, &["rev-list", "--count", "HEAD"]),
+        "1",
+        "amend must rewrite the tip in place, never add a commit on top"
+    );
+    let success: git_vista_protocol::AmendCommitSuccess =
+        serde_json::from_str(&body).expect("a 200 amend body is AmendCommitSuccess JSON");
+    assert_eq!(success.old_tip, before);
+    assert_eq!(success.new_tip.as_deref(), Some(after.as_str()));
+    assert_eq!(
+        success.amended_published_commit,
+        Some(false),
+        "no remote is configured, so the walk ran and the honest answer is \
+         `false` — not `None`, which is reserved for a walk that failed"
+    );
+}
+
+/// The executor-level compare-and-swap: an `expected_tip` that was stale
+/// **when the plan was built** (the client reviewed an old tip) is refused
+/// with a 400 — kind `stale_tip`, per the endpoint's typed contract — and
+/// the repository is untouched. This is the leg `enforce_fresh` deliberately
+/// does not cover: its per-precondition re-check runs only for preconditions
+/// that *held* at build time, so a stale-from-the-start `RefAt` flows
+/// through to `exec_amend_commit`'s own guard (`planner.rs`; the
+/// moved-after-build race is separately pinned as a 409 by
+/// `amend_commit_refuses_when_the_tip_moved_after_the_plan_was_built` in
+/// `planner`'s unit tests — 400 says "your request is wrong", 409 says "you
+/// lost a race", and the two must not blur).
+#[tokio::test]
+async fn a_stale_expected_tip_is_refused_as_stale_tip_without_touching_the_repo() {
+    let (_dir, repo) = seeded_repo();
+    let stale = tip(&repo, "HEAD");
+    // The tip moves before the request is even built: the client's picture
+    // is out of date, not racing.
+    std::fs::write(repo.join("a.txt"), "moved on\n").unwrap();
+    run(&repo, &["add", "a.txt"]);
+    run(&repo, &["commit", "-q", "-m", "moved on"]);
+    let now = tip(&repo, "HEAD");
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::AmendCommit {
+            message: message("must not land"),
+            expected_tip: oid(&stale),
+            allow_empty: false,
+        },
+    )
+    .await;
+    let error = amend_error(status, &body);
+    assert_eq!(error.kind, git_vista_protocol::AmendFailureKind::StaleTip);
+    assert_eq!(tip(&repo, "HEAD"), now, "a refused CAS must not move HEAD");
+    assert_eq!(
+        out(&repo, &["log", "-1", "--format=%s"]),
+        "moved on",
+        "a refused CAS must not rewrite any commit"
+    );
+    assert_eq!(
+        out(&repo, &["rev-list", "--count", "HEAD"]),
+        "2",
+        "a refused CAS must not create or drop commits"
+    );
+}
+
+/// Repository hooks genuinely execute during an amend — through the same
+/// single sealed spawn as the amend itself (there is no separate hook
+/// runner to bypass; `argv_boundary` pins the spawn sites). The proof is a
+/// passing `pre-commit` hook that writes a marker file: amend succeeds AND
+/// the marker exists, so the hook demonstrably ran inside the pipeline's
+/// one `git commit --amend` invocation. Without this, the rejection test
+/// below could pass against an implementation that ran hooks through some
+/// second, unsandboxed path — or a future `--no-verify` "fix" could
+/// silently stop running hooks and every rejection test would just never
+/// fire again.
+#[tokio::test]
+async fn the_amend_runs_repository_hooks_inside_the_pipelines_own_spawn() {
+    let (_dir, repo) = seeded_repo();
+    let before = tip(&repo, "HEAD");
+    let marker = repo.join(".git/hook-ran-marker");
+    std::fs::write(
+        repo.join(".git/hooks/pre-commit"),
+        "#!/bin/sh\ntouch \"$(git rev-parse --git-dir)/hook-ran-marker\"\nexit 0\n",
+    )
+    .unwrap();
+    make_executable(&repo.join(".git/hooks/pre-commit"));
+    assert!(!marker.exists(), "the marker must start absent");
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::AmendCommit {
+            message: message("amended with hook"),
+            expected_tip: oid(&before),
+            allow_empty: false,
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+    assert!(
+        marker.exists(),
+        "the pre-commit hook must have executed during the amend — if it \
+         did not, hooks are being bypassed (--no-verify, or a second spawn \
+         path) and every hook-rejection classification is dead code"
+    );
+}
+
+/// A rejecting hook classifies as `hook_rejected` — driven with the hard
+/// case, a **silent** hook (exit 1, not a byte of output), because git
+/// prints nothing of its own for a hook rejection (verified against git
+/// 2.43), so an implementation that "classified" by matching some
+/// hook-related stderr text would pass a chatty-hook test and misclassify
+/// every quiet real-world hook. All three rejectable hook points this argv
+/// has are driven — the same three `rejectable_hook_present` probes for
+/// (`pre-commit`, `prepare-commit-msg`, `commit-msg`; `git commit --amend
+/// -m` runs `prepare-commit-msg` even with `-m`, and a silent exit-1 there
+/// fails the amend with the same empty-stderr signature) — so trimming the
+/// planner's hook list or regressing any one point turns this red. The
+/// repository must be untouched afterward.
+#[tokio::test]
+async fn a_hook_rejection_is_classified_as_hook_rejected() {
+    for hook in ["pre-commit", "prepare-commit-msg", "commit-msg"] {
+        let (_dir, repo) = seeded_repo();
+        let before = tip(&repo, "HEAD");
+        std::fs::write(
+            repo.join(format!(".git/hooks/{hook}")),
+            "#!/bin/sh\nexit 1\n",
+        )
+        .unwrap();
+        make_executable(&repo.join(format!(".git/hooks/{hook}")));
+
+        let (status, body) = pipeline(
+            &repo,
+            GitOperation::AmendCommit {
+                message: message("must not land"),
+                expected_tip: oid(&before),
+                allow_empty: false,
+            },
+        )
+        .await;
+        let error = amend_error(status, &body);
+        assert_eq!(
+            error.kind,
+            git_vista_protocol::AmendFailureKind::HookRejected,
+            "{hook}: {body}"
+        );
+        assert_eq!(
+            tip(&repo, "HEAD"),
+            before,
+            "{hook}: a rejected amend must not move HEAD"
+        );
+        assert_eq!(
+            out(&repo, &["log", "-1", "--format=%s"]),
+            "seed",
+            "{hook}: a rejected amend must not rewrite the commit"
+        );
+    }
+}
+
+/// The paired negative for hook classification: a failure that happens
+/// **while a rejectable hook is present** but is *not* the hook's doing —
+/// git's own would-become-empty refusal — must classify as `other`, not
+/// `hook_rejected`. This is what proves the classifier is not just "a hook
+/// exists, so blame the hook": the hook here demonstrably passes (it writes
+/// a marker), and the refusal comes from git afterward.
+#[tokio::test]
+async fn a_non_hook_failure_with_a_hook_present_is_not_blamed_on_the_hook() {
+    let (_dir, repo) = seeded_repo();
+    // A second commit whose staged reversal would make the amended commit
+    // empty: `git commit --amend` (without allow_empty) refuses with its
+    // "You asked to amend the most recent commit…" advice, exit 1, no
+    // `fatal:` — the exact shape most easily confused with a silent hook.
+    std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+    run(&repo, &["add", "b.txt"]);
+    run(&repo, &["commit", "-q", "-m", "add b"]);
+    let before = tip(&repo, "HEAD");
+    run(&repo, &["rm", "-q", "--cached", "b.txt"]);
+
+    let marker = repo.join(".git/hook-ran-marker");
+    std::fs::write(
+        repo.join(".git/hooks/pre-commit"),
+        "#!/bin/sh\ntouch \"$(git rev-parse --git-dir)/hook-ran-marker\"\nexit 0\n",
+    )
+    .unwrap();
+    make_executable(&repo.join(".git/hooks/pre-commit"));
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::AmendCommit {
+            message: message("would become empty"),
+            expected_tip: oid(&before),
+            allow_empty: false,
+        },
+    )
+    .await;
+    let error = amend_error(status, &body);
+    assert!(
+        marker.exists(),
+        "the hook must actually have run and passed — otherwise this test \
+         is not the negative it claims to be"
+    );
+    assert_eq!(
+        error.kind,
+        git_vista_protocol::AmendFailureKind::Other,
+        "git's own empty-amend refusal must not be blamed on the passing hook: {body}"
+    );
+    assert_eq!(tip(&repo, "HEAD"), before, "the refusal must not move HEAD");
+}
+
+/// A signing failure classifies as `signing_failed`, for both signer
+/// shapes: the gpg format (git's canonical `gpg failed to sign the data`
+/// stderr, forced deterministically with `gpg.program=/bin/false`) and the
+/// ssh format (an unloadable signing key — no canonical gpg line, which is
+/// exactly why the classifier needs its config-probe leg). The repository
+/// must be untouched afterward.
+#[tokio::test]
+async fn a_signing_failure_is_classified_as_signing_failed() {
+    let cases: &[&[(&str, &str)]] = &[
+        // gpg format: the signer program itself fails.
+        &[("commit.gpgsign", "true"), ("gpg.program", "/bin/false")],
+        // ssh format: the signing key cannot be loaded.
+        &[
+            ("commit.gpgsign", "true"),
+            ("gpg.format", "ssh"),
+            ("user.signingkey", "/nonexistent-signing-key"),
+        ],
+    ];
+    for case in cases {
+        let (_dir, repo) = seeded_repo();
+        let before = tip(&repo, "HEAD");
+        for (key, value) in *case {
+            run(&repo, &["config", key, value]);
+        }
+        let (status, body) = pipeline(
+            &repo,
+            GitOperation::AmendCommit {
+                message: message("must not land"),
+                expected_tip: oid(&before),
+                allow_empty: false,
+            },
+        )
+        .await;
+        let error = amend_error(status, &body);
+        assert_eq!(
+            error.kind,
+            git_vista_protocol::AmendFailureKind::SigningFailed,
+            "{case:?}: {body}"
+        );
+        assert_eq!(
+            tip(&repo, "HEAD"),
+            before,
+            "{case:?}: a failed signing must not move HEAD"
+        );
+        assert_eq!(
+            out(&repo, &["log", "-1", "--format=%s"]),
+            "seed",
+            "{case:?}: a failed signing must not rewrite the commit"
+        );
+    }
+}
+
+/// The published-history guard's positive: amending a commit that is
+/// reachable from a remote-tracking ref answers `amended_published_commit:
+/// Some(true)` — and the amend still **succeeds**, because the flag is
+/// advisory by decision (ADR 0040), never blocking. The negative
+/// (`Some(false)` with no remote) is pinned by
+/// `amend_commit_executes_through_the_pipeline`; together they prove the
+/// flag is computed, not constant.
+///
+/// The second leg is the adversarial depth case: the amended tip is *not*
+/// the remote-tracking ref's own tip — the remote has moved past it — so a
+/// naive "is HEAD the remote tip?" comparison would answer `false`. Only a
+/// real reachability walk answers `true` here.
+#[tokio::test]
+async fn amending_a_published_commit_is_flagged_in_the_response() {
+    for remote_moves_past in [false, true] {
+        let (dir, repo) = seeded_repo();
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        run(
+            &repo,
+            &["remote", "add", "origin", &remote.display().to_string()],
+        );
+        run(&repo, &["push", "-q", "origin", "main"]);
+        let published_tip = tip(&repo, "HEAD");
+        if remote_moves_past {
+            // The remote gains a commit on top of the one being amended, so
+            // the amended commit is published-but-buried.
+            run(&repo, &["commit", "-q", "--allow-empty", "-m", "on top"]);
+            run(&repo, &["push", "-q", "origin", "main"]);
+            run(&repo, &["reset", "-q", "--hard", &published_tip]);
+        }
+
+        let (status, body) = pipeline(
+            &repo,
+            GitOperation::AmendCommit {
+                message: message("amend published history"),
+                expected_tip: oid(&published_tip),
+                allow_empty: false,
+            },
+        )
+        .await;
+        assert_ok(status, &body);
+        let success: git_vista_protocol::AmendCommitSuccess =
+            serde_json::from_str(&body).expect("a 200 amend body is AmendCommitSuccess JSON");
+        assert_eq!(
+            success.amended_published_commit,
+            Some(true),
+            "remote_moves_past={remote_moves_past}: the amended-away commit \
+             is reachable from refs/remotes/origin/main and must be flagged"
+        );
+        assert_eq!(
+            out(&repo, &["log", "-1", "--format=%s"]),
+            "amend published history",
+            "remote_moves_past={remote_moves_past}: the flag is advisory — \
+             the amend itself must still have run"
+        );
+    }
+}
+
+/// Amending moves only the checked-out branch. Another ref pointing at the
+/// same commit under a different name (the issue's named adversarial case)
+/// keeps the pre-amend commit exactly where it was — reachable, unmoved,
+/// unrewritten.
+#[tokio::test]
+async fn a_sibling_ref_at_the_amended_commit_is_left_untouched() {
+    let (_dir, repo) = seeded_repo();
+    let before = tip(&repo, "HEAD");
+    run(&repo, &["branch", "keeper", &before]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::AmendCommit {
+            message: message("amended message"),
+            expected_tip: oid(&before),
+            allow_empty: false,
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+    assert_eq!(
+        tip(&repo, "keeper"),
+        before,
+        "the sibling branch must still point at the pre-amend commit"
+    );
+    assert_eq!(
+        out(&repo, &["log", "-1", "--format=%s", "keeper"]),
+        "seed",
+        "the pre-amend commit itself must be unrewritten"
+    );
+    assert_ne!(tip(&repo, "HEAD"), before);
+}
+
+/// A detached HEAD refuses the amend (400, untouched repo): there is no
+/// checked-out branch for the operation to target and — the load-bearing
+/// half — no branch ref for the plan's `ResetRef` recovery to reset, so
+/// running would mean rewriting history with no recovery story. The plan's
+/// own `shape` degrades recovery to `NotNeeded` on detached HEAD, which is
+/// only honest as long as nothing executes.
+#[tokio::test]
+async fn a_detached_head_refuses_the_amend() {
+    let (_dir, repo) = seeded_repo();
+    let before = tip(&repo, "HEAD");
+    run(&repo, &["checkout", "-q", "--detach", &before]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::AmendCommit {
+            message: message("must not land"),
+            expected_tip: oid(&before),
+            allow_empty: false,
+        },
+    )
+    .await;
+    let error = amend_error(status, &body);
+    assert_eq!(
+        error.kind,
+        git_vista_protocol::AmendFailureKind::Other,
+        "{body}"
+    );
     assert_eq!(
         tip(&repo, "HEAD"),
         before,
-        "the stub must never move HEAD — M2.19a ships no execution"
+        "a refused detached-HEAD amend must not move HEAD"
+    );
+    assert_eq!(out(&repo, &["log", "-1", "--format=%s"]), "seed");
+}
+
+/// A successful amend is journaled as `ActivityKind::Amend` with the exact
+/// old→new tip pair — the record that makes the amend show up in
+/// `/api/activity` attributed to the app, and (because `old_oid` is the
+/// pre-amend tip, still live in the object database) makes the feed's
+/// reset-back undo hint work: `assemble_feed`'s `undo_hint` offers a
+/// `ResetBranch { to: old_oid, expected_tip: new_oid }` for the newest
+/// Amend event on a branch (`git_vista_core::activity`, its own tested
+/// mapping). Asserting the journaled oids here is what proves the recovery
+/// story starts from true values rather than from unread placeholders.
+#[tokio::test]
+async fn a_successful_amend_journals_the_old_and_new_tips_for_undo() {
+    let (_dir, repo) = seeded_repo();
+    let before = tip(&repo, "HEAD");
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::AmendCommit {
+            message: message("amended for the journal"),
+            expected_tip: oid(&before),
+            allow_empty: false,
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+    let after = tip(&repo, "HEAD");
+
+    let events = journal::read_all(&repo);
+    let amend = events
+        .iter()
+        .find(|e| e.kind == git_vista_core::activity::ActivityKind::Amend)
+        .expect("a successful amend must append an Amend journal event");
+    assert_eq!(amend.ref_name.as_deref(), Some("main"));
+    assert_eq!(
+        amend.old_oid.as_deref(),
+        Some(before.as_str()),
+        "the journaled old tip is the amended-away commit — the undo target"
     );
     assert_eq!(
-        out(&repo, &["log", "-1", "--format=%s"]),
-        "seed",
-        "the stub must never create a new commit"
+        amend.new_oid.as_deref(),
+        Some(after.as_str()),
+        "the journaled new tip is the rewritten commit — the undo's CAS pin"
     );
+    assert_eq!(
+        amend.source,
+        git_vista_core::activity::ActivitySource::App,
+        "the amend must be attributed to the app, not left to reflog inference"
+    );
+}
+
+/// Make a fixture hook executable (`chmod +x`).
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(permissions.mode() | 0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
 }
 
 // --- #227 (M2.20a): typed remote vocabulary, execution not yet wired -------
