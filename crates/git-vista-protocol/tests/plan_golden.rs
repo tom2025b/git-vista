@@ -16,7 +16,7 @@
 use git_vista_protocol::{
     BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, OperationHash, Plan,
     Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName, RepositoryToken,
-    RiskLevel, StageDirection, UnixSeconds, WorktreeToken,
+    RiskLevel, StageDirection, UnixSeconds, WorktreePath, WorktreeToken,
 };
 
 const FIXTURE: &str = include_str!("fixtures/plan_v1.json");
@@ -32,6 +32,10 @@ fn branch(name: &str) -> BranchName {
 
 fn rname(name: &str) -> RefName {
     RefName::new(name).unwrap()
+}
+
+fn wpath(path: &str) -> WorktreePath {
+    WorktreePath::new(path).unwrap()
 }
 
 /// One plan, with the boilerplate identity/window fields filled in and the
@@ -360,6 +364,26 @@ fn golden_plans() -> Vec<Plan> {
             Vec::new(),
             RecoveryStrategy::NotNeeded,
         ),
+        plan(
+            'e',
+            GitOperation::DiscardTrackedPaths {
+                paths: vec![wpath("src/lib.rs"), wpath("dir/edited.txt")],
+            },
+            RiskLevel::Destructive,
+            Vec::new(),
+            Vec::new(),
+            RecoveryStrategy::RecoverableIfStaged,
+        ),
+        plan(
+            'f',
+            GitOperation::DeleteUntrackedPaths {
+                paths: vec![wpath("scratch/tmp.log")],
+            },
+            RiskLevel::Destructive,
+            Vec::new(),
+            Vec::new(),
+            RecoveryStrategy::Irrecoverable,
+        ),
     ]
 }
 
@@ -434,6 +458,8 @@ fn golden_set_covers_every_operation_variant() {
         "revert_commit",
         "reset_test_repo",
         "stage_selection",
+        "discard_tracked_paths",
+        "delete_untracked_paths",
     ]
     .into_iter()
     .map(String::from)
