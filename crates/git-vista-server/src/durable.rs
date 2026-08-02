@@ -566,6 +566,9 @@ fn recovery_oid(recovery: &RecoveryStrategy) -> Option<&CommitOid> {
         RecoveryStrategy::NotNeeded
         | RecoveryStrategy::DeleteCreatedBranch { .. }
         | RecoveryStrategy::CheckoutPrevious { .. }
+        // A dangling blob (if any) isn't a commit a ref can point at — this
+        // function only ever writes a ref naming a commit.
+        | RecoveryStrategy::RecoverableIfStaged
         | RecoveryStrategy::Irrecoverable => None,
     }
 }

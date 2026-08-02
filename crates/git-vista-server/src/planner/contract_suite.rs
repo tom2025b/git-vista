@@ -105,6 +105,10 @@ fn message(s: &str) -> CommitMessage {
     CommitMessage::new(s).unwrap()
 }
 
+fn wpath(s: &str) -> WorktreePath {
+    WorktreePath::new(s).unwrap()
+}
+
 /// The full planner pipeline, driven through the real entry point with the
 /// process-global selection injected: guard → busy check → build → validate →
 /// staleness gate → execute. What every test in layer 1 and 3 drives.
@@ -166,6 +170,12 @@ fn covered_by(op: &GitOperation) -> &'static str {
         GitOperation::RevertCommit { .. } => "revert_commit_executes_through_the_pipeline",
         GitOperation::ResetTestRepo => "reset_test_repo_executes_through_the_pipeline",
         GitOperation::StageSelection { .. } => "stage_selection_executes_through_the_pipeline",
+        GitOperation::DiscardTrackedPaths { .. } => {
+            "discard_tracked_paths_executes_through_the_pipeline"
+        }
+        GitOperation::DeleteUntrackedPaths { .. } => {
+            "delete_untracked_paths_executes_through_the_pipeline"
+        }
     }
 }
 
@@ -229,6 +239,12 @@ fn every_operation_kind_names_a_distinct_pipeline_test() {
                 .unwrap(),
             patch: String::new(),
             whole_files: vec!["a.txt".to_string()],
+        },
+        GitOperation::DiscardTrackedPaths {
+            paths: vec![wpath("a.txt")],
+        },
+        GitOperation::DeleteUntrackedPaths {
+            paths: vec![wpath("a.txt")],
         },
     ];
     let names: Vec<&str> = samples.iter().map(covered_by).collect();
@@ -801,6 +817,363 @@ async fn reset_test_repo_executes_through_the_pipeline() {
     assert_eq!(out(&repo, &["status", "--porcelain"]), "");
 }
 
+// --- #219 (M2.18a): discard tracked-path changes / delete untracked paths --
+
+#[tokio::test]
+async fn discard_tracked_paths_executes_through_the_pipeline() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::DiscardTrackedPaths {
+            paths: vec![wpath("a.txt")],
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(out(&repo, &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn delete_untracked_paths_executes_through_the_pipeline() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("scratch.txt"), "junk\n").unwrap();
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::DeleteUntrackedPaths {
+            paths: vec![wpath("scratch.txt")],
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+    assert!(!repo.join("scratch.txt").exists());
+    assert_eq!(out(&repo, &["status", "--porcelain"]), "");
+}
+
+/// The race guard, in isolation: [`exec_delete_untracked_paths`] refuses a
+/// path that was previewed as untracked but has since been staged (a
+/// concurrent `git add` outside this app's own serialization — exactly the
+/// drift #219's race guard exists to catch), called directly rather than
+/// through the full pipeline so this pins the guard's own refusal logic
+/// deterministically, not merely as an emergent property of the generic
+/// whole-repository staleness gate (`enforce_fresh`) that also happens to
+/// cover the same drift.
+#[tokio::test]
+async fn exec_delete_untracked_paths_refuses_a_path_that_changed_since_it_was_previewed() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("scratch.txt"), "junk\n").unwrap();
+    run(&repo, &["add", "scratch.txt"]);
+    let (status, why) =
+        exec_delete_untracked_paths(&repo, NetworkNeed::Local, &[wpath("scratch.txt")]).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}");
+    assert!(why.contains("scratch.txt"), "{why}");
+    // Refused, not silently no-op'd: the file is exactly what `git add` left
+    // it as — staged, not deleted.
+    assert!(repo.join("scratch.txt").exists());
+    assert_eq!(
+        out(&repo, &["diff", "--cached", "--name-only"]),
+        "scratch.txt"
+    );
+}
+
+/// The discard-side twin of the test above: a path previewed as
+/// tracked-and-dirty that has since gone clean (reverted by something
+/// outside this app's serialization) is refused, not silently no-op'd.
+#[tokio::test]
+async fn exec_discard_tracked_paths_refuses_a_path_that_changed_since_it_was_previewed() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
+    // Reverted by something other than this operation before it runs.
+    run(&repo, &["checkout", "--", "a.txt"]);
+    let (status, why) =
+        exec_discard_tracked_paths(&repo, NetworkNeed::Local, &[wpath("a.txt")]).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}");
+    assert!(why.contains("a.txt"), "{why}");
+}
+
+/// The full-pipeline shape of the race (#219 acceptance): build a plan
+/// naming two untracked paths, then let ONE of them get staged before
+/// execution — the whole batch must refuse, and even the path that never
+/// drifted (`also.txt`) must be left untouched. That second assertion is
+/// what proves "refuse, don't partially apply" rather than merely "refuse
+/// eventually".
+#[tokio::test]
+async fn a_raced_delete_untracked_paths_is_refused_and_mutates_nothing() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("keep.txt"), "keep\n").unwrap();
+    std::fs::write(repo.join("also.txt"), "also\n").unwrap();
+    let op = GitOperation::DeleteUntrackedPaths {
+        paths: vec![wpath("keep.txt"), wpath("also.txt")],
+    };
+    let (plan, observed) = build_plan(&repo, op, tokens()).await;
+    // The race: `keep.txt` gets staged between build and execute.
+    run(&repo, &["add", "keep.txt"]);
+    let (status, why) = run_prebuilt(&repo, plan, observed).await;
+    assert_ne!(status, StatusCode::OK, "{why}");
+    assert!(repo.join("keep.txt").exists());
+    assert!(repo.join("also.txt").exists());
+}
+
+/// The symlink-containment guard, proven against a **real** symlink whose
+/// resolved target sits outside the worktree — not a mocked path string.
+/// `delete_untracked_paths` on an untracked path that is itself a symlink
+/// pointing outside the worktree must refuse, and the target must be left
+/// completely untouched.
+#[tokio::test]
+async fn delete_untracked_paths_refuses_a_real_symlink_escaping_the_worktree() {
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, "outside content\n").unwrap();
+
+    let (_dir, repo) = seeded_repo();
+    let link = repo.join("evil-link");
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    // Genuinely untracked, and genuinely a symlink escaping the worktree —
+    // both facts asserted before the guard is ever exercised.
+    assert_eq!(out(&repo, &["status", "--porcelain"]), "?? evil-link");
+    assert!(std::fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+
+    let (status, why) =
+        exec_delete_untracked_paths(&repo, NetworkNeed::Local, &[wpath("evil-link")]).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}");
+    assert!(why.contains("evil-link"), "{why}");
+    assert!(secret.exists(), "the outside target must be untouched");
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap(),
+        "outside content\n"
+    );
+    // The symlink dirent itself is untouched too — `git clean` never ran.
+    assert!(std::fs::symlink_metadata(&link).is_ok());
+}
+
+/// The discard-side twin: a tracked, uncommitted-edit path whose on-disk
+/// entry is a real symlink resolving outside the worktree must also be
+/// refused before `git checkout` ever runs.
+#[tokio::test]
+async fn discard_tracked_paths_refuses_a_real_symlink_escaping_the_worktree() {
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, "outside content\n").unwrap();
+
+    let (_dir, repo) = seeded_repo();
+    // Track a symlink pointing at a harmless in-repo target first...
+    let link = repo.join("link.txt");
+    std::os::unix::fs::symlink(repo.join("a.txt"), &link).unwrap();
+    run(&repo, &["add", "link.txt"]);
+    run(&repo, &["commit", "-q", "-m", "add symlink"]);
+    // ...then, without staging, repoint it outside the worktree: a real
+    // uncommitted edit (the symlink's own target changed) — exactly what
+    // DiscardTrackedPaths is being asked to discard.
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    assert_ne!(out(&repo, &["status", "--porcelain"]), "");
+
+    let (status, why) =
+        exec_discard_tracked_paths(&repo, NetworkNeed::Local, &[wpath("link.txt")]).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}");
+    assert!(secret.exists(), "the outside target must be untouched");
+    // The symlink must still point outside — `git checkout` never ran, so it
+    // was never reverted to its committed (safe) target either.
+    assert_eq!(std::fs::read_link(&link).unwrap(), secret);
+}
+
+/// Recovery-language honesty (#219 acceptance): `DeleteUntrackedPaths`'s
+/// response and journal text must never sound recoverable — a regression
+/// guard on the STRING CONTENT, not just the `RecoveryStrategy::Irrecoverable`
+/// tag, so a future edit that quietly softens the wording fails loudly here.
+#[tokio::test]
+async fn delete_untracked_paths_text_never_sounds_recoverable() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("scratch.txt"), "junk\n").unwrap();
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::DeleteUntrackedPaths {
+            paths: vec![wpath("scratch.txt")],
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+    let body_lower = body.to_lowercase();
+    for forbidden in ["undo", "restore", "recover"] {
+        assert!(
+            !body_lower.contains(forbidden),
+            "response text must not sound recoverable (found {forbidden:?}): {body}"
+        );
+    }
+    let journaled = crate::journal::read_all(&repo);
+    let entry = journaled
+        .last()
+        .expect("the delete must have journaled an event");
+    let summary_lower = entry.summary.to_lowercase();
+    for forbidden in ["undo", "restore", "recover"] {
+        assert!(
+            !summary_lower.contains(forbidden),
+            "journal text must not sound recoverable (found {forbidden:?}): {}",
+            entry.summary
+        );
+    }
+    // The exact honest wording is present, not merely "no forbidden words".
+    assert!(entry.summary.contains("permanently"), "{}", entry.summary);
+}
+
+/// The tracked-discard sibling never implies more recoverability than
+/// [`RecoveryStrategy::Irrecoverable`] actually offers: this text is allowed
+/// to say a qualified "recoverable", but only the narrow, true claim (staged
+/// content survives until `git gc`) — never a blanket "this can be undone".
+#[tokio::test]
+async fn discard_tracked_paths_text_states_the_qualified_recovery_story() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::DiscardTrackedPaths {
+            paths: vec![wpath("a.txt")],
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+    // The qualifier must be present — "staged" and "gc" — so the claim is
+    // never a blanket, unqualified "this can be undone".
+    assert!(body.contains("staged"), "{body}");
+    assert!(body.contains("gc"), "{body}");
+    let journaled = crate::journal::read_all(&repo);
+    let entry = journaled
+        .last()
+        .expect("the discard must have journaled an event");
+    assert!(entry.summary.contains("staged"), "{}", entry.summary);
+    assert!(entry.summary.contains("gc"), "{}", entry.summary);
+}
+
+/// Review finding (blocker): a bare `git checkout -- <path>` is a no-op for
+/// a path whose only difference is STAGED (index != HEAD, worktree ==
+/// index) — verified empirically against real git before this fix — so the
+/// pre-fix executor returned 200 and journaled "discarded" while the file
+/// was left exactly as the user staged it. This drives a staged-only edit
+/// (`git add` with no further worktree change) through the real executor and
+/// asserts the content actually reverts to HEAD.
+#[tokio::test]
+async fn discard_tracked_paths_actually_reverts_a_staged_only_change() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "staged edit\n").unwrap();
+    run(&repo, &["add", "a.txt"]);
+    assert_eq!(out(&repo, &["status", "--porcelain"]), "M  a.txt");
+
+    let (status, body) =
+        exec_discard_tracked_paths(&repo, NetworkNeed::Local, &[wpath("a.txt")]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        out(&repo, &["status", "--porcelain"]),
+        "",
+        "a staged-only change must actually revert, not silently survive"
+    );
+    let content = std::fs::read_to_string(repo.join("a.txt")).unwrap();
+    assert_eq!(content, "a\n", "content must be back to HEAD's version");
+}
+
+/// Same fix, the mixed case: a path both staged AND further edited
+/// unstaged on top must fully revert to HEAD, discarding both layers in one
+/// call — not just the unstaged layer bare `checkout --` would have reached.
+#[tokio::test]
+async fn discard_tracked_paths_reverts_both_staged_and_unstaged_layers() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "staged layer\n").unwrap();
+    run(&repo, &["add", "a.txt"]);
+    std::fs::write(repo.join("a.txt"), "unstaged layer on top\n").unwrap();
+    assert_eq!(out(&repo, &["status", "--porcelain"]), "MM a.txt");
+
+    let (status, body) =
+        exec_discard_tracked_paths(&repo, NetworkNeed::Local, &[wpath("a.txt")]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(out(&repo, &["status", "--porcelain"]), "");
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+}
+
+/// Review finding (blocker): a `WorktreePath` naming a wholly-untracked
+/// DIRECTORY passed every pre-fix guard and reached `git clean -f`, which
+/// recursively deleted every file nested under it while the response
+/// reported only the one requested entry. Both operations must refuse a
+/// directory-shaped target outright now.
+#[tokio::test]
+async fn delete_untracked_paths_refuses_a_directory_rather_than_recursing_silently() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::create_dir_all(repo.join("scratch_dir/nested")).unwrap();
+    std::fs::write(repo.join("scratch_dir/one.txt"), "one\n").unwrap();
+    std::fs::write(repo.join("scratch_dir/nested/two.txt"), "two\n").unwrap();
+    // Exactly what a real `git status --porcelain=v2 -z` reports for a
+    // wholly-untracked directory: one collapsed entry, trailing slash.
+    assert_eq!(out(&repo, &["status", "--porcelain"]), "?? scratch_dir/");
+
+    let (status, why) =
+        exec_delete_untracked_paths(&repo, NetworkNeed::Local, &[wpath("scratch_dir")]).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}");
+    assert!(
+        repo.join("scratch_dir/one.txt").exists(),
+        "nothing nested may be touched by a refusal"
+    );
+    assert!(repo.join("scratch_dir/nested/two.txt").exists());
+
+    // The exact porcelain spelling (trailing slash) must refuse identically
+    // — this is the should-fix half of the same finding (a spurious 409 for
+    // the unslashed form would have been the OTHER failure mode; directories
+    // are never valid either way now, so the spelling stops mattering).
+    let (status2, _) =
+        exec_delete_untracked_paths(&repo, NetworkNeed::Local, &[wpath("scratch_dir/")]).await;
+    assert_eq!(status2, StatusCode::CONFLICT);
+}
+
+/// The same directory refusal, `DiscardTrackedPaths` side — the guard is
+/// shared code (`symlink_containment_guard`), but the review finding named
+/// both operations explicitly, so both get their own regression proof.
+#[tokio::test]
+async fn discard_tracked_paths_refuses_a_directory_target() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "edited\n").unwrap();
+    let (status, why) =
+        exec_discard_tracked_paths(&repo, NetworkNeed::Local, &[wpath("src")]).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}");
+}
+
+/// The pure logic [`partial_delete_report`] exists for (review finding):
+/// `git clean`'s own stdout is the ground truth for what actually got
+/// removed, and a requested path missing from it must never be silently
+/// folded into a claimed full success. Tested directly against a hand-built
+/// stdout string — the real race that produces this exact mismatch can't be
+/// deterministically timed in a permanent test (the review that found this
+/// bug used an empirical microsecond-scale stagger to land inside the
+/// window), but the honesty property under test here doesn't depend on how
+/// the mismatch arose, only on whether it's reported truthfully.
+#[test]
+fn partial_delete_report_flags_any_requested_path_git_clean_silently_skipped() {
+    // The exact scenario the review demonstrated: 3 requested, one silently
+    // skipped (since-tracked), git still exits as if fully successful.
+    let stdout = "Removing x.txt\nRemoving z.txt\n";
+    let msg = partial_delete_report(&["x.txt", "y.txt", "z.txt"], stdout)
+        .expect("a missing requested path must never be silently folded into success");
+    assert!(msg.contains("x.txt"), "{msg}");
+    assert!(msg.contains("z.txt"), "{msg}");
+    assert!(msg.contains("y.txt"), "{msg}");
+    assert!(
+        !msg.to_lowercase().contains("undo")
+            && !msg.to_lowercase().contains("restore")
+            && !msg.to_lowercase().contains("recover"),
+        "a partial-failure message for an operation with no undo must not sound \
+         reversible either: {msg}"
+    );
+}
+
+#[test]
+fn partial_delete_report_is_silent_when_every_requested_path_was_removed() {
+    let stdout = "Removing a.txt\nRemoving b.txt\n";
+    assert_eq!(partial_delete_report(&["a.txt", "b.txt"], stdout), None);
+}
+
 // ---------------------------------------------------------------------------
 // Layer 2 — every write route funnels into this planner
 // ---------------------------------------------------------------------------
@@ -880,6 +1253,9 @@ fn every_git_write_route_reaches_the_planner() {
         ("/api/force-delete-branch", "force_delete_branch"),
         ("/api/rebase", "rebase"),
         ("/api/reset-test-repo", "reset_test_repo"),
+        // #219 (M2.18a): discard/delete of working-tree paths.
+        ("/api/discard-tracked-paths", "discard_tracked_paths"),
+        ("/api/delete-untracked-paths", "delete_untracked_paths"),
     ];
     assert_eq!(
         posts.len(),
@@ -960,6 +1336,8 @@ fn every_git_write_route_reaches_the_planner() {
         ("src/handlers/reset.rs", "reset_test_repo", None),
         ("src/activity.rs", "undo", None),
         ("src/handlers/staging.rs", "staging_apply", None),
+        ("src/handlers/discard.rs", "discard_tracked_paths", None),
+        ("src/handlers/discard.rs", "delete_untracked_paths", None),
     ];
     for (file, handler, helper) in funnel {
         let src = source(file);
