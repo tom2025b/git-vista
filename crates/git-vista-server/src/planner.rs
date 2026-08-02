@@ -1240,6 +1240,47 @@ async fn shape(
             Vec::new(),
             RecoveryStrategy::Irrecoverable,
         ),
+        // M2.19a (#222): contract only — see `GitOperation::AmendCommit`'s
+        // doc comment for the full reasoning behind every choice below.
+        // Deliberately *not* built from `head_moves` above: that helper
+        // derives its "before" oid from `observed`, but amend needs a real
+        // compare-and-swap against the operation's own `expected_tip`
+        // (mirroring `EmptyCommitOnBranch`/`ResetBranch`), since "the tip
+        // moved since this was reviewed" is exactly the danger a CAS
+        // precondition exists to catch.
+        GitOperation::AmendCommit { expected_tip, .. } => {
+            let mut preconditions = Vec::new();
+            if let Some(name) = head_name.clone() {
+                preconditions.push(Precondition::BranchCheckedOut { branch: name });
+            }
+            if let Some(r) = &head_ref {
+                preconditions.push(Precondition::RefAt {
+                    ref_name: r.clone(),
+                    oid: expected_tip.clone(),
+                });
+            }
+            let changes = match &head_ref {
+                Some(r) => vec![RefChange {
+                    ref_name: r.clone(),
+                    before: RefState::At(expected_tip.clone()),
+                    after: RefState::Computed,
+                }],
+                None => Vec::new(),
+            };
+            // `ResetRef`, deliberately not a new tag — see the variant's doc
+            // comment for why this is the honest choice, not the
+            // closest-looking tag picked by reflex.
+            let recovery = match &head_ref {
+                Some(r) => RecoveryStrategy::ResetRef {
+                    ref_name: r.clone(),
+                    to: expected_tip.clone(),
+                },
+                // Detached HEAD: no branch ref for `ResetRef` to name — the
+                // same degradation `head_moves` uses for the same case.
+                None => RecoveryStrategy::NotNeeded,
+            };
+            (RiskLevel::Destructive, preconditions, changes, recovery)
+        }
     }
 }
 
@@ -1350,6 +1391,22 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         GitOperation::DeleteUntrackedPaths { paths } => {
             exec_delete_untracked_paths(repo, need, &paths).await
         }
+        // M2.19a (#222) ships the typed contract only — see
+        // `GitOperation::AmendCommit`'s doc comment. `git commit --amend`
+        // execution is M2.19b's (#223) to add, deliberately, so a
+        // history-rewriting operation gets a review of its own rather than
+        // riding in on this vocabulary-only change. This arm exists only
+        // because `execute`'s match must stay exhaustive over the closed
+        // `GitOperation` vocabulary (#142): no handler builds an
+        // `AmendCommit` plan today, so in practice it is unreachable, but if
+        // it is ever reached it must refuse rather than silently no-op or
+        // run a placeholder git command against a real repository.
+        GitOperation::AmendCommit { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "Amending a commit is not yet wired for execution (tracked by #223) — \
+             this plan's contract exists, but nothing executed it."
+                .to_string(),
+        ),
     }
 }
 
@@ -2851,6 +2908,20 @@ mod tests {
         );
     }
 
+    /// `git rev-parse HEAD` in `repo`, trimmed — for tests that need a real
+    /// oid to build a compare-and-swap `GitOperation` against (#222).
+    async fn git_rev_parse_head(repo: &Path) -> String {
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "git rev-parse HEAD failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     /// A fresh repository on branch `main` with one committed file and a
     /// clean working tree.
     fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
@@ -3797,6 +3868,108 @@ mod tests {
         };
         let (plan, observed) = build_plan(&repo, op, tokens()).await;
         assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // M2.19a (#222): `GitOperation::AmendCommit`'s `shape` — contract only,
+    // no execution (see the variant's own doc comment and planner::execute's
+    // stub arm). These pin the plan-building side: risk, the CAS
+    // precondition, the expected ref change, and the recovery strategy.
+    // -----------------------------------------------------------------------
+
+    /// The happy-path shape: `Destructive` risk, a `BranchCheckedOut` +
+    /// `RefAt(expected_tip)` precondition pair on the checked-out branch, a
+    /// `Computed` ref change from `expected_tip`, and `ResetRef` recovery
+    /// back to `expected_tip` — exactly the design the variant's doc comment
+    /// argues for, pinned so a later edit that quietly reached for
+    /// `RecoverableIfStaged` or `Irrecoverable` instead fails here.
+    #[tokio::test]
+    async fn amend_commit_shape_is_destructive_with_cas_precondition_and_reset_recovery() {
+        let (_dir, repo) = seeded_repo();
+        let head = git_rev_parse_head(&repo).await;
+        let head_oid = CommitOid::new(head.clone()).unwrap();
+
+        let op = GitOperation::AmendCommit {
+            message: CommitMessage::new("fix: typo").unwrap(),
+            expected_tip: head_oid.clone(),
+            allow_empty: false,
+        };
+        let (plan, observed) = build_plan(&repo, op, tokens()).await;
+
+        assert_eq!(plan.risk, RiskLevel::Destructive);
+        assert_eq!(
+            plan.preconditions,
+            vec![
+                Precondition::BranchCheckedOut {
+                    branch: BranchName::new("main").unwrap(),
+                },
+                Precondition::RefAt {
+                    ref_name: RefName::new("refs/heads/main").unwrap(),
+                    oid: head_oid.clone(),
+                },
+            ]
+        );
+        assert_eq!(
+            plan.expected_ref_changes,
+            vec![RefChange {
+                ref_name: RefName::new("refs/heads/main").unwrap(),
+                before: RefState::At(head_oid.clone()),
+                after: RefState::Computed,
+            }]
+        );
+        assert_eq!(
+            plan.recovery,
+            RecoveryStrategy::ResetRef {
+                ref_name: RefName::new("refs/heads/main").unwrap(),
+                to: head_oid,
+            }
+        );
+        // Both preconditions genuinely hold against the freshly seeded repo —
+        // proves the shape isn't vacuously satisfied by an always-true check.
+        assert!(observed.held_at_build.iter().all(|&h| h));
+    }
+
+    /// `expected_tip` is a *live* check, not a value the plan merely carries:
+    /// build a plan whose `expected_tip` matches HEAD, then let another
+    /// commit land before execution. `refs/heads/main` moving trips
+    /// `enforce_fresh`'s generation check before its per-precondition loop
+    /// ever runs — the same layering every other tip-moved race in this
+    /// codebase goes through (`a_generation_move_refuses_execution`;
+    /// `EmptyCommitOnBranch` and `ResetBranch`'s own `RefAt` preconditions
+    /// are shadowed by it too, for the identical reason: any ref move is by
+    /// construction also a generation move). The named `RefAt` precondition
+    /// still earns its place — it is what the reviewer/UI sees named and
+    /// individually reviewable in `Plan::preconditions`, and it is the
+    /// backstop `verify_precondition` would use should a future generation
+    /// algorithm ever narrow which refs it digests. What matters here, and
+    /// what this test actually proves, is the end-to-end guarantee: a plan
+    /// built against one tip is refused, not silently honoured, once that
+    /// tip has moved.
+    #[tokio::test]
+    async fn amend_commit_refuses_when_the_tip_moved_after_the_plan_was_built() {
+        let (_dir, repo) = seeded_repo();
+        let head = git_rev_parse_head(&repo).await;
+
+        let op = GitOperation::AmendCommit {
+            message: CommitMessage::new("fix: typo").unwrap(),
+            expected_tip: CommitOid::new(head).unwrap(),
+            allow_empty: false,
+        };
+        let (plan, observed) = build_plan(&repo, op, tokens()).await;
+        assert!(
+            observed.held_at_build.iter().all(|&h| h),
+            "both preconditions should hold at build time"
+        );
+        assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+
+        // The race: another commit lands on main before this plan executes.
+        std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+        run(&repo, &["add", "a.txt"]);
+        run(&repo, &["commit", "-q", "-m", "raced ahead"]);
+
+        let (status, why) = enforce_fresh(&repo, &plan, &observed).await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(why.contains("repository changed"), "{why}");
     }
 
     // -----------------------------------------------------------------------
