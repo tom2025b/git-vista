@@ -1056,6 +1056,61 @@ mod tests {
         }
     }
 
+    /// Every reachable `blocked_reason`, pinned to its exact wording and to
+    /// the action it belongs to.
+    ///
+    /// `an_empty_selection_can_never_be_confirmed` above only asks whether a
+    /// reason is *present*, which a swap between the two arms' strings
+    /// satisfies just as well as the correct assignment does — verified by
+    /// mutation: giving `DiscardTracked` the delete arm's "No untracked files
+    /// to delete." left all 37 tests in this module green while the user was
+    /// being told the wrong thing about the wrong operation. That is exactly
+    /// the copy-paste this file's two near-identical arms invite, and this is
+    /// the test that refuses it.
+    ///
+    /// The exact-string pins catch the swap; the vocabulary assertions below
+    /// them survive a rewording, so a future edit that legitimately rephrases
+    /// both lines still cannot cross them over.
+    #[test]
+    fn each_blocked_reason_names_its_own_action() {
+        // Nothing selected — the same reason whether or not the arm is set,
+        // because there is nothing to arm.
+        for armed in [false, true] {
+            assert_eq!(
+                worktree_confirm(WorktreeAction::DiscardTracked, &[], armed).blocked_reason,
+                Some("No tracked changes to discard."),
+                "armed={armed}"
+            );
+            assert_eq!(
+                worktree_confirm(WorktreeAction::DeleteUntracked, &[], armed).blocked_reason,
+                Some("No untracked files to delete."),
+                "armed={armed}"
+            );
+        }
+        // Files selected, step 1 not yet taken — the delete's own state, and
+        // one the discard arm can never be in.
+        assert_eq!(
+            worktree_confirm(WorktreeAction::DeleteUntracked, &paths(2), false).blocked_reason,
+            Some("Complete step 1 first — this delete is permanent.")
+        );
+
+        // Rewording-proof half: each reason speaks its own arm's verb and
+        // never the other's. Note the nouns cannot be used for this —
+        // "tracked" is a substring of "untracked", so a `contains("tracked")`
+        // check would hold for both and prove nothing.
+        let discard_empty = worktree_confirm(WorktreeAction::DiscardTracked, &[], false)
+            .blocked_reason
+            .expect("an empty discard is blocked");
+        let delete_empty = worktree_confirm(WorktreeAction::DeleteUntracked, &[], false)
+            .blocked_reason
+            .expect("an empty delete is blocked");
+        assert_ne!(discard_empty, delete_empty);
+        assert!(discard_empty.contains("discard"), "{discard_empty}");
+        assert!(!discard_empty.contains("delete"), "{discard_empty}");
+        assert!(delete_empty.contains("delete"), "{delete_empty}");
+        assert!(!delete_empty.contains("discard"), "{delete_empty}");
+    }
+
     /// #65's 44x44 floor, on the one declaration the new controls use. These
     /// buttons are inline-styled, so `features::a11y::audit`'s stylesheet
     /// census cannot see them — this is the check that can.

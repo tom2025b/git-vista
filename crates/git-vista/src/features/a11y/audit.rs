@@ -24,6 +24,7 @@ const STYLES: &str = include_str!("../../../styles.css");
 const APP_MOD: &str = include_str!("../../app/mod.rs");
 const RENDER_NODES: &str = include_str!("../../render/nodes.rs");
 const RENDER_STUBS: &str = include_str!("../../render/stubs.rs");
+const MENU: &str = include_str!("../../menu.rs");
 
 fn stylesheet() -> Vec<Rule> {
     parse(STYLES)
@@ -668,4 +669,134 @@ fn opening_tag_stops_at_the_first_angle_bracket() {
     );
     assert_eq!(opening_tag("nothing here", "<section"), None);
     assert_eq!(opening_tag("<section unterminated", "<section"), None);
+}
+
+// ── Disabled controls that still have to explain themselves ─────────────────────
+//
+// #65's finding was that a disabled item's reason lived only in `title`, which a
+// finger never surfaces. The fix put the reason on screen *and* into the item's
+// accessible name (`graph::core::disabled_menu_item_copy`). Both halves of that fix
+// are load-bearing, and both are quietly undone by rendering the item as a `<span>`:
+// a `<span>` has no role that supports `aria-label`/`aria-disabled`, so those two
+// attributes are discarded, and it is not focusable, so `Tab` walks past the one
+// item in the menu that most needs explaining. `menu.rs`'s module docs write the
+// full reasoning; this is what holds it.
+
+const DISABLED_CTX_ITEM: &str = "class=\"ctx-item disabled\"";
+
+/// The opening tag (element name plus attributes, without the angle brackets) of
+/// every element in `src` carrying `class="ctx-item disabled"`.
+///
+/// These `view!` blocks put the class on its own line, so the element name is found
+/// by walking back to the nearest `<`.
+fn disabled_ctx_item_tags(src: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(DISABLED_CTX_ITEM) {
+        let at = from + rel;
+        from = at + DISABLED_CTX_ITEM.len();
+        let Some(open) = src[..at].rfind('<') else {
+            continue;
+        };
+        let Some(close_rel) = src[open..].find('>') else {
+            continue;
+        };
+        out.push(&src[open + 1..open + close_rel]);
+    }
+    out
+}
+
+/// The element name a tag from [`disabled_ctx_item_tags`] declares.
+fn element_of(tag: &str) -> &str {
+    tag.split_whitespace().next().unwrap_or("")
+}
+
+/// Every greyed-out context-menu item is a focusable `<button>` carrying
+/// `aria-disabled`, never a `<span>` and never a natively-`disabled` button.
+///
+/// The two ways to fail this are opposites of each other and both silently drop the
+/// reason: a `<span>` is skipped by `Tab` and ignores the ARIA attributes outright,
+/// and a `<button prop:disabled=true>` is removed from the tab order by the browser.
+/// The shipped shape is the third one — a `<button>` with `aria-disabled="true"`, no
+/// `prop:disabled`, and no `on:click`, so it is inert by construction while staying
+/// reachable. `dialogs/confirm.rs` argues the same case for its confirm button.
+#[test]
+fn every_disabled_context_menu_item_is_focusable() {
+    let tags = disabled_ctx_item_tags(MENU);
+
+    // Anti-vacuity floor. "Every tag is a button" is trivially true of an empty
+    // list, so if this census ever stopped finding the items — file moved, markup
+    // reshaped, class renamed — the assertions below would go green while checking
+    // nothing. Seven is what menu.rs has today (GitHub link, two commit items,
+    // Stage Changes, Discard Changes, Delete Untracked Files, the offline notice).
+    assert!(
+        tags.len() >= 7,
+        "only {} `.ctx-item.disabled` item(s) found in menu.rs — this census has \
+         lost its subject and every assertion below it is now vacuous. If items \
+         were genuinely removed, lower this floor deliberately rather than \
+         letting the tripwire expire on its own.",
+        tags.len()
+    );
+
+    for tag in &tags {
+        assert_eq!(
+            element_of(tag),
+            "button",
+            "a disabled context-menu item is rendered as `<{}>`. Only a `<button>` \
+             is focusable and only a `<button>` honours the `aria-label` / \
+             `aria-disabled` that `disabled_menu_item_copy` builds — on a `<span>` \
+             the reason reaches nobody who cannot see it. Tag: {tag}",
+            element_of(tag)
+        );
+        assert!(
+            !tag.contains("prop:disabled"),
+            "a disabled context-menu item sets `prop:disabled`, which takes it out \
+             of the tab order and makes its own reason unreachable by the user it \
+             was written for. `aria-disabled` plus no `on:click` is the shape that \
+             stays reachable. Tag: {tag}"
+        );
+        assert!(
+            tag.contains("aria-disabled=\"true\""),
+            "a disabled context-menu item does not announce itself as unavailable \
+             — it reads as an ordinary, actionable button. Tag: {tag}"
+        );
+    }
+}
+
+/// The census helper is proved on both shapes it has to tell apart, so the tripwire
+/// above is known capable of failing rather than assumed to be.
+#[test]
+fn the_disabled_item_census_can_tell_a_span_from_a_button() {
+    // The shape menu.rs shipped before this tripwire existed — this is the paired
+    // negative, and it is what proves the assertion is not decorative.
+    let old = "view! {\n    <span\n        class=\"ctx-item disabled\"\n        \
+               aria-disabled=\"true\"\n    >\n";
+    let old_tags = disabled_ctx_item_tags(old);
+    assert_eq!(old_tags.len(), 1);
+    assert_eq!(element_of(old_tags[0]), "span");
+
+    let new = "view! {\n    <button\n        class=\"ctx-item disabled\"\n        \
+               aria-disabled=\"true\"\n    >\n";
+    let new_tags = disabled_ctx_item_tags(new);
+    assert_eq!(new_tags.len(), 1);
+    assert_eq!(element_of(new_tags[0]), "button");
+    assert!(new_tags[0].contains("aria-disabled=\"true\""));
+
+    // The other refusable shape, and the empty case.
+    let native = "<button class=\"ctx-item disabled\" prop:disabled=true>";
+    assert!(disabled_ctx_item_tags(native)[0].contains("prop:disabled"));
+    assert!(disabled_ctx_item_tags("no menu items here").is_empty());
+}
+
+/// The stylesheet already dresses the focused-but-disabled item, so making these
+/// focusable needs no CSS change — but that only holds while the rule is there.
+#[test]
+fn a_focused_disabled_context_menu_item_has_a_declared_appearance() {
+    let rules = stylesheet();
+    assert!(
+        !rules_for_selector(&rules, ".ctx-item.disabled:focus-visible").is_empty(),
+        "`.ctx-item.disabled:focus-visible` has gone from styles.css. These items \
+         are deliberately focusable (see menu.rs's module docs), so a keyboard user \
+         will land on one and the stylesheet has to say what that looks like."
+    );
 }
