@@ -235,8 +235,8 @@ fn the_production_policy_is_never_unsandboxed_today() {
 // returned Strict unconditionally would also pass it.
 
 use git_vista_protocol::{
-    BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, RefName, RemoteName,
-    StageDirection, WorktreePath,
+    BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
+    MergeStrategy, RefName, RemoteName, StageDirection, WorktreePath,
 };
 
 fn branch(s: &str) -> BranchName {
@@ -254,20 +254,35 @@ fn wpath(s: &str) -> WorktreePath {
 /// `GitOperation` variant is named here with **no wildcard arm**, so adding a
 /// variant fails this match at compile time until an arm exists for it.
 ///
-/// This is the guard that is actually load-bearing, not the count assertion in
-/// `exactly_one_operation_declares_a_network_need` below — a hand-maintained
-/// `Vec` and a hand-maintained integer can agree with each other while both
-/// silently omit a real variant, which is exactly what happened here between
-/// M2.17b (#213), M2.18a (#219) and M2.19a (#222): `every_operation()` below
-/// went four variants (`StageSelection`, `DiscardTrackedPaths`,
-/// `DeleteUntrackedPaths`, `AmendCommit`) stale against the enum while its
-/// count literal quietly stayed self-consistent at the old number, so the
-/// exhaustiveness test never noticed a real variant's classification (this
-/// one shipped `AmendCommit => NetworkNeed::Local` with zero coverage). The
-/// match below can't drift the same way: every arm here is required to
-/// compile at all, so it forces a reviewer's eyes onto this file the moment a
-/// variant is added — which is also why `every_operation_declares_every_variant`
-/// checks its output against `every_operation()`, not the other way around.
+/// # What this match does *not* prove
+///
+/// Being honest about the limit, because an earlier version of this comment
+/// was not: forcing an arm here is **presence enforcement only**. It makes a
+/// contributor write *some* name for a new variant; it cannot make them add
+/// that variant to [`every_operation`]'s hand-written `Vec`, and it cannot
+/// make them add the name to the hand-written `expected` set in
+/// [`every_operation_declares_every_variant`]. Those two are ordinary data,
+/// not compile-checked. A contributor who adds a variant, writes its arm
+/// here, and forgets both of those leaves all three sources *mutually
+/// self-consistent and all three wrong* — the census silently shrinks and
+/// every test in this file stays green while the new variant's
+/// `NetworkNeed` has zero coverage.
+///
+/// That is exactly what happened between M2.17b (#213), M2.18a (#219) and
+/// M2.19a (#222), when `every_operation()` went four variants
+/// (`StageSelection`, `DiscardTrackedPaths`, `DeleteUntrackedPaths`,
+/// `AmendCommit`) stale against the enum while its count literal quietly
+/// stayed self-consistent at the old number, and `AmendCommit` shipped with a
+/// zero-coverage classification.
+///
+/// The guard that actually closes that hole is
+/// [`every_operation_covers_every_variant_the_enum_declares`], which compares
+/// the census against the variant list **serde's derive macro generates from
+/// the enum definition itself** — the one source in this file that no human
+/// maintains and that therefore cannot drift stale in step with the others.
+/// This match remains worth keeping for what it *does* do: it gives typed,
+/// rename-safe provenance for the names the set assertions compare, so a
+/// variant renamed in `plan.rs` cannot quietly keep matching a stale string.
 fn variant_name(op: &GitOperation) -> &'static str {
     match op {
         GitOperation::CreateBranch { .. } => "CreateBranch",
@@ -289,14 +304,72 @@ fn variant_name(op: &GitOperation) -> &'static str {
         GitOperation::DiscardTrackedPaths { .. } => "DiscardTrackedPaths",
         GitOperation::DeleteUntrackedPaths { .. } => "DeleteUntrackedPaths",
         GitOperation::AmendCommit { .. } => "AmendCommit",
+        GitOperation::FetchRemote { .. } => "FetchRemote",
+        GitOperation::PullBranch { .. } => "PullBranch",
     }
 }
 
+/// The wire name serde's `Serialize` derive gives `op` — read off the real
+/// serialization rather than recomputed here, so it is the enum's own
+/// `#[serde(tag = "op", rename_all = "snake_case")]` contract talking and not
+/// a second hand-written mapping that could disagree with it.
+fn wire_name(op: &GitOperation) -> String {
+    let json = serde_json::to_value(op).expect("GitOperation serializes");
+    json.get("op")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("serialized GitOperation has no `op` tag: {json}"))
+        .to_string()
+}
+
+/// **Every variant the `GitOperation` enum actually declares**, harvested from
+/// serde's own derive output instead of maintained by hand.
+///
+/// Deserializing an `op` tag that matches nothing makes serde report
+/// `unknown variant `…`, expected one of `create_branch`, `commit_on_head`, …`
+/// — and that list is generated by the derive macro *from the enum
+/// definition*, so it grows the moment a variant is added and there is no
+/// edit anyone can forget. This is the only variant census in this file that
+/// is not hand-written, which is precisely why the completeness guard below
+/// is built on it: the failure mode being defended against is a human
+/// updating some of the hand-written sources and not the others.
+///
+/// If serde ever changes this message's shape the parse yields a set that
+/// cannot equal the sampled one, so the guard fails loudly rather than
+/// quietly harvesting nothing and passing — the vacuous-green direction is
+/// closed by construction, and
+/// [`the_serde_variant_census_is_actually_harvesting_names`] pins it directly.
+fn variant_names_the_enum_declares() -> std::collections::BTreeSet<String> {
+    let err = serde_json::from_str::<GitOperation>(r#"{"op":"__no_such_variant__"}"#)
+        .expect_err("a nonexistent op tag must not deserialize");
+    let message = err.to_string();
+    let list = message
+        .split_once("expected one of ")
+        .unwrap_or_else(|| {
+            panic!("serde's unknown-variant message no longer has the expected shape: {message}")
+        })
+        .1;
+    list.split(", ")
+        .map(|token| {
+            token
+                .trim()
+                .trim_end_matches(|c: char| !c.is_ascii_graphic())
+        })
+        .filter_map(|token| token.strip_prefix('`'))
+        .filter_map(|token| token.split('`').next())
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// One value of every `GitOperation` variant, so the classifier test below is
-/// exhaustive in fact and not only in intent. Kept in sync with
-/// [`variant_name`] by `every_operation_declares_every_variant` below, which
-/// fails if this list ever again omits (or duplicates) a variant `variant_name`
-/// knows about.
+/// exhaustive in fact and not only in intent.
+///
+/// This `Vec` is hand-written and therefore *can* be forgotten — see
+/// [`variant_name`]'s doc for why the compile-enforced match does not prevent
+/// that. What prevents it is
+/// [`every_operation_covers_every_variant_the_enum_declares`], which checks
+/// this list against [`variant_names_the_enum_declares`]; adding a variant to
+/// `plan.rs` and not to this `Vec` fails that test.
 fn every_operation() -> Vec<GitOperation> {
     let tip = "1111111111111111111111111111111111111111";
     vec![
@@ -324,6 +397,8 @@ fn every_operation() -> Vec<GitOperation> {
         GitOperation::PushBranch {
             branch: branch("feature"),
             remote: RemoteName::new("origin").expect("valid remote"),
+            set_upstream: false,
+            force: ForcePublish::None,
         },
         GitOperation::DeleteBranch {
             branch: branch("feature"),
@@ -363,7 +438,32 @@ fn every_operation() -> Vec<GitOperation> {
             expected_tip: oid(tip),
             allow_empty: false,
         },
+        GitOperation::FetchRemote {
+            remote: RemoteName::new("origin").expect("valid remote"),
+        },
+        GitOperation::PullBranch {
+            remote: RemoteName::new("origin").expect("valid remote"),
+            branch: branch("main"),
+            strategy: MergeStrategy::Merge,
+        },
     ]
+}
+
+/// A lease-force push, for the tests below that must see *both* `ForcePublish`
+/// modes. Kept out of [`every_operation`] on purpose: that list is
+/// one-value-per-variant (its own guard asserts no variant appears twice), and
+/// `PushBranch`'s two force modes are one variant. Their classification is
+/// checked separately by
+/// [`a_lease_force_push_declares_remote_like_every_other_push`].
+fn lease_force_push() -> GitOperation {
+    GitOperation::PushBranch {
+        branch: branch("feature"),
+        remote: RemoteName::new("origin").expect("valid remote"),
+        set_upstream: true,
+        force: ForcePublish::WithLease {
+            expected_remote_tip: oid("2222222222222222222222222222222222222222"),
+        },
+    }
 }
 
 /// Proves [`every_operation`] is actually exhaustive, rather than trusting a
@@ -371,7 +471,7 @@ fn every_operation() -> Vec<GitOperation> {
 /// let `AmendCommit` ship with a zero-coverage `NetworkNeed` classification in
 /// M2.19a, #222): every value `every_operation()` returns is tagged through
 /// [`variant_name`]'s compile-enforced match, and the resulting name set must
-/// be the full 19 with none missing and none doubled.
+/// be the full 21 with none missing and none doubled.
 #[test]
 fn every_operation_declares_every_variant() {
     let names: std::collections::BTreeSet<&str> =
@@ -401,6 +501,8 @@ fn every_operation_declares_every_variant() {
         "DiscardTrackedPaths",
         "DeleteUntrackedPaths",
         "AmendCommit",
+        "FetchRemote",
+        "PullBranch",
     ]
     .into_iter()
     .collect();
@@ -412,52 +514,249 @@ fn every_operation_declares_every_variant() {
     );
 }
 
-/// Exactly one operation in the enum reaches a remote, and it is `PushBranch`.
+/// Which variants the enum declares that `samples` never produced a value of.
 ///
-/// The negative half is what matters: eighteen operations must be `Local`, so
-/// a future edit that classified, say, `MergeBranch` as `Remote` to "be safe"
-/// would be caught here. Widening is not safe — it moves an operation from the
-/// no-network Strict tier into a tier with outbound TCP on four ports.
+/// Factored out of the guard below so the guard's ability to fail can itself
+/// be tested — see
+/// [`the_completeness_guard_catches_a_variant_dropped_from_the_census`].
+fn variants_missing_from(samples: &[GitOperation]) -> std::collections::BTreeSet<String> {
+    let sampled: std::collections::BTreeSet<String> = samples.iter().map(wire_name).collect();
+    variant_names_the_enum_declares()
+        .difference(&sampled)
+        .cloned()
+        .collect()
+}
+
+/// **The guard that actually closes the M2.19a (#222) drift hole.**
+///
+/// Every other census in this file is hand-written — [`every_operation`]'s
+/// `Vec`, the `expected` name set above, the count literals below — so all of
+/// them can be left stale *together*, staying mutually consistent while the
+/// enum has moved on. That is not hypothetical: it is the recorded history of
+/// #213/#219/#222, and it is reproducible today by deleting a variant from all
+/// three at once, which leaves this file's other tests green even with that
+/// variant's `NetworkNeed` classification wrong.
+///
+/// This test compares the census against [`variant_names_the_enum_declares`],
+/// which serde's derive macro generates from the enum definition. Nobody
+/// maintains that list, so it cannot be forgotten in step with the others: add
+/// a variant to `plan.rs` and this test fails until [`every_operation`] carries
+/// a value of it, which in turn is what forces the `NetworkNeed`
+/// classification below to be exercised at all.
 #[test]
-fn exactly_one_operation_declares_a_network_need() {
+fn every_operation_covers_every_variant_the_enum_declares() {
+    let missing = variants_missing_from(&every_operation());
+    assert!(
+        missing.is_empty(),
+        "every_operation() is stale against the GitOperation enum — it has no \
+         value for {missing:?}, so those variants' NetworkNeed classification \
+         has zero coverage in this file. Add a sample for each to \
+         every_operation() (and its name to variant_name()/the expected set)."
+    );
+}
+
+/// The paired negative for the guard above: drop one variant from the census —
+/// exactly the shape of the #222 regression, where `AmendCommit` was absent
+/// from `every_operation()` — and the mechanism must name it.
+///
+/// Without this, `every_operation_covers_every_variant_the_enum_declares`
+/// would be a green assertion with nothing proving it can ever go red (for
+/// instance if [`variant_names_the_enum_declares`] silently harvested an empty
+/// set, its `difference` would be empty and the guard would pass forever).
+#[test]
+fn the_completeness_guard_catches_a_variant_dropped_from_the_census() {
+    let truncated: Vec<GitOperation> = every_operation()
+        .into_iter()
+        .filter(|op| !matches!(op, GitOperation::AmendCommit { .. }))
+        .collect();
+    assert_eq!(
+        truncated.len(),
+        every_operation().len() - 1,
+        "the negative control must actually remove AmendCommit"
+    );
+    let missing = variants_missing_from(&truncated);
+    assert_eq!(
+        missing,
+        ["amend_commit".to_string()].into_iter().collect(),
+        "dropping AmendCommit from the census must be reported as missing; \
+         if this is empty the completeness guard cannot fail and is vacuous"
+    );
+}
+
+/// [`variant_names_the_enum_declares`] must be harvesting real names, not
+/// returning an empty or truncated set that would make the guard vacuous in a
+/// way the negative control above cannot see.
+///
+/// Pinned against [`variant_name`]'s independent, compile-enforced match:
+/// every name that match knows, snake_cased by serde, must appear in the
+/// harvested set and the two must be the same size. Two independently-derived
+/// lists agreeing is the point — this is not asserting the mapping by calling
+/// the function that defines it.
+#[test]
+fn the_serde_variant_census_is_actually_harvesting_names() {
+    let harvested = variant_names_the_enum_declares();
+    assert!(
+        harvested.len() >= 21,
+        "serde's variant census came back implausibly short ({}): the \
+         unknown-variant message parse has probably broken — {harvested:?}",
+        harvested.len()
+    );
+    for op in every_operation() {
+        assert!(
+            harvested.contains(&wire_name(&op)),
+            "serde reports variant names that do not include {:?}'s wire name \
+             {:?} — the harvest is not parsing what it claims to",
+            variant_name(&op),
+            wire_name(&op)
+        );
+    }
+    assert_eq!(
+        harvested.len(),
+        every_operation().len(),
+        "the enum declares variants the census has no sample for, or vice \
+         versa; declared: {harvested:?}"
+    );
+}
+
+/// Exactly three operations in the enum reach a remote, and they are
+/// `PushBranch`, `FetchRemote` and `PullBranch` (M2.20a, #227 — it was one,
+/// `PushBranch`, until fetch and pull joined it).
+///
+/// The **negative half is what matters**: the other eighteen must be `Local`,
+/// so a future edit that classified, say, `MergeBranch` as `Remote` to "be
+/// safe" is caught here. Widening is not safe — it moves an operation from
+/// the no-network Strict tier into a tier with outbound TCP on four ports.
+///
+/// Asserting the whole *set* (rather than a count plus a spot-check on one
+/// name) is deliberate: a count alone would let a swap through — reclassify
+/// `FetchRemote` down to `Local` and `MergeBranch` up to `Remote` and the
+/// total is still three. The names come from [`variant_name`]'s
+/// compile-enforced match rather than from `format!("{op:?}")`, so the
+/// comparison is over typed provenance and a variant renamed in `plan.rs`
+/// cannot quietly keep matching a stale `Debug` prefix.
+#[test]
+fn exactly_the_three_remote_operations_declare_a_network_need() {
     let ops = every_operation();
     assert_eq!(
         ops.len(),
-        19,
-        "every_operation() must list every GitOperation variant; the enum has 19 \
-         (see every_operation_declares_every_variant for the check that actually \
-         enforces this)"
+        21,
+        "every_operation() must list every GitOperation variant; the enum has 21 \
+         (this literal is a tripwire, not the enforcement — \
+         every_operation_covers_every_variant_the_enum_declares is what checks \
+         the census against the enum itself and cannot be left stale with it)"
     );
-    let mut remote = Vec::new();
+    let mut remote = std::collections::BTreeSet::new();
+    let mut local = std::collections::BTreeSet::new();
     for op in &ops {
         match network_need_for_operation(op) {
-            NetworkNeed::Remote => remote.push(format!("{op:?}")),
-            NetworkNeed::Local => {}
-        }
+            NetworkNeed::Remote => remote.insert(variant_name(op)),
+            NetworkNeed::Local => local.insert(variant_name(op)),
+        };
     }
+    let expected: std::collections::BTreeSet<&str> = ["PushBranch", "FetchRemote", "PullBranch"]
+        .into_iter()
+        .collect();
     assert_eq!(
-        remote.len(),
-        1,
-        "exactly one operation may declare Remote; declared: {remote:?}"
+        remote, expected,
+        "the set of network-reaching operations changed; declared Remote: {remote:?}"
     );
-    assert!(
-        remote[0].starts_with("PushBranch"),
-        "the one Remote operation must be PushBranch, not {}",
-        remote[0]
+    assert_eq!(
+        local.len(),
+        18,
+        "the other eighteen operations must stay Local; declared Local: {local:?}"
+    );
+}
+
+/// A `PushBranch` carrying [`ForcePublish::WithLease`] is still `Remote` —
+/// the force mode changes the plan's [`RiskLevel`], never the tier.
+///
+/// This exists because `every_operation()` can only hold one value per
+/// variant, so the lease-force shape would otherwise have **zero** coverage
+/// in this file — precisely the gap that let `AmendCommit` ship unclassified
+/// (see [`variant_name`]'s doc). The paired assertion below is the one with
+/// teeth: it pins that the two force modes agree, so a future edit that made
+/// the classification depend on `force` at all fails here.
+#[test]
+fn a_lease_force_push_declares_remote_like_every_other_push() {
+    let plain = GitOperation::PushBranch {
+        branch: branch("feature"),
+        remote: RemoteName::new("origin").expect("valid remote"),
+        set_upstream: false,
+        force: ForcePublish::None,
+    };
+    assert_eq!(
+        network_need_for_operation(&lease_force_push()),
+        NetworkNeed::Remote,
+        "a force-with-lease push reaches a remote like any other push"
+    );
+    assert_eq!(
+        network_need_for_operation(&lease_force_push()),
+        network_need_for_operation(&plain),
+        "the tier must not depend on the force mode — risk and reach are \
+         independent axes (see RiskLevel::Destructive's doc in plan.rs)"
+    );
+}
+
+/// Both `MergeStrategy` values classify identically: the integration happens
+/// after the objects arrive, so it cannot change whether a socket opens.
+///
+/// The negative this guards: a reader who thinks "rebase is the local half"
+/// and splits the arm would silently route a pull's fetch through the Strict
+/// tier, breaking it at runtime with `EACCES` on `connect()`.
+#[test]
+fn both_pull_strategies_declare_the_same_network_need() {
+    let remote = RemoteName::new("origin").expect("valid remote");
+    let needs: Vec<NetworkNeed> = [MergeStrategy::Merge, MergeStrategy::Rebase]
+        .into_iter()
+        .map(|strategy| {
+            network_need_for_operation(&GitOperation::PullBranch {
+                remote: remote.clone(),
+                branch: branch("main"),
+                strategy,
+            })
+        })
+        .collect();
+    assert_eq!(
+        needs,
+        vec![NetworkNeed::Remote, NetworkNeed::Remote],
+        "both pull strategies must declare Remote; got {needs:?}"
     );
 }
 
 /// The declaration is what picks the tier, and the *stated* argv of each
-/// operation must agree with it — this is the cross-check's own premise, tested
-/// on the real argv the planner builds for the one remote operation.
+/// remote operation must agree with it — this is the cross-check's own
+/// premise, tested on the argvs the planner builds (push, live today) or will
+/// build (fetch/pull, #229/#230).
+///
+/// Why the future argvs are worth pinning now: the D3 cross-check
+/// `debug_assert`s on a `Local` declaration meeting a `Remote`-looking argv.
+/// The reverse — `Remote` declared, argv unrecognised — is tolerated
+/// silently, which means a `fetch`/`pull` argv missing from
+/// `REMOTE_SUBCOMMANDS` would produce *no* signal at all when #229/#230 land.
+/// Checking it here is the only place that failure mode is visible before it
+/// matters.
 #[test]
-fn the_push_declaration_and_the_push_argv_agree() {
-    assert_eq!(
-        network_need(&["push", "origin", "feature"]),
-        NetworkNeed::Remote,
-        "the argv classifier must agree with the PushBranch declaration, or \
-         every push would trip the D3 cross-check"
-    );
+fn the_remote_declarations_and_their_argvs_agree() {
+    for args in [
+        vec!["push", "origin", "feature"],
+        vec!["push", "--set-upstream", "origin", "feature"],
+        vec![
+            "push",
+            "--force-with-lease=feature:abc",
+            "origin",
+            "feature",
+        ],
+        vec!["fetch", "origin"],
+        vec!["pull", "--no-rebase", "origin", "main"],
+        vec!["pull", "--rebase", "origin", "main"],
+    ] {
+        assert_eq!(
+            network_need(&args),
+            NetworkNeed::Remote,
+            "the argv classifier must agree with the declaration for {args:?}, \
+             or the D3 cross-check would be tripped (push) or silent (fetch/pull)"
+        );
+    }
 }
 
 // --- the cross-check (D3) --------------------------------------------------

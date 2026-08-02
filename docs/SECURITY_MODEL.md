@@ -549,8 +549,29 @@ requested path, before and after the spawn) rather than a parse of `git clean`'s
 is gettext-translated and misreports under a non-C locale. A mismatch is a 409, never a
 claimed success.)*
 
+*(Lease/CAS half typed, not yet executable: ADR 0039, #227 — `GitOperation::PushBranch`'s
+`force: ForcePublish` makes the lease structural: `ForcePublish` has exactly two variants,
+`None` and `WithLease { expected_remote_tip }`, and no third, unguarded "force" variant
+exists anywhere in the type — a bare `--force` push cannot be constructed in Rust or
+deserialized off the wire. `planner::shape` turns a `WithLease` into a live
+`Precondition::RefAt` compare-and-swap on the remote-tracking ref
+(`refs/remotes/<remote>/<branch>`), bound into the plan's `operation_hash` at build time, and
+raises the plan's risk from `Remote` to `Destructive`. This is the typed **contract** only:
+`planner::execute` refuses every `PushBranch` combination except the pre-existing plain
+fast-forward push with `501`, so a lease-force push cannot yet run. "Strong warning" and
+"re-auth option" remain open scope, along with execution itself, for #231.)*
+
 No gesture, pressure threshold, swipe, or double-tap directly executes a destructive
 operation. Touch gestures may select or open a plan; final confirmation is explicit.
+
+*Worktree-destructive reporting is partly implemented (2026-08-02, ADR 0037, #284 —
+`planner::{observe_deletion, DeleteOutcome}`). `DeleteUntrackedPaths` has no safety
+checkpoint and can have none: an untracked path was never written to the object
+database, so there is nothing to check point to. The control that stands in for one is
+that the operation may never misreport itself — no decision branches on git's
+gettext-translated prose, the report is a filesystem observation, and the count states
+what this operation destroyed rather than what was requested. Preview and typed file
+impact land with the M2+ review roundtrip.*
 
 ## Clone and Network Controls
 

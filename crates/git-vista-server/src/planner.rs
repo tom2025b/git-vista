@@ -35,10 +35,10 @@ use git_vista_core::activity::ActivityKind;
 use git_vista_core::identity::{GenerationInputs, RepositoryId};
 use git_vista_core::seed::{parse_seed, reset_plan, Seed};
 use git_vista_protocol::{
-    BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, IdempotencyKey,
-    OperationHash, OperationStage, Plan, Precondition, RecoveryStrategy, RefChange, RefName,
-    RefState, RemoteName, RepositoryToken, RiskLevel, UnixSeconds, WorktreePath, WorktreeToken,
-    IDEMPOTENCY_HEADER,
+    BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
+    IdempotencyKey, OperationHash, OperationStage, Plan, Precondition, RecoveryStrategy, RefChange,
+    RefName, RefState, RemoteName, RepositoryToken, RiskLevel, UnixSeconds, WorktreePath,
+    WorktreeToken, IDEMPOTENCY_HEADER,
 };
 
 use crate::git_cmd::{git_ok, rev_parse, ExecUnavailable};
@@ -1051,7 +1051,12 @@ async fn shape(
             let (preconditions, changes, recovery) = head_moves(extra);
             (RiskLevel::Reversible, preconditions, changes, recovery)
         }
-        GitOperation::PushBranch { branch, remote } => {
+        GitOperation::PushBranch {
+            branch,
+            remote,
+            force,
+            ..
+        } => {
             let mut preconditions = vec![Precondition::RemoteConfigured {
                 remote: remote.clone(),
             }];
@@ -1061,6 +1066,36 @@ async fn shape(
             }));
             // The remote-tracking ref this push is expected to move.
             let tracking = RefName::new(format!("refs/remotes/{remote}/{branch}")).ok();
+            // M2.20a (#227): the lease *is* a compare-and-swap, so it becomes
+            // one — a `Precondition::RefAt` on the remote-tracking ref, the
+            // same machinery `ResetBranch`/`AmendCommit` use on local refs.
+            //
+            // Two things this deliberately does not do. It does not re-read
+            // the remote to fill the oid in: the value that makes a lease
+            // mean anything is the one the *user reviewed*, and a freshly
+            // read one would assert only that the remote has not moved since
+            // a millisecond ago. And it does not fall back to some
+            // observation when the ref is unnameable — a lease with no
+            // precondition would be a force push with a reassuring label,
+            // which is the one outcome `ForcePublish` exists to prevent, so
+            // an unnameable tracking ref yields no lease precondition *and*
+            // no execution (see `execute`'s refusal below).
+            //
+            // A `match` rather than an `if let`: should `ForcePublish` ever
+            // grow a third variant, this stops compiling instead of silently
+            // treating the new mode as unleased.
+            let lease = match force {
+                ForcePublish::None => None,
+                ForcePublish::WithLease {
+                    expected_remote_tip,
+                } => Some(expected_remote_tip),
+            };
+            if let (Some(oid), Some(r)) = (lease, &tracking) {
+                preconditions.push(Precondition::RefAt {
+                    ref_name: r.clone(),
+                    oid: oid.clone(),
+                });
+            }
             let remote_tip = Obs::from_read(rev_parse(repo, &format!("{remote}/{branch}")).await);
             let local_tip = Obs::from_read(rev_parse(repo, branch.as_str()).await);
             // D5: `before` is a *claim* about the remote-tracking ref shown to
@@ -1081,8 +1116,17 @@ async fn shape(
                 }],
                 _ => Vec::new(),
             };
+            // A lease-force can leave commits on the remote branch referenced
+            // by nothing, which an ordinary fast-forward push cannot — see
+            // `RiskLevel::Destructive`'s doc for why one scalar has to rank
+            // that above `Remote`. Recovery stays `Irrecoverable` for both:
+            // the effect left the machine either way.
+            let risk = match force {
+                ForcePublish::None => RiskLevel::Remote,
+                ForcePublish::WithLease { .. } => RiskLevel::Destructive,
+            };
             (
-                RiskLevel::Remote,
+                risk,
                 preconditions,
                 changes,
                 RecoveryStrategy::Irrecoverable,
@@ -1281,6 +1325,51 @@ async fn shape(
             };
             (RiskLevel::Destructive, preconditions, changes, recovery)
         }
+        // M2.20a (#227): contract only — see each variant's doc comment in
+        // `plan.rs` for the reasoning behind every choice below. Execution is
+        // #229's and #230's; `execute` refuses both today.
+        //
+        // A fetch moves only `refs/remotes/<remote>/*`, and *which* of them
+        // is not knowable until git has spoken to the remote — so there is no
+        // honest `RefChange` to list here, and listing a guessed one would be
+        // a claim shown to a reviewer that the operation may not honour (the
+        // same D5 posture the push arm above takes with `Obs::Unknown`). The
+        // one thing that must hold is that the remote is configured.
+        GitOperation::FetchRemote { remote } => (
+            RiskLevel::Safe,
+            vec![Precondition::RemoteConfigured {
+                remote: remote.clone(),
+            }],
+            Vec::new(),
+            RecoveryStrategy::NotNeeded,
+        ),
+        // A pull is a fetch (nothing to describe, above) plus an integration
+        // that moves exactly one local ref: the checked-out branch. That is
+        // precisely `head_moves`' shape, and it is reused rather than
+        // re-derived so pull, merge and rebase cannot drift apart —
+        // `MergeBranch` above passes the same `RefAt` extra for the same
+        // reason.
+        //
+        // The CAS is on the *local* branch, not the remote one. A pull's
+        // danger is that the local branch moved under the reviewer between
+        // plan and execution (someone committed, or another pull landed);
+        // where the remote sits is what the fetch half is for, and pinning it
+        // would refuse pulls for the ordinary reason that the remote received
+        // a new commit — the very thing being pulled.
+        GitOperation::PullBranch { remote, .. } => {
+            let mut extra = vec![Precondition::RemoteConfigured {
+                remote: remote.clone(),
+            }];
+            if let (Some(r), Some(o)) = (&head_ref, &head_oid) {
+                extra.push(Precondition::RefAt {
+                    ref_name: r.clone(),
+                    oid: o.clone(),
+                });
+            }
+            let (mut preconditions, changes, recovery) = head_moves(None);
+            preconditions.extend(extra);
+            (RiskLevel::Reversible, preconditions, changes, recovery)
+        }
     }
 }
 
@@ -1349,9 +1438,31 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
             exec_checkout(repo, need, &branch, &observed).await
         }
         GitOperation::MergeBranch { branch } => exec_merge(repo, need, &branch, &observed).await,
-        GitOperation::PushBranch { branch, remote } => {
-            exec_push(repo, need, &branch, &remote).await
-        }
+        // M2.20a (#227) widened `PushBranch` with `set_upstream` and `force`.
+        // Only the combination that existed before — no upstream write, no
+        // force — executes; it runs the byte-identical argv `/api/push` has
+        // always run, so this slice changes no live behaviour.
+        //
+        // The other combinations refuse. Not because a `501` is tidy, but
+        // because the alternative is worse in a specific way: an arm that
+        // ignored the new fields and ran a plain push would execute an
+        // operation the user did *not* approve — they asked for
+        // `--force-with-lease` and would silently get a fast-forward push
+        // whose failure they would then be tempted to resolve by hand. The
+        // plan's hash binds `force`; execution has to honour it or refuse.
+        GitOperation::PushBranch {
+            branch,
+            remote,
+            set_upstream: false,
+            force: ForcePublish::None,
+        } => exec_push(repo, need, &branch, &remote).await,
+        GitOperation::PushBranch { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "Pushing with --set-upstream or --force-with-lease is not yet wired \
+             for execution (tracked by #231) — this plan's contract exists, but \
+             nothing executed it."
+                .to_string(),
+        ),
         GitOperation::DeleteBranch { branch } => {
             exec_delete(repo, need, &branch, &observed, false).await
         }
@@ -1405,6 +1516,29 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
             StatusCode::NOT_IMPLEMENTED,
             "Amending a commit is not yet wired for execution (tracked by #223) — \
              this plan's contract exists, but nothing executed it."
+                .to_string(),
+        ),
+        // M2.20a (#227) ships the typed contract for fetch and pull only —
+        // see their doc comments in `plan.rs`. Execution belongs to #229 and
+        // #230, deliberately, so that the first code in this server to open a
+        // socket with a user's credentials on it gets a review of its own
+        // rather than riding in on a vocabulary change.
+        //
+        // These arms exist because `execute`'s match must stay exhaustive
+        // over the closed vocabulary (#142). Nothing builds either operation
+        // today, so in practice they are unreachable — but reached, they must
+        // refuse rather than no-op silently or run a placeholder git command
+        // against a real repository and a real remote.
+        GitOperation::FetchRemote { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "Fetching from a remote is not yet wired for execution (tracked by \
+             #229) — this plan's contract exists, but nothing executed it."
+                .to_string(),
+        ),
+        GitOperation::PullBranch { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "Pulling from a remote is not yet wired for execution (tracked by \
+             #230) — this plan's contract exists, but nothing executed it."
                 .to_string(),
         ),
     }
@@ -2721,51 +2855,234 @@ async fn exec_discard_tracked_paths(
     )
 }
 
-/// Compare what `git clean -f`'s own stdout says it actually removed
-/// ("Removing <path>" per entry) against the full `requested` set, and build
-/// an honest partial-result message if any requested path is missing —
-/// `None` when every requested path was reported removed. Pure: takes
-/// `git clean`'s stdout text directly, no repository access, so the
-/// mismatch-detection and message-building logic is testable with a
-/// hand-built stdout string, independent of ever triggering the real race
-/// this exists to report on (see [`exec_delete_untracked_paths`]'s doc
-/// comment for why the race itself can't be a deterministic permanent test).
-fn partial_delete_report(requested: &[&str], clean_stdout: &str) -> Option<String> {
-    let removed: std::collections::HashSet<&str> = clean_stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix("Removing "))
-        .collect();
-    let missing: Vec<&str> = requested
+/// After `git clean -f -- <paths>` has run, ask the **filesystem** which of
+/// `requested` is actually gone, and build an honest partial-result message
+/// naming any that survived — `None` when every requested path really was
+/// removed.
+///
+/// **Why the filesystem and not `git clean`'s stdout (#284).** Until #284
+/// this parsed `git clean`'s own output for `Removing <path>`. That string is
+/// passed through gettext in git's source, so it is translated whenever a
+/// `git.mo` catalog is installed and `LANG`/`LC_MESSAGES` names a non-English
+/// locale — and production spawns inherit the server's environment in full,
+/// because `sandbox::spawn`'s `env_clear`/`env` are `#[cfg(test)]`-only *by
+/// design* (argv and env cannot change after policy classification). Under
+/// `LANG=fr_FR.UTF-8` with translations installed, three successfully deleted
+/// files matched no prefix, all three looked un-deleted, and the endpoint
+/// returned 409 telling the user their files had survived — after they were
+/// irreversibly gone. That is the exact inversion of the property this
+/// function exists to provide, so the parse is gone: a dirent that is still
+/// there was not deleted, in every language.
+///
+/// **`symlink_metadata`, not `Path::exists`.** `exists()` follows the link, so
+/// a *dangling* symlink — one whose target is already gone — reports as
+/// absent while its dirent is still sitting in the worktree. `git clean` can
+/// and does delete dangling symlinks, so both "clean removed it" and "clean
+/// skipped it" would look identical to `exists()`, reintroducing a false
+/// success in the narrow case. `symlink_metadata` stats the entry itself and
+/// tells the two apart. (Same reason `symlink_containment_guard` uses it.)
+///
+/// **What this can still get wrong, stated plainly.** If something *else*
+/// deleted a requested path in the same window, we cannot see that it was
+/// not us. See [`DeleteOutcome`] for how much of that window the
+/// before-snapshot closes and what is left.
+///
+/// A stat error other than "not found" (an unreadable parent directory, say)
+/// counts as absent, deliberately: presence is the claim that has to be
+/// *proved* here, and an error proves nothing.
+///
+/// Synchronous `stat` calls in an async fn, deliberately: one per requested
+/// path, bounded by the request, on entries `symlink_containment_guard` and
+/// `verify_path_states` stat'd microseconds earlier — not worth a
+/// `spawn_blocking` hop and the join-error branch that comes with it.
+fn present_paths<'a>(repo: &Path, requested: &[&'a str]) -> Vec<&'a str> {
+    requested
         .iter()
         .copied()
-        .filter(|p| !removed.contains(p))
-        .collect();
-    if missing.is_empty() {
-        return None;
+        .filter(|p| std::fs::symlink_metadata(repo.join(p)).is_ok())
+        .collect()
+}
+
+/// What the worktree says happened to each requested path, split three ways
+/// by comparing a presence snapshot taken immediately *before* the `git
+/// clean` spawn against one taken immediately after.
+///
+/// **Why three buckets and not two (#284, review finding).** The first cut of
+/// this only looked at the worktree *after* the spawn, so "absent now" was
+/// read as "we deleted it". That silently credits this operation with a
+/// deletion it did not perform: `git clean -f -- a.txt b.txt` exits 0 and
+/// says nothing when `b.txt` is already gone (verified directly against real
+/// git), so a second git-vista tab, a shell `rm`, or an editor auto-clean
+/// removing `b.txt` first produced a 200 reading "Deleted 2 untracked paths
+/// permanently" — and, worse, a *journal* entry saying the same. The journal
+/// is the durable record for the one operation in this vocabulary with no
+/// undo of any kind; an entry claiming a destruction we did not cause is a
+/// corrupt audit trail, not a rounding error.
+///
+/// **How much window this actually closes, stated plainly.** Not all of it.
+/// [`verify_path_states`] already refuses a path that has vanished by the
+/// time its `git status` runs (a missing path classifies as
+/// [`PathKind::Other`], never [`PathKind::Untracked`]), so the exposure was
+/// always the gap between that read and `git clean`'s own `unlink`. The
+/// before-snapshot moves the near edge of that gap from "before a `git
+/// status` subprocess spawn, a porcelain parse, and a `git clean` subprocess
+/// spawn" to "after all of those, one `stat` before the spawn" — milliseconds
+/// down to whatever elapses inside `git clean` itself. What remains is an
+/// external deleter landing *inside* the child process's own run. Closing
+/// that last sliver needs a repo-wide exclusive lock this endpoint does not
+/// hold, which is a different and much larger decision; narrowing it by three
+/// orders of magnitude costs one `stat` per requested path on entries that
+/// were stat'd twice already.
+///
+/// **The bias is unchanged and deliberate.** A path still on disk is always
+/// reported as a survivor, whoever put it there. This can still never claim a
+/// destroyed file survived — the inversion #284 was filed about, and the only
+/// failure direction that makes a user stop looking for data that is gone for
+/// good.
+#[derive(Debug, PartialEq, Eq)]
+struct DeleteOutcome<'a> {
+    /// Present before the spawn, absent after: this operation removed it.
+    /// The count the response and the journal are allowed to claim.
+    deleted: Vec<&'a str>,
+    /// Absent before the spawn and absent after: gone for good, but not by
+    /// our hand. Reported, never counted as ours.
+    already_gone: Vec<&'a str>,
+    /// Still in the worktree: not deleted, whatever it points at. `git clean`
+    /// silently skips a path that has become tracked since the pre-flight
+    /// check (no error, exit 0), which is how this bucket normally fills.
+    survived: Vec<&'a str>,
+}
+
+/// Compare the before-snapshot against the live worktree. `present_before`
+/// comes from [`present_paths`] called immediately before the spawn.
+fn observe_deletion<'a>(
+    repo: &Path,
+    requested: &[&'a str],
+    present_before: &[&'a str],
+) -> DeleteOutcome<'a> {
+    let present_after = present_paths(repo, requested);
+    let mut outcome = DeleteOutcome {
+        deleted: Vec::new(),
+        already_gone: Vec::new(),
+        survived: Vec::new(),
+    };
+    for p in requested.iter().copied() {
+        if present_after.contains(&p) {
+            outcome.survived.push(p);
+        } else if present_before.contains(&p) {
+            outcome.deleted.push(p);
+        } else {
+            outcome.already_gone.push(p);
+        }
     }
-    // Some of the batch is already, irreversibly gone — that cannot be
-    // undone by refusing now. What this can still do is refuse to claim
-    // full success: name exactly what happened instead of a count that
-    // doesn't match reality.
-    let removed_list = requested
-        .iter()
-        .copied()
-        .filter(|p| removed.contains(p))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let missing_list = missing.join(", ");
-    Some(format!(
-        "Partial result: {removed_list} {} deleted permanently, but {missing_list} \
-         {} not — its state changed (likely became tracked) in the instant between \
-         the pre-flight check and this running. Nothing further was applied for \
-         {missing_list}; re-check its status before retrying.",
-        if removed_list.is_empty() {
+    outcome
+}
+
+impl DeleteOutcome<'_> {
+    /// The 409 body when some requested path is still on disk — `None` when
+    /// nothing survived. Refusing now cannot un-delete what already went, so
+    /// what this can still do is name exactly what happened instead of a
+    /// count that does not match reality.
+    fn partial_refusal(&self) -> Option<String> {
+        if self.survived.is_empty() {
+            return None;
+        }
+        let survived_list = self.survived.join(", ");
+        let survived_verb = if self.survived.len() == 1 {
             "was"
         } else {
             "were"
-        },
-        if missing.len() == 1 { "was" } else { "were" }
-    ))
+        };
+        let destroyed = if self.deleted.is_empty() {
+            "Partial result: nothing was deleted".to_string()
+        } else {
+            format!(
+                "Partial result: {} {} deleted permanently",
+                self.deleted.join(", "),
+                if self.deleted.len() == 1 {
+                    "was"
+                } else {
+                    "were"
+                }
+            )
+        };
+        let mut msg = format!(
+            "{destroyed}, but {survived_list} {survived_verb} not — its state changed \
+             (likely became tracked) in the instant between the pre-flight check and \
+             this running. Nothing further was applied for {survived_list}; re-check \
+             its status before retrying."
+        );
+        msg.push_str(&self.already_gone_note());
+        Some(msg)
+    }
+
+    /// The whole client-facing outcome — status, response body, journal line
+    /// — derived from nothing but what the worktree proved.
+    ///
+    /// **Why this composes the message instead of the executor (review
+    /// finding).** The count started life as `paths.len()` in the executor,
+    /// which is what defect 2 of #284 fixed for duplicates and what the
+    /// before-snapshot fixes for foreign deletions. Both are the same mistake:
+    /// counting what was *asked for* rather than what was *observed*. While
+    /// that arithmetic lived inline in an `async fn` that does its own
+    /// `stat`ing, no test could reach a state where the two counts differ, so
+    /// reverting it to `paths.len()` passed the entire suite — a green test
+    /// proving nothing. Owning it here makes the divergent case constructible
+    /// (see `a_report_counts_only_what_this_operation_destroyed`) and leaves
+    /// the executor a thin caller with no count of its own to get wrong.
+    fn report(&self) -> (StatusCode, String, String) {
+        if let Some(msg) = self.partial_refusal() {
+            let journal = format!("delete-untracked-paths partial result — {msg}");
+            return (StatusCode::CONFLICT, msg, journal);
+        }
+        // `self.deleted.len()`, and no other number is in scope to reach for:
+        // the count is the user's only record of what is gone for good.
+        let count = self.deleted.len();
+        let s = if count == 1 { "" } else { "s" };
+        let note = self.already_gone_note();
+        // Deliberately no "undo"/"restore"/"recover" anywhere in this text (a
+        // regression test greps for exactly those words) — this is the one
+        // operation in the vocabulary where saying so plainly is the honest
+        // thing to say, not merely the cautious one.
+        let journal = format!(
+            "deleted {count} untracked path{s} permanently — never stored in git, no \
+             way to bring the content back{note}"
+        );
+        let body = format!(
+            "Deleted {count} untracked path{s} permanently. That content was never \
+             stored in git, so there is no way to bring it back.{note}"
+        );
+        (StatusCode::OK, body, journal)
+    }
+
+    /// One sentence disclosing paths that were already gone before the spawn,
+    /// empty when there were none. Kept separate so both the refusal body and
+    /// the success body say the same thing about them.
+    fn already_gone_note(&self) -> String {
+        if self.already_gone.is_empty() {
+            return String::new();
+        }
+        let list = self.already_gone.join(", ");
+        let verb = if self.already_gone.len() == 1 {
+            "was"
+        } else {
+            "were"
+        };
+        format!(
+            " {list} {verb} already gone before this ran, so {} not deleted by this \
+             operation — something else outside Git-Vista removed {}.",
+            if self.already_gone.len() == 1 {
+                "it was"
+            } else {
+                "they were"
+            },
+            if self.already_gone.len() == 1 {
+                "it"
+            } else {
+                "them"
+            }
+        )
+    }
 }
 
 /// `git clean -f -- <paths>` (`/api/delete-untracked-paths`, #219): delete
@@ -2796,6 +3113,12 @@ async fn exec_delete_untracked_paths(
     }
     let mut args: Vec<&str> = vec!["clean", "-f", "--"];
     args.extend(paths.iter().map(WorktreePath::as_str));
+    // Snapshot presence as late as possible — the very last thing before the
+    // spawn — so what this operation is credited with destroying is what it
+    // actually destroyed, not merely what is missing afterwards. See
+    // [`DeleteOutcome`] for the window this does and does not close.
+    let requested: Vec<&str> = paths.iter().map(WorktreePath::as_str).collect();
+    let present_before = present_paths(repo, &requested);
     let output = match run_git(repo, need, &args).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/delete-untracked-paths", &e),
@@ -2815,40 +3138,25 @@ async fn exec_delete_untracked_paths(
     // rest of the batch — verified directly against real git. Locking out
     // the whole race window needs a repo-wide exclusive lock this endpoint
     // doesn't hold; what's tractable and load-bearing without one is never
-    // reporting success that isn't true: `git clean`'s own stdout names
-    // exactly what it removed, so that is compared against the full
-    // requested set before this returns 200 (`partial_delete_report`, pure
-    // and directly tested against a hand-built mismatch — the timing race
-    // itself isn't something a permanent test can trigger deterministically,
-    // but the honesty property this exists for doesn't depend on how a
-    // mismatch arose).
-    let stdout_text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let requested: Vec<&str> = paths.iter().map(WorktreePath::as_str).collect();
-    if let Some(msg) = partial_delete_report(&requested, &stdout_text) {
-        eprintln!("git-vista: /api/delete-untracked-paths partial: {msg}");
-        journal_app_event(
-            repo,
-            ActivityKind::Other,
-            None,
-            Obs::Absent,
-            Obs::Absent,
-            format!("delete-untracked-paths partial result — {msg}"),
-        )
-        .await;
-        return (StatusCode::CONFLICT, msg);
+    // reporting success that isn't true: every requested path is re-stat'd
+    // before this returns 200, and one still on disk was not deleted
+    // (`observe_deletion`; #284 replaced an English-only parse of `git
+    // clean`'s stdout with that check — see [`DeleteOutcome`]'s doc comment,
+    // which also covers why the *before* snapshot above is needed to avoid
+    // the mirror-image dishonesty of crediting ourselves with someone else's
+    // deletion). The timing race itself isn't something a permanent test can
+    // trigger deterministically, but the honesty property this exists for
+    // doesn't depend on how a mismatch arose.
+    //
+    // Everything client-facing past this point is [`DeleteOutcome::report`]'s
+    // — this executor deliberately keeps no count of its own to get wrong.
+    let outcome = observe_deletion(repo, &requested, &present_before);
+    let (status, body, summary) = outcome.report();
+    if status == StatusCode::CONFLICT {
+        eprintln!("git-vista: /api/delete-untracked-paths partial: {body}");
+    } else {
+        println!("[/api/delete-untracked-paths] {summary}");
     }
-
-    let count = paths.len();
-    let s = if count == 1 { "" } else { "s" };
-    // Deliberately no "undo"/"restore"/"recover" anywhere in this text (a
-    // regression test greps for exactly those words) — this is the one
-    // operation in the vocabulary where saying so plainly is the honest
-    // thing to say, not merely the cautious one.
-    let summary = format!(
-        "deleted {count} untracked path{s} permanently — never stored in git, no way \
-         to bring the content back"
-    );
-    println!("[/api/delete-untracked-paths] {summary}");
     journal_app_event(
         repo,
         ActivityKind::Other,
@@ -2858,13 +3166,7 @@ async fn exec_delete_untracked_paths(
         summary,
     )
     .await;
-    (
-        StatusCode::OK,
-        format!(
-            "Deleted {count} untracked path{s} permanently. That content was never \
-             stored in git, so there is no way to bring it back."
-        ),
-    )
+    (status, body)
 }
 
 // ---------------------------------------------------------------------------
@@ -3842,6 +4144,8 @@ mod tests {
         let op = GitOperation::PushBranch {
             branch: BranchName::new("main").unwrap(),
             remote: RemoteName::new("origin").unwrap(),
+            set_upstream: false,
+            force: ForcePublish::None,
         };
         let (plan, observed) = build_plan(&repo, op, tokens()).await;
         assert!(
@@ -3865,6 +4169,8 @@ mod tests {
         let op = GitOperation::PushBranch {
             branch: BranchName::new("main").unwrap(),
             remote: RemoteName::new("origin").unwrap(), // never configured
+            set_upstream: false,
+            force: ForcePublish::None,
         };
         let (plan, observed) = build_plan(&repo, op, tokens()).await;
         assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
@@ -3970,6 +4276,234 @@ mod tests {
         let (status, why) = enforce_fresh(&repo, &plan, &observed).await.unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(why.contains("repository changed"), "{why}");
+    }
+
+    // -----------------------------------------------------------------------
+    // M2.20a (#227): `FetchRemote` / `PullBranch` / the widened `PushBranch`
+    // in `shape` — contract only, no execution (see each variant's doc
+    // comment in `plan.rs` and `planner::execute`'s stub arms).
+    // -----------------------------------------------------------------------
+
+    /// A repository with a real, configured `origin` on disk — several shape
+    /// tests below need `RemoteConfigured` to actually hold, so that
+    /// `held_at_build` proving the preconditions are satisfiable means
+    /// something.
+    async fn seeded_repo_with_remote() -> (tempfile::TempDir, PathBuf) {
+        let (dir, repo) = seeded_repo();
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        run(
+            &repo,
+            &["remote", "add", "origin", &remote.display().to_string()],
+        );
+        (dir, repo)
+    }
+
+    /// Fetch is `Safe` with `NotNeeded` recovery, one `RemoteConfigured`
+    /// precondition, and **no** expected ref change.
+    ///
+    /// The negative assertions are the point. `Safe`/`NotNeeded` is an
+    /// unusual pairing for a network operation, and the plausible wrong
+    /// answers are exactly the ones a later edit would reach for by reflex:
+    /// `RiskLevel::Remote` (because it talks to a remote) or
+    /// `RecoveryStrategy::Irrecoverable` (because push has it). Both are
+    /// pinned as *not* the answer, with the reasoning in the variant's doc
+    /// comment — a fetch cannot lose anything a user owns.
+    #[tokio::test]
+    async fn fetch_remote_shape_is_safe_with_nothing_to_recover() {
+        let (_dir, repo) = seeded_repo_with_remote().await;
+        let op = GitOperation::FetchRemote {
+            remote: RemoteName::new("origin").unwrap(),
+        };
+        let (plan, observed) = build_plan(&repo, op, tokens()).await;
+
+        assert_eq!(plan.risk, RiskLevel::Safe);
+        assert_ne!(
+            plan.risk,
+            RiskLevel::Remote,
+            "reach and risk are independent axes — see the variant's doc"
+        );
+        assert_eq!(
+            plan.preconditions,
+            vec![Precondition::RemoteConfigured {
+                remote: RemoteName::new("origin").unwrap(),
+            }]
+        );
+        assert!(
+            plan.expected_ref_changes.is_empty(),
+            "which refs/remotes/* move is unknowable before git speaks to the \
+             remote; a guessed RefChange would be a claim shown to a reviewer"
+        );
+        assert_eq!(plan.recovery, RecoveryStrategy::NotNeeded);
+        assert_ne!(plan.recovery, RecoveryStrategy::Irrecoverable);
+        assert!(
+            observed.held_at_build.iter().all(|&h| h),
+            "the remote is configured, so the one precondition must hold — \
+             otherwise this test would pass against an unsatisfiable shape"
+        );
+    }
+
+    /// Pull is `Reversible` with a CAS on the **local** branch and `ResetRef`
+    /// recovery back to the tip the plan observed — the same story merge and
+    /// rebase have, because a pull is a fetch plus one of those.
+    ///
+    /// Two negatives carry the reasoning: it must not be `Irrecoverable`
+    /// (that is push's tag, for an effect that left the machine — a pull's
+    /// did not), and its `RefAt` must name `refs/heads/main`, not
+    /// `refs/remotes/origin/main`. Pinning the remote tip would refuse a pull
+    /// for the ordinary reason that the remote received a commit, i.e. for
+    /// the very thing being pulled.
+    #[tokio::test]
+    async fn pull_branch_shape_is_reversible_with_a_local_cas_and_reset_recovery() {
+        let (_dir, repo) = seeded_repo_with_remote().await;
+        let head_oid = CommitOid::new(git_rev_parse_head(&repo).await).unwrap();
+        let main = RefName::new("refs/heads/main").unwrap();
+
+        for strategy in [
+            git_vista_protocol::MergeStrategy::Merge,
+            git_vista_protocol::MergeStrategy::Rebase,
+        ] {
+            let op = GitOperation::PullBranch {
+                remote: RemoteName::new("origin").unwrap(),
+                branch: BranchName::new("main").unwrap(),
+                strategy,
+            };
+            let (plan, observed) = build_plan(&repo, op, tokens()).await;
+
+            assert_eq!(plan.risk, RiskLevel::Reversible, "{strategy:?}");
+            assert_eq!(
+                plan.preconditions,
+                vec![
+                    Precondition::BranchCheckedOut {
+                        branch: BranchName::new("main").unwrap(),
+                    },
+                    Precondition::RemoteConfigured {
+                        remote: RemoteName::new("origin").unwrap(),
+                    },
+                    Precondition::RefAt {
+                        ref_name: main.clone(),
+                        oid: head_oid.clone(),
+                    },
+                ],
+                "{strategy:?}"
+            );
+            assert!(
+                !plan.preconditions.iter().any(|p| matches!(
+                    p,
+                    Precondition::RefAt { ref_name, .. }
+                        if ref_name.as_str().starts_with("refs/remotes/")
+                )),
+                "{strategy:?}: a pull must not pin the remote tip — that would \
+                 refuse the pull for the reason it exists"
+            );
+            assert_eq!(
+                plan.expected_ref_changes,
+                vec![RefChange {
+                    ref_name: main.clone(),
+                    before: RefState::At(head_oid.clone()),
+                    after: RefState::Computed,
+                }],
+                "{strategy:?}"
+            );
+            assert_eq!(
+                plan.recovery,
+                RecoveryStrategy::ResetRef {
+                    ref_name: main.clone(),
+                    to: head_oid.clone(),
+                },
+                "{strategy:?}"
+            );
+            assert_ne!(
+                plan.recovery,
+                RecoveryStrategy::Irrecoverable,
+                "{strategy:?}: a pull's effect never left this machine"
+            );
+            assert!(observed.held_at_build.iter().all(|&h| h), "{strategy:?}");
+        }
+    }
+
+    /// The lease is a compare-and-swap on the **remote-tracking** ref, and it
+    /// exists only when a lease was actually asked for.
+    ///
+    /// Both halves run against the same repository, so the difference is
+    /// attributable to `force` and nothing else. Without the negative half a
+    /// `shape` that emitted the lease precondition unconditionally would pass
+    /// — and an unconditional precondition on `refs/remotes/origin/main`
+    /// would refuse ordinary pushes whenever the remote had moved, which is
+    /// most of the time.
+    #[tokio::test]
+    async fn only_a_lease_force_push_pins_the_remote_tracking_ref() {
+        let (_dir, repo) = seeded_repo_with_remote().await;
+        let tracking = RefName::new("refs/remotes/origin/main").unwrap();
+        let lease_tip = CommitOid::new("4".repeat(40)).unwrap();
+
+        let lease_precondition = |plan: &Plan| {
+            plan.preconditions
+                .iter()
+                .find(
+                    |p| matches!(p, Precondition::RefAt { ref_name, .. } if *ref_name == tracking),
+                )
+                .cloned()
+        };
+
+        let (plain, _) = build_plan(
+            &repo,
+            GitOperation::PushBranch {
+                branch: BranchName::new("main").unwrap(),
+                remote: RemoteName::new("origin").unwrap(),
+                set_upstream: false,
+                force: ForcePublish::None,
+            },
+            tokens(),
+        )
+        .await;
+        assert_eq!(plain.risk, RiskLevel::Remote);
+        assert_eq!(
+            lease_precondition(&plain),
+            None,
+            "a fast-forward push must not pin the remote tip"
+        );
+
+        let (leased, _) = build_plan(
+            &repo,
+            GitOperation::PushBranch {
+                branch: BranchName::new("main").unwrap(),
+                remote: RemoteName::new("origin").unwrap(),
+                set_upstream: false,
+                force: ForcePublish::WithLease {
+                    expected_remote_tip: lease_tip.clone(),
+                },
+            },
+            tokens(),
+        )
+        .await;
+        assert_eq!(
+            leased.risk,
+            RiskLevel::Destructive,
+            "a lease-force can leave remote commits referenced by nothing"
+        );
+        assert_eq!(
+            lease_precondition(&leased),
+            Some(Precondition::RefAt {
+                ref_name: tracking,
+                oid: lease_tip.clone(),
+            }),
+            "the lease must become a live compare-and-swap on the tracking ref"
+        );
+        // The oid must be the *reviewed* one, not one re-read from the repo.
+        // A lease re-derived at plan time would assert only that the remote
+        // has not moved since a millisecond ago, and would protect nobody.
+        assert_ne!(
+            lease_tip.as_str(),
+            git_rev_parse_head(&repo).await,
+            "the fixture's lease oid must differ from anything in the repo, or \
+             this test could not tell a carried oid from a re-read one"
+        );
+        // Recovery is unchanged by the force mode: the effect left the machine
+        // either way.
+        assert_eq!(plain.recovery, RecoveryStrategy::Irrecoverable);
+        assert_eq!(leased.recovery, RecoveryStrategy::Irrecoverable);
     }
 
     // -----------------------------------------------------------------------
