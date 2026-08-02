@@ -213,6 +213,49 @@ that census, and additionally asserts that `planner/fetch.rs` really does call
 `honours_cancellation` returning `true` for an executor that ignored the latch is precisely
 the "green test, dead mechanism" shape this repository keeps finding.
 
+#### How "it kills the child" is proved — and how the first attempt did not prove it
+
+Post-review correction (#229 review, finding 1). The original behavioural test asserted
+that after a cancel the child is gone from `/proc`. It was vacuous, and measurably so:
+deleting `child.start_kill()` from `git_streamed_for` — leaving the latch, the `cancelled`
+flag and the loop `break` intact, so the runner stops reading but never kills — left **all
+seven tests in `fetch_suite` green**, ~8s slower. The hung `upload-pack` fixture exits on
+its own, `child.wait()` returns either way, and every timeout in the file was the same
+order of magnitude as the hang, so "the process is gone afterwards" was equally true of a
+cancel that merely waited it out.
+
+Two independent proofs replace it, because the property is worth more than one angle:
+
+```mermaid
+flowchart LR
+    subgraph T1["cancelling_a_running_fetch_kills_the_child…"]
+        A["proc scan finds it"] --> B["dwell PROMPT,<br/>still running"]
+        B --> C["cancel"] --> D["answered + gone<br/>within PROMPT"]
+    end
+    subgraph T2["a_cancelled_stream_leaves_a_signalled_child…"]
+        E["cancel the stream"] --> F["WTERMSIG == SIGKILL"]
+        F --> G["paired negative:<br/>uncancelled run,<br/>no signal"]
+    end
+```
+
+* **Promptness, made a fair question.** `HANG` (the fixture's sleep) is 20s and `PROMPT`
+  (the budget) is 3s. The test dwells `PROMPT` *before* cancelling and asserts the fetch is
+  still running and the driver has not answered — establishing on that run, not by
+  construction, that the child was not about to exit anyway. It then requires death within
+  `PROMPT` of the cancel, with ≥14s of hanging still owed.
+* **The mechanism, with no clock involved.** `a_cancelled_stream_leaves_a_signalled_child_not_an_exited_one`
+  drives `git_streamed_for` directly and asserts `ExitStatus::signal() == Some(SIGKILL)`.
+  `WTERMSIG` is set by the kernel only for a signalled process; a child that ran to the end
+  of its sleep reports `None` and a real exit code however patient the runner was. Its
+  timeout is deliberately generous so a wait-it-out implementation fails *on the signal*
+  rather than on a deadline. The paired negative — same helper, same repository, no cancel
+  — must report `cancelled == false` and `signal() == None`, which rules out an
+  implementation that claimed `SIGKILL` unconditionally.
+
+Both were re-run against the same mutation and both fail. That is the bar: a cancellation
+test that cannot fail when the kill is deleted is worse than no test, because it is cited
+as evidence.
+
 ### 5. What a fetch did is **observed from refs**, never read out of git's prose
 
 The issue requires the terminal status to state "plainly whether the fetch completed
@@ -310,6 +353,35 @@ observed before/after oids — not one summary entry, because the activity feed 
 refs. Nothing is journaled when nothing moved, the same posture `exec_checkout` takes
 towards a no-op checkout. Journaling runs on the cancelled and failed paths too: whatever
 landed before the stop is still a thing that happened to the repository.
+
+**Every exit path after the spawn journals, including the one with no diff to report.**
+Post-review addition (#229 review, finding 3). There is exactly one exit that is reached
+*after* `git fetch` has run and *without* a ref diff: the post-fetch re-read of
+`refs/remotes/<remote>/*` failing. As first written it returned a bare `500` and journaled
+nothing — so a fetch that genuinely moved `origin/main` and then hit an `EMFILE` on the
+re-read left the repository changed and the activity feed silent. That is the same
+divergence between what happened and what was recorded that decision 3 observes refs to
+avoid, arriving through the back door.
+
+`journal_unobserved` closes it with one entry that **admits** the gap:
+
+| Field | Value | Why |
+|---|---|---|
+| `ref_name` | `None` | Which ref moved is precisely what is unknown; naming one would be fabrication |
+| `old_oid` / `new_oid` | `Obs::Unknown` | Not `Obs::Absent` — D5's whole distinction. `Absent` asserts the ref does not exist; the truth is git could not be read |
+| summary | carries "…which remote-tracking refs moved is unknown: `<why>`" | `journal_app_event` turns `Unknown` into an explicit note, so empty oids can never be read as "nothing moved" |
+
+```mermaid
+flowchart TD
+    A["git fetch returned"] --> B{"re-read the remote's<br/>tracking refs"}
+    B -->|ok| C["diff before/after"]
+    C --> D["journal_updates:<br/>one entry per moved ref"]
+    B -->|failed| E["journal_unobserved:<br/>one entry, tips Unknown"]
+    E --> F["500 — the fetch ran but<br/>the refs could not be re-read"]
+```
+
+`why` is safe to journal: it comes back through `run_git` under `NetworkNeed::Remote`, so
+it has already been through #228's `redact_if_remote`.
 
 The **generation bump is not done in this executor**, deliberately.
 `plan_and_execute_tracked` already re-reads the generation after *every* operation and puts
@@ -425,6 +497,24 @@ to avoid. If pruning is wanted, it is a vocabulary change first.
   English-marker heuristics. Both degrade to "no claim" rather than to a wrong claim, and
   both are pure functions with paired-negative tests, so tightening them later is a
   one-function change.
+- **`fetch_suite` is 7 tests → 11, and each addition was chosen by a mutation that
+  survived** (#229 review). The three mutations, and what now kills each:
+
+  | Mutation | Before | Now fails |
+  |---|---|---|
+  | Delete `child.start_kill()` | all 7 green, ~8s slower | `cancelling_a_running_fetch…` (promptness) **and** `a_cancelled_stream_leaves_a_signalled_child…` (`WTERMSIG`) |
+  | Delete the success-path `journal_updates` | all 23 fetch-touching tests in the workspace green | `a_fetch_that_moves_a_ref_journals_it_per_ref` |
+  | Delete `journal_unobserved` | the path did not exist | `a_fetch_whose_outcome_cannot_be_observed_is_journaled_as_unknown` |
+
+  The journal legs read back through `journal::read_all` — the same parser `/api/activity`
+  uses — and check oids against `git rev-parse`, not against the response body, so they
+  cannot pass by comparing a value with itself. `an_up_to_date_fetch_journals_nothing` is
+  their paired negative.
+- **The unobservable-outcome path is driven, not merely written.** Its fixture installs a
+  `reference-transaction` hook that corrupts `.git/packed-refs` at the `committed` stage,
+  so `refs/remotes/origin/main` genuinely moves and only then does `for-each-ref` become
+  fatal — the real divergence, reproduced, rather than a unit test of a function nothing
+  calls.
 
 ## Where this is implemented
 
@@ -444,7 +534,13 @@ to avoid. If pruning is wanted, it is a vocabulary change first.
   pipeline-facing `progress()` / `cancel_signal()`.
 - `crates/git-vista-server/src/planner/fetch.rs` — `parse_progress`, `classify_failure`,
   `remote_tracking_refs`, `diff_refs`, `exec_fetch`, `cancelled_response`, `error_body`,
-  `journal_updates`, and their unit tests.
+  `journal_updates`, `journal_unobserved`. The inline `mod tests` covers the **pure**
+  functions here (`parse_progress`, `classify_failure`, `diff_refs`) with paired negatives;
+  the journaling and the executor are behavioural and are covered in `fetch_suite.rs`, not
+  here. (An earlier revision of this list said "and their unit tests" of the whole
+  enumeration, which was not true of `journal_updates` — it had no coverage anywhere until
+  the #229 review found it. Corrected rather than quietly dropped, because the inaccurate
+  claim is what let the gap survive a read of this file.)
 - `crates/git-vista-server/src/planner.rs` — `mod fetch`, the `execute` arm replacing the
   501 stub, `honours_cancellation`, the `fetch_error_body` re-export.
 - `crates/git-vista-server/src/handlers/fetch.rs` — the `POST /api/fetch` handler.
@@ -455,6 +551,10 @@ to avoid. If pruning is wanted, it is a vocabulary change first.
   `EXPECTED_ROUTE_COUNT` 41 → 43.
 - `crates/git-vista-server/src/durable.rs` — `progress` rehydrated as `None`, with the
   reason.
+- `crates/git-vista-server/src/planner/fetch_suite.rs` — the behavioural battery: progress
+  with its paired no-op leg, the two cancellation proofs (promptness against `HANG`/
+  `PROMPT`, and `WTERMSIG` with its paired negative), the dropped-connection replay, the
+  live-path redaction leg, and the three journal legs.
 - `crates/git-vista-server/src/planner/contract_suite.rs` — the real-execution battery
   replacing the stub-inertness test, the cancellation census, funnel/POST census rows.
 - `docs/SECURITY_MODEL.md` — "Remote and Forge Credentials" annotation; see below.

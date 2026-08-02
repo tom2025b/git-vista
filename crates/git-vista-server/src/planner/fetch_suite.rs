@@ -44,6 +44,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 
+use git_vista_core::activity::{ActivityEvent, ActivityKind, ActivitySource};
 use git_vista_protocol::{
     FetchError, FetchFailureKind, FetchSuccess, GitOperation, IdempotencyKey, RemoteName,
     RepositoryToken, TransferPhase, WorktreeToken,
@@ -324,36 +325,182 @@ async fn a_fetch_with_nothing_to_transfer_publishes_no_progress() {
 // Cancellation
 // ---------------------------------------------------------------------------
 
-/// A remote whose `upload-pack` sleeps, so `git fetch` hangs at the point a
-/// real transfer would be running — deterministically, with no socket, no
-/// port to bind and no timing race.
+/// How long the hung remote below blocks for.
+///
+/// This is **load-bearing, not a tuning knob**: every "the cancel was prompt"
+/// assertion in this file is only worth something because it is bounded far
+/// below this. See [`PROMPT`].
+const HANG: Duration = Duration::from_secs(20);
+
+/// The budget a cancel gets, both for the endpoint to answer and for the child
+/// to be gone from `/proc`.
+///
+/// **Why a budget at all, and why this one.** A cancelled fetch under
+/// [`hang_the_next_fetch`] ends up dead either way *eventually* — the hung
+/// `upload-pack` exits on its own after [`HANG`], so `child.wait()` returns
+/// with or without a kill. A test that only asked "is the process gone
+/// afterwards?" with a timeout of [`HANG`]'s own order therefore passes
+/// identically for an implementation that never kills anything and merely
+/// waits the remote out. That is not a hypothetical: deleting
+/// `child.start_kill()` from `git_cmd::git_streamed_for` and re-running this
+/// file made all seven tests pass, ~8s slower.
+///
+/// So the discriminating question is **promptness**, and it is only a fair
+/// question if the natural exit is provably later than the budget. The
+/// cancellation test establishes that empirically — it dwells `PROMPT`
+/// *before* cancelling and asserts the fetch is still running — so a pass
+/// requires the child to die within `PROMPT` of the cancel when it had at
+/// least `HANG - 2 * PROMPT` (14s) of hanging left to do. Only a kill does
+/// that; the real one lands in well under a second.
+const PROMPT: Duration = Duration::from_secs(3);
+
+/// A remote whose `upload-pack` sleeps for [`HANG`], so `git fetch` hangs at
+/// the point a real transfer would be running — deterministically, with no
+/// socket, no port to bind and no timing race.
 ///
 /// `remote.<name>.uploadpack` is a repository-local config key git honours for
 /// a path remote (verified against git 2.43.0: the fetch blocks until the
-/// sleep ends). The sleep is short enough that a leaked grandchild dies on its
-/// own well inside one test session, and long enough that the cancel below is
-/// never racing it.
+/// sleep ends). The sleep is short enough that a leaked grandchild (the kill
+/// reaches the direct child, not the `sh` git started — ADR 0043) dies on its
+/// own well inside one test session, and long enough that a cancel that only
+/// *waited* could never be mistaken for one that killed.
 fn hang_the_next_fetch(repo: &Path) {
     run(
         repo,
-        &["config", "remote.origin.uploadpack", "sh -c 'sleep 10' --"],
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            &format!("sh -c 'sleep {}' --", HANG.as_secs()),
+        ],
     );
 }
 
+/// The mechanism, observed directly: a cancelled [`git_streamed_for`] run
+/// leaves a child that was **killed by a signal**, not one that exited.
+///
+/// This is the assertion the endpoint-level test below cannot make — it only
+/// sees a status code and a `/proc` scan — and it is the one that cannot be
+/// satisfied by waiting. `WTERMSIG` is set by the kernel when and only when
+/// the process was signalled; a child that ran its hung `upload-pack` to the
+/// end and exited normally reports `signal() == None` and a real exit code, no
+/// matter how patient the runner was.
+///
+/// The paired negative is the second leg: the *same* helper, on the *same*
+/// repository, with no cancel, comes back `cancelled == false` and
+/// `signal() == None`. Without it, an implementation that reported
+/// `Some(SIGKILL)` unconditionally would pass the first leg.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_stream_leaves_a_signalled_child_not_an_exited_one() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (_dir, repo) = repo_with_remote_ahead(5);
+    hang_the_next_fetch(&repo);
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let run_repo = repo.clone();
+    let cancelled_run = tokio::spawn(async move {
+        crate::git_cmd::git_streamed_for(
+            &run_repo,
+            &["fetch", "--progress", "origin"],
+            crate::sandbox::NetworkNeed::Remote,
+            Some(rx),
+            |_| {},
+        )
+        .await
+    });
+
+    let scan_repo = repo.clone();
+    assert!(
+        within(HANG, || !live_fetch_processes(&scan_repo).is_empty()).await,
+        "no git fetch process appeared for {repo:?} — nothing below would mean \
+         anything"
+    );
+    tx.send(true).unwrap();
+
+    // Deliberately generous — promptness is
+    // `cancelling_a_running_fetch_kills_the_child_and_says_nothing_moved`'s
+    // job. This test's assertion is about *how* the child ended, and it is
+    // worth more for being answerable even when the runner takes its time:
+    // a wait-it-out implementation reaches the signal check and fails there,
+    // on the mechanism, rather than on a clock.
+    let killed = tokio::time::timeout(HANG * 3, cancelled_run)
+        .await
+        .expect("the cancelled stream must resolve at all")
+        .unwrap()
+        .expect("the run itself must not error");
+    assert!(
+        killed.cancelled,
+        "the runner must report the cancel it acted on"
+    );
+    assert_eq!(
+        killed.output.status.signal(),
+        Some(SIGKILL),
+        "the child must have been SIGKILLed. A `signal()` of None means it \
+         exited on its own — i.e. the cancel stopped reading and left `git \
+         fetch` talking to the remote, which is the exact failure this \
+         endpoint exists to prevent. Status was {:?}",
+        killed.output.status
+    );
+
+    // The paired negative: no cancel, same helper, same repository — an
+    // ordinary fetch is neither `cancelled` nor signalled.
+    run(&repo, &["config", "--unset", "remote.origin.uploadpack"]);
+    let ordinary = crate::git_cmd::git_streamed_for(
+        &repo,
+        &["fetch", "--progress", "origin"],
+        crate::sandbox::NetworkNeed::Remote,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("an ordinary fetch must run");
+    assert!(
+        !ordinary.cancelled,
+        "a run nobody cancelled must not report a cancel"
+    );
+    assert_eq!(
+        ordinary.output.status.signal(),
+        None,
+        "an ordinary fetch's child exits; if this also reports a signal, the \
+         assertion above is reading something other than the kill"
+    );
+    assert!(
+        ordinary.output.status.success(),
+        "the paired-negative fetch must actually have worked: {:?}",
+        String::from_utf8_lossy(&ordinary.output.stderr)
+    );
+}
+
+/// `SIGKILL`, spelled out rather than pulled from a dependency this crate does
+/// not otherwise need. Fixed at 9 on every Linux ABI.
+const SIGKILL: i32 = 9;
+
 /// **The load-bearing cancellation test**: a running fetch is cancelled
-/// through the real endpoint, and the child process is *gone* afterwards.
+/// through the real endpoint, and the child process is *gone promptly*
+/// afterwards.
 ///
-/// Three assertions, in the order that makes each one mean something:
+/// Four legs, in the order that makes each one mean something:
 ///
-/// 1. While the fetch runs, `/proc` shows a matching process. This is the
-///    anti-vacuity leg — without it, "no process afterwards" would also be
-///    true of a scan that can never find anything, and the test would pass
-///    over a cancel that did nothing at all.
-/// 2. `POST /api/operations/{id}/cancel` answers `202`.
-/// 3. The process is gone, and the terminal record is a `409` carrying
-///    `FetchFailureKind::Cancelled` with **no** refs moved — the fetch was
-///    still inside `upload-pack`, so nothing local had changed, and the
-///    repository is checked directly to confirm it.
+/// 1. While the fetch runs, `/proc` shows a matching process. Without it, "no
+///    process afterwards" would also be true of a scan that can never find
+///    anything, and the test would pass over a cancel that did nothing at all.
+/// 2. **The hang outlives the budget.** The test dwells [`PROMPT`] without
+///    cancelling and asserts the fetch is *still* running and the driver has
+///    *not* answered. This is what makes leg 4 discriminating: it establishes
+///    on this run, not by construction, that the child was not about to exit
+///    on its own.
+/// 3. `POST /api/operations/{id}/cancel` answers `202`.
+/// 4. Within [`PROMPT`] the driver answers **and** the process is gone — with
+///    at least `HANG - 2 * PROMPT` of hanging still owed. The terminal record
+///    is a `409` carrying `FetchFailureKind::Cancelled` with **no** refs
+///    moved: the fetch was still inside `upload-pack`, so nothing local had
+///    changed, and the repository is checked directly to confirm it.
+///
+/// Leg 2 and the tight bound in leg 4 are the fix for a real hole: with the
+/// old 20s timeouts against a 10s hang, removing `child.start_kill()` from
+/// `git_cmd::git_streamed_for` left every assertion here passing.
+/// [`a_cancelled_stream_leaves_a_signalled_child_not_an_exited_one`] proves
+/// the same property a second way, by the child's termination signal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_a_running_fetch_kills_the_child_and_says_nothing_moved() {
     let (_dir, repo) = repo_with_remote_ahead(5);
@@ -371,13 +518,24 @@ async fn cancelling_a_running_fetch_kills_the_child_and_says_nothing_moved() {
 
     let scan_repo = repo.clone();
     assert!(
-        within(Duration::from_secs(20), || !live_fetch_processes(
-            &scan_repo
-        )
-        .is_empty())
-        .await,
+        within(HANG, || !live_fetch_processes(&scan_repo).is_empty()).await,
         "no git fetch process appeared for {repo:?} — the fixture never got \
          as far as spawning one, so nothing below would mean anything"
+    );
+
+    // Leg 2: the fixture really does hang past the budget the cancel is held
+    // to, so "gone within PROMPT of the cancel" cannot be satisfied by the
+    // child simply reaching the end of its sleep.
+    tokio::time::sleep(PROMPT).await;
+    assert!(
+        !live_fetch_processes(&repo).is_empty(),
+        "the hung fetch exited on its own inside the promptness budget — the \
+         budget below would then prove nothing about killing. Raise HANG."
+    );
+    assert!(
+        !driver.is_finished(),
+        "the uncancelled fetch already answered inside the promptness budget; \
+         the assertions below could not distinguish a kill from a wait"
     );
 
     let response =
@@ -389,9 +547,13 @@ async fn cancelling_a_running_fetch_kills_the_child_and_says_nothing_moved() {
         "a running, cancellable operation must accept the cancel"
     );
 
-    let (status, body) = tokio::time::timeout(Duration::from_secs(20), driver)
+    let (status, body) = tokio::time::timeout(PROMPT, driver)
         .await
-        .expect("the cancelled fetch must return promptly, not run to the sleep's end")
+        .expect(
+            "the cancelled fetch must return within the promptness budget. \
+             Timing out here with the hung remote still owed most of its \
+             sleep is what a cancel that merely stops waiting looks like",
+        )
         .unwrap();
     handle.finish(status, body.clone(), None);
 
@@ -412,9 +574,7 @@ async fn cancelling_a_running_fetch_kills_the_child_and_says_nothing_moved() {
     );
 
     assert!(
-        within(Duration::from_secs(10), || live_fetch_processes(&repo)
-            .is_empty())
-        .await,
+        within(PROMPT, || live_fetch_processes(&repo).is_empty()).await,
         "the git fetch child survived the cancel — a cancel that only stops \
          waiting leaves git running against the remote, which is the exact \
          failure this endpoint exists to prevent. Still alive: {:?}",
@@ -653,5 +813,229 @@ async fn a_credential_leaked_by_the_remote_never_reaches_the_operation_record() 
             .contains(SECRET),
         "the whole recorded status must be free of the secret, not just the \
          field this test happened to look at"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The journal — what the activity feed is told a fetch did
+// ---------------------------------------------------------------------------
+
+/// Every `ActivityKind::Fetch` entry this repository's journal holds.
+///
+/// Read back off disk through `journal::read_all`, i.e. through the same
+/// parser `/api/activity` uses — not by inspecting whatever `journal_updates`
+/// happened to be handed. A round trip through the JSONL is the only way this
+/// proves the feed would actually see the entry.
+fn journaled_fetches(repo: &Path) -> Vec<ActivityEvent> {
+    crate::journal::read_all(repo)
+        .into_iter()
+        .filter(|e| e.kind == ActivityKind::Fetch)
+        .collect()
+}
+
+/// A fetch that moves a remote-tracking ref journals **one `Fetch` entry per
+/// moved ref**, carrying the observed before/after oids — so the activity feed
+/// can say "origin/main moved from X to Y" instead of "a fetch happened".
+///
+/// This closes a real gap: `journal_updates` shipped with no coverage at all,
+/// and commenting out its call on the success path left all 23 fetch-touching
+/// tests in the workspace green. ADR 0043 listed it as unit-tested; it was not.
+///
+/// The oids are checked against `git rev-parse` rather than against the
+/// response body — asserting the journal matches the response would only prove
+/// the two came from the same variable. The repository is the referee.
+///
+/// The paired negative is the test below: an up-to-date fetch journals nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fetch_that_moves_a_ref_journals_it_per_ref() {
+    let (_dir, repo) = repo_with_remote_ahead(5);
+    assert!(
+        journaled_fetches(&repo).is_empty(),
+        "the fixture must start with an empty journal, or the count below \
+         measures the fixture rather than the fetch"
+    );
+
+    let (handle, record) = admit_fetch("journal-moved");
+    let (status, body) = run_tracked(&repo, record, fetch_op()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    handle.finish(status, body.clone(), None);
+
+    // What the repository itself says the ref is now — the referee.
+    let tip = std::process::Command::new("git")
+        .args(["rev-parse", "refs/remotes/origin/main"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(tip.status.success(), "the fetch must have created the ref");
+    let tip = String::from_utf8_lossy(&tip.stdout).trim().to_string();
+
+    let entries = journaled_fetches(&repo);
+    assert_eq!(
+        entries.len(),
+        1,
+        "one moved ref must journal exactly one Fetch entry, not zero and not \
+         a summary plus a per-ref one: {entries:?}"
+    );
+    let entry = &entries[0];
+    assert_eq!(
+        entry.ref_name.as_deref(),
+        Some("refs/remotes/origin/main"),
+        "the entry must name the ref that moved: {entry:?}"
+    );
+    assert_eq!(
+        entry.new_oid.as_deref(),
+        Some(tip.as_str()),
+        "the journaled new tip must be the oid git now reports: {entry:?}"
+    );
+    assert_eq!(
+        entry.old_oid, None,
+        "the fixture deletes the tracking ref before fetching, so the \
+         observed previous tip is Absent — a journal claiming a previous oid \
+         would be inventing one: {entry:?}"
+    );
+    assert_eq!(
+        entry.source,
+        ActivitySource::App,
+        "a fetch this server ran must be attributed to the app: {entry:?}"
+    );
+    assert!(
+        entry.summary.contains("origin/main"),
+        "the summary must name the ref that moved: {}",
+        entry.summary
+    );
+    assert!(
+        !entry.summary.contains("unknown"),
+        "an observed fetch must not be journaled as unknown: {}",
+        entry.summary
+    );
+}
+
+/// The paired negative: an already-up-to-date fetch journals **nothing**.
+///
+/// Without this leg, `a_fetch_that_moves_a_ref_journals_it_per_ref` would pass
+/// for an implementation that journaled an entry on entry to `exec_fetch`
+/// regardless of what moved — a feed in which every fetch looks like a change
+/// is exactly as uninformative as one in which none do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_up_to_date_fetch_journals_nothing() {
+    let (_dir, repo) = repo_with_remote_ahead(0);
+    let (handle, record) = admit_fetch("journal-noop");
+    let (status, body) = run_tracked(&repo, record, fetch_op()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let success: FetchSuccess = serde_json::from_str(&body).unwrap();
+    assert!(
+        success.updated_refs.is_empty(),
+        "the fixture must have nothing to fetch, or this proves nothing: {:?}",
+        success.updated_refs
+    );
+    handle.finish(status, body, None);
+
+    assert!(
+        journaled_fetches(&repo).is_empty(),
+        "a fetch that moved nothing must leave no trace in the feed: {:?}",
+        journaled_fetches(&repo)
+    );
+}
+
+/// Break the served repository's ref store *during* the fetch, at the moment
+/// git commits the ref update.
+///
+/// `reference-transaction` fires with `committed` once the new
+/// `refs/remotes/origin/main` is durable, so the ref genuinely moves and only
+/// then does the ref store become unreadable. That is exactly the state
+/// `exec_fetch`'s post-fetch re-read has to cope with: the repository changed,
+/// and no one can say how.
+///
+/// A malformed `packed-refs` is the lever because `git for-each-ref` treats it
+/// as fatal (`exit 128`, verified against git 2.43.0) while the already-written
+/// loose ref stays on disk.
+fn blind_the_repository_after_the_fetch(repo: &Path) {
+    let hooks = repo.join(".git/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("reference-transaction");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = committed ]; then\n\
+             printf 'not a packed-refs file\\n' > '{}/.git/packed-refs'\n\
+             fi\n\
+             exit 0\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A fetch that ran, moved a ref, and then could not be re-read still leaves a
+/// journal entry — one that **admits** the outcome is unknown.
+///
+/// This is the one exit path from `exec_fetch` that has no ref diff to
+/// describe, and before this it returned silently: the repository had changed
+/// and the activity feed said nothing at all, which is the divergence between
+/// what happened and what was recorded that the rest of the module observes
+/// refs to avoid.
+///
+/// The premise is asserted three ways rather than assumed, because a fixture
+/// that merely failed early would make the whole thing vacuous:
+///
+/// * the response is the specific "the fetch ran but … could not be re-read"
+///   refusal, so this really is the re-read path and not, say, a spawn
+///   failure before git ever started;
+/// * the loose `refs/remotes/origin/main` is on disk, so a ref really did move
+///   while unobservable — the divergence is real, not hypothetical;
+/// * the entry's oids are `None` *and* the summary says so, distinguishing
+///   "there was no such tip" (`Obs::Absent`) from "git could not be read"
+///   (`Obs::Unknown`), which is the whole point of D5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fetch_whose_outcome_cannot_be_observed_is_journaled_as_unknown() {
+    let (_dir, repo) = repo_with_remote_ahead(5);
+    blind_the_repository_after_the_fetch(&repo);
+
+    let (handle, record) = admit_fetch("journal-blinded");
+    let (status, body) = run_tracked(&repo, record, fetch_op()).await;
+    handle.finish(status, body.clone(), None);
+
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the fixture must reach the post-fetch re-read failure: {body}"
+    );
+    assert!(
+        body.contains("could not be re-read"),
+        "…and it must be *that* refusal, not some earlier one: {body}"
+    );
+    assert!(
+        repo.join(".git/refs/remotes/origin/main").exists(),
+        "the fixture must let the ref actually move before blinding the repo, \
+         or there is no divergence for the journal to record"
+    );
+
+    let entries = journaled_fetches(&repo);
+    assert_eq!(
+        entries.len(),
+        1,
+        "an unobservable fetch must still leave exactly one entry: {entries:?}"
+    );
+    let entry = &entries[0];
+    assert_eq!(
+        entry.ref_name, None,
+        "which ref moved is precisely what is unknown; naming one would be \
+         fabrication: {entry:?}"
+    );
+    assert_eq!(entry.old_oid, None, "{entry:?}");
+    assert_eq!(entry.new_oid, None, "{entry:?}");
+    assert!(
+        entry.summary.contains("unknown"),
+        "the summary must admit the outcome is unknown rather than leave the \
+         empty oids to be read as ‘nothing moved’: {}",
+        entry.summary
+    );
+    assert_eq!(entry.source, ActivitySource::App, "{entry:?}");
+    assert_eq!(
+        entry.undo, None,
+        "an outcome nobody observed offers no undo: {entry:?}"
     );
 }

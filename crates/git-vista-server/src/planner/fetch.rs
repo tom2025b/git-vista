@@ -361,13 +361,21 @@ pub(super) async fn exec_fetch(
     let after = match remote_tracking_refs(repo, need, remote).await {
         Ok(refs) => refs,
         Err(why) => {
+            // The only exit path reached *after* git fetch has already run
+            // and *without* a ref diff to describe it. Every other exit
+            // (success, failure, cancelled) journals what moved; returning
+            // silently from here would leave the activity feed claiming
+            // nothing happened while the repository on disk says otherwise —
+            // the silent divergence the rest of this module observes refs to
+            // avoid. So the fact of the unobserved run is journaled instead.
+            journal_unobserved(repo, remote, &why).await;
             return couldnt_run(
                 ENDPOINT,
                 &format!(
                     "the fetch ran but refs/remotes/{} could not be re-read: {why}",
                     remote.as_str()
                 ),
-            )
+            );
         }
     };
     let updated = diff_refs(&before, &after);
@@ -515,6 +523,40 @@ async fn journal_updates(
         )
         .await;
     }
+}
+
+/// Journal the one fetch outcome this module cannot name: `git fetch` ran to
+/// completion and the re-read of `refs/remotes/<remote>/*` that would say what
+/// it moved failed.
+///
+/// **One entry, with no `ref_name`**, because the per-ref set is precisely
+/// what is unknown — inventing a ref name here would be the fabrication
+/// [`journal_updates`] avoids by only ever journaling refs it watched change.
+///
+/// **`Obs::Unknown` on both tips, not `Obs::Absent`** — D5's distinction, and
+/// the reason it exists. `Absent` would assert the refs do not exist; the
+/// truth is that git could not be read. `journal_app_event` turns `Unknown`
+/// into an explicit "(tips unknown — git could not be read)" on the summary,
+/// so a reader of the feed sees an admission rather than a gap.
+///
+/// `why` is already redacted: it comes back through `run_git` under
+/// [`NetworkNeed::Remote`], which applies the same `redact_if_remote` every
+/// other Network-tier output goes through (#228).
+async fn journal_unobserved(repo: &Path, remote: &RemoteName, why: &str) {
+    journal_app_event(
+        repo,
+        ActivityKind::Fetch,
+        None,
+        Obs::Unknown,
+        Obs::Unknown,
+        format!(
+            "fetched from ‘{}’, but refs/remotes/{} could not be re-read afterwards, \
+             so which remote-tracking refs moved is unknown: {why}",
+            remote.as_str(),
+            remote.as_str()
+        ),
+    )
+    .await;
 }
 
 #[cfg(test)]
