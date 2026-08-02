@@ -75,19 +75,18 @@ pub struct MenuData {
     pub remote_web_url: Option<String>,
 }
 
-/// What the commit-message dialog (Issue #33) is collecting a message for:
-/// which kind of commit, and where it should land.
-#[derive(Clone)]
-pub struct CommitDialog {
-    /// `git commit --allow-empty` (an empty commit) vs a staged-changes commit.
-    pub allow_empty: bool,
-    /// Branch the commit should land on. `None` => the checked-out branch (a
-    /// plain `git commit` on HEAD — every commit item on a commit dot). `Some`
-    /// => a branch stub's own name: the server writes the commit object and
-    /// moves just that ref, so an empty branch can take its first commit
-    /// without a checkout. Only ever `Some` together with `allow_empty`.
-    pub branch: Option<String>,
-}
+// What the commit-message dialog (Issue #33) is collecting a message for now lives
+// in `features/dialogs/commit.rs` as `CommitIntent` (M2.19c, #224), re-exported here
+// so the modules that raise the dialog keep importing it from one place. Same move,
+// and the same reason, as `PendingOp` below: this module is wasm-only, and the
+// three-mode decision — commit the index, record an empty commit, rewrite the tip —
+// has to be decidable (and tested) on the host.
+//
+// The `allow_empty: bool` + `branch: Option<String>` pair it replaces carried an
+// unwritten rule ("`branch` is `Some` only when `allow_empty` is") that nothing
+// enforced, and had no room for an amend's `expected_tip` that would not also have
+// been representable on a commit that has no use for it.
+pub use crate::features::dialogs::commit::CommitIntent;
 
 // The branch-operation vocabulary moved to `features/operations/kind.rs` in M1.11
 // (#64): it is framework-free, so it compiles and is unit-tested on the host target,
