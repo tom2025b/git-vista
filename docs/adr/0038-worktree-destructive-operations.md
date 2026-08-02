@@ -1,4 +1,4 @@
-# ADR 0037 — Worktree-destructive operations: a typed per-path impact, a preview that names every file, and one control the risk class asks for that cannot exist
+# ADR 0038 — Worktree-destructive operations: a typed per-path impact, a preview that names every file, and one control the risk class asks for that cannot exist
 
 - **Status:** Accepted — implemented and tested.
 - **Date:** 2026-08-02.
@@ -14,7 +14,10 @@
   (why a path arrives as a validated newtype and not as a string),
   [0018](0018-plan-staleness-enforcement.md) (`enforce_fresh`, which these operations
   deliberately re-check *on top of*), [0021](0021-durable-operation-journal-and-recovery-refs.md)
-  (`RecoveryStrategy`, which this ADR splits one more way).
+  (`RecoveryStrategy`, which this ADR splits one more way), and
+  [0037](0037-observe-state-not-git-prose.md) (the governing decision for how the delete's own
+  success/failure report is verified — a filesystem observation, not a parse of git's stdout;
+  this ADR names that mechanism only to point at 0037, and no longer describes it itself).
 
 ## Context
 
@@ -104,14 +107,21 @@ if a path becomes tracked between the verification read and the `clean` call —
 0, and deletes the rest of the batch. Verified directly against real git.
 
 Closing the window needs a repo-wide exclusive lock this endpoint does not hold. What is
-tractable without one is refusing to *report* success that is not true: `git clean` names on
-stdout exactly what it removed, and that set is compared against the full requested set
-before a 200 is returned. A mismatch is a 409 naming the discrepancy, plus a journal entry.
+tractable without one is refusing to *report* success that is not true — and, per
+[ADR 0037](0037-observe-state-not-git-prose.md), that report is not built by reading `git
+clean`'s stdout. `git clean`'s removal line is prose passed through gettext and translated
+under a non-C locale, so a decision that branches on matching it can misreport a genuine
+deletion as a survivor. The report here is a filesystem observation instead — `symlink_metadata`
+on each requested path, taken immediately before and after the spawn, so a dangling symlink
+whose target was already gone is not mistaken for one `clean` removed — compared against the
+full requested set before a 200 is returned. A mismatch is a 409 naming the discrepancy, plus a
+journal entry.
 
 ```mermaid
 sequenceDiagram
     participant U as Browser
     participant P as planner
+    participant FS as worktree filesystem
     participant G as git
     U->>P: POST /api/delete-untracked-paths
     P->>P: enforce_fresh — generation-level
@@ -119,12 +129,14 @@ sequenceDiagram
     P->>G: git status — per-path check
     G-->>P: all still untracked
     Note over P,G: the window: another writer may git add here
+    P->>FS: symlink_metadata per path, presence before
     P->>G: git clean -f -- p1 p2 p3
-    G-->>P: exit 0, stdout names what was removed
-    P->>P: compare removed set against requested set
-    alt sets match
+    G-->>P: exit 0, prose not trusted — ADR 0037
+    P->>FS: symlink_metadata per path, presence after
+    P->>P: compare presence-after against requested set
+    alt every path now absent
         P-->>U: 200 — deleted N paths permanently
-    else a path was skipped
+    else a path is still present
         P-->>U: 409 — partial result, named
     end
 ```
@@ -279,7 +291,8 @@ comment beside it — the failure mode a typed field exists to prevent.
 | `WorktreePath` newtype and its refusals | `crates/git-vista-protocol/src/newtype.rs` |
 | `WorktreePathsRequest` wire body | `crates/git-vista-protocol/src/dto.rs` |
 | Operation variants, risk, `RecoveryStrategy` | `crates/git-vista-protocol/src/plan.rs` |
-| Executors, `verify_path_states`, `symlink_containment_guard`, `partial_delete_report` | `crates/git-vista-server/src/planner.rs` |
+| Executors, `verify_path_states`, `symlink_containment_guard` | `crates/git-vista-server/src/planner.rs` |
+| Deletion-verification report (filesystem observation, not stdout parsing) | see [ADR 0037](0037-observe-state-not-git-prose.md) |
 | Endpoints | `crates/git-vista-server/src/handlers/discard.rs` |
 | Contract tripwires, including the "never sounds recoverable" grep | `crates/git-vista-server/src/planner/contract_suite.rs` |
 | Confirmation copy and ceremony (pure, host-tested) | `crates/git-vista/src/features/dialogs/core.rs` |
