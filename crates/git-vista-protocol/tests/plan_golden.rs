@@ -1,6 +1,6 @@
 //! Golden-fixture test for the [`Plan`] wire contract (M1.06a, #142).
 //!
-//! `tests/fixtures/plan_v1.json` is the **committed** wire form of nineteen
+//! `tests/fixtures/plan_v1.json` is the **committed** wire form of twenty-one
 //! plans — one per [`GitOperation`] variant, together exercising every
 //! [`RiskLevel`], [`Precondition`], [`RefState`] and [`RecoveryStrategy`]
 //! variant. The test proves the contract is lossless in both directions:
@@ -14,9 +14,10 @@
 //! review the diff, and record the protocol implications (M1.02 rules).
 
 use git_vista_protocol::{
-    BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, OperationHash, Plan,
-    Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName, RepositoryToken,
-    RiskLevel, StageDirection, UnixSeconds, WorktreePath, WorktreeToken,
+    BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
+    MergeStrategy, OperationHash, Plan, Precondition, RecoveryStrategy, RefChange, RefName,
+    RefState, RemoteName, RepositoryToken, RiskLevel, StageDirection, UnixSeconds, WorktreePath,
+    WorktreeToken,
 };
 
 const FIXTURE: &str = include_str!("fixtures/plan_v1.json");
@@ -195,9 +196,16 @@ fn golden_plans() -> Vec<Plan> {
         ),
         plan(
             'b',
+            // The push shape production actually emits: fast-forward, no
+            // upstream write. M2.20a's other combinations are pinned by
+            // `a_lease_force_push_pins_its_own_wire_shape` below rather than
+            // here, because `golden_set_covers_every_operation_variant`
+            // allows only one plan per `op` tag.
             GitOperation::PushBranch {
                 branch: branch("main"),
                 remote: RemoteName::new("origin").unwrap(),
+                set_upstream: false,
+                force: ForcePublish::None,
             },
             RiskLevel::Remote,
             vec![
@@ -415,7 +423,262 @@ fn golden_plans() -> Vec<Plan> {
                 to: oid('2'),
             },
         ),
+        // #227 (M2.20a): contract only, like `amend_commit` above — the
+        // vocabulary and its network classification land before #229/#230
+        // wire any socket. The golden plans pin the wire shape now so those
+        // slices cannot quietly change it while adding execution.
+        //
+        // Fetch is `Safe`/`NotNeeded` with no ref change listed: which
+        // `refs/remotes/*` move is unknowable until git has spoken to the
+        // remote, so there is nothing honest to claim (see the variant doc).
+        plan(
+            'b',
+            GitOperation::FetchRemote {
+                remote: RemoteName::new("origin").unwrap(),
+            },
+            RiskLevel::Safe,
+            vec![Precondition::RemoteConfigured {
+                remote: RemoteName::new("origin").unwrap(),
+            }],
+            Vec::new(),
+            RecoveryStrategy::NotNeeded,
+        ),
+        plan(
+            'c',
+            GitOperation::PullBranch {
+                remote: RemoteName::new("origin").unwrap(),
+                branch: branch("main"),
+                strategy: MergeStrategy::Rebase,
+            },
+            RiskLevel::Reversible,
+            vec![
+                Precondition::BranchCheckedOut {
+                    branch: branch("main"),
+                },
+                Precondition::RemoteConfigured {
+                    remote: RemoteName::new("origin").unwrap(),
+                },
+                Precondition::RefAt {
+                    ref_name: rname("refs/heads/main"),
+                    oid: oid('2'),
+                },
+            ],
+            vec![RefChange {
+                ref_name: rname("refs/heads/main"),
+                before: RefState::At(oid('2')),
+                after: RefState::Computed,
+            }],
+            RecoveryStrategy::ResetRef {
+                ref_name: rname("refs/heads/main"),
+                to: oid('2'),
+            },
+        ),
     ]
+}
+
+/// The lease-force push's wire form, pinned against a literal rather than
+/// against a round trip.
+///
+/// A round-trip test (serialize, deserialize, compare) passes for *any*
+/// self-consistent encoding — including one where `ForcePublish` grew a
+/// `#[serde(untagged)]` attribute and `{"mode": "with_lease"}` silently
+/// became something else. Comparing against bytes written out by hand is what
+/// makes the encoding itself the thing under test, which is the whole reason
+/// this file exists.
+#[test]
+fn a_lease_force_push_pins_its_own_wire_shape() {
+    let op = GitOperation::PushBranch {
+        branch: branch("main"),
+        remote: RemoteName::new("origin").unwrap(),
+        set_upstream: true,
+        force: ForcePublish::WithLease {
+            expected_remote_tip: oid('4'),
+        },
+    };
+    let expected = serde_json::json!({
+        "op": "push_branch",
+        "branch": "main",
+        "remote": "origin",
+        "set_upstream": true,
+        "force": {
+            "mode": "with_lease",
+            "expected_remote_tip": "4444444444444444444444444444444444444444",
+        },
+    });
+    assert_eq!(serde_json::to_value(&op).unwrap(), expected);
+    // …and back, so the pin is bidirectional.
+    assert_eq!(
+        serde_json::from_value::<GitOperation>(expected).unwrap(),
+        op
+    );
+}
+
+/// The pre-M2.20a `push_branch` body must now be **rejected**, not silently
+/// completed with defaults.
+///
+/// This is the paired negative for the fixture change above: without it, a
+/// `#[serde(default)]` slipped onto `set_upstream` or `force` would leave
+/// every other test in this file green while an omitted `force` quietly
+/// became `ForcePublish::None`. That is a live risk rather than a
+/// hypothetical — the old shape is exactly what a stale client, a replayed
+/// request body, or a copy-pasted fixture would send.
+#[test]
+fn the_pre_m2_20a_push_body_no_longer_deserializes() {
+    let old = serde_json::json!({
+        "op": "push_branch",
+        "branch": "main",
+        "remote": "origin",
+    });
+    let err = serde_json::from_value::<GitOperation>(old)
+        .expect_err("a push body without set_upstream/force must be a hard error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("set_upstream") || msg.contains("force"),
+        "the error must name the missing field, got: {msg}"
+    );
+
+    // The paired positive, proving the rejection above is about the missing
+    // fields and not about some unrelated breakage in this JSON: the same
+    // body with both fields supplied deserializes fine.
+    let complete = serde_json::json!({
+        "op": "push_branch",
+        "branch": "main",
+        "remote": "origin",
+        "set_upstream": false,
+        "force": { "mode": "none" },
+    });
+    assert_eq!(
+        serde_json::from_value::<GitOperation>(complete).unwrap(),
+        GitOperation::PushBranch {
+            branch: branch("main"),
+            remote: RemoteName::new("origin").unwrap(),
+            set_upstream: false,
+            force: ForcePublish::None,
+        }
+    );
+}
+
+/// No wire body can ask for an unguarded force push (#227 acceptance).
+///
+/// `ForcePublish` has no such variant, so this is really a test that no
+/// *serde* attribute has quietly made one reachable — `untagged`, an alias,
+/// or a `From<bool>`-style shim would each re-open the hole the type was
+/// shaped to close. Every spelling a caller might reach for must be a hard
+/// deserialize error.
+#[test]
+fn no_wire_body_can_request_an_unguarded_force_push() {
+    for force in [
+        serde_json::json!({ "mode": "force" }),
+        serde_json::json!({ "mode": "forced" }),
+        serde_json::json!({ "mode": "with_lease" }), // a lease with no oid
+        // A stray key alongside the lease: `deny_unknown_fields` catches this
+        // on the struct variant, so a misspelled `expected_remote_tip` cannot
+        // become a lease that pins nothing.
+        serde_json::json!({
+            "mode": "with_lease",
+            "expected_remote_tip": "4444444444444444444444444444444444444444",
+            "also_force": true,
+        }),
+        serde_json::json!("force"),
+        serde_json::json!(true),
+        serde_json::json!(null),
+    ] {
+        let body = serde_json::json!({
+            "op": "push_branch",
+            "branch": "main",
+            "remote": "origin",
+            "set_upstream": false,
+            "force": force,
+        });
+        assert!(
+            serde_json::from_value::<GitOperation>(body.clone()).is_err(),
+            "a force mode of {force} must not deserialize"
+        );
+    }
+
+    // The one stray-key case serde does *not* reject, recorded here rather
+    // than left as a surprise: `deny_unknown_fields` has no effect on a
+    // **unit** variant of an internally-tagged enum, so a tip supplied
+    // alongside `"mode": "none"` is ignored. That degrades toward the safe
+    // variant — the result is `ForcePublish::None`, a plain fast-forward
+    // push, which the plan then shows as `RiskLevel::Remote` with no lease
+    // precondition for the user to approve. It is pinned so that a future
+    // encoding change which made this parse as a *lease* (or, worse, as
+    // anything forceful) fails here instead of shipping.
+    let stray = serde_json::json!({
+        "op": "push_branch",
+        "branch": "main",
+        "remote": "origin",
+        "set_upstream": false,
+        "force": { "mode": "none", "expected_remote_tip": "4444444444444444444444444444444444444444" },
+    });
+    assert_eq!(
+        serde_json::from_value::<GitOperation>(stray).unwrap(),
+        GitOperation::PushBranch {
+            branch: branch("main"),
+            remote: RemoteName::new("origin").unwrap(),
+            set_upstream: false,
+            force: ForcePublish::None,
+        },
+        "an ignored stray key must still land on the *safe* force mode"
+    );
+}
+
+/// A `pull_branch` body that omits `strategy` is a deserialize error — #227's
+/// headline acceptance criterion, and the reason [`MergeStrategy`] has no
+/// `Default`.
+///
+/// The paired positives matter as much as the negative: both real strategies
+/// must deserialize, so this cannot pass by `pull_branch` being broken
+/// outright. And an invented third value must fail, so it cannot pass by the
+/// field accepting anything at all.
+#[test]
+fn a_pull_without_a_strategy_is_a_deserialize_error() {
+    let without = serde_json::json!({
+        "op": "pull_branch",
+        "remote": "origin",
+        "branch": "main",
+    });
+    let err = serde_json::from_value::<GitOperation>(without)
+        .expect_err("an omitted pull strategy must be an error, never a default");
+    assert!(
+        err.to_string().contains("strategy"),
+        "the error must name the missing field, got: {err}"
+    );
+
+    for (wire, expected) in [
+        ("merge", MergeStrategy::Merge),
+        ("rebase", MergeStrategy::Rebase),
+    ] {
+        let body = serde_json::json!({
+            "op": "pull_branch",
+            "remote": "origin",
+            "branch": "main",
+            "strategy": wire,
+        });
+        assert_eq!(
+            serde_json::from_value::<GitOperation>(body).unwrap(),
+            GitOperation::PullBranch {
+                remote: RemoteName::new("origin").unwrap(),
+                branch: branch("main"),
+                strategy: expected,
+            },
+            "‘{wire}’ must be the wire name for {expected:?}"
+        );
+    }
+
+    for invented in ["auto", "default", "ff_only", ""] {
+        let body = serde_json::json!({
+            "op": "pull_branch",
+            "remote": "origin",
+            "branch": "main",
+            "strategy": invented,
+        });
+        assert!(
+            serde_json::from_value::<GitOperation>(body).is_err(),
+            "‘{invented}’ must not be an accepted strategy"
+        );
+    }
 }
 
 #[test]
@@ -492,6 +755,8 @@ fn golden_set_covers_every_operation_variant() {
         "discard_tracked_paths",
         "delete_untracked_paths",
         "amend_commit",
+        "fetch_remote",
+        "pull_branch",
     ]
     .into_iter()
     .map(String::from)
