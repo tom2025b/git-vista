@@ -1017,6 +1017,35 @@ fn reset_amend_clears_preflight(src: &str) -> bool {
     body[..end].contains("amend_preflight")
 }
 
+/// Whether the ceremony's second step records the agreement **before** it
+/// re-submits.
+///
+/// Scoped to the `confirm_published` closure's body — from its `let` line to
+/// the next top-level `let` in the same component — so neither the `submit_amend`
+/// definition above it nor the `SubmitPath::Amend(target) => submit_amend(target)`
+/// call below it can stand in for the re-submit this is ordering against.
+///
+/// Fail-closed on a missing subject, like its two siblings: a body with no
+/// `confirm_amend_target` call, or no closure at all, is not a passing source.
+fn records_consent_before_it_resubmits(src: &str) -> bool {
+    let Some(start) = src.find("let confirm_published = ") else {
+        return false;
+    };
+    let body = &src[start..];
+    let end = body[1..]
+        .find("\n    let ")
+        .map(|i| i + 1)
+        .unwrap_or(body.len());
+    let body = &body[..end];
+    match (
+        body.find("confirm_amend_target("),
+        body.find("submit_amend("),
+    ) {
+        (Some(record), Some(resubmit)) => record < resubmit,
+        _ => false,
+    }
+}
+
 /// The gate has to be in front of the POST, not behind it.
 ///
 /// What it is guarding against is not a hypothetical: `submit_amend` is a
@@ -1066,6 +1095,75 @@ fn the_gate_ordering_census_can_spot_a_gate_behind_the_send() {
     // No gate at all, and no subject at all, both read as failures.
     assert!(!gates_before_it_sends("amend_commit_request(&m, &t).await"));
     assert!(!gates_before_it_sends("nothing to see here"));
+}
+
+/// The way *past* the banner has to record the agreement before it re-submits.
+///
+/// The gate tripwire above only proves the banner gets raised; this one proves
+/// the user can get through it. `submit_amend` re-reads `dialogs.amend_knowledge()`
+/// synchronously to decide the pre-flight, so a `confirm_published` that
+/// re-submitted first and recorded second would answer `Preflight::Confirm`
+/// again and re-enter `AwaitingPublishedConfirm` — the banner's own button
+/// permanently inert, and no amend of published history reachable through the
+/// UI at all. The closure lives in a file `cargo test --workspace` never
+/// compiles, so both the swap and the deletion are green-suite failures.
+#[test]
+fn the_way_past_the_banner_records_the_agreement_before_it_resubmits() {
+    assert!(
+        records_consent_before_it_resubmits(COMMIT_MODAL),
+        "`confirm_published` in dialogs/commit.rs no longer calls \
+         `dialogs.confirm_amend_target(..)` before `submit_amend(..)`. \
+         `submit_amend` re-reads the knowledge to decide the pre-flight, so this \
+         order is the only thing that lets a confirmed amend of published history \
+         ever be sent — reversed or dropped, the confirm button loops on its own \
+         banner forever."
+    );
+    assert!(
+        COMMIT_MODAL.contains("on:click=move |_| confirm_published(target.clone())"),
+        "the ceremony's confirm button is no longer wired to `confirm_published`, \
+         so the ordering above guards a closure nothing presses"
+    );
+}
+
+/// Both answers, against fixture source — and the scoping, which is the whole
+/// reason this reads a closure body rather than the file.
+#[test]
+fn the_consent_ordering_census_can_spot_a_record_behind_the_resubmit() {
+    let fixed = "    let confirm_published = move |target: AmendTarget| {\n        \
+                 dialogs.confirm_amend_target(target.expected_tip());\n        \
+                 submit_amend(target);\n    };\n";
+    assert!(records_consent_before_it_resubmits(fixed));
+
+    // The shape that would ship the bug: re-submit first, record afterwards.
+    let swapped = "    let confirm_published = move |target: AmendTarget| {\n        \
+                   submit_amend(target.clone());\n        \
+                   dialogs.confirm_amend_target(target.expected_tip());\n    };\n";
+    assert!(!records_consent_before_it_resubmits(swapped));
+
+    // Dropping the record entirely is a failure, not a vacuous pass.
+    let unrecorded = "    let confirm_published = move |target: AmendTarget| {\n        \
+                      submit_amend(target);\n    };\n";
+    assert!(!records_consent_before_it_resubmits(unrecorded));
+
+    // The paired negative that justifies the scoping: the record is present in
+    // the file, but in a *different* closure. A whole-file `find` would compare
+    // that call against the first `submit_amend(` and pass.
+    let elsewhere = "    let confirm_published = move |target: AmendTarget| {\n        \
+                     submit_amend(target);\n    };\n\n    \
+                     let something_else = move || {\n        \
+                     dialogs.confirm_amend_target(tip);\n    };\n";
+    assert!(!records_consent_before_it_resubmits(elsewhere));
+
+    // …and the mirror of it: an earlier closure that records must not be
+    // credited to `confirm_published`.
+    let recorded_earlier = "    let something_else = move || {\n        \
+                            dialogs.confirm_amend_target(tip);\n    };\n\n    \
+                            let confirm_published = move |target: AmendTarget| {\n        \
+                            submit_amend(target);\n    };\n";
+    assert!(!records_consent_before_it_resubmits(recorded_earlier));
+
+    // No subject at all is not a pass.
+    assert!(!records_consent_before_it_resubmits("nothing to see here"));
 }
 
 /// A fresh dialog must not inherit the previous amend's consent.
