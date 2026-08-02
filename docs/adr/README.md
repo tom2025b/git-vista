@@ -48,4 +48,5 @@ it, and note the link in both.
 | [0034](0034-cat-file-batch-single-spawn-reads.md) | File-at-commit reads go through one long-lived `cat-file --batch` process | Accepted — implemented and tested |
 | [0035](0035-inspector-bottom-sheet-wiring.md) | The inspector bottom sheet is wired to `ShellMode`, following the finger during drag | Accepted — implemented and tested |
 | [0036](0036-network-tier-exec-harness-askpass-and-redaction.md) | The Network-tier exec harness: forced askpass hardening, byte-level redaction, and what stays open | Accepted — implemented and tested |
+| [0037](0037-observe-state-not-git-prose.md) | Observe state, never parse git's prose: destructive operations report what the worktree proves | Accepted — implemented and tested |
 | [0039](0039-remote-operation-vocabulary.md) | The typed remote-operation vocabulary: `FetchRemote`, `PullBranch`, and a lease-guarded `PushBranch` | Accepted — typed contract implemented and tested; execution not yet wired (#229/#230/#231) |

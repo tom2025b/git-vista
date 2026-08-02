@@ -2855,51 +2855,234 @@ async fn exec_discard_tracked_paths(
     )
 }
 
-/// Compare what `git clean -f`'s own stdout says it actually removed
-/// ("Removing <path>" per entry) against the full `requested` set, and build
-/// an honest partial-result message if any requested path is missing —
-/// `None` when every requested path was reported removed. Pure: takes
-/// `git clean`'s stdout text directly, no repository access, so the
-/// mismatch-detection and message-building logic is testable with a
-/// hand-built stdout string, independent of ever triggering the real race
-/// this exists to report on (see [`exec_delete_untracked_paths`]'s doc
-/// comment for why the race itself can't be a deterministic permanent test).
-fn partial_delete_report(requested: &[&str], clean_stdout: &str) -> Option<String> {
-    let removed: std::collections::HashSet<&str> = clean_stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix("Removing "))
-        .collect();
-    let missing: Vec<&str> = requested
+/// After `git clean -f -- <paths>` has run, ask the **filesystem** which of
+/// `requested` is actually gone, and build an honest partial-result message
+/// naming any that survived — `None` when every requested path really was
+/// removed.
+///
+/// **Why the filesystem and not `git clean`'s stdout (#284).** Until #284
+/// this parsed `git clean`'s own output for `Removing <path>`. That string is
+/// passed through gettext in git's source, so it is translated whenever a
+/// `git.mo` catalog is installed and `LANG`/`LC_MESSAGES` names a non-English
+/// locale — and production spawns inherit the server's environment in full,
+/// because `sandbox::spawn`'s `env_clear`/`env` are `#[cfg(test)]`-only *by
+/// design* (argv and env cannot change after policy classification). Under
+/// `LANG=fr_FR.UTF-8` with translations installed, three successfully deleted
+/// files matched no prefix, all three looked un-deleted, and the endpoint
+/// returned 409 telling the user their files had survived — after they were
+/// irreversibly gone. That is the exact inversion of the property this
+/// function exists to provide, so the parse is gone: a dirent that is still
+/// there was not deleted, in every language.
+///
+/// **`symlink_metadata`, not `Path::exists`.** `exists()` follows the link, so
+/// a *dangling* symlink — one whose target is already gone — reports as
+/// absent while its dirent is still sitting in the worktree. `git clean` can
+/// and does delete dangling symlinks, so both "clean removed it" and "clean
+/// skipped it" would look identical to `exists()`, reintroducing a false
+/// success in the narrow case. `symlink_metadata` stats the entry itself and
+/// tells the two apart. (Same reason `symlink_containment_guard` uses it.)
+///
+/// **What this can still get wrong, stated plainly.** If something *else*
+/// deleted a requested path in the same window, we cannot see that it was
+/// not us. See [`DeleteOutcome`] for how much of that window the
+/// before-snapshot closes and what is left.
+///
+/// A stat error other than "not found" (an unreadable parent directory, say)
+/// counts as absent, deliberately: presence is the claim that has to be
+/// *proved* here, and an error proves nothing.
+///
+/// Synchronous `stat` calls in an async fn, deliberately: one per requested
+/// path, bounded by the request, on entries `symlink_containment_guard` and
+/// `verify_path_states` stat'd microseconds earlier — not worth a
+/// `spawn_blocking` hop and the join-error branch that comes with it.
+fn present_paths<'a>(repo: &Path, requested: &[&'a str]) -> Vec<&'a str> {
+    requested
         .iter()
         .copied()
-        .filter(|p| !removed.contains(p))
-        .collect();
-    if missing.is_empty() {
-        return None;
+        .filter(|p| std::fs::symlink_metadata(repo.join(p)).is_ok())
+        .collect()
+}
+
+/// What the worktree says happened to each requested path, split three ways
+/// by comparing a presence snapshot taken immediately *before* the `git
+/// clean` spawn against one taken immediately after.
+///
+/// **Why three buckets and not two (#284, review finding).** The first cut of
+/// this only looked at the worktree *after* the spawn, so "absent now" was
+/// read as "we deleted it". That silently credits this operation with a
+/// deletion it did not perform: `git clean -f -- a.txt b.txt` exits 0 and
+/// says nothing when `b.txt` is already gone (verified directly against real
+/// git), so a second git-vista tab, a shell `rm`, or an editor auto-clean
+/// removing `b.txt` first produced a 200 reading "Deleted 2 untracked paths
+/// permanently" — and, worse, a *journal* entry saying the same. The journal
+/// is the durable record for the one operation in this vocabulary with no
+/// undo of any kind; an entry claiming a destruction we did not cause is a
+/// corrupt audit trail, not a rounding error.
+///
+/// **How much window this actually closes, stated plainly.** Not all of it.
+/// [`verify_path_states`] already refuses a path that has vanished by the
+/// time its `git status` runs (a missing path classifies as
+/// [`PathKind::Other`], never [`PathKind::Untracked`]), so the exposure was
+/// always the gap between that read and `git clean`'s own `unlink`. The
+/// before-snapshot moves the near edge of that gap from "before a `git
+/// status` subprocess spawn, a porcelain parse, and a `git clean` subprocess
+/// spawn" to "after all of those, one `stat` before the spawn" — milliseconds
+/// down to whatever elapses inside `git clean` itself. What remains is an
+/// external deleter landing *inside* the child process's own run. Closing
+/// that last sliver needs a repo-wide exclusive lock this endpoint does not
+/// hold, which is a different and much larger decision; narrowing it by three
+/// orders of magnitude costs one `stat` per requested path on entries that
+/// were stat'd twice already.
+///
+/// **The bias is unchanged and deliberate.** A path still on disk is always
+/// reported as a survivor, whoever put it there. This can still never claim a
+/// destroyed file survived — the inversion #284 was filed about, and the only
+/// failure direction that makes a user stop looking for data that is gone for
+/// good.
+#[derive(Debug, PartialEq, Eq)]
+struct DeleteOutcome<'a> {
+    /// Present before the spawn, absent after: this operation removed it.
+    /// The count the response and the journal are allowed to claim.
+    deleted: Vec<&'a str>,
+    /// Absent before the spawn and absent after: gone for good, but not by
+    /// our hand. Reported, never counted as ours.
+    already_gone: Vec<&'a str>,
+    /// Still in the worktree: not deleted, whatever it points at. `git clean`
+    /// silently skips a path that has become tracked since the pre-flight
+    /// check (no error, exit 0), which is how this bucket normally fills.
+    survived: Vec<&'a str>,
+}
+
+/// Compare the before-snapshot against the live worktree. `present_before`
+/// comes from [`present_paths`] called immediately before the spawn.
+fn observe_deletion<'a>(
+    repo: &Path,
+    requested: &[&'a str],
+    present_before: &[&'a str],
+) -> DeleteOutcome<'a> {
+    let present_after = present_paths(repo, requested);
+    let mut outcome = DeleteOutcome {
+        deleted: Vec::new(),
+        already_gone: Vec::new(),
+        survived: Vec::new(),
+    };
+    for p in requested.iter().copied() {
+        if present_after.contains(&p) {
+            outcome.survived.push(p);
+        } else if present_before.contains(&p) {
+            outcome.deleted.push(p);
+        } else {
+            outcome.already_gone.push(p);
+        }
     }
-    // Some of the batch is already, irreversibly gone — that cannot be
-    // undone by refusing now. What this can still do is refuse to claim
-    // full success: name exactly what happened instead of a count that
-    // doesn't match reality.
-    let removed_list = requested
-        .iter()
-        .copied()
-        .filter(|p| removed.contains(p))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let missing_list = missing.join(", ");
-    Some(format!(
-        "Partial result: {removed_list} {} deleted permanently, but {missing_list} \
-         {} not — its state changed (likely became tracked) in the instant between \
-         the pre-flight check and this running. Nothing further was applied for \
-         {missing_list}; re-check its status before retrying.",
-        if removed_list.is_empty() {
+    outcome
+}
+
+impl DeleteOutcome<'_> {
+    /// The 409 body when some requested path is still on disk — `None` when
+    /// nothing survived. Refusing now cannot un-delete what already went, so
+    /// what this can still do is name exactly what happened instead of a
+    /// count that does not match reality.
+    fn partial_refusal(&self) -> Option<String> {
+        if self.survived.is_empty() {
+            return None;
+        }
+        let survived_list = self.survived.join(", ");
+        let survived_verb = if self.survived.len() == 1 {
             "was"
         } else {
             "were"
-        },
-        if missing.len() == 1 { "was" } else { "were" }
-    ))
+        };
+        let destroyed = if self.deleted.is_empty() {
+            "Partial result: nothing was deleted".to_string()
+        } else {
+            format!(
+                "Partial result: {} {} deleted permanently",
+                self.deleted.join(", "),
+                if self.deleted.len() == 1 {
+                    "was"
+                } else {
+                    "were"
+                }
+            )
+        };
+        let mut msg = format!(
+            "{destroyed}, but {survived_list} {survived_verb} not — its state changed \
+             (likely became tracked) in the instant between the pre-flight check and \
+             this running. Nothing further was applied for {survived_list}; re-check \
+             its status before retrying."
+        );
+        msg.push_str(&self.already_gone_note());
+        Some(msg)
+    }
+
+    /// The whole client-facing outcome — status, response body, journal line
+    /// — derived from nothing but what the worktree proved.
+    ///
+    /// **Why this composes the message instead of the executor (review
+    /// finding).** The count started life as `paths.len()` in the executor,
+    /// which is what defect 2 of #284 fixed for duplicates and what the
+    /// before-snapshot fixes for foreign deletions. Both are the same mistake:
+    /// counting what was *asked for* rather than what was *observed*. While
+    /// that arithmetic lived inline in an `async fn` that does its own
+    /// `stat`ing, no test could reach a state where the two counts differ, so
+    /// reverting it to `paths.len()` passed the entire suite — a green test
+    /// proving nothing. Owning it here makes the divergent case constructible
+    /// (see `a_report_counts_only_what_this_operation_destroyed`) and leaves
+    /// the executor a thin caller with no count of its own to get wrong.
+    fn report(&self) -> (StatusCode, String, String) {
+        if let Some(msg) = self.partial_refusal() {
+            let journal = format!("delete-untracked-paths partial result — {msg}");
+            return (StatusCode::CONFLICT, msg, journal);
+        }
+        // `self.deleted.len()`, and no other number is in scope to reach for:
+        // the count is the user's only record of what is gone for good.
+        let count = self.deleted.len();
+        let s = if count == 1 { "" } else { "s" };
+        let note = self.already_gone_note();
+        // Deliberately no "undo"/"restore"/"recover" anywhere in this text (a
+        // regression test greps for exactly those words) — this is the one
+        // operation in the vocabulary where saying so plainly is the honest
+        // thing to say, not merely the cautious one.
+        let journal = format!(
+            "deleted {count} untracked path{s} permanently — never stored in git, no \
+             way to bring the content back{note}"
+        );
+        let body = format!(
+            "Deleted {count} untracked path{s} permanently. That content was never \
+             stored in git, so there is no way to bring it back.{note}"
+        );
+        (StatusCode::OK, body, journal)
+    }
+
+    /// One sentence disclosing paths that were already gone before the spawn,
+    /// empty when there were none. Kept separate so both the refusal body and
+    /// the success body say the same thing about them.
+    fn already_gone_note(&self) -> String {
+        if self.already_gone.is_empty() {
+            return String::new();
+        }
+        let list = self.already_gone.join(", ");
+        let verb = if self.already_gone.len() == 1 {
+            "was"
+        } else {
+            "were"
+        };
+        format!(
+            " {list} {verb} already gone before this ran, so {} not deleted by this \
+             operation — something else outside Git-Vista removed {}.",
+            if self.already_gone.len() == 1 {
+                "it was"
+            } else {
+                "they were"
+            },
+            if self.already_gone.len() == 1 {
+                "it"
+            } else {
+                "them"
+            }
+        )
+    }
 }
 
 /// `git clean -f -- <paths>` (`/api/delete-untracked-paths`, #219): delete
@@ -2930,6 +3113,12 @@ async fn exec_delete_untracked_paths(
     }
     let mut args: Vec<&str> = vec!["clean", "-f", "--"];
     args.extend(paths.iter().map(WorktreePath::as_str));
+    // Snapshot presence as late as possible — the very last thing before the
+    // spawn — so what this operation is credited with destroying is what it
+    // actually destroyed, not merely what is missing afterwards. See
+    // [`DeleteOutcome`] for the window this does and does not close.
+    let requested: Vec<&str> = paths.iter().map(WorktreePath::as_str).collect();
+    let present_before = present_paths(repo, &requested);
     let output = match run_git(repo, need, &args).await {
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/delete-untracked-paths", &e),
@@ -2949,40 +3138,25 @@ async fn exec_delete_untracked_paths(
     // rest of the batch — verified directly against real git. Locking out
     // the whole race window needs a repo-wide exclusive lock this endpoint
     // doesn't hold; what's tractable and load-bearing without one is never
-    // reporting success that isn't true: `git clean`'s own stdout names
-    // exactly what it removed, so that is compared against the full
-    // requested set before this returns 200 (`partial_delete_report`, pure
-    // and directly tested against a hand-built mismatch — the timing race
-    // itself isn't something a permanent test can trigger deterministically,
-    // but the honesty property this exists for doesn't depend on how a
-    // mismatch arose).
-    let stdout_text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let requested: Vec<&str> = paths.iter().map(WorktreePath::as_str).collect();
-    if let Some(msg) = partial_delete_report(&requested, &stdout_text) {
-        eprintln!("git-vista: /api/delete-untracked-paths partial: {msg}");
-        journal_app_event(
-            repo,
-            ActivityKind::Other,
-            None,
-            Obs::Absent,
-            Obs::Absent,
-            format!("delete-untracked-paths partial result — {msg}"),
-        )
-        .await;
-        return (StatusCode::CONFLICT, msg);
+    // reporting success that isn't true: every requested path is re-stat'd
+    // before this returns 200, and one still on disk was not deleted
+    // (`observe_deletion`; #284 replaced an English-only parse of `git
+    // clean`'s stdout with that check — see [`DeleteOutcome`]'s doc comment,
+    // which also covers why the *before* snapshot above is needed to avoid
+    // the mirror-image dishonesty of crediting ourselves with someone else's
+    // deletion). The timing race itself isn't something a permanent test can
+    // trigger deterministically, but the honesty property this exists for
+    // doesn't depend on how a mismatch arose.
+    //
+    // Everything client-facing past this point is [`DeleteOutcome::report`]'s
+    // — this executor deliberately keeps no count of its own to get wrong.
+    let outcome = observe_deletion(repo, &requested, &present_before);
+    let (status, body, summary) = outcome.report();
+    if status == StatusCode::CONFLICT {
+        eprintln!("git-vista: /api/delete-untracked-paths partial: {body}");
+    } else {
+        println!("[/api/delete-untracked-paths] {summary}");
     }
-
-    let count = paths.len();
-    let s = if count == 1 { "" } else { "s" };
-    // Deliberately no "undo"/"restore"/"recover" anywhere in this text (a
-    // regression test greps for exactly those words) — this is the one
-    // operation in the vocabulary where saying so plainly is the honest
-    // thing to say, not merely the cautious one.
-    let summary = format!(
-        "deleted {count} untracked path{s} permanently — never stored in git, no way \
-         to bring the content back"
-    );
-    println!("[/api/delete-untracked-paths] {summary}");
     journal_app_event(
         repo,
         ActivityKind::Other,
@@ -2992,13 +3166,7 @@ async fn exec_delete_untracked_paths(
         summary,
     )
     .await;
-    (
-        StatusCode::OK,
-        format!(
-            "Deleted {count} untracked path{s} permanently. That content was never \
-             stored in git, so there is no way to bring it back."
-        ),
-    )
+    (status, body)
 }
 
 // ---------------------------------------------------------------------------
