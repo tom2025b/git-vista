@@ -487,6 +487,124 @@ async fn a_pull_with_nothing_to_integrate_reports_that_nothing_moved() {
     );
 }
 
+/// **`advanced` is read off the branch tip, not off the fetch's ref list —
+/// direction one: the fetch moved nothing and the branch moved anyway.**
+///
+/// Every other test in this file runs a fixture where "the fetch had something
+/// to bring" and "the checked-out branch had something to integrate" are the
+/// same fact, so all of them pass equally for
+/// `advanced = !head_after.same_observation(&head_before)` (what the code says)
+/// and for `advanced = !updated_refs.is_empty()` (a conflation of the two
+/// halves). Verified by mutation before this test existed: the whole 12-test
+/// suite plus the contract suite's pull case stayed green with the conflated
+/// version in place.
+///
+/// Here the objects are fetched **first**, by the harness, so the pull's own
+/// fetch half has nothing left to move — and the integration still advances the
+/// branch by two commits' worth of history. `updated_refs` is empty and
+/// `advanced` must be `true`, which the conflated version cannot produce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pull_that_had_nothing_left_to_fetch_still_reports_the_branch_advanced() {
+    let (_dir, repo) = diverged_repo("mine.txt");
+    // The harness does the fetch, outside the server, so the pull's fetch half
+    // is a genuine no-op rather than a mocked one.
+    run(&repo, &["fetch", "-q", "origin"]);
+    assert_eq!(
+        out(&repo, &["rev-parse", "refs/remotes/origin/main"]),
+        out(&repo.join("upstream.git"), &["rev-parse", "main"]),
+        "the pre-fetch must have left nothing for the pull's fetch half to do"
+    );
+    let before = out(&repo, &["rev-parse", "HEAD"]);
+
+    let (status, body) = pipeline(&repo, pull_op(MergeStrategy::Merge)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: PullSuccess = serde_json::from_str(&body).unwrap();
+
+    assert!(
+        parsed.updated_refs.is_empty(),
+        "the objects were already local, so the fetch half moved no \
+         remote-tracking ref: {body}"
+    );
+    // The referee: git says the branch moved.
+    assert_ne!(
+        out(&repo, &["rev-parse", "HEAD"]),
+        before,
+        "the integration must really have advanced the branch, or this test \
+         is asserting nothing"
+    );
+    assert!(
+        parsed.advanced,
+        "`advanced` must come from the checked-out branch's tip before and \
+         after, not from whether the fetch half moved a ref — here the fetch \
+         moved nothing and the branch moved: {body}"
+    );
+    assert!(
+        parsed.message.contains("Pulled"),
+        "…and the message must agree with the field: {}",
+        parsed.message
+    );
+}
+
+/// **Direction two: the fetch moved a ref and the branch did not.**
+///
+/// The mirror of the test above, and the leg that catches the conflation the
+/// other way round. The remote gains a commit on a branch nobody is pulling,
+/// so the pull's fetch half really does update `refs/remotes/origin/other` —
+/// while `origin/main`, the ref the integration runs against, is already
+/// merged. `updated_refs` is non-empty and `advanced` must be `false`.
+///
+/// Together the two tests make `advanced` and `!updated_refs.is_empty()`
+/// independently observable: no implementation can satisfy both by deriving
+/// one from the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pull_whose_fetch_moved_an_unrelated_ref_does_not_claim_the_branch_advanced() {
+    let (dir, repo) = diverged_repo("mine.txt");
+    // Get `main` fully integrated first, so the second pull's integration has
+    // nothing to do.
+    let (status, body) = pipeline(&repo, pull_op(MergeStrategy::Merge)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let settled = out(&repo, &["rev-parse", "HEAD"]);
+
+    // A commit on a branch this pull does not name.
+    let authoring = dir.path().join("authoring");
+    run(&authoring, &["checkout", "-q", "-b", "other"]);
+    std::fs::write(authoring.join("elsewhere.txt"), "not yours\n").unwrap();
+    run(&authoring, &["add", "elsewhere.txt"]);
+    run(&authoring, &["commit", "-q", "-m", "unrelated work"]);
+    run(&authoring, &["push", "-q", "origin", "other"]);
+
+    let (status, body) = pipeline(&repo, pull_op(MergeStrategy::Merge)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: PullSuccess = serde_json::from_str(&body).unwrap();
+
+    assert!(
+        parsed
+            .updated_refs
+            .iter()
+            .any(|u| u.ref_name.ends_with("origin/other")),
+        "the fetch half must have brought the unrelated branch over, or this \
+         test's premise is gone: {body}"
+    );
+    // The referee: git says the branch did not move.
+    assert_eq!(
+        out(&repo, &["rev-parse", "HEAD"]),
+        settled,
+        "`origin/main` was already integrated, so nothing may have moved the \
+         checked-out branch"
+    );
+    assert!(
+        !parsed.advanced,
+        "`advanced` describes the checked-out branch, not the fetch: a ref \
+         moved for a branch nobody pulled, and the pulled branch stood still: \
+         {body}"
+    );
+    assert!(
+        parsed.message.contains("Already up to date"),
+        "…and the message must agree with the field: {}",
+        parsed.message
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Conflict: an outcome, aborted, observed
 // ---------------------------------------------------------------------------
@@ -702,6 +820,185 @@ async fn an_uncancelled_pull_under_the_same_plumbing_does_integrate() {
         "the uncancelled pull must actually integrate"
     );
     assert_eq!(parents(&repo, "HEAD"), 2, "…as a merge, in this case");
+}
+
+// ---------------------------------------------------------------------------
+// The sandbox tier the two halves run in
+// ---------------------------------------------------------------------------
+
+/// The network namespace this test process is in, as
+/// `readlink /proc/self/ns/net` reports it (`net:[<inode>]`).
+///
+/// The probe both hook tests below compare against. It is a *host* fact, so a
+/// spawn that reports this string ran with the host's network — no bwrap, no
+/// `--unshare-net` — and one that reports anything else did not.
+fn host_netns() -> String {
+    std::fs::read_link("/proc/self/ns/net")
+        .expect("Linux: /proc/self/ns/net")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Install an executable hook that records its own network namespace, one line
+/// per invocation, in `<repo>/.git/<sink>`.
+///
+/// Inside `.git` rather than the working tree so no `git status` in this file
+/// starts measuring the probe. `cat >/dev/null` drains the stdin git hands a
+/// `reference-transaction` hook — a hook that leaves it unread can make git
+/// see a write error on a large transaction — and the explicit `exit 0` keeps
+/// a `reference-transaction` hook from aborting the ref update it is watching.
+fn install_netns_hook(repo: &Path, hook: &str, sink: &str) {
+    let hooks = repo.join(".git/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let path = hooks.join(hook);
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncat >/dev/null 2>&1\nreadlink /proc/self/ns/net >> \"$(git rev-parse --git-dir)/{sink}\"\nexit 0\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// Every line a [`install_netns_hook`] sink collected.
+fn netns_lines(repo: &Path, sink: &str) -> Vec<String> {
+    match std::fs::read_to_string(repo.join(".git").join(sink)) {
+        Ok(text) => text.lines().map(str::to_string).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// **A pull's integration half runs in the same sandbox tier as a direct
+/// merge** — so a repository hook cannot reach the network through
+/// `POST /api/pull` when the byte-identical command through `POST /api/merge`
+/// denies it.
+///
+/// # Why this is a real hole and not a theoretical one
+///
+/// `need` is not a label, it *chooses the tier*: `tier_for(Remote, untrusted)`
+/// is `Tier::Network` (no bwrap, `AF_INET` permitted, `DEFAULT_GIT_PORTS`
+/// reachable) and `tier_for(Local, untrusted)` is `Tier::Strict` (bwrap
+/// `--unshare-net`, `--net-deny`). `policy_for` sets `HookMode::Run` in both.
+/// A pull is classified `Remote` because its *fetch* half opens a socket; if
+/// that need is threaded into `exec_merge`/`exec_rebase` as well, then a
+/// `post-merge` hook in a hostile clone gets outbound TCP for free, on the one
+/// operation such a clone is most likely to be the target of. Nothing else in
+/// the suite would notice: the pull would still fetch, still integrate, still
+/// journal.
+///
+/// # What is asserted, and why it cannot pass vacuously
+///
+/// The probe is `readlink /proc/self/ns/net`, run from real git hooks:
+///
+/// * the `post-merge` hook fires inside the **integration** half. Its
+///   namespace must **differ** from this process's — i.e. bwrap unshared it,
+///   i.e. `Tier::Strict`.
+/// * the `reference-transaction` hook fires during the **fetch** half too, as
+///   `refs/remotes/origin/main` is written. At least one of its lines must
+///   **equal** this process's namespace — the fetch genuinely is `Remote` and
+///   genuinely does run in `Tier::Network`.
+///
+/// That second leg is what makes the first non-vacuous. Without it, a probe
+/// that could never report the host namespace (a test runner already inside a
+/// netns, a hook that silently never ran) would satisfy the first assertion for
+/// a reason that has nothing to do with the tier. With it, the same probe is
+/// shown reporting both answers within one pull.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hook_in_a_pulls_integration_half_runs_without_the_network_the_fetch_half_has() {
+    let (_dir, repo) = diverged_repo("mine.txt");
+    install_netns_hook(&repo, "post-merge", "gv_netns_post_merge");
+    install_netns_hook(&repo, "reference-transaction", "gv_netns_ref_tx");
+
+    let host = host_netns();
+    let (status, body) = pipeline(&repo, pull_op(MergeStrategy::Merge)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The fetch half: Network tier, so its hook sees the host's namespace.
+    // This is the leg that proves the probe can say "host".
+    let fetch_side = netns_lines(&repo, "gv_netns_ref_tx");
+    assert!(
+        !fetch_side.is_empty(),
+        "the reference-transaction hook never ran, so this test's probe \
+         measured nothing. Hooks must be enabled (HookMode::Run) and the \
+         fetch must have updated a ref for this fixture to say anything."
+    );
+    assert!(
+        fetch_side.contains(&host),
+        "a pull's fetch half is NetworkNeed::Remote and must run in \
+         Tier::Network — no bwrap, so its hooks share this process's network \
+         namespace. Saw {fetch_side:?}, this process is in {host}. If this \
+         leg fails the probe below proves nothing."
+    );
+
+    // The integration half: Strict tier, so its hook is in a namespace of its
+    // own — bwrap's `--unshare-net`, and with it `--net-deny` and the seccomp
+    // filter that refuses `connect` outright.
+    let merge_side = netns_lines(&repo, "gv_netns_post_merge");
+    assert_eq!(
+        merge_side.len(),
+        1,
+        "the post-merge hook must have run exactly once — a pull of a diverged \
+         history really does merge. Saw {merge_side:?}"
+    );
+    assert_ne!(
+        merge_side[0], host,
+        "a pull's integration half must run in Tier::Strict, exactly as \
+         POST /api/merge does: its hooks must NOT share this process's network \
+         namespace. Seeing {host} here means `exec_merge` was spawned under the \
+         pull's operation-level NetworkNeed::Remote, which hands every \
+         post-merge hook in an untrusted repository outbound TCP on \
+         DEFAULT_GIT_PORTS that the same command through POST /api/merge denies."
+    );
+}
+
+/// The paired reference point: the *same* hook, the *same* probe, driven
+/// through `POST /api/merge`'s own operation.
+///
+/// The test above says the pull's integration half is not in the host's
+/// network namespace. This says what it must match instead — the direct merge
+/// route, which has declared `NetworkNeed::Local` since long before pull
+/// existed. Without this leg "not the host namespace" is only half a claim;
+/// with it, the two routes into `exec_merge` are shown to confine a hook the
+/// same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hook_in_a_direct_merge_is_confined_the_same_way() {
+    let (_dir, repo) = diverged_repo("mine.txt");
+    // Bring the upstream commit over without going through the server, then
+    // give it a local name — `MergeBranch` names a local branch.
+    run(&repo, &["fetch", "-q", "origin"]);
+    run(
+        &repo,
+        &["branch", "upstream-copy", "refs/remotes/origin/main"],
+    );
+    install_netns_hook(&repo, "post-merge", "gv_netns_post_merge");
+
+    let host = host_netns();
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::MergeBranch {
+            branch: BranchName::new("upstream-copy").unwrap(),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let seen = netns_lines(&repo, "gv_netns_post_merge");
+    assert_eq!(
+        seen.len(),
+        1,
+        "the post-merge hook must have run exactly once: {seen:?}"
+    );
+    assert_ne!(
+        seen[0], host,
+        "POST /api/merge is NetworkNeed::Local -> Tier::Strict, so its hooks \
+         run with an unshared network namespace. If this ever stops being \
+         true, the pull test above is comparing against nothing."
+    );
 }
 
 // ---------------------------------------------------------------------------

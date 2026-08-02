@@ -527,7 +527,24 @@ new exposure a pull has that a fetch does not is local, not credential-shaped:
 the integration half can leave the working tree half-merged, so a failed
 integration is aborted and the restoration is **observed** — the branch tip is
 re-read and `git ls-files --unmerged` listed — before the response claims the
-repository is back where it started.)*
+repository is back where it started.
+
+**The tier the second half runs in is part of that decision** (ADR 0044 §4). A
+pull is the first operation in this server to run a *local* git command under a
+`NetworkNeed::Remote` operation, and `need` is what `tier_for` dispatches on,
+while `policy_for` sets `HookMode::Run` in every tier. Threading the pull's own
+`Remote` need into `exec_merge`/`exec_rebase` would therefore have run this
+repository's `post-merge` / `post-checkout` / `post-rewrite` hooks in
+`Tier::Network` — outbound TCP on `DEFAULT_GIT_PORTS`, no `--unshare-net` —
+i.e. the identical git command would be **more** capable through `/api/pull`
+than through `/api/merge`, which declares `Local` and lands in `Tier::Strict`.
+`planner::pull::INTEGRATION_NEED` pins the integration half (and the abort, and
+`git ls-files --unmerged`) to `NetworkNeed::Local`, so `need` reaches exactly
+one call in `exec_pull`: `run_fetch`. Proved behaviourally rather than by
+inspection — `planner::pull_suite` runs real git hooks that report
+`readlink /proc/self/ns/net`, asserts the fetch half's hook shares the server's
+network namespace and the integration half's does not, and pins the same answer
+for a direct merge.)*
 
 ## Request Integrity
 
