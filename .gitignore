@@ -64,3 +64,7 @@
 # Live dual-account mailbox — session state, not project history.
 # Both sessions read/write these at one absolute path; they must not travel through git.
 .claude/parallel/
+
+# Disposable MCP server for driving the testbed during a build session.
+# Scaffolding, not a product feature — build it, use it, delete it.
+/tmp-mcp/
