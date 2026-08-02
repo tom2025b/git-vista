@@ -26,6 +26,25 @@ slice edits either `plan.rs`'s `GitOperation` enum or `planner.rs`'s dispatch, s
 vocabulary, risk ranking, recovery answers and network classification land first, reviewed
 on their own, before any code runs `git tag` or opens a socket.
 
+**Scope note — why this slice touches `planner.rs`, `sandbox/`, and `durable.rs` at
+all.** #235's text promised "Nothing in this slice touches `planner.rs` or any handler",
+and scoped acceptance to the protocol crate. That boundary turned out to be
+unimplementable as written, by this repository's own earlier decisions: adding a
+`GitOperation` variant is a **compile error** until every deliberately wildcard-free
+exhaustive match names it — `planner::shape` and `execute`,
+`sandbox::network_need_for_operation` (ADR 0036's tier dispatch), `covered_by`,
+`durable::recovery_oid` — and the dispatch census tests assert the variant set, so even a
+compiling placeholder fails the suite. Those tripwires exist precisely so a new operation
+can never land half-classified. The server-side additions here are the minimal *honest*
+answers the tripwires demand — risk rank, preconditions, recovery, network need — with
+execution refused (`501`) and proven inert; they are not early delivery of the later
+M2.21 execution slices. The one alternative that would have kept the diff
+protocol-only-plus-stubs — placeholder arms ("classify `Local` for now", dummy risk) —
+is the shape ADR 0039 rejected by name, because the classification sits in the live data
+path the day execution arrives. The issue's stated *reason* for the boundary (not racing
+in-flight work on `planner.rs`) was still honoured in effect: nothing else was in flight
+on these files when this landed.
+
 Before this branch the vocabulary had 21 variants and nothing tag-shaped. The issue's own
 sketch prescribed field shapes for the new variants; two of those shapes turned out to be
 reflex answers this ADR overrides deliberately (Decision §2 and §3) — both deviations are
@@ -238,3 +257,4 @@ this decision is executable prematurely.
   value is not a commit — today, exactly the tag refs this slice introduces.
 
 **Signed:** thomas2025 · 2026-08-02T09:42:00-04:00
+**Amended (scope note, adversarial-review follow-up):** thomas2025 · 2026-08-02T06:02:11-04:00
