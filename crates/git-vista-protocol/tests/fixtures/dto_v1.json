@@ -133,6 +133,19 @@
     "updated_refs": [],
     "worktree_restored": false
   },
+  "push_request_plain": {
+    "branch": "main",
+    "set_upstream": false,
+    "force": null
+  },
+  "push_request_upstream_and_lease": {
+    "branch": "feature/x",
+    "set_upstream": true,
+    "force": {
+      "mode": "with_lease",
+      "expected_remote_tip": "4444444444444444444444444444444444444444"
+    }
+  },
   "clone_request": {
     "url": "https://github.com/owner/repo.git"
   },
