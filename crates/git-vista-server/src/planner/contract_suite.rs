@@ -2935,7 +2935,8 @@ fn without_fetch_head(fingerprint: &str) -> String {
 }
 
 /// The census of operations that claim to be cancellable is exactly
-/// `{FetchRemote, PullBranch}` (M2.20c #229, widened by M2.20d #230).
+/// `{FetchRemote, PullBranch, PushBranch}` (M2.20c #229, widened by M2.20d #230
+/// and M2.20e #231).
 ///
 /// `planner::honours_cancellation` is answered to an operator by
 /// `POST /api/operations/{id}/cancel`: a `true` there is a promise that the
@@ -2973,7 +2974,7 @@ fn only_operations_with_a_real_cancellation_point_claim_to_be_cancellable() {
         .collect();
     assert_eq!(
         cancellable.len(),
-        2,
+        3,
         "the cancellable census changed — every `true` arm in \
          planner::honours_cancellation promises an executor that watches the \
          cancellation latch, so adding one means adding that executor too: \
@@ -2990,6 +2991,12 @@ fn only_operations_with_a_real_cancellation_point_claim_to_be_cancellable() {
             .iter()
             .any(|op| matches!(op, GitOperation::PullBranch { .. })),
         "PullBranch is cancellable during its fetch half (#230), got {cancellable:?}"
+    );
+    assert!(
+        cancellable
+            .iter()
+            .any(|op| matches!(op, GitOperation::PushBranch { .. })),
+        "PushBranch is cancellable during its transfer (#231), got {cancellable:?}"
     );
 
     let src = source("src/planner/fetch.rs");
@@ -3022,6 +3029,76 @@ fn only_operations_with_a_real_cancellation_point_claim_to_be_cancellable() {
          this server (ADR 0044 D1), or the askpass hardening and redaction of \
          ADR 0036 have two places to drift apart in"
     );
+
+    let push_src = source("src/planner/push.rs");
+    assert!(
+        push_src.contains("crate::operations::cancel_signal()"),
+        "planner::push must take the operation's cancellation latch — \
+         honours_cancellation(PushBranch) promises it does (#231)"
+    );
+    assert!(
+        push_src.contains("git_streamed_for("),
+        "planner::push must run its git through the streaming, cancellable \
+         runner — the collecting `run_git` cannot be interrupted, and a push \
+         is the one operation whose effect is on someone else's machine"
+    );
+}
+
+/// **The force-construction tripwire.** `planner::push::push_argv` is the only
+/// place in this server that builds a push command line, and nothing in its
+/// production half can produce an unguarded force.
+///
+/// Two halves, and neither is redundant:
+///
+///  * `push::tests::no_push_argv_can_carry_a_bare_force` proves the *builder*
+///    cannot emit one, over the whole `ForcePublish` × `set_upstream` × name
+///    space. What it cannot prove is that some other module builds a push argv
+///    of its own — a function's own tests never see its siblings.
+///  * This test closes that: `src/planner.rs`, which built `&["push", …]`
+///    inline until M2.20e moved it, must no longer name `push` as a git
+///    subcommand at all, and `planner/push.rs`'s production half must contain
+///    the leased flag and none of the unguarded spellings.
+///
+/// The source scan stops at `#[cfg(test)]`, on purpose: `push.rs`'s own tests
+/// contain the literal `"--force"` precisely because they assert it never
+/// appears in an argv, and a scan that could not tell the two apart would have
+/// to be weakened until it proved nothing.
+#[test]
+fn only_planner_push_builds_a_push_argv_and_it_can_only_build_a_leased_force() {
+    let planner = source("src/planner.rs");
+    assert!(
+        !planner.contains("\"push\""),
+        "src/planner.rs names `push` as a git subcommand again — every push \
+         argv must be built by planner::push::push_argv, which is the one \
+         function whose `match` over ForcePublish cannot reach an unguarded \
+         force (#231, ADR 0045 D1)"
+    );
+
+    let src = source("src/planner/push.rs");
+    let split = src
+        .find("#[cfg(test)]")
+        .expect("planner/push.rs has a test module");
+    let production = &src[..split];
+    assert!(
+        production.contains("--force-with-lease="),
+        "the leased flag must be built here, or nothing offers the capability \
+         at all"
+    );
+    for forbidden in [
+        "\"--force\"",
+        "\"-f\"",
+        "\"--force-if-includes\"",
+        "--force=",
+        "'--force'",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "planner::push's production half contains {forbidden} — the only \
+             force this server may ever build is `--force-with-lease=`, and it \
+             is the one thing standing between a user and another party's \
+             commits"
+        );
+    }
 }
 
 /// [`GitOperation::PullBranch`] executes end-to-end through the pipeline
@@ -3098,17 +3175,28 @@ async fn pull_branch_executes_through_the_pipeline() {
     }
 }
 
-/// The widened `PushBranch` combinations that M2.20a does **not** execute are
-/// refused, and refused inertly — nothing reaches the remote.
+/// **No `PushBranch` combination is a stub any more** (M2.20e, #231): every one
+/// of the four reaches a real executor, and the two that were `501` until this
+/// slice are the two that matter.
 ///
-/// This is the case that most needed writing down, because unlike fetch and
-/// pull, `PushBranch` has a *live* executor sitting right next to the stub.
-/// An arm that ignored the new fields would have run a perfectly ordinary
-/// push — succeeding, mutating the remote, and reporting success for an
-/// operation nobody approved. The remote's ref listing being empty afterwards
-/// is what rules that out; the status code alone could not.
+/// The predecessor of this test asserted the opposite — that the widened
+/// combinations were refused `NOT_IMPLEMENTED` without touching the remote —
+/// and it earned its keep: `PushBranch` had a *live* executor sitting next to
+/// the stub, so an arm that ignored the new fields would have run a perfectly
+/// ordinary push and reported success for an operation nobody approved. What
+/// replaces it has to keep that guarantee while the stub is gone, so it asserts
+/// the *positive* half: a `501` for any push combination now means the executor
+/// lost an arm.
+///
+/// Deliberately **not** a behavioural push: these run against a filesystem-path
+/// remote, which the sandbox refuses for a push by construction (receive-pack's
+/// quarantine migration is a cross-directory rename and the shim withholds
+/// `LANDLOCK_ACCESS_FS_REFER`). So the assertion here is exactly what this
+/// fixture can honestly support — the plan reached execution and git ran — and
+/// the *behaviour* of each combination against a real remote is
+/// [`super::push_suite`]'s, over `git daemon`.
 #[tokio::test]
-async fn the_unwired_push_combinations_are_refused_without_touching_the_remote() {
+async fn every_push_combination_reaches_a_real_executor() {
     for force in [
         ForcePublish::None,
         ForcePublish::WithLease {
@@ -3116,12 +3204,6 @@ async fn the_unwired_push_combinations_are_refused_without_touching_the_remote()
         },
     ] {
         for set_upstream in [true, false] {
-            if !set_upstream && force == ForcePublish::None {
-                // The one combination that *does* execute — covered by
-                // `push_branch_executes_through_the_pipeline` above, which
-                // asserts the push really reaches the remote.
-                continue;
-            }
             let (dir, repo) = seeded_repo();
             let remote = dir.path().join("remote.git");
             std::fs::create_dir_all(&remote).unwrap();
@@ -3131,7 +3213,6 @@ async fn the_unwired_push_combinations_are_refused_without_touching_the_remote()
                 &["remote", "add", "origin", &remote.display().to_string()],
             );
 
-            let before = repo_fingerprint(&repo);
             let (status, body) = pipeline(
                 &repo,
                 GitOperation::PushBranch {
@@ -3142,23 +3223,36 @@ async fn the_unwired_push_combinations_are_refused_without_touching_the_remote()
                 },
             )
             .await;
-            assert_eq!(
+            assert_ne!(
                 status,
                 StatusCode::NOT_IMPLEMENTED,
-                "set_upstream={set_upstream} force={force:?}: {body}"
+                "every push combination is wired for execution since #231; a \
+                 501 means an arm went missing (set_upstream={set_upstream} \
+                 force={force:?}): {body}"
             );
+            assert!(
+                !body.contains("not yet wired"),
+                "…and the stub's wording must be gone with it: {body}"
+            );
+            // The lease combinations are refused by the pre-flight — the
+            // fixture's tracking ref does not exist, let alone hold forty
+            // zeroes — and the fast-forward ones die in git's sandboxed
+            // receive-pack. Either way nothing may have landed.
             assert_eq!(
                 out(&remote, &["for-each-ref", "refs/heads"]),
                 "",
-                "nothing may reach the remote for an unwired push combination \
-                 (set_upstream={set_upstream} force={force:?})"
+                "no push may have landed on this path remote \
+                 (set_upstream={set_upstream} force={force:?}): {body}"
             );
-            assert_eq!(
-                repo_fingerprint(&repo),
-                before,
-                "the refusal must also leave the local repository untouched \
-                 (set_upstream={set_upstream} force={force:?})"
-            );
+            if matches!(force, ForcePublish::WithLease { .. }) {
+                assert_eq!(
+                    status,
+                    StatusCode::CONFLICT,
+                    "a lease whose tip does not match the tracking ref must be \
+                     refused before git is spawned (set_upstream={set_upstream}): \
+                     {body}"
+                );
+            }
         }
     }
 }

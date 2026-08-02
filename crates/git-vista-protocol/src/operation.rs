@@ -127,33 +127,52 @@ pub enum OperationStage {
     Finished,
 }
 
-/// Which phase of an object transfer git reported (M2.20c, #229).
+/// Which phase of an object transfer git reported (M2.20c, #229; widened for
+/// push by M2.20e, #231).
 ///
-/// These are git's own `--progress` phases, in the order a fetch goes through
-/// them, **not** invented UI steps — the same posture [`OperationStage`] takes
-/// towards the planner's stages. They live beside [`OperationStage`] rather
-/// than inside it because they are *not* pipeline stages: a fetch is in
-/// `OperationStage::Executing` for the whole of this sequence, and folding
-/// them into that enum would have made every existing exhaustive match over
-/// `OperationStage` (the frontend has one) wrong the day a fetch ran.
+/// These are git's own `--progress` phases, in the order a transfer goes
+/// through them, **not** invented UI steps — the same posture
+/// [`OperationStage`] takes towards the planner's stages. They live beside
+/// [`OperationStage`] rather than inside it because they are *not* pipeline
+/// stages: a fetch is in `OperationStage::Executing` for the whole of this
+/// sequence, and folding them into that enum would have made every existing
+/// exhaustive match over `OperationStage` (the frontend has one) wrong the day
+/// a fetch ran.
 ///
-/// Wire values are `snake_case`. The first three are reported *by the remote*
-/// (git prefixes them `remote:`), the last two by the local process.
+/// # One vocabulary, both directions
+///
+/// A fetch and a push print the *same* phase names for the work each side
+/// does; which side does which work is what differs. Fetching, the remote
+/// enumerates/counts/compresses (git prefixes those `remote:`) and the local
+/// process receives and resolves. Pushing, the local process
+/// enumerates/counts/compresses and **writes**, and the remote resolves. So
+/// there is no `PushPhase` twin here: the tag says what git is doing, and
+/// which end is doing it is already known from the operation.
+///
+/// Wire values are `snake_case`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferPhase {
-    /// `remote: Enumerating objects: N, done.` — the remote is deciding what
-    /// to send. Reports no percentage, only a running count.
+    /// `Enumerating objects: N, done.` — deciding what to send. Reports no
+    /// percentage, only a running count.
     Enumerating,
-    /// `remote: Counting objects: N% (a/b)`.
+    /// `Counting objects: N% (a/b)`.
     Counting,
-    /// `remote: Compressing objects: N% (a/b)`.
+    /// `Compressing objects: N% (a/b)`.
     Compressing,
-    /// `Receiving objects: N% (a/b)` — bytes are arriving locally. The phase
-    /// a user waits in, and the reason this vocabulary exists at all.
+    /// `Receiving objects: N% (a/b)` — bytes are arriving locally, i.e. a
+    /// fetch's transfer. The phase a user waits in, and the reason this
+    /// vocabulary exists at all.
     Receiving,
-    /// `Resolving deltas: N% (a/b)` — the local index is being built. Nothing
-    /// has touched a ref yet at this point.
+    /// `Writing objects: N% (a/b), <size> | <rate>` — bytes are leaving
+    /// locally, i.e. a push's transfer (M2.20e, #231). [`Self::Receiving`]'s
+    /// mirror image, and a separate tag rather than a shared "transferring"
+    /// one because a UI that says "receiving" while a user pushes is telling
+    /// them the wrong story about which way their data is going.
+    Writing,
+    /// `Resolving deltas: N% (a/b)` — an index is being built from the pack
+    /// (locally after a fetch, on the remote after a push, where git prefixes
+    /// it `remote:`). Nothing has touched a ref yet at this point.
     Resolving,
 }
 

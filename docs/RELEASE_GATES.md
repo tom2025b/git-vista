@@ -311,7 +311,7 @@ Each setting, one line each, with its cost:
 | `required_pull_request_reviews = null` | No required review count/approval — solo-maintainer project, nothing to require | None — there is no second reviewer to require here |
 | `restrictions = null` | No push-access restriction beyond normal repo permissions | None |
 | `required_linear_history = false` | Merge commits stay allowed (matches current practice — normal merges, not squash-only) | None — this project already uses real merge commits, confirmed in Part 2 |
-| `allow_force_pushes = false` | No force-push to `main`, from anyone | Matches the project's own standing "never force-push" rule — makes it structurally true instead of only a convention |
+| `allow_force_pushes = false` | No force-push to `main`, from anyone | Matches the project's own standing "never force-push `main`" working rule — makes it structurally true instead of only a convention. (This is about *this repository's* branch protection. It is not the same claim as anything the app does: since M2.20e (#231) git-vista can force-publish a branch under a lease, on an explicit user-approved plan. See ADR 0045.) |
 | `allow_deletions = false` | `main` itself cannot be deleted | Belt-and-braces, effectively free |
 
 **Ruleset alternative**, if Tom prefers the newer mechanism (more

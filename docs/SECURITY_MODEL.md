@@ -476,7 +476,7 @@ request actually gets today, so a reader doesn't have to infer "shipped" from
 |---|---|---|
 | Existing Git credential helpers / SSH agent reuse | **Implemented** | #188's carve-out (`sandbox/ssh_remote.rs`, ADR 0033) — `~/.ssh/known_hosts` and `$SSH_AUTH_SOCK` are reachable on every Network-tier spawn; private keys stay `EACCES`. |
 | No browser-uploaded SSH keys | **Implemented** | Structural: the browser never has a private-key upload path at all. |
-| `core.askpass` never runs (M1.13 finding I5) | **Implemented** | `sandbox/network_exec.rs`'s `network_command` forces `-c core.askpass=` on every Network-tier spawn; `git_cmd.rs`'s `sandboxed()` routes every `NetworkNeed::Remote` call through it, so this reaches production (`exec_push` today), not only this module's own tests. |
+| `core.askpass` never runs (M1.13 finding I5) | **Implemented** | `sandbox/network_exec.rs`'s `network_command` forces `-c core.askpass=` on every Network-tier spawn; `git_cmd.rs`'s `sandboxed()` routes every `NetworkNeed::Remote` call through it, so this reaches production — every fetch, pull and push executor (`planner::fetch`, `planner::pull`, `planner::push`), not only this module's own tests. |
 | Redact URL userinfo from logs/operation records | **Implemented, narrower than the bullet reads** | `network_exec::redact_url_userinfo`/`redact_output` strip `user[:pass]@` from every `<scheme>://…` substring in a spawn's captured stdout/stderr, wired into `git_output_for` for every `Remote`-declared call. |
 | Redact HTTP `Authorization` header text and query-string tokens | **Not implemented** | Only URL userinfo is redacted. A credential surfaced as `?access_token=…` or in `Authorization: Bearer …`-shaped text would currently appear verbatim in a redacted `Output`. No test in this area exercises that shape. |
 | Redact credential-helper output | **Partially implemented** | A credential helper's stderr passes through the same `redact_output` as everything else, so a *userinfo-shaped* leak in it is caught (proven against a real credential helper: `network_exec_redacts_a_real_credential_helpers_leaked_url`) — but a helper leaking a bare token or an `Authorization`-shaped string is not, for the same reason as the row above. |
@@ -528,6 +528,27 @@ the integration half can leave the working tree half-merged, so a failed
 integration is aborted and the restoration is **observed** — the branch tip is
 re-read and `git ls-files --unmerged` listed — before the response claims the
 repository is back where it started.)*
+
+*(Push execution: ADR 0045, #231 — `POST /api/push` completes the remote trio and, like
+a pull, adds **no new spawn**: `planner::push` goes through the same
+`git_cmd::git_streamed_for`, so every row of the table above applies to a push unchanged
+— the same `sandboxed()` chokepoint, the same forced `-c core.askpass=`, the same
+`redact_if_remote` on both the collected output and the live streaming records. That is
+proven on the push path in its own right rather than assumed from fetch's proof:
+`planner::push_suite::a_credential_leaked_by_the_remote_never_reaches_the_push_response`
+stages a remote whose `pre-receive` hook prints a credential-bearing URL on stderr,
+asserts the **premise** by first running the same fixture through plain unsandboxed git
+and finding the literal secret, and then requires the server's response to carry the host
+but not the credential. `PushRequest` carries a branch name, an optional `set_upstream`
+flag and an optional `ForcePublish` — **never a URL, never a remote name, never a path**;
+the remote is `origin`, fixed by the handler and gated by the plan's `RemoteConfigured`
+precondition, so no request can aim this server's credential helpers or SSH agent at a
+host of the client's choosing. The `expected_remote_tip` a lease carries is a `CommitOid`,
+validated as forty hex characters before it can reach an argv. One limitation is worth
+stating here rather than only in the ADR: a push is the one operation whose effect is on
+a machine this server does not control, and git records `refs/remotes/<remote>/<branch>`
+only *after* the remote reports the update accepted — so a cancelled push cannot claim
+the remote is unchanged, and its terminal message says so instead of reassuring.)*
 
 ## Request Integrity
 
@@ -595,10 +616,32 @@ exists anywhere in the type — a bare `--force` push cannot be constructed in R
 deserialized off the wire. `planner::shape` turns a `WithLease` into a live
 `Precondition::RefAt` compare-and-swap on the remote-tracking ref
 (`refs/remotes/<remote>/<branch>`), bound into the plan's `operation_hash` at build time, and
-raises the plan's risk from `Remote` to `Destructive`. This is the typed **contract** only:
-`planner::execute` refuses every `PushBranch` combination except the pre-existing plain
-fast-forward push with `501`, so a lease-force push cannot yet run. "Strong warning" and
-"re-auth option" remain open scope, along with execution itself, for #231.)*
+raises the plan's risk from `Remote` to `Destructive`.)*
+
+*(Lease/CAS half now executes: ADR 0045, #231 — the typed contract above is carried
+through to the argv. `planner::push::push_argv` is the **only** function in this server
+that builds a push command line; its `match` over `ForcePublish` has no wildcard arm, and
+the sole arm that emits a force flag emits `--force-with-lease=<branch>:<oid>`. So the
+guarantee is no longer "the type cannot name a bare force" but "no path through the
+executor can produce one", asserted over the whole input space
+(`push::no_push_argv_can_carry_a_bare_force`) and at source level for the modules around
+it (`contract_suite::only_planner_push_builds_a_push_argv_and_it_can_only_build_a_leased_force`).
+**The lease is checked twice, by two parties, against two different things, and neither
+subsumes the other.** Before anything is spawned, `verify_lease` compares the reviewed
+`expected_remote_tip` against this repository's live `refs/remotes/<remote>/<branch>`; a
+mismatch, a missing ref or an unreadable one all refuse (409, or 500 for "git could not
+run" — an unread ref is evidence about nothing) and **no socket is opened and no
+credential is offered**. This is not redundant with the ADR 0018 staleness gate: that gate
+re-verifies the lease's `Precondition::RefAt` only when it *held at build time*, which is
+precisely not the stale-or-forged case. Then git's own `--force-with-lease` compares the
+same value against what the remote **advertises during the push** — the only check that
+can see a colleague's commit landing between review and submit, since the
+remote-tracking ref is a local cache. Both refusals are proven against a real remote's ref
+listing rather than a status code: `push_suite::a_lease_lost_to_a_concurrent_push_is_refused_and_the_remote_keeps_the_other_commit`
+and `push_suite::a_lease_tip_that_does_not_match_the_tracking_ref_never_reaches_the_remote`,
+the latter by an observed absence (the remote's `pre-receive` hook never fires). "Strong
+warning" and "re-auth option" remain open scope for the client ceremony, M2.20g #232 —
+the plan already carries `RiskLevel::Destructive` for the frontend to scale it from.)*
 
 *(History rewrite, amend member — partially implemented: ADR 0040, #223. **Recovery
 ref:** done — a successful amend journals `ActivityKind::Amend` with the exact old→new

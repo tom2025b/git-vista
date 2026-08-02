@@ -1768,31 +1768,18 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
             )
             .await
         }
-        // M2.20a (#227) widened `PushBranch` with `set_upstream` and `force`.
-        // Only the combination that existed before — no upstream write, no
-        // force — executes; it runs the byte-identical argv `/api/push` has
-        // always run, so this slice changes no live behaviour.
-        //
-        // The other combinations refuse. Not because a `501` is tidy, but
-        // because the alternative is worse in a specific way: an arm that
-        // ignored the new fields and ran a plain push would execute an
-        // operation the user did *not* approve — they asked for
-        // `--force-with-lease` and would silently get a fast-forward push
-        // whose failure they would then be tempted to resolve by hand. The
-        // plan's hash binds `force`; execution has to honour it or refuse.
+        // M2.20a (#227) widened `PushBranch` with `set_upstream` and `force`;
+        // M2.20e (#231, ADR 0045) wired all four combinations through
+        // `planner::push`. **One arm, not one per combination**: the fields are
+        // passed down whole, so there is exactly one place that turns them into
+        // an argv (`push::push_argv`) and no path on which a mode the user
+        // approved could be silently dropped on the way to git.
         GitOperation::PushBranch {
             branch,
             remote,
-            set_upstream: false,
-            force: ForcePublish::None,
-        } => exec_push(repo, need, &branch, &remote).await,
-        GitOperation::PushBranch { .. } => (
-            StatusCode::NOT_IMPLEMENTED,
-            "Pushing with --set-upstream or --force-with-lease is not yet wired \
-             for execution (tracked by #231) — this plan's contract exists, but \
-             nothing executed it."
-                .to_string(),
-        ),
+            set_upstream,
+            force,
+        } => push::exec_push(repo, need, &branch, &remote, set_upstream, &force).await,
         GitOperation::DeleteBranch { branch } => {
             exec_delete(repo, need, &branch, &observed, false).await
         }
@@ -2850,44 +2837,6 @@ async fn exec_merge(
     resp
 }
 
-/// `git push <remote> <branch>` (`/api/push`).
-async fn exec_push(
-    repo: &Path,
-    need: NetworkNeed,
-    branch: &BranchName,
-    remote: &RemoteName,
-) -> (StatusCode, String) {
-    debug_assert_eq!(
-        need,
-        NetworkNeed::Remote,
-        "push is the one operation in the enum that reaches a remote; if it \
-         arrives here declared Local, `network_need_for_operation` is wrong and \
-         the sandbox will (correctly) deny the connect"
-    );
-    let resp = run_branch_cmd(
-        repo,
-        need,
-        "/api/push",
-        &["push", remote.as_str()],
-        &RefName::from(branch),
-        format!("pushed '{branch}' to {remote}"),
-    )
-    .await;
-    if resp.0 == StatusCode::OK {
-        let tip = Obs::from_read(rev_parse(repo, branch.as_str()).await);
-        journal_app_event(
-            repo,
-            ActivityKind::Push,
-            Some(branch.as_str().to_string()),
-            Obs::Absent, // a push records only where the branch ended up
-            tip,
-            format!("pushed ‘{branch}’ to {remote}"),
-        )
-        .await;
-    }
-    resp
-}
-
 /// `git branch -d`/`-D <branch>` (`/api/delete-branch` /
 /// `/api/force-delete-branch`). The tip was captured BEFORE the delete (git
 /// removes the branch's reflog with the branch) — that journaled oid is
@@ -3913,6 +3862,12 @@ async fn exec_delete_untracked_paths(
 #[cfg(test)]
 mod contract_suite;
 
+/// git's `--progress` records, parsed once for both directions (M2.20c #229
+/// built it inside `fetch`; M2.20e #231 moved it here when push needed the same
+/// parser). One owner, because nothing fails loudly when a progress bar is
+/// subtly wrong — two copies would drift and no test would notice.
+mod transfer;
+
 /// M2.20c (#229): the fetch executor. Its own file rather than another
 /// `exec_*` in this one, because a fetch brings three concerns no other
 /// operation has — live progress parsing, cancellation, and a failure
@@ -3925,6 +3880,12 @@ mod fetch;
 /// it deliberately owns *no* spawn of its own: the fetch comes from
 /// [`fetch::run_fetch`] and the integration from `exec_merge`/`exec_rebase`.
 mod pull;
+
+/// M2.20e (#231, ADR 0045): the push executor. Its own file for the reason
+/// `fetch` and `pull` have one, plus a sharper one: it is the only operation
+/// here that can make *another party's* commits unreachable, and the code that
+/// decides whether it may is worth reading in one piece.
+mod push;
 
 /// `POST /api/fetch`'s error-body constructor, re-exported so the handler's
 /// own request-shape refusals carry the same contract the executor's do.
@@ -3951,10 +3912,11 @@ pub(crate) use pull::error_body as pull_error_body;
 /// the `true` set to an exact census, so widening it is a visible edit rather
 /// than a side effect.
 ///
-/// `FetchRemote` and — since M2.20d (#230) — `PullBranch` qualify. Every other
-/// executor runs a git command that finishes in milliseconds; the machinery
-/// would be real but the window to use it would not, and a cancel endpoint
-/// that usually arrives too late teaches users to distrust it.
+/// `FetchRemote`, `PullBranch` (M2.20d, #230) and `PushBranch` (M2.20e, #231)
+/// qualify — the three operations that move objects over a transport. Every
+/// other executor runs a git command that finishes in milliseconds; the
+/// machinery would be real but the window to use it would not, and a cancel
+/// endpoint that usually arrives too late teaches users to distrust it.
 ///
 /// # What `true` means for a pull, exactly
 ///
@@ -3967,9 +3929,23 @@ pub(crate) use pull::error_body as pull_error_body;
 /// millisecond-scale local commands and interrupting one is how a repository
 /// is left half-integrated. That is a narrower promise than fetch's, and it is
 /// the honest one: the cancellable window is where the time actually goes.
+///
+/// # And what it means for a push
+///
+/// Narrower still, and the difference is worth stating because it is not about
+/// this server's diligence. `planner::push` hands the latch to the same spawn,
+/// so a cancel kills `git push` promptly — but a push's effect is on a *remote*,
+/// and git records `refs/remotes/<remote>/<branch>` only after that remote has
+/// reported the update accepted. A cancel landing in between stops this
+/// repository from learning about a change that already happened elsewhere. So
+/// the promise is "the transfer stops", never "nothing was published", and
+/// `push::cancelled_response` says exactly that rather than the reassuring
+/// version.
 pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
     match op {
-        GitOperation::FetchRemote { .. } | GitOperation::PullBranch { .. } => true,
+        GitOperation::FetchRemote { .. }
+        | GitOperation::PullBranch { .. }
+        | GitOperation::PushBranch { .. } => true,
         GitOperation::CreateBranch { .. }
         | GitOperation::CommitOnHead { .. }
         | GitOperation::EmptyCommitOnBranch { .. }
@@ -3979,7 +3955,6 @@ pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
         | GitOperation::StageSelection { .. }
         | GitOperation::CheckoutBranch { .. }
         | GitOperation::MergeBranch { .. }
-        | GitOperation::PushBranch { .. }
         | GitOperation::DeleteBranch { .. }
         | GitOperation::ForceDeleteBranch { .. }
         | GitOperation::RebaseOntoBase { .. }
@@ -4014,6 +3989,12 @@ mod fetch_suite;
 // cancel that stops the integration starting, and the journal.
 #[cfg(test)]
 mod pull_suite;
+
+// M2.20e (#231): the push slice's behavioural tests — a real remote, the lease
+// refused in both of its two distinct ways, the upstream actually recorded,
+// live progress, and a cancel that stops the push.
+#[cfg(test)]
+mod push_suite;
 
 #[cfg(test)]
 mod tests {
