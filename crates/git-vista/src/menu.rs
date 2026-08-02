@@ -7,6 +7,32 @@
 //! `shell.close_menu()`, because closing the menu synchronously disposes the
 //! handler's own reactive owner, after which a further signal write is
 //! unreliable. The "Commit …" and merge/push/delete items all follow it.
+//!
+//! **Disabled items are `<button>`s that are never `disabled`.** Every item
+//! this menu greys out carries a reason built by
+//! [`disabled_menu_item_copy`], and that reason exists for the keyboard and
+//! screen-reader user #65 was about. Two things have to be true for it to
+//! actually reach them, and a `<span>` gets both wrong:
+//!
+//! 1. `aria-label` and `aria-disabled` are only honoured on an element whose
+//!    role supports them. A bare `<span>` is `role="generic"`, so both
+//!    attributes are dropped on the floor — the accessible name reverts to the
+//!    element's text and nothing announces the item as unavailable.
+//! 2. A `<span>` is not focusable, so Tab walks straight past it. Its enabled
+//!    siblings are `<button>`s and *are* tab stops, which means the item a
+//!    keyboard user most needs an explanation for is the one item they can
+//!    never land on.
+//!
+//! So these render as `<button>` with `aria-disabled="true"` and **no**
+//! `prop:disabled` — a genuinely disabled button leaves the tab order and
+//! takes its own explanation with it. The button has no `on:click`, so it is
+//! inert by construction rather than by the browser's grace. This is the same
+//! reasoning `dialogs/confirm.rs` writes out for the confirm button that
+//! carries a `blocked_reason`, and `features::a11y::audit`'s
+//! `every_disabled_context_menu_item_is_focusable` holds the line over this
+//! file's bytes. `styles.css` already dresses both forms
+//! (`.ctx-item.disabled` and `.ctx-item.disabled:focus-visible`), so nothing
+//! there changes.
 
 use leptos::*;
 
@@ -14,13 +40,14 @@ use git_vista_core::activity::UndoAction;
 
 use crate::api::{
     create_branch_request, fetch_head_branch, fetch_rebase_status, fetch_status, fetch_undoables,
-    stage_request, unstage_request,
+    fetch_worktree_status, stage_request, unstage_request,
 };
 use crate::features::core_traits::RequestTarget;
 use crate::features::dialogs::core::Dialog;
 use crate::features::graph::core::disabled_menu_item_copy;
 use crate::features::operations::core::PendingIntent;
 use crate::features::shell::signals::{self as shell_state, Shell};
+use crate::features::status::core::{deletable_untracked_paths, discardable_tracked_paths};
 use crate::geometry::menu_placement;
 use crate::gestures::viewport_size;
 use crate::icons::icon_set;
@@ -129,6 +156,32 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
             }
         },
     );
+    // The per-path working-tree status (`GET /api/status/v2`, M2.18b/#220) —
+    // fetched when the menu opens on the HEAD commit, keyed exactly like
+    // `staged_count`. The v1 read above cannot serve this: the discard/delete
+    // confirmations must name the exact paths, and must classify each one the
+    // same way the server's own `verify_path_states` will (tracked-dirty vs
+    // untracked), which only the v2 per-entry shape carries.
+    //
+    // A failed or still-in-flight read resolves to `None`, and both items then
+    // render *disabled with the reason* rather than vanishing — an item that
+    // silently disappears while a status probe is slow reads as "this repo
+    // can't do that", which would be a lie.
+    let worktree = create_local_resource(
+        move || {
+            (
+                shell.menu().is_some_and(|m| m.is_head && !m.is_branch),
+                graph.get().epoch(),
+            )
+        },
+        |(open, _)| async move {
+            if open {
+                fetch_worktree_status().await.ok()
+            } else {
+                None
+            }
+        },
+    );
     move || {
         shell.menu().map(|m| {
             // Tracked read: the menu lives inside the overlay wrapper's reactive block,
@@ -159,7 +212,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         "No GitHub page (no github.com remote, or it isn't pushed)";
                     let (aria_label, visible_reason) = disabled_menu_item_copy(label, REASON);
                     view! {
-                        <span
+                        <button
                             class="ctx-item disabled"
                             title=REASON
                             aria-disabled="true"
@@ -168,7 +221,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                             <span class="nf ctx-icon">{ic.github}</span>
                             {label}
                             <span class="ctx-item-reason">{visible_reason}</span>
-                        </span>
+                        </button>
                     }
                     .into_view()
                 }
@@ -276,7 +329,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         };
                         let (aria_label, visible_reason) = disabled_menu_item_copy(label, reason);
                         return view! {
-                            <span
+                            <button
                                 class="ctx-item disabled"
                                 title=reason
                                 aria-disabled="true"
@@ -285,7 +338,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                                 <span class="nf ctx-icon">{icon}</span>
                                 {label}
                                 <span class="ctx-item-reason">{visible_reason}</span>
-                            </span>
+                            </button>
                         }
                         .into_view();
                     }
@@ -361,7 +414,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 };
                 let (aria_label, visible_reason) = disabled_menu_item_copy("Stage Changes", reason);
                 view! {
-                    <span
+                    <button
                         class="ctx-item disabled"
                         title=reason
                         aria-disabled="true"
@@ -370,7 +423,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         <span class="nf ctx-icon">{ic.added}</span>
                         "Stage Changes"
                         <span class="ctx-item-reason">{visible_reason}</span>
-                    </span>
+                    </button>
                 }
                 .into_view()
             };
@@ -441,6 +494,111 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         <span class="nf ctx-icon">{ic.undo}</span>
                         "Select Changes to Unstage…"
                     </button>
+                }
+            });
+            // "Discard Changes…" / "Delete Untracked Files…" (M2.18b, #220):
+            // the UI half of #219's two typed working-tree operations. Both
+            // open the confirm modal rather than acting immediately — that
+            // modal is where the paths are listed and where the delete's
+            // second deliberate step lives (`features::dialogs::core`).
+            //
+            // HEAD-gated like the staging items above, and for the same
+            // reason: the working tree belongs to the checked-out commit, so
+            // offering either from a stub or an older commit would act
+            // somewhere other than where the user is pointing.
+            //
+            // The path lists are built by the host-tested selectors in
+            // `features::status::core`, which mirror the server's own
+            // classification. Building them here by hand would mean a
+            // confirmation the user completes and the server then 409s.
+            let live_status = worktree.get().flatten();
+            let discard_changes = is_head.then(|| {
+                let paths = live_status
+                    .as_ref()
+                    .map(discardable_tracked_paths)
+                    .unwrap_or_default();
+                if paths.is_empty() {
+                    let reason = if live_status.is_none() {
+                        "Waiting for a working-tree status read"
+                    } else {
+                        "No tracked file has uncommitted changes"
+                    };
+                    let (aria_label, visible_reason) =
+                        disabled_menu_item_copy("Discard Changes…", reason);
+                    view! {
+                        <button
+                            class="ctx-item disabled"
+                            title=reason
+                            aria-disabled="true"
+                            aria-label=aria_label
+                        >
+                            <span class="nf ctx-icon">{ic.undo}</span>
+                            "Discard Changes…"
+                            <span class="ctx-item-reason">{visible_reason}</span>
+                        </button>
+                    }
+                    .into_view()
+                } else {
+                    let on = move |_| {
+                        // Raise the modal *before* `close_menu` disposes this
+                        // handler's reactive owner — the ordering rule this
+                        // module's doc comment opens with.
+                        dialogs.open(Dialog::Confirm);
+                        shell.open_confirm(PendingOp::DiscardTrackedPaths {
+                            paths: paths.clone(),
+                        });
+                        shell.close_menu();
+                    };
+                    view! {
+                        <button class="ctx-item" on:click=on>
+                            <span class="nf ctx-icon">{ic.undo}</span>
+                            "Discard Changes…"
+                        </button>
+                    }
+                    .into_view()
+                }
+            });
+            let delete_untracked = is_head.then(|| {
+                let paths = live_status
+                    .as_ref()
+                    .map(deletable_untracked_paths)
+                    .unwrap_or_default();
+                if paths.is_empty() {
+                    let reason = if live_status.is_none() {
+                        "Waiting for a working-tree status read"
+                    } else {
+                        "No untracked files in the working tree"
+                    };
+                    let (aria_label, visible_reason) =
+                        disabled_menu_item_copy("Delete Untracked Files…", reason);
+                    view! {
+                        <button
+                            class="ctx-item disabled"
+                            title=reason
+                            aria-disabled="true"
+                            aria-label=aria_label
+                        >
+                            <span class="nf ctx-icon">{ic.deleted}</span>
+                            "Delete Untracked Files…"
+                            <span class="ctx-item-reason">{visible_reason}</span>
+                        </button>
+                    }
+                    .into_view()
+                } else {
+                    let on = move |_| {
+                        dialogs.open(Dialog::Confirm);
+                        shell.open_confirm(PendingOp::DeleteUntrackedPaths {
+                            paths: paths.clone(),
+                        });
+                        shell.close_menu();
+                    };
+                    view! {
+                        <button class="ctx-item" on:click=on>
+                            <span class="nf ctx-icon">{ic.deleted}</span>
+                            "Delete Untracked Files…"
+                        </button>
+                    }
+                    .into_view()
                 }
             });
             // The branch operations (Issue #33 follow-up): merge / push / delete, one
@@ -672,7 +830,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 if let Some(reason) = reason {
                     let (aria_label, visible_reason) = disabled_menu_item_copy(&label, &reason);
                     return view! {
-                        <span
+                        <button
                             class="ctx-item disabled"
                             title=reason
                             aria-disabled="true"
@@ -681,7 +839,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                             <span class="nf ctx-icon">{ic.merge}</span>
                             {label}
                             <span class="ctx-item-reason">{visible_reason}</span>
-                        </span>
+                        </button>
                     }
                     .into_view();
                 }
@@ -774,6 +932,8 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     {unstage_changes}
                     {select_stage}
                     {select_unstage}
+                    {discard_changes}
+                    {delete_untracked}
                     {commit_changes}
                     {commit_empty}
                     {branch_items}
@@ -787,7 +947,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 const REASON: &str = "This device reports it is offline";
                 let (aria_label, visible_reason) = disabled_menu_item_copy("Write actions", REASON);
                 view! {
-                    <span
+                    <button
                         class="ctx-item disabled"
                         title=REASON
                         aria-disabled="true"
@@ -796,7 +956,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         <span class="nf ctx-icon">{ic.commit}</span>
                         "Write actions"
                         <span class="ctx-item-reason">{visible_reason}</span>
-                    </span>
+                    </button>
                 }
             });
             // Clamp the menu inside the *visual* viewport (iPad fix): a tap in
