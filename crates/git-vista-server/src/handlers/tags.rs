@@ -44,15 +44,24 @@ use git_vista_protocol::plan::{CommitOid, TagMessage, TagName, MAX_TAG_MESSAGE_L
 
 use crate::handlers::read::{resolve_repo, RepoQuery};
 
-/// What is appended to a tag message that had to be cut, so the cut is visible
-/// to whoever reads it.
+/// What says a tag message was cut, so the cut is visible to whoever reads it.
 ///
 /// A prefix that silently *looks* like the whole message is the failure this
 /// exists to prevent: [`TagDetail`] has no `truncated` flag (it is a
 /// `deny_unknown_fields` contract that shipped in M2.21a), so the only place
 /// left to be honest is inside the display text itself.
+///
+/// Stored *without* a leading separator so it can also stand alone as the
+/// whole message — see [`fit_message`] for the case where nothing survived the
+/// reader's cap. When it follows retained text it is joined with
+/// [`TRUNCATION_SEPARATOR`], which reproduces the wire text byte for byte.
 const TRUNCATION_NOTE: &str =
-    "\n\n[git-vista: this tag's message is longer than 16 KiB; it was cut here]";
+    "[git-vista: this tag's message is longer than 16 KiB; it was cut here]";
+
+/// What separates retained message text from [`TRUNCATION_NOTE`]: a blank
+/// line, so the note reads as its own paragraph and never runs on from the
+/// last retained line.
+const TRUNCATION_SEPARATOR: &str = "\n\n";
 
 /// Every tag in the repository, sorted by name.
 ///
@@ -172,10 +181,11 @@ fn tag_detail(record: &TagRecord) -> Option<TagDetail> {
         target,
         tag_object,
         tagger: record.tagger.clone(),
-        message: record
-            .message
-            .as_deref()
-            .and_then(|m| fit_message(m, record.message_truncated)),
+        // Both halves of the reader's answer go in, not just the text: a
+        // record can carry `message: None` *and* `message_truncated: true`
+        // (see `fit_message`), and `.as_deref().and_then(..)` would drop the
+        // truncation fact on the floor for exactly that record.
+        message: fit_message(record.message.as_deref(), record.message_truncated),
         signature: if record.signed {
             SignatureStatus::Unverifiable
         } else {
@@ -187,23 +197,53 @@ fn tag_detail(record: &TagRecord) -> Option<TagDetail> {
 /// Fit a tag's annotation into a [`TagMessage`], appending [`TRUNCATION_NOTE`]
 /// whenever bytes were dropped.
 ///
-/// `already_truncated` is the reader's own byte-level fact from
-/// [`TagRecord::message_truncated`] — never re-derived from this string's
-/// length, which has already been trimmed. Both inputs matter: the message can
-/// be short enough to fit here and still be a prefix of a much longer one.
-fn fit_message(message: &str, already_truncated: bool) -> Option<TagMessage> {
-    if !already_truncated && message.len() <= MAX_TAG_MESSAGE_LEN {
-        return TagMessage::new(message).ok();
+/// Takes **both halves** of what [`git_vista_git::read_tags`] found: the text
+/// it retained (`None` when nothing was worth keeping) and `already_truncated`,
+/// its own byte-level fact from [`TagRecord::message_truncated`] — never
+/// re-derived from this string's length, which has already been trimmed.
+///
+/// The three input shapes are genuinely different facts and each gets its own
+/// answer:
+///
+/// * `(None, false)` — the tag has no annotation body. `None` on the wire.
+/// * `(Some(text), _)` — the usual case: the text, with the note appended if
+///   anything was cut.
+/// * `(None, true)` — **the case this signature exists for.** The retained
+///   prefix trimmed down to nothing while real bytes were dropped past the cap.
+///   That happens when an annotation's first [`MAX_TAG_MESSAGE_LEN`] bytes are
+///   all whitespace (reachable straight through porcelain:
+///   `git tag -a --cleanup=verbatim -F`). Reporting `None` here would be
+///   byte-identical on the wire to a tag with no annotation at all, so a tag
+///   carrying megabytes of content would render as "no annotation" — a
+///   stronger version of the very "prefix that reads like the whole message"
+///   failure [`TRUNCATION_NOTE`] exists to prevent. The note therefore stands
+///   alone as the entire message, and it leads (no separator), so a
+///   first-line preview shows the note rather than a blank line.
+fn fit_message(message: Option<&str>, already_truncated: bool) -> Option<TagMessage> {
+    let retained = match (message, already_truncated) {
+        (None, false) => return None,
+        (None, true) => "",
+        (Some(text), _) => text,
+    };
+    if !already_truncated && retained.len() <= MAX_TAG_MESSAGE_LEN {
+        return TagMessage::new(retained).ok();
     }
-    // Leave room for the note, and cut on a character boundary so a
-    // multi-byte character is dropped whole rather than mangled.
+    if retained.is_empty() {
+        return TagMessage::new(TRUNCATION_NOTE).ok();
+    }
+    // Leave room for the note and its separator, and cut on a character
+    // boundary so a multi-byte character is dropped whole rather than mangled.
     let mut end = MAX_TAG_MESSAGE_LEN
-        .saturating_sub(TRUNCATION_NOTE.len())
-        .min(message.len());
-    while end > 0 && !message.is_char_boundary(end) {
+        .saturating_sub(TRUNCATION_NOTE.len() + TRUNCATION_SEPARATOR.len())
+        .min(retained.len());
+    while end > 0 && !retained.is_char_boundary(end) {
         end -= 1;
     }
-    TagMessage::new(format!("{}{TRUNCATION_NOTE}", &message[..end])).ok()
+    TagMessage::new(format!(
+        "{}{TRUNCATION_SEPARATOR}{TRUNCATION_NOTE}",
+        &retained[..end]
+    ))
+    .ok()
 }
 
 #[cfg(test)]
@@ -493,13 +533,77 @@ pub(crate) mod tests {
     /// A multi-byte character straddling the cut point is dropped whole.
     #[test]
     fn a_cut_never_splits_a_character() {
-        let room = MAX_TAG_MESSAGE_LEN - TRUNCATION_NOTE.len();
+        let room = MAX_TAG_MESSAGE_LEN - (TRUNCATION_NOTE.len() + TRUNCATION_SEPARATOR.len());
         // One byte of a two-byte 'é' would land past the boundary.
         let mut text = "x".repeat(room - 1);
         text.push('é');
         text.push_str("tail");
-        let fitted = fit_message(&text, true).unwrap();
+        let fitted = fit_message(Some(&text), true).unwrap();
         assert!(!fitted.as_str().contains('\u{FFFD}'));
-        assert_eq!(fitted.as_str().len(), room - 1 + TRUNCATION_NOTE.len());
+        assert_eq!(
+            fitted.as_str().len(),
+            room - 1 + TRUNCATION_SEPARATOR.len() + TRUNCATION_NOTE.len()
+        );
+    }
+
+    /// The regression this pair of tests exists for (#236 review).
+    ///
+    /// `git_vista_git::annotation_message` answers with **two** facts, and
+    /// `(None, true)` is a reachable pair: an annotation whose first 16 KiB is
+    /// all whitespace retains nothing yet really was cut. The mapping used to
+    /// read `record.message.as_deref().and_then(|m| fit_message(m, ..))`, which
+    /// short-circuits on the `None` and never consults the flag — so the wire
+    /// said `message: null`, indistinguishable from a tag with no annotation
+    /// at all, for a tag carrying arbitrarily much content past the cap.
+    ///
+    /// The negative leg is the load-bearing half: a genuinely empty annotation
+    /// must *still* be `null`, or this fix would have bought honesty about
+    /// truncation by inventing a message for every unannotated tag.
+    #[test]
+    fn a_message_cut_down_to_nothing_still_says_it_was_cut() {
+        let mut record = annotated("v-all-whitespace-prefix");
+        record.message = None;
+        record.message_truncated = true;
+
+        let message = tag_detail(&record)
+            .unwrap()
+            .message
+            .expect("a truncated message must never be reported as absent");
+        assert_eq!(
+            message.as_str(),
+            TRUNCATION_NOTE,
+            "with nothing retained the note is the whole message"
+        );
+        assert!(
+            !message.as_str().starts_with('\n'),
+            "the note has to lead, or a first-line preview shows a blank line \
+             and the reader learns nothing"
+        );
+    }
+
+    #[test]
+    fn a_tag_that_really_has_no_annotation_is_still_null() {
+        let mut record = annotated("v-blank");
+        record.message = None;
+        record.message_truncated = false;
+        assert_eq!(
+            tag_detail(&record).unwrap().message,
+            None,
+            "no message and nothing cut is a genuinely absent annotation"
+        );
+
+        // And a lightweight tag, which can never have either.
+        assert_eq!(tag_detail(&lightweight("v-light")).unwrap().message, None);
+    }
+
+    /// Splitting the note from its separator must not have moved a single byte
+    /// on the wire: the appended form is still exactly what it always was.
+    #[test]
+    fn the_appended_note_is_byte_identical_to_the_single_constant_it_replaced() {
+        let fitted = fit_message(Some("head"), true).unwrap();
+        assert_eq!(
+            fitted.as_str(),
+            "head\n\n[git-vista: this tag's message is longer than 16 KiB; it was cut here]"
+        );
     }
 }
