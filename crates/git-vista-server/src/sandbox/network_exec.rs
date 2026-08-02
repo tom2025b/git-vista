@@ -3,6 +3,16 @@
 //! hardening and output redaction are enforced structurally rather than
 //! re-derived at each of the three call sites.
 //!
+//! [`network_command`] is wired into production at `git_cmd.rs`'s single
+//! spawn chokepoint (`sandboxed`): any call declaring
+//! [`NetworkNeed::Remote`] gets this module's forced askpass hardening on
+//! the way in and [`redact_output`]'s redaction on the way out, rather than
+//! this module owning a second, parallel policy-build-and-spawn path of its
+//! own. `exec_push` (`planner.rs`) is the one production caller today —
+//! wiring `exec_fetch`/`exec_pull` on, once #227 adds them, is "declare
+//! `NetworkNeed::Remote`", not "remember to call this module" — the
+//! chokepoint they already go through is what enforces it.
+//!
 //! # What this closes
 //!
 //! `docs/superpowers/evidence/m1.13-design-trail/m1.13-findings.md` finding
@@ -81,7 +91,7 @@
 use std::path::Path;
 use std::process::Output;
 
-use super::{policy_for, spawn, NetworkNeed, Policy};
+use super::{spawn, Policy};
 
 /// Prepended to every Network-tier spawn's args, ahead of the subcommand —
 /// see the module doc for why this is the one flag this harness forces.
@@ -95,33 +105,6 @@ use super::{policy_for, spawn, NetworkNeed, Policy};
 /// flags, it must not repeat `core.askpass` ahead of the subcommand, and
 /// that should be caught in review, not by this ordering.
 const FORCED_NETWORK_ARGS: &[&str] = &["-c", "core.askpass="];
-
-/// Why a Network-tier spawn could not be run at all — mirrors
-/// `git_cmd::ExecUnavailable`'s two-cause fold (policy-build failure and
-/// spawn/IO failure are the same "we observed nothing" fact to every caller)
-/// but keeps the underlying `ShimError` typed rather than stringified, since
-/// this lives beside `policy_for` rather than across the crate boundary
-/// `git_cmd.rs` sits at.
-#[derive(Debug)]
-pub(crate) enum NetworkExecError {
-    /// The Network-tier policy itself could not be built (missing shim,
-    /// unset `$HOME`, a `.git` geometry `repo_paths` refuses).
-    Policy(super::shim::ShimError),
-    /// The composed launcher could not be spawned, or its `Output` could not
-    /// be collected.
-    Io(std::io::Error),
-}
-
-impl std::fmt::Display for NetworkExecError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Policy(e) => write!(f, "{e}"),
-            Self::Io(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for NetworkExecError {}
 
 /// Build the composed launcher for one Network-tier remote spawn: `policy`'s
 /// argv (#188's SSH carve-out and agent-socket grant included, whenever
@@ -147,114 +130,132 @@ pub(crate) fn network_command(
     spawn::command_async(policy, repo, &full)
 }
 
-/// The production entry point: builds the Network-tier policy itself via
-/// [`policy_for`] (`NetworkNeed::Remote`, so #188's SSH carve-out and
-/// agent-socket grant are wired in exactly as they are for every other
-/// Network-tier spawn — nothing here reimplements that machinery), runs
-/// through [`network_command`], and redacts the captured output before
-/// returning it.
-///
-/// # Not yet called from `planner.rs`
-///
-/// #228's allowed paths are `sandbox/**` plus `durable.rs`/journal redaction
-/// helpers; wiring `planner.rs`'s `exec_push` (and the `exec_fetch`/
-/// `exec_pull` #227 will add) onto this function is explicitly left for that
-/// integration step — see this crate's issue tracker and the module doc
-/// above. `#[allow(dead_code)]` on this item is the same "lands before its
-/// caller" state `sandbox/mod.rs`'s own module doc describes for
-/// `sandbox_argv` between Task 1 and Task 5 of #66; it should come off the
-/// moment a real caller lands.
-#[allow(dead_code)]
-pub(crate) async fn run_network_git(
-    repo: &Path,
-    read_only: bool,
-    args: &[&str],
-) -> Result<Output, NetworkExecError> {
-    let policy =
-        policy_for(repo, read_only, NetworkNeed::Remote).map_err(NetworkExecError::Policy)?;
-    let output = network_command(&policy, repo, args)
-        .output()
-        .await
-        .map_err(NetworkExecError::Io)?;
-    Ok(redact_output(output))
-}
-
 /// Strip `user[:pass]@` userinfo from every `<scheme>://…` URL substring
-/// found in `text`, leaving the scheme, host and path intact —
+/// found in `bytes`, leaving the scheme, host and path intact —
 /// `docs/SECURITY_MODEL.md`'s "Remote and Forge Credentials" bullet: "Redact
 /// URL userinfo … from logs and operation records."
 ///
-/// No URL-parsing crate: `text` is not itself a URL, it is arbitrary text
+/// No URL-parsing crate: `bytes` is not itself a URL, it is arbitrary bytes
 /// (git's stderr, a credential helper's own diagnostic output) that may
 /// contain zero, one, or several URLs anywhere inside it, so parsing the
-/// whole string as one URL does not apply. This scans for every `://`
+/// whole buffer as one URL does not apply. This scans for every `://`
 /// occurrence that is immediately preceded by scheme characters
 /// (`[A-Za-z0-9+.-]`), takes that URL's authority as the run up to the next
-/// `/`, `?`, `#`, whitespace, or end of string, and — only when that
-/// authority contains an `@` — drops everything up to and including the
-/// *last* `@` in it (the userinfo delimiter; a password can itself contain
-/// `@`, which is why this is "last", not "first").
+/// `/`, `?`, `#`, ASCII whitespace, or end of buffer — treating an *embedded*
+/// `://` found during that scan as still part of the authority rather than a
+/// second delimiter (see the inner comment below: a password containing
+/// `://` must not be able to truncate the scan before the real userinfo
+/// delimiter) — and, only when that authority contains an `@`, drops
+/// everything up to and including the *last* `@` in it (the userinfo
+/// delimiter; a password can itself contain `@`, which is why this is
+/// "last", not "first").
 ///
-/// Operates on `char`s rather than raw bytes so every slice point this
-/// function chooses is a valid boundary regardless of what non-ASCII text
-/// surrounds a redacted URL — git's own output is not guaranteed ASCII (a
-/// path component can be any byte the filesystem allows).
-pub(crate) fn redact_url_userinfo(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let is_scheme_char = |c: char| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.';
+/// Operates on raw bytes, not `char`s or `&str`: every delimiter this
+/// function looks for (`:`, `/`, `?`, `#`, `@`, ASCII whitespace, and the
+/// scheme-char class) is a single ASCII byte, and a UTF-8 continuation or
+/// lead byte for any multi-byte code point is always `>= 0x80` — it can
+/// never equal an ASCII byte value. So this never needs to know whether
+/// `bytes` is valid UTF-8 at all: it cannot misread a multi-byte sequence as
+/// one of these delimiters, and every position it slices at sits immediately
+/// after a single-byte ASCII delimiter (always its own whole code point,
+/// never a continuation byte) or at a buffer boundary — both of which are
+/// valid UTF-8 char boundaries whenever the surrounding bytes are valid
+/// UTF-8. This is what lets [`redact_bytes`] redact a buffer that carries
+/// one stray non-UTF-8 byte (git's stdout is not guaranteed valid UTF-8 — a
+/// path component can be any byte the filesystem allows) without falling
+/// back to leaving the *entire* buffer unredacted just because one byte in
+/// it doesn't decode: the invalid byte is simply never matched as a
+/// delimiter, and passes through unchanged like any other non-ASCII byte.
+fn redact_url_userinfo_bytes(bytes: &[u8]) -> Vec<u8> {
+    let n = bytes.len();
+    let is_scheme_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.';
+    let is_authority_delim = |b: u8| b == b'/' || b == b'?' || b == b'#' || b.is_ascii_whitespace();
 
-    let mut out = String::with_capacity(text.len());
+    let mut out = Vec::with_capacity(n);
     let mut i = 0usize;
     while i < n {
         let starts_scheme_sep =
-            i + 2 < n && chars[i] == ':' && chars[i + 1] == '/' && chars[i + 2] == '/';
-        if starts_scheme_sep && i > 0 && is_scheme_char(chars[i - 1]) {
+            i + 2 < n && bytes[i] == b':' && bytes[i + 1] == b'/' && bytes[i + 2] == b'/';
+        if starts_scheme_sep && i > 0 && is_scheme_byte(bytes[i - 1]) {
             // Authority = the run after "://" up to the next path/query/
-            // fragment/whitespace delimiter, or the end of the string.
+            // fragment/whitespace delimiter, or the end of the buffer — with
+            // one carve-out: a `/` that is itself the first half of another
+            // "://"-shaped run (checked by looking one byte back for `:` and
+            // one byte forward for `/`) is treated as still-inside-the-
+            // authority rather than the terminator. Without this, a
+            // credential value that happens to contain the literal text
+            // "://" (a plausible crafted/reused token) truncates the scan
+            // before the real userinfo `@`, and the whole URL — credential
+            // included — passes through unredacted. Skipping both bytes of
+            // the embedded separator when this fires keeps the scan moving
+            // forward rather than looping on the same position.
             let mut end = i + 3;
-            while end < n
-                && chars[end] != '/'
-                && chars[end] != '?'
-                && chars[end] != '#'
-                && !chars[end].is_whitespace()
-            {
+            loop {
+                if end >= n {
+                    break;
+                }
+                let b = bytes[end];
+                if b == b'/' && end + 1 < n && bytes[end + 1] == b'/' && bytes[end - 1] == b':' {
+                    end += 2;
+                    continue;
+                }
+                if is_authority_delim(b) {
+                    break;
+                }
                 end += 1;
             }
             // Last '@' inside the authority, if any.
             let mut at = None;
             let mut k = i + 3;
             while k < end {
-                if chars[k] == '@' {
+                if bytes[k] == b'@' {
                     at = Some(k);
                 }
                 k += 1;
             }
-            out.push_str("://");
+            out.extend_from_slice(b"://");
             let keep_from = at.map_or(i + 3, |a| a + 1);
-            for &c in &chars[keep_from..end] {
-                out.push(c);
-            }
+            out.extend_from_slice(&bytes[keep_from..end]);
             i = end;
             continue;
         }
-        out.push(chars[i]);
+        out.push(bytes[i]);
         i += 1;
     }
     out
 }
 
-/// [`redact_url_userinfo`] applied to both halves of a spawn's captured
-/// output — the one place this harness's callers get sanitisation "for
-/// free" regardless of which of them eventually reaches a response, a log
-/// line, or a journal record built from this `Output`.
+/// [`redact_url_userinfo_bytes`] over a `&str`, for callers (and this file's
+/// own pure unit tests) that already have text rather than raw process
+/// output.
 ///
-/// Non-UTF-8 bytes are left untouched rather than lossily reinterpreted:
-/// `redact_url_userinfo` needs `&str` to scan characters, and git's stdout
-/// in particular can carry non-UTF-8 path bytes (`git_cmd.rs`'s own byte-not-
-/// String convention exists for the same reason). A lossy round-trip would
-/// silently corrupt those bytes for a redaction that, being ASCII-anchored
-/// (`://`, `@`), has nothing to find in binary output anyway.
+/// The round-trip through `String::from_utf8` cannot fail for `str` input:
+/// see [`redact_url_userinfo_bytes`]'s doc for why every slice boundary it
+/// chooses is a valid UTF-8 char boundary whenever the input bytes are.
+pub(crate) fn redact_url_userinfo(text: &str) -> String {
+    String::from_utf8(redact_url_userinfo_bytes(text.as_bytes()))
+        .expect("redact_url_userinfo_bytes preserves UTF-8 validity for str input")
+}
+
+/// [`redact_url_userinfo_bytes`] applied to both halves of a spawn's
+/// captured output — the one place this harness's callers get sanitisation
+/// "for free" regardless of which of them eventually reaches a response, a
+/// log line, or a journal record built from this `Output`.
+///
+/// Works directly on the raw bytes, with no UTF-8 validity check or
+/// fallback: git's stdout in particular can carry non-UTF-8 path bytes
+/// (`git_cmd.rs`'s own byte-not-`String` convention exists for the same
+/// reason), and this redaction is ASCII-anchored (`://`, `@`) so it has
+/// nothing to find *in* a non-UTF-8 byte and nothing to corrupt by leaving
+/// it untouched — see [`redact_url_userinfo_bytes`]'s doc. Earlier revisions
+/// of this function validated the whole buffer as UTF-8 first and skipped
+/// redaction entirely on any decode failure; that meant a single stray
+/// non-ASCII byte anywhere in a buffer — trivially producible by a hostile
+/// credential helper — suppressed redaction of an otherwise-plain-ASCII
+/// secret URL elsewhere in the *same* buffer. Operating on bytes directly
+/// removes the whole-buffer-or-nothing failure mode: every byte is either
+/// part of a matched delimiter or copied through untouched, independent of
+/// what else is in the buffer.
 pub(crate) fn redact_output(output: Output) -> Output {
     Output {
         status: output.status,
@@ -264,10 +265,26 @@ pub(crate) fn redact_output(output: Output) -> Output {
 }
 
 fn redact_bytes(bytes: &[u8]) -> Vec<u8> {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => redact_url_userinfo(s).into_bytes(),
-        Err(_) => bytes.to_vec(),
-    }
+    redact_url_userinfo_bytes(bytes)
+}
+
+/// A redacted view of the argv a Network-tier spawn ran with, for callers
+/// that want to log or journal "ran: git <args…>" style diagnostics.
+///
+/// [`redact_output`] only ever sees a spawn's captured stdout/stderr —
+/// `run_network_git`'s own `args: &[&str]` parameter is a second sink for
+/// exactly the same secret shape, since every SSH test in this file (and
+/// every real caller) routinely passes the remote URL as one of `args`
+/// (`&["push", &fixture.repo_url, …]`). Nothing upstream can redact args on
+/// this module's behalf — a caller that logs `args` directly bypasses
+/// [`redact_output`] entirely — so this gives that caller the same
+/// [`redact_url_userinfo`] treatment as a first-class, explicit primitive
+/// rather than leaving args logging to rediscover (or forget) the need for
+/// it independently.
+#[allow(dead_code)] // no caller yet — see this file's module doc; wired in
+                    // once a diagnostic/journal path logs the argv.
+pub(crate) fn redact_args(args: &[&str]) -> Vec<String> {
+    args.iter().map(|a| redact_url_userinfo(a)).collect()
 }
 
 #[cfg(test)]
@@ -428,6 +445,103 @@ mod tests {
         );
     }
 
+    /// A password value that itself contains the literal text `://` (a
+    /// plausible crafted/reused token) must not defeat redaction — the
+    /// blocker this file's own review found: the authority-end scan used to
+    /// stop at the *first* `/` it saw, which for this input is the first
+    /// slash of the embedded `://`, well before the real userinfo `@`.
+    #[test]
+    fn redact_url_userinfo_strips_a_password_containing_a_scheme_separator() {
+        assert_eq!(
+            redact_url_userinfo("https://user:pa://hunter2ss@host/repo.git"),
+            "https://host/repo.git"
+        );
+    }
+
+    /// Paired negative for the case above: proves the assertion is capable
+    /// of failing — the OLD (pre-fix) algorithm returned this exact input
+    /// byte-for-byte unchanged, secret and all.
+    #[test]
+    fn unredacted_password_containing_a_scheme_separator_still_leaks() {
+        let secret = "hunter2ss";
+        let s = format!("https://user:pa://{secret}@host/repo.git");
+        assert!(
+            s.contains(secret),
+            "test setup: secret must be present pre-redaction"
+        );
+        assert!(
+            !redact_url_userinfo(&s).contains(secret),
+            "redaction must remove it even though the password contains '://'; got: {}",
+            redact_url_userinfo(&s)
+        );
+    }
+
+    /// The other blocker this file's own review found: `redact_bytes` used
+    /// to validate the *entire* buffer as UTF-8 before redacting anything,
+    /// so one stray non-UTF-8 byte anywhere in a buffer — trivially
+    /// producible by a hostile credential helper — suppressed redaction of
+    /// an otherwise-plain-ASCII secret URL elsewhere in that same buffer.
+    /// This plants a secret, then one invalid UTF-8 byte, then asserts the
+    /// secret is still gone from the redacted output.
+    #[test]
+    fn redact_bytes_still_redacts_a_secret_when_the_buffer_also_has_an_invalid_utf8_byte() {
+        let mut buf = b"debug: tried https://user:hunter2@host/repo.git".to_vec();
+        buf.push(0xFF); // not valid UTF-8 on its own or as a continuation here
+        buf.extend_from_slice(b" -- trailing text after the bad byte");
+
+        let redacted = redact_bytes(&buf);
+        assert!(
+            !redacted
+                .windows(8)
+                .any(|w| w == b"hunter2@" || w == b"hunter2\xff"),
+            "secret survived redaction: {}",
+            String::from_utf8_lossy(&redacted)
+        );
+        assert!(
+            !String::from_utf8_lossy(&redacted).contains("hunter2"),
+            "secret survived redaction (lossy view): {}",
+            String::from_utf8_lossy(&redacted)
+        );
+        // The invalid byte itself is preserved (passed through), not
+        // dropped or lossily replaced — same "don't corrupt binary output"
+        // posture the module doc commits to.
+        assert!(redacted.contains(&0xFF));
+    }
+
+    /// Paired negative: without redaction, the secret is present in the raw
+    /// buffer (proves the setup actually contains what the test above
+    /// claims), AND — this is the specific regression — the OLD whole-buffer
+    /// UTF-8 gate would have returned `buf` completely unchanged the moment
+    /// `std::str::from_utf8` hit the 0xFF byte, secret included.
+    #[test]
+    fn unredacted_buffer_with_a_trailing_invalid_byte_still_contains_the_secret() {
+        let mut buf = b"debug: tried https://user:hunter2@host/repo.git".to_vec();
+        buf.push(0xFF);
+        assert!(
+            std::str::from_utf8(&buf).is_err(),
+            "test setup: buffer must be invalid UTF-8"
+        );
+        assert!(String::from_utf8_lossy(&buf).contains("hunter2"));
+    }
+
+    #[test]
+    fn redact_args_strips_userinfo_from_every_arg_that_has_it() {
+        let args = [
+            "push",
+            "https://user:tok@host/repo.git",
+            "HEAD:refs/heads/main",
+        ];
+        let redacted = redact_args(&args);
+        assert_eq!(
+            redacted,
+            vec![
+                "push".to_string(),
+                "https://host/repo.git".to_string(),
+                "HEAD:refs/heads/main".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn redact_output_redacts_both_stdout_and_stderr() {
         let raw = Output {
@@ -569,6 +683,31 @@ mod https_suite {
     /// the forcing — and asserts the marker DOES run there. That is what
     /// makes the main assertion non-vacuous: this test would fail if
     /// `FORCED_NETWORK_ARGS` were ever dropped or reordered wrongly.
+    ///
+    /// # A single unreproduced failure, investigated and left open
+    ///
+    /// An adversarial review of this PR reported one observed failure of
+    /// this exact test under real concurrent load, with `hardened.stderr`
+    /// reading "Authentication failed for '\<url\>'" — a message shape that,
+    /// if genuine, would mean the marker script actually ran despite the
+    /// forcing. Investigated in the same review round: 65 runs total (15
+    /// `cargo test` iterations of this test under a concurrently-running
+    /// `cargo test --workspace` plus CPU/IO stress, and 50 more via a
+    /// standalone bash reproduction of the same two-phase check under the
+    /// same stress) produced zero repeats of a hardened-phase bypass. A
+    /// source read found no mechanism that could cause one: `-c
+    /// core.askpass=` is a command-line override, which git's own config
+    /// precedence always ranks above repo-local `.git/config` regardless of
+    /// read order or timing (not a race this crate's code arbitrates), and
+    /// the one known process-wide-env-mutation hazard in this crate's own
+    /// tests (`sandbox::argv::SSH_AUTH_SOCK_LOCK`'s doc) does not touch
+    /// `core.askpass`/`GIT_ASKPASS`/`SSH_ASKPASS` anywhere in this codebase.
+    /// Left open rather than "fixed" with an unverified change: there is
+    /// nothing concrete to change, and a speculative retry-tolerant rewrite
+    /// of a security-load-bearing test would hide a real flake if one exists
+    /// rather than catch it. If this reproduces again, capture the full
+    /// process environment and `ps` tree at the moment of failure, not just
+    /// the stderr string.
     #[tokio::test]
     async fn repo_local_askpass_is_never_executed() {
         let server = Http401::start();

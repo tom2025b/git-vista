@@ -144,9 +144,9 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // literal `"git"`; no argument is client-influenced.
     "src/sandbox/clone_live.rs",
     // #228 (M2.20b): the shared Network-tier exec harness. Its production
-    // functions (`network_command`, `run_network_git`) build no `Command` of
-    // their own — they call `spawn::command_async`, the same chokepoint
-    // every other spawn site in this crate already goes through. The only
+    // function (`network_command`) builds no `Command` of its own — it
+    // calls `spawn::command_async`, the same chokepoint every other spawn
+    // site in this crate already goes through. The only
     // `Command::new` literal in this file is `#[cfg(test)]` fixture setup
     // (`run()`, `git init`/`git config` for the askpass/credential-helper
     // fixtures) — same posture as `repo_paths.rs`/`hostile.rs` above.
