@@ -538,6 +538,15 @@ fast-forward push with `501`, so a lease-force push cannot yet run. "Strong warn
 No gesture, pressure threshold, swipe, or double-tap directly executes a destructive
 operation. Touch gestures may select or open a plan; final confirmation is explicit.
 
+*Worktree-destructive reporting is partly implemented (2026-08-02, ADR 0037, #284 —
+`planner::{observe_deletion, DeleteOutcome}`). `DeleteUntrackedPaths` has no safety
+checkpoint and can have none: an untracked path was never written to the object
+database, so there is nothing to check point to. The control that stands in for one is
+that the operation may never misreport itself — no decision branches on git's
+gettext-translated prose, the report is a filesystem observation, and the count states
+what this operation destroyed rather than what was requested. Preview and typed file
+impact land with the M2+ review roundtrip.*
+
 ## Clone and Network Controls
 
 - Restrict clone schemes by operating mode and configuration.

@@ -317,6 +317,7 @@ fn admit_clone(
     let Some(key) = key else {
         return Ok(CloneAdmission::Fresh(CloneGuard {
             key: None,
+            url: url.to_string(),
             finished: false,
         }));
     };
@@ -364,6 +365,7 @@ fn admit_clone(
     );
     Ok(CloneAdmission::Fresh(CloneGuard {
         key: Some(key),
+        url: url.to_string(),
         finished: false,
     }))
 }
@@ -380,10 +382,19 @@ fn admit_clone(
 /// reason.
 ///
 /// No key at all (`key: None`, the no-idempotency-key case) makes both
-/// `finish` and `Drop` no-ops: nothing was claimed, so nothing needs settling.
+/// `finish` and `Drop` no-ops: nothing was claimed, so nothing needs settling
+/// — `url` is still populated in that case (both [`admit_clone`] construction
+/// sites have it in hand), but goes unused, which is harmless.
+///
+/// `url` exists so [`record_outcome`] never has to fabricate one (#288,
+/// review finding): the defensive `or_insert_with` branch it guards against
+/// — the record having been evicted or otherwise missing by the time this
+/// guard settles — needs a real URL to re-insert, and the caller's admitted
+/// URL, carried here from the moment `admit_clone` had it, is that value.
 #[derive(Debug)]
 struct CloneGuard {
     key: Option<IdempotencyKey>,
+    url: String,
     finished: bool,
 }
 
@@ -402,7 +413,7 @@ impl CloneGuard {
                 message: message.clone(),
             },
         };
-        record_outcome(key, outcome);
+        record_outcome(key, self.url.clone(), outcome);
     }
 }
 
@@ -414,6 +425,7 @@ impl Drop for CloneGuard {
         if let Some(key) = self.key.take() {
             record_outcome(
                 key,
+                self.url.clone(),
                 CloneOutcome::Failed {
                     status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
                     message: "The clone stopped without finishing. Check the repository \
@@ -428,7 +440,15 @@ impl Drop for CloneGuard {
 /// Settle `key`'s record to a terminal `outcome`, inserting one if eviction
 /// (or, in principle, a bug) already dropped it — `finish`/`Drop` must always
 /// be able to leave a replayable record behind, never silently no-op.
-fn record_outcome(key: IdempotencyKey, outcome: CloneOutcome) {
+///
+/// `url` is the caller's real, admitted URL — [`CloneGuard`] carries it from
+/// the moment `admit_clone` had it — used only by the `or_insert_with` branch
+/// below, when there's no existing record to `and_modify`. Before #288 that
+/// branch fabricated a placeholder URL instead of taking one from the caller;
+/// a re-inserted record now carries the same URL admission would have stored,
+/// so a later `admit_clone` for this key compares against the truth rather
+/// than a manufactured mismatch.
+fn record_outcome(key: IdempotencyKey, url: String, outcome: CloneOutcome) {
     let now = crate::activity::now_secs();
     if let Ok(mut reg) = clone_records().lock() {
         reg.entry(key)
@@ -437,7 +457,7 @@ fn record_outcome(key: IdempotencyKey, outcome: CloneOutcome) {
                 r.ended_at = Some(now);
             })
             .or_insert_with(|| CloneRecord {
-                url: "https://example.invalid/repo.git".to_string(),
+                url,
                 outcome: Some(outcome),
                 ended_at: Some(now),
             });
@@ -1102,6 +1122,71 @@ mod tests {
                 assert!(msg.contains("different clone URL"), "{msg}");
             }
             Ok(_) => panic!("a key reused for a different url must be refused, not admitted"),
+        }
+    }
+
+    /// The fabrication this issue exists for (#288, review finding):
+    /// `record_outcome`'s `or_insert_with` branch used to invent
+    /// `"https://example.invalid/repo.git"` for a key with no existing
+    /// record — and that fabricated string was byte-identical to the URL
+    /// every other fixture in this module already used, so no test could
+    /// tell a correctly-threaded URL from a fabrication. `real_url` below is
+    /// deliberately **not** `"https://example.invalid/repo.git"`, so a
+    /// regression back to the fabricated placeholder is something this test
+    /// can actually catch rather than pass vacuously.
+    ///
+    /// Drives `record_outcome` directly on a key with **no** existing
+    /// record — the exact `or_insert_with` branch, reached the same way
+    /// eviction or a bug would reach it, without needing either — then
+    /// proves the re-inserted record carries the caller's real URL rather
+    /// than a placeholder two ways: `admit_clone` with the *same* key and
+    /// *same* URL must replay the recorded outcome (a fabricated record
+    /// would compare its placeholder against `real_url`, mismatch, and 409);
+    /// and `admit_clone` with the same key but a *different* URL must still
+    /// 409 as a key collision (proving the stored `url` really is
+    /// `real_url` and not a wildcard or an ignored field — a record that
+    /// answered "same" no matter what URL was compared would pass the first
+    /// assertion for the wrong reason).
+    #[test]
+    fn record_outcome_re_insert_carries_the_caller_s_real_url_not_a_fabrication() {
+        let key = IdempotencyKey::new("test-clone-288-re-insert-url").unwrap();
+        let real_url = "https://example.invalid/re-inserted.git";
+
+        record_outcome(
+            key.clone(),
+            real_url.to_string(),
+            CloneOutcome::Succeeded(test_descriptor("re-inserted")),
+        );
+
+        // Same key, same URL: a correctly-threaded record replays. A
+        // fabricated record's `url` ("https://example.invalid/repo.git")
+        // would not equal `real_url`, so `admit_clone` would 409 here
+        // instead of replaying — the exact false collision #288 reports.
+        match admit_clone(Some(key.clone()), real_url).expect("same key, same url must not error") {
+            CloneAdmission::Replay(Ok(Json(descriptor))) => {
+                assert_eq!(descriptor.name, "re-inserted");
+            }
+            CloneAdmission::Replay(Err(e)) => {
+                panic!("expected a replayed success, got a replayed failure instead: {e:?}")
+            }
+            CloneAdmission::Fresh(_) => {
+                panic!(
+                    "a key with an existing (re-inserted) record must replay, not be \
+                     admitted fresh"
+                )
+            }
+        }
+
+        // Same key, a DIFFERENT url: must still 409. This is the negative
+        // check — it proves the stored record genuinely holds `real_url`
+        // (a mismatch is detected), ruling out a re-insert that silently
+        // ignored the URL or stored an always-matching wildcard.
+        match admit_clone(Some(key), "https://example.invalid/a-different-repo.git") {
+            Err((status, msg)) => {
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert!(msg.contains("different clone URL"), "{msg}");
+            }
+            Ok(_) => panic!("a different url against the re-inserted record must still 409"),
         }
     }
 
