@@ -235,8 +235,8 @@ fn the_production_policy_is_never_unsandboxed_today() {
 // returned Strict unconditionally would also pass it.
 
 use git_vista_protocol::{
-    BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, RefName, RemoteName,
-    StageDirection, WorktreePath,
+    BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
+    MergeStrategy, RefName, RemoteName, StageDirection, WorktreePath,
 };
 
 fn branch(s: &str) -> BranchName {
@@ -255,7 +255,7 @@ fn wpath(s: &str) -> WorktreePath {
 /// variant fails this match at compile time until an arm exists for it.
 ///
 /// This is the guard that is actually load-bearing, not the count assertion in
-/// `exactly_one_operation_declares_a_network_need` below — a hand-maintained
+/// `exactly_the_three_remote_operations_declare_a_network_need` below — a hand-maintained
 /// `Vec` and a hand-maintained integer can agree with each other while both
 /// silently omit a real variant, which is exactly what happened here between
 /// M2.17b (#213), M2.18a (#219) and M2.19a (#222): `every_operation()` below
@@ -289,6 +289,8 @@ fn variant_name(op: &GitOperation) -> &'static str {
         GitOperation::DiscardTrackedPaths { .. } => "DiscardTrackedPaths",
         GitOperation::DeleteUntrackedPaths { .. } => "DeleteUntrackedPaths",
         GitOperation::AmendCommit { .. } => "AmendCommit",
+        GitOperation::FetchRemote { .. } => "FetchRemote",
+        GitOperation::PullBranch { .. } => "PullBranch",
     }
 }
 
@@ -324,6 +326,8 @@ fn every_operation() -> Vec<GitOperation> {
         GitOperation::PushBranch {
             branch: branch("feature"),
             remote: RemoteName::new("origin").expect("valid remote"),
+            set_upstream: false,
+            force: ForcePublish::None,
         },
         GitOperation::DeleteBranch {
             branch: branch("feature"),
@@ -363,7 +367,32 @@ fn every_operation() -> Vec<GitOperation> {
             expected_tip: oid(tip),
             allow_empty: false,
         },
+        GitOperation::FetchRemote {
+            remote: RemoteName::new("origin").expect("valid remote"),
+        },
+        GitOperation::PullBranch {
+            remote: RemoteName::new("origin").expect("valid remote"),
+            branch: branch("main"),
+            strategy: MergeStrategy::Merge,
+        },
     ]
+}
+
+/// A lease-force push, for the tests below that must see *both* `ForcePublish`
+/// modes. Kept out of [`every_operation`] on purpose: that list is
+/// one-value-per-variant (its own guard asserts no variant appears twice), and
+/// `PushBranch`'s two force modes are one variant. Their classification is
+/// checked separately by
+/// [`a_lease_force_push_declares_remote_like_every_other_push`].
+fn lease_force_push() -> GitOperation {
+    GitOperation::PushBranch {
+        branch: branch("feature"),
+        remote: RemoteName::new("origin").expect("valid remote"),
+        set_upstream: true,
+        force: ForcePublish::WithLease {
+            expected_remote_tip: oid("2222222222222222222222222222222222222222"),
+        },
+    }
 }
 
 /// Proves [`every_operation`] is actually exhaustive, rather than trusting a
@@ -371,7 +400,7 @@ fn every_operation() -> Vec<GitOperation> {
 /// let `AmendCommit` ship with a zero-coverage `NetworkNeed` classification in
 /// M2.19a, #222): every value `every_operation()` returns is tagged through
 /// [`variant_name`]'s compile-enforced match, and the resulting name set must
-/// be the full 19 with none missing and none doubled.
+/// be the full 21 with none missing and none doubled.
 #[test]
 fn every_operation_declares_every_variant() {
     let names: std::collections::BTreeSet<&str> =
@@ -401,6 +430,8 @@ fn every_operation_declares_every_variant() {
         "DiscardTrackedPaths",
         "DeleteUntrackedPaths",
         "AmendCommit",
+        "FetchRemote",
+        "PullBranch",
     ]
     .into_iter()
     .collect();
@@ -412,52 +443,144 @@ fn every_operation_declares_every_variant() {
     );
 }
 
-/// Exactly one operation in the enum reaches a remote, and it is `PushBranch`.
+/// Exactly three operations in the enum reach a remote, and they are
+/// `PushBranch`, `FetchRemote` and `PullBranch` (M2.20a, #227 — it was one,
+/// `PushBranch`, until fetch and pull joined it).
 ///
-/// The negative half is what matters: eighteen operations must be `Local`, so
-/// a future edit that classified, say, `MergeBranch` as `Remote` to "be safe"
-/// would be caught here. Widening is not safe — it moves an operation from the
-/// no-network Strict tier into a tier with outbound TCP on four ports.
+/// The **negative half is what matters**: the other eighteen must be `Local`,
+/// so a future edit that classified, say, `MergeBranch` as `Remote` to "be
+/// safe" is caught here. Widening is not safe — it moves an operation from
+/// the no-network Strict tier into a tier with outbound TCP on four ports.
+///
+/// Asserting the whole *set* (rather than a count plus a spot-check on one
+/// name) is deliberate: a count alone would let a swap through — reclassify
+/// `FetchRemote` down to `Local` and `MergeBranch` up to `Remote` and the
+/// total is still three. The names come from [`variant_name`]'s
+/// compile-enforced match rather than from `format!("{op:?}")`, so the
+/// comparison is over typed provenance and a variant renamed in `plan.rs`
+/// cannot quietly keep matching a stale `Debug` prefix.
 #[test]
-fn exactly_one_operation_declares_a_network_need() {
+fn exactly_the_three_remote_operations_declare_a_network_need() {
     let ops = every_operation();
     assert_eq!(
         ops.len(),
-        19,
-        "every_operation() must list every GitOperation variant; the enum has 19 \
+        21,
+        "every_operation() must list every GitOperation variant; the enum has 21 \
          (see every_operation_declares_every_variant for the check that actually \
          enforces this)"
     );
-    let mut remote = Vec::new();
+    let mut remote = std::collections::BTreeSet::new();
+    let mut local = std::collections::BTreeSet::new();
     for op in &ops {
         match network_need_for_operation(op) {
-            NetworkNeed::Remote => remote.push(format!("{op:?}")),
-            NetworkNeed::Local => {}
-        }
+            NetworkNeed::Remote => remote.insert(variant_name(op)),
+            NetworkNeed::Local => local.insert(variant_name(op)),
+        };
     }
+    let expected: std::collections::BTreeSet<&str> = ["PushBranch", "FetchRemote", "PullBranch"]
+        .into_iter()
+        .collect();
     assert_eq!(
-        remote.len(),
-        1,
-        "exactly one operation may declare Remote; declared: {remote:?}"
+        remote, expected,
+        "the set of network-reaching operations changed; declared Remote: {remote:?}"
     );
-    assert!(
-        remote[0].starts_with("PushBranch"),
-        "the one Remote operation must be PushBranch, not {}",
-        remote[0]
+    assert_eq!(
+        local.len(),
+        18,
+        "the other eighteen operations must stay Local; declared Local: {local:?}"
+    );
+}
+
+/// A `PushBranch` carrying [`ForcePublish::WithLease`] is still `Remote` —
+/// the force mode changes the plan's [`RiskLevel`], never the tier.
+///
+/// This exists because `every_operation()` can only hold one value per
+/// variant, so the lease-force shape would otherwise have **zero** coverage
+/// in this file — precisely the gap that let `AmendCommit` ship unclassified
+/// (see [`variant_name`]'s doc). The paired assertion below is the one with
+/// teeth: it pins that the two force modes agree, so a future edit that made
+/// the classification depend on `force` at all fails here.
+#[test]
+fn a_lease_force_push_declares_remote_like_every_other_push() {
+    let plain = GitOperation::PushBranch {
+        branch: branch("feature"),
+        remote: RemoteName::new("origin").expect("valid remote"),
+        set_upstream: false,
+        force: ForcePublish::None,
+    };
+    assert_eq!(
+        network_need_for_operation(&lease_force_push()),
+        NetworkNeed::Remote,
+        "a force-with-lease push reaches a remote like any other push"
+    );
+    assert_eq!(
+        network_need_for_operation(&lease_force_push()),
+        network_need_for_operation(&plain),
+        "the tier must not depend on the force mode — risk and reach are \
+         independent axes (see RiskLevel::Destructive's doc in plan.rs)"
+    );
+}
+
+/// Both `MergeStrategy` values classify identically: the integration happens
+/// after the objects arrive, so it cannot change whether a socket opens.
+///
+/// The negative this guards: a reader who thinks "rebase is the local half"
+/// and splits the arm would silently route a pull's fetch through the Strict
+/// tier, breaking it at runtime with `EACCES` on `connect()`.
+#[test]
+fn both_pull_strategies_declare_the_same_network_need() {
+    let remote = RemoteName::new("origin").expect("valid remote");
+    let needs: Vec<NetworkNeed> = [MergeStrategy::Merge, MergeStrategy::Rebase]
+        .into_iter()
+        .map(|strategy| {
+            network_need_for_operation(&GitOperation::PullBranch {
+                remote: remote.clone(),
+                branch: branch("main"),
+                strategy,
+            })
+        })
+        .collect();
+    assert_eq!(
+        needs,
+        vec![NetworkNeed::Remote, NetworkNeed::Remote],
+        "both pull strategies must declare Remote; got {needs:?}"
     );
 }
 
 /// The declaration is what picks the tier, and the *stated* argv of each
-/// operation must agree with it — this is the cross-check's own premise, tested
-/// on the real argv the planner builds for the one remote operation.
+/// remote operation must agree with it — this is the cross-check's own
+/// premise, tested on the argvs the planner builds (push, live today) or will
+/// build (fetch/pull, #229/#230).
+///
+/// Why the future argvs are worth pinning now: the D3 cross-check
+/// `debug_assert`s on a `Local` declaration meeting a `Remote`-looking argv.
+/// The reverse — `Remote` declared, argv unrecognised — is tolerated
+/// silently, which means a `fetch`/`pull` argv missing from
+/// `REMOTE_SUBCOMMANDS` would produce *no* signal at all when #229/#230 land.
+/// Checking it here is the only place that failure mode is visible before it
+/// matters.
 #[test]
-fn the_push_declaration_and_the_push_argv_agree() {
-    assert_eq!(
-        network_need(&["push", "origin", "feature"]),
-        NetworkNeed::Remote,
-        "the argv classifier must agree with the PushBranch declaration, or \
-         every push would trip the D3 cross-check"
-    );
+fn the_remote_declarations_and_their_argvs_agree() {
+    for args in [
+        vec!["push", "origin", "feature"],
+        vec!["push", "--set-upstream", "origin", "feature"],
+        vec![
+            "push",
+            "--force-with-lease=feature:abc",
+            "origin",
+            "feature",
+        ],
+        vec!["fetch", "origin"],
+        vec!["pull", "--no-rebase", "origin", "main"],
+        vec!["pull", "--rebase", "origin", "main"],
+    ] {
+        assert_eq!(
+            network_need(&args),
+            NetworkNeed::Remote,
+            "the argv classifier must agree with the declaration for {args:?}, \
+             or the D3 cross-check would be tripped (push) or silent (fetch/pull)"
+        );
+    }
 }
 
 // --- the cross-check (D3) --------------------------------------------------

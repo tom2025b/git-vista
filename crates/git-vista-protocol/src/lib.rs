@@ -90,9 +90,10 @@ pub use patch_plan::{
     StageDirection, StagingDiff,
 };
 pub use plan::{
-    BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, OperationHash, Plan,
-    PlanFieldError, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
-    RepositoryToken, RiskLevel, UnixSeconds, WorktreePath, WorktreeToken,
+    BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
+    MergeStrategy, OperationHash, Plan, PlanFieldError, Precondition, RecoveryStrategy, RefChange,
+    RefName, RefState, RemoteName, RepositoryToken, RiskLevel, UnixSeconds, WorktreePath,
+    WorktreeToken,
 };
 pub use status::{
     parse_porcelain_v2_z, ChangeKind, ChangeSides, ConflictKind, ParsedStatus, StatusEntry,
