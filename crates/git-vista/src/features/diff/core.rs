@@ -537,4 +537,159 @@ diff --git a/bar.txt b/bar.txt
         assert_eq!(hunks[0].old_start, 1);
         assert_eq!(hunks[0].new_start, 0);
     }
+
+    // ---- Diff hunk-navigation performance budget (#211, M2.16f) ---------------
+    //
+    // #211's text calls its target "the virtualized diff view (69c)". As of
+    // this writing that is a stale premise, not a live shape to benchmark:
+    // the diff view renders `CommitDiff.patch` as one flat `<pre>` (this
+    // module's own doc comment, `detail.rs`, `viewer.rs`) — no virtualization
+    // is wired into it. #69c's `CumulativeHeights`/`visible_range`
+    // (`git_vista_core::virtualize`) is a real, already-tested primitive, but
+    // it has zero consumers in the tree (verified: no reference to either
+    // name outside its own module and its own tests). There is nothing
+    // "virtualized diff view" shaped to measure yet.
+    //
+    // What *is* real, host-tested, and runs on every diff render today
+    // regardless of virtualization is `hunk_nav` itself: a full O(n) walk of
+    // the raw patch text, called from `detail.rs::accessible_patch_view`
+    // (panel and full-screen viewer) and from `staging_view.rs` for
+    // hunk-selection labels. Its own doc comment above already names the
+    // failure mode this budget pins down: "a 5 MB refactor diff can carry
+    // tens of thousands of hunks, and a rescan-per-hunk would stall the
+    // iPad's main thread before first paint." That per-hunk-rescan shape
+    // does not exist today (both passes here are already O(n)), but nothing
+    // stops a future edit from accidentally reintroducing it — that is
+    // exactly the regression a budget test exists to catch.
+    //
+    // **What this budget does NOT cover** (stated plainly, per house rule —
+    // a budget that quietly claims more than it measures is worse than none):
+    // - The actual DOM/`<pre>` construction in `detail.rs`/`viewer.rs` is
+    //   `#[cfg(target_arch = "wasm32")]`-gated; `cargo test --workspace`
+    //   never compiles it and this repo has no wasm test harness. Unmeasured.
+    // - Whether virtualization is "engaged" — it isn't wired into the diff
+    //   view at all, so there is nothing to prove engaged or broken. A
+    //   future task that wires `CumulativeHeights` into the render path
+    //   should add its own budget alongside that wiring.
+    // - Real-world patch text (renamed files, binary markers, combined merge
+    //   headers, mixed hunk sizes). The generator below produces one
+    //   synthetic file with uniformly-sized hunks — deliberately the
+    //   cheapest-per-byte shape (like 68e's uniform untracked-file
+    //   generator), so this is closer to a best case than a worst case.
+
+    /// One synthetic hunk: 2 context lines, `pairs` removed lines, `pairs`
+    /// added lines — `old_len == new_len == 2 + pairs`, so the header counts
+    /// match the body exactly (a mismatched header would make `hunk_nav`'s
+    /// countdown desync, corrupting every later hunk's line-index mapping —
+    /// this generator must not itself be the thing that breaks the
+    /// measurement). Hunks are numbered into `bench.rs` under one file
+    /// header, since `hunk_nav`'s cost is dominated by total line count, not
+    /// by how many file headers that count is spread across.
+    fn generate_patch(num_hunks: usize, pairs: usize) -> String {
+        let mut s = String::from("--- a/bench.rs\n+++ b/bench.rs\n");
+        for i in 0..num_hunks {
+            let start = 1 + i * 1000; // spaced out so ranges never overlap
+            let len = 2 + pairs;
+            s.push_str(&format!("@@ -{start},{len} +{start},{len} @@\n"));
+            s.push_str(" context one\n context two\n");
+            for j in 0..pairs {
+                s.push_str(&format!("-removed line {j}\n"));
+            }
+            for j in 0..pairs {
+                s.push_str(&format!("+added line {j}\n"));
+            }
+        }
+        s
+    }
+
+    /// One measurement: wall-clock time for `hunk_nav` over a synthetic
+    /// `num_hunks`-hunk patch, plus the patch's own byte length (so the
+    /// ladder can be read against `DIFF_PATCH_CAP`/`DIFF_PATCH_CAP_FULL` in
+    /// `handlers/read.rs`, 200,000 / 5,000,000 bytes) and a structural check
+    /// that every hunk was actually found — a fast wrong answer (e.g. an
+    /// early return, or a countdown desync eating the rest of the patch)
+    /// must not be mistaken for a fast correct one.
+    fn time_hunk_nav(num_hunks: usize) -> (std::time::Duration, usize, usize) {
+        let patch = generate_patch(num_hunks, 3);
+        let bytes = patch.len();
+        let start = std::time::Instant::now();
+        let nav = hunk_nav(&patch);
+        let elapsed = start.elapsed();
+        assert_eq!(
+            nav.len(),
+            num_hunks,
+            "hunk_nav found {} of {num_hunks} synthetic hunks — a fast wrong \
+             answer, not a fast correct one; the measurement below is not \
+             trustworthy if this fails",
+            nav.len()
+        );
+        (elapsed, bytes, nav.len())
+    }
+
+    /// The real measurement behind `docs/PERFORMANCE_BUDGETS.md`'s `hunk_nav`
+    /// section — **not** part of the normal test run. `#[ignore]`d because a
+    /// 50,000-hunk synthetic patch (~7 MB of generated text) has no place in
+    /// every `cargo test`/CI run; `hunk_nav_budget_holds_at_2k_hunks` below
+    /// is the fast, always-on regression check derived from what this finds.
+    ///
+    /// Run explicitly to reproduce or update the recorded numbers:
+    /// `cargo test -p git-vista -- --ignored --nocapture hunk_nav_ladder`
+    ///
+    /// One host, one run each — not a statistically controlled benchmark
+    /// suite, same caveat `docs/PERFORMANCE_BUDGETS.md` states up front.
+    #[test]
+    #[ignore = "generates up to a ~7 MB synthetic patch; run explicitly, see doc comment"]
+    fn hunk_nav_ladder() {
+        println!("\n#211 hunk_nav ladder (one host, one run each):");
+        println!("{:>10}  {:>12}  {:>10}", "n_hunks", "elapsed", "bytes");
+        for n in [100usize, 1_000, 2_000, 10_000, 20_000, 50_000] {
+            let (elapsed, bytes, _found) = time_hunk_nav(n);
+            println!("{n:>10}  {elapsed:>12?}  {bytes:>10}");
+        }
+    }
+
+    /// A scaling check, not just a wall-clock one: 10x the hunk count must
+    /// not cost anywhere near 10x-squared the time. `hunk_nav` is O(n) by
+    /// construction (two linear passes — see the module doc and the doc
+    /// comment on the per-file-ordinal pass above), so time should scale
+    /// roughly linearly; this asserts a generous *upper* bound on the ratio
+    /// (25x for a 10x size increase) loose enough to absorb real per-call
+    /// overhead and a loaded CI runner, but tight enough that an accidental
+    /// quadratic reintroduction — which would show roughly a 10x *further*
+    /// slowdown on top of the expected 10x, i.e. close to 100x — still fails
+    /// it. This is the check that would actually catch the "rescan-per-hunk"
+    /// regression the module doc above warns about; the wall-clock budget
+    /// test below would not reliably catch it until it got much worse.
+    #[test]
+    fn hunk_nav_scales_roughly_linearly_not_quadratically() {
+        let (small_elapsed, _, _) = time_hunk_nav(2_000);
+        let (large_elapsed, _, _) = time_hunk_nav(20_000);
+        let small_nanos = small_elapsed.as_nanos().max(1);
+        let large_nanos = large_elapsed.as_nanos();
+        let ratio = large_nanos as f64 / small_nanos as f64;
+        assert!(
+            ratio < 25.0,
+            "hunk_nav took {large_elapsed:?} at 20,000 hunks vs {small_elapsed:?} \
+             at 2,000 hunks — a {ratio:.1}x slowdown for a 10x size increase. \
+             hunk_nav is meant to be O(n); this ratio is only consistent with \
+             an accidental quadratic (or worse) regression, not measurement \
+             noise."
+        );
+    }
+
+    /// The always-on regression check: 2,000 hunks (~280 KB of patch text,
+    /// cheap enough for every `cargo test`/CI run, and past `DIFF_PATCH_CAP`
+    /// — a realistic "hit the panel's cap" size) must complete well inside a
+    /// generous multiple of the budget `docs/PERFORMANCE_BUDGETS.md` states.
+    #[test]
+    fn hunk_nav_budget_holds_at_2k_hunks() {
+        let (elapsed, _bytes, _found) = time_hunk_nav(2_000);
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "hunk_nav over a 2,000-hunk patch took {elapsed:?}, budget is \
+             500ms (see docs/PERFORMANCE_BUDGETS.md) — this is a real \
+             regression, not flakiness, unless the CI runner is unusually \
+             loaded"
+        );
+    }
 }
