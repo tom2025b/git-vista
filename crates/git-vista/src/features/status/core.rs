@@ -388,6 +388,87 @@ fn label_with_extras(base: String, submodule: Option<&SubmoduleState>, binary: b
     label_with_binary(label_with_submodule(base, submodule), binary)
 }
 
+// ---------------------------------------------------------------------------
+// Which paths each discard/delete operation may name (M2.18b, #220)
+// ---------------------------------------------------------------------------
+//
+// These two functions exist to make the frontend's selection agree, by
+// construction, with what the M2.18a backend (#219) will actually accept —
+// `planner.rs`'s `classify_path_states` / `verify_path_states` re-derive the
+// same classification from a *fresh* `git status` immediately before running
+// git, and refuse the whole batch if any path disagrees. Offering the user a
+// path the backend classifies differently isn't a cosmetic mismatch: it is a
+// confirmation dialog that lists files, takes two taps, and then 409s.
+//
+// The rules are copied from that server-side classification, not invented:
+//
+//   * `DiscardTrackedPaths` wants `PathKind::TrackedDirty` — a porcelain `1`
+//     (`StatusEntry::Changed`) or `2` (`StatusEntry::Renamed`) record. A
+//     rename contributes its **new** path only; `origin_path` no longer names
+//     anything on disk. Conflicted and ignored entries are never inserted
+//     server-side, so they classify as `Other` by absence and are refused.
+//   * `DeleteUntrackedPaths` wants `PathKind::Untracked` — a porcelain `?`
+//     record and nothing else.
+//
+// Both also refuse a path that names a **directory**. `/api/status/v2` runs
+// `git status --porcelain=v2 --branch -z` with no `--untracked-files=all`, so
+// git's default `normal` mode collapses an entirely-untracked directory into
+// one `?? dir/` record — and `symlink_containment_guard` refuses a directory
+// target outright, precisely so that one entry cannot stand in for everything
+// nested under it. Filtering the collapsed entry here keeps it out of a
+// confirmation body that could otherwise understate the blast radius of the
+// one operation with no way back.
+
+/// True for the trailing-slash spelling `git status` uses for a collapsed
+/// untracked directory. Kept as a named predicate because it is the one place
+/// the frontend depends on that spelling.
+fn names_a_directory(path: &str) -> bool {
+    path.ends_with('/')
+}
+
+/// The paths a `DiscardTrackedPaths` request may name, given one live status
+/// read — sorted, so the confirmation body reads the same way twice over an
+/// unchanged worktree (`git-status(1)` guarantees no order of its own; see
+/// this module's "Sort order" section).
+pub fn discardable_tracked_paths(status: &WorktreeStatus) -> Vec<String> {
+    let mut paths: Vec<String> = status
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            StatusEntry::Changed { path, .. } | StatusEntry::Renamed { path, .. } => {
+                Some(path.clone())
+            }
+            StatusEntry::Untracked { .. }
+            | StatusEntry::Ignored { .. }
+            | StatusEntry::Conflicted { .. } => None,
+        })
+        .filter(|p| !names_a_directory(p))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The paths a `DeleteUntrackedPaths` request may name, given one live status
+/// read — sorted, same reasoning as [`discardable_tracked_paths`].
+pub fn deletable_untracked_paths(status: &WorktreeStatus) -> Vec<String> {
+    let mut paths: Vec<String> = status
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            StatusEntry::Untracked { path, .. } => Some(path.clone()),
+            StatusEntry::Changed { .. }
+            | StatusEntry::Renamed { .. }
+            | StatusEntry::Ignored { .. }
+            | StatusEntry::Conflicted { .. } => None,
+        })
+        .filter(|p| !names_a_directory(p))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,5 +723,167 @@ mod tests {
         let sections = StatusSections::from_worktree_status(&s);
         let row = &sections.rows(StatusSection::Conflicted)[0];
         assert!(row.accessible_label.contains("added by them"));
+    }
+
+    // -----------------------------------------------------------------
+    // M2.18b (#220): which paths each operation may name
+    // -----------------------------------------------------------------
+
+    /// A worktree carrying one of every entry kind, so each test below can
+    /// assert both what its function picks up *and* what it leaves behind.
+    fn mixed_worktree() -> WorktreeStatus {
+        status(vec![
+            changed(
+                "src/edited.rs",
+                ChangeSides::UnstagedOnly {
+                    unstaged: ChangeKind::Modified,
+                },
+            ),
+            changed(
+                "src/staged.rs",
+                ChangeSides::StagedOnly {
+                    staged: ChangeKind::Added,
+                },
+            ),
+            StatusEntry::Renamed {
+                path: "src/new_name.rs".to_string(),
+                origin_path: "src/old_name.rs".to_string(),
+                score: 100,
+                unstaged: None,
+                submodule: None,
+                binary: false,
+            },
+            StatusEntry::Untracked {
+                path: "scratch.txt".to_string(),
+                binary: false,
+            },
+            StatusEntry::Ignored {
+                path: "target/".to_string(),
+            },
+            StatusEntry::Conflicted {
+                path: "clash.rs".to_string(),
+                kind: ConflictKind::BothModified,
+                submodule: None,
+            },
+        ])
+    }
+
+    /// The discard selection is exactly the server's `PathKind::TrackedDirty`
+    /// set: changed + renamed-new-path, and *nothing* else. The exclusions
+    /// carry the weight — an untracked or conflicted path reaching
+    /// `/api/discard-tracked-paths` is a guaranteed 409 from
+    /// `verify_path_states`, after the user has already confirmed.
+    #[test]
+    fn discard_selects_only_the_tracked_dirty_paths() {
+        let picked = discardable_tracked_paths(&mixed_worktree());
+        assert_eq!(
+            picked,
+            vec![
+                "src/edited.rs".to_string(),
+                "src/new_name.rs".to_string(),
+                "src/staged.rs".to_string(),
+            ]
+        );
+        // Named individually so a future regression says which rule broke.
+        assert!(
+            !picked.contains(&"src/old_name.rs".to_string()),
+            "{picked:?}"
+        );
+        assert!(!picked.contains(&"scratch.txt".to_string()), "{picked:?}");
+        assert!(!picked.contains(&"target/".to_string()), "{picked:?}");
+        assert!(!picked.contains(&"clash.rs".to_string()), "{picked:?}");
+    }
+
+    /// The delete selection is exactly the server's `PathKind::Untracked`
+    /// set. A tracked-but-dirty path here would mean `git clean -f` was asked
+    /// to remove a file whose content *is* in the object database — the two
+    /// operations are separate variants precisely so that cannot happen.
+    #[test]
+    fn delete_selects_only_the_untracked_paths() {
+        let picked = deletable_untracked_paths(&mixed_worktree());
+        assert_eq!(picked, vec!["scratch.txt".to_string()]);
+        assert!(!picked.contains(&"src/edited.rs".to_string()), "{picked:?}");
+        assert!(!picked.contains(&"target/".to_string()), "{picked:?}");
+        assert!(!picked.contains(&"clash.rs".to_string()), "{picked:?}");
+    }
+
+    /// `/api/status/v2` runs `git status` in its default untracked mode, so
+    /// an entirely-untracked directory arrives collapsed to one `dir/`
+    /// record — and the backend refuses a directory target outright
+    /// (`symlink_containment_guard`), because that single entry would stand
+    /// in for every file nested under it.
+    ///
+    /// The second assertion is the paired negative: it pins that the entry
+    /// really is present in the input and really is an `Untracked` record,
+    /// so this test fails if the filter is removed rather than passing
+    /// because the fixture never contained a directory in the first place.
+    #[test]
+    fn a_collapsed_untracked_directory_is_never_offered() {
+        let s = status(vec![
+            StatusEntry::Untracked {
+                path: "scratch/".to_string(),
+                binary: false,
+            },
+            StatusEntry::Untracked {
+                path: "note.txt".to_string(),
+                binary: false,
+            },
+        ]);
+        assert_eq!(deletable_untracked_paths(&s), vec!["note.txt".to_string()]);
+        // Paired negative: without the directory rule, the same input yields
+        // both — so the assertion above is capable of failing.
+        let unfiltered: Vec<String> = s
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                StatusEntry::Untracked { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unfiltered.len(), 2, "{unfiltered:?}");
+        assert!(
+            unfiltered.contains(&"scratch/".to_string()),
+            "{unfiltered:?}"
+        );
+    }
+
+    /// Both selections are sorted, so two reads of an unchanged worktree
+    /// produce the same confirmation body. The paired assertion pins that
+    /// the *input* order really did differ — otherwise "equal outputs" would
+    /// prove nothing about sorting.
+    #[test]
+    fn selection_order_does_not_follow_gits_undefined_entry_order() {
+        let a = changed(
+            "z.rs",
+            ChangeSides::UnstagedOnly {
+                unstaged: ChangeKind::Modified,
+            },
+        );
+        let b = changed(
+            "a.rs",
+            ChangeSides::UnstagedOnly {
+                unstaged: ChangeKind::Modified,
+            },
+        );
+        let forwards = status(vec![a.clone(), b.clone()]);
+        let backwards = status(vec![b, a]);
+        assert_ne!(forwards.entries, backwards.entries);
+        assert_eq!(
+            discardable_tracked_paths(&forwards),
+            discardable_tracked_paths(&backwards)
+        );
+        assert_eq!(
+            discardable_tracked_paths(&forwards),
+            vec!["a.rs".to_string(), "z.rs".to_string()]
+        );
+    }
+
+    /// A clean worktree offers neither operation anything — the empty case
+    /// the confirmation's own "nothing to act on" arm is built for.
+    #[test]
+    fn a_clean_worktree_offers_no_paths_to_either_operation() {
+        let s = status(vec![]);
+        assert!(discardable_tracked_paths(&s).is_empty());
+        assert!(deletable_untracked_paths(&s).is_empty());
     }
 }

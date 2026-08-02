@@ -1,11 +1,32 @@
-//! The branch-op / undo confirmation modal (Issue #33 follow-up).
+//! The branch-op / undo / working-tree confirmation modal (Issue #33
+//! follow-up; M2.18b, #220 added the second ceremony).
+//!
+//! Two confirmation strengths live here, and the difference is structural
+//! rather than cosmetic: a branch operation or a discard is one tap on the
+//! confirm button, while deleting untracked files — the one operation in this
+//! app with no way back — leaves that button inert until a separate arm
+//! control has been pressed. Which ceremony an operation gets, and every word
+//! either one shows, is decided in `features::dialogs::core` (pure,
+//! host-tested); this file is the part that needs a DOM.
 
 use leptos::*;
 
 use git_vista_core::activity::UndoAction;
 
-use crate::features::dialogs::core::Dialog;
+use crate::features::dialogs::core::{
+    worktree_confirm, ConfirmPrompt, Dialog, WorktreeAction, TOUCH_TARGET_STYLE,
+};
+use crate::features::graph::core::disabled_menu_item_copy;
 use crate::state::{Features, PendingOp};
+
+/// The confirm/cancel button base style, with #65's 44x44 floor.
+///
+/// Every button in this modal carries it. The floor used to be missing here:
+/// the old `padding:6px 14px` on a 13px font lands around 30px tall, under
+/// the minimum the rest of the app was brought up to in #65 — and this modal
+/// is inline-styled (see `dialogs/mod.rs` for why), so the stylesheet census
+/// in `features::a11y::audit` never saw it.
+const BUTTON_BASE: &str = "padding:8px 16px; font:inherit; border-radius:6px; ";
 
 /// The branch-op confirmation modal (Issue #33 follow-up). Reuses the commit
 /// modal's iPad-proven inline-styled overlay, minus any text input (so no void
@@ -42,6 +63,8 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
         if let Some(next) = operations.take_escalation() {
             // Restamp the ghost-click guard, exactly as when the modal is first shown:
             // the modal never visually closes, but it is now asking a different question.
+            // `open` also disarms the two-tap control, so a re-asked question never
+            // inherits an arm the user gave the previous one.
             dialogs.open(Dialog::Confirm);
             shell.open_confirm(next);
         }
@@ -49,25 +72,36 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
 
     move || {
         shell.confirm_op().map(|op| {
+            // Tracked read: the arm control and the confirm button both re-render the
+            // moment step one is taken.
+            let armed = dialogs.confirm_armed();
             // `enabled` gates the confirm button: a merge into itself or a detached
             // HEAD has no valid target, so the dialog is informational (Cancel only).
-            let (title, body, confirm_label, danger, enabled) = match &op {
+            let ConfirmPrompt {
+                title,
+                body,
+                confirm_label,
+                danger,
+                enabled,
+                arm,
+                blocked_reason,
+            } = match &op {
                 PendingOp::Merge { branch, into } => match into {
-                    Some(into) if into != branch => (
+                    Some(into) if into != branch => ConfirmPrompt::plain(
                         "Merge branch",
                         format!("Merge ‘{branch}’ into ‘{into}’? This updates ‘{into}’ in the working tree."),
                         "Merge",
                         false,
                         true,
                     ),
-                    Some(into) => (
+                    Some(into) => ConfirmPrompt::plain(
                         "Merge branch",
                         format!("‘{into}’ is the branch you're on — there's nothing to merge into itself."),
                         "Merge",
                         false,
                         false,
                     ),
-                    None => (
+                    None => ConfirmPrompt::plain(
                         "Merge branch",
                         format!("HEAD is detached, so there's no branch to merge ‘{branch}’ into. Check out a branch first."),
                         "Merge",
@@ -75,7 +109,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                         false,
                     ),
                 },
-                PendingOp::Push { branch } => (
+                PendingOp::Push { branch } => ConfirmPrompt::plain(
                     "Push branch",
                     format!("Push ‘{branch}’ to origin?"),
                     "Push",
@@ -83,7 +117,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                     true,
                 ),
                 PendingOp::Checkout { branch, current } => match current {
-                    Some(current) if current == branch => (
+                    Some(current) if current == branch => ConfirmPrompt::plain(
                         "Checkout branch",
                         format!("‘{branch}’ is already the branch you're on — nothing to switch."),
                         "Checkout",
@@ -91,7 +125,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                         false,
                     ),
                     // A different branch, or detached HEAD (which a checkout re-attaches).
-                    _ => (
+                    _ => ConfirmPrompt::plain(
                         "Checkout branch",
                         format!("Check out ‘{branch}’? This switches the working tree and HEAD to ‘{branch}’."),
                         "Checkout",
@@ -100,7 +134,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                     ),
                 },
                 PendingOp::Delete { branch, current } => match current {
-                    Some(current) if current == branch => (
+                    Some(current) if current == branch => ConfirmPrompt::plain(
                         "Delete branch",
                         format!("‘{branch}’ is the branch you're on — check out another branch before deleting it."),
                         "Delete",
@@ -108,7 +142,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                         false,
                     ),
                     // A different branch, or detached HEAD: safe to offer the delete.
-                    _ => (
+                    _ => ConfirmPrompt::plain(
                         "Delete branch",
                         format!("Delete branch ‘{branch}’? Only a fully-merged branch can be deleted here."),
                         "Delete",
@@ -118,7 +152,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                 },
                 // Reached only after a safe delete was refused for "not fully merged"
                 // (see `run_confirmed`): offer the override, spelling out the risk.
-                PendingOp::ForceDelete { branch } => (
+                PendingOp::ForceDelete { branch } => ConfirmPrompt::plain(
                     "Force delete branch",
                     format!("‘{branch}’ isn't fully merged — force-deleting it discards any commits it holds that aren't on another branch. This can't be undone. Force delete it anyway?"),
                     "Force Delete",
@@ -138,7 +172,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                         ""
                     };
                     match &u.action {
-                        UndoAction::ResetBranch { .. } => (
+                        UndoAction::ResetBranch { .. } => ConfirmPrompt::plain(
                             "Undo — move branch back",
                             format!(
                                 "{}? The discarded commits leave the graph but stay \
@@ -149,7 +183,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                             true,
                             true,
                         ),
-                        UndoAction::RestoreBranch { .. } => (
+                        UndoAction::RestoreBranch { .. } => ConfirmPrompt::plain(
                             "Restore branch",
                             format!(
                                 "{}? This re-creates the branch exactly where it \
@@ -160,7 +194,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                             false,
                             true,
                         ),
-                        UndoAction::RevertCommit { .. } => (
+                        UndoAction::RevertCommit { .. } => ConfirmPrompt::plain(
                             "Revert commit",
                             format!(
                                 "{}? This adds a new commit that reverses it — \
@@ -174,14 +208,14 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                     }
                 }
                 PendingOp::Rebase { current, base } => match current {
-                    Some(branch) => (
+                    Some(branch) => ConfirmPrompt::plain(
                         "Rebase branch",
                         format!("Rebase ‘{branch}’ onto {base}? This replays ‘{branch}’’s commits on top of the latest {base} and rewrites its history."),
                         "Rebase",
                         false,
                         true,
                     ),
-                    None => (
+                    None => ConfirmPrompt::plain(
                         "Rebase branch",
                         "HEAD is detached, so there's no branch to rebase. Check out a branch first.".to_string(),
                         "Rebase",
@@ -189,20 +223,65 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                         false,
                     ),
                 },
+                // The two working-tree operations (M2.18b, #220). Both prompts —
+                // wording, which ceremony, what is enabled — come from the pure
+                // core, so the asymmetry between them is decided somewhere a host
+                // test can read it rather than inside this wasm-only view.
+                PendingOp::DiscardTrackedPaths { paths } => {
+                    worktree_confirm(WorktreeAction::DiscardTracked, paths, armed)
+                }
+                PendingOp::DeleteUntrackedPaths { paths } => {
+                    worktree_confirm(WorktreeAction::DeleteUntracked, paths, armed)
+                }
             };
             // The confirm button is muted when disabled, red for a destructive
             // delete, green otherwise.
             let confirm_style = if !enabled {
-                "padding:6px 14px; font:inherit; color:var(--muted); \
-                 background:#21262d; border:1px solid #30363d; border-radius:6px; \
-                 opacity:0.6;"
+                format!("{BUTTON_BASE}{TOUCH_TARGET_STYLE}color:var(--muted); \
+                         background:#21262d; border:1px solid #30363d; opacity:0.6;")
             } else if danger {
-                "padding:6px 14px; font:inherit; color:#fff; \
-                 background:#da3633; border:1px solid #f85149; border-radius:6px;"
+                format!("{BUTTON_BASE}{TOUCH_TARGET_STYLE}color:#fff; \
+                         background:#da3633; border:1px solid #f85149;")
             } else {
-                "padding:6px 14px; font:inherit; color:#fff; \
-                 background:#238636; border:1px solid #2ea043; border-radius:6px;"
+                format!("{BUTTON_BASE}{TOUCH_TARGET_STYLE}color:#fff; \
+                         background:#238636; border:1px solid #2ea043;")
             };
+            // #65: a reason conveyed only through `title=` never surfaces on a tap
+            // and is never announced, so it goes into the button's `aria-label`
+            // *and* onto the screen as its own line. `disabled_menu_item_copy` is
+            // the same composition `menu.rs`'s disabled items use — reused rather
+            // than restated, so there is one rule for it.
+            let (confirm_aria, visible_reason) = match blocked_reason {
+                Some(reason) => {
+                    let (aria, visible) = disabled_menu_item_copy(confirm_label, reason);
+                    (aria, Some(visible))
+                }
+                None => (confirm_label.to_string(), None),
+            };
+            // Step one of the two-tap ceremony, for the operation that has one.
+            // A `<button>` with `aria-pressed`, not a checkbox: this modal takes
+            // no form controls (see the module doc), and the state change has to
+            // be announced, not merely visible.
+            let arm_control = arm.map(|step| {
+                let arm_style = if step.pressed {
+                    format!("{BUTTON_BASE}{TOUCH_TARGET_STYLE}width:100%; text-align:left; \
+                             margin-bottom:12px; color:#f0f6fc; background:#5a1e1e; \
+                             border:1px solid #f85149;")
+                } else {
+                    format!("{BUTTON_BASE}{TOUCH_TARGET_STYLE}width:100%; text-align:left; \
+                             margin-bottom:12px; color:var(--fg); background:#21262d; \
+                             border:1px solid #30363d;")
+                };
+                view! {
+                    <button
+                        style=arm_style
+                        aria-pressed=if step.pressed { "true" } else { "false" }
+                        on:click=move |_| dialogs.arm_confirm()
+                    >
+                        {step.label}
+                    </button>
+                }
+            });
             view! {
                 <div
                     style="position:fixed; top:0; left:0; width:100vw; height:100vh; \
@@ -224,20 +303,52 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                         on:click=move |ev| ev.stop_propagation()
                     >
                         <div style="font-weight:600; margin-bottom:12px;">{title}</div>
-                        <div style="margin-bottom:14px; line-height:1.4;">{body}</div>
+                        // `pre-wrap`: the working-tree prompts list one path per line,
+                        // and every other prompt is a single paragraph either way.
+                        <div style="margin-bottom:14px; line-height:1.4; \
+                                    white-space:pre-wrap; max-height:50vh; \
+                                    overflow-y:auto;">{body}</div>
+                        {arm_control}
+                        {visible_reason.map(|reason| view! {
+                            <div style="margin-bottom:10px; color:var(--muted); \
+                                        line-height:1.4;">{reason}</div>
+                        })}
                         <div style="display:flex; gap:8px; justify-content:flex-end;">
                             <button
-                                style="padding:6px 14px; font:inherit; color:var(--fg); \
-                                       background:#21262d; border:1px solid #30363d; \
-                                       border-radius:6px;"
+                                style=format!("{BUTTON_BASE}{TOUCH_TARGET_STYLE}\
+                                               color:var(--fg); background:#21262d; \
+                                               border:1px solid #30363d;")
                                 on:click=move |_| shell.close_confirm()
                             >
                                 "Cancel"
                             </button>
+                            // Two ways to be inert, and which one applies turns
+                            // on whether this button carries its own reason.
+                            //
+                            // A branch arm's reason lives in the body text
+                            // (`blocked_reason: None`), so `prop:disabled`
+                            // stays exactly as it was — no behaviour change to
+                            // anything that predates #220.
+                            //
+                            // A working-tree arm's reason is folded into
+                            // `aria-label`, and a genuinely disabled button
+                            // leaves the tab order — which would make that
+                            // reason unreachable by the exact user it was
+                            // written for (#65's finding, again). Those stay
+                            // focusable and are refused in the handler instead.
+                            // That guard is also what makes the two-tap
+                            // ceremony real rather than decorative: `disabled`
+                            // is the browser's to honour, `enabled` is ours.
                             <button
                                 style=confirm_style
-                                prop:disabled=!enabled
-                                on:click=move |_| run_confirmed()
+                                prop:disabled=!enabled && blocked_reason.is_none()
+                                aria-disabled=if enabled { "false" } else { "true" }
+                                aria-label=confirm_aria
+                                on:click=move |_| {
+                                    if enabled {
+                                        run_confirmed();
+                                    }
+                                }
                             >
                                 {confirm_label}
                             </button>
