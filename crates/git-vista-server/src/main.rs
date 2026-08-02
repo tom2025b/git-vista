@@ -113,6 +113,7 @@ use handlers::commit::{amend_commit, create_commit, stage_all, unstage_all};
 use handlers::discard::{delete_untracked_paths, discard_tracked_paths};
 use handlers::fetch::fetch_remote;
 use handlers::protocol::protocol_info;
+use handlers::pull::pull_branch;
 use handlers::read::{
     commit_detail, commit_diff, commits, file_at_commit, frame, head_branch, worktree_status,
     worktree_status_v2,
@@ -470,6 +471,13 @@ fn api_router(
             // cancellation has to actually kill a process — see
             // `planner::fetch` and the cancel route below.
             .route("/api/fetch", post(fetch_remote))
+            // M2.20d (#230, ADR 0044): fetch and then integrate. Its own route
+            // rather than a flag on `/api/fetch`, because it is a different
+            // operation with a different risk (a fetch is additive; a pull
+            // moves the checked-out branch) and — the reason that matters —
+            // its request body carries the mandatory merge/rebase strategy a
+            // fetch has no field for.
+            .route("/api/pull", post(pull_branch))
             .route("/api/delete-branch", post(delete_branch))
             // iPad-testing follow-up: switch HEAD to a branch (`git checkout`).
             .route("/api/checkout", post(checkout_branch))

@@ -510,6 +510,25 @@ before and after, never from git's prose. Known limitation, recorded rather
 than hidden: the kill reaches the direct child only, so a grandchild transport
 process may briefly outlive it.)*
 
+*(Pull execution: ADR 0044, #230 — `POST /api/pull` adds **no new spawn** to
+this section, and that is the security-relevant decision. Its fetch half is
+`planner::fetch`'s own `run_fetch`, so every row of the table above applies to
+a pull byte-for-byte: the same `sandboxed()` chokepoint, the same forced `-c
+core.askpass=`, the same `redact_if_remote` on both the collected output and
+the live streaming records. A second `git fetch` here would have been a second
+surface for a credential to leak from and the first one to drift, so
+`planner::contract_suite` pins at source level that `planner/pull.rs` contains
+neither `git_streamed_for(` nor the literal `"fetch"`, and
+`planner::pull_suite` proves the reuse behaviourally — a pull publishes
+transfer progress, which only the one streaming path can produce. Like
+`FetchRequest`, `PullRequest` carries a **configured remote name and a branch
+name, never a URL**, gated by the same `RemoteConfigured` precondition. The one
+new exposure a pull has that a fetch does not is local, not credential-shaped:
+the integration half can leave the working tree half-merged, so a failed
+integration is aborted and the restoration is **observed** — the branch tip is
+re-read and `git ls-files --unmerged` listed — before the response claims the
+repository is back where it started.)*
+
 ## Request Integrity
 
 Every mutation request contains:
