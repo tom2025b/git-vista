@@ -9,13 +9,15 @@
 //!     the real `build_plan → validate → enforce_fresh → execute` composition
 //!     against a real temporary repository and asserts the mutation landed.
 //!     [`covered_by`] matches exhaustively over the enum, so adding a new
-//!     variant refuses to compile until it gets a pipeline test. (Two
-//!     exceptions today: `FetchRemote` and `PullBranch`, M2.20a #227, ship
-//!     no execution — their pipeline tests assert the *stubs'* refusal and
-//!     that the repository stayed byte-identical, the honest version of
-//!     this layer's claim until #229/#230 wire real execution in.
-//!     `AmendCommit` was staged the same way by #222 and graduated to a
-//!     real execution test when #223 wired `exec_amend_commit`.)
+//!     variant refuses to compile until it gets a pipeline test. (Six
+//!     exceptions today: `FetchRemote` and `PullBranch` (M2.20a #227) and
+//!     the four tag operations (M2.21a #235) ship no execution — their
+//!     pipeline tests assert the *stubs'* refusal and that the repository
+//!     stayed byte-identical, the honest version of this layer's claim
+//!     until #229/#230 and the later M2.21 slices of #74 wire real
+//!     execution in. `AmendCommit` was staged the same way by #222 and
+//!     graduated to a real execution test when #223 wired
+//!     `exec_amend_commit`.)
 //!  2. **Single-funnel proof** — a source-level test walks the router's POST
 //!     table and every git-write handler, asserting each one reaches
 //!     [`plan_and_execute`] (directly or through its named local helper) and
@@ -185,6 +187,10 @@ fn covered_by(op: &GitOperation) -> &'static str {
         GitOperation::AmendCommit { .. } => "amend_commit_executes_through_the_pipeline",
         GitOperation::FetchRemote { .. } => "fetch_remote_executes_through_the_pipeline",
         GitOperation::PullBranch { .. } => "pull_branch_executes_through_the_pipeline",
+        GitOperation::CreateTag { .. } => "create_tag_executes_through_the_pipeline",
+        GitOperation::DeleteLocalTag { .. } => "delete_local_tag_executes_through_the_pipeline",
+        GitOperation::DeleteRemoteTag { .. } => "delete_remote_tag_executes_through_the_pipeline",
+        GitOperation::PushTag { .. } => "push_tag_executes_through_the_pipeline",
     }
 }
 
@@ -269,6 +275,22 @@ fn every_operation_kind_names_a_distinct_pipeline_test() {
             remote: RemoteName::new("origin").unwrap(),
             branch: branch("b"),
             strategy: git_vista_protocol::MergeStrategy::Merge,
+        },
+        GitOperation::CreateTag {
+            name: TagName::new("v1").unwrap(),
+            target: oid(&zeros),
+            annotation: None,
+        },
+        GitOperation::DeleteLocalTag {
+            name: TagName::new("v1").unwrap(),
+        },
+        GitOperation::DeleteRemoteTag {
+            name: TagName::new("v1").unwrap(),
+            remote: RemoteName::new("origin").unwrap(),
+        },
+        GitOperation::PushTag {
+            name: TagName::new("v1").unwrap(),
+            remote: RemoteName::new("origin").unwrap(),
         },
     ];
     let names: Vec<&str> = samples.iter().map(covered_by).collect();
@@ -2550,6 +2572,15 @@ fn repo_fingerprint_detects_every_change_it_claims_to_watch() {
         ("--set-upstream writing branch config", &|repo: &Path| {
             run(repo, &["config", "branch.main.remote", "origin"])
         }),
+        // M2.21a (#235): the two local tag mutations the tag stubs below
+        // must be provably not making.
+        ("a lightweight tag created (ref only)", &|repo: &Path| {
+            run(repo, &["tag", "marker"])
+        }),
+        (
+            "an annotated tag created (ref plus tag object)",
+            &|repo: &Path| run(repo, &["tag", "-a", "-m", "v1", "v1"]),
+        ),
     ];
     for (what, mutate) in cases {
         let (_dir, repo) = seeded_repo();
@@ -2721,4 +2752,273 @@ async fn the_unwired_push_combinations_are_refused_without_touching_the_remote()
             );
         }
     }
+}
+
+// --- #235 (M2.21a): typed tag vocabulary, execution not yet wired ----------
+
+fn tname(s: &str) -> TagName {
+    TagName::new(s).unwrap()
+}
+
+/// [`GitOperation::CreateTag`] proves its shape end-to-end through the real
+/// pipeline, for **both kinds**, but M2.21a ships no execution — the later
+/// M2.21 slices of #74 own it.
+///
+/// Both kinds are driven for the same reason `pull_branch` drives both
+/// strategies: a stub that refused the annotated form and quietly executed
+/// the lightweight one (or vice versa) would be invisible to a single-shape
+/// test. The plan's shape is also pinned per kind — lightweight promises the
+/// ref lands exactly at `target`, annotated honestly says `Computed` (the
+/// ref will point at a tag object that does not exist yet).
+#[tokio::test]
+async fn create_tag_executes_through_the_pipeline() {
+    for annotation in [
+        None,
+        Some(git_vista_protocol::TagAnnotation {
+            message: git_vista_protocol::TagMessage::new("v1.0.0 — notes").unwrap(),
+            sign: false,
+        }),
+    ] {
+        let (_dir, repo) = seeded_repo();
+        let target = tip(&repo, "HEAD");
+
+        // The shape half: risk, CAS-style absence precondition, per-kind
+        // after-state, and the delete-created recovery.
+        let op = GitOperation::CreateTag {
+            name: tname("v1.0.0"),
+            target: oid(&target),
+            annotation: annotation.clone(),
+        };
+        let (plan, _observed) = build_plan(&repo, op.clone(), tokens()).await;
+        assert_eq!(plan.risk, RiskLevel::Reversible, "{annotation:?}");
+        assert!(
+            plan.preconditions.contains(&Precondition::RefAbsent {
+                ref_name: RefName::new("refs/tags/v1.0.0").unwrap(),
+            }),
+            "creating a tag must be guarded on the tag not already existing"
+        );
+        let expected_after = match &annotation {
+            None => RefState::At(oid(&target)),
+            Some(_) => RefState::Computed,
+        };
+        assert_eq!(
+            plan.expected_ref_changes,
+            vec![RefChange {
+                ref_name: RefName::new("refs/tags/v1.0.0").unwrap(),
+                before: RefState::Absent,
+                after: expected_after,
+            }],
+            "{annotation:?}"
+        );
+        assert_eq!(
+            plan.recovery,
+            RecoveryStrategy::DeleteCreatedTag {
+                name: tname("v1.0.0"),
+            }
+        );
+
+        // The stub half: refused, and provably inert.
+        let before = repo_fingerprint(&repo);
+        let (status, body) = pipeline(&repo, op).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_IMPLEMENTED,
+            "{annotation:?}: {body}"
+        );
+        assert_eq!(
+            repo_fingerprint(&repo),
+            before,
+            "the {annotation:?} stub must leave the repository byte-identical — \
+             M2.21a ships no tag-create execution (#74)"
+        );
+        // The paired positive for the inertness claim: the very mutation the
+        // stub must not make *does* change the fingerprint when plain git
+        // makes it, so the assertion above was capable of failing.
+        run(&repo, &["tag", "v1.0.0", &target]);
+        assert_ne!(
+            repo_fingerprint(&repo),
+            before,
+            "creating the tag for real must move the fingerprint, or the \
+             inertness assertion above is vacuous"
+        );
+    }
+}
+
+/// [`GitOperation::DeleteLocalTag`], same contract-only staging: the plan's
+/// shape is proven against a *real* annotated tag, execution is refused, and
+/// the tag demonstrably survives.
+#[tokio::test]
+async fn delete_local_tag_executes_through_the_pipeline() {
+    let (_dir, repo) = seeded_repo();
+    run(&repo, &["tag", "-a", "-m", "v1.0.0 — notes", "v1.0.0"]);
+
+    let before = repo_fingerprint(&repo);
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::DeleteLocalTag {
+            name: tname("v1.0.0"),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(
+        repo_fingerprint(&repo),
+        before,
+        "the stub must leave the repository byte-identical — M2.21a ships no \
+         tag-delete execution (#74)"
+    );
+    // Paired positive: really deleting the tag moves the fingerprint.
+    run(&repo, &["tag", "-d", "v1.0.0"]);
+    assert_ne!(
+        repo_fingerprint(&repo),
+        before,
+        "deleting the tag for real must move the fingerprint, or the \
+         inertness assertion above is vacuous"
+    );
+}
+
+/// The decision #235 was told not to make by reflex, pinned against a real
+/// repository: a `DeleteLocalTag` plan's CAS precondition and `RecreateTag`
+/// recovery both carry the **unpeeled** ref value — for an annotated tag,
+/// the tag *object's* oid — and not the peeled commit.
+///
+/// The negative half is the test: the two oids of a real annotated tag
+/// genuinely differ, so asserting "recovery == tag object" here cannot pass
+/// while the observation secretly peels. Recovery at the unpeeled oid is
+/// what restores the original tag byte-identically (message, tagger,
+/// signature); recovery at the peeled commit would silently demote an
+/// annotated tag to a lightweight one — see `RecreateTag`'s doc in plan.rs.
+#[tokio::test]
+async fn delete_local_tag_recovery_carries_the_unpeeled_tag_object() {
+    let (_dir, repo) = seeded_repo();
+    run(&repo, &["tag", "-a", "-m", "v1.0.0 — notes", "v1.0.0"]);
+    let tag_object = tip(&repo, "refs/tags/v1.0.0");
+    let peeled_commit = tip(&repo, "refs/tags/v1.0.0^{}");
+    assert_ne!(
+        tag_object, peeled_commit,
+        "an annotated tag's ref value must differ from its peeled commit, or \
+         this test cannot tell the two apart and proves nothing"
+    );
+
+    let (plan, _observed) = build_plan(
+        &repo,
+        GitOperation::DeleteLocalTag {
+            name: tname("v1.0.0"),
+        },
+        tokens(),
+    )
+    .await;
+    assert_eq!(plan.risk, RiskLevel::Destructive);
+    assert_eq!(
+        plan.recovery,
+        RecoveryStrategy::RecreateTag {
+            name: tname("v1.0.0"),
+            at: oid(&tag_object),
+        },
+        "recovery must carry the tag object (unpeeled), not the tagged commit"
+    );
+    assert_eq!(
+        plan.preconditions,
+        vec![Precondition::RefAt {
+            ref_name: RefName::new("refs/tags/v1.0.0").unwrap(),
+            oid: oid(&tag_object),
+        }],
+        "the CAS pin is the same unpeeled value the recovery restores"
+    );
+    assert_eq!(
+        plan.expected_ref_changes,
+        vec![RefChange {
+            ref_name: RefName::new("refs/tags/v1.0.0").unwrap(),
+            before: RefState::At(oid(&tag_object)),
+            after: RefState::Absent,
+        }]
+    );
+}
+
+/// [`GitOperation::DeleteRemoteTag`], contract-only like the fetch/pull stubs
+/// above and with the same reason to prove inertness hard: the remote here is
+/// real, reachable, and holds the tag — a stub that answered `501` *after*
+/// pushing the deletion would pass a status-only assertion while having
+/// destroyed the remote's ref.
+#[tokio::test]
+async fn delete_remote_tag_executes_through_the_pipeline() {
+    let (dir, repo) = seeded_repo();
+    run(&repo, &["tag", "-a", "-m", "v1", "v1.0.0"]);
+    let remote = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote).unwrap();
+    run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    run(
+        &repo,
+        &["remote", "add", "origin", &remote.display().to_string()],
+    );
+    run(&repo, &["push", "-q", "origin", "main", "v1.0.0"]);
+    let remote_tags_before = out(&remote, &["for-each-ref", "refs/tags"]);
+    assert!(
+        remote_tags_before.contains("v1.0.0"),
+        "the remote must really hold the tag, or 'nothing was deleted' is vacuous"
+    );
+
+    let before = repo_fingerprint(&repo);
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::DeleteRemoteTag {
+            name: tname("v1.0.0"),
+            remote: RemoteName::new("origin").unwrap(),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(
+        out(&remote, &["for-each-ref", "refs/tags"]),
+        remote_tags_before,
+        "the remote's tag must survive the stub — M2.21a ships no execution (#74)"
+    );
+    assert_eq!(
+        repo_fingerprint(&repo),
+        before,
+        "the stub must leave the local repository byte-identical too"
+    );
+}
+
+/// [`GitOperation::PushTag`], contract-only: the remote is real and reachable
+/// and does *not* have the tag, so a stub that pushed before refusing would
+/// demonstrably leave `refs/tags/v1.0.0` on it.
+#[tokio::test]
+async fn push_tag_executes_through_the_pipeline() {
+    let (dir, repo) = seeded_repo();
+    run(&repo, &["tag", "-a", "-m", "v1", "v1.0.0"]);
+    let remote = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote).unwrap();
+    run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    run(
+        &repo,
+        &["remote", "add", "origin", &remote.display().to_string()],
+    );
+    run(&repo, &["push", "-q", "origin", "main"]);
+    assert_eq!(
+        out(&remote, &["for-each-ref", "refs/tags"]),
+        "",
+        "the remote must start without the tag, or 'nothing was pushed' is vacuous"
+    );
+
+    let before = repo_fingerprint(&repo);
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::PushTag {
+            name: tname("v1.0.0"),
+            remote: RemoteName::new("origin").unwrap(),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(
+        out(&remote, &["for-each-ref", "refs/tags"]),
+        "",
+        "no tag may reach the remote — M2.21a ships no push-tag execution (#74)"
+    );
+    assert_eq!(
+        repo_fingerprint(&repo),
+        before,
+        "the stub must leave the local repository byte-identical too"
+    );
 }

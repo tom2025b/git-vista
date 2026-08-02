@@ -52,3 +52,4 @@ it, and note the link in both.
 | [0038](0038-worktree-destructive-operations.md) | Worktree-destructive operations: typed per-path impact, a preview that names every file, and one required control that cannot exist | Accepted — implemented and tested |
 | [0039](0039-remote-operation-vocabulary.md) | The typed remote-operation vocabulary: `FetchRemote`, `PullBranch`, and a lease-guarded `PushBranch` | Accepted — typed contract implemented and tested; execution not yet wired (#229/#230/#231) |
 | [0040](0040-amend-execution.md) | Amend execution: its own route, an executor-level CAS, an advisory published-history flag, and typed failure kinds | Accepted — implemented and tested |
+| [0041](0041-tag-operation-vocabulary.md) | The typed tag vocabulary: four variants, and an undo that restores the exact tag object | Accepted — typed contract implemented and tested; execution not yet wired (M2.21 slices of #74) |

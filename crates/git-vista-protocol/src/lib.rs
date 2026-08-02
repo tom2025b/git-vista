@@ -76,7 +76,8 @@ pub use dto::{
     validate_clone_url, AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind,
     BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
     HookPolicy, RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest,
-    SessionInfo, SessionRequest, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
+    SessionInfo, SessionRequest, SignatureStatus, TagDetail, TagKind, WorktreePathsRequest,
+    CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use history::{HistoryFrame, HistoryPage};
@@ -92,8 +93,8 @@ pub use patch_plan::{
 pub use plan::{
     BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
     MergeStrategy, OperationHash, Plan, PlanFieldError, Precondition, RecoveryStrategy, RefChange,
-    RefName, RefState, RemoteName, RepositoryToken, RiskLevel, UnixSeconds, WorktreePath,
-    WorktreeToken,
+    RefName, RefState, RemoteName, RepositoryToken, RiskLevel, TagAnnotation, TagMessage, TagName,
+    UnixSeconds, WorktreePath, WorktreeToken, MAX_TAG_MESSAGE_LEN,
 };
 pub use status::{
     parse_porcelain_v2_z, ChangeKind, ChangeSides, ConflictKind, ParsedStatus, StatusEntry,

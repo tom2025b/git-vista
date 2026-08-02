@@ -40,8 +40,12 @@
 //! | `POST /api/discard-tracked-paths` | `git checkout -- <paths>` | [`GitOperation::DiscardTrackedPaths`] |
 //! | `POST /api/delete-untracked-paths` | `git clean -f -- <paths>` | [`GitOperation::DeleteUntrackedPaths`] |
 //! | `POST /api/amend-commit` | `git commit --amend [--allow-empty] -m` | [`GitOperation::AmendCommit`] |
+//! | *(planned, #74 M2.21b)* | `git tag [-a\|-s -m] <name> <target>` | [`GitOperation::CreateTag`] |
+//! | *(planned, #74 M2.21e)* | `git tag -d <name>` | [`GitOperation::DeleteLocalTag`] |
+//! | *(planned, #74 M2.21e)* | `git push <remote> --delete refs/tags/<name>` | [`GitOperation::DeleteRemoteTag`] |
+//! | *(planned, #74 M2.21f)* | `git push <remote> refs/tags/<name>` | [`GitOperation::PushTag`] |
 //!
-//! The two *(planned)* rows are deliberate exceptions to "one variant per
+//! The *(planned)* rows are deliberate exceptions to "one variant per
 //! real mutation found by auditing the write handlers": M2.19a (#222) and
 //! M2.20a (#227) land the typed contract — the variant, its plan-building
 //! wiring in `git-vista-server`'s `planner::shape`, its `sandbox` network
@@ -52,6 +56,11 @@
 //! table already had a live handler when its variant landed.
 //! [`GitOperation::AmendCommit`] went through exactly that staging and
 //! graduated: #222 landed the contract, #223 (ADR 0040) the execution.
+//! The four tag rows (M2.21a, #235, ADR 0041) are staged the same way: the
+//! typed contract — variants, `shape` wiring, network classification, golden
+//! fixture — lands and gets reviewed before any handler can build one, and
+//! `planner::execute` refuses all four with `501` until the later M2.21
+//! slices (#74) wire them.
 //!
 //! [`GitOperation::PushBranch`] is the one row that already had a handler and
 //! was **widened** anyway (M2.20a, #227: `set_upstream` and `force`). Its
@@ -68,7 +77,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::newtype::{
-    require_git_safe, require_hex, require_non_empty, require_worktree_relative_path,
+    require_git_safe, require_hex, require_non_empty, require_non_empty_bounded,
+    require_worktree_relative_path,
 };
 
 /// Why a plan field failed validation — see
@@ -120,6 +130,14 @@ validated_string!(
     /// A git object id — 40 (SHA-1) or 64 (SHA-256) lowercase hex characters,
     /// the same shape `git-vista-core`'s `ObjectId` enforces. Used wherever a
     /// plan pins an exact commit (CAS preconditions, recovery targets).
+    ///
+    /// Almost always a commit; the one deliberate exception is
+    /// [`RecoveryStrategy::RecreateTag`], whose `at` is *whatever object the
+    /// deleted tag ref pointed at* — a *tag object* when the tag was
+    /// annotated. The hex shape is identical and git addresses both the same
+    /// way, so a sibling `TagObjectOid` newtype would duplicate the validator
+    /// to encode a distinction no consumer switches on (see that variant's
+    /// doc for why carrying the unpeeled oid is the whole point).
     CommitOid,
     |v| require_hex(v, &[40, 64], "commit id", "40 or 64")
 );
@@ -152,6 +170,35 @@ validated_string!(
     /// push handler addresses). Non-empty and not option-shaped.
     RemoteName,
     |v| require_git_safe(v, "remote name")
+);
+
+validated_string!(
+    /// A tag's short name (`v1.0.0`, `release/2026-08`) — non-empty and not
+    /// option-shaped, exactly the [`require_git_safe`] gate [`BranchName`] and
+    /// [`RefName`] apply before a name reaches a git argv (M2.21a, #235).
+    TagName,
+    |v| require_git_safe(v, "tag name")
+);
+
+/// The most bytes a [`TagMessage`] may carry (16 KiB).
+///
+/// A cap because — unlike [`CommitMessage`], whose contents the *server's own
+/// handlers* already gate — a tag message rides inside a [`GitOperation`] that
+/// is hashed, journaled, and (for an annotated tag) written verbatim into the
+/// repository's object database. Unbounded client-chosen bytes in all three
+/// places is exactly the "client input grows server-side state" concern
+/// `require_token`'s length cap exists for. 16 KiB is generous for real
+/// release notes (the kernel's longest tag messages are ~2 KiB) while keeping
+/// a hostile 100 MB "message" a wire-boundary 400 instead of a stored blob.
+pub const MAX_TAG_MESSAGE_LEN: usize = 16 * 1024;
+
+validated_string!(
+    /// An annotated tag's message body — non-empty after trimming (the same
+    /// rejection [`CommitMessage`] gives) and at most
+    /// [`MAX_TAG_MESSAGE_LEN`] bytes (M2.21a, #235; see the constant for why
+    /// this one is bounded when `CommitMessage` is not).
+    TagMessage,
+    |v| require_non_empty_bounded(v, "tag message", MAX_TAG_MESSAGE_LEN)
 );
 
 validated_string!(
@@ -267,6 +314,41 @@ pub enum ForcePublish {
         /// `refs/remotes/<remote>/<branch>`.
         expected_remote_tip: CommitOid,
     },
+}
+
+/// The annotation of a [`GitOperation::CreateTag`] — present ⇒ an annotated
+/// tag (a real tag *object* with message, tagger and date), absent ⇒ a
+/// lightweight tag (a bare ref, no object) (M2.21a, #235, ADR 0041).
+///
+/// # Why `sign` lives *inside* the annotation, not beside it
+///
+/// Git cannot sign a lightweight tag: the signature is embedded in the tag
+/// object, and a lightweight tag has no object to embed it in. A flat
+/// `CreateTag { message: Option<TagMessage>, sign: bool }` — the shape #235
+/// sketched — would make `sign: true, message: None` representable: a signed
+/// tag with no object to sign, which no git argv can honour. This crate's
+/// standing posture ([`ForcePublish`]'s "no bare-force variant" note) is that
+/// a state which must never execute is best made *unrepresentable* rather
+/// than caught by convention, so the signing flag exists only where a tag
+/// object exists to carry a signature.
+///
+/// # `sign` has no `#[serde(default)]`, like `PushBranch`'s new fields
+///
+/// A body that supplies an annotation but omits `sign` is a 400, not an
+/// unsigned tag by silent default — every annotated-tag request states
+/// whether it asks for a signature, the same "make every caller state both
+/// answers" reasoning M2.20a applied to `set_upstream`/`force`. Where the
+/// signing *key and config* come from is deliberately **not** modelled here:
+/// that is #239's territory (M2.21d), and until it lands `planner::execute`
+/// refuses every `CreateTag` anyway (contract-only slice).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TagAnnotation {
+    /// The tag object's message body (`git tag -a|-s -m <message>`).
+    pub message: TagMessage,
+    /// Ask git to GPG-sign the tag object (`git tag -s`). Carried in the
+    /// reviewed contract now; execution and signing config are #239's.
+    pub sign: bool,
 }
 
 /// Every Git mutation git-vista can perform against the served repository —
@@ -613,6 +695,104 @@ pub enum GitOperation {
         branch: BranchName,
         strategy: MergeStrategy,
     },
+    /// `git tag <name> <target>` (lightweight) or `git tag -a|-s -m <message>
+    /// <name> <target>` (annotated) — create a tag at a commit (planned, M2.21
+    /// slices of #74).
+    ///
+    /// # Contract only (M2.21a, #235, ADR 0041)
+    ///
+    /// No handler builds this yet and `planner::execute` refuses it — the
+    /// same staging #222 used for `AmendCommit` and #227 for fetch/pull, so
+    /// the vocabulary, risk ranking and network classification are reviewed
+    /// before any tag is ever written.
+    ///
+    /// # One variant, kind chosen by `annotation` — not two variants
+    ///
+    /// Unlike [`GitOperation::DiscardTrackedPaths`] /
+    /// [`GitOperation::DeleteUntrackedPaths`] — split because their risk and
+    /// recovery stories differ — lightweight and annotated tag creation share
+    /// one risk ([`RiskLevel::Reversible`]), one precondition shape
+    /// (`RefAbsent` on `refs/tags/<name>`), and one recovery
+    /// ([`RecoveryStrategy::DeleteCreatedTag`]). Two variants would be two
+    /// spellings of one mutation. The states that must differ, differ in the
+    /// type anyway: see [`TagAnnotation`] for why the signing flag lives
+    /// inside the option, making a "signed lightweight tag"
+    /// unrepresentable rather than refusable.
+    ///
+    /// # `target` is always the commit the tag speaks for
+    ///
+    /// For a lightweight tag the new ref points exactly at `target`; for an
+    /// annotated tag the ref points at a *tag object* (created by the
+    /// operation, so [`RefState::Computed`] in the plan) which itself points
+    /// at `target`. Either way `target` is what the reviewer approves tagging.
+    CreateTag {
+        name: TagName,
+        target: CommitOid,
+        /// Present ⇒ annotated (and possibly signed); absent ⇒ lightweight.
+        /// Absence is a *reviewed* value here, not a config-resolved default
+        /// — the plan shows exactly which kind will be created — so an
+        /// `Option` is honest where [`MergeStrategy`]'s missing-field-is-400
+        /// posture guards against a choice some config file would otherwise
+        /// make silently.
+        annotation: Option<TagAnnotation>,
+    },
+    /// `git tag -d <name>` — delete a local tag (planned, M2.21e of #74).
+    ///
+    /// # Contract only (M2.21a, #235) — see [`GitOperation::CreateTag`]
+    ///
+    /// # This is `-D`-shaped, not `-d`-shaped, despite the flag
+    ///
+    /// `git branch -d` refuses to delete unmerged work, which is why
+    /// [`GitOperation::DeleteBranch`] ranks [`RiskLevel::Reversible`]. `git
+    /// tag -d` has **no such guard**: it deletes regardless of whether the
+    /// tagged commit is reachable from anything else, so a tag that was the
+    /// only ref keeping a commit alive takes that commit with it (reflogs
+    /// don't cover tag refs). The shape therefore ranks it
+    /// [`RiskLevel::Destructive`] with [`ForceDeleteBranch`]'s reasoning
+    /// (`ForceDeleteBranch`), not `DeleteBranch`'s — and recovery is
+    /// [`RecoveryStrategy::RecreateTag`] carrying the *exact* pre-delete ref
+    /// value, which restores an annotated tag byte-identically (signature
+    /// included) rather than minting a look-alike. See that variant's doc.
+    ///
+    /// [`ForceDeleteBranch`]: GitOperation::ForceDeleteBranch
+    DeleteLocalTag { name: TagName },
+    /// `git push <remote> --delete refs/tags/<name>` — delete a tag from a
+    /// remote (planned, M2.21e of #74).
+    ///
+    /// # Contract only (M2.21a, #235) — see [`GitOperation::CreateTag`]
+    ///
+    /// A **separate variant** from [`GitOperation::DeleteLocalTag`], never
+    /// one operation parameterised by a "where" flag: one is a local ref
+    /// edit ([`RiskLevel::Destructive`] locally recoverable via the object
+    /// store), the other *leaves the machine* — it is a push under the hood,
+    /// classified `NetworkNeed::Remote` and routed through the network
+    /// tier's askpass hardening (ADR 0036) accordingly. Same split, same
+    /// reasoning as discard-vs-delete in #219.
+    ///
+    /// # Recovery is [`RecoveryStrategy::Irrecoverable`], with one honest nuance
+    ///
+    /// The remote's ref is gone and no local command can restore *other
+    /// clones'* view of it. If a same-named local tag still exists, a later
+    /// [`GitOperation::PushTag`] can re-publish it — but the plan cannot
+    /// promise the local tag survives until then, so the strategy tag stays
+    /// the honest "git-vista offers no undo", exactly
+    /// [`GitOperation::DiscardTrackedPaths`]'s posture of putting nuance in
+    /// prose rather than optimism in the tag.
+    DeleteRemoteTag { name: TagName, remote: RemoteName },
+    /// `git push <remote> refs/tags/<name>` — publish one tag (planned,
+    /// M2.21f of #74).
+    ///
+    /// # Contract only (M2.21a, #235) — see [`GitOperation::CreateTag`]
+    ///
+    /// Pushes exactly the named tag — never `--tags` (publishing every local
+    /// tag is not an operation this vocabulary can express, deliberately) and
+    /// never `--force` (git refuses to move an existing remote tag, and no
+    /// field here can ask it not to — the same
+    /// structurally-unrepresentable posture as [`ForcePublish`]).
+    /// [`RiskLevel::Remote`] and [`RecoveryStrategy::Irrecoverable`] for
+    /// [`GitOperation::PushBranch`]'s reason: the effect leaves the machine,
+    /// and whoever fetches the tag keeps it.
+    PushTag { name: TagName, remote: RemoteName },
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +908,44 @@ pub enum RecoveryStrategy {
     /// Delete the branch the operation created (undo of a create/restore that
     /// added a ref and nothing else).
     DeleteCreatedBranch { name: BranchName },
+    /// Point `refs/tags/<name>` back at `at` — the undo for a
+    /// [`GitOperation::DeleteLocalTag`] (M2.21a, #235, ADR 0041), mirroring
+    /// [`RecreateBranch`](Self::RecreateBranch) exactly as tag-delete mirrors
+    /// branch-delete.
+    ///
+    /// # `at` is the *unpeeled* pre-delete ref value — that is the decision
+    ///
+    /// For a lightweight tag `at` is the tagged commit. For an **annotated**
+    /// tag it is the **tag object's own oid** (what `git rev-parse
+    /// refs/tags/<name>` returned before the delete, and what `git tag -d`
+    /// prints as `(was <oid>)`) — *not* the peeled commit. `git tag -d`
+    /// deletes only the ref; the tag object survives, dangling, until git gc
+    /// prunes it, so `git update-ref refs/tags/<name> <at>` restores the tag
+    /// **byte-identically**: same message, same tagger, same date, same GPG
+    /// signature. #235's sketch (`{ name, target, message }`) would instead
+    /// re-run `git tag -a` and mint a *look-alike* — new tagger, new date,
+    /// signature gone forever, since no key this server will ever hold can
+    /// re-sign as the original tagger. Carrying the one oid that makes exact
+    /// recovery possible is the entire difference between an undo and a
+    /// forgery.
+    ///
+    /// # "Until git gc" — and the pin that extends it
+    ///
+    /// Like every recovery that names a dangling object, this holds only
+    /// until gc prunes it. But `durable`'s recovery pin
+    /// (`refs/git-vista/recovery/<id>`, which `recovery_oid` feeds) points a
+    /// real ref at `at`, keeping the tag object *reachable* — so taking this
+    /// strategy's oid durable is also what protects it from gc. A
+    /// message-carrying shape would have had nothing to pin.
+    RecreateTag { name: TagName, at: CommitOid },
+    /// Delete the tag the operation created (undo of a
+    /// [`GitOperation::CreateTag`], which added `refs/tags/<name>` and —
+    /// annotated — one now-unreferenced tag object, and nothing else). The
+    /// tag sibling of [`DeleteCreatedBranch`](Self::DeleteCreatedBranch),
+    /// separate because the ref namespace and the deleting command differ
+    /// and a consumer switching on this type must be able to say "tag", not
+    /// "branch".
+    DeleteCreatedTag { name: TagName },
     /// Check the previous branch back out (undo of a checkout).
     CheckoutPrevious { branch: BranchName },
     /// Revert the commit the operation lands (history-preserving recovery for
@@ -816,6 +1034,43 @@ mod tests {
         assert!(GenerationToken::new("1234567890").is_ok());
         assert!(RemoteName::new("origin").is_ok());
         assert!(CommitMessage::new("fix: a thing").is_ok());
+        assert!(TagName::new("v1.0.0").is_ok());
+        assert!(TagName::new("release/2026-08").is_ok());
+        assert!(TagMessage::new("v1.0.0 — first stable release\n\nNotes here.").is_ok());
+    }
+
+    #[test]
+    fn tag_newtypes_reject_bad_values() {
+        // TagName: the same require_git_safe gate as BranchName — empty and
+        // option-shaped are refused before a name could reach a git argv.
+        assert_eq!(TagName::new(""), Err(PlanFieldError::Empty("tag name")));
+        assert_eq!(
+            TagName::new("-d"),
+            Err(PlanFieldError::OptionShaped("tag name"))
+        );
+        // TagMessage: non-empty like CommitMessage…
+        assert_eq!(
+            TagMessage::new("  \n "),
+            Err(PlanFieldError::Empty("tag message"))
+        );
+        // …and, unlike CommitMessage, bounded (see MAX_TAG_MESSAGE_LEN's doc).
+        assert_eq!(
+            TagMessage::new("x".repeat(MAX_TAG_MESSAGE_LEN + 1)),
+            Err(PlanFieldError::TooLong {
+                field: "tag message",
+                max: MAX_TAG_MESSAGE_LEN
+            })
+        );
+        // The paired positive at the exact boundary, so the cap is proven to
+        // sit at MAX_TAG_MESSAGE_LEN and not one byte off.
+        assert!(TagMessage::new("x".repeat(MAX_TAG_MESSAGE_LEN)).is_ok());
+        // Deserialize runs the same validators (the wire is the boundary).
+        assert!(serde_json::from_str::<TagName>(r#""-d""#).is_err());
+        assert!(serde_json::from_str::<TagMessage>(&format!(
+            "\"{}\"",
+            "x".repeat(MAX_TAG_MESSAGE_LEN + 1)
+        ))
+        .is_err());
     }
 
     #[test]
@@ -907,6 +1162,57 @@ mod tests {
                 r#"{{"op":"amend_commit","message":"fix: typo","expected_tip":"{}","allow_empty":false}}"#,
                 "a".repeat(40)
             )
+        );
+        // M2.21a (#235): the four tag operations' wire names and field order.
+        let lightweight = GitOperation::CreateTag {
+            name: TagName::new("v1.0.0").unwrap(),
+            target: oid('a'),
+            annotation: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&lightweight).unwrap(),
+            format!(
+                r#"{{"op":"create_tag","name":"v1.0.0","target":"{}","annotation":null}}"#,
+                "a".repeat(40)
+            )
+        );
+        let annotated = GitOperation::CreateTag {
+            name: TagName::new("v1.0.0").unwrap(),
+            target: oid('a'),
+            annotation: Some(TagAnnotation {
+                message: TagMessage::new("v1.0.0").unwrap(),
+                sign: false,
+            }),
+        };
+        assert_eq!(
+            serde_json::to_string(&annotated).unwrap(),
+            format!(
+                r#"{{"op":"create_tag","name":"v1.0.0","target":"{}","annotation":{{"message":"v1.0.0","sign":false}}}}"#,
+                "a".repeat(40)
+            )
+        );
+        let delete_local = GitOperation::DeleteLocalTag {
+            name: TagName::new("v1.0.0").unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_string(&delete_local).unwrap(),
+            r#"{"op":"delete_local_tag","name":"v1.0.0"}"#
+        );
+        let delete_remote = GitOperation::DeleteRemoteTag {
+            name: TagName::new("v1.0.0").unwrap(),
+            remote: RemoteName::new("origin").unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_string(&delete_remote).unwrap(),
+            r#"{"op":"delete_remote_tag","name":"v1.0.0","remote":"origin"}"#
+        );
+        let push_tag = GitOperation::PushTag {
+            name: TagName::new("v1.0.0").unwrap(),
+            remote: RemoteName::new("origin").unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_string(&push_tag).unwrap(),
+            r#"{"op":"push_tag","name":"v1.0.0","remote":"origin"}"#
         );
     }
 
