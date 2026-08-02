@@ -177,10 +177,17 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
     // Recording the agreement and re-submitting are one closure so they cannot
     // drift apart, and the agreement is recorded against the target's own tip —
     // never "the current tip" — so a dialog retargeted between the warning and
-    // the press cannot inherit consent given for a different commit. Forgetting
-    // the record would fail safe rather than silently: `amend_preflight` would
-    // answer `Confirm` again and the button would simply re-raise the same
-    // banner.
+    // the press cannot inherit consent given for a different commit.
+    //
+    // **The order of the two lines is load-bearing.** `submit_amend` re-reads
+    // `dialogs.amend_knowledge()` synchronously to decide the pre-flight, so
+    // recording second — or not at all — makes `amend_preflight` answer
+    // `Confirm` again and re-enter `AwaitingPublishedConfirm`. That fails safe
+    // in the sense that nothing is sent, but it is not benign: the banner's own
+    // button becomes permanently inert and no amend of published history is
+    // reachable through the UI at all. Nothing here compiles under
+    // `cargo test`, so the order is pinned by a source census —
+    // `features::a11y::audit::the_way_past_the_banner_records_the_agreement_before_it_resubmits`.
     let confirm_published = move |target: AmendTarget| {
         dialogs.confirm_amend_target(target.expected_tip());
         submit_amend(target);
