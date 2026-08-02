@@ -29,6 +29,13 @@ pub(crate) mod capabilities;
 /// cannot supply the tier a repository needs. See its module doc for why the
 /// plan's `CapabilityAbsent => Blocked` mapping is not implemented.
 pub(crate) mod hook_policy;
+/// #228 (M2.20b): the shared Network-tier exec harness — askpass hardening
+/// (`-c core.askpass=`, closing the M1.13 finding I5 RCE gap) and output
+/// redaction, the one execution path every fetch/pull/push spawn is meant to
+/// go through. See its module doc for the full account, including why it does
+/// not force `credential.helper=` and why the exact `terminal prompts
+/// disabled` string is out of reach without widening the spawn chokepoint.
+pub(crate) mod network_exec;
 /// Task 9, part 2: the boot probe — launches the composed launcher against a
 /// throwaway hostile-hook repo and classifies the result into a
 /// [`probe::ProbeVerdict`], gating server startup (INV-13 / Global
@@ -739,6 +746,16 @@ pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         // paths — index/worktree only, never a remote.
         GitOperation::DiscardTrackedPaths { .. } => NetworkNeed::Local,
         GitOperation::DeleteUntrackedPaths { .. } => NetworkNeed::Local,
+        // M2.19a (#222): `git commit --amend` rewrites the checked-out
+        // branch's tip in place — index/object-database/ref work, never a
+        // socket. Whether the *amended-away* commit had already been pushed
+        // (and so now diverges from a remote-tracking ref) is a fact about
+        // history, not about what this operation asks git to do over the
+        // wire; see `GitOperation::AmendCommit`'s doc comment for why that
+        // question is left to #223's execution slice rather than answered
+        // here. This variant also has no execution wired yet (#223) — this
+        // arm exists purely to keep this match total.
+        GitOperation::AmendCommit { .. } => NetworkNeed::Local,
     }
 }
 

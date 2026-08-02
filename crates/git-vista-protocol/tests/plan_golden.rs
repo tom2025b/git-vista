@@ -1,6 +1,6 @@
 //! Golden-fixture test for the [`Plan`] wire contract (M1.06a, #142).
 //!
-//! `tests/fixtures/plan_v1.json` is the **committed** wire form of sixteen
+//! `tests/fixtures/plan_v1.json` is the **committed** wire form of nineteen
 //! plans — one per [`GitOperation`] variant, together exercising every
 //! [`RiskLevel`], [`Precondition`], [`RefState`] and [`RecoveryStrategy`]
 //! variant. The test proves the contract is lossless in both directions:
@@ -384,6 +384,37 @@ fn golden_plans() -> Vec<Plan> {
             Vec::new(),
             RecoveryStrategy::Irrecoverable,
         ),
+        // #222 (M2.19a): contract only — no handler builds this variant yet
+        // and no execution is wired (see `GitOperation::AmendCommit`'s doc
+        // comment); the golden plan still pins the wire shape today so #223
+        // cannot silently change it while wiring execution in.
+        plan(
+            'a',
+            GitOperation::AmendCommit {
+                message: CommitMessage::new("fix: correct the typo").unwrap(),
+                expected_tip: oid('2'),
+                allow_empty: false,
+            },
+            RiskLevel::Destructive,
+            vec![
+                Precondition::BranchCheckedOut {
+                    branch: branch("main"),
+                },
+                Precondition::RefAt {
+                    ref_name: rname("refs/heads/main"),
+                    oid: oid('2'),
+                },
+            ],
+            vec![RefChange {
+                ref_name: rname("refs/heads/main"),
+                before: RefState::At(oid('2')),
+                after: RefState::Computed,
+            }],
+            RecoveryStrategy::ResetRef {
+                ref_name: rname("refs/heads/main"),
+                to: oid('2'),
+            },
+        ),
     ]
 }
 
@@ -460,6 +491,7 @@ fn golden_set_covers_every_operation_variant() {
         "stage_selection",
         "discard_tracked_paths",
         "delete_untracked_paths",
+        "amend_commit",
     ]
     .into_iter()
     .map(String::from)
