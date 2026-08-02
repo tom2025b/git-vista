@@ -360,6 +360,203 @@ pub fn draft_scope_action(old: Option<&str>, new: Option<&str>) -> DraftScopeAct
     }
 }
 
+// ---------------------------------------------------------------------------
+// The tiered discard/delete confirmation (M2.18b, #220)
+// ---------------------------------------------------------------------------
+//
+// # Why two ceremonies, and why the difference is structural
+//
+// `DeleteUntrackedPaths` (`git clean -f`) is the **first operation in this
+// app with no way back of any kind**. The content it removes was never
+// written to git's object database, so there is no blob to find, no reflog
+// entry, no journal event to replay — `planner.rs`'s own response text says
+// so in as many words ("That content was never stored in git, so there is no
+// way to bring it back"), and a server-side regression test greps that text
+// for "undo", "restore" and "recover" to keep it that way.
+//
+// `DiscardTrackedPaths` (`git checkout --`) is a weaker claim: content that
+// was *staged* before it ran is still reachable in the object database until
+// the next `git gc`. The backend tags both `RecoveryStrategy::Irrecoverable`
+// but spells that difference out in words rather than letting one tag imply
+// the same story for both.
+//
+// So the UI difference is not a label swap. Delete demands **two deliberate
+// taps in sequence** — the confirm button is inert until an explicit arm
+// control is pressed — while discard is a single tap on a modal that already
+// lists every affected path. #220 rules out a type-to-confirm field for the
+// reason `dialogs/mod.rs` documents: a void `<input>` panics Leptos' CSR
+// node-walk on iOS WebKit, which is why this whole modal is textarea-or-
+// nothing.
+//
+// # The one place this deviates from #220's written bullets
+//
+// #220 says "`DeleteUntracked`'s confirmation … uses `danger: true` styling;
+// `DiscardTracked`'s does not". Both are `danger: true` here. `danger: false`
+// renders the confirm button **green** (`dialogs/confirm.rs`'s
+// `confirm_style`), which reads as "safe" — and discarding a worktree-only
+// edit destroys its only copy just as permanently as the delete does. Saying
+// "safe" in colour while saying "gone" in words is the same overclaim the
+// backend's wording test exists to prevent, so the asymmetry is carried by
+// the ceremony, the title and the body instead of by the button colour.
+
+/// Which of the two working-tree operations a confirmation is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeAction {
+    /// `git checkout -- <paths>` — recoverable only for staged content, and
+    /// only until the next `git gc`.
+    DiscardTracked,
+    /// `git clean -f -- <paths>` — permanent, full stop.
+    DeleteUntracked,
+}
+
+/// The extra, deliberate step the delete ceremony demands before its confirm
+/// button does anything. `None` on [`ConfirmPrompt`] means a single-tap
+/// confirmation — which is the whole visible difference between the tiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArmStep {
+    /// The arm control's own label — states which step it is, and flips once
+    /// pressed so the two taps are distinguishable without colour.
+    pub label: &'static str,
+    /// Maps to `aria-pressed`: this is a toggle, and a screen-reader user
+    /// needs to hear that step one has landed.
+    pub pressed: bool,
+}
+
+/// Everything `dialogs/confirm.rs` renders for one confirmation.
+///
+/// The first five fields are exactly the `(title, body, confirm_label,
+/// danger, enabled)` tuple that view's match has always produced; the last
+/// two are M2.18b's addition, and are what let one modal host two different
+/// ceremonies without the branch operations noticing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmPrompt {
+    pub title: &'static str,
+    pub body: String,
+    pub confirm_label: &'static str,
+    pub danger: bool,
+    /// Whether the confirm button may actually run the operation right now.
+    pub enabled: bool,
+    /// The second deliberate step, for the ceremony that has one.
+    pub arm: Option<ArmStep>,
+    /// Why the confirm button is inert — `None` exactly when `enabled`.
+    ///
+    /// Rendered as a **visible line** as well as folded into the button's
+    /// `aria-label` (via `graph::core::disabled_menu_item_copy`), because
+    /// #65's finding was that a `title`-only reason never surfaces on a tap
+    /// and is never announced.
+    pub blocked_reason: Option<&'static str>,
+}
+
+impl ConfirmPrompt {
+    /// A single-tap confirmation with no extra step and nothing blocking it
+    /// beyond `enabled` — the shape every branch/undo arm of
+    /// `confirm_modal_view` has always had. Its `enabled: false` cases (a
+    /// merge into itself, a detached HEAD) carry their reason in the body
+    /// text, which is why `blocked_reason` stays `None` for them rather than
+    /// duplicating it.
+    pub fn plain(
+        title: &'static str,
+        body: String,
+        confirm_label: &'static str,
+        danger: bool,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            title,
+            body,
+            confirm_label,
+            danger,
+            enabled,
+            arm: None,
+            blocked_reason: None,
+        }
+    }
+}
+
+/// How many paths a confirmation body lists before it summarises the rest.
+///
+/// A body long enough to scroll past the confirm button is its own hazard on
+/// an iPad; twelve fits the modal at the sizes this app is used at. Whatever
+/// is cut is still *counted* — see [`path_list`].
+pub const PATH_LIST_LIMIT: usize = 12;
+
+/// The 44x44 floor (#65) as an inline-style prefix.
+///
+/// This modal is inline-styled end to end — `dialogs/mod.rs` records why (the
+/// iPad-proven recipe), and that is also why these controls do not appear in
+/// `features::a11y::audit`'s stylesheet census, which can only see CSS
+/// selectors. Naming the declaration once here is what makes the floor
+/// host-checkable at all.
+pub const TOUCH_TARGET_STYLE: &str = "min-height:44px; min-width:44px; ";
+
+/// Render `paths` as a bulleted block, capped at `limit`, always stating the
+/// full count so a truncated list can never understate what is about to
+/// happen.
+pub fn path_list(paths: &[String], limit: usize) -> String {
+    let shown: Vec<String> = paths.iter().take(limit).map(|p| format!("• {p}")).collect();
+    let hidden = paths.len().saturating_sub(shown.len());
+    if hidden == 0 {
+        shown.join("\n")
+    } else {
+        format!("{}\n• …and {hidden} more", shown.join("\n"))
+    }
+}
+
+/// The title, body, button copy and ceremony for one working-tree
+/// confirmation.
+///
+/// `armed` is the live state of [`ArmStep`]'s toggle. It is consulted **only**
+/// by [`WorktreeAction::DeleteUntracked`]: a discard is a single-tap
+/// confirmation and must not become gated on a control it never shows.
+pub fn worktree_confirm(action: WorktreeAction, paths: &[String], armed: bool) -> ConfirmPrompt {
+    let count = paths.len();
+    let s = if count == 1 { "" } else { "s" };
+    let list = path_list(paths, PATH_LIST_LIMIT);
+    match action {
+        WorktreeAction::DiscardTracked => ConfirmPrompt {
+            title: "Discard changes to tracked files",
+            body: format!(
+                "Discard uncommitted changes to {count} tracked file{s}?\n\n{list}\n\n\
+                 Each one goes back to its checked-out version. Content you staged \
+                 before this runs is recoverable from git's object database, and only \
+                 until the next git gc — a change you never staged has no other copy."
+            ),
+            confirm_label: "Discard",
+            danger: true,
+            enabled: count > 0,
+            arm: None,
+            blocked_reason: (count == 0).then_some("No tracked changes to discard."),
+        },
+        WorktreeAction::DeleteUntracked => ConfirmPrompt {
+            title: "Permanently delete untracked files",
+            body: format!(
+                "Delete {count} untracked file{s} from the working tree?\n\n{list}\n\n\
+                 This content was never stored in git, so once these files are gone \
+                 nothing in this repository — and nothing in git-vista — holds a copy \
+                 of them. This is permanent."
+            ),
+            confirm_label: "Delete Permanently",
+            danger: true,
+            enabled: count > 0 && armed,
+            arm: (count > 0).then_some(ArmStep {
+                label: if armed {
+                    "Step 1 of 2 done — the permanent delete is enabled"
+                } else {
+                    "Step 1 of 2 — I understand this is permanent"
+                },
+                pressed: armed,
+            }),
+            blocked_reason: if count == 0 {
+                Some("No untracked files to delete.")
+            } else if !armed {
+                Some("Complete step 1 first — this delete is permanent.")
+            } else {
+                None
+            },
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,5 +869,199 @@ mod tests {
             draft_scope_action(Some("old"), Some("new")),
             DraftScopeAction::SeedFromStorage
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The tiered discard/delete confirmation (M2.18b, #220)
+    // -----------------------------------------------------------------
+
+    fn paths(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("scratch/file{i}.txt")).collect()
+    }
+
+    /// Every string this module puts on screen for one action, so a
+    /// vocabulary check cannot pass by only looking at the easy field.
+    fn all_copy(c: &ConfirmPrompt) -> String {
+        let mut s = format!("{} {} {}", c.title, c.body, c.confirm_label);
+        if let Some(a) = &c.arm {
+            s.push(' ');
+            s.push_str(a.label);
+        }
+        if let Some(r) = c.blocked_reason {
+            s.push(' ');
+            s.push_str(r);
+        }
+        s.to_lowercase()
+    }
+
+    const FORBIDDEN: [&str; 3] = ["undo", "restore", "recover"];
+
+    /// The regression this repo's server side already holds itself to
+    /// (`delete_untracked_paths_text_never_sounds_recoverable` in
+    /// `planner/contract_suite.rs`), applied to the words the *user actually
+    /// reads* — the response body it greps is not what the confirmation
+    /// dialog shows, so holding the same line here needs its own test.
+    ///
+    /// The second half is the paired positive that proves the grep can fire:
+    /// the discard copy is *allowed* the qualified word, and does contain it.
+    /// Without that, an empty or renamed field would let the first half pass
+    /// while saying nothing.
+    #[test]
+    fn the_delete_copy_never_sounds_recoverable_but_the_grep_still_works() {
+        for armed in [false, true] {
+            let delete = worktree_confirm(WorktreeAction::DeleteUntracked, &paths(2), armed);
+            let text = all_copy(&delete);
+            for word in FORBIDDEN {
+                assert!(
+                    !text.contains(word),
+                    "delete copy must not sound recoverable (found {word:?}, armed={armed}): {text}"
+                );
+            }
+            assert!(text.contains("permanent"), "{text}");
+        }
+        // Paired positive: the same grep over the discard copy DOES hit, so
+        // the assertions above are capable of failing.
+        let discard = worktree_confirm(WorktreeAction::DiscardTracked, &paths(2), false);
+        let discard_text = all_copy(&discard);
+        assert!(
+            discard_text.contains("recover"),
+            "the discard copy is meant to state the qualified recovery story: {discard_text}"
+        );
+        // …and only the *qualified* claim, never a blanket one — the two
+        // qualifiers the server's own text is tested for.
+        assert!(discard_text.contains("staged"), "{discard_text}");
+        assert!(discard_text.contains("git gc"), "{discard_text}");
+    }
+
+    /// The tiering is a different *ceremony*, not the same modal with a
+    /// different label: delete needs a second deliberate step, discard does
+    /// not, and `armed` must not leak across into the discard arm.
+    #[test]
+    fn delete_needs_two_taps_and_discard_needs_one() {
+        let p = paths(3);
+
+        let delete_unarmed = worktree_confirm(WorktreeAction::DeleteUntracked, &p, false);
+        assert!(!delete_unarmed.enabled, "an unarmed delete must be inert");
+        assert_eq!(
+            delete_unarmed.arm,
+            Some(ArmStep {
+                label: "Step 1 of 2 — I understand this is permanent",
+                pressed: false,
+            })
+        );
+        assert!(delete_unarmed.blocked_reason.is_some());
+
+        let delete_armed = worktree_confirm(WorktreeAction::DeleteUntracked, &p, true);
+        assert!(delete_armed.enabled, "arming is what makes it live");
+        assert!(delete_armed.arm.is_some_and(|a| a.pressed));
+        assert_eq!(delete_armed.blocked_reason, None);
+
+        // The discard arm ignores `armed` entirely — a single flag wired to
+        // gate both would make one of these two assertions fail.
+        for armed in [false, true] {
+            let discard = worktree_confirm(WorktreeAction::DiscardTracked, &p, armed);
+            assert!(discard.enabled, "a discard is a single-tap confirmation");
+            assert_eq!(discard.arm, None);
+            assert_eq!(discard.blocked_reason, None);
+        }
+    }
+
+    /// The anti-cosmetic assertion: if a future edit collapsed these into one
+    /// prompt with a swapped verb, this is what would catch it.
+    #[test]
+    fn the_two_confirmations_differ_in_more_than_their_label() {
+        let p = paths(2);
+        let discard = worktree_confirm(WorktreeAction::DiscardTracked, &p, true);
+        let delete = worktree_confirm(WorktreeAction::DeleteUntracked, &p, true);
+        assert_ne!(discard.title, delete.title);
+        assert_ne!(discard.body, delete.body);
+        assert_ne!(discard.confirm_label, delete.confirm_label);
+        assert_ne!(
+            discard.arm.is_some(),
+            delete.arm.is_some(),
+            "the ceremony itself must differ, not only the wording"
+        );
+    }
+
+    /// Both are `danger: true` — the deviation from #220's literal bullet,
+    /// pinned so it is a recorded decision rather than a drift. `danger:
+    /// false` paints the confirm button green, and a green button on an
+    /// operation that destroys an unstaged edit's only copy says "safe"
+    /// when the body says "gone".
+    #[test]
+    fn both_confirmations_are_styled_destructive() {
+        let p = paths(1);
+        assert!(worktree_confirm(WorktreeAction::DiscardTracked, &p, false).danger);
+        assert!(worktree_confirm(WorktreeAction::DeleteUntracked, &p, false).danger);
+    }
+
+    /// #220: no blind "discard all" wording — the body names the files.
+    #[test]
+    fn the_body_lists_the_exact_paths() {
+        let p = vec!["src/a.rs".to_string(), "docs/b.md".to_string()];
+        for action in [
+            WorktreeAction::DiscardTracked,
+            WorktreeAction::DeleteUntracked,
+        ] {
+            let body = worktree_confirm(action, &p, true).body;
+            assert!(body.contains("src/a.rs"), "{body}");
+            assert!(body.contains("docs/b.md"), "{body}");
+        }
+    }
+
+    /// A list longer than the cap is summarised, never silently shortened:
+    /// the count in the first line still covers every path, and the overflow
+    /// is stated. The paired assertion pins that something really was cut —
+    /// otherwise "the count is right" would hold trivially.
+    #[test]
+    fn a_truncated_list_still_states_the_full_count() {
+        let p = paths(PATH_LIST_LIMIT + 5);
+        let body = worktree_confirm(WorktreeAction::DeleteUntracked, &p, true).body;
+        assert!(
+            body.contains(&format!("Delete {} untracked files", p.len())),
+            "{body}"
+        );
+        assert!(body.contains("…and 5 more"), "{body}");
+        let last = p.last().unwrap();
+        assert!(
+            !body.contains(last.as_str()),
+            "the fixture must actually overflow the cap, or this test proves nothing: {body}"
+        );
+    }
+
+    #[test]
+    fn path_list_shows_everything_when_it_fits() {
+        let p = paths(3);
+        let listed = path_list(&p, PATH_LIST_LIMIT);
+        assert_eq!(listed.lines().count(), 3);
+        assert!(!listed.contains("more"), "{listed}");
+    }
+
+    /// The empty case is reachable in production, not hypothetical: the menu
+    /// builds its path list from a status snapshot, and the worktree can go
+    /// clean between that read and the tap.
+    #[test]
+    fn an_empty_selection_can_never_be_confirmed() {
+        for action in [
+            WorktreeAction::DiscardTracked,
+            WorktreeAction::DeleteUntracked,
+        ] {
+            for armed in [false, true] {
+                let c = worktree_confirm(action, &[], armed);
+                assert!(!c.enabled, "{:?} armed={armed}", c.title);
+                assert!(c.blocked_reason.is_some(), "{:?}", c.title);
+                // Nothing to arm when there is nothing to delete.
+                assert_eq!(c.arm, None);
+            }
+        }
+    }
+
+    /// #65's 44x44 floor, on the one declaration the new controls use. These
+    /// buttons are inline-styled, so `features::a11y::audit`'s stylesheet
+    /// census cannot see them — this is the check that can.
+    #[test]
+    fn the_touch_target_style_declares_forty_four_on_both_axes() {
+        assert!(TOUCH_TARGET_STYLE.contains("min-height:44px"));
+        assert!(TOUCH_TARGET_STYLE.contains("min-width:44px"));
     }
 }

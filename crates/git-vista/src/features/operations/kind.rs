@@ -64,6 +64,28 @@ pub enum OperationKind {
     /// discarded state is already on the remote. Offered from the graph menu's undo
     /// section (`/api/undoables`) and straight from Activity feed rows.
     Undo(Undoable),
+    /// `git checkout -- <paths>` on named working-tree paths
+    /// (`POST /api/discard-tracked-paths`, M2.18a/#219 backend, M2.18b/#220
+    /// UI). `paths` are worktree-relative and must every one be *tracked and
+    /// dirty* — the server re-derives that classification from a fresh
+    /// `git status` and refuses the whole batch if any path disagrees, so
+    /// the frontend builds this list with
+    /// `features::status::core::discardable_tracked_paths` rather than by
+    /// hand.
+    ///
+    /// Named for the server's own `GitOperation::DiscardTrackedPaths` rather
+    /// than #220's shorter suggestion, so the two halves of one operation
+    /// are greppable as one thing.
+    DiscardTrackedPaths { paths: Vec<String> },
+    /// `git clean -f -- <paths>` (`POST /api/delete-untracked-paths`).
+    ///
+    /// **The one operation in this vocabulary with no way back.** The content
+    /// was never in git's object database, so nothing in the repository, the
+    /// reflog or this app's journal can produce it again. That is why
+    /// `dialogs/core.rs`'s confirmation for this demands a second deliberate
+    /// tap, and why nothing in its user-facing copy — or in `describe`
+    /// below — says "undo", "restore" or "recover".
+    DeleteUntrackedPaths { paths: Vec<String> },
 }
 
 impl OperationKind {
@@ -79,7 +101,25 @@ impl OperationKind {
             Self::Checkout { branch, .. } => format!("Checking out \u{2018}{branch}\u{2019}"),
             Self::Rebase { base, .. } => format!("Rebasing onto {base}"),
             Self::Undo(u) => format!("Undoing: {}", u.label),
+            Self::DiscardTrackedPaths { paths } => {
+                format!("Discarding changes to {}", file_count(paths.len()))
+            }
+            // "permanently" carries the same load here as it does in the
+            // server's own journal line: this strip is the only trace of the
+            // operation the user sees once the modal closes.
+            Self::DeleteUntrackedPaths { paths } => {
+                format!("Deleting {} permanently", file_count(paths.len()))
+            }
         }
+    }
+}
+
+/// `"1 file"` / `"3 files"` — the pluralisation both worktree arms need.
+fn file_count(n: usize) -> String {
+    if n == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{n} files")
     }
 }
 
@@ -113,14 +153,67 @@ mod tests {
                 current: None,
                 base: "origin/main".into(),
             },
+            OperationKind::DiscardTrackedPaths {
+                paths: vec!["src/a.rs".into()],
+            },
+            OperationKind::DeleteUntrackedPaths {
+                paths: vec!["scratch.txt".into(), "note.md".into()],
+            },
         ];
         for k in kinds {
             let text = k.describe();
             assert!(!text.is_empty());
             assert!(
-                !text.contains("OperationKind") && !text.contains("ForceDelete"),
+                !text.contains("OperationKind")
+                    && !text.contains("ForceDelete")
+                    && !text.contains("TrackedPaths"),
                 "leaked a type name: {text}"
             );
         }
+    }
+
+    /// The status strip is the only place the delete is named once its modal
+    /// has closed, so it holds the same line the confirmation and the
+    /// server's own journal text do (M2.18b, #220).
+    ///
+    /// The paired assertion is the discard arm: its text is *allowed* those
+    /// words and is checked to be free of them anyway for a different reason
+    /// — proving the two arms produce genuinely different strings rather
+    /// than one shared template that happens to avoid the words.
+    #[test]
+    fn the_delete_never_describes_itself_as_reversible() {
+        let delete = OperationKind::DeleteUntrackedPaths {
+            paths: vec!["scratch.txt".into()],
+        }
+        .describe();
+        let lower = delete.to_lowercase();
+        for word in ["undo", "restore", "recover"] {
+            assert!(!lower.contains(word), "found {word:?} in: {delete}");
+        }
+        assert!(lower.contains("permanently"), "{delete}");
+
+        let discard = OperationKind::DiscardTrackedPaths {
+            paths: vec!["scratch.txt".into()],
+        }
+        .describe();
+        assert_ne!(
+            discard, delete,
+            "the two operations must not describe themselves identically"
+        );
+        assert!(!discard.to_lowercase().contains("permanently"), "{discard}");
+    }
+
+    #[test]
+    fn a_single_file_is_not_described_as_files() {
+        let one = OperationKind::DeleteUntrackedPaths {
+            paths: vec!["a.txt".into()],
+        }
+        .describe();
+        assert!(one.contains("1 file") && !one.contains("1 files"), "{one}");
+        let two = OperationKind::DeleteUntrackedPaths {
+            paths: vec!["a.txt".into(), "b.txt".into()],
+        }
+        .describe();
+        assert!(two.contains("2 files"), "{two}");
     }
 }

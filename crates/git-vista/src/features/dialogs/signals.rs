@@ -77,6 +77,20 @@ pub struct Dialogs {
     /// clobber rule maps that to `KeepSignal` and the early return below
     /// leaves this value at the last-known repository.
     draft_scope: StoredValue<Option<String>>,
+    /// Whether the confirm modal's second-step arm control has been pressed
+    /// (M2.18b, #220).
+    ///
+    /// An `RwSignal`, unlike the guard beside it: the arm control and the
+    /// confirm button both *render* from this — that visible state change is
+    /// the whole point of a two-tap ceremony.
+    ///
+    /// Reset by [`Dialogs::open`] rather than by whoever raises the
+    /// operation, so it cannot survive into a question it wasn't answered
+    /// for. That matters most on the path `DialogsCore::open`'s own doc
+    /// comment describes: `confirm.rs`'s escalation effect reopens the confirm
+    /// modal *in place* with a different operation, and an arm that carried
+    /// over would hand the new question a confirm button the user never armed.
+    confirm_armed: RwSignal<bool>,
 }
 
 impl Dialogs {
@@ -87,6 +101,7 @@ impl Dialogs {
             // lands, and seeding happens in `set_draft_scope` when it does.
             commit_msg: create_rw_signal(String::new()),
             draft_scope: store_value(None),
+            confirm_armed: create_rw_signal(false),
         }
     }
 
@@ -175,6 +190,25 @@ impl Dialogs {
     /// `set_value(js_sys::Date::now())` calls this replaces.
     pub fn open(&self, d: Dialog) {
         self.core.update_value(|c| c.open(d, js_sys::Date::now()));
+        // Every open is a new question, so the two-tap arm starts over (#220).
+        // Here rather than in the openers for the same reason the guard stamp
+        // is here: eleven call sites getting it right by repetition is what
+        // M1.11 was cleaning up.
+        self.confirm_armed.set(false);
+    }
+
+    /// Press the confirm modal's second-step arm control (#220). One-way
+    /// within a single question — the only thing that clears it is a fresh
+    /// [`Dialogs::open`].
+    pub fn arm_confirm(&self) {
+        self.confirm_armed.set(true);
+    }
+
+    /// Whether the second step has been taken. A **tracked** read: the arm
+    /// control's own label and the confirm button's enabled state both
+    /// re-render from it.
+    pub fn confirm_armed(&self) -> bool {
+        self.confirm_armed.get()
     }
 
     /// Record that `d` closed. A no-op if some other dialog has since replaced it.

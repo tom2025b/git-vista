@@ -14,13 +14,14 @@ use git_vista_core::activity::UndoAction;
 
 use crate::api::{
     create_branch_request, fetch_head_branch, fetch_rebase_status, fetch_status, fetch_undoables,
-    stage_request, unstage_request,
+    fetch_worktree_status, stage_request, unstage_request,
 };
 use crate::features::core_traits::RequestTarget;
 use crate::features::dialogs::core::Dialog;
 use crate::features::graph::core::disabled_menu_item_copy;
 use crate::features::operations::core::PendingIntent;
 use crate::features::shell::signals::{self as shell_state, Shell};
+use crate::features::status::core::{deletable_untracked_paths, discardable_tracked_paths};
 use crate::geometry::menu_placement;
 use crate::gestures::viewport_size;
 use crate::icons::icon_set;
@@ -126,6 +127,32 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 fetch_status().await.map(|s| s.staged.len()).unwrap_or(0)
             } else {
                 0
+            }
+        },
+    );
+    // The per-path working-tree status (`GET /api/status/v2`, M2.18b/#220) —
+    // fetched when the menu opens on the HEAD commit, keyed exactly like
+    // `staged_count`. The v1 read above cannot serve this: the discard/delete
+    // confirmations must name the exact paths, and must classify each one the
+    // same way the server's own `verify_path_states` will (tracked-dirty vs
+    // untracked), which only the v2 per-entry shape carries.
+    //
+    // A failed or still-in-flight read resolves to `None`, and both items then
+    // render *disabled with the reason* rather than vanishing — an item that
+    // silently disappears while a status probe is slow reads as "this repo
+    // can't do that", which would be a lie.
+    let worktree = create_local_resource(
+        move || {
+            (
+                shell.menu().is_some_and(|m| m.is_head && !m.is_branch),
+                graph.get().epoch(),
+            )
+        },
+        |(open, _)| async move {
+            if open {
+                fetch_worktree_status().await.ok()
+            } else {
+                None
             }
         },
     );
@@ -441,6 +468,111 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         <span class="nf ctx-icon">{ic.undo}</span>
                         "Select Changes to Unstage…"
                     </button>
+                }
+            });
+            // "Discard Changes…" / "Delete Untracked Files…" (M2.18b, #220):
+            // the UI half of #219's two typed working-tree operations. Both
+            // open the confirm modal rather than acting immediately — that
+            // modal is where the paths are listed and where the delete's
+            // second deliberate step lives (`features::dialogs::core`).
+            //
+            // HEAD-gated like the staging items above, and for the same
+            // reason: the working tree belongs to the checked-out commit, so
+            // offering either from a stub or an older commit would act
+            // somewhere other than where the user is pointing.
+            //
+            // The path lists are built by the host-tested selectors in
+            // `features::status::core`, which mirror the server's own
+            // classification. Building them here by hand would mean a
+            // confirmation the user completes and the server then 409s.
+            let live_status = worktree.get().flatten();
+            let discard_changes = is_head.then(|| {
+                let paths = live_status
+                    .as_ref()
+                    .map(discardable_tracked_paths)
+                    .unwrap_or_default();
+                if paths.is_empty() {
+                    let reason = if live_status.is_none() {
+                        "Waiting for a working-tree status read"
+                    } else {
+                        "No tracked file has uncommitted changes"
+                    };
+                    let (aria_label, visible_reason) =
+                        disabled_menu_item_copy("Discard Changes…", reason);
+                    view! {
+                        <span
+                            class="ctx-item disabled"
+                            title=reason
+                            aria-disabled="true"
+                            aria-label=aria_label
+                        >
+                            <span class="nf ctx-icon">{ic.undo}</span>
+                            "Discard Changes…"
+                            <span class="ctx-item-reason">{visible_reason}</span>
+                        </span>
+                    }
+                    .into_view()
+                } else {
+                    let on = move |_| {
+                        // Raise the modal *before* `close_menu` disposes this
+                        // handler's reactive owner — the ordering rule this
+                        // module's doc comment opens with.
+                        dialogs.open(Dialog::Confirm);
+                        shell.open_confirm(PendingOp::DiscardTrackedPaths {
+                            paths: paths.clone(),
+                        });
+                        shell.close_menu();
+                    };
+                    view! {
+                        <button class="ctx-item" on:click=on>
+                            <span class="nf ctx-icon">{ic.undo}</span>
+                            "Discard Changes…"
+                        </button>
+                    }
+                    .into_view()
+                }
+            });
+            let delete_untracked = is_head.then(|| {
+                let paths = live_status
+                    .as_ref()
+                    .map(deletable_untracked_paths)
+                    .unwrap_or_default();
+                if paths.is_empty() {
+                    let reason = if live_status.is_none() {
+                        "Waiting for a working-tree status read"
+                    } else {
+                        "No untracked files in the working tree"
+                    };
+                    let (aria_label, visible_reason) =
+                        disabled_menu_item_copy("Delete Untracked Files…", reason);
+                    view! {
+                        <span
+                            class="ctx-item disabled"
+                            title=reason
+                            aria-disabled="true"
+                            aria-label=aria_label
+                        >
+                            <span class="nf ctx-icon">{ic.deleted}</span>
+                            "Delete Untracked Files…"
+                            <span class="ctx-item-reason">{visible_reason}</span>
+                        </span>
+                    }
+                    .into_view()
+                } else {
+                    let on = move |_| {
+                        dialogs.open(Dialog::Confirm);
+                        shell.open_confirm(PendingOp::DeleteUntrackedPaths {
+                            paths: paths.clone(),
+                        });
+                        shell.close_menu();
+                    };
+                    view! {
+                        <button class="ctx-item" on:click=on>
+                            <span class="nf ctx-icon">{ic.deleted}</span>
+                            "Delete Untracked Files…"
+                        </button>
+                    }
+                    .into_view()
                 }
             });
             // The branch operations (Issue #33 follow-up): merge / push / delete, one
@@ -774,6 +906,8 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     {unstage_changes}
                     {select_stage}
                     {select_unstage}
+                    {discard_changes}
+                    {delete_untracked}
                     {commit_changes}
                     {commit_empty}
                     {branch_items}
