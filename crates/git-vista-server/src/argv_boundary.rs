@@ -106,6 +106,16 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // git, outside the harness under test, so an assertion can never be
     // satisfied by the same code it is checking.
     "src/planner/pull_suite.rs",
+    // #[cfg(test)] git fixtures for the M2.20e (#231) push suite: the served
+    // repository, its bare remote and the `git daemon` that serves it over
+    // `git://` (a path remote cannot receive a push under the sandbox), the
+    // third-party clone whose push makes a lease lose, and the deliberately
+    // *unsandboxed* `git push` that asserts the redaction test's premise. Every
+    // read that decides whether an assertion passes — the remote's
+    // `for-each-ref`, `rev-parse` and `merge-base --is-ancestor` — is plain git
+    // outside the harness under test, so no assertion can be satisfied by the
+    // same code it is checking.
+    "src/planner/push_suite.rs",
     "src/state.rs",         // #[cfg(test)] fixture setup
     "src/argv_boundary.rs", // this file (the scan reads its own source)
     // The M1.13b spawn chokepoint (#66, Task 5). It builds a git Command from

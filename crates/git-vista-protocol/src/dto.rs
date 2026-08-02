@@ -146,14 +146,66 @@ pub struct AmendCommitSuccess {
 }
 
 /// Body of the branch-operation requests (Issue #33 follow-up): merge
-/// (`POST /api/merge`), push (`POST /api/push`), delete (`POST /api/delete-branch`),
+/// (`POST /api/merge`), delete (`POST /api/delete-branch`),
 /// force-delete (`POST /api/force-delete-branch`), and checkout (`POST /api/checkout`).
 /// All act on a single named branch, so they share one shape. `branch` is a
 /// local branch name; the backend validates it and forwards git's own error text.
+///
+/// `POST /api/push` used this shape too until M2.20e (#231) gave it
+/// [`PushRequest`], which is this plus the two things a push can now say for
+/// itself. A `{"branch": …}` body still parses as a `PushRequest`, so nothing
+/// that spoke to `/api/push` before has to change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BranchRequest {
     pub branch: String,
+}
+
+/// Body of a `POST /api/push` request (M2.20e, #231): publish the local branch
+/// `branch` to the server-configured remote, optionally recording it as the
+/// branch's upstream and optionally force-publishing **under a lease**.
+///
+/// # The two optional fields, and why they are optional *here* and nowhere else
+///
+/// [`GitOperation::PushBranch`](crate::plan::GitOperation::PushBranch) carries
+/// `set_upstream` and `force` with **no** `#[serde(default)]` and
+/// [`ForcePublish`](crate::plan::ForcePublish) derives no `Default`, so nothing
+/// in the reviewed operation vocabulary can be constructed without stating both
+/// (M2.20a, #227). That guarantee is about the *plan a user approves*, and it is
+/// untouched: this DTO is a request, the handler maps it onto the operation, and
+/// the operation still has to say both out loud.
+///
+/// What defaulting buys is that an omitted field means the endpoint's
+/// long-standing behaviour — a plain fast-forward push with no upstream write —
+/// so a client written before this slice keeps working byte-for-byte. The
+/// defaults are the *safe* end of both axes, which is the direction a default is
+/// allowed to point: absent means "do less", never "force".
+///
+/// # There is no `remote`
+///
+/// `/api/push` has always pushed to `origin`, and adding a client-named remote
+/// here would be a separate decision with its own hazard (a request that can
+/// name where this server's credentials get sent). `force`'s
+/// `expected_remote_tip` is likewise never a URL and never a path — it is an
+/// object id, validated by [`CommitOid`](crate::plan::CommitOid).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushRequest {
+    pub branch: String,
+    /// `git push --set-upstream` — record `<remote>/<branch>` as this branch's
+    /// upstream on success. Absent ⇒ `false`, the behaviour `/api/push` has
+    /// always had.
+    #[serde(default)]
+    pub set_upstream: bool,
+    /// Absent ⇒ [`ForcePublish::None`](crate::plan::ForcePublish::None).
+    ///
+    /// `Option` rather than a `#[serde(default)]` on `ForcePublish` itself: a
+    /// `Default` impl on that enum would let *every* construction site omit the
+    /// force mode, including ones that should have to think about it, and #227's
+    /// whole posture is that a force is never something a type supplies quietly.
+    /// The handler turns `None` into `ForcePublish::None` in one visible place.
+    #[serde(default)]
+    pub force: Option<crate::plan::ForcePublish>,
 }
 
 /// Body of `POST /api/discard-tracked-paths` / `POST /api/delete-untracked-paths`

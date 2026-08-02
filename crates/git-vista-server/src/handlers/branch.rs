@@ -12,7 +12,8 @@ use axum::http::StatusCode;
 use axum::Json;
 
 use git_vista_protocol::{
-    BranchName, BranchRequest, CreateBranchRequest, ForcePublish, GitOperation, RemoteName,
+    BranchName, BranchRequest, CreateBranchRequest, ForcePublish, GitOperation, PushRequest,
+    RemoteName,
 };
 
 use crate::planner;
@@ -85,19 +86,45 @@ pub(crate) async fn merge_branch(Json(req): Json<BranchRequest>) -> (StatusCode,
 /// error; that text is forwarded to the UI.
 ///
 /// M2.20a (#227) widened [`GitOperation::PushBranch`] with `set_upstream` and
-/// `force`. This endpoint pins both to the values that reproduce the argv it
-/// has always run — no upstream write, no force — so its behaviour is
-/// unchanged. It is `/api/push`'s *own* posture, not a default the type
-/// supplies: `ForcePublish` has no `Default` impl and the fields have no
-/// `#[serde(default)]`, so every construction site has to say this out loud.
-/// Offering either capability here is M2.20g's (#231) to design, together
-/// with the UI ceremony a force deserves.
-pub(crate) async fn push_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
-    branch_op(req, |branch| GitOperation::PushBranch {
+/// `force` and this endpoint pinned both to the values that reproduced the argv
+/// it had always run. M2.20e (#231, ADR 0045) wired execution for all four
+/// combinations, so the endpoint now *offers* them — otherwise the executor
+/// would be code with no caller, which is the shape #228 shipped once and this
+/// project has been paying for since.
+///
+/// # What is still not a default
+///
+/// [`PushRequest`]'s two new fields default to the endpoint's long-standing
+/// behaviour, so a client that sends `{"branch": …}` — which is every client
+/// written before this slice, including the live frontend — gets a plain
+/// fast-forward push with no upstream write, byte for byte. That defaulting
+/// lives **here, in the request**, and stops here: `ForcePublish` still has no
+/// `Default` impl and [`GitOperation::PushBranch`]'s fields still carry no
+/// `#[serde(default)]`, so the line below is a construction site stating its
+/// posture out loud, exactly as #227 intended. The default points at *less*
+/// capability, never more, which is the only direction a default is allowed to
+/// point for a flag like this.
+///
+/// The confirmation ceremony a force-publish deserves in the UI is M2.20g's
+/// (#232) — the plan this builds already carries `RiskLevel::Destructive` for a
+/// lease push (M2.20a), which is what the frontend will scale that ceremony
+/// from.
+pub(crate) async fn push_branch(Json(req): Json<PushRequest>) -> (StatusCode, String) {
+    let PushRequest {
         branch,
-        remote: RemoteName::new("origin").expect("'origin' is a valid remote name"),
-        set_upstream: false,
-        force: ForcePublish::None,
+        set_upstream,
+        force,
+    } = req;
+    branch_op(BranchRequest { branch }, move |branch| {
+        GitOperation::PushBranch {
+            branch,
+            remote: RemoteName::new("origin").expect("'origin' is a valid remote name"),
+            set_upstream,
+            // The one place `/api/push` turns "the body said nothing about
+            // forcing" into a value. Written out rather than derived, so the
+            // safe reading is visible at the site that chose it.
+            force: force.unwrap_or(ForcePublish::None),
+        }
     })
     .await
 }
