@@ -234,7 +234,10 @@ fn the_production_policy_is_never_unsandboxed_today() {
 // "local gets Strict" proves very little on its own, since a `policy_for` that
 // returned Strict unconditionally would also pass it.
 
-use git_vista_protocol::{BranchName, CommitMessage, CommitOid, GitOperation, RefName, RemoteName};
+use git_vista_protocol::{
+    BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, RefName, RemoteName,
+    StageDirection, WorktreePath,
+};
 
 fn branch(s: &str) -> BranchName {
     BranchName::new(s).expect("valid branch name")
@@ -242,15 +245,58 @@ fn branch(s: &str) -> BranchName {
 fn oid(s: &str) -> CommitOid {
     CommitOid::new(s).expect("valid oid")
 }
+fn wpath(s: &str) -> WorktreePath {
+    WorktreePath::new(s).expect("valid worktree path")
+}
+
+/// Compile-time coverage guard, the same pattern
+/// `planner::contract_suite::covered_by` uses for the identical problem: every
+/// `GitOperation` variant is named here with **no wildcard arm**, so adding a
+/// variant fails this match at compile time until an arm exists for it.
+///
+/// This is the guard that is actually load-bearing, not the count assertion in
+/// `exactly_one_operation_declares_a_network_need` below — a hand-maintained
+/// `Vec` and a hand-maintained integer can agree with each other while both
+/// silently omit a real variant, which is exactly what happened here between
+/// M2.17b (#213), M2.18a (#219) and M2.19a (#222): `every_operation()` below
+/// went four variants (`StageSelection`, `DiscardTrackedPaths`,
+/// `DeleteUntrackedPaths`, `AmendCommit`) stale against the enum while its
+/// count literal quietly stayed self-consistent at the old number, so the
+/// exhaustiveness test never noticed a real variant's classification (this
+/// one shipped `AmendCommit => NetworkNeed::Local` with zero coverage). The
+/// match below can't drift the same way: every arm here is required to
+/// compile at all, so it forces a reviewer's eyes onto this file the moment a
+/// variant is added — which is also why `every_operation_declares_every_variant`
+/// checks its output against `every_operation()`, not the other way around.
+fn variant_name(op: &GitOperation) -> &'static str {
+    match op {
+        GitOperation::CreateBranch { .. } => "CreateBranch",
+        GitOperation::CommitOnHead { .. } => "CommitOnHead",
+        GitOperation::EmptyCommitOnBranch { .. } => "EmptyCommitOnBranch",
+        GitOperation::StageAll => "StageAll",
+        GitOperation::UnstageAll => "UnstageAll",
+        GitOperation::CheckoutBranch { .. } => "CheckoutBranch",
+        GitOperation::MergeBranch { .. } => "MergeBranch",
+        GitOperation::PushBranch { .. } => "PushBranch",
+        GitOperation::DeleteBranch { .. } => "DeleteBranch",
+        GitOperation::ForceDeleteBranch { .. } => "ForceDeleteBranch",
+        GitOperation::RebaseOntoBase { .. } => "RebaseOntoBase",
+        GitOperation::RestoreBranch { .. } => "RestoreBranch",
+        GitOperation::ResetBranch { .. } => "ResetBranch",
+        GitOperation::RevertCommit { .. } => "RevertCommit",
+        GitOperation::ResetTestRepo => "ResetTestRepo",
+        GitOperation::StageSelection { .. } => "StageSelection",
+        GitOperation::DiscardTrackedPaths { .. } => "DiscardTrackedPaths",
+        GitOperation::DeleteUntrackedPaths { .. } => "DeleteUntrackedPaths",
+        GitOperation::AmendCommit { .. } => "AmendCommit",
+    }
+}
 
 /// One value of every `GitOperation` variant, so the classifier test below is
-/// exhaustive in fact and not only in intent.
-///
-/// This deliberately does **not** use a wildcard or a macro: adding a variant
-/// makes `network_need_for_operation` fail to compile, and this list is what
-/// then makes the *test* fail to be exhaustive in a way a reviewer notices —
-/// the count assertion below is what turns "somebody added a variant and only
-/// fixed the match" into a red test.
+/// exhaustive in fact and not only in intent. Kept in sync with
+/// [`variant_name`] by `every_operation_declares_every_variant` below, which
+/// fails if this list ever again omits (or duplicates) a variant `variant_name`
+/// knows about.
 fn every_operation() -> Vec<GitOperation> {
     let tip = "1111111111111111111111111111111111111111";
     vec![
@@ -299,13 +345,77 @@ fn every_operation() -> Vec<GitOperation> {
         },
         GitOperation::RevertCommit { commit: oid(tip) },
         GitOperation::ResetTestRepo,
+        GitOperation::StageSelection {
+            direction: StageDirection::Stage,
+            expected_diff_generation: GenerationToken::new("diff-v1:x")
+                .expect("valid generation token"),
+            patch: String::new(),
+            whole_files: vec!["a.txt".to_string()],
+        },
+        GitOperation::DiscardTrackedPaths {
+            paths: vec![wpath("a.txt")],
+        },
+        GitOperation::DeleteUntrackedPaths {
+            paths: vec![wpath("a.txt")],
+        },
+        GitOperation::AmendCommit {
+            message: CommitMessage::new("msg").expect("valid message"),
+            expected_tip: oid(tip),
+            allow_empty: false,
+        },
     ]
+}
+
+/// Proves [`every_operation`] is actually exhaustive, rather than trusting a
+/// hand-maintained list to agree with a hand-maintained count (the gap that
+/// let `AmendCommit` ship with a zero-coverage `NetworkNeed` classification in
+/// M2.19a, #222): every value `every_operation()` returns is tagged through
+/// [`variant_name`]'s compile-enforced match, and the resulting name set must
+/// be the full 19 with none missing and none doubled.
+#[test]
+fn every_operation_declares_every_variant() {
+    let names: std::collections::BTreeSet<&str> =
+        every_operation().iter().map(variant_name).collect();
+    assert_eq!(
+        every_operation().len(),
+        names.len(),
+        "every_operation() lists the same GitOperation variant more than once"
+    );
+    let expected: std::collections::BTreeSet<&str> = [
+        "CreateBranch",
+        "CommitOnHead",
+        "EmptyCommitOnBranch",
+        "StageAll",
+        "UnstageAll",
+        "CheckoutBranch",
+        "MergeBranch",
+        "PushBranch",
+        "DeleteBranch",
+        "ForceDeleteBranch",
+        "RebaseOntoBase",
+        "RestoreBranch",
+        "ResetBranch",
+        "RevertCommit",
+        "ResetTestRepo",
+        "StageSelection",
+        "DiscardTrackedPaths",
+        "DeleteUntrackedPaths",
+        "AmendCommit",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        names, expected,
+        "every_operation() must list exactly the GitOperation variants \
+         variant_name() knows about — if this fails after adding a variant, \
+         add it to both variant_name() and every_operation()"
+    );
 }
 
 /// Exactly one operation in the enum reaches a remote, and it is `PushBranch`.
 ///
-/// The negative half is what matters: fourteen operations must be `Local`, so a
-/// future edit that classified, say, `MergeBranch` as `Remote` to "be safe"
+/// The negative half is what matters: eighteen operations must be `Local`, so
+/// a future edit that classified, say, `MergeBranch` as `Remote` to "be safe"
 /// would be caught here. Widening is not safe — it moves an operation from the
 /// no-network Strict tier into a tier with outbound TCP on four ports.
 #[test]
@@ -313,8 +423,10 @@ fn exactly_one_operation_declares_a_network_need() {
     let ops = every_operation();
     assert_eq!(
         ops.len(),
-        15,
-        "every_operation() must list every GitOperation variant; the enum has 15"
+        19,
+        "every_operation() must list every GitOperation variant; the enum has 19 \
+         (see every_operation_declares_every_variant for the check that actually \
+         enforces this)"
     );
     let mut remote = Vec::new();
     for op in &ops {

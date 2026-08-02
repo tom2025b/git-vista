@@ -37,6 +37,16 @@
 //! | `POST /api/reset-test-repo` | seeded composite restore | [`GitOperation::ResetTestRepo`] |
 //! | `POST /api/discard-tracked-paths` | `git checkout -- <paths>` | [`GitOperation::DiscardTrackedPaths`] |
 //! | `POST /api/delete-untracked-paths` | `git clean -f -- <paths>` | [`GitOperation::DeleteUntrackedPaths`] |
+//! | *(planned, #223)* | `git commit --amend [--allow-empty] -m` | [`GitOperation::AmendCommit`] |
+//!
+//! [`GitOperation::AmendCommit`] is a deliberate exception to "one variant
+//! per real mutation found by auditing the write handlers": M2.19a (#222)
+//! lands the typed contract — the variant, its plan-building wiring in
+//! `git-vista-server`'s `planner::shape`, and the golden fixture — ahead of
+//! any handler that could build one, so that the history-rewriting
+//! execution (M2.19b, #223) is reviewed as its own slice. See the variant's
+//! own doc comment for the full reasoning; every other row in this table
+//! already had a live handler when its variant landed.
 //!
 //! `POST /api/clone`, `/api/delete-clone`, `/api/select` and `/api/rescan` are
 //! deliberately **not** operations: they manage the catalog / app session (which
@@ -292,6 +302,90 @@ pub enum GitOperation {
     /// `Irrecoverable`, previously used only by push and test-repo-reset,
     /// applies here for a stronger reason than either of those).
     DeleteUntrackedPaths { paths: Vec<WorktreePath> },
+    /// `git commit --amend [--allow-empty] -m <message>` — rewrite the
+    /// checked-out branch's tip commit in place (a new message, and,
+    /// with `allow_empty` when nothing is staged, an otherwise-empty
+    /// commit) rather than adding a new commit on top of it (planned
+    /// `POST /api/amend-commit`, M2.19, #72).
+    ///
+    /// # Contract only (M2.19a, #222) — see the module docs' table note
+    ///
+    /// No handler builds this variant yet; it exists so the typed
+    /// vocabulary, `git-vista-server`'s `planner::shape` wiring, and the
+    /// golden fixture are settled and reviewed *before* M2.19b (#223) adds
+    /// the actual `git commit --amend` invocation — a history-rewriting
+    /// operation that earns a review of its own rather than riding in on
+    /// this one.
+    ///
+    /// # No `branch` field
+    ///
+    /// Unlike [`GitOperation::EmptyCommitOnBranch`], amend always targets
+    /// whatever the checked-out branch's tip already is. There is no "amend
+    /// a commit on a branch that isn't checked out" primitive the way there
+    /// is an "add an empty commit to a stub branch" one — amending
+    /// presupposes an existing commit to rewrite, and this app never lets a
+    /// user pick some other branch's commit to amend. A future milestone
+    /// that needs that is a new variant, not a field bolted on here.
+    ///
+    /// # `expected_tip` is a live compare-and-swap, not a carried value
+    ///
+    /// `shape` turns `expected_tip` into a [`Precondition::RefAt`] on the
+    /// checked-out branch — the same CAS pattern
+    /// [`GitOperation::ResetBranch`] and [`GitOperation::EmptyCommitOnBranch`]
+    /// already use for their own expected-tip fields. Amending when the tip
+    /// moved under the reviewer between plan and execution is *the*
+    /// dangerous case here: the reviewer approved rewriting one specific
+    /// commit, and the `Precondition` machinery is what makes "the tip is
+    /// still what was reviewed" a live, execution-time check rather than a
+    /// value this field merely carries around unread.
+    ///
+    /// # Recovery is `ResetRef`, deliberately not a new tag
+    ///
+    /// Moving the checked-out branch back to `expected_tip` fully restores
+    /// the pre-amend state — exactly the "reset the ref back" recovery
+    /// every other commit-creating operation in this vocabulary already
+    /// uses ([`GitOperation::CommitOnHead`], [`GitOperation::MergeBranch`],
+    /// [`GitOperation::RebaseOntoBase`]) via `shape`'s shared `head_moves`
+    /// helper. Two more exotic tags were considered and rejected rather
+    /// than picked by reflex:
+    ///
+    ///   - [`RecoveryStrategy::RecoverableIfStaged`] is #219's tag for
+    ///     **working-tree content**, whose recoverability depends on
+    ///     whether it happened to have been staged before a discard. A
+    ///     commit's content has no such conditional — it is always in the
+    ///     object database by definition — so that question has no
+    ///     analogue here.
+    ///   - [`RecoveryStrategy::Irrecoverable`] would misstate a case that
+    ///     is trivially restorable by moving one ref back.
+    ///
+    /// What *is* worth saying honestly: the amended-away commit sits on no
+    /// ref afterward, so — like every commit `ResetRef` recovers — it
+    /// survives only in the reflog until the next `git gc` (the default
+    /// ~90-day reflog expiry). That caveat is not unique to amend; it
+    /// already applies silently to `CommitOnHead`'s and `MergeBranch`'s
+    /// `ResetRef` recovery too, so giving amend a different tag for the
+    /// same property would single it out inconsistently rather than fix a
+    /// real gap.
+    ///
+    /// # Divergence from an already-pushed tip is out of scope here
+    ///
+    /// Amending a commit that has already been pushed makes the local and
+    /// remote branch diverge — a real consequence, but not one this
+    /// contract slice models: `shape`'s `Precondition::RefAt` only ever
+    /// checks the **local** ref (matching every other CAS precondition in
+    /// this file), and this variant carries no remote/tracking-ref field.
+    /// Whether execution should warn, refuse, or require an explicit
+    /// force-push acknowledgment when the checked-out branch has a
+    /// remote-tracking ref ahead of `expected_tip` is an execution-time
+    /// decision — #223's to make, once it also owns the git invocation and
+    /// can decide what UX the danger deserves. Network need is unaffected
+    /// either way: amending never itself talks to a remote (see
+    /// `sandbox::network_need_for_operation`).
+    AmendCommit {
+        message: CommitMessage,
+        expected_tip: CommitOid,
+        allow_empty: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +653,18 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&delete).unwrap(),
             r#"{"op":"delete_untracked_paths","paths":["scratch/tmp.log"]}"#
+        );
+        let amend = GitOperation::AmendCommit {
+            message: CommitMessage::new("fix: typo").unwrap(),
+            expected_tip: oid('a'),
+            allow_empty: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&amend).unwrap(),
+            format!(
+                r#"{{"op":"amend_commit","message":"fix: typo","expected_tip":"{}","allow_empty":false}}"#,
+                "a".repeat(40)
+            )
         );
     }
 
