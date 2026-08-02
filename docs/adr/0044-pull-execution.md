@@ -239,7 +239,7 @@ Two small widenings made that honest rather than approximate:
   reach an argv changed; only the name of the thing being described did.
 
 - **`IntegrationCaller`**, a two-variant enum passed to both executors, decides what the
-  activity feed records. See §5.
+  activity feed records. See §6.
 
 **`git rev-parse refs/remotes/<remote>/<branch>` gates the integration**, before it runs. A
 fetch that succeeded without producing the ref the caller named is
@@ -248,7 +248,76 @@ classification of git's "not something we can merge", so it is true under any lo
 fetch half's work is still reported: the objects arrived, the tracking refs moved, and the
 response says so.
 
-### 4. A conflict is aborted, the abort is verified by observation, and the result is a 409
+### 4. The integration half declares `NetworkNeed::Local` — a pull is not a wider door into `git merge`
+
+Reusing `exec_merge` / `exec_rebase` means reusing the *sandbox tier* they run in, and that
+took a deliberate correction found in review: the obvious code threads `exec_pull`'s own
+`need` into both halves, and `network_need_for_operation(PullBranch)` is
+`NetworkNeed::Remote`.
+
+`need` is not a label. It is what picks the tier, and hooks run in every tier:
+
+```mermaid
+flowchart TD
+    OP["GitOperation::PullBranch"] --> N["network_need_for_operation<br/>=> NetworkNeed::Remote"]
+    N --> F["fetch half<br/>run_fetch → git_streamed_for"]
+    N -.->|the bug| M1["integration half<br/>git merge / git rebase"]
+    N --> L["INTEGRATION_NEED<br/>= NetworkNeed::Local"]
+    L --> M2["integration half<br/>git merge / git rebase"]
+    F --> T1["tier_for Remote, untrusted<br/>=> Tier::Network"]
+    M1 --> T1
+    M2 --> T2["tier_for Local, untrusted<br/>=> Tier::Strict"]
+    T1 --> H1["HookMode::Run<br/>net_ports = DEFAULT_GIT_PORTS<br/>no bwrap namespaces"]
+    T2 --> H2["HookMode::Run<br/>--net-deny + bwrap --unshare-net"]
+```
+
+`policy_for` sets `HookMode::Run` unconditionally — that is ADR 0029's posture, and it is
+correct: a repository's hooks are part of the repository, and blocking them is the degrade
+ADR 0029 rejects by name. What must therefore be right is the *tier* they run in. Under
+`Tier::Network` a `post-merge`, `post-checkout` or `post-rewrite` hook gets outbound TCP on
+22/443/80/9418 and no network namespace; under `Tier::Strict` it gets `--net-deny`, bwrap's
+`--unshare-net`, and a seccomp filter that refuses `connect` outright.
+
+So threading the pull's `Remote` need into the integration half would mean **the identical
+git command is more dangerous through `POST /api/pull` than through `POST /api/merge`** —
+and a pull is precisely the operation a hostile clone's hooks are waiting for. Nothing in
+the functional suite would have noticed: the pull still fetches, still integrates, still
+journals.
+
+`planner::pull::INTEGRATION_NEED` is therefore a named constant, and `need` appears exactly
+once in `exec_pull` — on the call to `run_fetch`. `unmerged_paths` and `restored` take no
+need parameter at all, so there is no third place for the wrong one to be threaded into.
+The declaration is truthful rather than merely conservative: `git merge`, `git rebase`,
+their `--abort`s and `git ls-files --unmerged` reach no remote, and `reconcile_need` only
+ever complains about the opposite direction (declared `Local`, argv looks remote).
+
+**How it is proved.** Not by reading the source, and not by asserting a mapping against the
+function that defines it. `pull_suite` installs real git hooks that record
+`readlink /proc/self/ns/net` and drives a real pull:
+
+```mermaid
+sequenceDiagram
+    participant T as test process
+    participant P as exec_pull
+    participant RT as reference-transaction hook
+    participant PM as post-merge hook
+    T->>P: POST /api/pull (merge)
+    P->>RT: fetch half, Tier::Network
+    RT-->>T: netns == the test process's
+    P->>PM: integration half, Tier::Strict
+    PM-->>T: netns != the test process's
+```
+
+The fetch-side leg is what keeps the integration-side leg from passing vacuously: it shows
+the same probe reporting the host namespace within the same pull, so "different namespace"
+cannot be an artefact of a hook that never ran or of a test runner already inside a
+namespace. `a_hook_in_a_direct_merge_is_confined_the_same_way` pins the reference point on
+the `POST /api/merge` route. Both were verified by mutation — setting `INTEGRATION_NEED`
+back to `NetworkNeed::Remote` fails the pull test with the host namespace on both sides and
+leaves every other test in the crate green, which is exactly how the hole survived first
+review.
+
+### 5. A conflict is aborted, the abort is verified by observation, and the result is a 409
 
 ```mermaid
 flowchart TD
@@ -313,7 +382,7 @@ conflict test would still pass.
 `OperationState::Failed` from any non-2xx, so the operation is correctly not `Succeeded`,
 and a client gets a state it can act on rather than an apology.
 
-### 5. The feed records the operation the user approved, not the git command that ran it
+### 6. The feed records the operation the user approved, not the git command that ran it
 
 A pull's integration half runs `git merge` or `git rebase`. A user who pressed "Pull" never
 asked for a merge. A feed showing `Fetch` + `Merge` for one approved `PullBranch` describes
@@ -352,7 +421,7 @@ The generation bump is inherited, not re-done: `plan_and_execute_tracked` re-rea
 generation after every operation. An executor that also bumped it would be a second source
 of truth for a value that must have exactly one.
 
-### 6. `advanced` is an observation, and failing to observe refuses the pull
+### 7. `advanced` is an observation, and failing to observe refuses the pull
 
 `PullSuccess::advanced` answers "did the pull change anything?" — the question the response
 exists for. It is computed from the branch tip before and after, not from git's prose and
@@ -365,7 +434,27 @@ moved (a fetch writes only `refs/remotes/*`). Reusing it keeps one source of tru
 same value. **If either side is `Obs::Unknown`, the pull refuses** rather than integrating
 and then guessing.
 
-### 7. One `Box::pin`, and why it is load-bearing
+**And it is `advanced`, not `!updated_refs.is_empty()`** — two facts about two different
+halves that the first draft of this suite could not tell apart. Every fixture in it had
+"the fetch had something to bring" and "the checked-out branch had something to integrate"
+as the *same* fact, so replacing the tip comparison with the fetch's ref list left all
+thirteen pull tests green. Two fixtures now separate them, one in each direction:
+
+```mermaid
+flowchart LR
+    subgraph A["pre-fetched by the harness"]
+      A1["fetch half moves nothing<br/>updated_refs = []"] --> A2["integration moves HEAD<br/>advanced = true"]
+    end
+    subgraph B["remote gains a commit on 'other'"]
+      B1["fetch half moves origin/other<br/>updated_refs = [origin/other]"] --> B2["origin/main already merged<br/>advanced = false"]
+    end
+```
+
+In both, `git rev-parse HEAD` before and after is the referee for the `advanced` claim, so
+neither test asserts the field against the code that produced it. No implementation can
+satisfy both by deriving either value from the other.
+
+### 8. One `Box::pin`, and why it is load-bearing
 
 Adding a single `.await` frame to the fetch path — `exec_fetch` awaiting `run_fetch` — took
 the fetch suite from green to `fatal runtime error: stack overflow`. The cause was
@@ -387,10 +476,11 @@ to be deepest on the stack.
 |---|---|---|
 | `git fetch` spawn, sandbox tier, askpass hardening, redaction | ✅ `run_fetch` → `git_streamed_for` | — |
 | Transfer progress parsing and publication | ✅ | — |
-| Cancellation during transfer | ✅ | a second latch read between the halves (§8) |
+| Cancellation during transfer | ✅ | a second latch read between the halves (§3's state diagram) |
 | Ref observation, `journal_unobserved` | ✅ | — |
 | Fetch failure taxonomy | ✅ | a total, literal-table mapping into `PullFailureKind` |
 | Merge / rebase execution | ✅ `exec_merge` / `exec_rebase` | `IntegrationCaller`; `RefName` targets |
+| Sandbox tier of the integration half | ✅ `Tier::Strict`, same as `/api/merge` | `INTEGRATION_NEED`, so the pull's `Remote` need cannot leak into it (§4) |
 | Conflict abort + restoration check | — | all of it |
 | `NoSuchRemoteBranch` observation | — | all of it |
 | Wire DTOs | — | `PullRequest` / `PullSuccess` / `PullError` / `PullFailureKind` |
@@ -479,11 +569,19 @@ the census stale.
 - A conflicted pull leaves a browser-only user with a clean working tree and a sentence
   they can act on, and says which of the two conflict states they are in.
 - The activity feed describes pulls as pulls.
+- The integration half runs in the **same sandbox tier as a direct merge**, so a repository
+  hook cannot reach the network through `/api/pull` when `/api/merge` denies it — pinned by
+  a behavioural namespace probe rather than by source inspection (§4).
 - The pipeline's future shrank 19×, fixing a latent stack-overflow hazard that predated
   this slice.
 
 **Costs and open edges, stated plainly.**
 
+- **A pull still runs *two* tiers, and that is inherent.** The fetch half needs
+  `Tier::Network`; the integration half needs `Tier::Strict`. §4 makes the split explicit
+  instead of accidental, but it does mean one approved operation spans two sandbox
+  postures, and any future step added to `exec_pull` has to state which one it belongs to.
+  The netns probe in `pull_suite` is what will catch a step that picks wrong.
 - **The between-halves cancel check is not covered behaviourally.** Reaching it needs a
   cancel that lands after `git fetch` exits and before `git merge` spawns; every way to
   arrange that is a timing race, and a cancel landing a moment earlier is caught by
