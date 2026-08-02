@@ -35,10 +35,10 @@ use git_vista_core::activity::ActivityKind;
 use git_vista_core::identity::{GenerationInputs, RepositoryId};
 use git_vista_core::seed::{parse_seed, reset_plan, Seed};
 use git_vista_protocol::{
-    BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
-    IdempotencyKey, OperationHash, OperationStage, Plan, Precondition, RecoveryStrategy, RefChange,
-    RefName, RefState, RemoteName, RepositoryToken, RiskLevel, UnixSeconds, WorktreePath,
-    WorktreeToken, IDEMPOTENCY_HEADER,
+    AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitMessage, CommitOid,
+    ForcePublish, GenerationToken, GitOperation, IdempotencyKey, OperationHash, OperationStage,
+    Plan, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
+    RepositoryToken, RiskLevel, UnixSeconds, WorktreePath, WorktreeToken, IDEMPOTENCY_HEADER,
 };
 
 use crate::git_cmd::{git_ok, rev_parse, ExecUnavailable};
@@ -1284,8 +1284,9 @@ async fn shape(
             Vec::new(),
             RecoveryStrategy::Irrecoverable,
         ),
-        // M2.19a (#222): contract only — see `GitOperation::AmendCommit`'s
-        // doc comment for the full reasoning behind every choice below.
+        // M2.19a (#222) shaped this; M2.19b (#223) executes it — see
+        // `GitOperation::AmendCommit`'s doc comment for the full reasoning
+        // behind every choice below, and `exec_amend_commit` for execution.
         // Deliberately *not* built from `head_moves` above: that helper
         // derives its "before" oid from `observed`, but amend needs a real
         // compare-and-swap against the operation's own `expected_tip`
@@ -1502,22 +1503,14 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         GitOperation::DeleteUntrackedPaths { paths } => {
             exec_delete_untracked_paths(repo, need, &paths).await
         }
-        // M2.19a (#222) ships the typed contract only — see
-        // `GitOperation::AmendCommit`'s doc comment. `git commit --amend`
-        // execution is M2.19b's (#223) to add, deliberately, so a
-        // history-rewriting operation gets a review of its own rather than
-        // riding in on this vocabulary-only change. This arm exists only
-        // because `execute`'s match must stay exhaustive over the closed
-        // `GitOperation` vocabulary (#142): no handler builds an
-        // `AmendCommit` plan today, so in practice it is unreachable, but if
-        // it is ever reached it must refuse rather than silently no-op or
-        // run a placeholder git command against a real repository.
-        GitOperation::AmendCommit { .. } => (
-            StatusCode::NOT_IMPLEMENTED,
-            "Amending a commit is not yet wired for execution (tracked by #223) — \
-             this plan's contract exists, but nothing executed it."
-                .to_string(),
-        ),
+        // M2.19a (#222) shipped the typed contract; M2.19b (#223, ADR 0040)
+        // wired this execution — `handlers::commit::amend_commit` builds the
+        // operation from `POST /api/amend-commit`.
+        GitOperation::AmendCommit {
+            message,
+            expected_tip,
+            allow_empty,
+        } => exec_amend_commit(repo, need, &message, &expected_tip, allow_empty, &observed).await,
         // M2.20a (#227) ships the typed contract for fetch and pull only —
         // see their doc comments in `plan.rs`. Execution belongs to #229 and
         // #230, deliberately, so that the first code in this server to open a
@@ -1827,6 +1820,309 @@ async fn exec_empty_commit_on_branch(
     )
     .await;
     (StatusCode::OK, "Created commit.".to_string())
+}
+
+/// `git commit --amend [--allow-empty] -m <message>` (`/api/amend-commit`,
+/// M2.19b #223, ADR 0040): rewrite the checked-out branch's tip commit in
+/// place — the first history-rewriting execution in this vocabulary, so every
+/// step here is defensive by design.
+///
+/// The order of operations is deliberate:
+///
+///  1. **Detached-HEAD refusal.** Amend targets the checked-out *branch* (the
+///     variant's doc comment: there is no "amend some other commit"
+///     primitive), and the plan's `ResetRef` recovery needs a branch ref to
+///     reset — on detached HEAD `shape` degrades recovery to `NotNeeded`,
+///     which would be a lie the moment a rewrite actually happened. Refuse
+///     rather than run with no recovery story.
+///  2. **The compare-and-swap.** The executor-level guard, mirroring
+///     `exec_empty_commit_on_branch`'s CAS and `exec_reset_branch`'s: the tip
+///     observed at plan-build time must equal the operation's `expected_tip`.
+///     This is the leg that catches a request whose `expected_tip` was stale
+///     *from the start* — `enforce_fresh` re-verifies only preconditions that
+///     held at build time, so a failed-at-build `RefAt` flows through to
+///     exactly this refusal (a 400: the client's picture of the repository is
+///     wrong, which is a request problem, not a race — races are the gate's
+///     409s). D5: an `Absent` observation (unborn HEAD — nothing to amend)
+///     refuses here too, and an `Unknown` one never reaches this function at
+///     all (`enforce_fresh` refuses unreadable observations with a 500).
+///  3. **The published-history flag**, read *before* the rewrite while the
+///     amended-away commit is still the tip. Advisory, never blocking — the
+///     user may be amending published history knowingly, and the pre-flight
+///     ceremony belongs to the client (M2.19d); ADR 0040 records why.
+///  4. `git commit --amend`, through the sealed chokepoint like every other
+///     mutation (hooks — when the sandbox's `HookMode` runs them at all —
+///     execute as children of this one spawn; there is no separate hook
+///     path to bypass, which `argv_boundary`'s spawn-site census pins).
+///  5. On failure, the typed classification ([`classify_amend_failure`]);
+///     on success, the journal event (old tip → new tip, `ActivityKind::Amend`)
+///     whose oid pair is what makes the amend visible in `/api/activity` and
+///     undoable via its reset-back hint. The durable `ResetRef` recovery ref
+///     is not written here: the tracked pipeline writes it for every
+///     operation from the plan's own `recovery` (see
+///     `plan_and_execute_tracked`), which `shape` pins to
+///     `ResetRef { <branch>, expected_tip }` for this operation.
+async fn exec_amend_commit(
+    repo: &Path,
+    need: NetworkNeed,
+    message: &CommitMessage,
+    expected_tip: &CommitOid,
+    allow_empty: bool,
+    observed: &Observed,
+) -> (StatusCode, String) {
+    let Some(branch) = observed.head_branch.clone() else {
+        return amend_refusal(
+            AmendFailureKind::Other,
+            "Amending requires a checked-out branch — HEAD is detached. \
+             Check out a branch and try again.",
+        );
+    };
+    match observed.head_tip.known().map(String::as_str) {
+        Some(tip) if tip == expected_tip.as_str() => {}
+        Some(_) => {
+            return amend_refusal(
+                AmendFailureKind::StaleTip,
+                "HEAD has moved since this amend was reviewed — refresh and try again.",
+            )
+        }
+        None => {
+            return amend_refusal(
+                AmendFailureKind::StaleTip,
+                "There is no commit here to amend — refresh and try again.",
+            )
+        }
+    }
+
+    let published = amended_commit_is_published(repo, expected_tip).await;
+
+    let mut args = vec!["commit", "--amend"];
+    if allow_empty {
+        args.push("--allow-empty");
+    }
+    args.push("-m");
+    args.push(message.as_str());
+    let output = match run_git(repo, need, &args).await {
+        Ok(o) => o,
+        Err(e) => return couldnt_run("/api/amend-commit", &e),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let kind = classify_amend_failure(
+            &stderr,
+            signing_requested(repo, need).await,
+            rejectable_hook_present(repo, need).await,
+        );
+        // Amend shares `git commit`'s quirk: some refusals go to stdout.
+        let msg = stderr_stdout_or(&output, "git commit --amend failed.");
+        return amend_refusal(kind, &msg);
+    }
+
+    let new = Obs::from_read(rev_parse(repo, "HEAD").await);
+    let summary = message
+        .as_str()
+        .lines()
+        .next()
+        .unwrap_or(message.as_str())
+        .to_string();
+    println!(
+        "[/api/amend-commit] amended tip of '{branch}' ({} → {})",
+        short(expected_tip.as_str()),
+        new.known().map(|o| short(o)).unwrap_or("unknown"),
+    );
+    journal_app_event(
+        repo,
+        ActivityKind::Amend,
+        Some(branch),
+        // The pre-amend tip is the CAS pin this operation was built on — an
+        // exact value, not a read. The new tip is a post-mutation read that
+        // can honestly be `Unknown` (D5), in which case the journal notes it
+        // and no undo is offered.
+        Obs::Known(expected_tip.as_str().to_string()),
+        new.clone(),
+        summary,
+    )
+    .await;
+    let body = AmendCommitSuccess {
+        message: "Amended commit.".to_string(),
+        old_tip: expected_tip.as_str().to_string(),
+        new_tip: new.known().cloned(),
+        amended_published_commit: published,
+    };
+    (
+        StatusCode::OK,
+        serde_json::to_string(&body).expect("AmendCommitSuccess serialization cannot fail"),
+    )
+}
+
+/// The one constructor for `/api/amend-commit`'s 400 contract: every refusal
+/// body from that endpoint — the handler's request-shape rejections and the
+/// executor's classified failures alike — is an [`AmendCommitError`] built
+/// here, so a client can always parse a 400 from this route as that one type.
+pub(crate) fn amend_refusal(kind: AmendFailureKind, message: &str) -> (StatusCode, String) {
+    eprintln!("git-vista: /api/amend-commit refused ({kind:?}): {message}");
+    (
+        StatusCode::BAD_REQUEST,
+        serde_json::to_string(&AmendCommitError {
+            kind,
+            message: message.to_string(),
+        })
+        .expect("AmendCommitError serialization cannot fail"),
+    )
+}
+
+/// Whether `tip` is reachable from any remote-tracking ref — the
+/// published-history guard's question (#223). Three-state on purpose:
+/// `Some(true)`/`Some(false)` are the walk's real answer, `None` is "the walk
+/// failed", which the response must not collapse into `false` (a
+/// shared-history warning that silently reads unknown as unpublished fails
+/// open — the exact `Obs` lesson, applied to the wire).
+///
+/// Reuses [`git_vista_git::remote_membership`] — the shared remote walk
+/// `handlers::read` already uses twice for its own on-remote flags — rather
+/// than the capped [`git_vista_git::read_remote_commits`] the activity feed
+/// uses. The issue named the capped helper, but the cap is wrong for *this*
+/// question: `read_remote_commits` keeps only the newest `HISTORY_LIMIT`
+/// remote commits, and the tip being amended is routinely deep below that in
+/// remote terms — this repository's own workflow (branches preserved forever
+/// after merging) makes "amend the tip of a branch merged into origin/main
+/// long ago" an ordinary case, and a capped walk would answer `false` for
+/// exactly the shared commit the flag exists to warn about. A false negative
+/// is the dangerous direction for a defense-in-depth flag, so the exact,
+/// stop-when-found membership walk is the right shared helper; nothing is
+/// re-implemented (ADR 0040 records the substitution).
+async fn amended_commit_is_published(repo: &Path, tip: &CommitOid) -> Option<bool> {
+    let repo = repo.to_path_buf();
+    let requested: std::collections::HashSet<git_vista_core::model::Oid> =
+        std::iter::once(git_vista_core::model::Oid(tip.as_str().to_string())).collect();
+    tokio::task::spawn_blocking(
+        move || match git_vista_git::remote_membership(&repo, &requested) {
+            Ok(found) => Some(!found.is_empty()),
+            Err(e) => {
+                eprintln!(
+                    "git-vista: /api/amend-commit couldn't check remote reachability \
+                     (reporting it as unknown, not as unpublished): {e}"
+                );
+                None
+            }
+        },
+    )
+    .await
+    .unwrap_or(None)
+}
+
+/// Whether this repository's own config asks for commit signing
+/// (`commit.gpgsign`, normalized through `--type=bool`). A probe for
+/// [`classify_amend_failure`]'s ssh-format leg — locale-independent, unlike
+/// stderr. Unset, unreadable, or git-couldn't-run all answer `false`: a
+/// classification probe must never invent a claim it could not read.
+async fn signing_requested(repo: &Path, need: NetworkNeed) -> bool {
+    match run_git(
+        repo,
+        need,
+        &["config", "--type=bool", "--get", "commit.gpgsign"],
+    )
+    .await
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "true",
+        _ => false,
+    }
+}
+
+/// Whether a hook that can reject `git commit --amend` (`pre-commit`,
+/// `prepare-commit-msg`, `commit-msg`) exists — executable — in the
+/// **effective** hooks directory.
+///
+/// "Effective" is the load-bearing word: the directory is asked of git
+/// *through the same sealed chokepoint the amend itself ran through*
+/// (`rev-parse --git-path hooks`), so when the sandbox policy is
+/// `HookMode::Blocked` — which injects `-c core.hooksPath=<server-owned
+/// empty dir>` into every spawn, shim and unsandboxed tier alike — this
+/// probe sees that same empty directory and answers `false`. A repository
+/// whose hooks cannot run can never have a failure classified as a hook
+/// rejection, with no separate policy plumbing to drift out of sync.
+async fn rejectable_hook_present(repo: &Path, need: NetworkNeed) -> bool {
+    let hooks_dir = match run_git(repo, need, &["rev-parse", "--git-path", "hooks"]).await {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return false,
+    };
+    if hooks_dir.is_empty() {
+        return false;
+    }
+    // `--git-path` answers relative to the repository when it answers
+    // relatively at all (the spawn runs `git -C <repo>`).
+    let dir = {
+        let p = PathBuf::from(&hooks_dir);
+        if p.is_absolute() {
+            p
+        } else {
+            repo.join(p)
+        }
+    };
+    ["pre-commit", "prepare-commit-msg", "commit-msg"]
+        .iter()
+        .any(|hook| {
+            std::fs::metadata(dir.join(hook))
+                .map(|m| {
+                    use std::os::unix::fs::PermissionsExt;
+                    m.is_file() && m.permissions().mode() & 0o111 != 0
+                })
+                .unwrap_or(false)
+        })
+}
+
+/// Classify a failed `git commit --amend` into the typed
+/// [`AmendFailureKind`] the wire carries (#223), so the frontend never
+/// regex-sniffs stderr itself. Pure over its three inputs — the async probes
+/// live in the callers — so every branch is unit-testable without a spawn.
+///
+/// What each leg rests on, and how it degrades (all verified empirically
+/// against git 2.43 — see the paired tests):
+///
+///  * **Signing, gpg format:** git's canonical `gpg failed to sign the data`
+///    line. Exact under the C/English locales; under a translated locale the
+///    body text differs and this leg falls through — degrading toward
+///    `Other`, which promises nothing (safe).
+///  * **Signing, ssh format:** the leading error line names the key path and
+///    varies, but `fatal: failed to write commit object` is common to every
+///    failed-signer shape — meaningful as a signing signal only when the
+///    repo's config actually requested signing, which is what the
+///    locale-independent `signing_requested` probe supplies. Without that
+///    guard, a genuine object-store write failure would masquerade as a
+///    signing problem.
+///  * **Hook rejection:** git prints **nothing of its own** when a hook
+///    rejects a commit — a silently-failing `pre-commit` yields exit 1 with
+///    empty stderr *and* stdout — so there is no positive marker to match,
+///    only an inference: a rejectable hook exists (the effective-hooks-dir
+///    probe), and stderr carries no `fatal:` (the prefix is hardcoded in
+///    git's `die()`, never localized, so this guard is locale-proof) and not
+///    the one known non-fatal refusal this argv can produce (the
+///    would-become-empty advice, "You asked to amend the most recent
+///    commit…"). Known residuals, accepted and safe-directional: a hook that
+///    itself prints `fatal:` classifies as `Other` (right message, weaker
+///    kind); under a non-English locale the would-become-empty text is
+///    translated, so with a hook present that refusal classifies as
+///    `HookRejected` (wrong kind, and the message shown is still git's own
+///    correct advice).
+///  * Everything else: [`AmendFailureKind::Other`], with git's words
+///    forwarded untouched.
+fn classify_amend_failure(
+    stderr: &str,
+    signing_requested: bool,
+    rejectable_hook_present: bool,
+) -> AmendFailureKind {
+    if stderr.contains("gpg failed to sign the data") {
+        return AmendFailureKind::SigningFailed;
+    }
+    if signing_requested && stderr.contains("failed to write commit object") {
+        return AmendFailureKind::SigningFailed;
+    }
+    if rejectable_hook_present
+        && !stderr.contains("fatal:")
+        && !stderr.contains("You asked to amend the most recent commit")
+    {
+        return AmendFailureKind::HookRejected;
+    }
+    AmendFailureKind::Other
 }
 
 /// `git add -A` (`/api/stage`).
@@ -4276,6 +4572,125 @@ mod tests {
         let (status, why) = enforce_fresh(&repo, &plan, &observed).await.unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(why.contains("repository changed"), "{why}");
+    }
+
+    // -----------------------------------------------------------------------
+    // M2.19b (#223): `classify_amend_failure` — the pure classification the
+    // wire's `AmendFailureKind` rests on. Driven branch by branch with the
+    // stderr shapes captured from a real git 2.43 (see the function's doc
+    // comment), plus the paired negatives that keep each leg from going
+    // vacuous. The end-to-end versions (real hooks, real failed signers,
+    // through the full pipeline) live in `contract_suite`.
+    // -----------------------------------------------------------------------
+
+    /// Every classification branch, with its paired negative on the same
+    /// row: the input that must NOT take that branch differs from the
+    /// matching one by exactly the load-bearing fact.
+    #[test]
+    fn classify_amend_failure_covers_every_branch_with_paired_negatives() {
+        use AmendFailureKind::*;
+        // Captured verbatim from git 2.43 (scratch experiments, 2026-08-02).
+        let gpg = "error: gpg failed to sign the data:\n(no gpg output)\nfatal: failed to write commit object";
+        let ssh = "error: Couldn't load public key /k: No such file or directory?\n\nfatal: failed to write commit object";
+        let empty_amend = "You asked to amend the most recent commit, but doing so would make\nit empty. You can repeat your command with --allow-empty, or you can\nremove the commit entirely with \"git reset HEAD^\".";
+        let merge_fatal = "fatal: You are in the middle of a merge -- cannot amend.";
+
+        // (stderr, signing_requested, hook_present) → expected kind, and why.
+        let cases: &[(&str, bool, bool, AmendFailureKind, &str)] = &[
+            // -- signing, gpg format: the canonical line decides alone --
+            (gpg, true, false, SigningFailed, "gpg line, signing on"),
+            (
+                gpg,
+                false,
+                false,
+                SigningFailed,
+                "the canonical gpg line is decisive even unprobed",
+            ),
+            (
+                gpg,
+                true,
+                true,
+                SigningFailed,
+                "signing outranks a present hook",
+            ),
+            // -- signing, ssh format: needs the config probe --
+            (
+                ssh,
+                true,
+                false,
+                SigningFailed,
+                "ssh-format signer failure with signing configured",
+            ),
+            (
+                ssh,
+                false,
+                false,
+                Other,
+                "paired negative: the identical stderr WITHOUT signing configured is a \
+              plain object-write failure — blaming the signer would hide disk trouble",
+            ),
+            // -- hook rejection: silence plus a hook, and nothing fatal --
+            (
+                "",
+                false,
+                true,
+                HookRejected,
+                "the real shape: silent hook, empty stderr",
+            ),
+            (
+                "nope: bad message",
+                false,
+                true,
+                HookRejected,
+                "a chatty hook is still a hook",
+            ),
+            (
+                "",
+                false,
+                false,
+                Other,
+                "paired negative: the identical silence with NO hook present must not \
+              invent a hook to blame",
+            ),
+            (
+                merge_fatal,
+                false,
+                true,
+                Other,
+                "paired negative: git's own fatal refusals never classify as a hook, \
+              hook present or not — the fatal: prefix is die()'s, unlocalized",
+            ),
+            (
+                empty_amend,
+                false,
+                true,
+                Other,
+                "paired negative: the would-become-empty advice is git's, not the \
+              hook's, even though it is non-fatal and a hook is present",
+            ),
+            // -- everything else --
+            (
+                merge_fatal,
+                false,
+                false,
+                Other,
+                "an ordinary fatal is Other",
+            ),
+            (
+                empty_amend,
+                false,
+                false,
+                Other,
+                "the empty-amend advice is Other",
+            ),
+        ];
+        for (stderr, signing, hook, expected, why) in cases {
+            assert_eq!(
+                classify_amend_failure(stderr, *signing, *hook),
+                *expected,
+                "{why} (stderr={stderr:?}, signing={signing}, hook={hook})"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

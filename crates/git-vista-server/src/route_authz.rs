@@ -97,6 +97,9 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     ("/api/rescan", Method::POST, Authz::SessionAndCsrf),
     ("/api/branch", Method::POST, Authz::SessionAndCsrf),
     ("/api/commit", Method::POST, Authz::SessionAndCsrf),
+    // M2.19b (#223): amend rewrites the tip commit — a Destructive git write,
+    // so the full write posture like every other mutation here.
+    ("/api/amend-commit", Method::POST, Authz::SessionAndCsrf),
     ("/api/stage", Method::POST, Authz::SessionAndCsrf),
     // Staging selections (M2.17b, #213). The diff read is GET (no CSRF
     // surface) but still full_routes-only — it feeds the write surface and
@@ -142,7 +145,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 40;
+const EXPECTED_ROUTE_COUNT: usize = 41;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in
