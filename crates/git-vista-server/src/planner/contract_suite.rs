@@ -181,6 +181,8 @@ fn covered_by(op: &GitOperation) -> &'static str {
             "delete_untracked_paths_executes_through_the_pipeline"
         }
         GitOperation::AmendCommit { .. } => "amend_commit_executes_through_the_pipeline",
+        GitOperation::FetchRemote { .. } => "fetch_remote_executes_through_the_pipeline",
+        GitOperation::PullBranch { .. } => "pull_branch_executes_through_the_pipeline",
     }
 }
 
@@ -215,6 +217,8 @@ fn every_operation_kind_names_a_distinct_pipeline_test() {
         GitOperation::PushBranch {
             branch: branch("b"),
             remote: RemoteName::new("origin").unwrap(),
+            set_upstream: false,
+            force: ForcePublish::None,
         },
         GitOperation::DeleteBranch {
             branch: branch("b"),
@@ -255,6 +259,14 @@ fn every_operation_kind_names_a_distinct_pipeline_test() {
             message: message("m"),
             expected_tip: oid(&zeros),
             allow_empty: false,
+        },
+        GitOperation::FetchRemote {
+            remote: RemoteName::new("origin").unwrap(),
+        },
+        GitOperation::PullBranch {
+            remote: RemoteName::new("origin").unwrap(),
+            branch: branch("b"),
+            strategy: git_vista_protocol::MergeStrategy::Merge,
         },
     ];
     let names: Vec<&str> = samples.iter().map(covered_by).collect();
@@ -580,6 +592,8 @@ async fn push_branch_executes_through_the_pipeline() {
         GitOperation::PushBranch {
             branch: branch("main"),
             remote: RemoteName::new("origin").unwrap(),
+            set_upstream: false,
+            force: ForcePublish::None,
         },
     )
     .await;
@@ -1150,22 +1164,28 @@ async fn discard_tracked_paths_refuses_a_directory_target() {
     assert_eq!(status, StatusCode::CONFLICT, "{why}");
 }
 
-/// The pure logic [`partial_delete_report`] exists for (review finding):
-/// `git clean`'s own stdout is the ground truth for what actually got
-/// removed, and a requested path missing from it must never be silently
-/// folded into a claimed full success. Tested directly against a hand-built
-/// stdout string — the real race that produces this exact mismatch can't be
-/// deterministically timed in a permanent test (the review that found this
-/// bug used an empirical microsecond-scale stagger to land inside the
-/// window), but the honesty property under test here doesn't depend on how
-/// the mismatch arose, only on whether it's reported truthfully.
+/// The logic [`partial_delete_report`] exists for (review finding):
+/// a requested path that `git clean` silently skipped must never be folded
+/// into a claimed full success. Driven against a real worktree — the real
+/// race that produces this exact mismatch can't be deterministically timed in
+/// a permanent test (the review that found this bug used an empirical
+/// microsecond-scale stagger to land inside the window), but the honesty
+/// property under test here doesn't depend on how the mismatch arose, only on
+/// whether it's reported truthfully.
 #[test]
 fn partial_delete_report_flags_any_requested_path_git_clean_silently_skipped() {
     // The exact scenario the review demonstrated: 3 requested, one silently
-    // skipped (since-tracked), git still exits as if fully successful.
-    let stdout = "Removing x.txt\nRemoving z.txt\n";
-    let msg = partial_delete_report(&["x.txt", "y.txt", "z.txt"], stdout)
-        .expect("a missing requested path must never be silently folded into success");
+    // skipped (since-tracked), git still exits as if fully successful. Here
+    // that end state is built directly: x and z gone, y still on disk.
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("y.txt"), "skipped\n").unwrap();
+    let msg = observe_deletion(
+        &repo,
+        &["x.txt", "y.txt", "z.txt"],
+        &["x.txt", "y.txt", "z.txt"],
+    )
+    .partial_refusal()
+    .expect("a surviving requested path must never be silently folded into success");
     assert!(msg.contains("x.txt"), "{msg}");
     assert!(msg.contains("z.txt"), "{msg}");
     assert!(msg.contains("y.txt"), "{msg}");
@@ -1178,10 +1198,400 @@ fn partial_delete_report_flags_any_requested_path_git_clean_silently_skipped() {
     );
 }
 
+/// #284 defect 1: the report must be silent when the files really are gone,
+/// **in any locale**. `git clean`'s `Removing %s` goes through gettext, and
+/// production spawns inherit the server's `LANG` (`sandbox::spawn`'s
+/// `env_clear` is `#[cfg(test)]`-only by design), so the pre-#284 parse
+/// inverted itself under a translated git: three deleted files matched no
+/// prefix, all three looked un-deleted, and the endpoint answered 409 —
+/// "your files survived" — about files that were already gone for good.
+///
+/// The positive leg runs a **real** `git clean` and asserts silence. The
+/// paired negative re-implements the pre-#284 parse inline and pins that it
+/// would have got the same end state wrong, so the positive leg is proven
+/// capable of failing rather than merely green.
 #[test]
-fn partial_delete_report_is_silent_when_every_requested_path_was_removed() {
-    let stdout = "Removing a.txt\nRemoving b.txt\n";
-    assert_eq!(partial_delete_report(&["a.txt", "b.txt"], stdout), None);
+fn partial_delete_report_reads_the_worktree_so_a_translated_git_cannot_invert_it() {
+    let (_dir, repo) = seeded_repo();
+    for p in ["x.txt", "y.txt", "z.txt"] {
+        std::fs::write(repo.join(p), "junk\n").unwrap();
+    }
+    // Really deleted, by real git.
+    run(&repo, &["clean", "-f", "--", "x.txt", "y.txt", "z.txt"]);
+    for p in ["x.txt", "y.txt", "z.txt"] {
+        assert!(
+            std::fs::symlink_metadata(repo.join(p)).is_err(),
+            "{p} should be gone before the report is asked anything"
+        );
+    }
+    assert_eq!(
+        observe_deletion(
+            &repo,
+            &["x.txt", "y.txt", "z.txt"],
+            &["x.txt", "y.txt", "z.txt"]
+        )
+        .partial_refusal(),
+        None,
+        "every requested path is gone from disk — claiming a partial result here \
+         is the 409-after-destruction inversion #284 was filed about"
+    );
+
+    // Paired negative: the pre-#284 decision, re-implemented here in full and
+    // run against the SAME end state, so "the old code would have got this
+    // wrong" is demonstrated rather than asserted. `translated_stdout` is what
+    // git 2.43 prints for these three deletions under `LANG=fr_FR.UTF-8` with
+    // its message catalogs installed; production spawns inherit the server's
+    // locale, because `sandbox::spawn`'s `env_clear` is `#[cfg(test)]`-only by
+    // design (argv and env cannot change after policy classification), so
+    // widening that boundary was never the fix available here.
+    let translated_stdout = "Suppression de x.txt\nSuppression de y.txt\nSuppression de z.txt\n";
+    let old_verdict_survivors: Vec<&str> = {
+        let removed: std::collections::HashSet<&str> = translated_stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("Removing "))
+            .collect();
+        ["x.txt", "y.txt", "z.txt"]
+            .into_iter()
+            .filter(|p| !removed.contains(p))
+            .collect()
+    };
+    assert_eq!(
+        old_verdict_survivors,
+        ["x.txt", "y.txt", "z.txt"],
+        "the old stdout parse called all three destroyed files survivors, so the \
+         endpoint answered 409 — 'your files were NOT deleted' — after they were \
+         irreversibly gone. That verdict is what the assertion above must not \
+         reproduce."
+    );
+}
+
+/// #284, the trap in the fix the issue proposed. `Path::exists()` follows a
+/// symlink, so a **dangling** symlink — dirent present, target gone —
+/// reports as absent. `git clean` can delete dangling symlinks, so an
+/// `exists()`-based check cannot tell "clean removed the link" from "clean
+/// skipped the link, and the link's target happened to be missing already":
+/// both read as deleted, and the second is a false success.
+/// `symlink_metadata` stats the entry itself and separates them.
+///
+/// Both legs run against the same real dangling symlink: skipped (survivor,
+/// must be named) and then actually removed by real `git clean` (must be
+/// silent).
+#[test]
+fn partial_delete_report_tells_a_surviving_dangling_symlink_from_a_deleted_one() {
+    let (_dir, repo) = seeded_repo();
+    let link = repo.join("dangling");
+    std::os::unix::fs::symlink(repo.join("no-such-target"), &link).unwrap();
+
+    // Paired negative on the naive fix: `exists()` already says "gone" for
+    // this entry, which is still sitting in the worktree.
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok(),
+        "the dirent is there"
+    );
+    assert!(
+        !link.exists(),
+        "`exists()` follows the link and reports absent — an `exists()`-based \
+         check would call this survivor deleted"
+    );
+
+    let msg = observe_deletion(&repo, &["dangling"], &["dangling"])
+        .partial_refusal()
+        .expect("an entry still in the worktree was not deleted, whatever it points at");
+    assert!(msg.contains("dangling"), "{msg}");
+
+    // Paired positive: once real `git clean` removes the same entry — which
+    // it does, dangling target and all — the report goes silent.
+    run(&repo, &["clean", "-f", "--", "dangling"]);
+    assert!(std::fs::symlink_metadata(&link).is_err());
+    assert_eq!(
+        observe_deletion(&repo, &["dangling"], &["dangling"]).partial_refusal(),
+        None
+    );
+}
+
+/// #284 review finding: the mirror image of the bug #284 itself fixed. Asking
+/// only "is it gone *now*?" reads "absent" as "we deleted it", so a path that
+/// something else removed first gets credited to this operation — in the
+/// response count, and in the **journal**, which is the durable record for the
+/// one operation with no undo of any kind.
+///
+/// The end state built here is exactly what the race produces: both requested
+/// paths are absent from disk, but only `a.txt` was there when the snapshot
+/// was taken immediately before the spawn. `git clean -f -- a.txt b.txt`
+/// exits 0 and prints nothing about `b.txt` in that case (verified against
+/// real git), so the spawn itself offers no evidence either way — the
+/// before-snapshot is the only thing that can tell the two apart.
+#[test]
+fn a_deletion_by_something_else_is_not_credited_to_this_operation() {
+    let (_dir, repo) = seeded_repo();
+    // `a.txt` is the seed commit's tracked file, so these use names that the
+    // fixture does not already put on disk.
+    let requested = ["ours.txt", "theirs.txt"];
+    // Neither path is on disk now. `ours.txt` was present at the pre-spawn
+    // snapshot (we removed it); `theirs.txt` was already gone by then.
+    let present_before = ["ours.txt"];
+    for p in requested {
+        assert!(
+            std::fs::symlink_metadata(repo.join(p)).is_err(),
+            "{p} must be absent for this end state"
+        );
+    }
+
+    let outcome = observe_deletion(&repo, &requested, &present_before);
+    assert_eq!(
+        outcome.deleted,
+        ["ours.txt"],
+        "only the path this operation actually removed may be counted as ours"
+    );
+    assert_eq!(
+        outcome.already_gone,
+        ["theirs.txt"],
+        "a path that was already gone before the spawn was not deleted by us"
+    );
+    assert!(outcome.survived.is_empty(), "{:?}", outcome.survived);
+
+    // Nothing survived, so this is still a success — the honest report is a
+    // 200 whose count is 1, not a 409.
+    assert_eq!(outcome.partial_refusal(), None);
+
+    // The disclosure that goes into both the response and the journal names
+    // the path and says plainly that we did not delete it.
+    let note = outcome.already_gone_note();
+    assert!(note.contains("theirs.txt"), "{note}");
+    assert!(
+        note.contains("not deleted by this operation"),
+        "the journal must not imply we destroyed it: {note}"
+    );
+    assert!(
+        !note.contains("ours.txt"),
+        "the path we really did delete must not be disclaimed: {note}"
+    );
+
+    // Paired negative: the two-bucket decision this replaced, re-implemented
+    // in full and run against the SAME end state, so "the old shape would
+    // have got this wrong" is demonstrated rather than asserted. It had no
+    // before-snapshot at all, so every absent path counted as ours.
+    let old_deleted: Vec<&str> = requested
+        .into_iter()
+        .filter(|p| std::fs::symlink_metadata(repo.join(p)).is_err())
+        .collect();
+    assert_eq!(
+        old_deleted,
+        ["ours.txt", "theirs.txt"],
+        "the pre-fix shape credited this operation with destroying 2 paths when it \
+         destroyed 1, and journalled 'deleted 2 untracked paths permanently' — a \
+         durable audit record of a destruction it did not perform. That verdict is \
+         what the assertions above must not reproduce."
+    );
+    assert_ne!(
+        outcome.deleted.len(),
+        old_deleted.len(),
+        "if these agree, the before-snapshot is not doing anything"
+    );
+}
+
+/// The count in the response and the journal is what this operation
+/// *destroyed*, not what the client *asked for* — pinned at the one place
+/// that computes it, because that is the only place the two can be made to
+/// differ.
+///
+/// This test exists because the first cut of the fix left `let count =
+/// paths.len()` reachable in the executor: reverting the count to the
+/// requested length passed all 558 tests, since no test could construct a
+/// state where the numbers disagree. Composing the report from the observed
+/// outcome makes the divergence expressible here.
+#[test]
+fn a_report_counts_only_what_this_operation_destroyed() {
+    // Three requested; one really destroyed by us, two already gone.
+    let outcome = DeleteOutcome {
+        deleted: vec!["ours.txt"],
+        already_gone: vec!["theirs.txt", "alsotheirs.txt"],
+        survived: vec![],
+    };
+    let (status, body, journal) = outcome.report();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "nothing survived, so this succeeded"
+    );
+    assert!(
+        body.contains("Deleted 1 untracked path permanently"),
+        "the count is the 1 we destroyed, not the 3 that are gone: {body}"
+    );
+    assert!(
+        !body.contains("Deleted 3") && !body.contains("Deleted 2"),
+        "counting the request instead of the result is the whole bug: {body}"
+    );
+    assert!(
+        body.contains("theirs.txt") && body.contains("alsotheirs.txt"),
+        "the ones we did not delete are still disclosed, just not claimed: {body}"
+    );
+    // The journal is the durable half and must agree with the response — an
+    // audit record that credits us with 3 destructions is the real damage.
+    assert!(
+        journal.contains("deleted 1 untracked path permanently"),
+        "{journal}"
+    );
+    assert!(!journal.contains("deleted 3"), "{journal}");
+    assert!(
+        !journal.to_lowercase().contains("undo")
+            && !journal.to_lowercase().contains("restore")
+            && !journal.to_lowercase().contains("recover"),
+        "{journal}"
+    );
+}
+
+/// The plain success path still reads exactly as it did — no stray
+/// disclosure sentence when there is nothing to disclose.
+#[test]
+fn a_clean_success_report_says_nothing_about_foreign_deletions() {
+    let outcome = DeleteOutcome {
+        deleted: vec!["a.txt", "b.txt"],
+        already_gone: vec![],
+        survived: vec![],
+    };
+    let (status, body, journal) = outcome.report();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        "Deleted 2 untracked paths permanently. That content was never stored in \
+         git, so there is no way to bring it back."
+    );
+    assert!(!journal.contains("already gone"), "{journal}");
+}
+
+/// The two disclosures compose: a path can survive *and* another can have
+/// been removed by something else in the same batch, and the 409 body has to
+/// carry both facts without confusing them for each other.
+#[test]
+fn a_refusal_reports_survivors_and_foreign_deletions_as_different_things() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("survivor.txt"), "still here\n").unwrap();
+    let requested = ["ours.txt", "theirs.txt", "survivor.txt"];
+    // `ours.txt` we deleted; `theirs.txt` was gone before we ran;
+    // `survivor.txt` is still on disk.
+    let outcome = observe_deletion(&repo, &requested, &["ours.txt", "survivor.txt"]);
+    assert_eq!(outcome.deleted, ["ours.txt"]);
+    assert_eq!(outcome.already_gone, ["theirs.txt"]);
+    assert_eq!(outcome.survived, ["survivor.txt"]);
+
+    let msg = outcome
+        .partial_refusal()
+        .expect("a surviving requested path must always refuse");
+    assert!(
+        msg.contains("ours.txt was deleted permanently"),
+        "the one we destroyed is named as destroyed: {msg}"
+    );
+    assert!(
+        msg.contains("survivor.txt was not"),
+        "the survivor is named as not deleted: {msg}"
+    );
+    assert!(
+        msg.contains("theirs.txt was already gone before this ran"),
+        "the foreign deletion is disclosed as a third, distinct outcome: {msg}"
+    );
+    assert!(
+        !msg.to_lowercase().contains("undo")
+            && !msg.to_lowercase().contains("restore")
+            && !msg.to_lowercase().contains("recover"),
+        "still no reversibility implied for an operation that has none: {msg}"
+    );
+}
+
+/// The bias #284 exists to preserve, pinned against the new three-way split:
+/// a path still on disk is a survivor *whoever* put it there, so the
+/// before-snapshot can never be read as licence to call a present file
+/// deleted. This is the direction that must never invert — the one that makes
+/// a user stop looking for data that is gone for good.
+#[test]
+fn a_path_still_on_disk_is_a_survivor_even_if_the_snapshot_missed_it() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("appeared.txt"), "written after the snapshot\n").unwrap();
+    // The pathological input: the snapshot says it was not there, yet it is.
+    let outcome = observe_deletion(&repo, &["appeared.txt"], &[]);
+    assert_eq!(
+        outcome.survived,
+        ["appeared.txt"],
+        "presence now outranks the snapshot — never report a present file as gone"
+    );
+    assert!(outcome.deleted.is_empty());
+    assert!(outcome.already_gone.is_empty());
+    let msg = outcome.partial_refusal().expect("must refuse");
+    assert!(
+        msg.starts_with("Partial result: nothing was deleted"),
+        "with an empty deleted set the message must say so, not trail an empty list: {msg}"
+    );
+}
+
+/// #284 defect 2, end to end through the two production functions that own
+/// the count: `handlers::discard::validate_paths` (where the dedupe lives)
+/// composed with the executor whose message says `paths.len()`. The
+/// assertion that matters is the last one — the number in the response
+/// equals the number of files that actually left the disk.
+#[tokio::test]
+async fn a_duplicated_delete_request_reports_the_count_that_really_happened() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("scratch.txt"), "junk\n").unwrap();
+    std::fs::write(repo.join("other.txt"), "junk\n").unwrap();
+
+    let paths =
+        crate::handlers::discard::validate_paths(git_vista_protocol::WorktreePathsRequest {
+            paths: vec![
+                "scratch.txt".to_string(),
+                "other.txt".to_string(),
+                "scratch.txt".to_string(),
+            ],
+        })
+        .expect("a repeated path is client sloppiness, not a wire error");
+
+    let (status, body) = exec_delete_untracked_paths(&repo, NetworkNeed::Local, &paths).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Ground truth first: exactly two files actually left the disk, nothing
+    // else was touched, and the working tree is clean.
+    assert!(std::fs::symlink_metadata(repo.join("scratch.txt")).is_err());
+    assert!(std::fs::symlink_metadata(repo.join("other.txt")).is_err());
+    assert_eq!(out(&repo, &["status", "--porcelain"]), "");
+    // The load-bearing assertion, and the one that fails against the pre-#284
+    // shape: without the dedupe `paths` held 3 entries, `git clean` still
+    // removed the same 2 files, the survivor check still found nothing left
+    // behind, and `paths.len()` put "Deleted 3 untracked paths permanently"
+    // in the response — an overstated blast radius in the one operation with
+    // no undo, where the count is the user's only record of what is gone.
+    assert!(
+        body.contains("Deleted 2 untracked paths"),
+        "the reported count must be the 2 files that actually left the disk, not \
+         the 3 entries the client happened to type: {body}"
+    );
+    assert_eq!(paths.len(), 2, "the repeat must not survive validation");
+}
+
+/// The discard-side twin of the count fix: same `validate_paths`, same
+/// `paths.len()` message, so a repeated path must not inflate that count
+/// either.
+#[tokio::test]
+async fn a_duplicated_discard_request_reports_the_count_that_really_happened() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
+
+    let paths =
+        crate::handlers::discard::validate_paths(git_vista_protocol::WorktreePathsRequest {
+            paths: vec!["a.txt".to_string(), "a.txt".to_string()],
+        })
+        .expect("a repeated path is client sloppiness, not a wire error");
+
+    let (status, body) = exec_discard_tracked_paths(&repo, NetworkNeed::Local, &paths).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Ground truth: one file, reverted to HEAD, working tree clean.
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(out(&repo, &["status", "--porcelain"]), "");
+    // The pre-#284 shape said "2 tracked paths" here for the one file it
+    // discarded.
+    assert!(
+        body.contains("1 tracked path.") && !body.contains('2'),
+        "one path was discarded, so the response must say 1: {body}"
+    );
+    assert_eq!(paths.len(), 1, "the repeat must not survive validation");
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,6 +1954,8 @@ async fn a_broken_precondition_is_refused_end_to_end() {
         GitOperation::PushBranch {
             branch: branch("main"),
             remote: RemoteName::new("origin").unwrap(),
+            set_upstream: false,
+            force: ForcePublish::None,
         },
         tokens(),
     )
@@ -1598,4 +2010,256 @@ async fn amend_commit_executes_through_the_pipeline() {
         "seed",
         "the stub must never create a new commit"
     );
+}
+
+// --- #227 (M2.20a): typed remote vocabulary, execution not yet wired -------
+
+/// Everything a fetch, pull or push could change about a repository, in one
+/// comparable string — the inertness assertion for the contract-only stubs
+/// below.
+///
+/// Checking HEAD alone (which is all the `AmendCommit` stub above needed)
+/// would be far too weak here: a fetch that ran would move refs under
+/// `refs/remotes/`, write `FETCH_HEAD`, and add objects while leaving HEAD
+/// exactly where it was, so a HEAD-only assertion would pass with the network
+/// operation having fully executed. `--set-upstream` writes only config, and
+/// would be invisible to every ref check. So this covers all five surfaces:
+/// every ref, `FETCH_HEAD`, the object store, local config, and the
+/// index/worktree.
+///
+/// [`repo_fingerprint_detects_every_change_it_claims_to_watch`] below proves
+/// this is capable of failing on each of them, rather than being a constant
+/// that makes its callers vacuously green.
+fn repo_fingerprint(repo: &Path) -> String {
+    let refs = out(repo, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let head = out(repo, &["rev-parse", "HEAD"]);
+    let status = out(repo, &["status", "--porcelain=v2", "--branch"]);
+    let objects = out(repo, &["count-objects", "-v"]);
+    let config = {
+        let mut lines: Vec<String> = out(repo, &["config", "--local", "--list"])
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines.sort();
+        lines.join("\n")
+    };
+    let fetch_head = repo.join(".git/FETCH_HEAD").exists();
+    format!(
+        "refs:\n{refs}\nhead:{head}\nstatus:\n{status}\nobjects:\n{objects}\n\
+         config:\n{config}\nfetch_head:{fetch_head}"
+    )
+}
+
+/// The anti-vacuity proof for [`repo_fingerprint`]: each mutation a fetch,
+/// pull or push would make must change the fingerprint.
+///
+/// Without this, `fetch_remote_executes_through_the_pipeline` and
+/// `pull_branch_executes_through_the_pipeline` below would be exactly the
+/// kind of test this repository has been bitten by six times — asserting
+/// "nothing changed" against a helper that could not have noticed if
+/// everything had. Each case is driven with plain `git`, so the helper is
+/// tested against real repository mutations rather than against itself.
+/// One simulated mutation: what a real fetch/pull/push would do, and how to
+/// reproduce it with plain `git`.
+type FingerprintCase = (&'static str, &'static dyn Fn(&Path));
+
+#[test]
+fn repo_fingerprint_detects_every_change_it_claims_to_watch() {
+    let cases: &[FingerprintCase] = &[
+        ("a fetch moving a remote-tracking ref", &|repo: &Path| {
+            run(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+        }),
+        ("a fetch writing FETCH_HEAD", &|repo: &Path| {
+            std::fs::write(repo.join(".git/FETCH_HEAD"), "").unwrap()
+        }),
+        (
+            // Deliberately isolated to the object store: the source file is
+            // written inside `.git`, which `git status` ignores, so this case
+            // fails unless `count-objects` is genuinely part of the
+            // fingerprint. A blob added under the worktree would have changed
+            // the status line too and let an objects-blind fingerprint pass.
+            "a fetch adding objects and nothing else",
+            &|repo: &Path| {
+                let src = repo.join(".git/fetched-blob-source");
+                std::fs::write(&src, "fetched\n").unwrap();
+                run(repo, &["hash-object", "-w", ".git/fetched-blob-source"]);
+            },
+        ),
+        ("a pull moving the checked-out branch", &|repo: &Path| {
+            run(repo, &["commit", "-q", "--allow-empty", "-m", "pulled"])
+        }),
+        ("--set-upstream writing branch config", &|repo: &Path| {
+            run(repo, &["config", "branch.main.remote", "origin"])
+        }),
+    ];
+    for (what, mutate) in cases {
+        let (_dir, repo) = seeded_repo();
+        let before = repo_fingerprint(&repo);
+        mutate(&repo);
+        assert_ne!(
+            before,
+            repo_fingerprint(&repo),
+            "repo_fingerprint must notice {what}; it did not, so every \
+             inertness assertion built on it is vacuous"
+        );
+    }
+}
+
+/// [`GitOperation::FetchRemote`] proves its *shape* end-to-end through the
+/// real pipeline (build → validate → enforce_fresh), but M2.20a ships no
+/// execution — #229's to add.
+///
+/// The status code is the weaker half of this test. The half that matters is
+/// [`repo_fingerprint`]: a stub that answered `501` *after* running `git
+/// fetch` would pass a status-only assertion while having opened a socket,
+/// contacted a real remote with whatever credentials the environment offered,
+/// and written objects and refs. The remote here is configured and reachable
+/// (a bare repo on disk with a commit the fetch would pull), so "nothing
+/// changed" is a claim about an operation that genuinely *could* have
+/// changed something.
+#[tokio::test]
+async fn fetch_remote_executes_through_the_pipeline() {
+    let (dir, repo) = seeded_repo();
+
+    // A real, reachable remote holding a commit this repo does not have — so
+    // a fetch that actually ran would demonstrably move refs and add objects.
+    let remote = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote).unwrap();
+    run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    run(
+        &repo,
+        &["remote", "add", "origin", &remote.display().to_string()],
+    );
+    run(&repo, &["push", "-q", "origin", "main"]);
+    run(&repo, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
+    run(&repo, &["push", "-q", "origin", "main"]);
+    run(&repo, &["update-ref", "-d", "refs/remotes/origin/main"]);
+
+    let before = repo_fingerprint(&repo);
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::FetchRemote {
+            remote: RemoteName::new("origin").unwrap(),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(
+        repo_fingerprint(&repo),
+        before,
+        "the stub must leave the repository byte-identical — M2.20a ships no \
+         fetch execution (#229)"
+    );
+}
+
+/// [`GitOperation::PullBranch`], same contract-only staging as fetch above
+/// (#230 owns execution), and the same inertness proof.
+///
+/// Both strategies are driven: a stub that refused `Merge` and quietly ran
+/// `Rebase` would otherwise be invisible here, and the whole reason
+/// `MergeStrategy` is mandatory is that the two do different things to
+/// history.
+#[tokio::test]
+async fn pull_branch_executes_through_the_pipeline() {
+    for strategy in [
+        git_vista_protocol::MergeStrategy::Merge,
+        git_vista_protocol::MergeStrategy::Rebase,
+    ] {
+        let (dir, repo) = seeded_repo();
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        run(
+            &repo,
+            &["remote", "add", "origin", &remote.display().to_string()],
+        );
+        run(&repo, &["push", "-q", "origin", "main"]);
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
+        run(&repo, &["push", "-q", "origin", "main"]);
+        run(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+        run(&repo, &["update-ref", "-d", "refs/remotes/origin/main"]);
+
+        let before = repo_fingerprint(&repo);
+        let (status, body) = pipeline(
+            &repo,
+            GitOperation::PullBranch {
+                remote: RemoteName::new("origin").unwrap(),
+                branch: branch("main"),
+                strategy,
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{strategy:?}: {body}");
+        assert_eq!(
+            repo_fingerprint(&repo),
+            before,
+            "the {strategy:?} stub must leave the repository byte-identical — \
+             M2.20a ships no pull execution (#230)"
+        );
+    }
+}
+
+/// The widened `PushBranch` combinations that M2.20a does **not** execute are
+/// refused, and refused inertly — nothing reaches the remote.
+///
+/// This is the case that most needed writing down, because unlike fetch and
+/// pull, `PushBranch` has a *live* executor sitting right next to the stub.
+/// An arm that ignored the new fields would have run a perfectly ordinary
+/// push — succeeding, mutating the remote, and reporting success for an
+/// operation nobody approved. The remote's ref listing being empty afterwards
+/// is what rules that out; the status code alone could not.
+#[tokio::test]
+async fn the_unwired_push_combinations_are_refused_without_touching_the_remote() {
+    for force in [
+        ForcePublish::None,
+        ForcePublish::WithLease {
+            expected_remote_tip: oid(&"0".repeat(40)),
+        },
+    ] {
+        for set_upstream in [true, false] {
+            if !set_upstream && force == ForcePublish::None {
+                // The one combination that *does* execute — covered by
+                // `push_branch_executes_through_the_pipeline` above, which
+                // asserts the push really reaches the remote.
+                continue;
+            }
+            let (dir, repo) = seeded_repo();
+            let remote = dir.path().join("remote.git");
+            std::fs::create_dir_all(&remote).unwrap();
+            run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+            run(
+                &repo,
+                &["remote", "add", "origin", &remote.display().to_string()],
+            );
+
+            let before = repo_fingerprint(&repo);
+            let (status, body) = pipeline(
+                &repo,
+                GitOperation::PushBranch {
+                    branch: branch("main"),
+                    remote: RemoteName::new("origin").unwrap(),
+                    set_upstream,
+                    force: force.clone(),
+                },
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_IMPLEMENTED,
+                "set_upstream={set_upstream} force={force:?}: {body}"
+            );
+            assert_eq!(
+                out(&remote, &["for-each-ref", "refs/heads"]),
+                "",
+                "nothing may reach the remote for an unwired push combination \
+                 (set_upstream={set_upstream} force={force:?})"
+            );
+            assert_eq!(
+                repo_fingerprint(&repo),
+                before,
+                "the refusal must also leave the local repository untouched \
+                 (set_upstream={set_upstream} force={force:?})"
+            );
+        }
+    }
 }
