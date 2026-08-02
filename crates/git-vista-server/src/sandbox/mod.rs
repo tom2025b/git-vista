@@ -710,15 +710,42 @@ pub(crate) fn network_need(args: &[&str]) -> NetworkNeed {
 /// `Remote` would silently *widen* every new operation's sandbox. Neither
 /// failure is acceptable, and the fix for both is to refuse to have a default.
 ///
+/// That example stopped being hypothetical in M2.20a (#227), which added
+/// `FetchRemote` and `PullBranch` for real. The build did fail here until
+/// both arms existed — the guarantee this doc claims, observed working
+/// rather than assumed (`network_need_for_operation` is the *only* thing in
+/// the server that had to change for those two variants to be admitted to
+/// the network tier).
+///
 /// If a variant's answer is ever unobvious, the tie-break is fail-closed:
 /// `Local` routes to the stricter tier, so a misclassified network operation
 /// breaks loudly rather than quietly gaining a socket.
 pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
     match op {
-        // The one operation in the enum that talks to a remote. `remote` is
-        // part of its argv, but that is not why it is classified here — it is
-        // classified here because pushing is what the server decided to do.
+        // The three operations in the enum that talk to a remote. `remote` is
+        // part of each one's argv, but that is not why they are classified
+        // here — they are classified here because reaching a remote is what
+        // the server decided to do.
+        //
+        // M2.20a (#227) added the second and third. Neither executes yet
+        // (#229/#230 own that), and it would have been tempting to classify
+        // an operation that never spawns anything as `Local` "for now". That
+        // would be the exact mistake this match exists to prevent: the
+        // declaration is what picks the tier for the spawn, so a `Local`
+        // placeholder would be a *wrong* answer sitting in the live data path
+        // waiting for execution to arrive, and the arm that had to change
+        // would be in this file rather than in the slice that wires the
+        // socket. Classify by what the operation *is*, not by whether it runs
+        // today.
         GitOperation::PushBranch { .. } => NetworkNeed::Remote,
+        // `git fetch <remote>` — the whole operation is a network round trip;
+        // `RiskLevel::Safe` says nothing local can be lost, which is an
+        // independent axis from how far it reaches (see the variant's doc).
+        GitOperation::FetchRemote { .. } => NetworkNeed::Remote,
+        // `git pull` is a fetch plus an integration; the fetch half alone
+        // settles this. Neither `MergeStrategy` changes the answer — merge
+        // and rebase differ only in what happens after the objects arrive.
+        GitOperation::PullBranch { .. } => NetworkNeed::Remote,
 
         // Everything below manipulates refs, the index, the working tree or
         // the object database, all of it local. None of them opens a socket in
