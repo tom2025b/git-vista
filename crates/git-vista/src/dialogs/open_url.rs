@@ -20,10 +20,18 @@ use crate::features::graph::core::GraphCore;
 /// modals (z-index 30), this one is also reachable from inside the open picker
 /// (ADR 0006's "Clone URL…" button, which doesn't close the picker) — its
 /// z-index must beat the picker's 900 or the picker intercepts every click.
+///
+/// `checking_status` (#278) is a second, narrower busy flag: it flips true
+/// only for the span, if any, that `clone_request` spends polling `GET
+/// /api/clone-status/{key}` after the original `POST` response was lost,
+/// timed out, or reported "already in progress". `cloning` alone still gates
+/// dismissal (the pin is "any attempt in flight, whichever phase"); this one
+/// only changes what the button says while that later phase runs.
 pub fn open_url_view(
     open_url: RwSignal<bool>,
     clone_url: RwSignal<String>,
     cloning: RwSignal<bool>,
+    checking_status: RwSignal<bool>,
     dialogs: Dialogs,
     graph: RwSignal<GraphCore>,
     mode_for: RwSignal<Option<RepositoryDescriptor>>,
@@ -42,6 +50,15 @@ pub fn open_url_view(
             // the server may already be pointing at it (`set_current` runs
             // before the reply) — bumping makes a completed-but-lost clone
             // appear instead of staying silently absent.
+            //
+            // #278: `checking_status` flips true only if `clone_request` falls
+            // back to polling `GET /api/clone-status/{key}` — a lost, timed
+            // out, or "already in progress" `POST /api/clone` response — so the
+            // button can say "Checking…" instead of leaving "Cloning…" up for
+            // a phase that is no longer the original request. Always cleared
+            // here, on both arms, whether or not it was ever set.
+            let outcome = clone_request(&url, move || checking_status.set(true)).await;
+            checking_status.set(false);
             let CloneSettlement {
                 clear_busy,
                 close_dialog,
@@ -49,7 +66,7 @@ pub fn open_url_view(
                 bump_epoch,
                 mode_screen_for,
                 alert,
-            } = clone_settlement(clone_request(&url).await);
+            } = clone_settlement(outcome);
             if clear_busy {
                 cloning.set(false);
             }
@@ -88,11 +105,17 @@ pub fn open_url_view(
                 // idle while a clone is still running — the "acted like it
                 // worked" half of that bug. Composes with the ghost-click
                 // guard rather than replacing it. Worst-case pin is
-                // 2×CLONE_TIMEOUT_MS (~19 min, hung tunnel + blind retry) —
-                // an accepted trade for a single-operator tool; the
-                // hide-don't-cancel + settlement-toast alternative is noted
-                // in #263 if this ever grates.
-                if clone_dialog_may_dismiss(cloning.get_untracked(), dialogs.may_dismiss()) {
+                // 2×CLONE_TIMEOUT_MS (~19 min, hung tunnel + blind retry)
+                // for the POST itself — an accepted trade for a
+                // single-operator tool. #278's poll budget would have stacked
+                // roughly another hour on top of that, so the *polling* phase
+                // is dismissable (read-only GET loop, nothing to strand);
+                // see `clone_dialog_may_dismiss`.
+                if clone_dialog_may_dismiss(
+                    cloning.get_untracked(),
+                    checking_status.get_untracked(),
+                    dialogs.may_dismiss(),
+                ) {
                     dialogs.close(Dialog::OpenUrl);
                     open_url.set(false);
                 }
@@ -131,9 +154,13 @@ pub fn open_url_view(
                         // ghost-click leg: explicit buttons skip that guard
                         // (it protects backdrops from synthesized taps), but
                         // the pin itself lives in one host-tested place.
-                        prop:disabled=move || cloning.get()
+                        prop:disabled=move || cloning.get() && !checking_status.get()
                         on:click=move |_| {
-                            if clone_dialog_may_dismiss(cloning.get_untracked(), true) {
+                            if clone_dialog_may_dismiss(
+                                cloning.get_untracked(),
+                                checking_status.get_untracked(),
+                                true,
+                            ) {
                                 open_url.set(false);
                             }
                         }
@@ -147,8 +174,42 @@ pub fn open_url_view(
                         prop:disabled=move || cloning.get() || clone_url.get().trim().is_empty()
                         on:click=move |_| submit_clone()
                     >
-                        {move || if cloning.get() { "Cloning…" } else { "Open" }}
+                        {move || {
+                            // #278: distinct from plain "Cloning…" once the
+                            // original response is lost and the dialog has
+                            // fallen back to polling clone-status — a poll can
+                            // legitimately run for most of its ~10-minute
+                            // budget on a large repo, and "Cloning…" alone
+                            // would look stuck rather than still working.
+                            if checking_status.get() {
+                                "Checking…"
+                            } else if cloning.get() {
+                                "Cloning…"
+                            } else {
+                                "Open"
+                            }
+                        }}
                     </button>
+                </div>
+                // #278 review finding: the Cloning -> Checking transition was
+                // a bare text swap inside a <button>, which no screen reader
+                // announces. This is the permanently-mounted `role="status"`
+                // live region #242's offline banner established for exactly
+                // this: the WRAPPER must exist from mount and only its
+                // CONTENT change, because iOS VoiceOver often stays silent
+                // for a `role="status"` element inserted already-populated.
+                // Empty (and therefore silent) until a state actually
+                // changes.
+                <div role="status" aria-live="polite" class="sr-only">
+                    {move || {
+                        if checking_status.get() {
+                            "Still working. The first reply was lost, so                              git-vista is asking the server what happened to                              this clone."
+                        } else if cloning.get() {
+                            "Cloning the repository."
+                        } else {
+                            ""
+                        }
+                    }}
                 </div>
             </div>
         </div>

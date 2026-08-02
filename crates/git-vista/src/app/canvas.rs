@@ -229,18 +229,51 @@ pub(super) fn graph_canvas(
     // explicitly retries. There is deliberately no timer and no automatic retry:
     // a failing cursor hammered on a loop is how a graph the user is reading
     // turns into a request storm.
+    //
+    // #217: `eager` is on only when `history_ui.want_full_history` names *this
+    // canvas's own* repository — i.e. the user already drove THIS repository's
+    // history to completeness earlier in the session. Unlike `complete`, that
+    // latch is not cleared by the epoch-reset effect in `mod.rs`, so a fresh
+    // epoch's canvas (mounted with only page 1, camera reset to `home`,
+    // nowhere near the loaded edge) resumes pagination toward completion on
+    // its own instead of waiting for the user to scroll all the way back down.
+    // Comparing ids rather than reading a bare bool is what keeps that from
+    // leaking across a repository switch — `force_bump` is the same primitive
+    // behind both a reload and a switch, so a bool would silently auto-
+    // paginate the whole of whatever unrelated repo the user opened next
+    // (review finding). This is still the same single-flight, no-auto-retry
+    // loop — `eager` only widens *when* `should_prefetch` fires, not what
+    // happens on `Error`.
     create_effect(move |_| {
         let (_, visible_end) = visible.get();
         let rows = row_count.get();
         let viewport_h = vp_h.get();
         let scale = camera.get().scale;
         let load = page_load.get();
+        let eager = {
+            let latched = history_ui.want_full_history.get();
+            let here = ctx
+                .try_with_value(|c| c.frame.worktree_id.clone())
+                .flatten();
+            // Both sides must name a repository AND agree. A `None` on either
+            // side never enables eager loading: an unidentified repo has not
+            // demonstrated anything, and must not inherit another's latch.
+            latched.is_some() && latched == here
+        };
         // The aggregate's own answer to "is there more?" — read untracked, since
         // it changes only as part of an append we are about to publish anyway.
         let has_cursor = ctx
             .try_with_value(|c| c.loaded.cursor.is_some())
             .unwrap_or(false);
-        if !should_prefetch(visible_end, rows, viewport_h, scale, &load, has_cursor) {
+        if !should_prefetch(
+            visible_end,
+            rows,
+            viewport_h,
+            scale,
+            &load,
+            has_cursor,
+            eager,
+        ) {
             return;
         }
 
@@ -350,6 +383,19 @@ pub(super) fn graph_canvas(
                         ctx.with_value(|c| (c.loaded.rows.len(), c.loaded.is_complete()));
                     row_count.set(rows);
                     history_ui.complete.set(complete);
+                    // #217: latch "the user drove THIS repository's history to
+                    // completeness" the moment this multi-page aggregate first
+                    // reaches it, so a later epoch bump's fresh canvas knows to
+                    // resume pagination in the background rather than sit
+                    // disabled until a full manual re-scroll. Stored as the
+                    // repository's own id so it cannot speak for a different
+                    // one after a switch.
+                    if complete {
+                        let here = ctx
+                            .try_with_value(|c| c.frame.worktree_id.clone())
+                            .flatten();
+                        history_ui.want_full_history.set(here);
+                    }
                     // Only rows that existed before this page can have been
                     // re-keyed; a straight append leaves their labels exactly
                     // where they were, so the rebuild is bought only when a
@@ -595,7 +641,7 @@ pub(super) fn graph_canvas(
             {dialogs::confirm_modal_view(features)}
             {detail::detail_panel_view(features, settings, detail, ctx)}
             {activity::activity_panel_view(features, settings, read_only)}
-            {viewer::viewer_view(shell, settings)}
+            {viewer::viewer_view(features, settings, ctx)}
         </div>
     }
 }

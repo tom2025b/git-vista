@@ -85,6 +85,13 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // -- registered only when `full_routes` is set (ADR 0005: never built at
     //    all on the LAN router, not merely gated) --
     ("/api/clone", Method::POST, Authz::SessionAndCsrf),
+    // #263: a read of a clone attempt's outcome, same posture as the
+    // `/api/operations/{id}` read below it — a GET, so no CSRF surface.
+    (
+        "/api/clone-status/{key}",
+        Method::GET,
+        Authz::SessionRequired,
+    ),
     ("/api/delete-clone", Method::POST, Authz::SessionAndCsrf),
     ("/api/select", Method::POST, Authz::SessionAndCsrf),
     ("/api/rescan", Method::POST, Authz::SessionAndCsrf),
@@ -135,7 +142,11 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
+<<<<<<< HEAD
 const EXPECTED_ROUTE_COUNT: usize = 39;
+=======
+const EXPECTED_ROUTE_COUNT: usize = 38;
+>>>>>>> origin/main
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

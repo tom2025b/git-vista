@@ -108,7 +108,7 @@ use git_vista_protocol::RepoMode;
 use handlers::branch::{
     checkout_branch, create_branch, delete_branch, force_delete_branch, merge_branch, push_branch,
 };
-use handlers::clone::{clone_repo, delete_clone_repo};
+use handlers::clone::{clone_repo, clone_status, delete_clone_repo};
 use handlers::commit::{create_commit, stage_all, unstage_all};
 use handlers::discard::{delete_untracked_paths, discard_tracked_paths};
 use handlers::protocol::protocol_info;
@@ -422,6 +422,14 @@ fn api_router(
         api = api
             // Phase 12: clone a public URL into a temp dir and view it read-only.
             .route("/api/clone", post(clone_repo))
+            // #263: what happened to a clone attempt admitted under an
+            // idempotency key — the recovery channel for a client that lost
+            // the `POST /api/clone` response above and wants to reconcile
+            // without re-POSTing. Registered alongside `/api/clone`, same
+            // reasoning as `/api/operations/{id}` below: this describes a
+            // write's outcome, so the LAN router must never see it either
+            // (ADR 0005).
+            .route("/api/clone-status/{key}", get(clone_status))
             // ADR 0008: delete a persistent clone (catalog entry + directory),
             // guarded to paths that canonicalize inside the clones root.
             .route("/api/delete-clone", post(delete_clone_repo))
