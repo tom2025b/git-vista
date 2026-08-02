@@ -24,6 +24,7 @@
 //! #145 makes the validation load-bearing, both on top of exactly this
 //! pipeline.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -36,7 +37,7 @@ use git_vista_core::seed::{parse_seed, reset_plan, Seed};
 use git_vista_protocol::{
     BranchName, CommitMessage, CommitOid, GenerationToken, GitOperation, IdempotencyKey,
     OperationHash, OperationStage, Plan, Precondition, RecoveryStrategy, RefChange, RefName,
-    RefState, RemoteName, RepositoryToken, RiskLevel, UnixSeconds, WorktreeToken,
+    RefState, RemoteName, RepositoryToken, RiskLevel, UnixSeconds, WorktreePath, WorktreeToken,
     IDEMPOTENCY_HEADER,
 };
 
@@ -1214,6 +1215,31 @@ async fn shape(
             Vec::new(),
             RecoveryStrategy::Irrecoverable,
         ),
+        // #219: neither operation moves a ref, so there is nothing for a
+        // `Precondition`/`RefChange` to describe here — the real admission
+        // gate is the per-path tracked/untracked re-verification the
+        // executor runs immediately before running git (`verify_path_states`),
+        // the same "real gate lives in the executor, not in `shape`" posture
+        // `StageSelection` above already established for its own diff-generation
+        // check.
+        //
+        // Distinct recovery strategies (review finding): a discarded tracked
+        // path may still be recoverable from the object database if it was
+        // ever staged; a deleted untracked path never can be. Sharing one
+        // tag here would defeat the reason `RecoveryStrategy` is typed at
+        // all.
+        GitOperation::DiscardTrackedPaths { .. } => (
+            RiskLevel::Destructive,
+            Vec::new(),
+            Vec::new(),
+            RecoveryStrategy::RecoverableIfStaged,
+        ),
+        GitOperation::DeleteUntrackedPaths { .. } => (
+            RiskLevel::Destructive,
+            Vec::new(),
+            Vec::new(),
+            RecoveryStrategy::Irrecoverable,
+        ),
     }
 }
 
@@ -1317,6 +1343,12 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
                 &whole_files,
             )
             .await
+        }
+        GitOperation::DiscardTrackedPaths { paths } => {
+            exec_discard_tracked_paths(repo, need, &paths).await
+        }
+        GitOperation::DeleteUntrackedPaths { paths } => {
+            exec_delete_untracked_paths(repo, need, &paths).await
         }
     }
 }
@@ -2332,6 +2364,450 @@ async fn exec_reset_test_repo(repo: &Path, need: NetworkNeed) -> (StatusCode, St
     );
     println!("[/api/reset-test-repo] {msg}");
     (StatusCode::OK, msg)
+}
+
+// --- #219 (M2.18a): discard tracked-path changes / delete untracked paths --
+//
+// The first genuinely irreversible operation in this vocabulary:
+// `DeleteUntrackedPaths` has no journal-backed undo at all, because an
+// untracked path was never in git's object database to begin with. Every
+// guard below exists because of that fact — a bug here can delete real,
+// uncommitted, unstaged work with zero recovery path, so each guard is
+// written to refuse rather than guess whenever it cannot prove a path is
+// safe.
+
+/// A requested path's tracked/untracked classification, as `git status`
+/// reports it right now — the shape [`verify_path_states`] re-checks
+/// immediately before running `git checkout --`/`git clean -f` (#219's race
+/// guard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathKind {
+    /// A tracked path with an uncommitted change (staged and/or unstaged, or
+    /// a rename) — what [`GitOperation::DiscardTrackedPaths`] expects every
+    /// one of its paths to be.
+    TrackedDirty,
+    /// An untracked path (porcelain `?`) — what
+    /// [`GitOperation::DeleteUntrackedPaths`] expects every one of its paths
+    /// to be.
+    Untracked,
+    /// Anything else `git status` reports for the path (ignored, a merge
+    /// conflict) or nothing at all (clean, deleted, never existed) — never a
+    /// valid target for either operation.
+    Other,
+}
+
+/// Classify every path a live `git status --porcelain=v2 -z` reports, folded
+/// to exactly the tracked/untracked distinction [`verify_path_states`] needs.
+/// Reuses `git_vista_protocol`'s already-tested `-z` parser rather than a
+/// bespoke one — see that module's doc comment for why `-z` (never the
+/// quoted/tab format) is the only shape that survives an arbitrary path
+/// losslessly.
+///
+/// A renamed entry's *new* path is `TrackedDirty` (it is the path that
+/// exists on disk right now); its `origin_path` is not inserted at all — the
+/// old name no longer names anything a discard/delete could act on.
+/// Ignored and conflicted entries are never inserted, so they classify as
+/// [`PathKind::Other`] by absence — never a valid target for either
+/// operation.
+fn classify_path_states(parsed: &git_vista_protocol::ParsedStatus) -> HashMap<String, PathKind> {
+    use git_vista_protocol::StatusEntry;
+    let mut out = HashMap::new();
+    for entry in &parsed.entries {
+        match entry {
+            StatusEntry::Changed { path, .. } | StatusEntry::Renamed { path, .. } => {
+                out.insert(path.clone(), PathKind::TrackedDirty);
+            }
+            StatusEntry::Untracked { path, .. } => {
+                out.insert(path.clone(), PathKind::Untracked);
+            }
+            StatusEntry::Ignored { .. } | StatusEntry::Conflicted { .. } => {}
+        }
+    }
+    out
+}
+
+/// The race guard (#219): re-resolve every requested path against a **fresh**
+/// `git status --porcelain=v2 -z`, immediately before running the destructive
+/// git command, and refuse — the whole batch, not just the drifted path — if
+/// any path's live classification no longer matches what this operation
+/// requires.
+///
+/// This is deliberate redundancy on top of the generic staleness gate
+/// (`enforce_fresh`, which already refuses on *any* worktree drift via the
+/// whole-repository `status` digest) — the same reasoning
+/// `exec_stage_selection` already documents for its own inside-the-lock
+/// diff-generation re-check: the generic gate proves *something* moved, this
+/// proves *these exact paths* are still what the plan claims, with a refusal
+/// that names the path rather than the whole repository. Given the stakes
+/// (`DeleteUntrackedPaths` has no undo at all), that redundancy is the point,
+/// not an oversight.
+///
+/// Checking every path before running git at all — rather than looping
+/// path-by-path through separate git invocations — is what makes "refuse
+/// (not skip, not partially apply)" true by construction: either every path
+/// passes and the one `git checkout --`/`git clean -f` call runs over the
+/// whole batch, or the whole batch is refused before git ever runs.
+async fn verify_path_states(
+    repo: &Path,
+    need: NetworkNeed,
+    paths: &[WorktreePath],
+    expect: PathKind,
+    op_name: &str,
+) -> Result<(), (StatusCode, String)> {
+    let output = match run_git(repo, need, &["status", "--porcelain=v2", "-z"]).await {
+        Ok(o) => o,
+        Err(e) => {
+            return Err(couldnt_run(
+                op_name,
+                &format!("couldn't run git status: {e}"),
+            ))
+        }
+    };
+    if !output.status.success() {
+        return Err(couldnt_run(
+            op_name,
+            &"git status failed, so these paths cannot be re-verified before executing",
+        ));
+    }
+    let parsed = git_vista_protocol::parse_porcelain_v2_z(&output.stdout);
+    let live = classify_path_states(&parsed);
+    for path in paths {
+        let actual = live.get(path.as_str()).copied().unwrap_or(PathKind::Other);
+        if actual != expect {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "‘{}’ changed while this was pending — refusing rather than \
+                     partially applying.",
+                    path.as_str()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The symlink-containment guard (#219): refuse any requested path whose
+/// fully resolved location — following every symlinked path component, AND a
+/// symlinked final entry, exactly what `std::fs::canonicalize` follows —
+/// lands outside the worktree root. Also refuses a path that names a
+/// **directory** outright (review finding, both operations): `git status`
+/// collapses an entirely-untracked directory to one `?? dir/` entry, so
+/// naming that one entry to `DeleteUntrackedPaths` would recursively delete
+/// everything nested under it via `git clean -f` (verified: no `-d` flag
+/// needed for an *explicitly named* directory, unlike wildcard/recursive
+/// traversal) while the response and journal report only the one requested
+/// entry — silently understating the blast radius of the one operation in
+/// this vocabulary with no undo at all. Refusing directories outright is the
+/// conservative fix consistent with this module's "refuse rather than
+/// guess" posture, not an attempt to make directory deletion safe; naming
+/// individual files remains fully supported. This also resolves the
+/// trailing-slash mismatch a live directory entry's porcelain spelling
+/// (`dir/`) would otherwise cause against an unslashed request — directories
+/// are never a valid target either way now, so the spelling stops mattering.
+///
+/// Reuses `bin/gv-sandbox/main.rs`'s `resolve_excludes` pattern (canonicalize
+/// each path, compare against the canonicalized worktree root, fail closed
+/// on any canonicalize error other than `NotFound`) rather than a fresh
+/// lexical check — `WorktreePath`'s own `..`-rejection is necessary but not
+/// sufficient, because a symlink's target is not spelled in the path string
+/// at all (see that newtype's doc comment).
+///
+/// `NotFound` is deliberately not a refusal here, mirroring `resolve_excludes`
+/// exactly: a path that does not exist has nothing to prove an escape about,
+/// and [`verify_path_states`] independently refuses a path whose status no
+/// longer matches what the operation expects — which a vanished path always
+/// does. `std::fs::canonicalize`/`std::fs::symlink_metadata` are blocking
+/// filesystem I/O, so this runs on a blocking thread (the same offload
+/// discipline as every other synchronous read in this module — see the
+/// "blocking-work offload" section above).
+async fn symlink_containment_guard(
+    repo: &Path,
+    paths: &[WorktreePath],
+    op_name: &'static str,
+) -> Result<(), (StatusCode, String)> {
+    let repo_owned = repo.to_path_buf();
+    let rels: Vec<String> = paths.iter().map(|p| p.as_str().to_string()).collect();
+    let result = tokio::task::spawn_blocking(move || -> Result<(), (StatusCode, String)> {
+        let repo_canon = std::fs::canonicalize(&repo_owned).map_err(|e| {
+            couldnt_run(op_name, &format!("couldn't resolve the worktree root: {e}"))
+        })?;
+        for rel in &rels {
+            let joined = repo_owned.join(rel);
+            match std::fs::canonicalize(&joined) {
+                Ok(resolved) => {
+                    if !resolved.starts_with(&repo_canon) {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            format!(
+                                "‘{rel}’ resolves outside the worktree through a symlink — \
+                                 refusing."
+                            ),
+                        ));
+                    }
+                    // Real, in-worktree directory: refuse (see doc comment).
+                    // `symlink_metadata` (not `metadata`) on the RESOLVED
+                    // path so a symlink-to-a-directory is judged by what it
+                    // actually points at, already proven in-bounds above.
+                    let is_dir = std::fs::symlink_metadata(&resolved)
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false);
+                    if is_dir {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            format!(
+                                "‘{rel}’ names a directory — refusing rather than deleting \
+                                 its contents recursively under one requested entry; name \
+                                 individual files instead."
+                            ),
+                        ));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Nothing to prove an escape about; `verify_path_states`
+                    // independently refuses a vanished path. See this
+                    // function's own doc comment.
+                }
+                Err(e) => {
+                    return Err(couldnt_run(
+                        op_name,
+                        &format!("couldn't resolve ‘{rel}’: {e}"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(inner) => inner,
+        Err(join_err) => Err(couldnt_run(
+            op_name,
+            &format!("containment check task panicked: {join_err}"),
+        )),
+    }
+}
+
+/// `git checkout -- <paths>` (`/api/discard-tracked-paths`, #219): discard
+/// uncommitted changes to already-tracked paths, restoring each to its
+/// checked-out (index, else HEAD) version. See
+/// [`GitOperation::DiscardTrackedPaths`]'s doc comment for the exact,
+/// qualified recovery story this response/journal text spells out — this is
+/// destructive, and only *sometimes* undoable outside git-vista.
+async fn exec_discard_tracked_paths(
+    repo: &Path,
+    need: NetworkNeed,
+    paths: &[WorktreePath],
+) -> (StatusCode, String) {
+    if let Err(refused) = symlink_containment_guard(repo, paths, "/api/discard-tracked-paths").await
+    {
+        return refused;
+    }
+    if let Err(refused) = verify_path_states(
+        repo,
+        need,
+        paths,
+        PathKind::TrackedDirty,
+        "/api/discard-tracked-paths",
+    )
+    .await
+    {
+        return refused;
+    }
+    // `git checkout HEAD -- <paths>`, not the bare `git checkout -- <paths>`
+    // the issue's own shorthand suggested: bare `checkout --` only resets
+    // the worktree to the INDEX, so a path whose only difference is staged
+    // (index != HEAD, worktree == index) is a silent no-op — verified
+    // empirically before this fix landed (review finding: it returned 200
+    // and journaled "discarded" while the git command changed nothing).
+    // `checkout HEAD --` resets both index and worktree to HEAD, discarding
+    // staged and unstaged changes alike, which is what "discard uncommitted
+    // changes" means to a caller regardless of staging state — and the
+    // staged blob (if any) still survives as a dangling object until the
+    // next `git gc`, confirmed with `git fsck --unreachable`, so the
+    // recovery-story text below stays true either way.
+    let mut args: Vec<&str> = vec!["checkout", "HEAD", "--"];
+    args.extend(paths.iter().map(WorktreePath::as_str));
+    let output = match run_git(repo, need, &args).await {
+        Ok(o) => o,
+        Err(e) => return couldnt_run("/api/discard-tracked-paths", &e),
+    };
+    if !output.status.success() {
+        let msg = stderr_or(&output, "git checkout failed.");
+        eprintln!("git-vista: /api/discard-tracked-paths failed: {msg}");
+        return (StatusCode::BAD_REQUEST, msg);
+    }
+    let count = paths.len();
+    let s = if count == 1 { "" } else { "s" };
+    let summary = format!(
+        "discarded uncommitted changes to {count} tracked path{s} — recoverable only \
+         for content staged before this ran, and only until git gc; a worktree-only \
+         edit is gone"
+    );
+    println!("[/api/discard-tracked-paths] {summary}");
+    journal_app_event(
+        repo,
+        ActivityKind::Other,
+        None,
+        Obs::Absent,
+        Obs::Absent,
+        summary,
+    )
+    .await;
+    (
+        StatusCode::OK,
+        format!(
+            "Discarded uncommitted changes to {count} tracked path{s}. Recoverable only \
+             for content that was staged before this ran, and only until the next git \
+             gc — a worktree-only edit is gone."
+        ),
+    )
+}
+
+/// Compare what `git clean -f`'s own stdout says it actually removed
+/// ("Removing <path>" per entry) against the full `requested` set, and build
+/// an honest partial-result message if any requested path is missing —
+/// `None` when every requested path was reported removed. Pure: takes
+/// `git clean`'s stdout text directly, no repository access, so the
+/// mismatch-detection and message-building logic is testable with a
+/// hand-built stdout string, independent of ever triggering the real race
+/// this exists to report on (see [`exec_delete_untracked_paths`]'s doc
+/// comment for why the race itself can't be a deterministic permanent test).
+fn partial_delete_report(requested: &[&str], clean_stdout: &str) -> Option<String> {
+    let removed: std::collections::HashSet<&str> = clean_stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("Removing "))
+        .collect();
+    let missing: Vec<&str> = requested
+        .iter()
+        .copied()
+        .filter(|p| !removed.contains(p))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    // Some of the batch is already, irreversibly gone — that cannot be
+    // undone by refusing now. What this can still do is refuse to claim
+    // full success: name exactly what happened instead of a count that
+    // doesn't match reality.
+    let removed_list = requested
+        .iter()
+        .copied()
+        .filter(|p| removed.contains(p))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let missing_list = missing.join(", ");
+    Some(format!(
+        "Partial result: {removed_list} {} deleted permanently, but {missing_list} \
+         {} not — its state changed (likely became tracked) in the instant between \
+         the pre-flight check and this running. Nothing further was applied for \
+         {missing_list}; re-check its status before retrying.",
+        if removed_list.is_empty() {
+            "was"
+        } else {
+            "were"
+        },
+        if missing.len() == 1 { "was" } else { "were" }
+    ))
+}
+
+/// `git clean -f -- <paths>` (`/api/delete-untracked-paths`, #219): delete
+/// untracked paths from the working tree outright. **No journal-backed undo
+/// exists for this at all** — an untracked path was never written to git's
+/// object database, so there is nothing anywhere in this repository to reset
+/// back to. See [`GitOperation::DeleteUntrackedPaths`]'s doc comment.
+async fn exec_delete_untracked_paths(
+    repo: &Path,
+    need: NetworkNeed,
+    paths: &[WorktreePath],
+) -> (StatusCode, String) {
+    if let Err(refused) =
+        symlink_containment_guard(repo, paths, "/api/delete-untracked-paths").await
+    {
+        return refused;
+    }
+    if let Err(refused) = verify_path_states(
+        repo,
+        need,
+        paths,
+        PathKind::Untracked,
+        "/api/delete-untracked-paths",
+    )
+    .await
+    {
+        return refused;
+    }
+    let mut args: Vec<&str> = vec!["clean", "-f", "--"];
+    args.extend(paths.iter().map(WorktreePath::as_str));
+    let output = match run_git(repo, need, &args).await {
+        Ok(o) => o,
+        Err(e) => return couldnt_run("/api/delete-untracked-paths", &e),
+    };
+    if !output.status.success() {
+        let msg = stderr_or(&output, "git clean failed.");
+        eprintln!("git-vista: /api/delete-untracked-paths failed: {msg}");
+        return (StatusCode::BAD_REQUEST, msg);
+    }
+
+    // The TOCTOU this closes (review finding, empirically demonstrated): a
+    // path can become tracked in the gap between `verify_path_states`'s read
+    // and this exact `git clean` call — a concurrent `git add`, an IDE
+    // auto-stage, a second git-vista tab. `git clean -f -- p1 p2 p3` is NOT
+    // atomic across a multi-path pathspec: it silently SKIPS a path that's
+    // since become tracked (no error, exit 0) while still deleting the
+    // rest of the batch — verified directly against real git. Locking out
+    // the whole race window needs a repo-wide exclusive lock this endpoint
+    // doesn't hold; what's tractable and load-bearing without one is never
+    // reporting success that isn't true: `git clean`'s own stdout names
+    // exactly what it removed, so that is compared against the full
+    // requested set before this returns 200 (`partial_delete_report`, pure
+    // and directly tested against a hand-built mismatch — the timing race
+    // itself isn't something a permanent test can trigger deterministically,
+    // but the honesty property this exists for doesn't depend on how a
+    // mismatch arose).
+    let stdout_text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let requested: Vec<&str> = paths.iter().map(WorktreePath::as_str).collect();
+    if let Some(msg) = partial_delete_report(&requested, &stdout_text) {
+        eprintln!("git-vista: /api/delete-untracked-paths partial: {msg}");
+        journal_app_event(
+            repo,
+            ActivityKind::Other,
+            None,
+            Obs::Absent,
+            Obs::Absent,
+            format!("delete-untracked-paths partial result — {msg}"),
+        )
+        .await;
+        return (StatusCode::CONFLICT, msg);
+    }
+
+    let count = paths.len();
+    let s = if count == 1 { "" } else { "s" };
+    // Deliberately no "undo"/"restore"/"recover" anywhere in this text (a
+    // regression test greps for exactly those words) — this is the one
+    // operation in the vocabulary where saying so plainly is the honest
+    // thing to say, not merely the cautious one.
+    let summary = format!(
+        "deleted {count} untracked path{s} permanently — never stored in git, no way \
+         to bring the content back"
+    );
+    println!("[/api/delete-untracked-paths] {summary}");
+    journal_app_event(
+        repo,
+        ActivityKind::Other,
+        None,
+        Obs::Absent,
+        Obs::Absent,
+        summary,
+    )
+    .await;
+    (
+        StatusCode::OK,
+        format!(
+            "Deleted {count} untracked path{s} permanently. That content was never \
+             stored in git, so there is no way to bring it back."
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
