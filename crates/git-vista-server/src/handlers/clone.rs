@@ -39,6 +39,7 @@ use serde::Serialize;
 use git_vista_core::identity::WorktreeId;
 use git_vista_protocol::{
     validate_clone_url, CloneRequest, DeleteCloneRequest, IdempotencyKey, RepositoryDescriptor,
+    CLONE_IN_PROGRESS_SENTINEL,
 };
 
 use crate::state::{
@@ -340,9 +341,10 @@ fn admit_clone(
         return match &record.outcome {
             None => Err((
                 StatusCode::CONFLICT,
-                "A clone for this request is already in progress. Wait for it to finish \
-                 before retrying."
-                    .to_string(),
+                format!(
+                    "A clone for this request is {CLONE_IN_PROGRESS_SENTINEL}. Wait for it \
+                     to finish before retrying."
+                ),
             )),
             Some(CloneOutcome::Succeeded(descriptor)) => {
                 Ok(CloneAdmission::Replay(Ok(Json(descriptor.clone()))))
@@ -984,9 +986,19 @@ mod tests {
         let _ = release_first_tx.send(());
         first.await.expect("the first task must not panic");
 
+        let Err((status, message)) = &second_result else {
+            panic!("a second request for a key already in progress must be refused, not admitted");
+        };
+        assert_eq!(*status, StatusCode::CONFLICT);
+        // #289: drives the real refusal arm (not a helper that just returns
+        // the constant) and asserts on the actual returned message, imported
+        // from the protocol crate rather than a hand-copied literal — this
+        // is what makes rewording the surrounding sentence free while moving
+        // or dropping the sentinel itself fails this test.
         assert!(
-            matches!(second_result, Err((StatusCode::CONFLICT, _))),
-            "a second request for a key already in progress must be refused, not admitted"
+            message.contains(CLONE_IN_PROGRESS_SENTINEL),
+            "the still-running refusal must contain the sentinel the client's \
+             clone_response_should_poll matches on to keep polling this 409 — got {message:?}"
         );
         assert_eq!(
             spawned.load(Ordering::SeqCst),
