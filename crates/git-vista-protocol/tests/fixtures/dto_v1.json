@@ -18,6 +18,22 @@
     "allow_empty": false,
     "expected_tip": "5555555555555555555555555555555555555555"
   },
+  "amend_commit_success_published": {
+    "message": "Amended commit.",
+    "old_tip": "5555555555555555555555555555555555555555",
+    "new_tip": "6666666666666666666666666666666666666666",
+    "amended_published_commit": true
+  },
+  "amend_commit_success_unknown_reach": {
+    "message": "Amended commit.",
+    "old_tip": "5555555555555555555555555555555555555555",
+    "new_tip": null,
+    "amended_published_commit": null
+  },
+  "amend_commit_error_hook_rejected": {
+    "kind": "hook_rejected",
+    "message": "pre-commit: trailing whitespace on line 3"
+  },
   "branch_request": {
     "branch": "main"
   },

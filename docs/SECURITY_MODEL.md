@@ -561,6 +561,22 @@ raises the plan's risk from `Remote` to `Destructive`. This is the typed **contr
 fast-forward push with `501`, so a lease-force push cannot yet run. "Strong warning" and
 "re-auth option" remain open scope, along with execution itself, for #231.)*
 
+*(History rewrite, amend member — partially implemented: ADR 0040, #223. **Recovery
+ref:** done — a successful amend journals `ActivityKind::Amend` with the exact old→new
+tip pair (feeding `/api/activity`'s reset-back undo hint), and the tracked pipeline pins
+the pre-amend commit as a `refs/git-vista/recovery/<operation-id>` ref from the plan's
+`ResetRef { …, expected_tip }` (ADR 0021), so the amended-away commit survives on a real
+ref, not only in the reflog. The execution is compare-and-swapped on the tip the client
+reviewed (stale-from-the-start refuses 400 `stale_tip`; moved-while-pending refuses 409
+at the ADR 0018 gate), refuses detached HEAD outright, and reports whether the
+amended-away commit was reachable from a remote-tracking ref as the **advisory**
+three-state `amended_published_commit` flag — never a block, since amending published
+history knowingly is legitimate; failures reach the client as typed kinds
+(`hook_rejected` / `signing_failed` / `stale_tip` / `other`), not stderr to sniff.
+**Preview and explicit confirmation:** the client ceremony is M2.19d's, still open; reset
+and rebase members of this row predate the plan machinery's client-review roundtrip,
+which lands with M2+.)*
+
 No gesture, pressure threshold, swipe, or double-tap directly executes a destructive
 operation. Touch gestures may select or open a plan; final confirmation is explicit.
 
