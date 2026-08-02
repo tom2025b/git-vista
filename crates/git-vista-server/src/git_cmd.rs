@@ -210,6 +210,18 @@ impl std::fmt::Display for ExecUnavailable {
 
 impl std::error::Error for ExecUnavailable {}
 
+/// # `NetworkNeed::Remote` goes through the #228 askpass-hardening harness
+///
+/// A `Remote`-declared spawn is built via
+/// [`crate::sandbox::network_exec::network_command`], not the bare
+/// `spawn::command_async` every other tier uses — that is the one place
+/// `-c core.askpass=` gets spliced ahead of `args`, closing the M1.13
+/// finding-I5 `core.askpass` RCE gap on every Network-tier spawn this
+/// chokepoint composes (`network_exec.rs`'s module doc has the full
+/// reasoning). This is the single seam every git the server runs goes
+/// through, so wiring the hardening in here — rather than in each caller —
+/// is what makes "every fetch/pull/push exec function" get it by
+/// construction instead of by each call site remembering to ask for it.
 fn sandboxed(
     repo: &Path,
     args: &[&str],
@@ -218,7 +230,11 @@ fn sandboxed(
     let read_only = crate::state::read_only_for_path(repo);
     let need = crate::sandbox::reconcile_need(declared, args);
     let policy = crate::sandbox::policy_for(repo, read_only, need).map_err(|e| e.to_string())?;
-    Ok(crate::sandbox::spawn::command_async(&policy, repo, args))
+    Ok(if need == crate::sandbox::NetworkNeed::Remote {
+        crate::sandbox::network_exec::network_command(&policy, repo, args)
+    } else {
+        crate::sandbox::spawn::command_async(&policy, repo, args)
+    })
 }
 
 /// Run `git -C <repo> <args…>` through the sealed launcher and collect its
@@ -263,13 +279,44 @@ pub(crate) async fn git_output(repo: &Path, args: &[&str]) -> std::io::Result<Ou
 /// [`git_output`] with the network need stated explicitly — the arity the
 /// planner uses, where the declaration comes from the typed `GitOperation`
 /// being executed rather than from this file's knowledge of its callers.
+///
+/// `Remote`-declared calls get their captured `Output` passed through
+/// [`crate::sandbox::network_exec::redact_output`] before it reaches the
+/// caller — the redaction half of #228's deliverable, applied at the same
+/// chokepoint [`sandboxed`] applies the askpass hardening at, so nothing
+/// downstream (a response body, a log line, a journal record built from this
+/// `Output`) can see an unredacted secret without this function's caller
+/// deliberately reaching around it.
 pub(crate) async fn git_output_for(
     repo: &Path,
     args: &[&str],
     declared: crate::sandbox::NetworkNeed,
 ) -> std::io::Result<Output> {
     let cmd = sandboxed(repo, args, declared).map_err(std::io::Error::other)?;
-    cmd.output().await
+    let output = cmd.output().await?;
+    Ok(redact_if_remote(output, declared))
+}
+
+/// The redact-or-pass-through decision [`git_output_for`] and
+/// [`git_output_with_stdin`] both make, pulled out as a pure function so it
+/// is directly unit-testable against a hand-built `Output` — no process
+/// spawn, no fake `git` on `PATH`, nothing that needs a sandbox policy or a
+/// substituted environment. That matters here specifically: `git_output_for`
+/// itself takes no env/stdio configuration (production deliberately runs
+/// with the server's real environment — see [`sandboxed`]'s doc), so a test
+/// that wanted to drive a fake `git` through the *whole* function would have
+/// to mutate `PATH` process-wide, which races every other test in this
+/// binary under `cargo test`'s default parallel-threads-one-process model
+/// (`sandbox::argv::SSH_AUTH_SOCK_LOCK` documents the identical hazard for a
+/// different variable). Splitting the decision out avoids needing that at
+/// all: the two callers are then thin enough to trust by inspection, and
+/// this function carries the actual test coverage.
+fn redact_if_remote(output: Output, declared: crate::sandbox::NetworkNeed) -> Output {
+    if declared == crate::sandbox::NetworkNeed::Remote {
+        crate::sandbox::network_exec::redact_output(output)
+    } else {
+        output
+    }
 }
 
 /// [`git_output_for`] with `input` written to the child's stdin first — the
@@ -308,7 +355,12 @@ pub(crate) async fn git_output_with_stdin(
     });
     let output = child.wait_with_output().await;
     let _ = writer.await;
-    output
+    // Same redaction posture as `git_output_for` — see [`redact_if_remote`].
+    // No current caller declares `Remote` here (`stage_selection`'s `apply
+    // --cached` is always `Local`), but the arity is generic over
+    // `declared`, so this keeps that promise true rather than leaving it
+    // true only by accident.
+    output.map(|o| redact_if_remote(o, declared))
 }
 
 /// Declares `NetworkNeed::Local` for the same reason [`git_output`] does: all
@@ -1017,6 +1069,134 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         !pid_alive(pid)
+    }
+
+    /// A `PATH` containing nothing but a fake `git` that writes its argv
+    /// (unit-separator-joined) to stdout and exits 0 — same technique
+    /// `network_exec.rs`'s own argv-shape test uses, duplicated here (rather
+    /// than shared) because that helper is private to that file's test
+    /// module. Written inside `repo` (already rw-granted by the policy under
+    /// test) since a path outside every grant a Network-tier policy makes
+    /// cannot be exec'd at all under Landlock.
+    fn fake_git_dumper(repo: &Path) -> String {
+        let dir = repo.join("fake-bin");
+        std::fs::create_dir_all(&dir).expect("mkdir fake-bin");
+        let bin = dir.join("git");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\037' \"$a\"; done; printf '\\n'\n",
+        )
+        .expect("write fake git");
+        let mut perm = std::fs::metadata(&bin).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&bin, perm).unwrap();
+        dir.to_string_lossy().into_owned()
+    }
+
+    /// The regression this file's own review found (#228 blocker): a
+    /// `NetworkNeed::Remote`-declared spawn used to go through the same bare
+    /// `spawn::command_async` every other tier uses, with no `-c
+    /// core.askpass=` hardening — so `exec_push` (the one production caller
+    /// today) never actually got the askpass RCE closure `network_exec.rs`
+    /// builds, even though that harness existed and was fully tested in
+    /// isolation. This proves the *wiring*, not just the underlying
+    /// mechanism (already proven exhaustively by
+    /// `network_exec::https_suite::repo_local_askpass_is_never_executed`):
+    /// `sandboxed()` itself, called exactly the way `git_output_for` calls
+    /// it, must route a `Remote`-declared spawn through the hardened
+    /// launcher.
+    #[tokio::test]
+    async fn sandboxed_forces_askpass_hardening_for_remote_network_need() {
+        let (_dir, repo) = seeded_repo();
+        let dumper = fake_git_dumper(&repo);
+
+        let cmd = sandboxed(
+            &repo,
+            &["ls-remote", "origin"],
+            crate::sandbox::NetworkNeed::Remote,
+        )
+        .expect("policy builds for a Network-tier need");
+        let out = cmd
+            .pinned_env_for_test(&[("PATH", dumper), ("HOME", std::env::var("HOME").unwrap())])
+            .output()
+            .await
+            .expect("fake git runs");
+        let argv_line = String::from_utf8_lossy(&out.stdout);
+        let args: Vec<&str> = argv_line
+            .trim()
+            .trim_end_matches('\u{1f}')
+            .split('\u{1f}')
+            .collect();
+        assert!(
+            args.windows(2).any(|w| w == ["-c", "core.askpass="]),
+            "sandboxed() did not force askpass hardening for NetworkNeed::Remote; argv={args:?}"
+        );
+    }
+
+    /// Paired negative: a `Local`-declared spawn (every other tier) must
+    /// NOT carry the Network-tier forcing — proves the assertion above is
+    /// actually discriminating on `need`, not just always true of every
+    /// spawn this fixture produces.
+    #[tokio::test]
+    async fn sandboxed_does_not_force_askpass_hardening_for_local_network_need() {
+        let (_dir, repo) = seeded_repo();
+        let dumper = fake_git_dumper(&repo);
+
+        let cmd = sandboxed(
+            &repo,
+            &["status", "--short"],
+            crate::sandbox::NetworkNeed::Local,
+        )
+        .expect("policy builds for a Local need");
+        let out = cmd
+            .pinned_env_for_test(&[("PATH", dumper), ("HOME", std::env::var("HOME").unwrap())])
+            .output()
+            .await
+            .expect("fake git runs");
+        let argv_line = String::from_utf8_lossy(&out.stdout);
+        let args: Vec<&str> = argv_line
+            .trim()
+            .trim_end_matches('\u{1f}')
+            .split('\u{1f}')
+            .collect();
+        assert!(
+            !args.windows(2).any(|w| w == ["-c", "core.askpass="]),
+            "a Local-need spawn unexpectedly carried Network-tier askpass forcing; argv={args:?}"
+        );
+    }
+
+    /// The redaction half of the same wiring: [`redact_if_remote`] — the
+    /// exact decision `git_output_for` and `git_output_with_stdin` both
+    /// delegate to — must strip URL userinfo from a `Remote`-declared
+    /// `Output` and leave a `Local`-declared one byte-for-byte untouched.
+    /// No process spawn needed: see `redact_if_remote`'s own doc for why a
+    /// fake-`git`-on-`PATH` version of this test would have to mutate `PATH`
+    /// process-wide and race every other test in this binary.
+    #[test]
+    fn redact_if_remote_redacts_only_when_declared_remote() {
+        let raw = || Output {
+            status: std::process::ExitStatus::default(),
+            stdout: Vec::new(),
+            stderr: b"fatal: https://user:hunter2@host/repo.git unreachable".to_vec(),
+        };
+
+        let remote = redact_if_remote(raw(), crate::sandbox::NetworkNeed::Remote);
+        let remote_stderr = String::from_utf8_lossy(&remote.stderr);
+        assert!(
+            !remote_stderr.contains("hunter2"),
+            "Remote-declared Output was not redacted: {remote_stderr}"
+        );
+
+        // Paired negative: Local-declared output is untouched, AND proves
+        // the raw fixture really does carry the secret un-redacted (so the
+        // Remote assertion above is capable of failing, not vacuous).
+        let local = redact_if_remote(raw(), crate::sandbox::NetworkNeed::Local);
+        assert_eq!(
+            local.stderr,
+            raw().stderr,
+            "Local-declared Output must pass through unchanged"
+        );
+        assert!(String::from_utf8_lossy(&local.stderr).contains("hunter2"));
     }
 
     #[tokio::test]

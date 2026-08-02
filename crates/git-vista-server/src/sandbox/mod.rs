@@ -29,6 +29,13 @@ pub(crate) mod capabilities;
 /// cannot supply the tier a repository needs. See its module doc for why the
 /// plan's `CapabilityAbsent => Blocked` mapping is not implemented.
 pub(crate) mod hook_policy;
+/// #228 (M2.20b): the shared Network-tier exec harness — askpass hardening
+/// (`-c core.askpass=`, closing the M1.13 finding I5 RCE gap) and output
+/// redaction, the one execution path every fetch/pull/push spawn is meant to
+/// go through. See its module doc for the full account, including why it does
+/// not force `credential.helper=` and why the exact `terminal prompts
+/// disabled` string is out of reach without widening the spawn chokepoint.
+pub(crate) mod network_exec;
 /// Task 9, part 2: the boot probe — launches the composed launcher against a
 /// throwaway hostile-hook repo and classifies the result into a
 /// [`probe::ProbeVerdict`], gating server startup (INV-13 / Global
