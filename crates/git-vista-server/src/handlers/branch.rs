@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use axum::Json;
 
 use git_vista_protocol::{
-    BranchName, BranchRequest, CreateBranchRequest, GitOperation, RemoteName,
+    BranchName, BranchRequest, CreateBranchRequest, ForcePublish, GitOperation, RemoteName,
 };
 
 use crate::planner;
@@ -83,10 +83,21 @@ pub(crate) async fn merge_branch(Json(req): Json<BranchRequest>) -> (StatusCode,
 /// Push a branch to `origin` (Issue #33 follow-up): `git push origin <branch>`
 /// via [`GitOperation::PushBranch`]. A non-origin remote (or none) makes git
 /// error; that text is forwarded to the UI.
+///
+/// M2.20a (#227) widened [`GitOperation::PushBranch`] with `set_upstream` and
+/// `force`. This endpoint pins both to the values that reproduce the argv it
+/// has always run — no upstream write, no force — so its behaviour is
+/// unchanged. It is `/api/push`'s *own* posture, not a default the type
+/// supplies: `ForcePublish` has no `Default` impl and the fields have no
+/// `#[serde(default)]`, so every construction site has to say this out loud.
+/// Offering either capability here is M2.20g's (#231) to design, together
+/// with the UI ceremony a force deserves.
 pub(crate) async fn push_branch(Json(req): Json<BranchRequest>) -> (StatusCode, String) {
     branch_op(req, |branch| GitOperation::PushBranch {
         branch,
         remote: RemoteName::new("origin").expect("'origin' is a valid remote name"),
+        set_upstream: false,
+        force: ForcePublish::None,
     })
     .await
 }
