@@ -44,6 +44,29 @@ pub struct CreateCommitRequest {
     pub branch: Option<String>,
 }
 
+/// Body of the planned `POST /api/amend-commit` request (M2.19, #72;
+/// contract-only for now — no handler builds this into a
+/// [`crate::GitOperation::AmendCommit`] yet, that is M2.19b, #223).
+///
+/// `expected_tip` is the compare-and-swap: the full hex commit id the client
+/// last saw as the checked-out branch's tip, matching
+/// [`crate::GitOperation::AmendCommit`]'s own `expected_tip` field one-to-one.
+/// It is a *separate* field from `message`/`allow_empty` rather than folded
+/// into [`CreateCommitRequest`] because amend has no `branch` field to begin
+/// with (it always targets the checked-out branch's own tip — see that
+/// variant's doc comment) and, unlike a plain commit, is only safe to run at
+/// all when the tip a reviewer approved rewriting is still there; a shared
+/// DTO would let a `branch`-carrying request silently no-op past that check
+/// or would need the CAS field bolted onto a shape that has no other use for
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmendCommitRequest {
+    pub message: String,
+    pub allow_empty: bool,
+    pub expected_tip: String,
+}
+
 /// Body of the branch-operation requests (Issue #33 follow-up): merge
 /// (`POST /api/merge`), push (`POST /api/push`), delete (`POST /api/delete-branch`),
 /// force-delete (`POST /api/force-delete-branch`), and checkout (`POST /api/checkout`).
@@ -460,6 +483,24 @@ mod tests {
         let back: CreateCommitRequest =
             serde_json::from_str(r#"{"message":"m","allow_empty":true}"#).unwrap();
         assert_eq!(back.branch, None);
+    }
+
+    #[test]
+    fn amend_commit_request_roundtrips_and_rejects_unknown_fields() {
+        let req = AmendCommitRequest {
+            message: "msg".into(),
+            allow_empty: false,
+            expected_tip: "0123456789abcdef0123456789abcdef01234567".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AmendCommitRequest>(&json).unwrap(),
+            req
+        );
+        assert!(serde_json::from_str::<AmendCommitRequest>(
+            r#"{"message":"m","allow_empty":false,"expected_tip":"deadbeef","branch":"main"}"#
+        )
+        .is_err());
     }
 
     #[test]
