@@ -13,6 +13,11 @@
     "allow_empty": true,
     "branch": "feature/idea"
   },
+  "amend_commit_request": {
+    "message": "fix: correct the typo",
+    "allow_empty": false,
+    "expected_tip": "5555555555555555555555555555555555555555"
+  },
   "branch_request": {
     "branch": "main"
   },
