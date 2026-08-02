@@ -182,6 +182,20 @@ pub struct CloneRequest {
     pub url: String,
 }
 
+/// The substring `handlers/clone.rs::admit_clone` guarantees appears in the
+/// message of its `409 Conflict` refusal for a clone that is still *running*
+/// (as opposed to the sibling 409 for a key reused with a different URL,
+/// which does not contain it). The frontend's `clone_response_should_poll`
+/// (#278) matches on this substring to decide whether that 409 is worth
+/// polling `GET /api/clone-status/{key}` for, rather than treating it as
+/// terminal.
+///
+/// Both sides reference this one constant (#289) so the coupling is a
+/// compile-time fact: the surrounding sentence is free to be reworded, but
+/// moving or dropping the sentinel itself is a deliberate, single-place edit
+/// instead of a silent break in the client's polling.
+pub const CLONE_IN_PROGRESS_SENTINEL: &str = "already in progress";
+
 /// Which experience a repository is opened in (ADR 0006/0007). `Visualize` is
 /// look-only: the server refuses every mutation while it is the current mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
