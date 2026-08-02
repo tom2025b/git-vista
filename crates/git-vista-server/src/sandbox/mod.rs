@@ -746,6 +746,16 @@ pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         // paths — index/worktree only, never a remote.
         GitOperation::DiscardTrackedPaths { .. } => NetworkNeed::Local,
         GitOperation::DeleteUntrackedPaths { .. } => NetworkNeed::Local,
+        // M2.19a (#222): `git commit --amend` rewrites the checked-out
+        // branch's tip in place — index/object-database/ref work, never a
+        // socket. Whether the *amended-away* commit had already been pushed
+        // (and so now diverges from a remote-tracking ref) is a fact about
+        // history, not about what this operation asks git to do over the
+        // wire; see `GitOperation::AmendCommit`'s doc comment for why that
+        // question is left to #223's execution slice rather than answered
+        // here. This variant also has no execution wired yet (#223) — this
+        // arm exists purely to keep this match total.
+        GitOperation::AmendCommit { .. } => NetworkNeed::Local,
     }
 }
 
