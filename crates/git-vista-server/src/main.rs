@@ -111,6 +111,7 @@ use handlers::branch::{
 use handlers::clone::{clone_repo, clone_status, delete_clone_repo};
 use handlers::commit::{amend_commit, create_commit, stage_all, unstage_all};
 use handlers::discard::{delete_untracked_paths, discard_tracked_paths};
+use handlers::fetch::fetch_remote;
 use handlers::protocol::protocol_info;
 use handlers::read::{
     commit_detail, commit_diff, commits, file_at_commit, frame, head_branch, worktree_status,
@@ -463,6 +464,12 @@ fn api_router(
             // Issue #33 follow-up: branch operations, each shelling out to git.
             .route("/api/merge", post(merge_branch))
             .route("/api/push", post(push_branch))
+            // M2.20c (#229, ADR 0043): fetch from a configured remote. The
+            // first write here that can take a minute, so it is also the
+            // first one whose progress is worth streaming and whose
+            // cancellation has to actually kill a process — see
+            // `planner::fetch` and the cancel route below.
+            .route("/api/fetch", post(fetch_remote))
             .route("/api/delete-branch", post(delete_branch))
             // iPad-testing follow-up: switch HEAD to a branch (`git checkout`).
             .route("/api/checkout", post(checkout_branch))
@@ -490,6 +497,15 @@ fn api_router(
             .route(
                 "/api/operations/{id}/events",
                 get(handlers::operations::operation_events),
+            )
+            // M2.20c (#229): ask a running operation to stop — it kills the
+            // running child process, so it is a write (it changes what the
+            // server does), not a read of a write's outcome like the two
+            // routes above it, and carries the full session + CSRF posture
+            // like every other POST here.
+            .route(
+                "/api/operations/{id}/cancel",
+                post(handlers::operations::cancel_operation),
             );
     }
 

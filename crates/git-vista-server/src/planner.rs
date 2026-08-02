@@ -1534,9 +1534,10 @@ async fn shape(
             };
             (RiskLevel::Destructive, preconditions, changes, recovery)
         }
-        // M2.20a (#227): contract only — see each variant's doc comment in
-        // `plan.rs` for the reasoning behind every choice below. Execution is
-        // #229's and #230's; `execute` refuses both today.
+        // M2.20a (#227) shaped both of these — see each variant's doc comment
+        // in `plan.rs` for the reasoning behind every choice below. Fetch now
+        // executes (M2.20c, #229, ADR 0043) against exactly this plan; pull's
+        // executor is still #230's, and `execute` refuses it.
         //
         // A fetch moves only `refs/remotes/<remote>/*`, and *which* of them
         // is not knowable until git has spoken to the remote — so there is no
@@ -1830,23 +1831,18 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
             expected_tip,
             allow_empty,
         } => exec_amend_commit(repo, need, &message, &expected_tip, allow_empty, &observed).await,
-        // M2.20a (#227) ships the typed contract for fetch and pull only —
-        // see their doc comments in `plan.rs`. Execution belongs to #229 and
-        // #230, deliberately, so that the first code in this server to open a
-        // socket with a user's credentials on it gets a review of its own
-        // rather than riding in on a vocabulary change.
-        //
-        // These arms exist because `execute`'s match must stay exhaustive
-        // over the closed vocabulary (#142). Nothing builds either operation
-        // today, so in practice they are unreachable — but reached, they must
-        // refuse rather than no-op silently or run a placeholder git command
-        // against a real repository and a real remote.
-        GitOperation::FetchRemote { .. } => (
-            StatusCode::NOT_IMPLEMENTED,
-            "Fetching from a remote is not yet wired for execution (tracked by \
-             #229) — this plan's contract exists, but nothing executed it."
-                .to_string(),
-        ),
+        // M2.20a (#227) shipped the typed contract for fetch and pull;
+        // M2.20c (#229, ADR 0043) wired *fetch* execution — the first code in
+        // this server to open a socket with a user's credentials on it, which
+        // is why it got a review of its own rather than riding in on the
+        // vocabulary change. `handlers::fetch::fetch_remote` builds the
+        // operation from `POST /api/fetch`.
+        GitOperation::FetchRemote { remote } => fetch::exec_fetch(repo, need, &remote).await,
+        // Pull is still contract-only; this arm exists because `execute`'s
+        // match must stay exhaustive over the closed vocabulary (#142), and
+        // reached it must refuse rather than no-op silently or run a
+        // placeholder git command against a real repository and a real
+        // remote.
         GitOperation::PullBranch { .. } => (
             StatusCode::NOT_IMPLEMENTED,
             "Pulling from a remote is not yet wired for execution (tracked by \
@@ -3827,6 +3823,65 @@ async fn exec_delete_untracked_paths(
 #[cfg(test)]
 mod contract_suite;
 
+/// M2.20c (#229): the fetch executor. Its own file rather than another
+/// `exec_*` in this one, because a fetch brings three concerns no other
+/// operation has — live progress parsing, cancellation, and a failure
+/// taxonomy — and they belong together.
+mod fetch;
+
+/// `POST /api/fetch`'s error-body constructor, re-exported so the handler's
+/// own request-shape refusals carry the same contract the executor's do.
+pub(crate) use fetch::error_body as fetch_error_body;
+
+/// Whether cancelling this operation can actually stop it (M2.20c, #229).
+///
+/// **This is a claim about [`execute`], not a wish.** An arm answering `true`
+/// promises that the executor it dispatches to takes
+/// [`crate::operations::cancel_signal`] and hands it to the process it
+/// spawns; anything else must answer `false`, because
+/// `POST /api/operations/{id}/cancel` reports its answer to an operator, and
+/// "cancelling…" for an operation nothing will ever stop is worse than a
+/// plain refusal.
+///
+/// No wildcard arm, on purpose: a new `GitOperation` variant fails to compile
+/// here until someone states which side it is on. The contract suite pins
+/// the `true` set to an exact census, so widening it is a visible edit rather
+/// than a side effect.
+///
+/// Today only `FetchRemote` qualifies. Every other executor runs a git
+/// command that finishes in milliseconds; the machinery would be real but
+/// the window to use it would not, and a cancel endpoint that usually
+/// arrives too late teaches users to distrust it.
+pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
+    match op {
+        GitOperation::FetchRemote { .. } => true,
+        GitOperation::CreateBranch { .. }
+        | GitOperation::CommitOnHead { .. }
+        | GitOperation::EmptyCommitOnBranch { .. }
+        | GitOperation::AmendCommit { .. }
+        | GitOperation::StageAll
+        | GitOperation::UnstageAll
+        | GitOperation::StageSelection { .. }
+        | GitOperation::CheckoutBranch { .. }
+        | GitOperation::MergeBranch { .. }
+        | GitOperation::PushBranch { .. }
+        | GitOperation::PullBranch { .. }
+        | GitOperation::DeleteBranch { .. }
+        | GitOperation::ForceDeleteBranch { .. }
+        | GitOperation::RebaseOntoBase { .. }
+        | GitOperation::RestoreBranch { .. }
+        | GitOperation::ResetBranch { .. }
+        | GitOperation::RevertCommit { .. }
+        | GitOperation::ResetTestRepo
+        | GitOperation::DiscardTrackedPaths { .. }
+        | GitOperation::DeleteUntrackedPaths { .. }
+        | GitOperation::CreateTag { .. }
+        | GitOperation::DeleteLocalTag { .. }
+        | GitOperation::DeleteRemoteTag { .. }
+        | GitOperation::PushTag { .. } => false,
+    }
+}
+
 #[cfg(test)]
 mod coordination_suite;
 
@@ -3834,6 +3889,11 @@ mod coordination_suite;
 // disconnected client.
 #[cfg(test)]
 mod lifecycle_suite;
+
+// M2.20c (#229): the fetch slice's behavioural tests — real spawns, real
+// cancellation, the dropped-connection replay, and redaction on the live path.
+#[cfg(test)]
+mod fetch_suite;
 
 #[cfg(test)]
 mod tests {

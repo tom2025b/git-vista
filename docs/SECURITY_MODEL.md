@@ -490,6 +490,26 @@ The three "Not implemented" / "Aspirational" gaps above are open scope for a
 future slice, not silent regressions of this one — #228's own scope explicitly
 reads "strip userinfo from URLs **at minimum**."
 
+*(Fetch execution: ADR 0043, #229 — `POST /api/fetch` is the second production
+caller of the harness the table above describes, and the first that reads a
+child's output **while it is still running**. Three consequences for this
+section. First, redaction now covers the streaming path as well as the
+collected one: `git_cmd::git_streamed_for` runs every `\r`/`\n`-separated
+stderr record through `redact_url_userinfo` before handing it to its caller's
+callback, so the live sink is not a hole in the "Redact URL userinfo" row —
+proven against a remote that really leaks a credential-bearing URL on its own
+stderr, with the unredacted premise asserted in the same test
+(`planner::fetch_suite::a_credential_leaked_by_the_remote_never_reaches_the_operation_record`).
+Second, `FetchRequest` carries a **configured remote name, never a URL**, so no
+request can aim this server's credential helpers or SSH agent at a host of the
+client's choosing; the name is gated by the plan's `RemoteConfigured`
+precondition. Third, a fetch can now be cancelled — `POST
+/api/operations/{id}/cancel` SIGKILLs the direct child — and what a cancelled
+fetch reports about the repository is read from `refs/remotes/<remote>/*`
+before and after, never from git's prose. Known limitation, recorded rather
+than hidden: the kill reaches the direct child only, so a grandchild transport
+process may briefly outlive it.)*
+
 ## Request Integrity
 
 Every mutation request contains:

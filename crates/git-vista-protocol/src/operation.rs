@@ -20,6 +20,9 @@
 //! - [`OperationStatus`] — the record: the replayable result plus the
 //!   post-execution generation and typed recovery a client needs to reconcile.
 //! - [`ProgressEvent`] — one server-sent event on the operation's stream.
+//! - [`TransferProgress`] / [`TransferPhase`] (M2.20c, #229) — *inside* the
+//!   `Executing` stage, which phase of an object transfer git is in and how
+//!   far through it is. A long fetch is otherwise one opaque "running".
 //!
 //! Everything here is transport only. The registry that holds records, decides
 //! duplicates, and evicts, lives in the server; issue #62 makes it durable, and
@@ -124,6 +127,57 @@ pub enum OperationStage {
     Finished,
 }
 
+/// Which phase of an object transfer git reported (M2.20c, #229).
+///
+/// These are git's own `--progress` phases, in the order a fetch goes through
+/// them, **not** invented UI steps — the same posture [`OperationStage`] takes
+/// towards the planner's stages. They live beside [`OperationStage`] rather
+/// than inside it because they are *not* pipeline stages: a fetch is in
+/// `OperationStage::Executing` for the whole of this sequence, and folding
+/// them into that enum would have made every existing exhaustive match over
+/// `OperationStage` (the frontend has one) wrong the day a fetch ran.
+///
+/// Wire values are `snake_case`. The first three are reported *by the remote*
+/// (git prefixes them `remote:`), the last two by the local process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferPhase {
+    /// `remote: Enumerating objects: N, done.` — the remote is deciding what
+    /// to send. Reports no percentage, only a running count.
+    Enumerating,
+    /// `remote: Counting objects: N% (a/b)`.
+    Counting,
+    /// `remote: Compressing objects: N% (a/b)`.
+    Compressing,
+    /// `Receiving objects: N% (a/b)` — bytes are arriving locally. The phase
+    /// a user waits in, and the reason this vocabulary exists at all.
+    Receiving,
+    /// `Resolving deltas: N% (a/b)` — the local index is being built. Nothing
+    /// has touched a ref yet at this point.
+    Resolving,
+}
+
+/// How far through a [`TransferPhase`] git has got (M2.20c, #229).
+///
+/// Every field past `phase` is optional because git's own reporting is: the
+/// `Enumerating` line carries a count and no percentage, and a phase's
+/// closing `, done.` line may repeat the last numbers or not. A client that
+/// wants a progress bar uses `percent` when present and falls back to naming
+/// the phase; nothing here is ever synthesised to make the shape rectangular,
+/// because a fabricated percentage is worse than an honest absent one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferProgress {
+    /// The phase this report is about.
+    pub phase: TransferPhase,
+    /// Percentage complete, 0-100, when git printed one.
+    pub percent: Option<u8>,
+    /// Objects done so far in this phase, when git printed a `(a/b)` pair —
+    /// or the running count on the `Enumerating` line, which has no total.
+    pub objects: Option<u64>,
+    /// Objects in this phase in total, when git printed a `(a/b)` pair.
+    pub total_objects: Option<u64>,
+}
+
 /// The full record of one operation — the response of
 /// `GET /api/operations/{id}` and the payload of the stream's final event.
 ///
@@ -170,6 +224,19 @@ pub struct OperationStatus {
     /// How the pre-operation state can be recovered, from the plan that ran.
     /// `None` until a plan exists.
     pub recovery: Option<RecoveryStrategy>,
+    /// The last object-transfer report this operation produced (M2.20c,
+    /// #229). `None` for every operation that transfers nothing, and for a
+    /// fetch that has not yet reached its first phase. On a *terminal*
+    /// record it is the last report before the operation ended, which is
+    /// exactly the useful thing after a cancel ("it stopped 62% through
+    /// receiving").
+    ///
+    /// **Not persisted across a restart** (`durable.rs` rehydrates this as
+    /// `None`): a terminal record's transfer is over, and a *running* one is
+    /// not resumable across a process boundary anyway — the same reasoning
+    /// that module already applies to running records generally.
+    #[serde(default)]
+    pub progress: Option<TransferProgress>,
 }
 
 impl OperationStatus {
@@ -200,6 +267,12 @@ pub struct ProgressEvent {
     pub stage: OperationStage,
     /// When the transition happened (Unix seconds, server clock).
     pub at: UnixSeconds,
+    /// The object-transfer report at this moment, when the operation is one
+    /// that transfers objects and has started (M2.20c, #229). This is what
+    /// makes a long fetch legible: `stage` stays `Executing` throughout, and
+    /// this field is the only thing that moves.
+    #[serde(default)]
+    pub progress: Option<TransferProgress>,
 }
 
 /// The SSE `event:` name carrying a [`ProgressEvent`].
@@ -238,6 +311,7 @@ mod tests {
             recovery: Some(RecoveryStrategy::DeleteCreatedBranch {
                 name: BranchName::new("feature/x").unwrap(),
             }),
+            progress: None,
         }
     }
 
@@ -332,8 +406,55 @@ mod tests {
             state: OperationState::Running,
             stage: OperationStage::Planning,
             at: UnixSeconds(1_753_400_001),
+            progress: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert_eq!(serde_json::from_str::<ProgressEvent>(&json).unwrap(), e);
+    }
+
+    /// M2.20c (#229): the transfer vocabulary's wire spellings are contract —
+    /// a client's progress bar branches on them.
+    #[test]
+    fn transfer_phase_wire_names_are_stable_snake_case() {
+        for (phase, wire) in [
+            (TransferPhase::Enumerating, r#""enumerating""#),
+            (TransferPhase::Counting, r#""counting""#),
+            (TransferPhase::Compressing, r#""compressing""#),
+            (TransferPhase::Receiving, r#""receiving""#),
+            (TransferPhase::Resolving, r#""resolving""#),
+        ] {
+            assert_eq!(serde_json::to_string(&phase).unwrap(), wire);
+        }
+    }
+
+    /// A `progress`-carrying event round-trips, **and** an event minted by a
+    /// server that predates the field still parses — the additive-field rule
+    /// (M1.02) applied to the one field #229 adds to a live wire type.
+    #[test]
+    fn transfer_progress_round_trips_and_is_optional_on_the_wire() {
+        let e = ProgressEvent {
+            id: OperationId::new("op_dead_beef").unwrap(),
+            state: OperationState::Running,
+            stage: OperationStage::Executing,
+            at: UnixSeconds(1_753_400_001),
+            progress: Some(TransferProgress {
+                phase: TransferPhase::Receiving,
+                percent: Some(42),
+                objects: Some(51),
+                total_objects: Some(120),
+            }),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(serde_json::from_str::<ProgressEvent>(&json).unwrap(), e);
+
+        let older =
+            r#"{"id":"op_dead_beef","state":"running","stage":"executing","at":1753400001}"#;
+        assert_eq!(
+            serde_json::from_str::<ProgressEvent>(older)
+                .unwrap()
+                .progress,
+            None,
+            "an event from a server without the field must parse, not fail"
+        );
     }
 }
