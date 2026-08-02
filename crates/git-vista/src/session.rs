@@ -49,6 +49,31 @@ pub async fn establish_session() -> Result<bool, String> {
     Ok(info.authenticated)
 }
 
+/// Re-check whether a session cookie is usable, **without** re-attempting the
+/// bootstrap-token exchange (#218) — the retry half of [`establish_session`].
+///
+/// Two reasons this is not just `establish_session` called again:
+///
+/// * **The token is single-use and already spent.** `take_bootstrap_token`
+///   consumes it from the URL fragment on the first attempt, and the server
+///   replaces it the moment one is redeemed. A retry re-POSTing it can only
+///   fail; the cookie it may already have set is the thing worth looking for.
+/// * **`POST /api/session` is rate-limited on the LAN listener and `GET` is
+///   not** (`handlers::session::create_session` calls `SignInLimiter::check`;
+///   `session_status` does not). Retrying the POST would spend a real
+///   sign-in attempt per try — five per minute is the whole budget — so a
+///   flaky-network user could lock themselves out of sign-in precisely when
+///   the retry is meant to be helping them. A GET costs nothing.
+pub async fn recheck_session() -> Result<bool, String> {
+    let info = get_session().await?;
+    let _ = session_state::apply(SessionEvent::Established {
+        csrf: info.csrf.clone(),
+        via_lan: info.via_lan,
+        hook_policy: info.hook_policy,
+    });
+    Ok(info.authenticated)
+}
+
 /// Read the one-time token from the `#s=<token>` URL fragment, if present, and
 /// strip the whole fragment from the visible URL via `history.replaceState` so the
 /// secret is gone from the address bar and back/forward history the instant it's
