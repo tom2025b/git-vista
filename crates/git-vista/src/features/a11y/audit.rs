@@ -1046,6 +1046,126 @@ fn records_consent_before_it_resubmits(src: &str) -> bool {
     }
 }
 
+/// The brace-matched body that follows `marker` — the block from the first
+/// `{` after it to its matching `}`, exclusive.
+///
+/// Every census below that says "on the live path" needs this. A whole-file
+/// `src.contains("some_call(")` cannot tell a call the browser reaches from
+/// text that merely exists in the file: moving the call into an `if false {}`
+/// beneath its old home, or into a helper nothing invokes, leaves the string
+/// present and the mechanism dead. Scoping to a body is what makes the
+/// difference checkable.
+///
+/// Fail-closed by construction: a missing marker, no block after it, or an
+/// unbalanced one all return `None`, and every caller reads `None` as a
+/// failed census rather than as "nothing to check".
+///
+/// Brace counting, not parsing — it is counting braces in Rust source it is
+/// compiled alongside, so an unbalanced brace inside a string literal in the
+/// scanned region would confuse it. None of the scanned regions contain one,
+/// and if one is ever added the census fails closed (unbalanced ⇒ `None`)
+/// rather than passing vacuously.
+fn braced_body<'a>(src: &'a str, marker: &str) -> Option<&'a str> {
+    let start = src.find(marker)?;
+    let rest = &src[start..];
+    let open = rest.find('{')?;
+    let mut depth = 0usize;
+    for (i, c) in rest[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[open + 1..open + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether the context menu's amend opener records the tip's published answer
+/// **from the read itself** — inside the `if let Ok(detail)` arm of the
+/// `fetch_commit_detail` in its own `on_amend` handler.
+///
+/// Scoped twice rather than once. The handler alone is not enough: a
+/// `record_amend_detail` call sitting in an unreachable branch *inside*
+/// `on_amend` would satisfy a handler-wide `contains` while the gate read
+/// nothing, which is exactly the mutation this predicate replaces a whole-file
+/// check to catch.
+fn menu_records_detail_from_the_read(src: &str) -> bool {
+    let Some(handler) = braced_body(src, "let on_amend = ") else {
+        return false;
+    };
+    let Some(read) = braced_body(handler, "if let Ok(detail) = fetch_commit_detail(") else {
+        return false;
+    };
+    read.contains("record_amend_detail(")
+}
+
+/// Whether the amend opener holds the confirm button **before** it spawns the
+/// read that decides the pre-flight (#225).
+///
+/// The ordering is the whole fix: `Dialogs::open` leaves the phase `Idle`
+/// (confirm enabled) and `amend_preflight` reads an unlanded detail as
+/// `Unknown`, which sends. Entering the hold after the spawn — or not at all —
+/// re-opens the window in which a press POSTs an amend of published history
+/// with no ceremony at all.
+fn menu_holds_the_press_until_the_read_answers(src: &str) -> bool {
+    let Some(handler) = braced_body(src, "let on_amend = ") else {
+        return false;
+    };
+    match (
+        handler.find("begin_publication_read("),
+        handler.find("spawn_local("),
+    ) {
+        (Some(hold), Some(spawn)) => hold < spawn,
+        _ => false,
+    }
+}
+
+/// Whether that hold is released on **both** outcomes of the read.
+///
+/// The mirror of the census above, and it needs to be here: a hold nothing
+/// releases is not a safer version of the bug, it is a different bug — the
+/// confirm button inert forever whenever a single `GET /api/commit/{id}`
+/// fails, making amend unreachable through the UI. So the release must be in
+/// the spawned block and **not** confined to its `Ok` arm.
+fn menu_releases_the_press_on_either_outcome(src: &str) -> bool {
+    let Some(handler) = braced_body(src, "let on_amend = ") else {
+        return false;
+    };
+    let Some(spawned) = braced_body(handler, "spawn_local(") else {
+        return false;
+    };
+    let Some(read) = braced_body(spawned, "if let Ok(detail) = fetch_commit_detail(") else {
+        return false;
+    };
+    spawned.contains("finish_publication_read(") && !read.contains("finish_publication_read(")
+}
+
+/// Whether the guided re-check records the *new* tip's published answer on its
+/// own live path: after the detail read that supplies it, and before the phase
+/// that re-enables the confirm button.
+///
+/// Both bounds matter. Recording before the read is recording nothing;
+/// recording after `Recheck::Retargeted` is recording it after the button the
+/// gate protects has already come back on.
+fn recheck_records_detail_before_it_re_enables(src: &str) -> bool {
+    let Some(body) = braced_body(src, "let recheck = ") else {
+        return false;
+    };
+    match (
+        body.find("let detail = match fetch_commit_detail("),
+        body.find("record_amend_detail("),
+        body.find("Recheck::Retargeted {"),
+    ) {
+        (Some(read), Some(record), Some(retargeted)) => read < record && record < retargeted,
+        _ => false,
+    }
+}
+
 /// The gate has to be in front of the POST, not behind it.
 ///
 /// What it is guarding against is not a hypothetical: `submit_amend` is a
@@ -1066,18 +1186,200 @@ fn the_published_history_ceremony_runs_before_the_request_does() {
         "the ceremony's phase is gone from the modal, so `Preflight::Confirm` has \
          nowhere to land and the warning it decides on is never rendered"
     );
+    // Scoped to the live path, not to the file. A whole-file `contains` here
+    // used to pass with the call moved into an unreachable branch under the
+    // very same handler — string present, mechanism dead.
     assert!(
-        MENU.contains("record_amend_detail("),
-        "menu.rs no longer records `CommitDetail::on_remote` when it opens amend \
-         mode, so the pre-flight gate has nothing to read and every amend looks \
-         unpublished to it"
+        menu_records_detail_from_the_read(MENU),
+        "menu.rs's `on_amend` handler no longer records `CommitDetail::on_remote` \
+         inside the `if let Ok(detail) = fetch_commit_detail(..)` arm, so the \
+         pre-flight gate has nothing to read and every amend looks unpublished to \
+         it. A call elsewhere in the file — or in a branch that never runs — does \
+         not count."
     );
     assert!(
-        COMMIT_MODAL.contains("record_amend_detail("),
+        recheck_records_detail_before_it_re_enables(COMMIT_MODAL),
         "the guided re-check no longer records the retargeted commit's own \
-         published answer, so amending after a stale tip is gated on the previous \
-         commit's flag or on nothing"
+         published answer between reading it and re-enabling the confirm button, \
+         so amending after a stale tip is gated on the previous commit's flag or \
+         on nothing"
     );
+}
+
+/// Both answers for each of the two live-path censuses above — a predicate
+/// that always said "yes" would satisfy them perfectly.
+#[test]
+fn the_live_path_censuses_can_spot_a_call_that_never_runs() {
+    let live = "    let on_amend = move |_| {\n        \
+                spawn_local(async move {\n            \
+                if let Ok(detail) = fetch_commit_detail(&tip).await {\n                \
+                dialogs.record_amend_detail(&tip, detail.on_remote);\n            }\n        \
+                });\n    };\n";
+    assert!(menu_records_detail_from_the_read(live));
+
+    // The shape that ships the bug: present in the handler, unreachable.
+    let dead = "    let on_amend = move |_| {\n        \
+                spawn_local(async move {\n            \
+                if let Ok(detail) = fetch_commit_detail(&tip).await {\n                \
+                dialogs.seed_amend_msg(&detail.message);\n            }\n            \
+                if false {\n                \
+                dialogs.record_amend_detail(&tip, true);\n            }\n        \
+                });\n    };\n";
+    assert!(!menu_records_detail_from_the_read(dead));
+
+    // Present in the file, but in another handler entirely.
+    let elsewhere = "    let on_amend = move |_| {\n        \
+                     if let Ok(detail) = fetch_commit_detail(&tip).await {\n            \
+                     dialogs.seed_amend_msg(&detail.message);\n        }\n    };\n\n    \
+                     let something_else = move || {\n        \
+                     dialogs.record_amend_detail(&tip, true);\n    };\n";
+    assert!(!menu_records_detail_from_the_read(elsewhere));
+
+    // No subject at all reads as a failure, not a vacuous pass.
+    assert!(!menu_records_detail_from_the_read("nothing to see here"));
+
+    let recheck_live = "    let recheck = move |t: String| {\n        \
+                        let detail = match fetch_commit_detail(&new_tip).await {\n            \
+                        Ok(d) => d,\n            Err(e) => return,\n        };\n        \
+                        dialogs.record_amend_detail(&new_tip, detail.on_remote);\n        \
+                        set(stale(Recheck::Retargeted { new_tip }));\n    };\n";
+    assert!(recheck_records_detail_before_it_re_enables(recheck_live));
+
+    // Recorded after the confirm button is back on — too late to gate it.
+    let recheck_late = "    let recheck = move |t: String| {\n        \
+                        let detail = match fetch_commit_detail(&new_tip).await {\n            \
+                        Ok(d) => d,\n            Err(e) => return,\n        };\n        \
+                        set(stale(Recheck::Retargeted { new_tip }));\n        \
+                        dialogs.record_amend_detail(&new_tip, detail.on_remote);\n    };\n";
+    assert!(!recheck_records_detail_before_it_re_enables(recheck_late));
+
+    // Dropped entirely.
+    let recheck_none = "    let recheck = move |t: String| {\n        \
+                        let detail = match fetch_commit_detail(&new_tip).await {\n            \
+                        Ok(d) => d,\n            Err(e) => return,\n        };\n        \
+                        set(stale(Recheck::Retargeted { new_tip }));\n    };\n";
+    assert!(!recheck_records_detail_before_it_re_enables(recheck_none));
+
+    assert!(!recheck_records_detail_before_it_re_enables("nothing here"));
+}
+
+/// The window this issue's gate is useless in: opening amend mode is
+/// synchronous, the read that tells the gate whether the commit is published
+/// is not.
+///
+/// Between the two, `PreflightKnowledge` answers `Unknown` and
+/// `amend_preflight` maps `Unknown` to *send*. So for as long as
+/// `GET /api/commit/{tip}` takes, a press of the green Amend button would POST
+/// a rewrite of published history with no ceremony shown — not the documented
+/// failed-read gap, but the ordinary first moments of every amend. The fix is
+/// an explicit hold, and both halves of it live in a file `cargo test
+/// --workspace` never compiles, so this census is the only thing that checks
+/// them.
+#[test]
+fn the_press_is_held_until_the_publication_answer_lands() {
+    assert!(
+        menu_holds_the_press_until_the_read_answers(MENU),
+        "menu.rs's `on_amend` no longer calls `dialogs.begin_publication_read(..)` \
+         before it spawns the detail read. Without that hold the confirm button is \
+         live while the pre-flight has nothing to read, and `amend_preflight` sends \
+         on an unread detail — an amend of pushed history goes out with no warning \
+         at all if the user presses inside that window."
+    );
+    assert!(
+        menu_releases_the_press_on_either_outcome(MENU),
+        "menu.rs's spawned read no longer releases the hold outside its `Ok` arm. A \
+         hold that only a successful read clears leaves the confirm button inert \
+         forever whenever `GET /api/commit/{{id}}` fails, which makes amend \
+         unreachable through the UI."
+    );
+    assert!(
+        DIALOG_SIGNALS.contains("fn finish_publication_read("),
+        "the release half of the hold is gone from Dialogs, so `menu.rs` is calling \
+         something that no longer decides anything"
+    );
+}
+
+/// Both answers for the hold census, and for its mirror.
+#[test]
+fn the_hold_census_can_spot_a_hold_that_is_too_late_or_never_lifted() {
+    let held = "    let on_amend = move |_| {\n        \
+                dialogs.open(Dialog::Commit);\n        \
+                dialogs.begin_publication_read(&tip);\n        \
+                spawn_local(async move {\n            \
+                if let Ok(detail) = fetch_commit_detail(&tip).await {\n                \
+                dialogs.record_amend_detail(&tip, detail.on_remote);\n            }\n            \
+                dialogs.finish_publication_read(&tip);\n        });\n    };\n";
+    assert!(menu_holds_the_press_until_the_read_answers(held));
+    assert!(menu_releases_the_press_on_either_outcome(held));
+
+    // The shape that ships the bug: the hold is entered inside the async
+    // block, i.e. after the window it was supposed to close has opened.
+    let late = "    let on_amend = move |_| {\n        \
+                dialogs.open(Dialog::Commit);\n        \
+                spawn_local(async move {\n            \
+                dialogs.begin_publication_read(&tip);\n            \
+                if let Ok(detail) = fetch_commit_detail(&tip).await {\n                \
+                dialogs.record_amend_detail(&tip, detail.on_remote);\n            }\n            \
+                dialogs.finish_publication_read(&tip);\n        });\n    };\n";
+    assert!(!menu_holds_the_press_until_the_read_answers(late));
+
+    // No hold at all.
+    let unheld = "    let on_amend = move |_| {\n        \
+                  dialogs.open(Dialog::Commit);\n        \
+                  spawn_local(async move {\n            \
+                  if let Ok(detail) = fetch_commit_detail(&tip).await {\n                \
+                  dialogs.record_amend_detail(&tip, detail.on_remote);\n            }\n        \
+                  });\n    };\n";
+    assert!(!menu_holds_the_press_until_the_read_answers(unheld));
+
+    // Released only when the read succeeds — the inert-forever failure.
+    let ok_only = "    let on_amend = move |_| {\n        \
+                   dialogs.begin_publication_read(&tip);\n        \
+                   spawn_local(async move {\n            \
+                   if let Ok(detail) = fetch_commit_detail(&tip).await {\n                \
+                   dialogs.record_amend_detail(&tip, detail.on_remote);\n                \
+                   dialogs.finish_publication_read(&tip);\n            }\n        \
+                   });\n    };\n";
+    assert!(menu_holds_the_press_until_the_read_answers(ok_only));
+    assert!(!menu_releases_the_press_on_either_outcome(ok_only));
+
+    // Never released at all.
+    let never = "    let on_amend = move |_| {\n        \
+                 dialogs.begin_publication_read(&tip);\n        \
+                 spawn_local(async move {\n            \
+                 if let Ok(detail) = fetch_commit_detail(&tip).await {\n                \
+                 dialogs.record_amend_detail(&tip, detail.on_remote);\n            }\n        \
+                 });\n    };\n";
+    assert!(!menu_releases_the_press_on_either_outcome(never));
+
+    assert!(!menu_holds_the_press_until_the_read_answers("nothing here"));
+    assert!(!menu_releases_the_press_on_either_outcome("nothing here"));
+}
+
+/// The scanner every live-path census above is built on, answered both ways.
+///
+/// Worth its own test because a `braced_body` that returned the rest of the
+/// file on a nested block would silently turn all four of them back into the
+/// whole-file checks they replaced.
+#[test]
+fn the_body_scanner_stops_at_the_matching_brace() {
+    let src = "let a = || {\n    inner { nested }\n    keep;\n};\nlet b = || {\n    other;\n};\n";
+    let a = braced_body(src, "let a = ").expect("a has a body");
+    assert!(a.contains("keep;"), "{a:?}");
+    assert!(a.contains("nested"), "nesting must not end the body early");
+    assert!(
+        !a.contains("other;"),
+        "the body ran past its own closing brace into the next item: {a:?}"
+    );
+
+    let b = braced_body(src, "let b = ").expect("b has a body");
+    assert!(b.contains("other;"));
+    assert!(!b.contains("keep;"));
+
+    // Fail-closed on every degenerate input.
+    assert!(braced_body(src, "let missing = ").is_none());
+    assert!(braced_body("let a = no_block_here;", "let a = ").is_none());
+    assert!(braced_body("let a = || { unterminated", "let a = ").is_none());
 }
 
 /// Both answers, against fixture source — a predicate that always returned true

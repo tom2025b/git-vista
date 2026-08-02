@@ -17,8 +17,8 @@ use leptos::{
 };
 
 use crate::features::dialogs::commit::{
-    adopt_seed, message_buffer, persist_key, seed_outcome, AmendPhase, CommitIntent, MessageBuffer,
-    PreflightKnowledge, SeedOutcome,
+    adopt_seed, is_reading_publication_for, message_buffer, persist_key, seed_outcome, AmendPhase,
+    CommitIntent, MessageBuffer, PreflightKnowledge, SeedOutcome,
 };
 use crate::features::dialogs::core::{draft_scope_action, Dialog, DialogsCore, DraftScopeAction};
 
@@ -262,6 +262,38 @@ impl Dialogs {
     pub fn record_amend_detail(&self, tip: &str, on_remote: bool) {
         self.amend_preflight
             .update_value(|k| k.record_detail(tip, on_remote));
+    }
+
+    /// Hold the confirm button while `GET /api/commit/{tip}` — the read that
+    /// supplies the pre-flight's only input — is outstanding (#225).
+    ///
+    /// Call it in the *same synchronous handler* that opens amend mode, after
+    /// [`Dialogs::open`] (which resets the phase) and before the read is
+    /// spawned. Both halves of that ordering are load-bearing and neither is
+    /// checkable by the compiler, so they are pinned by a source census in
+    /// `features::a11y::audit`.
+    pub fn begin_publication_read(&self, tip: &str) {
+        self.amend_phase.set(AmendPhase::ReadingPublication {
+            tip: tip.to_string(),
+        });
+    }
+
+    /// Release the publication-read window for `tip` — **on both outcomes of
+    /// the read**, success and failure alike (#225).
+    ///
+    /// Releasing on failure is not an oversight. `amend_preflight` treats an
+    /// unread detail as `Unknown` and sends, deliberately (see its doc
+    /// comment); holding the button shut on a failed read would instead make
+    /// amend unreachable whenever a single GET went wrong. The window is for
+    /// "the answer is coming", not "the answer never came".
+    ///
+    /// Only clears the phase if it is still *this* tip's window — the caller
+    /// resumes after an `await`, and the dialog may have been reopened on
+    /// another commit meanwhile.
+    pub fn finish_publication_read(&self, tip: &str) {
+        if is_reading_publication_for(&self.amend_phase.get_untracked(), tip) {
+            self.amend_phase.set(AmendPhase::Idle);
+        }
     }
 
     /// Record the ceremony's explicit second step for `tip` (#225).
