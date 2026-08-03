@@ -221,6 +221,59 @@ sequenceDiagram
 `Reversible`): the gc experiment above is exactly why. The recovery exists, but it is a
 *recovery*, not the automatic safety `git branch -d`'s unmerged-work guard provides.
 
+#### 4a. Where the pin is written — inside the guard, before the delete
+
+The sequence above is the contract. It was not, at first, the code: the pin was written by
+`plan_and_execute_tracked` **after** `plan_and_execute_in` returned — which is after
+`execute` ran `git tag -d` *and* after the per-repository mutation guard dropped, with a
+live-generation observation (several git subprocesses) and a sqlite write in between. For
+the width of that gap the tag object and the commit under it were reachable from nothing,
+while the guard was free and any other operation on the repository could run. Nothing in
+this server disables `gc.auto`, so any git invocation in that window — this server's own
+next queued mutation, a read endpoint, a terminal — could prune both objects permanently,
+leaving the journal's `recovery` field naming an oid that no longer exists: a recovery
+record that cannot recover.
+
+`durable::write_recovery_ref` calling itself "best-effort and off the response path" is
+what made that look acceptable. It is best-effort in the sense that *failing* to write it
+must not fail the user's operation; it is not a licence to write it *late*. The JSON
+`recovery` field is a record of the decision, not a second copy of the object.
+
+The pin therefore moved into `planner::pin_recovery`, called from the guarded region of
+both compositions (`plan_and_execute_in` and `submit_plan`), after the gates — so a refused
+plan leaves no stray ref — and immediately before `execute`. The window is now closed by
+construction rather than by being narrow.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Building
+    Building --> Waiting: plan built, generation observed
+    Waiting --> Guarded: mutation guard acquired
+    state Guarded {
+        [*] --> Gates
+        Gates --> Pinned: validate, enforce_fresh
+        Pinned --> Deleted: update-ref recovery pin written
+        Deleted --> [*]: git tag -d
+    }
+    Guarded --> Recorded: guard released
+    Recorded --> [*]: journal row persisted
+    note right of Pinned
+        object reachable again
+        before its last ref goes
+    end note
+```
+
+Proved three ways, each of which fails on its own when the call is moved back:
+`contract_suite::the_recovery_pin_is_composed_inside_the_guard_before_execution` pins the
+composition (and that the wrapper writes no ref);
+`lifecycle_suite::the_recovery_pin_exists_before_the_tag_it_saves_is_deleted` drives the
+real tracked path while a concurrent process watches for the instant the tag ref vanishes,
+samples whether a pin existed *then*, and prunes the way `gc --auto` would; and
+`a_deleted_tag_is_restorable_byte_identically_and_the_pin_is_what_saves_it` now drives a
+tracked pipeline so the ref under test is production's own, written in production's order,
+rather than one the test wrote by hand before calling the pipeline — which had quietly made
+it a proof about an ordering the shipped code never used.
+
 ### 5. Journalling: `ActivityKind::Other`, and the before-oid is the observation
 
 Both operations journal against `refs/tags/<name>` with `ActivityKind::Other` — the honest
@@ -304,10 +357,17 @@ inertness tests are untouched — those *are* still the contract.
 - A deleted tag's *undo* is now demonstrated end to end rather than asserted: the exact
   tag object comes back byte-identically after `git gc --prune=now`, and the paired
   negative shows it would not without the recovery pin.
-- **No frontend.** #238's acceptance criteria include "New Tag"/"Delete Tag" items in
-  `menu.rs`; those files are outside this slice's scope and no UI calls these routes yet.
-  The routes are reachable by any HTTP client (and by the MCP bridge), but a user driving
-  the app cannot reach them until the menu slice lands.
+- **No frontend, so #238 is not finished.** #238's acceptance criteria include "New
+  Tag"/"Delete Tag" items in `menu.rs` with confirm-before-destructive behaviour; those
+  files are outside this slice's scope and no UI calls these routes yet. Nothing in the
+  frontend crate is touched, and there is no tag surface for a menu item to hang off:
+  `api::fetch_tags` and `features::tags::core` (M2.21b, #236) still have no component
+  consuming them, so the missing work is a whole UI slice — a tags panel, two
+  `OperationKind` variants, and a *text-entry* dialog the confirm-only dialog vocabulary
+  does not yet have. **The issue must stay open until that lands**, notwithstanding the
+  `Closes #238` in this branch's commit message; closing it on merge would retire an
+  acceptance criterion that was never met. The routes are reachable by any HTTP client
+  (and by the MCP bridge), but a user driving the app cannot reach them.
 - **A serde affordance, found here and written down rather than papered over:** a write DTO
   can be filled *positionally* from a JSON array. `argv_boundary`'s "raw argv arrays are
   refused" assertions were passing on arity, not on shape, and a comfortable falsehood was
@@ -330,8 +390,17 @@ inertness tests are untouched — those *are* still the contract.
 - `crates/git-vista-server/src/route_authz.rs` — the two classification rows;
   `EXPECTED_ROUTE_COUNT` 42 → 44.
 - `crates/git-vista-server/src/planner.rs` — `create_tag_argv`, `exec_create_tag`,
-  `exec_delete_local_tag`, the two `execute` arms replacing the `501` stubs, and the
-  argv-property unit test.
+  `exec_delete_local_tag`, the two `execute` arms replacing the `501` stubs, the
+  argv-property unit test, and `pin_recovery` — the guarded, pre-`execute` recovery-pin
+  write called by both compositions (§4a), replacing the post-pipeline write that used to
+  live in `plan_and_execute_tracked`.
+- `crates/git-vista-server/src/operations.rs` — `current_operation_id`, so the guarded
+  region can name the recovery ref without threading an id through five signatures.
+- `crates/git-vista-server/src/durable.rs` — `write_recovery_ref`'s doc corrected: it is
+  best-effort in the sense that it may *fail*, not that it may be *late*.
+- `crates/git-vista-server/src/planner/lifecycle_suite.rs` —
+  `the_recovery_pin_exists_before_the_tag_it_saves_is_deleted`: the ordering proved against
+  the production tracked path, with a concurrent pruner as the observer.
 - `crates/git-vista-server/src/planner/contract_suite.rs` — the tag execution battery
   replacing the two inertness stubs (create both kinds, duplicate-name refusal, signing
   refusal, the editor battery, delete, missing-tag refusal, the recovery/gc pair test);
