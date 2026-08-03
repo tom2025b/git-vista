@@ -317,7 +317,7 @@ pub(crate) async fn build_plan_only(
 ///   closed with now depends on [`refuses_when_unmet_at_build`]:
 ///   `SeedRecorded` still flows to the executor's own legacy refusal (the
 ///   reset's 404), while `RemoteConfigured` is refused by `enforce_fresh`
-///   itself, because nothing downstream of it refuses at all (ADR 0044).
+///   itself, because nothing downstream of it refuses at all (ADR 0047).
 ///   Not just prose: the contract suite's two
 ///   `review_window_*_drift_fails_closed_*` tests prove the refusal (and its
 ///   byte-identity with the never-held case) for both generation-invisible
@@ -4095,7 +4095,7 @@ mod pull_suite;
 #[cfg(test)]
 mod push_suite;
 
-// The remote-target boundary (#229 follow-up, ADR 0044): a real listener that
+// The remote-target boundary (#229 follow-up, ADR 0047): a real listener that
 // must never be connected to, its paired positive control, and the
 // unconfigured-remote refusal — for fetch and for pull, which share the
 // machinery verbatim.
@@ -5088,7 +5088,7 @@ mod tests {
     /// afterwards. For `RemoteConfigured` nothing does — `git push`/`git
     /// fetch` reinterpret an unknown remote as a transport target rather than
     /// refusing it — so the test was pinning the mechanism of a real hole
-    /// (`planner::remote_boundary_suite`, ADR 0044) as if it were a
+    /// (`planner::remote_boundary_suite`, ADR 0047) as if it were a
     /// guarantee.
     ///
     /// The rule it states is still the rule, so it is kept and made

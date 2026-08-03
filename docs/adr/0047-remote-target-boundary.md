@@ -1,4 +1,4 @@
-# ADR 0044 — Which host a fetch may contact: a name-shaped newtype *and* a precondition that refuses instead of being skipped
+# ADR 0047 — Which host a fetch may contact: a name-shaped newtype *and* a precondition that refuses instead of being skipped
 
 - **Status:** Accepted — implemented and tested.
 - **Date:** 2026-08-02.

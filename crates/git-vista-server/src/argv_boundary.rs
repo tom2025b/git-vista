@@ -117,7 +117,7 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // same code it is checking.
     "src/planner/push_suite.rs",
     // #[cfg(test)] git fixtures for the remote-target boundary suite (ADR
-    // 0044): a repository, an in-tree bare target the server must refuse to
+    // 0047): a repository, an in-tree bare target the server must refuse to
     // fetch from, and `git remote add` for the paired positive control.
     "src/planner/remote_boundary_suite.rs",
     "src/state.rs",         // #[cfg(test)] fixture setup

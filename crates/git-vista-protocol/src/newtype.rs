@@ -42,7 +42,7 @@ pub enum PlanFieldError {
     /// remote nickname may (`:`, `/`, `@`, `~`, whitespace, …), starts with
     /// `.`, or embeds `..` — i.e. it is URL-shaped or path-shaped, and git
     /// would resolve it as a transport target rather than looking it up in
-    /// the repository's configuration (ADR 0044).
+    /// the repository's configuration (ADR 0047).
     NotRemoteName(&'static str),
 }
 
@@ -158,7 +158,7 @@ pub(crate) fn require_worktree_relative_path(
     Ok(())
 }
 
-/// The wire-boundary gate for the *name of a configured remote* (ADR 0044):
+/// The wire-boundary gate for the *name of a configured remote* (ADR 0047):
 /// [`require_git_safe`]'s non-empty/not-option-shaped check, a length cap, and
 /// then the rule that matters — the value must be a plain nickname, never a
 /// transport target.

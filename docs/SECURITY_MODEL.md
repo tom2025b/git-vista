@@ -567,7 +567,7 @@ a machine this server does not control, and git records `refs/remotes/<remote>/<
 only *after* the remote reports the update accepted — so a cancelled push cannot claim
 the remote is unchanged, and its terminal message says so instead of reassuring.)*
 
-### Which host a remote-reaching operation may contact (ADR 0044, #229 follow-up)
+### Which host a remote-reaching operation may contact (ADR 0047, #229 follow-up)
 
 The paragraph above claimed the `RemoteConfigured` precondition was what kept a
 request from choosing the host. **It was not, and neither was the type.** Both
