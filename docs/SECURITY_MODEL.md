@@ -502,8 +502,8 @@ stderr, with the unredacted premise asserted in the same test
 (`planner::fetch_suite::a_credential_leaked_by_the_remote_never_reaches_the_operation_record`).
 Second, `FetchRequest` carries a **configured remote name, never a URL**, so no
 request can aim this server's credential helpers or SSH agent at a host of the
-client's choosing; the name is gated by the plan's `RemoteConfigured`
-precondition. Third, a fetch can now be cancelled — `POST
+client's choosing — see the correction below, which is where that guarantee
+actually comes from. Third, a fetch can now be cancelled — `POST
 /api/operations/{id}/cancel` SIGKILLs the direct child — and what a cancelled
 fetch reports about the repository is read from `refs/remotes/<remote>/*`
 before and after, never from git's prose. Known limitation, recorded rather
@@ -566,6 +566,69 @@ stating here rather than only in the ADR: a push is the one operation whose effe
 a machine this server does not control, and git records `refs/remotes/<remote>/<branch>`
 only *after* the remote reports the update accepted — so a cancelled push cannot claim
 the remote is unchanged, and its terminal message says so instead of reassuring.)*
+
+### Which host a remote-reaching operation may contact (ADR 0044, #229 follow-up)
+
+The paragraph above claimed the `RemoteConfigured` precondition was what kept a
+request from choosing the host. **It was not, and neither was the type.** Both
+halves were repaired; the correction is recorded here rather than edited away,
+because the shape of the mistake is the reusable part.
+
+| What was claimed | What was true | What holds now |
+|---|---|---|
+| `RemoteName` is a name | Its validator was "non-empty, not starting with `-`", which accepts `https://attacker.example/r.git` | `require_remote_name`: ASCII letters, digits, `.`, `-`, `_`, no leading `.`, no `..`, ≤ 100 bytes. Refuses every URL, scp-style, path and `ext::` shape. Runs from `Deserialize`, so it covers pull/push/tag too |
+| `RemoteConfigured` gates it | `enforce_fresh` re-verified only preconditions that **held at build time**; one that already failed was skipped, on the assumption that the executor would refuse instead | `planner::refuses_when_unmet_at_build` names the one precondition with no such executor guard, and `enforce_fresh` refuses it directly |
+
+The assumption under the second row is the load-bearing lesson. It is sound for
+every other precondition — `git branch` refuses a name that exists, `git rebase`
+refuses a dirty tree — and it is false for remotes, because **git does not
+refuse an unknown remote; it reinterprets it as a transport target.** Verified
+against git 2.43.0: `git fetch ghost.git`, with no `ghost.git` remote, fetches
+from the *directory* `ghost.git`. The endpoint then answered `200 … already up
+to date`, because a fetch from an ad-hoc target moves no
+`refs/remotes/<remote>/*` and the before/after diff is therefore empty — a fetch
+that reached somewhere it was never authorised to, reported as a no-op.
+
+Proven by driving the real pipeline against a **live loopback listener** that
+must never be connected to, with a paired positive control on the same run that
+must connect (`planner::remote_boundary_suite`). The port is 9418 — the only
+unprivileged entry in `sandbox::DEFAULT_GIT_PORTS` — precisely so the sandbox's
+own Network-tier grant permits the connect and cannot be what makes the test
+pass.
+
+Because both halves live in the shared machinery, `POST /api/pull` inherits them
+verbatim: `PullBranch` carries the same `RemoteName` and the same
+`RemoteConfigured` precondition, and the suite asserts that a pull with an
+unconfigured remote is refused by the gate (409) *before* `execute` is reached
+at all.
+
+That assertion was written while pull's executor was still a `501` stub, to
+prove the refusal came from the gate rather than the stub. **With #230 landed it
+guards a live `git fetch`**, and the mutation that shows it says so: flipping
+`refuses_when_unmet_at_build`'s `RemoteConfigured` arm to `false` on this branch
+makes the pull answer `400 … The fetch from ‘ghost.git’ succeeded, but it has no
+branch ‘main’` — git really did read the in-tree directory as a transport
+target, through pull's own executor. The precondition arm is the only thing
+between a client-chosen `remote` string and that fetch.
+
+Push reaches the same guard from a different direction, and depends on it more.
+`PushRequest` carries no remote field at all — `handlers::branch::push_operation`
+fixes it to `origin` — so `require_remote_name` has no client input to refuse on
+this route. **`RemoteConfigured` is the whole of the protection for a push**, and
+`planner::push_refuses_an_unconfigured_remote_before_reaching_its_executor` holds
+it down.
+
+That test pins the refusal's *wording*, not just its status, and the mutation
+that justifies it is worth recording. With the `RemoteConfigured` arm flipped to
+`false`, a push naming an unconfigured `ghost.git` reaches git, which resolves it
+as a path and talks to the in-tree directory — turned away only by
+`! [rejected] main -> main (fetch first)`, i.e. because that fixture's local
+branch was not a descendant. A fast-forwardable one would have landed, and the
+sandbox did not intervene. **And git's own non-fast-forward rejection is also a
+`409`**, so asserting the status alone would have passed with the gate removed.
+Only `unmet_at_build`'s sentence distinguishes "we refused before contacting
+anything" from "the remote refused us after we contacted it" — which is the
+distinction this whole section exists to make.
 
 ## Request Integrity
 
