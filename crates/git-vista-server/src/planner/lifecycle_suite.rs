@@ -384,3 +384,185 @@ async fn a_row_left_running_recovers_as_failed_and_is_rehydrated_into_the_regist
 
     let _ = repo; // seeded but unused directly — the row is entirely synthetic
 }
+
+// ---------------------------------------------------------------------------
+// M2.21d — the recovery pin's ordering against the command it protects
+// ---------------------------------------------------------------------------
+
+/// Whether the loose ref file for `name` exists. Two `stat` calls and no
+/// `.await`, on purpose: the observer below has to sample the repository at an
+/// instant, and any await point would let the thing it is looking for happen
+/// while it was suspended.
+fn loose_ref_exists(repo: &Path, name: &str) -> bool {
+    repo.join(".git").join(name).exists()
+}
+
+/// Whether *any* recovery pin has been written yet. The observer cannot know
+/// the operation's minted id (it is minted inside `plan_and_execute_tracked`
+/// and the observer is racing that very call), and it does not need to: this
+/// repository is a throwaway with exactly one operation run against it.
+fn any_recovery_pin(repo: &Path) -> bool {
+    std::fs::read_dir(repo.join(".git/refs/git-vista/recovery"))
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
+}
+
+fn git_stdout(repo: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn object_exists(repo: &Path, oid: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["cat-file", "-e", oid])
+        .current_dir(repo)
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// **The gc race the recovery pin exists to lose, run against the production
+/// lifecycle path** (#238, ADR 0048).
+///
+/// `DeleteLocalTag` is ranked `Destructive` rather than `Irreversible` on one
+/// claim: `refs/git-vista/recovery/<id>` keeps the deleted annotated tag's
+/// now-dangling tag object — and, when no branch reaches it, the commit under
+/// it — alive through `git gc`, so `update-ref` at the plan's recovery oid puts
+/// the tag back byte-identically. That claim is only true if the pin exists
+/// **before** `git tag -d` removes the last other reference to the object.
+///
+/// Until this test, it did not. The pin was written by
+/// `plan_and_execute_tracked` after `plan_and_execute_in` returned — after
+/// `execute` ran the delete, and after the per-repository mutation guard
+/// dropped — with a live-generation observation and a sqlite write in between.
+/// Any other git process touching this repository in that gap (this server's
+/// own next queued mutation, a read endpoint, a terminal, anything that honours
+/// `gc.auto`, which nothing here disables) could prune both objects
+/// permanently, leaving the journal's `recovery` field naming an oid that no
+/// longer exists — a recovery record that cannot recover.
+///
+/// The observer models that process. It polls for the exact instant
+/// `refs/tags/v1.0.0` disappears (loose-file `stat`, sub-millisecond, no await
+/// between the two samples) and records whether a pin existed at that instant;
+/// then it prunes, the way `gc --auto` would. Two assertions follow, and they
+/// fail for different reasons: the sample says the pin was late, the prune says
+/// what being late costs.
+///
+/// Three anti-vacuity guards, because each of them would otherwise let this
+/// pass while the mechanism was broken:
+///
+///  * The tagged commit is reachable from **nothing else** — no branch, and the
+///    reflogs are expired before pruning. With it on a branch, "the commit
+///    survived" would be true whatever this code did.
+///  * The repository is asserted to have **no** recovery pin before the
+///    operation starts, so "a pin existed when the tag vanished" cannot be
+///    satisfied by leftover state.
+///  * The observer must actually **witness the transition**. A delete that
+///    never happened (a refusal, a wrong fixture) would otherwise leave every
+///    assertion below trivially true; instead it times out and says so.
+///
+/// The paired negative — the same delete with no pin at all, and `git gc`
+/// taking both objects — is `contract_suite`'s
+/// `a_deleted_tag_is_restorable_byte_identically_and_the_pin_is_what_saves_it`,
+/// whose unpinned leg proves these objects are genuinely prunable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_recovery_pin_exists_before_the_tag_it_saves_is_deleted() {
+    let (_dir, repo) = seeded_repo();
+    // A commit no branch reaches: the annotated tag is its only anchor.
+    run(&repo, &["checkout", "-q", "--detach"]);
+    run(&repo, &["commit", "-q", "--allow-empty", "-m", "released"]);
+    let released = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    run(
+        &repo,
+        &["tag", "-a", "-m", "v1.0.0 — release notes", "v1.0.0"],
+    );
+    run(&repo, &["checkout", "-q", "main"]);
+    let tag_object = git_stdout(&repo, &["rev-parse", "refs/tags/v1.0.0"]);
+    assert_ne!(
+        tag_object, released,
+        "an annotated tag's ref value must differ from its commit, or the pin \
+         under test is not pinning a tag object at all"
+    );
+    assert!(
+        loose_ref_exists(&repo, "refs/tags/v1.0.0"),
+        "the observer below detects the delete by this file's disappearance"
+    );
+    assert!(
+        !any_recovery_pin(&repo),
+        "no pin may pre-exist, or ‘a pin was there when the tag vanished’ \
+         proves nothing about this operation"
+    );
+
+    // The concurrent git process. It is *not* holding the mutation guard, and
+    // that is the faithful model: `gc --auto` fires from any git invocation,
+    // including this server's read paths, which never take that guard.
+    let watched = repo.clone();
+    let observer = tokio::spawn(async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            // The sample: two stats, in this order, with nothing between them.
+            if !loose_ref_exists(&watched, "refs/tags/v1.0.0") {
+                let pinned_at_delete = any_recovery_pin(&watched);
+                // Now do what a `gc --auto` would have done in this window.
+                run(&watched, &["reflog", "expire", "--expire=now", "--all"]);
+                run(&watched, &["gc", "-q", "--prune=now"]);
+                return Some(pinned_at_delete);
+            }
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_micros(200)).await;
+        }
+    });
+
+    let k = key("tag-pin-ordering");
+    let op = GitOperation::DeleteLocalTag {
+        name: TagName::new("v1.0.0").unwrap(),
+    };
+    let (status, body) = tracked(k.clone(), &repo, op.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+
+    let pinned_at_delete = observer
+        .await
+        .expect("the observer task must not panic")
+        .expect(
+            "the observer never saw refs/tags/v1.0.0 disappear — the delete this \
+             test is about did not happen, so nothing below would have meant anything",
+        );
+
+    assert!(
+        pinned_at_delete,
+        "the recovery pin was still unwritten at the instant `git tag -d` removed \
+         the tag: for the whole of that window the tag object and the commit under \
+         it are unreachable and any concurrent git may prune them"
+    );
+    assert!(
+        object_exists(&repo, &tag_object),
+        "a prune racing the delete took the tag object — the pin was not in place \
+         in time, so the plan's recovery oid now names nothing"
+    );
+    assert!(
+        object_exists(&repo, &released),
+        "and with it the commit the tag spoke for: this is the history loss the \
+         Destructive (not Irreversible) rank promises cannot happen"
+    );
+
+    // The pin production wrote is the one the journal row names, at the plan's
+    // recovery oid — restoring there is what gives back an *annotated* tag.
+    let id = record_for(&k, &op).id();
+    assert_eq!(
+        git_stdout(
+            &repo,
+            &[
+                "rev-parse",
+                &format!("refs/git-vista/recovery/{}", id.as_str())
+            ]
+        ),
+        tag_object,
+        "the surviving pin must be the operation's own, at the unpeeled tag object"
+    );
+}

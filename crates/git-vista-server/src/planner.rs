@@ -186,10 +186,17 @@ async fn plan_and_execute_tracked(
             // account.
             let terminal = handle.terminal_status(status, &message, generation.clone());
             crate::durable::persist(durable_key, terminal.clone()).await;
-            if let Some(recovery) = &terminal.recovery {
-                crate::durable::write_recovery_ref(&repo, &terminal.id, recovery).await;
-            }
 
+            // No recovery-ref write here, and that absence is load-bearing.
+            // The pin (`refs/git-vista/recovery/<id>`) is what keeps a deleted
+            // annotated tag's now-dangling tag object — and the commit under
+            // it — reachable against `git gc`. Written *here* it would land
+            // after `execute` already ran `git tag -d` **and** after
+            // `plan_and_execute_in` dropped the per-repository mutation guard,
+            // so any other operation on this repository could run (and fire
+            // `gc --auto`) in the gap and prune the only copy of the object the
+            // pin was supposed to save. It is now written inside the guarded
+            // region, immediately before `execute` — see `pin_recovery`.
             handle.finish(status, message, generation);
         },
     ));
@@ -255,9 +262,56 @@ pub(crate) async fn plan_and_execute_in(
     if let Err(refused) = enforce_fresh(repo, &plan, &observed).await {
         return refused;
     }
+    // Still inside the guard, and after the gates: pin the restore point before
+    // the command that destroys it runs. See [`pin_recovery`].
+    pin_recovery(repo, &plan.recovery).await;
     crate::operations::stage(OperationStage::Executing);
     execute(repo, plan, observed).await
     // `_guard` drops here: the next queued mutation of this repository proceeds.
+}
+
+/// Write the plan's recovery pin — `refs/git-vista/recovery/<operation id>` at
+/// the oid [`RecoveryStrategy`] names — **inside the mutation guard, before
+/// [`execute`] runs**.
+///
+/// # Why the ordering is the whole point
+///
+/// For [`GitOperation::DeleteLocalTag`] the pin is not a convenience: it is the
+/// only thing keeping the deleted annotated tag's object reachable. `git tag -d`
+/// removes the sole ref to that object, and the object is in turn the sole ref
+/// to the commit it tagged when no branch reaches it. Unreachable objects are
+/// what `git gc` exists to remove, and nothing in this server disables
+/// `gc.auto`, so *any* concurrent git invocation against the repository can
+/// prune both — permanently, with the plan's `recovery` field then naming an
+/// oid that no longer exists, which is a recovery record that cannot recover.
+///
+/// Written after `execute`, the pin would necessarily be written after that
+/// window opened. Written after `plan_and_execute_in` returned — where it used
+/// to live, in the tracked wrapper — it would also be after `_guard` dropped,
+/// so the next queued mutation of this repository was free to run inside the
+/// gap. Here, the ref exists before the ref that needs it disappears and the
+/// guard is still held throughout, so the window is closed by construction
+/// rather than by being narrow.
+///
+/// Ordering *within* the guard matters too, and this sits where it does on
+/// purpose: after `validate`/`enforce_fresh`, so a refused plan leaves no ref
+/// behind, and before `execute`, which is the only thing here that can destroy
+/// what is being pinned.
+///
+/// Best-effort in the same sense as before — a failure to write it is logged,
+/// never turned into a refusal — because the alternative is refusing an
+/// operation the user asked for over a durability bonus. What changed is *when*
+/// the bonus is claimed, not how failure is handled.
+///
+/// A no-op when [`crate::operations::current_operation_id`] is `None` (the
+/// contract and coordination suites, which drive the pipeline untracked): there
+/// is no operation id to name the ref after. The lifecycle suite, which drives
+/// the real tracked wrapper, is where this is proved.
+async fn pin_recovery(repo: &Path, recovery: &RecoveryStrategy) {
+    let Some(id) = crate::operations::current_operation_id() else {
+        return;
+    };
+    crate::durable::write_recovery_ref(repo, &id, recovery).await;
 }
 
 /// The build stage alone (M2.23c, #247): observe the live repository and
@@ -358,6 +412,7 @@ pub(crate) async fn submit_plan(
     if let Err(refused) = enforce_fresh(repo, &plan, &observed).await {
         return refused;
     }
+    pin_recovery(repo, &plan.recovery).await;
     crate::operations::stage(OperationStage::Executing);
     execute(repo, plan, observed).await
     // `_guard` drops here, exactly as in `plan_and_execute_in`.

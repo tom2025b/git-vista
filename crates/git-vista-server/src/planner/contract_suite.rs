@@ -132,6 +132,32 @@ async fn pipeline(repo: &Path, op: GitOperation) -> (StatusCode, String) {
     plan_and_execute_in(repo, None, tokens(), op).await
 }
 
+/// [`pipeline`] driven inside a tracked operation's progress scope — the shape
+/// production runs in, since `plan_and_execute_tracked` wraps the pipeline in
+/// `operations::with_progress`.
+///
+/// The difference that matters here is `planner::pin_recovery`: it names the
+/// recovery ref after the operation's id, so it is a no-op under the plain
+/// [`pipeline`] above (no id to name) and writes the pin under this one. A test
+/// about what the pin *does* therefore has to drive this, or it would be
+/// pinning by hand and proving nothing about production's ordering.
+async fn tracked_pipeline(repo: &Path, op: GitOperation, key: &str) -> (StatusCode, String) {
+    let hash = operation_hash(&op);
+    let (repository, worktree) = tokens();
+    let k = IdempotencyKey::new(format!("contract-{key}")).unwrap();
+    let (handle, record) = match crate::operations::admit(&k, &op, &hash, repository, worktree) {
+        crate::operations::Admission::Fresh(handle, record) => (handle, record),
+        _ => panic!("‘{key}’ must be a fresh idempotency key in this binary"),
+    };
+    let out = crate::operations::with_progress(
+        record,
+        plan_and_execute_in(repo, None, tokens(), op.clone()),
+    )
+    .await;
+    handle.finish(out.0, out.1.clone(), None);
+    out
+}
+
 /// The pipeline from `validate` on, for tests that tamper with a built plan
 /// or let the repository move between build and execution.
 async fn run_prebuilt(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, String) {
@@ -1906,6 +1932,70 @@ fn the_production_entry_point_composes_the_tested_stages_in_order() {
     }
 }
 
+/// **The recovery pin is composed inside the guard, before execution** — in
+/// *both* compositions, and nowhere after them.
+///
+/// This is the shape half of the guarantee `lifecycle_suite`'s
+/// `the_recovery_pin_exists_before_the_tag_it_saves_is_deleted` proves
+/// behaviourally, and it is here because the behavioural test can only observe
+/// the ordering it happens to race; this one cannot be satisfied by a lucky
+/// schedule.
+///
+/// The ordering is load-bearing for `DeleteLocalTag` specifically.
+/// `refs/git-vista/recovery/<id>` is the only thing keeping a deleted annotated
+/// tag's now-dangling tag object — and, when no branch reaches it, the commit
+/// under it — alive against `git gc`. `git tag -d` removes the last other ref
+/// to that object, so a pin written afterwards is a pin written during a window
+/// in which the object it names can already have been pruned. Written after
+/// `plan_and_execute_in` *returned* — where it lived until this test existed —
+/// it was also after `_guard` dropped, so the next queued mutation of the same
+/// repository (and any `gc --auto` it fires) was free to run inside that gap.
+///
+/// The final assertion is the anti-regression one: the tracked wrapper must not
+/// write the ref at all. Restoring the old call there while leaving the new one
+/// in place would look harmless and would silently re-open nothing — but
+/// *moving* it back is exactly the regression, and only "it is not in the
+/// wrapper" catches that.
+#[test]
+fn the_recovery_pin_is_composed_inside_the_guard_before_execution() {
+    let src = source("src/planner.rs");
+    for composition in ["plan_and_execute_in", "submit_plan"] {
+        let body = fn_body(&src, composition);
+        let mut from = 0;
+        for stage in [
+            "coordinator::lock(",
+            "enforce_fresh(",
+            "pin_recovery(",
+            "execute(",
+        ] {
+            match body[from..].find(stage) {
+                Some(at) => from += at + stage.len(),
+                None => panic!(
+                    "{composition} no longer calls {stage} after the previous stage — the \
+                     recovery pin must be written while the mutation guard is held, after \
+                     the gates (so a refused plan leaves no ref) and before execute (so a \
+                     destructive command cannot outrun the pin that makes it recoverable)"
+                ),
+            }
+        }
+    }
+
+    let pin = fn_body(&src, "pin_recovery");
+    assert!(
+        pin.contains("write_recovery_ref("),
+        "pin_recovery must actually write the ref"
+    );
+
+    let tracked = fn_body(&src, "plan_and_execute_tracked");
+    assert!(
+        !tracked.contains("write_recovery_ref("),
+        "the recovery ref must NOT be written from the lifecycle wrapper: that runs \
+         after plan_and_execute_in returned, which is after the destructive command \
+         ran AND after the per-repository guard dropped — the exact gc window the pin \
+         exists to close"
+    );
+}
+
 /// The outer entry point still applies the write gate and delegates, now
 /// through the lifecycle layer: the handlers' single funnel is unchanged by the
 /// #60 split or the #61 one.
@@ -3290,6 +3380,15 @@ async fn delete_local_tag_refuses_a_tag_that_does_not_exist() {
 ///  * **The pin is load-bearing, not decorative.** `write_recovery_ref` is
 ///    what makes the dangling tag object reachable; the negative leg deletes
 ///    the same tag with no pin and shows `git gc` takes both objects.
+///
+/// The pinned leg drives [`tracked_pipeline`] so that the ref is written by
+/// `planner::pin_recovery` — production's own call, in production's own place
+/// (inside the mutation guard, before `execute`). It used to be written by hand
+/// *before* calling the pipeline, which quietly made this a proof about an
+/// ordering the shipped code did not use. That the two orderings differ at all
+/// is the subject of `the_recovery_pin_is_composed_inside_the_guard_before_execution`
+/// and of `lifecycle_suite`'s
+/// `the_recovery_pin_exists_before_the_tag_it_saves_is_deleted`.
 #[tokio::test]
 async fn a_deleted_tag_is_restorable_byte_identically_and_the_pin_is_what_saves_it() {
     for pinned in [true, false] {
@@ -3324,20 +3423,17 @@ async fn a_deleted_tag_is_restorable_byte_identically_and_the_pin_is_what_saves_
             "the recovery oid is the unpeeled tag object"
         );
 
-        // The pipeline's own durability step, driven here because
-        // `plan_and_execute_in` deliberately stops short of it (the tracked
-        // wrapper writes the ref after recording the result — see
-        // `plan_and_execute_tracked`).
-        if pinned {
-            crate::durable::write_recovery_ref(
-                &repo,
-                &git_vista_protocol::OperationId::new("op-tag-recovery").unwrap(),
-                &plan.recovery,
-            )
-            .await;
-        }
-
-        let (status, body) = pipeline(&repo, op).await;
+        // The pin is *production's*, not this test's: `pin_recovery` writes it
+        // inside the mutation guard immediately before `execute`, so under
+        // `tracked_pipeline` the ref is already there when `git tag -d` runs.
+        // The unpinned leg drives the plain `pipeline`, which has no operation
+        // id to name a ref after and so writes none — which is exactly the
+        // world this test's negative half needs.
+        let (status, body) = if pinned {
+            tracked_pipeline(&repo, op, "tag-recovery-pin").await
+        } else {
+            pipeline(&repo, op).await
+        };
         assert_ok(status, &body);
         assert!(
             git_ok(&repo, &["rev-parse", "--verify", "refs/tags/v1.0.0"])
