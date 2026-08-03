@@ -26,7 +26,11 @@
 //!   phase a fetch can never produce, with the paired negative that an
 //!   up-to-date push publishes nothing;
 //! * **cancellation kills the child**, observed in `/proc` and bounded by a
-//!   promptness budget, with the remote's ref proving nothing landed.
+//!   promptness budget, with the remote's ref proving nothing landed — and its
+//!   other half, the cancel that lands *after* the remote-tracking ref has
+//!   already advanced, which must say that much was accepted rather than
+//!   reassure. Those are the two arms of `cancelled_response`, and each test
+//!   asserts the other arm's wording is absent.
 //!
 //! # The fixture shape, and why there are two of them
 //!
@@ -521,6 +525,15 @@ async fn a_fast_forward_push_reaches_the_remote_and_journals_the_mode() {
     assert!(
         !entry.summary.contains("force-published") && !entry.summary.contains("--set-upstream"),
         "the summary must not claim a mode that did not run: {}",
+        entry.summary
+    );
+    // The paired negative for
+    // `a_cancel_that_lands_after_the_ref_moved_reports_what_the_remote_accepted`:
+    // a push nobody cancelled must not carry the cancelled tail, or that test
+    // would pass for an implementation that appended it unconditionally.
+    assert!(
+        !entry.summary.contains("cancelled"),
+        "a push that ran to completion must not be journaled as cancelled: {}",
         entry.summary
     );
 }
@@ -1331,6 +1344,197 @@ async fn a_cancelled_push_stream_leaves_a_signalled_child_not_an_exited_one() {
         ordinary.output.status.success(),
         "the paired-negative push must actually have worked: {:?}",
         String::from_utf8_lossy(&ordinary.output.stderr)
+    );
+}
+
+/// `sleep`, by absolute path, for a hook that runs **inside the sandbox**.
+///
+/// The shim's read-only grant covers `/usr` and `/bin`, but nothing promises the
+/// hook a usable `PATH`, so a bare `sleep` could be "command not found" on a host
+/// whose environment differs from this one. The hang test's second leg would
+/// catch that (an instantly-returning hook fails "the push had already exited"),
+/// so the risk is a confusing red rather than a false green — but a hook that
+/// resolves its own binary turns a host-shaped flake into no flake at all.
+fn sleep_binary() -> &'static str {
+    ["/usr/bin/sleep", "/bin/sleep"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .expect("this host must have a sleep binary for the hang fixture")
+}
+
+/// Hang the **pushing** repository at the instant `refs/remotes/origin/<branch>`
+/// becomes durable, so a cancel arriving now lands on a push whose observed
+/// before/after diff is already non-empty.
+///
+/// `reference-transaction` fires with `committed` once the tracking-ref update
+/// is on disk and unlocked — the same fact
+/// [`blind_the_repository_after_the_push`] rests on, verified against git
+/// 2.43.0. A push held here has therefore *already* had its ref update accepted
+/// by the remote and recorded locally, and is still alive to be killed.
+///
+/// **No remote-side lever can produce this state**, which is why the hang goes
+/// in the local repository rather than in the bare remote like
+/// [`hang_the_remotes_next_receive`]: `git push` does not call
+/// `transport_update_tracking_ref` until `push_refs` has returned, and
+/// `push_refs` does not return until `finish_connect` has reaped
+/// `receive-pack`. Both `pre-receive` and `post-receive` run on the far side of
+/// that wait, so a push hung by either has a tracking ref that has *not* moved —
+/// exactly the case
+/// `cancelling_a_running_push_kills_the_child_and_the_remote_does_not_move`
+/// already covers.
+///
+/// The hook is installed after all fixture commits, so the only transaction it
+/// ever sees is the push's own tracking-ref update.
+fn hang_the_repository_once_the_tracking_ref_lands(repo: &Path) {
+    let hooks = repo.join(".git/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("reference-transaction");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = committed ]; then\n\
+             {} {}\n\
+             fi\n\
+             exit 0\n",
+            sleep_binary(),
+            HANG.as_secs()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A push cancelled **after** the remote-tracking ref has already advanced says
+/// *that much was accepted*, and journals the ref it moved with the cancel
+/// admitted in the summary.
+///
+/// This is the other half of cancellation, and until this test it had none:
+/// every cancel fixture in this file blocks on the remote's `pre-receive`, which
+/// is by construction before any ref update, so `updated` was always empty when
+/// a test cancelled. Mutating [`super::push::cancelled_response`]'s non-empty
+/// arm — or deleting `journal_updates`' `" (the push was then cancelled)"` tail
+/// — left the whole suite green.
+///
+/// What makes the run mean something, in the order the legs establish it:
+///
+/// 1. **The tracking ref really moved**, polled until it holds the local tip.
+///    Without this the test would be the empty-diff case again.
+/// 2. **The push is still alive** at that moment, and the driver has not
+///    answered. A cancel arriving after the child exited takes
+///    `run.cancelled == false` and never reaches the branch under test, so this
+///    is what makes leg 4 a cancellation result rather than a success.
+/// 3. The cancel goes through the real endpoint and is accepted.
+/// 4. The answer is the non-empty sentence — and **not** the empty one, which is
+///    the paired negative: an implementation stuck on either branch fails here
+///    or in the existing `pre-receive` test, and no implementation passes both
+///    while ignoring what it observed.
+/// 5. The remote is then read directly and *is* at the pushed tip, so the
+///    sentence's claim ("accepted by the remote") is checked against the remote
+///    rather than against the same diff that produced it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_that_lands_after_the_ref_moved_reports_what_the_remote_accepted() {
+    let fx = fixture(2);
+    let want = fx.local_tip();
+    let was = fx.remote_tip();
+    assert_ne!(was, want, "the fixture must have something to push");
+    hang_the_repository_once_the_tracking_ref_lands(&fx.repo);
+
+    let op = push_op(false, ForcePublish::None);
+    let (handle, record) = admit_push("cancel-after-ref", &op);
+    let id = record.id();
+
+    let driver = {
+        let repo = fx.repo.clone();
+        let record = record.clone();
+        tokio::spawn(async move { run_tracked(&repo, record, op).await })
+    };
+
+    // Leg 1.
+    assert!(
+        within(HANG, || fx.tracking_tip() == want).await,
+        "refs/remotes/origin/main never reached the pushed tip, so the push \
+         never got past the wire and this test would be measuring the \
+         empty-diff case the pre-receive test already covers"
+    );
+
+    // Leg 2 — the discriminating one.
+    assert!(
+        !live_push_processes(&fx.repo).is_empty(),
+        "the push had already exited when its ref landed, so the cancel below \
+         cannot reach the cancelled path at all"
+    );
+    assert!(
+        !driver.is_finished(),
+        "the push answered before it was cancelled; the assertions below would \
+         then be about a *successful* push's message"
+    );
+
+    // Leg 3.
+    let response =
+        crate::handlers::operations::cancel_operation(axum::extract::Path(id.as_str().to_string()))
+            .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "a running push must accept the cancel"
+    );
+
+    // Leg 4.
+    let (status, body) = tokio::time::timeout(PROMPT, driver)
+        .await
+        .expect(
+            "the cancelled push must return within the promptness budget, with \
+             the hook still owed most of its sleep",
+        )
+        .unwrap();
+    handle.finish(status, body.clone(), None);
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("had already been updated, so that much was accepted by the remote"),
+        "a cancel that landed after the ref moved must say so — the user needs \
+         to know their push partly landed: {body}"
+    );
+    assert!(
+        !body.contains("never saw the remote accept"),
+        "…and must not report an observed ref update as an unobserved one: {body}"
+    );
+
+    // Leg 5: the referee.
+    assert_eq!(
+        fx.remote_tip(),
+        want,
+        "the message claims the remote accepted the update; the remote itself \
+         must agree, or the sentence is a guess dressed as an observation"
+    );
+
+    let entries = journaled_pushes(&fx.repo);
+    assert_eq!(
+        entries.len(),
+        1,
+        "the one ref that moved must journal exactly one entry: {entries:?}"
+    );
+    let entry = &entries[0];
+    assert_eq!(
+        entry.ref_name.as_deref(),
+        Some("refs/remotes/origin/main"),
+        "{entry:?}"
+    );
+    assert_eq!(entry.old_oid.as_deref(), Some(was.as_str()), "{entry:?}");
+    assert_eq!(entry.new_oid.as_deref(), Some(want.as_str()), "{entry:?}");
+    assert_eq!(entry.source, ActivitySource::App, "{entry:?}");
+    assert!(
+        entry.summary.contains("(the push was then cancelled)"),
+        "the feed must not show a ref that moved under a cancelled push as an \
+         ordinary completed push — the difference is the whole reason to read \
+         the feed after a cancel: {}",
+        entry.summary
+    );
+    assert!(
+        entry.summary.starts_with("pushed "),
+        "…while still naming the mode that ran: {}",
+        entry.summary
     );
 }
 

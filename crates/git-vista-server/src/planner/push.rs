@@ -1051,6 +1051,82 @@ mod tests {
         }
     }
 
+    /// One moved ref, for the cancellation-wording test below.
+    fn moved(name: &str) -> RemoteRefUpdate {
+        RemoteRefUpdate {
+            ref_name: name.into(),
+            old_oid: Some("aaa".into()),
+            new_oid: Some("bbb".into()),
+        }
+    }
+
+    /// A cancelled push's sentence is chosen by **what was observed**, and the
+    /// two branches say opposite things.
+    ///
+    /// Both legs are load-bearing and neither stands alone. An implementation
+    /// stuck on the empty-diff sentence would tell a user whose force-publish
+    /// *did* land that this repository never saw the remote accept it — on the
+    /// one operation whose effect is on another machine, where no later local
+    /// read can correct the record. One stuck on the non-empty sentence would
+    /// claim the remote accepted refs nothing here ever saw. So each leg
+    /// asserts the other branch's discriminating phrase is **absent**, not just
+    /// that its own is present.
+    ///
+    /// The count and its plural are asserted too — this sentence is read by a
+    /// human deciding whether to go looking at the remote, and "after 2
+    /// remote-tracking ref had already been updated" is the shape a dropped
+    /// plural arm produces.
+    #[test]
+    fn a_cancelled_push_says_which_of_the_two_things_it_observed() {
+        let (b, r) = (branch("main"), remote("origin"));
+
+        let (status, nothing_seen) = cancelled_response(&b, &r, &[]);
+        assert_eq!(status, StatusCode::CONFLICT, "{nothing_seen}");
+        assert!(
+            nothing_seen.contains("never saw the remote accept"),
+            "{nothing_seen}"
+        );
+        assert!(
+            nothing_seen.contains("Fetch to see where the remote actually is"),
+            "an unobserved cancel must send the reader to the only place that \
+             can answer: {nothing_seen}"
+        );
+        assert!(
+            !nothing_seen.contains("had already been updated"),
+            "an empty diff must not claim the remote accepted anything: \
+             {nothing_seen}"
+        );
+
+        let (status, one) = cancelled_response(&b, &r, &[moved("refs/remotes/origin/main")]);
+        assert_eq!(status, StatusCode::CONFLICT, "{one}");
+        assert!(
+            one.contains("after 1 remote-tracking ref had already been updated"),
+            "{one}"
+        );
+        assert!(
+            one.contains("accepted by the remote"),
+            "a ref that moved here moved because the remote accepted it, and \
+             the sentence is what tells the user their push partly landed: {one}"
+        );
+        assert!(
+            !one.contains("never saw the remote accept"),
+            "a diff that did move must not be reported as one that did not: {one}"
+        );
+
+        let (_, two) = cancelled_response(
+            &b,
+            &r,
+            &[
+                moved("refs/remotes/origin/main"),
+                moved("refs/remotes/origin/side"),
+            ],
+        );
+        assert!(
+            two.contains("after 2 remote-tracking refs had already been updated"),
+            "the count and its plural are both read by a human: {two}"
+        );
+    }
+
     /// The replaced tip comes from the observed diff, and only for the branch
     /// this push named — a sibling ref moving in the same push must not be
     /// reported as the one that was overwritten.
