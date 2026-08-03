@@ -3895,10 +3895,16 @@ async fn a_plan_built_for_another_selection_is_refused_at_submit() {
 /// hold the real mutation guard, start the submit (it observes — remote still
 /// configured, so the re-derived census reads *held* — then queues on our
 /// guard), break the precondition while it queues, release the guard. The
-/// gate's live recheck must refuse with `verify_precondition`'s own 409. If
-/// the re-derivation is ever dropped or emptied, `enforce_fresh` skips the
-/// recheck, the push reaches `exec_push`, and git's 400 with different words
-/// fails both assertions.
+/// gate's live recheck must refuse with `verify_precondition`'s own 409 —
+/// specifically the "no longer configured" wording, which is what
+/// distinguishes *this* path from the never-held one.
+///
+/// If the re-derivation is ever dropped or emptied, `held_at_build` reads
+/// false, `enforce_fresh` skips the live recheck, and the refusal becomes
+/// `unmet_at_build`'s "not configured" instead (ADR 0044 — before it, the
+/// push reached `exec_push` and git answered a 400). Either way the wording
+/// assertion below fails, which is the property that matters: the mutation
+/// is still caught, and now it is caught without a git process ever running.
 #[tokio::test]
 async fn a_generation_invisible_break_while_queued_is_refused_by_the_gates_live_recheck() {
     let (_dir, repo) = seeded_repo();
@@ -3954,10 +3960,19 @@ async fn a_generation_invisible_break_while_queued_is_refused_by_the_gates_live_
 /// The review-window half of the same corner, and the exact claim
 /// `submit_plan`'s doc and ADR 0042 §3 make in prose: a `RemoteConfigured`
 /// precondition that held at build and silently broke **before** submit is
-/// re-derived as never-held (the census is re-read at submission), skipped by
-/// `enforce_fresh`, and flows to the executor's legacy refusal — "from the
+/// re-derived as never-held (the census is re-read at submission) — "from the
 /// submitter's seat the two cases are genuinely indistinguishable, and both
-/// fail closed". Proven, not asserted: twin repositories, one running the
+/// fail closed".
+///
+/// What both cases fail closed *with* changed in ADR 0044. This test used to
+/// document them as flowing to the executor's legacy refusal; for
+/// `RemoteConfigured` there is no such refusal (git reinterprets an unknown
+/// remote as a transport target rather than rejecting it), so
+/// `enforce_fresh` now refuses it directly via
+/// `planner::refuses_when_unmet_at_build`. The assertion this test actually
+/// makes — that the two paths are byte-identical and both refuse — is
+/// unchanged and still holds, which is why it is the assertion and not the
+/// prose that was load-bearing. Proven, not asserted: twin repositories, one running the
 /// single-shot path with the remote *never* configured, one running the split
 /// path with the remote removed during the review window, must refuse with
 /// byte-identical status and body — and refuse, full stop.
