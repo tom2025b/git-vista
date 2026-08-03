@@ -156,6 +156,60 @@ pub struct BranchRequest {
     pub branch: String,
 }
 
+/// Body of a `POST /api/tag` request (M2.21d, #238): create the tag `name` at
+/// the commit `commit` (full hex id, or a symbolic start point the server
+/// resolves — same posture as [`CreateBranchRequest`]).
+///
+/// # `message` is what chooses the *kind* of tag
+///
+/// `None` (or absent) means a **lightweight** tag: `refs/tags/<name>` points
+/// straight at `commit` and no object is written. `Some(text)` means an
+/// **annotated** tag: git writes a tag object carrying the message, the
+/// tagger and the date, and the ref points at *that*.
+///
+/// Modelling the kind as "is there a message?" rather than as a separate
+/// `annotated: bool` beside an `Option<String>` is deliberate, and it is the
+/// same nesting [`crate::TagAnnotation`] uses for the operation itself: the
+/// pair `{annotated: true, message: null}` would be representable on the
+/// wire, would mean "annotate this tag with a message I did not give you",
+/// and is precisely the request that makes `git tag -a` open an editor. A
+/// headless server has no editor and no one to type into it, so that request
+/// must not be expressible — see ADR 0048. With this shape it is not: there
+/// is no way to ask for an annotated tag without also supplying its text.
+///
+/// # `sign`
+///
+/// Accepted so a client can ask, and **refused** by the executor until M2.21e
+/// wires signing (#74). Refused rather than silently ignored: quietly
+/// producing an unsigned tag for a request that asked for a signed one is a
+/// wrong outcome the user cannot see. `sign: true` with no `message` is
+/// refused by the handler — a signed tag is annotated by definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTagRequest {
+    pub name: String,
+    pub commit: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub sign: bool,
+}
+
+/// Body of a `POST /api/delete-tag` request (M2.21d, #238): delete the **local**
+/// tag `tag` (`git tag -d`). Nothing here reaches a remote — deleting a
+/// remote tag is [`crate::GitOperation::DeleteRemoteTag`], its own operation
+/// with its own route still to come (#74), because it opens a socket with
+/// credentials on it.
+///
+/// Its own type rather than a reuse of [`BranchRequest`]: the field names the
+/// thing being deleted, and a body whose key is `branch` on a tag endpoint
+/// invites exactly the copy-paste that deletes the wrong kind of ref.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteTagRequest {
+    pub tag: String,
+}
+
 /// Body of `POST /api/discard-tracked-paths` / `POST /api/delete-untracked-paths`
 /// (#219, M2.18a): the working-tree paths to discard uncommitted changes to,
 /// or delete outright. `paths` must be non-empty (the backend rejects an
@@ -713,6 +767,62 @@ mod tests {
             r#"{"paths":["a.txt"],"repo":"/etc"}"#
         )
         .is_err());
+    }
+
+    /// M2.21d (#238). The load-bearing half is the last assertion: the wire
+    /// has no way to say "annotated, but no message" — the shape that would
+    /// make `git tag -a` open an editor on a headless server (ADR 0048).
+    #[test]
+    fn tag_requests_roundtrip_and_cannot_ask_for_an_annotation_with_no_message() {
+        let lightweight = CreateTagRequest {
+            name: "v1.0.0".into(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            message: None,
+            sign: false,
+        };
+        let json = serde_json::to_string(&lightweight).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CreateTagRequest>(&json).unwrap(),
+            lightweight
+        );
+
+        let annotated = CreateTagRequest {
+            message: Some("first stable release".into()),
+            ..lightweight.clone()
+        };
+        let json = serde_json::to_string(&annotated).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CreateTagRequest>(&json).unwrap(),
+            annotated
+        );
+
+        // Both optional fields default when absent.
+        let bare: CreateTagRequest =
+            serde_json::from_str(r#"{"name":"v1","commit":"deadbeef"}"#).unwrap();
+        assert_eq!(bare.message, None);
+        assert!(!bare.sign);
+
+        let del = DeleteTagRequest {
+            tag: "v1.0.0".into(),
+        };
+        let json = serde_json::to_string(&del).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DeleteTagRequest>(&json).unwrap(),
+            del
+        );
+
+        // No path smuggling, and no separate annotate flag to disagree with
+        // `message` — `annotated: true` is not a field, so a body carrying it
+        // is a hard 400 rather than a request for an editor.
+        assert!(serde_json::from_str::<CreateTagRequest>(
+            r#"{"name":"v1","commit":"c","repo":"/etc"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<CreateTagRequest>(
+            r#"{"name":"v1","commit":"c","annotated":true}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<DeleteTagRequest>(r#"{"tag":"v1","repo":"/etc"}"#).is_err());
     }
 
     #[test]

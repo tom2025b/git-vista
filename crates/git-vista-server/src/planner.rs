@@ -41,7 +41,7 @@ use git_vista_protocol::{
     AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitMessage, CommitOid,
     ForcePublish, GenerationToken, GitOperation, IdempotencyKey, OperationHash, OperationStage,
     Plan, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
-    RepositoryToken, RiskLevel, TagName, UnixSeconds, WorktreePath, WorktreeToken,
+    RepositoryToken, RiskLevel, TagAnnotation, TagName, UnixSeconds, WorktreePath, WorktreeToken,
     IDEMPOTENCY_HEADER,
 };
 
@@ -1853,27 +1853,24 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
              #230) — this plan's contract exists, but nothing executed it."
                 .to_string(),
         ),
-        // M2.21a (#235, ADR 0041) ships the typed tag contract only — the
-        // same staging as fetch/pull above. Execution belongs to the later
-        // M2.21 slices (#74): create/delete are their own slices, and the
-        // two remote-reaching operations are the first tag code that would
-        // open a socket with credentials on it, which earns a review of its
-        // own. These arms exist because this match must stay exhaustive over
-        // the closed vocabulary (#142); reached, they refuse rather than
+        // M2.21a (#235, ADR 0041) shipped the typed tag contract; M2.21d
+        // (#238, ADR 0048) wires the two **local** halves below —
+        // `handlers::tags::create_tag` and `handlers::tags::delete_tag` build
+        // them from `POST /api/tag` and `POST /api/delete-tag`.
+        GitOperation::CreateTag {
+            name,
+            target,
+            annotation,
+        } => exec_create_tag(repo, need, &name, &target, annotation.as_ref()).await,
+        GitOperation::DeleteLocalTag { name } => {
+            exec_delete_local_tag(repo, need, &name, &observed).await
+        }
+        // The two remote-reaching tag operations stay contract-only: they are
+        // the first tag code that would open a socket with credentials on it,
+        // which earns a review of its own (the same staging fetch/pull got
+        // above). These arms exist because this match must stay exhaustive
+        // over the closed vocabulary (#142); reached, they refuse rather than
         // no-op silently or improvise a git command.
-        GitOperation::CreateTag { .. } => (
-            StatusCode::NOT_IMPLEMENTED,
-            "Creating a tag is not yet wired for execution (M2.21, tracked \
-             under #74) — this plan's contract exists, but nothing executed it."
-                .to_string(),
-        ),
-        GitOperation::DeleteLocalTag { .. } => (
-            StatusCode::NOT_IMPLEMENTED,
-            "Deleting a local tag is not yet wired for execution (M2.21, \
-             tracked under #74) — this plan's contract exists, but nothing \
-             executed it."
-                .to_string(),
-        ),
         GitOperation::DeleteRemoteTag { .. } => (
             StatusCode::NOT_IMPLEMENTED,
             "Deleting a remote tag is not yet wired for execution (M2.21, \
@@ -2476,6 +2473,164 @@ fn classify_amend_failure(
         return AmendFailureKind::HookRejected;
     }
     AmendFailureKind::Other
+}
+
+// --- M2.21d (#238, ADR 0048): local tag execution ---------------------------
+
+/// The argv for one [`GitOperation::CreateTag`] — pulled out of
+/// [`exec_create_tag`] as a pure function so the **no-editor guarantee** can
+/// be asserted over the exact bytes that reach `execve`, without a repository,
+/// a spawn, or an environment.
+///
+/// Two properties this function exists to make checkable, both of which are
+/// the whole of ADR 0048's create half:
+///
+///  * **`-m <message>` is present whenever `-a` is.** `git tag -a` with no
+///    message writes `.git/TAG_EDITMSG` and launches `core.editor`; on a
+///    headless server there is no editor and nobody to type into one, so that
+///    process either dies on a `true`-shaped editor or waits forever. There
+///    is no `--no-edit` on `git tag` to close this after the fact — the only
+///    defence is never to build the argv that asks for it.
+///  * **`--edit` is never present.** It would re-open the editor even with
+///    `-m` given.
+///
+/// The type system already makes the bad case unrepresentable — an annotated
+/// tag *is* a [`TagAnnotation`], which cannot exist without a non-empty
+/// [`TagMessage`] — so this function has no failure mode to encode. That is
+/// the point: the guarantee is structural, and this is where it is visible.
+///
+/// `-a` is passed explicitly even though `-m` alone would imply it, so the
+/// argv says which kind of tag it is building rather than relying on a git
+/// implication a reader would have to know.
+fn create_tag_argv<'a>(
+    name: &'a TagName,
+    target: &'a CommitOid,
+    annotation: Option<&'a TagAnnotation>,
+) -> Vec<&'a str> {
+    match annotation {
+        None => vec!["tag", name.as_str(), target.as_str()],
+        Some(a) => vec![
+            "tag",
+            "-a",
+            "-m",
+            a.message.as_str(),
+            name.as_str(),
+            target.as_str(),
+        ],
+    }
+}
+
+/// `git tag [-a -m <message>] <name> <target>` (`/api/tag`).
+///
+/// Lightweight and annotated are one operation with one argv builder
+/// ([`create_tag_argv`]) rather than two executors: everything after the argv
+/// — the refusal forwarding, the journal entry, the response — is identical,
+/// and the *plan* already told the reviewer which kind they approved (an
+/// annotated create's [`RefState::Computed`] after-state versus a lightweight
+/// one's exact `At(target)`).
+///
+/// Signing is refused, not ignored. `TagAnnotation::sign` exists in the typed
+/// vocabulary since M2.21a; M2.21e (#74) wires it. Answering `501` here means
+/// a client that asked for a signed tag is told it did not get one — where
+/// dropping the flag would hand back an ordinary annotated tag under a name
+/// the user believes is signed. The refusal happens *before* the argv is
+/// built, so no `git tag` runs at all.
+async fn exec_create_tag(
+    repo: &Path,
+    need: NetworkNeed,
+    name: &TagName,
+    target: &CommitOid,
+    annotation: Option<&TagAnnotation>,
+) -> (StatusCode, String) {
+    if annotation.is_some_and(|a| a.sign) {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "Signing a tag is not yet wired (M2.21e, tracked under #74). \
+             Nothing was created — retry without signing if an unsigned \
+             annotated tag is what you want."
+                .to_string(),
+        );
+    }
+    let annotated = annotation.is_some();
+    let args = create_tag_argv(name, target, annotation);
+    let output = match run_git(repo, need, &args).await {
+        Ok(o) => o,
+        Err(e) => return couldnt_run("/api/tag", &e),
+    };
+    if !output.status.success() {
+        // B3 posture, same as `/api/branch`: git owns ref-name validation and
+        // the "already exists" refusal, and its stderr is forwarded verbatim.
+        let msg = stderr_or(&output, "git tag failed.");
+        eprintln!("git-vista: /api/tag failed: {msg}");
+        return (StatusCode::BAD_REQUEST, msg);
+    }
+    let kind = if annotated {
+        "annotated"
+    } else {
+        "lightweight"
+    };
+    println!(
+        "[/api/tag] created {kind} tag '{name}' at {}",
+        short(target.as_str())
+    );
+    // The ref's resulting value, read back rather than assumed: for an
+    // annotated tag it is the *tag object* git just wrote, an oid nothing
+    // could have known at plan time (which is exactly why the plan's
+    // after-state is `RefState::Computed`). `Obs::Unknown` if the read fails —
+    // journalled as unknown, never silently as the target.
+    let new = Obs::from_read(rev_parse_ref_unpeeled(repo, &format!("refs/tags/{name}")).await);
+    journal_app_event(
+        repo,
+        // `git-vista-core`'s `ActivityKind` has no tag member; `Other` is the
+        // honest existing bucket (the same one `/api/discard-tracked-paths`
+        // uses) and the summary carries the detail. A `TagCreated` kind is a
+        // core-crate widening, not this slice's.
+        ActivityKind::Other,
+        Some(format!("refs/tags/{name}")),
+        Obs::Absent, // a created tag has no previous value, by definition
+        new,
+        format!("created {kind} tag ‘{name}’"),
+    )
+    .await;
+    (StatusCode::OK, format!("Created {kind} tag '{name}'."))
+}
+
+/// `git tag -d <name>` (`/api/delete-tag`) — the **local** delete only;
+/// nothing here reaches a remote (`NetworkNeed::Local`, ADR 0036).
+///
+/// `observed.branch_tip` is the tag ref's **unpeeled** pre-delete value, read
+/// by [`observe_operation`] before anything was touched. It is the same value
+/// the plan's compare-and-swap precondition pinned and the same value
+/// [`RecoveryStrategy::RecreateTag`] carries, and it is what is journalled as
+/// the old oid — so the one number a human or a recovery path needs is
+/// recorded from the observation, not re-read after the ref is gone (there
+/// would be nothing left to read: tag refs keep no reflog).
+async fn exec_delete_local_tag(
+    repo: &Path,
+    need: NetworkNeed,
+    name: &TagName,
+    observed: &Observed,
+) -> (StatusCode, String) {
+    let output = match run_git(repo, need, &["tag", "-d", name.as_str()]).await {
+        Ok(o) => o,
+        Err(e) => return couldnt_run("/api/delete-tag", &e),
+    };
+    if !output.status.success() {
+        let msg = stderr_or(&output, "git tag -d failed.");
+        eprintln!("git-vista: /api/delete-tag failed: {msg}");
+        return (StatusCode::BAD_REQUEST, msg);
+    }
+    println!("[/api/delete-tag] deleted tag '{name}'");
+    journal_app_event(
+        repo,
+        ActivityKind::Other,
+        Some(format!("refs/tags/{name}")),
+        observed.branch_tip.clone(),
+        Obs::Absent, // the tag is gone: its new value is a real absence
+        format!("deleted tag ‘{name}’"),
+    )
+    .await;
+    (StatusCode::OK, format!("Deleted tag '{name}'."))
 }
 
 /// `git add -A` (`/api/stage`).
@@ -3886,6 +4041,96 @@ mod tests {
         run(&repo, &["add", "a.txt"]);
         run(&repo, &["commit", "-q", "-m", "seed"]);
         (dir, repo)
+    }
+
+    /// M2.21d (#238, ADR 0048): the argv `git tag` is actually handed, over
+    /// every shape the type system admits.
+    ///
+    /// The claim being pinned is a *property*, not a spelling: **whenever
+    /// `-a` appears, `-m <message>` appears too, and `--edit` never appears
+    /// at all**. `git tag -a` with neither is what launches `core.editor`,
+    /// and there is no `--no-edit` on `git tag` to undo that later — so this
+    /// is the only place the guarantee can be checked before a process
+    /// exists. The behavioural half (nothing ever writes `.git/TAG_EDITMSG`,
+    /// and a blocking editor really would hang) is
+    /// `contract_suite::annotated_tag_creation_never_opens_an_editor`.
+    ///
+    /// Note the shapes iterated: an annotated tag *is* a `TagAnnotation`,
+    /// which cannot hold an empty `TagMessage`, so "annotated with no
+    /// message" is not among them — that is the guarantee, expressed as a
+    /// type rather than as a check.
+    #[test]
+    fn a_tag_argv_never_asks_for_an_editor() {
+        let name = TagName::new("v1.0.0").unwrap();
+        let target = CommitOid::new("a".repeat(40)).unwrap();
+        let annotations = [
+            None,
+            Some(TagAnnotation {
+                message: git_vista_protocol::TagMessage::new("notes").unwrap(),
+                sign: false,
+            }),
+            // A message that looks like an option: it must ride as `-m`'s
+            // value, never as a flag of its own.
+            Some(TagAnnotation {
+                message: git_vista_protocol::TagMessage::new("--edit").unwrap(),
+                sign: false,
+            }),
+        ];
+        for annotation in annotations {
+            let argv = create_tag_argv(&name, &target, annotation.as_ref());
+            assert_eq!(argv[0], "tag");
+            // Scan *flag* positions only. The entry after `-m` is that
+            // option's value, and git's own parser consumes it as one no
+            // matter what it spells — which is precisely why an
+            // option-shaped message is safe here and why passing the message
+            // as its own argv entry (rather than glued into one) is the
+            // whole defence. Scanning every entry blindly would flag the
+            // message `--edit` as if it were a request for an editor; it is
+            // not, and `contract_suite::annotated_tag_creation_never_opens_
+            // an_editor` drives that exact message through real git to prove
+            // it lands as text.
+            let value_of_m = argv.iter().position(|x| *x == "-m").map(|i| i + 1);
+            for (i, arg) in argv.iter().enumerate() {
+                if Some(i) == value_of_m {
+                    continue;
+                }
+                assert!(
+                    !matches!(*arg, "--edit" | "-e"),
+                    "{argv:?} asks git to open an editor"
+                );
+                assert!(
+                    !matches!(*arg, "-f" | "--force"),
+                    "{argv:?} would repoint an existing tag past the plan's \
+                     RefAbsent precondition"
+                );
+                assert!(
+                    !matches!(*arg, "-s" | "--sign" | "-u" | "--local-user"),
+                    "{argv:?} asks for a signature this slice does not wire"
+                );
+            }
+            match annotation.as_ref() {
+                None => assert_eq!(argv, vec!["tag", "v1.0.0", &"a".repeat(40)]),
+                Some(a) => {
+                    let dash_a = argv
+                        .iter()
+                        .position(|x| *x == "-a")
+                        .expect("an annotated create must say -a");
+                    let dash_m = argv
+                        .iter()
+                        .position(|x| *x == "-m")
+                        .expect("…and -a with no -m is exactly the editor case");
+                    assert!(dash_m > dash_a, "{argv:?}");
+                    assert_eq!(
+                        argv.get(dash_m + 1).copied(),
+                        Some(a.message.as_str()),
+                        "the message must be -m's own argv entry, so an \
+                         option-shaped message can never be read as a flag"
+                    );
+                    // The name and the target still follow, in that order.
+                    assert_eq!(argv[argv.len() - 2..], ["v1.0.0", &"a".repeat(40)]);
+                }
+            }
+        }
     }
 
     /// #145 acceptance 1 + 4 (the race): a plan built against generation N is

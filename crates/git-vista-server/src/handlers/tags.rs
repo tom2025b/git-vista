@@ -1,4 +1,6 @@
-//! `GET /api/tags` — the tag listing (M2.21b, #236).
+//! The tag endpoints: `GET /api/tags` (the listing, M2.21b #236) and the two
+//! **local** tag writes, `POST /api/tag` and `POST /api/delete-tag` (M2.21d
+//! #238, ADR 0048).
 //!
 //! The read half of M2.21: what `GET /api/frame`'s ref badges throw away.
 //! `read_refs` peels every `refs/tags/*` straight to a commit, so a badge can
@@ -25,13 +27,19 @@
 //!
 //! # No new spawn path
 //!
-//! There is no subprocess at all. `read_tags` opens the repository once with
-//! `gix::open_opts(.., isolated())` — the same posture as every other
+//! There is no subprocess **in this file**. `read_tags` opens the repository
+//! once with `gix::open_opts(.., isolated())` — the same posture as every other
 //! `git-vista-git` read — and decodes each tag object out of the mapped object
 //! database. So there is nothing for the Tier::Strict `sandbox::spawn`
 //! chokepoint to classify here, and in particular nothing that could become a
 //! spawn *per tag*; #221's held-open `cat-file --batch` would be strictly more
 //! expensive than reading the odb we already have open.
+//!
+//! The two write handlers keep that true: like every other write handler since
+//! M1.06b (#143) they validate their request, build one typed
+//! [`GitOperation`], and hand it to [`crate::planner`] — the one place a
+//! mutating git argv is constructed. `git tag` / `git tag -d` run in
+//! `planner::exec_create_tag` / `planner::exec_delete_local_tag`, not here.
 
 use axum::extract::Query;
 use axum::http::{header, HeaderValue, StatusCode};
@@ -39,10 +47,17 @@ use axum::response::IntoResponse;
 use axum::Json;
 
 use git_vista_git::TagRecord;
-use git_vista_protocol::dto::{SignatureStatus, TagDetail, TagKind};
-use git_vista_protocol::plan::{CommitOid, TagMessage, TagName, MAX_TAG_MESSAGE_LEN};
+use git_vista_protocol::dto::{
+    CreateTagRequest, DeleteTagRequest, SignatureStatus, TagDetail, TagKind,
+};
+use git_vista_protocol::plan::{
+    CommitOid, TagAnnotation, TagMessage, TagName, MAX_TAG_MESSAGE_LEN,
+};
+use git_vista_protocol::GitOperation;
 
 use crate::handlers::read::{resolve_repo, RepoQuery};
+use crate::planner;
+use crate::state::reject_if_read_only;
 
 /// What says a tag message was cut, so the cut is visible to whoever reads it.
 ///
@@ -106,6 +121,165 @@ pub(crate) async fn tag_list(
     let tags: Vec<TagDetail> = records.iter().filter_map(tag_detail).collect();
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
     Ok((no_store, Json(tags)))
+}
+
+/// Create a tag in the served repository (`POST /api/tag`, M2.21d #238, ADR
+/// 0048): `git tag <name> <commit>` (lightweight) or `git tag -a -m <message>
+/// <name> <commit>` (annotated), via [`GitOperation::CreateTag`].
+///
+/// # The refusal that matters is the empty annotation
+///
+/// A body carrying `"message": ""` (or nothing but whitespace) is asking for
+/// an annotated tag with no text. On a terminal, `git tag -a` answers that by
+/// opening `$EDITOR`; this server is headless, so the same request would hand
+/// git a process nobody can ever finish. It is refused **here**, with words,
+/// before an operation exists — a 400, not a hung request. Note that this is
+/// the *only* way the shape can arise: `message: None` is a lightweight tag,
+/// and a non-empty message becomes a [`TagMessage`], so once past this handler
+/// "annotated" and "has a message" are the same fact (ADR 0048).
+///
+/// Everything else is git's own job, the B3 posture [`create_branch`] takes:
+/// git validates the ref name, refuses a name that already exists, and its
+/// stderr is forwarded verbatim. The two checks made here are the ones that
+/// must happen before a value reaches an argv at all — non-empty, and not
+/// option-shaped.
+///
+/// [`create_branch`]: crate::handlers::branch::create_branch
+pub(crate) async fn create_tag(Json(req): Json<CreateTagRequest>) -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    let name = req.name.trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Tag name can't be empty.".to_string(),
+        );
+    }
+    if name.starts_with('-') {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Tag name can't start with '-'.".to_string(),
+        );
+    }
+    let name = match TagName::new(name) {
+        Ok(name) => name,
+        // Unreachable after the two checks above; kept total rather than panic.
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()),
+    };
+
+    let annotation = match annotation_for(req.message.as_deref(), req.sign) {
+        Ok(annotation) => annotation,
+        Err(refusal) => return (StatusCode::BAD_REQUEST, refusal),
+    };
+
+    let repo = match crate::state::resolve_target() {
+        Ok((repo, _entry)) => repo,
+        Err(rejected) => return rejected,
+    };
+    // The operation pins an exact commit id, like `/api/branch`: the UI sends
+    // the tapped node's full oid, and a symbolic or abbreviated start point in
+    // a hand-crafted request is resolved first.
+    let target = match planner::resolve_commit_oid(&repo, req.commit.trim()).await {
+        Ok(target) => target,
+        Err(refused) => return refused,
+    };
+    planner::plan_and_execute(GitOperation::CreateTag {
+        name,
+        target,
+        annotation,
+    })
+    .await
+}
+
+/// Turn a request's `message`/`sign` pair into the operation's optional
+/// [`TagAnnotation`], or into the words a refusal should carry.
+///
+/// A pure function on purpose: this is the whole of the "no editor" decision
+/// on the request side, and [`create_tag`] cannot be called in a test without
+/// a registered process-global selection (`state::CURRENT`), so testing the
+/// decision *through* the handler would mean either mutating shared state or
+/// not testing it. Same split, same reasoning as `git_cmd::redact_if_remote`.
+///
+/// The three shapes and their answers:
+///
+/// * **absent** — a lightweight tag. No annotation, no object, no message.
+/// * **present and blank** — refused. This is the editor-shaped request: it
+///   asks for an annotation whose text was never supplied. Note it is refused
+///   rather than *downgraded* to lightweight, which is the tempting lenient
+///   reading: the caller asked for release notes, so quietly producing a tag
+///   without them is a wrong outcome, not a forgiving one.
+/// * **present with text** — an annotated tag, `sign` carried through for the
+///   executor to accept (M2.21e) or refuse (today).
+///
+/// `sign` without a message is refused separately: a signature lives *in* the
+/// tag object, so a signed lightweight tag is not a thing git can make. The
+/// typed vocabulary already makes that unrepresentable ([`TagAnnotation`]
+/// nests `sign` inside the annotation); this is the wire-side half of the same
+/// rule, and it exists so the caller gets a sentence instead of watching a
+/// `sign: true` they sent be silently dropped on the floor.
+fn annotation_for(message: Option<&str>, sign: bool) -> Result<Option<TagAnnotation>, String> {
+    let annotation = match message.map(str::trim) {
+        None => None,
+        Some("") => {
+            return Err(
+                "An annotated tag needs a message — this server has no editor to \
+                        open for one. Send the message, or omit it for a lightweight tag."
+                    .to_string(),
+            )
+        }
+        // Reachable failure: `TagMessage` is capped at `MAX_TAG_MESSAGE_LEN`.
+        Some(text) => Some(TagAnnotation {
+            message: TagMessage::new(text).map_err(|e| e.to_string())?,
+            sign,
+        }),
+    };
+    if sign && annotation.is_none() {
+        return Err("A signed tag is an annotated tag — send a message with it.".to_string());
+    }
+    Ok(annotation)
+}
+
+/// Delete a **local** tag (`POST /api/delete-tag`, M2.21d #238, ADR 0048):
+/// `git tag -d <tag>` via [`GitOperation::DeleteLocalTag`].
+///
+/// Local only. Deleting the tag from a remote is
+/// [`GitOperation::DeleteRemoteTag`] — a separate operation, on a separate
+/// route still to come (#74), because it opens a socket with credentials on
+/// it. A user who deletes here and expects the remote to follow is wrong, but
+/// they are wrong in the safe direction: nothing left the machine.
+///
+/// The plan this builds carries [`RiskLevel::Destructive`] and a
+/// [`RecoveryStrategy::RecreateTag`] pinned to the tag ref's *unpeeled* value;
+/// see ADR 0048 for why that one oid is what makes the undo an exact
+/// restoration rather than a re-authored look-alike, and why the recovery ref
+/// written from it is what keeps the tagged commit alive against `git gc`.
+///
+/// [`RiskLevel::Destructive`]: git_vista_protocol::RiskLevel::Destructive
+/// [`RecoveryStrategy::RecreateTag`]: git_vista_protocol::RecoveryStrategy::RecreateTag
+pub(crate) async fn delete_tag(Json(req): Json<DeleteTagRequest>) -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    let tag = req.tag.trim();
+    if tag.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Tag name can't be empty.".to_string(),
+        );
+    }
+    if tag.starts_with('-') {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Tag name can't start with '-'.".to_string(),
+        );
+    }
+    let name = match TagName::new(tag) {
+        Ok(name) => name,
+        // Unreachable after the two checks above; kept total rather than panic.
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()),
+    };
+    planner::plan_and_execute(GitOperation::DeleteLocalTag { name }).await
 }
 
 /// Map one [`TagRecord`] onto the wire DTO, or `None` when it cannot be
@@ -413,6 +587,63 @@ pub(crate) mod tests {
             message_truncated: false,
             signed: false,
         }
+    }
+
+    /// M2.21d (#238), the request-side half of the no-editor guarantee (ADR
+    /// 0048): the only three shapes a body can carry, and the two that must
+    /// be refused in words rather than acted on.
+    ///
+    /// The blank-message case is the one that matters. A "lenient" reading
+    /// would drop the empty annotation and create a lightweight tag; the
+    /// assertion here is that it is an `Err` instead, because the request
+    /// asked for release notes and a tag without them is a different tag.
+    /// Deserialising the same shapes off the wire is
+    /// `dto::tests::tag_requests_roundtrip_and_cannot_ask_for_an_annotation_with_no_message`;
+    /// this covers what the handler does with them afterwards.
+    #[test]
+    fn a_blank_annotation_is_refused_in_words_not_quietly_downgraded() {
+        assert_eq!(
+            annotation_for(None, false),
+            Ok(None),
+            "no message is a lightweight tag, not an error"
+        );
+
+        let annotated = annotation_for(Some("release notes"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(annotated.message.as_str(), "release notes");
+        assert!(!annotated.sign);
+        assert!(
+            annotation_for(Some("release notes"), true)
+                .unwrap()
+                .unwrap()
+                .sign,
+            "a signing request rides through to the executor, which refuses it"
+        );
+
+        // Whitespace is trimmed before the newtype, so the stored message is
+        // never padded — and a message that is *only* whitespace is the
+        // editor-shaped request.
+        assert_eq!(
+            annotation_for(Some("  release notes  "), false)
+                .unwrap()
+                .unwrap()
+                .message
+                .as_str(),
+            "release notes"
+        );
+        for blank in ["", "   ", "\n", " \t\n "] {
+            let refusal = annotation_for(Some(blank), false)
+                .expect_err("an annotation with no text must be refused");
+            assert!(
+                refusal.contains("needs a message"),
+                "the refusal must say what is missing: {refusal}"
+            );
+        }
+        // A signature has nowhere to live without a tag object.
+        let refusal =
+            annotation_for(None, true).expect_err("sign without a message must be refused");
+        assert!(refusal.contains("annotated tag"), "{refusal}");
     }
 
     /// The mapping is asserted against **hand-written wire JSON**, not against
