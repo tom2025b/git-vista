@@ -1085,23 +1085,102 @@ fn braced_body<'a>(src: &'a str, marker: &str) -> Option<&'a str> {
     None
 }
 
-/// Whether the context menu's amend opener records the tip's published answer
-/// **from the read itself** — inside the `if let Ok(detail)` arm of the
-/// `fetch_commit_detail` in its own `on_amend` handler.
+/// Whether `needle` appears in `body` at `body`'s **own statement level** —
+/// brace depth zero within it, i.e. not tucked inside a nested block.
 ///
-/// Scoped twice rather than once. The handler alone is not enough: a
-/// `record_amend_detail` call sitting in an unreachable branch *inside*
-/// `on_amend` would satisfy a handler-wide `contains` while the gate read
-/// nothing, which is exactly the mutation this predicate replaces a whole-file
-/// check to catch.
-fn menu_records_detail_from_the_read(src: &str) -> bool {
+/// The difference between "the string is somewhere in this block" and "this
+/// block runs it": `if false { .. }`, `match { .. }`, a closure and a nested
+/// `if let` all raise the depth, and a call under any of them is a call the
+/// block does not unconditionally make.
+///
+/// Brace counting, with `braced_body`'s caveat and for its reason — a brace
+/// inside a string literal in the scanned region would confuse it, and none of
+/// the scanned regions contain one.
+fn at_statement_level(body: &str, needle: &str) -> bool {
+    let mut depth = 0i32;
+    for (i, c) in body.char_indices() {
+        if depth == 0 && body[i..].starts_with(needle) {
+            return true;
+        }
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether the context menu's amend opener applies the tip's detail **from the
+/// read itself and unconditionally** — a statement of the `if let Ok(detail)`
+/// arm of the `fetch_commit_detail` in its own `on_amend` handler.
+///
+/// Scoped three ways, and it is worth being exact about what each buys, because
+/// this predicate's previous incarnation was reported as pinning more than it
+/// did.
+///
+/// * The **handler** scope rejects a call that lives elsewhere in `menu.rs`.
+/// * The **`if let Ok` arm** scope rejects a call that runs without a detail to
+///   apply.
+/// * The **statement-level** scope rejects a call nested inside anything within
+///   that arm — `if false { .. }` chief among them.
+///
+/// What it still does not prove, and what no source census can: that
+/// `on_amend` is itself reachable, or that no `return` precedes the call. The
+/// earlier doc here claimed to catch "an unreachable branch *inside*
+/// `on_amend`", and the mutation that was cited as proof placed the dead branch
+/// *outside* the `Ok` arm. Placed inside it — `if let Ok(detail) = .. { if
+/// false { record } }` — the whole suite stayed green. The statement-level
+/// scope above is what closes that gap; the reachability of the handler itself
+/// remains unpinned, and is what the iPad testbed pass is for.
+fn menu_applies_the_detail_from_the_read(src: &str) -> bool {
     let Some(handler) = braced_body(src, "let on_amend = ") else {
         return false;
     };
     let Some(read) = braced_body(handler, "if let Ok(detail) = fetch_commit_detail(") else {
         return false;
     };
-    read.contains("record_amend_detail(")
+    at_statement_level(read, "apply_amend_detail(")
+}
+
+/// Whether `menu.rs` reaches the pre-flight's inputs **only** through the
+/// guarded chokepoint.
+///
+/// The point of `Dialogs::apply_amend_detail` is that this callback resumes
+/// after an `await` and cannot assume the dialog still points at the tip it was
+/// spawned for. A direct `record_amend_detail`/`seed_amend_msg` here is that
+/// assumption re-made by hand — and it is the exact shape of the bug the guard
+/// was added to close, so a later edit reaching for the raw pair must not pass
+/// unnoticed. Whole-file on purpose: there is no legitimate second caller in
+/// this file, so any occurrence is the finding.
+fn menu_writes_the_detail_only_through_the_guard(src: &str) -> bool {
+    !src.contains("record_amend_detail(") && !src.contains("seed_amend_msg(")
+}
+
+/// Whether `Dialogs::apply_amend_detail` actually consults the currency check
+/// before it writes — and writes only under it.
+///
+/// Both halves are needed. Consulting `detail_read_use` and then writing
+/// regardless is a guard in name only, so the two writes must be *nested*
+/// (statement-level would mean unconditional); and nesting them under some
+/// other condition while never asking `detail_read_use` is the same bug wearing
+/// a different `if`. `signals.rs` is `#[cfg(target_arch = "wasm32")]`, so this
+/// census is the only thing that reads it.
+fn signals_guard_the_detail_before_applying_it(src: &str) -> bool {
+    let Some(body) = braced_body(src, "pub fn apply_amend_detail(") else {
+        return false;
+    };
+    let (Some(guard), Some(record), Some(seed)) = (
+        body.find("detail_read_use("),
+        body.find("record_amend_detail("),
+        body.find("seed_amend_msg("),
+    ) else {
+        return false;
+    };
+    guard < record
+        && guard < seed
+        && !at_statement_level(body, "record_amend_detail(")
+        && !at_statement_level(body, "seed_amend_msg(")
 }
 
 /// Whether the amend opener holds the confirm button **before** it spawns the
@@ -1186,16 +1265,32 @@ fn the_published_history_ceremony_runs_before_the_request_does() {
         "the ceremony's phase is gone from the modal, so `Preflight::Confirm` has \
          nowhere to land and the warning it decides on is never rendered"
     );
-    // Scoped to the live path, not to the file. A whole-file `contains` here
+    // Scoped to the live path, not to the file, and to a statement of that
+    // path rather than to anything nested inside it. A whole-file `contains`
     // used to pass with the call moved into an unreachable branch under the
-    // very same handler — string present, mechanism dead.
+    // very same handler; an arm-wide one still passed with that branch moved
+    // *inside* the arm.
     assert!(
-        menu_records_detail_from_the_read(MENU),
-        "menu.rs's `on_amend` handler no longer records `CommitDetail::on_remote` \
-         inside the `if let Ok(detail) = fetch_commit_detail(..)` arm, so the \
-         pre-flight gate has nothing to read and every amend looks unpublished to \
-         it. A call elsewhere in the file — or in a branch that never runs — does \
-         not count."
+        menu_applies_the_detail_from_the_read(MENU),
+        "menu.rs's `on_amend` handler no longer applies the `CommitDetail` as a \
+         statement of the `if let Ok(detail) = fetch_commit_detail(..)` arm, so \
+         the pre-flight gate has nothing to read and every amend looks \
+         unpublished to it. A call elsewhere in the file, or nested inside \
+         anything within that arm, does not count."
+    );
+    assert!(
+        menu_writes_the_detail_only_through_the_guard(MENU),
+        "menu.rs writes the pre-flight's input directly again instead of going \
+         through `Dialogs::apply_amend_detail`. That callback resumes after an \
+         `await`: writing an abandoned tip's answer evicts the answer for the \
+         commit the dialog now shows, and the published-history ceremony stops \
+         firing for it."
+    );
+    assert!(
+        signals_guard_the_detail_before_applying_it(DIALOG_SIGNALS),
+        "`Dialogs::apply_amend_detail` no longer consults `detail_read_use` \
+         before recording the flag and seeding the box, so the chokepoint menu.rs \
+         routes through has stopped checking anything"
     );
     assert!(
         recheck_records_detail_before_it_re_enables(COMMIT_MODAL),
@@ -1213,30 +1308,57 @@ fn the_live_path_censuses_can_spot_a_call_that_never_runs() {
     let live = "    let on_amend = move |_| {\n        \
                 spawn_local(async move {\n            \
                 if let Ok(detail) = fetch_commit_detail(&tip).await {\n                \
-                dialogs.record_amend_detail(&tip, detail.on_remote);\n            }\n        \
-                });\n    };\n";
-    assert!(menu_records_detail_from_the_read(live));
+                dialogs.apply_amend_detail(&tip, detail.on_remote, &detail.message);\n            \
+                }\n        });\n    };\n";
+    assert!(menu_applies_the_detail_from_the_read(live));
+    assert!(menu_writes_the_detail_only_through_the_guard(live));
 
     // The shape that ships the bug: present in the handler, unreachable.
     let dead = "    let on_amend = move |_| {\n        \
                 spawn_local(async move {\n            \
                 if let Ok(detail) = fetch_commit_detail(&tip).await {\n                \
-                dialogs.seed_amend_msg(&detail.message);\n            }\n            \
+                log(&detail.message);\n            }\n            \
                 if false {\n                \
-                dialogs.record_amend_detail(&tip, true);\n            }\n        \
+                dialogs.apply_amend_detail(&tip, true, \"m\");\n            }\n        \
                 });\n    };\n";
-    assert!(!menu_records_detail_from_the_read(dead));
+    assert!(!menu_applies_the_detail_from_the_read(dead));
+
+    // The same mutation the arm-scoped predicate could not see: the dead branch
+    // moved *inside* the `Ok` arm, so an arm-wide `contains` finds the string
+    // while nothing runs it. This is the case the previous census claimed to
+    // catch and did not — the whole suite stayed green against it.
+    let dead_inside = "    let on_amend = move |_| {\n        \
+                       spawn_local(async move {\n            \
+                       if let Ok(detail) = fetch_commit_detail(&tip).await {\n                \
+                       log(&detail.message);\n                \
+                       if false {\n                    \
+                       dialogs.apply_amend_detail(&tip, true, \"m\");\n                \
+                       }\n            }\n        });\n    };\n";
+    assert!(
+        !menu_applies_the_detail_from_the_read(dead_inside),
+        "a call nested inside the arm is not a call the arm makes"
+    );
 
     // Present in the file, but in another handler entirely.
     let elsewhere = "    let on_amend = move |_| {\n        \
                      if let Ok(detail) = fetch_commit_detail(&tip).await {\n            \
-                     dialogs.seed_amend_msg(&detail.message);\n        }\n    };\n\n    \
+                     log(&detail.message);\n        }\n    };\n\n    \
                      let something_else = move || {\n        \
-                     dialogs.record_amend_detail(&tip, true);\n    };\n";
-    assert!(!menu_records_detail_from_the_read(elsewhere));
+                     dialogs.apply_amend_detail(&tip, true, \"m\");\n    };\n";
+    assert!(!menu_applies_the_detail_from_the_read(elsewhere));
 
     // No subject at all reads as a failure, not a vacuous pass.
-    assert!(!menu_records_detail_from_the_read("nothing to see here"));
+    assert!(!menu_applies_the_detail_from_the_read(
+        "nothing to see here"
+    ));
+
+    // The guard-bypass census, both ways: the raw pair is the finding.
+    assert!(!menu_writes_the_detail_only_through_the_guard(
+        "dialogs.record_amend_detail(&tip, detail.on_remote);"
+    ));
+    assert!(!menu_writes_the_detail_only_through_the_guard(
+        "dialogs.seed_amend_msg(&detail.message);"
+    ));
 
     let recheck_live = "    let recheck = move |t: String| {\n        \
                         let detail = match fetch_commit_detail(&new_tip).await {\n            \
@@ -1261,6 +1383,71 @@ fn the_live_path_censuses_can_spot_a_call_that_never_runs() {
     assert!(!recheck_records_detail_before_it_re_enables(recheck_none));
 
     assert!(!recheck_records_detail_before_it_re_enables("nothing here"));
+}
+
+/// The statement-level scanner the strengthened census rests on, answered both
+/// ways.
+///
+/// It is the whole difference between "the block mentions this call" and "the
+/// block makes this call", so a version that ignored depth would quietly return
+/// the census to the one that let `if false { .. }` through.
+#[test]
+fn the_statement_level_scanner_ignores_calls_nested_inside_the_block() {
+    let body = "    plain();\n    if false {\n        buried();\n    }\n    match x {\n        \
+                _ => armed(),\n    }\n    tail();\n";
+    assert!(at_statement_level(body, "plain("));
+    assert!(at_statement_level(body, "tail("));
+    assert!(
+        !at_statement_level(body, "buried("),
+        "a call under `if false` is not a statement of this block"
+    );
+    assert!(!at_statement_level(body, "armed("));
+    assert!(!at_statement_level(body, "absent("));
+
+    // A closure body is nested too — the call is deferred, not made.
+    assert!(!at_statement_level(
+        "    spawn(|| { later(); });\n",
+        "later("
+    ));
+}
+
+/// The chokepoint census, answered both ways.
+///
+/// `signals.rs` is wasm-only, so nothing but this reads whether the guard it
+/// holds is actually in front of the writes it authorises.
+#[test]
+fn the_chokepoint_census_can_spot_a_guard_that_guards_nothing() {
+    let guarded = "    pub fn apply_amend_detail(&self, tip: &str, on_remote: bool, m: &str) {\n\
+                   \x20       match detail_read_use(&self.amend_phase.get_untracked(), tip) {\n\
+                   \x20           DetailUse::Apply => {\n\
+                   \x20               self.record_amend_detail(tip, on_remote);\n\
+                   \x20               self.seed_amend_msg(m);\n\
+                   \x20           }\n            DetailUse::Discard => {}\n        }\n    }\n";
+    assert!(signals_guard_the_detail_before_applying_it(guarded));
+
+    // Consulted, then ignored — the writes run either way.
+    let advisory = "    pub fn apply_amend_detail(&self, tip: &str, on_remote: bool, m: &str) {\n\
+                    \x20       let _ = detail_read_use(&self.amend_phase.get_untracked(), tip);\n\
+                    \x20       self.record_amend_detail(tip, on_remote);\n\
+                    \x20       self.seed_amend_msg(m);\n    }\n";
+    assert!(!signals_guard_the_detail_before_applying_it(advisory));
+
+    // Guarded, but by something that is not the currency check.
+    let wrong_guard = "    pub fn apply_amend_detail(&self, tip: &str, on_remote: bool, m: &str) \
+                       {\n        if !m.is_empty() {\n            \
+                       self.record_amend_detail(tip, on_remote);\n            \
+                       self.seed_amend_msg(m);\n        }\n    }\n";
+    assert!(!signals_guard_the_detail_before_applying_it(wrong_guard));
+
+    // Only half of it behind the guard: the seed still escapes.
+    let half = "    pub fn apply_amend_detail(&self, tip: &str, on_remote: bool, m: &str) {\n\
+                \x20       if let DetailUse::Apply = detail_read_use(&self.phase(), tip) {\n\
+                \x20           self.record_amend_detail(tip, on_remote);\n        }\n        \
+                self.seed_amend_msg(m);\n    }\n";
+    assert!(!signals_guard_the_detail_before_applying_it(half));
+
+    // The method itself gone reads as a failed census, not a vacuous pass.
+    assert!(!signals_guard_the_detail_before_applying_it("nothing here"));
 }
 
 /// The window this issue's gate is useless in: opening amend mode is
