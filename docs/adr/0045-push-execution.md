@@ -503,7 +503,8 @@ and a request default that points at less capability cannot smuggle a force past
 
 Every mechanism below was broken on purpose and the run repeated; the named test is the one
 that went red. A test that stays green when its mechanism is deleted is worse than no test,
-and this repository has now found ten of those.
+and this repository has now found twelve of those — the last two in this slice's own
+cancellation wording, recorded under "The second review round" below.
 
 | Mutation | Caught by |
 |---|---|
@@ -517,12 +518,14 @@ and this repository has now found ten of those.
 | the pre-spawn cancel latch is removed | `push_suite::a_cancel_that_lands_before_execution_stops_the_push_starting` |
 | `upstream_of` returns the plausible constant `origin/<branch>` | `push_suite::the_upstream_is_read_from_the_repository_not_assumed` |
 | the cancelled-push message claims the remote is unchanged | `push_suite::cancelling_a_running_push_kills_the_child_and_the_remote_does_not_move` |
-| **`/api/push` ignores the request's `force`** (a silent downgrade of every approved force-publish to a fast-forward) | `handlers::branch::tests::the_request_reaches_the_operation_whole`; `…::every_force_mode_the_wire_can_carry_is_exercised_by_the_mapping_table` — **added by the review round below; before it, this mutation left all ~700 tests green** |
+| the cancelled-push message's **non-empty** arm is garbled, or both arms collapse to one | `push::a_cancelled_push_says_which_of_the_two_things_it_observed`; `push_suite::a_cancel_that_lands_after_the_ref_moved_reports_what_the_remote_accepted` — **added by the second review round below; before them, every cancellation fixture blocked before any ref update, so `updated` was always empty and this arm never ran** |
+| `journal_updates` drops (or unconditionally appends) its `" (the push was then cancelled)"` tail | `push_suite::a_cancel_that_lands_after_the_ref_moved_reports_what_the_remote_accepted` (drops); `push_suite::a_fast_forward_push_reaches_the_remote_and_journals_the_mode` (unconditional) — **added by the second review round below** |
+| **`/api/push` ignores the request's `force`** (a silent downgrade of every approved force-publish to a fast-forward) | `handlers::branch::tests::the_request_reaches_the_operation_whole`; `…::every_force_mode_the_wire_can_carry_is_exercised_by_the_mapping_table` — **added by the first review round below; before it, this mutation left all ~700 tests green** |
 | `/api/push` ignores the request's `set_upstream` | `handlers::branch::tests::the_request_reaches_the_operation_whole` |
-| the `journal_unobserved` write is removed | `push_suite::a_push_whose_outcome_cannot_be_observed_is_journaled_as_unknown` — **added by the review round below; before it, this call had no coverage at all** |
-| `TransferPhase::Writing`'s wire spelling drifts | `operation::tests::transfer_phase_wire_names_are_stable_snake_case` — **added by the review round below; the variant shipped with no pinned wire name** |
+| the `journal_unobserved` write is removed | `push_suite::a_push_whose_outcome_cannot_be_observed_is_journaled_as_unknown` — **added by the first review round below; before it, this call had no coverage at all** |
+| `TransferPhase::Writing`'s wire spelling drifts | `operation::tests::transfer_phase_wire_names_are_stable_snake_case` — **added by the first review round below; the variant shipped with no pinned wire name** |
 
-### The review round, and the three holes it found
+### The first review round, and the three holes it found
 
 The first pass of this slice proved `planner::push` exhaustively and left three gaps that
 only mutation could surface. They are recorded here rather than quietly fixed, because the
@@ -556,6 +559,67 @@ only mutation could surface. They are recorded here rather than quietly fixed, b
    enum the day it grows. The list is now backed by a census through an exhaustive `match`, so
    a seventh variant is a compile error there, and each spelling is asserted in both
    directions — a client reads these as well as writes them.
+
+### The second review round: half of cancellation was never exercised
+
+A later anti-vacuity pass found that D4's careful two-branch cancellation wording had only
+**one** branch under test. Every cancellation fixture in `push_suite` hangs the remote's
+`pre-receive` hook, which by construction runs *before* any ref update, so `updated` was
+empty every time a test cancelled a push. The empty arm ("this repository never saw the
+remote accept it — fetch to see where the remote actually is") was well covered; the
+non-empty arm ("cancelled after N remote-tracking ref(s) had already been updated, so that
+much was accepted by the remote") and `journal_updates`' matching `" (the push was then
+cancelled)"` tail had **zero** coverage. Rewriting the non-empty sentence, or swapping the
+two arms outright, left all ~700 tests green.
+
+That is the worst branch in this slice to lose, because it is the one sentence that tells a
+user their force-publish **partly landed** — the case where the remote has already moved and
+this process was killed before it could finish saying so.
+
+Closing it needed a lever no remote-side hook can provide. `git push` does not call
+`transport_update_tracking_ref` until `push_refs` has returned, and `push_refs` does not
+return until `finish_connect` has reaped `receive-pack` — so a push hung by *either*
+`pre-receive` or `post-receive` has a tracking ref that has not moved. The hang therefore
+goes in the **pushing** repository: a `reference-transaction` hook that sleeps on
+`committed`, i.e. once `refs/remotes/origin/main` is durable and unlocked and the push is
+still alive to be killed. That is exactly D4's window, reproduced on demand:
+
+```mermaid
+sequenceDiagram
+    participant X as exec_push
+    participant G as git push
+    participant R as remote
+    X->>G: spawn, streaming
+    G->>R: pack
+    R-->>G: ref accepted
+    G->>G: write refs/remotes/origin/main
+    Note over G: reference-transaction committed<br/>fixture hangs here
+    X->>G: SIGKILL on cancel
+    X->>X: re-list refs, diff is NON-empty
+    X-->>X: N remote-tracking refs had already been updated
+```
+
+Five legs keep the new test honest, and each was proven by mutation: the tracking ref must
+actually reach the pushed tip (or it is the empty case again), the child must still be alive
+and the driver unanswered at that instant (or the cancel never reaches the cancelled path —
+neutering the hook's condition makes the test fail *there*, not silently pass as a success),
+the driver must answer within the promptness budget with ~20 s of hook sleep still owed
+(deleting `child.start_kill()` fails here), the message must carry the non-empty phrase and
+**not** the empty one, and the remote's own `rev-parse` must agree that it accepted the
+update — so "accepted by the remote" is checked against the remote rather than against the
+same diff that produced the sentence.
+
+The journal tail is paired in both directions: the cancelled push must carry it, and
+`a_fast_forward_push_reaches_the_remote_and_journals_the_mode` now asserts a completed push
+does **not**, so an unconditional tail fails too. Pluralisation and the count get a pure test
+(`push::a_cancelled_push_says_which_of_the_two_things_it_observed`), which also asserts each
+arm's discriminating phrase is absent from the other.
+
+**The reusable lesson:** a fixture chosen for one property silently fixes the value of
+another. `pre-receive` was picked because it proves "the remote did not move", and that same
+choice pinned `updated` to empty in *every* cancellation test written afterwards. When a
+function branches on an observation, ask which branch the fixture makes unreachable — and
+build the second fixture for the other one.
 
 Three structural notes about the suite itself:
 
@@ -621,3 +685,4 @@ inside a handler.
 ---
 
 **Signed:** thomas2025 · 2026-08-02T16:03:35-04:00
+**Amended (second review round — cancellation coverage):** thomas2025 · 2026-08-02T20:57:42-04:00
