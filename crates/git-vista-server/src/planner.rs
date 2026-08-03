@@ -1285,9 +1285,19 @@ async fn shape(
             // a millisecond ago. And it does not fall back to some
             // observation when the ref is unnameable — a lease with no
             // precondition would be a force push with a reassuring label,
-            // which is the one outcome `ForcePublish` exists to prevent, so
-            // an unnameable tracking ref yields no lease precondition *and*
-            // no execution (see `execute`'s refusal below).
+            // which is the one outcome `ForcePublish` exists to prevent.
+            //
+            // M2.20e (#231) moved where that last guarantee is kept, and the
+            // move is worth stating because the old sentence here cited a
+            // `501` in `execute` that no longer exists. Every `PushBranch`
+            // combination now executes, so "no precondition ⇒ no execution"
+            // is no longer true by refusal — it is true because
+            // `planner::push::verify_lease` re-derives
+            // `refs/remotes/<remote>/<branch>` from the same two validated
+            // newtypes and refuses `409` on its own, whether or not this
+            // function managed to name the ref. The lease is checked before a
+            // socket exists either way; what changed is that the check lives
+            // beside the spawn rather than in a stub next to it.
             //
             // A `match` rather than an `if let`: should `ForcePublish` ever
             // grow a third variant, this stops compiling instead of silently
