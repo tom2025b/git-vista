@@ -17,7 +17,7 @@
 //! repository path, which `docs/adr/0002-versioned-api-contract.md` already
 //! refuses for the same reason.
 //!
-//! **Two separate things enforce it, and both are needed** (ADR 0044 — the
+//! **Two separate things enforce it, and both are needed** (ADR 0047 — the
 //! original version of this comment claimed the second one alone did, and it
 //! did not, which is the hole `planner::remote_boundary_suite` was written
 //! against):
