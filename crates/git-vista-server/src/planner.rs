@@ -312,12 +312,16 @@ pub(crate) async fn build_plan_only(
 ///   `held_at_build` is re-derived too, which reads a precondition that
 ///   silently broke during the review window (possible only for the
 ///   generation-invisible pair, `RemoteConfigured`/`SeedRecorded`) as
-///   built-stale: it flows to the executor's own legacy refusal instead of
-///   `enforce_fresh`'s — from the submitter's seat the two cases are
-///   genuinely indistinguishable, and both fail closed. Not just prose: the
-///   contract suite's two `review_window_*_drift_fails_closed_*` tests prove
-///   the refusal (and its byte-identity with the never-held case) for both
-///   generation-invisible preconditions, and
+///   built-stale — from the submitter's seat the two cases are genuinely
+///   indistinguishable, and both fail closed. *Which* refusal they fail
+///   closed with now depends on [`refuses_when_unmet_at_build`]:
+///   `SeedRecorded` still flows to the executor's own legacy refusal (the
+///   reset's 404), while `RemoteConfigured` is refused by `enforce_fresh`
+///   itself, because nothing downstream of it refuses at all (ADR 0044).
+///   Not just prose: the contract suite's two
+///   `review_window_*_drift_fails_closed_*` tests prove the refusal (and its
+///   byte-identity with the never-held case) for both generation-invisible
+///   preconditions, and
 ///   `a_generation_invisible_break_while_queued_is_refused_by_the_gates_live_recheck`
 ///   proves the re-derivation itself is load-bearing (emptying it passed the
 ///   whole suite before that test existed).
@@ -843,7 +847,10 @@ async fn observe_live(repo: &Path) -> Observed {
 ///  2. **Preconditions**: every precondition that *held* at build time is
 ///     re-verified against the live repository. One that already failed at
 ///     build time is skipped here — the executor's own legacy guard refuses
-///     it with the exact wording it always had.
+///     it with the exact wording it always had — **unless**
+///     [`refuses_when_unmet_at_build`] says there is no such guard, in which
+///     case this gate refuses it itself. See that function for why the
+///     "skip it, the executor will catch it" rule needed an exception.
 async fn enforce_fresh(
     repo: &Path,
     plan: &Plan,
@@ -877,9 +884,91 @@ async fn enforce_fresh(
     for (i, precondition) in plan.preconditions.iter().enumerate() {
         if observed.held_at_build.get(i).copied().unwrap_or(false) {
             verify_precondition(repo, precondition, &live).await?;
+        } else if refuses_when_unmet_at_build(precondition) {
+            return Err(unmet_at_build(precondition));
         }
     }
     Ok(())
+}
+
+/// Whether a precondition that **already failed when the plan was built** must
+/// be refused *here*, instead of being skipped and left to the executor.
+///
+/// # Why this exception exists
+///
+/// [`enforce_fresh`]'s skip is not laziness — it is what keeps a genuinely
+/// unmet precondition producing git's own words rather than a second,
+/// paraphrased refusal. It rests on an assumption that was written down but
+/// never checked: *every* precondition that can fail at build time has an
+/// executor-side guard that refuses when it does. Create-branch's
+/// `RefAbsent` has one (`git branch` refuses an existing name), rebase's
+/// `CleanWorktree` has one (git refuses a dirty tree), the reset's
+/// `SeedRecorded` has one (`exec_reset_test_repo` re-reads the seed and 404s,
+/// pinned by `contract_suite`'s
+/// `review_window_seed_drift_fails_closed_with_the_never_recorded_refusal`).
+///
+/// [`Precondition::RemoteConfigured`] has none, and cannot have one, because
+/// **`git fetch`/`git pull`/`git push` do not refuse an unknown remote —
+/// they reinterpret it as a transport target.** Verified against git 2.43.0:
+/// `git fetch ghost.git`, with no such remote, fetches from the *directory*
+/// `ghost.git` and writes `FETCH_HEAD`. Before this arm existed the fetch
+/// endpoint then answered `200 … already up to date`, because the
+/// before/after diff of `refs/remotes/ghost.git/*` is empty for an ad-hoc
+/// target: a fetch that reached somewhere it was never authorised to, reported
+/// as a no-op. With a URL in the field the same path opened a real socket
+/// (`remote_boundary_suite` reproduces it against a listener).
+///
+/// So this is the one precondition whose failure must stop the pipeline, and
+/// the gate is the only place that can do it — the executor is precisely
+/// where the damage happens.
+///
+/// No wildcard arm, on purpose: a new [`Precondition`] variant fails to
+/// compile here until someone states which side it is on, and the contract
+/// suite pins the `true` set to an exact census so widening it is a visible
+/// edit rather than a side effect. The question each arm answers is narrow:
+/// *if this precondition is false and we run the executor anyway, does the
+/// executor refuse?*
+pub(crate) fn refuses_when_unmet_at_build(precondition: &Precondition) -> bool {
+    match precondition {
+        // git resolves an unknown remote as a URL or a path instead of
+        // refusing it. Nothing downstream says no. See above.
+        Precondition::RemoteConfigured { .. } => true,
+        // Every one of these is refused by the git command the executor runs
+        // (a missing ref, an occupied ref, the wrong checked-out branch, a
+        // dirty tree) or by the executor's own re-read (`SeedRecorded`), in
+        // that command's own words — which is strictly better than a
+        // paraphrase from here.
+        Precondition::RefAt { .. }
+        | Precondition::RefExists { .. }
+        | Precondition::RefAbsent { .. }
+        | Precondition::BranchCheckedOut { .. }
+        | Precondition::BranchNotCheckedOut { .. }
+        | Precondition::CleanWorktree
+        | Precondition::SeedRecorded => false,
+    }
+}
+
+/// The refusal [`refuses_when_unmet_at_build`] earns: a `409` naming the
+/// precondition that was already false when the plan was built.
+///
+/// `409` and not `400`: the request is well-formed, and the same request
+/// against the same repository with the remote configured would be accepted —
+/// this is a statement about the repository, which is what every other
+/// precondition refusal in `verify_precondition` is too.
+fn unmet_at_build(precondition: &Precondition) -> (StatusCode, String) {
+    let why = match precondition {
+        Precondition::RemoteConfigured { remote } => format!(
+            "Remote ‘{}’ is not configured in this repository — nothing was contacted. \
+             Add it with `git remote add`, or pick a remote this repository knows.",
+            remote.as_str()
+        ),
+        // Unreachable while `refuses_when_unmet_at_build` names exactly one
+        // arm; kept total rather than panicking, and worded so a future arm
+        // that forgets to add its own sentence still refuses honestly.
+        other => format!("A precondition of this plan does not hold: {other:?}."),
+    };
+    eprintln!("git-vista: refusing an unmet precondition: {why}");
+    (StatusCode::CONFLICT, why)
 }
 
 /// Check one [`Precondition`] against the live repository. `live` supplies the
@@ -4015,6 +4104,13 @@ mod fetch_suite;
 #[cfg(test)]
 mod pull_suite;
 
+// The remote-target boundary (#229 follow-up, ADR 0044): a real listener that
+// must never be connected to, its paired positive control, and the
+// unconfigured-remote refusal — for fetch and for pull, which share the
+// machinery verbatim.
+#[cfg(test)]
+mod remote_boundary_suite;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4989,20 +5085,78 @@ mod tests {
         assert!(why.contains("no longer configured"), "{why}");
     }
 
-    /// A precondition that already failed at build time is *not* enforced here:
-    /// it flows to the executor's legacy guard so refusal texts stay exactly
-    /// what they always were.
+    /// A precondition that already failed at build time is *not* enforced
+    /// here: it flows to the executor's legacy guard, so refusal texts stay
+    /// exactly what they always were.
+    ///
+    /// # Why the example is `RefAbsent` and no longer `RemoteConfigured`
+    ///
+    /// This test used to make the same point with a never-configured push
+    /// remote, and it passed for a reason it did not check: it asserted the
+    /// gate steps aside without ever asserting anything catches the operation
+    /// afterwards. For `RemoteConfigured` nothing does — `git push`/`git
+    /// fetch` reinterpret an unknown remote as a transport target rather than
+    /// refusing it — so the test was pinning the mechanism of a real hole
+    /// (`planner::remote_boundary_suite`, ADR 0044) as if it were a
+    /// guarantee.
+    ///
+    /// The rule it states is still the rule, so it is kept and made
+    /// load-bearing instead of deleted: the example moves to `RefAbsent`,
+    /// where the executor's guard is real, and the second leg **proves** that
+    /// guard fires rather than assuming it. The exception is asserted
+    /// directly in the third leg, so the two halves of the policy are visible
+    /// in one place.
     #[tokio::test]
     async fn a_precondition_unmet_at_build_time_is_left_to_the_executor() {
         let (_dir, repo) = seeded_repo();
-        let op = GitOperation::PushBranch {
+        run(&repo, &["branch", "dup"]);
+        let op = GitOperation::CreateBranch {
+            name: BranchName::new("dup").unwrap(), // already exists
+            at: CommitOid::new(git_rev_parse_head(&repo).await).unwrap(),
+        };
+        let (plan, observed) = build_plan(&repo, op.clone(), tokens()).await;
+        assert!(
+            plan.preconditions
+                .iter()
+                .any(|p| matches!(p, Precondition::RefAbsent { .. })),
+            "CreateBranch no longer carries RefAbsent — this test's premise is gone"
+        );
+        assert!(
+            !observed.held_at_build.iter().any(|&h| h),
+            "the precondition must be unmet at build time, or the gate below \
+             is being asked the wrong question"
+        );
+
+        // Leg 1: the gate steps aside.
+        assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+
+        // Leg 2 — the leg this test was missing: something downstream really
+        // does refuse, in git's own words. Without it, "the gate steps aside"
+        // is only half a claim.
+        let (status, why) = plan_and_execute_in(&repo, None, tokens(), op).await;
+        assert!(
+            !status.is_success(),
+            "the executor's own guard must refuse the duplicate branch: {why}"
+        );
+        assert!(
+            why.contains("already exists"),
+            "expected git's own wording, got: {why}"
+        );
+
+        // Leg 3: the exception. `RemoteConfigured` has no such guard, so the
+        // gate must refuse it itself rather than stepping aside.
+        let push = GitOperation::PushBranch {
             branch: BranchName::new("main").unwrap(),
             remote: RemoteName::new("origin").unwrap(), // never configured
             set_upstream: false,
             force: ForcePublish::None,
         };
-        let (plan, observed) = build_plan(&repo, op, tokens()).await;
-        assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+        let (plan, observed) = build_plan(&repo, push, tokens()).await;
+        let (status, why) = enforce_fresh(&repo, &plan, &observed)
+            .await
+            .expect_err("an unconfigured remote must not reach the executor");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(why.contains("not configured"), "{why}");
     }
 
     // -----------------------------------------------------------------------
