@@ -177,7 +177,7 @@ validated_string!(
     /// The name of a remote **configured in the repository** — `origin`,
     /// `upstream`, `fork-2`. Never a URL and never a path.
     ///
-    /// # This is a security boundary (ADR 0044)
+    /// # This is a security boundary (ADR 0047)
     ///
     /// It was [`require_git_safe`] until #229's follow-up, which is
     /// non-empty and not option-shaped — and therefore accepted

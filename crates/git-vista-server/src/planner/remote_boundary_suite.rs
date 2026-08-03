@@ -1,5 +1,5 @@
 //! The regression battery for **which host a remote-reaching operation may
-//! actually talk to** (#229 follow-up, ADR 0044).
+//! actually talk to** (#229 follow-up, ADR 0047).
 //!
 //! # The hole these tests were written against
 //!
@@ -406,7 +406,7 @@ async fn an_unconfigured_remote_is_never_fetched_from() {
     // The refusal is plain text, like every other `enforce_fresh` refusal
     // (the staleness 409 has always been). `handlers::fetch`'s `FetchError`
     // contract covers the refusals *that handler* makes itself — see the gap
-    // note in ADR 0044.
+    // note in ADR 0047.
     assert!(
         serde_json::from_str::<FetchError>(&body).is_err(),
         "if this ever becomes a FetchError, the assertion above is the one to \

@@ -510,7 +510,7 @@ before and after, never from git's prose. Known limitation, recorded rather
 than hidden: the kill reaches the direct child only, so a grandchild transport
 process may briefly outlive it.)*
 
-### Which host a remote-reaching operation may contact (ADR 0044, #229 follow-up)
+### Which host a remote-reaching operation may contact (ADR 0047, #229 follow-up)
 
 The paragraph above claimed the `RemoteConfigured` precondition was what kept a
 request from choosing the host. **It was not, and neither was the type.** Both
