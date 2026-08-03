@@ -619,6 +619,122 @@ async fn a_push_publishes_transfer_progress_including_the_writing_phase() {
     }
 }
 
+/// Break the *pushing* repository's ref store at the moment git records the
+/// remote-tracking ref, so `exec_push`'s post-push re-read fails.
+///
+/// `reference-transaction` fires with `committed` once
+/// `refs/remotes/<remote>/<branch>` is durable — verified against git 2.43.0,
+/// which runs the hook for the tracking-ref update a push performs, exactly as
+/// it does for a fetch's. The hook is installed after all fixture commits, so
+/// the only transaction it ever sees is the push's.
+///
+/// A malformed `packed-refs` is the lever because `git for-each-ref` treats it
+/// as fatal (`exit 128`) while the already-written loose ref stays on disk —
+/// which is precisely the state this exit path exists for: the repository
+/// changed, and nothing can say how.
+fn blind_the_repository_after_the_push(repo: &Path) {
+    let hooks = repo.join(".git/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("reference-transaction");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = committed ]; then\n\
+             printf 'not a packed-refs file\\n' > '{}/.git/packed-refs'\n\
+             fi\n\
+             exit 0\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A push that ran, moved the remote, and then could not be re-read still
+/// leaves a journal entry — one that **admits** the outcome is unknown.
+///
+/// [`super::push::journal_unobserved`] had no test at all until this one, which
+/// is the shape of gap this repository keeps finding: a journal write with zero
+/// coverage reads as diligence and behaves as nothing. Deleting the call left
+/// every other test in the crate green (mutation run below), and the feed would
+/// then have claimed nothing happened on the one operation whose effect is on
+/// **another machine** — where, unlike a fetch, no later local read can reveal
+/// it.
+///
+/// The premise is asserted rather than assumed, because a fixture that merely
+/// failed early would make the whole thing vacuous:
+///
+/// * the response is the specific "could not be re-read" refusal, so this is
+///   the post-push re-read path and not some earlier spawn failure;
+/// * the loose `refs/remotes/origin/main` is on disk holding the pushed tip, so
+///   a ref really did move while unobservable — the divergence is real;
+/// * the entry's oids are `None` **and** the summary says the outcome is
+///   unknown, which is what distinguishes `Obs::Unknown` ("git could not be
+///   read") from `Obs::Absent` ("there was no such tip") — the whole of D5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_push_whose_outcome_cannot_be_observed_is_journaled_as_unknown() {
+    let fx = fixture(2);
+    let want = fx.local_tip();
+    blind_the_repository_after_the_push(&fx.repo);
+
+    let (status, body) = pipeline(&fx.repo, push_op(false, ForcePublish::None)).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the fixture must reach the post-push re-read failure: {body}"
+    );
+    assert!(
+        body.contains("could not be re-read"),
+        "…and it must be *that* refusal, not some earlier one: {body}"
+    );
+
+    let loose = fx.repo.join(".git/refs/remotes/origin/main");
+    assert!(
+        loose.exists(),
+        "the fixture must let the tracking ref actually move before blinding \
+         the repository, or there is no divergence for the journal to record"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&loose).unwrap().trim(),
+        want,
+        "…and it must hold the tip that was pushed"
+    );
+    assert_eq!(
+        fx.remote_tip(),
+        want,
+        "the remote really did move — this is a push whose *effect* is real and \
+         whose *record* is what went missing"
+    );
+
+    let entries = journaled_pushes(&fx.repo);
+    assert_eq!(
+        entries.len(),
+        1,
+        "an unobservable push must still leave exactly one entry: {entries:?}"
+    );
+    let entry = &entries[0];
+    assert_eq!(
+        entry.ref_name, None,
+        "which ref moved is precisely what is unknown; naming one would be \
+         fabrication: {entry:?}"
+    );
+    assert_eq!(entry.old_oid, None, "{entry:?}");
+    assert_eq!(entry.new_oid, None, "{entry:?}");
+    assert!(
+        entry.summary.contains("unknown"),
+        "the summary must admit the outcome is unknown rather than leave the \
+         empty oids to be read as ‘nothing moved’: {}",
+        entry.summary
+    );
+    assert_eq!(entry.source, ActivitySource::App, "{entry:?}");
+    assert_eq!(
+        entry.undo, None,
+        "an outcome nobody observed offers no undo: {entry:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // --set-upstream
 // ---------------------------------------------------------------------------

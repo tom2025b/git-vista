@@ -482,6 +482,20 @@ and a request default that points at less capability cannot smuggle a force past
   and the shim withholds `LANDLOCK_ACCESS_FS_REFER`), so the behavioural suite spins a
   `git daemon` on the arbitrated port 9418 and serializes on `test_ports::PortClaim`. This
   is a real cost in test wall-clock, paid because the alternative is not testing a push.
+- **The two ref listings run in the operation's tier, not the tightest one that would do.**
+  `transfer::remote_tracking_refs` takes the caller's `NetworkNeed` and a push passes
+  `Remote`, so the `git for-each-ref` before and after the transfer lands in `Tier::Network`
+  — no bwrap namespaces, git's ports reachable — where `NetworkNeed::Local` would put it in
+  `Tier::Strict`. This is inherited behaviour, not something #231 introduced: the helper came
+  from `planner::fetch` (#229) already shaped this way, and a fetch and a pull do the same.
+  It is reported rather than changed for two reasons. The exposure is not the one ADR 0044 §4
+  found on the pull path — that was about **hooks**, which `HookMode::Run` executes in every
+  tier, and `for-each-ref` runs none and execs nothing. And tightening it would change fetch
+  and pull as well, on a code path with no probe: the namespace test ADR 0044 uses works
+  because a hook can `readlink /proc/self/ns/net`, and a command that runs no hooks offers no
+  such observation, so the change could not be proved to have happened. Worth doing as its
+  own slice, with `need` removed from the helper's signature the way #230 removed it from
+  `unmerged_paths` — a structural proof rather than a test — not smuggled in here untested.
 
 ---
 
@@ -503,6 +517,45 @@ and this repository has now found ten of those.
 | the pre-spawn cancel latch is removed | `push_suite::a_cancel_that_lands_before_execution_stops_the_push_starting` |
 | `upstream_of` returns the plausible constant `origin/<branch>` | `push_suite::the_upstream_is_read_from_the_repository_not_assumed` |
 | the cancelled-push message claims the remote is unchanged | `push_suite::cancelling_a_running_push_kills_the_child_and_the_remote_does_not_move` |
+| **`/api/push` ignores the request's `force`** (a silent downgrade of every approved force-publish to a fast-forward) | `handlers::branch::tests::the_request_reaches_the_operation_whole`; `…::every_force_mode_the_wire_can_carry_is_exercised_by_the_mapping_table` — **added by the review round below; before it, this mutation left all ~700 tests green** |
+| `/api/push` ignores the request's `set_upstream` | `handlers::branch::tests::the_request_reaches_the_operation_whole` |
+| the `journal_unobserved` write is removed | `push_suite::a_push_whose_outcome_cannot_be_observed_is_journaled_as_unknown` — **added by the review round below; before it, this call had no coverage at all** |
+| `TransferPhase::Writing`'s wire spelling drifts | `operation::tests::transfer_phase_wire_names_are_stable_snake_case` — **added by the review round below; the variant shipped with no pinned wire name** |
+
+### The review round, and the three holes it found
+
+The first pass of this slice proved `planner::push` exhaustively and left three gaps that
+only mutation could surface. They are recorded here rather than quietly fixed, because the
+*shape* of each is the reusable lesson.
+
+1. **A proven executor reached through an unproven mapping.** `handlers::branch::push_branch`
+   destructured `PushRequest` and built `GitOperation::PushBranch` inline, and nothing tested
+   that mapping. Replacing `force.unwrap_or(ForcePublish::None)` with a bare
+   `ForcePublish::None` — an endpoint that silently downgrades every approved force-publish —
+   left the entire crate green. Every property `push_argv` proves is a property of a function
+   that was, on that mutation, never reached with a lease. The fix is structural as well as
+   test-side: the mapping moved into `push_operation`, which **consumes the request by value
+   and destructures it exhaustively**, so the handler has no field left to drop, and the
+   mapping is asserted against *literal* operations over the whole request space (a table
+   whose right-hand side re-derived values from the request would agree with any mapping,
+   including one that swapped the two flags).
+
+2. **A journal write with no coverage.** `push::journal_unobserved` — the one exit path where
+   `git push` ran and `refs/remotes/<remote>/*` could not be re-read — had no test. Deleting
+   the call was invisible. That is the worst place in this slice for the feed to go quiet: a
+   fetch whose outcome is unobservable can be re-observed later from this machine, and a push's
+   cannot, because what changed is on the remote. `push_suite::a_push_whose_outcome_cannot_be_observed_is_journaled_as_unknown`
+   fills it, using `fetch_suite`'s lever — a `reference-transaction` hook that corrupts
+   `packed-refs` once the tracking-ref update commits (verified: git 2.43.0 runs that hook for
+   a *push*'s tracking-ref transaction, and `for-each-ref` then exits 128 while the loose ref
+   stays on disk). The premise is asserted three ways so the entry cannot be passing over an
+   early failure.
+
+3. **A new wire variant with no pinned spelling.** `TransferPhase::Writing` was added to a
+   `#[serde(rename_all)]` enum whose contract test is a *list*, and a list stops covering an
+   enum the day it grows. The list is now backed by a census through an exhaustive `match`, so
+   a seventh variant is a compile error there, and each spelling is asserted in both
+   directions — a client reads these as well as writes them.
 
 Three structural notes about the suite itself:
 
@@ -533,7 +586,8 @@ callers, and this project has been paying attention since.
 ```mermaid
 flowchart LR
     R["main.rs<br/>POST /api/push"] --> H["handlers::branch::push_branch<br/>PushRequest"]
-    H --> B["branch_op"]
+    H --> M["push_operation<br/>the request becomes the operation"]
+    M --> B["branch_op"]
     B --> P["planner::plan_and_execute"]
     P --> PI["plan_and_execute_in<br/>build, validate, enforce_fresh"]
     PI --> EX["planner::execute<br/>PushBranch arm"]
@@ -545,6 +599,13 @@ flowchart LR
 `/api/push` accepts `set_upstream` and `force` on the wire, so the lease path has a real
 caller and is not code awaiting a UI. The UI *ceremony* for choosing a force-publish is
 #232's; the capability is live and reachable today by any authenticated client.
+
+**Reachability is not only "is there a caller".** The `push_operation` node above is drawn
+separately because that link is where this slice's first review round found the chain
+broken in a way a call-graph could not see: the caller existed, and dropped a field. A
+reachability argument has to cover *what arrives*, not just *that something arrives* — which
+is why the mapping is now a pure function with a literal-valued test rather than three lines
+inside a handler.
 
 ---
 
