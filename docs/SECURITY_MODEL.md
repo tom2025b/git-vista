@@ -600,6 +600,33 @@ while the pin exists. This is the typed **contract** only: `planner::execute` re
 four operations with `501`, proven inert by the contract suite against real repositories
 and real on-disk remotes.)*
 
+*(Local tag operations now execute: ADR 0048, #238 — amends the paragraph above, which
+described all four tag operations as contract-only. `CreateTag` (unsigned, both kinds) and
+`DeleteLocalTag` execute through `POST /api/tag` and `POST /api/delete-tag`, both
+`full_routes`-only with the standard `SessionAndCsrf` write posture — note the deliberate
+split from the `GET /api/tags` listing, which stays on both listeners because it discloses
+only committed history. Still refused with `501`, each for its own reason: `sign: true`
+(M2.21e owns signing config, and silently returning an *unsigned* tag under a name the
+user believes is signed is a wrong outcome they cannot see), and `DeleteRemoteTag`/
+`PushTag` (the first tag code that opens a socket with credentials on it, so it earns a
+review of its own — both still declare `NetworkNeed::Remote`, and the local pair declaring
+`Local` is what pins that nothing added here can reach a remote). **The no-editor
+guarantee:** `git tag -a` with no message launches `core.editor`, which on a headless
+server is either a dead process or a request that never returns, and `git tag` has no
+`--no-edit` to close it after the fact — so the state is made **unrepresentable** rather
+than checked for. `TagAnnotation` carries a non-empty `TagMessage`, the wire DTO has no
+`annotated` flag (so `{annotated: true, message: null}` cannot be spelled), and the pure
+`create_tag_argv` emits `-a` and `-m <message>` together or neither. Proven two ways:
+over the argv without a spawn, and behaviourally against `.git/TAG_EDITMSG` — the witness
+git writes if and only if it took the editor path — with a paired positive showing a
+blocking editor really does hang the process the executor avoids. **The recovery control
+is now demonstrated, not asserted:** against a tag whose commit no branch reaches,
+`durable::write_recovery_ref`'s pin leaves both the tag object and that commit alive
+through `git gc --prune=now`, and `update-ref` at the unpeeled oid restores the tag
+byte-identically; the paired leg without the pin loses both. That is why `DeleteLocalTag`
+keeps its `Destructive` rank — the recovery exists, but it is a recovery, not the
+automatic guard `git branch -d` provides.)*
+
 No gesture, pressure threshold, swipe, or double-tap directly executes a destructive
 operation. Touch gestures may select or open a plan; final confirmation is explicit.
 

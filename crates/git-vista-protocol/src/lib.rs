@@ -74,10 +74,10 @@ pub use diff::{
 };
 pub use dto::{
     validate_clone_url, AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind,
-    BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
-    HookPolicy, RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest,
-    SessionInfo, SessionRequest, SignatureStatus, TagDetail, TagKind, WorktreePathsRequest,
-    CLONE_IN_PROGRESS_SENTINEL,
+    BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, CreateTagRequest,
+    DeleteCloneRequest, DeleteTagRequest, HookPolicy, RebaseStatus, RepoMode, RepositoryDescriptor,
+    RepositoryKind, SelectRequest, SessionInfo, SessionRequest, SignatureStatus, TagDetail,
+    TagKind, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use history::{HistoryFrame, HistoryPage};
