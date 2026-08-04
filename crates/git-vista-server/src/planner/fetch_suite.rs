@@ -300,6 +300,53 @@ async fn a_real_fetch_publishes_transfer_progress_on_its_operation_record() {
 /// Without this leg, the test above would also pass for an implementation that
 /// published a fabricated `TransferProgress` unconditionally on entry —
 /// a progress bar that always moves is not a progress bar.
+/// `refs/remotes/origin/HEAD` is a *symbolic* ref pointing at a branch that is
+/// already reported, so counting it reports one branch movement twice.
+///
+/// This is a real regression, not a hypothetical: git 2.54 writes that symref
+/// during `fetch` and git 2.43 does not, so five fetch tests passed on the
+/// development box (2.43) and failed in CI (2.54) — the observed result
+/// depended on the host's git.
+///
+/// The symref is planted explicitly here rather than left to whichever git is
+/// installed, so this test fails on EVERY git version if the filter in
+/// `remote_tracking_refs` is removed. A test that only fails on git ≥ 2.54
+/// would be green on the machine most likely to reintroduce the bug.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_remote_head_symref_is_not_reported_as_a_moved_branch() {
+    let (_dir, repo) = repo_with_remote_ahead(1);
+    // Point origin/HEAD at origin/main by hand. Git may or may not create this
+    // itself depending on version; the assertion must not depend on that.
+    run(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+
+    let (handle, record) = admit_fetch("head-symref");
+    let (status, body) = run_tracked(&repo, record.clone(), fetch_op()).await;
+    handle.finish(status, body.clone(), None);
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let success: FetchSuccess = serde_json::from_str(&body).unwrap();
+    assert!(
+        !success.updated_refs.is_empty(),
+        "the fixture is one commit behind, so a real branch update must be \
+         reported — otherwise this test would pass by reporting nothing at all"
+    );
+    assert!(
+        success
+            .updated_refs
+            .iter()
+            .all(|u| u.ref_name != "refs/remotes/origin/HEAD"),
+        "origin/HEAD is a symref onto a branch already listed; reporting it \
+         double-counts one movement: {:?}",
+        success.updated_refs
+    );
+}
+
+/// The paired negative: a fetch with nothing to transfer publishes **no**
+/// progress at all.
+///
+/// Without this leg, the test above would also pass for an implementation that
+/// published a fabricated `TransferProgress` unconditionally on entry —
+/// a progress bar that always moves is not a progress bar.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fetch_with_nothing_to_transfer_publishes_no_progress() {
     let (_dir, repo) = repo_with_remote_ahead(0);
