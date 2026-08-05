@@ -276,6 +276,15 @@ impl Operations {
                     // it here would mark a live fetch `Failed` and — worse — would
                     // clobber the bound id, since `bind_id` overwrites rather than
                     // refuses (`core::OperationsCore::bind_id`).
+                    //
+                    // What happens instead, stated plainly because it is a
+                    // deliberate behaviour change: the entry stays in flight,
+                    // showing the truth, and its outcome arrives on the progress
+                    // stream this task never touches — or, if that connection died
+                    // too, on the next boot, because the resolver already wrote the
+                    // `localStorage` entry `resume_inflight_remote_op` reads. Before
+                    // the id could be bound early, neither recovery existed and the
+                    // only option was to guess `Failed`.
                     if write_binding.get() == DispatchBinding::Pending {
                         write_binding.set(DispatchBinding::Closed);
                         settle_locally(core, graph, &write_key, reason, false);
