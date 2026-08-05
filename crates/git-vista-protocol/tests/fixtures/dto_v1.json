@@ -37,6 +37,115 @@
   "branch_request": {
     "branch": "main"
   },
+  "fetch_request": {
+    "remote": "origin"
+  },
+  "fetch_success_with_updates": {
+    "remote": "origin",
+    "message": "Fetched from ‘origin’: 2 remote-tracking refs updated.",
+    "updated_refs": [
+      {
+        "ref_name": "refs/remotes/origin/main",
+        "old_oid": "1111111111111111111111111111111111111111",
+        "new_oid": "2222222222222222222222222222222222222222"
+      },
+      {
+        "ref_name": "refs/remotes/origin/feature",
+        "old_oid": null,
+        "new_oid": "3333333333333333333333333333333333333333"
+      }
+    ]
+  },
+  "fetch_success_already_up_to_date": {
+    "remote": "origin",
+    "message": "Fetched from ‘origin’: already up to date.",
+    "updated_refs": []
+  },
+  "fetch_error_auth": {
+    "kind": "authentication_failed",
+    "message": "fatal: Authentication failed for 'https://example.invalid/repo.git/'",
+    "updated_refs": []
+  },
+  "fetch_error_cancelled_after_a_ref_moved": {
+    "kind": "cancelled",
+    "message": "The fetch from ‘origin’ was cancelled after 1 remote-tracking ref had already been updated.",
+    "updated_refs": [
+      {
+        "ref_name": "refs/remotes/origin/main",
+        "old_oid": "1111111111111111111111111111111111111111",
+        "new_oid": "2222222222222222222222222222222222222222"
+      }
+    ]
+  },
+  "pull_request_merge": {
+    "remote": "origin",
+    "branch": "main",
+    "strategy": "merge"
+  },
+  "pull_request_rebase": {
+    "remote": "upstream",
+    "branch": "release/2026-08",
+    "strategy": "rebase"
+  },
+  "pull_success_advanced": {
+    "remote": "origin",
+    "branch": "main",
+    "strategy": "rebase",
+    "message": "Pulled ‘main’ from ‘origin’ into the checked-out branch (rebase strategy).",
+    "updated_refs": [
+      {
+        "ref_name": "refs/remotes/origin/main",
+        "old_oid": "1111111111111111111111111111111111111111",
+        "new_oid": "2222222222222222222222222222222222222222"
+      }
+    ],
+    "advanced": true
+  },
+  "pull_success_already_up_to_date": {
+    "remote": "origin",
+    "branch": "main",
+    "strategy": "merge",
+    "message": "Already up to date — ‘main’ on ‘origin’ has nothing the checked-out branch doesn’t already have.",
+    "updated_refs": [],
+    "advanced": false
+  },
+  "pull_error_strategy_required": {
+    "kind": "strategy_required",
+    "message": "A pull must say how to integrate what it fetches: send \"strategy\": \"merge\" or \"strategy\": \"rebase\".",
+    "updated_refs": [],
+    "worktree_restored": true
+  },
+  "pull_error_conflict_restored": {
+    "kind": "conflict",
+    "message": "Pulling ‘main’ from ‘origin’ (merge strategy) failed: CONFLICT (content): Merge conflict in a.txt The merge was aborted and the checked-out branch is back where it started.",
+    "updated_refs": [
+      {
+        "ref_name": "refs/remotes/origin/main",
+        "old_oid": "1111111111111111111111111111111111111111",
+        "new_oid": "2222222222222222222222222222222222222222"
+      }
+    ],
+    "worktree_restored": true
+  },
+  "pull_error_conflict_left_in_progress": {
+    "kind": "conflict_left_in_progress",
+    "message": "Pulling ‘main’ from ‘origin’ (rebase strategy) failed: error: could not apply 1a2b3c4 The rebase could not be aborted cleanly.",
+    "updated_refs": [],
+    "worktree_restored": false
+  },
+  "push_request_plain": {
+    "branch": "main",
+    "set_upstream": false,
+    "force": null
+  },
+  "push_request_upstream_and_lease": {
+    "branch": "feature/x",
+    "set_upstream": true,
+    "force": {
+      "mode": "with_lease",
+      "expected_remote_tip": "4444444444444444444444444444444444444444"
+    }
+  },
   "clone_request": {
     "url": "https://github.com/owner/repo.git"
   },
