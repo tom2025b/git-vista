@@ -1,5 +1,36 @@
 # Git-Vista Git Client Roadmap
 
+> **Historical document — proposed roadmap, not current scope.**
+> Written 2026-07-15, before the V1 scope freeze (ADR 0049, 2026-08-05,
+> `docs/adr/0049-v1-scope-freeze.md`). Read this
+> alongside `docs/adr/` and the live roadmap (`./dev roadmap`) for what actually
+> shipped and what remains open.
+>
+> **What this doc promised that ADR 0049 cut (closed won't-do, reopenable):**
+> - *Should/Nice-to-Have*: interactive rebase's execution engine — the planner
+>   (#82) and executor (#83) — is cut; the touch-first plan UI never got built.
+>   Printable/shareable redacted diagrams (#95) and out-of-process extensions
+>   for forge providers/teaching content (#96) are cut.
+> - *Teaching Layer* section: the simulator backend (#93), conflict/rebase
+>   trainers (#94), and printable diagrams (#95) — three of its five bullets —
+>   are cut. Only Explain Mode (#92) and the production operation vocabulary it
+>   overlays remain live.
+> - *Forge Integration* build order: step 1 (provider-neutral types, #88), step
+>   3 (Forgejo adapter, #90), and step 4 (GitLab adapter, #91) are cut. Only
+>   step 2 (GitHub adapter, #89, re-scoped to absorb what it needs from #88)
+>   remains.
+> - *Release Horizons → Later*: "Extension SDK", "optional classroom
+>   coordination and a separately designed multi-user service" both trace to
+>   the retired M7 milestone (#96, #97, #98, #99) and are cut, not deferred to
+>   a later release.
+>
+> **Kept, not cut:** V1 ("Safe Visual Client") scope, and V2's worktrees/stash/
+> compare/cherry-pick/revert/conflict-resolution/blame/bisect line, are the live
+> M1–M5 backlog and are not affected by this freeze. Interactive rebase's shared
+> infrastructure (#84 conflict resolution, #85 force-with-lease) is explicitly
+> kept even though the rebase planner/executor (#82/#83) it was meant to sit
+> under is cut.
+
 Status: proposed
 
 This roadmap treats Git-Vista as a professional Git client for one developer,

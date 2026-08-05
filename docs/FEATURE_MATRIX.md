@@ -1,5 +1,40 @@
 # Git-Vista Feature Matrix
 
+> **Historical document — planning baseline, not current status.**
+> Written 2026-07-16, before the V1 scope freeze (ADR 0049, 2026-08-05,
+> `docs/adr/0049-v1-scope-freeze.md`). Cell
+> values below (`Target`, `Later`) predate the freeze; treat this table as a
+> snapshot of intent on that date, not a live status board. `./dev roadmap`
+> and `docs/adr/` reflect current shipped/open/cut state.
+>
+> **Rows whose "V2 professional" / "Later" targets ADR 0049 cut (closed
+> won't-do, reopenable):**
+> - **Forgejo integration** row — "Target" at V2 traces to #90, cut (depended on
+>   #88, also cut).
+> - **GitLab integration** row — "Read-only target if capacity" traces to #91,
+>   cut.
+> - **Interactive rebase** row — the touch-plan "Target" at V2 traces to the
+>   planner/executor pair #82/#83, both cut. The row's "V1 foundation:
+>   Operation foundation" and "Later: Advanced automation" cells are unaffected
+>   (no dependency on #82/#83).
+> - **Interactive lessons** row — "First lessons" at V2 and "Lesson
+>   marketplace" at Later trace to the simulator (#93) and trainers (#94), both
+>   cut.
+> - **Classroom/assessment** row — "Separate service mode" at Later traces to
+>   #97 (M7, retired) and #93/#94/#95 (M6 teaching-backend line, cut).
+> - **Forge plugin boundary** row — "Out-of-process SDK" at Later traces to
+>   #96, cut (its own precondition, a second real adapter, was never met since
+>   #90/#91 are also cut).
+> - **Offline simulator/lessons** row — "Target if capacity" at V2 traces to
+>   the same cut simulator/trainer line (#93/#94).
+> - **Paired HTTPS LAN mode** row — "Design only" at V1, "Optional" at V2
+>   traces to #98, cut.
+>
+> **Explain mode row is NOT cut** — #92 is explicitly kept; its "Event
+>   vocabulary" (V1) / "Target" (V2) cells still describe live scope.
+> **GitHub pull requests row is NOT cut** — #89 is kept (re-scoped to absorb
+>   what it needs from #88).
+
 Status: planning baseline
 
 This matrix separates current implementation, the safe-client foundation, the

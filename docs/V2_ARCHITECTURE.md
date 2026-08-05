@@ -1,5 +1,48 @@
 # Git-Vista V2 Architecture
 
+> **Historical document — proposed target architecture, not current scope.**
+> Written 2026-07-16, before the V1 scope freeze (ADR 0049, 2026-08-05,
+> `docs/adr/0049-v1-scope-freeze.md`). Read
+> alongside `docs/adr/` (0001–0049) and `./dev roadmap` for what actually
+> shipped. `docs/SECURITY_MODEL.md` is current and out of scope for this
+> banner.
+>
+> **What this doc promised that ADR 0049 cut (closed won't-do, reopenable):**
+> - *Product Boundary*: "Extensible to GitHub, GitLab, Forgejo, and later forge
+>   providers" — GitLab (#91) and Forgejo (#90) integration are cut; only
+>   GitHub (#89) remains as the built-in adapter. "A platform on which
+>   teaching, simulation, and classroom features can be built" — the
+>   simulator (#93), trainers (#94), and classroom-as-separate-service (#97)
+>   behind that claim are cut; only Explain Mode (#92) stands.
+> - *Target Crate Layout*: `git-vista-learning` (simulator/lessons/assessment,
+>   #93–#95, #97) and `git-vista-plugin-sdk` (out-of-process extension
+>   protocol, #96) are both listed as "Later: … only when their first
+>   production feature begins" — that production feature was cut, so neither
+>   crate has a live trigger to extract.
+> - *Plugin and Forge Architecture*: the `ForgeProvider` trait's stated proof
+>   path ("first prove the interface with three built-in forge adapters") can
+>   no longer be met at V1 scope — only one adapter (GitHub, #89) is planned;
+>   Forgejo (#90) and GitLab (#91), the second and third, are cut. The
+>   out-of-process third-party plugin system (#96) that trait was meant to lead
+>   to is cut.
+> - *Migration Strategy, Stage E*: "Add the learning backend after operation
+>   contracts are stable" — no learning backend is in scope; the whole M6
+>   teaching-product line except Explain Mode (#92) is cut.
+> - *Definition of V2 Architectural Success*: "GitHub, GitLab, and Forgejo can
+>   be integrated without provider types entering core Git services" and "The
+>   same professional operation model can drive a synthetic teaching repo" are
+>   both no-longer-current success criteria — GitLab/Forgejo (#91/#90) and the
+>   synthetic teaching backend (#93) are cut.
+>
+> **Kept, not cut — and this is the important nuance:** the `ForgeProvider`
+> capability-boundary *design* and the provider-neutral `ChangeRequest`
+> vocabulary are still the intended shape for the one adapter that ships
+> (#89, GitHub); only the second/third-provider breadth used to justify and
+> prove the abstraction is cut. Likewise the operation-pipeline, concurrency,
+> undo/recovery, and query/cache architecture in this document describes
+> mechanisms that already exist and shipped independent of the teaching/forge-
+> breadth cuts above — do not read this banner as retracting those sections.
+
 Status: proposed
 
 This document defines the target architecture for Git-Vista as a serious,
