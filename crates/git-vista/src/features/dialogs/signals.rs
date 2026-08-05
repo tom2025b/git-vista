@@ -17,7 +17,8 @@ use leptos::{
 };
 
 use crate::features::dialogs::commit::{
-    adopt_seed, message_buffer, persist_key, seed_outcome, AmendPhase, CommitIntent, MessageBuffer,
+    adopt_seed, detail_read_use, is_reading_publication_for, message_buffer, persist_key,
+    seed_outcome, AmendPhase, CommitIntent, DetailUse, MessageBuffer, PreflightKnowledge,
     SeedOutcome,
 };
 use crate::features::dialogs::core::{draft_scope_action, Dialog, DialogsCore, DraftScopeAction};
@@ -113,6 +114,15 @@ pub struct Dialogs {
     /// re-runs that closure — state created inside it would be wiped by the
     /// very step that produced it.
     amend_phase: RwSignal<AmendPhase>,
+    /// What the dialog has learned about the commit an amend would rewrite,
+    /// and what the user has agreed to about it (M2.19d, #225).
+    ///
+    /// A `StoredValue`, not a signal: nothing renders from it. The banner that
+    /// *does* render comes from [`AmendPhase::AwaitingPublishedConfirm`],
+    /// which the submit handler enters after consulting this — so a detail read
+    /// landing late changes what the next press does, not what is currently on
+    /// screen, and gives no reason to re-render the modal underneath the user.
+    amend_preflight: StoredValue<PreflightKnowledge>,
 }
 
 impl Dialogs {
@@ -127,6 +137,7 @@ impl Dialogs {
             amend_msg: create_rw_signal(String::new()),
             amend_seed: store_value(String::new()),
             amend_phase: create_rw_signal(AmendPhase::Idle),
+            amend_preflight: store_value(PreflightKnowledge::default()),
         }
     }
 
@@ -242,12 +253,105 @@ impl Dialogs {
         self.amend_phase.set(phase);
     }
 
-    /// Clear the amend buffer, its seed and its phase — on a successful amend,
-    /// and whenever a dialog opens for a different question.
+    /// Record what `GET /api/commit/{tip}` said about whether that commit is
+    /// already on a remote (#225).
+    ///
+    /// Called from both places the dialog reads a detail — opening amend mode
+    /// from the context menu, and the guided re-check's retarget — because the
+    /// pre-flight gate has to answer for whichever commit the dialog is
+    /// currently pointed at, not for whichever one it was opened on.
+    ///
+    /// Unconditional, and therefore only safe where the caller can prove the
+    /// dialog still points at `tip`. The guided re-check can: it retargets and
+    /// records with no `await` between the two. The menu's opener cannot, and
+    /// must go through [`Dialogs::apply_amend_detail`] instead.
+    pub fn record_amend_detail(&self, tip: &str, on_remote: bool) {
+        self.amend_preflight
+            .update_value(|k| k.record_detail(tip, on_remote));
+    }
+
+    /// Apply a resolved `GET /api/commit/{tip}` — its published flag *and* its
+    /// message — **iff that read still speaks for the dialog** (#225).
+    ///
+    /// The chokepoint for every detail read that crosses an `await`. The
+    /// decision is [`detail_read_use`], which is host-tested; this is only the
+    /// two writes it authorises, because nothing in this file compiles under
+    /// `cargo test --workspace`. A source census in `features::a11y::audit`
+    /// pins that the guard is consulted first and that both writes sit inside
+    /// it.
+    ///
+    /// Applying an abandoned tip's answer is not a harmless late write:
+    /// [`PreflightKnowledge`] holds one read at a time, so it *evicts* the
+    /// answer for the commit on screen and the published-history ceremony
+    /// stops firing for it. See [`detail_read_use`] for the whole reasoning.
+    pub fn apply_amend_detail(&self, tip: &str, on_remote: bool, message: &str) -> DetailUse {
+        match detail_read_use(&self.amend_phase.get_untracked(), tip) {
+            DetailUse::Apply => {
+                self.record_amend_detail(tip, on_remote);
+                self.seed_amend_msg(message);
+                DetailUse::Apply
+            }
+            DetailUse::Discard => DetailUse::Discard,
+        }
+    }
+
+    /// Hold the confirm button while `GET /api/commit/{tip}` — the read that
+    /// supplies the pre-flight's only input — is outstanding (#225).
+    ///
+    /// Call it in the *same synchronous handler* that opens amend mode, after
+    /// [`Dialogs::open`] (which resets the phase) and before the read is
+    /// spawned. Both halves of that ordering are load-bearing and neither is
+    /// checkable by the compiler, so they are pinned by a source census in
+    /// `features::a11y::audit`.
+    pub fn begin_publication_read(&self, tip: &str) {
+        self.amend_phase.set(AmendPhase::ReadingPublication {
+            tip: tip.to_string(),
+        });
+    }
+
+    /// Release the publication-read window for `tip` — **on both outcomes of
+    /// the read**, success and failure alike (#225).
+    ///
+    /// Releasing on failure is not an oversight. `amend_preflight` treats an
+    /// unread detail as `Unknown` and sends, deliberately (see its doc
+    /// comment); holding the button shut on a failed read would instead make
+    /// amend unreachable whenever a single GET went wrong. The window is for
+    /// "the answer is coming", not "the answer never came".
+    ///
+    /// Only clears the phase if it is still *this* tip's window — the caller
+    /// resumes after an `await`, and the dialog may have been reopened on
+    /// another commit meanwhile.
+    pub fn finish_publication_read(&self, tip: &str) {
+        if is_reading_publication_for(&self.amend_phase.get_untracked(), tip) {
+            self.amend_phase.set(AmendPhase::Idle);
+        }
+    }
+
+    /// Record the ceremony's explicit second step for `tip` (#225).
+    pub fn confirm_amend_target(&self, tip: &str) {
+        self.amend_preflight.update_value(|k| k.confirm(tip));
+    }
+
+    /// What the pre-flight gate consults. Untracked by construction (a
+    /// `StoredValue`), which is what the submit handler needs: it reads this
+    /// inside a click handler that must not subscribe to anything.
+    pub fn amend_knowledge(&self) -> PreflightKnowledge {
+        self.amend_preflight.with_value(|k| k.clone())
+    }
+
+    /// Clear the amend buffer, its seed, its phase and everything the
+    /// pre-flight gate knows — on a successful amend, and whenever a dialog
+    /// opens for a different question.
+    ///
+    /// The pre-flight half matters most on the second of those: a fresh open is
+    /// a fresh commit, and inheriting "the user already agreed to rewrite
+    /// published history" would spend one amend's consent on another's.
     pub fn reset_amend(&self) {
         self.amend_msg.set(String::new());
         self.amend_seed.set_value(String::new());
         self.amend_phase.set(AmendPhase::Idle);
+        self.amend_preflight
+            .set_value(PreflightKnowledge::default());
     }
 
     /// The scope the draft belongs to right now — captured by the commit

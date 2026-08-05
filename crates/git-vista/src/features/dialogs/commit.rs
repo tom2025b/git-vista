@@ -1,4 +1,6 @@
-//! The commit dialog's decisions — framework-free, host-tested (M2.19c, #224).
+//! The commit dialog's decisions — framework-free, host-tested (M2.19c, #224;
+//! the published-history ceremony and the actionable refusal copy, M2.19d,
+//! #225).
 //!
 //! `dialogs/commit.rs` (the view) is wasm-only: it never compiles under
 //! `cargo test --workspace`, so anything decided there is decided untested.
@@ -33,6 +35,18 @@
 //! [`AmendPhase::Stale`], whose guided re-check keeps the confirm button
 //! disabled until a fresh tip has been read and shown. The type is the
 //! enforcement; [`phase_view`] is where the rule is stated and tested.
+//!
+//! # Rewriting pushed history is the client's ceremony to run
+//!
+//! ADR 0040 records that `POST /api/amend-commit` does **not** refuse an amend
+//! of a commit that is already on a remote: it runs it and reports it
+//! afterwards, because refusing would make a legitimate operation impossible
+//! and because the server cannot know whether the user was told. #225 is the
+//! other half of that decision. [`amend_preflight`] is what stands between the
+//! confirm button and the POST, and [`PreflightKnowledge`] is why a
+//! confirmation given for one commit cannot be spent on a different one — the
+//! guided re-check above retargets an *open* dialog, so "the user already
+//! agreed" has to carry which commit they agreed about.
 
 use git_vista_core::model::{GitRef, RefKind};
 use git_vista_core::status::{ChangeKind, RepoStatus};
@@ -797,6 +811,136 @@ pub fn published_advisory(success: &AmendCommitSuccess) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// The pre-flight published-history ceremony (#225)
+// ---------------------------------------------------------------------------
+
+/// Whether the commit an amend is about to rewrite is already on a remote.
+///
+/// The input is `CommitDetail::on_remote` — an *exact* answer for one commit
+/// (`git_vista_git::remote_membership`'s bounded walk), not membership of
+/// whatever page of history happens to be loaded. The dialog already fetches
+/// that detail to pre-fill the message box, so the pre-flight costs no extra
+/// request.
+///
+/// Three states, not two, because "we never read it" is not "it is not
+/// published": a failed `GET /api/commit/{id}` leaves the box empty and the
+/// dialog would otherwise have to pretend it knew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetPublication {
+    /// Read for this exact tip, and it is reachable from a remote-tracking ref.
+    Published,
+    /// Read for this exact tip, and it is not.
+    Unpublished,
+    /// Never read, the read failed, or what was read was read for a *different*
+    /// commit — the guided re-check retargets the open dialog without clearing
+    /// this, so a stale answer must not be mistaken for this tip's answer.
+    Unknown,
+}
+
+/// What the pre-flight gate consults, all of it scoped to a specific tip.
+///
+/// Tip-scoping is the load-bearing part. The dialog can be retargeted at a
+/// different commit while it is open — that is what the post-stale-tip guided
+/// re-check does, deliberately without going through `Dialogs::open` so the
+/// typed message survives — so both halves of this ("what we read" and "what
+/// the user agreed to") carry the commit they were true of. A confirmation
+/// given for one commit is not a confirmation for the next one, and that is a
+/// property of this type rather than of a reset some later edit can forget.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreflightKnowledge {
+    /// The last `CommitDetail` read: which commit it was for, and its
+    /// `on_remote`.
+    read: Option<(String, bool)>,
+    /// The commit the user explicitly agreed to rewrite, if any.
+    confirmed: Option<String>,
+}
+
+impl PreflightKnowledge {
+    /// Record a `CommitDetail` answer. Called wherever the dialog reads one —
+    /// opening amend mode from the menu, and again after the guided re-check
+    /// retargets.
+    pub fn record_detail(&mut self, tip: &str, on_remote: bool) {
+        self.read = Some((tip.to_string(), on_remote));
+    }
+
+    /// Record that the user took the ceremony's explicit second step for `tip`.
+    pub fn confirm(&mut self, tip: &str) {
+        self.confirmed = Some(tip.to_string());
+    }
+
+    /// What is known about `tip` specifically.
+    pub fn publication(&self, tip: &str) -> TargetPublication {
+        match &self.read {
+            Some((read_tip, on_remote)) if read_tip == tip => {
+                if *on_remote {
+                    TargetPublication::Published
+                } else {
+                    TargetPublication::Unpublished
+                }
+            }
+            _ => TargetPublication::Unknown,
+        }
+    }
+
+    /// Whether the user has confirmed rewriting `tip` — and no other commit.
+    pub fn confirmed_for(&self, tip: &str) -> bool {
+        self.confirmed.as_deref() == Some(tip)
+    }
+}
+
+/// What the confirm button's press may do right now.
+///
+/// Both arms carry the [`AmendTarget`] back out rather than letting the caller
+/// rebuild one: an [`AmendTarget`] can still only originate in [`submit_path`],
+/// so the ceremony cannot become a second way to conjure an amend of some other
+/// commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Preflight {
+    /// Nothing to escalate — `POST /api/amend-commit` now.
+    Send(AmendTarget),
+    /// The target is published and the user has not agreed to that yet. The
+    /// view must send **nothing** and enter
+    /// [`AmendPhase::AwaitingPublishedConfirm`].
+    Confirm(AmendTarget),
+}
+
+/// The pre-flight gate: does this press need the published-history ceremony
+/// first?
+///
+/// ADR 0040 records that the server does **not** block an amend of pushed
+/// history — it executes it and reports it afterwards, because refusing would
+/// make a legitimate operation impossible and because only the client knows
+/// whether the user was told. This function is that "only the client knows"
+/// half: it is what stands between a press and the POST.
+///
+/// [`TargetPublication::Unknown`] sends. That is a deliberate, narrow choice
+/// and not an assumption of safety: escalating on "we could not read the
+/// detail" would put a history-rewriting ceremony in front of ordinary amends
+/// whenever a request failed, training the user to click through it — and the
+/// case is already covered on the other side by [`published_advisory`], which
+/// reports an unknown answer as unknown rather than as an all-clear. The gap
+/// is real and stated: an amend whose detail read **failed** reaches the
+/// server with no pre-flight, and the user learns about the divergence
+/// afterwards.
+///
+/// What that concession does **not** cover, and what
+/// [`AmendPhase::ReadingPublication`] exists to close, is the read that has
+/// simply not answered *yet*. Opening amend mode is synchronous and the read
+/// is not, so treating "in flight" the same as "failed" would have left every
+/// amend un-gated for the length of its own detail request — the common case,
+/// not the exceptional one. "We are about to know" holds the button; "we could
+/// not find out" releases it.
+pub fn amend_preflight(target: AmendTarget, knowledge: &PreflightKnowledge) -> Preflight {
+    let tip = target.expected_tip();
+    match knowledge.publication(tip) {
+        TargetPublication::Published if !knowledge.confirmed_for(tip) => Preflight::Confirm(target),
+        TargetPublication::Published
+        | TargetPublication::Unpublished
+        | TargetPublication::Unknown => Preflight::Send(target),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The guided re-check after a stale tip
 // ---------------------------------------------------------------------------
 
@@ -828,6 +972,39 @@ pub enum Recheck {
 pub enum AmendPhase {
     /// Nothing attempted (or the dialog was just opened).
     Idle,
+    /// The dialog has just been pointed at `tip` and the
+    /// `GET /api/commit/{tip}` that answers "is this commit already on a
+    /// remote?" has not come back yet (M2.19d, #225). **Nothing has been
+    /// sent**, and the confirm button is inert for the duration.
+    ///
+    /// This phase exists because [`amend_preflight`] reads
+    /// [`PreflightKnowledge`], and before that read lands the knowledge
+    /// answers [`TargetPublication::Unknown`] — which *sends*. Opening amend
+    /// mode is synchronous and the read is not, so without this the window
+    /// between the menu click and the detail arriving is a window in which
+    /// pressing the green button POSTs an amend of published history with no
+    /// ceremony shown at all. That window is not the documented
+    /// failed-read gap: the read has not failed, it simply has not answered,
+    /// and "we are about to know" is a different state from "we could not
+    /// find out".
+    ///
+    /// It is a phase rather than a second flag beside
+    /// [`PreflightKnowledge`] because the phase is already what the view
+    /// renders the confirm button from — one source of truth, not two that
+    /// can drift.
+    ReadingPublication {
+        /// The commit whose detail is being read. Carried so the read's own
+        /// completion can tell "still my window" from "the dialog has since
+        /// been reopened on a different commit" — see
+        /// [`is_reading_publication_for`].
+        tip: String,
+    },
+    /// Amend was pressed on a commit that is already on a remote, and
+    /// **nothing has been sent**. The ceremony (#225): the press is spent on
+    /// raising the warning, and a second, differently-labelled control is the
+    /// only way on. Carries the target so the confirmation cannot be applied
+    /// to a commit other than the one it names.
+    AwaitingPublishedConfirm { target: AmendTarget },
     /// The request is in flight.
     InFlight,
     /// The compare-and-swap refused: HEAD moved and **nothing was rewritten**.
@@ -879,11 +1056,61 @@ pub struct PhaseView {
 /// behave the opposite way on purpose: a hook or signing failure leaves the
 /// reviewed tip untouched, so retrying after fixing it amends exactly the
 /// commit the user already approved.
+///
+/// [`AmendPhase::AwaitingPublishedConfirm`] (#225) shares the disabled-confirm
+/// rule for a different reason: nothing has been *sent*, and the way past it is
+/// the banner's own button, so that agreeing to rewrite pushed history is a
+/// separate act with its own words rather than a second press of the same
+/// green button.
 pub fn phase_view(phase: &AmendPhase) -> PhaseView {
     match phase {
         AmendPhase::Idle => PhaseView {
             notice: None,
             confirm_enabled: true,
+            busy: false,
+        },
+        AmendPhase::ReadingPublication { tip } => PhaseView {
+            notice: Some(Notice {
+                title: "Checking this commit…".to_string(),
+                body: format!(
+                    "Reading {}. Whether it is already on a remote decides whether \
+                     amending it asks you to confirm first, so nothing can be sent \
+                     until that answer is in. Nothing has been sent.",
+                    short_tip(tip),
+                ),
+                action: None,
+            }),
+            // Inert for the same reason as the ceremony below, one step
+            // earlier: the pre-flight's own input is missing, and
+            // `amend_preflight` reads a missing answer as `Unknown`, which
+            // sends. A press here would be a press that skipped the gate
+            // without anyone deciding to.
+            confirm_enabled: false,
+            // Not `busy`: no amend is in flight and nothing in the repository
+            // is being changed. `busy` is what the view shows while a write is
+            // outstanding, and showing it for a read would say the amend had
+            // started.
+            busy: false,
+        },
+        AmendPhase::AwaitingPublishedConfirm { target } => PhaseView {
+            notice: Some(Notice {
+                title: "This commit has already been pushed".to_string(),
+                body: format!(
+                    "Nothing has been sent yet. {} is reachable from a remote-tracking \
+                     ref, so it is on a remote and other clones may already have it. \
+                     Amending replaces it with a different commit: your branch and the \
+                     remote's will diverge, a plain push will be refused, and anyone who \
+                     already pulled the old commit has to reconcile it by hand. Cancel \
+                     leaves it exactly as it is.",
+                    short_tip(target.expected_tip()),
+                ),
+                action: Some("Rewrite this pushed commit"),
+            }),
+            // The green Amend button goes inert on purpose: the press that
+            // raised this warning must not also be the press that satisfies it,
+            // and the way on carries its own, different words. That is the
+            // whole difference between a ceremony and a banner.
+            confirm_enabled: false,
             busy: false,
         },
         AmendPhase::InFlight => PhaseView {
@@ -960,20 +1187,36 @@ pub fn phase_view(phase: &AmendPhase) -> PhaseView {
             }
         }
         AmendPhase::Refused { refusal, message } => {
+            // Each of the three names something the user can actually go and
+            // do (#225). Not decoration: a hook rejection and a signing failure
+            // are fixed in completely different places, and the pre-#225 copy
+            // ("fix what the hook checks", "fix the signing key") named the
+            // category without naming a single thing to open or type. The
+            // unclassified case says so out loud instead of guessing, because
+            // inventing a remedy for a failure nobody classified is how a user
+            // ends up editing a signing config over a full disk.
             let (title, next) = match refusal {
                 AmendRefusal::Hook => (
                     "A repository hook refused the amend",
-                    "Nothing was rewritten. Fix what the hook checks, then amend again — \
-                     your message is still here.",
+                    "Nothing was rewritten. What the hook printed is above — fix what it \
+                     reports and press Amend again; your message is still here. This \
+                     dialog has no bypass, so a hook you believe is wrong has to be fixed \
+                     or disabled in the repository's hooks directory (.git/hooks).",
                 ),
                 AmendRefusal::Signing => (
                     "Signing the amended commit failed",
-                    "Nothing was rewritten. This is a signing-setup problem, not a problem \
-                     with the message; fix the signing key and amend again.",
+                    "Nothing was rewritten, and this is a signing-setup problem rather \
+                     than anything about your message. Check that `git config \
+                     user.signingkey` names a key you still have, that `git config \
+                     commit.gpgsign` is set the way you meant, and that the key is \
+                     unlocked — then press Amend again.",
                 ),
                 AmendRefusal::Other => (
                     "Git refused the amend",
-                    "Nothing was rewritten. Your message is still here.",
+                    "Nothing was rewritten. This isn't a hook rejection or a signing \
+                     failure, and nothing classified it further, so git's own words above \
+                     are all there is to go on — read them, fix what they name, and press \
+                     Amend again. Your message is still here.",
                 ),
             };
             PhaseView {
@@ -1002,6 +1245,70 @@ pub fn phase_view(phase: &AmendPhase) -> PhaseView {
             confirm_enabled: true,
             busy: false,
         },
+    }
+}
+
+/// Whether `phase` is the publication-read window for `tip` specifically
+/// (M2.19d, #225).
+///
+/// The read's completion callback asks this before releasing the window back
+/// to [`AmendPhase::Idle`]. It has to ask, rather than clearing
+/// unconditionally, because it runs after an `await`: by then the dialog may
+/// have been cancelled and reopened on a *different* commit, which starts a
+/// *new* read window, and a blind clear would release that one early — handing
+/// the next commit exactly the un-gated press this phase was added to remove.
+/// Tip-scoped for the same reason [`PreflightKnowledge`] is: an answer about
+/// one commit is not an answer about another.
+pub fn is_reading_publication_for(phase: &AmendPhase, tip: &str) -> bool {
+    matches!(phase, AmendPhase::ReadingPublication { tip: open } if open == tip)
+}
+
+/// What a resolved `GET /api/commit/{tip}` may still do to the dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailUse {
+    /// The read still speaks for the dialog: record its `on_remote` as the
+    /// pre-flight's input, and offer its message as the pre-fill.
+    Apply,
+    /// The dialog has moved on since this read was spawned. Drop the answer
+    /// whole — the flag *and* the message.
+    Discard,
+}
+
+/// Whether a detail read that has just resolved for `tip` may be applied to
+/// the dialog (M2.19d, #225).
+///
+/// The exact counterpart of [`is_reading_publication_for`], and it exists
+/// because the release half of the read window had that currency check and the
+/// *apply* half did not. Both run after the same `await`, so both face the same
+/// hazard: by the time the read answers, the dialog may have been reopened on a
+/// different commit.
+///
+/// The failure that leaves is a silent downgrade of the ceremony, not a cosmetic
+/// one. `PreflightKnowledge` holds one read at a time and is tip-scoped, so an
+/// abandoned tip's answer recorded late does not merely sit there unused — it
+/// *evicts* the answer read for the commit now on screen, and
+/// [`PreflightKnowledge::publication`] then reports that commit as
+/// [`TargetPublication::Unknown`], which [`amend_preflight`] maps to
+/// [`Preflight::Send`]. A published commit therefore gets amended with no
+/// warning at all, which is the one outcome #225 exists to prevent. The
+/// interleaving is ordinary: open amend on A, dismiss, open amend on B, and
+/// whichever of the two `GET`s is slower lands last.
+///
+/// The message half rides along for the same reason. [`adopt_seed`] adopts an
+/// incoming pre-fill whenever the box is untouched, which is precisely the
+/// state a freshly reopened dialog is in — so an unguarded late read would
+/// quietly load commit A's message into a box that is about to amend commit B.
+///
+/// Note what this does **not** guard, deliberately: the guided re-check's own
+/// record, which is not reached through a read window. See the call site in
+/// `dialogs/commit.rs` — it retargets the dialog and records the answer with no
+/// `await` between the two, so its knowledge and the dialog's target move
+/// together and cannot disagree.
+pub fn detail_read_use(phase: &AmendPhase, tip: &str) -> DetailUse {
+    if is_reading_publication_for(phase, tip) {
+        DetailUse::Apply
+    } else {
+        DetailUse::Discard
     }
 }
 
@@ -1700,6 +2007,199 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // The pre-flight published-history ceremony (#225)
+    // -----------------------------------------------------------------
+
+    /// The only way to build an [`AmendTarget`] — deliberately, so these tests
+    /// exercise the same construction path the confirm button does.
+    fn target(tip: &str) -> AmendTarget {
+        match submit_path(&CommitIntent::Amend {
+            expected_tip: tip.to_string(),
+        }) {
+            SubmitPath::Amend(t) => t,
+            other => panic!("an amend intent must reach the amend path, got {other:?}"),
+        }
+    }
+
+    fn read_detail(tip: &str, on_remote: bool) -> PreflightKnowledge {
+        let mut k = PreflightKnowledge::default();
+        k.record_detail(tip, on_remote);
+        k
+    }
+
+    /// The ceremony fires on a published target and on nothing else.
+    ///
+    /// Both directions, because a gate that always escalated would satisfy the
+    /// positive case perfectly and would also make every ordinary amend a
+    /// two-step ritual the user learns to click through.
+    #[test]
+    fn only_a_commit_read_as_published_gets_the_ceremony() {
+        assert_eq!(
+            amend_preflight(target(TIP), &read_detail(TIP, true)),
+            Preflight::Confirm(target(TIP)),
+            "amending a commit the detail read says is on a remote must stop and ask"
+        );
+
+        assert_eq!(
+            amend_preflight(target(TIP), &read_detail(TIP, false)),
+            Preflight::Send(target(TIP)),
+            "a commit that is provably not on a remote gets no extra step — the \
+             ceremony is only worth anything if it is rare"
+        );
+
+        assert_eq!(
+            amend_preflight(target(TIP), &PreflightKnowledge::default()),
+            Preflight::Send(target(TIP)),
+            "no detail was read, so there is no flag; the stated rule is that an \
+             absent flag sends, and `published_advisory` reports it afterwards"
+        );
+
+        // A read that was made for a *different* commit is not this commit's
+        // answer. The dialog is retargetable while open, so this is reachable:
+        // the guided re-check moves it from one tip to another.
+        assert_eq!(
+            amend_preflight(target(TIP), &read_detail(NEW_TIP, true)),
+            Preflight::Send(target(TIP)),
+            "a published answer read for another commit must not be spent on this one"
+        );
+        assert_eq!(
+            amend_preflight(target(NEW_TIP), &read_detail(NEW_TIP, true)),
+            Preflight::Confirm(target(NEW_TIP)),
+            "…and the commit it *was* read for must still escalate"
+        );
+    }
+
+    /// A confirmation is spent on the commit it was given for, and on no other.
+    ///
+    /// The failure this pins is specific and reachable: the user agrees to
+    /// rewrite published commit A, the amend is refused for a stale tip, the
+    /// guided re-check retargets the open dialog at published commit B — and a
+    /// consent recorded as a bare boolean would carry over, rewriting B's
+    /// pushed history with no warning shown at all.
+    #[test]
+    fn a_confirmation_does_not_carry_across_a_retarget() {
+        let mut k = read_detail(TIP, true);
+        k.confirm(TIP);
+        assert_eq!(
+            amend_preflight(target(TIP), &k),
+            Preflight::Send(target(TIP)),
+            "once the user has agreed for this commit, the next press must send \
+             rather than loop on the same banner"
+        );
+
+        // The re-check retargets and records the new tip's own answer.
+        k.record_detail(NEW_TIP, true);
+        assert_eq!(
+            amend_preflight(target(NEW_TIP), &k),
+            Preflight::Confirm(target(NEW_TIP)),
+            "a different commit is a different decision, however recently the \
+             previous one was agreed to"
+        );
+
+        // And confirming the new one does not retroactively un-confirm anything
+        // — it simply moves to the commit now on screen.
+        k.confirm(NEW_TIP);
+        assert_eq!(
+            amend_preflight(target(NEW_TIP), &k),
+            Preflight::Send(target(NEW_TIP))
+        );
+        assert!(
+            k.confirmed_for(NEW_TIP) && !k.confirmed_for(TIP),
+            "consent tracks one commit at a time"
+        );
+    }
+
+    /// A fresh dialog inherits nothing — the state `Dialogs::reset_amend`
+    /// installs is the state that escalates.
+    #[test]
+    fn a_fresh_dialog_has_agreed_to_nothing_and_knows_nothing() {
+        let fresh = PreflightKnowledge::default();
+        assert_eq!(fresh.publication(TIP), TargetPublication::Unknown);
+        assert!(!fresh.confirmed_for(TIP));
+    }
+
+    #[test]
+    fn the_ceremony_names_the_risk_and_makes_agreeing_a_separate_act() {
+        let view = phase_view(&AmendPhase::AwaitingPublishedConfirm {
+            target: target(TIP),
+        });
+        assert!(
+            !view.confirm_enabled,
+            "the press that raised the warning must not also be the press that \
+             satisfies it — otherwise a double-tap rewrites pushed history"
+        );
+        assert!(
+            !view.busy,
+            "nothing has been sent, so the dialog is not waiting on anything"
+        );
+        let notice = view
+            .notice
+            .expect("the ceremony is a banner or it is nothing");
+        assert!(notice.body.contains(short_tip(TIP)), "{}", notice.body);
+        for phrase in [
+            // What is at stake, in the user's own terms.
+            "Nothing has been sent yet",
+            "remote",
+            "diverge",
+            "push will be refused",
+        ] {
+            assert!(
+                notice.body.contains(phrase),
+                "the warning has to name the risk, not gesture at it — missing \
+                 {phrase:?} in: {}",
+                notice.body
+            );
+        }
+        assert!(
+            notice.action.is_some(),
+            "a warning with no way past it is a dead end, not a ceremony"
+        );
+    }
+
+    /// The ceremony must not be mistakable for any other banner the dialog
+    /// raises — most of all not for the post-hoc advisory, which says the
+    /// rewrite has *already* happened.
+    #[test]
+    fn the_ceremony_reads_as_its_own_screen() {
+        let ceremony = phase_view(&AmendPhase::AwaitingPublishedConfirm {
+            target: target(TIP),
+        })
+        .notice
+        .unwrap();
+        let others = [
+            AmendPhase::InFlight,
+            AmendPhase::Refused {
+                refusal: AmendRefusal::Hook,
+                message: "hook".into(),
+            },
+            AmendPhase::Unavailable("gone".into()),
+            stale(Recheck::Idle),
+        ];
+        for phase in others {
+            let notice = phase_view(&phase).notice.expect("explained");
+            assert_ne!(notice.title, ceremony.title, "{phase:?}");
+        }
+
+        // The post-hoc advisory is the one that says it already happened; the
+        // pre-flight is the one that says nothing has. They are different
+        // sentences on purpose.
+        let after = published_advisory(&AmendCommitSuccess {
+            message: "Amended commit.".into(),
+            old_tip: TIP.into(),
+            new_tip: Some(NEW_TIP.into()),
+            amended_published_commit: Some(true),
+        })
+        .expect("a published amend is reported afterwards too");
+        assert!(after.contains("have now diverged") || after.contains("now diverged"));
+        assert!(
+            ceremony.body.contains("Nothing has been sent yet"),
+            "{}",
+            ceremony.body
+        );
+        assert_ne!(after, ceremony.body);
+    }
+
+    // -----------------------------------------------------------------
     // The guided re-check
     // -----------------------------------------------------------------
 
@@ -1913,6 +2413,100 @@ mod tests {
         assert_ne!(titles[0], titles[2]);
     }
 
+    /// Each classified refusal names something the user can go and do — and
+    /// the three do not name the same thing.
+    ///
+    /// Distinct *titles* were already pinned; this is the half that matters
+    /// once the user has read the title. A hook rejection is fixed in the
+    /// repository's hooks, a signing failure in git's signing config, and the
+    /// two remedies have nothing in common — copy that said "fix it and try
+    /// again" three times would pass a title-distinctness check and still send
+    /// the user to the wrong place.
+    #[test]
+    fn each_refusal_names_a_remedy_of_its_own() {
+        let body = |refusal| {
+            phase_view(&AmendPhase::Refused {
+                refusal,
+                message: "git said this.".into(),
+            })
+            .notice
+            .expect("a refusal is explained")
+            .body
+        };
+        let hook = body(AmendRefusal::Hook);
+        let signing = body(AmendRefusal::Signing);
+        let other = body(AmendRefusal::Other);
+
+        // Where the hook lives, and the honest statement that there is no
+        // bypass in this dialog.
+        assert!(hook.contains(".git/hooks"), "{hook}");
+        assert!(
+            hook.contains("no bypass") || hook.contains("has no bypass"),
+            "a user whose hook is wrong will look for the escape hatch; saying \
+             there isn't one here is the actionable answer: {hook}"
+        );
+
+        // The two config keys the issue names, verbatim, because they are what
+        // the user has to type.
+        assert!(signing.contains("user.signingkey"), "{signing}");
+        assert!(signing.contains("commit.gpgsign"), "{signing}");
+
+        // Neither remedy may leak into the other's screen: sending a user with
+        // a failing pre-commit hook to their signing config is worse than
+        // saying nothing.
+        assert!(
+            !hook.contains("gpgsign") && !hook.contains("signingkey"),
+            "{hook}"
+        );
+        assert!(!signing.contains(".git/hooks"), "{signing}");
+
+        // The unclassified case says it is unclassified rather than borrowing
+        // one of the other two remedies.
+        assert!(
+            other.contains("isn't a hook rejection") && other.contains("signing failure"),
+            "an unclassified failure must rule the classified ones out rather \
+             than guess between them: {other}"
+        );
+        assert!(
+            !other.contains(".git/hooks") && !other.contains("gpgsign"),
+            "{other}"
+        );
+
+        // And all three are genuinely different screens, not one string with
+        // prefixes glued on.
+        assert_ne!(hook, signing);
+        assert_ne!(signing, other);
+        assert_ne!(hook, other);
+    }
+
+    /// The third, unclassified kind still reaches the user — visibly, with
+    /// git's own words intact.
+    ///
+    /// This is the acceptance criterion that no raw, unclassified stderr is all
+    /// the user gets: `Other` is a classification the *server* made, so its
+    /// message is shown inside a banner that says what happened to their
+    /// history, rather than being dumped alone.
+    #[test]
+    fn an_unclassified_refusal_is_still_a_visible_banner_with_gits_words() {
+        let notice = phase_view(&AmendPhase::Refused {
+            refusal: AmendRefusal::Other,
+            message: "error: could not write commit object: No space left on device".into(),
+        })
+        .notice
+        .expect("an unclassified refusal must not fall through to no banner at all");
+        assert!(!notice.title.trim().is_empty());
+        assert!(
+            notice.body.contains("No space left on device"),
+            "git's own words are the only diagnosis there is here: {}",
+            notice.body
+        );
+        assert!(
+            notice.body.contains("Nothing was rewritten"),
+            "the user's first question is still whether their history changed: {}",
+            notice.body
+        );
+    }
+
     #[test]
     fn idle_shows_no_banner_and_in_flight_blocks_a_second_press() {
         let idle = phase_view(&AmendPhase::Idle);
@@ -1926,6 +2520,339 @@ mod tests {
             !flying.confirm_enabled,
             "a second press while the first amend is in flight is a second rewrite"
         );
+    }
+
+    /// The window the pre-flight gate cannot cover on its own (#225).
+    ///
+    /// `amend_preflight` reads `Unknown` as *send*, deliberately. Opening amend
+    /// mode is synchronous and the read that turns `Unknown` into an answer is
+    /// not, so the phase — not the knowledge — is what has to keep the button
+    /// off in between. The paired assertion below is the one that matters:
+    /// `Unknown` still sends, which is why the hold cannot be dropped.
+    #[test]
+    fn the_publication_read_holds_the_press_while_the_gate_would_still_send() {
+        let view = phase_view(&AmendPhase::ReadingPublication { tip: TIP.into() });
+        assert!(
+            !view.confirm_enabled,
+            "the confirm button is live while the pre-flight has nothing to read — \
+             a press here sends an un-gated amend"
+        );
+        assert!(
+            !view.busy,
+            "nothing is being written; `busy` would tell the user the amend had started"
+        );
+        let notice = view.notice.expect("the user is told why the button is off");
+        assert!(
+            notice.body.contains("Nothing has been sent"),
+            "{}",
+            notice.body
+        );
+        assert!(
+            notice.action.is_none(),
+            "this banner has no way past it — waiting is the only thing to do"
+        );
+        assert!(
+            notice.body.contains(&TIP[..7]),
+            "the banner names the commit being read: {}",
+            notice.body
+        );
+
+        // The reason the hold exists at all: with the read unlanded, the gate
+        // itself would let the press through.
+        assert_eq!(
+            amend_preflight(target(TIP), &PreflightKnowledge::default()),
+            Preflight::Send(target(TIP)),
+            "if this ever stops being `Send`, re-read the hold above — it may no \
+             longer be load-bearing"
+        );
+    }
+
+    /// The release is tip-scoped, and that is not decoration: it runs after an
+    /// `await`, by which point the dialog may be showing a different commit's
+    /// read window.
+    #[test]
+    fn only_the_read_that_opened_the_window_may_close_it() {
+        let mine = AmendPhase::ReadingPublication { tip: TIP.into() };
+        assert!(is_reading_publication_for(&mine, TIP));
+
+        assert!(
+            !is_reading_publication_for(&mine, NEW_TIP),
+            "a read for one commit must not release another commit's window — that \
+             hands the second commit the un-gated press this phase removes"
+        );
+
+        // Every other phase reads as "not my window", so a late-landing read
+        // cannot stamp `Idle` over a banner the user is being shown.
+        for other in [
+            AmendPhase::Idle,
+            AmendPhase::InFlight,
+            AmendPhase::AwaitingPublishedConfirm {
+                target: target(TIP),
+            },
+            AmendPhase::Unavailable("gone".into()),
+        ] {
+            assert!(
+                !is_reading_publication_for(&other, TIP),
+                "{other:?} is not a publication-read window"
+            );
+        }
+    }
+
+    /// The amend dialog's message box, as much of it as these tests need: the
+    /// live text and the last pre-fill offered, which is the pair
+    /// [`adopt_seed`] decides from.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct MessageBox {
+        text: String,
+        seed: String,
+    }
+
+    impl MessageBox {
+        /// `Dialogs::seed_amend_msg`, transcribed: adopt if untouched, and
+        /// record the offer as the next comparison's baseline either way.
+        fn seed(&mut self, incoming: &str) -> SeedOutcome {
+            let adopted = adopt_seed(&self.text, &self.seed, incoming);
+            if let Some(next) = &adopted {
+                self.text = next.clone();
+            }
+            self.seed = incoming.to_string();
+            seed_outcome(adopted.as_ref())
+        }
+    }
+
+    /// The whole of what the spawned `GET /api/commit/{tip}` does when it
+    /// resolves: consult [`detail_read_use`], and on [`DetailUse::Apply`]
+    /// record the published flag and offer the message.
+    ///
+    /// This is the decision `menu.rs`'s completion callback makes, kept here
+    /// because that file never compiles under `cargo test --workspace`. The
+    /// census in `features::a11y::audit` is what pins the callback to this
+    /// function rather than to a copy of it.
+    fn detail_lands(
+        phase: &AmendPhase,
+        knowledge: &mut PreflightKnowledge,
+        message_box: &mut MessageBox,
+        tip: &str,
+        on_remote: bool,
+        message: &str,
+    ) -> DetailUse {
+        match detail_read_use(phase, tip) {
+            DetailUse::Apply => {
+                knowledge.record_detail(tip, on_remote);
+                message_box.seed(message);
+                DetailUse::Apply
+            }
+            DetailUse::Discard => DetailUse::Discard,
+        }
+    }
+
+    const TIP_MSG: &str = "the commit the user walked away from";
+    const NEW_TIP_MSG: &str = "the commit now on screen";
+
+    /// The ceremony bypass an unguarded apply leaves open (#225).
+    ///
+    /// Reachable by ordinary use: open amend on TIP, dismiss it, open amend on
+    /// NEW_TIP. Two `GET /api/commit/{id}`s are now in flight and nothing
+    /// orders them. If the abandoned one lands last it overwrites the
+    /// single-slot `PreflightKnowledge` with an answer about a commit the
+    /// dialog is no longer pointed at — and because that knowledge is
+    /// tip-scoped, the commit that *is* on screen goes back to `Unknown`, which
+    /// `amend_preflight` sends. A published commit is then rewritten with no
+    /// warning shown at all.
+    #[test]
+    fn a_read_for_an_abandoned_tip_cannot_downgrade_the_commit_now_on_screen() {
+        let mut knowledge = PreflightKnowledge::default();
+        let mut message_box = MessageBox::default();
+
+        // NEW_TIP's own read lands first and answers honestly: published.
+        let phase = AmendPhase::ReadingPublication {
+            tip: NEW_TIP.into(),
+        };
+        assert_eq!(
+            detail_lands(
+                &phase,
+                &mut knowledge,
+                &mut message_box,
+                NEW_TIP,
+                true,
+                NEW_TIP_MSG,
+            ),
+            DetailUse::Apply,
+            "the read that opened the window is the read the window is for"
+        );
+        assert_eq!(
+            amend_preflight(target(NEW_TIP), &knowledge),
+            Preflight::Confirm(target(NEW_TIP)),
+            "the paired positive: with its own answer in hand the gate escalates"
+        );
+
+        // Its window closes; the dialog sits idle on NEW_TIP, confirm live.
+        let phase = AmendPhase::Idle;
+
+        // Now the abandoned read for TIP resolves. TIP is not on a remote, so
+        // recording it is exactly the answer that makes the gate relax.
+        assert_eq!(
+            detail_lands(
+                &phase,
+                &mut knowledge,
+                &mut message_box,
+                TIP,
+                false,
+                TIP_MSG,
+            ),
+            DetailUse::Discard,
+            "this read was spawned for a commit the dialog has since left"
+        );
+
+        assert_eq!(
+            amend_preflight(target(NEW_TIP), &knowledge),
+            Preflight::Confirm(target(NEW_TIP)),
+            "an answer about the commit the user walked away from evicted the \
+             answer about the one on screen, so the published-history ceremony \
+             does not fire — the exact rewrite-without-warning #225 exists to stop"
+        );
+        assert_eq!(
+            knowledge.publication(NEW_TIP),
+            TargetPublication::Published,
+            "the surviving read must still be NEW_TIP's, not TIP's"
+        );
+        assert_eq!(
+            message_box.text, NEW_TIP_MSG,
+            "the box is about to amend NEW_TIP; a late read must not load the \
+             other commit's message into it"
+        );
+    }
+
+    /// The same eviction, one beat earlier: the abandoned read lands while the
+    /// commit on screen is *still* being read.
+    ///
+    /// Worth its own case because the phase differs — `ReadingPublication` for
+    /// another tip rather than `Idle` — and because the damage is worse. The
+    /// window closes on the tip it was opened for, so NEW_TIP's own read still
+    /// lands afterwards; what an unguarded apply corrupts here is the message
+    /// box, which the user may already be reading.
+    #[test]
+    fn a_read_for_an_abandoned_tip_cannot_seed_the_box_of_another_commit() {
+        let mut knowledge = PreflightKnowledge::default();
+        let mut message_box = MessageBox::default();
+        let phase = AmendPhase::ReadingPublication {
+            tip: NEW_TIP.into(),
+        };
+
+        assert_eq!(
+            detail_lands(
+                &phase,
+                &mut knowledge,
+                &mut message_box,
+                TIP,
+                false,
+                TIP_MSG
+            ),
+            DetailUse::Discard,
+            "NEW_TIP's window is open; TIP's read is nobody's answer"
+        );
+        assert_eq!(
+            message_box,
+            MessageBox::default(),
+            "an untouched box adopts whatever is offered it, so nothing may be \
+             offered on behalf of a commit the dialog is not amending"
+        );
+        assert_eq!(
+            knowledge.publication(NEW_TIP),
+            TargetPublication::Unknown,
+            "and nothing was recorded for the commit on screen either"
+        );
+
+        // The paired positive, and the proof the guard is not simply refusing
+        // everything: NEW_TIP's own read still lands and still escalates.
+        assert_eq!(
+            detail_lands(
+                &phase,
+                &mut knowledge,
+                &mut message_box,
+                NEW_TIP,
+                true,
+                NEW_TIP_MSG,
+            ),
+            DetailUse::Apply,
+        );
+        assert_eq!(message_box.text, NEW_TIP_MSG);
+        assert_eq!(
+            amend_preflight(target(NEW_TIP), &knowledge),
+            Preflight::Confirm(target(NEW_TIP))
+        );
+    }
+
+    /// What the discarded read would have done, had it been applied.
+    ///
+    /// Without this the two tests above could pass against a `MessageBox` that
+    /// never adopts anything and a gate that never relaxes — proving the guard
+    /// works only because the hazard is not real. It is: `adopt_seed` adopts
+    /// into an untouched box, and a recorded answer for another tip does read
+    /// as `Unknown` ⇒ `Send` for the one on screen.
+    #[test]
+    fn the_discarded_read_is_a_read_that_would_have_done_real_harm() {
+        let mut knowledge = PreflightKnowledge::default();
+        knowledge.record_detail(NEW_TIP, true);
+        let mut message_box = MessageBox::default();
+        message_box.seed(NEW_TIP_MSG);
+        assert_eq!(message_box.text, NEW_TIP_MSG);
+
+        // Apply TIP's late answer directly — bypassing `detail_read_use`, which
+        // is what the code did before this guard existed.
+        knowledge.record_detail(TIP, false);
+        assert_eq!(
+            message_box.seed(TIP_MSG),
+            SeedOutcome::Replaced,
+            "the box was untouched, so the pre-fill is adopted — that is why the \
+             guard has to sit in front of the seed as well as the flag"
+        );
+
+        assert_eq!(
+            amend_preflight(target(NEW_TIP), &knowledge),
+            Preflight::Send(target(NEW_TIP)),
+            "this is the bypass: the commit on screen is published, and the gate \
+             sends anyway because its answer was evicted"
+        );
+        assert_eq!(message_box.text, TIP_MSG);
+    }
+
+    /// Every phase that is not this tip's read window discards, and the one
+    /// that is applies.
+    ///
+    /// A `detail_read_use` that always answered `Apply` is the bug; one that
+    /// always answered `Discard` would pass the two hazard tests above while
+    /// making the pre-flight permanently blind, since the *only* thing that
+    /// ever records a published flag from the menu is this path.
+    #[test]
+    fn only_the_read_the_window_was_opened_for_may_be_applied() {
+        assert_eq!(
+            detail_read_use(&AmendPhase::ReadingPublication { tip: TIP.into() }, TIP),
+            DetailUse::Apply,
+        );
+        assert_eq!(
+            detail_read_use(&AmendPhase::ReadingPublication { tip: TIP.into() }, NEW_TIP),
+            DetailUse::Discard,
+        );
+        for other in [
+            AmendPhase::Idle,
+            AmendPhase::InFlight,
+            AmendPhase::AwaitingPublishedConfirm {
+                target: target(TIP),
+            },
+            AmendPhase::Stale {
+                reviewed_tip: TIP.into(),
+                message: "moved".into(),
+                recheck: Recheck::Idle,
+            },
+            AmendPhase::Unavailable("gone".into()),
+        ] {
+            assert_eq!(
+                detail_read_use(&other, TIP),
+                DetailUse::Discard,
+                "{other:?} is not a publication-read window for {TIP}"
+            );
+        }
     }
 
     #[test]

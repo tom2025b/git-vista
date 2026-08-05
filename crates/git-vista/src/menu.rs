@@ -406,6 +406,19 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         shell.open_commit_dialog(CommitIntent::Amend {
                             expected_tip: tip.clone(),
                         });
+                        // Hold the confirm button until the read below answers
+                        // whether this commit is already on a remote (#225).
+                        // Opening is synchronous and the read is not, so
+                        // without this the dialog spends the whole request
+                        // showing an *enabled* Amend button over a pre-flight
+                        // that has nothing to read — and `amend_preflight`
+                        // sends on "nothing read". Two ordering constraints,
+                        // both pinned by `features::a11y::audit` because
+                        // nothing here compiles under `cargo test`: after
+                        // `dialogs.open` (which resets the phase), and before
+                        // `shell.close_menu()` (which disposes this handler's
+                        // reactive owner, after which writes are unreliable).
+                        dialogs.begin_publication_read(&tip);
                         status.refetch();
                         shell.close_menu();
                         // Pre-fill with the tip's *whole* message (summary and body), not
@@ -414,10 +427,38 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         // the body of every commit amended from here. A failed read leaves
                         // the box empty and the confirm button disabled, which is the safe
                         // direction — the dialog never invents a message.
+                        //
+                        // The same read answers two questions (#225): the
+                        // pre-fill, and whether this commit is already on a
+                        // remote — `CommitDetail::on_remote`, an exact
+                        // per-commit walk rather than membership of whatever
+                        // page is loaded. Recorded against `tip` so it can only
+                        // ever gate an amend of this commit. A failed read
+                        // records nothing, and `amend_preflight` treats "not
+                        // read" as unknown; see its doc comment for why unknown
+                        // sends rather than escalates.
+                        //
+                        // Both answers go through `apply_amend_detail` rather
+                        // than being written here, and that is the fix for a
+                        // second window as real as the one the hold above
+                        // closes: this callback resumes after an `await`, by
+                        // which point the dialog may have been reopened on
+                        // another commit. `PreflightKnowledge` holds one read
+                        // at a time, so writing an abandoned tip's answer here
+                        // *evicts* the answer for the commit on screen and the
+                        // ceremony silently stops firing for it. The currency
+                        // check lives in `detail_read_use`, where it is
+                        // host-tested; nothing in this file is.
                         spawn_local(async move {
                             if let Ok(detail) = fetch_commit_detail(&tip).await {
-                                dialogs.seed_amend_msg(&detail.message);
+                                dialogs.apply_amend_detail(&tip, detail.on_remote, &detail.message);
                             }
+                            // Outside the `Ok` arm on purpose: a failed read
+                            // has to release the button too, or one bad GET
+                            // would make amend permanently unreachable. That
+                            // lands on the documented `Unknown` ⇒ send path,
+                            // which is a stated gap rather than a new one.
+                            dialogs.finish_publication_read(&tip);
                         });
                     };
                     view! {
