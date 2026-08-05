@@ -530,7 +530,7 @@ fn bind_and_watch(
     // happen mid-operation and therefore the only time the entry is worth
     // anything.
     persist_if_remote_op(kind, &id);
-    subscribe(core, graph, id);
+    subscribe(core, graph, id, STREAM_REATTACH_MAX_ATTEMPTS);
 }
 
 /// Put a failure this feature discovered in front of the user, in the app's
@@ -691,7 +691,99 @@ fn commit_settlement(
 /// The protocol version rides in the **query string**, not a header: `EventSource` cannot
 /// set request headers, which is exactly why ADR 0020 gave this one route a query-string
 /// negotiation path (the server allows it for this path alone).
-fn subscribe(core: RwSignal<OperationsCore>, graph: RwSignal<GraphCore>, id: OperationId) {
+/// How many times a lost progress stream is re-established before the client
+/// admits, out loud, that it does not know the outcome (#232 follow-up).
+///
+/// Bounded for a reason the review found the hard way. `on_error` used to just
+/// `close()` the stream and leave the entry in flight — harmless while nothing
+/// read that list, and *fatal* the moment `menu.rs`'s `remote_op_running` gate
+/// started keying off it: one dropped tunnel and Fetch **and** Pull were
+/// disabled for the rest of the session, with no way back short of a reload.
+/// This deployment is an iPad over an SSH tunnel, so that is not an exotic
+/// case, it is Tuesday.
+const STREAM_REATTACH_MAX_ATTEMPTS: u32 = 6;
+
+/// How long to wait before each re-attach. Six attempts at two seconds rides
+/// out a blip without holding a stuck row on screen for a minute.
+const STREAM_REATTACH_INTERVAL_MS: u64 = 2_000;
+
+/// What a user is told when the re-attach budget runs out. Deliberately does
+/// not claim the operation failed — it claims *we lost track of it*, which is
+/// the only honest thing left to say, and points at the check that resolves it.
+/// Same posture as `clone_poll_exhausted_message` takes for #278's poll.
+const STREAM_LOST_MESSAGE: &str = "Lost contact with the server while this was running, and \
+                                   couldn't get it back. It may well have finished — check the \
+                                   graph before running it again, or you can end up doing it \
+                                   twice.";
+
+/// Re-establish a progress stream that dropped, or — once the budget is gone —
+/// settle the entry honestly so it stops blocking the menu (#232 follow-up).
+///
+/// `GET /api/operations/{id}` first rather than blindly reopening the stream:
+/// the operation may have finished *during* the outage, in which case there is
+/// no stream left to join and the terminal record is the answer. That is the
+/// same status-then-decide shape [`resume_inflight_remote_op`] uses on boot,
+/// and `resume_decision` is the pure, host-tested half both share.
+///
+/// `budget` is what stops a permanently-dead tunnel from looping forever: it
+/// rides *through* the re-subscription, so a stream that reconnects and dies
+/// again resumes counting down rather than starting fresh.
+fn reattach_after_stream_loss(
+    core: RwSignal<OperationsCore>,
+    graph: RwSignal<GraphCore>,
+    id: OperationId,
+    budget: u32,
+) {
+    spawn_local(async move {
+        for _ in 0..STREAM_REATTACH_MAX_ATTEMPTS {
+            api::sleep_ms(STREAM_REATTACH_INTERVAL_MS).await;
+            // Still unreachable — that is not an outcome either, so keep trying
+            // within budget rather than inventing a verdict.
+            let Ok(status) = api::fetch_operation_status(&id).await else {
+                continue;
+            };
+            let _ =
+                core.try_update(|c| c.observe(&id, status.state, status.stage, status.progress));
+            match resume_decision(status.state) {
+                ResumeDecision::Settle => {
+                    if let Some(outcome) = Settlement::from_terminal(
+                        status.state,
+                        status.message.clone(),
+                        status.generation,
+                    ) {
+                        commit_settlement(core, graph, &id, outcome);
+                    }
+                    return;
+                }
+                ResumeDecision::Subscribe => {
+                    subscribe(core, graph, id.clone(), budget);
+                    return;
+                }
+            }
+        }
+        // Budget gone. The entry cannot stay in flight: `settle` is the only
+        // thing that removes it, the menu gate reads that list, and a row that
+        // can never leave it is a permanent lockout. So say what is true —
+        // contact was lost, the outcome is unknown — and let the user act on it.
+        commit_settlement(
+            core,
+            graph,
+            &id,
+            Settlement {
+                state: OperationState::Failed,
+                message: Some(STREAM_LOST_MESSAGE.to_string()),
+                generation: None,
+            },
+        );
+    });
+}
+
+fn subscribe(
+    core: RwSignal<OperationsCore>,
+    graph: RwSignal<GraphCore>,
+    id: OperationId,
+    reattach_budget: u32,
+) {
     let url = format!(
         "/api/operations/{}/events?protocol={}",
         id.as_str(),
@@ -735,12 +827,35 @@ fn subscribe(core: RwSignal<OperationsCore>, graph: RwSignal<GraphCore>, id: Ope
             commit_settlement(core, graph, &record.id, outcome);
         });
 
-    // A transport failure is not an outcome — the operation may well have run. Close the
-    // stream and leave the entry in flight; `GET /api/operations/{id}` remains the way to
-    // reconcile, and the next repository read will show what actually happened.
+    // A transport failure is not an outcome — the operation may well have run. But
+    // "not an outcome" cannot mean "nothing happens": this used to close the stream
+    // and walk away, which left the entry in flight forever, and once `menu.rs`'s
+    // `remote_op_running` gate started reading that list, one dropped tunnel disabled
+    // Fetch and Pull for the whole session. So close the dead socket and hand off to
+    // [`reattach_after_stream_loss`], which re-reads the record, rejoins the stream if
+    // there is still one to join, and — only once its budget is spent — settles the
+    // entry with the honest "we lost track of this" message rather than a guess.
     let on_error_source = source.clone();
+    let reattach_id = id.clone();
     let on_error = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
         on_error_source.close();
+        if reattach_budget > 0 {
+            reattach_after_stream_loss(core, graph, reattach_id.clone(), reattach_budget - 1);
+        } else {
+            // Budget exhausted upstream. Same reasoning as the exhausted arm in
+            // `reattach_after_stream_loss`: the row must not be able to outlive
+            // every recovery path, because the menu gate reads it.
+            commit_settlement(
+                core,
+                graph,
+                &reattach_id,
+                Settlement {
+                    state: OperationState::Failed,
+                    message: Some(STREAM_LOST_MESSAGE.to_string()),
+                    generation: None,
+                },
+            );
+        }
     });
 
     let _ = source
@@ -818,7 +933,7 @@ fn resume_inflight_remote_op(core: RwSignal<OperationsCore>, graph: RwSignal<Gra
                     commit_settlement(core, graph, &id, outcome);
                 }
             }
-            ResumeDecision::Subscribe => subscribe(core, graph, id),
+            ResumeDecision::Subscribe => subscribe(core, graph, id, STREAM_REATTACH_MAX_ATTEMPTS),
         }
     });
 }
