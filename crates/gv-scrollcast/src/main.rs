@@ -270,11 +270,25 @@ fn resolve_out_dir(requested: &Path) -> Result<PathBuf> {
 
     if let Some(repo_root) = find_repo_root() {
         let repo_root = normalize_lexically(&repo_root);
-        if candidate.starts_with(&repo_root) {
+        // Inside the repo is allowed ONLY where git itself already ignores the
+        // path. The rule being enforced is "never write into the *tracked*
+        // tree" — not "never write under the repo root", which would reject
+        // this tool's own documented default (`./out`) and leave the happy
+        // path unrunnable from the one directory people actually run it from.
+        //
+        // Asking git, rather than comparing prefixes, is deliberate and fixes
+        // two things at once. It makes the answer authoritative (the
+        // `.gitignore` entry for `/out/` is what grants permission, so the
+        // rule and the permission live in one place), and it closes the
+        // symlink hole a lexical check cannot see: `--out /tmp/link` where
+        // `/tmp/link` points into the repo passes any `starts_with` test but
+        // is correctly refused here, because git resolves the real path.
+        if candidate.starts_with(&repo_root) && !git_ignores(&repo_root, &candidate) {
             bail!(
-                "--out {} resolves to {} which is inside this repository's working tree ({}) — \
-                 pass a directory outside the repo (rendered video/PNG output does not belong in \
-                 the tracked tree)",
+                "--out {} resolves to {} which is inside this repository's working tree ({}) \
+                 and is NOT gitignored — rendered video/PNG output must never land in the \
+                 tracked tree. Either pass a directory outside the repo, or add this path to \
+                 .gitignore (the default `./out` is already there).",
                 requested.display(),
                 candidate.display(),
                 repo_root.display(),

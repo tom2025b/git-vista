@@ -645,10 +645,38 @@ mod tests {
 
     #[test]
     fn resolve_chrome_binary_accepts_an_explicit_path_that_does_exist() {
-        // Any real file works for this check — resolution never inspects
-        // the binary's contents, only that the path exists.
-        let this_file = Path::new(file!());
-        let resolved = resolve_chrome_binary(Some(this_file)).unwrap();
-        assert_eq!(resolved, this_file);
+        // A file this test creates itself, NOT `file!()`.
+        //
+        // `file!()` expands to a path relative to the *workspace* root, while
+        // a test binary's working directory is the *package* directory — so
+        // the original version of this test could never pass from inside this
+        // workspace, and shipped red. Building the fixture here makes the
+        // test independent of where it is run from, which is the only way it
+        // can be honest about what it claims to check.
+        let dir = std::env::temp_dir().join("gv-scrollcast-resolve-chrome-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let fake = dir.join("chrome-headless-shell");
+        std::fs::write(&fake, b"not really a browser").expect("write fixture");
+
+        // Resolution never inspects the binary's contents, only that the path
+        // exists and is a file — so any real file exercises the same path.
+        let resolved = resolve_chrome_binary(Some(&fake)).unwrap();
+        assert_eq!(resolved, fake);
+
+        let _ = std::fs::remove_file(&fake);
+    }
+
+    #[test]
+    fn resolve_chrome_binary_rejects_a_directory_even_though_it_exists() {
+        // The guard is "exists AND is a file". A bare `exists()` check would
+        // accept a directory here and fail much later inside chromiumoxide
+        // with a far less obvious message.
+        let dir = std::env::temp_dir();
+        let err = resolve_chrome_binary(Some(&dir)).unwrap_err();
+        assert!(
+            err.to_string().contains("is not a file")
+                || err.to_string().contains("does not exist or is not a file"),
+            "unexpected message: {err}"
+        );
     }
 }

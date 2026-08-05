@@ -64,3 +64,10 @@
 # Live dual-account mailbox — session state, not project history.
 # Both sessions read/write these at one absolute path; they must not travel through git.
 .claude/parallel/
+
+# gv-scrollcast (#325) render output — big PNGs and MP4s, never product.
+# The tool's --out guard permits an in-repo path ONLY when git actually
+# ignores it, so this entry is what makes the documented default (`./out`)
+# usable at all. Removing it does not loosen anything; it makes the default
+# stop working, loudly.
+/out/
