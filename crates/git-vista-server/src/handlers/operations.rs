@@ -1,16 +1,32 @@
 //! `GET /api/operations/{id}` and `GET /api/operations/{id}/events` (M1.08, #61):
-//! ask what happened to an operation, or watch one happen.
+//! ask what happened to an operation, or watch one happen. Plus
+//! `GET /api/operations/by-key/{key}` (M2.20f, #232): ask what id got minted
+//! for an operation that may still be *running*.
 //!
-//! These are the *recovery* half of the lifecycle work. A client whose response
-//! was lost — the iPad's SSH tunnel dropping mid-push is the case this project
-//! is built around — has the operation id from the
+//! The first two are the *recovery* half of the lifecycle work. A client whose
+//! response was lost — the iPad's SSH tunnel dropping mid-push is the case
+//! this project is built around — has the operation id from the
 //! [`OPERATION_HEADER`](git_vista_protocol::OPERATION_HEADER) and can ask here
 //! rather than inferring the outcome from the graph.
 //!
-//! Both routes are **reads of write outcomes**, so they are registered only on
-//! the loopback router, alongside the writes they describe (ADR 0005): the LAN
-//! listener never sees them exist. Authentication is the ordinary session gate
-//! every other read carries.
+//! The third exists because that header arrives too late for anything that
+//! wants to act *during* the operation: `planner::plan_and_execute_tracked`
+//! does not answer a tracked write's own request until
+//! `record.wait_terminal().await` resolves, so `OPERATION_HEADER` is only
+//! ever visible once the operation is already terminal. The server knows the
+//! id immediately, though — `note_minted` runs right after `admit` in the
+//! planner — and the client already holds the one thing that names the
+//! operation before that: the idempotency key it minted to send the write in
+//! the first place. `by_key` is the read side of that: fire the write, then
+//! poll this route with the same key until it answers, and bind the cancel
+//! button / progress stream / reload-recovery state to the id it returns
+//! instead of waiting for the write to finish.
+//!
+//! All three are **reads of write outcomes** (or of an in-flight write's
+//! identity), so they are registered only on the loopback router, alongside
+//! the writes they describe (ADR 0005): the LAN listener never sees them
+//! exist. Authentication is the ordinary session gate every other read
+//! carries.
 //!
 //! ## Why the stream takes its protocol version in the query string
 //!
@@ -55,6 +71,60 @@ const HEARTBEAT: Duration = Duration::from_secs(15);
 /// stream still open after this is a client that stopped reading, and the
 /// record remains available from the plain `GET` either way.
 const MAX_STREAM_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
+/// `GET /api/operations/by-key/{key}` — the [`OperationId`] admitted for one
+/// idempotency key, so a client can learn it *while the operation it names is
+/// still running* (M2.20f, #232). See this module's doc comment for why this
+/// route exists at all: `OPERATION_HEADER` on the tracked write's own
+/// response cannot answer this question in time.
+///
+/// ## The race, and why a 404 here is always safe to retry
+///
+/// The intended caller fires `POST /api/fetch` (or any other tracked write)
+/// carrying a freshly-minted key, *without* awaiting the response body, and
+/// immediately starts polling this route with that same key. That means this
+/// handler is expected to run concurrently with — and frequently *before* —
+/// the moment `operations::admit` inserts the key into the registry
+/// (`operations.rs`), simply because the POST has to reach the planner first.
+///
+/// A 404 therefore means one of two things this handler deliberately does
+/// not distinguish, because a caller cannot act on the difference anyway:
+///
+/// * **not admitted yet** — keep polling; this is the expected shape of a
+///   request that starts polling before its own POST has been scheduled.
+/// * **never will be, or aged out** — a key from a different session, a typo,
+///   or a record old enough that [`operations::evict`](crate::operations)
+///   already dropped it. Polling forever here is harmless (this handler runs
+///   no git, mutates nothing, and costs one mutex lock), but it will never
+///   start answering, so a caller needs its own retry budget/timeout — this
+///   route provides no signal to distinguish "still coming" from "never
+///   coming", by design: an unguessable key means there is nothing safe to
+///   say about *why* it is unrecognised without leaking whether the server
+///   ever minted anything resembling it.
+///
+/// A malformed key (not token-shaped) is refused the same 404 rather than a
+/// 400: it cannot name a key this server would ever accept, so it is exactly
+/// as "no such admission" as one that is merely unrecognised — the same
+/// posture [`resolve`] already takes for a malformed operation id.
+pub(crate) async fn operation_by_key(Path(key): Path<String>) -> Response {
+    let Ok(key) = IdempotencyKey::new(key) else {
+        return by_key_not_found();
+    };
+    match crate::operations::lookup_by_key(&key) {
+        Some(id) => Json(OperationByKeyResponse { id }).into_response(),
+        None => by_key_not_found(),
+    }
+}
+
+fn by_key_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "No operation is admitted under that key yet. If you just sent the \
+         write this key belongs to, retry shortly — it may still be on its \
+         way to the server.",
+    )
+        .into_response()
+}
 
 /// `GET /api/operations/{id}` — the recorded status of one operation.
 ///
@@ -264,6 +334,59 @@ mod tests {
             Admission::Fresh(handle, record) => (record.id(), handle),
             _ => panic!("a fresh key must be admitted"),
         }
+    }
+
+    /// The load-bearing behaviour this route exists for: the id is readable
+    /// by key *before* the operation finishes, not only from the terminal
+    /// `OPERATION_HEADER` — the whole point being that a client can bind its
+    /// cancel button / progress stream to the id while a fetch or push is
+    /// still transferring.
+    #[tokio::test]
+    async fn by_key_resolves_the_id_while_the_operation_is_still_running() {
+        let key = IdempotencyKey::new("handler-by-key-running").unwrap();
+        let op = GitOperation::CommitOnHead {
+            message: CommitMessage::new("by-key-running").unwrap(),
+            allow_empty: true,
+        };
+        let hash = OperationHash::new("b".repeat(64)).unwrap();
+        let Admission::Fresh(handle, record) = operations::admit(
+            &key,
+            &op,
+            &hash,
+            RepositoryToken::new("test-repo").unwrap(),
+            WorktreeToken::new("test-worktree").unwrap(),
+        ) else {
+            panic!("a fresh key must be admitted");
+        };
+
+        let response = operation_by_key(Path(key.as_str().to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: OperationByKeyResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.id, record.id());
+
+        handle.finish(StatusCode::OK, "done".into(), None);
+    }
+
+    /// A key nothing was ever admitted under is 404, not a panic — the
+    /// expected steady state of a client that starts polling immediately
+    /// after firing its own POST, before the server has admitted it yet.
+    #[tokio::test]
+    async fn by_key_of_an_unadmitted_key_is_not_found() {
+        let response =
+            operation_by_key(Path("handler-by-key-never-admitted".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A key that isn't token-shaped can't name anything this server would
+    /// ever admit, so it is the same 404 rather than a 400 — same posture as
+    /// a malformed operation id on the sibling routes below.
+    #[tokio::test]
+    async fn by_key_of_a_malformed_key_is_not_found() {
+        let response = operation_by_key(Path("not a token".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// An id that never existed and one that has been forgotten answer the

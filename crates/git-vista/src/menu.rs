@@ -1019,6 +1019,26 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 }
                 .into_view()
             });
+            // Whether a Fetch or Pull is already running (#232, M2.20f).
+            // Both share the single localStorage resume slot
+            // (`prefs::INFLIGHT_REMOTE_OP_KEY` / `InFlightRemoteOp`) — see
+            // that key's doc comment in `prefs.rs`. A second Fetch or Pull
+            // admitted while one is in flight overwrites that one entry, so
+            // on reload only the second resumes and the first is silently
+            // lost (or the second settles and clears the key while the
+            // first is still running). This closure is the actual gate;
+            // `operations.core()` is the same public accessor
+            // `in_flight_count` uses, just filtered to the two kinds that
+            // share the slot rather than counting every in-flight write.
+            let remote_op_running = move || {
+                operations.core().with(|c| {
+                    c.in_flight()
+                        .find(|f| {
+                            matches!(f.kind, PendingOp::Fetch { .. } | PendingOp::Pull { .. })
+                        })
+                        .map(|f| f.kind.describe())
+                })
+            };
             // "Fetch" (#232, M2.20f): repo-scoped like Rebase, not per-branch
             // like Push — there's no per-branch remote-tracking surface in
             // this menu. Single tap, styled exactly like `push_item`: no
@@ -1027,7 +1047,27 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
             // that in practice only `origin` is ever in play, and #232's
             // scope names no remote picker, so the remote is fixed rather
             // than offered as a choice.
+            //
+            // Disabled (with reason, #65) while a Fetch or Pull is already
+            // in flight — see `remote_op_running` above.
             let fetch_item = (!m.is_branch).then(|| {
+                if let Some(running) = remote_op_running() {
+                    let reason = format!("{running} — only one Fetch or Pull can run at a time");
+                    let (aria_label, visible_reason) = disabled_menu_item_copy("Fetch", &reason);
+                    return view! {
+                        <button
+                            class="ctx-item disabled"
+                            title=reason
+                            aria-disabled="true"
+                            aria-label=aria_label
+                        >
+                            <span class="nf ctx-icon">{ic.branch_alt}</span>
+                            "Fetch"
+                            <span class="ctx-item-reason">{visible_reason}</span>
+                        </button>
+                    }
+                    .into_view();
+                }
                 let on = move |_| {
                     dialogs.open(Dialog::Confirm);
                     shell.open_confirm(PendingOp::Fetch {
@@ -1072,7 +1112,26 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
             // to satisfy `PendingIntent`'s shape and is discarded the
             // instant `admit_intent` returns; it never reaches the picker,
             // the wire, or the screen.
+            // Disabled (with reason, #65) while a Fetch or Pull is already
+            // in flight — see `remote_op_running` above `fetch_item`.
             let pull_item = (!m.is_branch).then(|| {
+                if let Some(running) = remote_op_running() {
+                    let reason = format!("{running} — only one Fetch or Pull can run at a time");
+                    let (aria_label, visible_reason) = disabled_menu_item_copy("Pull", &reason);
+                    return view! {
+                        <button
+                            class="ctx-item disabled"
+                            title=reason
+                            aria-disabled="true"
+                            aria-label=aria_label
+                        >
+                            <span class="nf ctx-icon">{ic.merge}</span>
+                            "Pull"
+                            <span class="ctx-item-reason">{visible_reason}</span>
+                        </button>
+                    }
+                    .into_view();
+                }
                 let on = move |_| {
                     shell.close_menu();
                     let seq = operations.next_seq();

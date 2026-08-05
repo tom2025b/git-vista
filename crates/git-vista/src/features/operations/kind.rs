@@ -147,13 +147,26 @@ impl OperationKind {
         }
     }
 
-    /// Whether the server's executor watches this operation's cancellation
-    /// latch — mirrors `planner::honours_cancellation` on the server side
-    /// (`crates/git-vista-server/src/planner.rs`), kept in sync by this
-    /// cross-reference rather than a shared type, since the two crates
-    /// don't share the match. Only `Fetch` and `Pull` are cancellable today
-    /// (M2.20f, #232): a cancel button must never be offered for anything
-    /// else, since the server would answer it with a 409.
+    /// Whether the client offers a Cancel button for this operation.
+    ///
+    /// This is **not** a full mirror of the server's
+    /// `planner::honours_cancellation` (`crates/git-vista-server/src/planner.rs`,
+    /// checked at ~4294) — it used to claim to be, and that claim was false.
+    /// The server watches the cancellation latch for `FetchRemote`,
+    /// `PullBranch`, *and* `PushBranch`; the client here only offers Cancel
+    /// for `Fetch` and `Pull`. That gap is a deliberate scope decision, not
+    /// a bug the way the false doc comment implied: #232/M2.20f's whole
+    /// surface — the progress strip, the resume-across-reload plumbing in
+    /// `prefs.rs`, this menu's disabled-while-in-flight gate — was scoped to
+    /// Fetch/Pull throughout, and offering Cancel for Push is real UI work
+    /// (a new client-side button plus surfacing the server's own weaker
+    /// promise for it — see `honours_cancellation`'s doc comment on what
+    /// "cancelled" even means for a push whose effect already landed on the
+    /// remote) that #232 never asked for. If a future issue extends
+    /// cancellation to Push, add `Self::Push { .. }` here and update the
+    /// test below to expect it — the two-crate cross-reference stays
+    /// (there's still no shared type), but this comment now says what the
+    /// client actually does rather than what it claims to.
     pub fn is_cancellable(&self) -> bool {
         matches!(self, Self::Fetch { .. } | Self::Pull { .. })
     }
@@ -292,6 +305,16 @@ mod fetch_pull_tests {
     /// Mutation this catches: dropping `| Self::Pull { .. }` (or the whole
     /// `matches!` arm) from `is_cancellable`, or flipping it to `true` for
     /// everything.
+    ///
+    /// `Push` is asserted `false` here **deliberately**, not because it
+    /// happens to fall out of the current match. The server's
+    /// `planner::honours_cancellation` (`crates/git-vista-server/src/planner.rs`)
+    /// says `true` for `PushBranch` — this test pins the client's narrower,
+    /// intentional #232/M2.20f scope (Fetch/Pull only) against that wider
+    /// server behaviour, so a future change that widens the client's set
+    /// must edit this assertion on purpose rather than trip over it by
+    /// accident. See `is_cancellable`'s doc comment for why Push isn't
+    /// included yet.
     #[test]
     fn is_cancellable_is_true_only_for_fetch_and_pull() {
         assert!(fetch().is_cancellable());
@@ -303,6 +326,9 @@ mod fetch_pull_tests {
                 branch: "feature".into(),
                 into: Some("main".into()),
             },
+            // Server-honoured (`honours_cancellation` says `true` for
+            // `PushBranch`), client-narrower-by-choice — see the doc
+            // comment on `is_cancellable` above.
             OperationKind::Push {
                 branch: "feature".into(),
             },

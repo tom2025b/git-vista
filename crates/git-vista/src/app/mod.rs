@@ -210,9 +210,11 @@ pub fn App() -> impl IntoView {
     let operations = Operations::new(operations_core, graph);
     // #232, M2.20f: resume watching a Fetch/Pull that was still in flight
     // when this tab reloaded or was suspended and resumed — before
-    // anything else reads `operations_core`, so the menu's "don't
-    // re-offer Fetch/Pull while one is running" gate sees it from the
-    // first render.
+    // anything else reads `operations_core`, so `menu.rs`'s
+    // `remote_op_running` gate (which disables Fetch/Pull, with a reason,
+    // while either is in flight) sees the resumed entry from the first
+    // render, rather than a render-or-two where the resumed op is real but
+    // the menu still offers a second one.
     operations.resume_from_storage();
 
     // The history signals the App owns (M1.10, #63). `print_graph_open` opens the

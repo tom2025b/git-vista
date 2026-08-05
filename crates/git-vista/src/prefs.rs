@@ -50,8 +50,10 @@ pub fn store_node_icons_pref(on: bool) {
 /// localStorage key for the one Fetch/Pull the client is currently
 /// tracking across reloads (#232, M2.20f) — see
 /// `features::operations::core::InFlightRemoteOp`. At most one entry: the
-/// menu already suppresses re-offering Fetch/Pull while one is in flight,
-/// so there is never a second one to track.
+/// menu (`menu.rs`'s `remote_op_running` gate on `fetch_item`/`pull_item`)
+/// renders Fetch and Pull as disabled, with a reason, whenever either is
+/// already in flight, so there is never a second one to admit and
+/// overwrite this slot with.
 const INFLIGHT_REMOTE_OP_KEY: &str = "git-vista.inflight-remote-op";
 
 /// Load the persisted in-flight Fetch/Pull, if any and if it still
