@@ -42,7 +42,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use git_vista_protocol::{
-    OperationId, OperationStatus, ProgressEvent, UnixSeconds, PROGRESS_EVENT, RESULT_EVENT,
+    IdempotencyKey, OperationByKeyResponse, OperationId, OperationStatus, ProgressEvent,
+    UnixSeconds, PROGRESS_EVENT, RESULT_EVENT,
 };
 
 use crate::operations;

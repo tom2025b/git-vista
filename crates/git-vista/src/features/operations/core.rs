@@ -13,7 +13,7 @@ use git_vista_protocol::dto::{
     FetchError, FetchFailureKind, FetchSuccess, PullError, PullFailureKind, PullSuccess,
 };
 use git_vista_protocol::operation::{
-    IdempotencyKey, OperationId, OperationStage, OperationState, TransferProgress,
+    IdempotencyKey, OperationId, OperationStage, OperationState, TransferPhase, TransferProgress,
 };
 use git_vista_protocol::plan::{GenerationToken, MergeStrategy};
 
@@ -185,6 +185,59 @@ fn pull_summary(message: &str) -> Option<String> {
         | PullFailureKind::NoSuchRemoteBranch
         | PullFailureKind::Other => err.message,
     })
+}
+
+/// The word for a [`TransferPhase`], matching the vocabulary `TransferPhase`'s own doc
+/// comment (`operation.rs`) documents git as printing, lower-cased to match this strip's
+/// existing stage text (`stage_text` in `view.rs`) rather than shouting git's capitalised
+/// log lines at the user.
+fn phase_word(phase: TransferPhase) -> &'static str {
+    match phase {
+        TransferPhase::Enumerating => "enumerating objects",
+        TransferPhase::Counting => "counting objects",
+        TransferPhase::Compressing => "compressing objects",
+        TransferPhase::Receiving => "receiving objects",
+        TransferPhase::Writing => "writing objects",
+        TransferPhase::Resolving => "resolving deltas",
+    }
+}
+
+/// Turns one [`TransferProgress`] report into the text a user reads (M2.20g, #232) — the
+/// concrete answer to the issue's acceptance criterion "show live progress ... rather than a
+/// spinner with no detail". Pure on purpose: this crate has no wasm test harness at all, so
+/// anything the view needs to show about a transfer's progress has to be derivable, and
+/// tested, as a plain function of data rather than asserted against rendered markup.
+///
+/// Degrades exactly the way [`TransferProgress`]'s own doc comment (`operation.rs`) requires
+/// of every reader of the type: never fabricate a number git did not print.
+///
+/// - `percent` present -> `"<phase> NN%"`. Preferred over the object counts whenever both are
+///   present, because it is the more compact signal and the one phase that never carries a
+///   percentage (`Enumerating`) also never carries a total, so there is no case where
+///   choosing percent throws away a fraction the counts could have shown instead.
+/// - `percent` absent, `objects`/`total_objects` both present -> `"<phase> a/b"` (no trailing
+///   "objects" word — `phase_word` already names what is being counted, and for
+///   [`TransferPhase::Resolving`] that word is "deltas", not "objects").
+/// - `percent` absent, only `objects` present -> `"<phase> a"` — `Enumerating`'s own shape,
+///   which has a running count and no total to pair it with.
+/// - Nothing but the phase -> the phase name alone, never `"0/0"` or any other invented
+///   figure.
+///
+/// Rendered beside, never instead of, `stage_text`'s own line (`view.rs`): the stage names
+/// the pipeline step (`Executing`), this names the git-level detail inside it, and a fetch
+/// spends its *entire* `Executing` stage moving through this one function's five phases.
+pub fn progress_line(progress: &TransferProgress) -> String {
+    let phase = phase_word(progress.phase);
+    // No trailing "objects" word on the counted forms: `phase_word` already says what is
+    // being counted ("enumerating objects", "resolving deltas", ...), so appending it again
+    // would either repeat ("enumerating objects 12 objects") or lie ("resolving deltas 12/50
+    // objects" when they are deltas, not objects).
+    match (progress.percent, progress.objects, progress.total_objects) {
+        (Some(pct), _, _) => format!("{phase} {pct}%"),
+        (None, Some(done), Some(total)) => format!("{phase} {done}/{total}"),
+        (None, Some(done), None) => format!("{phase} {done}"),
+        (None, None, _) => phase.to_string(),
+    }
 }
 
 /// An operation that has resolved, kept briefly so its outcome can be shown and dismissed.
@@ -1366,5 +1419,106 @@ mod progress_and_cancel_tests {
         let mut c = OperationsCore::default();
         let err = c.request_cancel(&id("nope")).unwrap_err();
         assert_eq!(err, OperationsRejection::UnknownOperation);
+    }
+}
+
+#[cfg(test)]
+mod progress_line_tests {
+    use super::*;
+
+    fn progress(
+        phase: TransferPhase,
+        percent: Option<u8>,
+        objects: Option<u64>,
+        total_objects: Option<u64>,
+    ) -> TransferProgress {
+        TransferProgress {
+            phase,
+            percent,
+            objects,
+            total_objects,
+        }
+    }
+
+    /// The acceptance criterion in miniature: two different reports must read as two
+    /// different lines, or a view rendering this function's output could stop moving while
+    /// the underlying mechanism kept ticking and no test here would notice.
+    #[test]
+    fn two_different_percentages_render_two_different_lines() {
+        let low = progress(TransferPhase::Receiving, Some(10), None, None);
+        let high = progress(TransferPhase::Receiving, Some(90), None, None);
+        assert_ne!(progress_line(&low), progress_line(&high));
+        assert_eq!(progress_line(&low), "receiving objects 10%");
+        assert_eq!(progress_line(&high), "receiving objects 90%");
+    }
+
+    /// A different phase at the same percentage must also render distinctly — otherwise a
+    /// mutation that dropped `phase` from the format string entirely would still pass the
+    /// percentage-only comparison above.
+    #[test]
+    fn two_different_phases_render_two_different_lines() {
+        let receiving = progress(TransferPhase::Receiving, Some(50), None, None);
+        let resolving = progress(TransferPhase::Resolving, Some(50), None, None);
+        assert_ne!(progress_line(&receiving), progress_line(&resolving));
+    }
+
+    /// Percent is preferred over the object counts when both are present — never render a
+    /// stale-looking `a/b` alongside a percentage that already says more.
+    #[test]
+    fn percent_wins_over_object_counts_when_both_are_present() {
+        let line = progress_line(&progress(
+            TransferPhase::Writing,
+            Some(75),
+            Some(300),
+            Some(400),
+        ));
+        assert_eq!(line, "writing objects 75%");
+    }
+
+    /// No percentage but a full `(a/b)` pair falls back to the counts, exactly the
+    /// `Counting`/`Compressing`/`Resolving` shape before git's first percentage line for a
+    /// phase arrives.
+    #[test]
+    fn object_counts_render_when_percent_is_absent() {
+        let line = progress_line(&progress(
+            TransferPhase::Resolving,
+            None,
+            Some(12),
+            Some(50),
+        ));
+        assert_eq!(line, "resolving deltas 12/50");
+    }
+
+    /// `Enumerating`'s own shape (`operation.rs`'s doc comment on `objects`): a running count
+    /// with no total. Must never render as `"12/0"` or similar invented total.
+    #[test]
+    fn a_running_count_with_no_total_never_fabricates_a_denominator() {
+        let line = progress_line(&progress(TransferPhase::Enumerating, None, Some(12), None));
+        assert_eq!(line, "enumerating objects 12");
+        assert!(!line.contains("0"), "no fabricated total, ever: {line}");
+    }
+
+    /// Nothing but the phase: the phase name alone, never a fabricated "0/0" or "0%" — the
+    /// literal case `TransferProgress`'s own doc comment (`operation.rs`) exists to forbid.
+    #[test]
+    fn a_bare_phase_with_no_numbers_renders_as_the_phase_alone() {
+        let line = progress_line(&progress(TransferPhase::Counting, None, None, None));
+        assert_eq!(line, "counting objects");
+        assert!(!line.contains('%') && !line.contains('/'));
+    }
+
+    /// The other half of the acceptance criterion: an operation with no progress at all
+    /// (`InFlight::progress` is `None`) must render with no progress fragment whatsoever —
+    /// this is `view.rs`'s job (rendering `Option<TransferProgress>`), so this test pins the
+    /// contract `progress_line` itself hands the view: it is only ever called on a `Some`,
+    /// and a `None` must produce no call and therefore no fragment.
+    #[test]
+    fn a_progress_free_operation_has_nothing_for_the_view_to_render() {
+        let no_progress: Option<TransferProgress> = None;
+        let rendered = no_progress.as_ref().map(progress_line);
+        assert_eq!(
+            rendered, None,
+            "a progress-free operation must produce no progress fragment"
+        );
     }
 }
