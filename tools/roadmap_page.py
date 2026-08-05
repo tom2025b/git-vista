@@ -103,6 +103,47 @@ def fetch_milestones(warnings: list[str]) -> list[dict]:
     return data
 
 
+def fetch_cut_counts(milestones: list[dict], warnings: list[str]) -> dict[str, int]:
+    """Per milestone: how many of its closed issues were closed as NOT PLANNED.
+
+    GitHub's milestone metadata counts every closed issue identically, which is
+    how the page came to show scope removal as progress the night ADR 0049
+    closed 18 never-started issues. The `state_reason` field tells them apart:
+    `not_planned` is a cut, everything else (including the null reason on
+    pre-field closes, e.g. all of M1's) counts as shipped. Pull requests are
+    excluded — the milestone metadata counts them, we do not.
+
+    A failed query warns and returns 0 cuts for that milestone, which makes the
+    page OVERSTATE progress — so the warning is surfaced in the footer rather
+    than swallowed.
+    """
+    cuts: dict[str, int] = {}
+    for m in milestones:
+        key = milestone_key(m.get("title", "") or "")
+        number = m.get("number")
+        if key is None or number is None or int(m.get("closed_issues") or 0) == 0:
+            continue
+        ok, out = run_gh([
+            "api",
+            f"repos/{REPO_SLUG}/issues?milestone={number}&state=closed&per_page=100",
+        ])
+        if not ok:
+            warnings.append(f"cut counts for {key}: {out} — cuts shown as 0, progress may be overstated")
+            continue
+        try:
+            issues = json.loads(out)
+            cuts[key] = sum(
+                1
+                for i in issues
+                if isinstance(i, dict)
+                and "pull_request" not in i
+                and i.get("state_reason") == "not_planned"
+            )
+        except (json.JSONDecodeError, TypeError) as e:
+            warnings.append(f"cut counts for {key}: unparseable ({e}) — cuts shown as 0")
+    return cuts
+
+
 def fetch_merged_last_24h(warnings: list[str]) -> int | None:
     ok, out = run_gh([
         "pr", "list", "--state", "merged", "--limit", "30", "--json", "mergedAt",
@@ -161,20 +202,30 @@ def _sort_key(m: dict) -> tuple:
 
 
 def build_rows(
-    milestones: list[dict], review_overrides: dict[str, int]
+    milestones: list[dict],
+    review_overrides: dict[str, int],
+    cut_counts: dict[str, int] | None = None,
 ) -> tuple[list[dict], str | None]:
+    cut_counts = cut_counts or {}
     rows: list[dict] = []
     for m in sorted(milestones, key=_sort_key):
         title = (m.get("title") or "").strip()
         key = milestone_key(title) or (title[:12] or "?")
         theme = THEMES.get(key, title or key)
-        closed = int(m.get("closed_issues") or 0)
+        closed_raw = int(m.get("closed_issues") or 0)
+        cut = min(cut_counts.get(key, 0), closed_raw)
+        # "closed" from here on means SHIPPED. Cuts are scope removal, drawn
+        # outside the progress bar and outside every denominator — removing
+        # work must never look like finishing it (the night of ADR 0049
+        # taught exactly that lesson on this exact page's numbers).
+        closed = closed_raw - cut
         open_ = int(m.get("open_issues") or 0)
         review = review_overrides.get(key, 0)
         rows.append({
             "key": key,
             "theme": theme,
             "closed": closed,
+            "cut": cut,
             "review": review,
             "open": open_,
             "gh_state": m.get("state", "open"),
@@ -199,7 +250,15 @@ def build_rows(
         r["current"] = r["key"] == current_key
         r["total"] = r["closed"] + r["review"] + r["open"]
         if r["open"] == 0 and r["review"] == 0:
-            r["state_label"] = "Shipped" if r["closed"] > 0 else "No issues"
+            # An all-cut milestone shipped NOTHING — "Retired", never
+            # "Shipped". (M7 was exactly this shape and the old logic
+            # would have labeled it Shipped.)
+            if r["closed"] > 0:
+                r["state_label"] = "Shipped"
+            elif r["cut"] > 0:
+                r["state_label"] = "Retired"
+            else:
+                r["state_label"] = "No issues"
         elif r["closed"] == 0 and r["review"] == 0:
             r["state_label"] = "Planned"
         else:
@@ -343,6 +402,10 @@ HTML_TEMPLATE = r"""<title>Git-Vista Roadmap</title>
   .seg:last-child { margin-right: 0; border-radius: 0 4px 4px 0; }
   .seg:focus-visible { outline: 2px solid var(--ink); }
   .seg.closed { background: var(--closed); }
+  .seg.cut {
+    background: repeating-linear-gradient(45deg, var(--muted) 0 4px, var(--track) 4px 8px);
+    margin-left: 3px; border-radius: 4px; opacity: 0.85;
+  }
   .seg.review { background: var(--review); }
   .seg.track { background: var(--track); box-shadow: inset 0 0 0 1px var(--ring); }
   .seg:hover { filter: brightness(1.08); }
@@ -440,7 +503,7 @@ HTML_TEMPLATE = r"""<title>Git-Vista Roadmap</title>
     <h2>Table view</h2>
     <table>
       <thead>
-        <tr><th>Milestone</th><th>Theme</th><th class="num">Closed</th><th class="num">In review</th><th class="num">Open</th><th>State</th></tr>
+        <tr><th>Milestone</th><th>Theme</th><th class="num">Shipped</th><th class="num">In review</th><th class="num">Open</th><th class="num">Cut</th><th>State</th></tr>
       </thead>
       <tbody id="tbody"></tbody>
     </table>
@@ -453,15 +516,16 @@ HTML_TEMPLATE = r"""<title>Git-Vista Roadmap</title>
 
 <script>
   const DATA = __DATA_JSON__;
-  const MAX = Math.max(1, ...DATA.map(d => d.closed + d.review + d.open));
+  const MAX = Math.max(1, ...DATA.map(d => d.closed + d.review + d.open + d.cut));
   const rows = document.getElementById("rows");
   const tbody = document.getElementById("tbody");
   const tip = document.getElementById("tip");
 
   const SEGDEFS = [
-    ["closed", "Closed"],
+    ["closed", "Shipped"],
     ["review", "In review"],
     ["track", "Open"],
+    ["cut", "Cut (not planned)"],
   ];
 
   for (const d of DATA) {
@@ -478,8 +542,9 @@ HTML_TEMPLATE = r"""<title>Git-Vista Roadmap</title>
     bar.className = "bar";
     bar.setAttribute("role", "img");
     bar.setAttribute("aria-label",
-      `${d.v} ${d.theme}: ${d.closed} closed, ${d.review} in review, ${d.open} open`);
-    const counts = { closed: d.closed, review: d.review, track: d.open };
+      `${d.v} ${d.theme}: ${d.closed} shipped, ${d.review} in review, ${d.open} open` +
+      (d.cut ? `, ${d.cut} cut as not planned` : ""));
+    const counts = { closed: d.closed, review: d.review, track: d.open, cut: d.cut };
     for (const [cls, label] of SEGDEFS) {
       const n = counts[cls];
       if (n === 0) continue;
@@ -487,7 +552,9 @@ HTML_TEMPLATE = r"""<title>Git-Vista Roadmap</title>
       seg.className = "seg " + cls;
       seg.style.width = (n / MAX) * 100 + "%";
       seg.tabIndex = 0;
-      const text = `${d.v} — ${d.theme}\n${label}: ${n} of ${total} issues`;
+      const text = cls === "cut"
+        ? `${d.v} — ${d.theme}\n${label}: ${n} — scope removed by ADR 0049, not progress`
+        : `${d.v} — ${d.theme}\n${label}: ${n} of ${total} issues`;
       seg.addEventListener("mousemove", e => showTip(text, e.clientX, e.clientY));
       seg.addEventListener("mouseleave", hideTip);
       seg.addEventListener("focus", () => {
@@ -501,7 +568,7 @@ HTML_TEMPLATE = r"""<title>Git-Vista Roadmap</title>
 
     const count = document.createElement("span");
     count.className = "count";
-    count.textContent = `${d.closed + d.review}/${total}`;
+    count.textContent = `${d.closed + d.review}/${total}` + (d.cut ? ` · ${d.cut} cut` : "");
     row.appendChild(count);
 
     if (d.current) {
@@ -515,7 +582,8 @@ HTML_TEMPLATE = r"""<title>Git-Vista Roadmap</title>
     const tr = document.createElement("tr");
     for (const [content, cls] of [
       [d.v, "mono"], [d.theme, ""], [String(d.closed), "num"],
-      [String(d.review), "num"], [String(d.open), "num"], [d.state, ""],
+      [String(d.review), "num"], [String(d.open), "num"],
+      [String(d.cut), "num"], [d.state, ""],
     ]) {
       const td = document.createElement("td");
       if (cls) td.className = cls;
@@ -609,14 +677,16 @@ def render_html(
             "v": r["key"],
             "theme": r["theme"],
             "closed": r["closed"],
+            "cut": r["cut"],
             "review": r["review"],
             "open": r["open"],
             "state": r["state_label"],
             "current": r["current"],
             "here": (
                 (
-                    f'{r["closed"]} closed · {r["open"]} open'
+                    f'{r["closed"]} shipped · {r["open"]} open'
                     + (f' · {r["review"]} in review' if r["review"] else "")
+                    + (f' · {r["cut"]} cut' if r["cut"] else "")
                 )
                 if r["current"]
                 else ""
@@ -652,17 +722,22 @@ def render_html(
 # ---------------------------------------------------------------------------
 
 FIXTURE_MILESTONES = [
-    {"title": "M1 — Foundation", "state": "closed", "closed_issues": 39, "open_issues": 0},
-    {"title": "M2 — Daily driver", "state": "open", "closed_issues": 24, "open_issues": 28},
-    {"title": "M3 — Parallel work", "state": "open", "closed_issues": 0, "open_issues": 5},
+    {"title": "M1 — Foundation", "state": "closed", "closed_issues": 39, "open_issues": 0, "number": 1},
+    {"title": "M2 — Daily driver", "state": "open", "closed_issues": 24, "open_issues": 28, "number": 2},
+    {"title": "M3 — Parallel work", "state": "open", "closed_issues": 0, "open_issues": 5, "number": 3},
+    # M7-shaped: every closed issue is a cut — must read Retired, never Shipped
+    {"title": "M7 — Ecosystem", "state": "closed", "closed_issues": 4, "open_issues": 0, "number": 7},
+    # M4-shaped: mixed — 2 of its closes are cuts, so shipped is 0 with 4 open
+    {"title": "M4 — History", "state": "open", "closed_issues": 2, "open_issues": 4, "number": 4},
 ]
+FIXTURE_CUTS = {"M7": 4, "M4": 2}
 FIXTURE_MERGED_24H = 12
 FIXTURE_REVIEW = {"M2": 3}
 FIXTURE_TIMESTAMP = "2026-08-02 05:16 UTC"
 
 
 def run_selftest() -> int:
-    rows, current_key = build_rows(FIXTURE_MILESTONES, FIXTURE_REVIEW)
+    rows, current_key = build_rows(FIXTURE_MILESTONES, FIXTURE_REVIEW, FIXTURE_CUTS)
     tiles = compute_tiles(rows, current_key, FIXTURE_MERGED_24H)
     html = render_html(
         rows, tiles, current_key,
@@ -679,11 +754,13 @@ def run_selftest() -> int:
 
     # Expected fixture arithmetic, computed independently of build_rows/
     # compute_tiles so the test isn't just re-asserting its own inputs:
-    #   closed_total = 39 + 24 + 0        = 63
-    #   total_total  = 39 + (24+3+28) + 5 = 99
-    #   pct          = round(100*63/99)   = 64
+    #   closed_total = 39 + 24 + 0 + 0(M7 all cut) + 0(M4 both cut) = 63
+    #   total_total  = 39 + (24+3+28) + 5 + 0(M7) + 4(M4 open)       = 103
+    #   pct          = round(100*63/103)                              = 61
+    #   (cuts excluded from BOTH numerator and denominator — removing
+    #    scope must never move the progress number in either direction)
     expected_closed_total = 63
-    expected_total_total = 99
+    expected_total_total = 103
     expected_pct = round(100 * expected_closed_total / expected_total_total)
 
     check(f"closed_total == {expected_closed_total}", tiles["closed_total"] == expected_closed_total)
@@ -702,11 +779,20 @@ def run_selftest() -> int:
     if m:
         data = json.loads(m.group(1))
         got_keys = {d["v"] for d in data}
-        check("DATA has M1, M2, M3", got_keys == {"M1", "M2", "M3"})
+        check("DATA has M1, M2, M3, M4, M7", got_keys == {"M1", "M2", "M3", "M4", "M7"})
         m2 = next((d for d in data if d["v"] == "M2"), None)
         check("M2 review override (3) reflected in DATA", m2 is not None and m2["review"] == 3)
         m1 = next((d for d in data if d["v"] == "M1"), None)
         check("M1 state == Shipped", m1 is not None and m1["state"] == "Shipped")
+        # The honesty checks ADR 0049 earned: cuts are not progress.
+        m7 = next((d for d in data if d["v"] == "M7"), None)
+        check("M7 (all cuts) state == Retired, NOT Shipped",
+              m7 is not None and m7["state"] == "Retired")
+        check("M7 shipped == 0 with cut == 4",
+              m7 is not None and m7["closed"] == 0 and m7["cut"] == 4)
+        m4 = next((d for d in data if d["v"] == "M4"), None)
+        check("M4 shipped == 0 (its 2 closes were cuts), cut == 2",
+              m4 is not None and m4["closed"] == 0 and m4["cut"] == 2)
 
     check(f"grand total ({expected_total_total}) visible in tiles",
           str(expected_total_total) in html)
@@ -742,9 +828,10 @@ def main() -> int:
 
     warnings: list[str] = []
     milestones = fetch_milestones(warnings)
+    cut_counts = fetch_cut_counts(milestones, warnings)
     merged_24h = fetch_merged_last_24h(warnings)
 
-    rows, current_key = build_rows(milestones, review_overrides)
+    rows, current_key = build_rows(milestones, review_overrides, cut_counts)
     tiles = compute_tiles(rows, current_key, merged_24h)
     timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
 
