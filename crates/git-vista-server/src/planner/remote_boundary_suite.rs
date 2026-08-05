@@ -61,8 +61,8 @@ use std::time::Duration;
 use axum::http::StatusCode;
 
 use git_vista_protocol::{
-    BranchName, FetchError, GitOperation, MergeStrategy, Precondition, RemoteName, RepositoryToken,
-    WorktreeToken,
+    BranchName, FetchError, ForcePublish, GitOperation, MergeStrategy, Precondition, RemoteName,
+    RepositoryToken, WorktreeToken,
 };
 
 use crate::handlers::fetch::validate_remote;
@@ -507,6 +507,109 @@ async fn pull_refuses_an_unconfigured_remote_before_reaching_its_executor() {
     assert!(
         !repo.join(".git/FETCH_HEAD").exists(),
         "pull's fetch half must not have run"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The same protection, on push
+// ---------------------------------------------------------------------------
+
+/// **Push depends on this gate more than fetch or pull do, not less.**
+///
+/// `PushRequest` has no remote field at all — `handlers::branch::push_operation`
+/// fixes it to `origin` — so `require_remote_name` has no client input to refuse
+/// on this route, and defence (a) contributes nothing here. `RemoteConfigured`
+/// is the whole of the protection, and `PushBranch`'s plan puts it first.
+///
+/// # Why this asserts the *wording*, and why the status alone is not enough
+///
+/// Measured, not assumed. Flipping `refuses_when_unmet_at_build`'s
+/// `RemoteConfigured` arm to `false` on this merge produces:
+///
+/// ```text
+/// To ghost.git
+///  ! [rejected]        main -> main (fetch first)
+/// error: failed to push some refs to 'ghost.git'
+/// ```
+///
+/// Two things follow, and both shaped the assertions below.
+///
+/// First, **the push really did reach the ad-hoc directory target.** git
+/// resolved `ghost.git` as a path and talked to it; it was turned away only
+/// because this fixture's local `main` is not a descendant of the target's.
+/// Had it been one, the push would have landed. The sandbox did not stop it —
+/// so the "target's branch did not move" leg below is a fixture guard, not a
+/// proof of the boundary, and is labelled as one.
+///
+/// Second, and the reason this test pins a sentence: **that executor-side
+/// rejection is itself a `409`.** A non-fast-forward and an unmet precondition
+/// are the same status. `assert_eq!(status, CONFLICT)` therefore passes with
+/// the gate removed — it is exactly the vacuous green this suite's module doc
+/// warns about. `unmet_at_build`'s wording is the only part of the response
+/// that only `enforce_fresh` can produce, so it is the assertion that fails
+/// under the mutation, and the one that makes this test worth running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_refuses_an_unconfigured_remote_before_reaching_its_executor() {
+    let (dir, repo) = seeded_repo();
+    let target = bare_target_inside(dir.path(), &repo, "ghost.git");
+
+    // The fixture's bare target already carries its own `main` (the "payload"
+    // commit). So the honest question is not "is it empty" — it never was —
+    // but "did this push overwrite it". Both tips are read before the call, and
+    // asserted different, so "unchanged" is a statement with content.
+    let tip_of = |git_dir: &Path| -> String {
+        let out = std::process::Command::new("git")
+            .args(["--git-dir", git_dir.to_str().unwrap(), "rev-parse"])
+            .arg("refs/heads/main")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "fixture: {git_dir:?} has no main");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let target_before = tip_of(&target);
+    let ours = tip_of(&repo.join(".git"));
+    assert_ne!(
+        target_before, ours,
+        "fixture: the target must not already agree with us, or 'unchanged' \
+         would be indistinguishable from 'pushed'"
+    );
+
+    let (status, body) = super::plan_and_execute_in(
+        &repo,
+        None,
+        tokens(),
+        GitOperation::PushBranch {
+            branch: BranchName::new("main").unwrap(),
+            remote: RemoteName::new("ghost.git").unwrap(),
+            set_upstream: false,
+            force: ForcePublish::None,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a push naming an unconfigured remote must be refused by the staleness \
+         gate, before `exec_push` is dispatched to: {body}"
+    );
+    assert!(
+        body.contains("is not configured in this repository"),
+        "the refusal must be `unmet_at_build`'s — any other refusal (the \
+         sandbox's, the executor's) would leave the gate untested: {body}"
+    );
+    assert!(
+        body.contains("ghost.git"),
+        "the refusal must name the remote: {body}"
+    );
+
+    // Secondary, and deliberately labelled as such: true here, but also true
+    // with the gate removed, because the sandbox refuses a path-remote push on
+    // its own. It guards the fixture, not the boundary.
+    assert_eq!(
+        tip_of(&target),
+        target_before,
+        "the ad-hoc target's branch must not have moved"
     );
 }
 

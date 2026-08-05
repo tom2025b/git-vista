@@ -127,33 +127,52 @@ pub enum OperationStage {
     Finished,
 }
 
-/// Which phase of an object transfer git reported (M2.20c, #229).
+/// Which phase of an object transfer git reported (M2.20c, #229; widened for
+/// push by M2.20e, #231).
 ///
-/// These are git's own `--progress` phases, in the order a fetch goes through
-/// them, **not** invented UI steps — the same posture [`OperationStage`] takes
-/// towards the planner's stages. They live beside [`OperationStage`] rather
-/// than inside it because they are *not* pipeline stages: a fetch is in
-/// `OperationStage::Executing` for the whole of this sequence, and folding
-/// them into that enum would have made every existing exhaustive match over
-/// `OperationStage` (the frontend has one) wrong the day a fetch ran.
+/// These are git's own `--progress` phases, in the order a transfer goes
+/// through them, **not** invented UI steps — the same posture
+/// [`OperationStage`] takes towards the planner's stages. They live beside
+/// [`OperationStage`] rather than inside it because they are *not* pipeline
+/// stages: a fetch is in `OperationStage::Executing` for the whole of this
+/// sequence, and folding them into that enum would have made every existing
+/// exhaustive match over `OperationStage` (the frontend has one) wrong the day
+/// a fetch ran.
 ///
-/// Wire values are `snake_case`. The first three are reported *by the remote*
-/// (git prefixes them `remote:`), the last two by the local process.
+/// # One vocabulary, both directions
+///
+/// A fetch and a push print the *same* phase names for the work each side
+/// does; which side does which work is what differs. Fetching, the remote
+/// enumerates/counts/compresses (git prefixes those `remote:`) and the local
+/// process receives and resolves. Pushing, the local process
+/// enumerates/counts/compresses and **writes**, and the remote resolves. So
+/// there is no `PushPhase` twin here: the tag says what git is doing, and
+/// which end is doing it is already known from the operation.
+///
+/// Wire values are `snake_case`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferPhase {
-    /// `remote: Enumerating objects: N, done.` — the remote is deciding what
-    /// to send. Reports no percentage, only a running count.
+    /// `Enumerating objects: N, done.` — deciding what to send. Reports no
+    /// percentage, only a running count.
     Enumerating,
-    /// `remote: Counting objects: N% (a/b)`.
+    /// `Counting objects: N% (a/b)`.
     Counting,
-    /// `remote: Compressing objects: N% (a/b)`.
+    /// `Compressing objects: N% (a/b)`.
     Compressing,
-    /// `Receiving objects: N% (a/b)` — bytes are arriving locally. The phase
-    /// a user waits in, and the reason this vocabulary exists at all.
+    /// `Receiving objects: N% (a/b)` — bytes are arriving locally, i.e. a
+    /// fetch's transfer. The phase a user waits in, and the reason this
+    /// vocabulary exists at all.
     Receiving,
-    /// `Resolving deltas: N% (a/b)` — the local index is being built. Nothing
-    /// has touched a ref yet at this point.
+    /// `Writing objects: N% (a/b), <size> | <rate>` — bytes are leaving
+    /// locally, i.e. a push's transfer (M2.20e, #231). [`Self::Receiving`]'s
+    /// mirror image, and a separate tag rather than a shared "transferring"
+    /// one because a UI that says "receiving" while a user pushes is telling
+    /// them the wrong story about which way their data is going.
+    Writing,
+    /// `Resolving deltas: N% (a/b)` — an index is being built from the pack
+    /// (locally after a fetch, on the remote after a push, where git prefixes
+    /// it `remote:`). Nothing has touched a ref yet at this point.
     Resolving,
 }
 
@@ -414,16 +433,64 @@ mod tests {
 
     /// M2.20c (#229): the transfer vocabulary's wire spellings are contract —
     /// a client's progress bar branches on them.
+    ///
+    /// **Every variant, kept every variant by a census** (M2.20e, #231). The
+    /// table alone is a list, and a list silently stops covering the enum the
+    /// day it grows: `Writing` was added by #231 and this test kept passing
+    /// without it, leaving the one phase a pushing user spends the whole
+    /// transfer in with no pinned wire name at all. The `match` below has no
+    /// wildcard, so a new variant is a compile error here, and the count then
+    /// forces it into the table rather than merely into the enum.
+    ///
+    /// Both directions, too: a spelling that only serialized correctly would
+    /// still break a client, since the same string has to come back off the
+    /// wire as the same variant.
     #[test]
     fn transfer_phase_wire_names_are_stable_snake_case() {
-        for (phase, wire) in [
+        /// Every variant, named — exhaustive, no wildcard.
+        fn tag(phase: TransferPhase) -> &'static str {
+            match phase {
+                TransferPhase::Enumerating => "enumerating",
+                TransferPhase::Counting => "counting",
+                TransferPhase::Compressing => "compressing",
+                TransferPhase::Receiving => "receiving",
+                TransferPhase::Writing => "writing",
+                TransferPhase::Resolving => "resolving",
+            }
+        }
+
+        let table = [
             (TransferPhase::Enumerating, r#""enumerating""#),
             (TransferPhase::Counting, r#""counting""#),
             (TransferPhase::Compressing, r#""compressing""#),
             (TransferPhase::Receiving, r#""receiving""#),
+            // #231: a push's transfer phase. `Receiving`'s mirror image and a
+            // separate tag on purpose — a UI that said "receiving" while a
+            // user pushes would be telling them the wrong story about which
+            // way their data is going.
+            (TransferPhase::Writing, r#""writing""#),
             (TransferPhase::Resolving, r#""resolving""#),
-        ] {
+        ];
+
+        let mut covered: Vec<&str> = table.iter().map(|(p, _)| tag(*p)).collect();
+        covered.sort_unstable();
+        covered.dedup();
+        assert_eq!(
+            covered.len(),
+            6,
+            "TransferPhase grew a variant — add its wire spelling to the table \
+             above, or the phase ships with no pinned name (which is exactly \
+             how `writing` shipped unpinned in #231): covered {covered:?}"
+        );
+
+        for (phase, wire) in table {
             assert_eq!(serde_json::to_string(&phase).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<TransferPhase>(wire).unwrap(),
+                phase,
+                "the spelling must round-trip — a client reads it as well as \
+                 writes it"
+            );
         }
     }
 

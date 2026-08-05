@@ -35,102 +35,15 @@
 //! typed operation would be a flag the plan's reviewer never sees and the
 //! plan's hash never binds.
 
-use std::collections::BTreeMap;
-
 use axum::http::StatusCode;
 
-use git_vista_protocol::{
-    FetchError, FetchFailureKind, FetchSuccess, RemoteName, RemoteRefUpdate, TransferPhase,
-    TransferProgress,
-};
+use git_vista_protocol::{FetchError, FetchFailureKind, FetchSuccess, RemoteName, RemoteRefUpdate};
 
+use super::transfer::{diff_refs, parse_progress, remote_tracking_refs};
 use super::*;
 
 /// The endpoint name in log lines, matching every other executor here.
 const ENDPOINT: &str = "/api/fetch";
-
-// ---------------------------------------------------------------------------
-// Progress parsing
-// ---------------------------------------------------------------------------
-
-/// Parse one of git's `--progress` records into a [`TransferProgress`].
-///
-/// The records this recognises, verified byte-for-byte against git 2.43.0's
-/// own output (see the tests below, which are built from a captured real
-/// fetch):
-///
-/// ```text
-/// remote: Enumerating objects: 121, done.
-/// remote: Counting objects:  37% (45/121)
-/// remote: Compressing objects: 100% (120/120), done.
-/// Receiving objects:  66% (80/120), 174.40 KiB | 14.53 MiB/s
-/// Resolving deltas: 100% (39/39), completed with 1 local object.
-/// ```
-///
-/// `None` for anything else — including git's `From <url>` header, its
-/// `a1b2c3..d4e5f6  main -> origin/main` summary lines, and every warning or
-/// error. That is deliberate: this function's job is progress, and a record
-/// it does not understand must not be turned into a fabricated phase. The
-/// error path has its own reader ([`classify_failure`]) and the ref outcome
-/// has its own observation.
-///
-/// # Locale
-///
-/// These phase names are gettext-translated: under `LC_ALL=de_DE` git prints
-/// `Objekte empfangen`, and the `remote:`-prefixed three come from the
-/// *remote's* locale, not this host's. Unrecognised records simply produce no
-/// progress, so a non-English pair degrades to "no progress bar", never to a
-/// wrong one. `SandboxedCommand` exposes no `env` setter by construction
-/// (#228's C10 hazard #1), so this cannot be closed by forcing `LC_ALL=C`
-/// here; ADR 0043 records that as an accepted, reported gap.
-pub(super) fn parse_progress(record: &str) -> Option<TransferProgress> {
-    let record = record.strip_prefix("remote:").unwrap_or(record).trim();
-    let (phase, rest) = [
-        ("Enumerating objects:", TransferPhase::Enumerating),
-        ("Counting objects:", TransferPhase::Counting),
-        ("Compressing objects:", TransferPhase::Compressing),
-        ("Receiving objects:", TransferPhase::Receiving),
-        ("Resolving deltas:", TransferPhase::Resolving),
-    ]
-    .into_iter()
-    .find_map(|(needle, phase)| record.strip_prefix(needle).map(|rest| (phase, rest.trim())))?;
-
-    // `Enumerating` reports a bare running count and no percentage; every
-    // other phase reports `N% (a/b)`.
-    let percent = rest
-        .split('%')
-        .next()
-        .filter(|_| rest.contains('%'))
-        .and_then(|p| p.trim().parse::<u8>().ok())
-        .filter(|p| *p <= 100);
-
-    let (objects, total_objects) = match rest.split_once('(') {
-        Some((_, after)) => {
-            let inside = after.split(')').next().unwrap_or("");
-            match inside.split_once('/') {
-                Some((done, total)) => (
-                    done.trim().parse::<u64>().ok(),
-                    total.trim().parse::<u64>().ok(),
-                ),
-                None => (None, None),
-            }
-        }
-        // `Enumerating objects: 121, done.` — the count is the first token.
-        None => (
-            rest.split(&[',', ' '][..])
-                .next()
-                .and_then(|n| n.trim().parse::<u64>().ok()),
-            None,
-        ),
-    };
-
-    Some(TransferProgress {
-        phase,
-        percent,
-        objects,
-        total_objects,
-    })
-}
 
 // ---------------------------------------------------------------------------
 // Failure classification
@@ -215,88 +128,6 @@ pub(super) fn classify_failure(stderr: &str) -> FetchFailureKind {
     }
 
     FetchFailureKind::Other
-}
-
-// ---------------------------------------------------------------------------
-// Observing what the fetch did
-// ---------------------------------------------------------------------------
-
-/// Every `refs/remotes/<remote>/*` **branch** ref and the object it points at.
-///
-/// `Err` is "we could not observe", which is a refusal reason and never
-/// silently an empty map — a fetch whose before-state is unknown cannot
-/// honestly answer "did anything move?" afterwards, and that answer is the
-/// whole contract of a cancelled fetch (D5's posture: we did not observe
-/// anything, so we may not act as though we did).
-///
-/// **`refs/remotes/<remote>/HEAD` is excluded**, and that exclusion is
-/// load-bearing rather than cosmetic. It is a *symbolic* ref pointing at one
-/// of the branch refs already in this map, so counting it reports a single
-/// branch movement twice — once as `origin/main`, once as `origin/HEAD`
-/// shadowing it. Worse, whether it appears at all is a git-version
-/// difference: git 2.54 writes it during `fetch`, git 2.43 does not, so
-/// including it makes the observed result depend on the git on the host.
-/// CI (2.54) failed five fetch tests that passed locally (2.43) for exactly
-/// this reason. A remote-tracking *branch* is what a fetch moves; the symref
-/// is bookkeeping about which branch is default.
-async fn remote_tracking_refs(
-    repo: &Path,
-    need: NetworkNeed,
-    remote: &RemoteName,
-) -> Result<BTreeMap<String, String>, String> {
-    let prefix = format!("refs/remotes/{}/", remote.as_str());
-    let output = run_git(
-        repo,
-        need,
-        &["for-each-ref", "--format=%(refname) %(objectname)", &prefix],
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(stderr_or(&output, "git for-each-ref failed."));
-    }
-    let head_symref = format!("{prefix}HEAD");
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let (name, oid) = line.trim().split_once(' ')?;
-            if name == head_symref {
-                return None;
-            }
-            Some((name.to_string(), oid.to_string()))
-        })
-        .collect())
-}
-
-/// The before/after difference, as the wire type. Sorted by ref name (the
-/// `BTreeMap` gives that for free), so two identical fetches report
-/// identically.
-fn diff_refs(
-    before: &BTreeMap<String, String>,
-    after: &BTreeMap<String, String>,
-) -> Vec<RemoteRefUpdate> {
-    let mut out = Vec::new();
-    for (name, new_oid) in after {
-        match before.get(name) {
-            Some(old) if old == new_oid => {}
-            old => out.push(RemoteRefUpdate {
-                ref_name: name.clone(),
-                old_oid: old.cloned(),
-                new_oid: Some(new_oid.clone()),
-            }),
-        }
-    }
-    for (name, old_oid) in before {
-        if !after.contains_key(name) {
-            out.push(RemoteRefUpdate {
-                ref_name: name.clone(),
-                old_oid: Some(old_oid.clone()),
-                new_oid: None,
-            });
-        }
-    }
-    out.sort_by(|a, b| a.ref_name.cmp(&b.ref_name));
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -666,100 +497,6 @@ async fn journal_unobserved(repo: &Path, remote: &RemoteName, why: &str) {
 mod tests {
     use super::*;
 
-    /// Records captured verbatim from a real `git fetch --progress` (git
-    /// 2.43.0) against a local remote, `\r`-split the way
-    /// `git_cmd::emit_records` splits them.
-    #[test]
-    fn every_real_progress_record_shape_parses() {
-        let cases: &[(&str, TransferProgress)] = &[
-            (
-                "remote: Enumerating objects: 121, done.",
-                TransferProgress {
-                    phase: TransferPhase::Enumerating,
-                    percent: None,
-                    objects: Some(121),
-                    total_objects: None,
-                },
-            ),
-            (
-                "remote: Counting objects:  37% (45/121)",
-                TransferProgress {
-                    phase: TransferPhase::Counting,
-                    percent: Some(37),
-                    objects: Some(45),
-                    total_objects: Some(121),
-                },
-            ),
-            (
-                "remote: Compressing objects: 100% (120/120), done.",
-                TransferProgress {
-                    phase: TransferPhase::Compressing,
-                    percent: Some(100),
-                    objects: Some(120),
-                    total_objects: Some(120),
-                },
-            ),
-            (
-                "Receiving objects:  66% (80/120), 174.40 KiB | 14.53 MiB/s",
-                TransferProgress {
-                    phase: TransferPhase::Receiving,
-                    percent: Some(66),
-                    objects: Some(80),
-                    total_objects: Some(120),
-                },
-            ),
-            (
-                "Resolving deltas: 100% (39/39), completed with 1 local object.",
-                TransferProgress {
-                    phase: TransferPhase::Resolving,
-                    percent: Some(100),
-                    objects: Some(39),
-                    total_objects: Some(39),
-                },
-            ),
-        ];
-        for (record, expected) in cases {
-            assert_eq!(
-                parse_progress(record).as_ref(),
-                Some(expected),
-                "failed to parse {record:?}"
-            );
-        }
-    }
-
-    /// The paired negative: everything else a fetch prints must produce **no**
-    /// progress. Without this, a parser that returned a default
-    /// `TransferProgress` for any input would pass the test above and publish
-    /// a fabricated phase for git's ref-summary lines.
-    #[test]
-    fn non_progress_records_produce_no_progress() {
-        for record in [
-            "From /tmp/upstream",
-            "   fc81d61..43138c2  main       -> origin/main",
-            " * [new branch]      feature    -> origin/feature",
-            "fatal: Authentication failed for 'https://example.invalid/r.git/'",
-            "remote: Total 120 (delta 39), reused 0 (delta 0), pack-reused 0",
-            "warning: no common commits",
-            "",
-            "remote:",
-        ] {
-            assert_eq!(
-                parse_progress(record),
-                None,
-                "{record:?} must not be read as progress"
-            );
-        }
-    }
-
-    /// A percentage git could not have printed is dropped rather than
-    /// clamped: a bar drawn from a fabricated number is worse than no bar.
-    #[test]
-    fn an_impossible_percentage_is_dropped_not_clamped() {
-        let p = parse_progress("Receiving objects: 250% (5/2)").unwrap();
-        assert_eq!(p.percent, None);
-        assert_eq!(p.objects, Some(5));
-    }
-
     #[test]
     fn classification_names_the_actionable_cause() {
         for (stderr, expected) in [
@@ -826,54 +563,5 @@ mod tests {
             ),
             FetchFailureKind::AuthenticationFailed
         );
-    }
-
-    fn refs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn the_ref_diff_reports_moved_new_and_gone_refs_and_nothing_else() {
-        let before = refs(&[
-            ("refs/remotes/origin/main", "aaa"),
-            ("refs/remotes/origin/stable", "bbb"),
-            ("refs/remotes/origin/dropped", "ccc"),
-        ]);
-        let after = refs(&[
-            ("refs/remotes/origin/main", "ddd"),
-            ("refs/remotes/origin/stable", "bbb"),
-            ("refs/remotes/origin/fresh", "eee"),
-        ]);
-        let diff = diff_refs(&before, &after);
-        assert_eq!(
-            diff,
-            vec![
-                RemoteRefUpdate {
-                    ref_name: "refs/remotes/origin/dropped".into(),
-                    old_oid: Some("ccc".into()),
-                    new_oid: None,
-                },
-                RemoteRefUpdate {
-                    ref_name: "refs/remotes/origin/fresh".into(),
-                    old_oid: None,
-                    new_oid: Some("eee".into()),
-                },
-                RemoteRefUpdate {
-                    ref_name: "refs/remotes/origin/main".into(),
-                    old_oid: Some("aaa".into()),
-                    new_oid: Some("ddd".into()),
-                },
-            ],
-            "an unchanged ref must not appear, and the order must be stable"
-        );
-    }
-
-    #[test]
-    fn an_unchanged_listing_diffs_to_nothing() {
-        let same = refs(&[("refs/remotes/origin/main", "aaa")]);
-        assert!(diff_refs(&same, &same).is_empty());
     }
 }
