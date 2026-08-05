@@ -16,8 +16,9 @@ capture   Print Graph sheet (HTML/SVG file) -> one full-height PNG,
 pacing    commit density -> speed curve -> a scroll timeline, built against
           the scrollable height (image height minus one viewport)
 chapters  chapters.txt sidecar (a YouTube-style timestamp list) +
-          pivot-callout text (built, but always empty input today — see
-          "Known gaps" below)
+          pivot-callout text — merges, ref badges, and month boundaries
+          detected off the sheet's own rendered metadata (see "Verified
+          end-to-end" below for a real run's chapters.txt and callout frame)
 encode    timeline -> cropped frames, with a callout card composited onto
           each dwell frame -> H.264/yuv420p MP4, with +faststart
 ```
@@ -38,14 +39,21 @@ with a message naming every location checked if neither is found:
 | headless Chromium | `$GV_SCROLLCAST_CHROME` | override → env → `PATH` (`chrome-headless-shell`) → vendored Playwright copy |
 | ffmpeg | `$GV_SCROLLCAST_FFMPEG` | env → `PATH` (`ffmpeg`) → vendored Playwright copy |
 
-On this box the vendored fallbacks are the Playwright cache under
-`~/.cache/ms-playwright/`. **That bundled `ffmpeg` is deliberately stripped**
-(built for Playwright's own webm/vp8 screen-recording, not general encoding)
-— it has no `libx264`, no `aac`, no PNG decoder, no MP4 muxer, and no `lavfi
-anullsrc` filter. `gv-scrollcast` checks for all five *before* doing any
-capture or encode work and refuses to start rather than fail partway through
-a multi-minute run. Point `$GV_SCROLLCAST_FFMPEG` at a full ffmpeg build to
-actually produce a video on this box.
+On this box the vendored Playwright fallback for Chromium
+(`~/.cache/ms-playwright/chromium_headless_shell-1228/…`) is what
+`resolve_chrome_binary` actually finds and uses — there is no
+`chrome-headless-shell` on `PATH`. **The Playwright cache's own bundled
+`ffmpeg` is deliberately stripped** (built for Playwright's own webm/vp8
+screen-recording, not general encoding) — it has no `libx264`, no `aac`, no
+PNG decoder, no MP4 muxer, and no `lavfi anullsrc` filter, so it is *not*
+what gets used. As of 2026-08-05 this box has a real system **ffmpeg 6.1.1**
+at `/usr/bin/ffmpeg` (verified: `libx264` present, MP4 muxer present,
+`yuv420p` pixel format produced) — `gv-scrollcast` finds it on `PATH` with no
+env var needed. `gv-scrollcast` checks for all five required ffmpeg features
+*before* doing any capture or encode work and refuses to start rather than
+fail partway through a multi-minute run. If a box only has the stripped
+Playwright ffmpeg on `PATH`, point `$GV_SCROLLCAST_FFMPEG` at a full ffmpeg
+build instead.
 
 ### The input file
 
@@ -68,11 +76,15 @@ gv-scrollcast <input> [OPTIONS]
   --date-overlay        burn a corner date marker into frames  [not yet implemented — see below]
   --audio <path>        mux this audio file instead of a silent placeholder track
   --width <px>          rendered viewport width          [default: 1920 — see below]
-  --max-pivots <n>      cap pivot callouts               [default: 12 — currently has no effect, see below]
+  --max-pivots <n>      cap pivot callouts               [default: 12]
   --out <dir>           output directory                 [default: ./out]
 ```
 
 ### Worked examples
+
+These three are illustrative — none of them was actually run for this doc.
+The invocation confirmed against a real capture/encode pass on this box is
+in "Verified end-to-end" further down.
 
 ```bash
 # The 4-minute default: density-paced scroll, silent placeholder audio track,
@@ -102,6 +114,91 @@ gv-scrollcast: done
 format YouTube's video-description chapter parser accepts — paste it
 straight into the upload description.
 
+### Verified end-to-end (2026-08-05)
+
+This crate had never actually produced a video before — `ffmpeg` was missing
+on this box until now. With a real ffmpeg installed, the CLI was run
+end-to-end against a hand-built synthetic sheet (320 commit rows, spanning
+several months, with merges and ref badges scattered through) matching
+`graph_sheet()`'s exact markup shape (`crates/git-vista/src/print.rs:189-398`
+— the `<circle>`+`text.node-icon` pairing, `text.label-msg.pg-msg` /
+`text.label-meta.pg-meta`, the same geometry constants from
+`crates/git-vista/src/geometry.rs`), since there is still no way to get a
+real sheet onto disk without starting the app server (forbidden — see "The
+input file" above):
+
+```bash
+gv-scrollcast /tmp/gv-scrollcast-sheet.html --duration 20 --out /tmp/gv-scrollcast-out
+```
+
+Real output from that run:
+
+```text
+gv-scrollcast: chrome  -> /home/tom/.cache/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell
+gv-scrollcast: ffmpeg  -> /usr/bin/ffmpeg
+gv-scrollcast: out dir -> /tmp/gv-scrollcast-out
+gv-scrollcast: capturing /tmp/gv-scrollcast-sheet.html
+gv-scrollcast: captured 1920x17924 PNG, 320 commit node(s) found
+gv-scrollcast: timeline built: 12 segment(s), 36.0s total
+gv-scrollcast: encoding (this is the slow part)...
+gv-scrollcast: done
+video:      /tmp/gv-scrollcast-out/scrollcast.mp4
+chapters:   /tmp/gv-scrollcast-out/chapters.txt
+capture:    /tmp/gv-scrollcast-out/capture.png
+1080 frames, 36.0s video
+```
+
+(`--duration 20` came out as 36.0s, not 20.0s. `build_timeline` normally
+*carves* dwell time out of `--duration`'s own budget
+(`scroll_budget = (target_duration_secs - total_dwell).max(0.0)`,
+`pacing.rs:139`) so the finished video matches the target, pivots and all.
+But the synthetic sheet's 8 ref-badge rows plus several merge rows gave
+`detect_pivots_from_meta` more than `--max-pivots`' default of 12 real
+candidates, and 12 pivots × `DEFAULT_DWELL_SECS` (3.0s, `pacing.rs:62`) alone
+is 36s — already past the 20s target before any scrolling happens. The
+`.max(0.0)` clamp means `scroll_budget` floors at zero rather than going
+negative, so the video is exactly `total_dwell` (36.0s) with no scroll time
+left over, not a truncated 20s. A short `--duration` on a sheet this dense
+in landmarks is a real way to hit this; pass a longer `--duration` or a
+smaller `--max-pivots` to keep the two numbers close.)
+
+`ffprobe` on the resulting `scrollcast.mp4` confirms the documented encode
+contract, not just its intent:
+
+```text
+codec_name=h264, pix_fmt=yuv420p, width=1920, height=1080, fps=30/1
+codec_name=aac (audio track)
+duration=36.000000
+```
+
+`chapters.txt` from that same run — real pivots fired, not just the
+mandatory first line:
+
+```text
+0:00 Start
+0:12 Marked — 0000056
+0:24 Marked — 00000d7
+```
+
+This sheet's 8 ref-badge rows and several merge rows gave
+`detect_pivots_from_meta` well over `--max-pivots`' default of 12
+candidates, so (per the dwell-budget math above) the video actually contains
+up to 12 real dwell/callout segments, not 2 — the frame extracted below, at
+`0:12`, is one of them. `chapters.txt` only shows 2 lines because
+`format_chapters` deliberately drops any chapter mark within
+`MIN_CHAPTER_GAP_SECS` (10s, `chapters.rs:499`) of the previous surviving
+one (`chapters.rs:548`) — a readable YouTube-description chapter list, not
+an inventory of every dwell in the video. With the dwells packed back to
+back (scroll budget was entirely consumed by dwell time, see above), most of
+the 12 collapsed under that 10s filter; only the two spaced far enough apart
+survived into the text file.
+
+A frame extracted at `0:12` (`ffmpeg -ss 12.5 -i scrollcast.mp4 -frames:v 1
+…`) shows a real callout card composited over the scrolling sheet: a dark
+banner reading `MARKED — 0000056` with the detail line `commit #86: do the
+thing, take 86 · Grace Hopper · Mar 22 9:00 PM` beneath it — confirming the
+encode lane's callout-card path is live, not just chapters.txt text.
+
 ### `--out` and this repo's `.gitignore` — why some in-repo paths are refused
 
 `--out` is checked against this repository's own working tree before
@@ -126,33 +223,29 @@ too, alongside the `--duration`/`--width` checks below.
 
 ## Known gaps in this build
 
-Three things worth knowing before assuming a flag does what its name
-suggests. All three are explained in full, with file:line citations, in
-`main.rs`'s top doc comment; this is the short version.
+Two things worth knowing before assuming a flag does what its name suggests.
+Both are explained in full, with file:line citations, in `main.rs`'s top doc
+comment; this is the short version.
 
-1. **Pivot callouts (merges, tags, month boundaries) don't fire yet.**
-   Detecting them needs a real commit id, a real Unix timestamp, and real
-   ref names/kinds aligned to each node's pixel position. The capture stage
-   now extracts a per-commit summary/author/date-text/has-refs/is-merge
-   record off the rendered sheet (`CaptureResult::commit_metas`), but that
-   record is display text read off already-rendered markup, not the
-   underlying data — it cannot honestly be turned into what pivot detection
-   needs (see `main.rs`'s top doc comment, gap 1, for exactly which fields
-   are and are not recoverable and why). `chapters.txt` is still written
-   every run, but today it only ever contains the mandatory `0:00 Start`
-   line — there are no mid-video chapter marks or on-screen callout cards
-   yet. `--max-pivots` is accepted and stored for when this is wired up, but
-   has no effect in this build.
-2. **`--date-overlay` is parsed but not drawn.** Burning a marker into every
+1. **`--date-overlay` is parsed but not drawn.** Burning a marker into every
    frame needs a hook in the frame-cropping step that doesn't exist yet.
    Passing the flag prints a warning and otherwise changes nothing about the
    output.
-3. **`--width` must currently be `1920`.** The encoder's camera is a fixed
+2. **`--width` must currently be `1920`.** The encoder's camera is a fixed
    1920×1080; any other *requested* width is rejected at startup (before any
    capture work runs) rather than partway through the pipeline. The
    *captured* width is checked again, separately, right after capture
    returns — see "Fails fast, not partway through" below for why both checks
    exist.
+
+Pivot callouts (merges, ref badges, month boundaries) **do fire** —
+`chapters::detect_pivots_from_meta` consumes the capture stage's
+sheet-derived `CommitMeta` (summary/author/date-text/has-refs/is-merge) and
+feeds real pivots to both the timeline (dwells) and the encoder's callout
+cards. This was previously an open gap in this doc; it was closed in an
+earlier repair round and confirmed end-to-end in the run below — see
+"Verified end-to-end" for what an actual `chapters.txt` and callout frame
+look like out of a real run, not just what the code is supposed to do.
 
 ## Fails fast, not partway through
 

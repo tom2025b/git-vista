@@ -321,9 +321,9 @@ pub struct RemoteRefUpdate {
 /// branch on (M2.20c, #229) — the same contract, and the same honesty about
 /// its limits, as [`AmendFailureKind`] above.
 ///
-/// Two of these are **observed facts**, not heuristics: [`Self::Cancelled`]
+/// One of these is an **observed fact**, not a heuristic: [`Self::Cancelled`]
 /// is set because *this server* killed the child on an operator's cancel
-/// request, and it is never inferred from output. The remaining three are
+/// request, and it is never inferred from output. The remaining four are
 /// classified from git's stderr against a documented marker set (see
 /// `planner::fetch::classify_failure`), which is gettext-translated under a
 /// non-English locale and version-dependent — so a failure that does not
@@ -337,6 +337,13 @@ pub enum FetchFailureKind {
     /// (HTTP 401, or a rejected SSH key). Actionable: the user configures a
     /// credential helper or an SSH agent on the host — this server never
     /// prompts, and since #228 it cannot be made to (`-c core.askpass=`).
+    ///
+    /// This is genuinely the case that "no credential helper is configured"
+    /// or "the configured one has nothing to offer" describes. It is
+    /// deliberately **not** the case below — see
+    /// [`Self::CredentialHelperBlocked`]'s doc comment for the distinction,
+    /// which matters because this variant's own advice ("configure a
+    /// credential helper") is *wrong* for that other case.
     AuthenticationFailed,
     /// The remote could not be reached at all: connection refused, no route,
     /// DNS failure, timeout. Actionable: a network problem, not a repository
@@ -346,6 +353,30 @@ pub enum FetchFailureKind {
     /// an authenticated user, upload-pack disabled. Actionable: the remote's
     /// configuration or the user's access to it, not the local repository.
     RemoteRejected,
+    /// A credential helper *is* configured, but crashed before it could run
+    /// because this server's sandbox denies it the file it needs just to
+    /// start — not because the user never configured one.
+    ///
+    /// Distinct from [`Self::AuthenticationFailed`] on purpose (#325 lane 4):
+    /// git's own fallback message for this case ("could not read Username")
+    /// already matches that variant's marker set, which would tell the user
+    /// to do the one thing that's already done. Concretely, on this host the
+    /// global `credential.helper = !gh auth git-credential` crashes with
+    /// `failed to create root command: failed to read configuration: open
+    /// ~/.config/gh/config.yml: permission denied`, because the sandbox's
+    /// Network tier withholds `~/.config/gh` wholesale — it holds
+    /// `hosts.yml`, the operator's OAuth token, and there is no file-level
+    /// carve-out for the plain-prefs half of that directory
+    /// (`sandbox::DEFAULT_SECRET_EXCLUDES`; predicted and flagged, unresolved,
+    /// in the original M1.13b sandbox design doc under "F2"). Actionable: use
+    /// an `ssh://` remote instead — the sandbox's SSH agent-socket and
+    /// `known_hosts` carve-outs (#188, `sandbox::ssh_remote`) are the one
+    /// credential path this server's Network tier actually admits end to end
+    /// (`docs/SECURITY_MODEL.md`'s implemented-vs-aspirational table).
+    /// Widening the `.config/gh` exclusion is a real sandbox weakening (every
+    /// Network-tier spawn, including a hostile hook from a served repo, would
+    /// gain read access to the OAuth token) and is out of scope here.
+    CredentialHelperBlocked,
     /// An operator cancelled the operation and the server terminated the
     /// running `git fetch`. `updated_refs` on the error body says whether
     /// anything had already moved.
@@ -424,11 +455,12 @@ pub struct PullRequest {
 /// Three groups, and the distinction between them is the point:
 ///
 ///  * **The fetch half failed.** [`Self::AuthenticationFailed`],
-///    [`Self::RemoteUnreachable`], [`Self::RemoteRejected`] and
-///    [`Self::Other`] are the same taxonomy [`FetchFailureKind`] already
-///    defines, mapped across one-to-one so a client that already handles a
-///    failed fetch handles a failed pull's fetch half identically. Nothing was
-///    integrated, so the checked-out branch never moved.
+///    [`Self::RemoteUnreachable`], [`Self::RemoteRejected`],
+///    [`Self::CredentialHelperBlocked`] and [`Self::Other`] are the same
+///    taxonomy [`FetchFailureKind`] already defines, mapped across
+///    one-to-one so a client that already handles a failed fetch handles a
+///    failed pull's fetch half identically. Nothing was integrated, so the
+///    checked-out branch never moved.
 ///  * **The integration half failed.** [`Self::Conflict`] and
 ///    [`Self::ConflictLeftInProgress`] are *observed* states of the
 ///    repository, not classifications of git's prose — see each variant.
@@ -451,6 +483,11 @@ pub enum PullFailureKind {
     /// The remote answered and refused — the
     /// [`FetchFailureKind::RemoteRejected`] case.
     RemoteRejected,
+    /// A credential helper is configured but the sandbox blocked its own
+    /// startup — the [`FetchFailureKind::CredentialHelperBlocked`] case; see
+    /// its doc comment for why this is distinct from
+    /// [`Self::AuthenticationFailed`].
+    CredentialHelperBlocked,
     /// An operator cancelled the operation. `updated_refs` says whether the
     /// fetch half had already moved anything; the integration half never ran,
     /// so the checked-out branch is untouched.

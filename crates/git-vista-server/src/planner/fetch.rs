@@ -74,6 +74,36 @@ pub(super) fn classify_failure(stderr: &str) -> FetchFailureKind {
     // (`Authentication failed` from HTTP, `Permission denied` from SSH).
     let s = stderr.to_ascii_lowercase();
 
+    // --- credential helper blocked by this server's own sandbox --------
+    // Checked *before* the generic authentication markers below, and it has
+    // to be: this host's configured HTTPS credential helper
+    // (`credential.helper = !/usr/bin/gh auth git-credential`, global
+    // `~/.gitconfig`) crashes on startup when the sandbox's Network tier
+    // withholds `~/.config/gh` (`sandbox::DEFAULT_SECRET_EXCLUDES` — it
+    // holds `hosts.yml`, the OAuth token, with no file-level carve-out for
+    // the rest of the directory). Reproduced end to end (#325 lane 4,
+    // 2026-08-05): a real `git ls-remote` against a live 401 challenge, with
+    // this exact broken helper wired in, produces git falling back to its
+    // own generic line —
+    //   fatal: could not read Username for '...': No such device or address
+    // — on the *same* stderr as gh's own crash. That generic fallback
+    // already matches the "could not read username" marker in the
+    // authentication block below, which would classify this
+    // `AuthenticationFailed` and tell the user to "configure a credential
+    // helper" — advice that is false here, since one is configured. `gh`'s
+    // crash text is the more specific, and more true, signal, so it is
+    // checked first and wins.
+    // Two independent markers: gh's own Cobra-wrapper crash text (stable
+    // across the versions checked, but a future `gh` release could reword
+    // it), and the underlying mechanism — the excluded directory's name next
+    // to a permission refusal — which stays true regardless of gh's wording
+    // as long as the sandbox is what is doing the excluding.
+    if s.contains("failed to create root command")
+        || (s.contains(".config/gh") && s.contains("permission denied"))
+    {
+        return FetchFailureKind::CredentialHelperBlocked;
+    }
+
     // --- authentication -------------------------------------------------
     // HTTP: `fatal: Authentication failed for 'https://…'`.
     // HTTP with askpass forced off (#228): `could not read Username for …`.
@@ -562,6 +592,54 @@ mod tests {
                  returned error: 403"
             ),
             FetchFailureKind::AuthenticationFailed
+        );
+    }
+
+    /// #325 lane 4: the exact combined stderr a real `git ls-remote` produced
+    /// against a live HTTP `401` challenge, with `credential.helper = !gh
+    /// auth git-credential` wired in and `gh`'s own config unreadable
+    /// (reproduced by denying `~/.config/gh/config.yml`, the same errno
+    /// shape — `EACCES` — the sandbox's Landlock policy produces for an
+    /// excluded path). Pinned verbatim rather than paraphrased, so this test
+    /// fails if `gh`'s crash wording ever drifts far enough to stop matching.
+    ///
+    /// Also proves the ordering claim in `classify_failure`'s own comment:
+    /// this same string contains "could not read username" (the generic
+    /// auth marker) *and* "failed to create root command" (the specific
+    /// one) — without the specific check running first, this would silently
+    /// classify as [`FetchFailureKind::AuthenticationFailed`] instead, which
+    /// is why that ordering is asserted here rather than merely described.
+    #[test]
+    fn a_sandboxed_gh_credential_helper_crash_classifies_distinctly_from_generic_auth() {
+        let stderr = "failed to create root command: failed to read configuration: open \
+                       /home/tom/.config/gh/config.yml: permission denied\n\n\
+                       fatal: could not read Username for 'http://127.0.0.1:19191': No such \
+                       device or address";
+        assert!(
+            stderr
+                .to_ascii_lowercase()
+                .contains("could not read username"),
+            "fixture must still trip the generic auth marker, or this test \
+             is not proving the ordering it claims to"
+        );
+        assert_eq!(
+            classify_failure(stderr),
+            FetchFailureKind::CredentialHelperBlocked
+        );
+    }
+
+    /// The mechanism-based marker (directory name + "permission denied")
+    /// catches the same failure even if `gh`'s wrapper wording changes —
+    /// tested independently of the Cobra preamble so a future `gh` version
+    /// bumping "failed to create root command" does not silently fall back
+    /// to `AuthenticationFailed` with no test noticing.
+    #[test]
+    fn the_config_gh_permission_denied_marker_is_independent_of_ghs_wrapper_text() {
+        assert_eq!(
+            classify_failure(
+                "some future gh: open /home/tom/.config/gh/config.yml: permission denied"
+            ),
+            FetchFailureKind::CredentialHelperBlocked
         );
     }
 }
