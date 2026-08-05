@@ -639,6 +639,11 @@ pub(super) fn graph_canvas(
             {menu::menu_view(features, settings, read_only)}
             {dialogs::commit_dialog_view(features)}
             {dialogs::confirm_modal_view(features)}
+            // #232: the pull strategy picker is a fourth modal rather than an
+            // arm of `confirm_modal_view` — see its doc comment; the short
+            // version is that it exists precisely to supply the field a
+            // `PendingOp::Pull` cannot be built without.
+            {dialogs::pull_picker_view(features)}
             {dialogs::error_modal_view(features)}
             {detail::detail_panel_view(features, settings, detail, ctx)}
             {activity::activity_panel_view(features, settings, read_only)}
