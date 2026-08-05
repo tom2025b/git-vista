@@ -145,10 +145,32 @@ pub(super) async fn remote_tracking_refs(
     if !output.status.success() {
         return Err(stderr_or(&output, "git for-each-ref failed."));
     }
+    // `refs/remotes/<remote>/HEAD` is excluded, and that exclusion is
+    // load-bearing rather than cosmetic. It is a *symbolic* ref pointing at
+    // one of the branch refs already in this map, so counting it reports a
+    // single branch movement twice — once as `origin/main`, once as
+    // `origin/HEAD` shadowing it. Worse, whether it appears at all is a
+    // git-version difference: git 2.54 writes it during `fetch`, git 2.43
+    // does not, so including it makes the observed result depend on the git
+    // on the host. CI (2.54) failed five fetch tests that passed locally
+    // (2.43) for exactly this reason. A remote-tracking *branch* is what a
+    // transfer moves; the symref is bookkeeping about which branch is default.
+    //
+    // This filter arrived on `main` in `e80d647` while this function still
+    // lived in `fetch.rs`. Hoisting the function into this shared module (so
+    // fetch, pull and push observe refs identically) moved the code out from
+    // under that fix, and the merge presented it as an add/add conflict whose
+    // HEAD side was empty — resolving it the obvious way would have dropped
+    // the filter silently. It is restored here so all three transfer paths
+    // inherit it, which is the point of sharing the function at all.
+    let head_symref = format!("{prefix}HEAD");
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
             let (name, oid) = line.trim().split_once(' ')?;
+            if name == head_symref {
+                return None;
+            }
             Some((name.to_string(), oid.to_string()))
         })
         .collect())
