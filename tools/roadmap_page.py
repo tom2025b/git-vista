@@ -146,7 +146,7 @@ def fetch_cut_counts(milestones: list[dict], warnings: list[str]) -> dict[str, i
 
 def fetch_merged_last_24h(warnings: list[str]) -> int | None:
     ok, out = run_gh([
-        "pr", "list", "--state", "merged", "--limit", "30", "--json", "mergedAt",
+        "pr", "list", "--state", "merged", "--limit", "200", "--json", "mergedAt",
     ])
     if not ok:
         warnings.append(f"merged PRs: {out}")
@@ -168,6 +168,12 @@ def fetch_merged_last_24h(warnings: list[str]) -> int | None:
             continue
         if dt >= cutoff:
             count += 1
+    # If every fetched PR is inside the window, the true count may exceed the
+    # fetch limit — report the floor honestly instead of presenting it as exact.
+    if prs and count == len(prs):
+        warnings.append(
+            f"merged PRs: all {count} fetched rows are within 24h — count is a floor, not exact"
+        )
     return count
 
 
@@ -219,8 +225,14 @@ def build_rows(
         # work must never look like finishing it (the night of ADR 0049
         # taught exactly that lesson on this exact page's numbers).
         closed = closed_raw - cut
-        open_ = int(m.get("open_issues") or 0)
-        review = review_overrides.get(key, 0)
+        open_raw = int(m.get("open_issues") or 0)
+        # --review describes a SUBSET of the open issues (an issue with an
+        # open PR against it is still an open issue in GitHub's count), so it
+        # must be carved OUT of open, never added beside it — adding was a
+        # double-count that inflated every total the tiles showed. Clamped so
+        # an override larger than reality cannot push open negative.
+        review = min(review_overrides.get(key, 0), open_raw)
+        open_ = open_raw - review
         rows.append({
             "key": key,
             "theme": theme,
@@ -757,12 +769,14 @@ def run_selftest() -> int:
     # Expected fixture arithmetic, computed independently of build_rows/
     # compute_tiles so the test isn't just re-asserting its own inputs:
     #   closed_total = 39 + 24 + 0 + 0(M7 all cut) + 0(M4 both cut) = 63
-    #   total_total  = 39 + (24+3+28) + 5 + 0(M7) + 4(M4 open)       = 103
-    #   pct          = round(100*63/103)                              = 61
+    #   M2's 3 in-review are a SUBSET of its 28 open (open shows 25),
+    #   so M2's total is 24+3+25 = 52, not 55:
+    #   total_total  = 39 + 52 + 5 + 0(M7) + 4(M4 open)              = 100
+    #   pct          = round(100*63/100)                              = 63
     #   (cuts excluded from BOTH numerator and denominator — removing
     #    scope must never move the progress number in either direction)
     expected_closed_total = 63
-    expected_total_total = 103
+    expected_total_total = 100
     expected_pct = round(100 * expected_closed_total / expected_total_total)
 
     check(f"closed_total == {expected_closed_total}", tiles["closed_total"] == expected_closed_total)
@@ -784,6 +798,8 @@ def run_selftest() -> int:
         check("DATA has M1, M2, M3, M4, M7", got_keys == {"M1", "M2", "M3", "M4", "M7"})
         m2 = next((d for d in data if d["v"] == "M2"), None)
         check("M2 review override (3) reflected in DATA", m2 is not None and m2["review"] == 3)
+        check("M2 open shows 25 — review carved OUT of open, not double-counted",
+              m2 is not None and m2["open"] == 25)
         m1 = next((d for d in data if d["v"] == "M1"), None)
         check("M1 state == Shipped", m1 is not None and m1["state"] == "Shipped")
         # The honesty checks ADR 0049 earned: cuts are not progress.
