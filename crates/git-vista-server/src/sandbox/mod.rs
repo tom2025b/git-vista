@@ -727,16 +727,20 @@ pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         // here — they are classified here because reaching a remote is what
         // the server decided to do.
         //
-        // M2.20a (#227) added the second and third. Neither executes yet
-        // (#229/#230 own that), and it would have been tempting to classify
-        // an operation that never spawns anything as `Local` "for now". That
-        // would be the exact mistake this match exists to prevent: the
-        // declaration is what picks the tier for the spawn, so a `Local`
-        // placeholder would be a *wrong* answer sitting in the live data path
-        // waiting for execution to arrive, and the arm that had to change
-        // would be in this file rather than in the slice that wires the
-        // socket. Classify by what the operation *is*, not by whether it runs
-        // today.
+        // M2.20a (#227) added the second and third before either executed,
+        // and it would have been tempting to classify an operation that never
+        // spawned anything as `Local` "for now". That would have been the
+        // exact mistake this match exists to prevent: the declaration is what
+        // picks the tier for the spawn, so a `Local` placeholder would be a
+        // *wrong* answer sitting in the live data path waiting for execution
+        // to arrive, and the arm that had to change would be in this file
+        // rather than in the slice that wires the socket. Classify by what
+        // the operation *is*, not by whether it runs today.
+        //
+        // That paid off exactly as intended in M2.20c (#229): wiring
+        // `exec_fetch` needed **no change here at all** — the `Remote`
+        // declaration this arm already carried is what routed the first real
+        // fetch through the network tier and #228's askpass hardening.
         GitOperation::PushBranch { .. } => NetworkNeed::Remote,
         // `git fetch <remote>` — the whole operation is a network round trip;
         // `RiskLevel::Safe` says nothing local can be lost, which is an

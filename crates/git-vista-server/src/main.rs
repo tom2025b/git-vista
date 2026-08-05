@@ -111,7 +111,10 @@ use handlers::branch::{
 use handlers::clone::{clone_repo, clone_status, delete_clone_repo};
 use handlers::commit::{amend_commit, create_commit, stage_all, unstage_all};
 use handlers::discard::{delete_untracked_paths, discard_tracked_paths};
+use handlers::fetch::fetch_remote;
+use handlers::plan::plan_operation;
 use handlers::protocol::protocol_info;
+use handlers::pull::pull_branch;
 use handlers::read::{
     commit_detail, commit_diff, commits, file_at_commit, frame, head_branch, worktree_status,
     worktree_status_v2,
@@ -406,6 +409,12 @@ fn api_router(
         // alongside the v1 shape above — not a replacement. See handlers::read
         // for why both exist side by side.
         .route("/api/status/v2", get(worktree_status_v2))
+        // M2.21b (#236): every tag with the metadata the `/api/frame` ref
+        // badges throw away — lightweight vs annotated, the peeled target, and
+        // an annotated tag's own object, tagger and message. A read of
+        // committed, published history like `/api/frame`, so it is registered
+        // on the LAN router too; it never discloses working-tree state.
+        .route("/api/tags", get(handlers::tags::tag_list))
         // Activity/Undo feature, step 3: the chronological event feed —
         // journal + reflogs + snapshot diffs, folded and attributed.
         .route("/api/activity", get(activity::activity_feed))
@@ -463,6 +472,19 @@ fn api_router(
             // Issue #33 follow-up: branch operations, each shelling out to git.
             .route("/api/merge", post(merge_branch))
             .route("/api/push", post(push_branch))
+            // M2.20c (#229, ADR 0043): fetch from a configured remote. The
+            // first write here that can take a minute, so it is also the
+            // first one whose progress is worth streaming and whose
+            // cancellation has to actually kill a process — see
+            // `planner::fetch` and the cancel route below.
+            .route("/api/fetch", post(fetch_remote))
+            // M2.20d (#230, ADR 0044): fetch and then integrate. Its own route
+            // rather than a flag on `/api/fetch`, because it is a different
+            // operation with a different risk (a fetch is additive; a pull
+            // moves the checked-out branch) and — the reason that matters —
+            // its request body carries the mandatory merge/rebase strategy a
+            // fetch has no field for.
+            .route("/api/pull", post(pull_branch))
             .route("/api/delete-branch", post(delete_branch))
             // iPad-testing follow-up: switch HEAD to a branch (`git checkout`).
             .route("/api/checkout", post(checkout_branch))
@@ -480,6 +502,14 @@ fn api_router(
             // the second with no journal-backed undo at all.
             .route("/api/discard-tracked-paths", post(discard_tracked_paths))
             .route("/api/delete-untracked-paths", post(delete_untracked_paths))
+            // M2.23d (#248, ADR 0046): build one reviewable Plan and hand it
+            // back — the only endpoint that mints a plan without running it,
+            // and what the MCP `plan_*` tools call. Registered here with the
+            // writes, not with the reads, for two independent reasons: it is
+            // the front half of a mutation (a plan is an approval token, not
+            // a report), and a LAN visualize session must never see one
+            // (ADR 0005). Executing an approved plan is #249's own route.
+            .route("/api/plan", post(plan_operation))
             // M1.08 (#61): what happened to one write, and its live progress.
             // Registered with the writes, not the reads — these describe write
             // outcomes, so the LAN router must never see them either (ADR 0005).
@@ -490,6 +520,15 @@ fn api_router(
             .route(
                 "/api/operations/{id}/events",
                 get(handlers::operations::operation_events),
+            )
+            // M2.20c (#229): ask a running operation to stop — it kills the
+            // running child process, so it is a write (it changes what the
+            // server does), not a read of a write's outcome like the two
+            // routes above it, and carries the full session + CSRF posture
+            // like every other POST here.
+            .route(
+                "/api/operations/{id}/cancel",
+                post(handlers::operations::cancel_operation),
             );
     }
 
@@ -670,20 +709,34 @@ mod tests {
             Arc::new(CursorCodec::new()),
         );
         let cookie = bootstrap_cookie(router.clone(), "192.168.1.42:8080", &token).await;
-        let resp = router
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/commit")
-                    .header(header::HOST, "192.168.1.42:8080")
-                    .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
-                    .header(header::COOKIE, cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // `/api/plan` (M2.23d, #248) is checked here beside `/api/commit`:
+        // it mutates nothing, but it mints the approval token #249's submit
+        // stage accepts, and it reveals the repository's live generation,
+        // preconditions and expected ref changes. A LAN visualize session
+        // must not be able to ask for one — ADR 0005 says the route is never
+        // *built* on this router, and a 404 is what proves that (a 403 would
+        // mean it exists and something gated it).
+        for path in ["/api/commit", "/api/plan"] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .header(header::HOST, "192.168.1.42:8080")
+                        .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                        .header(header::COOKIE, cookie.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{path} is registered on the LAN router"
+            );
+        }
     }
 
     #[tokio::test]
@@ -704,12 +757,65 @@ mod tests {
         let cookie = bootstrap_cookie(router.clone(), "localhost:8080", &token).await;
         // /api/commit is registered POST-only; a GET reaches real routing and
         // gets axum's own 405 -- proving the path exists, in contrast to the
-        // LAN router's 404 above.
+        // LAN router's 404 above. This is the paired positive for the LAN
+        // test: without it, a `/api/plan` route deleted outright would still
+        // 404 there and the LAN assertion would pass vacuously.
+        for path in ["/api/commit", "/api/plan"] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .header(header::HOST, "localhost:8080")
+                        .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                        .header(header::COOKIE, cookie.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{path} is not registered on the loopback router"
+            );
+        }
+    }
+
+    /// M2.21b (#236) end to end: a real request through the real router — auth
+    /// gate, contract layer, route table, handler, `git_vista_git::read_tags`,
+    /// and the `TagDetail` mapping — against a repository on disk.
+    ///
+    /// The expectations are written as literal wire JSON compared against
+    /// values read back out of git itself (`rev-parse`, `cat-file`), never
+    /// against anything the mapping code produced, so the assertion cannot be
+    /// satisfied by a mapping that is merely self-consistent.
+    #[tokio::test]
+    async fn api_tags_reports_both_tag_kinds_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = handlers::tags::tests::build_tagged_fixture(dir.path());
+        let repo_id = &fixture.repo_id;
+
+        let sessions = Arc::new(SessionManager::new(None));
+        let token = sessions.current_bootstrap();
+        let session_state = SessionState {
+            manager: sessions,
+            via_lan: false,
+            rate_limiter: None,
+        };
+        let router = api_router(
+            session_state,
+            HostPolicy::loopback(PORT),
+            true,
+            Arc::new(CursorCodec::new()),
+        );
+        let cookie = bootstrap_cookie(router.clone(), "localhost:8080", &token).await;
         let resp = router
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/api/commit")
+                    .uri(format!("/api/tags?repo={repo_id}"))
                     .header(header::HOST, "localhost:8080")
                     .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
                     .header(header::COOKIE, cookie)
@@ -718,6 +824,50 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "as the client sees it, a tag listing is never cacheable. Note this \
+             is `security::require_auth`'s doing — it overwrites Cache-Control \
+             on every authenticated API response — so this cannot fail if the \
+             handler alone stops setting it; that case is covered by \
+             `handlers::tags::tests::the_handler_itself_marks_the_listing_no_store`"
+        );
+        let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            body,
+            serde_json::json!([
+                {
+                    "name": "tip-marker",
+                    "kind": "lightweight",
+                    "target": fixture.tip,
+                    // Absence as absence: a lightweight tag genuinely has no
+                    // object, no tagger and no message.
+                    "tag_object": null,
+                    "tagger": null,
+                    "message": null,
+                    "signature": "unsigned",
+                },
+                {
+                    "name": "v1.0",
+                    "kind": "annotated",
+                    // The peeled commit, not the tag object — the two are
+                    // asserted to differ below.
+                    "target": fixture.root,
+                    "tag_object": fixture.tag_object,
+                    "tagger": fixture.tagger,
+                    "message": "one\n\nrelease notes",
+                    "signature": "unsigned",
+                }
+            ])
+        );
+        assert_ne!(
+            fixture.tag_object, fixture.root,
+            "an annotated tag's object and its target must be different objects, \
+             or the assertion above would pass for a handler that never peeled"
+        );
     }
 }

@@ -39,8 +39,8 @@ use git_vista_core::identity::{GenerationInputs, RepositoryId};
 use git_vista_core::seed::{parse_seed, reset_plan, Seed};
 use git_vista_protocol::{
     AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitMessage, CommitOid,
-    ForcePublish, GenerationToken, GitOperation, IdempotencyKey, OperationHash, OperationStage,
-    Plan, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
+    ForcePublish, GenerationToken, GitOperation, IdempotencyKey, MergeStrategy, OperationHash,
+    OperationStage, Plan, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
     RepositoryToken, RiskLevel, TagName, UnixSeconds, WorktreePath, WorktreeToken,
     IDEMPOTENCY_HEADER,
 };
@@ -312,12 +312,16 @@ pub(crate) async fn build_plan_only(
 ///   `held_at_build` is re-derived too, which reads a precondition that
 ///   silently broke during the review window (possible only for the
 ///   generation-invisible pair, `RemoteConfigured`/`SeedRecorded`) as
-///   built-stale: it flows to the executor's own legacy refusal instead of
-///   `enforce_fresh`'s — from the submitter's seat the two cases are
-///   genuinely indistinguishable, and both fail closed. Not just prose: the
-///   contract suite's two `review_window_*_drift_fails_closed_*` tests prove
-///   the refusal (and its byte-identity with the never-held case) for both
-///   generation-invisible preconditions, and
+///   built-stale — from the submitter's seat the two cases are genuinely
+///   indistinguishable, and both fail closed. *Which* refusal they fail
+///   closed with now depends on [`refuses_when_unmet_at_build`]:
+///   `SeedRecorded` still flows to the executor's own legacy refusal (the
+///   reset's 404), while `RemoteConfigured` is refused by `enforce_fresh`
+///   itself, because nothing downstream of it refuses at all (ADR 0047).
+///   Not just prose: the contract suite's two
+///   `review_window_*_drift_fails_closed_*` tests prove the refusal (and its
+///   byte-identity with the never-held case) for both generation-invisible
+///   preconditions, and
 ///   `a_generation_invisible_break_while_queued_is_refused_by_the_gates_live_recheck`
 ///   proves the re-derivation itself is load-bearing (emptying it passed the
 ///   whole suite before that test existed).
@@ -659,7 +663,13 @@ async fn observe_for_submission(repo: &Path, plan: &Plan) -> Observed {
 /// wouldn't classify as a repository, so it has no catalog entry) a fixed
 /// placeholder keeps the plan well-formed; execution then fails with git's own
 /// error exactly as the un-migrated handlers did.
-fn selection_tokens() -> (RepositoryToken, WorktreeToken) {
+///
+/// `pub(crate)` since M2.23d (#248) so `handlers::plan` mints a plan's tokens
+/// through the *same* function [`plan_and_execute`] does. A second, parallel
+/// derivation would be the one way `/api/plan` could hand back a plan whose
+/// tokens `submit_plan` (#249) then refuses as "built for a different
+/// repository or worktree" — a bug visible only across two slices.
+pub(crate) fn selection_tokens() -> (RepositoryToken, WorktreeToken) {
     match current_handle() {
         Some(handle) => (
             RepositoryToken::new(handle.repository.to_string())
@@ -843,7 +853,10 @@ async fn observe_live(repo: &Path) -> Observed {
 ///  2. **Preconditions**: every precondition that *held* at build time is
 ///     re-verified against the live repository. One that already failed at
 ///     build time is skipped here — the executor's own legacy guard refuses
-///     it with the exact wording it always had.
+///     it with the exact wording it always had — **unless**
+///     [`refuses_when_unmet_at_build`] says there is no such guard, in which
+///     case this gate refuses it itself. See that function for why the
+///     "skip it, the executor will catch it" rule needed an exception.
 async fn enforce_fresh(
     repo: &Path,
     plan: &Plan,
@@ -877,9 +890,91 @@ async fn enforce_fresh(
     for (i, precondition) in plan.preconditions.iter().enumerate() {
         if observed.held_at_build.get(i).copied().unwrap_or(false) {
             verify_precondition(repo, precondition, &live).await?;
+        } else if refuses_when_unmet_at_build(precondition) {
+            return Err(unmet_at_build(precondition));
         }
     }
     Ok(())
+}
+
+/// Whether a precondition that **already failed when the plan was built** must
+/// be refused *here*, instead of being skipped and left to the executor.
+///
+/// # Why this exception exists
+///
+/// [`enforce_fresh`]'s skip is not laziness — it is what keeps a genuinely
+/// unmet precondition producing git's own words rather than a second,
+/// paraphrased refusal. It rests on an assumption that was written down but
+/// never checked: *every* precondition that can fail at build time has an
+/// executor-side guard that refuses when it does. Create-branch's
+/// `RefAbsent` has one (`git branch` refuses an existing name), rebase's
+/// `CleanWorktree` has one (git refuses a dirty tree), the reset's
+/// `SeedRecorded` has one (`exec_reset_test_repo` re-reads the seed and 404s,
+/// pinned by `contract_suite`'s
+/// `review_window_seed_drift_fails_closed_with_the_never_recorded_refusal`).
+///
+/// [`Precondition::RemoteConfigured`] has none, and cannot have one, because
+/// **`git fetch`/`git pull`/`git push` do not refuse an unknown remote —
+/// they reinterpret it as a transport target.** Verified against git 2.43.0:
+/// `git fetch ghost.git`, with no such remote, fetches from the *directory*
+/// `ghost.git` and writes `FETCH_HEAD`. Before this arm existed the fetch
+/// endpoint then answered `200 … already up to date`, because the
+/// before/after diff of `refs/remotes/ghost.git/*` is empty for an ad-hoc
+/// target: a fetch that reached somewhere it was never authorised to, reported
+/// as a no-op. With a URL in the field the same path opened a real socket
+/// (`remote_boundary_suite` reproduces it against a listener).
+///
+/// So this is the one precondition whose failure must stop the pipeline, and
+/// the gate is the only place that can do it — the executor is precisely
+/// where the damage happens.
+///
+/// No wildcard arm, on purpose: a new [`Precondition`] variant fails to
+/// compile here until someone states which side it is on, and the contract
+/// suite pins the `true` set to an exact census so widening it is a visible
+/// edit rather than a side effect. The question each arm answers is narrow:
+/// *if this precondition is false and we run the executor anyway, does the
+/// executor refuse?*
+pub(crate) fn refuses_when_unmet_at_build(precondition: &Precondition) -> bool {
+    match precondition {
+        // git resolves an unknown remote as a URL or a path instead of
+        // refusing it. Nothing downstream says no. See above.
+        Precondition::RemoteConfigured { .. } => true,
+        // Every one of these is refused by the git command the executor runs
+        // (a missing ref, an occupied ref, the wrong checked-out branch, a
+        // dirty tree) or by the executor's own re-read (`SeedRecorded`), in
+        // that command's own words — which is strictly better than a
+        // paraphrase from here.
+        Precondition::RefAt { .. }
+        | Precondition::RefExists { .. }
+        | Precondition::RefAbsent { .. }
+        | Precondition::BranchCheckedOut { .. }
+        | Precondition::BranchNotCheckedOut { .. }
+        | Precondition::CleanWorktree
+        | Precondition::SeedRecorded => false,
+    }
+}
+
+/// The refusal [`refuses_when_unmet_at_build`] earns: a `409` naming the
+/// precondition that was already false when the plan was built.
+///
+/// `409` and not `400`: the request is well-formed, and the same request
+/// against the same repository with the remote configured would be accepted —
+/// this is a statement about the repository, which is what every other
+/// precondition refusal in `verify_precondition` is too.
+fn unmet_at_build(precondition: &Precondition) -> (StatusCode, String) {
+    let why = match precondition {
+        Precondition::RemoteConfigured { remote } => format!(
+            "Remote ‘{}’ is not configured in this repository — nothing was contacted. \
+             Add it with `git remote add`, or pick a remote this repository knows.",
+            remote.as_str()
+        ),
+        // Unreachable while `refuses_when_unmet_at_build` names exactly one
+        // arm; kept total rather than panicking, and worded so a future arm
+        // that forgets to add its own sentence still refuses honestly.
+        other => format!("A precondition of this plan does not hold: {other:?}."),
+    };
+    eprintln!("git-vista: refusing an unmet precondition: {why}");
+    (StatusCode::CONFLICT, why)
 }
 
 /// Check one [`Precondition`] against the live repository. `live` supplies the
@@ -1285,9 +1380,19 @@ async fn shape(
             // a millisecond ago. And it does not fall back to some
             // observation when the ref is unnameable — a lease with no
             // precondition would be a force push with a reassuring label,
-            // which is the one outcome `ForcePublish` exists to prevent, so
-            // an unnameable tracking ref yields no lease precondition *and*
-            // no execution (see `execute`'s refusal below).
+            // which is the one outcome `ForcePublish` exists to prevent.
+            //
+            // M2.20e (#231) moved where that last guarantee is kept, and the
+            // move is worth stating because the old sentence here cited a
+            // `501` in `execute` that no longer exists. Every `PushBranch`
+            // combination now executes, so "no precondition ⇒ no execution"
+            // is no longer true by refusal — it is true because
+            // `planner::push::verify_lease` re-derives
+            // `refs/remotes/<remote>/<branch>` from the same two validated
+            // newtypes and refuses `409` on its own, whether or not this
+            // function managed to name the ref. The lease is checked before a
+            // socket exists either way; what changed is that the check lives
+            // beside the spawn rather than in a stub next to it.
             //
             // A `match` rather than an `if let`: should `ForcePublish` ever
             // grow a third variant, this stops compiling instead of silently
@@ -1534,9 +1639,10 @@ async fn shape(
             };
             (RiskLevel::Destructive, preconditions, changes, recovery)
         }
-        // M2.20a (#227): contract only — see each variant's doc comment in
-        // `plan.rs` for the reasoning behind every choice below. Execution is
-        // #229's and #230's; `execute` refuses both today.
+        // M2.20a (#227) shaped both of these — see each variant's doc comment
+        // in `plan.rs` for the reasoning behind every choice below. Fetch now
+        // executes (M2.20c, #229, ADR 0043) against exactly this plan; pull's
+        // executor is still #230's, and `execute` refuses it.
         //
         // A fetch moves only `refs/remotes/<remote>/*`, and *which* of them
         // is not knowable until git has spoken to the remote — so there is no
@@ -1757,39 +1863,37 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         GitOperation::CheckoutBranch { branch } => {
             exec_checkout(repo, need, &branch, &observed).await
         }
-        GitOperation::MergeBranch { branch } => exec_merge(repo, need, &branch, &observed).await,
-        // M2.20a (#227) widened `PushBranch` with `set_upstream` and `force`.
-        // Only the combination that existed before — no upstream write, no
-        // force — executes; it runs the byte-identical argv `/api/push` has
-        // always run, so this slice changes no live behaviour.
-        //
-        // The other combinations refuse. Not because a `501` is tidy, but
-        // because the alternative is worse in a specific way: an arm that
-        // ignored the new fields and ran a plain push would execute an
-        // operation the user did *not* approve — they asked for
-        // `--force-with-lease` and would silently get a fast-forward push
-        // whose failure they would then be tempted to resolve by hand. The
-        // plan's hash binds `force`; execution has to honour it or refuse.
+        GitOperation::MergeBranch { branch } => {
+            exec_merge(
+                repo,
+                need,
+                &RefName::from(&branch),
+                &observed,
+                IntegrationCaller::Direct,
+            )
+            .await
+        }
+        // M2.20a (#227) widened `PushBranch` with `set_upstream` and `force`;
+        // M2.20e (#231, ADR 0045) wired all four combinations through
+        // `planner::push`. **One arm, not one per combination**: the fields are
+        // passed down whole, so there is exactly one place that turns them into
+        // an argv (`push::push_argv`) and no path on which a mode the user
+        // approved could be silently dropped on the way to git.
         GitOperation::PushBranch {
             branch,
             remote,
-            set_upstream: false,
-            force: ForcePublish::None,
-        } => exec_push(repo, need, &branch, &remote).await,
-        GitOperation::PushBranch { .. } => (
-            StatusCode::NOT_IMPLEMENTED,
-            "Pushing with --set-upstream or --force-with-lease is not yet wired \
-             for execution (tracked by #231) — this plan's contract exists, but \
-             nothing executed it."
-                .to_string(),
-        ),
+            set_upstream,
+            force,
+        } => push::exec_push(repo, need, &branch, &remote, set_upstream, &force).await,
         GitOperation::DeleteBranch { branch } => {
             exec_delete(repo, need, &branch, &observed, false).await
         }
         GitOperation::ForceDeleteBranch { branch } => {
             exec_delete(repo, need, &branch, &observed, true).await
         }
-        GitOperation::RebaseOntoBase { base } => exec_rebase(repo, need, &base, &observed).await,
+        GitOperation::RebaseOntoBase { base } => {
+            exec_rebase(repo, need, &base, &observed, IntegrationCaller::Direct).await
+        }
         GitOperation::RestoreBranch { name, tip } => {
             exec_restore_branch(repo, need, &name, &tip).await
         }
@@ -1830,29 +1934,25 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
             expected_tip,
             allow_empty,
         } => exec_amend_commit(repo, need, &message, &expected_tip, allow_empty, &observed).await,
-        // M2.20a (#227) ships the typed contract for fetch and pull only —
-        // see their doc comments in `plan.rs`. Execution belongs to #229 and
-        // #230, deliberately, so that the first code in this server to open a
-        // socket with a user's credentials on it gets a review of its own
-        // rather than riding in on a vocabulary change.
-        //
-        // These arms exist because `execute`'s match must stay exhaustive
-        // over the closed vocabulary (#142). Nothing builds either operation
-        // today, so in practice they are unreachable — but reached, they must
-        // refuse rather than no-op silently or run a placeholder git command
-        // against a real repository and a real remote.
-        GitOperation::FetchRemote { .. } => (
-            StatusCode::NOT_IMPLEMENTED,
-            "Fetching from a remote is not yet wired for execution (tracked by \
-             #229) — this plan's contract exists, but nothing executed it."
-                .to_string(),
-        ),
-        GitOperation::PullBranch { .. } => (
-            StatusCode::NOT_IMPLEMENTED,
-            "Pulling from a remote is not yet wired for execution (tracked by \
-             #230) — this plan's contract exists, but nothing executed it."
-                .to_string(),
-        ),
+        // M2.20a (#227) shipped the typed contract for fetch and pull;
+        // M2.20c (#229, ADR 0043) wired *fetch* execution — the first code in
+        // this server to open a socket with a user's credentials on it, which
+        // is why it got a review of its own rather than riding in on the
+        // vocabulary change. `handlers::fetch::fetch_remote` builds the
+        // operation from `POST /api/fetch`.
+        GitOperation::FetchRemote { remote } => fetch::exec_fetch(repo, need, &remote).await,
+        // M2.20d (#230, ADR 0044) wired pull execution: the fetch half is
+        // `planner::fetch`'s own `run_fetch` — the same spawn, the same
+        // streamed progress, the same cancellation latch, never a second copy
+        // — and the integration half is `exec_merge`/`exec_rebase` above,
+        // dispatched on the `strategy` the reviewed plan carries.
+        // `handlers::pull::pull_branch` builds the operation from
+        // `POST /api/pull`.
+        GitOperation::PullBranch {
+            remote,
+            branch,
+            strategy,
+        } => pull::exec_pull(repo, need, &remote, &branch, strategy, &observed).await,
         // M2.21a (#235, ADR 0041) ships the typed tag contract only — the
         // same staging as fetch/pull above. Execution belongs to the later
         // M2.21 slices (#74): create/delete are their own slices, and the
@@ -2651,18 +2751,26 @@ async fn exec_unstage_all(repo: &Path, need: NetworkNeed) -> (StatusCode, String
     }
 }
 
-/// One `git <args…> <branch>` branch operation with the shared error posture
+/// One `git <args…> <ref>` branch operation with the shared error posture
 /// (stderr, then stdout, then a generic line) — the old `run_branch_op` core.
+///
+/// `target` is a [`RefName`] rather than a [`BranchName`] since M2.20d
+/// (#230): four of the five callers pass a local branch (converted for free —
+/// see `impl From<&BranchName> for RefName`), and the fifth is a pull's
+/// integration half, whose target is the remote-tracking name `origin/main`
+/// and never a local branch. Both newtypes carry the identical
+/// non-empty/not-option-shaped gate, so nothing about what may reach an argv
+/// changed; only the name of the thing being described did.
 async fn run_branch_cmd(
     repo: &Path,
     need: NetworkNeed,
     endpoint: &str,
     args: &[&str],
-    branch: &BranchName,
+    target: &RefName,
     ok_msg: String,
 ) -> (StatusCode, String) {
     let mut argv: Vec<&str> = args.to_vec();
-    argv.push(branch.as_str());
+    argv.push(target.as_str());
     let output = match run_git(repo, need, &argv).await {
         Ok(o) => o,
         Err(e) => return couldnt_run(endpoint, &e),
@@ -2692,7 +2800,7 @@ async fn exec_checkout(
         need,
         "/api/checkout",
         &["checkout"],
-        branch,
+        &RefName::from(branch),
         format!("checked out '{branch}'"),
     )
     .await;
@@ -2717,20 +2825,80 @@ async fn exec_checkout(
     resp
 }
 
-/// `git merge --no-edit <branch>` into the checked-out branch (`/api/merge`).
+/// Why an integration ([`exec_merge`] / [`exec_rebase`]) is running — and
+/// therefore what the activity feed must say happened (M2.20d, #230).
+///
+/// **The feed records the operation the user approved, not the git command
+/// that implemented it.** A pull's second half runs `git merge` or
+/// `git rebase`, but a user who pressed "Pull" never asked for a merge; a feed
+/// showing `Fetch` + `Merge` for one approved `PullBranch` describes an
+/// operation nobody submitted, and its undo hint would offer to undo half of
+/// it. So the caller says who it is, and the one entry names the pull and the
+/// strategy that ran.
+///
+/// A typed two-variant enum rather than a `bool` for ADR 0015's reason and one
+/// more: the `Pull` arm has to *carry* the strategy, which a flag could not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntegrationCaller {
+    /// `POST /api/merge` or `POST /api/rebase` — the user asked for exactly
+    /// this git operation, and the feed says exactly that. The wording every
+    /// existing entry already has.
+    Direct,
+    /// The integration half of `POST /api/pull` (M2.20d, #230). One
+    /// [`ActivityKind::Pull`] entry naming the strategy, replacing — never
+    /// accompanying — the `Merge`/`Rebase` entry the `Direct` arm writes.
+    Pull(MergeStrategy),
+}
+
+impl IntegrationCaller {
+    /// The `(kind, summary)` this caller's journal entry carries, given the
+    /// ref that was integrated and the branch it landed on.
+    fn journal_as(
+        self,
+        target: &RefName,
+        into: &str,
+        direct: (ActivityKind, String),
+    ) -> (ActivityKind, String) {
+        match self {
+            IntegrationCaller::Direct => direct,
+            IntegrationCaller::Pull(strategy) => (
+                ActivityKind::Pull,
+                format!(
+                    "pulled ‘{target}’ into ‘{into}’ ({} strategy)",
+                    strategy_word(strategy)
+                ),
+            ),
+        }
+    }
+}
+
+/// The wire spelling of a [`MergeStrategy`], for the one place a human reads
+/// it: the activity feed and the terminal message. Deliberately the same word
+/// the request body carries (`"merge"` / `"rebase"`), so what a user reads
+/// afterwards is what they can type to ask for it again.
+fn strategy_word(strategy: MergeStrategy) -> &'static str {
+    match strategy {
+        MergeStrategy::Merge => "merge",
+        MergeStrategy::Rebase => "rebase",
+    }
+}
+
+/// `git merge --no-edit <ref>` into the checked-out branch (`/api/merge`, and
+/// the merge half of `/api/pull`).
 async fn exec_merge(
     repo: &Path,
     need: NetworkNeed,
-    branch: &BranchName,
+    target: &RefName,
     observed: &Observed,
+    caller: IntegrationCaller,
 ) -> (StatusCode, String) {
     let resp = run_branch_cmd(
         repo,
         need,
         "/api/merge",
         &["merge", "--no-edit"],
-        branch,
-        format!("merged '{branch}' into HEAD"),
+        target,
+        format!("merged '{target}' into HEAD"),
     )
     .await;
     if resp.0 == StatusCode::OK {
@@ -2747,57 +2915,27 @@ async fn exec_merge(
         if new.same_observation(&observed.head_tip) {
             return (
                 StatusCode::OK,
-                format!("Already up to date — ‘{branch}’ has no commits the current branch doesn’t already have."),
+                format!("Already up to date — ‘{target}’ has no commits the current branch doesn’t already have."),
             );
         }
         let into = read_head_branch_blocking(repo)
             .await
             .unwrap_or_else(|| "HEAD".into());
+        let (kind, summary) = caller.journal_as(
+            target,
+            &into,
+            (
+                ActivityKind::Merge,
+                format!("merged ‘{target}’ into ‘{into}’"),
+            ),
+        );
         journal_app_event(
             repo,
-            ActivityKind::Merge,
+            kind,
             Some(into.clone()),
             observed.head_tip.clone(),
             new,
-            format!("merged ‘{branch}’ into ‘{into}’"),
-        )
-        .await;
-    }
-    resp
-}
-
-/// `git push <remote> <branch>` (`/api/push`).
-async fn exec_push(
-    repo: &Path,
-    need: NetworkNeed,
-    branch: &BranchName,
-    remote: &RemoteName,
-) -> (StatusCode, String) {
-    debug_assert_eq!(
-        need,
-        NetworkNeed::Remote,
-        "push is the one operation in the enum that reaches a remote; if it \
-         arrives here declared Local, `network_need_for_operation` is wrong and \
-         the sandbox will (correctly) deny the connect"
-    );
-    let resp = run_branch_cmd(
-        repo,
-        need,
-        "/api/push",
-        &["push", remote.as_str()],
-        branch,
-        format!("pushed '{branch}' to {remote}"),
-    )
-    .await;
-    if resp.0 == StatusCode::OK {
-        let tip = Obs::from_read(rev_parse(repo, branch.as_str()).await);
-        journal_app_event(
-            repo,
-            ActivityKind::Push,
-            Some(branch.as_str().to_string()),
-            Obs::Absent, // a push records only where the branch ended up
-            tip,
-            format!("pushed ‘{branch}’ to {remote}"),
+            summary,
         )
         .await;
     }
@@ -2826,7 +2964,7 @@ async fn exec_delete(
         need,
         endpoint,
         &["branch", flag],
-        branch,
+        &RefName::from(branch),
         format!("{verb} branch '{branch}'"),
     )
     .await;
@@ -2855,8 +2993,10 @@ async fn exec_rebase(
     need: NetworkNeed,
     base: &RefName,
     observed: &Observed,
+    caller: IntegrationCaller,
 ) -> (StatusCode, String) {
     let old = observed.head_tip.clone();
+    let target = base;
     let base = base.as_str();
 
     let output = match run_git(repo, need, &["rebase", base]).await {
@@ -2881,15 +3021,15 @@ async fn exec_rebase(
             );
         }
         println!("[/api/rebase] rebased HEAD onto {base}");
-        journal_app_event(
-            repo,
-            ActivityKind::Rebase,
-            Some(branch.clone()),
-            old,
-            new,
-            format!("rebased ‘{branch}’ onto {base}"),
-        )
-        .await;
+        let (kind, summary) = caller.journal_as(
+            target,
+            &branch,
+            (
+                ActivityKind::Rebase,
+                format!("rebased ‘{branch}’ onto {base}"),
+            ),
+        );
+        journal_app_event(repo, kind, Some(branch.clone()), old, new, summary).await;
         (StatusCode::OK, format!("Rebased onto {base}."))
     } else {
         let msg = stderr_stdout_or(&output, "git rebase failed.");
@@ -3827,6 +3967,115 @@ async fn exec_delete_untracked_paths(
 #[cfg(test)]
 mod contract_suite;
 
+/// git's `--progress` records, parsed once for both directions (M2.20c #229
+/// built it inside `fetch`; M2.20e #231 moved it here when push needed the same
+/// parser). One owner, because nothing fails loudly when a progress bar is
+/// subtly wrong — two copies would drift and no test would notice.
+mod transfer;
+
+/// M2.20c (#229): the fetch executor. Its own file rather than another
+/// `exec_*` in this one, because a fetch brings three concerns no other
+/// operation has — live progress parsing, cancellation, and a failure
+/// taxonomy — and they belong together.
+mod fetch;
+
+/// M2.20d (#230, ADR 0044): the pull executor. Its own file for the same
+/// reason `fetch` has one — a pull composes two halves with different failure
+/// vocabularies and a conflict-abort story neither half has on its own — and
+/// it deliberately owns *no* spawn of its own: the fetch comes from
+/// [`fetch::run_fetch`] and the integration from `exec_merge`/`exec_rebase`.
+mod pull;
+
+/// M2.20e (#231, ADR 0045): the push executor. Its own file for the reason
+/// `fetch` and `pull` have one, plus a sharper one: it is the only operation
+/// here that can make *another party's* commits unreachable, and the code that
+/// decides whether it may is worth reading in one piece.
+mod push;
+
+/// `POST /api/fetch`'s error-body constructor, re-exported so the handler's
+/// own request-shape refusals carry the same contract the executor's do.
+pub(crate) use fetch::error_body as fetch_error_body;
+
+/// `POST /api/pull`'s error-body constructor, re-exported for the same reason
+/// [`fetch_error_body`] is: the handler's request-shape refusals — above all
+/// the missing-`strategy` 400 that is #230's whole point — must parse as the
+/// endpoint's one error type, exactly like the executor's do.
+pub(crate) use pull::error_body as pull_error_body;
+
+/// Whether cancelling this operation can actually stop it (M2.20c, #229).
+///
+/// **This is a claim about [`execute`], not a wish.** An arm answering `true`
+/// promises that the executor it dispatches to takes
+/// [`crate::operations::cancel_signal`] and hands it to the process it
+/// spawns; anything else must answer `false`, because
+/// `POST /api/operations/{id}/cancel` reports its answer to an operator, and
+/// "cancelling…" for an operation nothing will ever stop is worse than a
+/// plain refusal.
+///
+/// No wildcard arm, on purpose: a new `GitOperation` variant fails to compile
+/// here until someone states which side it is on. The contract suite pins
+/// the `true` set to an exact census, so widening it is a visible edit rather
+/// than a side effect.
+///
+/// `FetchRemote`, `PullBranch` (M2.20d, #230) and `PushBranch` (M2.20e, #231)
+/// qualify — the three operations that move objects over a transport. Every
+/// other executor runs a git command that finishes in milliseconds; the
+/// machinery would be real but the window to use it would not, and a cancel
+/// endpoint that usually arrives too late teaches users to distrust it.
+///
+/// # What `true` means for a pull, exactly
+///
+/// A pull is a fetch plus an integration, and only the first half is long.
+/// `planner::pull` hands the latch to the same streaming spawn `planner::fetch`
+/// uses, so a cancel during the transfer SIGKILLs the child, and it reads the
+/// latch **once more** between the halves so a cancel that lands while the
+/// fetch is finishing stops the integration from ever starting. A cancel that
+/// arrives *during* `git merge`/`git rebase` is not honoured — those are
+/// millisecond-scale local commands and interrupting one is how a repository
+/// is left half-integrated. That is a narrower promise than fetch's, and it is
+/// the honest one: the cancellable window is where the time actually goes.
+///
+/// # And what it means for a push
+///
+/// Narrower still, and the difference is worth stating because it is not about
+/// this server's diligence. `planner::push` hands the latch to the same spawn,
+/// so a cancel kills `git push` promptly — but a push's effect is on a *remote*,
+/// and git records `refs/remotes/<remote>/<branch>` only after that remote has
+/// reported the update accepted. A cancel landing in between stops this
+/// repository from learning about a change that already happened elsewhere. So
+/// the promise is "the transfer stops", never "nothing was published", and
+/// `push::cancelled_response` says exactly that rather than the reassuring
+/// version.
+pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
+    match op {
+        GitOperation::FetchRemote { .. }
+        | GitOperation::PullBranch { .. }
+        | GitOperation::PushBranch { .. } => true,
+        GitOperation::CreateBranch { .. }
+        | GitOperation::CommitOnHead { .. }
+        | GitOperation::EmptyCommitOnBranch { .. }
+        | GitOperation::AmendCommit { .. }
+        | GitOperation::StageAll
+        | GitOperation::UnstageAll
+        | GitOperation::StageSelection { .. }
+        | GitOperation::CheckoutBranch { .. }
+        | GitOperation::MergeBranch { .. }
+        | GitOperation::DeleteBranch { .. }
+        | GitOperation::ForceDeleteBranch { .. }
+        | GitOperation::RebaseOntoBase { .. }
+        | GitOperation::RestoreBranch { .. }
+        | GitOperation::ResetBranch { .. }
+        | GitOperation::RevertCommit { .. }
+        | GitOperation::ResetTestRepo
+        | GitOperation::DiscardTrackedPaths { .. }
+        | GitOperation::DeleteUntrackedPaths { .. }
+        | GitOperation::CreateTag { .. }
+        | GitOperation::DeleteLocalTag { .. }
+        | GitOperation::DeleteRemoteTag { .. }
+        | GitOperation::PushTag { .. } => false,
+    }
+}
+
 #[cfg(test)]
 mod coordination_suite;
 
@@ -3834,6 +4083,30 @@ mod coordination_suite;
 // disconnected client.
 #[cfg(test)]
 mod lifecycle_suite;
+
+// M2.20c (#229): the fetch slice's behavioural tests — real spawns, real
+// cancellation, the dropped-connection replay, and redaction on the live path.
+#[cfg(test)]
+mod fetch_suite;
+
+// M2.20d (#230): the pull slice's behavioural tests — the merge-vs-rebase
+// history difference against one diverged fixture, the conflict abort, the
+// cancel that stops the integration starting, and the journal.
+#[cfg(test)]
+mod pull_suite;
+
+// M2.20e (#231): the push slice's behavioural tests — a real remote, the lease
+// refused in both of its two distinct ways, the upstream actually recorded,
+// live progress, and a cancel that stops the push.
+#[cfg(test)]
+mod push_suite;
+
+// The remote-target boundary (#229 follow-up, ADR 0047): a real listener that
+// must never be connected to, its paired positive control, and the
+// unconfigured-remote refusal — for fetch and for pull, which share the
+// machinery verbatim.
+#[cfg(test)]
+mod remote_boundary_suite;
 
 #[cfg(test)]
 mod tests {
@@ -4809,20 +5082,78 @@ mod tests {
         assert!(why.contains("no longer configured"), "{why}");
     }
 
-    /// A precondition that already failed at build time is *not* enforced here:
-    /// it flows to the executor's legacy guard so refusal texts stay exactly
-    /// what they always were.
+    /// A precondition that already failed at build time is *not* enforced
+    /// here: it flows to the executor's legacy guard, so refusal texts stay
+    /// exactly what they always were.
+    ///
+    /// # Why the example is `RefAbsent` and no longer `RemoteConfigured`
+    ///
+    /// This test used to make the same point with a never-configured push
+    /// remote, and it passed for a reason it did not check: it asserted the
+    /// gate steps aside without ever asserting anything catches the operation
+    /// afterwards. For `RemoteConfigured` nothing does — `git push`/`git
+    /// fetch` reinterpret an unknown remote as a transport target rather than
+    /// refusing it — so the test was pinning the mechanism of a real hole
+    /// (`planner::remote_boundary_suite`, ADR 0047) as if it were a
+    /// guarantee.
+    ///
+    /// The rule it states is still the rule, so it is kept and made
+    /// load-bearing instead of deleted: the example moves to `RefAbsent`,
+    /// where the executor's guard is real, and the second leg **proves** that
+    /// guard fires rather than assuming it. The exception is asserted
+    /// directly in the third leg, so the two halves of the policy are visible
+    /// in one place.
     #[tokio::test]
     async fn a_precondition_unmet_at_build_time_is_left_to_the_executor() {
         let (_dir, repo) = seeded_repo();
-        let op = GitOperation::PushBranch {
+        run(&repo, &["branch", "dup"]);
+        let op = GitOperation::CreateBranch {
+            name: BranchName::new("dup").unwrap(), // already exists
+            at: CommitOid::new(git_rev_parse_head(&repo).await).unwrap(),
+        };
+        let (plan, observed) = build_plan(&repo, op.clone(), tokens()).await;
+        assert!(
+            plan.preconditions
+                .iter()
+                .any(|p| matches!(p, Precondition::RefAbsent { .. })),
+            "CreateBranch no longer carries RefAbsent — this test's premise is gone"
+        );
+        assert!(
+            !observed.held_at_build.iter().any(|&h| h),
+            "the precondition must be unmet at build time, or the gate below \
+             is being asked the wrong question"
+        );
+
+        // Leg 1: the gate steps aside.
+        assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+
+        // Leg 2 — the leg this test was missing: something downstream really
+        // does refuse, in git's own words. Without it, "the gate steps aside"
+        // is only half a claim.
+        let (status, why) = plan_and_execute_in(&repo, None, tokens(), op).await;
+        assert!(
+            !status.is_success(),
+            "the executor's own guard must refuse the duplicate branch: {why}"
+        );
+        assert!(
+            why.contains("already exists"),
+            "expected git's own wording, got: {why}"
+        );
+
+        // Leg 3: the exception. `RemoteConfigured` has no such guard, so the
+        // gate must refuse it itself rather than stepping aside.
+        let push = GitOperation::PushBranch {
             branch: BranchName::new("main").unwrap(),
             remote: RemoteName::new("origin").unwrap(), // never configured
             set_upstream: false,
             force: ForcePublish::None,
         };
-        let (plan, observed) = build_plan(&repo, op, tokens()).await;
-        assert!(enforce_fresh(&repo, &plan, &observed).await.is_ok());
+        let (plan, observed) = build_plan(&repo, push, tokens()).await;
+        let (status, why) = enforce_fresh(&repo, &plan, &observed)
+            .await
+            .expect_err("an unconfigured remote must not reach the executor");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(why.contains("not configured"), "{why}");
     }
 
     // -----------------------------------------------------------------------

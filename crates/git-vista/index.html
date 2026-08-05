@@ -80,7 +80,16 @@
          Standalone home-screen launch on iOS needs no worker — only the
          apple-mobile-web-app-capable meta above — so nothing is lost by this. -->
     <!-- Build this crate's `git-vista-ui` binary to wasm. -->
-    <link data-trunk rel="rust" data-bin="git-vista-ui" />
+    <!-- data-wasm-opt-params: the vendored wasm-opt (v123) validates with an
+         older default feature set than current rustc emits, so a release
+         build fails at validation, not at codegen. Two features are needed,
+         each found by running wasm-opt by hand until it exited 0:
+           * bulk-memory            — rustc emits `memory.copy`
+           * nontrapping-float-to-int — rustc emits `i64.trunc_sat_f64_u`
+         Both are baseline in every browser this app targets; the flags only
+         tell wasm-opt to accept what the compiler already produced. -->
+    <link data-trunk rel="rust" data-bin="git-vista-ui"
+          data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int" />
     <link data-trunk rel="css" href="styles.css" />
     <!-- The bundled Nerd Font symbols (icons.rs / the .nf class in styles.css).
          Shipping the font means the glyph icons render on every device — an

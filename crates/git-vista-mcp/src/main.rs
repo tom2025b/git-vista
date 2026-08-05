@@ -8,6 +8,18 @@
 //! only after the planner split (#247) so that agents submit reviewable plans
 //! through the same funnel the browser uses, never argv.
 //!
+//! # Still no write capability after M2.23d (#248)
+//!
+//! [`plan_tools`] added one `plan_<operation>` tool per exposed
+//! `GitOperation` variant. Every one of them **builds a reviewable `Plan` and
+//! returns it, executing nothing**: the only endpoint they can reach is
+//! `POST /api/plan`, which on the server side reaches only
+//! `planner::build_plan_only` — no mutation guard, no executor, no argv.
+//! Submitting an approved plan is #249's `execute_plan` on its own endpoint;
+//! the separation is the point of the funnel, and
+//! `plan_tools::tests::every_plan_tool_posts_only_to_api_plan` is what keeps
+//! it a fact rather than an intention.
+//!
 //! # Transport choice, recorded per #245's scope
 //!
 //! Hand-rolled **newline-delimited JSON-RPC 2.0**, which is MCP's stdio
@@ -22,6 +34,7 @@
 
 mod auth;
 mod http;
+mod plan_tools;
 mod tools;
 
 use std::io::{BufRead, Write};

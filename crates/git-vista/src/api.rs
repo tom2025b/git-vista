@@ -18,6 +18,7 @@ use git_vista_core::diff::{CommitDiff, FileContent};
 use git_vista_core::model::CommitDetail;
 use git_vista_core::net::{network_error_text, offline_refusal_text};
 use git_vista_core::status::RepoStatus;
+use git_vista_protocol::dto::TagDetail;
 use git_vista_protocol::operation::{IdempotencyKey, OperationId};
 use git_vista_protocol::{
     ApiError, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
@@ -1075,6 +1076,28 @@ pub async fn fetch_activity(limit: usize) -> Result<Vec<ActivityEvent>, String> 
     let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<Vec<ActivityEvent>>()
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
+/// Fetch every tag with its full metadata (`GET /api/tags`, M2.21b #236):
+/// lightweight vs annotated, the tagged commit, and — for annotated tags —
+/// the tag object, tagger and message.
+///
+/// A live read like the feed beside it: a tag can appear or vanish from a
+/// terminal at any moment, so it is fetched fresh whenever the Activity panel
+/// opens and cache-busted the same way.
+pub async fn fetch_tags() -> Result<Vec<TagDetail>, String> {
+    let url = format!("/api/tags?t={}", js_sys::Date::now());
+    let resp = req_get(&url).send().await.map_err(network_error)?;
+    if resp.ok() {
+        resp.json::<Vec<TagDetail>>()
             .await
             .map_err(|e| e.to_string())
     } else {
