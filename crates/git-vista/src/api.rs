@@ -22,10 +22,10 @@ use git_vista_protocol::dto::TagDetail;
 use git_vista_protocol::operation::{IdempotencyKey, OperationId, OperationStatus};
 use git_vista_protocol::{
     BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
-    FetchRequest, MergeStrategy, PatchPlan, PatchPreview, ProtocolInfo, PullRequest, RebaseStatus,
-    RepoMode, RepositoryDescriptor, SelectRequest, SessionInfo, SessionRequest, StageDirection,
-    StagingDiff, WorktreePathsRequest, WorktreeStatus, CSRF_HEADER, IDEMPOTENCY_HEADER,
-    OPERATION_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
+    FetchRequest, MergeStrategy, OperationByKeyResponse, PatchPlan, PatchPreview, ProtocolInfo,
+    PullRequest, RebaseStatus, RepoMode, RepositoryDescriptor, SelectRequest, SessionInfo,
+    SessionRequest, StageDirection, StagingDiff, WorktreePathsRequest, WorktreeStatus, CSRF_HEADER,
+    IDEMPOTENCY_HEADER, OPERATION_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
 use crate::features::dialogs::commit::{amend_body, classify_amend_response, AmendOutcome};
@@ -731,6 +731,61 @@ const CLONE_STATUS_POLL_TIMEOUT_MS: u64 = 15_000;
 /// here to one that dies at second 590 — so the honest bound is the
 /// server's whole window, not a guessed fraction of it.
 const CLONE_POLL_MAX_ATTEMPTS: u32 = 120;
+
+/// How long to wait between `GET /api/operations/by-key/{key}` polls while
+/// resolving a just-fired write's operation id (M2.20f, #232).
+///
+/// **The one number in this block that is not derived from an existing
+/// budget**, and deliberately far tighter than
+/// [`CLONE_POLL_INTERVAL_MS`]'s 5s: that interval is sized to a `git clone`'s
+/// duration, whereas what is being waited on here is a POST that is *already
+/// in flight* travelling the last hop to `operations::admit`. The server
+/// knows the id the instant `admit` returns — `note_minted` runs immediately
+/// after it in `planner::plan_and_execute_tracked` — so the gap this bridges
+/// is one handler dispatch over a loopback SSH forward, not a transfer. At
+/// 5s the Cancel button and the progress bar would appear five seconds after
+/// every fetch started, which is most of a small fetch.
+///
+/// Erring short is cheap in a way it is not for clone: this read runs no git,
+/// mutates nothing, and costs the server one mutex lock
+/// (`operations::lookup_by_key`), and the loop stops the moment it gets an
+/// answer — for anything that settles fast, the write's own response wins the
+/// race and no poll is ever sent at all.
+const OPERATION_ID_POLL_INTERVAL_MS: u64 = 200;
+
+/// The per-attempt deadline for one `by-key` poll — the same bound
+/// [`CLONE_STATUS_POLL_TIMEOUT_MS`] sets, by aliasing it rather than
+/// restating a number, because the reasoning transfers exactly: both
+/// handlers answer from an in-memory map behind a mutex and do no I/O, so a
+/// poll still outstanding past this is a dead tunnel rather than a slow
+/// server, and giving up early to try again beats eating the whole budget
+/// waiting.
+const OPERATION_ID_POLL_TIMEOUT_MS: u64 = CLONE_STATUS_POLL_TIMEOUT_MS;
+
+/// How many `by-key` polls to make before giving up on ever learning the id.
+///
+/// Derived from [`REQUEST_TIMEOUT_MS`] rather than chosen: that constant is
+/// this client's bound on *one* HTTP attempt, so a write whose key has not
+/// been admitted after a whole such window has not reached the server's
+/// handler at all — either it is still hung on a socket
+/// [`send_write_with_key`]'s own retry has not yet given up on, or the route
+/// does not exist because the server predates it. Neither becomes true by
+/// polling longer.
+///
+/// Giving up here is **not** an error. It costs the operation its live
+/// progress, its Cancel button and its reload-recovery entry; the write
+/// itself is untouched and still settles from its own response, exactly as it
+/// did before this route existed. That degradation is the whole reason the
+/// budget can be this blunt.
+///
+/// Attempts, not wall-clock, is what is bounded — the same honesty
+/// [`CLONE_POLL_MAX_ATTEMPTS`] states: a poll that itself times out on
+/// [`OPERATION_ID_POLL_TIMEOUT_MS`] only adds slack on top of the floor, which
+/// biases toward giving a flaky tunnel more time rather than less. Only one
+/// poll is ever open at a time (see [`resolve_operation_id`]), so a long
+/// budget cannot become a pile of concurrent requests.
+const OPERATION_ID_POLL_MAX_ATTEMPTS: u32 =
+    (REQUEST_TIMEOUT_MS / OPERATION_ID_POLL_INTERVAL_MS) as u32;
 
 /// Resolve after `ms` milliseconds — the polling loop's spacing, built the
 /// same way as [`with_deadline`]'s timer (`leptos::set_timeout` + a oneshot):
