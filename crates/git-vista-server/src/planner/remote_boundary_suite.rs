@@ -462,11 +462,19 @@ async fn a_configured_remote_still_fetches() {
 /// `Precondition::RemoteConfigured`, and its `remote` field is the identical
 /// [`RemoteName`].
 ///
-/// Pull's executor is still `501` on this branch (#230 wires it). That is what
-/// makes this assertion meaningful rather than incidental: the refusal must
-/// arrive from the **staleness gate** — a `409` — *before* `execute` is
-/// reached at all. A `501` here would mean the guard is downstream of the
-/// dispatch and would evaporate the moment pull's executor lands.
+/// This test was written on the fetch branch, where pull's executor was still
+/// a `501` stub, to prove the refusal arrives from the **staleness gate** — a
+/// `409` — *before* `execute` is reached at all, rather than from the stub.
+///
+/// **#230 has since landed, and that makes this test stronger, not
+/// redundant.** Pull's executor is now real, so the thing this assertion holds
+/// back is a live `git fetch`, not a `not_implemented` response. Verified by
+/// mutation on the merge commit that brought the two branches together:
+/// flipping `refuses_when_unmet_at_build`'s `RemoteConfigured` arm to `false`
+/// makes this test fail with `400` and the body
+/// `"The fetch from ‘ghost.git’ succeeded, but it has no branch ‘main’"` — the
+/// ad-hoc directory target really was contacted, through pull's own executor.
+/// Restoring the arm returns it to `409`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pull_refuses_an_unconfigured_remote_before_reaching_its_executor() {
     let (dir, repo) = seeded_repo();
@@ -488,8 +496,9 @@ async fn pull_refuses_an_unconfigured_remote_before_reaching_its_executor() {
         status,
         StatusCode::CONFLICT,
         "pull must be refused by the same gate fetch is, before its executor \
-         is dispatched to (a 501 here would mean the guard sits downstream of \
-         the dispatch and would vanish when #230 lands): {body}"
+         is dispatched to — anything but a 409 here means the guard sits \
+         downstream of the dispatch, and with #230 landed that means a real \
+         fetch was attempted: {body}"
     );
     assert!(
         body.contains("ghost.git"),

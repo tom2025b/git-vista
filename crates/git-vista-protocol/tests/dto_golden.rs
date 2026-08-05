@@ -28,8 +28,9 @@
 use git_vista_protocol::{
     AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind, BranchRequest,
     CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest, FetchError,
-    FetchFailureKind, FetchRequest, FetchSuccess, HookPolicy, RebaseStatus, RemoteRefUpdate,
-    RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo, SessionRequest,
+    FetchFailureKind, FetchRequest, FetchSuccess, HookPolicy, MergeStrategy, PullError,
+    PullFailureKind, PullRequest, PullSuccess, RebaseStatus, RemoteRefUpdate, RepoMode,
+    RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo, SessionRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +54,13 @@ struct DtoGoldenSet {
     fetch_success_already_up_to_date: FetchSuccess,
     fetch_error_auth: FetchError,
     fetch_error_cancelled_after_a_ref_moved: FetchError,
+    pull_request_merge: PullRequest,
+    pull_request_rebase: PullRequest,
+    pull_success_advanced: PullSuccess,
+    pull_success_already_up_to_date: PullSuccess,
+    pull_error_strategy_required: PullError,
+    pull_error_conflict_restored: PullError,
+    pull_error_conflict_left_in_progress: PullError,
     clone_request: CloneRequest,
     select_request: SelectRequest,
     delete_clone_request: DeleteCloneRequest,
@@ -170,6 +178,85 @@ fn golden_set() -> DtoGoldenSet {
                 old_oid: Some("1111111111111111111111111111111111111111".to_string()),
                 new_oid: Some("2222222222222222222222222222222222222222".to_string()),
             }],
+        },
+        // M2.20d (#230). Both strategies are pinned as *request* fixtures on
+        // purpose: `strategy` is the one field on this wire family with no
+        // default and no third value, so its two spellings ("merge" /
+        // "rebase") are exactly the bytes a client hard-codes. A rename here
+        // would silently turn every pull into a 400.
+        pull_request_merge: PullRequest {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+            strategy: MergeStrategy::Merge,
+        },
+        pull_request_rebase: PullRequest {
+            remote: "upstream".to_string(),
+            branch: "release/2026-08".to_string(),
+            strategy: MergeStrategy::Rebase,
+        },
+        pull_success_advanced: PullSuccess {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+            strategy: MergeStrategy::Rebase,
+            message: "Pulled ‘main’ from ‘origin’ into the checked-out branch \
+                      (rebase strategy)."
+                .to_string(),
+            updated_refs: vec![RemoteRefUpdate {
+                ref_name: "refs/remotes/origin/main".to_string(),
+                old_oid: Some("1111111111111111111111111111111111111111".to_string()),
+                new_oid: Some("2222222222222222222222222222222222222222".to_string()),
+            }],
+            advanced: true,
+        },
+        // The no-op success. `advanced: false` must reach the wire as an
+        // explicit `false`, not be omitted: "the pull ran and the branch did
+        // not move" is the answer, and a missing key would read as "the server
+        // didn't say".
+        pull_success_already_up_to_date: PullSuccess {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+            strategy: MergeStrategy::Merge,
+            message: "Already up to date — ‘main’ on ‘origin’ has nothing the \
+                      checked-out branch doesn’t already have."
+                .to_string(),
+            updated_refs: Vec::new(),
+            advanced: false,
+        },
+        // #230's headline refusal, pinned because the frontend branches on it
+        // to prompt for a strategy rather than showing a generic error.
+        pull_error_strategy_required: PullError {
+            kind: PullFailureKind::StrategyRequired,
+            message: "A pull must say how to integrate what it fetches: send \
+                      \"strategy\": \"merge\" or \"strategy\": \"rebase\"."
+                .to_string(),
+            updated_refs: Vec::new(),
+            worktree_restored: true,
+        },
+        // The two conflict outcomes, both pinned: they demand opposite things
+        // of the user (choose again vs. your working tree needs attention), so
+        // a client that collapsed them would give the wrong advice half the
+        // time. `worktree_restored` is what tells them apart.
+        pull_error_conflict_restored: PullError {
+            kind: PullFailureKind::Conflict,
+            message: "Pulling ‘main’ from ‘origin’ (merge strategy) failed: \
+                      CONFLICT (content): Merge conflict in a.txt The merge was \
+                      aborted and the checked-out branch is back where it started."
+                .to_string(),
+            updated_refs: vec![RemoteRefUpdate {
+                ref_name: "refs/remotes/origin/main".to_string(),
+                old_oid: Some("1111111111111111111111111111111111111111".to_string()),
+                new_oid: Some("2222222222222222222222222222222222222222".to_string()),
+            }],
+            worktree_restored: true,
+        },
+        pull_error_conflict_left_in_progress: PullError {
+            kind: PullFailureKind::ConflictLeftInProgress,
+            message: "Pulling ‘main’ from ‘origin’ (rebase strategy) failed: \
+                      error: could not apply 1a2b3c4 The rebase could not be \
+                      aborted cleanly."
+                .to_string(),
+            updated_refs: Vec::new(),
+            worktree_restored: false,
         },
         clone_request: CloneRequest {
             url: "https://github.com/owner/repo.git".to_string(),

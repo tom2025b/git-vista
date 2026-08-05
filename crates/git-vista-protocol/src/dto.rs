@@ -281,6 +281,147 @@ pub struct FetchSuccess {
     pub updated_refs: Vec<RemoteRefUpdate>,
 }
 
+/// Body of a `POST /api/pull` request (M2.20d, #230): fetch from `remote` and
+/// integrate its `branch` into the checked-out branch using `strategy`.
+///
+/// # `strategy` has no default, here or anywhere — that is the endpoint
+///
+/// [`MergeStrategy`] has no `Auto` variant and this field carries no
+/// `#[serde(default)]`, so a body that omits it **cannot deserialize**. The
+/// handler turns that into a `400` naming the two legal values rather than
+/// falling back to anything, because the fallback `git pull` itself would use
+/// is `pull.rebase` / `branch.<name>.rebase` — a value that lives in a config
+/// file this app never shows, so two people running "Pull" on the same branch
+/// could get two different histories and neither reviewed which. #230's whole
+/// reason to exist is that this choice is always the caller's, stated.
+///
+/// # A remote *name* and a remote *branch*, never a URL
+///
+/// Same posture as [`FetchRequest`], for the same reason: a body that could
+/// name a URL would let any authenticated client point this server — and
+/// whatever credential helper or SSH agent the host offers it — at a host of
+/// the client's choosing. `branch` is the branch **on the remote**
+/// (`git pull origin main` ⇒ `main`); the destination is always whatever
+/// branch is checked out, exactly as for
+/// [`GitOperation::MergeBranch`](crate::plan::GitOperation::MergeBranch).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequest {
+    pub remote: String,
+    pub branch: String,
+    pub strategy: crate::plan::MergeStrategy,
+}
+
+/// Why a `POST /api/pull` failed, as a typed tag the client can branch on
+/// (M2.20d, #230).
+///
+/// Three groups, and the distinction between them is the point:
+///
+///  * **The fetch half failed.** [`Self::AuthenticationFailed`],
+///    [`Self::RemoteUnreachable`], [`Self::RemoteRejected`] and
+///    [`Self::Other`] are the same taxonomy [`FetchFailureKind`] already
+///    defines, mapped across one-to-one so a client that already handles a
+///    failed fetch handles a failed pull's fetch half identically. Nothing was
+///    integrated, so the checked-out branch never moved.
+///  * **The integration half failed.** [`Self::Conflict`] and
+///    [`Self::ConflictLeftInProgress`] are *observed* states of the
+///    repository, not classifications of git's prose — see each variant.
+///  * **Neither ran.** [`Self::StrategyRequired`] is the missing-`strategy`
+///    refusal above; [`Self::NoSuchRemoteBranch`] is the fetch having
+///    succeeded without producing the ref the caller asked to integrate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullFailureKind {
+    /// The request did not name an integration strategy. Actionable in the
+    /// most literal sense: re-send with `"strategy": "merge"` or
+    /// `"strategy": "rebase"`. Never produced by anything the repository did.
+    StrategyRequired,
+    /// The remote demanded credentials this server could not supply — the
+    /// [`FetchFailureKind::AuthenticationFailed`] case.
+    AuthenticationFailed,
+    /// The remote could not be reached at all — the
+    /// [`FetchFailureKind::RemoteUnreachable`] case.
+    RemoteUnreachable,
+    /// The remote answered and refused — the
+    /// [`FetchFailureKind::RemoteRejected`] case.
+    RemoteRejected,
+    /// An operator cancelled the operation. `updated_refs` says whether the
+    /// fetch half had already moved anything; the integration half never ran,
+    /// so the checked-out branch is untouched.
+    Cancelled,
+    /// The fetch succeeded but `refs/remotes/<remote>/<branch>` does not
+    /// exist afterwards, so there is nothing to integrate. **Observed** by
+    /// listing the ref, not read out of a git error, so it is true under any
+    /// locale. Nothing was integrated.
+    NoSuchRemoteBranch,
+    /// The integration conflicted and was aborted; the checked-out branch is
+    /// back at its pre-pull tip and no merge or rebase is in progress.
+    ///
+    /// **This is an outcome, not a server error.** It is reported `409`, with
+    /// `worktree_restored: true` — a state a browser-only user can act on
+    /// (resolve upstream, or pull with the other strategy) rather than a
+    /// `500` that says the server broke.
+    Conflict,
+    /// The integration conflicted **and** the abort did not restore the
+    /// repository: a merge or rebase is still in progress in the working
+    /// tree. Reported separately from [`Self::Conflict`] because the two
+    /// demand opposite things of the user — one is "nothing happened, choose
+    /// again", the other is "your working tree needs attention, and this app
+    /// cannot finish it for you". `worktree_restored` is `false`.
+    ConflictLeftInProgress,
+    /// Everything else, reported with git's own words in `message`.
+    Other,
+}
+
+/// Body of a **failed** `POST /api/pull` (status 400, or 409 for a cancel or
+/// a conflict): the typed classification, git's own explanation, whatever the
+/// fetch half moved before stopping, and whether the repository is back where
+/// it started.
+///
+/// A response DTO, so no `deny_unknown_fields` (M1.02 additive rule).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullError {
+    pub kind: PullFailureKind,
+    pub message: String,
+    /// Remote-tracking refs the fetch half moved before the pull stopped. A
+    /// failed *integration* still leaves these — the objects arrived and the
+    /// tracking refs advanced, which is exactly why a retry with the other
+    /// strategy has nothing left to download.
+    #[serde(default)]
+    pub updated_refs: Vec<RemoteRefUpdate>,
+    /// Whether the checked-out branch is at its pre-pull tip **and** no merge
+    /// or rebase is in progress — both re-read from the repository after the
+    /// abort, never inferred from the abort command's exit status. `false`
+    /// means the working tree needs a human.
+    pub worktree_restored: bool,
+}
+
+/// Body of a **successful** `POST /api/pull` (status 200).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullSuccess {
+    /// The remote pulled from, echoed so the response is self-contained.
+    pub remote: String,
+    /// The branch **on the remote** that was integrated.
+    pub branch: String,
+    /// The strategy that actually ran, echoed back. A client never has to
+    /// remember what it asked for to render what happened — and a response
+    /// that echoed the *other* strategy would be a bug this field makes
+    /// visible instead of invisible.
+    pub strategy: crate::plan::MergeStrategy,
+    /// A short human sentence for the UI; the machine-readable answers are
+    /// `updated_refs` and `advanced`.
+    pub message: String,
+    /// The fetch half's observed before/after diff of
+    /// `refs/remotes/<remote>/*`, exactly as [`FetchSuccess`] reports it.
+    #[serde(default)]
+    pub updated_refs: Vec<RemoteRefUpdate>,
+    /// Whether the integration moved the checked-out branch. Observed by
+    /// reading its tip before and after; a read that fails **refuses the
+    /// operation** rather than reporting a guess, so this is always a fact
+    /// and `false` always means "already up to date".
+    pub advanced: bool,
+}
+
 /// Body of a `POST /api/clone` request (Phase 12): clone the public repository at
 /// `url` into the persistent clones store (ADR 0008) and open it look-only
 /// pending the operator's mode choice. `url` is a git-cloneable URL (typically

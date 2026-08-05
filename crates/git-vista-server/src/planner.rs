@@ -39,8 +39,8 @@ use git_vista_core::identity::{GenerationInputs, RepositoryId};
 use git_vista_core::seed::{parse_seed, reset_plan, Seed};
 use git_vista_protocol::{
     AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitMessage, CommitOid,
-    ForcePublish, GenerationToken, GitOperation, IdempotencyKey, OperationHash, OperationStage,
-    Plan, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
+    ForcePublish, GenerationToken, GitOperation, IdempotencyKey, MergeStrategy, OperationHash,
+    OperationStage, Plan, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
     RepositoryToken, RiskLevel, TagName, UnixSeconds, WorktreePath, WorktreeToken,
     IDEMPOTENCY_HEADER,
 };
@@ -1847,7 +1847,16 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         GitOperation::CheckoutBranch { branch } => {
             exec_checkout(repo, need, &branch, &observed).await
         }
-        GitOperation::MergeBranch { branch } => exec_merge(repo, need, &branch, &observed).await,
+        GitOperation::MergeBranch { branch } => {
+            exec_merge(
+                repo,
+                need,
+                &RefName::from(&branch),
+                &observed,
+                IntegrationCaller::Direct,
+            )
+            .await
+        }
         // M2.20a (#227) widened `PushBranch` with `set_upstream` and `force`.
         // Only the combination that existed before — no upstream write, no
         // force — executes; it runs the byte-identical argv `/api/push` has
@@ -1879,7 +1888,9 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         GitOperation::ForceDeleteBranch { branch } => {
             exec_delete(repo, need, &branch, &observed, true).await
         }
-        GitOperation::RebaseOntoBase { base } => exec_rebase(repo, need, &base, &observed).await,
+        GitOperation::RebaseOntoBase { base } => {
+            exec_rebase(repo, need, &base, &observed, IntegrationCaller::Direct).await
+        }
         GitOperation::RestoreBranch { name, tip } => {
             exec_restore_branch(repo, need, &name, &tip).await
         }
@@ -1927,17 +1938,18 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         // vocabulary change. `handlers::fetch::fetch_remote` builds the
         // operation from `POST /api/fetch`.
         GitOperation::FetchRemote { remote } => fetch::exec_fetch(repo, need, &remote).await,
-        // Pull is still contract-only; this arm exists because `execute`'s
-        // match must stay exhaustive over the closed vocabulary (#142), and
-        // reached it must refuse rather than no-op silently or run a
-        // placeholder git command against a real repository and a real
-        // remote.
-        GitOperation::PullBranch { .. } => (
-            StatusCode::NOT_IMPLEMENTED,
-            "Pulling from a remote is not yet wired for execution (tracked by \
-             #230) — this plan's contract exists, but nothing executed it."
-                .to_string(),
-        ),
+        // M2.20d (#230, ADR 0044) wired pull execution: the fetch half is
+        // `planner::fetch`'s own `run_fetch` — the same spawn, the same
+        // streamed progress, the same cancellation latch, never a second copy
+        // — and the integration half is `exec_merge`/`exec_rebase` above,
+        // dispatched on the `strategy` the reviewed plan carries.
+        // `handlers::pull::pull_branch` builds the operation from
+        // `POST /api/pull`.
+        GitOperation::PullBranch {
+            remote,
+            branch,
+            strategy,
+        } => pull::exec_pull(repo, need, &remote, &branch, strategy, &observed).await,
         // M2.21a (#235, ADR 0041) ships the typed tag contract only — the
         // same staging as fetch/pull above. Execution belongs to the later
         // M2.21 slices (#74): create/delete are their own slices, and the
@@ -2736,18 +2748,26 @@ async fn exec_unstage_all(repo: &Path, need: NetworkNeed) -> (StatusCode, String
     }
 }
 
-/// One `git <args…> <branch>` branch operation with the shared error posture
+/// One `git <args…> <ref>` branch operation with the shared error posture
 /// (stderr, then stdout, then a generic line) — the old `run_branch_op` core.
+///
+/// `target` is a [`RefName`] rather than a [`BranchName`] since M2.20d
+/// (#230): four of the five callers pass a local branch (converted for free —
+/// see `impl From<&BranchName> for RefName`), and the fifth is a pull's
+/// integration half, whose target is the remote-tracking name `origin/main`
+/// and never a local branch. Both newtypes carry the identical
+/// non-empty/not-option-shaped gate, so nothing about what may reach an argv
+/// changed; only the name of the thing being described did.
 async fn run_branch_cmd(
     repo: &Path,
     need: NetworkNeed,
     endpoint: &str,
     args: &[&str],
-    branch: &BranchName,
+    target: &RefName,
     ok_msg: String,
 ) -> (StatusCode, String) {
     let mut argv: Vec<&str> = args.to_vec();
-    argv.push(branch.as_str());
+    argv.push(target.as_str());
     let output = match run_git(repo, need, &argv).await {
         Ok(o) => o,
         Err(e) => return couldnt_run(endpoint, &e),
@@ -2777,7 +2797,7 @@ async fn exec_checkout(
         need,
         "/api/checkout",
         &["checkout"],
-        branch,
+        &RefName::from(branch),
         format!("checked out '{branch}'"),
     )
     .await;
@@ -2802,20 +2822,80 @@ async fn exec_checkout(
     resp
 }
 
-/// `git merge --no-edit <branch>` into the checked-out branch (`/api/merge`).
+/// Why an integration ([`exec_merge`] / [`exec_rebase`]) is running — and
+/// therefore what the activity feed must say happened (M2.20d, #230).
+///
+/// **The feed records the operation the user approved, not the git command
+/// that implemented it.** A pull's second half runs `git merge` or
+/// `git rebase`, but a user who pressed "Pull" never asked for a merge; a feed
+/// showing `Fetch` + `Merge` for one approved `PullBranch` describes an
+/// operation nobody submitted, and its undo hint would offer to undo half of
+/// it. So the caller says who it is, and the one entry names the pull and the
+/// strategy that ran.
+///
+/// A typed two-variant enum rather than a `bool` for ADR 0015's reason and one
+/// more: the `Pull` arm has to *carry* the strategy, which a flag could not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntegrationCaller {
+    /// `POST /api/merge` or `POST /api/rebase` — the user asked for exactly
+    /// this git operation, and the feed says exactly that. The wording every
+    /// existing entry already has.
+    Direct,
+    /// The integration half of `POST /api/pull` (M2.20d, #230). One
+    /// [`ActivityKind::Pull`] entry naming the strategy, replacing — never
+    /// accompanying — the `Merge`/`Rebase` entry the `Direct` arm writes.
+    Pull(MergeStrategy),
+}
+
+impl IntegrationCaller {
+    /// The `(kind, summary)` this caller's journal entry carries, given the
+    /// ref that was integrated and the branch it landed on.
+    fn journal_as(
+        self,
+        target: &RefName,
+        into: &str,
+        direct: (ActivityKind, String),
+    ) -> (ActivityKind, String) {
+        match self {
+            IntegrationCaller::Direct => direct,
+            IntegrationCaller::Pull(strategy) => (
+                ActivityKind::Pull,
+                format!(
+                    "pulled ‘{target}’ into ‘{into}’ ({} strategy)",
+                    strategy_word(strategy)
+                ),
+            ),
+        }
+    }
+}
+
+/// The wire spelling of a [`MergeStrategy`], for the one place a human reads
+/// it: the activity feed and the terminal message. Deliberately the same word
+/// the request body carries (`"merge"` / `"rebase"`), so what a user reads
+/// afterwards is what they can type to ask for it again.
+fn strategy_word(strategy: MergeStrategy) -> &'static str {
+    match strategy {
+        MergeStrategy::Merge => "merge",
+        MergeStrategy::Rebase => "rebase",
+    }
+}
+
+/// `git merge --no-edit <ref>` into the checked-out branch (`/api/merge`, and
+/// the merge half of `/api/pull`).
 async fn exec_merge(
     repo: &Path,
     need: NetworkNeed,
-    branch: &BranchName,
+    target: &RefName,
     observed: &Observed,
+    caller: IntegrationCaller,
 ) -> (StatusCode, String) {
     let resp = run_branch_cmd(
         repo,
         need,
         "/api/merge",
         &["merge", "--no-edit"],
-        branch,
-        format!("merged '{branch}' into HEAD"),
+        target,
+        format!("merged '{target}' into HEAD"),
     )
     .await;
     if resp.0 == StatusCode::OK {
@@ -2832,19 +2912,27 @@ async fn exec_merge(
         if new.same_observation(&observed.head_tip) {
             return (
                 StatusCode::OK,
-                format!("Already up to date — ‘{branch}’ has no commits the current branch doesn’t already have."),
+                format!("Already up to date — ‘{target}’ has no commits the current branch doesn’t already have."),
             );
         }
         let into = read_head_branch_blocking(repo)
             .await
             .unwrap_or_else(|| "HEAD".into());
+        let (kind, summary) = caller.journal_as(
+            target,
+            &into,
+            (
+                ActivityKind::Merge,
+                format!("merged ‘{target}’ into ‘{into}’"),
+            ),
+        );
         journal_app_event(
             repo,
-            ActivityKind::Merge,
+            kind,
             Some(into.clone()),
             observed.head_tip.clone(),
             new,
-            format!("merged ‘{branch}’ into ‘{into}’"),
+            summary,
         )
         .await;
     }
@@ -2870,7 +2958,7 @@ async fn exec_push(
         need,
         "/api/push",
         &["push", remote.as_str()],
-        branch,
+        &RefName::from(branch),
         format!("pushed '{branch}' to {remote}"),
     )
     .await;
@@ -2911,7 +2999,7 @@ async fn exec_delete(
         need,
         endpoint,
         &["branch", flag],
-        branch,
+        &RefName::from(branch),
         format!("{verb} branch '{branch}'"),
     )
     .await;
@@ -2940,8 +3028,10 @@ async fn exec_rebase(
     need: NetworkNeed,
     base: &RefName,
     observed: &Observed,
+    caller: IntegrationCaller,
 ) -> (StatusCode, String) {
     let old = observed.head_tip.clone();
+    let target = base;
     let base = base.as_str();
 
     let output = match run_git(repo, need, &["rebase", base]).await {
@@ -2966,15 +3056,15 @@ async fn exec_rebase(
             );
         }
         println!("[/api/rebase] rebased HEAD onto {base}");
-        journal_app_event(
-            repo,
-            ActivityKind::Rebase,
-            Some(branch.clone()),
-            old,
-            new,
-            format!("rebased ‘{branch}’ onto {base}"),
-        )
-        .await;
+        let (kind, summary) = caller.journal_as(
+            target,
+            &branch,
+            (
+                ActivityKind::Rebase,
+                format!("rebased ‘{branch}’ onto {base}"),
+            ),
+        );
+        journal_app_event(repo, kind, Some(branch.clone()), old, new, summary).await;
         (StatusCode::OK, format!("Rebased onto {base}."))
     } else {
         let msg = stderr_stdout_or(&output, "git rebase failed.");
@@ -3918,9 +4008,22 @@ mod contract_suite;
 /// taxonomy — and they belong together.
 mod fetch;
 
+/// M2.20d (#230, ADR 0044): the pull executor. Its own file for the same
+/// reason `fetch` has one — a pull composes two halves with different failure
+/// vocabularies and a conflict-abort story neither half has on its own — and
+/// it deliberately owns *no* spawn of its own: the fetch comes from
+/// [`fetch::run_fetch`] and the integration from `exec_merge`/`exec_rebase`.
+mod pull;
+
 /// `POST /api/fetch`'s error-body constructor, re-exported so the handler's
 /// own request-shape refusals carry the same contract the executor's do.
 pub(crate) use fetch::error_body as fetch_error_body;
+
+/// `POST /api/pull`'s error-body constructor, re-exported for the same reason
+/// [`fetch_error_body`] is: the handler's request-shape refusals — above all
+/// the missing-`strategy` 400 that is #230's whole point — must parse as the
+/// endpoint's one error type, exactly like the executor's do.
+pub(crate) use pull::error_body as pull_error_body;
 
 /// Whether cancelling this operation can actually stop it (M2.20c, #229).
 ///
@@ -3937,13 +4040,25 @@ pub(crate) use fetch::error_body as fetch_error_body;
 /// the `true` set to an exact census, so widening it is a visible edit rather
 /// than a side effect.
 ///
-/// Today only `FetchRemote` qualifies. Every other executor runs a git
-/// command that finishes in milliseconds; the machinery would be real but
-/// the window to use it would not, and a cancel endpoint that usually
-/// arrives too late teaches users to distrust it.
+/// `FetchRemote` and — since M2.20d (#230) — `PullBranch` qualify. Every other
+/// executor runs a git command that finishes in milliseconds; the machinery
+/// would be real but the window to use it would not, and a cancel endpoint
+/// that usually arrives too late teaches users to distrust it.
+///
+/// # What `true` means for a pull, exactly
+///
+/// A pull is a fetch plus an integration, and only the first half is long.
+/// `planner::pull` hands the latch to the same streaming spawn `planner::fetch`
+/// uses, so a cancel during the transfer SIGKILLs the child, and it reads the
+/// latch **once more** between the halves so a cancel that lands while the
+/// fetch is finishing stops the integration from ever starting. A cancel that
+/// arrives *during* `git merge`/`git rebase` is not honoured — those are
+/// millisecond-scale local commands and interrupting one is how a repository
+/// is left half-integrated. That is a narrower promise than fetch's, and it is
+/// the honest one: the cancellable window is where the time actually goes.
 pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
     match op {
-        GitOperation::FetchRemote { .. } => true,
+        GitOperation::FetchRemote { .. } | GitOperation::PullBranch { .. } => true,
         GitOperation::CreateBranch { .. }
         | GitOperation::CommitOnHead { .. }
         | GitOperation::EmptyCommitOnBranch { .. }
@@ -3954,7 +4069,6 @@ pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
         | GitOperation::CheckoutBranch { .. }
         | GitOperation::MergeBranch { .. }
         | GitOperation::PushBranch { .. }
-        | GitOperation::PullBranch { .. }
         | GitOperation::DeleteBranch { .. }
         | GitOperation::ForceDeleteBranch { .. }
         | GitOperation::RebaseOntoBase { .. }
@@ -3983,6 +4097,12 @@ mod lifecycle_suite;
 // cancellation, the dropped-connection replay, and redaction on the live path.
 #[cfg(test)]
 mod fetch_suite;
+
+// M2.20d (#230): the pull slice's behavioural tests — the merge-vs-rebase
+// history difference against one diverged fixture, the conflict abort, the
+// cancel that stops the integration starting, and the journal.
+#[cfg(test)]
+mod pull_suite;
 
 // The remote-target boundary (#229 follow-up, ADR 0047): a real listener that
 // must never be connected to, its paired positive control, and the

@@ -300,10 +300,51 @@ fn diff_refs(
 }
 
 // ---------------------------------------------------------------------------
-// The executor
+// The fetch step, as an outcome rather than a response
 // ---------------------------------------------------------------------------
 
-/// `git fetch --progress <remote>` (`POST /api/fetch`).
+/// What one run of the fetch step did, before any endpoint has decided what
+/// HTTP status it deserves.
+///
+/// This type exists because M2.20d (#230) needs the fetch step *without* the
+/// `/api/fetch` response contract wrapped around it: a pull is a fetch plus an
+/// integration, and its wire shape is [`PullSuccess`]/[`PullError`], not
+/// [`FetchSuccess`]/[`FetchError`]. Splitting here rather than letting
+/// `planner::pull` build its own spawn is the whole point — there is exactly
+/// one place in this server that runs `git fetch`, so the streaming progress,
+/// the cancellation latch, the before/after ref observation and #228's
+/// Network-tier hardening cannot exist in a second, quietly-diverging copy.
+///
+/// Every variant carries `updated`: the observed ref diff, which is the
+/// honest answer to "what landed?" in *all* of them, including the ones that
+/// failed part-way. [`Self::Unobservable`] is the exception, and it is the
+/// exception precisely because that answer is what could not be obtained.
+pub(super) enum FetchStep {
+    /// `git fetch` exited 0. `updated` may still be empty (already up to
+    /// date), which is a success.
+    Completed { updated: Vec<RemoteRefUpdate> },
+    /// The operator cancelled. `output` is `None` when the cancel landed
+    /// before anything was spawned.
+    Cancelled {
+        updated: Vec<RemoteRefUpdate>,
+        output: Option<std::process::Output>,
+    },
+    /// `git fetch` ran and exited non-zero.
+    Failed {
+        kind: FetchFailureKind,
+        message: String,
+        updated: Vec<RemoteRefUpdate>,
+    },
+    /// git could not be run at all, or the ref listing that establishes the
+    /// baseline failed — nothing was spawned, so nothing moved.
+    CouldNotRun { why: String },
+    /// `git fetch` ran to completion and the re-read that would say what it
+    /// moved failed. The one outcome with no ref diff, and the reason
+    /// [`journal_unobserved`] exists.
+    Unobservable { why: String },
+}
+
+/// Run `git fetch --progress <remote>` and report what it did.
 ///
 /// The shape, in order, and why each step is where it is:
 ///
@@ -319,15 +360,19 @@ fn diff_refs(
 ///    own channel.
 /// 4. **Observe again, and diff.** This is the answer that reaches the
 ///    client, for success, failure and cancellation alike.
-/// 5. **Journal and bump the generation** on a real update. The generation
-///    bump is not done here: `plan_and_execute_tracked` re-reads it after
-///    *every* operation and puts it on the terminal record, so a fetch gets
-///    it by construction (and would get it wrong if this module also did it).
-pub(super) async fn exec_fetch(
+/// 5. **Journal** what moved. The generation bump is not done here:
+///    `plan_and_execute_tracked` re-reads it after *every* operation and puts
+///    it on the terminal record, so a fetch gets it by construction (and would
+///    get it wrong if this module also did it).
+///
+/// `endpoint` is only ever a log label — `/api/fetch` or `/api/pull` — so the
+/// two callers' stderr lines stay attributable. It never reaches an argv.
+pub(super) async fn run_fetch(
     repo: &Path,
     need: NetworkNeed,
     remote: &RemoteName,
-) -> (StatusCode, String) {
+    endpoint: &str,
+) -> FetchStep {
     debug_assert_eq!(
         need,
         NetworkNeed::Remote,
@@ -339,10 +384,9 @@ pub(super) async fn exec_fetch(
     let before = match remote_tracking_refs(repo, need, remote).await {
         Ok(refs) => refs,
         Err(why) => {
-            return couldnt_run(
-                ENDPOINT,
-                &format!("couldn't list refs/remotes/{}: {why}", remote.as_str()),
-            )
+            return FetchStep::CouldNotRun {
+                why: format!("couldn't list refs/remotes/{}: {why}", remote.as_str()),
+            }
         }
     };
 
@@ -352,10 +396,21 @@ pub(super) async fn exec_fetch(
         // still built from the same diff (of `before` against itself) rather
         // than from a hardcoded empty list, so there is exactly one place
         // that decides what "which refs moved" means.
-        return cancelled_response(remote, diff_refs(&before, &before), None);
+        return FetchStep::Cancelled {
+            updated: diff_refs(&before, &before),
+            output: None,
+        };
     }
 
-    let run = crate::git_cmd::git_streamed_for(
+    // `Box::pin`, and it is load-bearing rather than stylistic. Measured:
+    // `git_streamed_for`'s future is ~66 KiB, which is most of the whole
+    // planner pipeline's state machine — inlined, every caller that awaits it
+    // (`run_fetch`, then `exec_fetch` or `exec_pull`, then `execute`, then
+    // `plan_and_execute_in`) carries a copy in its own frame, and in a debug
+    // build that overflows a 2 MiB test thread's stack. One allocation, on an
+    // operation that is about to open a socket and receive a pack, is not a
+    // cost worth measuring; the crash it prevents is.
+    let run = Box::pin(crate::git_cmd::git_streamed_for(
         repo,
         &["fetch", "--progress", remote.as_str()],
         need,
@@ -365,12 +420,12 @@ pub(super) async fn exec_fetch(
                 crate::operations::progress(progress);
             }
         },
-    )
+    ))
     .await;
 
     let run = match run {
         Ok(run) => run,
-        Err(e) => return couldnt_run(ENDPOINT, &e),
+        Err(e) => return FetchStep::CouldNotRun { why: e.to_string() },
     };
 
     let after = match remote_tracking_refs(repo, need, remote).await {
@@ -384,56 +439,89 @@ pub(super) async fn exec_fetch(
             // the silent divergence the rest of this module observes refs to
             // avoid. So the fact of the unobserved run is journaled instead.
             journal_unobserved(repo, remote, &why).await;
-            return couldnt_run(
-                ENDPOINT,
-                &format!(
-                    "the fetch ran but refs/remotes/{} could not be re-read: {why}",
-                    remote.as_str()
-                ),
-            );
+            return FetchStep::Unobservable { why };
         }
     };
     let updated = diff_refs(&before, &after);
 
     if run.cancelled {
-        let resp = cancelled_response(remote, updated.clone(), Some(&run.output));
         journal_updates(repo, remote, &updated, "cancelled part-way").await;
-        return resp;
+        return FetchStep::Cancelled {
+            updated,
+            output: Some(run.output),
+        };
     }
 
     let stderr = String::from_utf8_lossy(&run.output.stderr).into_owned();
     if !run.output.status.success() {
         let kind = classify_failure(&stderr);
         let message = stderr_stdout_or(&run.output, "git fetch failed.");
-        eprintln!("git-vista: {ENDPOINT} failed ({kind:?}): {message}");
+        eprintln!("git-vista: {endpoint} failed ({kind:?}): {message}");
         // A failed fetch can still have updated some refs before it died, and
         // the journal must record what actually landed either way.
         journal_updates(repo, remote, &updated, "failed part-way").await;
-        return (StatusCode::BAD_REQUEST, error_body(kind, message, updated));
+        return FetchStep::Failed {
+            kind,
+            message,
+            updated,
+        };
     }
 
     journal_updates(repo, remote, &updated, "fetched").await;
+    FetchStep::Completed { updated }
+}
 
-    let message = if updated.is_empty() {
-        format!("Fetched from ‘{}’: already up to date.", remote.as_str())
-    } else {
-        format!(
-            "Fetched from ‘{}’: {} remote-tracking ref{} updated.",
-            remote.as_str(),
-            updated.len(),
-            if updated.len() == 1 { "" } else { "s" }
-        )
-    };
-    println!("[{ENDPOINT}] {message}");
-    (
-        StatusCode::OK,
-        serde_json::to_string(&FetchSuccess {
-            remote: remote.as_str().to_string(),
+// ---------------------------------------------------------------------------
+// The executor
+// ---------------------------------------------------------------------------
+
+/// `git fetch --progress <remote>` (`POST /api/fetch`) — [`run_fetch`] plus
+/// this endpoint's own response contract, and nothing else.
+pub(super) async fn exec_fetch(
+    repo: &Path,
+    need: NetworkNeed,
+    remote: &RemoteName,
+) -> (StatusCode, String) {
+    match run_fetch(repo, need, remote, ENDPOINT).await {
+        FetchStep::CouldNotRun { why } => couldnt_run(ENDPOINT, &why),
+        FetchStep::Unobservable { why } => couldnt_run(
+            ENDPOINT,
+            &format!(
+                "the fetch ran but refs/remotes/{} could not be re-read: {why}",
+                remote.as_str()
+            ),
+        ),
+        FetchStep::Cancelled { updated, output } => {
+            cancelled_response(remote, updated, output.as_ref())
+        }
+        FetchStep::Failed {
+            kind,
             message,
-            updated_refs: updated,
-        })
-        .expect("FetchSuccess serialization cannot fail"),
-    )
+            updated,
+        } => (StatusCode::BAD_REQUEST, error_body(kind, message, updated)),
+        FetchStep::Completed { updated } => {
+            let message = if updated.is_empty() {
+                format!("Fetched from ‘{}’: already up to date.", remote.as_str())
+            } else {
+                format!(
+                    "Fetched from ‘{}’: {} remote-tracking ref{} updated.",
+                    remote.as_str(),
+                    updated.len(),
+                    if updated.len() == 1 { "" } else { "s" }
+                )
+            };
+            println!("[{ENDPOINT}] {message}");
+            (
+                StatusCode::OK,
+                serde_json::to_string(&FetchSuccess {
+                    remote: remote.as_str().to_string(),
+                    message,
+                    updated_refs: updated,
+                })
+                .expect("FetchSuccess serialization cannot fail"),
+            )
+        }
+    }
 }
 
 /// The cancelled terminal response.

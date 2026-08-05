@@ -99,6 +99,13 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // *unsandboxed* `git fetch` that asserts the redaction test's premise (the
     // fixture really does leak a credential when nothing redacts it).
     "src/planner/fetch_suite.rs",
+    // #[cfg(test)] git fixtures for the M2.20d (#230) pull suite: the diverged
+    // and conflicting repositories plus their in-tree bare remote, and the
+    // read-only `rev-parse`/`rev-list`/`merge-base`/`ls-files` calls that make
+    // the *repository* the referee for what a pull did — deliberately plain
+    // git, outside the harness under test, so an assertion can never be
+    // satisfied by the same code it is checking.
+    "src/planner/pull_suite.rs",
     // #[cfg(test)] git fixtures for the remote-target boundary suite (ADR
     // 0047): a repository, an in-tree bare target the server must refuse to
     // fetch from, and `git remote add` for the paired positive control.

@@ -510,6 +510,42 @@ before and after, never from git's prose. Known limitation, recorded rather
 than hidden: the kill reaches the direct child only, so a grandchild transport
 process may briefly outlive it.)*
 
+*(Pull execution: ADR 0044, #230 — `POST /api/pull` adds **no new spawn** to
+this section, and that is the security-relevant decision. Its fetch half is
+`planner::fetch`'s own `run_fetch`, so every row of the table above applies to
+a pull byte-for-byte: the same `sandboxed()` chokepoint, the same forced `-c
+core.askpass=`, the same `redact_if_remote` on both the collected output and
+the live streaming records. A second `git fetch` here would have been a second
+surface for a credential to leak from and the first one to drift, so
+`planner::contract_suite` pins at source level that `planner/pull.rs` contains
+neither `git_streamed_for(` nor the literal `"fetch"`, and
+`planner::pull_suite` proves the reuse behaviourally — a pull publishes
+transfer progress, which only the one streaming path can produce. Like
+`FetchRequest`, `PullRequest` carries a **configured remote name and a branch
+name, never a URL**, gated by the same `RemoteConfigured` precondition. The one
+new exposure a pull has that a fetch does not is local, not credential-shaped:
+the integration half can leave the working tree half-merged, so a failed
+integration is aborted and the restoration is **observed** — the branch tip is
+re-read and `git ls-files --unmerged` listed — before the response claims the
+repository is back where it started.
+
+**The tier the second half runs in is part of that decision** (ADR 0044 §4). A
+pull is the first operation in this server to run a *local* git command under a
+`NetworkNeed::Remote` operation, and `need` is what `tier_for` dispatches on,
+while `policy_for` sets `HookMode::Run` in every tier. Threading the pull's own
+`Remote` need into `exec_merge`/`exec_rebase` would therefore have run this
+repository's `post-merge` / `post-checkout` / `post-rewrite` hooks in
+`Tier::Network` — outbound TCP on `DEFAULT_GIT_PORTS`, no `--unshare-net` —
+i.e. the identical git command would be **more** capable through `/api/pull`
+than through `/api/merge`, which declares `Local` and lands in `Tier::Strict`.
+`planner::pull::INTEGRATION_NEED` pins the integration half (and the abort, and
+`git ls-files --unmerged`) to `NetworkNeed::Local`, so `need` reaches exactly
+one call in `exec_pull`: `run_fetch`. Proved behaviourally rather than by
+inspection — `planner::pull_suite` runs real git hooks that report
+`readlink /proc/self/ns/net`, asserts the fetch half's hook shares the server's
+network namespace and the integration half's does not, and pins the same answer
+for a direct merge.)*
+
 ### Which host a remote-reaching operation may contact (ADR 0047, #229 follow-up)
 
 The paragraph above claimed the `RemoteConfigured` precondition was what kept a
@@ -540,10 +576,19 @@ own Network-tier grant permits the connect and cannot be what makes the test
 pass.
 
 Because both halves live in the shared machinery, `POST /api/pull` inherits them
-verbatim when #230 wires its executor: `PullBranch` carries the same
-`RemoteName` and the same `RemoteConfigured` precondition, and the suite asserts
-today that a pull with an unconfigured remote is refused by the gate (409)
-*before* reaching pull's not-yet-implemented executor (501).
+verbatim: `PullBranch` carries the same `RemoteName` and the same
+`RemoteConfigured` precondition, and the suite asserts that a pull with an
+unconfigured remote is refused by the gate (409) *before* `execute` is reached
+at all.
+
+That assertion was written while pull's executor was still a `501` stub, to
+prove the refusal came from the gate rather than the stub. **With #230 landed it
+guards a live `git fetch`**, and the mutation that shows it says so: flipping
+`refuses_when_unmet_at_build`'s `RemoteConfigured` arm to `false` on this branch
+makes the pull answer `400 … The fetch from ‘ghost.git’ succeeded, but it has no
+branch ‘main’` — git really did read the in-tree directory as a transport
+target, through pull's own executor. The precondition arm is the only thing
+between a client-chosen `remote` string and that fetch.
 
 ## Request Integrity
 
