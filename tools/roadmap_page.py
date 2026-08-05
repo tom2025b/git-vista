@@ -384,6 +384,7 @@ HTML_TEMPLATE = r"""<title>Git-Vista Roadmap</title>
   .legend .key { display: inline-flex; align-items: center; gap: 6px; }
   .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
   .swatch.closed { background: var(--closed); }
+  .swatch.cut { background: repeating-linear-gradient(45deg, var(--muted) 0 3px, var(--track) 3px 6px); }
   .swatch.review { background: var(--review); }
   .swatch.track { background: var(--track); box-shadow: inset 0 0 0 1px var(--ring); }
 
@@ -492,9 +493,10 @@ HTML_TEMPLATE = r"""<title>Git-Vista Roadmap</title>
   <div class="panel">
     <h2>Issues per milestone</h2>
     <div class="legend" aria-hidden="true">
-      <span class="key"><span class="swatch closed"></span>Closed</span>
+      <span class="key"><span class="swatch closed"></span>Shipped</span>
       <span class="key"><span class="swatch review"></span>In review</span>
       <span class="key"><span class="swatch track"></span>Open</span>
+      <span class="key"><span class="swatch cut"></span>Cut — not planned, outside progress</span>
     </div>
     <div class="rows" id="rows"></div>
   </div>
@@ -649,7 +651,7 @@ def render_html(
 
     tile2_value = esc(str(tiles["current_key"]))
     if current_key:
-        parts = [f'{tiles["current_closed"]} closed', f'{tiles["current_open"]} open']
+        parts = [f'{tiles["current_closed"]} shipped', f'{tiles["current_open"]} open']
         if tiles["current_review"]:
             parts.append(f'{tiles["current_review"]} in review')
         tile2_note = " · ".join(parts)
