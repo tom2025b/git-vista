@@ -43,6 +43,8 @@ use crate::features::graph::core::{
 use crate::features::operations::core::OperationsCore;
 use crate::features::operations::signals::Operations;
 use crate::features::operations::view::operations_status_view;
+use crate::features::session::core::seed_retry_attempts_for;
+use crate::features::session::core::seed_retry_delay_ms;
 use crate::features::session::core::session_retry_delay_ms;
 use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
@@ -290,6 +292,51 @@ pub fn App() -> impl IntoView {
             }
             None => history_ui.phase.set(HistoryPhase::SeedError { epoch }),
         }
+    });
+
+    // #218 residual gap: `HistoryPhase::SeedError` used to have no automatic
+    // self-heal at all. `seed_for_epoch` makes two sequential `send_read`-backed
+    // calls, each already good for one immediate retry (api.rs's `send_read`)
+    // bounded by `REQUEST_TIMEOUT_MS`; if a flaky tunnel outlasts both,
+    // `seed_for_epoch` returns `Err`, the promotion effect above sets
+    // `SeedError`, and nothing retried it — the user was stuck on the single
+    // status line above until clicking Refresh (which just calls the same
+    // `force_bump` this effect now schedules automatically, with backoff).
+    //
+    // `(u64, u32)` = (the epoch this chain's own last `force_bump` produced,
+    // attempts spent so far). Deliberately a *second* signal, not folded into
+    // the epoch-reset effect a few lines up: that effect fires on every epoch
+    // change, including the ones this very mechanism causes, so resetting the
+    // counter there would zero the budget on every retry and make it
+    // unbounded. `seed_retry_attempts_for` carries the reasoning for why
+    // "per-epoch" has to mean "per failure chain" instead — read its doc
+    // comment before touching this.
+    let seed_retry = create_rw_signal((0u64, 0u32));
+    create_effect(move |_| {
+        let HistoryPhase::SeedError { epoch } = history_ui.phase.get() else {
+            return;
+        };
+        let (expected_epoch, attempts_used) = seed_retry.get_untracked();
+        let attempts_used = seed_retry_attempts_for(expected_epoch, epoch, attempts_used);
+        let Some(delay) = seed_retry_delay_ms(attempts_used) else {
+            return; // Budget spent for this chain: stop, leave the error visible.
+        };
+        let next_attempt = attempts_used + 1;
+        set_timeout(
+            move || {
+                // Stale-timer guard: if the user already manually refreshed
+                // (or a drift reload etc. superseded this failure) since the
+                // timer was armed, the panel is no longer showing the epoch
+                // this retry was for — firing anyway would race a reload
+                // that's already in flight, so skip it.
+                if history_ui.phase.get_untracked() != (HistoryPhase::SeedError { epoch }) {
+                    return;
+                }
+                let new_epoch = graph.try_update(|g| g.force_bump()).unwrap_or_default();
+                seed_retry.set((new_epoch, next_attempt));
+            },
+            std::time::Duration::from_millis(delay as u64),
+        );
     });
 
     // The last accepted Frame — the single source of repo metadata now that the
