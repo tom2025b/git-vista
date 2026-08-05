@@ -362,7 +362,7 @@ mod tests {
         use axum::http::{header, Request};
         use axum::routing::post;
         use axum::Router;
-        use git_vista_protocol::{ApiError, PROTOCOL_HEADER, PROTOCOL_VERSION};
+        use git_vista_protocol::{PROTOCOL_HEADER, PROTOCOL_VERSION};
         use tower::ServiceExt;
 
         let router = Router::new()
@@ -388,20 +388,24 @@ mod tests {
             (status, String::from_utf8_lossy(&bytes).into_owned())
         }
 
-        /// The endpoint's own error body, dug out of the `ApiError` envelope
-        /// `middleware::api_contract` wraps every non-JSON 4xx in.
+        /// The endpoint's own error body — parsed directly, **not** dug out of
+        /// an `ApiError` envelope.
         ///
-        /// The nesting is the server-wide convention (`/api/fetch` and
-        /// `/api/amend-commit` are wrapped identically), not something this
-        /// endpoint chose — a handler returning `(StatusCode, String)` is
-        /// `text/plain`, and the envelope carries its text through verbatim
-        /// as `message`. Unwrapping it here rather than asserting on the raw
-        /// bytes is what makes this test about *this endpoint's* contract.
+        /// This mirrors `/api/amend-commit`'s contract exactly (and
+        /// `/api/fetch`'s, which builds its `FetchError` the same way): the
+        /// handler returns `(StatusCode, String)` with the `String` already a
+        /// pre-serialized typed DTO, and `middleware::rewrap_error` (#323)
+        /// recognises a JSON-object body and passes it through untouched
+        /// instead of escaping it into a generic envelope's `message` field.
+        /// Before #323's fix this test asserted the *bug* — a `PullError`
+        /// double-encoded inside `ApiError.message` — as if it were the
+        /// contract; the frontend never actually unwrapped an envelope here
+        /// (`api.rs::receipt` hands the raw response text straight to
+        /// `pull_summary`, which parses it as `PullError` directly), so that
+        /// assertion was pinning behaviour nothing downstream relied on.
         fn inner(raw: &str) -> PullError {
-            let envelope: ApiError =
-                serde_json::from_str(raw).expect("every 4xx is an ApiError envelope");
-            serde_json::from_str(&envelope.error.message)
-                .expect("…whose message is this endpoint's own PullError")
+            serde_json::from_str(raw)
+                .unwrap_or_else(|e| panic!("body was not a bare PullError: {e}\nbody={raw}"))
         }
 
         // Leg 1 + 2.
