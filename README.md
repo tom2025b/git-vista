@@ -1,21 +1,27 @@
 # Git-Vista
 
-Git-Vista is becoming a professional, touch-first visual Git client for one
-developer using an iPad to work with real repositories on Linux. The browser is
-the portable UI platform; Rust, Axum, `gix`, System Git, Leptos, and WebAssembly
+Git-Vista is a professional, touch-first visual Git client for one developer
+using an iPad to work with real repositories on Linux. The browser is the
+portable UI platform; Rust, Axum, `gix`, System Git, Leptos, and WebAssembly
 provide the native repository service and adaptive client.
 
-The current implementation is a working prototype centered on a clean, zoomable
-vertical commit graph. The proposed V2 direction adds a safe daily-driver Git
-workflow, SSH-first remote access, worktrees, stash, history editing, conflicts,
-forge integration, PWA behavior, and teaching built on professional semantics.
+Its **V1 foundation is complete**: every write reaches the repository through
+one typed, reviewable planner, mutations against a repository serialize, Git
+process execution is policy-bounded, and an operation journal makes recovery
+provable rather than assumed. V1's daily-driver line — full working-tree
+status, diffs, staging, commit/amend/hook/signing UX, remotes, tags, and an
+installable PWA — is **in progress** on top of that foundation. The proposed
+V2 direction beyond it adds worktrees, stash, history editing, conflict
+resolution, forge integration, and teaching built on the same professional
+semantics. See [Status](#status) below for exactly what has shipped.
 
-> **Current security boundary:** the prototype is hard-limited to
+> **Current security boundary:** the server is hard-limited to
 > `127.0.0.1:8080` and requires a single-use bootstrap, HttpOnly session, CSRF,
 > and strict Host/Origin checks. Non-loopback bind overrides are refused; an SSH
-> local-port forward is the only supported iPad access path. Mutation
-> serialization, bounded Git execution, and durable recovery remain M1 work
-> before professional daily-driver use.
+> local-port forward is the only supported iPad access path. Every mutation —
+> from the browser or from an MCP agent — is planned, serialized per repository,
+> and journaled before it runs; see [the security model](docs/SECURITY_MODEL.md)
+> and the ADR index below for how.
 
 ## Product Direction
 
@@ -29,22 +35,30 @@ forge integration, PWA behavior, and teaching built on professional semantics.
 
 ## Documentation
 
-- [Future vision](docs/FUTURE_VISION.md)
-- [V2 architecture](docs/V2_ARCHITECTURE.md)
-- [Git client roadmap](docs/GIT_CLIENT_ROADMAP.md)
+- [Architecture Decision Records](docs/adr/) — the numbered, dated record of
+  every decision expensive to reverse (49 so far, 0001–0049). This is where
+  implemented behavior is authoritative; start here before trusting a claim in
+  a prose doc below against the running code.
+- [Future vision](docs/FUTURE_VISION.md) — proposed, not current.
+- [V2 architecture](docs/V2_ARCHITECTURE.md) — proposed, not current.
+- [Git client roadmap](docs/GIT_CLIENT_ROADMAP.md) — proposed, not current.
 - [iPad interaction design](docs/IPAD_DESIGN.md)
 - [Remote Linux architecture](docs/REMOTE_ARCHITECTURE.md)
 - [Security model](docs/SECURITY_MODEL.md)
-- [Feature and competitive matrix](docs/FEATURE_MATRIX.md)
+- [Feature and competitive matrix](docs/FEATURE_MATRIX.md) — proposed baseline,
+  not current.
 
 `DESIGN.md` preserves the prototype's phased implementation history. The
-documents under `docs/` are proposed architecture, not claims about the current
-code. Agent prompts, session handoffs, and running project memory are local
-working material and are intentionally excluded from the public repository.
+future-vision, V2-architecture, roadmap, and feature-matrix documents under
+`docs/` are proposed direction, not claims about the current code — treat an
+ADR or the code itself as the tiebreaker whenever one of them looks ahead of
+what has actually shipped. Agent prompts, session handoffs, and running
+project memory are local working material and are intentionally excluded from
+the repository's public-facing docs.
 
 ## Workspace layout
 
-The current prototype has five crates:
+The workspace has six crates:
 
 ```
 git-vista/
@@ -57,7 +71,10 @@ git-vista/
     │                             #   API error envelope, request-id, wire DTOs
     ├── git-vista-git/            # native git reading via gix (native-only)
     ├── git-vista-server/         # axum HTTP backend
-    │   └── src/                  # routes, contract middleware, Git commands, state
+    │   └── src/                  # routes, planner, journal, contract
+    │                             #   middleware, sandboxed Git execution, state
+    ├── git-vista-mcp/            # MCP stdio bridge: agents drive git-vista
+    │                             #   through the same HTTP API the browser uses
     └── git-vista/                # the Leptos wasm UI (bin: git-vista-ui)
         ├── index.html            # Trunk entry point
         ├── styles.css
@@ -73,29 +90,52 @@ both depend on it, while `git-vista-core` stays free of transport concerns. See
 filesystem repo and can't compile for wasm, so keeping it out of `core` lets the
 browser frontend depend on a clean, wasm-safe core. Both the server and the UI
 share `git-vista-core`'s types, so the same structs flow from the git walker
-through JSON into the UI with no duplication. V2 will split pure domain,
-versioned protocol, graph, repository application, and forge concerns as those
-boundaries earn their own crates.
+through JSON into the UI with no duplication.
+
+`git-vista-mcp` is kept **separate from `git-vista-server`** on purpose too: it
+links `git-vista-protocol` and `git-vista-core` for the shared wire types but
+never the server crate, so an agent talking MCP reaches the repository only
+through the same loopback HTTP API and the same reviewable planner the browser
+uses — never a shell, never raw argv. A dependency-graph test proves the write
+path is structurally unreachable from this crate, not merely unrouted. See
+[ADR 0046](docs/adr/0046-mcp-plan-tool-surface.md).
+
+V2 will split pure domain, versioned protocol, graph, repository application,
+and forge concerns further as those boundaries earn their own crates.
 
 ## Architecture
 
 ```
-  browser (SPA, wasm)                    git-vista-server (native)
-  ────────────────────      HTTP         ─────────────────────────
-  fetch /api/commits   ───────────────▶  walk_history + layout  ─┐
-  fetch /api/commit/id ───────────────▶  read_commit            ─┤ gix reads
-  POST  /api/branch    ───────────────▶  git branch  (shell)    ─┤ the repo on
-  POST  /api/commit    ───────────────▶  git commit  (shell)    ─┤ the filesystem
-  POST  /api/merge|push|delete-branch ▶  git … (shell)          ─┤
-  POST  /api/clone     ───────────────▶  git clone → clones dir ─┤
-  POST  /api/delete-clone             ▶  rm clone (guarded)      ─┘
+  browser (SPA, wasm)                                  git-vista-server (native)
+  ────────────────────                HTTP             ─────────────────────────
+  fetch  /api/commits, /api/status  ─────────────────▶  reads: walk_history,
+  fetch  /api/diff/{id}, /api/file  ─────────────────▶  status, diff, activity  ─┐
+                                                                                  │ gix reads
+  POST   /api/plan                  ─────────────────▶  shared planner:         ─┤ the repo
+         { operation, targets }                          typed operation        ─┤ on the
+                                     ◀─────────────────   → reviewable Plan       │ filesystem
+  POST   /api/{commit,branch,merge,                                             ─┤
+         push,pull,fetch,tag,       ─────────────────▶  execute: serialized     ─┤ system git
+         amend-commit,checkout,…}                         per-repo, journaled,     (shell,
+                                                            bounded git exec       sandboxed)
+                                     ◀─────────────────   → result / undo ref    ─┘
+
+  MCP agent (stdio)  ──git-vista-mcp──▶  same loopback HTTP API, same planner,
+                                          read tools + build-only plan tools
+                                          (execution is a separate, later stage)
 ```
 
-The server serves both the WASM bundle and same-origin API on `:8080`. Same-origin
-delivery reduces frontend configuration; it does not authenticate the current
-write endpoints.
+Every write — whatever the caller — goes through the one shared planner
+described in [ADR 0016](docs/adr/0016-shared-write-planner.md): build a typed
+`Plan` from a closed operation vocabulary
+([ADR 0015](docs/adr/0015-typed-operation-vocabulary-and-plan-schema.md)),
+then execute it, serialized per repository, against a policy-bounded Git
+process, with a durable operation journal behind it
+([ADR 0019](docs/adr/0019-serialized-mutations-per-repository.md),
+[ADR 0021](docs/adr/0021-durable-operation-journal-and-recovery-refs.md)).
+The server serves both the WASM bundle and same-origin API on `:8080`.
 
-## Current Prototype Features
+## Current Features
 
 - Vertical commit graph with robust lane assignment (branches, merges, octopus).
 - Pan & zoom via **Pointer Events** — drag to pan, wheel to zoom on desktop,
@@ -106,23 +146,35 @@ write endpoints.
   on-screen rows are rendered, for large histories).
 - **GitHub links** on commits/refs when the repo has a `github.com` origin — only
   for pushed objects, so a link never 404s.
-- Write actions from the graph's context menu: create branch, commit, merge, push,
-  delete branch (each confirmed in an iPad-safe in-app modal).
-- **Commit detail panel** (Phase 10): "View details" opens a side panel with the
-  full message body and both author & committer signatures; parent hashes are
+- **Commit detail panel**: "View details" opens a side panel with the full
+  message body and both author & committer signatures; parent hashes are
   clickable to walk up the history.
-- **Open URL** (Phase 12, persisted by ADR 0008): paste a public
-  `https://`/`http://`/`git://` URL to clone it into the persistent clones
-  store, then choose Visualize (read-only) or Active mode. Clones survive a
-  restart and stay listed in the picker until deleted.
-- **Controls & shortcuts** (Phase 13): drag/one-finger to pan, wheel/pinch to zoom,
-  plus keyboard shortcuts on desktop and the iPad Magic Keyboard — `+`/`-` zoom, `0`
-  resets the view, `r` refreshes, `Esc` closes the open menu/panel. A **Reset view**
-  button recenters the camera for pure touch/trackpad use (no keyboard needed).
-- Working-tree summary, stage-all/unstage-all, commit diffs, file viewing, branch
-  checkout, rebase gating, activity history, contextual undo, and graph printing.
+- **Open URL**: paste a public `https://`/`http://`/`git://` URL to clone it
+  into the persistent clones store, then choose Visualize (read-only) or
+  Active mode. Clones survive a restart and stay listed in the picker until
+  deleted.
+- **Controls & shortcuts**: drag/one-finger to pan, wheel/pinch to zoom, plus
+  keyboard shortcuts on desktop and the iPad Magic Keyboard — `+`/`-` zoom, `0`
+  resets the view, `r` refreshes, `Esc` closes the open menu/panel. A **Reset
+  view** button recenters the camera for pure touch/trackpad use.
+- Working-tree summary, stage-all/unstage-all, commit diffs, file viewing,
+  branch checkout, rebase gating, activity history, contextual undo, and graph
+  printing.
+- **Write actions** from the graph's context menu, each confirmed in an
+  iPad-safe in-app modal and each running through the shared planner: create
+  branch, commit, **amend**, merge, **fetch, pull, push**, delete branch,
+  create/list/delete **tags**.
+- **MCP agent bridge** (`git-vista-mcp`): an agent gets read tools (graph,
+  commit detail, diff, activity, status, repository selection) plus 23
+  build-only `plan_<operation>` tools — it can ask "what would this operation
+  do" and get back risk, preconditions, and affected refs with nothing
+  touching the repository. Submitting an approved plan for execution is a
+  separate, later stage. See
+  [ADR 0046](docs/adr/0046-mcp-plan-tool-surface.md).
 
-See the [feature matrix](docs/FEATURE_MATRIX.md) for an honest current/target split.
+See the [feature matrix](docs/FEATURE_MATRIX.md) for the target/current split
+(the matrix predates the M2 work above and is due a refresh; the ADR index is
+the current source of truth in the meantime).
 
 ## Prerequisites
 
@@ -144,7 +196,7 @@ replacing the previous process, then points the server at a repository.
 ./gv ~/code/myproj    # visualise another repo by path
 ```
 
-Then open the **sign-in link** it prints (M1.04):
+Then open the **sign-in link** it prints:
 
 ```
 gv: sign in on the iPad/browser by opening this one-time link:
@@ -239,7 +291,8 @@ Frontend-only iteration (no API, no real data) still works with
 
 ## Tests
 
-These are the exact commands CI runs, in the order it runs them:
+These are the exact commands CI runs, in the order it runs them (`./dev gate`
+runs all five):
 
 ```sh
 cargo fmt --all -- --check                                # formatting is clean
@@ -249,9 +302,10 @@ cargo test --workspace                                    # headless test suite
 cd crates/git-vista && trunk build                        # the real wasm bundle
 ```
 
-The core and Git crates include headless tests and repository fixtures. V2 requires
-additional route-policy, operation-state, crash-recovery, browser, and real-device
-coverage described in the architecture documents.
+The core and Git crates include headless tests and repository fixtures;
+`git-vista-server` additionally carries planner, journal, sandbox, and
+contract-suite coverage. V2 requires additional route-policy, browser, and
+real-device coverage described in the architecture documents.
 
 ### Toolchain and terminal colour
 
@@ -269,8 +323,31 @@ a `--check` diff or a lint log into a file.
 
 ## Status
 
-The visualizer prototype is functional and has continued beyond its original
-Phase 12/13 plan. Repository identity, protocol negotiation, catalog isolation,
-and loopback sessions have landed. It is not yet a professional daily-driver
-client: typed operation planning, mutation serialization, bounded Git process
-policy, and durable recovery evidence still precede broader Git feature work.
+**M1 — V1 Foundation** is complete (39 issues shipped, 0 open): repository
+identity, protocol negotiation, catalog isolation, loopback sessions, the
+typed operation vocabulary and shared planner, serialized per-repository
+mutations, a bounded and sandboxed Git process policy, and a durable
+operation journal with recovery refs have all landed and shipped.
+
+**M2 — Daily Driver: Status to Push [V1]** is the active milestone, roughly
+**62% done** (34 shipped / 21 open, per `./dev roadmap`). Fetch, pull, and
+push execution, tag listing and local tag create/delete, amend UX, published-
+history warnings, the build/submit planner split, and the MCP `plan_<operation>`
+tool surface all landed most recently. Remaining M2 work is full working-tree
+status and diff UI, file/hunk/partial staging, guarded discard, complete
+commit/hook/signing UX, full remote and upstream management, and an
+installable PWA with offline read-only mode — see `./dev roadmap` for the
+open issue list.
+
+M3 (parallel work & recovery), M4 (history editing), M5 (investigation &
+forges), and M6 (teaching semantics, reduced to a single issue) are the
+proposed V2 milestones beyond the V1 line; M7 was retired and M8 deleted as
+never-started. [ADR 0049](docs/adr/0049-v1-scope-freeze.md) records that scope
+freeze — eighteen never-started issues closed as won't-do, each with an
+explicit return condition — and is the place to check before assuming
+anything described only in `FUTURE_VISION.md`, `V2_ARCHITECTURE.md`, or
+`GIT_CLIENT_ROADMAP.md` is still intended as written.
+
+49 ADRs (`docs/adr/`, numbered 0001–0049) now record the project's
+architectural decisions in order; treat that index, not this README's prose,
+as the living record of what has actually shipped.

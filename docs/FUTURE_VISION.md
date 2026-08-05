@@ -1,5 +1,33 @@
 # Git-Vista Future Vision
 
+> **Historical document — vision snapshot, not current scope.**
+> Written 2026-07-15, before the V1 scope freeze (ADR 0049, 2026-08-05,
+> `docs/adr/0049-v1-scope-freeze.md`). Read this
+> alongside `docs/adr/` (the numbered decision record, 0001–0049) and the live
+> roadmap (`./dev roadmap`), which reflect what actually shipped.
+>
+> **What this doc promised that ADR 0049 cut (closed won't-do, reopenable):**
+> - *Horizon 3 — Learning on Real Semantics*: the disposable-repository simulator
+>   (#93), conflict/rebase trainers (#94), and printable/shareable diagrams (#95)
+>   are cut. Only Explain Mode (#92) survives, unchanged, as M6's sole remaining
+>   issue.
+> - *Horizon 4 — Ecosystem Without Core Erosion*: the whole direction is cut —
+>   the out-of-process extension protocol (#96), classroom coordination as a
+>   separate service (#97), paired-HTTPS LAN research (#98), and optional local
+>   snapshot sync (#99). Milestone M7 ("Ecosystem and Classroom"), which held
+>   all four, is retired.
+> - Forge-provider breadth: provider-neutral forge capabilities (#88), Forgejo
+>   (#90), and GitLab (#91) integration are cut. GitHub-only (#89) is what
+>   shipped/remains for V1.
+> - "Teaching Reconsidered" and its architecture claims (operation journal as
+>   learning timeline, redacted instructor presentation, isolated lesson
+>   backend) describe the now-cut simulator/trainer/classroom line, not a live
+>   target.
+>
+> **Kept, not cut:** Horizon 1 and Horizon 2 (daily-driver and professional-depth
+> workflows) are exactly the M1–M5 line that did ship or remains open scope —
+> not affected by this freeze.
+
 Status: product direction
 
 ## Five-Year Thesis
