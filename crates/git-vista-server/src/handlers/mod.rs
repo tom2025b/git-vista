@@ -22,7 +22,8 @@
 //!     merge-or-rebase choice required on the wire and never defaulted.
 //!   * [`operations`] — one write's recorded lifecycle, its progress stream,
 //!     and (since #229) cancelling one that is still running.
-//!   * [`operations`] — one write's recorded lifecycle, and its progress stream.
+//!   * [`tags`]    — `GET /api/tags`, every tag with its kind, target, tagger
+//!     and message (M2.21b, #236).
 //!   * [`plan`] — `POST /api/plan` (#248): build a reviewable `Plan` and hand
 //!     it back unexecuted — the only endpoint that mints a plan without
 //!     running it, and the one the MCP `plan_*` tools sit on.
@@ -61,6 +62,8 @@ pub(crate) mod rebase;
 pub(crate) mod reset;
 pub(crate) mod select;
 pub(crate) mod staging;
+// M2.21b (#236): `GET /api/tags`, the tag listing with type/target/tagger/message.
+pub(crate) mod tags;
 // M1.04 (#57): establish / check / revoke a loopback session.
 pub(crate) mod session;
 

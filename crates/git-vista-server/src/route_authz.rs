@@ -79,6 +79,12 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // #68c: the generation-tagged WorktreeStatus DTO — same read posture as
     // the v1 endpoint immediately above.
     ("/api/status/v2", Method::GET, Authz::SessionRequired),
+    // M2.21b (#236): the tag listing. A GET (no CSRF surface) and *not*
+    // full_routes-gated: unlike `/api/staging/diff` above it discloses only
+    // committed, published history — the same class of fact `/api/frame`'s ref
+    // badges already carry — never working-tree contents, which is the line
+    // ADR 0005 draws for what the LAN router may see.
+    ("/api/tags", Method::GET, Authz::SessionRequired),
     ("/api/activity", Method::GET, Authz::SessionRequired),
     ("/api/undoables/{id}", Method::GET, Authz::SessionRequired),
     ("/api/rebase-status", Method::GET, Authz::SessionRequired),

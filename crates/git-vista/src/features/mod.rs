@@ -15,3 +15,4 @@ pub mod operations;
 pub mod session;
 pub mod shell;
 pub mod status;
+pub mod tags;

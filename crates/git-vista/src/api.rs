@@ -18,6 +18,7 @@ use git_vista_core::diff::{CommitDiff, FileContent};
 use git_vista_core::model::CommitDetail;
 use git_vista_core::net::{network_error_text, offline_refusal_text};
 use git_vista_core::status::RepoStatus;
+use git_vista_protocol::dto::TagDetail;
 use git_vista_protocol::operation::{IdempotencyKey, OperationId};
 use git_vista_protocol::{
     ApiError, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
@@ -27,6 +28,7 @@ use git_vista_protocol::{
     PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
+use crate::features::dialogs::commit::{amend_body, classify_amend_response, AmendOutcome};
 use crate::features::dialogs::core::{
     clone_poll_step, clone_response_should_poll, ClonePollOutcome, ClonePollStep,
 };
@@ -971,6 +973,48 @@ pub async fn create_commit_request(
     }
 }
 
+/// Rewrite the checked-out branch's tip commit (`POST /api/amend-commit`,
+/// M2.19c #224 over M2.19a #222 / M2.19b #223).
+///
+/// Three things make this a different function from [`create_commit_request`]
+/// rather than a flag on it, and all three are the endpoint's own design (ADR
+/// 0040):
+///
+/// - **A separate route.** An amend sent to a server that predates #223 must
+///   404, never be quietly accepted as a plain commit — "created a second
+///   commit instead of rewriting the first" is a silent wrong outcome.
+/// - **A compare-and-swap.** `expected_tip` is the full commit id the *user*
+///   reviewed. The server refuses if HEAD has moved since, which is the whole
+///   protection: it is not a staleness optimisation, it is what stops an amend
+///   rewriting a commit nobody looked at.
+/// - **A typed answer.** Every 400 from this route is an `AmendCommitError`,
+///   and 200 is an `AmendCommitSuccess`. Reading them is
+///   `features::dialogs::commit::classify_amend_response` — pure, host-tested
+///   against bodies serialized from the server's own DTOs — so this function
+///   carries no parsing or classification of its own.
+///
+/// Never returns `Result`: the caller must handle a stale tip differently from
+/// an error (see [`AmendOutcome`]), and a `Result<_, String>` is exactly the
+/// shape that would let it treat them the same.
+pub async fn amend_commit_request(message: &str, expected_tip: &str) -> AmendOutcome {
+    if let Err(refusal) = refuse_if_offline().and_then(|()| refuse_if_visualize()) {
+        return AmendOutcome::Unavailable(refusal);
+    }
+    let body = amend_body(message, expected_tip);
+    let resp = match write_json("/api/amend-commit", &body).await {
+        Ok((resp, _key)) => resp,
+        // A transport failure: the request may or may not have reached the
+        // server, which is precisely what `Unavailable`'s copy says.
+        Err(e) => return AmendOutcome::Unavailable(e),
+    };
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .unwrap_or_else(|_| format!("HTTP {status}"));
+    classify_amend_response(status, &text)
+}
+
 /// Ask the backend to stage all working-tree changes (`POST /api/stage`) — a
 /// plain `git add -A`, so modified/new/deleted files move into the index and can
 /// then be committed. Bodyless, like the rebase request; a non-2xx body is git's
@@ -1032,6 +1076,28 @@ pub async fn fetch_activity(limit: usize) -> Result<Vec<ActivityEvent>, String> 
     let resp = req_get(&url).send().await.map_err(network_error)?;
     if resp.ok() {
         resp.json::<Vec<ActivityEvent>>()
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        Err(resp
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
+/// Fetch every tag with its full metadata (`GET /api/tags`, M2.21b #236):
+/// lightweight vs annotated, the tagged commit, and — for annotated tags —
+/// the tag object, tagger and message.
+///
+/// A live read like the feed beside it: a tag can appear or vanish from a
+/// terminal at any moment, so it is fetched fresh whenever the Activity panel
+/// opens and cache-busted the same way.
+pub async fn fetch_tags() -> Result<Vec<TagDetail>, String> {
+    let url = format!("/api/tags?t={}", js_sys::Date::now());
+    let resp = req_get(&url).send().await.map_err(network_error)?;
+    if resp.ok() {
+        resp.json::<Vec<TagDetail>>()
             .await
             .map_err(|e| e.to_string())
     } else {

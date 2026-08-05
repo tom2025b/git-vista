@@ -63,6 +63,17 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // (`worktree_status`) now goes through `crate::git_cmd::git_output`
     // (#66 Task 6); this entry now covers only its `#[cfg(test)]` fixtures.
     "src/handlers/read.rs",
+    // M2.21b (#236): `#[cfg(test)]` fixture setup only. `GET /api/tags` runs
+    // no subprocess at all in production — `git_vista_git::read_tags` opens
+    // the repository with `gix` and decodes tag objects out of the mapped
+    // object database — so every `Command::new` in this file builds a
+    // throwaway tagged repository for the tests. It lives here rather than in
+    // `main.rs` precisely because `main.rs` must keep constructing no
+    // `Command` at all (see `every_allowlist_entry_names_a_live_spawn_site`,
+    // which uses it as its negative control) and because
+    // `sandbox::escape_contract`'s R7 pins `main.rs`'s `GIT_*` surface to two
+    // variables.
+    "src/handlers/tags.rs",
     // `#[cfg(test)]` fixture setup only — `git init -q`, to build repositories
     // `read_repo_facts` can classify. This entry used to read "static-arg read
     // at registration", which stopped being true when registration moved to the
@@ -221,6 +232,13 @@ const ALLOWED_GIT_CRATE_SPAWN_SITES: &[&str] = &[
     // `Command::new` left in the file is below its `#[cfg(test)] pub(crate) mod
     // tests` line, building real repositories for the suites to read.
     "src/history.rs",
+    // M2.21b (#236): `#[cfg(test)]` fixture setup only, same posture as
+    // `src/history.rs` above. `read_tags` itself spawns nothing — it opens the
+    // repository with `gix::open_opts(.., isolated())` and decodes each tag
+    // object out of the mapped object database — so the file's only
+    // `Command::new` sites build tagged fixture repositories (`git tag`,
+    // `git mktag`, `git pack-refs`) for the suite to read back.
+    "src/tags.rs",
 ];
 
 /// The one carve-out from "every spawn site names `git` literally": sites that
