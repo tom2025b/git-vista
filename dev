@@ -13,7 +13,7 @@
 #   dev roadmap           print milestones + open issues, grouped by M-band
 #   dev roadmap-page      regenerate design-docs/roadmap.html from live GitHub data
 #   dev start <issue#>    branch off fresh main for an issue (feature/mX.YY-slug)
-#   dev wip [message]     checkpoint: add + commit (as claude_2010) + push
+#   dev wip [message]     checkpoint: add + commit (as Claude_Max) + push
 #   dev resume [issue#]   show branch state, WIP commits, and handoff.md
 #   dev signin            reprint the sign-in link(s) for the running server
 #   dev doctor            diagnose listener/session/tunnel state without secrets
@@ -35,7 +35,7 @@ cd "$REPO"
 
 # Author identity for commits this script makes: name distinguishes Claude's
 # commits from Tom's in `git log`; the noreply email dodges GitHub's GH007.
-GIT_AS=(-c user.name=claude_2010 -c user.email=262510778+tom2025b@users.noreply.github.com)
+GIT_AS=(-c user.name=Claude_Max -c user.email=262510778+tom2025b@users.noreply.github.com)
 
 die() { echo "dev: $*" >&2; exit 1; }
 
