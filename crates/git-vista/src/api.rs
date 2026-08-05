@@ -1352,6 +1352,190 @@ pub async fn fetch_worktree_status() -> Result<WorktreeStatus, String> {
     }
 }
 
+/// One `GET /api/operations/by-key/{key}` poll's outcome — the decision input
+/// for [`operation_id_poll_step`] (M2.20f, #232).
+///
+/// Shaped from the handler's own three answers
+/// (`handlers/operations.rs::operation_by_key`), not guessed: `200` with an
+/// [`OperationByKeyResponse`], `404` for "no operation is admitted under that
+/// key **yet**", and — the case no server response can represent — the poll
+/// request itself failing before any answer was read.
+///
+/// Note what is deliberately *not* a variant: there is no "definitely never
+/// will be admitted". The handler's own doc comment says it refuses to
+/// distinguish "not admitted yet" from "never will be, or aged out", because
+/// "an unguessable key means there is nothing safe to say about *why* it is
+/// unrecognised". So the budget, not the status code, is what ends the wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OperationIdPoll {
+    /// `200 {"id": …}` — the server has admitted this key and minted an id.
+    Found(OperationId),
+    /// `404` — nothing is admitted under this key at this instant.
+    NotAdmitted,
+    /// The poll never got an answer: transport failure, timeout, an
+    /// unparseable body, or any other status. Retryable, like `NotAdmitted`.
+    PollError(String),
+}
+
+/// What to do after one `by-key` poll: bind the id, wait and poll again, or
+/// stop trying and let the write settle from its own response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OperationIdStep {
+    Bind(OperationId),
+    KeepPolling,
+    GiveUp,
+}
+
+/// The decision behind the `by-key` poll loop — the same shape as
+/// `clone_poll_step`, and for the same reason: the retryable-vs-terminal
+/// distinction is a rule worth stating once, in one place, rather than
+/// re-deriving it inside a loop body.
+///
+/// Only [`OperationIdPoll::Found`] is an answer. Both other variants are
+/// retried within budget, and both for the reason the clone loop retries its
+/// own `Unknown`/`PollError`: a 404 here is the *expected* first answer (the
+/// POST this key belongs to is still travelling to the handler), and a failed
+/// poll is the flaky-tunnel condition the whole feature exists to ride out.
+///
+/// Unlike `clone_poll_step`, exhaustion resolves to [`OperationIdStep::GiveUp`]
+/// rather than to an error message. Nothing failed: the write is still in
+/// flight and still settles from its own response. The only thing lost is the
+/// live half — progress, Cancel, reload recovery — so surfacing an error here
+/// would report a failure that has not happened.
+///
+/// **Not host-testable where it sits.** `api.rs` compiles only for wasm
+/// (`main.rs`: `#[cfg(target_arch = "wasm32")] mod api;`) because `gloo-net`
+/// is a wasm32-only dependency, so this function has no `cargo test` reach
+/// from here; it is written free-standing, taking no wasm types, precisely so
+/// it can be lifted into `features::operations::core` — which is host-compiled
+/// and host-tested — without changing a line of it.
+fn operation_id_poll_step(
+    outcome: OperationIdPoll,
+    attempts_made: u32,
+    max_attempts: u32,
+) -> OperationIdStep {
+    match outcome {
+        OperationIdPoll::Found(id) => OperationIdStep::Bind(id),
+        OperationIdPoll::NotAdmitted | OperationIdPoll::PollError(_) => {
+            if attempts_made >= max_attempts {
+                OperationIdStep::GiveUp
+            } else {
+                OperationIdStep::KeepPolling
+            }
+        }
+    }
+}
+
+/// One `GET /api/operations/by-key/{key}` attempt, mapped to the outcome
+/// [`operation_id_poll_step`] decides on. Bounded by
+/// [`OPERATION_ID_POLL_TIMEOUT_MS`] independently of the interval between
+/// attempts, so a hung poll cannot itself eat the budget.
+///
+/// Cache-busted with `t=<ms>` like every other read here, and this one needs
+/// it more than most: the answer *flips* from `404` to `200` partway through
+/// the loop, so an iOS Safari cache that served the first 404 back for every
+/// later poll would make the id permanently unlearnable — a stuck Cancel
+/// button and no progress bar, with no error anywhere to explain it.
+async fn fetch_operation_id_by_key(key: &IdempotencyKey) -> OperationIdPoll {
+    let url = format!(
+        "/api/operations/by-key/{}?t={}",
+        encode_component(key.as_str()),
+        js_sys::Date::now()
+    );
+    let resp = match with_deadline(req_get(&url).send(), OPERATION_ID_POLL_TIMEOUT_MS).await {
+        None => return OperationIdPoll::PollError(timeout_error()),
+        Some(Err(e)) => return OperationIdPoll::PollError(network_error(e)),
+        Some(Ok(resp)) => resp,
+    };
+    // The handler's `by_key_not_found`, *and* the bare 404 an older server
+    // gives for a route it does not have. Indistinguishable on the wire and
+    // treated identically on purpose: both mean "no id to bind right now",
+    // and the budget is what eventually separates "not yet" from "never".
+    if resp.status() == 404 {
+        return OperationIdPoll::NotAdmitted;
+    }
+    if !resp.ok() {
+        return OperationIdPoll::PollError(format!("HTTP {}", resp.status()));
+    }
+    match with_deadline(
+        resp.json::<OperationByKeyResponse>(),
+        OPERATION_ID_POLL_TIMEOUT_MS,
+    )
+    .await
+    {
+        None => OperationIdPoll::PollError(timeout_error()),
+        Some(Err(e)) => OperationIdPoll::PollError(e.to_string()),
+        Some(Ok(body)) => OperationIdPoll::Found(body.id),
+    }
+}
+
+/// Learn the [`OperationId`] the server minted for `key`, **while the write
+/// that carries it is still running** (M2.20f, #232).
+///
+/// # Why this exists at all
+///
+/// A tracked write's own response cannot answer this in time.
+/// `planner::plan_and_execute_tracked` ends with `record.wait_terminal().await`
+/// (`crates/git-vista-server/src/planner.rs:204`), so the `POST` — and with it
+/// the `x-git-vista-operation` header [`receipt`] reads — is withheld until the
+/// operation is already over. Everything that has to act *during* the
+/// operation (the Cancel button, the progress stream, the `localStorage` entry
+/// a reload recovers from) therefore has to reach the id another way. The
+/// server has it the whole time: `operations::note_minted` runs immediately
+/// after `admit` (`planner.rs:142`), and `lookup_by_key` reads it out without
+/// waiting for anything.
+///
+/// # The admit race, and why it is a bounded retry rather than a single call
+///
+/// The caller fires the write **without awaiting it** and calls this straight
+/// away, so this poll routinely reaches the server *before* the write it is
+/// asking about does. A `404` is therefore the expected first answer, not a
+/// failure — see [`OperationIdPoll`] — and the loop is what turns that
+/// expected miss into an answer a beat later.
+///
+/// `should_stop` is checked before every attempt and lets the caller end the
+/// loop early once the write's own response has made the question moot (it
+/// answered with an id, or it settled without one). Without it, a fetch that
+/// finishes in 50ms would leave this polling a key nobody is waiting on.
+///
+/// Exactly one request is open at any moment — attempt, await, sleep, repeat —
+/// so the budget bounds total time, never the number of live connections.
+///
+/// `None` means the id was never learned within
+/// [`OPERATION_ID_POLL_MAX_ATTEMPTS`], or the caller asked to stop. It is not
+/// an error and carries no message: the write is untouched and still settles
+/// from its own response.
+pub async fn resolve_operation_id(
+    key: IdempotencyKey,
+    should_stop: impl Fn() -> bool,
+) -> Option<OperationId> {
+    for attempt in 1..=OPERATION_ID_POLL_MAX_ATTEMPTS {
+        if should_stop() {
+            return None;
+        }
+        // Sleep first, like `poll_clone_status_until_settled`: the write was
+        // fired microseconds ago and has not yet reached a handler, so an
+        // immediate poll is a guaranteed 404 and a wasted round trip.
+        sleep_ms(OPERATION_ID_POLL_INTERVAL_MS).await;
+        if should_stop() {
+            return None;
+        }
+        let outcome = fetch_operation_id_by_key(&key).await;
+        match operation_id_poll_step(outcome, attempt, OPERATION_ID_POLL_MAX_ATTEMPTS) {
+            OperationIdStep::Bind(id) => return Some(id),
+            OperationIdStep::GiveUp => return None,
+            OperationIdStep::KeepPolling => {}
+        }
+    }
+    // Unreachable in practice — the last iteration always supplies
+    // `attempt == OPERATION_ID_POLL_MAX_ATTEMPTS`, which `operation_id_poll_step`
+    // resolves to `GiveUp`. Kept as the same honest fallback the clone loop
+    // keeps rather than `unreachable!()`: an off-by-one here must degrade to
+    // "no live progress", never to a panic that takes the whole app down
+    // mid-fetch.
+    None
+}
+
 /// Read an operation's current record (`GET /api/operations/{id}`) —
 /// answers whether or not the operation has finished (the route's own doc
 /// comment, `handlers/operations.rs::operation_status`). Used only for

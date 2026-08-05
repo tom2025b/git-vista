@@ -4,6 +4,9 @@
 //! holds only what genuinely needs Leptos: reading the live epoch out of a signal, and
 //! keeping the pending intent in a `StoredValue` that survives the closures that write it.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use leptos::{
     spawn_local, store_value, RwSignal, SignalGetUntracked, SignalUpdate, SignalWith,
     SignalWithUntracked, StoredValue,
@@ -19,12 +22,15 @@ use git_vista_protocol::PROTOCOL_VERSION;
 
 use crate::api::{self, WriteReceipt};
 use crate::features::core_traits::{RequestKey, RequestTarget};
+use crate::features::dialogs::core::{Dialog, ErrorNotice};
+use crate::features::dialogs::signals::Dialogs;
 use crate::features::graph::core::GraphCore;
 use crate::features::operations::core::{
     escalation, latest_wins, remote_op_kind, resume_decision, InFlightRemoteOp, IntentSeq,
     OperationsCore, PendingIntent, ResumeDecision, Settled, Settlement,
 };
 use crate::features::operations::kind::OperationKind;
+use crate::features::shell::signals::Shell;
 use crate::prefs;
 
 /// Mint the next value of a click-order sequence.
@@ -75,6 +81,31 @@ pub struct Operations {
     /// and sequences only ever increase, so a surviving record can never out-rank a newer
     /// tap.
     pending_intent: StoredValue<Option<PendingIntent>>,
+    /// Where this feature's own failures become words on screen (#316) —
+    /// see [`ErrorSink`] for why it is installed after construction rather
+    /// than passed to [`Operations::new`].
+    error_sink: StoredValue<Option<ErrorSink>>,
+}
+
+/// The handles needed to raise the app's error modal, held so a failure
+/// discovered inside a `spawn_local` continuation — where there is no view,
+/// no props and no return value — can still be reported to the user.
+///
+/// Installed by [`Operations::install_error_sink`] rather than taken by
+/// [`Operations::new`] because of the order `App` has to build things in: the
+/// operations registry is created *early*, above `graph_canvas`, so an
+/// in-flight write survives the epoch bump its own completion causes, while
+/// [`Shell`] and [`Dialogs`] are created much later, alongside the overlays
+/// they own. Nothing can hold both at construction time without moving one of
+/// them, and moving the registry down is precisely the bug M1.11 fixed.
+///
+/// `None` until installed, and that case is handled rather than assumed away:
+/// a failure raised before wiring goes to the browser console instead of
+/// vanishing.
+#[derive(Clone, Copy)]
+struct ErrorSink {
+    shell: Shell,
+    dialogs: Dialogs,
 }
 
 impl Operations {
@@ -84,7 +115,18 @@ impl Operations {
             graph,
             intent_seq: store_value(IntentSeq::default()),
             pending_intent: store_value(None::<PendingIntent>),
+            error_sink: store_value(None::<ErrorSink>),
         }
+    }
+
+    /// Wire this feature's failure reports into the app's error modal (#316).
+    ///
+    /// Call once from `App`, after [`Shell`] and [`Dialogs`] exist. Until it
+    /// is called, [`Operations::cancel`]'s refusals reach the console and not
+    /// the user — see [`ErrorSink`] for why the two-step is unavoidable.
+    pub fn install_error_sink(&self, shell: Shell, dialogs: Dialogs) {
+        self.error_sink
+            .set_value(Some(ErrorSink { shell, dialogs }));
     }
 
     /// Mint the next click-order sequence for a branch operation.
@@ -147,6 +189,56 @@ impl Operations {
     /// response lands. `dialogs/confirm.rs` used to clear the dialog and then `spawn_local`
     /// a future nothing held a reference to — which is why closing a panel mid-write left
     /// no trace that anything was happening.
+    ///
+    /// # Why this fires the write and then looks its id up separately
+    ///
+    /// The obvious arrangement — `send(...).await`, then bind, persist and
+    /// subscribe — is what this used to do, and it silently disabled every
+    /// live feature built on top of it. A tracked write's response is
+    /// withheld until the operation is **already terminal**:
+    /// `planner::plan_and_execute_tracked` ends with
+    /// `record.wait_terminal().await`
+    /// (`crates/git-vista-server/src/planner.rs:204`), so the
+    /// `x-git-vista-operation` header only ever arrives after there is
+    /// nothing left to watch. Awaiting it meant the Cancel button appeared
+    /// at the moment cancelling became impossible, the progress stream was
+    /// subscribed to after the transfer had ended, and the `localStorage`
+    /// entry a reload recovers from was written after the reload window had
+    /// closed. Three dead features, one `await`.
+    ///
+    /// So the write goes out on its own task and is **not** awaited here,
+    /// while a second task asks the server what id it minted for the key
+    /// this client already holds — `api::resolve_operation_id`, over
+    /// `GET /api/operations/by-key/{key}`. The server knows the id from the
+    /// instant `admit` returns (`operations::note_minted`, `planner.rs:142`),
+    /// which is the whole flight earlier than the response.
+    ///
+    /// # The two tasks, and the one thing they must not both do
+    ///
+    /// Either task can be the one that learns the id first, and on a fast
+    /// operation the response genuinely wins. Both therefore go through
+    /// [`bind_and_watch`], which binds, persists and subscribes **once** and
+    /// records that it did in a shared [`DispatchBinding`]. That cell is the
+    /// whole concurrency argument: wasm is single-threaded and
+    /// [`bind_and_watch`] contains no `await`, so its check-then-set cannot
+    /// interleave, and `subscribe` therefore cannot run twice for one
+    /// operation.
+    ///
+    /// A terminal event that lands *while* the resolver is still polling is
+    /// not lost, and not because of anything this client does: the progress
+    /// stream's first event is always the current snapshot, so a subscriber
+    /// that arrives after the operation finished is answered immediately with
+    /// the terminal record rather than waiting for a transition that already
+    /// happened (`handlers/operations.rs::operation_events`, and its doc
+    /// comment saying exactly that).
+    ///
+    /// # Degrading rather than breaking
+    ///
+    /// A server that has no `by-key` route answers `404` forever, the
+    /// resolver spends its budget and returns `None`, and the write settles
+    /// from its own response through the same [`bind_and_watch`] call the old
+    /// code made — identical behaviour to before this existed, minus the live
+    /// half. Nothing in the write path depends on the lookup succeeding.
     pub fn dispatch(&self, kind: OperationKind) {
         let key = api::new_idempotency_key();
         let core = self.core;
@@ -158,42 +250,76 @@ impl Operations {
             Some(Ok(_)) => {}
             _ => return,
         }
+        // Shared by the two tasks below. An `Rc<Cell<_>>` rather than a
+        // `StoredValue`: this is per-dispatch bookkeeping with no reactive
+        // reader, and it must outlive the reactive owner that started the
+        // write — a confirm dialog that closes the instant it dispatches
+        // disposes that owner, and a disposed `StoredValue` would start
+        // silently refusing the writes this state machine depends on.
+        let binding = Rc::new(Cell::new(DispatchBinding::Pending));
+
+        // The write itself, fired and deliberately not awaited by anything
+        // that needs to act during the operation.
         let sent = kind.clone();
+        let write_binding = Rc::clone(&binding);
+        let write_key = key.clone();
         spawn_local(async move {
-            match send(&sent, key.clone()).await {
-                // The request never went out (Visualize mode, or a body that would not
-                // serialize). Settle it locally so the refusal is visible state rather
-                // than a silently dropped intent.
+            match send(&sent, write_key.clone()).await {
+                // Either a refusal that never left the client (Visualize mode, a body
+                // that would not serialize) or a transport failure after both of
+                // `send_write_with_key`'s attempts.
                 Err(reason) => {
-                    settle_locally(core, graph, &key, reason, false);
-                }
-                Ok(receipt) => {
-                    match receipt.operation.clone() {
-                        // Operation-tracked: bind the server's handle, then read the
-                        // record off the stream. The stream is what carries the
-                        // post-execution generation, which the write response does not.
-                        Some(id) => {
-                            if core
-                                .try_update(|c| c.bind_id(&key, id.clone()))
-                                .is_some_and(|r| r.is_ok())
-                            {
-                                // #232, M2.20f: persist a Fetch/Pull's identity so a
-                                // reload or Safari tab suspend/resume can find it
-                                // again — see `resume_inflight_remote_op`. A no-op
-                                // for every other kind.
-                                persist_if_remote_op(&sent, &id);
-                                subscribe(core, graph, id);
-                            }
-                        }
-                        // Not operation-tracked (`select`, `rescan`, `clone`,
-                        // `delete-clone` never reach the server's planner). The HTTP
-                        // answer is the whole outcome.
-                        None => {
-                            settle_locally(core, graph, &key, receipt.message, receipt.ok);
-                        }
+                    // Only settle locally if nothing has bound a real id. If the
+                    // resolver already found one, the operation demonstrably reached
+                    // `admit` and is running server-side, and this file's standing
+                    // rule applies: a transport failure is not an outcome. Settling
+                    // it here would mark a live fetch `Failed` and — worse — would
+                    // clobber the bound id, since `bind_id` overwrites rather than
+                    // refuses (`core::OperationsCore::bind_id`).
+                    if write_binding.get() == DispatchBinding::Pending {
+                        write_binding.set(DispatchBinding::Closed);
+                        settle_locally(core, graph, &write_key, reason, false);
                     }
                 }
+                Ok(receipt) => match receipt.operation.clone() {
+                    // Operation-tracked: bind the server's handle, then read the
+                    // record off the stream. The stream is what carries the
+                    // post-execution generation, which the write response does not.
+                    // A no-op when the resolver got here first — it subscribed to
+                    // that same stream, and the terminal record is on it.
+                    Some(id) => {
+                        bind_and_watch(core, graph, &write_binding, &write_key, &sent, id);
+                    }
+                    // Not operation-tracked (`select`, `rescan`, `clone`,
+                    // `delete-clone` never reach the server's planner). The HTTP
+                    // answer is the whole outcome — and the resolver can never have
+                    // bound anything for such a write, because a key that never
+                    // reaches `admit` is never in the registry `lookup_by_key`
+                    // reads.
+                    None => {
+                        if write_binding.get() == DispatchBinding::Pending {
+                            write_binding.set(DispatchBinding::Closed);
+                            settle_locally(core, graph, &write_key, receipt.message, receipt.ok);
+                        }
+                    }
+                },
             }
+        });
+
+        // The id lookup, racing the write it describes — and expected to win.
+        spawn_local(async move {
+            // Stop polling the moment the write's own response has made the
+            // question moot, so a 50ms delete does not leave a loop running
+            // against a key nobody is waiting on.
+            let watcher = Rc::clone(&binding);
+            let stop = move || watcher.get() != DispatchBinding::Pending;
+            // `None` is the ordinary degraded answer, not a failure: the
+            // budget ran out, or the write already settled. Either way the
+            // response task owns the outcome and there is nothing to report.
+            let Some(id) = api::resolve_operation_id(key.clone(), stop).await else {
+                return;
+            };
+            bind_and_watch(core, graph, &binding, &key, &kind, id);
         });
     }
 
@@ -249,12 +375,74 @@ impl Operations {
     /// hold for every other write: the operation may still be running, and
     /// its real resolution is still coming through the stream this call
     /// never touches.
+    ///
+    /// # Changing nothing is not the same as saying nothing
+    ///
+    /// This method used to be a single `if let Ok(Requested) = …` with no
+    /// `else`, which made all four of those outcomes indistinguishable from a
+    /// button that does not work. Tapping Cancel on a dropped SSH tunnel
+    /// produced no row change, no modal, no console line — nothing, forever.
+    /// That is the exact failure #316 exists to end: a write that fails must
+    /// say so in the app's own modal, in words.
+    ///
+    /// So every arm is matched, and the four non-`Requested` ones report
+    /// through [`ErrorSink`] — the same `dialogs.open(Dialog::Error)` +
+    /// `shell.open_error(...)` pair the context menu uses for its own
+    /// refusals. What none of them do is change the operation's state: the
+    /// row stays in flight, because it *is* in flight, and its real
+    /// resolution still arrives on the stream.
     pub fn cancel(&self, id: &OperationId) {
         let core = self.core;
+        let sink = self.error_sink;
         let id = id.clone();
         spawn_local(async move {
-            if let Ok(api::CancelOutcome::Requested) = api::cancel_operation_request(&id).await {
-                let _ = core.try_update(|c| c.request_cancel(&id));
+            match api::cancel_operation_request(&id).await {
+                // The latch is set. The only client-side effect there is
+                // honest ground for: the row reads "cancelling…" until the
+                // pipeline says what it managed to do.
+                Ok(api::CancelOutcome::Requested) => {
+                    let _ = core.try_update(|c| c.request_cancel(&id));
+                }
+                // 409. The operation finished between the button rendering and
+                // the tap landing — a race the UI cannot close, only explain.
+                Ok(api::CancelOutcome::AlreadyFinished) => report_error(
+                    sink,
+                    "Couldn't cancel",
+                    "This operation had already finished by the time the cancel \
+                     reached the server, so there was nothing left to stop. Its \
+                     result is on its way."
+                        .to_string(),
+                ),
+                // 409. `planner::honours_cancellation` said no. The menu is
+                // meant to keep the button from being offered at all here
+                // (`OperationKind::is_cancellable`), so reaching this means the
+                // two disagree — which the user should hear about rather than
+                // experience as a dead button.
+                Ok(api::CancelOutcome::NotCancellable) => report_error(
+                    sink,
+                    "Couldn't cancel",
+                    "The server will not cancel this kind of operation — it has no \
+                     cancellation point to stop at. Wait for it to finish."
+                        .to_string(),
+                ),
+                // 404. The id was read off this operation's own bind, so this
+                // is close to impossible mid-session; say so plainly rather
+                // than swallowing it, because if it ever does happen the
+                // client's idea of what is running has diverged from the
+                // server's and that is worth seeing.
+                Ok(api::CancelOutcome::Unknown) => report_error(
+                    sink,
+                    "Couldn't cancel",
+                    "The server has no record of this operation, so there was nothing \
+                     to cancel. It may have finished long enough ago to be forgotten — \
+                     refresh to see what the repository actually looks like."
+                        .to_string(),
+                ),
+                // Offline refusal, Visualize refusal, timeout, network error, or
+                // an unexpected status. `api::cancel_operation_request` has
+                // already unwrapped each of these into prose meant for a human
+                // (#316), so it is shown verbatim rather than re-worded here.
+                Err(reason) => report_error(sink, "Couldn't cancel", reason),
             }
         });
     }
@@ -267,6 +455,97 @@ impl Operations {
     /// this bundle exposes.
     pub fn resume_from_storage(&self) {
         resume_inflight_remote_op(self.core, self.graph);
+    }
+}
+
+/// Which of a dispatch's two tasks has claimed the operation's outcome
+/// (M2.20f, #232).
+///
+/// [`Operations::dispatch`] runs the write and the `by-key` id lookup
+/// concurrently, and either can finish first. This is the one fact they
+/// coordinate on, and it exists to enforce exactly two rules: `subscribe`
+/// runs at most once per operation, and a write that has already been settled
+/// locally is never re-bound to a server id afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchBinding {
+    /// No id yet. The resolver is still polling, and the write's own response
+    /// has not arrived.
+    Pending,
+    /// A server id is bound, persisted where applicable, and its progress
+    /// stream is subscribed to — all exactly once.
+    Bound,
+    /// The operation was settled without ever having a server id: a refusal
+    /// that never left the client, a transport failure with nothing bound, or
+    /// a write the planner never tracked.
+    Closed,
+}
+
+/// Attach `id` to the in-flight entry `key` names, remember it for a reload,
+/// and start watching its progress stream — **once**, whichever of
+/// [`Operations::dispatch`]'s two tasks gets here first.
+///
+/// **Contains no `await`, and must not grow one.** That is what makes the
+/// check-then-set atomic: wasm is single-threaded, so a function with no
+/// suspension point cannot interleave with the other task, and the `Pending`
+/// test below therefore cannot be passed by both callers. Introduce an await
+/// between the test and the `set` and the second caller subscribes to a
+/// stream the first is already reading — two `EventSource`s against
+/// `MAX_LIVE_STREAMS` for one operation, and two settlements racing into
+/// `commit_settlement`.
+fn bind_and_watch(
+    core: RwSignal<OperationsCore>,
+    graph: RwSignal<GraphCore>,
+    binding: &Cell<DispatchBinding>,
+    key: &IdempotencyKey,
+    kind: &OperationKind,
+    id: OperationId,
+) {
+    if binding.get() != DispatchBinding::Pending {
+        return;
+    }
+    if core
+        .try_update(|c| c.bind_id(key, id.clone()))
+        .is_none_or(|r| r.is_err())
+    {
+        // The owning scope is gone, or the entry is no longer in flight
+        // (already settled, already dismissed). Either way there is nothing
+        // to watch and nothing the other task should try again.
+        binding.set(DispatchBinding::Closed);
+        return;
+    }
+    binding.set(DispatchBinding::Bound);
+    // #232, M2.20f: persist a Fetch/Pull's identity so a reload or Safari tab
+    // suspend/resume can find it again — see `resume_inflight_remote_op`. A
+    // no-op for every other kind. Reached from the resolver it is finally
+    // written *during* the transfer, which is the only time a reload can
+    // happen mid-operation and therefore the only time the entry is worth
+    // anything.
+    persist_if_remote_op(kind, &id);
+    subscribe(core, graph, id);
+}
+
+/// Put a failure this feature discovered in front of the user, in the app's
+/// own modal (#316).
+///
+/// The `dialogs.open(Dialog::Error)` call is the ghost-click guard and comes
+/// first, then the notice — the ordering `Shell::open_error`'s own doc comment
+/// requires and every other opener in the app follows.
+///
+/// With no sink installed the message goes to the console instead. That is a
+/// real degradation and is deliberately not silent: a failure with nowhere to
+/// go must still leave a trace, since "nothing happened at all" is the bug
+/// this function exists to stop.
+fn report_error(sink: StoredValue<Option<ErrorSink>>, title: &'static str, body: String) {
+    // `try_with_value`, not `with_value`: this runs from a `spawn_local`
+    // continuation that can outlive the scope which stored the sink.
+    match sink.try_with_value(|s| *s).flatten() {
+        Some(ErrorSink { shell, dialogs }) => {
+            dialogs.open(Dialog::Error);
+            shell.open_error(ErrorNotice { title, body });
+        }
+        None => {
+            web_sys::console::error_1(&format!("git-vista: {title}: {body}").into());
+        }
     }
 }
 
