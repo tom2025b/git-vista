@@ -58,7 +58,8 @@ use tokio::sync::watch;
 
 use git_vista_protocol::{
     GenerationToken, GitOperation, IdempotencyKey, OperationHash, OperationId, OperationStage,
-    OperationState, OperationStatus, RecoveryStrategy, RepositoryToken, UnixSeconds, WorktreeToken,
+    OperationState, OperationStatus, RecoveryStrategy, RepositoryToken, TransferProgress,
+    UnixSeconds, WorktreeToken,
 };
 
 /// How many records the registry keeps. Bounded because the client chooses the
@@ -88,6 +89,22 @@ pub(crate) struct Record {
     /// entries without scanning the key map.
     key: IdempotencyKey,
     status: watch::Sender<OperationStatus>,
+    /// The cancellation latch (M2.20c, #229): `false` until an operator asks
+    /// for this operation to stop, then `true` forever.
+    ///
+    /// A separate `watch` rather than a field on the snapshot, deliberately.
+    /// The snapshot is what a *client* observes and what `durable` persists;
+    /// "someone asked for this to stop" is an instruction to the running
+    /// pipeline, not a fact about the operation's outcome — the outcome is
+    /// the terminal record the pipeline then writes, which is the only thing
+    /// that can honestly say whether the cancel arrived in time. Keeping the
+    /// two apart is what stops a record from reading "cancelled" while the
+    /// fetch it names actually completed.
+    ///
+    /// Latching (never reset to `false`) closes the race where a cancel
+    /// arrives microseconds before the executor takes its receiver: the
+    /// executor's first read already sees `true` and never spawns.
+    cancel: watch::Sender<bool>,
 }
 
 impl Record {
@@ -134,6 +151,44 @@ impl Record {
         // yields borrows `rx`, and a tail expression would keep it alive past
         // the receiver's own drop.
         recorded
+    }
+
+    /// Ask this operation to stop (M2.20c, #229).
+    ///
+    /// Returns `false` — and changes nothing — when the record is already
+    /// terminal, because there is nothing left to cancel and answering "ok"
+    /// would tell an operator their cancel took effect on an operation that
+    /// had already finished. Returns `true` when the latch moved *or* was
+    /// already set: a repeated cancel of a still-running operation is
+    /// idempotent, not an error.
+    ///
+    /// Setting the latch is the *whole* of this function. It never touches
+    /// the status snapshot: only the pipeline may terminalise a record, and
+    /// only after it has observed what actually happened to the repository.
+    pub(crate) fn request_cancel(&self) -> bool {
+        if self.status.borrow().is_terminal() {
+            return false;
+        }
+        self.cancel.send_replace(true);
+        true
+    }
+
+    /// A receiver for the cancellation latch, for the executor to select on.
+    pub(crate) fn cancel_signal(&self) -> watch::Receiver<bool> {
+        self.cancel.subscribe()
+    }
+
+    /// Publish an object-transfer report (M2.20c, #229). A no-op once
+    /// terminal, and a no-op when nothing changed, so a fetch reporting the
+    /// same percentage twice does not wake every subscriber twice.
+    fn set_progress(&self, progress: TransferProgress) {
+        self.status.send_if_modified(|s| {
+            if s.is_terminal() || s.progress == Some(progress) {
+                return false;
+            }
+            s.progress = Some(progress);
+            true
+        });
     }
 
     /// Publish a stage change. A no-op once terminal, so a late stage report
@@ -361,10 +416,13 @@ pub(crate) fn admit(
         message: None,
         generation: None,
         recovery: None,
+        progress: None,
     });
+    let (cancel, _) = watch::channel(false);
     let record = Arc::new(Record {
         key: key.clone(),
         status,
+        cancel,
     });
 
     reg.by_key.insert(key.clone(), Arc::clone(&record));
@@ -399,9 +457,14 @@ pub(crate) fn rehydrate(records: Vec<(IdempotencyKey, OperationStatus)>) {
     for (key, status) in records {
         let id = status.id.clone();
         let (status_tx, _) = watch::channel(status);
+        // Every rehydrated record is already terminal (see this function's
+        // doc), so its latch can never be observed by a pipeline — but it is
+        // built unset rather than skipped so `Record` has one shape.
+        let (cancel, _) = watch::channel(false);
         let record = Arc::new(Record {
             key: key.clone(),
             status: status_tx,
+            cancel,
         });
         reg.by_key.insert(key, Arc::clone(&record));
         reg.by_id.insert(id.clone(), record);
@@ -555,6 +618,24 @@ pub(crate) fn stage(stage: OperationStage) {
 /// chokepoint, not in five signatures.
 pub(crate) fn current_operation_id() -> Option<OperationId> {
     PIPELINE.try_with(|record| record.id()).ok()
+}
+
+/// Report an object-transfer step from inside the pipeline (M2.20c, #229). A
+/// no-op outside a tracked operation, so the executor can report
+/// unconditionally — exactly like [`stage`] above.
+pub(crate) fn progress(progress: TransferProgress) {
+    let _ = PIPELINE.try_with(|record| record.set_progress(progress));
+}
+
+/// The cancellation latch of the operation this pipeline is running, if it is
+/// running under one (M2.20c, #229).
+///
+/// `None` outside a tracked operation — the contract/coordination suites
+/// drive the planner directly — which the executor must read as *"nobody can
+/// cancel this"*, never as *"cancelled"*. Fail-safe in the right direction:
+/// an untracked run completes normally instead of refusing to start.
+pub(crate) fn cancel_signal() -> Option<watch::Receiver<bool>> {
+    PIPELINE.try_with(|record| record.cancel_signal()).ok()
 }
 
 /// Record how the pre-operation state could be recovered, from the plan the

@@ -476,7 +476,7 @@ request actually gets today, so a reader doesn't have to infer "shipped" from
 |---|---|---|
 | Existing Git credential helpers / SSH agent reuse | **Implemented** | #188's carve-out (`sandbox/ssh_remote.rs`, ADR 0033) — `~/.ssh/known_hosts` and `$SSH_AUTH_SOCK` are reachable on every Network-tier spawn; private keys stay `EACCES`. |
 | No browser-uploaded SSH keys | **Implemented** | Structural: the browser never has a private-key upload path at all. |
-| `core.askpass` never runs (M1.13 finding I5) | **Implemented** | `sandbox/network_exec.rs`'s `network_command` forces `-c core.askpass=` on every Network-tier spawn; `git_cmd.rs`'s `sandboxed()` routes every `NetworkNeed::Remote` call through it, so this reaches production (`exec_push` today), not only this module's own tests. |
+| `core.askpass` never runs (M1.13 finding I5) | **Implemented** | `sandbox/network_exec.rs`'s `network_command` forces `-c core.askpass=` on every Network-tier spawn; `git_cmd.rs`'s `sandboxed()` routes every `NetworkNeed::Remote` call through it, so this reaches production — every fetch, pull and push executor (`planner::fetch`, `planner::pull`, `planner::push`), not only this module's own tests. |
 | Redact URL userinfo from logs/operation records | **Implemented, narrower than the bullet reads** | `network_exec::redact_url_userinfo`/`redact_output` strip `user[:pass]@` from every `<scheme>://…` substring in a spawn's captured stdout/stderr, wired into `git_output_for` for every `Remote`-declared call. |
 | Redact HTTP `Authorization` header text and query-string tokens | **Not implemented** | Only URL userinfo is redacted. A credential surfaced as `?access_token=…` or in `Authorization: Bearer …`-shaped text would currently appear verbatim in a redacted `Output`. No test in this area exercises that shape. |
 | Redact credential-helper output | **Partially implemented** | A credential helper's stderr passes through the same `redact_output` as everything else, so a *userinfo-shaped* leak in it is caught (proven against a real credential helper: `network_exec_redacts_a_real_credential_helpers_leaked_url`) — but a helper leaking a bare token or an `Authorization`-shaped string is not, for the same reason as the row above. |
@@ -489,6 +489,146 @@ request actually gets today, so a reader doesn't have to infer "shipped" from
 The three "Not implemented" / "Aspirational" gaps above are open scope for a
 future slice, not silent regressions of this one — #228's own scope explicitly
 reads "strip userinfo from URLs **at minimum**."
+
+*(Fetch execution: ADR 0043, #229 — `POST /api/fetch` is the second production
+caller of the harness the table above describes, and the first that reads a
+child's output **while it is still running**. Three consequences for this
+section. First, redaction now covers the streaming path as well as the
+collected one: `git_cmd::git_streamed_for` runs every `\r`/`\n`-separated
+stderr record through `redact_url_userinfo` before handing it to its caller's
+callback, so the live sink is not a hole in the "Redact URL userinfo" row —
+proven against a remote that really leaks a credential-bearing URL on its own
+stderr, with the unredacted premise asserted in the same test
+(`planner::fetch_suite::a_credential_leaked_by_the_remote_never_reaches_the_operation_record`).
+Second, `FetchRequest` carries a **configured remote name, never a URL**, so no
+request can aim this server's credential helpers or SSH agent at a host of the
+client's choosing — see the correction below, which is where that guarantee
+actually comes from. Third, a fetch can now be cancelled — `POST
+/api/operations/{id}/cancel` SIGKILLs the direct child — and what a cancelled
+fetch reports about the repository is read from `refs/remotes/<remote>/*`
+before and after, never from git's prose. Known limitation, recorded rather
+than hidden: the kill reaches the direct child only, so a grandchild transport
+process may briefly outlive it.)*
+
+*(Pull execution: ADR 0044, #230 — `POST /api/pull` adds **no new spawn** to
+this section, and that is the security-relevant decision. Its fetch half is
+`planner::fetch`'s own `run_fetch`, so every row of the table above applies to
+a pull byte-for-byte: the same `sandboxed()` chokepoint, the same forced `-c
+core.askpass=`, the same `redact_if_remote` on both the collected output and
+the live streaming records. A second `git fetch` here would have been a second
+surface for a credential to leak from and the first one to drift, so
+`planner::contract_suite` pins at source level that `planner/pull.rs` contains
+neither `git_streamed_for(` nor the literal `"fetch"`, and
+`planner::pull_suite` proves the reuse behaviourally — a pull publishes
+transfer progress, which only the one streaming path can produce. Like
+`FetchRequest`, `PullRequest` carries a **configured remote name and a branch
+name, never a URL**, gated by the same `RemoteConfigured` precondition. The one
+new exposure a pull has that a fetch does not is local, not credential-shaped:
+the integration half can leave the working tree half-merged, so a failed
+integration is aborted and the restoration is **observed** — the branch tip is
+re-read and `git ls-files --unmerged` listed — before the response claims the
+repository is back where it started.
+
+**The tier the second half runs in is part of that decision** (ADR 0044 §4). A
+pull is the first operation in this server to run a *local* git command under a
+`NetworkNeed::Remote` operation, and `need` is what `tier_for` dispatches on,
+while `policy_for` sets `HookMode::Run` in every tier. Threading the pull's own
+`Remote` need into `exec_merge`/`exec_rebase` would therefore have run this
+repository's `post-merge` / `post-checkout` / `post-rewrite` hooks in
+`Tier::Network` — outbound TCP on `DEFAULT_GIT_PORTS`, no `--unshare-net` —
+i.e. the identical git command would be **more** capable through `/api/pull`
+than through `/api/merge`, which declares `Local` and lands in `Tier::Strict`.
+`planner::pull::INTEGRATION_NEED` pins the integration half (and the abort, and
+`git ls-files --unmerged`) to `NetworkNeed::Local`, so `need` reaches exactly
+one call in `exec_pull`: `run_fetch`. Proved behaviourally rather than by
+inspection — `planner::pull_suite` runs real git hooks that report
+`readlink /proc/self/ns/net`, asserts the fetch half's hook shares the server's
+network namespace and the integration half's does not, and pins the same answer
+for a direct merge.)*
+
+*(Push execution: ADR 0045, #231 — `POST /api/push` completes the remote trio and, like
+a pull, adds **no new spawn**: `planner::push` goes through the same
+`git_cmd::git_streamed_for`, so every row of the table above applies to a push unchanged
+— the same `sandboxed()` chokepoint, the same forced `-c core.askpass=`, the same
+`redact_if_remote` on both the collected output and the live streaming records. That is
+proven on the push path in its own right rather than assumed from fetch's proof:
+`planner::push_suite::a_credential_leaked_by_the_remote_never_reaches_the_push_response`
+stages a remote whose `pre-receive` hook prints a credential-bearing URL on stderr,
+asserts the **premise** by first running the same fixture through plain unsandboxed git
+and finding the literal secret, and then requires the server's response to carry the host
+but not the credential. `PushRequest` carries a branch name, an optional `set_upstream`
+flag and an optional `ForcePublish` — **never a URL, never a remote name, never a path**;
+the remote is `origin`, fixed by the handler and gated by the plan's `RemoteConfigured`
+precondition, so no request can aim this server's credential helpers or SSH agent at a
+host of the client's choosing. The `expected_remote_tip` a lease carries is a `CommitOid`,
+validated as forty hex characters before it can reach an argv. One limitation is worth
+stating here rather than only in the ADR: a push is the one operation whose effect is on
+a machine this server does not control, and git records `refs/remotes/<remote>/<branch>`
+only *after* the remote reports the update accepted — so a cancelled push cannot claim
+the remote is unchanged, and its terminal message says so instead of reassuring.)*
+
+### Which host a remote-reaching operation may contact (ADR 0047, #229 follow-up)
+
+The paragraph above claimed the `RemoteConfigured` precondition was what kept a
+request from choosing the host. **It was not, and neither was the type.** Both
+halves were repaired; the correction is recorded here rather than edited away,
+because the shape of the mistake is the reusable part.
+
+| What was claimed | What was true | What holds now |
+|---|---|---|
+| `RemoteName` is a name | Its validator was "non-empty, not starting with `-`", which accepts `https://attacker.example/r.git` | `require_remote_name`: ASCII letters, digits, `.`, `-`, `_`, no leading `.`, no `..`, ≤ 100 bytes. Refuses every URL, scp-style, path and `ext::` shape. Runs from `Deserialize`, so it covers pull/push/tag too |
+| `RemoteConfigured` gates it | `enforce_fresh` re-verified only preconditions that **held at build time**; one that already failed was skipped, on the assumption that the executor would refuse instead | `planner::refuses_when_unmet_at_build` names the one precondition with no such executor guard, and `enforce_fresh` refuses it directly |
+
+The assumption under the second row is the load-bearing lesson. It is sound for
+every other precondition — `git branch` refuses a name that exists, `git rebase`
+refuses a dirty tree — and it is false for remotes, because **git does not
+refuse an unknown remote; it reinterprets it as a transport target.** Verified
+against git 2.43.0: `git fetch ghost.git`, with no `ghost.git` remote, fetches
+from the *directory* `ghost.git`. The endpoint then answered `200 … already up
+to date`, because a fetch from an ad-hoc target moves no
+`refs/remotes/<remote>/*` and the before/after diff is therefore empty — a fetch
+that reached somewhere it was never authorised to, reported as a no-op.
+
+Proven by driving the real pipeline against a **live loopback listener** that
+must never be connected to, with a paired positive control on the same run that
+must connect (`planner::remote_boundary_suite`). The port is 9418 — the only
+unprivileged entry in `sandbox::DEFAULT_GIT_PORTS` — precisely so the sandbox's
+own Network-tier grant permits the connect and cannot be what makes the test
+pass.
+
+Because both halves live in the shared machinery, `POST /api/pull` inherits them
+verbatim: `PullBranch` carries the same `RemoteName` and the same
+`RemoteConfigured` precondition, and the suite asserts that a pull with an
+unconfigured remote is refused by the gate (409) *before* `execute` is reached
+at all.
+
+That assertion was written while pull's executor was still a `501` stub, to
+prove the refusal came from the gate rather than the stub. **With #230 landed it
+guards a live `git fetch`**, and the mutation that shows it says so: flipping
+`refuses_when_unmet_at_build`'s `RemoteConfigured` arm to `false` on this branch
+makes the pull answer `400 … The fetch from ‘ghost.git’ succeeded, but it has no
+branch ‘main’` — git really did read the in-tree directory as a transport
+target, through pull's own executor. The precondition arm is the only thing
+between a client-chosen `remote` string and that fetch.
+
+Push reaches the same guard from a different direction, and depends on it more.
+`PushRequest` carries no remote field at all — `handlers::branch::push_operation`
+fixes it to `origin` — so `require_remote_name` has no client input to refuse on
+this route. **`RemoteConfigured` is the whole of the protection for a push**, and
+`planner::push_refuses_an_unconfigured_remote_before_reaching_its_executor` holds
+it down.
+
+That test pins the refusal's *wording*, not just its status, and the mutation
+that justifies it is worth recording. With the `RemoteConfigured` arm flipped to
+`false`, a push naming an unconfigured `ghost.git` reaches git, which resolves it
+as a path and talks to the in-tree directory — turned away only by
+`! [rejected] main -> main (fetch first)`, i.e. because that fixture's local
+branch was not a descendant. A fast-forwardable one would have landed, and the
+sandbox did not intervene. **And git's own non-fast-forward rejection is also a
+`409`**, so asserting the status alone would have passed with the gate removed.
+Only `unmet_at_build`'s sentence distinguishes "we refused before contacting
+anything" from "the remote refused us after we contacted it" — which is the
+distinction this whole section exists to make.
 
 ## Request Integrity
 
@@ -556,10 +696,32 @@ exists anywhere in the type — a bare `--force` push cannot be constructed in R
 deserialized off the wire. `planner::shape` turns a `WithLease` into a live
 `Precondition::RefAt` compare-and-swap on the remote-tracking ref
 (`refs/remotes/<remote>/<branch>`), bound into the plan's `operation_hash` at build time, and
-raises the plan's risk from `Remote` to `Destructive`. This is the typed **contract** only:
-`planner::execute` refuses every `PushBranch` combination except the pre-existing plain
-fast-forward push with `501`, so a lease-force push cannot yet run. "Strong warning" and
-"re-auth option" remain open scope, along with execution itself, for #231.)*
+raises the plan's risk from `Remote` to `Destructive`.)*
+
+*(Lease/CAS half now executes: ADR 0045, #231 — the typed contract above is carried
+through to the argv. `planner::push::push_argv` is the **only** function in this server
+that builds a push command line; its `match` over `ForcePublish` has no wildcard arm, and
+the sole arm that emits a force flag emits `--force-with-lease=<branch>:<oid>`. So the
+guarantee is no longer "the type cannot name a bare force" but "no path through the
+executor can produce one", asserted over the whole input space
+(`push::no_push_argv_can_carry_a_bare_force`) and at source level for the modules around
+it (`contract_suite::only_planner_push_builds_a_push_argv_and_it_can_only_build_a_leased_force`).
+**The lease is checked twice, by two parties, against two different things, and neither
+subsumes the other.** Before anything is spawned, `verify_lease` compares the reviewed
+`expected_remote_tip` against this repository's live `refs/remotes/<remote>/<branch>`; a
+mismatch, a missing ref or an unreadable one all refuse (409, or 500 for "git could not
+run" — an unread ref is evidence about nothing) and **no socket is opened and no
+credential is offered**. This is not redundant with the ADR 0018 staleness gate: that gate
+re-verifies the lease's `Precondition::RefAt` only when it *held at build time*, which is
+precisely not the stale-or-forged case. Then git's own `--force-with-lease` compares the
+same value against what the remote **advertises during the push** — the only check that
+can see a colleague's commit landing between review and submit, since the
+remote-tracking ref is a local cache. Both refusals are proven against a real remote's ref
+listing rather than a status code: `push_suite::a_lease_lost_to_a_concurrent_push_is_refused_and_the_remote_keeps_the_other_commit`
+and `push_suite::a_lease_tip_that_does_not_match_the_tracking_ref_never_reaches_the_remote`,
+the latter by an observed absence (the remote's `pre-receive` hook never fires). "Strong
+warning" and "re-auth option" remain open scope for the client ceremony, M2.20g #232 —
+the plan already carries `RiskLevel::Destructive` for the frontend to scale it from.)*
 
 *(History rewrite, amend member — partially implemented: ADR 0040, #223. **Recovery
 ref:** done — a successful amend journals `ActivityKind::Amend` with the exact old→new

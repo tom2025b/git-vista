@@ -453,6 +453,46 @@ pub fn install_key_listener(
                     // at press time, so it is wherever the pages landed so far
                     // put it, never the mount-time value.
                     "0" => camera.set(home.get_untracked()),
+                    // Desktop paging. The graph is drag-to-pan first because it
+                    // was built for the iPad, where a drag is the natural gesture
+                    // and there is no keyboard to speak of. On a mouse-only box
+                    // that leaves dragging as the ONLY way to cross a long
+                    // history, which is slow and imprecise — 2627 commits is a
+                    // lot of dragging.
+                    //
+                    // Pans by 90% of the viewport rather than a full screen, so
+                    // one row of context carries across the jump; a full-height
+                    // page leaves the reader with no anchor and it is easy to
+                    // lose your place in a graph where lines matter more than
+                    // rows. Sign: panning the camera DOWN the history means
+                    // moving the content up, hence the negated dy.
+                    //
+                    // Space/Shift-Space match the browser's own scroll idiom, and
+                    // Home/End here are the whole-graph versions of the per-node
+                    // Home/End in `on_node_keydown` — those need a focused node,
+                    // which a user who has only ever dragged will not have.
+                    // Shift-Space pages back, matching every browser and reader:
+                    // Space alone is "more", Shift-Space is "back". Shift is not
+                    // in the modifier bail-out above precisely so this works.
+                    " " if ev.shift_key() => {
+                        ev.prevent_default();
+                        let page = window_inner_height() * 0.9;
+                        camera.update(|c| *c = c.panned(0.0, page));
+                    }
+                    "PageDown" | " " => {
+                        ev.prevent_default();
+                        let page = window_inner_height() * 0.9;
+                        camera.update(|c| *c = c.panned(0.0, -page));
+                    }
+                    "PageUp" => {
+                        ev.prevent_default();
+                        let page = window_inner_height() * 0.9;
+                        camera.update(|c| *c = c.panned(0.0, page));
+                    }
+                    "Home" => {
+                        ev.prevent_default();
+                        camera.set(home.get_untracked());
+                    }
                     "r" | "R" => {
                         graph.update(|g| {
                             g.force_bump();

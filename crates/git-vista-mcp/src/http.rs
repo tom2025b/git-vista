@@ -55,6 +55,14 @@ pub struct HttpResponse {
 
 impl std::fmt::Debug for HttpResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured for the same reason as `auth::Session`'s impl: a field
+        // added here later is a compile error in this function until somebody
+        // decides whether it may be printed.
+        let HttpResponse {
+            status: _,
+            headers: _,
+            body: _,
+        } = self;
         f.debug_struct("HttpResponse")
             .field("status", &self.status)
             .field(
@@ -229,5 +237,45 @@ mod tests {
     #[test]
     fn a_missing_header_terminator_is_refused() {
         assert!(parse_response(b"HTTP/1.1 200 OK\r\n").is_err());
+    }
+
+    /// `/api/session`'s response carries the live session cookie in a
+    /// `set-cookie` header and the CSRF token in its body, so this struct's
+    /// hand-written `Debug` shows header *names* and a body *length* only.
+    /// Nothing pinned that; a derived impl (or one field added back) would put
+    /// both secrets one `{resp:?}` away from an error string on stdout.
+    #[test]
+    fn debugging_a_response_shows_no_header_value_and_no_body_bytes() {
+        let resp = HttpResponse {
+            status: 200,
+            headers: vec![(
+                "set-cookie".into(),
+                "gv_session=CookieSecret0123456789; HttpOnly".into(),
+            )],
+            body: br#"{"csrf":"CsrfSecret9876543210"}"#.to_vec(),
+        };
+        let rendered = format!("{resp:?}");
+        assert!(
+            !rendered.contains("CookieSecret0123456789"),
+            "a set-cookie value reached a Debug rendering: {rendered}"
+        );
+        assert!(
+            !rendered.contains("CsrfSecret9876543210"),
+            "the response body reached a Debug rendering: {rendered}"
+        );
+        // Still useful, not merely empty: status, the header's NAME, and the
+        // body's length are exactly what a debug line is for.
+        assert!(rendered.contains("200"), "{rendered}");
+        assert!(rendered.contains("set-cookie"), "{rendered}");
+        assert!(
+            rendered.contains(&resp.body.len().to_string()),
+            "{rendered}"
+        );
+        // Anti-vacuity: the sentinels are ordinary Debug-visible strings.
+        let leaky = format!("{:?}", (&resp.headers, String::from_utf8_lossy(&resp.body)));
+        assert!(
+            leaky.contains("CookieSecret0123456789") && leaky.contains("CsrfSecret9876543210"),
+            "the test's own sentinels do not survive Debug: {leaky}"
+        );
     }
 }

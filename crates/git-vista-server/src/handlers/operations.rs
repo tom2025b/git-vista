@@ -126,6 +126,68 @@ pub(crate) async fn operation_events(Path(id): Path<String>) -> Response {
         .into_response()
 }
 
+/// `POST /api/operations/{id}/cancel` — ask a running operation to stop
+/// (M2.20c, #229).
+///
+/// ## What this endpoint promises, and what it does not
+///
+/// It promises to **set the operation's cancellation latch**, which its
+/// executor is watching, and to answer honestly about whether that could
+/// possibly do anything. It does *not* promise the operation stops at a
+/// particular point, and it never terminalises the record itself: only the
+/// pipeline may do that, and only after it has observed what actually
+/// happened to the repository. A cancel that lands one millisecond after
+/// `git fetch` updated `refs/remotes/origin/main` must produce a terminal
+/// record that says the ref moved — which is possible only if the pipeline,
+/// not this handler, writes it.
+///
+/// Three refusals, each answering a different question the operator has:
+///
+/// * **404** — no such operation (or an id that isn't token-shaped). Same
+///   answer for both, for the same reason the reads above give one: an id is
+///   unguessable, and distinguishing them would say which ids exist.
+/// * **409, "already finished"** — the record is terminal. Answering `202`
+///   here would tell an operator their cancel took effect on an operation
+///   that had already run to completion.
+/// * **409, "cannot be cancelled"** — the operation's executor does not watch
+///   the latch ([`planner::honours_cancellation`]). Setting it would be a
+///   no-op dressed up as an action.
+///
+/// A repeated cancel of a still-running operation is `202` again: idempotent,
+/// not an error — a client whose response was lost must be able to retry.
+///
+/// `202 Accepted` rather than `200`: the fetch's own outcome is a separate
+/// record, and the client learns it from the stream or from
+/// `GET /api/operations/{id}` exactly as it would have anyway.
+pub(crate) async fn cancel_operation(Path(id): Path<String>) -> Response {
+    let Some(record) = resolve(&id) else {
+        return not_found();
+    };
+    let snapshot = record.status();
+    if !crate::planner::honours_cancellation(&snapshot.operation) {
+        return (
+            StatusCode::CONFLICT,
+            "This kind of operation cannot be cancelled — it does not run long \
+             enough to have a cancellation point. Wait for it to finish.",
+        )
+            .into_response();
+    }
+    if !record.request_cancel() {
+        return (
+            StatusCode::CONFLICT,
+            "This operation has already finished — read its recorded result \
+             rather than cancelling it.",
+        )
+            .into_response();
+    }
+    (
+        StatusCode::ACCEPTED,
+        "Cancelling. The operation's own record will say what it managed to do \
+         before it stopped.",
+    )
+        .into_response()
+}
+
 /// Look one record up by the raw path segment, validating its shape first: an
 /// id that isn't token-shaped can't name a record this server minted, so it is
 /// the same "no such operation" as one that was never issued.
@@ -164,6 +226,10 @@ fn encode(snapshot: &OperationStatus) -> Event {
         state: snapshot.state,
         stage: snapshot.stage,
         at: UnixSeconds(crate::activity::now_secs()),
+        // M2.20c (#229): the transfer report, when there is one. This is what
+        // makes a fetch legible on the stream — `stage` sits at `Executing`
+        // for its whole life and only this field moves.
+        progress: snapshot.progress,
     };
     Event::default()
         .event(PROGRESS_EVENT)

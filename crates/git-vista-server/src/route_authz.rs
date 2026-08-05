@@ -117,6 +117,19 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     ("/api/undo", Method::POST, Authz::SessionAndCsrf),
     ("/api/merge", Method::POST, Authz::SessionAndCsrf),
     ("/api/push", Method::POST, Authz::SessionAndCsrf),
+    // M2.20c (#229): fetch from a configured remote. A git write that opens a
+    // socket with whatever credentials the host offers, which makes the CSRF
+    // half of this classification load-bearing in a way it is not for a local
+    // mutation: a cross-origin page that could trigger this would be making
+    // *this server's* credentials talk to a remote.
+    ("/api/fetch", Method::POST, Authz::SessionAndCsrf),
+    // M2.20d (#230): pull is fetch's classification plus a local mutation —
+    // it moves the checked-out branch and rewrites the working tree. Both
+    // halves of the reasoning above apply, and the second one harder: a
+    // cross-origin page that could trigger this would not merely make this
+    // server's credentials talk to a remote, it would land whatever came back
+    // on the user's branch.
+    ("/api/pull", Method::POST, Authz::SessionAndCsrf),
     ("/api/delete-branch", Method::POST, Authz::SessionAndCsrf),
     // M2.21d (#238): the local tag writes. Note the split from
     // `GET /api/tags` above — that read is registered on both listeners
@@ -144,11 +157,28 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
         Method::POST,
         Authz::SessionAndCsrf,
     ),
+    // M2.23d (#248, ADR 0046): build a reviewable Plan and hand it back,
+    // executing nothing. Classified `SessionAndCsrf` — the full write
+    // posture — even though it mutates nothing: `security.rs`'s gate keys on
+    // HTTP method, so a POST needs CSRF regardless, and the classification
+    // should say what the route *is* rather than what it currently runs. A
+    // plan carries an `OperationHash` that #249's submit stage accepts as
+    // approval for exactly that mutation, so minting one is the front half of
+    // a write and belongs at the write posture, on the loopback router only.
+    ("/api/plan", Method::POST, Authz::SessionAndCsrf),
     ("/api/operations/{id}", Method::GET, Authz::SessionRequired),
     (
         "/api/operations/{id}/events",
         Method::GET,
         Authz::SessionRequired,
+    ),
+    // M2.20c (#229): cancelling a running operation changes what the server
+    // does — it kills a child process — so it is a write, not a read of a
+    // write's outcome like the two routes above it. Full write posture.
+    (
+        "/api/operations/{id}/cancel",
+        Method::POST,
+        Authz::SessionAndCsrf,
     ),
 ];
 
@@ -157,7 +187,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 44;
+const EXPECTED_ROUTE_COUNT: usize = 48;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

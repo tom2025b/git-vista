@@ -427,6 +427,14 @@ fn row_to_status(
                 generation: generation.and_then(|g| GenerationToken::new(g).ok()),
                 recovery: recovery_json
                     .and_then(|r| serde_json::from_str::<RecoveryStrategy>(&r).ok()),
+                // M2.20c (#229): transfer progress is deliberately **not** a
+                // column and is never rehydrated. It describes a transfer in
+                // flight, and this table only ever hands back records this
+                // process did not run: every row `recover` returns is
+                // terminal (it force-fails anything a prior process left
+                // running), so a persisted "receiving 62%" would be a
+                // progress report about a process that no longer exists.
+                progress: None,
             },
         ))
     })();
@@ -658,6 +666,7 @@ mod tests {
                 ref_name: RefName::new("refs/heads/main").unwrap(),
                 to: CommitOid::new("b".repeat(40)).unwrap(),
             }),
+            progress: None,
         }
     }
 

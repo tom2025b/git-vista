@@ -20,6 +20,9 @@
 //! - [`OperationStatus`] — the record: the replayable result plus the
 //!   post-execution generation and typed recovery a client needs to reconcile.
 //! - [`ProgressEvent`] — one server-sent event on the operation's stream.
+//! - [`TransferProgress`] / [`TransferPhase`] (M2.20c, #229) — *inside* the
+//!   `Executing` stage, which phase of an object transfer git is in and how
+//!   far through it is. A long fetch is otherwise one opaque "running".
 //!
 //! Everything here is transport only. The registry that holds records, decides
 //! duplicates, and evicts, lives in the server; issue #62 makes it durable, and
@@ -124,6 +127,76 @@ pub enum OperationStage {
     Finished,
 }
 
+/// Which phase of an object transfer git reported (M2.20c, #229; widened for
+/// push by M2.20e, #231).
+///
+/// These are git's own `--progress` phases, in the order a transfer goes
+/// through them, **not** invented UI steps — the same posture
+/// [`OperationStage`] takes towards the planner's stages. They live beside
+/// [`OperationStage`] rather than inside it because they are *not* pipeline
+/// stages: a fetch is in `OperationStage::Executing` for the whole of this
+/// sequence, and folding them into that enum would have made every existing
+/// exhaustive match over `OperationStage` (the frontend has one) wrong the day
+/// a fetch ran.
+///
+/// # One vocabulary, both directions
+///
+/// A fetch and a push print the *same* phase names for the work each side
+/// does; which side does which work is what differs. Fetching, the remote
+/// enumerates/counts/compresses (git prefixes those `remote:`) and the local
+/// process receives and resolves. Pushing, the local process
+/// enumerates/counts/compresses and **writes**, and the remote resolves. So
+/// there is no `PushPhase` twin here: the tag says what git is doing, and
+/// which end is doing it is already known from the operation.
+///
+/// Wire values are `snake_case`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferPhase {
+    /// `Enumerating objects: N, done.` — deciding what to send. Reports no
+    /// percentage, only a running count.
+    Enumerating,
+    /// `Counting objects: N% (a/b)`.
+    Counting,
+    /// `Compressing objects: N% (a/b)`.
+    Compressing,
+    /// `Receiving objects: N% (a/b)` — bytes are arriving locally, i.e. a
+    /// fetch's transfer. The phase a user waits in, and the reason this
+    /// vocabulary exists at all.
+    Receiving,
+    /// `Writing objects: N% (a/b), <size> | <rate>` — bytes are leaving
+    /// locally, i.e. a push's transfer (M2.20e, #231). [`Self::Receiving`]'s
+    /// mirror image, and a separate tag rather than a shared "transferring"
+    /// one because a UI that says "receiving" while a user pushes is telling
+    /// them the wrong story about which way their data is going.
+    Writing,
+    /// `Resolving deltas: N% (a/b)` — an index is being built from the pack
+    /// (locally after a fetch, on the remote after a push, where git prefixes
+    /// it `remote:`). Nothing has touched a ref yet at this point.
+    Resolving,
+}
+
+/// How far through a [`TransferPhase`] git has got (M2.20c, #229).
+///
+/// Every field past `phase` is optional because git's own reporting is: the
+/// `Enumerating` line carries a count and no percentage, and a phase's
+/// closing `, done.` line may repeat the last numbers or not. A client that
+/// wants a progress bar uses `percent` when present and falls back to naming
+/// the phase; nothing here is ever synthesised to make the shape rectangular,
+/// because a fabricated percentage is worse than an honest absent one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferProgress {
+    /// The phase this report is about.
+    pub phase: TransferPhase,
+    /// Percentage complete, 0-100, when git printed one.
+    pub percent: Option<u8>,
+    /// Objects done so far in this phase, when git printed a `(a/b)` pair —
+    /// or the running count on the `Enumerating` line, which has no total.
+    pub objects: Option<u64>,
+    /// Objects in this phase in total, when git printed a `(a/b)` pair.
+    pub total_objects: Option<u64>,
+}
+
 /// The full record of one operation — the response of
 /// `GET /api/operations/{id}` and the payload of the stream's final event.
 ///
@@ -170,6 +243,19 @@ pub struct OperationStatus {
     /// How the pre-operation state can be recovered, from the plan that ran.
     /// `None` until a plan exists.
     pub recovery: Option<RecoveryStrategy>,
+    /// The last object-transfer report this operation produced (M2.20c,
+    /// #229). `None` for every operation that transfers nothing, and for a
+    /// fetch that has not yet reached its first phase. On a *terminal*
+    /// record it is the last report before the operation ended, which is
+    /// exactly the useful thing after a cancel ("it stopped 62% through
+    /// receiving").
+    ///
+    /// **Not persisted across a restart** (`durable.rs` rehydrates this as
+    /// `None`): a terminal record's transfer is over, and a *running* one is
+    /// not resumable across a process boundary anyway — the same reasoning
+    /// that module already applies to running records generally.
+    #[serde(default)]
+    pub progress: Option<TransferProgress>,
 }
 
 impl OperationStatus {
@@ -200,6 +286,12 @@ pub struct ProgressEvent {
     pub stage: OperationStage,
     /// When the transition happened (Unix seconds, server clock).
     pub at: UnixSeconds,
+    /// The object-transfer report at this moment, when the operation is one
+    /// that transfers objects and has started (M2.20c, #229). This is what
+    /// makes a long fetch legible: `stage` stays `Executing` throughout, and
+    /// this field is the only thing that moves.
+    #[serde(default)]
+    pub progress: Option<TransferProgress>,
 }
 
 /// The SSE `event:` name carrying a [`ProgressEvent`].
@@ -238,6 +330,7 @@ mod tests {
             recovery: Some(RecoveryStrategy::DeleteCreatedBranch {
                 name: BranchName::new("feature/x").unwrap(),
             }),
+            progress: None,
         }
     }
 
@@ -332,8 +425,103 @@ mod tests {
             state: OperationState::Running,
             stage: OperationStage::Planning,
             at: UnixSeconds(1_753_400_001),
+            progress: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert_eq!(serde_json::from_str::<ProgressEvent>(&json).unwrap(), e);
+    }
+
+    /// M2.20c (#229): the transfer vocabulary's wire spellings are contract —
+    /// a client's progress bar branches on them.
+    ///
+    /// **Every variant, kept every variant by a census** (M2.20e, #231). The
+    /// table alone is a list, and a list silently stops covering the enum the
+    /// day it grows: `Writing` was added by #231 and this test kept passing
+    /// without it, leaving the one phase a pushing user spends the whole
+    /// transfer in with no pinned wire name at all. The `match` below has no
+    /// wildcard, so a new variant is a compile error here, and the count then
+    /// forces it into the table rather than merely into the enum.
+    ///
+    /// Both directions, too: a spelling that only serialized correctly would
+    /// still break a client, since the same string has to come back off the
+    /// wire as the same variant.
+    #[test]
+    fn transfer_phase_wire_names_are_stable_snake_case() {
+        /// Every variant, named — exhaustive, no wildcard.
+        fn tag(phase: TransferPhase) -> &'static str {
+            match phase {
+                TransferPhase::Enumerating => "enumerating",
+                TransferPhase::Counting => "counting",
+                TransferPhase::Compressing => "compressing",
+                TransferPhase::Receiving => "receiving",
+                TransferPhase::Writing => "writing",
+                TransferPhase::Resolving => "resolving",
+            }
+        }
+
+        let table = [
+            (TransferPhase::Enumerating, r#""enumerating""#),
+            (TransferPhase::Counting, r#""counting""#),
+            (TransferPhase::Compressing, r#""compressing""#),
+            (TransferPhase::Receiving, r#""receiving""#),
+            // #231: a push's transfer phase. `Receiving`'s mirror image and a
+            // separate tag on purpose — a UI that said "receiving" while a
+            // user pushes would be telling them the wrong story about which
+            // way their data is going.
+            (TransferPhase::Writing, r#""writing""#),
+            (TransferPhase::Resolving, r#""resolving""#),
+        ];
+
+        let mut covered: Vec<&str> = table.iter().map(|(p, _)| tag(*p)).collect();
+        covered.sort_unstable();
+        covered.dedup();
+        assert_eq!(
+            covered.len(),
+            6,
+            "TransferPhase grew a variant — add its wire spelling to the table \
+             above, or the phase ships with no pinned name (which is exactly \
+             how `writing` shipped unpinned in #231): covered {covered:?}"
+        );
+
+        for (phase, wire) in table {
+            assert_eq!(serde_json::to_string(&phase).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<TransferPhase>(wire).unwrap(),
+                phase,
+                "the spelling must round-trip — a client reads it as well as \
+                 writes it"
+            );
+        }
+    }
+
+    /// A `progress`-carrying event round-trips, **and** an event minted by a
+    /// server that predates the field still parses — the additive-field rule
+    /// (M1.02) applied to the one field #229 adds to a live wire type.
+    #[test]
+    fn transfer_progress_round_trips_and_is_optional_on_the_wire() {
+        let e = ProgressEvent {
+            id: OperationId::new("op_dead_beef").unwrap(),
+            state: OperationState::Running,
+            stage: OperationStage::Executing,
+            at: UnixSeconds(1_753_400_001),
+            progress: Some(TransferProgress {
+                phase: TransferPhase::Receiving,
+                percent: Some(42),
+                objects: Some(51),
+                total_objects: Some(120),
+            }),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(serde_json::from_str::<ProgressEvent>(&json).unwrap(), e);
+
+        let older =
+            r#"{"id":"op_dead_beef","state":"running","stage":"executing","at":1753400001}"#;
+        assert_eq!(
+            serde_json::from_str::<ProgressEvent>(older)
+                .unwrap()
+                .progress,
+            None,
+            "an event from a server without the field must parse, not fail"
+        );
     }
 }

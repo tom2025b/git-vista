@@ -39,10 +39,11 @@ use leptos::*;
 use git_vista_core::activity::UndoAction;
 
 use crate::api::{
-    create_branch_request, fetch_head_branch, fetch_rebase_status, fetch_status, fetch_undoables,
-    fetch_worktree_status, stage_request, unstage_request,
+    create_branch_request, fetch_commit_detail, fetch_head_branch, fetch_rebase_status,
+    fetch_status, fetch_undoables, fetch_worktree_status, stage_request, unstage_request,
 };
 use crate::features::core_traits::RequestTarget;
+use crate::features::dialogs::commit::{amend_offer, AmendOffer};
 use crate::features::dialogs::core::Dialog;
 use crate::features::graph::core::disabled_menu_item_copy;
 use crate::features::operations::core::PendingIntent;
@@ -51,7 +52,7 @@ use crate::features::status::core::{deletable_untracked_paths, discardable_track
 use crate::geometry::menu_placement;
 use crate::gestures::viewport_size;
 use crate::icons::icon_set;
-use crate::state::{CommitDialog, Features, MenuData, PendingOp, Settings};
+use crate::state::{CommitIntent, Features, MenuData, PendingOp, Settings};
 
 /// Open this menu on `commit`, for an entry point that knows only the commit and a
 /// header — not the richer context the graph's own dots carry (M1.11, #64).
@@ -347,15 +348,27 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         // synchronously disposes this handler's own reactive owner, so
                         // any signal write after it is unreliable. Set the dialog first.
                         //
-                        // No `clear_commit_msg()` here any more (#226): opening is how a
+                        // No draft clear here (#226): opening is how a
                         // suspension-recovered draft comes back, so the opener must not
                         // wipe it. The draft clears on successful submit instead
-                        // (`dialogs/commit.rs`), which is what actually consumes it.
+                        // (`dialogs/commit.rs`'s `clear_message_for`), which is what
+                        // actually consumes it. Note what `dialogs.open` *does* reset:
+                        // the amend buffer and phase (#224), which belong to a different
+                        // question than the one this item is asking.
                         dialogs.open(Dialog::Commit);
-                        shell.open_commit_dialog(CommitDialog {
-                            allow_empty,
-                            branch: stub_branch.clone(),
+                        shell.open_commit_dialog(if allow_empty {
+                            CommitIntent::Empty {
+                                branch: stub_branch.clone(),
+                            }
+                        } else {
+                            CommitIntent::Staged
                         });
+                        // The dialog's staged-scope review renders from the shared
+                        // status read, and the menu may have been sitting open since
+                        // before the last stage/unstage. Refetching here is what makes
+                        // the list the user is about to approve a statement about the
+                        // repository *now* rather than whenever the panel last looked.
+                        status.refetch();
                         shell.close_menu();
                     };
                     view! {
@@ -368,6 +381,112 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 };
             let commit_changes = make_commit_item(ic.commit, "Commit Changes", false);
             let commit_empty = make_commit_item(ic.commit, "Create empty commit", true);
+            // "Amend last commit" (M2.19c, #224) — the third commit mode, beside the
+            // other two and gated the same way, with one extra restriction: unlike an
+            // empty commit, it is never offered on a branch stub. `GitOperation::
+            // AmendCommit` has no branch target at all (it always rewrites the
+            // checked-out branch's own tip), so there is no "amend that stub" to offer.
+            //
+            // The tapped commit's id is the compare-and-swap pin the request carries.
+            // That is the point of taking it from here rather than re-reading HEAD at
+            // submit time: it is the commit the user was looking at when they chose to
+            // rewrite it, and the server refuses if the tip has moved since — which the
+            // dialog then turns into a guided re-check rather than an error.
+            //
+            // The gate itself is `amend_offer`, in the host-tested core, not a
+            // condition spelled out here: this file is wasm-only, so an inverted
+            // or dropped condition would put "Amend last commit" on every stub —
+            // or take it away everywhere — with nothing in the suite going red.
+            let amend_tip = m.commit.clone();
+            let amend_item = match amend_offer(is_head, is_stub) {
+                AmendOffer::Offered => {
+                    let on_amend = move |_| {
+                        let tip = amend_tip.clone();
+                        dialogs.open(Dialog::Commit);
+                        shell.open_commit_dialog(CommitIntent::Amend {
+                            expected_tip: tip.clone(),
+                        });
+                        // Hold the confirm button until the read below answers
+                        // whether this commit is already on a remote (#225).
+                        // Opening is synchronous and the read is not, so
+                        // without this the dialog spends the whole request
+                        // showing an *enabled* Amend button over a pre-flight
+                        // that has nothing to read — and `amend_preflight`
+                        // sends on "nothing read". Two ordering constraints,
+                        // both pinned by `features::a11y::audit` because
+                        // nothing here compiles under `cargo test`: after
+                        // `dialogs.open` (which resets the phase), and before
+                        // `shell.close_menu()` (which disposes this handler's
+                        // reactive owner, after which writes are unreliable).
+                        dialogs.begin_publication_read(&tip);
+                        status.refetch();
+                        shell.close_menu();
+                        // Pre-fill with the tip's *whole* message (summary and body), not
+                        // the graph row's first line: `git commit --amend -m` replaces the
+                        // message outright, so seeding from a summary would silently drop
+                        // the body of every commit amended from here. A failed read leaves
+                        // the box empty and the confirm button disabled, which is the safe
+                        // direction — the dialog never invents a message.
+                        //
+                        // The same read answers two questions (#225): the
+                        // pre-fill, and whether this commit is already on a
+                        // remote — `CommitDetail::on_remote`, an exact
+                        // per-commit walk rather than membership of whatever
+                        // page is loaded. Recorded against `tip` so it can only
+                        // ever gate an amend of this commit. A failed read
+                        // records nothing, and `amend_preflight` treats "not
+                        // read" as unknown; see its doc comment for why unknown
+                        // sends rather than escalates.
+                        //
+                        // Both answers go through `apply_amend_detail` rather
+                        // than being written here, and that is the fix for a
+                        // second window as real as the one the hold above
+                        // closes: this callback resumes after an `await`, by
+                        // which point the dialog may have been reopened on
+                        // another commit. `PreflightKnowledge` holds one read
+                        // at a time, so writing an abandoned tip's answer here
+                        // *evicts* the answer for the commit on screen and the
+                        // ceremony silently stops firing for it. The currency
+                        // check lives in `detail_read_use`, where it is
+                        // host-tested; nothing in this file is.
+                        spawn_local(async move {
+                            if let Ok(detail) = fetch_commit_detail(&tip).await {
+                                dialogs.apply_amend_detail(&tip, detail.on_remote, &detail.message);
+                            }
+                            // Outside the `Ok` arm on purpose: a failed read
+                            // has to release the button too, or one bad GET
+                            // would make amend permanently unreachable. That
+                            // lands on the documented `Unknown` ⇒ send path,
+                            // which is a stated gap rather than a new one.
+                            dialogs.finish_publication_read(&tip);
+                        });
+                    };
+                    view! {
+                        <button class="ctx-item" on:click=on_amend>
+                            <span class="nf ctx-icon">{ic.commit}</span>
+                            "Amend last commit"
+                        </button>
+                    }
+                    .into_view()
+                }
+                AmendOffer::Blocked(reason) => {
+                    let (aria_label, visible_reason) =
+                        disabled_menu_item_copy("Amend last commit", reason);
+                    view! {
+                        <button
+                            class="ctx-item disabled"
+                            title=reason
+                            aria-disabled="true"
+                            aria-label=aria_label
+                        >
+                            <span class="nf ctx-icon">{ic.commit}</span>
+                            "Amend last commit"
+                            <span class="ctx-item-reason">{visible_reason}</span>
+                        </button>
+                    }
+                    .into_view()
+                }
+            };
             // "Stage Changes" (git add -A): move the working-tree changes into the
             // index so they can be committed. Like committing, it acts on the
             // checked-out branch, so it's offered on the HEAD commit and disabled
@@ -936,6 +1055,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     {delete_untracked}
                     {commit_changes}
                     {commit_empty}
+                    {amend_item}
                     {branch_items}
                     {rebase_item}
                 }

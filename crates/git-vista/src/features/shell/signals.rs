@@ -44,7 +44,7 @@ use crate::features::activity::signals::Activity;
 use crate::features::shell::core::{
     ConnectivityCore, ModeSettler, Overlay, OverlayStack, ShellMode,
 };
-use crate::state::{CommitDialog, MenuData, PendingOp, ViewerDoc};
+use crate::state::{CommitIntent, MenuData, PendingOp, ViewerDoc};
 
 /// The reactive browser-side half of the bottom-sheet model.
 ///
@@ -349,7 +349,7 @@ pub fn install_connectivity_signal() -> RwSignal<bool> {
 pub struct Shell {
     stack: RwSignal<OverlayStack>,
     menu: RwSignal<Option<MenuData>>,
-    commit_dialog: RwSignal<Option<CommitDialog>>,
+    commit_dialog: RwSignal<Option<CommitIntent>>,
     confirm_op: RwSignal<Option<PendingOp>>,
     detail_id: RwSignal<Option<String>>,
     viewer_doc: RwSignal<Option<ViewerDoc>>,
@@ -370,7 +370,7 @@ impl Shell {
         Self {
             stack: create_rw_signal(OverlayStack::default()),
             menu: create_rw_signal(None::<MenuData>),
-            commit_dialog: create_rw_signal(None::<CommitDialog>),
+            commit_dialog: create_rw_signal(None::<CommitIntent>),
             confirm_op: create_rw_signal(None::<PendingOp>),
             detail_id: create_rw_signal(None::<String>),
             viewer_doc: create_rw_signal(None::<ViewerDoc>),
@@ -392,7 +392,7 @@ impl Shell {
     /// The caller still stamps the ghost-click guard (`Dialogs::open`) itself: the guard is
     /// about *when* a modal appeared, which is the dialogs feature's business, and routing
     /// it through here would put two unrelated rules in one call.
-    pub fn open_commit_dialog(&self, d: CommitDialog) {
+    pub fn open_commit_dialog(&self, d: CommitIntent) {
         self.present(Overlay::CommitDialog);
         self.commit_dialog.set(Some(d));
     }
@@ -482,12 +482,12 @@ impl Shell {
     }
 
     /// A tracked read — the commit modal re-renders from it.
-    pub fn commit_dialog(&self) -> Option<CommitDialog> {
+    pub fn commit_dialog(&self) -> Option<CommitIntent> {
         self.commit_dialog.get()
     }
 
     /// An untracked read, for the submit handler that must not subscribe.
-    pub fn commit_dialog_untracked(&self) -> Option<CommitDialog> {
+    pub fn commit_dialog_untracked(&self) -> Option<CommitIntent> {
         self.commit_dialog.get_untracked()
     }
 

@@ -428,10 +428,12 @@ fn golden_plans() -> Vec<Plan> {
                 to: oid('2'),
             },
         ),
-        // #227 (M2.20a): contract only, like `amend_commit` above — the
-        // vocabulary and its network classification land before #229/#230
-        // wire any socket. The golden plans pin the wire shape now so those
-        // slices cannot quietly change it while adding execution.
+        // #227 (M2.20a): the vocabulary and its network classification landed
+        // before #229/#230 wired any socket, and these golden plans pinned the
+        // wire shape so those slices could not quietly change it while adding
+        // execution. It held: M2.20c (#229) wired `exec_fetch` against exactly
+        // the plan below — same risk class, same single precondition, same
+        // empty ref-change list — and this fixture needed no regeneration.
         //
         // Fetch is `Safe`/`NotNeeded` with no ref change listed: which
         // `refs/remotes/*` move is unknowable until git has spoken to the
@@ -1008,6 +1010,190 @@ fn golden_fixture_round_trips_losslessly() {
     );
 }
 
+/// The brace-matched body that follows `marker`, exclusive of the braces.
+/// `None` on a missing marker, no block, or an unbalanced one — every caller
+/// reads that as a failed extraction rather than as "nothing to check".
+fn braced_body<'a>(src: &'a str, marker: &str) -> Option<&'a str> {
+    let start = src.find(marker)?;
+    let rest = &src[start..];
+    let open = rest.find('{')?;
+    let mut depth = 0usize;
+    for (i, c) in rest[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[open + 1..open + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Everything from `//` to end of line removed.
+///
+/// Runs **before** [`braced_body`], not after: doc-comment prose contains
+/// unmatched braces (`{name}` in a formatted example, `${…}`), and a brace
+/// matcher that counted those would run the enum body off its own end and swallow
+/// whatever followed. Safe to do line-wise here because the region scanned holds
+/// no string literals.
+fn strip_line_comments(src: &str) -> String {
+    src.lines()
+        .map(|line| match line.find("//") {
+            Some(i) => &line[..i],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The variant names declared at the top level of an enum body — the
+/// identifier that opens each variant, ignoring its fields and any nesting
+/// inside them. Expects comment-free input (see [`strip_line_comments`]).
+fn top_level_variant_names(code: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut depth = 0i32;
+    let mut expecting = true;
+    let bytes: Vec<char> = code.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            '{' | '(' | '[' => {
+                depth += 1;
+                i += 1;
+            }
+            '}' | ')' | ']' => {
+                depth -= 1;
+                i += 1;
+            }
+            ',' if depth == 0 => {
+                expecting = true;
+                i += 1;
+            }
+            c if depth == 0 && expecting && (c.is_alphabetic() || c == '_') => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_alphanumeric() || bytes[i] == '_') {
+                    i += 1;
+                }
+                names.push(bytes[start..i].iter().collect::<String>());
+                expecting = false;
+            }
+            _ => i += 1,
+        }
+    }
+    names
+}
+
+/// serde's `rename_all = "snake_case"` applied to a PascalCase variant name.
+fn snake_case(name: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() {
+            if i != 0 {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The wire tags [`GitOperation`] *declares*, read back out of the enum's own
+/// source — not a list copied beside it.
+///
+/// This is the `route_authz::registered_routes` trick: the check is only worth
+/// anything if the "expected" side is re-derived from the real thing rather
+/// than hand-maintained. A hand-copied literal here would stay in sync only by
+/// somebody remembering, and the failure it is supposed to catch — a variant
+/// added with dispatch arms (which the compiler *does* force) but no golden
+/// plan — is exactly the case where nobody thought about the fixture.
+fn declared_operation_tags() -> std::collections::BTreeSet<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plan.rs");
+    let src = strip_line_comments(&std::fs::read_to_string(&path).expect("readable plan.rs"));
+    let body = braced_body(&src, "pub enum GitOperation ")
+        .expect("plan.rs still declares `pub enum GitOperation { .. }`");
+    let names = top_level_variant_names(body);
+    assert!(
+        !names.is_empty(),
+        "extracted no variants from GitOperation — the scanner no longer \
+         recognises the enum's shape, which would let this whole test pass \
+         vacuously"
+    );
+    names.iter().map(|n| snake_case(n)).collect()
+}
+
+/// Both answers for the extractor the census below rests on.
+///
+/// Without this, an extractor that returned the empty set — or that stopped at
+/// the first variant — would make `golden_set_covers_every_operation_variant`
+/// agree with itself and prove nothing.
+#[test]
+fn the_variant_extractor_reads_every_shape_and_only_variants() {
+    let source = "pub enum Thing {\n\
+                  /// A doc comment with a stray { brace and an Ident.\n\
+                  Unit,\n\
+                  Tuple(SomeType, Other),\n\
+                  Struct { field: Map<String, Vec<u8>>, other: bool },\n\
+                  Last,\n\
+                  }\nfn after() { NotAVariant }\n";
+    let stripped = strip_line_comments(source);
+    let body = braced_body(&stripped, "pub enum Thing ").expect("body");
+    assert_eq!(
+        top_level_variant_names(body),
+        vec!["Unit", "Tuple", "Struct", "Last"],
+        "field types, doc-comment prose and code after the enum must not be \
+         mistaken for variants"
+    );
+    // What that stray `{` in the doc comment is for: run the matcher over the
+    // *unstripped* source and it never gets back to depth zero, so the body is
+    // not found at all. `declared_operation_tags` would then panic on its
+    // `expect` — loud, not silent — but only because the strip happens first
+    // is the right body found. Ordering, pinned.
+    assert!(
+        braced_body(source, "pub enum Thing ").is_none(),
+        "an unmatched brace in a comment no longer confuses the matcher, so \
+         `strip_line_comments` running first has stopped being load-bearing — \
+         check the claim in its doc comment before trusting it"
+    );
+
+    // And the balanced version, which is the quieter half of the same problem:
+    // a comment whose braces match shifts the boundary without ever failing.
+    let balanced = "pub enum Thing {\n\
+                    /// prose with {a balanced} pair\n\
+                    Only,\n\
+                    }\nfn after() { NotAVariant }\n";
+    assert_eq!(
+        top_level_variant_names(
+            braced_body(&strip_line_comments(balanced), "pub enum Thing ").expect("body")
+        ),
+        vec!["Only"]
+    );
+    // The quiet failure: braces that *match* leave the boundary alone, so
+    // nothing errors — the prose inside the comment is simply counted as a
+    // variant and the real one is missed. No exception, no empty set, just a
+    // wrong answer that `declared_operation_tags` would compare against.
+    assert_eq!(
+        top_level_variant_names(braced_body(balanced, "pub enum Thing ").expect("body")),
+        vec!["prose"],
+        "if comment prose has stopped being mistaken for variants, \
+         `strip_line_comments` may no longer be doing anything"
+    );
+
+    assert_eq!(snake_case("CreateBranch"), "create_branch");
+    assert_eq!(snake_case("EmptyCommitOnBranch"), "empty_commit_on_branch");
+    assert_eq!(snake_case("StageAll"), "stage_all");
+
+    // Fail-closed on a shape it cannot read.
+    assert!(braced_body("pub enum Thing;", "pub enum Thing ").is_none());
+    assert!(braced_body("pub enum Thing { unterminated", "pub enum Thing ").is_none());
+}
+
 #[test]
 fn golden_set_covers_every_operation_variant() {
     // One plan per variant of the closed vocabulary: count the distinct `op`
@@ -1029,35 +1215,18 @@ fn golden_set_covers_every_operation_variant() {
         plans.len(),
         "duplicate operation kinds in the golden set"
     );
-    let expected: std::collections::BTreeSet<String> = [
-        "create_branch",
-        "commit_on_head",
-        "empty_commit_on_branch",
-        "stage_all",
-        "unstage_all",
-        "checkout_branch",
-        "merge_branch",
-        "push_branch",
-        "delete_branch",
-        "force_delete_branch",
-        "rebase_onto_base",
-        "restore_branch",
-        "reset_branch",
-        "revert_commit",
-        "reset_test_repo",
-        "stage_selection",
-        "discard_tracked_paths",
-        "delete_untracked_paths",
-        "amend_commit",
-        "fetch_remote",
-        "pull_branch",
-        "create_tag",
-        "delete_local_tag",
-        "delete_remote_tag",
-        "push_tag",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
-    assert_eq!(tags, expected, "operation wire tags changed");
+    // The expected side is re-read from `GitOperation`'s own source, not
+    // copied beside it. The compiler already forces a new variant to grow a
+    // dispatch arm in `planner.rs`; nothing forces it to grow a golden plan,
+    // and a literal list here would have kept quiet about that at the old
+    // count. Derived, the same omission fails with the missing tag named.
+    let expected = declared_operation_tags();
+    assert_eq!(
+        tags, expected,
+        "the golden plans and the GitOperation vocabulary disagree — a variant \
+         in the enum with no golden plan (add one to `golden_plans()` and \
+         regenerate the fixture with REGEN_GOLDEN=1), a golden plan for a \
+         variant that no longer exists, or a deliberate wire rename that has \
+         not reached the fixture"
+    );
 }
