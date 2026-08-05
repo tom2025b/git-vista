@@ -28,36 +28,17 @@
 //! lane's mandate. Each is explained where it's implemented below; this list
 //! is the map so a reader doesn't have to hunt for them:
 //!
-//! 1. **Pivot callouts never fire yet** (see `run_pipeline`'s `chapters::
-//!    detect_pivots` call site for the full accounting). `detect_pivots`
-//!    needs `&[git_vista_core::model::GraphRow]` — a real `Oid`, an `i64`
-//!    Unix timestamp, and a real `Vec<GitRef>` with ref names/kinds. A later
-//!    repair pass gave `capture.rs` a `CaptureResult::commit_metas:
-//!    Vec<CommitMeta>` (capture.rs:434-453) — pixel-aligned per-commit text
-//!    read straight off the rendered sheet — but `CommitMeta` cannot be
-//!    turned into a `GraphRow` honestly: its `short_sha` is a pre-truncated
-//!    7-char display string with no path back to a real `Oid`, its
-//!    `date_text` is a locale-formatted display string with no path back to
-//!    an epoch, and it carries no parent list and no ref names at all (only
-//!    a bare `has_refs: bool`). Fabricating those fields would either trip
-//!    `detect_pivots`'s length assert (chapters.rs:201-207, it panics, not
-//!    errors, on mismatch) if built wrong, or silently render invented tag
-//!    names and dates on a callout card if built "successfully" — worse
-//!    than the gap. Closing this for real needs either `chapters.rs`
-//!    (lane 3's file, not this lane's) gaining a `CommitMeta`-shaped entry
-//!    point, or this crate independently re-deriving real `GraphRow`s from
-//!    the actual repository (a new dependency and a new `--repo` flag,
-//!    materially bigger than a repair pass). So this CLI still always
-//!    passes an empty pivot list to `detect_pivots`, which is exactly what
-//!    `chapters::format_chapters` is documented to accept (chapters.rs:
-//!    365-401): a `chapters.txt` sidecar is still written, just with only
-//!    the mandatory `0:00 Start` line, and `pacing::build_timeline` runs
-//!    with no dwells. The (still-empty) `pivots` value is threaded through
-//!    to `EncodeConfig::pivots` too, so the callout-card renderer a
-//!    concurrent lane built in `encode.rs` is fully wired end-to-end and
-//!    will start firing the moment gap 1 above actually closes, with no
-//!    second edit needed here. `--max-pivots` is parsed and stored for that
-//!    day, but has no effect today.
+//! 1. **Pivot callouts — CLOSED in repair round 2.** `chapters::
+//!    detect_pivots_from_meta` now consumes `capture::CommitMeta` (the
+//!    honest sheet-derived subset: merge glyph, unknown-kind ref badge
+//!    scored at branch weight, rendered month text), so real pivots reach
+//!    both the timeline (dwells) and `EncodeConfig::pivots` (the callout
+//!    cards). What it still does NOT do — deliberately — is invent tag
+//!    names, epochs or parent lists the sheet never carried; see the bridge
+//!    comment in chapters.rs for the exact signal-by-signal accounting.
+//!    Pivot y values are clamped to the scrollable span at the call site,
+//!    so a landmark in the last viewport is dwelt on at the camera's final
+//!    resting position rather than silently dropped by the splice loop.
 //! 2. **`--date-overlay` is accepted but not drawn** (see `run`). Burning a
 //!    per-frame marker means writing pixels *while cropping each frame* —
 //!    `encode.rs`'s only public entry point, `encode_video`, has no overlay
@@ -675,52 +656,32 @@ async fn run_pipeline(
     let multipliers =
         build_multipliers(&capture_result.commit_ys, scrollable_height_px, cli.linear);
 
-    // Gap 1 (this file's top doc comment) — STILL a real gap, only
-    // partially narrowed by a concurrent lane's work, not closed by it.
-    // `capture::CaptureResult` now carries `commit_metas: Vec<CommitMeta>`
-    // (capture.rs:434-453), index-aligned with `commit_ys`. But `chapters::
-    // detect_pivots` (chapters.rs:201) still takes `&[GraphRow]`, and
-    // `CommitMeta` cannot honestly be turned into one — not a missing
-    // conversion function, a missing *fact*:
-    //   - `GraphRow.commit.id` is a real `Oid` (git-vista-core/src/
-    //     model.rs:12); `CommitMeta::short_sha` is print.rs's already-
-    //     truncated 7-char display string (capture.rs:462-463) — there is no
-    //     way to recover the other 33+ hex characters from it.
-    //   - `GraphRow.commit.time` is an `i64` Unix timestamp that `detect_
-    //     pivots`'s own month-boundary detection depends on (chapters.rs:
-    //     221-222, `civil_from_unix`); `CommitMeta::date_text` is a browser-
-    //     locale-formatted display string (capture.rs:470-474, e.g. "Jun 29
-    //     14:32") with no reliable inverse back to an epoch value.
-    //   - `GraphRow.refs` is `Vec<GitRef>` with a real name and `RefKind`
-    //     (model.rs:90-98), which `render_label`/`render_detail` read
-    //     directly to print e.g. `"Tag: v1.2.0"` (chapters.rs:271-274);
-    //     `CommitMeta::has_refs` is a bare `bool` (capture.rs:475-479) — no
-    //     ref name or kind survives the page probe at all.
-    //   - `GraphRow.commit.parents` (a real `Vec<Oid>`) doesn't exist in
-    //     `CommitMeta` either; `is_merge: Option<bool>` (capture.rs:480-486)
-    //     is derived honestly from the node's icon glyph instead, and is
-    //     real — but it is the one field of five that transfers.
-    // Fabricating the other four (a made-up `Oid` from `short_sha`, a
-    // parsed-back epoch from `date_text`, an invented ref name/kind from
-    // `has_refs`, an empty-or-guessed `parents`) is exactly what capture.rs's
-    // own doc comment (capture.rs:109-117) warns is worse than the gap:
-    // either it trips `detect_pivots`'s length assert (chapters.rs:201-207,
-    // it panics, not errors, on mismatch) if built wrong, or it silently
-    // renders fabricated tag names/dates on a callout card someone narrates
-    // over, while *looking* wired. Bridging this for real needs one of two
-    // things neither of which is this lane's file to make: `chapters::
-    // detect_pivots` gaining a `CommitMeta`-shaped entry point (chapters.rs,
-    // lane 3's file), or a genuinely independent source of real `GraphRow`s
-    // (e.g. re-walking the actual repo via `git-vista-core`/`git-vista-git`,
-    // which this crate does not currently depend on and which would need a
-    // new `--repo` flag to even know which repository's history matches the
-    // sheet being scrolled — a materially bigger feature than a repair pass
-    // over this crate's four confirmed findings). So: still called with two
-    // genuinely empty slices, still an honest statement of "zero rows'
-    // worth of real metadata are available to this call," not a fabricated
-    // one. `cli.max_pivots` remains threaded through, still with no effect
-    // on an empty input.
-    let pivots = chapters::detect_pivots(&[], &[], cli.max_pivots);
+    // Gap 1 — CLOSED (repair round 2). `chapters::detect_pivots_from_meta`
+    // is the `CommitMeta`-shaped entry point the previous round said was
+    // missing: it consumes exactly what the sheet honestly carries (merge
+    // glyph, an unknown-kind ref badge scored at branch weight, the rendered
+    // month text changing) and fabricates none of the four facts a real
+    // `GraphRow` would add. The callout renderer in encode.rs has been wired
+    // since the previous round; this call is what finally feeds it.
+    //
+    // Pivot y values are clamped to the scrollable span: the timeline ends
+    // at `scrollable_height_px` (the frozen-tail fix above), so a landmark
+    // living in the last viewport-height of the sheet is dwelt on at the
+    // camera's final resting position — still on screen, since by definition
+    // the bottom viewport shows it — rather than silently dropped by
+    // `build_timeline`'s splice loop, which never emits a pivot beyond the
+    // image height it was given.
+    let pivots: Vec<pacing::Pivot> = chapters::detect_pivots_from_meta(
+        &capture_result.commit_metas,
+        &capture_result.commit_ys,
+        cli.max_pivots,
+    )
+    .into_iter()
+    .map(|mut p| {
+        p.y = p.y.min(scrollable_height_px as f64);
+        p
+    })
+    .collect();
 
     let segments = pacing::build_timeline(
         scrollable_height_px as f64,

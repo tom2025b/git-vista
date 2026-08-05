@@ -19,6 +19,17 @@ use git_vista_core::model::{CommitSummary, GitRef, GraphRow, RefKind};
 
 use crate::pacing::{Pivot, Segment};
 
+// The `GraphRow` pivot path below is currently unreached from the binary:
+// repair round 2's `detect_pivots_from_meta` bridge (end of this file) is
+// what production actually calls, because `capture.rs` can only produce
+// `CommitMeta`, never a real `GraphRow`. This path is deliberately KEPT, not
+// deleted: it is the correct entry point for the day this tool grows a
+// `--repo` flag and re-derives real rows from the repository itself, its
+// tests are what pin the ranking weights (`reason_score`) the meta bridge
+// shares, and deleting ~200 tested lines to silence a dead-code lint would
+// be trading a compiler note for a rebuild. Each item carries its own
+// `#[allow(dead_code)]` rather than a module-wide blanket, so any NEW dead
+// code still gets flagged.
 // ---------------------------------------------------------------------------
 // Calendar math, dependency-free
 // ---------------------------------------------------------------------------
@@ -36,6 +47,7 @@ use crate::pacing::{Pivot, Segment};
 /// It is short enough to host-test directly against known dates rather than
 /// trust by citation alone (see `civil_date_matches_known_reference_dates`
 /// below).
+#[allow(dead_code)]
 fn civil_from_unix(unix_secs: i64) -> (i64, u32, u32) {
     let days = unix_secs.div_euclid(86_400);
     let z = days + 719_468;
@@ -51,6 +63,7 @@ fn civil_from_unix(unix_secs: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+#[allow(dead_code)]
 const MONTH_NAMES: [&str; 12] = [
     "January",
     "February",
@@ -67,12 +80,14 @@ const MONTH_NAMES: [&str; 12] = [
 ];
 
 /// `"August 2026"` — the label a month-boundary pivot shows.
+#[allow(dead_code)]
 fn month_label(unix_secs: i64) -> String {
     let (y, m, _) = civil_from_unix(unix_secs);
     format!("{} {y}", MONTH_NAMES[(m - 1) as usize])
 }
 
 /// `"Aug 5, 2026"` — compact enough for a one-line card detail.
+#[allow(dead_code)]
 fn short_date(unix_secs: i64) -> String {
     let (y, m, d) = civil_from_unix(unix_secs);
     format!("{} {d}, {y}", &MONTH_NAMES[(m - 1) as usize][..3])
@@ -88,6 +103,7 @@ fn short_date(unix_secs: i64) -> String {
 /// [`significance_score`] and [`render_label`]/[`render_detail`] agree on
 /// what happened at a commit without recomputing it three times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum Reason {
     Tag,
     Branch,
@@ -122,6 +138,7 @@ fn reason_score(reason: Reason) -> i64 {
     }
 }
 
+#[allow(dead_code)]
 fn ref_reason(kind: &RefKind) -> Reason {
     match kind {
         RefKind::Tag => Reason::Tag,
@@ -136,6 +153,7 @@ fn ref_reason(kind: &RefKind) -> Reason {
 /// comment) has to return something; nothing outside this crate ever sees
 /// it. External callers only ever see the capped, sorted `Vec<Pivot>`
 /// [`detect_pivots`] returns.
+#[allow(dead_code)]
 pub(crate) struct Candidate {
     row_idx: usize,
     y: f64,
@@ -147,6 +165,7 @@ pub(crate) struct Candidate {
 /// max-of-applicable, because a tagged merge (a release commit) really is
 /// more significant than either a plain tag or a plain merge alone — the
 /// video should hold longest exactly there.
+#[allow(dead_code)]
 fn significance_score(
     commit: &CommitSummary,
     refs: &[GitRef],
@@ -170,6 +189,7 @@ fn significance_score(
     reasons
 }
 
+#[allow(dead_code)]
 fn octopus_bonus(commit: &CommitSummary) -> i64 {
     if commit.parents.len() > 2 {
         2 * (commit.parents.len() as i64 - 2)
@@ -203,6 +223,7 @@ fn octopus_bonus(commit: &CommitSummary) -> i64 {
 /// are a caller bug (a capture that silently dropped or duplicated a node),
 /// not a data condition this function should paper over, so it asserts
 /// rather than truncating one to fit the other.
+#[allow(dead_code)]
 pub(crate) fn rank_pivots(rows: &[GraphRow], commit_ys: &[CommitY]) -> Vec<Candidate> {
     assert_eq!(
         rows.len(),
@@ -261,6 +282,7 @@ pub(crate) fn rank_pivots(rows: &[GraphRow], commit_ys: &[CommitY]) -> Vec<Candi
 /// Ranking itself (which candidates are the "most-deliberate" ones that
 /// survive the cap) is [`rank_pivots`]'s job, not this function's — see its
 /// doc comment for why the two are kept separate.
+#[allow(dead_code)]
 pub fn detect_pivots(rows: &[GraphRow], commit_ys: &[CommitY], max_pivots: usize) -> Vec<Pivot> {
     let mut candidates = rank_pivots(rows, commit_ys);
     candidates.truncate(max_pivots);
@@ -398,6 +420,7 @@ pub fn detect_pivots_from_meta(
 }
 
 /// Short label for the callout card's title line — the "what" in one glance.
+#[allow(dead_code)]
 fn render_label(row: &GraphRow, reasons: &[Reason]) -> String {
     // Priority order for the headline reason, most-specific first: a tag
     // name is the single most useful word to show ("v1.2.0"), then a branch
@@ -432,8 +455,10 @@ fn render_label(row: &GraphRow, reasons: &[Reason]) -> String {
 /// about 10-12 words, with a little margin for the reader's eye to also
 /// land on the callout box itself before reading starts. Twelve is the cap
 /// this function enforces, not a suggestion left to whoever writes the copy.
+#[allow(dead_code)]
 const CARD_MAX_WORDS: usize = 12;
 
+#[allow(dead_code)]
 fn render_detail(row: &GraphRow, reasons: &[Reason]) -> String {
     let what = if reasons.contains(&Reason::Merge) {
         format!("Merge: {}", row.commit.summary)
@@ -452,6 +477,7 @@ fn render_detail(row: &GraphRow, reasons: &[Reason]) -> String {
 /// was cut. Splits on whitespace only (no attempt at sentence-aware
 /// truncation) — this is a 3-second card, not a summary, and the exact cut
 /// point matters far less than the cap being enforced at all.
+#[allow(dead_code)]
 fn cap_words(text: &str, max_words: usize) -> String {
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.len() <= max_words {
@@ -879,5 +905,86 @@ mod tests {
         assert_eq!(format_timestamp(59.0), "0:59");
         assert_eq!(format_timestamp(60.0), "1:00");
         assert_eq!(format_timestamp(3_661.0), "1:01:01");
+    }
+}
+
+#[cfg(test)]
+mod meta_bridge_tests {
+    use super::*;
+    use crate::capture::CommitMeta;
+
+    fn meta(sha: &str, date: &str, merge: Option<bool>, refs: bool) -> CommitMeta {
+        CommitMeta {
+            short_sha: sha.to_string(),
+            summary: format!("summary of {sha}"),
+            author: "tomb".to_string(),
+            date_text: date.to_string(),
+            has_refs: refs,
+            is_merge: merge,
+        }
+    }
+
+    /// Mutation this catches: the cap keeping the LOW scorers (the inverted
+    /// comparator that survived the first review, now applied to the meta
+    /// path). Asserted on WHICH label survives, never on a count.
+    #[test]
+    fn the_cap_keeps_the_badge_over_the_bare_merge() {
+        let metas = vec![
+            meta("aaaaaaa", "Jun 01 10:00", Some(true), false), // merge only: 10
+            meta("bbbbbbb", "Jun 02 10:00", None, true),        // badge: 20
+        ];
+        let ys = vec![CommitY { y: 100.0 }, CommitY { y: 200.0 }];
+        let picked = detect_pivots_from_meta(&metas, &ys, 1);
+        assert_eq!(picked.len(), 1);
+        assert!(
+            picked[0].label.contains("bbbbbbb"),
+            "the ref badge must outrank the bare merge, got: {}",
+            picked[0].label
+        );
+    }
+
+    /// Mutation this catches: month comparison inverted or dropped. The
+    /// month token is display text ("Jun" -> "Jul"); the first row must
+    /// never count as a boundary.
+    #[test]
+    fn a_month_change_scores_and_the_first_row_never_does() {
+        let metas = vec![
+            meta("aaaaaaa", "Jun 29 14:32", None, false), // first row: nothing
+            meta("bbbbbbb", "Jul 01 09:00", None, false), // month changed
+        ];
+        let ys = vec![CommitY { y: 10.0 }, CommitY { y: 500.0 }];
+        let picked = detect_pivots_from_meta(&metas, &ys, 10);
+        assert_eq!(picked.len(), 1, "only the transition row is a landmark");
+        assert_eq!(picked[0].y, 500.0);
+        assert!(picked[0].label.contains("Jul"), "{}", picked[0].label);
+    }
+
+    /// An ambiguous merge glyph (None) must claim nothing — honesty is the
+    /// whole point of the bridge.
+    #[test]
+    fn an_ambiguous_glyph_scores_zero() {
+        let metas = vec![meta("aaaaaaa", "Jun 01 10:00", None, false)];
+        let ys = vec![CommitY { y: 50.0 }];
+        assert!(detect_pivots_from_meta(&metas, &ys, 10).is_empty());
+    }
+
+    /// Output is video order (ascending y) regardless of score order.
+    #[test]
+    fn output_is_ascending_y_after_the_cap() {
+        let metas = vec![
+            meta("aaaaaaa", "Jun 01 10:00", Some(true), false),
+            meta("bbbbbbb", "Jun 02 10:00", None, true),
+            meta("ccccccc", "Jun 03 10:00", Some(true), true),
+        ];
+        let ys = vec![
+            CommitY { y: 900.0 },
+            CommitY { y: 100.0 },
+            CommitY { y: 500.0 },
+        ];
+        let picked = detect_pivots_from_meta(&metas, &ys, 3);
+        let got: Vec<f64> = picked.iter().map(|p| p.y).collect();
+        let mut sorted = got.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(got, sorted, "pivots must come back in scroll order");
     }
 }
