@@ -16,7 +16,12 @@
 //!   * [`reset`]  — restore a seeded test repo to its recorded state.
 //!   * [`discard`] — discard uncommitted changes to tracked paths, or delete
 //!     untracked paths outright (#219).
-//!   * [`operations`] — one write's recorded lifecycle, and its progress stream.
+//!   * [`fetch`] — fetch from a configured remote (M2.20c, #229): the first
+//!     long-running network write, with streamed progress and cancellation.
+//!   * [`pull`] — fetch and then integrate (M2.20d, #230), with the
+//!     merge-or-rebase choice required on the wire and never defaulted.
+//!   * [`operations`] — one write's recorded lifecycle, its progress stream,
+//!     and (since #229) cancelling one that is still running.
 //!
 //! Since M1.06b (#143) the write handlers don't run git themselves: each
 //! validates its request, builds one typed `GitOperation` (#142), and hands it
@@ -38,6 +43,10 @@ pub(crate) mod clone;
 pub(crate) mod commit;
 // #219 (M2.18a): discard tracked-path changes / delete untracked paths.
 pub(crate) mod discard;
+// M2.20c (#229): fetch from a configured remote.
+pub(crate) mod fetch;
+// M2.20d (#230): fetch and integrate, with a mandatory merge/rebase strategy.
+pub(crate) mod pull;
 // M1.08 (#61): what happened to an operation, and watching one happen.
 pub(crate) mod operations;
 pub(crate) mod protocol;
