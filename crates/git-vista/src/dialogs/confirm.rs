@@ -12,11 +12,13 @@
 use leptos::*;
 
 use git_vista_core::activity::UndoAction;
+use git_vista_protocol::MergeStrategy;
 
 use crate::features::dialogs::core::{
-    worktree_confirm, ConfirmPrompt, Dialog, WorktreeAction, TOUCH_TARGET_STYLE,
+    worktree_confirm, ConfirmPrompt, Dialog, PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
 };
 use crate::features::graph::core::disabled_menu_item_copy;
+use crate::features::operations::kind::OperationKind;
 use crate::state::{Features, PendingOp};
 
 /// The confirm/cancel button base style, with #65's 44x44 floor.
