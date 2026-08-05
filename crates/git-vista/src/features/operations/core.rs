@@ -1507,18 +1507,39 @@ mod progress_line_tests {
         assert!(!line.contains('%') && !line.contains('/'));
     }
 
-    /// The other half of the acceptance criterion: an operation with no progress at all
-    /// (`InFlight::progress` is `None`) must render with no progress fragment whatsoever —
-    /// this is `view.rs`'s job (rendering `Option<TransferProgress>`), so this test pins the
-    /// contract `progress_line` itself hands the view: it is only ever called on a `Some`,
-    /// and a `None` must produce no call and therefore no fragment.
+    /// A transfer that has started but reported no counts yet must still name its
+    /// phase, never render as blank and never invent a number.
+    ///
+    /// **This replaces a test that proved nothing.** The previous version built a
+    /// literal `None`, called `.map(progress_line)` on it, and asserted the result
+    /// was `None` — which is a property of `Option::map` in the standard library,
+    /// not of this module. `progress_line` was never invoked, so no mutation to it
+    /// (or to `view.rs`) could turn that test red. It is exactly the shape this
+    /// repo's standing caution names: structurally complete, semantically inert.
+    ///
+    /// The genuinely uncoverable half — that `view.rs` renders no fragment when
+    /// `InFlight::progress` is `None` — lives in wasm-only code with no test
+    /// harness in this crate at all (`features/operations/mod.rs` gates `view.rs`
+    /// behind `cfg(target_arch = "wasm32")`). It is checked by hand on the device
+    /// pass rather than pretended at here. Saying so is worth more than a green
+    /// test that cannot fail.
     #[test]
-    fn a_progress_free_operation_has_nothing_for_the_view_to_render() {
-        let no_progress: Option<TransferProgress> = None;
-        let rendered = no_progress.as_ref().map(progress_line);
-        assert_eq!(
-            rendered, None,
-            "a progress-free operation must produce no progress fragment"
+    fn a_transfer_with_no_counts_yet_still_names_its_phase() {
+        let bare = TransferProgress {
+            phase: TransferPhase::Enumerating,
+            percent: None,
+            objects: None,
+            total_objects: None,
+        };
+        let line = progress_line(&bare);
+        assert!(
+            !line.trim().is_empty(),
+            "a phase-only progress must still say something: {line:?}"
         );
+        // The no-fabrication rule TransferProgress's own doc comment states: with
+        // nothing counted, there is no honest percentage and no honest denominator.
+        assert!(!line.contains('%'), "invented a percentage: {line:?}");
+        assert!(!line.contains('/'), "invented a denominator: {line:?}");
+        assert!(!line.contains('0'), "invented a zero count: {line:?}");
     }
 }

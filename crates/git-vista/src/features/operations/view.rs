@@ -114,9 +114,17 @@ pub fn operations_status_view(operations: Operations) -> impl IntoView {
                                     None => format!("{stage}…"),
                                 }
                             };
-                            // Only `FetchRemote`/`PullBranch`/`PushBranch` honour
-                            // cancellation server-side (`planner::honours_cancellation`),
-                            // mirrored here by `OperationKind::is_cancellable()`; and
+                            // `OperationKind::is_cancellable()` is **narrower than the
+                            // server on purpose, and is not a mirror** — this comment
+                            // used to claim it was one, which was false. The server's
+                            // `planner::honours_cancellation` (planner.rs:4294-4299)
+                            // returns true for `FetchRemote`, `PullBranch` **and**
+                            // `PushBranch`; the client offers Cancel for Fetch and Pull
+                            // only, because #232 scoped itself there and a cancelled
+                            // push carries a weaker promise the UI does not yet explain
+                            // (the transfer stops; it does not mean nothing was
+                            // published). See `kind.rs::is_cancellable`, where that
+                            // decision is recorded and pinned by its test. And
                             // there is nothing to cancel before the write response has
                             // bound a server id (`InFlight::id` is `None` in that
                             // window) — both gate the button so it is never offered

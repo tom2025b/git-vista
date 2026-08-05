@@ -414,6 +414,20 @@ pub fn App() -> impl IntoView {
     // actually lands, rather than migrating them twice.
     let shell = Shell::new(activity);
 
+    // #232 follow-up: give `operations` the handles it needs to put its own
+    // failures on screen. It is created ~200 lines above this, deliberately —
+    // above `graph_canvas`, so an in-flight write survives the epoch bump its
+    // completion causes (M1.11) — but `Shell` and `Dialogs` cannot exist that
+    // early, so the wiring is a second step rather than a constructor argument.
+    //
+    // Without this line every refusal `Operations::cancel` receives (offline,
+    // an evicted id, either 409, a dropped tunnel) reaches the browser console
+    // and nobody else: the user taps Cancel on a stalled fetch and gets
+    // silence. The review that caught it found the sink installed nowhere at
+    // all — a finished feature shipped inert because its one wiring line fell
+    // between two work boundaries, and no test could see it.
+    operations.install_error_sink(shell, dialogs_guard);
+
     // The window's current layout mode (M1.12, #65). Created here, not in
     // graph_canvas, for the same reason `shell` is: an epoch bump's rebuild must
     // not tear down and reinstall the resize listener mid-session.
