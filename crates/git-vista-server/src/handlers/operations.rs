@@ -375,8 +375,7 @@ mod tests {
     /// after firing its own POST, before the server has admitted it yet.
     #[tokio::test]
     async fn by_key_of_an_unadmitted_key_is_not_found() {
-        let response =
-            operation_by_key(Path("handler-by-key-never-admitted".to_string())).await;
+        let response = operation_by_key(Path("handler-by-key-never-admitted".to_string())).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
