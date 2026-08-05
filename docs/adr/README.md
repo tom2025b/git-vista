@@ -60,3 +60,4 @@ it, and note the link in both.
 | [0046](0046-mcp-plan-tool-surface.md) | The MCP plan-tool surface: 23 build-only tools, one endpoint, and a variant that cannot be exposed | Accepted — implemented and tested |
 | [0047](0047-remote-target-boundary.md) | Which host a fetch may contact: a name-shaped newtype *and* a precondition that refuses instead of being skipped | Accepted — implemented and tested |
 | [0048](0048-local-tag-execution.md) | Local tag execution: the annotation that cannot be empty, and the pin that outlives the tag | Accepted — implemented and tested; signing and the two remote-reaching tag operations still refuse (M2.21e/f of #74) |
+| [0049](0049-v1-scope-freeze.md) | V1 scope freeze: eighteen never-started issues closed as won't-do, M6/M7 retired, M8 deleted | Accepted — tracker changes only; no code or protocol touched |
