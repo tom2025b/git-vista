@@ -12,6 +12,7 @@
 //! a *different* operation, and needs `Debug` for the assertions that prove it.
 
 use git_vista_core::activity::Undoable;
+use git_vista_protocol::MergeStrategy;
 
 /// A branch operation awaiting confirmation in the modal (Issue #33 follow-up).
 /// Merge and delete change history/refs and push reaches the network, so each is
@@ -58,6 +59,25 @@ pub enum OperationKind {
         current: Option<String>,
         base: String,
     },
+    /// Fetch from `remote` (`git fetch <remote>`, M2.20f/#232) — updates the
+    /// remote-tracking refs; moves nothing local. Repo-scoped like
+    /// [`Self::Rebase`] above, not per-branch like [`Self::Push`].
+    Fetch { remote: String },
+    /// Pull `branch` from `remote` into the checked-out branch, integrating
+    /// with `strategy` (`git fetch` + `git merge`/`git rebase`, M2.20f/#232).
+    ///
+    /// `strategy` has no default anywhere in this vocabulary (ADR 0044): the
+    /// picker that builds this variant cannot construct it before the user
+    /// has chosen Merge or Rebase, so there is no "unset" value this field
+    /// could ever silently carry — the type itself rules it out, the same
+    /// discipline the wire `PullRequest` already enforces one layer further
+    /// out (an omitted `strategy` field there is a deserialize error, never
+    /// a fallback).
+    Pull {
+        remote: String,
+        branch: String,
+        strategy: MergeStrategy,
+    },
     /// Execute one undo action (Activity/Undo step 5, `POST /api/undo`). Carries the
     /// whole [`Undoable`] — the action plus its server-built label and `warn_pushed`
     /// flag — so the dialog can name exactly what it's about to do and warn when the
@@ -100,6 +120,20 @@ impl OperationKind {
             Self::ForceDelete { branch } => format!("Force-deleting \u{2018}{branch}\u{2019}"),
             Self::Checkout { branch, .. } => format!("Checking out \u{2018}{branch}\u{2019}"),
             Self::Rebase { base, .. } => format!("Rebasing onto {base}"),
+            Self::Fetch { remote } => format!("Fetching from \u{2018}{remote}\u{2019}"),
+            Self::Pull {
+                remote,
+                branch,
+                strategy,
+            } => {
+                let verb = match strategy {
+                    MergeStrategy::Merge => "merge",
+                    MergeStrategy::Rebase => "rebase",
+                };
+                format!(
+                    "Pulling \u{2018}{branch}\u{2019} from \u{2018}{remote}\u{2019} ({verb} strategy)"
+                )
+            }
             Self::Undo(u) => format!("Undoing: {}", u.label),
             Self::DiscardTrackedPaths { paths } => {
                 format!("Discarding changes to {}", file_count(paths.len()))
@@ -111,6 +145,17 @@ impl OperationKind {
                 format!("Deleting {} permanently", file_count(paths.len()))
             }
         }
+    }
+
+    /// Whether the server's executor watches this operation's cancellation
+    /// latch — mirrors `planner::honours_cancellation` on the server side
+    /// (`crates/git-vista-server/src/planner.rs`), kept in sync by this
+    /// cross-reference rather than a shared type, since the two crates
+    /// don't share the match. Only `Fetch` and `Pull` are cancellable today
+    /// (M2.20f, #232): a cancel button must never be offered for anything
+    /// else, since the server would answer it with a 409.
+    pub fn is_cancellable(&self) -> bool {
+        matches!(self, Self::Fetch { .. } | Self::Pull { .. })
     }
 }
 
@@ -152,6 +197,14 @@ mod tests {
             OperationKind::Rebase {
                 current: None,
                 base: "origin/main".into(),
+            },
+            OperationKind::Fetch {
+                remote: "origin".into(),
+            },
+            OperationKind::Pull {
+                remote: "origin".into(),
+                branch: "main".into(),
+                strategy: MergeStrategy::Merge,
             },
             OperationKind::DiscardTrackedPaths {
                 paths: vec!["src/a.rs".into()],
@@ -215,5 +268,90 @@ mod tests {
         }
         .describe();
         assert!(two.contains("2 files"), "{two}");
+    }
+}
+
+#[cfg(test)]
+mod fetch_pull_tests {
+    use super::*;
+
+    fn fetch() -> OperationKind {
+        OperationKind::Fetch {
+            remote: "origin".into(),
+        }
+    }
+
+    fn pull(strategy: MergeStrategy) -> OperationKind {
+        OperationKind::Pull {
+            remote: "origin".into(),
+            branch: "main".into(),
+            strategy,
+        }
+    }
+
+    /// Mutation this catches: dropping `| Self::Pull { .. }` (or the whole
+    /// `matches!` arm) from `is_cancellable`, or flipping it to `true` for
+    /// everything.
+    #[test]
+    fn is_cancellable_is_true_only_for_fetch_and_pull() {
+        assert!(fetch().is_cancellable());
+        assert!(pull(MergeStrategy::Merge).is_cancellable());
+        assert!(pull(MergeStrategy::Rebase).is_cancellable());
+
+        let not_cancellable = [
+            OperationKind::Merge {
+                branch: "feature".into(),
+                into: Some("main".into()),
+            },
+            OperationKind::Push {
+                branch: "feature".into(),
+            },
+            OperationKind::Delete {
+                branch: "feature".into(),
+                current: None,
+            },
+            OperationKind::ForceDelete {
+                branch: "feature".into(),
+            },
+            OperationKind::Checkout {
+                branch: "feature".into(),
+                current: None,
+            },
+            OperationKind::Rebase {
+                current: None,
+                base: "origin/main".into(),
+            },
+            OperationKind::DiscardTrackedPaths {
+                paths: vec!["src/a.rs".into()],
+            },
+            OperationKind::DeleteUntrackedPaths {
+                paths: vec!["scratch.txt".into()],
+            },
+        ];
+        for k in not_cancellable {
+            assert!(!k.is_cancellable(), "{k:?} should not be cancellable");
+        }
+    }
+
+    /// Mutation this catches: describe()'s Pull arm hard-coding one verb
+    /// (e.g. always "merge") instead of reading `strategy` — ADR 0044's
+    /// no-default rule would then be silently undone in the one place a
+    /// user actually sees the choice confirmed.
+    #[test]
+    fn pull_describes_the_strategy_it_will_actually_run() {
+        let merge = pull(MergeStrategy::Merge).describe();
+        let rebase = pull(MergeStrategy::Rebase).describe();
+        assert_ne!(merge, rebase);
+        assert!(merge.to_lowercase().contains("merge"));
+        assert!(rebase.to_lowercase().contains("rebase"));
+    }
+
+    /// Mutation this catches: describe() interpolating the wrong field (e.g.
+    /// swapping `remote`/`branch`, or a copy-pasted literal "origin").
+    #[test]
+    fn fetch_and_pull_name_the_remote_they_describe() {
+        assert!(fetch().describe().contains("origin"));
+        assert!(pull(MergeStrategy::Merge).describe().contains("origin"));
+        assert!(pull(MergeStrategy::Merge).describe().contains("main"));
     }
 }

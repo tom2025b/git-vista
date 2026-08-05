@@ -1019,6 +1019,104 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 }
                 .into_view()
             });
+            // "Fetch" (#232, M2.20f): repo-scoped like Rebase, not per-branch
+            // like Push — there's no per-branch remote-tracking surface in
+            // this menu. Single tap, styled exactly like `push_item`: no
+            // live pre-check needed, because a fetch has no branch
+            // dependency the way merge/checkout/delete do. ADR 0047 records
+            // that in practice only `origin` is ever in play, and #232's
+            // scope names no remote picker, so the remote is fixed rather
+            // than offered as a choice.
+            let fetch_item = (!m.is_branch).then(|| {
+                let on = move |_| {
+                    dialogs.open(Dialog::Confirm);
+                    shell.open_confirm(PendingOp::Fetch {
+                        remote: "origin".to_string(),
+                    });
+                    shell.close_menu();
+                };
+                view! {
+                    <button class="ctx-item" on:click=on>
+                        // Reuses the remote-branch glyph — both actions talk
+                        // to the remote, and this app has no dedicated
+                        // fetch/pull icon yet.
+                        <span class="nf ctx-icon">{ic.branch_alt}</span>
+                        "Fetch"
+                    </button>
+                }
+                .into_view()
+            });
+            // "Pull" (#232, M2.20f, ADR 0044): repo-scoped like Rebase.
+            // Unlike every other branch op here, this cannot open the shared
+            // `Dialog::Confirm` modal directly: `MergeStrategy` has exactly
+            // two variants, derives no `Default`, and carries no sentinel
+            // "not yet chosen" value (plan.rs:307-316), so there is no
+            // `OperationKind::Pull` this click could build before the user
+            // has picked one — inventing a placeholder to "correct before
+            // dispatch" would be exactly the silent default ADR 0044 spent
+            // three enforcement layers ruling out at the wire layer. Instead
+            // this opens the picker (`Dialogs::open_pull_picker`), which
+            // holds only `{remote, branch}` until a tap on Merge or Rebase
+            // supplies the missing field; only the picker's own confirm tap
+            // constructs `OperationKind::Pull`, at the same instant it is
+            // dispatched.
+            //
+            // The branch is resolved live on click, exactly like
+            // `rebase_item`'s `fetch_head_branch()` pre-check above, guarded
+            // by the same click-order race protection (`admit_intent`) every
+            // other live-checked item here uses: a slower response from an
+            // earlier tap must not reopen the picker over a dialog a later
+            // tap is already showing. The intent's `kind` is never sent
+            // anywhere — `operations.dispatch` is never called with it —
+            // `MergeStrategy::Merge` is an inert placeholder that exists only
+            // to satisfy `PendingIntent`'s shape and is discarded the
+            // instant `admit_intent` returns; it never reaches the picker,
+            // the wire, or the screen.
+            let pull_item = (!m.is_branch).then(|| {
+                let on = move |_| {
+                    shell.close_menu();
+                    let seq = operations.next_seq();
+                    let key = operations.request_key(RequestTarget::Repository);
+                    spawn_local(async move {
+                        let remote = "origin".to_string();
+                        match fetch_head_branch().await.unwrap_or(None) {
+                            Some(branch) => {
+                                let intent = PendingIntent {
+                                    seq,
+                                    key,
+                                    kind: PendingOp::Pull {
+                                        remote: remote.clone(),
+                                        branch: branch.clone(),
+                                        strategy: git_vista_protocol::plan::MergeStrategy::Merge,
+                                    },
+                                };
+                                if !operations.admit_intent(&intent) {
+                                    return;
+                                }
+                                dialogs.open_pull_picker(remote, branch);
+                            }
+                            // No branch to pull into. #316 pattern: the app's
+                            // own modal, never a silent no-op and never a
+                            // native alert().
+                            None => {
+                                dialogs.open(Dialog::Error);
+                                shell.open_error(ErrorNotice {
+                                    title: "Can't pull",
+                                    body: "HEAD is detached — check out a branch first."
+                                        .to_string(),
+                                });
+                            }
+                        }
+                    });
+                };
+                view! {
+                    <button class="ctx-item" on:click=on>
+                        <span class="nf ctx-icon">{ic.merge}</span>
+                        "Pull"
+                    </button>
+                }
+                .into_view()
+            });
             // The undo section (step 5): one item per action `/api/undoables`
             // returned for this commit — reset-style undos when its result is
             // still a branch tip, a restore when it's a deleted branch's lost
@@ -1085,6 +1183,8 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     {amend_item}
                     {branch_items}
                     {rebase_item}
+                    {fetch_item}
+                    {pull_item}
                 }
             });
             // The one disabled row standing in for the whole write set while

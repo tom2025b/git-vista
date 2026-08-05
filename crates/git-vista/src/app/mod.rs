@@ -208,6 +208,12 @@ pub fn App() -> impl IntoView {
     // change (acceptance criterion 2).
     let operations_core = create_rw_signal(OperationsCore::default());
     let operations = Operations::new(operations_core, graph);
+    // #232, M2.20f: resume watching a Fetch/Pull that was still in flight
+    // when this tab reloaded or was suspended and resumed — before
+    // anything else reads `operations_core`, so the menu's "don't
+    // re-offer Fetch/Pull while one is running" gate sees it from the
+    // first render.
+    operations.resume_from_storage();
 
     // The history signals the App owns (M1.10, #63). `print_graph_open` opens the
     // full static print view (crate::print) from the topbar; `history_complete`

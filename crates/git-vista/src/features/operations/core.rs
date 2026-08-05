@@ -9,8 +9,13 @@
 //! [`IdempotencyKey`], [`OperationId`] — not parallel client copies, so an SSE
 //! [`ProgressEvent`](git_vista_protocol::operation::ProgressEvent) maps straight in.
 
-use git_vista_protocol::operation::{IdempotencyKey, OperationId, OperationStage, OperationState};
-use git_vista_protocol::plan::GenerationToken;
+use git_vista_protocol::dto::{
+    FetchError, FetchFailureKind, FetchSuccess, PullError, PullFailureKind, PullSuccess,
+};
+use git_vista_protocol::operation::{
+    IdempotencyKey, OperationId, OperationStage, OperationState, TransferProgress,
+};
+use git_vista_protocol::plan::{GenerationToken, MergeStrategy};
 
 use crate::features::core_traits::{Applied, Invalidate, InvalidateScope, RequestKey};
 use crate::features::operations::kind::OperationKind;
@@ -34,6 +39,21 @@ pub struct InFlight {
     pub kind: OperationKind,
     pub state: OperationState,
     pub stage: OperationStage,
+    /// The last object-transfer report this operation has produced
+    /// (M2.20f, #232) — the client-side mirror of the server's
+    /// `OperationStatus::progress` and `ProgressEvent::progress`. `None`
+    /// for every operation that transfers nothing, and for a fetch/pull
+    /// that has not yet reached its first phase; never synthesized, so a
+    /// caller that wants a percentage falls back to naming the phase
+    /// rather than inventing one.
+    pub progress: Option<TransferProgress>,
+    /// Whether a cancel has been asked for and the server accepted the
+    /// request (M2.20f, #232). Set by [`OperationsCore::request_cancel`],
+    /// never by [`OperationsCore::settle`] — ADR 0043: cancelling only
+    /// sets a latch and never terminalises the record itself, so this
+    /// stays `true` on an entry that remains, honestly, in flight until
+    /// the real terminal event arrives.
+    pub cancel_requested: bool,
 }
 
 /// What the client needs from a terminal record: whether it worked, what git said, and the
@@ -78,6 +98,92 @@ pub fn escalation(kind: &OperationKind, message: &str) -> Option<OperationKind> 
         }
         _ => None,
     }
+}
+
+/// A settled [`OperationKind::Fetch`]/[`OperationKind::Pull`]'s `message` as a short human
+/// line, instead of the typed JSON it actually is.
+///
+/// `Settlement::message` is `OperationStatus::message` verbatim (`signals.rs`'s
+/// `subscribe()` reads `record.message.clone()` straight into it), and for these two kinds
+/// that field is the un-rewrapped [`FetchSuccess`]/[`FetchError`]/[`PullSuccess`]/
+/// [`PullError`] body, never git's prose alone. `middleware::api_contract` only rewraps a
+/// response whose *whole HTTP status* is 4xx/5xx; `GET /api/operations/{id}` and the SSE
+/// `result` event both answer `200` with the record embedded as data, so the typed JSON
+/// inside `message` reaches this function exactly as the planner stored it. Left unrendered,
+/// the settled card in `view.rs` would show that JSON verbatim at the user — the same
+/// failure mode #316 fixed for the commit/reset `alert()` calls, on a channel #316's own
+/// `split_error_response` never reaches (that function unwraps the `ApiError` envelope a
+/// *direct* non-2xx response carries; a settled record's `message` was never wrapped in
+/// one).
+///
+/// Each kind tries its own success shape first, then its own error shape — the two never
+/// collide (`FetchSuccess`/`PullSuccess` have no `kind` field; `FetchError`/`PullError`
+/// require one), so which is tried first is not load-bearing. A kind that is neither `Fetch`
+/// nor `Pull`, or a `message` that parses as neither shape, comes back unmodified: never
+/// worse than the raw string it replaces.
+pub fn fetch_or_pull_summary(kind: &OperationKind, message: &str) -> String {
+    match kind {
+        OperationKind::Fetch { .. } => {
+            fetch_summary(message).unwrap_or_else(|| message.to_string())
+        }
+        OperationKind::Pull { .. } => {
+            pull_summary(message).unwrap_or_else(|| message.to_string())
+        }
+        _ => message.to_string(),
+    }
+}
+
+/// `Some` line for a `message` that parses as [`FetchSuccess`] or [`FetchError`]; `None` for
+/// anything else, so the caller's fallback stays the one place that decides what "could not
+/// parse" shows.
+fn fetch_summary(message: &str) -> Option<String> {
+    if let Ok(ok) = serde_json::from_str::<FetchSuccess>(message) {
+        return Some(ok.message);
+    }
+    let err = serde_json::from_str::<FetchError>(message).ok()?;
+    Some(match err.kind {
+        // The other four kinds already read as a complete sentence — the server builds
+        // them that way (`planner::fetch::exec_fetch`/`cancelled_response`). Cancellation
+        // is the one outcome worth a leading tag, so a glance at the strip finds it
+        // without reading the whole line.
+        FetchFailureKind::Cancelled => format!("Fetch cancelled — {}", err.message),
+        FetchFailureKind::AuthenticationFailed
+        | FetchFailureKind::RemoteUnreachable
+        | FetchFailureKind::RemoteRejected
+        | FetchFailureKind::Other => err.message,
+    })
+}
+
+/// `Some` line for a `message` that parses as [`PullSuccess`] or [`PullError`]; `None` for
+/// anything else, mirroring [`fetch_summary`].
+fn pull_summary(message: &str) -> Option<String> {
+    if let Ok(ok) = serde_json::from_str::<PullSuccess>(message) {
+        return Some(ok.message);
+    }
+    let err = serde_json::from_str::<PullError>(message).ok()?;
+    Some(match err.kind {
+        // ADR 0044 §5's table is the source for these two tags: `Conflict` and
+        // `ConflictLeftInProgress` are the one distinction in this vocabulary that asks
+        // opposite things of the user ("choose again — nothing was lost" vs "the working
+        // tree needs a human"), so each gets a leading tag rather than living only in the
+        // trailing sentence git's own words already carry.
+        PullFailureKind::Conflict => {
+            format!("Pull hit a conflict — the tree was restored. {}", err.message)
+        }
+        PullFailureKind::ConflictLeftInProgress => format!(
+            "Pull hit a conflict and needs attention — the working tree is \
+             mid-integration. {}",
+            err.message
+        ),
+        // The fetch half's own cancellation tag, for the same scannability reason.
+        PullFailureKind::Cancelled => format!("Pull cancelled — {}", err.message),
+        PullFailureKind::StrategyRequired
+        | PullFailureKind::AuthenticationFailed
+        | PullFailureKind::RemoteUnreachable
+        | PullFailureKind::RemoteRejected
+        | PullFailureKind::NoSuchRemoteBranch
+        | PullFailureKind::Other => err.message,
+    })
 }
 
 /// An operation that has resolved, kept briefly so its outcome can be shown and dismissed.
@@ -128,6 +234,8 @@ impl OperationsCore {
             kind,
             state: OperationState::Accepted,
             stage: OperationStage::Queued,
+            progress: None,
+            cancel_requested: false,
         });
         Ok(Applied::Committed)
     }
@@ -151,22 +259,58 @@ impl OperationsCore {
     }
 
     /// Record one progress event.
+    ///
+    /// `progress` is compared too (M2.20f, #232), not just `state`/`stage`:
+    /// a fetch sits at `OperationStage::Executing` for its whole transfer,
+    /// so state/stage alone would report every percent tick as
+    /// [`Applied::NoChange`] and a live progress bar would never move.
     pub fn observe(
         &mut self,
         id: &OperationId,
         state: OperationState,
         stage: OperationStage,
+        progress: Option<TransferProgress>,
     ) -> Result<Applied, OperationsRejection> {
         let entry = self
             .in_flight
             .iter_mut()
             .find(|e| e.id.as_ref() == Some(id))
             .ok_or(OperationsRejection::UnknownOperation)?;
-        if entry.state == state && entry.stage == stage {
+        if entry.state == state && entry.stage == stage && entry.progress == progress {
             return Ok(Applied::NoChange);
         }
         entry.state = state;
         entry.stage = stage;
+        entry.progress = progress;
+        Ok(Applied::Committed)
+    }
+
+    /// Record that a cancel request for `id` was accepted by the server
+    /// (M2.20f, #232) — sets the client-side flag the status strip renders
+    /// as "cancelling…", without touching `state`/`stage`/`progress` and
+    /// without removing the entry from the in-flight list.
+    ///
+    /// **Never terminalises the entry.** ADR 0043 is explicit that
+    /// `POST /api/operations/{id}/cancel` "never terminalises the record
+    /// itself: only the pipeline may do that, and only after it has
+    /// observed what actually happened to the repository" — so this
+    /// method's whole job is recording that the *ask* landed, not
+    /// resolving anything. The real outcome still arrives, later, through
+    /// [`OperationsCore::settle`], exactly as for every other operation.
+    ///
+    /// Idempotent: a second cancel of the same operation (a retried
+    /// request, or a second tap before the first is acknowledged visually)
+    /// reports [`Applied::NoChange`] rather than an error.
+    pub fn request_cancel(&mut self, id: &OperationId) -> Result<Applied, OperationsRejection> {
+        let entry = self
+            .in_flight
+            .iter_mut()
+            .find(|e| e.id.as_ref() == Some(id))
+            .ok_or(OperationsRejection::UnknownOperation)?;
+        if entry.cancel_requested {
+            return Ok(Applied::NoChange);
+        }
+        entry.cancel_requested = true;
         Ok(Applied::Committed)
     }
 
@@ -232,6 +376,80 @@ impl OperationsCore {
     /// Settled operations, newest first.
     pub fn recent(&self) -> impl Iterator<Item = &Settled> {
         self.recent.iter()
+    }
+}
+
+/// The subset of an in-flight Fetch/Pull's identity persisted across a
+/// reload or Safari tab suspend/resume (#232, M2.20f) — the client-side
+/// half of the "reconnect, don't lose track" acceptance criterion.
+/// Deliberately its own struct rather than `#[derive(Serialize,
+/// Deserialize)]` on all of [`OperationKind`]: most variants
+/// (`Undo(Undoable)` among them) have no business gaining a wire shape
+/// just because two of their siblings now need one to survive
+/// `localStorage`.
+///
+/// `branch`/`strategy` are `None` together for a Fetch and `Some` together
+/// for a Pull — never mixed, because `OperationKind::Pull` cannot be
+/// constructed before the strategy picker supplies both at once (ADR
+/// 0044). [`remote_op_kind`] treats any other pairing as corrupt storage,
+/// not a third operation kind.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InFlightRemoteOp {
+    pub id: String,
+    pub remote: String,
+    pub branch: Option<String>,
+    pub strategy: Option<MergeStrategy>,
+}
+
+/// Rebuild the [`OperationKind`] a persisted [`InFlightRemoteOp`] names, or
+/// `None` for a shape [`InFlightRemoteOp`] itself cannot enforce but this
+/// app would never have written: a `branch` with no `strategy`, or a
+/// `strategy` with no `branch`. Pull always carries both together (ADR
+/// 0044), so either mismatch can only be storage that was hand-edited or
+/// left behind by a different client version — never a third operation
+/// kind, and never trusted.
+pub fn remote_op_kind(entry: &InFlightRemoteOp) -> Option<OperationKind> {
+    match (&entry.branch, entry.strategy) {
+        (None, None) => Some(OperationKind::Fetch {
+            remote: entry.remote.clone(),
+        }),
+        (Some(branch), Some(strategy)) => Some(OperationKind::Pull {
+            remote: entry.remote.clone(),
+            branch: branch.clone(),
+            strategy,
+        }),
+        _ => None,
+    }
+}
+
+/// What a boot-time reconnect should do with a resumed operation's live
+/// status (#232) — the pure half of `resume_inflight_remote_op`'s decision
+/// (`features::operations::signals`), so "terminal means settle, not-yet-
+/// terminal means keep watching" is a tested fact rather than an inline
+/// branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeDecision {
+    /// The operation already reached a terminal state while the tab was
+    /// away or reloading — replay the settlement once, immediately,
+    /// rather than opening a stream that would answer with the same
+    /// terminal `result` event anyway.
+    Settle,
+    /// Still running — resubscribe to its SSE stream and keep watching
+    /// live, the same as a freshly dispatched operation.
+    Subscribe,
+}
+
+/// Whether a resumed operation's status should be replayed as an
+/// immediate settlement or watched live. A pure wrapper over
+/// [`OperationState::is_terminal`], named and tested on its own so the
+/// reconnect path's central branch is a checked fact — #232's own
+/// acceptance criterion: reconnect to "current or terminal state", never
+/// lose track.
+pub fn resume_decision(state: OperationState) -> ResumeDecision {
+    if state.is_terminal() {
+        ResumeDecision::Settle
+    } else {
+        ResumeDecision::Subscribe
     }
 }
 
@@ -422,7 +640,7 @@ mod core_tests {
             OperationStage::Checking,
             OperationStage::Executing,
         ] {
-            c.observe(&id("op-1"), OperationState::Running, stage)
+            c.observe(&id("op-1"), OperationState::Running, stage, None)
                 .expect("stage accepted");
         }
         assert_eq!(c.in_flight().count(), 1);
@@ -439,6 +657,7 @@ mod core_tests {
             &id("op-1"),
             OperationState::Running,
             OperationStage::Planning,
+            None,
         )
         .unwrap();
         let applied = c
@@ -446,6 +665,7 @@ mod core_tests {
                 &id("op-1"),
                 OperationState::Running,
                 OperationStage::Planning,
+                None,
             )
             .unwrap();
         assert_eq!(applied, Applied::NoChange);
@@ -555,6 +775,7 @@ mod core_tests {
                 &id("op-1"),
                 OperationState::Running,
                 OperationStage::Planning,
+                None,
             )
             .unwrap_err();
         assert_eq!(err, OperationsRejection::UnknownOperation);
@@ -574,6 +795,123 @@ mod core_tests {
         .expect("a terminal record settles");
         assert_eq!(s.state, OperationState::Succeeded);
         assert_eq!(s.generation.as_ref().map(|g| g.as_str()), Some("9"));
+    }
+
+    // -----------------------------------------------------------------
+    // #232 (M2.20f): the boot-time reconnect for an in-flight Fetch/Pull
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_terminal_state_resumes_by_settling() {
+        assert_eq!(
+            resume_decision(OperationState::Succeeded),
+            ResumeDecision::Settle
+        );
+        assert_eq!(
+            resume_decision(OperationState::Failed),
+            ResumeDecision::Settle
+        );
+    }
+
+    #[test]
+    fn a_non_terminal_state_resumes_by_subscribing() {
+        assert_eq!(
+            resume_decision(OperationState::Accepted),
+            ResumeDecision::Subscribe
+        );
+        assert_eq!(
+            resume_decision(OperationState::Running),
+            ResumeDecision::Subscribe
+        );
+    }
+
+    #[test]
+    fn an_inflight_remote_op_round_trips_through_json() {
+        let fetch = InFlightRemoteOp {
+            id: "op-1".to_string(),
+            remote: "origin".to_string(),
+            branch: None,
+            strategy: None,
+        };
+        let json = serde_json::to_string(&fetch).expect("serializes");
+        let back: InFlightRemoteOp = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(fetch, back);
+
+        let pull = InFlightRemoteOp {
+            id: "op-2".to_string(),
+            remote: "origin".to_string(),
+            branch: Some("main".to_string()),
+            strategy: Some(MergeStrategy::Rebase),
+        };
+        let json = serde_json::to_string(&pull).expect("serializes");
+        let back: InFlightRemoteOp = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(pull, back);
+    }
+
+    #[test]
+    fn malformed_inflight_remote_op_json_refuses_to_deserialize() {
+        // A mutation check on the round trip above: dropping a required field
+        // must not silently produce a default-ish value nobody asked for.
+        assert!(serde_json::from_str::<InFlightRemoteOp>("{\"id\":\"op-1\"}").is_err());
+    }
+
+    #[test]
+    fn remote_op_kind_rebuilds_fetch_from_a_persisted_entry_with_no_branch() {
+        let entry = InFlightRemoteOp {
+            id: "op-1".into(),
+            remote: "origin".into(),
+            branch: None,
+            strategy: None,
+        };
+        assert_eq!(
+            remote_op_kind(&entry),
+            Some(OperationKind::Fetch {
+                remote: "origin".into()
+            })
+        );
+    }
+
+    #[test]
+    fn remote_op_kind_rebuilds_pull_from_a_persisted_entry_with_branch_and_strategy() {
+        let entry = InFlightRemoteOp {
+            id: "op-2".into(),
+            remote: "origin".into(),
+            branch: Some("main".into()),
+            strategy: Some(MergeStrategy::Rebase),
+        };
+        assert_eq!(
+            remote_op_kind(&entry),
+            Some(OperationKind::Pull {
+                remote: "origin".into(),
+                branch: "main".into(),
+                strategy: MergeStrategy::Rebase,
+            })
+        );
+    }
+
+    #[test]
+    fn remote_op_kind_refuses_a_branch_with_no_strategy_as_corrupt() {
+        // Pull always carries both together (ADR 0044) — a branch alone can
+        // only be storage that was hand-edited or written by a different
+        // client version, never a shape this app itself would produce.
+        let entry = InFlightRemoteOp {
+            id: "op-3".into(),
+            remote: "origin".into(),
+            branch: Some("main".into()),
+            strategy: None,
+        };
+        assert_eq!(remote_op_kind(&entry), None);
+    }
+
+    #[test]
+    fn remote_op_kind_refuses_a_strategy_with_no_branch_as_corrupt() {
+        let entry = InFlightRemoteOp {
+            id: "op-4".into(),
+            remote: "origin".into(),
+            branch: None,
+            strategy: Some(MergeStrategy::Merge),
+        };
+        assert_eq!(remote_op_kind(&entry), None);
     }
 }
 
@@ -684,5 +1022,339 @@ mod intent_tests {
         assert_eq!(seq.next(), 1);
         assert_eq!(seq.next(), 2);
         assert_eq!(seq.next(), 3);
+    }
+}
+
+#[cfg(test)]
+mod fetch_pull_summary_tests {
+    use super::*;
+
+    fn fetch_kind() -> OperationKind {
+        OperationKind::Fetch {
+            remote: "origin".into(),
+        }
+    }
+
+    fn pull_kind() -> OperationKind {
+        OperationKind::Pull {
+            remote: "origin".into(),
+            branch: "main".into(),
+            strategy: git_vista_protocol::plan::MergeStrategy::Merge,
+        }
+    }
+
+    fn fetch_error_body(kind: FetchFailureKind, message: &str) -> String {
+        // Built from the server's own DTO and serialized the way the server serializes
+        // it — not a hand-written JSON string that could agree with a client-side
+        // assumption while disagreeing with the wire.
+        serde_json::to_string(&FetchError {
+            kind,
+            message: message.to_string(),
+            updated_refs: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn pull_error_body(kind: PullFailureKind, message: &str, worktree_restored: bool) -> String {
+        serde_json::to_string(&PullError {
+            kind,
+            message: message.to_string(),
+            updated_refs: Vec::new(),
+            worktree_restored,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_kind_that_is_neither_fetch_nor_pull_passes_the_raw_message_through() {
+        let merge = OperationKind::Merge {
+            branch: "feature".into(),
+            into: Some("main".into()),
+        };
+        let raw = "{\"anything\":true}";
+        assert_eq!(fetch_or_pull_summary(&merge, raw), raw);
+    }
+
+    #[test]
+    fn a_fetch_success_body_reads_back_gits_own_words() {
+        let success = FetchSuccess {
+            remote: "origin".into(),
+            message: "Fetched from \u{2018}origin\u{2019}: 3 remote-tracking refs updated."
+                .into(),
+            updated_refs: Vec::new(),
+        };
+        let json = serde_json::to_string(&success).unwrap();
+        assert_eq!(fetch_or_pull_summary(&fetch_kind(), &json), success.message);
+    }
+
+    #[test]
+    fn a_pull_success_body_reads_back_gits_own_words() {
+        let success = PullSuccess {
+            remote: "origin".into(),
+            branch: "main".into(),
+            strategy: git_vista_protocol::plan::MergeStrategy::Rebase,
+            message: "Pulled \u{2018}main\u{2019} from \u{2018}origin\u{2019} into the \
+                      checked-out branch (rebase strategy)."
+                .into(),
+            updated_refs: Vec::new(),
+            advanced: true,
+        };
+        let json = serde_json::to_string(&success).unwrap();
+        assert_eq!(fetch_or_pull_summary(&pull_kind(), &json), success.message);
+    }
+
+    #[test]
+    fn every_passthrough_fetch_failure_kind_renders_gits_words_unmodified() {
+        // Named-mutation test: strict equality, not `.contains`. A bug that moved one of
+        // these arms into the `Cancelled` match arm would still produce text containing
+        // "git said this" — only equality catches the added tag.
+        for kind in [
+            FetchFailureKind::AuthenticationFailed,
+            FetchFailureKind::RemoteUnreachable,
+            FetchFailureKind::RemoteRejected,
+            FetchFailureKind::Other,
+        ] {
+            let body = fetch_error_body(kind, "git said this");
+            let line = fetch_or_pull_summary(&fetch_kind(), &body);
+            assert_eq!(line, "git said this", "{kind:?} must pass git's words through as-is");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_fetch_is_tagged_so_it_is_scannable() {
+        // Named mutation: swap `Cancelled` for any passthrough kind above and this must
+        // fail — the leading tag is the one thing this test exists to prove.
+        let body = fetch_error_body(FetchFailureKind::Cancelled, "the fetch was cancelled");
+        let line = fetch_or_pull_summary(&fetch_kind(), &body);
+        assert_eq!(line, "Fetch cancelled — the fetch was cancelled");
+    }
+
+    #[test]
+    fn every_passthrough_pull_failure_kind_renders_gits_words_unmodified() {
+        for kind in [
+            PullFailureKind::StrategyRequired,
+            PullFailureKind::AuthenticationFailed,
+            PullFailureKind::RemoteUnreachable,
+            PullFailureKind::RemoteRejected,
+            PullFailureKind::NoSuchRemoteBranch,
+            PullFailureKind::Other,
+        ] {
+            let body = pull_error_body(kind, "git said this", true);
+            let line = fetch_or_pull_summary(&pull_kind(), &body);
+            assert_eq!(line, "git said this", "{kind:?} must pass git's words through as-is");
+        }
+    }
+
+    #[test]
+    fn a_conflict_says_the_tree_was_restored_and_nothing_was_lost() {
+        // Named mutation: swap `Conflict` for `ConflictLeftInProgress` (or vice versa) and
+        // this must fail — ADR 0044 §5 states the two ask opposite things of the user, so
+        // they must never share a rendering.
+        let body = pull_error_body(PullFailureKind::Conflict, "git said this", true);
+        let line = fetch_or_pull_summary(&pull_kind(), &body);
+        assert_eq!(
+            line,
+            "Pull hit a conflict — the tree was restored. git said this"
+        );
+    }
+
+    #[test]
+    fn a_conflict_left_in_progress_says_the_tree_needs_attention() {
+        let body = pull_error_body(PullFailureKind::ConflictLeftInProgress, "git said this", false);
+        let line = fetch_or_pull_summary(&pull_kind(), &body);
+        assert_eq!(
+            line,
+            "Pull hit a conflict and needs attention — the working tree is \
+             mid-integration. git said this"
+        );
+        assert_ne!(
+            line,
+            fetch_or_pull_summary(
+                &pull_kind(),
+                &pull_error_body(PullFailureKind::Conflict, "git said this", true)
+            ),
+            "conflict and conflict-left-in-progress must never render the same line"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_pull_is_tagged_so_it_is_scannable() {
+        let body = pull_error_body(PullFailureKind::Cancelled, "the pull was cancelled", true);
+        let line = fetch_or_pull_summary(&pull_kind(), &body);
+        assert_eq!(line, "Pull cancelled — the pull was cancelled");
+    }
+
+    #[test]
+    fn a_message_that_is_not_json_falls_back_to_the_raw_string() {
+        let raw = "not json at all";
+        assert_eq!(fetch_or_pull_summary(&fetch_kind(), raw), raw);
+        assert_eq!(fetch_or_pull_summary(&pull_kind(), raw), raw);
+    }
+
+    #[test]
+    fn json_of_the_wrong_shape_falls_back_to_the_raw_string() {
+        // Valid JSON, but neither FetchSuccess/FetchError nor PullSuccess/PullError — a
+        // route that predates this typed contract, or a body reshaped in front of the
+        // server. Must not panic, and must not be silently discarded.
+        let raw = "{\"unexpected\":\"shape\"}";
+        assert_eq!(fetch_or_pull_summary(&fetch_kind(), raw), raw);
+        assert_eq!(fetch_or_pull_summary(&pull_kind(), raw), raw);
+    }
+}
+
+#[cfg(test)]
+mod progress_and_cancel_tests {
+    use super::*;
+    use git_vista_protocol::operation::TransferPhase;
+
+    fn key(s: &str) -> IdempotencyKey {
+        IdempotencyKey::new(s).expect("valid idempotency key")
+    }
+
+    fn id(s: &str) -> OperationId {
+        OperationId::new(s).expect("valid operation id")
+    }
+
+    fn fetch_kind() -> OperationKind {
+        OperationKind::Fetch {
+            remote: "origin".into(),
+        }
+    }
+
+    /// An admitted Fetch whose server id is already bound — the state every
+    /// test in this module starts from, mirroring `core_tests::running()`.
+    fn running() -> OperationsCore {
+        let mut c = OperationsCore::default();
+        c.admit(key("k1"), fetch_kind())
+            .expect("first admit accepted");
+        c.bind_id(&key("k1"), id("op-1")).expect("bind accepted");
+        c
+    }
+
+    fn receiving(percent: u8) -> TransferProgress {
+        TransferProgress {
+            phase: TransferPhase::Receiving,
+            percent: Some(percent),
+            objects: None,
+            total_objects: None,
+        }
+    }
+
+    /// Mutation this catches: dropping the `entry.progress = progress;`
+    /// assignment (or never adding the field), so a live percentage never
+    /// reaches anything a view could render.
+    #[test]
+    fn observe_stores_transfer_progress_when_present() {
+        let mut c = running();
+        let progress = receiving(42);
+        c.observe(
+            &id("op-1"),
+            OperationState::Running,
+            OperationStage::Executing,
+            Some(progress),
+        )
+        .expect("progress accepted");
+        let live = c.in_flight().next().expect("still in flight");
+        assert_eq!(live.progress, Some(progress));
+    }
+
+    /// Mutation this catches: leaving the `NoChange` guard as the old
+    /// two-field `entry.state == state && entry.stage == stage` check. A
+    /// fetch sits at `Executing` for its whole transfer (M2.20f, #232), so
+    /// without comparing `progress` too, every percent tick after the first
+    /// would be silently swallowed as "no change" and a live progress bar
+    /// would never move.
+    #[test]
+    fn a_progress_only_change_is_committed_even_when_state_and_stage_repeat() {
+        let mut c = running();
+        c.observe(
+            &id("op-1"),
+            OperationState::Running,
+            OperationStage::Executing,
+            Some(receiving(10)),
+        )
+        .unwrap();
+        let applied = c
+            .observe(
+                &id("op-1"),
+                OperationState::Running,
+                OperationStage::Executing,
+                Some(receiving(55)),
+            )
+            .unwrap();
+        assert_eq!(
+            applied,
+            Applied::Committed,
+            "percent moved, so this must not report NoChange"
+        );
+        assert_eq!(c.in_flight().next().unwrap().progress, Some(receiving(55)));
+    }
+
+    /// The paired regression guard: truly identical progress must still
+    /// report `NoChange`, so the heartbeat/stream-replay case this method's
+    /// original two-field check protected stays protected once a third
+    /// field is in the comparison.
+    #[test]
+    fn observing_identical_progress_twice_reports_no_change() {
+        let mut c = running();
+        c.observe(
+            &id("op-1"),
+            OperationState::Running,
+            OperationStage::Executing,
+            Some(receiving(10)),
+        )
+        .unwrap();
+        let applied = c
+            .observe(
+                &id("op-1"),
+                OperationState::Running,
+                OperationStage::Executing,
+                Some(receiving(10)),
+            )
+            .unwrap();
+        assert_eq!(applied, Applied::NoChange);
+    }
+
+    /// Mutation this catches: `request_cancel` removing the entry (e.g. a
+    /// copy-pasted `self.in_flight.remove(...)` from `settle`) instead of
+    /// only flagging it — ADR 0043 requires the row to stay in-flight until
+    /// the real terminal event arrives.
+    #[test]
+    fn request_cancel_sets_the_flag_without_removing_the_entry() {
+        let mut c = running();
+        let applied = c.request_cancel(&id("op-1")).expect("cancel accepted");
+        assert_eq!(applied, Applied::Committed);
+        let live = c.in_flight().next().expect("still in flight");
+        assert!(live.cancel_requested);
+        assert_eq!(
+            c.in_flight().count(),
+            1,
+            "a cancel request never terminalises the entry (ADR 0043)"
+        );
+    }
+
+    /// Mutation this catches: dropping the `if entry.cancel_requested {
+    /// return Ok(Applied::NoChange); }` guard, which would make a retried
+    /// cancel request read as a fresh transition every time.
+    #[test]
+    fn a_second_cancel_of_the_same_operation_is_a_noop() {
+        let mut c = running();
+        c.request_cancel(&id("op-1")).unwrap();
+        let applied = c.request_cancel(&id("op-1")).unwrap();
+        assert_eq!(
+            applied,
+            Applied::NoChange,
+            "a retried or repeated cancel must not be a second transition"
+        );
+    }
+
+    /// Mutation this catches: `request_cancel` using `.find(...).unwrap()`
+    /// (panics) or silently returning `Ok` instead of the same
+    /// `UnknownOperation` refusal every other by-id lookup here gives.
+    #[test]
+    fn cancelling_an_unknown_operation_is_refused() {
+        let mut c = OperationsCore::default();
+        let err = c.request_cancel(&id("nope")).unwrap_err();
+        assert_eq!(err, OperationsRejection::UnknownOperation);
     }
 }

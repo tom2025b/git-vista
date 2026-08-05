@@ -21,9 +21,11 @@ use crate::api::{self, WriteReceipt};
 use crate::features::core_traits::{RequestKey, RequestTarget};
 use crate::features::graph::core::GraphCore;
 use crate::features::operations::core::{
-    escalation, latest_wins, IntentSeq, OperationsCore, PendingIntent, Settled, Settlement,
+    escalation, latest_wins, remote_op_kind, resume_decision, IntentSeq, InFlightRemoteOp,
+    OperationsCore, PendingIntent, ResumeDecision, Settled, Settlement,
 };
 use crate::features::operations::kind::OperationKind;
+use crate::prefs;
 
 /// Mint the next value of a click-order sequence.
 ///
@@ -175,6 +177,11 @@ impl Operations {
                                 .try_update(|c| c.bind_id(&key, id.clone()))
                                 .is_some_and(|r| r.is_ok())
                             {
+                                // #232, M2.20f: persist a Fetch/Pull's identity so a
+                                // reload or Safari tab suspend/resume can find it
+                                // again — see `resume_inflight_remote_op`. A no-op
+                                // for every other kind.
+                                persist_if_remote_op(&sent, &id);
                                 subscribe(core, graph, id);
                             }
                         }
@@ -222,6 +229,45 @@ impl Operations {
     pub fn in_flight_count(&self) -> usize {
         self.core.with(|c| c.in_flight().count())
     }
+
+    /// Ask the server to cancel an in-flight Fetch/Pull (#232, ADR 0043/0044).
+    ///
+    /// `POST /api/operations/{id}/cancel` only sets a cancellation latch — it
+    /// never terminalises the record itself, only the pipeline may do that,
+    /// and only after it has observed what actually happened to the
+    /// repository (ADR 0043). So this call has exactly one honest effect: on
+    /// `202 Requested`, flip `InFlight::cancel_requested` so the row can show
+    /// "cancelling…" instead of removing the row or marking it done. The
+    /// operation's real resolution still arrives, unchanged, through the
+    /// existing [`subscribe`]/[`commit_settlement`] path once the executor
+    /// observes the kill and the terminal event carries `Cancelled`.
+    ///
+    /// Every other outcome — `AlreadyFinished`, `NotCancellable`, `Unknown`
+    /// (an evicted or never-admitted id), or a transport failure — changes
+    /// nothing client-side. A transport failure is not an outcome, the same
+    /// rule [`subscribe`]'s own `on_error` arm and this file's `send` already
+    /// hold for every other write: the operation may still be running, and
+    /// its real resolution is still coming through the stream this call
+    /// never touches.
+    pub fn cancel(&self, id: &OperationId) {
+        let core = self.core;
+        let id = id.clone();
+        spawn_local(async move {
+            if let Ok(api::CancelOutcome::Requested) = api::cancel_operation_request(&id).await {
+                let _ = core.try_update(|c| c.request_cancel(&id));
+            }
+        });
+    }
+
+    /// Resume watching a Fetch/Pull that was still in flight when the tab
+    /// reloaded or was suspended and resumed (#232, M2.20f). Call once, at
+    /// boot, immediately after [`Operations::new`] — see
+    /// [`resume_inflight_remote_op`] for what it actually does; this is
+    /// just the method-shaped door into it, matching every other action
+    /// this bundle exposes.
+    pub fn resume_from_storage(&self) {
+        resume_inflight_remote_op(self.core, self.graph);
+    }
 }
 
 /// One arm per `api.rs` write function — the mapping that made moving `PendingOp` here a
@@ -242,6 +288,12 @@ async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt,
             api::branch_op_request("/api/force-delete-branch", branch, key).await
         }
         OperationKind::Rebase { .. } => api::rebase_request(key).await,
+        OperationKind::Fetch { remote } => api::fetch_request(remote, key).await,
+        OperationKind::Pull {
+            remote,
+            branch,
+            strategy,
+        } => api::pull_request(remote, branch, *strategy, key).await,
         OperationKind::Undo(u) => api::undo_request(&u.action, key).await,
         // Two arms, not one parameterised by a bool — mirroring the two
         // separate `GitOperation` variants and the two separate endpoints
@@ -253,6 +305,36 @@ async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt,
             api::delete_untracked_paths_request(paths.clone(), key).await
         }
     }
+}
+
+/// Persist a just-bound Fetch/Pull's identity to `localStorage` (#232,
+/// M2.20f), so a reload or Safari tab suspend/resume can find it again on
+/// boot — see [`resume_inflight_remote_op`]. Every other operation kind is
+/// a no-op: only Fetch and Pull carry the "reconnect, don't lose track"
+/// acceptance criterion, and persisting one that settles in milliseconds
+/// (a delete, a checkout) would just leave stale storage behind for no
+/// reader to ever consult.
+fn persist_if_remote_op(kind: &OperationKind, id: &OperationId) {
+    let entry = match kind {
+        OperationKind::Fetch { remote } => InFlightRemoteOp {
+            id: id.as_str().to_string(),
+            remote: remote.clone(),
+            branch: None,
+            strategy: None,
+        },
+        OperationKind::Pull {
+            remote,
+            branch,
+            strategy,
+        } => InFlightRemoteOp {
+            id: id.as_str().to_string(),
+            remote: remote.clone(),
+            branch: Some(branch.clone()),
+            strategy: Some(*strategy),
+        },
+        _ => return,
+    };
+    prefs::store_inflight_remote_op(&entry);
 }
 
 /// Settle an operation from the HTTP answer alone, for the paths that have no record on
@@ -295,9 +377,18 @@ fn commit_settlement(
     outcome: Settlement,
 ) {
     let id = id.clone();
+    let cleared_id = id.clone();
     let published = core
         .try_update(move |c| c.settle(&id, outcome).ok())
         .flatten();
+    // #232, M2.20f: a settled Fetch/Pull is no longer "in flight to resume"
+    // — clear the boot-time reconnect entry the moment it settles for
+    // real. A no-op for every other kind (nothing was ever stored for
+    // them) and for a replayed terminal event (`published` is `None`
+    // then, exactly the case the comment below already names).
+    if published.is_some() {
+        prefs::clear_inflight_remote_op_if_matches(cleared_id.as_str());
+    }
     // A replayed terminal event settles nothing and publishes nothing, so a reconnected
     // stream cannot run `on_invalidate` twice. When it DOES publish, `on_invalidate` is
     // the D3 payoff: a settlement carrying the generation the graph already has skips the
@@ -333,7 +424,7 @@ fn subscribe(core: RwSignal<OperationsCore>, graph: RwSignal<GraphCore>, id: Ope
             let Ok(ev) = serde_json::from_str::<ProgressEvent>(&text) else {
                 return;
             };
-            let _ = core.try_update(|c| c.observe(&ev.id, ev.state, ev.stage));
+            let _ = core.try_update(|c| c.observe(&ev.id, ev.state, ev.stage, ev.progress));
         });
 
     let closing = source.clone();
@@ -376,4 +467,70 @@ fn subscribe(core: RwSignal<OperationsCore>, graph: RwSignal<GraphCore>, id: Ope
     on_progress.forget();
     on_result.forget();
     on_error.forget();
+}
+
+/// Resume watching a Fetch/Pull that was still in flight when the tab
+/// reloaded or was suspended and resumed (#232, M2.20f — the PWA-reload /
+/// Safari-suspend-resume acceptance criterion). Called once, from
+/// `App()`, via [`Operations::resume_from_storage`], immediately after
+/// [`Operations::new`].
+///
+/// Reuses the exact primitives a fresh [`Operations::dispatch`] uses
+/// rather than adding new core-mutating surface for this one path: `admit`
+/// under a key synthesised from the operation id itself (`IdempotencyKey`
+/// and `OperationId` share the same token-shape validator,
+/// `require_token`), `bind_id` to attach the real handle, an `observe` of
+/// the live status, and then either an immediate [`commit_settlement`]
+/// (finished while the tab was away) or [`subscribe`] (still running) —
+/// the choice made by [`resume_decision`], the pure, host-tested half of
+/// this.
+fn resume_inflight_remote_op(core: RwSignal<OperationsCore>, graph: RwSignal<GraphCore>) {
+    let Some(entry) = prefs::load_inflight_remote_op() else {
+        return;
+    };
+    let Ok(id) = OperationId::new(entry.id.as_str()) else {
+        // Corrupt or foreign storage content — never trusted, never acted on.
+        prefs::clear_inflight_remote_op_if_matches(entry.id.as_str());
+        return;
+    };
+    let Some(kind) = remote_op_kind(&entry) else {
+        prefs::clear_inflight_remote_op_if_matches(entry.id.as_str());
+        return;
+    };
+    let Ok(key) = IdempotencyKey::new(id.as_str()) else {
+        return;
+    };
+    spawn_local(async move {
+        // A transport failure is not an outcome (the same rule `subscribe`'s own
+        // `on_error` arm holds) — leave storage and core state untouched; the
+        // next boot tries again.
+        let Ok(status) = api::fetch_operation_status(&id).await else {
+            return;
+        };
+        if core
+            .try_update(|c| c.admit(key.clone(), kind.clone()))
+            .is_none_or(|r| r.is_err())
+        {
+            return;
+        }
+        if core
+            .try_update(|c| c.bind_id(&key, id.clone()))
+            .is_none_or(|r| r.is_err())
+        {
+            return;
+        }
+        let _ = core.try_update(|c| c.observe(&id, status.state, status.stage, status.progress));
+        match resume_decision(status.state) {
+            ResumeDecision::Settle => {
+                if let Some(outcome) = Settlement::from_terminal(
+                    status.state,
+                    status.message.clone(),
+                    status.generation,
+                ) {
+                    commit_settlement(core, graph, &id, outcome);
+                }
+            }
+            ResumeDecision::Subscribe => subscribe(core, graph, id),
+        }
+    });
 }

@@ -19,13 +19,13 @@ use git_vista_core::model::CommitDetail;
 use git_vista_core::net::{network_error_text, offline_refusal_text};
 use git_vista_core::status::RepoStatus;
 use git_vista_protocol::dto::TagDetail;
-use git_vista_protocol::operation::{IdempotencyKey, OperationId};
+use git_vista_protocol::operation::{IdempotencyKey, OperationId, OperationStatus};
 use git_vista_protocol::{
     BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
-    PatchPlan, PatchPreview, ProtocolInfo, RebaseStatus, RepoMode, RepositoryDescriptor,
-    SelectRequest, SessionInfo, SessionRequest, StageDirection, StagingDiff, WorktreePathsRequest,
-    WorktreeStatus, CSRF_HEADER, IDEMPOTENCY_HEADER, OPERATION_HEADER, PROTOCOL_HEADER,
-    PROTOCOL_VERSION,
+    FetchRequest, MergeStrategy, PatchPlan, PatchPreview, ProtocolInfo, PullRequest, RebaseStatus,
+    RepoMode, RepositoryDescriptor, SelectRequest, SessionInfo, SessionRequest, StageDirection,
+    StagingDiff, WorktreePathsRequest, WorktreeStatus, CSRF_HEADER, IDEMPOTENCY_HEADER,
+    OPERATION_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
 use crate::features::dialogs::commit::{amend_body, classify_amend_response, AmendOutcome};
@@ -73,6 +73,38 @@ const REQUEST_TIMEOUT_MS: u64 = 60_000;
 /// the server is still making progress on, early enough that the client still
 /// gives up before the server does and can report why.
 const CLONE_TIMEOUT_MS: u64 = 570_000;
+
+/// The deadline for `POST /api/fetch` alone (M2.20f, #232).
+///
+/// Fetch is operation-tracked — the write response only comes back once the
+/// server observes a terminal state (`planner::plan_and_execute_tracked`
+/// awaits `record.wait_terminal()` before the handler answers) — but that
+/// terminal state is not reached until the transfer itself is over.
+/// Architecturally this is the **clone shape** (a long-poll bounded by real
+/// transfer time), not the "fast op-tracked write" shape the branch
+/// operations are, so [`REQUEST_TIMEOUT_MS`] would abandon a fetch that is
+/// still genuinely receiving objects. Unlike clone, fetch *is*
+/// operation-tracked, so [`send_write_with_key`]'s single retry is safe even
+/// if it fires — a second attempt lands on the same admitted record rather
+/// than starting a second `git fetch` — but a needless retry racing a real
+/// transfer is still worth avoiding, which is what this deadline is for.
+///
+/// Set to mirror [`CLONE_TIMEOUT_MS`] exactly, for the same reasoning: late
+/// enough never to interrupt a transfer the server is still making progress
+/// on, early enough that the client still gives up before the server does.
+/// A separate named constant rather than reusing `CLONE_TIMEOUT_MS` — the
+/// issue's own wording — so pull's integration half growing slower later
+/// doesn't force renaming a constant fetch alone owns.
+const FETCH_TIMEOUT_MS: u64 = 570_000;
+
+/// The deadline for `POST /api/pull` alone (M2.20f, #232).
+///
+/// A pull's fetch half is exactly the same unbounded transfer
+/// [`FETCH_TIMEOUT_MS`] exists for — see that constant's doc comment for the
+/// full reasoning, which applies here unchanged. A distinct name, not a
+/// shared one, so pull's integration half growing slower some day doesn't
+/// force renaming a constant fetch alone owns.
+const PULL_TIMEOUT_MS: u64 = 570_000;
 
 /// Resolve to `Some(v)` if `fut` finishes within `ms`, or `None` if the deadline
 /// wins.
@@ -1265,6 +1297,26 @@ pub async fn fetch_worktree_status() -> Result<WorktreeStatus, String> {
     }
 }
 
+/// Read an operation's current record (`GET /api/operations/{id}`) —
+/// answers whether or not the operation has finished (the route's own doc
+/// comment, `handlers/operations.rs::operation_status`). Used only for
+/// the boot-time reconnect (#232, M2.20f): a resumed Fetch/Pull needs to
+/// know, once, what state it is in before deciding whether to replay a
+/// settlement or resubscribe to its SSE stream. Everywhere else on this
+/// client the record is read live, off the stream itself — this is the
+/// one place a plain poll is the right tool, because there is no stream
+/// to subscribe to until this call has answered.
+pub async fn fetch_operation_status(id: &OperationId) -> Result<OperationStatus, String> {
+    let url = format!("/api/operations/{}?t={}", id.as_str(), js_sys::Date::now());
+    req_get(&url)
+        .send()
+        .await
+        .map_err(network_error)?
+        .json::<OperationStatus>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Ask the backend to discard uncommitted changes to `paths`
 /// (`POST /api/discard-tracked-paths`, M2.18a/#219, wired by M2.18b/#220).
 ///
@@ -1399,6 +1451,137 @@ pub async fn branch_op_request(
     let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
     let (resp, _key) = send_write_with_key(path, Some(json), key, REQUEST_TIMEOUT_MS).await?;
     Ok(receipt(resp).await)
+}
+
+/// Ask the backend to fetch from `remote` (`POST /api/fetch`, M2.20f, #232).
+///
+/// Operation-tracked, the same shape as [`branch_op_request`] just above:
+/// the response carries an operation id ([`WriteReceipt::operation`]) the
+/// caller subscribes to for live progress, and a non-2xx `message` is the
+/// settled record's raw JSON body (a `FetchSuccess`/`FetchError`) rather
+/// than plain text — parse it instead of showing it verbatim.
+///
+/// Bounded by [`FETCH_TIMEOUT_MS`], not [`REQUEST_TIMEOUT_MS`] — see that
+/// constant's doc comment for why a fetch needs the longer deadline.
+pub async fn fetch_request(remote: &str, key: IdempotencyKey) -> Result<WriteReceipt, String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let json = serde_json::to_string(&FetchRequest {
+        remote: remote.to_string(),
+    })
+    .map_err(|e| e.to_string())?;
+    let (resp, _key) =
+        send_write_with_key("/api/fetch", Some(json), key, FETCH_TIMEOUT_MS).await?;
+    Ok(receipt(resp).await)
+}
+
+/// Ask the backend to pull `branch` from `remote` into the checked-out
+/// branch, integrating with `strategy` (`POST /api/pull`, M2.20f, #232).
+///
+/// `strategy` is a plain, always-present [`MergeStrategy`] here, never an
+/// `Option` — there is no sentinel this function could pass through for
+/// "not yet chosen". A caller can only reach this function once the user has
+/// actually picked Merge or Rebase; see `OperationKind::Pull`'s doc comment
+/// for where that discipline starts, and ADR 0044 for why the wire request
+/// enforces the identical rule one layer further out (an omitted `strategy`
+/// field is a `400`, never a fallback).
+///
+/// Bounded by [`PULL_TIMEOUT_MS`], for the same reason as [`fetch_request`]:
+/// a pull's fetch half is the same unbounded transfer.
+pub async fn pull_request(
+    remote: &str,
+    branch: &str,
+    strategy: MergeStrategy,
+    key: IdempotencyKey,
+) -> Result<WriteReceipt, String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let json = serde_json::to_string(&PullRequest {
+        remote: remote.to_string(),
+        branch: branch.to_string(),
+        strategy,
+    })
+    .map_err(|e| e.to_string())?;
+    let (resp, _key) = send_write_with_key("/api/pull", Some(json), key, PULL_TIMEOUT_MS).await?;
+    Ok(receipt(resp).await)
+}
+
+/// What the server said in answer to `POST /api/operations/{id}/cancel`
+/// (M2.20f, #232).
+///
+/// A cancel is a *request* to stop, never a promise the operation is
+/// finished: the endpoint "never terminalises the record itself... only the
+/// pipeline may do that, and only after it has observed what actually
+/// happened to the repository" (the server's own doc comment on
+/// `handlers::operations::cancel_operation`). So this type answers only the
+/// narrower question — did the server accept the attempt — and the real
+/// outcome still arrives later, through the operation's ordinary settlement
+/// path (the progress stream, or `GET /api/operations/{id}`), exactly like
+/// every other write here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// `202` — the cancellation latch is set, or was already set by an
+    /// earlier, replayed request. The server answers a repeated cancel of a
+    /// still-running operation with the same `202` (idempotent, not an
+    /// error), so this variant covers both.
+    Requested,
+    /// `409` — the operation had already reached a terminal state before the
+    /// cancel arrived. Nothing to stop; read the recorded result instead.
+    AlreadyFinished,
+    /// `409` — this kind of operation does not watch the cancellation latch
+    /// (the server's `planner::honours_cancellation` said no). Setting it
+    /// would be a no-op dressed up as an action. The client should never
+    /// reach this in practice — the menu is meant to keep a cancel button
+    /// from being offered at all for a non-cancellable kind — but the
+    /// answer is still handled honestly rather than assumed impossible.
+    NotCancellable,
+    /// `404` — no such operation id: never issued, or evicted. Vanishingly
+    /// unlikely mid-session (the id was read off this very operation's own
+    /// bind), but still a real answer, not a transport failure.
+    Unknown,
+}
+
+/// Ask the backend to cancel a running operation
+/// (`POST /api/operations/{id}/cancel`, M2.20f, #232).
+///
+/// Deliberately **not** routed through [`send_write_with_key`]: unlike every
+/// other write here, a cancel does not name a fresh user *intent* to
+/// dedupe — it targets an operation id that already exists, and the server
+/// itself already answers a repeated cancel of a still-running operation
+/// with the same `202` (see [`CancelOutcome::Requested`]). So this call
+/// carries no idempotency header and no body — the id in the URL is the
+/// whole request — and goes straight through `req_post` + [`with_deadline`],
+/// bounded by the ordinary [`REQUEST_TIMEOUT_MS`]: a cancel only sets a
+/// latch, so unlike a fetch/pull it never waits on a transfer and needs
+/// none of [`FETCH_TIMEOUT_MS`]'s slack.
+///
+/// Calls [`refuse_if_visualize`] as every other repo-write function here
+/// does, even though a Fetch/Pull can never be in flight during Visualize
+/// mode in the first place (`dispatch` already refuses them there) — this
+/// is defense in depth matching the file's own convention, not a reachable
+/// path.
+pub async fn cancel_operation_request(id: &OperationId) -> Result<CancelOutcome, String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let url = format!("/api/operations/{}/cancel", id.as_str());
+    let resp = match with_deadline(req_post(&url).send(), REQUEST_TIMEOUT_MS).await {
+        None => return Err(timeout_error()),
+        Some(Err(e)) => return Err(network_error(e)),
+        Some(Ok(resp)) => resp,
+    };
+    match resp.status() {
+        202 => Ok(CancelOutcome::Requested),
+        404 => Ok(CancelOutcome::Unknown),
+        409 => {
+            let message = user_facing_error(&url, resp).await;
+            Ok(if message.contains("already finished") {
+                CancelOutcome::AlreadyFinished
+            } else {
+                CancelOutcome::NotCancellable
+            })
+        }
+        _ => Err(user_facing_error(&url, resp).await),
+    }
 }
 
 /// The servable repositories (`GET /api/catalog`) — M1.03 built the endpoint,
