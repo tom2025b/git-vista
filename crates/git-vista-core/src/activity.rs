@@ -82,8 +82,17 @@ pub enum UndoAction {
 
 /// An [`UndoAction`] dressed for a menu: the action itself, a human label, and
 /// whether the state being discarded is already on the remote (in which case
-/// undoing locally leaves the remote ahead — we never force-push — and the
-/// confirm dialog says so).
+/// undoing locally leaves the remote ahead, because **no undo force-pushes** —
+/// and the confirm dialog says so).
+///
+/// That is a statement about this path only, and it became one that had to be
+/// said precisely in M2.20e (#231): git-vista can now force-publish, on an
+/// explicit user-initiated push carrying
+/// [`ForcePublish::WithLease`](git_vista_protocol::ForcePublish::WithLease). An
+/// undo still never does. The distinction is the point — a user who chooses to
+/// rewrite the remote reviews a plan that says so and is ranked
+/// `RiskLevel::Destructive`; an undo they asked to apply *locally* must never
+/// quietly reach out and do the same thing to a colleague's clone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Undoable {
     pub action: UndoAction,
@@ -404,7 +413,10 @@ fn undo_hint(
                 },
                 label: format!("Undo {verb} — reset ‘{ref_name}’ to {}", short(old)),
                 // The state being discarded is public: the remote will still
-                // have it after a local reset (we never force-push).
+                // have it after a local reset, because no undo force-pushes.
+                // (Since M2.20e (#231) a *push* can force-publish under a
+                // lease; that is an explicit, separately-approved operation and
+                // never something an undo reaches for. See `Undoable`'s doc.)
                 warn_pushed: remote.contains(new),
             })
         }
