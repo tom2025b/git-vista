@@ -361,6 +361,9 @@ async fn a_row_left_running_recovers_as_failed_and_is_rehydrated_into_the_regist
         message: None,
         generation: None,
         recovery: None,
+        // M2.20c (#229): never persisted, so a rehydrated row always reads
+        // `None` here regardless of what the crashed process was reporting.
+        progress: None,
     };
     crate::durable::persist_to(conn, k.clone(), mid_flight).await;
 

@@ -27,8 +27,10 @@
 
 use git_vista_protocol::{
     AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind, BranchRequest,
-    CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest, HookPolicy,
-    RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo,
+    CloneRequest, CommitOid, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
+    FetchError, FetchFailureKind, FetchRequest, FetchSuccess, ForcePublish, HookPolicy,
+    MergeStrategy, PullError, PullFailureKind, PullRequest, PullSuccess, PushRequest, RebaseStatus,
+    RemoteRefUpdate, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo,
     SessionRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -48,6 +50,20 @@ struct DtoGoldenSet {
     amend_commit_success_unknown_reach: AmendCommitSuccess,
     amend_commit_error_hook_rejected: AmendCommitError,
     branch_request: BranchRequest,
+    fetch_request: FetchRequest,
+    fetch_success_with_updates: FetchSuccess,
+    fetch_success_already_up_to_date: FetchSuccess,
+    fetch_error_auth: FetchError,
+    fetch_error_cancelled_after_a_ref_moved: FetchError,
+    pull_request_merge: PullRequest,
+    pull_request_rebase: PullRequest,
+    pull_success_advanced: PullSuccess,
+    pull_success_already_up_to_date: PullSuccess,
+    pull_error_strategy_required: PullError,
+    pull_error_conflict_restored: PullError,
+    pull_error_conflict_left_in_progress: PullError,
+    push_request_plain: PushRequest,
+    push_request_upstream_and_lease: PushRequest,
     clone_request: CloneRequest,
     select_request: SelectRequest,
     delete_clone_request: DeleteCloneRequest,
@@ -114,6 +130,157 @@ fn golden_set() -> DtoGoldenSet {
         },
         branch_request: BranchRequest {
             branch: "main".to_string(),
+        },
+        // M2.20c (#229). A remote *name*, never a URL — see `FetchRequest`.
+        fetch_request: FetchRequest {
+            remote: "origin".to_string(),
+        },
+        // A ref that moved and a ref that is new on the remote, so both
+        // `old_oid` shapes (`Some`/`None`) are pinned on the wire.
+        fetch_success_with_updates: FetchSuccess {
+            remote: "origin".to_string(),
+            message: "Fetched from ‘origin’: 2 remote-tracking refs updated.".to_string(),
+            updated_refs: vec![
+                RemoteRefUpdate {
+                    ref_name: "refs/remotes/origin/main".to_string(),
+                    old_oid: Some("1111111111111111111111111111111111111111".to_string()),
+                    new_oid: Some("2222222222222222222222222222222222222222".to_string()),
+                },
+                RemoteRefUpdate {
+                    ref_name: "refs/remotes/origin/feature".to_string(),
+                    old_oid: None,
+                    new_oid: Some("3333333333333333333333333333333333333333".to_string()),
+                },
+            ],
+        },
+        // The no-op success. `updated_refs` must reach the wire as `[]`, not
+        // be omitted: "the fetch ran and nothing moved" is the answer, and a
+        // missing key would read as "the server didn't say".
+        fetch_success_already_up_to_date: FetchSuccess {
+            remote: "origin".to_string(),
+            message: "Fetched from ‘origin’: already up to date.".to_string(),
+            updated_refs: Vec::new(),
+        },
+        fetch_error_auth: FetchError {
+            kind: FetchFailureKind::AuthenticationFailed,
+            message: "fatal: Authentication failed for 'https://example.invalid/repo.git/'"
+                .to_string(),
+            updated_refs: Vec::new(),
+        },
+        // The case the taxonomy exists for: cancelled *after* something had
+        // already landed locally. A client that renders "nothing changed" for
+        // every cancel would be lying here, which is why the ref list is a
+        // typed field on the error and not a sentence in `message`.
+        fetch_error_cancelled_after_a_ref_moved: FetchError {
+            kind: FetchFailureKind::Cancelled,
+            message: "The fetch from ‘origin’ was cancelled after 1 remote-tracking ref \
+                      had already been updated."
+                .to_string(),
+            updated_refs: vec![RemoteRefUpdate {
+                ref_name: "refs/remotes/origin/main".to_string(),
+                old_oid: Some("1111111111111111111111111111111111111111".to_string()),
+                new_oid: Some("2222222222222222222222222222222222222222".to_string()),
+            }],
+        },
+        // M2.20d (#230). Both strategies are pinned as *request* fixtures on
+        // purpose: `strategy` is the one field on this wire family with no
+        // default and no third value, so its two spellings ("merge" /
+        // "rebase") are exactly the bytes a client hard-codes. A rename here
+        // would silently turn every pull into a 400.
+        pull_request_merge: PullRequest {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+            strategy: MergeStrategy::Merge,
+        },
+        pull_request_rebase: PullRequest {
+            remote: "upstream".to_string(),
+            branch: "release/2026-08".to_string(),
+            strategy: MergeStrategy::Rebase,
+        },
+        pull_success_advanced: PullSuccess {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+            strategy: MergeStrategy::Rebase,
+            message: "Pulled ‘main’ from ‘origin’ into the checked-out branch \
+                      (rebase strategy)."
+                .to_string(),
+            updated_refs: vec![RemoteRefUpdate {
+                ref_name: "refs/remotes/origin/main".to_string(),
+                old_oid: Some("1111111111111111111111111111111111111111".to_string()),
+                new_oid: Some("2222222222222222222222222222222222222222".to_string()),
+            }],
+            advanced: true,
+        },
+        // The no-op success. `advanced: false` must reach the wire as an
+        // explicit `false`, not be omitted: "the pull ran and the branch did
+        // not move" is the answer, and a missing key would read as "the server
+        // didn't say".
+        pull_success_already_up_to_date: PullSuccess {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+            strategy: MergeStrategy::Merge,
+            message: "Already up to date — ‘main’ on ‘origin’ has nothing the \
+                      checked-out branch doesn’t already have."
+                .to_string(),
+            updated_refs: Vec::new(),
+            advanced: false,
+        },
+        // #230's headline refusal, pinned because the frontend branches on it
+        // to prompt for a strategy rather than showing a generic error.
+        pull_error_strategy_required: PullError {
+            kind: PullFailureKind::StrategyRequired,
+            message: "A pull must say how to integrate what it fetches: send \
+                      \"strategy\": \"merge\" or \"strategy\": \"rebase\"."
+                .to_string(),
+            updated_refs: Vec::new(),
+            worktree_restored: true,
+        },
+        // The two conflict outcomes, both pinned: they demand opposite things
+        // of the user (choose again vs. your working tree needs attention), so
+        // a client that collapsed them would give the wrong advice half the
+        // time. `worktree_restored` is what tells them apart.
+        pull_error_conflict_restored: PullError {
+            kind: PullFailureKind::Conflict,
+            message: "Pulling ‘main’ from ‘origin’ (merge strategy) failed: \
+                      CONFLICT (content): Merge conflict in a.txt The merge was \
+                      aborted and the checked-out branch is back where it started."
+                .to_string(),
+            updated_refs: vec![RemoteRefUpdate {
+                ref_name: "refs/remotes/origin/main".to_string(),
+                old_oid: Some("1111111111111111111111111111111111111111".to_string()),
+                new_oid: Some("2222222222222222222222222222222222222222".to_string()),
+            }],
+            worktree_restored: true,
+        },
+        pull_error_conflict_left_in_progress: PullError {
+            kind: PullFailureKind::ConflictLeftInProgress,
+            message: "Pulling ‘main’ from ‘origin’ (rebase strategy) failed: \
+                      error: could not apply 1a2b3c4 The rebase could not be \
+                      aborted cleanly."
+                .to_string(),
+            updated_refs: Vec::new(),
+            worktree_restored: false,
+        },
+        // M2.20e (#231). Both ends of `PushRequest`'s range, because the two
+        // pin different things. The plain one is what every client written
+        // before this slice sends — including the live frontend — and its
+        // fixture bytes are what a reviewer checks when asking "did the
+        // defaults stay the *safe* end?". The full one pins the lease's wire
+        // shape reaching this endpoint: `{"mode": "with_lease",
+        // "expected_remote_tip": …}`, the same internally-tagged encoding
+        // `plan_golden` pins inside the operation, so a client cannot be
+        // correct against one and wrong against the other.
+        push_request_plain: PushRequest {
+            branch: "main".to_string(),
+            set_upstream: false,
+            force: None,
+        },
+        push_request_upstream_and_lease: PushRequest {
+            branch: "feature/x".to_string(),
+            set_upstream: true,
+            force: Some(ForcePublish::WithLease {
+                expected_remote_tip: CommitOid::new("4".repeat(40)).unwrap(),
+            }),
         },
         clone_request: CloneRequest {
             url: "https://github.com/owner/repo.git".to_string(),
@@ -347,5 +514,61 @@ fn dto_v1_golden() {
         Some("hook_rejected"),
         "AmendFailureKind must reach the wire as snake_case strings — \
          M2.19d branches on these exact spellings"
+    );
+}
+
+/// **The backward-compatibility guarantee `/api/push` makes** (M2.20e, #231):
+/// a body that says only `{"branch": …}` still parses, and parses to the *safe*
+/// end of both new axes.
+///
+/// This is the one property in this file that protects a live client rather
+/// than a future one. The frontend on Tom's iPad sends exactly that body; if
+/// `set_upstream` or `force` ever lost its `#[serde(default)]`, every push from
+/// it would become a `422` about serde — a whole-app regression whose cause
+/// would be invisible from the UI.
+///
+/// The golden fixture pins the *serialized* shape; this pins the **parse** of a
+/// body the fixture does not contain, which is a different question. Both legs
+/// are here: absent means safe, and present means honoured — so a
+/// `PushRequest` that ignored `force` entirely (defaulting it away on the way
+/// in) would fail the second leg rather than quietly downgrading every
+/// force-publish to a fast-forward.
+#[test]
+fn a_push_body_from_before_this_slice_still_parses_and_defaults_to_the_safe_end() {
+    for raw in [
+        r#"{"branch":"main"}"#,
+        r#"{"branch":"main","set_upstream":false}"#,
+        r#"{"branch":"main","force":null}"#,
+    ] {
+        let parsed: PushRequest =
+            serde_json::from_str(raw).unwrap_or_else(|e| panic!("{raw} must still parse: {e}"));
+        assert_eq!(parsed.branch, "main");
+        assert!(
+            !parsed.set_upstream,
+            "an omitted set_upstream must mean *no* upstream write: {raw}"
+        );
+        assert_eq!(
+            parsed.force, None,
+            "an omitted force must mean *no* force — a default may only ever \
+             point at less capability: {raw}"
+        );
+    }
+
+    // The paired positive: a body that *does* say force is honoured, so the
+    // legs above are proving a default rather than a field being ignored.
+    let leased: PushRequest = serde_json::from_str(
+        r#"{"branch":"main","set_upstream":true,"force":{"mode":"with_lease",
+            "expected_remote_tip":"4444444444444444444444444444444444444444"}}"#,
+    )
+    .expect("a full push body must parse");
+    assert!(leased.set_upstream);
+    assert!(matches!(leased.force, Some(ForcePublish::WithLease { .. })));
+
+    // And `deny_unknown_fields` still holds: a stray key is a hard error, not a
+    // silently-ignored value that a client could believe the server acted on.
+    assert!(
+        serde_json::from_str::<PushRequest>(r#"{"branch":"main","remote":"evil"}"#).is_err(),
+        "a push body may not smuggle a field this endpoint does not have — \
+         above all not a remote"
     );
 }
