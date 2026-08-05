@@ -791,7 +791,7 @@ const OPERATION_ID_POLL_MAX_ATTEMPTS: u32 =
 /// same way as [`with_deadline`]'s timer (`leptos::set_timeout` + a oneshot):
 /// the same six lines, the same reasoning against pulling in `gloo-timers`
 /// for it.
-async fn sleep_ms(ms: u64) {
+pub(crate) async fn sleep_ms(ms: u64) {
     let (tx, rx) = futures::channel::oneshot::channel::<()>();
     leptos::set_timeout(
         move || {
