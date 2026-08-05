@@ -377,6 +377,19 @@ cmd_testbed() {
   sed -i "s/pub(crate) const PORT: u16 = 8080;/pub(crate) const PORT: u16 = $port;/" "$state"
   grep -q "const PORT: u16 = $port;" "$state" || die "could not retarget PORT in $state"
 
+  # `gv` carries the port too, and retargeting the server without retargeting it
+  # is worse than not retargeting either — the testbed then LOOKS driveable while
+  # every sign-in path points somewhere else. `gv` probes $PORT for a live
+  # server, mints the one-time token against it, prints the setup URL, and prints
+  # the iPad tunnel instructions. Left at 8080, all four of those address
+  # whatever is running in the MAIN tree: `dev signin` in a testbed hands you a
+  # link that signs you in to the production server, and the testbed you meant to
+  # drive is never reached. Same dead-end-branch argument as state.rs above makes
+  # the edit safe.
+  local gvbin="$dir/gv"
+  sed -i "s/^PORT=8080$/PORT=$port/" "$gvbin"
+  grep -q "^PORT=$port$" "$gvbin" || die "could not retarget PORT in $gvbin"
+
   # Build against the MAIN tree's target/ instead of a fresh empty one.
   #
   # This is the difference between ~95 seconds and several hours, measured on
