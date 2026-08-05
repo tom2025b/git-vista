@@ -94,6 +94,7 @@
 //! answer, and a caller with `$GV_SCROLLCAST_FFMPEG` pointed at a full build
 //! gets exactly the pipeline described above.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -101,7 +102,7 @@ use anyhow::{bail, Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::pacing::{camera_y_at, total_duration, Segment};
+use crate::pacing::{camera_y_at, total_duration, Pivot, Segment};
 
 /// The camera's fixed output size. Not configurable: the whole pacing model
 /// (`pacing::build_timeline`'s `band_height` argument) is built by the caller
@@ -135,8 +136,14 @@ pub enum AudioSource {
 /// Tunable encode knobs. Deliberately small: width/height/fps are fixed
 /// constants above (see their doc comment for why), and everything here is
 /// either a genuine quality/determinism trade (`crf`, `preset`) or unavoidably
-/// per-run (`audio`, `out_name`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// per-run (`audio`, `out_name`, `pivots`).
+///
+/// `Eq` is deliberately NOT derived here (unlike before `pivots` was added):
+/// `Pivot` (`pacing.rs`) carries an `f64` field and only derives `PartialEq`,
+/// for the same reason `Segment` in the same module isn't `Eq` either — `f64`
+/// has no total order. Adding a `Vec<Pivot>` field makes that the same
+/// constraint that already applies one type over.
+#[derive(Debug, Clone, PartialEq)]
 pub struct EncodeConfig {
     /// x264 constant-rate-factor. Fixed per run (never a bitrate target) —
     /// see this module's top doc comment on why CRF and not bitrate.
@@ -152,6 +159,25 @@ pub struct EncodeConfig {
     /// a property of the function's signature rather than a convention a
     /// caller could accidentally violate.
     pub out_name: String,
+    /// Pivot callouts to composite onto their matching dwell frames (see
+    /// `build_dwell_pivot_text` and the "Pivot callout cards" section
+    /// below). A field on `EncodeConfig` rather than a new parameter on
+    /// [`encode_video`] on purpose: `encode_video`'s only caller is
+    /// `main.rs`, outside this lane's file set for #325's repair pass
+    /// (`main.rs` is the crate root here — there is no `lib.rs` — so
+    /// `cargo build`/`cargo test` compile it and `encode.rs` as one unit,
+    /// and a changed *function signature* would leave the crate unable to
+    /// compile until `main.rs`'s call site was updated to match). A new
+    /// *struct field* on `EncodeConfig` does not have that problem: every
+    /// existing `EncodeConfig { .., ..EncodeConfig::default() }` literal
+    /// (main.rs:468-472 is the one real caller) picks it up automatically
+    /// at its default (empty), which is exactly today's real behaviour —
+    /// main.rs's own "Gap 1" doc comment already states it always passes
+    /// empty pivots right now. Wiring real pivots through therefore needs
+    /// no signature change at all, only `main.rs` setting this field
+    /// explicitly instead of leaving it defaulted; see this module's
+    /// `encode_video` doc comment for the exact line to change.
+    pub pivots: Vec<Pivot>,
 }
 
 impl Default for EncodeConfig {
@@ -161,6 +187,7 @@ impl Default for EncodeConfig {
             preset: "medium".to_string(),
             audio: AudioSource::Silent,
             out_name: "scrollcast.mp4".to_string(),
+            pivots: Vec::new(),
         }
     }
 }
@@ -671,7 +698,12 @@ async fn run_encode(ffmpeg: &Path, args: &[String], frames: FrameIter<'_>) -> Re
 
     let mut write_err = None;
     for frame in frames {
-        if let Err(e) = stdin.write_all(frame).await {
+        // `&frame` (`&Cow<[u8]>`) deref-coerces to `&[u8]` here, the same
+        // mechanism `&String` -> `&str` uses — `write_all` sees the same
+        // borrowed bytes whether this frame was a zero-copy scroll slice or
+        // an owned, card-composited dwell frame (see `FrameIter::Item`'s doc
+        // comment).
+        if let Err(e) = stdin.write_all(&frame).await {
             write_err = Some(e);
             break;
         }
@@ -694,14 +726,437 @@ async fn run_encode(ffmpeg: &Path, args: &[String], frames: FrameIter<'_>) -> Re
     Ok(())
 }
 
-/// Lazily yields each output frame's byte slice in order, computing its
-/// source `y` from `camera_y_at` on demand rather than precomputing and
-/// storing every frame's slice up front — with 7,200 frames that would be a
-/// 7,200-element `Vec<&[u8]>`, cheap in itself, but there is no reason to pay
-/// even that when a plain iterator does the same job.
+// ---------------------------------------------------------------------------
+// Pivot callout cards (#325 review finding A)
+// ---------------------------------------------------------------------------
+//
+// The owner's ask, verbatim from the review: at a pivot the scroll pauses,
+// "a little window that explains what was going on," then resumes. Before
+// this section existed, a dwell (`Segment::is_dwell()`, pacing.rs:55-59) was
+// a silent frozen frame — `encode.rs` never imported `Pivot` and had no text
+// rendering at all, so the callout the owner asked for simply never
+// appeared. This section is that card.
+//
+// Where the two inputs come from: `Segment::is_dwell()` is pacing.rs's own
+// method (pacing.rs:56-58, `y_start == y_end`); the `Pivot` text
+// (`label`/`detail`) is assembled by `chapters::render_label`/
+// `render_detail` (chapters.rs:267-315) from a commit's refs/merge-ness/
+// message, already capped to `chapters::CARD_MAX_WORDS` (12) words
+// (chapters.rs:301). Neither reaches this file today: `main.rs` currently
+// always calls `chapters::detect_pivots` with empty input (main.rs:442,
+// its own documented "Gap 1"), so `pivots` is always `vec![]`. Wiring real
+// pivots through therefore does not need a change to this crate's control
+// flow, only two things: (1) this section, so a non-empty `pivots` list has
+// somewhere to go, and (2) `main.rs` setting `EncodeConfig::pivots`
+// explicitly — see `EncodeConfig::pivots`'s own doc comment for exactly why
+// this is a new *struct field* rather than a new *function parameter* on
+// [`encode_video`], and exactly which line in `main.rs` needs to change.
+//
+// ## Why compositing into the RGB buffer, not an ffmpeg `drawtext` filter
+//
+// The review names both options and prefers this one; the reasons given are
+// worth restating because they are exactly why no `fontconfig`/`libfreetype`
+// dependency shows up anywhere in this change. `drawtext` needs a font file
+// resolvable at run time (`fontconfig`, or a hardcoded `fontfile=` path) —
+// exactly the kind of environment-dependent behaviour this module's own top
+// doc comment (`check_ffmpeg_capabilities`, "Fail at startup, never
+// mid-encode") exists to design out of this crate. Drawing into the buffer
+// this module already owns needs no new capability probe, no new binary
+// dependency, and produces the exact same bytes on every machine that runs
+// the same pinned ffmpeg — consistent with this module's existing
+// determinism story (see the top doc comment's "Determinism" section).
+// It is also the only one of the two options this module can unit-test
+// without spawning ffmpeg at all: a card is asserted by diffing byte buffers,
+// not by parsing rendered video output.
+//
+// ## The font: a tiny fixed 5x7 bitmap, uppercase-only, by design
+//
+// No Rust font-rendering crate is added, for the same reason `encode.rs`
+// shells out to `ffmpeg` for PNG decoding rather than adding an image crate
+// (see this file's top doc comment) — an owned dependency here would be a
+// cross-lane addition to `Cargo.toml`, outside this lane's file set.
+// Instead: a 5-column x 7-row bitmap glyph per character, packed one `u8`
+// per row (bit `c`, `c` in `0..5`, set when column `c` is lit — bit 0 is the
+// LEFTMOST pixel, not the usual "bit 0 is least significant / rightmost"
+// convention, so `draw_glyph_clamped` shifts by the column index directly).
+// The 48 glyphs in `glyph_rows` below were transcribed from ASCII art by a
+// small Python script (kept in this task's scratchpad, not part of the
+// crate) rather than hand-counted into hex/decimal — hand-transcribing 48
+// glyphs' worth of bit patterns is exactly the kind of mechanical task a
+// human silently gets a few bits wrong on, and a wrong bit here is a
+// wrong-looking letter that a `cargo test` run cannot catch by itself
+// (which is why `card_pixels_are_confined_to_the_card_region_not_the_frame`
+// and friends below assert on *regions*, not on font content — this
+// module's tests cannot verify a glyph "looks like" its letter, only that
+// drawing stays where it's supposed to and something actually changed).
+//
+// Deliberately uppercase-only: rendering both cases in a legible 5x7 cell
+// needs a materially bigger glyph table (roughly double: 26 more letters,
+// several of which — g/j/p/q/y — need descenders a 7-row cell cannot show
+// without shrinking the cap-height letters to make room), for a card whose
+// entire job is a ~12-word caption on screen for 3 seconds
+// (`pacing::DEFAULT_DWELL_SECS`) — legibility of case, not preservation of
+// it, is what that budget buys. `prepare_card_text` upper-cases (and
+// substitutes a couple of Unicode punctuation marks this crate's own text
+// actually produces — see its doc comment) before any glyph lookup runs.
+// Any character with no glyph (accented letters, most Unicode punctuation,
+// `chapters::cap_words`'s `…` before substitution) renders as a blank cell
+// rather than a placeholder box or a panic — a card that quietly drops one
+// unsupported glyph is honest about a known font-scope limit; a
+// crash on a tag name with an unexpected character would not be.
+
+/// Bitmap glyph width/height, in source pixels before `scale` is applied —
+/// see this section's module doc comment for the row/bit convention.
+const GLYPH_WIDTH: u32 = 5;
+const GLYPH_HEIGHT: u32 = 7;
+
+/// Look up one character's 7-row bitmap. Falls back to a blank (all-zero)
+/// glyph — rendered as empty space — for anything not in this crate's
+/// deliberately small uppercase-plus-punctuation set; see this section's
+/// module doc comment for why that is the right failure mode here (a
+/// dropped glyph, never a panic, on a tag/branch name this crate does not
+/// control the character set of).
+fn glyph_rows(c: char) -> [u8; 7] {
+    match c {
+        ' ' => [0, 0, 0, 0, 0, 0, 0],
+        '!' => [4, 4, 4, 4, 4, 0, 4],
+        '\'' => [4, 4, 0, 0, 0, 0, 0],
+        '(' => [8, 4, 2, 2, 2, 4, 8],
+        ')' => [2, 4, 8, 8, 8, 4, 2],
+        ',' => [0, 0, 0, 0, 0, 4, 2],
+        '-' => [0, 0, 0, 31, 0, 0, 0],
+        '.' => [0, 0, 0, 0, 0, 6, 6],
+        '/' => [16, 8, 8, 4, 2, 2, 1],
+        '0' => [14, 17, 25, 21, 19, 17, 14],
+        '1' => [4, 6, 4, 4, 4, 4, 31],
+        '2' => [14, 17, 16, 8, 4, 2, 31],
+        '3' => [15, 16, 16, 12, 16, 16, 15],
+        '4' => [8, 12, 10, 9, 31, 8, 8],
+        '5' => [31, 1, 15, 16, 16, 16, 15],
+        '6' => [12, 2, 1, 15, 17, 17, 14],
+        '7' => [31, 16, 8, 4, 2, 2, 2],
+        '8' => [14, 17, 17, 14, 17, 17, 14],
+        '9' => [14, 17, 17, 30, 16, 8, 6],
+        ':' => [0, 4, 0, 0, 0, 4, 0],
+        '?' => [14, 17, 16, 8, 4, 0, 4],
+        'A' => [14, 17, 17, 31, 17, 17, 17],
+        'B' => [15, 17, 17, 15, 17, 17, 15],
+        'C' => [30, 1, 1, 1, 1, 1, 30],
+        'D' => [15, 17, 17, 17, 17, 17, 15],
+        'E' => [31, 1, 1, 15, 1, 1, 31],
+        'F' => [31, 1, 1, 15, 1, 1, 1],
+        'G' => [30, 1, 1, 29, 17, 17, 30],
+        'H' => [17, 17, 17, 31, 17, 17, 17],
+        'I' => [31, 4, 4, 4, 4, 4, 31],
+        'J' => [28, 8, 8, 8, 8, 9, 6],
+        'K' => [17, 9, 5, 3, 5, 9, 17],
+        'L' => [1, 1, 1, 1, 1, 1, 31],
+        'M' => [17, 27, 21, 17, 17, 17, 17],
+        'N' => [17, 19, 21, 25, 17, 17, 17],
+        'O' => [14, 17, 17, 17, 17, 17, 14],
+        'P' => [15, 17, 17, 15, 1, 1, 1],
+        'Q' => [14, 17, 17, 17, 21, 9, 22],
+        'R' => [15, 17, 17, 15, 5, 9, 17],
+        'S' => [30, 1, 1, 14, 16, 16, 15],
+        'T' => [31, 4, 4, 4, 4, 4, 4],
+        'U' => [17, 17, 17, 17, 17, 17, 14],
+        'V' => [17, 17, 17, 17, 17, 10, 4],
+        'W' => [17, 17, 17, 21, 21, 27, 17],
+        'X' => [17, 17, 10, 4, 10, 17, 17],
+        'Y' => [17, 17, 10, 4, 4, 4, 4],
+        'Z' => [31, 16, 8, 4, 2, 1, 31],
+        '_' => [0, 0, 0, 0, 0, 0, 31],
+        _ => [0, 0, 0, 0, 0, 0, 0],
+    }
+}
+
+/// Upper-case the text and fold in the two non-ASCII punctuation marks this
+/// crate's own callout text can actually contain, before any glyph lookup:
+/// `chapters::render_detail` (chapters.rs:303-315) always joins with an em
+/// dash (`" — "`), and `chapters::cap_words` (chapters.rs:321-327) appends
+/// `"…"` (a single Unicode ellipsis character, not three periods) when it
+/// truncates. Neither has a glyph in this crate's deliberately small font
+/// (see this section's module doc comment), so both are rewritten to their
+/// nearest ASCII punctuation here rather than silently rendering as blank
+/// cells — a truncated detail line should still visibly end in *something*
+/// that reads as "more was cut here."
+fn prepare_card_text(s: &str) -> String {
+    s.replace('…', "...")
+        .replace('—', "-")
+        .replace('–', "-")
+        .to_uppercase()
+}
+
+/// Set one pixel to `rgb`, but only if `(x, y)` falls inside `clip`
+/// (`(x_min, y_min, x_max_exclusive, y_max_exclusive)`). Every drawing
+/// primitive in this section routes through this one function with the
+/// card's own rectangle as `clip` — see `draw_pivot_card` — which is what
+/// makes "drawing a card never touches a pixel outside the card's own
+/// rectangle" a property of this function's contract rather than something
+/// each caller has to get right independently. Also defends against `frame`
+/// being shorter than `frame_width * some height` implies (defensive only;
+/// `encode_video`'s frame buffers are always exactly one full
+/// `VIDEO_WIDTH x VIDEO_HEIGHT` frame, but a bounds-checked write costs
+/// nothing here and this function has no other way to learn the buffer's
+/// real height).
+fn set_pixel_clamped(
+    frame: &mut [u8],
+    frame_width: u32,
+    clip: (u32, u32, u32, u32),
+    x: u32,
+    y: u32,
+    rgb: [u8; 3],
+) {
+    let (x_min, y_min, x_max, y_max) = clip;
+    if x < x_min || x >= x_max || y < y_min || y >= y_max {
+        return;
+    }
+    let idx = (y as usize * frame_width as usize + x as usize) * 3;
+    if let Some(px) = frame.get_mut(idx..idx + 3) {
+        px.copy_from_slice(&rgb);
+    }
+}
+
+/// Fill an `w x h` rectangle at `(x0, y0)` with `rgb`, clipped to `clip`.
+/// Used both for the card's background/border (a big solid rect) and for
+/// each lit font pixel scaled up to a `scale x scale` block (see
+/// `draw_glyph_clamped`) — a "filled rectangle" is the one primitive both of
+/// those are built from.
+fn fill_rect_clamped(
+    frame: &mut [u8],
+    frame_width: u32,
+    clip: (u32, u32, u32, u32),
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    rgb: [u8; 3],
+) {
+    for y in y0..y0.saturating_add(h) {
+        for x in x0..x0.saturating_add(w) {
+            set_pixel_clamped(frame, frame_width, clip, x, y, rgb);
+        }
+    }
+}
+
+/// Draw one glyph at `(x0, y0)` (its top-left corner), each of its 5x7
+/// source pixels scaled up to a `scale x scale` block so a tiny bitmap font
+/// is legible on a 1920x1080 frame — see `draw_pivot_card`'s doc comment for
+/// the actual scale factors this crate uses for the label vs. detail lines.
+fn draw_glyph_clamped(
+    frame: &mut [u8],
+    frame_width: u32,
+    clip: (u32, u32, u32, u32),
+    x0: u32,
+    y0: u32,
+    scale: u32,
+    rows: [u8; 7],
+    rgb: [u8; 3],
+) {
+    for (row_idx, row_bits) in rows.iter().enumerate() {
+        for col in 0..GLYPH_WIDTH {
+            if (row_bits >> col) & 1 == 1 {
+                let px = x0 + col * scale;
+                let py = y0 + row_idx as u32 * scale;
+                fill_rect_clamped(frame, frame_width, clip, px, py, scale, scale, rgb);
+            }
+        }
+    }
+}
+
+/// Draw a whole line of text left-to-right starting at `(x0, y0)`, one
+/// `GLYPH_WIDTH + 1` (a 1-source-pixel gap between glyphs, scaled the same
+/// as the glyphs themselves) column pitch per character. No line wrapping —
+/// a line that runs past `clip`'s right edge is silently cut off there
+/// (every pixel past it is out of `clip` and `set_pixel_clamped` drops it),
+/// rather than overflowing onto the rest of the frame or onto a second row.
+/// This is deliberate: `chapters::cap_words` already bounds the detail
+/// line's word count, and a card whose label happens to come from an
+/// unusually long tag/branch name should crop cleanly at its own edge, not
+/// bleed pixels into the scrolling graph behind it.
+fn draw_text_line_clamped(
+    frame: &mut [u8],
+    frame_width: u32,
+    clip: (u32, u32, u32, u32),
+    x0: u32,
+    y0: u32,
+    scale: u32,
+    text: &str,
+    rgb: [u8; 3],
+) {
+    let pitch = (GLYPH_WIDTH + 1) * scale;
+    let mut x = x0;
+    for c in text.chars() {
+        draw_glyph_clamped(frame, frame_width, clip, x, y0, scale, glyph_rows(c), rgb);
+        x += pitch;
+    }
+}
+
+/// The card's fixed geometry, in `VIDEO_WIDTH x VIDEO_HEIGHT` frame pixels.
+/// Fixed rather than configurable: this is a repair-pass addition closing a
+/// blocker finding, not a new CLI surface, and a fixed layout is what keeps
+/// `card_pixels_are_confined_to_the_card_region_not_the_frame` (below) a
+/// meaningful test rather than one that has to re-derive the geometry it's
+/// checking.
+const CARD_WIDTH: u32 = 1200;
+const CARD_HEIGHT: u32 = 140;
+const CARD_MARGIN_BOTTOM: u32 = 90;
+const CARD_X: u32 = (VIDEO_WIDTH - CARD_WIDTH) / 2;
+const CARD_Y: u32 = VIDEO_HEIGHT - CARD_MARGIN_BOTTOM - CARD_HEIGHT;
+const CARD_BORDER_PX: u32 = 1;
+const CARD_PADDING_X: u32 = 28;
+const CARD_PADDING_TOP: u32 = 24;
+const CARD_LABEL_SCALE: u32 = 4;
+const CARD_DETAIL_SCALE: u32 = 2;
+const CARD_LINE_GAP: u32 = 14;
+
+const CARD_BORDER_RGB: [u8; 3] = [225, 225, 230];
+const CARD_BG_RGB: [u8; 3] = [18, 22, 34];
+const CARD_LABEL_RGB: [u8; 3] = [255, 255, 255];
+const CARD_DETAIL_RGB: [u8; 3] = [195, 200, 210];
+
+/// Composite the pivot callout card onto one frame buffer, in place. `frame`
+/// must be exactly one `VIDEO_WIDTH x VIDEO_HEIGHT` rgb24 frame (the same
+/// shape `extract_frame` produces) — this function has no way to check that
+/// beyond the bounds checks already inside `set_pixel_clamped`.
+///
+/// Layout: a filled rect + 1px border (the review's own suggested shape),
+/// bottom-centered with a `CARD_MARGIN_BOTTOM`-px gap from the frame's
+/// bottom edge, holding two left-aligned lines of text — the label at 4x
+/// scale, the detail line at 2x scale below it. Every pixel this function
+/// touches is inside `[CARD_X, CARD_X + CARD_WIDTH) x [CARD_Y, CARD_Y +
+/// CARD_HEIGHT)` by construction (that rectangle is `clip`, below, and every
+/// drawing call in this function routes through it) — see
+/// `card_pixels_are_confined_to_the_card_region_not_the_frame` for the test
+/// that pins this down.
+pub(crate) fn draw_pivot_card(frame: &mut [u8], label: &str, detail: &str) {
+    let clip = (CARD_X, CARD_Y, CARD_X + CARD_WIDTH, CARD_Y + CARD_HEIGHT);
+
+    // Border, then an inset background fill on top — the "filled rect + 1px
+    // border" the review asked for, built from the one rectangle primitive
+    // both need rather than a separate stroke-only border routine.
+    fill_rect_clamped(
+        frame,
+        VIDEO_WIDTH,
+        clip,
+        CARD_X,
+        CARD_Y,
+        CARD_WIDTH,
+        CARD_HEIGHT,
+        CARD_BORDER_RGB,
+    );
+    fill_rect_clamped(
+        frame,
+        VIDEO_WIDTH,
+        clip,
+        CARD_X + CARD_BORDER_PX,
+        CARD_Y + CARD_BORDER_PX,
+        CARD_WIDTH - 2 * CARD_BORDER_PX,
+        CARD_HEIGHT - 2 * CARD_BORDER_PX,
+        CARD_BG_RGB,
+    );
+
+    let label_text = prepare_card_text(label);
+    let detail_text = prepare_card_text(detail);
+    let label_y = CARD_Y + CARD_PADDING_TOP;
+    let detail_y = label_y + GLYPH_HEIGHT * CARD_LABEL_SCALE + CARD_LINE_GAP;
+
+    draw_text_line_clamped(
+        frame,
+        VIDEO_WIDTH,
+        clip,
+        CARD_X + CARD_PADDING_X,
+        label_y,
+        CARD_LABEL_SCALE,
+        &label_text,
+        CARD_LABEL_RGB,
+    );
+    draw_text_line_clamped(
+        frame,
+        VIDEO_WIDTH,
+        clip,
+        CARD_X + CARD_PADDING_X,
+        detail_y,
+        CARD_DETAIL_SCALE,
+        &detail_text,
+        CARD_DETAIL_RGB,
+    );
+}
+
+/// Match each dwell segment to the `Pivot` whose text it should show while
+/// the scroll holds. Mirrors `chapters::format_chapters`'s own matching rule
+/// (`seg.is_dwell() && seg.y_start == pivot.y`, chapters.rs:378-382) rather
+/// than inventing a second one — both are answering the same question
+/// ("which pivot does this dwell segment belong to?") from the same two
+/// inputs, and a caller passing pivots straight from
+/// `chapters::detect_pivots` into both `format_chapters` and this crate's
+/// `EncodeConfig::pivots` needs both answers to agree.
+///
+/// Computed once, up front, one entry per segment (not per frame): a dwell
+/// can hold for `pacing::DEFAULT_DWELL_SECS` (3.0s) at `FPS` (30), i.e. ~90
+/// frames, and every one of them needs the same answer — there is no reason
+/// to re-walk `pivots` 90 times to get it.
+fn build_dwell_pivot_text(segments: &[Segment], pivots: &[Pivot]) -> Vec<Option<(String, String)>> {
+    segments
+        .iter()
+        .map(|seg| {
+            if !seg.is_dwell() {
+                return None;
+            }
+            pivots
+                .iter()
+                .find(|p| p.y == seg.y_start)
+                .map(|p| (p.label.clone(), p.detail.clone()))
+        })
+        .collect()
+}
+
+/// Which segment (by index) covers time `t` — mirrors `pacing::camera_y_at`'s
+/// own walk over `segments` (pacing.rs:220-234) step for step, but returns
+/// the segment's *index* rather than its interpolated `y`. `camera_y_at`
+/// has no reason to expose that index (its only job is a position), but
+/// `FrameIter` needs it to look up `build_dwell_pivot_text`'s precomputed
+/// per-segment answer for the same time `t` it already asked `camera_y_at`
+/// about.
+///
+/// Duplicated here rather than added to `pacing.rs` because `pacing.rs` is
+/// out of this lane's file set for #325's repair pass (see the review's own
+/// instruction: "except where a lane is EXPLICITLY told its caller may pass
+/// different arguments to it — the file itself stays unedited"). If a
+/// future change legitimately touches both files, consider hoisting this
+/// back into `pacing.rs` as a `camera_segment_at` sibling to `camera_y_at`
+/// so the two walks cannot silently drift apart.
+fn segment_index_at(segments: &[Segment], t: f64) -> Option<usize> {
+    let mut elapsed = 0.0_f64;
+    for (i, seg) in segments.iter().enumerate() {
+        let seg_end = elapsed + seg.duration_secs;
+        if t <= seg_end || seg.duration_secs == 0.0 {
+            return Some(i);
+        }
+        elapsed = seg_end;
+    }
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments.len() - 1)
+    }
+}
+
+/// Lazily yields each output frame's byte in order (a plain slice for a
+/// scroll frame, an owned composited copy for a dwell frame with a pivot
+/// card — see `Item`'s doc comment), computing its source `y` from
+/// `camera_y_at` on demand rather than precomputing and storing every
+/// frame's slice up front — with 7,200 frames that would be a 7,200-element
+/// `Vec<_>`, cheap in itself, but there is no reason to pay even that when a
+/// plain iterator does the same job.
 struct FrameIter<'a> {
     raw_rgb: &'a [u8],
     segments: &'a [Segment],
+    /// One entry per `segments` element, precomputed once by
+    /// `build_dwell_pivot_text` before this iterator is built — see that
+    /// function's doc comment for why this is computed up front rather than
+    /// re-matched on every one of a dwell's ~90 frames.
+    dwell_pivot_text: &'a [Option<(String, String)>],
     image_width: u32,
     image_height: u32,
     frame_count: u64,
@@ -709,7 +1164,20 @@ struct FrameIter<'a> {
 }
 
 impl<'a> Iterator for FrameIter<'a> {
-    type Item = &'a [u8];
+    /// Borrowed (zero-copy) for the common case — a scroll frame is exactly
+    /// the slice `extract_frame` already produces, and this crate's whole
+    /// piping design (see the top doc comment's "Frame delivery" section)
+    /// depends on that staying zero-copy for the ~7,200 frames of a typical
+    /// run. Owned only for the rare dwell-with-a-pivot-card frame (at most a
+    /// few hundred per run — `chapters::detect_pivots`'s own `max_pivots`
+    /// cap, times ~90 frames each), where `draw_pivot_card` must mutate a
+    /// copy: `raw_rgb` is the one decoded source buffer every frame in the
+    /// whole video borrows from (see `decode_png_to_rgb24`'s doc comment),
+    /// so drawing directly into `self.raw_rgb`'s bytes would permanently
+    /// burn the card into that shared buffer for every later frame that
+    /// happens to read the same rows, not just the dwell frames it belongs
+    /// to.
+    type Item = Cow<'a, [u8]>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next >= self.frame_count {
@@ -725,16 +1193,33 @@ impl<'a> Iterator for FrameIter<'a> {
         // built, so by the time frames are being streamed this cannot fail.
         // `expect` is deliberate: this is an invariant this module itself
         // established a few lines above, not a fallible external input.
-        Some(
-            extract_frame(
-                self.raw_rgb,
-                self.image_width,
-                VIDEO_WIDTH,
-                VIDEO_HEIGHT,
-                y_px,
-            )
-            .expect("frame bounds already validated in encode_video"),
+        let base = extract_frame(
+            self.raw_rgb,
+            self.image_width,
+            VIDEO_WIDTH,
+            VIDEO_HEIGHT,
+            y_px,
         )
+        .expect("frame bounds already validated in encode_video");
+
+        // `segment_index_at` re-walks `segments` with the *same* `t` used
+        // above for `camera_y_at`, so the two agree on which segment this
+        // frame belongs to by construction (both are the same walk over the
+        // same input) — see that function's doc comment for why this is a
+        // deliberate duplication of `camera_y_at`'s logic rather than a
+        // second, different rule.
+        let dwell_text = segment_index_at(self.segments, t)
+            .and_then(|idx| self.dwell_pivot_text.get(idx))
+            .and_then(|entry| entry.as_ref());
+
+        match dwell_text {
+            Some((label, detail)) => {
+                let mut composited = base.to_vec();
+                draw_pivot_card(&mut composited, label, detail);
+                Some(Cow::Owned(composited))
+            }
+            None => Some(Cow::Borrowed(base)),
+        }
     }
 }
 
@@ -796,9 +1281,16 @@ pub async fn encode_video(
     };
 
     let args = build_encode_args(config, &out_path, video_duration_secs);
+    // See `EncodeConfig::pivots`'s doc comment for why this comes from a
+    // config field rather than a new `encode_video` parameter: `main.rs`
+    // (this function's only caller) is out of this lane's file set, and a
+    // struct field is the one way to thread this through that does not
+    // require a call-site change there to keep compiling.
+    let dwell_pivot_text = build_dwell_pivot_text(segments, &config.pivots);
     let frames = FrameIter {
         raw_rgb: &raw_rgb,
         segments,
+        dwell_pivot_text: &dwell_pivot_text,
         image_width,
         image_height,
         frame_count,
@@ -1162,18 +1654,273 @@ mod tests {
             y_end: 8000.0,
             duration_secs: 2.0, // 2s * FPS(30) = 60 frames
         }];
+        let dwell_pivot_text: Vec<Option<(String, String)>> = vec![None];
         let iter = FrameIter {
             raw_rgb: &img,
             segments: &segments,
+            dwell_pivot_text: &dwell_pivot_text,
             image_width: VIDEO_WIDTH,
             image_height,
             frame_count: 60,
             next: 0,
         };
-        let frames: Vec<&[u8]> = iter.collect();
+        let frames: Vec<Cow<'_, [u8]>> = iter.collect();
         assert_eq!(frames.len(), 60);
         assert!(frames
             .iter()
             .all(|f| f.len() == VIDEO_WIDTH as usize * 3 * VIDEO_HEIGHT as usize));
+    }
+
+    #[test]
+    fn frame_iter_produces_distinct_advancing_frames_for_a_moving_segment() {
+        // Finding C (the review's confirmed vacuous test): a mutation of
+        // `let t = self.next as f64 / FPS as f64;` down to a hardcoded
+        // `let t = 0.0;` inside `FrameIter::next` left
+        // `frame_iter_yields_exactly_frame_count_frames_each_of_the_right_size`
+        // fully green, because that test only ever asserts frame COUNT and
+        // SIZE — never that two frames actually differ, or that the crop
+        // advances. This test asserts on content instead: frame 0 and a
+        // later frame within the same moving (non-dwell) segment must be
+        // byte-distinct, and the later frame's crop must sit strictly
+        // further down the source image than frame 0's.
+        //
+        // Confirmed red under that exact mutation (applied locally, run,
+        // reverted — not committed): with `t` pinned to 0.0 every frame
+        // computes the same `y`, so `frames[0] == frames[30]` and
+        // `y30 > y0` both fail.
+        let image_height = 10_000;
+        let img = synthetic_image(VIDEO_WIDTH, image_height);
+        let segments = vec![Segment {
+            y_start: 0.0,
+            y_end: 8000.0,
+            duration_secs: 2.0, // 2s * FPS(30) = 60 frames, nonzero velocity throughout
+        }];
+        let dwell_pivot_text: Vec<Option<(String, String)>> = vec![None];
+        let iter = FrameIter {
+            raw_rgb: &img,
+            segments: &segments,
+            dwell_pivot_text: &dwell_pivot_text,
+            image_width: VIDEO_WIDTH,
+            image_height,
+            frame_count: 60,
+            next: 0,
+        };
+        let frames: Vec<Cow<'_, [u8]>> = iter.collect();
+        assert_eq!(frames.len(), 60);
+
+        // synthetic_image stamps each row's first byte with that row's index
+        // (mod 256) — see synthetic_image's doc comment above — so a moved
+        // crop necessarily changes byte 0 of the frame.
+        assert_ne!(
+            frames[0].as_ref(),
+            frames[30].as_ref(),
+            "frame 30 must differ from frame 0 across a segment with nonzero velocity"
+        );
+        let row_marker_at_0 = frames[0][0];
+        let row_marker_at_30 = frames[30][0];
+        assert!(
+            row_marker_at_30 > row_marker_at_0,
+            "expected the crop to advance strictly forward: frame 0 row-marker={row_marker_at_0}, \
+             frame 30 row-marker={row_marker_at_30}"
+        );
+    }
+
+    #[test]
+    fn frame_iter_composites_a_card_only_on_the_dwell_frame_a_scroll_frame_is_untouched() {
+        // End-to-end wiring check for finding A: a segment matched to a
+        // `dwell_pivot_text` entry must come back different from the raw
+        // crop (the card was drawn), while a segment with no matching entry
+        // must come back byte-identical to `extract_frame`'s own output —
+        // proving `FrameIter` only composites where it is told to, not on
+        // every frame.
+        let image_height = 5_000;
+        let img = synthetic_image(VIDEO_WIDTH, image_height);
+        let segments = vec![
+            Segment {
+                y_start: 0.0,
+                y_end: 0.0,
+                duration_secs: 1.0, // dwell: 30 frames at FPS
+            },
+            Segment {
+                y_start: 0.0,
+                y_end: 100.0,
+                duration_secs: 1.0, // scroll: 30 frames at FPS
+            },
+        ];
+        let dwell_pivot_text: Vec<Option<(String, String)>> = vec![
+            Some(("Tag: V1.0.0".to_string(), "Release".to_string())),
+            None,
+        ];
+        let iter = FrameIter {
+            raw_rgb: &img,
+            segments: &segments,
+            dwell_pivot_text: &dwell_pivot_text,
+            image_width: VIDEO_WIDTH,
+            image_height,
+            frame_count: 60,
+            next: 0,
+        };
+        let frames: Vec<Cow<'_, [u8]>> = iter.collect();
+
+        // Frame 0 is inside the dwell segment: its bytes must differ from
+        // the raw (uncomposited) crop at the same y, somewhere inside the
+        // card's own region.
+        let raw_dwell_crop =
+            extract_frame(&img, VIDEO_WIDTH, VIDEO_WIDTH, VIDEO_HEIGHT, 0).unwrap();
+        assert_ne!(
+            frames[0].as_ref(),
+            raw_dwell_crop,
+            "the dwell frame must have a card composited onto it"
+        );
+
+        // Frame 45 (15 frames into the second, scroll segment) has no
+        // matching dwell_pivot_text entry: it must come back exactly as
+        // extract_frame produced it — a zero-copy borrow, no card drawn.
+        assert!(
+            matches!(frames[45], Cow::Borrowed(_)),
+            "a scroll frame with no dwell text must stay a zero-copy borrow"
+        );
+    }
+
+    // ---- pivot callout card drawing ----
+
+    #[test]
+    fn card_pixels_are_confined_to_the_card_region_not_the_frame() {
+        // The review's own suggested assertion: "a frame-with-card differs
+        // from frame-without in exactly the card region." Starting from an
+        // all-zero frame makes both halves of that claim checkable: any
+        // byte outside [CARD_X, CARD_X+CARD_WIDTH) x [CARD_Y,
+        // CARD_Y+CARD_HEIGHT) must stay exactly 0, and at least one byte
+        // inside that region must have changed.
+        let mut frame = vec![0u8; VIDEO_WIDTH as usize * VIDEO_HEIGHT as usize * 3];
+        draw_pivot_card(
+            &mut frame,
+            "Tag: v1.0.0",
+            "Release v1.0.0 - Ada, Aug 5, 2026",
+        );
+
+        let mut changed_inside_card = false;
+        for y in 0..VIDEO_HEIGHT {
+            for x in 0..VIDEO_WIDTH {
+                let idx = (y as usize * VIDEO_WIDTH as usize + x as usize) * 3;
+                let px = &frame[idx..idx + 3];
+                let inside_card = x >= CARD_X
+                    && x < CARD_X + CARD_WIDTH
+                    && y >= CARD_Y
+                    && y < CARD_Y + CARD_HEIGHT;
+                if inside_card {
+                    if px != [0, 0, 0] {
+                        changed_inside_card = true;
+                    }
+                } else {
+                    assert_eq!(
+                        px,
+                        [0, 0, 0],
+                        "pixel ({x}, {y}) outside the card's own rectangle was touched"
+                    );
+                }
+            }
+        }
+        assert!(
+            changed_inside_card,
+            "drawing a card onto an all-zero frame produced no visible change at all"
+        );
+    }
+
+    #[test]
+    fn card_drawing_never_panics_on_a_label_wider_than_the_card() {
+        // draw_text_line_clamped documents "silently cut off, never
+        // overflow" for text that runs past the card's own right edge —
+        // this exercises that path directly with a deliberately oversized
+        // label, rather than trusting the cap on chapters.rs's own output
+        // (a tag/branch name is not word-capped the way a card's detail
+        // line is).
+        let mut frame = vec![0u8; VIDEO_WIDTH as usize * VIDEO_HEIGHT as usize * 3];
+        let long_label = "X".repeat(500);
+        draw_pivot_card(&mut frame, &long_label, &long_label);
+        // Reaching this line without a panic and without corrupting memory
+        // outside the frame buffer (which `cargo test` would catch as UB/
+        // a segfault, not a clean assertion failure) is the assertion.
+    }
+
+    #[test]
+    fn glyph_rows_falls_back_to_blank_for_an_unsupported_character() {
+        // This crate's font is deliberately uppercase-plus-punctuation only
+        // (see the "Pivot callout cards" module doc comment) — an accented
+        // letter or other unsupported character must render as blank space,
+        // not panic.
+        assert_eq!(glyph_rows('É'), [0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(glyph_rows('@'), [0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn prepare_card_text_upper_cases_and_substitutes_the_two_unicode_marks() {
+        let out = prepare_card_text("merge: fix bug — ada…");
+        assert_eq!(out, "MERGE: FIX BUG - ADA...");
+    }
+
+    // ---- finding B: the timeline must not extend past where the camera
+    // ---- can physically scroll ----
+
+    #[test]
+    fn last_frame_crop_y_reaches_exactly_the_scrollable_bottom_when_the_caller_passes_the_reduced_height(
+    ) {
+        // Finding B (major, measured): `camera_y_at` spans [0, image_height]
+        // (whatever `image_height` its caller built the timeline with), but
+        // `clamp_crop_y` (this module) pins the crop window at
+        // `image_height - viewport_h`. If a caller (main.rs, pre-fix) builds
+        // the timeline against the FULL source image height, the last
+        // several seconds of video hold a frozen frame: `y` keeps climbing
+        // past `image_height - viewport_h` while `clamp_crop_y` keeps
+        // returning the same pinned crop.
+        //
+        // The fix is a caller-side argument change outside this lane's file
+        // set (main.rs, not encode.rs — see this crate's repair-pass task):
+        // pass `image_height - viewport_h` (floored at 0), not the full
+        // image height, as the "image_height" argument to
+        // `pacing::commit_density`/`pacing::build_timeline`. This test
+        // proves the mechanism that fix depends on: given a timeline built
+        // against that reduced height, the LAST frame's crop y lands exactly
+        // on `image_height - viewport_h` — no held tail beyond the one
+        // frame that legitimately belongs there.
+        use crate::pacing::{build_timeline, commit_density, speed_multipliers, CommitY};
+
+        let full_image_height = 5_000.0_f64;
+        let viewport_h = VIDEO_HEIGHT as f64;
+        let scrollable_height = (full_image_height - viewport_h).max(0.0); // 3920.0
+
+        let band_height = 300.0;
+        let commits = vec![CommitY { y: 1_000.0 }, CommitY { y: 3_000.0 }];
+        // This is the fixed call shape: `scrollable_height`, not
+        // `full_image_height`, is what main.rs must pass here.
+        let density = commit_density(&commits, scrollable_height, band_height);
+        let multipliers = speed_multipliers(&density);
+        let segments = build_timeline(scrollable_height, band_height, &multipliers, &[], 60.0, 3.0);
+
+        let total = total_duration(&segments);
+        let y_at_end = camera_y_at(&segments, total);
+        assert!(
+            (y_at_end - scrollable_height).abs() < 1e-6,
+            "the timeline itself must end exactly at the scrollable height, got {y_at_end}"
+        );
+
+        // clamp_crop_y, given the REAL full image height, must place the
+        // last frame's crop top exactly where the camera physically stops —
+        // not short of it, not past it.
+        let crop_y_at_end = clamp_crop_y(y_at_end, full_image_height as u32, VIDEO_HEIGHT);
+        assert_eq!(crop_y_at_end, full_image_height as u32 - VIDEO_HEIGHT);
+
+        // And the frame one tick before the end must NOT already be pinned
+        // to that same crop position — proving there is no multi-frame
+        // plateau at the very end, only the single legitimate final frame.
+        let one_frame_secs = 1.0 / FPS as f64;
+        let y_before_end = camera_y_at(&segments, total - one_frame_secs);
+        let crop_before_end = clamp_crop_y(y_before_end, full_image_height as u32, VIDEO_HEIGHT);
+        assert!(
+            crop_before_end < crop_y_at_end,
+            "the frame one tick before the end is already pinned to the final crop position \
+             ({crop_before_end} == {crop_y_at_end}) — that is exactly the frozen-tail bug this \
+             test exists to catch"
+        );
     }
 }

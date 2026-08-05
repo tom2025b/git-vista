@@ -71,3 +71,6 @@
 # usable at all. Removing it does not loosen anything; it makes the default
 # stop working, loudly.
 /out/
+
+# PDF twins never sit beside their .md — the .md is the record (standing rule).
+crates/**/README.pdf

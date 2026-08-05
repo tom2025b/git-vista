@@ -83,6 +83,52 @@
 //! virtualization, print.rs:1-9), so off-screen rows have correct rects
 //! long before anything scrolls or resizes to make them visible.
 //!
+//! # Per-commit metadata: what `chapters::detect_pivots` needs vs what this
+//! module can honestly provide
+//!
+//! `chapters::detect_pivots` (chapters.rs:201-258) scores pivot candidates
+//! off `&[GraphRow]` — a real `Oid`, the full parent list, and a Unix
+//! timestamp (chapters.rs:180-186 documents the parallel-array contract with
+//! `commit_ys` this module already honours for pixel y-positions). This
+//! module has no way to produce a real `GraphRow`: it never touches git
+//! itself, only the already-rendered sheet's text, so anything it reports
+//! about a commit is *the string print.rs chose to draw*, not the underlying
+//! data it was drawn from. Two consequences follow directly from that:
+//!
+//! - [`CommitMeta::short_sha`] is print.rs's own truncated 7-char display id
+//!   (print.rs:367, `gr.commit.id.short()`), never a real `Oid` — there is no
+//!   way to invert a 7-char prefix back into the full hash from the page
+//!   alone, and this module does not pretend otherwise.
+//! - [`CommitMeta::date_text`] is `local_timestamp`'s already-formatted,
+//!   browser-timezone display string (print.rs:369, e.g. `"Jun 29 14:32"`),
+//!   never the `i64` Unix seconds a real `CommitSummary` carries — there is
+//!   no reliable way to invert a locale/timezone-formatted label back into an
+//!   epoch value from this side of the render. It is carried as text for a
+//!   human-facing callout card, never as something arithmetic is done on.
+//!
+//! So this module returns its own [`CommitMeta`] — the honest subset it can
+//! actually read off the DOM, one per commit node, index-aligned with
+//! `commit_ys` — rather than a fabricated `GraphRow` padded out with
+//! placeholder `Oid`s/parents/timestamps. That would either trip
+//! `detect_pivots`'s length assert if built wrong, or silently look correct
+//! while carrying data nobody derived from anything real — worse than an
+//! honest gap. Bridging `Vec<CommitMeta>` to whatever `detect_pivots` (or a
+//! future variant of it) actually needs is lane 4's wiring job, not this
+//! module's.
+//!
+//! **`is_merge` is the one field most tempting to fabricate**, since a real
+//! `GraphRow` would just check `commit.parents.len() > 1`. This module has no
+//! parent list at all, so instead of guessing it reads the one merge signal
+//! print.rs *does* draw: a node's own icon glyph is `ic.merge` for a merge
+//! commit and `ic.commit` otherwise (print.rs:294-298). Both of git-vista's
+//! icon sets are closed and fully known (icons.rs:96-159: `GitIcons` has
+//! exactly two instances, `ICONS` and `TEXT_ICONS`, an exhaustive struct
+//! literal each), so [`classify_merge_glyph`] compares the observed glyph
+//! against both sets' known merge/commit values and answers `None` — never
+//! `false` — for a glyph it doesn't recognize. `None` reaching a caller means
+//! "the sheet drew a glyph this module has no knowledge of," never "not a
+//! merge."
+//!
 //! # Determinism — what is and is not guaranteed
 //!
 //! This module fixes what it can: `--force-device-scale-factor=1` (so 1 CSS
@@ -174,38 +220,88 @@ const DISABLE_ANIMATIONS_JS: &str = "\
 /// The one JS probe this module runs against the loaded sheet: it reports
 /// enough for the caller to trust (or loudly reject) the capture before any
 /// pixels are spent on ffmpeg. Bundled into a single `evaluate_function`
-/// round-trip rather than two separate `evaluate()` calls because both
-/// numbers come from the same DOM snapshot at the same instant — splitting
-/// them into two round-trips would risk (harmlessly, but pointlessly) two
-/// different microtask-queue states answering the two questions.
+/// round-trip rather than several separate `evaluate()` calls because every
+/// number and string comes from the same DOM snapshot at the same instant —
+/// splitting them into multiple round-trips would risk (harmlessly, but
+/// pointlessly) different microtask-queue states answering different parts
+/// of the same question.
 ///
 /// Selector reasoning is in this module's doc comment above; the short
 /// version restated here because it explains what the JS below is doing:
 /// `text.node-icon` is the one class print.rs actually emits on a
 /// commit-node's icon glyph (print.rs:305), and its immediately preceding
 /// sibling is that same commit's `<circle>` by construction
-/// (print.rs:299-310).
+/// (print.rs:299-310). The same "known class -> sibling" pattern extends to
+/// the per-row label markup print.rs emits right after the nodes
+/// (print.rs:317-380, one `view!` per row via `rows.iter().zip(text_x)`, so
+/// row order is preserved the same way it is for `nodes`): each row's
+/// `text.label-msg.pg-msg` (the commit summary, print.rs:373) is immediately
+/// preceded, in that row's own per-row markup, by its last ref badge's
+/// `text.badge-text` (print.rs:355) *if and only if* print.rs drew any
+/// badges for that row — badges are built before the message text in the
+/// same per-row `view!` (print.rs:322-373). So `hasRefs` below is read the
+/// same way `commitYs` is: by class, then by sibling, never by counting or
+/// by badge content. Each row's `text.label-meta.pg-meta` (print.rs:374-377)
+/// holds a `<tspan class="nf">` (the icon glyph, always `ic.commit`
+/// regardless of merge status — print.rs:375 does not vary it) followed by a
+/// plain text-node sibling holding the short SHA, author, and date, each
+/// separated by a middot (print.rs:365-370's `meta` string) — read off that
+/// sibling directly, never by slicing a fixed number of characters off the
+/// front of the combined text, since nothing here should assume the icon
+/// glyph is exactly one character wide.
 const PROBE_JS: &str = "\
     () => {
         const scrollHeight = document.documentElement.scrollHeight;
         const svg = document.querySelector('svg.print-graph-svg');
         if (!svg) {
-            return { scrollHeight, commitYs: [], svgFound: false, nodeIconCount: 0 };
+            return {
+                scrollHeight, commitYs: [], svgFound: false, nodeIconCount: 0,
+                nodeIcons: [], msgCount: 0, metaCount: 0, commitMetas: [],
+            };
         }
         const icons = Array.from(svg.querySelectorAll('text.node-icon'));
         const commitYs = [];
+        const nodeIcons = [];
         for (const icon of icons) {
             const circle = icon.previousElementSibling;
             if (circle && circle.tagName.toLowerCase() === 'circle') {
                 const r = circle.getBoundingClientRect();
                 commitYs.push(r.top + r.height / 2);
+                nodeIcons.push(icon.textContent);
             }
         }
+
+        const msgEls = Array.from(svg.querySelectorAll('text.label-msg.pg-msg'));
+        const metaEls = Array.from(svg.querySelectorAll('text.label-meta.pg-meta'));
+        const commitMetas = msgEls.map((msgEl, i) => {
+            const metaEl = metaEls[i];
+            const prev = msgEl.previousElementSibling;
+            const hasRefs = !!(prev && prev.classList && prev.classList.contains('badge-text'));
+            let shortSha = '';
+            let author = '';
+            let dateText = '';
+            if (metaEl) {
+                const tspan = metaEl.querySelector('tspan');
+                const metaText = (tspan && tspan.nextSibling) ? tspan.nextSibling.textContent : '';
+                const parts = metaText.split(' \\u00b7 ');
+                if (parts.length === 3) {
+                    shortSha = parts[0].trim();
+                    author = parts[1].trim();
+                    dateText = parts[2].trim();
+                }
+            }
+            return { summary: msgEl.textContent, hasRefs, shortSha, author, dateText };
+        });
+
         return {
             scrollHeight,
             commitYs,
             svgFound: true,
             nodeIconCount: icons.length,
+            nodeIcons,
+            msgCount: msgEls.length,
+            metaCount: metaEls.length,
+            commitMetas,
         };
     }";
 
@@ -233,6 +329,61 @@ struct PageProbe {
     /// dropping rows whose markup didn't pair the way print.rs is expected
     /// to pair it.
     node_icon_count: usize,
+    /// Each successfully-paired node icon's own glyph text, in the same order
+    /// and under the same circle-pairing filter as `commit_ys` (so
+    /// `node_icons[i]` and `commit_ys[i]` describe the same commit) — the
+    /// only signal this module has for [`classify_merge_glyph`], since the
+    /// label markup's own icon (`text.label-meta.pg-meta`'s `tspan`) never
+    /// varies with merge status (print.rs:375 always emits `ic.commit`
+    /// there).
+    node_icons: Vec<String>,
+    /// How many `text.label-msg.pg-msg` elements existed. Checked equal to
+    /// `node_icon_count` (and `meta_count`) before `commit_metas` is trusted
+    /// for anything — see `run_capture`.
+    msg_count: usize,
+    /// How many `text.label-meta.pg-meta` elements existed. Same reason as
+    /// `msg_count`.
+    meta_count: usize,
+    /// Raw per-row text pulled off the sheet's label markup (PROBE_JS's doc
+    /// comment above has the full selector/sibling reasoning), in row order.
+    /// Not yet asserted aligned with `commit_ys`/`node_icons` — `run_capture`
+    /// checks `msg_count`/`meta_count`/`node_icon_count` all agree, and only
+    /// then zips this with `node_icons` to build the [`CommitMeta`]s a caller
+    /// actually receives.
+    commit_metas: Vec<RawCommitMeta>,
+}
+
+/// One row's text content, exactly as read off the label markup — see
+/// [`CommitMeta`] for the honest, index-aligned, caller-facing shape this is
+/// turned into (with `is_merge` folded in from `PageProbe::node_icons`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawCommitMeta {
+    /// `text.label-msg.pg-msg`'s text content (print.rs:373) — the commit
+    /// summary, already truncated by print.rs's own `MAX_SUMMARY_CHARS` if it
+    /// was long; this module does not know or re-derive that cap, only
+    /// reports what is actually on the page.
+    summary: String,
+    /// Whether this row's message text was immediately preceded, in its own
+    /// per-row markup, by a `text.badge-text` sibling (print.rs:355) — i.e.
+    /// whether print.rs drew at least one ref badge for this row. Never which
+    /// refs, only whether any exist.
+    has_refs: bool,
+    /// The short SHA parsed out of the label-meta line's text sibling
+    /// (print.rs:367, `gr.commit.id.short()`) — print.rs's own truncated
+    /// display id, not a real `Oid` (see this module's top doc comment).
+    /// Empty string if the meta text didn't parse into exactly three
+    /// middot-separated parts (a caller sees this as an empty field, not a
+    /// crash — the alignment/count checks in `run_capture` are what catch a
+    /// structurally broken sheet; a single row's unparsed text is reported
+    /// honestly rather than treated as fatal for the whole capture).
+    short_sha: String,
+    /// The author name parsed out the same way (print.rs:368).
+    author: String,
+    /// The already-formatted display date/time parsed out the same way
+    /// (print.rs:369, `local_timestamp`) — display text, not a timestamp; see
+    /// this module's top doc comment on why it cannot be inverted to one.
+    date_text: String,
 }
 
 /// Tunables for one capture run. Kept small and explicit (no builder) since
@@ -280,6 +431,87 @@ pub struct CaptureResult {
     /// One [`CommitY`] per commit node found on the sheet, in row order —
     /// feeds straight into `pacing::commit_density`.
     pub commit_ys: Vec<CommitY>,
+    /// One [`CommitMeta`] per commit node, **index-aligned with
+    /// `commit_ys`** (`commit_metas[i]` and `commit_ys[i]` describe the same
+    /// commit — same contract `chapters::detect_pivots` already documents for
+    /// its own `rows`/`commit_ys` parameters, chapters.rs:180-186). `run_
+    /// capture` asserts the lengths and pairing counts agree before this
+    /// struct is ever built (named-count errors, never a silent truncation —
+    /// see this module's top doc comment), so a caller never has to
+    /// re-verify alignment itself. See this module's top doc comment for
+    /// exactly what is and is not honestly derivable here versus a real
+    /// `GraphRow`.
+    // `#[allow(dead_code)]`: not yet read anywhere in *this lane's* file set.
+    // The caller that wires this into `chapters::detect_pivots`'s eventual
+    // replacement is main.rs (lane 4), which sits outside capture.rs's
+    // mandate — same cross-lane shape main.rs's own top doc comment already
+    // documents for `capture.rs`'s unread `opts` parameter (main.rs:70-79,
+    // `#[allow(unused_variables)]` at that `mod capture` boundary). Scoped to
+    // just this field, not the whole struct, so it stops silencing the
+    // moment lane 4's wiring reads it.
+    #[allow(dead_code)]
+    pub commit_metas: Vec<CommitMeta>,
+}
+
+/// The honest subset of a commit's rendered metadata this module can read
+/// off the Print Graph sheet — see this module's top doc comment ("Per-
+/// commit metadata") for why this is its own type rather than a fabricated
+/// `git_vista_core::model::GraphRow`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitMeta {
+    /// print.rs's own truncated 7-char display id (print.rs:367,
+    /// `gr.commit.id.short()`) — not a real `Oid`.
+    pub short_sha: String,
+    /// The commit summary line as rendered (print.rs:364,373) — already
+    /// truncated by print.rs's own `MAX_SUMMARY_CHARS` if it was long.
+    pub summary: String,
+    /// The author name as rendered (print.rs:368).
+    pub author: String,
+    /// The already-formatted, browser-timezone display date/time
+    /// (print.rs:369, `local_timestamp`) — display text, not a Unix
+    /// timestamp; see this module's top doc comment on why it cannot be
+    /// inverted to one.
+    pub date_text: String,
+    /// Whether print.rs drew at least one ref badge (branch/tag/HEAD/remote)
+    /// beside this commit (print.rs:317-363). Never which refs or how many —
+    /// the sheet's markup does not expose ref kind or name in any way this
+    /// module distinguishes from the summary text around it.
+    pub has_refs: bool,
+    /// Whether this commit is a merge, derived from the node's own icon
+    /// glyph (see [`classify_merge_glyph`] and this module's top doc
+    /// comment). `None` means the glyph matched neither of git-vista's two
+    /// known icon sets — reported as genuinely undetermined, never defaulted
+    /// to `false`, which would silently misreport every merge in that
+    /// scenario as a plain commit.
+    pub is_merge: Option<bool>,
+}
+
+/// The nerd-font and plain-text-fallback merge glyphs, respectively
+/// (`crates/git-vista/src/icons.rs:104,133`) — the two values `ic.merge`
+/// (print.rs:294-298's node icon) can literally be, per `GitIcons`'s two
+/// closed instances (icons.rs:96-159: exactly `ICONS` and `TEXT_ICONS`, no
+/// third set exists today).
+const MERGE_GLYPHS: [&str; 2] = ["\u{F419}", "><"];
+
+/// The corresponding non-merge (`ic.commit`) glyphs (icons.rs:102,131).
+const COMMIT_GLYPHS: [&str; 2] = ["\u{F417}", "*"];
+
+/// Classify a commit-node icon glyph as merge/non-merge/unknown, per this
+/// module's top doc comment on why `is_merge` is derived this way rather
+/// than fabricated from a parent list this module never has. Comparing
+/// against both known sets (rather than, say, "does it differ from the first
+/// glyph seen in this sheet") is deliberate: a sheet with zero merges would
+/// otherwise have no non-merge glyph to compare against, and a relative
+/// comparison can never tell you *which* of two distinct glyphs means
+/// "merge" — only that they differ.
+fn classify_merge_glyph(glyph: &str) -> Option<bool> {
+    if MERGE_GLYPHS.contains(&glyph) {
+        Some(true)
+    } else if COMMIT_GLYPHS.contains(&glyph) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// Find `name` on `$PATH`, the same lookup a shell does for a bare command,
@@ -525,6 +757,41 @@ async fn run_capture(
             probe.commit_ys.len()
         );
     }
+    // The same "must agree before we trust it" shape as the check above, one
+    // level further down the pipeline: `chapters::detect_pivots` *panics* (an
+    // `assert_eq!`, chapters.rs:201-207) on a `rows`/`commit_ys` length
+    // mismatch, and this module is what would hand it that mismatched data if
+    // print.rs's label markup (print.rs:317-380) ever stopped emitting
+    // exactly one message and one meta line per commit node. Erroring here,
+    // by name, before any `CommitMeta` is built, is what turns that would-be
+    // panic into a plain, attributable startup error instead.
+    if probe.msg_count != probe.node_icon_count || probe.meta_count != probe.node_icon_count {
+        bail!(
+            "found {} commit node(s) but {} `text.label-msg.pg-msg` and {} \
+             `text.label-meta.pg-meta` element(s) — print.rs's per-row label rendering \
+             (print.rs:317-380) no longer emits exactly one message and one meta line per commit \
+             node; refusing to build per-commit metadata that would misalign with commit_ys",
+            probe.node_icon_count,
+            probe.msg_count,
+            probe.meta_count
+        );
+    }
+    // Belt-and-braces: the counts just checked are self-reported by the same
+    // in-page script that built `node_icons`/`commit_metas`, so a bug in
+    // PROBE_JS itself (not print.rs's markup) could in principle report
+    // matching counts while the arrays it actually returned disagree.
+    // `Iterator::zip` would silently truncate to the shorter of the two
+    // rather than error, which is exactly the silent-misalignment failure
+    // mode this whole finding is about — so the real vector lengths are
+    // checked directly, not inferred from the counts above.
+    if probe.node_icons.len() != probe.commit_metas.len() {
+        bail!(
+            "internal probe mismatch: {} node icon glyph(s) but {} label metadata row(s) — \
+             cannot align per-commit metadata with commit_ys",
+            probe.node_icons.len(),
+            probe.commit_metas.len()
+        );
+    }
 
     let png_bytes = page
         .screenshot(
@@ -542,31 +809,78 @@ async fn run_capture(
     // The one check this whole module exists to make non-optional: a
     // capture that silently stopped short of the full sheet would just make
     // the finished video end early and look intentional — nothing
-    // downstream (pacing, encode) has any way to notice on its own. So the
-    // measured PNG height is compared against the page's own report of its
-    // content height, and any gap is a hard error naming both numbers,
-    // never a warning.
-    let height_diff = (png_height as f64 - probe.scroll_height).abs();
-    if height_diff > 1.0 {
-        bail!(
-            "capture truncated: the page reported scrollHeight={:.1}px but the captured PNG is \
-             {png_height}px tall (width {png_width}px) — the screenshot did not cover the whole \
-             print sheet",
-            probe.scroll_height
-        );
+    // downstream (pacing, encode) has any way to notice on its own. Pulled
+    // out into `verify_capture_height` so this specific comparison is
+    // host-tested on its own, independent of a running browser — see that
+    // function's doc comment for why.
+    if let Err(msg) = verify_capture_height(png_height, probe.scroll_height) {
+        bail!("{msg} (captured PNG width {png_width}px)");
     }
 
     std::fs::write(output_png, &png_bytes)
         .with_context(|| format!("writing the captured PNG to {}", output_png.display()))?;
 
-    let commit_ys = probe.commit_ys.into_iter().map(|y| CommitY { y }).collect();
+    let commit_ys: Vec<CommitY> = probe.commit_ys.into_iter().map(|y| CommitY { y }).collect();
+
+    // Lengths were already checked equal above (`node_icons.len() ==
+    // commit_metas.len() == commit_ys.len()`, transitively via
+    // `node_icon_count`), so this zip never silently drops a row.
+    let commit_metas: Vec<CommitMeta> = probe
+        .node_icons
+        .iter()
+        .zip(probe.commit_metas.iter())
+        .map(|(glyph, raw)| CommitMeta {
+            short_sha: raw.short_sha.clone(),
+            summary: raw.summary.clone(),
+            author: raw.author.clone(),
+            date_text: raw.date_text.clone(),
+            has_refs: raw.has_refs,
+            is_merge: classify_merge_glyph(glyph),
+        })
+        .collect();
 
     Ok(CaptureResult {
         png_path: output_png.to_path_buf(),
         width: png_width,
         height: png_height,
         commit_ys,
+        commit_metas,
     })
+}
+
+/// Whether a capture's measured PNG height matches the page's own reported
+/// content height — the one check this whole module exists to make
+/// non-optional (see `run_capture`'s call site for the failure mode this
+/// guards). Extracted into its own pure function, rather than left inline in
+/// `run_capture`, specifically because a prior review proved the inline
+/// version was untestable: nothing in this crate's suite exercised the
+/// comparison itself (only the surrounding plumbing), so a mutation of the
+/// `> 1.0` threshold to `> 1e9` left every existing test green while
+/// silently disabling truncation detection entirely. `truncation_of_more_
+/// than_one_pixel_is_rejected` below is exactly the test that mutation now
+/// fails.
+///
+/// `png_h` is the measured PNG height ([`png_dimensions`]'s second return
+/// value); `scroll_h` is the page's own `document.documentElement.
+/// scrollHeight` at probe time (`PageProbe::scroll_height`). A gap of more
+/// than one pixel is rejected — one pixel of slack, not zero, because
+/// `scroll_h` is a float derived from possibly sub-pixel CSS layout while
+/// `png_h` is an integer pixel count from the actual rasterized image; a
+/// wholly untruncated capture can legitimately round either direction by
+/// under a pixel with no real truncation having occurred, and this
+/// function's job is catching genuine truncation, not float/int rounding
+/// noise. The error carries BOTH numbers, never just one, so whoever reads
+/// it can tell at a glance which side is "wrong" (a short PNG vs. a page that
+/// somehow grew after the probe ran).
+fn verify_capture_height(png_h: u32, scroll_h: f64) -> Result<(), String> {
+    let diff = (png_h as f64 - scroll_h).abs();
+    if diff > 1.0 {
+        return Err(format!(
+            "capture truncated: the page reported scrollHeight={scroll_h:.1}px but the \
+             captured PNG is {png_h}px tall — the screenshot did not cover the whole print sheet"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -619,6 +933,70 @@ mod tests {
     fn png_dimensions_rejects_truncated_input() {
         let bytes = synthetic_png(100, 100);
         assert!(png_dimensions(&bytes[..10]).is_err());
+    }
+
+    // --- verify_capture_height ------------------------------------------
+    //
+    // This is the exact guard the review proved untestable while it lived
+    // inline in `run_capture`: mutating `> 1.0` to `> 1e9` left every test in
+    // this crate green, because nothing exercised the comparison in
+    // isolation. `truncation_of_more_than_one_pixel_is_rejected` below is the
+    // one that mutation now fails (a diff of 2.0px is `> 1.0` but nowhere
+    // near `> 1e9`, so the mutated function would wrongly return `Ok`).
+
+    #[test]
+    fn an_exact_height_match_is_accepted() {
+        assert!(verify_capture_height(1000, 1000.0).is_ok());
+    }
+
+    #[test]
+    fn a_one_pixel_gap_is_accepted() {
+        // The documented slack: sub-pixel CSS layout vs. an integer PNG
+        // height can legitimately differ by up to 1px with no truncation.
+        assert!(verify_capture_height(1001, 1000.0).is_ok());
+        assert!(verify_capture_height(999, 1000.0).is_ok());
+    }
+
+    #[test]
+    fn truncation_of_more_than_one_pixel_is_rejected() {
+        let err = verify_capture_height(1002, 1000.0).unwrap_err();
+        // Both numbers must be named — the whole point of a truncation error
+        // is telling the reader which two values disagreed, not just that
+        // "something" was short.
+        assert!(err.contains("1002"), "{err}");
+        assert!(err.contains("1000.0"), "{err}");
+    }
+
+    #[test]
+    fn a_large_truncation_is_also_rejected() {
+        // A realistic failure shape: a full-page screenshot that silently
+        // stopped a couple thousand pixels short of the real content height.
+        let err = verify_capture_height(1500, 4200.0).unwrap_err();
+        assert!(err.contains("1500"), "{err}");
+        assert!(err.contains("4200.0"), "{err}");
+    }
+
+    // --- classify_merge_glyph -------------------------------------------
+
+    #[test]
+    fn classify_merge_glyph_recognizes_both_known_merge_glyphs() {
+        assert_eq!(classify_merge_glyph("\u{F419}"), Some(true)); // nerd font
+        assert_eq!(classify_merge_glyph("><"), Some(true)); // plain-text fallback
+    }
+
+    #[test]
+    fn classify_merge_glyph_recognizes_both_known_commit_glyphs() {
+        assert_eq!(classify_merge_glyph("\u{F417}"), Some(false)); // nerd font
+        assert_eq!(classify_merge_glyph("*"), Some(false)); // plain-text fallback
+    }
+
+    #[test]
+    fn classify_merge_glyph_reports_unknown_rather_than_guessing() {
+        // A glyph from neither known icon set must never be defaulted to
+        // `false` — that would silently misreport a genuine merge (drawn
+        // with some future third icon set) as a plain commit.
+        assert_eq!(classify_merge_glyph("?"), None);
+        assert_eq!(classify_merge_glyph(""), None);
     }
 
     #[test]

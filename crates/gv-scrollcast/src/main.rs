@@ -301,6 +301,34 @@ fn resolve_out_dir(requested: &Path) -> Result<PathBuf> {
     Ok(candidate)
 }
 
+/// Whether git itself ignores `path` inside `repo_root`.
+///
+/// `git check-ignore` rather than a hand-rolled `.gitignore` parser: the
+/// precedence rules (negation, directory-only patterns, nested ignore files,
+/// `core.excludesFile`) are git's, and a second implementation of them would
+/// eventually disagree with the real one — in a guard whose whole job is
+/// deciding whether a write is safe. Asking the authority is cheaper and
+/// cannot drift.
+///
+/// **Fails closed.** If git cannot be run at all, this returns `false`, which
+/// makes the caller refuse an in-repo path rather than allow one. A missing
+/// git is a reason to be more careful about writing into a working tree, not
+/// less.
+fn git_ignores(repo_root: &Path, path: &Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("check-ignore")
+        .arg("-q")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Walk upward from the compiled-in crate location looking for a `.git`
 /// entry — the repository root this binary was built inside of. `None` if
 /// none is found (e.g. this binary was copied out of a checkout entirely),
