@@ -234,6 +234,60 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                         false,
                     ),
                 },
+                // "Fetch" (#232, M2.20f) — the mildest confirmation in this
+                // match, and the only new arm here that is actually reached:
+                // `menu.rs`'s `fetch_item` opens this modal directly, because
+                // unlike merge/checkout/delete a fetch has no branch a live
+                // pre-check could find it wrong about. Single tap, never
+                // danger-styled, and the body says what it does *not* touch —
+                // the whole reason a fetch is the safe half of the pair.
+                PendingOp::Fetch { remote } => ConfirmPrompt::plain(
+                    "Fetch from remote",
+                    format!(
+                        "Fetch from ‘{remote}’? This updates what this repository knows about \
+                         the remote's branches. Nothing local moves — not the branch you're on, \
+                         not the working tree, not a single commit."
+                    ),
+                    "Fetch",
+                    false,
+                    true,
+                ),
+                // "Pull" (#232, M2.20f, ADR 0044) — **not reached today.**
+                // `menu.rs`'s `pull_item` opens `Dialog::PullStrategy`
+                // instead, because `MergeStrategy` carries no "not yet
+                // chosen" value this modal could show (see `pull_picker_view`
+                // below, and `features::dialogs::core::PullTarget`).
+                //
+                // The arm exists because this match is exhaustive and a
+                // `unreachable!()` in a view is a panic in the browser, not a
+                // diagnostic. It is written to be *correct* rather than a
+                // placeholder: a future opener that does route a fully-formed
+                // pull here gets a true prompt naming the strategy that would
+                // actually run, not a lie that says "merge" while a rebase is
+                // dispatched — which is precisely the class of silent default
+                // ADR 0044 exists to forbid.
+                PendingOp::Pull {
+                    remote,
+                    branch,
+                    strategy,
+                } => ConfirmPrompt::plain(
+                    "Pull branch",
+                    match strategy {
+                        MergeStrategy::Merge => format!(
+                            "Pull ‘{branch}’ from ‘{remote}’ and merge? New commits on the \
+                             remote are fetched and merged into ‘{branch}’, making a merge \
+                             commit if the two have diverged."
+                        ),
+                        MergeStrategy::Rebase => format!(
+                            "Pull ‘{branch}’ from ‘{remote}’ and rebase? New commits on the \
+                             remote are fetched, then ‘{branch}’’s own commits are replayed on \
+                             top of them — which rewrites their history."
+                        ),
+                    },
+                    "Pull",
+                    false,
+                    true,
+                ),
                 // The two working-tree operations (M2.18b, #220). Both prompts —
                 // wording, which ceremony, what is enabled — come from the pure
                 // core, so the asymmetry between them is decided somewhere a host
