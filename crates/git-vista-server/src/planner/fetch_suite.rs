@@ -317,7 +317,14 @@ async fn the_remote_head_symref_is_not_reported_as_a_moved_branch() {
     let (_dir, repo) = repo_with_remote_ahead(1);
     // Point origin/HEAD at origin/main by hand. Git may or may not create this
     // itself depending on version; the assertion must not depend on that.
-    run(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+    run(
+        &repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
 
     let (handle, record) = admit_fetch("head-symref");
     let (status, body) = run_tracked(&repo, record.clone(), fetch_op()).await;
