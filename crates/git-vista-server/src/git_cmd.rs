@@ -363,6 +363,244 @@ pub(crate) async fn git_output_with_stdin(
     output.map(|o| redact_if_remote(o, declared))
 }
 
+/// What a [`git_streamed_for`] run ended as.
+///
+/// `Cancelled` is an **observed** outcome, never an inference: it is set only
+/// on the path where this module itself called `kill()`. The exit status of a
+/// SIGKILLed child is indistinguishable from several ordinary failures, so a
+/// caller that had to guess from `output.status` would guess wrong.
+pub(crate) struct StreamedRun {
+    /// Everything the child said, redacted exactly as [`git_output_for`]
+    /// redacts it. `stderr` is capped at [`STDERR_CAPTURE_CAP`] like every
+    /// other reader here — a cancelled fetch can have printed a great deal
+    /// of progress by the time it stops.
+    pub(crate) output: Output,
+    /// True when this function terminated the child because the cancel
+    /// signal fired.
+    pub(crate) cancelled: bool,
+}
+
+/// Spawn `git -C <repo> <args…>` and hand each **stderr record** to `on_line`
+/// *as it arrives*, killing the child if `cancel` fires (M2.20c, #229).
+///
+/// # Why a separate arity rather than a flag on `git_output_for`
+///
+/// `git_output_for` collects: nothing downstream of it can see a byte until
+/// the process has exited. That is right for every git the server ran before
+/// now — they finish in milliseconds — and useless for the one that does not.
+/// A fetch of a large repository is a minute of silence followed by an answer,
+/// and both halves of this slice (live progress, and a cancel that lands
+/// mid-transfer) need the child *while it is still running*. Rather than
+/// widen the collecting helper with a callback and a kill switch nobody else
+/// wants, this is its own function — going through the same [`sandboxed`]
+/// chokepoint, so it inherits #228's askpass hardening and the tier
+/// classification identically, and applying the same [`redact_if_remote`] to
+/// what it hands back.
+///
+/// # Records, not lines
+///
+/// git's `--progress` output separates updates with **carriage returns**, not
+/// newlines (verified against git 2.43: one `\n`-terminated line can hold a
+/// hundred `\r`-separated progress records). Splitting on `\n` alone would
+/// deliver one enormous record at the end of each phase — i.e. no live
+/// progress at all — so this splits on either.
+///
+/// Each record is redacted with [`crate::sandbox::network_exec::redact_url_userinfo`]
+/// *before* `on_line` sees it, not only in the collected `output`: the live
+/// path is a second sink for exactly the same secret shape, and a callback
+/// that logs what it is given must not be the hole in #228's redaction.
+///
+/// # Cancellation
+///
+/// `cancel` is a `watch<bool>` that latches. When it fires this function
+/// SIGKILLs the child and reaps it. **What it kills is the direct child** —
+/// the sandbox shim, which has `exec`'d git into the same pid — so `git
+/// fetch` itself dies. Any *grandchild* git started (an ssh transport, a
+/// credential helper) is not in a process group this function owns and may
+/// outlive the kill by however long it takes to notice its parent is gone;
+/// that is a documented limitation (ADR 0043), not an oversight.
+pub(crate) async fn git_streamed_for<F>(
+    repo: &Path,
+    args: &[&str],
+    declared: crate::sandbox::NetworkNeed,
+    mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    mut on_line: F,
+) -> std::io::Result<StreamedRun>
+where
+    F: FnMut(&str),
+{
+    let mut child = sandboxed(repo, args, declared)
+        .map_err(std::io::Error::other)?
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // If this future is dropped (the detached pipeline task was aborted),
+        // the child must not be left running against a real remote.
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let Some(stderr) = child.stderr.take() else {
+        return Err(std::io::Error::other("git stderr was not piped"));
+    };
+    // stdout is drained concurrently and kept: `git fetch` says little there,
+    // but an undrained pipe is a deadlock waiting for a chattier caller.
+    let stdout_task = child
+        .stdout
+        .take()
+        .map(|out| tokio::spawn(async move { drain_stdout(out).await }));
+
+    let mut reader = stderr;
+    let mut buf = [0u8; READ_CHUNK];
+    let mut pending: Vec<u8> = Vec::new();
+    let mut captured: Vec<u8> = Vec::new();
+    let mut cancelled = false;
+
+    loop {
+        let read = tokio::select! {
+            // Biased so a cancel that is already latched wins over a stream
+            // that has bytes ready: without this, a fetch receiving objects
+            // flat out could keep the read arm ready forever and starve the
+            // cancel arm.
+            biased;
+            () = wait_for_cancel(&mut cancel) => {
+                cancelled = true;
+                let _ = child.start_kill();
+                // Fall through to the wait below: the child must still be
+                // reaped, and whatever it managed to say is still ours.
+                break;
+            }
+            read = reader.read(&mut buf) => read?,
+        };
+        if read == 0 {
+            break;
+        }
+        if captured.len() < STDERR_CAPTURE_CAP {
+            let room = STDERR_CAPTURE_CAP - captured.len();
+            captured.extend_from_slice(&buf[..read.min(room)]);
+        }
+        pending.extend_from_slice(&buf[..read]);
+        emit_records(&mut pending, &mut on_line);
+        // `captured` is capped; `pending` must be too. It normally holds one
+        // partial record (a git progress record is tens of bytes), but a
+        // remote that streams without ever emitting `\r` or `\n` would
+        // otherwise grow it without bound — an unbounded allocation driven by
+        // a peer, which is the shape every other reader in this file exists
+        // to refuse. Flushing what we have as one record keeps the callback
+        // fed and the buffer bounded.
+        if pending.len() > MAX_PENDING_RECORD {
+            let oversized = std::mem::take(&mut pending);
+            emit_one(&oversized, &mut on_line);
+        }
+    }
+    // Whatever is left is a partial record; hand it over rather than drop it —
+    // a killed child's last words are exactly the interesting ones.
+    if !pending.is_empty() {
+        let tail = std::mem::take(&mut pending);
+        emit_one(&tail, &mut on_line);
+    }
+
+    let status = child.wait().await?;
+
+    // After a kill, **nothing more is read**, and that is a correctness point
+    // rather than a shortcut. The pipes' write ends are inherited by whatever
+    // the child had spawned — a transport helper, a credential helper, an
+    // `upload-pack` on the far side of a local remote — and those are
+    // processes this function does not own and cannot reap (see the doc
+    // comment's grandchild note). Reading to EOF would therefore block until
+    // *they* exit, which is exactly the wait the operator just asked to end:
+    // a cancel that hangs for as long as the fetch would have taken is not a
+    // cancel. Whatever was captured before the kill is the child's last words,
+    // and that is what the caller gets.
+    let stdout = match stdout_task {
+        Some(task) if cancelled => {
+            task.abort();
+            Vec::new()
+        }
+        Some(task) => task.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    Ok(StreamedRun {
+        output: redact_if_remote(
+            Output {
+                status,
+                stdout,
+                stderr: captured,
+            },
+            declared,
+        ),
+        cancelled,
+    })
+}
+
+/// Resolve the moment `cancel` is (or becomes) set, and **never** otherwise.
+///
+/// The "never" half is load-bearing and easy to get wrong: this sits in a
+/// `select!` arm, so a future that resolved immediately when there is nothing
+/// to wait on would win the race every iteration and starve the read arm
+/// forever. Both no-cancellation cases — no receiver at all (an untracked
+/// pipeline run) and every sender dropped — therefore park on
+/// `pending()` rather than returning.
+async fn wait_for_cancel(cancel: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    let Some(rx) = cancel else {
+        return std::future::pending().await;
+    };
+    // Scoped so the `Ref` guard is dropped before any await below.
+    if *rx.borrow_and_update() {
+        return;
+    }
+    if rx.wait_for(|c| *c).await.is_err() {
+        std::future::pending().await
+    }
+}
+
+/// Longest run of bytes [`git_streamed_for`] will hold waiting for a record
+/// delimiter before flushing it anyway. Generously past any real git progress
+/// record (tens of bytes) and past its longest ordinary message.
+const MAX_PENDING_RECORD: usize = 64 * 1024;
+
+/// Split `pending` on `\r` / `\n` and hand each complete record to `on_line`,
+/// leaving any trailing partial record in the buffer.
+fn emit_records<F: FnMut(&str)>(pending: &mut Vec<u8>, on_line: &mut F) {
+    let mut start = 0usize;
+    for i in 0..pending.len() {
+        if pending[i] == b'\r' || pending[i] == b'\n' {
+            emit_one(&pending[start..i], on_line);
+            start = i + 1;
+        }
+    }
+    if start > 0 {
+        pending.drain(..start);
+    }
+}
+
+/// One record, redacted, skipped if it is empty after trimming.
+fn emit_one<F: FnMut(&str)>(record: &[u8], on_line: &mut F) {
+    let text = String::from_utf8_lossy(record);
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    on_line(&crate::sandbox::network_exec::redact_url_userinfo(text));
+}
+
+/// Drain a child's stdout to EOF under the same cap as [`drain_stderr`].
+async fn drain_stdout(mut stdout: tokio::process::ChildStdout) -> Vec<u8> {
+    let mut kept: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; 8 * 1024];
+    loop {
+        match stdout.read(&mut chunk).await {
+            Ok(0) | Err(_) => return kept,
+            Ok(read) => {
+                if kept.len() < STDERR_CAPTURE_CAP {
+                    let room = STDERR_CAPTURE_CAP - kept.len();
+                    kept.extend_from_slice(&chunk[..read.min(room)]);
+                }
+            }
+        }
+    }
+}
+
 /// Declares `NetworkNeed::Local` for the same reason [`git_output`] does: all
 /// three production call sites are `/api/diff`'s `diff` reads
 /// (`--name-status`, `--numstat`, `--patch`), none of which can reach a
@@ -967,6 +1205,98 @@ mod tests {
     use std::time::Duration;
 
     use tokio::io::AsyncWriteExt;
+
+    /// Collect what [`emit_records`] delivers for one buffer, and what it
+    /// leaves behind for the next read.
+    fn split(bytes: &[u8]) -> (Vec<String>, Vec<u8>) {
+        let mut pending = bytes.to_vec();
+        let mut out = Vec::new();
+        emit_records(&mut pending, &mut |r: &str| out.push(r.to_string()));
+        (out, pending)
+    }
+
+    /// M2.20c (#229), the "records, not lines" claim: git separates progress
+    /// updates with **carriage returns**, and the splitter must deliver each
+    /// one as it arrives.
+    ///
+    /// The premise is asserted in the same test: this buffer — captured from
+    /// a real `git fetch --progress` — contains exactly **one** `\n`, so a
+    /// `\n`-only splitter would deliver one record at the end of the phase,
+    /// i.e. no live progress at all. Three records out of a one-line buffer
+    /// is the whole property.
+    #[test]
+    fn progress_records_are_split_on_carriage_returns_not_only_newlines() {
+        let buf = b"remote: Counting objects:  10% (1/10)\rremote: Counting objects:  \
+                    20% (2/10)\rremote: Counting objects: 100% (10/10), done.\n";
+        assert_eq!(
+            buf.iter().filter(|b| **b == b'\n').count(),
+            1,
+            "the fixture must be a single line, or this proves nothing"
+        );
+        let (records, pending) = split(buf);
+        assert_eq!(records.len(), 3, "{records:?}");
+        assert!(records[0].ends_with("(1/10)"), "{}", records[0]);
+        assert!(records[2].ends_with("done."), "{}", records[2]);
+        assert!(
+            pending.is_empty(),
+            "a fully-delimited buffer leaves nothing"
+        );
+    }
+
+    /// A record that has not finished arriving is held, not delivered as a
+    /// truncated one — and is delivered whole once its delimiter arrives.
+    #[test]
+    fn a_partial_record_is_held_until_its_delimiter_arrives() {
+        let mut pending = b"Receiving objects:  66% (80/120)\rReceiving objec".to_vec();
+        let mut out: Vec<String> = Vec::new();
+        emit_records(&mut pending, &mut |r: &str| out.push(r.to_string()));
+        assert_eq!(out, vec!["Receiving objects:  66% (80/120)".to_string()]);
+        assert_eq!(pending, b"Receiving objec");
+
+        pending.extend_from_slice(b"ts:  67% (81/120)\r");
+        out.clear();
+        emit_records(&mut pending, &mut |r: &str| out.push(r.to_string()));
+        assert_eq!(out, vec!["Receiving objects:  67% (81/120)".to_string()]);
+        assert!(pending.is_empty());
+    }
+
+    /// #228's redaction covers the **live** path too, not only the collected
+    /// `Output` — the callback is a second sink for the same secret shape.
+    ///
+    /// Premise asserted: the raw record really does carry the literal secret,
+    /// so the delivered record lacking it is a fact about redaction rather
+    /// than about a fixture that never leaked.
+    #[test]
+    fn a_streamed_record_is_redacted_before_the_callback_sees_it() {
+        const SECRET: &str = "hunter2-streamed";
+        let raw = format!("remote: tried https://svc:{SECRET}@leaked.invalid/r.git\n");
+        assert!(
+            raw.contains(SECRET),
+            "the fixture must leak when unredacted"
+        );
+
+        let (records, _) = split(raw.as_bytes());
+        assert_eq!(records.len(), 1);
+        assert!(
+            !records[0].contains(SECRET),
+            "a credential reached the live callback: {}",
+            records[0]
+        );
+        assert!(
+            records[0].contains("leaked.invalid"),
+            "redaction must strip the userinfo and keep the rest: {}",
+            records[0]
+        );
+    }
+
+    /// Empty records — the trailing `\n` after a `\r`, or a bare `remote:` —
+    /// are dropped rather than delivered as noise the parser would have to
+    /// filter itself.
+    #[test]
+    fn empty_records_are_not_delivered() {
+        let (records, _) = split(b"a\r\n\r\rb\n");
+        assert_eq!(records, vec!["a".to_string(), "b".to_string()]);
+    }
 
     /// `git <args…>` in `repo`; asserts success. Same shape as the planner
     /// suites' fixtures, duplicated because those helpers are private to

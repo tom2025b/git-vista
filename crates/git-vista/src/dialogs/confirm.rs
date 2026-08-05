@@ -164,10 +164,19 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                 // abc1234"); the body adds what that means for history, and the
                 // pushed warning when the discarded state is on the remote.
                 PendingOp::Undo(u) => {
+                    // M2.20e (#231): this used to read "git-vista never
+                    // force-pushes", which stopped being true the day an
+                    // explicit force-with-lease publish existed. The invariant
+                    // it was describing is narrower and still holds — an *undo*
+                    // never rewrites the remote — so the sentence now says that,
+                    // and points at the thing a user would otherwise go looking
+                    // for.
                     let warn = if u.warn_pushed {
-                        " The discarded state is already pushed: origin keeps it \
-                         (git-vista never force-pushes), so the branch will show \
-                         as behind until it's pushed again."
+                        " The discarded state is already pushed: undoing here \
+                         changes nothing on origin (an undo never force-pushes), \
+                         so the branch will show as behind until it's pushed \
+                         again. Rewriting what origin has is a separate, \
+                         explicit force-publish."
                     } else {
                         ""
                     };
