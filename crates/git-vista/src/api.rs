@@ -21,11 +21,11 @@ use git_vista_core::status::RepoStatus;
 use git_vista_protocol::dto::TagDetail;
 use git_vista_protocol::operation::{IdempotencyKey, OperationId};
 use git_vista_protocol::{
-    ApiError, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
-    DeleteCloneRequest, PatchPlan, PatchPreview, ProtocolInfo, RebaseStatus, RepoMode,
-    RepositoryDescriptor, SelectRequest, SessionInfo, SessionRequest, StageDirection, StagingDiff,
-    WorktreePathsRequest, WorktreeStatus, CSRF_HEADER, IDEMPOTENCY_HEADER, OPERATION_HEADER,
-    PROTOCOL_HEADER, PROTOCOL_VERSION,
+    BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
+    PatchPlan, PatchPreview, ProtocolInfo, RebaseStatus, RepoMode, RepositoryDescriptor,
+    SelectRequest, SessionInfo, SessionRequest, StageDirection, StagingDiff, WorktreePathsRequest,
+    WorktreeStatus, CSRF_HEADER, IDEMPOTENCY_HEADER, OPERATION_HEADER, PROTOCOL_HEADER,
+    PROTOCOL_VERSION,
 };
 
 use crate::features::dialogs::commit::{amend_body, classify_amend_response, AmendOutcome};
@@ -519,14 +519,12 @@ fn network_error(e: gloo_net::Error) -> String {
 /// Turn the versioned server error envelope into the message the UI should show.
 /// Falling back to the raw body preserves useful errors from an older server.
 async fn response_error(resp: gloo_net::http::Response) -> String {
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if let Ok(error) = serde_json::from_str::<ApiError>(&body) {
-        format!("{} (request {})", error.error.message, error.request_id)
-    } else if body.trim().is_empty() {
-        format!("HTTP {status}")
-    } else {
-        body
+    // Flattened over `response_error_detail` so there is exactly one error
+    // parser (#316): every one of this helper's call sites now shows the
+    // envelope's `error.message` alone — the request id stopped riding along
+    // in the user-facing string and goes to the console instead.
+    match response_error_detail(resp).await {
+        Ok(m) | Err(m) => m,
     }
 }
 
@@ -913,15 +911,49 @@ fn is_transport_error(e: &gloo_net::Error) -> bool {
 async fn response_error_detail(resp: gloo_net::http::Response) -> Result<String, String> {
     let status = resp.status();
     match resp.text().await {
-        Ok(body) if !body.trim().is_empty() => Ok(body),
+        Ok(body) if !body.trim().is_empty() => {
+            // #316: one parser for every error body. The envelope's
+            // `error.message` is the handler's own text — the clone
+            // in-progress sentinel included, so `clone_response_should_poll`
+            // matches on the unwrapped message exactly as it did on the raw
+            // body — and the request id goes to the console, never onward.
+            let parsed = crate::features::dialogs::core::split_error_response(status, &body);
+            if let Some(id) = &parsed.request_id {
+                web_sys::console::error_1(
+                    &format!("git-vista: request {id} failed: {}", parsed.message).into(),
+                );
+            }
+            Ok(parsed.message)
+        }
         Ok(_) => Ok(format!("HTTP {status}")),
         Err(_) => Err(format!("HTTP {status}")),
     }
 }
 
+/// Unwrap a non-2xx write response for the modal error path (#316): the
+/// user gets `error.message` alone, and the request id — the server-side
+/// correlation handle — goes to the console, never into the modal. The
+/// split itself is pure and host-tested (`split_error_response`).
+async fn user_facing_error(route: &str, resp: gloo_net::http::Response) -> String {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let parsed = crate::features::dialogs::core::split_error_response(status, &body);
+    if let Some(id) = &parsed.request_id {
+        web_sys::console::error_1(
+            &format!(
+                "git-vista: POST {route} failed (request {id}): {}",
+                parsed.message
+            )
+            .into(),
+        );
+    }
+    parsed.message
+}
+
 /// Ask the backend to create `name` at `commit` (Issue #18, `POST /api/branch`).
-/// On a non-2xx response the body is git's own error text, returned as `Err` so
-/// the caller can show the real reason (branch exists, bad name, …).
+/// On a non-2xx response the envelope's `error.message` is returned as `Err`
+/// (#316) so the caller can show the real reason (branch exists, bad name, …)
+/// without the wire JSON around it.
 ///
 /// The network-failure retry that used to live here is now [`send_write`]'s,
 /// for every write rather than only this one: since M1.08 both attempts carry
@@ -937,10 +969,7 @@ pub async fn create_branch_request(name: &str, commit: &str) -> Result<(), Strin
     if resp.ok() {
         Ok(())
     } else {
-        Err(resp
-            .text()
-            .await
-            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+        Err(user_facing_error("/api/branch", resp).await)
     }
 }
 
@@ -948,8 +977,8 @@ pub async fn create_branch_request(name: &str, commit: &str) -> Result<(), Strin
 /// `allow_empty` picks `git commit --allow-empty` (empty commit) vs a plain
 /// `git commit` (staged changes). `branch` targets a branch other than the
 /// checked-out one — the branch-stub path, empty commits only; `None` commits
-/// on HEAD as before. As with the branch request, a non-2xx body is git's own
-/// error text, returned as `Err`.
+/// on HEAD as before. As with the branch request, a non-2xx body is
+/// unwrapped to the envelope's `error.message` (#316), returned as `Err`.
 pub async fn create_commit_request(
     message: &str,
     allow_empty: bool,
@@ -966,10 +995,7 @@ pub async fn create_commit_request(
     if resp.ok() {
         Ok(())
     } else {
-        Err(resp
-            .text()
-            .await
-            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+        Err(user_facing_error("/api/commit", resp).await)
     }
 }
 
@@ -1026,10 +1052,7 @@ pub async fn stage_request() -> Result<(), String> {
     if resp.ok() {
         Ok(())
     } else {
-        Err(resp
-            .text()
-            .await
-            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+        Err(user_facing_error("/api/stage", resp).await)
     }
 }
 
@@ -1044,10 +1067,7 @@ pub async fn unstage_request() -> Result<(), String> {
     if resp.ok() {
         Ok(())
     } else {
-        Err(resp
-            .text()
-            .await
-            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+        Err(user_facing_error("/api/unstage", resp).await)
     }
 }
 
@@ -1356,10 +1376,7 @@ pub async fn reset_test_repo_request() -> Result<String, String> {
     if resp.ok() {
         Ok(resp.text().await.unwrap_or_default())
     } else {
-        Err(resp
-            .text()
-            .await
-            .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+        Err(user_facing_error("/api/reset-test-repo", resp).await)
     }
 }
 

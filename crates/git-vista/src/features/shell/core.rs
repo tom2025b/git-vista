@@ -75,6 +75,10 @@ pub enum Overlay {
     /// The Activity panel (`Overlays::activity`) — the overlay Esc could not
     /// previously reach at all.
     Activity,
+    /// The write-failure notice (#316) — `Shell::error_notice`. A modal like
+    /// Confirm, so it participates in the same exclusivity and Esc handling
+    /// instead of being a native alert() outside the overlay system.
+    Error,
 }
 
 impl Overlay {
@@ -87,8 +91,8 @@ impl Overlay {
     ///
     /// - [`Overlay::Detail`] and [`Overlay::Activity`] → [`Dock::RightEdge`]: both are
     ///   right-docked panels, and stacking them just hides one.
-    /// - [`Overlay::CommitDialog`] and [`Overlay::Confirm`] → [`Dock::Modal`]: both are
-    ///   full-screen-backdrop modals.
+    /// - [`Overlay::CommitDialog`], [`Overlay::Confirm`] and [`Overlay::Error`] →
+    ///   [`Dock::Modal`]: all three are full-screen-backdrop modals.
     /// - [`Overlay::Menu`] → [`Dock::Anchored`]: the context menu floats at a pointer
     ///   coordinate over the canvas and legitimately coexists with a right-edge panel.
     /// - [`Overlay::Viewer`] → [`Dock::FullScreen`]: it sits over the panel it was
@@ -96,7 +100,7 @@ impl Overlay {
     pub fn dock(self) -> Dock {
         match self {
             Overlay::Detail | Overlay::Activity => Dock::RightEdge,
-            Overlay::CommitDialog | Overlay::Confirm => Dock::Modal,
+            Overlay::CommitDialog | Overlay::Confirm | Overlay::Error => Dock::Modal,
             Overlay::Menu => Dock::Anchored,
             Overlay::Viewer => Dock::FullScreen,
         }
@@ -464,6 +468,7 @@ mod tests {
             Overlay::Activity, // evicts Detail
             Overlay::Menu,     // already present: raised, not duplicated
             Overlay::Confirm,  // already present: raised, not duplicated
+            Overlay::Error,    // evicts Confirm — the third modal (#316)
         ] {
             s.present(o);
         }
@@ -509,12 +514,16 @@ mod tests {
     }
 
     #[test]
-    fn the_two_modals_evict_each_other() {
+    fn the_modals_evict_each_other() {
+        // Three modals since #316's error notice joined the dock. Any modal
+        // presenting must evict whichever modal currently holds Dock::Modal.
         let mut s = OverlayStack::default();
         assert_eq!(s.present(Overlay::CommitDialog), None);
         assert_eq!(s.present(Overlay::Confirm), Some(Overlay::CommitDialog));
         assert_eq!(s.present(Overlay::CommitDialog), Some(Overlay::Confirm));
-        assert_eq!(s.top(), Some(Overlay::CommitDialog));
+        assert_eq!(s.present(Overlay::Error), Some(Overlay::CommitDialog));
+        assert_eq!(s.present(Overlay::Confirm), Some(Overlay::Error));
+        assert_eq!(s.top(), Some(Overlay::Confirm));
     }
 
     #[test]

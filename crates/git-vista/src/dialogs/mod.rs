@@ -35,7 +35,7 @@ mod open_url;
 mod reset;
 
 pub use commit::commit_dialog_view;
-pub use confirm::confirm_modal_view;
+pub use confirm::{confirm_modal_view, error_modal_view};
 pub use open_url::open_url_view;
 pub use reset::reset_repo_view;
 

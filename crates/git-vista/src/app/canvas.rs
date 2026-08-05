@@ -639,6 +639,7 @@ pub(super) fn graph_canvas(
             {menu::menu_view(features, settings, read_only)}
             {dialogs::commit_dialog_view(features)}
             {dialogs::confirm_modal_view(features)}
+            {dialogs::error_modal_view(features)}
             {detail::detail_panel_view(features, settings, detail, ctx)}
             {activity::activity_panel_view(features, settings, read_only)}
             {viewer::viewer_view(features, settings, ctx)}

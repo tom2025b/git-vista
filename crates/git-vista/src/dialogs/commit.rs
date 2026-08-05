@@ -16,7 +16,7 @@ use crate::features::dialogs::commit::{
     submit_path, AmendOutcome, AmendPhase, AmendTarget, CommitIntent, DialogCopy, PlainCommit,
     Preflight, Recheck, ScopeLine, ScopeReview, SubmitPath,
 };
-use crate::features::dialogs::core::{Dialog, PATH_LIST_LIMIT, TOUCH_TARGET_STYLE};
+use crate::features::dialogs::core::{Dialog, ErrorNotice, PATH_LIST_LIMIT, TOUCH_TARGET_STYLE};
 use crate::features::status::signals as status_state;
 use crate::state::Features;
 
@@ -100,7 +100,15 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
                         g.force_bump();
                     });
                 }
-                Err(e) => alert(&format!("Couldn't create commit:\n{e}")),
+                // #316: the envelope's message in the app's own modal —
+                // never the raw JSON body in a native alert().
+                Err(e) => {
+                    dialogs.open(Dialog::Error);
+                    shell.open_error(ErrorNotice {
+                        title: "Couldn't create commit",
+                        body: e,
+                    });
+                }
             }
         });
     };
