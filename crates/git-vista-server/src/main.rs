@@ -112,6 +112,7 @@ use handlers::clone::{clone_repo, clone_status, delete_clone_repo};
 use handlers::commit::{amend_commit, create_commit, stage_all, unstage_all};
 use handlers::discard::{delete_untracked_paths, discard_tracked_paths};
 use handlers::fetch::fetch_remote;
+use handlers::plan::plan_operation;
 use handlers::protocol::protocol_info;
 use handlers::pull::pull_branch;
 use handlers::read::{
@@ -501,6 +502,14 @@ fn api_router(
             // the second with no journal-backed undo at all.
             .route("/api/discard-tracked-paths", post(discard_tracked_paths))
             .route("/api/delete-untracked-paths", post(delete_untracked_paths))
+            // M2.23d (#248, ADR 0046): build one reviewable Plan and hand it
+            // back — the only endpoint that mints a plan without running it,
+            // and what the MCP `plan_*` tools call. Registered here with the
+            // writes, not with the reads, for two independent reasons: it is
+            // the front half of a mutation (a plan is an approval token, not
+            // a report), and a LAN visualize session must never see one
+            // (ADR 0005). Executing an approved plan is #249's own route.
+            .route("/api/plan", post(plan_operation))
             // M1.08 (#61): what happened to one write, and its live progress.
             // Registered with the writes, not the reads — these describe write
             // outcomes, so the LAN router must never see them either (ADR 0005).
@@ -700,20 +709,34 @@ mod tests {
             Arc::new(CursorCodec::new()),
         );
         let cookie = bootstrap_cookie(router.clone(), "192.168.1.42:8080", &token).await;
-        let resp = router
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/commit")
-                    .header(header::HOST, "192.168.1.42:8080")
-                    .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
-                    .header(header::COOKIE, cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // `/api/plan` (M2.23d, #248) is checked here beside `/api/commit`:
+        // it mutates nothing, but it mints the approval token #249's submit
+        // stage accepts, and it reveals the repository's live generation,
+        // preconditions and expected ref changes. A LAN visualize session
+        // must not be able to ask for one — ADR 0005 says the route is never
+        // *built* on this router, and a 404 is what proves that (a 403 would
+        // mean it exists and something gated it).
+        for path in ["/api/commit", "/api/plan"] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .header(header::HOST, "192.168.1.42:8080")
+                        .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                        .header(header::COOKIE, cookie.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{path} is registered on the LAN router"
+            );
+        }
     }
 
     #[tokio::test]
@@ -734,21 +757,30 @@ mod tests {
         let cookie = bootstrap_cookie(router.clone(), "localhost:8080", &token).await;
         // /api/commit is registered POST-only; a GET reaches real routing and
         // gets axum's own 405 -- proving the path exists, in contrast to the
-        // LAN router's 404 above.
-        let resp = router
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/commit")
-                    .header(header::HOST, "localhost:8080")
-                    .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
-                    .header(header::COOKIE, cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        // LAN router's 404 above. This is the paired positive for the LAN
+        // test: without it, a `/api/plan` route deleted outright would still
+        // 404 there and the LAN assertion would pass vacuously.
+        for path in ["/api/commit", "/api/plan"] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .header(header::HOST, "localhost:8080")
+                        .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                        .header(header::COOKIE, cookie.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{path} is not registered on the loopback router"
+            );
+        }
     }
 
     /// M2.21b (#236) end to end: a real request through the real router — auth

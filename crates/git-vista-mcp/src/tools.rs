@@ -56,8 +56,22 @@ pub enum ToolError {
     Execution(String),
 }
 
-/// The catalog of tools this bridge advertises to `tools/list`.
+/// The catalog of tools this bridge advertises to `tools/list` — the
+/// read-only surface here, then M2.23d's (#248) `plan_*` build-only tools
+/// appended from [`crate::plan_tools`].
 pub fn tool_catalog() -> serde_json::Value {
+    let mut catalog = read_tool_catalog();
+    catalog
+        .as_array_mut()
+        .expect("the read catalog is a JSON array")
+        .extend(crate::plan_tools::plan_tool_catalog());
+    catalog
+}
+
+/// The read-only six (#245/#246), kept as their own function so
+/// [`tool_catalog`] above reads as "reads, then plans" rather than one
+/// 500-line literal.
+fn read_tool_catalog() -> serde_json::Value {
     serde_json::json!([
         {
             "name": "list_repositories",
@@ -203,6 +217,94 @@ pub fn tool_catalog() -> serde_json::Value {
     ])
 }
 
+/// Enforce, at call time, the `additionalProperties: false` that every
+/// advertised `inputSchema` declares — for the tool's own arguments and for
+/// every nested object schema inside them.
+///
+/// # Why this has to be code and not just schema text
+///
+/// Nothing between an MCP client and this dispatcher validates arguments
+/// against the advertised schema: the client sends whatever it sends, and each
+/// tool body then reads only the specific keys it knows about
+/// (`args.get("cursor")`, `annotation_arg(args, "annotation")`, …). Without
+/// this check the `additionalProperties: false` in `tools/list` is decorative
+/// — `every_tool_schema_is_a_closed_object` below pins the advertised *text*,
+/// but the *behaviour* was the opposite of what the text promises.
+///
+/// A misspelled **required** key was already caught, incidentally, by being
+/// "missing". A misspelled **optional** key was not caught at all, and that is
+/// the dangerous half, because the tool then proceeds as if the argument had
+/// never been given:
+///
+/// - `plan_create_tag` with `"anotation"` built a bare **lightweight** tag —
+///   no message, no GPG signature — for a caller who asked for a signed
+///   annotated one, and the review digest cannot tell the two apart
+///   (`delete_created_tag` either way), so an agent reading only the digest
+///   sees no sign the request was silently downgraded.
+/// - `get_graph` with `"curser"` silently re-fetches page 1 for ever.
+/// - A typo inside `force` escapes `force_arg`'s paired mode/tip check, which
+///   only cross-validates the two spellings it knows.
+///
+/// Unknown *tool* names are deliberately passed through untouched: they are
+/// [`ToolError::Unknown`]'s business (JSON-RPC `-32602`), not a schema
+/// complaint.
+fn reject_undeclared_arguments(name: &str, args: &serde_json::Value) -> Result<(), ToolError> {
+    let catalog = tool_catalog();
+    let Some(tool) = catalog
+        .as_array()
+        .expect("the catalog is a JSON array")
+        .iter()
+        .find(|t| t["name"].as_str() == Some(name))
+    else {
+        return Ok(());
+    };
+    reject_undeclared_in(&tool["inputSchema"], args, name)
+}
+
+/// [`reject_undeclared_arguments`]'s recursion: one schema node against one
+/// JSON value. Only object-shaped values with a `properties` block are
+/// inspected — a wrong-*typed* value is the typed extractors' business to
+/// report (they name the field and say what shape they wanted), and
+/// duplicating that here would only produce two different errors for one
+/// mistake.
+fn reject_undeclared_in(
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+    path: &str,
+) -> Result<(), ToolError> {
+    let (Some(object), Some(properties)) = (
+        value.as_object(),
+        schema.get("properties").and_then(|p| p.as_object()),
+    ) else {
+        return Ok(());
+    };
+    let closed = schema.get("additionalProperties") == Some(&serde_json::Value::Bool(false));
+    for (key, sub_value) in object {
+        match properties.get(key) {
+            Some(sub_schema) => {
+                reject_undeclared_in(sub_schema, sub_value, &format!("{path}.{key}"))?;
+            }
+            None if closed => {
+                let mut known: Vec<&str> = properties.keys().map(String::as_str).collect();
+                known.sort_unstable();
+                let accepted = if known.is_empty() {
+                    "(this tool takes no arguments)".to_string()
+                } else {
+                    known.join(", ")
+                };
+                return Err(ToolError::Execution(format!(
+                    "`{path}` has no argument named `{key}`; its schema is closed \
+                     (additionalProperties: false). Accepted: {accepted}. Refused rather \
+                     than dropped: a misspelled optional argument would otherwise leave \
+                     the call proceeding as if it had never been given."
+                )));
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 /// Run a tool by name with its JSON-RPC `arguments` object. `session` is
 /// authenticated lazily on first use and re-established once on a 401 — the
 /// server rotates sessions on restart, and the bridge may well outlive one
@@ -212,6 +314,9 @@ pub fn call_tool(
     arguments: &serde_json::Value,
     session: &mut Option<Session>,
 ) -> Result<serde_json::Value, ToolError> {
+    // The advertised schema, enforced — before any argument is read and long
+    // before anything authenticates. See [`reject_undeclared_arguments`].
+    reject_undeclared_arguments(name, arguments)?;
     match name {
         "list_repositories" => get_json::<serde_json::Value>("/api/catalog", session),
         "select_repository" => select_repository(arguments, session),
@@ -242,7 +347,14 @@ pub fn call_tool(
             let path = format!("/api/activity{qs}");
             get_json::<Vec<git_vista_core::activity::ActivityEvent>>(&path, session)
         }
-        other => Err(ToolError::Unknown(other.to_string())),
+        // M2.23d (#248): the `plan_*` build-only surface. Tried *after* the
+        // read tools and before the unknown-tool refusal, so a plan tool's
+        // name can never shadow a read tool's, and an unrecognised name is
+        // still `Unknown` rather than silently swallowed.
+        other => match crate::plan_tools::call_plan_tool_live(other, arguments, session) {
+            Some(result) => result,
+            None => Err(ToolError::Unknown(other.to_string())),
+        },
     }
 }
 
@@ -519,9 +631,10 @@ fn authed_fetch(
 /// `authed_post`'s injected POST closure: `(path, body, cookie, csrf) ->
 /// response`. Named so the signature below reads, rather than clippy's
 /// `type_complexity` firing on it inline.
-type PostFn<'a> = dyn FnMut(&str, &[u8], &str, &str) -> Result<HttpResponse, String> + 'a;
+pub(crate) type PostFn<'a> =
+    dyn FnMut(&str, &[u8], &str, &str) -> Result<HttpResponse, String> + 'a;
 
-fn authed_post(
+pub(crate) fn authed_post(
     path: &str,
     body: &[u8],
     session: &mut Option<Session>,
@@ -587,6 +700,11 @@ mod tests {
 
     #[test]
     fn the_tool_catalog_lists_exactly_the_six_read_tools() {
+        // #248 appended the `plan_*` surface after these, so the read tools
+        // are now a *prefix* of the catalog rather than the whole of it —
+        // still pinned in order, and still pinned to exactly these names, so
+        // a read tool silently added, removed or renamed fails here as
+        // before. `plan_tools`'s own census owns the rest of the catalog.
         let cat = tool_catalog();
         let names: Vec<&str> = cat
             .as_array()
@@ -594,18 +712,31 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            names,
-            [
-                "list_repositories",
-                "select_repository",
-                "get_graph",
-                "get_commit_detail",
-                "get_commit_diff",
-                "get_status",
-                "get_activity",
-            ]
+        let expected_reads = [
+            "list_repositories",
+            "select_repository",
+            "get_graph",
+            "get_commit_detail",
+            "get_commit_diff",
+            "get_status",
+            "get_activity",
+        ];
+        assert_eq!(names[..expected_reads.len()], expected_reads);
+        assert!(
+            names[expected_reads.len()..]
+                .iter()
+                .all(|n| n.starts_with("plan_")),
+            "a non-read, non-plan tool appeared in the catalog: {names:?}"
         );
+        // Nothing after the reads may be a *write*: this crate's whole
+        // premise is that the only mutation surface is a reviewable plan.
+        for forbidden in ["execute", "submit", "apply", "run"] {
+            assert!(
+                !names.iter().any(|n| n.contains(forbidden)),
+                "‘{forbidden}’ appears in a tool name — #248 ships no execution \
+                 capability; that is #249's slice"
+            );
+        }
     }
 
     #[test]
@@ -621,6 +752,211 @@ mod tests {
                 tool["name"]
             );
         }
+    }
+
+    /// A value of the shape a schema node declares — used below to feed every
+    /// tool exactly its own declared arguments, nested objects included.
+    fn placeholder(schema: &serde_json::Value) -> serde_json::Value {
+        match schema["type"].as_str() {
+            Some("object") => {
+                let mut filled = serde_json::Map::new();
+                if let Some(props) = schema["properties"].as_object() {
+                    for (key, sub) in props {
+                        filled.insert(key.clone(), placeholder(sub));
+                    }
+                }
+                serde_json::Value::Object(filled)
+            }
+            Some("array") => serde_json::json!([placeholder(&schema["items"])]),
+            Some("boolean") => serde_json::json!(true),
+            Some("integer") | Some("number") => serde_json::json!(1),
+            _ => serde_json::json!("x"),
+        }
+    }
+
+    /// The behavioural half of `every_tool_schema_is_a_closed_object` above.
+    /// That test pins the advertised *text*; this one pins that the text is
+    /// true — every advertised tool refuses an argument its schema does not
+    /// declare, rather than dropping it.
+    #[test]
+    fn every_advertised_tool_refuses_an_undeclared_argument() {
+        let catalog = tool_catalog();
+        let tools = catalog.as_array().unwrap();
+        assert!(
+            tools.len() >= 30,
+            "the catalog shrank to {} tools — this census would prove little",
+            tools.len()
+        );
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let args = serde_json::json!({ "gv_not_a_real_argument": "x" });
+            match reject_undeclared_arguments(name, &args) {
+                Err(ToolError::Execution(msg)) => assert!(
+                    msg.contains("gv_not_a_real_argument"),
+                    "{name} refused without naming the offending key: {msg}"
+                ),
+                other => panic!("{name} accepted an undeclared argument: {other:?}"),
+            }
+        }
+    }
+
+    /// The paired positive, so the check above is not simply "refuse
+    /// everything": every tool's own full set of declared arguments — nested
+    /// objects filled out too — passes untouched.
+    #[test]
+    fn every_tools_own_declared_arguments_pass_the_closed_schema_check() {
+        for tool in tool_catalog().as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let args = placeholder(&tool["inputSchema"]);
+            assert!(
+                reject_undeclared_arguments(name, &args).is_ok(),
+                "{name} rejected its own declared arguments: {args}"
+            );
+        }
+    }
+
+    /// Nested schemas are closed too, and the refusal says *where*. `force`
+    /// and `annotation` are the only nested objects on this surface, and each
+    /// carries a field whose silent loss changes what git actually does.
+    #[test]
+    fn an_undeclared_argument_nested_inside_an_object_is_refused_too() {
+        let push = serde_json::json!({
+            "branch": "b", "remote": "origin", "set_upstream": false,
+            "force": { "mode": "none", "expected_remote_tipp": "x" }
+        });
+        match reject_undeclared_arguments("plan_push_branch", &push) {
+            Err(ToolError::Execution(msg)) => {
+                assert!(msg.contains("expected_remote_tipp"), "{msg}");
+                assert!(msg.contains("force"), "the refusal must say where: {msg}");
+            }
+            other => panic!("a typo inside `force` was accepted: {other:?}"),
+        }
+        let tag = serde_json::json!({
+            "name": "v1", "target": "0".repeat(40),
+            "annotation": { "message": "release", "signn": true }
+        });
+        match reject_undeclared_arguments("plan_create_tag", &tag) {
+            Err(ToolError::Execution(msg)) => {
+                assert!(msg.contains("signn"), "{msg}");
+                assert!(
+                    msg.contains("annotation"),
+                    "the refusal must say where: {msg}"
+                );
+            }
+            other => panic!("a typo inside `annotation` was accepted: {other:?}"),
+        }
+    }
+
+    /// The finding in its original clothes, driven through the real
+    /// dispatcher: `anotation` (one `n`) used to be read by nobody, so
+    /// `annotation_arg` answered `Ok(None)` and `plan_create_tag` built a bare
+    /// **lightweight** tag — no message, no GPG signature — for a caller who
+    /// asked for a signed annotated one. Nothing errored, and the review
+    /// digest says `delete_created_tag` for either kind, so an agent reading
+    /// the digest could not tell it had been downgraded.
+    ///
+    /// `target` is omitted deliberately: that keeps the call a purely local
+    /// refusal whichever way it fails, so removing the schema check turns this
+    /// test red (the message becomes "missing required argument `target`")
+    /// instead of turning it into a live network call.
+    #[test]
+    fn a_typod_annotation_cannot_silently_downgrade_a_signed_tag_to_a_lightweight_one() {
+        let mut none = None;
+        let args = serde_json::json!({
+            "name": "v1",
+            "anotation": { "message": "release", "sign": true }
+        });
+        match call_tool("plan_create_tag", &args, &mut none) {
+            Err(ToolError::Execution(msg)) => assert!(
+                msg.contains("anotation"),
+                "the misspelled key was dropped rather than refused: {msg}"
+            ),
+            other => panic!("a misspelled `annotation` was accepted: {other:?}"),
+        }
+        assert!(none.is_none(), "never authenticated for a refused call");
+    }
+
+    /// The same enforcement reaches the read tools, which have the same
+    /// exposure (`curser` for `cursor` would silently re-fetch page 1 for
+    /// ever). `id` is omitted for the same network-safety reason as above.
+    #[test]
+    fn a_misspelled_read_tool_argument_is_refused_by_call_tool_too() {
+        let mut none = None;
+        match call_tool(
+            "get_commit_detail",
+            &serde_json::json!({ "idd": "deadbeef" }),
+            &mut none,
+        ) {
+            Err(ToolError::Execution(msg)) => assert!(msg.contains("idd"), "{msg}"),
+            other => panic!("a misspelled read-tool argument was accepted: {other:?}"),
+        }
+        assert!(none.is_none());
+    }
+
+    /// The one seam that decides whether #248 works at all: `call_tool`'s
+    /// wildcard arm, which is the *only* place production code joins the
+    /// JSON-RPC `tools/call` dispatcher to the plan-tool implementation
+    /// (`main.rs`'s `tools::call_tool` → this arm →
+    /// `plan_tools::call_plan_tool_live`).
+    ///
+    /// Nothing covered it before: every `plan_tools` unit test calls the
+    /// injectable `call_plan_tool` directly, and the one integration test that
+    /// would have caught it is `#[ignore]`d behind a live server. Severing the
+    /// arm — `call_plan_tool_live` returning `None` unconditionally — left all
+    /// 47 tests green while every one of the 23 `plan_*` tools would answer
+    /// "Unknown tool" to a real MCP client.
+    ///
+    /// Each tool is called with **no arguments**, so the refusal is local and
+    /// unconditional: a plan tool that is reachable answers `Execution`
+    /// ("missing required argument"), and one that is not answers `Unknown`.
+    #[test]
+    fn every_plan_tool_is_reachable_through_call_tools_dispatcher() {
+        let catalog = tool_catalog();
+        let mut reached = 0;
+        let mut argument_free: Vec<&str> = Vec::new();
+        for tool in catalog.as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            if !name.starts_with("plan_") {
+                continue;
+            }
+            if tool["inputSchema"]["required"]
+                .as_array()
+                .expect("every plan schema declares a `required` list")
+                .is_empty()
+            {
+                argument_free.push(name);
+                continue;
+            }
+            let mut none = None;
+            match call_tool(name, &serde_json::json!({}), &mut none) {
+                Err(ToolError::Execution(msg)) => {
+                    assert!(msg.contains("missing required argument"), "{name}: {msg}");
+                    reached += 1;
+                }
+                Err(ToolError::Unknown(unknown)) => panic!(
+                    "`{unknown}` is advertised by tools/list but call_tool's dispatcher \
+                     never reaches the plan-tool implementation — every plan_* call would \
+                     answer ‘Unknown tool’ to a real MCP client"
+                ),
+                Ok(_) => panic!("{name} built a plan from no arguments at all"),
+            }
+            assert!(
+                none.is_none(),
+                "{name} authenticated for a call it refused locally"
+            );
+        }
+        assert_eq!(
+            reached, 21,
+            "expected 21 plan tools with a required argument to be exercised here"
+        );
+        // The two that cannot be probed this way, pinned by name: a tool that
+        // silently LOST its required arguments would land here instead of
+        // being exercised above, and this is what says so.
+        assert_eq!(
+            argument_free,
+            ["plan_stage_all", "plan_unstage_all"],
+            "the set of argument-free plan tools changed"
+        );
     }
 
     #[test]
@@ -816,6 +1152,55 @@ mod tests {
         .unwrap();
         assert_eq!(body, b"Selected.");
         assert_eq!(seen, [("gv_session=live".to_string(), "csrf".to_string())]);
+    }
+
+    /// Every failure string these two helpers build becomes a
+    /// `ToolError::Execution` the MCP host may render or log, so neither may
+    /// carry the live cookie or CSRF token. The error is assembled from the
+    /// path, the status and the *server's* body — never from the session —
+    /// and this pins that, in both the first-response and the
+    /// retried-after-401 legs.
+    #[test]
+    fn a_failed_request_never_leaks_the_session_cookie_or_csrf_into_its_error() {
+        const COOKIE: &str = "gv_session=CookieSecretABCDEF";
+        const CSRF: &str = "CsrfSecret123456";
+        let secret_session = || Session {
+            cookie: COOKIE.to_string(),
+            csrf: CSRF.to_string(),
+        };
+
+        let mut sess = Some(secret_session());
+        let get_err = authed_fetch(
+            "/api/status/v2",
+            &mut sess,
+            &mut |_, _| Ok(resp(500, b"the server said no")),
+            &mut || panic!("500 is not 401 — no re-authentication"),
+        )
+        .unwrap_err();
+
+        let mut sess = Some(secret_session());
+        let post_err = authed_post(
+            "/api/plan",
+            b"{}",
+            &mut sess,
+            &mut |_, _, _, _| Ok(resp(401, b"stale")),
+            &mut || Ok(secret_session()),
+        )
+        .unwrap_err();
+
+        for err in [&get_err, &post_err] {
+            // Anti-vacuity first: these really are the messages a client sees,
+            // carrying the server's own words — not empty strings that would
+            // pass the leak check for the wrong reason.
+            assert!(err.contains("/api/"), "{err}");
+            assert!(!err.contains("CookieSecretABCDEF"), "cookie leaked: {err}");
+            assert!(!err.contains("CsrfSecret123456"), "csrf leaked: {err}");
+        }
+        assert!(get_err.contains("the server said no"), "{get_err}");
+        assert!(
+            post_err.contains("even after re-authenticating"),
+            "{post_err}"
+        );
     }
 
     #[test]

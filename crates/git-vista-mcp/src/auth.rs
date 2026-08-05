@@ -65,6 +65,15 @@ pub struct Session {
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured rather than field-accessed on purpose: a field added to
+        // `Session` later is a **compile error right here** until somebody
+        // decides how (or whether) it may be printed. Without this, a new
+        // secret-bearing field would simply be absent from the rendering —
+        // which looks safe — or, worse, someone would "fix" the omission by
+        // deriving `Debug`. `tests::debugging_a_session_prints_neither_secret`
+        // pins the behaviour; this pins that the impl stays in step with the
+        // struct.
+        let Session { cookie: _, csrf: _ } = self;
         f.debug_struct("Session")
             .field("cookie", &"gv_session=<redacted>")
             .field("csrf", &"<redacted>")
@@ -180,6 +189,59 @@ mod tests {
         );
     }
 
+    /// Every `.rs` file in this crate's `src/`, read from disk at test time.
+    ///
+    /// This used to be a hand-written `include_str!` list — and #248 added
+    /// `plan_tools.rs` (1887 lines, a third of the crate) without updating it,
+    /// so the guard below kept passing green while silently covering none of
+    /// the file most likely to grow next. Enumerating the directory means the
+    /// next file cannot be forgotten the same way; nothing here needs editing
+    /// when one is added.
+    fn crate_sources() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading {dir:?}: {e}"))
+            .map(|entry| entry.expect("a readable directory entry").path())
+            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+            .map(|p| {
+                let name = p
+                    .file_name()
+                    .expect("a file, so it has a name")
+                    .to_string_lossy()
+                    .into_owned();
+                let body =
+                    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {p:?}: {e}"));
+                (name, body)
+            })
+            .collect();
+        sources.sort();
+        sources
+    }
+
+    /// Anti-vacuity for the guard below: a directory read that found nothing
+    /// (a moved `src/`, a wrong `CARGO_MANIFEST_DIR`, a filter that stopped
+    /// matching) would make the scan pass by scanning zero bytes. The names
+    /// here are a **floor**, not the list — a new file is picked up
+    /// automatically and needs no edit.
+    #[test]
+    fn the_source_census_really_sees_every_file_in_the_crate() {
+        let sources = crate_sources();
+        let names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
+        for expected in ["auth.rs", "http.rs", "main.rs", "plan_tools.rs", "tools.rs"] {
+            assert!(
+                names.contains(&expected),
+                "the source census missed {expected}: {names:?}"
+            );
+        }
+        for (name, body) in &sources {
+            assert!(
+                body.len() > 500,
+                "{name} was read as only {} bytes — the census is scanning nothing",
+                body.len()
+            );
+        }
+    }
+
     /// The #245 acceptance criterion — the token never lands in argv, env, or
     /// any file this crate writes — held structurally, not just by prose: the
     /// production half of every source file must stay free of the APIs that
@@ -187,12 +249,7 @@ mod tests {
     /// forces conscious review instead of slipping through.
     #[test]
     fn production_code_never_writes_files_env_or_spawns_processes() {
-        let sources = [
-            ("main.rs", include_str!("main.rs")),
-            ("auth.rs", include_str!("auth.rs")),
-            ("http.rs", include_str!("http.rs")),
-            ("tools.rs", include_str!("tools.rs")),
-        ];
+        let sources = crate_sources();
         let forbidden = [
             "fs::write",
             "File::create",
@@ -200,7 +257,7 @@ mod tests {
             "env::set_var",
             "Command::new",
         ];
-        for (name, src) in sources {
+        for (name, src) in &sources {
             let production = src.split("#[cfg(test)]").next().unwrap();
             for needle in forbidden {
                 assert!(
@@ -210,6 +267,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The hand-written [`Session`] `Debug` impl is the only thing standing
+    /// between the live session cookie and a `format!("{session:?}")` in some
+    /// future error string — `tools.rs` already folds server error bodies into
+    /// `ToolError::Execution(String)`, which the MCP host may log or show.
+    /// The impl carried a doc comment saying exactly that, and nothing pinned
+    /// it: replacing the two redactions with `&self.cookie` / `&self.csrf`
+    /// left all 47 tests green.
+    #[test]
+    fn debugging_a_session_prints_neither_the_cookie_nor_the_csrf_token() {
+        const COOKIE_SECRET: &str = "gv_session=CookieSecret0123456789";
+        const CSRF_SECRET: &str = "CsrfSecret9876543210";
+        let session = Session {
+            cookie: COOKIE_SECRET.to_string(),
+            csrf: CSRF_SECRET.to_string(),
+        };
+        let rendered = format!("{session:?}");
+
+        assert!(
+            !rendered.contains("CookieSecret0123456789"),
+            "the live session cookie reached a Debug rendering: {rendered}"
+        );
+        assert!(
+            !rendered.contains("CsrfSecret9876543210"),
+            "the CSRF token reached a Debug rendering: {rendered}"
+        );
+        // Redacted, not merely absent: an impl that printed nothing at all
+        // would pass the two assertions above while making every debug log
+        // useless. Both fields must still be named, both must say so.
+        assert!(rendered.contains("Session"), "{rendered}");
+        assert!(rendered.contains("cookie"), "{rendered}");
+        assert!(rendered.contains("csrf"), "{rendered}");
+        assert_eq!(
+            rendered.matches("<redacted>").count(),
+            2,
+            "both secrets must be redacted, not one: {rendered}"
+        );
+
+        // Anti-vacuity: these sentinels ARE Debug-visible strings, so their
+        // absence above is this impl's doing and not an artefact of values
+        // that could never have printed in the first place.
+        let leaky = format!("{:?}", (&session.cookie, &session.csrf));
+        assert!(
+            leaky.contains("CookieSecret0123456789") && leaky.contains("CsrfSecret9876543210"),
+            "the test's own sentinels do not survive Debug: {leaky}"
+        );
     }
 
     #[test]

@@ -57,4 +57,5 @@ it, and note the link in both.
 | [0043](0043-fetch-execution.md) | Fetch execution: progress on the lifecycle that already exists, a cancel that kills the child, and an outcome read from refs rather than prose | Accepted — implemented and tested; its claim about *which host* a fetch may reach is corrected by ADR 0047 |
 | [0044](0044-pull-execution.md) | Pull execution: one fetch in the server, a strategy the wire must state, and a conflict that is an outcome rather than an error | Accepted — implemented and tested |
 | [0045](0045-push-execution.md) | Push execution: a force that cannot be built, a lease checked by two parties, and a cancel that refuses to reassure | Accepted — implemented and tested |
+| [0046](0046-mcp-plan-tool-surface.md) | The MCP plan-tool surface: 23 build-only tools, one endpoint, and a variant that cannot be exposed | Accepted — implemented and tested |
 | [0047](0047-remote-target-boundary.md) | Which host a fetch may contact: a name-shaped newtype *and* a precondition that refuses instead of being skipped | Accepted — implemented and tested |
