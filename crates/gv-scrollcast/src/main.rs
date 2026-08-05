@@ -28,22 +28,36 @@
 //! lane's mandate. Each is explained where it's implemented below; this list
 //! is the map so a reader doesn't have to hunt for them:
 //!
-//! 1. **Pivot callouts never fire yet** (see `run_pipeline`). `chapters::
-//!    detect_pivots` needs `&[git_vista_core::model::GraphRow]` — full
-//!    commit metadata (refs, parents, message, time) — but `capture.rs`'s
-//!    in-page probe (capture.rs:188-210) extracts only pixel y-positions.
-//!    No module in this pipeline currently produces a `Vec<GraphRow>`
-//!    index-aligned with `commit_ys`, and `detect_pivots` *panics* (not
-//!    errors) on a length mismatch (chapters.rs:201-207, tested at
-//!    chapters.rs:538-543) — so calling it with fabricated placeholder rows
-//!    would either crash on the assert or silently produce zero pivots
-//!    while looking wired. Neither is honest. This CLI always passes an
-//!    empty pivot list instead, which is exactly what `chapters::
-//!    format_chapters` is documented to accept (chapters.rs:365-401): a
-//!    `chapters.txt` sidecar is still written, just with only the mandatory
-//!    `0:00 Start` line, and `pacing::build_timeline` runs with no dwells.
-//!    `--max-pivots` is parsed and stored for the day a lane adds that
-//!    extraction to `capture.rs`, but has no effect today.
+//! 1. **Pivot callouts never fire yet** (see `run_pipeline`'s `chapters::
+//!    detect_pivots` call site for the full accounting). `detect_pivots`
+//!    needs `&[git_vista_core::model::GraphRow]` — a real `Oid`, an `i64`
+//!    Unix timestamp, and a real `Vec<GitRef>` with ref names/kinds. A later
+//!    repair pass gave `capture.rs` a `CaptureResult::commit_metas:
+//!    Vec<CommitMeta>` (capture.rs:434-453) — pixel-aligned per-commit text
+//!    read straight off the rendered sheet — but `CommitMeta` cannot be
+//!    turned into a `GraphRow` honestly: its `short_sha` is a pre-truncated
+//!    7-char display string with no path back to a real `Oid`, its
+//!    `date_text` is a locale-formatted display string with no path back to
+//!    an epoch, and it carries no parent list and no ref names at all (only
+//!    a bare `has_refs: bool`). Fabricating those fields would either trip
+//!    `detect_pivots`'s length assert (chapters.rs:201-207, it panics, not
+//!    errors, on mismatch) if built wrong, or silently render invented tag
+//!    names and dates on a callout card if built "successfully" — worse
+//!    than the gap. Closing this for real needs either `chapters.rs`
+//!    (lane 3's file, not this lane's) gaining a `CommitMeta`-shaped entry
+//!    point, or this crate independently re-deriving real `GraphRow`s from
+//!    the actual repository (a new dependency and a new `--repo` flag,
+//!    materially bigger than a repair pass). So this CLI still always
+//!    passes an empty pivot list to `detect_pivots`, which is exactly what
+//!    `chapters::format_chapters` is documented to accept (chapters.rs:
+//!    365-401): a `chapters.txt` sidecar is still written, just with only
+//!    the mandatory `0:00 Start` line, and `pacing::build_timeline` runs
+//!    with no dwells. The (still-empty) `pivots` value is threaded through
+//!    to `EncodeConfig::pivots` too, so the callout-card renderer a
+//!    concurrent lane built in `encode.rs` is fully wired end-to-end and
+//!    will start firing the moment gap 1 above actually closes, with no
+//!    second edit needed here. `--max-pivots` is parsed and stored for that
+//!    day, but has no effect today.
 //! 2. **`--date-overlay` is accepted but not drawn** (see `run`). Burning a
 //!    per-frame marker means writing pixels *while cropping each frame* —
 //!    `encode.rs`'s only public entry point, `encode_video`, has no overlay
@@ -66,6 +80,38 @@
 //!    now-empty nested `out/`. Every other path used after that point is
 //!    already absolute, so the directory swap cannot affect anything else in
 //!    this run.
+//!
+//! # Two review findings fixed in this same repair pass (not gaps — bugs)
+//!
+//! Unlike the three items above, these are not "won't fix without another
+//! lane's file" — they were confirmed defects this lane's own file set could
+//! fix outright:
+//!
+//! - **`--duration`/captured width are validated as early as possible.**
+//!   `validate_duration` rejects non-finite or non-positive `--duration`
+//!   before Chromium is even resolved (NaN/negative would otherwise
+//!   silently corrupt `pacing::build_timeline`'s arithmetic or quietly
+//!   produce a zero-length timeline that only errors once `encode_video`
+//!   reports zero frames). `run_pipeline` also checks the *measured*
+//!   `capture_result.width` against `encode::VIDEO_WIDTH` immediately on
+//!   return from `capture_print_sheet` — before pacing or encode runs —
+//!   because the requested `--width` (checked at startup by
+//!   `validate_width`) and the browser's actual rendered width can still
+//!   diverge (horizontal overflow in the sheet's own content), and that
+//!   divergence previously surfaced only deep inside `encode::
+//!   extract_frame`, after a multi-minute capture had already run.
+//! - **The scroll timeline is built against the *scrollable* height, not
+//!   the full captured height.** `encode::clamp_crop_y` can only place the
+//!   camera between `0` and `image_height - VIDEO_HEIGHT`; a timeline built
+//!   against the full image height kept demanding positions past that for
+//!   roughly the last `VIDEO_HEIGHT` px worth of scroll-time, all clamping
+//!   to the same crop — a frozen tail. `run_pipeline` now computes
+//!   `scrollable_height_px = capture_result.height.saturating_sub(VIDEO_
+//!   HEIGHT)` once and passes it to both `build_multipliers` (and therefore
+//!   `pacing::commit_density`) and `pacing::build_timeline`, matching the
+//!   mechanism the encode lane's own repair-pass test proves
+//!   (`last_frame_crop_y_reaches_exactly_the_scrollable_bottom_when_the_
+//!   caller_passes_the_reduced_height`, encode.rs).
 
 // `#[allow(unused_variables)]`: capture.rs is lane 1's file, outside this
 // lane's set (main.rs/README.md/Cargo.toml only), and its own `run_capture`
@@ -201,6 +247,7 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     validate_width(cli.width)?;
+    validate_duration(cli.duration)?;
     if cli.date_overlay {
         eprintln!(
             "gv-scrollcast: warning: --date-overlay was requested but is not yet implemented \
@@ -245,6 +292,36 @@ fn validate_width(width: u32) -> Result<()> {
     Ok(())
 }
 
+/// Validate `--duration` before any Chromium/ffmpeg work starts (review
+/// finding, Job A): `clap`'s `f64` parser accepts `"nan"`, `"inf"`,
+/// `"-inf"`, and `"infinity"` (case-insensitively) as well as zero and
+/// negative numbers — none of which `pacing::build_timeline` can turn into a
+/// sane timeline. A `NaN` duration would make every `scroll_budget`/
+/// `band_secs` computation in `build_timeline` (pacing.rs:127-197) itself
+/// `NaN`, which then compares `false` against every `<=`/`>` it meets,
+/// silently producing whatever fallback branch happens to run first — not a
+/// clean error. Zero or negative durations aren't rejected by `build_timeline`
+/// either: `scroll_budget = (target_duration_secs - total_dwell).max(0.0)`
+/// (pacing.rs:139) just clamps to zero and the function returns a technically
+/// valid but useless zero-length `Vec<Segment>`, which `encode_video` then
+/// turns into its own `frame_count == 0` error (encode.rs:1228) — but only
+/// *after* capture has already spent its minutes of CPU. Rejecting all of
+/// these here, before Chromium is even resolved, is strictly earlier than
+/// either of those two silent-or-late failure modes.
+fn validate_duration(duration: f64) -> Result<()> {
+    if !duration.is_finite() || duration <= 0.0 {
+        bail!(
+            "--duration {duration} is not usable: it must be a finite, positive number of \
+             seconds. NaN/infinite values (clap's f64 parser accepts \"nan\"/\"inf\" literally) \
+             would silently corrupt every downstream timeline computation in pacing::\
+             build_timeline, and zero/negative values produce a zero-length timeline that only \
+             fails once encode_video reports 0 frames — both are being rejected here, before any \
+             Chromium/ffmpeg work starts, instead of after it."
+        );
+    }
+    Ok(())
+}
+
 /// Resolve and validate `--out`: must be creatable, and must not fall inside
 /// this repository's own working tree. The containment check runs *before*
 /// creating anything, so a forbidden path is never even `mkdir -p`'d.
@@ -256,6 +333,28 @@ fn validate_width(width: u32) -> Result<()> {
 /// operator happened to invoke the binary from and could miss the tree
 /// entirely if run from elsewhere on disk; the compiled-in path cannot.
 fn resolve_out_dir(requested: &Path) -> Result<PathBuf> {
+    resolve_out_dir_against(requested, find_repo_root().as_deref())
+}
+
+/// The pure decision `resolve_out_dir` makes, with the repo root taken as a
+/// parameter rather than rediscovered via `find_repo_root()` — split out
+/// purely for host-testability (this crate's standing style: pull the
+/// decision out from behind whatever makes it non-reproducible, same shape
+/// as capture.rs's `verify_capture_height` extraction). `resolve_out_dir`
+/// itself always calls this with `find_repo_root()`'s real answer; tests
+/// call it with a throwaway fixture repo's root instead, so "in-repo,
+/// non-ignored → refused" and "in-repo, gitignored → accepted" can be
+/// exercised without depending on *this* crate's own real `.git` (which
+/// `find_repo_root()` would otherwise always resolve to, making a fixture
+/// repo unreachable from inside a test run from this workspace).
+///
+/// `create_dir_all` still runs for real even under test — this function's
+/// contract is "creatable", not merely "nameable" — so callers (tests
+/// included) that want to observe rejection without touching disk must pass
+/// a `requested` path expected to fail before that point, and callers that
+/// want to observe acceptance must clean up the directory this creates
+/// themselves (see the tests below).
+fn resolve_out_dir_against(requested: &Path, repo_root: Option<&Path>) -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("reading the current working directory")?;
     let candidate = if requested.is_absolute() {
         requested.to_path_buf()
@@ -268,8 +367,8 @@ fn resolve_out_dir(requested: &Path) -> Result<PathBuf> {
     // meaningful "don't write into the repo" guard.
     let candidate = normalize_lexically(&candidate);
 
-    if let Some(repo_root) = find_repo_root() {
-        let repo_root = normalize_lexically(&repo_root);
+    if let Some(repo_root) = repo_root {
+        let repo_root = normalize_lexically(repo_root);
         // Inside the repo is allowed ONLY where git itself already ignores the
         // path. The rule being enforced is "never write into the *tracked*
         // tree" — not "never write under the repo root", which would reject
@@ -314,13 +413,39 @@ fn resolve_out_dir(requested: &Path) -> Result<PathBuf> {
 /// makes the caller refuse an in-repo path rather than allow one. A missing
 /// git is a reason to be more careful about writing into a working tree, not
 /// less.
+///
+/// **A trailing path separator is appended to the query, always.** `git
+/// check-ignore` only matches a *directory-only* `.gitignore` pattern
+/// (trailing `/`, exactly the shape this crate's own `.gitignore` entry uses
+/// for its documented default — `/out/`) when it can tell the queried path
+/// is a directory, and it can only tell that one of two ways: the path
+/// already exists on disk and git stats it, or the query string itself ends
+/// in a separator. `resolve_out_dir_against` calls this function
+/// *deliberately before* `create_dir_all` (see that function's doc comment:
+/// "a forbidden path is never even `mkdir -p`'d"), so on a fresh checkout's
+/// very first run the directory does not exist yet — and without this fix,
+/// `git check-ignore /repo/out` (no trailing slash, path absent) reports
+/// "not ignored" even though `/out/` is right there in `.gitignore`,
+/// wrongly rejecting this crate's own documented default `--out ./out`
+/// before it had ever run once. Confirmed against this exact repository's
+/// own `.gitignore` `/out/` entry while writing this repair pass's tests
+/// (`resolve_out_dir_against_accepts_a_gitignored_in_repo_path` below is
+/// what catches a regression). Always appending is safe because every
+/// caller of this function only ever queries a directory (`--out` is a
+/// directory, never a file) — there is no path this function is ever asked
+/// about that a trailing separator could mischaracterize.
 fn git_ignores(repo_root: &Path, path: &Path) -> bool {
+    let mut query = path.as_os_str().to_os_string();
+    if !query.to_string_lossy().ends_with(std::path::MAIN_SEPARATOR) {
+        query.push(std::path::MAIN_SEPARATOR.to_string());
+    }
+
     std::process::Command::new("git")
         .arg("-C")
         .arg(repo_root)
         .arg("check-ignore")
         .arg("-q")
-        .arg(path)
+        .arg(&query)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -424,25 +549,102 @@ async fn run_pipeline(
         capture_result.commit_ys.len(),
     );
 
-    let multipliers =
-        build_multipliers(&capture_result.commit_ys, capture_result.height, cli.linear);
+    // Review finding, Job A: `validate_width` (above, before Chromium is even
+    // resolved) checks the *requested* `--width`, but the browser's own
+    // full-page screenshot can still come back a different width than the
+    // viewport it was asked to render at — content wider than the requested
+    // viewport causes horizontal overflow in Chromium's full-page capture,
+    // and capture.rs never independently forces the output width the way it
+    // forces (and verifies) height (capture.rs:809-818's `verify_capture_
+    // height`, which this mirrors for width, has no width counterpart today).
+    // Left unchecked, that width mismatch would only surface once `encode::
+    // extract_frame` hard-rejects it (encode.rs:441-447) — *after* the
+    // capture that just spent minutes of Chromium CPU. Checking the measured
+    // width here, immediately on return from `capture_print_sheet` and before
+    // any of the pacing/encode work below, turns that into an immediate,
+    // named error naming both numbers instead.
+    if capture_result.width != VIDEO_WIDTH {
+        bail!(
+            "captured PNG is {}px wide, but encode.rs's camera is fixed at {VIDEO_WIDTH}px \
+             (encode.rs:112-113) and hard-rejects any other width instead of scaling to fit \
+             (encode.rs:441-447) — the requested --width {} was validated at startup \
+             (`validate_width`), but the page's own rendered content came back a different \
+             width than the viewport it was asked to render at (most likely horizontal overflow \
+             in the sheet itself). Refusing now, before any pacing/encode work runs, rather than \
+             failing deep inside frame extraction after the capture's minutes of CPU are already \
+             spent.",
+            capture_result.width,
+            cli.width,
+        );
+    }
 
-    // Gap 1 (this file's top doc comment): no module in this pipeline
-    // produces `Vec<GraphRow>` index-aligned with `commit_ys`, so there is
-    // no row metadata to hand `chapters::detect_pivots`. Called with two
-    // genuinely empty slices — an honest statement of "zero rows' worth of
-    // metadata are available" — rather than fabricated placeholder
-    // `GraphRow`s padded out to `commit_ys`'s real (non-empty) length: that
-    // would either trip `detect_pivots`'s equal-length assert (it panics,
-    // not errors, on mismatch — chapters.rs:201-207) if built wrong, or
-    // silently score zero everywhere while *looking* wired if built right,
-    // which is worse. `cli.max_pivots` is threaded through for the day a
-    // lane adds that extraction to `capture.rs`; with zero input rows it
-    // has no effect yet.
+    // Review finding, Job B (encode lane's report): `pacing::build_timeline`'s
+    // own y-range must stop where the camera can actually still crop to —
+    // `encode::clamp_crop_y` (encode.rs:450) pins the crop window at
+    // `image_height - VIDEO_HEIGHT`, so a timeline built against the FULL
+    // captured height keeps demanding camera positions past that point for
+    // the last `VIDEO_HEIGHT` px worth of scroll-time, all of which clamp to
+    // the exact same crop — a frozen tail while the clock keeps running. See
+    // `encode.rs`'s `last_frame_crop_y_reaches_exactly_the_scrollable_bottom_
+    // when_the_caller_passes_the_reduced_height` test (encode.rs, added by
+    // the encode lane's repair pass) for the mechanism this fixes.
+    // `saturating_sub` floors at 0 for a capture shorter than one viewport
+    // (nothing to scroll to at all), matching the encode lane's own
+    // `.max(0.0)` — done here in `u32` since both operands already are.
+    let scrollable_height_px = capture_result.height.saturating_sub(VIDEO_HEIGHT);
+
+    let multipliers =
+        build_multipliers(&capture_result.commit_ys, scrollable_height_px, cli.linear);
+
+    // Gap 1 (this file's top doc comment) — STILL a real gap, only
+    // partially narrowed by a concurrent lane's work, not closed by it.
+    // `capture::CaptureResult` now carries `commit_metas: Vec<CommitMeta>`
+    // (capture.rs:434-453), index-aligned with `commit_ys`. But `chapters::
+    // detect_pivots` (chapters.rs:201) still takes `&[GraphRow]`, and
+    // `CommitMeta` cannot honestly be turned into one — not a missing
+    // conversion function, a missing *fact*:
+    //   - `GraphRow.commit.id` is a real `Oid` (git-vista-core/src/
+    //     model.rs:12); `CommitMeta::short_sha` is print.rs's already-
+    //     truncated 7-char display string (capture.rs:462-463) — there is no
+    //     way to recover the other 33+ hex characters from it.
+    //   - `GraphRow.commit.time` is an `i64` Unix timestamp that `detect_
+    //     pivots`'s own month-boundary detection depends on (chapters.rs:
+    //     221-222, `civil_from_unix`); `CommitMeta::date_text` is a browser-
+    //     locale-formatted display string (capture.rs:470-474, e.g. "Jun 29
+    //     14:32") with no reliable inverse back to an epoch value.
+    //   - `GraphRow.refs` is `Vec<GitRef>` with a real name and `RefKind`
+    //     (model.rs:90-98), which `render_label`/`render_detail` read
+    //     directly to print e.g. `"Tag: v1.2.0"` (chapters.rs:271-274);
+    //     `CommitMeta::has_refs` is a bare `bool` (capture.rs:475-479) — no
+    //     ref name or kind survives the page probe at all.
+    //   - `GraphRow.commit.parents` (a real `Vec<Oid>`) doesn't exist in
+    //     `CommitMeta` either; `is_merge: Option<bool>` (capture.rs:480-486)
+    //     is derived honestly from the node's icon glyph instead, and is
+    //     real — but it is the one field of five that transfers.
+    // Fabricating the other four (a made-up `Oid` from `short_sha`, a
+    // parsed-back epoch from `date_text`, an invented ref name/kind from
+    // `has_refs`, an empty-or-guessed `parents`) is exactly what capture.rs's
+    // own doc comment (capture.rs:109-117) warns is worse than the gap:
+    // either it trips `detect_pivots`'s length assert (chapters.rs:201-207,
+    // it panics, not errors, on mismatch) if built wrong, or it silently
+    // renders fabricated tag names/dates on a callout card someone narrates
+    // over, while *looking* wired. Bridging this for real needs one of two
+    // things neither of which is this lane's file to make: `chapters::
+    // detect_pivots` gaining a `CommitMeta`-shaped entry point (chapters.rs,
+    // lane 3's file), or a genuinely independent source of real `GraphRow`s
+    // (e.g. re-walking the actual repo via `git-vista-core`/`git-vista-git`,
+    // which this crate does not currently depend on and which would need a
+    // new `--repo` flag to even know which repository's history matches the
+    // sheet being scrolled — a materially bigger feature than a repair pass
+    // over this crate's four confirmed findings). So: still called with two
+    // genuinely empty slices, still an honest statement of "zero rows'
+    // worth of real metadata are available to this call," not a fabricated
+    // one. `cli.max_pivots` remains threaded through, still with no effect
+    // on an empty input.
     let pivots = chapters::detect_pivots(&[], &[], cli.max_pivots);
 
     let segments = pacing::build_timeline(
-        capture_result.height as f64,
+        scrollable_height_px as f64,
         DENSITY_BAND_HEIGHT_PX,
         &multipliers,
         &pivots,
@@ -468,6 +670,21 @@ async fn run_pipeline(
     let encode_config = EncodeConfig {
         audio: audio_source,
         out_name: OUTPUT_VIDEO_NAME.to_string(),
+        // Threaded through per the encode lane's repair-pass report (its
+        // "IMPORTANT — activating this requires a one-line change in
+        // main.rs" note): `EncodeConfig::pivots` needs the same `pivots`
+        // this function already builds for `pacing::build_timeline` and
+        // `chapters::format_chapters`, so the callout-card mechanism reads
+        // from the one real source of pivots this pipeline has, rather than
+        // silently defaulting to `Vec::new()` forever even after a future
+        // lane closes the gap documented above. `pivots` is empty today for
+        // the reason documented at this function's `chapters::detect_
+        // pivots` call site — this line does not fabricate anything, it
+        // just stops the empty list from being reconstructed twice (once
+        // implicitly via `EncodeConfig::default()`, once really) and wires
+        // the real variable through so the day gap 1 closes, this becomes
+        // live with no second edit needed here.
+        pivots: pivots.clone(),
         ..EncodeConfig::default()
     };
 
@@ -506,13 +723,33 @@ async fn run_pipeline(
 /// means in this module's time-budget model). The non-linear path is just
 /// `pacing::commit_density` followed by `pacing::speed_multipliers`, exactly
 /// as already built and tested in `pacing.rs`.
-fn build_multipliers(commit_ys: &[pacing::CommitY], image_height: u32, linear: bool) -> Vec<f64> {
+///
+/// `scrollable_height_px` — **not** the full captured PNG height — for the
+/// same reason `run_pipeline` passes it to `pacing::build_timeline` instead
+/// of `capture_result.height`: `encode::clamp_crop_y` can only place the
+/// camera between `0` and `image_height - VIDEO_HEIGHT`, so bucketing
+/// density (and therefore band count) against the full height would count
+/// bands the camera timeline built from `build_timeline` never actually
+/// reaches at the same y-range this function's bands are keyed to. Passing
+/// the same reduced height to both keeps this function's band boundaries
+/// and `build_timeline`'s band boundaries in agreement — see this file's
+/// `build_multipliers_produces_one_multiplier_per_pacing_band` test for the
+/// exact cross-check with `pacing::commit_density`'s own band count.
+fn build_multipliers(
+    commit_ys: &[pacing::CommitY],
+    scrollable_height_px: u32,
+    linear: bool,
+) -> Vec<f64> {
     if linear {
-        let band_count = pacing::band_range(image_height as f64, DENSITY_BAND_HEIGHT_PX).count();
+        let band_count =
+            pacing::band_range(scrollable_height_px as f64, DENSITY_BAND_HEIGHT_PX).count();
         vec![1.0; band_count.max(1)]
     } else {
-        let density =
-            pacing::commit_density(commit_ys, image_height as f64, DENSITY_BAND_HEIGHT_PX);
+        let density = pacing::commit_density(
+            commit_ys,
+            scrollable_height_px as f64,
+            DENSITY_BAND_HEIGHT_PX,
+        );
         pacing::speed_multipliers(&density)
     }
 }
@@ -588,4 +825,248 @@ async fn encode_in(
         output_path: final_path,
         ..report
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- validate_width / validate_duration --------------------------------
+    //
+    // Both are new in this repair pass (review Job A: fail before any
+    // Chromium/ffmpeg work starts). Neither existed as a tested unit before
+    // — these are the first tests either function gets.
+
+    #[test]
+    fn validate_width_accepts_exactly_the_fixed_video_width() {
+        assert!(validate_width(VIDEO_WIDTH).is_ok());
+    }
+
+    #[test]
+    fn validate_width_rejects_anything_else_and_names_both_numbers() {
+        // Mutation this catches: comparing against the wrong constant (e.g.
+        // VIDEO_HEIGHT) or dropping one of the two numbers from the message.
+        let err = validate_width(1280).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("1280"), "{msg}");
+        assert!(msg.contains(&VIDEO_WIDTH.to_string()), "{msg}");
+    }
+
+    #[test]
+    fn validate_duration_accepts_a_normal_positive_value() {
+        assert!(validate_duration(240.0).is_ok());
+    }
+
+    #[test]
+    fn validate_duration_rejects_zero_and_negative() {
+        // Mutation this catches: using `< 0.0` instead of `<= 0.0`, which
+        // would let a zero duration through to `pacing::build_timeline`
+        // (which clamps it to an empty, useless timeline rather than
+        // erroring — see this fn's own doc comment).
+        assert!(validate_duration(0.0).is_err());
+        assert!(validate_duration(-5.0).is_err());
+    }
+
+    #[test]
+    fn validate_duration_rejects_nan_and_infinite() {
+        // Mutation this catches: dropping the `is_finite()` half of the
+        // check and relying on `<= 0.0` alone, which is false for both NaN
+        // (every comparison against NaN is false) and +infinity.
+        assert!(validate_duration(f64::NAN).is_err());
+        assert!(validate_duration(f64::INFINITY).is_err());
+        assert!(validate_duration(f64::NEG_INFINITY).is_err());
+    }
+
+    // ---- normalize_lexically -----------------------------------------------
+
+    #[test]
+    fn normalize_lexically_collapses_dot_and_dotdot_without_touching_disk() {
+        // Mutation this catches: dropping the `ParentDir => { out.pop(); }`
+        // arm (or swapping it for a no-op), which would leave a literal
+        // `..` component in the output instead of resolving it against the
+        // component that came before it.
+        let result = normalize_lexically(Path::new("/a/b/../c/./d"));
+        assert_eq!(result, Path::new("/a/c/d"));
+    }
+
+    #[test]
+    fn normalize_lexically_does_not_escape_past_root_via_excess_dotdot() {
+        // `PathBuf::pop()` on a path that is only `/` is a documented no-op,
+        // not a panic and not something that produces a `..` in the output
+        // — this exercises exactly that boundary, which a naive
+        // "always pop" implementation could get wrong if it didn't rely on
+        // `pop()`'s own root-aware behavior.
+        let result = normalize_lexically(Path::new("/../../a"));
+        assert_eq!(result, Path::new("/a"));
+    }
+
+    #[test]
+    fn normalize_lexically_leaves_an_already_clean_path_untouched() {
+        let result = normalize_lexically(Path::new("/home/tom/videos"));
+        assert_eq!(result, Path::new("/home/tom/videos"));
+    }
+
+    // ---- build_multipliers --------------------------------------------------
+
+    #[test]
+    fn build_multipliers_produces_one_multiplier_per_pacing_band() {
+        // Cross-checked directly against `pacing::commit_density`'s own
+        // band-count formula rather than a hardcoded expected number:
+        // finding B's fix (main.rs now passes `scrollable_height_px`, not
+        // the full capture height, to both `build_multipliers` and
+        // `pacing::build_timeline`) depends on both call sites bucketing
+        // pixels into the *same* bands. A silent drift between this
+        // function's band count and `pacing::commit_density`'s own would
+        // reopen a version of the exact desynchronization finding B fixed,
+        // just one layer higher — this test is what would catch that.
+        let commit_ys = vec![
+            pacing::CommitY { y: 10.0 },
+            pacing::CommitY { y: 250.0 },
+            pacing::CommitY { y: 610.0 },
+        ];
+        let scrollable_height_px = 1_000u32;
+
+        let multipliers = build_multipliers(&commit_ys, scrollable_height_px, false);
+        let density = pacing::commit_density(
+            &commit_ys,
+            scrollable_height_px as f64,
+            DENSITY_BAND_HEIGHT_PX,
+        );
+        assert_eq!(multipliers.len(), density.len());
+    }
+
+    #[test]
+    fn build_multipliers_linear_mode_also_agrees_on_band_count() {
+        // `--linear` takes a different code path (`pacing::band_range`
+        // rather than `pacing::commit_density`) to reach what should be the
+        // same band count — this proves the two paths actually agree with
+        // each other, not just that each independently "produces something".
+        let commit_ys = vec![pacing::CommitY { y: 500.0 }];
+        let scrollable_height_px = 1_000u32;
+
+        let linear = build_multipliers(&commit_ys, scrollable_height_px, true);
+        let density = pacing::commit_density(
+            &commit_ys,
+            scrollable_height_px as f64,
+            DENSITY_BAND_HEIGHT_PX,
+        );
+        assert_eq!(linear.len(), density.len());
+    }
+
+    #[test]
+    fn build_multipliers_never_returns_empty_even_for_a_zero_scrollable_height() {
+        // A capture no taller than one viewport has `scrollable_height_px`
+        // saturated to 0 by `run_pipeline` (finding B's fix) — both
+        // `pacing::band_range` and `pacing::commit_density` floor their own
+        // band count at 1 (`.max(1.0)`), and this function's `.max(1)` on
+        // the linear path exists to match that floor, not accidentally
+        // diverge from it into a genuinely empty `Vec`.
+        let multipliers = build_multipliers(&[], 0, true);
+        assert_eq!(multipliers.len(), 1);
+        let multipliers = build_multipliers(&[], 0, false);
+        assert_eq!(multipliers.len(), 1);
+    }
+
+    // ---- resolve_out_dir_against --------------------------------------------
+
+    /// Builds a throwaway git repository under `std::env::temp_dir()` with a
+    /// `.gitignore` that ignores exactly one named subdirectory. A FIXTURE
+    /// repo, never this crate's own — `find_repo_root()` walks from
+    /// `CARGO_MANIFEST_DIR` and would always resolve to *this* repository's
+    /// real root, which is exactly why `resolve_out_dir_against` takes
+    /// `repo_root` as a parameter instead of calling `find_repo_root()`
+    /// itself: it lets a test substitute a disposable repo instead of having
+    /// to exercise "in-repo, refused" against this actual working tree.
+    /// Built with plain `std::process::Command` git calls (`git init`),
+    /// exactly as the task specifies — no new dependency.
+    fn fixture_git_repo(unique_suffix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gv-scrollcast-out-dir-test-{unique_suffix}"));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup of a prior run's leftovers
+        std::fs::create_dir_all(&dir).expect("create fixture repo dir");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .arg("init")
+            .arg("-q")
+            .status()
+            .expect("run `git init` for the fixture repo");
+        assert!(status.success(), "git init failed for fixture repo");
+
+        // `git check-ignore` reads `.gitignore` straight off the working
+        // tree — it does not need this file staged or committed to take
+        // effect, so writing it is the whole setup.
+        std::fs::write(dir.join(".gitignore"), "/ignored-out/\n")
+            .expect("write fixture .gitignore");
+
+        dir
+    }
+
+    #[test]
+    fn git_ignores_matches_a_directory_only_pattern_even_though_the_directory_does_not_exist_yet() {
+        // The bug this repair pass found and fixed: `git check-ignore` only
+        // honours a directory-only pattern (trailing `/`, exactly this
+        // crate's own `.gitignore` shape for `/out/`) when it can tell the
+        // queried path is a directory — either by stat'ing an existing one,
+        // or by the query itself ending in a separator. `resolve_out_dir_
+        // against` calls `git_ignores` BEFORE creating anything, so without
+        // appending that separator here, this would return `false` on every
+        // fresh checkout's first run and reject this crate's own documented
+        // `--out ./out` default. Mutation this catches: dropping the
+        // trailing-separator append and passing `path` straight through.
+        let repo = fixture_git_repo("git-ignores-nonexistent-dir");
+        let candidate = repo.join("ignored-out"); // deliberately never created
+        assert!(
+            !candidate.exists(),
+            "sanity: this test is about the absent-path case"
+        );
+        assert!(git_ignores(&repo, &candidate));
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resolve_out_dir_against_refuses_an_in_repo_path_git_does_not_ignore() {
+        let repo = fixture_git_repo("refused");
+        let requested = repo.join("not-ignored-out");
+
+        let err = resolve_out_dir_against(&requested, Some(&repo)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("NOT gitignored"), "{msg}");
+        // Refused before ever creating anything — the whole point of
+        // checking containment before `create_dir_all` runs.
+        assert!(!requested.exists());
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resolve_out_dir_against_accepts_a_gitignored_in_repo_path() {
+        let repo = fixture_git_repo("accepted");
+        let requested = repo.join("ignored-out");
+
+        let resolved = resolve_out_dir_against(&requested, Some(&repo)).unwrap();
+        assert_eq!(resolved, requested);
+        assert!(
+            resolved.is_dir(),
+            "resolve_out_dir_against must actually create the accepted directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resolve_out_dir_against_accepts_any_path_when_no_repo_root_is_known() {
+        // `find_repo_root()` returns `None` when this binary was copied out
+        // of a checkout entirely (its own doc comment) — the containment
+        // check must be skipped entirely in that case, not treated as
+        // "everything is in-repo, refuse it all".
+        let dir = std::env::temp_dir().join("gv-scrollcast-out-dir-test-no-repo-root");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let resolved = resolve_out_dir_against(&dir, None).unwrap();
+        assert_eq!(resolved, dir);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

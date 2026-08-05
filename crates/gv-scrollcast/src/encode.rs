@@ -882,113 +882,95 @@ fn glyph_rows(c: char) -> [u8; 7] {
 /// that reads as "more was cut here."
 fn prepare_card_text(s: &str) -> String {
     s.replace('…', "...")
-        .replace('—', "-")
-        .replace('–', "-")
+        .replace(['—', '–'], "-")
         .to_uppercase()
 }
 
-/// Set one pixel to `rgb`, but only if `(x, y)` falls inside `clip`
-/// (`(x_min, y_min, x_max_exclusive, y_max_exclusive)`). Every drawing
-/// primitive in this section routes through this one function with the
-/// card's own rectangle as `clip` — see `draw_pivot_card` — which is what
-/// makes "drawing a card never touches a pixel outside the card's own
-/// rectangle" a property of this function's contract rather than something
-/// each caller has to get right independently. Also defends against `frame`
-/// being shorter than `frame_width * some height` implies (defensive only;
-/// `encode_video`'s frame buffers are always exactly one full
-/// `VIDEO_WIDTH x VIDEO_HEIGHT` frame, but a bounds-checked write costs
-/// nothing here and this function has no other way to learn the buffer's
-/// real height).
-fn set_pixel_clamped(
-    frame: &mut [u8],
+/// A frame buffer plus a fixed clip rectangle, bundled so every drawing
+/// primitive below (`set_pixel`/`fill_rect`/`draw_glyph`/`draw_text_line`)
+/// takes one fewer argument than a bare-function version would — the
+/// alternative (threading `frame`, `frame_width`, and `clip` through each
+/// free function individually) is what tripped clippy's `too_many_arguments`
+/// lint before this refactor, for functions that were correct but simply had
+/// more parameters than the lint's default threshold. Every one of these
+/// methods still routes through `set_pixel`, which is what makes "drawing a
+/// card never touches a pixel outside `clip`" a property of this struct's
+/// contract rather than something each caller has to get right
+/// independently — see `draw_pivot_card`, the one place `clip` is ever set
+/// to something other than the whole frame.
+struct ClippedCanvas<'a> {
+    frame: &'a mut [u8],
     frame_width: u32,
+    /// `(x_min, y_min, x_max_exclusive, y_max_exclusive)`.
     clip: (u32, u32, u32, u32),
-    x: u32,
-    y: u32,
-    rgb: [u8; 3],
-) {
-    let (x_min, y_min, x_max, y_max) = clip;
-    if x < x_min || x >= x_max || y < y_min || y >= y_max {
-        return;
-    }
-    let idx = (y as usize * frame_width as usize + x as usize) * 3;
-    if let Some(px) = frame.get_mut(idx..idx + 3) {
-        px.copy_from_slice(&rgb);
-    }
 }
 
-/// Fill an `w x h` rectangle at `(x0, y0)` with `rgb`, clipped to `clip`.
-/// Used both for the card's background/border (a big solid rect) and for
-/// each lit font pixel scaled up to a `scale x scale` block (see
-/// `draw_glyph_clamped`) — a "filled rectangle" is the one primitive both of
-/// those are built from.
-fn fill_rect_clamped(
-    frame: &mut [u8],
-    frame_width: u32,
-    clip: (u32, u32, u32, u32),
-    x0: u32,
-    y0: u32,
-    w: u32,
-    h: u32,
-    rgb: [u8; 3],
-) {
-    for y in y0..y0.saturating_add(h) {
-        for x in x0..x0.saturating_add(w) {
-            set_pixel_clamped(frame, frame_width, clip, x, y, rgb);
+impl ClippedCanvas<'_> {
+    /// Set one pixel to `rgb`, but only if `(x, y)` falls inside `self.clip`.
+    /// Also defends against `frame` being shorter than `frame_width * some
+    /// height` implies (defensive only; `encode_video`'s frame buffers are
+    /// always exactly one full `VIDEO_WIDTH x VIDEO_HEIGHT` frame, but a
+    /// bounds-checked write costs nothing here and this method has no other
+    /// way to learn the buffer's real height).
+    fn set_pixel(&mut self, x: u32, y: u32, rgb: [u8; 3]) {
+        let (x_min, y_min, x_max, y_max) = self.clip;
+        if x < x_min || x >= x_max || y < y_min || y >= y_max {
+            return;
+        }
+        let idx = (y as usize * self.frame_width as usize + x as usize) * 3;
+        if let Some(px) = self.frame.get_mut(idx..idx + 3) {
+            px.copy_from_slice(&rgb);
         }
     }
-}
 
-/// Draw one glyph at `(x0, y0)` (its top-left corner), each of its 5x7
-/// source pixels scaled up to a `scale x scale` block so a tiny bitmap font
-/// is legible on a 1920x1080 frame — see `draw_pivot_card`'s doc comment for
-/// the actual scale factors this crate uses for the label vs. detail lines.
-fn draw_glyph_clamped(
-    frame: &mut [u8],
-    frame_width: u32,
-    clip: (u32, u32, u32, u32),
-    x0: u32,
-    y0: u32,
-    scale: u32,
-    rows: [u8; 7],
-    rgb: [u8; 3],
-) {
-    for (row_idx, row_bits) in rows.iter().enumerate() {
-        for col in 0..GLYPH_WIDTH {
-            if (row_bits >> col) & 1 == 1 {
-                let px = x0 + col * scale;
-                let py = y0 + row_idx as u32 * scale;
-                fill_rect_clamped(frame, frame_width, clip, px, py, scale, scale, rgb);
+    /// Fill a `w x h` rectangle at `(x0, y0)` with `rgb`, clipped to
+    /// `self.clip`. Used both for the card's background/border (a big solid
+    /// rect) and for each lit font pixel scaled up to a `scale x scale`
+    /// block (see `draw_glyph`) — a "filled rectangle" is the one primitive
+    /// both of those are built from.
+    fn fill_rect(&mut self, x0: u32, y0: u32, w: u32, h: u32, rgb: [u8; 3]) {
+        for y in y0..y0.saturating_add(h) {
+            for x in x0..x0.saturating_add(w) {
+                self.set_pixel(x, y, rgb);
             }
         }
     }
-}
 
-/// Draw a whole line of text left-to-right starting at `(x0, y0)`, one
-/// `GLYPH_WIDTH + 1` (a 1-source-pixel gap between glyphs, scaled the same
-/// as the glyphs themselves) column pitch per character. No line wrapping —
-/// a line that runs past `clip`'s right edge is silently cut off there
-/// (every pixel past it is out of `clip` and `set_pixel_clamped` drops it),
-/// rather than overflowing onto the rest of the frame or onto a second row.
-/// This is deliberate: `chapters::cap_words` already bounds the detail
-/// line's word count, and a card whose label happens to come from an
-/// unusually long tag/branch name should crop cleanly at its own edge, not
-/// bleed pixels into the scrolling graph behind it.
-fn draw_text_line_clamped(
-    frame: &mut [u8],
-    frame_width: u32,
-    clip: (u32, u32, u32, u32),
-    x0: u32,
-    y0: u32,
-    scale: u32,
-    text: &str,
-    rgb: [u8; 3],
-) {
-    let pitch = (GLYPH_WIDTH + 1) * scale;
-    let mut x = x0;
-    for c in text.chars() {
-        draw_glyph_clamped(frame, frame_width, clip, x, y0, scale, glyph_rows(c), rgb);
-        x += pitch;
+    /// Draw one glyph at `(x0, y0)` (its top-left corner), each of its 5x7
+    /// source pixels scaled up to a `scale x scale` block so a tiny bitmap
+    /// font is legible on a 1920x1080 frame — see `draw_pivot_card`'s doc
+    /// comment for the actual scale factors this crate uses for the label
+    /// vs. detail lines.
+    fn draw_glyph(&mut self, x0: u32, y0: u32, scale: u32, rows: [u8; 7], rgb: [u8; 3]) {
+        for (row_idx, row_bits) in rows.iter().enumerate() {
+            for col in 0..GLYPH_WIDTH {
+                if (row_bits >> col) & 1 == 1 {
+                    let px = x0 + col * scale;
+                    let py = y0 + row_idx as u32 * scale;
+                    self.fill_rect(px, py, scale, scale, rgb);
+                }
+            }
+        }
+    }
+
+    /// Draw a whole line of text left-to-right starting at `(x0, y0)`, one
+    /// `GLYPH_WIDTH + 1` (a 1-source-pixel gap between glyphs, scaled the
+    /// same as the glyphs themselves) column pitch per character. No line
+    /// wrapping — a line that runs past `self.clip`'s right edge is
+    /// silently cut off there (every pixel past it is out of `clip` and
+    /// `set_pixel` drops it), rather than overflowing onto the rest of the
+    /// frame or onto a second row. This is deliberate: `chapters::
+    /// cap_words` already bounds the detail line's word count, and a card
+    /// whose label happens to come from an unusually long tag/branch name
+    /// should crop cleanly at its own edge, not bleed pixels into the
+    /// scrolling graph behind it.
+    fn draw_text_line(&mut self, x0: u32, y0: u32, scale: u32, text: &str, rgb: [u8; 3]) {
+        let pitch = (GLYPH_WIDTH + 1) * scale;
+        let mut x = x0;
+        for c in text.chars() {
+            self.draw_glyph(x, y0, scale, glyph_rows(c), rgb);
+            x += pitch;
+        }
     }
 }
 
@@ -1031,24 +1013,17 @@ const CARD_DETAIL_RGB: [u8; 3] = [195, 200, 210];
 /// that pins this down.
 pub(crate) fn draw_pivot_card(frame: &mut [u8], label: &str, detail: &str) {
     let clip = (CARD_X, CARD_Y, CARD_X + CARD_WIDTH, CARD_Y + CARD_HEIGHT);
+    let mut canvas = ClippedCanvas {
+        frame,
+        frame_width: VIDEO_WIDTH,
+        clip,
+    };
 
     // Border, then an inset background fill on top — the "filled rect + 1px
     // border" the review asked for, built from the one rectangle primitive
     // both need rather than a separate stroke-only border routine.
-    fill_rect_clamped(
-        frame,
-        VIDEO_WIDTH,
-        clip,
-        CARD_X,
-        CARD_Y,
-        CARD_WIDTH,
-        CARD_HEIGHT,
-        CARD_BORDER_RGB,
-    );
-    fill_rect_clamped(
-        frame,
-        VIDEO_WIDTH,
-        clip,
+    canvas.fill_rect(CARD_X, CARD_Y, CARD_WIDTH, CARD_HEIGHT, CARD_BORDER_RGB);
+    canvas.fill_rect(
         CARD_X + CARD_BORDER_PX,
         CARD_Y + CARD_BORDER_PX,
         CARD_WIDTH - 2 * CARD_BORDER_PX,
@@ -1061,20 +1036,14 @@ pub(crate) fn draw_pivot_card(frame: &mut [u8], label: &str, detail: &str) {
     let label_y = CARD_Y + CARD_PADDING_TOP;
     let detail_y = label_y + GLYPH_HEIGHT * CARD_LABEL_SCALE + CARD_LINE_GAP;
 
-    draw_text_line_clamped(
-        frame,
-        VIDEO_WIDTH,
-        clip,
+    canvas.draw_text_line(
         CARD_X + CARD_PADDING_X,
         label_y,
         CARD_LABEL_SCALE,
         &label_text,
         CARD_LABEL_RGB,
     );
-    draw_text_line_clamped(
-        frame,
-        VIDEO_WIDTH,
-        clip,
+    canvas.draw_text_line(
         CARD_X + CARD_PADDING_X,
         detail_y,
         CARD_DETAIL_SCALE,
@@ -1804,10 +1773,8 @@ mod tests {
             for x in 0..VIDEO_WIDTH {
                 let idx = (y as usize * VIDEO_WIDTH as usize + x as usize) * 3;
                 let px = &frame[idx..idx + 3];
-                let inside_card = x >= CARD_X
-                    && x < CARD_X + CARD_WIDTH
-                    && y >= CARD_Y
-                    && y < CARD_Y + CARD_HEIGHT;
+                let inside_card = (CARD_X..CARD_X + CARD_WIDTH).contains(&x)
+                    && (CARD_Y..CARD_Y + CARD_HEIGHT).contains(&y);
                 if inside_card {
                     if px != [0, 0, 0] {
                         changed_inside_card = true;
@@ -1883,14 +1850,27 @@ mod tests {
         // against that reduced height, the LAST frame's crop y lands exactly
         // on `image_height - viewport_h` — no held tail beyond the one
         // frame that legitimately belongs there.
-        use crate::pacing::{build_timeline, commit_density, speed_multipliers, CommitY};
+        use crate::pacing::{build_timeline, commit_density, speed_multipliers};
 
-        let full_image_height = 5_000.0_f64;
+        // `scrollable_height` is chosen as an exact multiple of
+        // `band_height` deliberately: `build_timeline` gives every band an
+        // equal time-share purely by its speed multiplier (pacing.rs:141-
+        // 144, `band_weight = 1.0 / mult`), regardless of that band's own
+        // pixel span — so a *truncated* last band (image_height not a clean
+        // multiple of band_height) legitimately crawls far slower per-pixel
+        // than the others, which is a real, separate property of
+        // build_timeline's own time-allocation model, not the frozen-tail
+        // bug this test exists to isolate. An exact multiple, combined with
+        // zero commits (uniform density -> uniform multiplier -> uniform
+        // velocity throughout), keeps this test's only variable the one
+        // finding B is actually about: whether the timeline's own y-range
+        // matches where the camera can physically stop.
+        let full_image_height = 4_080.0_f64;
         let viewport_h = VIDEO_HEIGHT as f64;
-        let scrollable_height = (full_image_height - viewport_h).max(0.0); // 3920.0
+        let scrollable_height = (full_image_height - viewport_h).max(0.0); // 3000.0
 
-        let band_height = 300.0;
-        let commits = vec![CommitY { y: 1_000.0 }, CommitY { y: 3_000.0 }];
+        let band_height = 300.0; // 3000.0 / 300.0 == 10 exactly
+        let commits = [];
         // This is the fixed call shape: `scrollable_height`, not
         // `full_image_height`, is what main.rs must pass here.
         let density = commit_density(&commits, scrollable_height, band_height);

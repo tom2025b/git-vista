@@ -105,10 +105,12 @@ enum Reason {
 /// bonus on top of the merge base rather than being treated the same as an
 /// ordinary two-parent merge.
 ///
-/// The `a_tagged_non_merge_outranks_a_bare_merge` test below is the guard: it
-/// is exactly the failure mode a "count refs + count merges" naive rule
-/// would produce if it weighted them equally instead of by how much a human
-/// actually decided to mark that moment.
+/// The `rank_pivots_puts_the_highest_scorer_first_before_any_cap_or_resort`
+/// and `a_release_tag_survives_a_max_pivots_cap_that_drops_a_routine_merge`
+/// tests below are the guard: they are exactly the failure mode a "count
+/// refs + count merges" naive rule would produce if it weighted them
+/// equally instead of by how much a human actually decided to mark that
+/// moment.
 fn reason_score(reason: Reason) -> i64 {
     match reason {
         Reason::Tag => 50,
@@ -129,9 +131,12 @@ fn ref_reason(kind: &RefKind) -> Reason {
     }
 }
 
-/// One scored candidate before ranking/capping. Kept private: callers only
-/// ever see the capped, sorted `Vec<Pivot>` [`detect_pivots`] returns.
-struct Candidate {
+/// One scored candidate before ranking/capping. `pub(crate)` only because
+/// [`rank_pivots`] (also `pub(crate)`, for the same reason — see its doc
+/// comment) has to return something; nothing outside this crate ever sees
+/// it. External callers only ever see the capped, sorted `Vec<Pivot>`
+/// [`detect_pivots`] returns.
+pub(crate) struct Candidate {
     row_idx: usize,
     y: f64,
     score: i64,
@@ -173,9 +178,23 @@ fn octopus_bonus(commit: &CommitSummary) -> i64 {
     }
 }
 
-/// Detect and rank pivot candidates from the rendered graph, returning at
-/// most `max_pivots`, in ascending `y` (top-to-bottom, i.e. the order the
-/// scroll actually encounters them in).
+/// Score and rank every pivot candidate in the rendered graph, best-first
+/// (highest [`reason_score`] total first, ties broken by `y` ascending —
+/// favours the earlier of two equally-significant moments, arbitrary but
+/// deterministic). See [`reason_score`]'s doc comment for the specific
+/// real-vs-routine failure this ordering defends against.
+///
+/// Split out of [`detect_pivots`] — which immediately truncates to
+/// `max_pivots` and re-sorts into video (`y`-ascending) order — for one
+/// reason: once that re-sort has happened, the *ranking* that decided which
+/// candidates survived the cap is no longer visible in the output at all.
+/// Any test that only inspects `detect_pivots`'s final `Vec<Pivot>` with
+/// `max_pivots >= candidates.len()` passes regardless of which candidates
+/// "won", because nothing was truncated to make the ranking observable. This
+/// function is the scored intermediate a test (or a future in-crate caller
+/// that needs the *why*, not just the final cut) can assert on directly:
+/// `rank_pivots(...)[0]` is unconditionally the single most significant
+/// candidate, full stop, before any cap or re-sort touches it.
 ///
 /// `rows` and `commit_ys` must be the same length and in the same order —
 /// this is `capture::CaptureResult`'s own contract (`commit_ys`: "One
@@ -184,21 +203,7 @@ fn octopus_bonus(commit: &CommitSummary) -> i64 {
 /// are a caller bug (a capture that silently dropped or duplicated a node),
 /// not a data condition this function should paper over, so it asserts
 /// rather than truncating one to fit the other.
-///
-/// Ranking rule (see [`reason_score`] for the weights and its doc comment
-/// for the specific failure this defends against): sum every applicable
-/// reason's score, break ties by `y` ascending (favours the earlier of two
-/// equally-significant moments, which is arbitrary but deterministic),
-/// keep the top `max_pivots`.
-///
-/// Cap exists because the owner's own ask was explicit about the failure
-/// mode: *"a 477-commit repo with a merge every third commit would produce
-/// a video that is mostly paused."* A merge-every-third-commit history has
-/// roughly 160 merge-only candidates; capping to, say, 12 means only the
-/// dozen most-deliberate moments (tags, octopus merges, tagged merges, real
-/// month transitions) survive, and the rest scroll through at the density
-/// pacing already computes for them.
-pub fn detect_pivots(rows: &[GraphRow], commit_ys: &[CommitY], max_pivots: usize) -> Vec<Pivot> {
+pub(crate) fn rank_pivots(rows: &[GraphRow], commit_ys: &[CommitY]) -> Vec<Candidate> {
     assert_eq!(
         rows.len(),
         commit_ys.len(),
@@ -236,8 +241,28 @@ pub fn detect_pivots(rows: &[GraphRow], commit_ys: &[CommitY], max_pivots: usize
     }
 
     // Highest score first; ties broken by y ascending (earlier moment wins,
-    // deterministically — see doc comment above).
+    // deterministically — see this function's doc comment above).
     candidates.sort_by(|a, b| b.score.cmp(&a.score).then(a.y.partial_cmp(&b.y).unwrap()));
+    candidates
+}
+
+/// Detect and rank pivot candidates from the rendered graph, returning at
+/// most `max_pivots`, in ascending `y` (top-to-bottom, i.e. the order the
+/// scroll actually encounters them in).
+///
+/// Cap exists because the owner's own ask was explicit about the failure
+/// mode: *"a 477-commit repo with a merge every third commit would produce
+/// a video that is mostly paused."* A merge-every-third-commit history has
+/// roughly 160 merge-only candidates; capping to, say, 12 means only the
+/// dozen most-deliberate moments (tags, octopus merges, tagged merges, real
+/// month transitions) survive, and the rest scroll through at the density
+/// pacing already computes for them.
+///
+/// Ranking itself (which candidates are the "most-deliberate" ones that
+/// survive the cap) is [`rank_pivots`]'s job, not this function's — see its
+/// doc comment for why the two are kept separate.
+pub fn detect_pivots(rows: &[GraphRow], commit_ys: &[CommitY], max_pivots: usize) -> Vec<Pivot> {
+    let mut candidates = rank_pivots(rows, commit_ys);
     candidates.truncate(max_pivots);
     // Re-sort into video order (ascending y) now that the cap has been
     // applied — the scroll encounters pivots top-to-bottom regardless of
@@ -450,6 +475,14 @@ mod tests {
         }
     }
 
+    fn gitref(name: &str, kind: RefKind) -> GitRef {
+        GitRef {
+            name: name.to_string(),
+            kind,
+            target: Oid("x".into()),
+        }
+    }
+
     // --- civil date math ------------------------------------------------
 
     #[test]
@@ -470,22 +503,92 @@ mod tests {
     // --- ranking ----------------------------------------------------------
 
     #[test]
-    fn a_tagged_non_merge_outranks_a_bare_merge() {
-        // The exact failure mode the task calls out: "a trivial merge does
-        // not outrank a release tag." A naive "is it a merge -> pivot" rule
-        // would rank these the other way (or equally); this asserts the
-        // deliberate-marker (tag) wins.
+    fn rank_pivots_puts_the_highest_scorer_first_before_any_cap_or_resort() {
+        // Direct test of the scored intermediate itself, before
+        // `detect_pivots`'s truncate+resort-by-y ever touches it. Row 0
+        // (earlier y) is a routine merge (score 10); row 1 (later y) carries
+        // a release tag (score 50). If ranking degenerated to plain y-order
+        // (the inverted-comparator mutation), row 0 would still be first
+        // here. If the tag's weight were gutted (the 50 -> 1 mutation), the
+        // merge's score-10 would outrank it and row 0 would again be first.
+        // Neither mutation can pass this: it asserts the winner by both
+        // identity (`row_idx`) and its actual score.
         let rows = vec![
             row(1_000, 2, vec![], "Merge branch 'feature'"),
             row(2_000, 1, vec![tag("v1.0.0")], "Release v1.0.0"),
         ];
         let ys = vec![CommitY { y: 10.0 }, CommitY { y: 20.0 }];
-        let pivots = detect_pivots(&rows, &ys, 10);
+        let ranked = rank_pivots(&rows, &ys);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].row_idx, 1, "the tagged release must rank first");
+        assert_eq!(ranked[0].score, 50);
+        assert_eq!(ranked[1].row_idx, 0);
+        assert_eq!(ranked[1].score, 10);
+    }
+
+    #[test]
+    fn a_release_tag_survives_a_max_pivots_cap_that_drops_a_routine_merge() {
+        // The exact failure mode the task calls out: "a trivial merge does
+        // not outrank a release tag." Unlike the old version of this test,
+        // the cap (`max_pivots: 1`) actually forces a choice between the
+        // two candidates — with a cap that never binds, `detect_pivots`'s
+        // final re-sort-by-y makes the ranking that produced its output
+        // unobservable, which is exactly how this finding's two mutations
+        // (inverted comparator, tag weight 50 -> 1) both survived unnoticed.
+        let rows = vec![
+            row(1_000, 2, vec![], "Merge branch 'feature'"),
+            row(2_000, 1, vec![tag("v1.0.0")], "Release v1.0.0"),
+        ];
+        let ys = vec![CommitY { y: 10.0 }, CommitY { y: 20.0 }];
+        let pivots = detect_pivots(&rows, &ys, 1);
+        assert_eq!(pivots.len(), 1);
+        assert!(
+            pivots[0].label.contains("v1.0.0"),
+            "the release tag must survive the cap, not the bare merge: {:?}",
+            pivots[0].label
+        );
+    }
+
+    #[test]
+    fn max_pivots_keeps_the_high_scorers_not_merely_a_count() {
+        // Five candidates with deliberately spread-apart scores (tag 50,
+        // branch 20, merge 10, remote-branch 10, head 5 — see
+        // `reason_score`), all in the same civil month so no month-boundary
+        // reason muddies the numbers, capped to 2. This must keep the tag
+        // and the branch specifically — asserting on which *labels* survive,
+        // not just that the output length is 2. A length-only assertion
+        // (the shape of the pre-existing `max_pivots_caps_output...` test
+        // below) cannot distinguish "kept the top 2" from "kept the bottom
+        // 2", which is exactly the gap an inverted ranking comparator hides
+        // behind.
+        let rows = vec![
+            row(1_000, 1, vec![tag("v1.0.0")], "release"),
+            row(
+                1_000,
+                1,
+                vec![gitref("main", RefKind::Branch)],
+                "branch tip",
+            ),
+            row(1_000, 2, vec![], "routine merge"),
+            row(
+                1_000,
+                1,
+                vec![gitref("origin/main", RefKind::RemoteBranch)],
+                "remote tip",
+            ),
+            row(1_000, 1, vec![gitref("HEAD", RefKind::Head)], "head"),
+        ];
+        let ys: Vec<CommitY> = (0..5).map(|i| CommitY { y: i as f64 * 10.0 }).collect();
+        let pivots = detect_pivots(&rows, &ys, 2);
         assert_eq!(pivots.len(), 2);
-        // Ranking survives the re-sort into y-order, so check the label
-        // directly rather than assuming position encodes rank.
-        let tagged = pivots.iter().find(|p| p.y == 20.0).unwrap();
-        assert!(tagged.label.contains("v1.0.0"), "{}", tagged.label);
+        let labels: Vec<&str> = pivots.iter().map(|p| p.label.as_str()).collect();
+        assert!(labels.iter().any(|l| l.contains("v1.0.0")), "{labels:?}");
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("main") && !l.contains("origin")),
+            "{labels:?}"
+        );
     }
 
     #[test]
