@@ -768,16 +768,17 @@ fn both_pull_strategies_declare_the_same_network_need() {
 
 /// The declaration is what picks the tier, and the *stated* argv of each
 /// remote operation must agree with it — this is the cross-check's own
-/// premise, tested on the argvs the planner builds (push, live today) or will
-/// build (fetch/pull, #229/#230).
+/// premise, tested on the argvs the planner builds (push and, since M2.20c
+/// #229, `fetch --progress`) or will build (pull, #230).
 ///
-/// Why the future argvs are worth pinning now: the D3 cross-check
+/// Why the not-yet-built argvs are worth pinning: the D3 cross-check
 /// `debug_assert`s on a `Local` declaration meeting a `Remote`-looking argv.
 /// The reverse — `Remote` declared, argv unrecognised — is tolerated
-/// silently, which means a `fetch`/`pull` argv missing from
-/// `REMOTE_SUBCOMMANDS` would produce *no* signal at all when #229/#230 land.
-/// Checking it here is the only place that failure mode is visible before it
-/// matters.
+/// silently, which means a `pull` argv missing from `REMOTE_SUBCOMMANDS`
+/// would produce *no* signal at all when #230 lands. Checking it here is the
+/// only place that failure mode is visible before it matters — and it earned
+/// its keep for fetch, whose real argv (`fetch --progress <remote>`) was
+/// pinned here a slice before anything ran it.
 #[test]
 fn the_remote_declarations_and_their_argvs_agree() {
     for args in [
@@ -789,6 +790,11 @@ fn the_remote_declarations_and_their_argvs_agree() {
             "origin",
             "feature",
         ],
+        // The argv `planner::fetch::exec_fetch` actually builds (M2.20c,
+        // #229) — `--progress` included, since a flag between the subcommand
+        // and the remote is exactly the shape a first-token classifier could
+        // have been written to miss.
+        vec!["fetch", "--progress", "origin"],
         vec!["fetch", "origin"],
         vec!["pull", "--no-rebase", "origin", "main"],
         vec!["pull", "--rebase", "origin", "main"],

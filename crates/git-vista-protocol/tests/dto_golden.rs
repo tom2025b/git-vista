@@ -27,9 +27,9 @@
 
 use git_vista_protocol::{
     AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind, BranchRequest,
-    CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest, HookPolicy,
-    RebaseStatus, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo,
-    SessionRequest,
+    CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest, FetchError,
+    FetchFailureKind, FetchRequest, FetchSuccess, HookPolicy, RebaseStatus, RemoteRefUpdate,
+    RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo, SessionRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +48,11 @@ struct DtoGoldenSet {
     amend_commit_success_unknown_reach: AmendCommitSuccess,
     amend_commit_error_hook_rejected: AmendCommitError,
     branch_request: BranchRequest,
+    fetch_request: FetchRequest,
+    fetch_success_with_updates: FetchSuccess,
+    fetch_success_already_up_to_date: FetchSuccess,
+    fetch_error_auth: FetchError,
+    fetch_error_cancelled_after_a_ref_moved: FetchError,
     clone_request: CloneRequest,
     select_request: SelectRequest,
     delete_clone_request: DeleteCloneRequest,
@@ -114,6 +119,57 @@ fn golden_set() -> DtoGoldenSet {
         },
         branch_request: BranchRequest {
             branch: "main".to_string(),
+        },
+        // M2.20c (#229). A remote *name*, never a URL — see `FetchRequest`.
+        fetch_request: FetchRequest {
+            remote: "origin".to_string(),
+        },
+        // A ref that moved and a ref that is new on the remote, so both
+        // `old_oid` shapes (`Some`/`None`) are pinned on the wire.
+        fetch_success_with_updates: FetchSuccess {
+            remote: "origin".to_string(),
+            message: "Fetched from ‘origin’: 2 remote-tracking refs updated.".to_string(),
+            updated_refs: vec![
+                RemoteRefUpdate {
+                    ref_name: "refs/remotes/origin/main".to_string(),
+                    old_oid: Some("1111111111111111111111111111111111111111".to_string()),
+                    new_oid: Some("2222222222222222222222222222222222222222".to_string()),
+                },
+                RemoteRefUpdate {
+                    ref_name: "refs/remotes/origin/feature".to_string(),
+                    old_oid: None,
+                    new_oid: Some("3333333333333333333333333333333333333333".to_string()),
+                },
+            ],
+        },
+        // The no-op success. `updated_refs` must reach the wire as `[]`, not
+        // be omitted: "the fetch ran and nothing moved" is the answer, and a
+        // missing key would read as "the server didn't say".
+        fetch_success_already_up_to_date: FetchSuccess {
+            remote: "origin".to_string(),
+            message: "Fetched from ‘origin’: already up to date.".to_string(),
+            updated_refs: Vec::new(),
+        },
+        fetch_error_auth: FetchError {
+            kind: FetchFailureKind::AuthenticationFailed,
+            message: "fatal: Authentication failed for 'https://example.invalid/repo.git/'"
+                .to_string(),
+            updated_refs: Vec::new(),
+        },
+        // The case the taxonomy exists for: cancelled *after* something had
+        // already landed locally. A client that renders "nothing changed" for
+        // every cancel would be lying here, which is why the ref list is a
+        // typed field on the error and not a sentence in `message`.
+        fetch_error_cancelled_after_a_ref_moved: FetchError {
+            kind: FetchFailureKind::Cancelled,
+            message: "The fetch from ‘origin’ was cancelled after 1 remote-tracking ref \
+                      had already been updated."
+                .to_string(),
+            updated_refs: vec![RemoteRefUpdate {
+                ref_name: "refs/remotes/origin/main".to_string(),
+                old_oid: Some("1111111111111111111111111111111111111111".to_string()),
+                new_oid: Some("2222222222222222222222222222222222222222".to_string()),
+            }],
         },
         clone_request: CloneRequest {
             url: "https://github.com/owner/repo.git".to_string(),

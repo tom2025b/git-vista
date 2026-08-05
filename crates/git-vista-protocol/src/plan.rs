@@ -28,7 +28,7 @@
 //! | `POST /api/checkout` | `git checkout <branch>` | [`GitOperation::CheckoutBranch`] |
 //! | `POST /api/merge` | `git merge --no-edit <branch>` | [`GitOperation::MergeBranch`] |
 //! | `POST /api/push` | `git push origin <branch>` | [`GitOperation::PushBranch`] |
-//! | *(planned, #229)* | `git fetch <remote>` | [`GitOperation::FetchRemote`] |
+//! | `POST /api/fetch` | `git fetch --progress <remote>` | [`GitOperation::FetchRemote`] |
 //! | *(planned, #230)* | `git pull --no-rebase\|--rebase` | [`GitOperation::PullBranch`] |
 //! | `POST /api/delete-branch` | `git branch -d <branch>` | [`GitOperation::DeleteBranch`] |
 //! | `POST /api/force-delete-branch` | `git branch -D <branch>` | [`GitOperation::ForceDeleteBranch`] |
@@ -78,7 +78,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::newtype::{
     require_git_safe, require_hex, require_non_empty, require_non_empty_bounded,
-    require_worktree_relative_path,
+    require_remote_name, require_worktree_relative_path,
 };
 
 /// Why a plan field failed validation — see
@@ -165,11 +165,41 @@ validated_string!(
     |v| require_non_empty(v, "commit message")
 );
 
+/// The most bytes a [`RemoteName`] may carry.
+///
+/// A cap for the reason [`MAX_TAG_MESSAGE_LEN`] is one: the value is
+/// client-chosen and rides into a [`Plan`] that is hashed, journaled and
+/// persisted. 100 bytes is far past any real nickname (`origin` is six) while
+/// keeping a hostile megabyte-long "name" a wire-boundary 400.
+pub const MAX_REMOTE_NAME_LEN: usize = 100;
+
 validated_string!(
-    /// A configured remote's name (today always `origin` — the only remote the
-    /// push handler addresses). Non-empty and not option-shaped.
+    /// The name of a remote **configured in the repository** — `origin`,
+    /// `upstream`, `fork-2`. Never a URL and never a path.
+    ///
+    /// # This is a security boundary (ADR 0047)
+    ///
+    /// It was [`require_git_safe`] until #229's follow-up, which is
+    /// non-empty and not option-shaped — and therefore accepted
+    /// `https://attacker.example/r.git`. `git fetch` does not refuse an
+    /// argument it cannot find in the config; it falls through to treating it
+    /// as a transport target, so that value made the `remote` request field
+    /// choose which host this server opens a socket to, with whatever
+    /// credential helper or SSH agent the host offers it. The validator now
+    /// refuses every URL and path shape — see
+    /// [`newtype::require_remote_name`](crate::newtype::require_remote_name)
+    /// for the exact rule, the table of shapes it refuses, and why it is
+    /// *necessary but not sufficient* (a well-formed name can still be one the
+    /// repository never configured, which the server's `RemoteConfigured`
+    /// precondition is what actually catches).
+    ///
+    /// Running the validator from `Deserialize` — which the macro does — is
+    /// what makes this reach `PullBranch`/`PushBranch`/`PushTag`/
+    /// `DeleteRemoteTag` too: their `remote` fields are this type, so a
+    /// submitted plan carrying a URL is a hard wire error before any handler
+    /// sees it.
     RemoteName,
-    |v| require_git_safe(v, "remote name")
+    |v| require_remote_name(v, "remote name", MAX_REMOTE_NAME_LEN)
 );
 
 validated_string!(
@@ -607,17 +637,21 @@ pub enum GitOperation {
         expected_tip: CommitOid,
         allow_empty: bool,
     },
-    /// `git fetch <remote>` — download the remote's objects and update its
-    /// remote-tracking refs (`refs/remotes/<remote>/*`), touching no local
-    /// branch, no index and no working tree (planned `POST /api/fetch`,
+    /// `git fetch --progress <remote>` — download the remote's objects and
+    /// update its remote-tracking refs (`refs/remotes/<remote>/*`), touching
+    /// no local branch, no index and no working tree (`POST /api/fetch`,
     /// M2.20, #73/#229).
     ///
-    /// # Contract only (M2.20a, #227)
+    /// # Staged in two slices (M2.20a #227, then M2.20c #229)
     ///
-    /// No handler builds this yet and `planner::execute` refuses it — the
-    /// same staging #222 used for `AmendCommit`, so the vocabulary and the
-    /// network classification land and get reviewed before any code opens a
-    /// socket.
+    /// The vocabulary and the network classification landed first, with
+    /// `planner::execute` refusing the variant — the same staging #222 used
+    /// for `AmendCommit`, so both got reviewed before any code opened a
+    /// socket. M2.20c (#229, ADR 0043) wired execution: streamed
+    /// [`TransferProgress`](crate::operation::TransferProgress) on the
+    /// operation's own record, a cancel that terminates the child process,
+    /// and a typed failure taxonomy
+    /// ([`FetchFailureKind`](crate::dto::FetchFailureKind)).
     ///
     /// # `RiskLevel::Safe`, and why that is not complacency
     ///
@@ -643,8 +677,9 @@ pub enum GitOperation {
     /// # Why it still declares `NetworkNeed::Remote`
     ///
     /// Low *risk* and high *reach* are independent axes. Fetch opens a
-    /// socket, so it needs the network tier — and, once #229 executes it,
-    /// the credential handling that tier brings. See
+    /// socket, so it needs the network tier — and, since #229 executes it,
+    /// the credential handling that tier brings (#228's forced
+    /// `core.askpass=` and output redaction). See
     /// `sandbox::network_need_for_operation`.
     FetchRemote { remote: RemoteName },
     /// `git pull --no-rebase|--rebase <remote> <branch>` — fetch, then

@@ -37,6 +37,46 @@
   "branch_request": {
     "branch": "main"
   },
+  "fetch_request": {
+    "remote": "origin"
+  },
+  "fetch_success_with_updates": {
+    "remote": "origin",
+    "message": "Fetched from ‘origin’: 2 remote-tracking refs updated.",
+    "updated_refs": [
+      {
+        "ref_name": "refs/remotes/origin/main",
+        "old_oid": "1111111111111111111111111111111111111111",
+        "new_oid": "2222222222222222222222222222222222222222"
+      },
+      {
+        "ref_name": "refs/remotes/origin/feature",
+        "old_oid": null,
+        "new_oid": "3333333333333333333333333333333333333333"
+      }
+    ]
+  },
+  "fetch_success_already_up_to_date": {
+    "remote": "origin",
+    "message": "Fetched from ‘origin’: already up to date.",
+    "updated_refs": []
+  },
+  "fetch_error_auth": {
+    "kind": "authentication_failed",
+    "message": "fatal: Authentication failed for 'https://example.invalid/repo.git/'",
+    "updated_refs": []
+  },
+  "fetch_error_cancelled_after_a_ref_moved": {
+    "kind": "cancelled",
+    "message": "The fetch from ‘origin’ was cancelled after 1 remote-tracking ref had already been updated.",
+    "updated_refs": [
+      {
+        "ref_name": "refs/remotes/origin/main",
+        "old_oid": "1111111111111111111111111111111111111111",
+        "new_oid": "2222222222222222222222222222222222222222"
+      }
+    ]
+  },
   "clone_request": {
     "url": "https://github.com/owner/repo.git"
   },

@@ -94,8 +94,17 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     "src/planner/contract_suite.rs", // #[cfg(test)] git fixtures for the #146 pipeline suite
     "src/planner/coordination_suite.rs", // #[cfg(test)] git fixtures for the #60 coordination suite
     "src/planner/lifecycle_suite.rs", // #[cfg(test)] git fixtures for the #61 lifecycle suite
-    "src/state.rs",                  // #[cfg(test)] fixture setup
-    "src/argv_boundary.rs",          // this file (the scan reads its own source)
+    // #[cfg(test)] git fixtures for the M2.20c (#229) fetch suite: building
+    // the repository + its in-tree bare remote, and one deliberate
+    // *unsandboxed* `git fetch` that asserts the redaction test's premise (the
+    // fixture really does leak a credential when nothing redacts it).
+    "src/planner/fetch_suite.rs",
+    // #[cfg(test)] git fixtures for the remote-target boundary suite (ADR
+    // 0047): a repository, an in-tree bare target the server must refuse to
+    // fetch from, and `git remote add` for the paired positive control.
+    "src/planner/remote_boundary_suite.rs",
+    "src/state.rs",         // #[cfg(test)] fixture setup
+    "src/argv_boundary.rs", // this file (the scan reads its own source)
     // The M1.13b spawn chokepoint (#66, Task 5). It builds a git Command from
     // `sandbox_argv(policy)`, so `argv[0]` is the shim (or bare `git` in the
     // unsandboxed tier), never a literal chosen here. Also in
