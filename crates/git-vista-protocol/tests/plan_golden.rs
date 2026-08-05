@@ -428,10 +428,12 @@ fn golden_plans() -> Vec<Plan> {
                 to: oid('2'),
             },
         ),
-        // #227 (M2.20a): contract only, like `amend_commit` above — the
-        // vocabulary and its network classification land before #229/#230
-        // wire any socket. The golden plans pin the wire shape now so those
-        // slices cannot quietly change it while adding execution.
+        // #227 (M2.20a): the vocabulary and its network classification landed
+        // before #229/#230 wired any socket, and these golden plans pinned the
+        // wire shape so those slices could not quietly change it while adding
+        // execution. It held: M2.20c (#229) wired `exec_fetch` against exactly
+        // the plan below — same risk class, same single precondition, same
+        // empty ref-change list — and this fixture needed no regeneration.
         //
         // Fetch is `Safe`/`NotNeeded` with no ref change listed: which
         // `refs/remotes/*` move is unknowable until git has spoken to the
