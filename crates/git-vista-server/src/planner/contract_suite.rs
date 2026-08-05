@@ -938,6 +938,218 @@ async fn revert_commit_executes_through_the_pipeline() {
     assert!(out(&repo, &["log", "-1", "--format=%s"]).starts_with("Revert"));
 }
 
+// --- #308: git 2.43 has no `revert --allow-empty` — the three diff-empty
+// triggers, plus the failure-cleanup subtlety the two-step fix introduces --
+
+/// #308, trigger 1: reverting a commit whose own diff was already empty (a
+/// bare `git commit --allow-empty`). On this box's git 2.43 (verified via
+/// `git --version` == 2.43.0), the single `git revert --no-edit <commit>`
+/// `exec_revert` currently runs (planner.rs:3362-3395) fails outright —
+/// `revert` gained `--allow-empty` only in 2.45 — so "undo" for a no-op
+/// commit is undoable in name only. Empirically reproduced in a disposable
+/// scratch repo before writing this: `git revert --no-edit <noop-sha>`
+/// exits 1 with "nothing to commit, working tree clean". The fix is the
+/// two-step `revert --no-commit` + `commit --allow-empty --no-edit`; this
+/// asserts the whole pipeline, not just the git invocation, ends in a real
+/// inverse commit.
+#[tokio::test]
+async fn revert_of_an_empty_commit_succeeds_with_an_inverse_empty_commit() {
+    let (_dir, repo) = seeded_repo();
+    run(&repo, &["commit", "-q", "--allow-empty", "-m", "noop change"]);
+    let noop = tip(&repo, "HEAD");
+    let before_count: u32 = out(&repo, &["rev-list", "--count", "HEAD"])
+        .parse()
+        .unwrap();
+
+    let (status, body) =
+        pipeline(&repo, GitOperation::RevertCommit { commit: oid(&noop) }).await;
+    assert_ok(status, &body);
+
+    assert_ne!(
+        tip(&repo, "HEAD"),
+        noop,
+        "a successful revert must land a new commit, not silently no-op"
+    );
+    assert!(
+        out(&repo, &["log", "-1", "--format=%s"]).starts_with("Revert"),
+        "the new commit must be the revert, not something else"
+    );
+    assert_eq!(
+        out(&repo, &["rev-list", "--count", "HEAD"]),
+        (before_count + 1).to_string(),
+        "exactly one new commit — the inverse — must land"
+    );
+    assert_eq!(
+        out(&repo, &["status", "--porcelain"]),
+        "",
+        "the working tree must stay clean"
+    );
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+}
+
+/// #308, trigger 2: reverting a commit that is not in HEAD's own history at
+/// all — the live repro (84570fe, an orphan lineage). `X`'s forward diff is
+/// real, but it was never merged into the checked-out branch, so reversing
+/// it against main's current tree is a no-op: the pre-change content the
+/// reverse patch would produce is already what's on disk. Same git-2.43
+/// failure as trigger 1, reached a different way — proving the bug isn't
+/// specific to `--allow-empty` commits, it's specific to an empty DIFF
+/// against HEAD however that's reached. Confirmed no fixture leak by
+/// asserting X is genuinely not an ancestor of main (a raw `merge-base
+/// --is-ancestor` check, not the `out()` helper, which asserts success and
+/// would panic on the expected-nonzero exit).
+#[tokio::test]
+async fn revert_of_a_commit_not_in_head_succeeds_when_its_reverse_diff_is_already_a_no_op() {
+    let (_dir, repo) = seeded_repo();
+    // main sits at the seed (a.txt = "a\n"). A sibling branch changes a.txt
+    // and is never merged — X is reachable only via `other`, not via main's
+    // history, matching the "not in HEAD" trigger.
+    run(&repo, &["checkout", "-q", "-b", "other"]);
+    std::fs::write(repo.join("a.txt"), "z\n").unwrap();
+    run(&repo, &["add", "a.txt"]);
+    run(&repo, &["commit", "-q", "-m", "change a to z on other"]);
+    let x = tip(&repo, "other");
+    run(&repo, &["checkout", "-q", "main"]);
+    let before = tip(&repo, "main");
+
+    let x_is_ancestor_of_main = std::process::Command::new("git")
+        .args(["merge-base", "--is-ancestor", &x, "main"])
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success();
+    assert!(
+        !x_is_ancestor_of_main,
+        "fixture error: X must NOT be reachable from main, or this isn't \
+         actually the not-in-HEAD trigger"
+    );
+
+    let (status, body) = pipeline(&repo, GitOperation::RevertCommit { commit: oid(&x) }).await;
+    assert_ok(status, &body);
+    assert_ne!(
+        tip(&repo, "HEAD"),
+        before,
+        "a new revert commit must land on main"
+    );
+    assert!(out(&repo, &["log", "-1", "--format=%s"]).starts_with("Revert"));
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(out(&repo, &["status", "--porcelain"]), "");
+}
+
+/// #308, trigger 3: reverting the SAME commit a second time. The first
+/// revert has a real, non-empty diff and already works on today's code
+/// (proven inline, not assumed); the second is what breaks — by the time it
+/// runs, the tree already matches what the reverse patch would produce, so
+/// the diff against HEAD is empty again, the same class of failure as
+/// triggers 1 and 2 reached a third way.
+#[tokio::test]
+async fn reverting_an_already_reverted_commit_succeeds_again() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "b\n").unwrap();
+    run(&repo, &["add", "a.txt"]);
+    run(&repo, &["commit", "-q", "-m", "change a to b"]);
+    let c = tip(&repo, "HEAD");
+
+    // First revert: non-empty diff, already works on today's code — not the
+    // regression under test, just fixture setup for the second one.
+    let (status1, body1) =
+        pipeline(&repo, GitOperation::RevertCommit { commit: oid(&c) }).await;
+    assert_ok(status1, &body1);
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+    let after_first = tip(&repo, "HEAD");
+    let count_after_first: u32 = out(&repo, &["rev-list", "--count", "HEAD"])
+        .parse()
+        .unwrap();
+
+    // Second revert of the SAME commit: the diff against HEAD is now empty.
+    let (status2, body2) =
+        pipeline(&repo, GitOperation::RevertCommit { commit: oid(&c) }).await;
+    assert_ok(status2, &body2);
+    assert_ne!(
+        tip(&repo, "HEAD"),
+        after_first,
+        "the second revert must land its own new commit"
+    );
+    assert_eq!(
+        out(&repo, &["rev-list", "--count", "HEAD"]),
+        (count_after_first + 1).to_string()
+    );
+    assert!(out(&repo, &["log", "-1", "--format=%s"]).starts_with("Revert"));
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(out(&repo, &["status", "--porcelain"]), "");
+}
+
+/// #308's own "critical subtlety": once the fix is a two-step `revert
+/// --no-commit` + `commit --allow-empty --no-edit`, a failure can now
+/// happen at the SECOND step (the commit) — not only the first, which is
+/// all today's single-step code can ever fail at. A rejecting hook only
+/// ever runs on `git commit`, so it can only fire here once the fix's
+/// second step exists at all. Proven with a hook that both writes a marker
+/// (so we know it genuinely ran) and rejects (so the commit fails): the
+/// marker's presence is exactly what a naive revert back to the single-step
+/// call cannot produce, because git bails out on "nothing to commit" before
+/// any hook ever runs for an empty-diff commit (empirically confirmed on
+/// this box's git 2.43: same hook script installed, single-step revert on
+/// an empty-diff commit leaves the marker absent). Cleanup must still leave
+/// the repository exactly as if nothing had been attempted — proving `git
+/// revert --abort` is correct cleanup after a failed STEP-2 commit, not
+/// only after a failed step-1 compute (empirically confirmed separately:
+/// REVERT_HEAD is cleared by git only on a successful commit, never a
+/// failed one, so a failed step-2 commit leaves the identical sequencer
+/// state a failed step-1 --no-commit would).
+#[tokio::test]
+async fn a_hook_rejected_commit_step_is_cleaned_up_after_the_hook_actually_ran() {
+    let (_dir, repo) = seeded_repo();
+    run(&repo, &["commit", "-q", "--allow-empty", "-m", "noop change"]);
+    let noop = tip(&repo, "HEAD");
+    let commit_count = out(&repo, &["rev-list", "--count", "HEAD"]);
+
+    let marker = repo.join(".git/hook-ran-marker");
+    std::fs::write(
+        repo.join(".git/hooks/pre-commit"),
+        "#!/bin/sh\ntouch \"$(git rev-parse --git-dir)/hook-ran-marker\"\nexit 1\n",
+    )
+    .unwrap();
+    make_executable(&repo.join(".git/hooks/pre-commit"));
+    assert!(!marker.exists(), "the marker must start absent");
+
+    let (status, body) =
+        pipeline(&repo, GitOperation::RevertCommit { commit: oid(&noop) }).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        marker.exists(),
+        "the pre-commit hook must actually have run — if it did not, the \
+         revert never reached a second `git commit` step at all, which is \
+         exactly the pre-fix single-`git revert --no-edit` behaviour (it \
+         bails out on \"nothing to commit\" before any hook runs)"
+    );
+
+    let revert_head_present = std::process::Command::new("git")
+        .args(["rev-parse", "-q", "--verify", "REVERT_HEAD"])
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success();
+    assert!(
+        !revert_head_present,
+        "REVERT_HEAD must be cleared — a dangling sequencer state after a \
+         failed step-2 commit means `git revert --abort` was skipped for \
+         that failure arm"
+    );
+    assert_eq!(tip(&repo, "HEAD"), noop, "a failed revert must not move HEAD");
+    assert_eq!(
+        out(&repo, &["rev-list", "--count", "HEAD"]),
+        commit_count,
+        "a failed revert must not create any commit, partial or otherwise"
+    );
+    assert_eq!(
+        out(&repo, &["status", "--porcelain"]),
+        "",
+        "the working tree must be left clean, not mid-revert"
+    );
+}
+
 #[tokio::test]
 async fn reset_test_repo_executes_through_the_pipeline() {
     let (_dir, repo) = seeded_repo();
