@@ -25,6 +25,11 @@ const APP_MOD: &str = include_str!("../../app/mod.rs");
 const RENDER_NODES: &str = include_str!("../../render/nodes.rs");
 const RENDER_STUBS: &str = include_str!("../../render/stubs.rs");
 const MENU: &str = include_str!("../../menu.rs");
+/// The commit modal (M2.19c, #224 widened it to three modes). Inline-styled end
+/// to end, so the stylesheet census below cannot see a single one of its
+/// controls — this file's own bytes are the only place its tap targets can be
+/// checked.
+const COMMIT_MODAL: &str = include_str!("../../dialogs/commit.rs");
 
 fn stylesheet() -> Vec<Rule> {
     parse(STYLES)
@@ -727,10 +732,11 @@ fn every_disabled_context_menu_item_is_focusable() {
     // Anti-vacuity floor. "Every tag is a button" is trivially true of an empty
     // list, so if this census ever stopped finding the items — file moved, markup
     // reshaped, class renamed — the assertions below would go green while checking
-    // nothing. Seven is what menu.rs has today (GitHub link, two commit items,
-    // Stage Changes, Discard Changes, Delete Untracked Files, the offline notice).
+    // nothing. Eight is what menu.rs has today (GitHub link, two commit items,
+    // "Amend last commit" since M2.19c/#224, Stage Changes, Discard Changes,
+    // Delete Untracked Files, the offline notice).
     assert!(
-        tags.len() >= 7,
+        tags.len() >= 8,
         "only {} `.ctx-item.disabled` item(s) found in menu.rs — this census has \
          lost its subject and every assertion below it is now vacuous. If items \
          were genuinely removed, lower this floor deliberately rather than \
@@ -786,6 +792,185 @@ fn the_disabled_item_census_can_tell_a_span_from_a_button() {
     let native = "<button class=\"ctx-item disabled\" prop:disabled=true>";
     assert!(disabled_ctx_item_tags(native)[0].contains("prop:disabled"));
     assert!(disabled_ctx_item_tags("no menu items here").is_empty());
+}
+
+// ── The commit modal's tap targets (M2.19c, #224) ───────────────────────────────
+//
+// This modal is inline-styled (see `dialogs/mod.rs` for the iPad-proven recipe it
+// follows), which puts every one of its controls outside the stylesheet census
+// above: `INTERACTIVE_CENSUS` reads CSS selectors, and there are none to read.
+// `dialogs/confirm.rs` hit the same gap in M2.18b and answered it by naming the
+// 44x44 floor once, as `TOUCH_TARGET_STYLE`, and pairing it with the button base
+// style at every site. #224 rewrote this modal — three modes, a scope review, a
+// re-check banner — and brought its buttons onto the same pairing; before that
+// they were `padding:6px 14px` on a 13px font, roughly 30px tall, under the floor
+// the rest of the app was raised to in #65.
+//
+// The tripwire is over that pairing rather than over rendered geometry, because
+// the pairing is the part that exists in this repository. What it cannot prove is
+// that the button is 44px on a real device — no test here can.
+
+/// Every place the modal's button base style is used, with what follows it.
+///
+/// Returns one entry per `{BUTTON_BASE}` occurrence, so a floor over the count is
+/// what stops the assertions going vacuous if the constant is renamed away.
+fn button_base_uses(src: &str) -> Vec<&str> {
+    const NEEDLE: &str = "{BUTTON_BASE}";
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(NEEDLE) {
+        let at = from + rel + NEEDLE.len();
+        from = at;
+        out.push(&src[at..src.len().min(at + NEEDLE.len() + 24)]);
+    }
+    out
+}
+
+#[test]
+fn every_commit_modal_button_carries_the_44px_floor() {
+    let uses = button_base_uses(COMMIT_MODAL);
+    // Anti-vacuity floor. Four is what the modal has today: Cancel, the confirm
+    // button's two style branches, and the re-check banner's action. "Every use
+    // is paired" is trivially true of no uses at all, so a rename that made this
+    // census find nothing would otherwise pass silently.
+    assert!(
+        uses.len() >= 4,
+        "only {} `{{BUTTON_BASE}}` use(s) found in dialogs/commit.rs — this census \
+         has lost its subject and the assertion below it is now vacuous. If buttons \
+         were genuinely removed, lower this floor deliberately.",
+        uses.len()
+    );
+    for tail in &uses {
+        assert!(
+            tail.starts_with("{TOUCH_TARGET_STYLE}"),
+            "a commit-modal button styles itself from BUTTON_BASE without the 44x44 \
+             floor beside it, so it inherits only the padding — the exact shape #65 \
+             found undersized. Follows BUTTON_BASE here: {tail:?}"
+        );
+    }
+
+    // The pre-#224 shape, named so a revert is caught rather than merely becoming
+    // un-asserted: a `style="padding:…"` literal is a control styled without going
+    // through `BUTTON_BASE` at all, which is how the old `padding:6px 14px`
+    // buttons (~30px tall on this font) escaped every check there was. Matched on
+    // the attribute rather than on the declaration alone, so the prose above and
+    // in `dialogs/commit.rs` may keep quoting the old value.
+    assert!(
+        !COMMIT_MODAL.contains("style=\"padding:"),
+        "a commit-modal control declares its own padding instead of building on \
+         BUTTON_BASE + TOUCH_TARGET_STYLE, so nothing holds it to the 44px floor"
+    );
+
+    // And the floor itself is still a floor. `TOUCH_TARGET_STYLE`'s own value is
+    // asserted where it is defined; this is the half that would notice the
+    // constant being pointed somewhere else.
+    assert!(
+        crate::features::dialogs::core::TOUCH_TARGET_STYLE.contains("min-height:44px"),
+        "TOUCH_TARGET_STYLE no longer declares the 44px floor the pairing above \
+         relies on"
+    );
+}
+
+/// The census helper is proved on both answers, against fixture source — otherwise
+/// a helper that returned an empty list would satisfy the loop above perfectly.
+#[test]
+fn the_button_base_census_can_spot_an_unfloored_button() {
+    let floored = r#"style=format!("{BUTTON_BASE}{TOUCH_TARGET_STYLE}color:#fff;")"#;
+    let uses = button_base_uses(floored);
+    assert_eq!(uses.len(), 1);
+    assert!(uses[0].starts_with("{TOUCH_TARGET_STYLE}"));
+
+    // The shape this modal actually shipped before #224 — the paired negative.
+    let unfloored = r#"style=format!("{BUTTON_BASE}color:#fff;")"#;
+    let uses = button_base_uses(unfloored);
+    assert_eq!(uses.len(), 1);
+    assert!(!uses[0].starts_with("{TOUCH_TARGET_STYLE}"));
+
+    assert!(button_base_uses("no buttons here").is_empty());
+}
+
+// ── The amend seams (M2.19c, #224) ──────────────────────────────────────────────
+//
+// `dialogs/commit.rs` and `menu.rs` are wasm-only: `cargo test --workspace` never
+// compiles them, and this crate has no wasm-bindgen-test harness, so nothing
+// *executes* a line of either. Two decisions used to live in them anyway — which
+// endpoint the confirm button reaches, and whether "Amend last commit" is offered
+// — and both were reachable-only-by-hand. They now come from host-tested
+// functions in `features::dialogs::commit`. These tripwires are the half that
+// notices if a later edit stops asking and starts deciding again; the tests over
+// the functions themselves are in that module.
+//
+// What they cannot prove: that the returned answer is rendered correctly. Only
+// that the answer is the one being consulted.
+
+/// Whether the guided re-check fills the message box before it announces what
+/// the box holds.
+///
+/// Fail-closed on a missing subject: if either landmark is gone this returns
+/// false rather than quietly passing, because a census with nothing to census
+/// is the vacuous-green shape this file exists to avoid.
+fn seeds_before_it_announces(src: &str) -> bool {
+    match (src.find("seed_amend_msg("), src.find("Recheck::Retargeted")) {
+        (Some(seed), Some(announce)) => seed < announce,
+        _ => false,
+    }
+}
+
+#[test]
+fn the_amend_seams_are_decided_in_the_host_tested_core() {
+    assert!(
+        COMMIT_MODAL.contains("submit_path("),
+        "the commit modal no longer asks `submit_path` which endpoint a press \
+         reaches, so the plain-commit / amend dispatch is being decided in a file \
+         no test compiles. An amend routed to the plain-commit closure writes a \
+         second commit instead of rewriting the tip."
+    );
+    assert!(
+        MENU.contains("amend_offer("),
+        "menu.rs no longer asks `amend_offer` whether to offer \"Amend last \
+         commit\", so the gate is a condition in a file no test compiles"
+    );
+    // The hand-rolled form, named so a revert is caught rather than merely
+    // becoming un-asserted.
+    assert!(
+        !MENU.contains("is_head && !is_stub"),
+        "the amend gate has been inlined back into menu.rs; inverting or dropping \
+         it there would offer an amend on every stub with nothing going red"
+    );
+}
+
+/// The ordering bug the M2.19c review found: the retarget banner claimed "your
+/// message below is unchanged" and the next statement re-seeded the box from the
+/// new tip, replacing exactly the text it had just vouched for.
+#[test]
+fn the_recheck_seeds_the_box_before_it_announces_what_the_box_holds() {
+    assert!(
+        seeds_before_it_announces(COMMIT_MODAL),
+        "dialogs/commit.rs sets Recheck::Retargeted before it calls \
+         seed_amend_msg. The banner speaks about the message box; seeding can \
+         replace the message box. Announcing first is a claim the next line can \
+         contradict, and the user's next act is to press Amend."
+    );
+}
+
+/// Both answers, against fixture source — a predicate that only ever returned
+/// true would satisfy the tripwire above perfectly.
+#[test]
+fn the_seed_ordering_census_can_spot_the_shape_that_shipped() {
+    let fixed = "let seeded = dialogs.seed_amend_msg(&d.message); \
+                 set(Recheck::Retargeted { new_tip, summary, message: seeded })";
+    assert!(seeds_before_it_announces(fixed));
+
+    // The paired negative: the pre-fix order.
+    let broken = "set(Recheck::Retargeted { new_tip, summary }); \
+                  dialogs.seed_amend_msg(&d.message);";
+    assert!(!seeds_before_it_announces(broken));
+
+    // And a source with no subject at all must not read as a pass.
+    assert!(!seeds_before_it_announces("nothing to see"));
+    assert!(!seeds_before_it_announces(
+        "dialogs.seed_amend_msg(&d.message);"
+    ));
 }
 
 /// The stylesheet already dresses the focused-but-disabled item, so making these

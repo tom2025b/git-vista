@@ -16,9 +16,11 @@ use leptos::{
     create_rw_signal, store_value, RwSignal, SignalGet, SignalGetUntracked, SignalSet, StoredValue,
 };
 
-use crate::features::dialogs::core::{
-    commit_draft_key, draft_scope_action, Dialog, DialogsCore, DraftScopeAction,
+use crate::features::dialogs::commit::{
+    adopt_seed, message_buffer, persist_key, seed_outcome, AmendPhase, CommitIntent, MessageBuffer,
+    SeedOutcome,
 };
+use crate::features::dialogs::core::{draft_scope_action, Dialog, DialogsCore, DraftScopeAction};
 
 /// Best-effort handle on the tab's `sessionStorage`, the `prefs.rs`
 /// convention: private browsing can refuse storage, in which case drafts
@@ -91,6 +93,26 @@ pub struct Dialogs {
     /// modal *in place* with a different operation, and an arm that carried
     /// over would hand the new question a confirm button the user never armed.
     confirm_armed: RwSignal<bool>,
+    /// The message being written for an **amend** (M2.19c, #224) — a second
+    /// buffer, deliberately, and never persisted.
+    ///
+    /// `features::dialogs::commit::MessageBuffer` carries the whole argument;
+    /// the short version is that amend mode *pre-fills* the box from HEAD, and
+    /// routing that pre-fill through the #226 draft would overwrite (and
+    /// persist over) a half-typed commit message the user still wants.
+    amend_msg: RwSignal<String>,
+    /// What [`Dialogs::amend_msg`] was last seeded with — the pre-filled tip
+    /// message. Only ever compared, never shown: it is how
+    /// `commit::adopt_seed` tells "the user hasn't touched this" from "the
+    /// user typed something", so a slow `GET /api/commit/{id}` can never land
+    /// on top of their words.
+    amend_seed: StoredValue<String>,
+    /// How the current amend attempt is going, including the guided re-check
+    /// after the compare-and-swap refuses. Lives here rather than inside the
+    /// modal's own view closure because retargeting the dialog at a fresh tip
+    /// re-runs that closure — state created inside it would be wiped by the
+    /// very step that produced it.
+    amend_phase: RwSignal<AmendPhase>,
 }
 
 impl Dialogs {
@@ -102,6 +124,9 @@ impl Dialogs {
             commit_msg: create_rw_signal(String::new()),
             draft_scope: store_value(None),
             confirm_armed: create_rw_signal(false),
+            amend_msg: create_rw_signal(String::new()),
+            amend_seed: store_value(String::new()),
+            amend_phase: create_rw_signal(AmendPhase::Idle),
         }
     }
 
@@ -122,35 +147,107 @@ impl Dialogs {
         }
         let restored = worktree_id
             .as_deref()
-            .and_then(|id| session_storage()?.get_item(&commit_draft_key(id)).ok()?)
+            .and_then(|id| {
+                let key = persist_key(MessageBuffer::Draft, id)?;
+                session_storage()?.get_item(&key).ok()?
+            })
             .unwrap_or_default();
         self.draft_scope.set_value(worktree_id);
         self.commit_msg.set(restored);
     }
 
-    /// A tracked read — the modal's `<textarea>` and its Commit button both render from it.
-    pub fn commit_msg(&self) -> String {
-        self.commit_msg.get()
+    /// A tracked read of the message `intent` is editing — the modal's
+    /// `<textarea>` and its confirm button both render from it.
+    ///
+    /// Which buffer that is comes from `commit::message_buffer`, not from a
+    /// match written out again here: the draft-vs-amend split is the thing
+    /// #226 and #224 have to agree on, so it is decided in one host-tested
+    /// place and consumed everywhere else.
+    pub fn message(&self, intent: &CommitIntent) -> String {
+        match message_buffer(intent) {
+            MessageBuffer::Draft => self.commit_msg.get(),
+            MessageBuffer::Amend => self.amend_msg.get(),
+        }
     }
 
     /// An untracked read, for the submit handler that must not subscribe.
-    pub fn commit_msg_untracked(&self) -> String {
-        self.commit_msg.get_untracked()
+    pub fn message_untracked(&self, intent: &CommitIntent) -> String {
+        match message_buffer(intent) {
+            MessageBuffer::Draft => self.commit_msg.get_untracked(),
+            MessageBuffer::Amend => self.amend_msg.get_untracked(),
+        }
     }
 
-    /// Update the draft, persisting every change (#226): unbounced on
-    /// purpose — a commit message is small, `sessionStorage` writes are
-    /// synchronous and cheap, and a debounce window is exactly the keystrokes
-    /// an iOS suspension would eat.
-    pub fn set_commit_msg(&self, msg: String) {
+    /// Update the message `intent` is editing, persisting it **iff** its
+    /// buffer has a storage key (#226 for the draft; nothing for amend).
+    ///
+    /// Unbounced on purpose — a commit message is small, `sessionStorage`
+    /// writes are synchronous and cheap, and a debounce window is exactly the
+    /// keystrokes an iOS suspension would eat.
+    pub fn set_message(&self, intent: &CommitIntent, msg: String) {
+        let buffer = message_buffer(intent);
         self.draft_scope.with_value(|scope| {
-            if let (Some(id), Some(storage)) = (scope.as_deref(), session_storage()) {
-                if storage.set_item(&commit_draft_key(id), &msg).is_err() {
+            let Some(id) = scope.as_deref() else { return };
+            // `None` here is not "no storage available" — it is a buffer that
+            // must not persist at all, which is the whole guarantee amend mode
+            // rests on.
+            let Some(key) = persist_key(buffer, id) else {
+                return;
+            };
+            if let Some(storage) = session_storage() {
+                if storage.set_item(&key, &msg).is_err() {
                     warn_persist_failed_once();
                 }
             }
         });
-        self.commit_msg.set(msg);
+        match buffer {
+            MessageBuffer::Draft => self.commit_msg.set(msg),
+            MessageBuffer::Amend => self.amend_msg.set(msg),
+        }
+    }
+
+    /// Offer `incoming` as the amend box's pre-filled message.
+    ///
+    /// Adopted only if the user has not typed since the last seed
+    /// (`commit::adopt_seed`), so the `GET /api/commit/{id}` behind the
+    /// pre-fill can land whenever it lands — including after the user has
+    /// started writing, or after the guided re-check has retargeted the
+    /// dialog at a different tip — without ever eating their words.
+    /// Returns what it did to the box. The guided re-check announces the
+    /// retarget in a banner that speaks about the box's contents, and it can
+    /// only be honest about them if it is told: an untouched pre-fill *is*
+    /// replaced here, so a banner that assumed otherwise would vouch for text
+    /// this call had just thrown away.
+    pub fn seed_amend_msg(&self, incoming: &str) -> SeedOutcome {
+        let current = self.amend_msg.get_untracked();
+        let seed = self.amend_seed.with_value(|s| s.clone());
+        let adopted = adopt_seed(&current, &seed, incoming);
+        if let Some(next) = &adopted {
+            self.amend_msg.set(next.clone());
+        }
+        // The seed is recorded either way: it is the baseline the *next*
+        // pre-fill compares against, and a rejected seed still means "this is
+        // what the tip says", not "nothing was offered".
+        self.amend_seed.set_value(incoming.to_string());
+        seed_outcome(adopted.as_ref())
+    }
+
+    /// The amend attempt's phase — a tracked read; the banner, the confirm
+    /// button and the busy state all render from it.
+    pub fn amend_phase(&self) -> AmendPhase {
+        self.amend_phase.get()
+    }
+
+    pub fn set_amend_phase(&self, phase: AmendPhase) {
+        self.amend_phase.set(phase);
+    }
+
+    /// Clear the amend buffer, its seed and its phase — on a successful amend,
+    /// and whenever a dialog opens for a different question.
+    pub fn reset_amend(&self) {
+        self.amend_msg.set(String::new());
+        self.amend_seed.set_value(String::new());
+        self.amend_phase.set(AmendPhase::Idle);
     }
 
     /// The scope the draft belongs to right now — captured by the commit
@@ -169,15 +266,27 @@ impl Dialogs {
     /// leave the submitted one to resurrect from storage later. The dialog
     /// *opener* deliberately calls no clear at all, because opening is how a
     /// suspension-recovered draft comes back.
-    pub fn clear_commit_msg_for(&self, submitted_scope: Option<&str>) {
-        if let (Some(id), Some(storage)) = (submitted_scope, session_storage()) {
-            let _ = storage.remove_item(&commit_draft_key(id));
-        }
-        let still_current = self
-            .draft_scope
-            .with_value(|s| s.as_deref() == submitted_scope);
-        if still_current {
-            self.commit_msg.set(String::new());
+    /// M2.19c (#224) took the `intent` argument: an amend consumes the amend
+    /// buffer, which has no persisted copy and no repository scope, so the
+    /// storage half of this must not run for it — clearing a draft key on an
+    /// amend's success would delete a commit message the user is still
+    /// writing.
+    pub fn clear_message_for(&self, intent: &CommitIntent, submitted_scope: Option<&str>) {
+        match message_buffer(intent) {
+            MessageBuffer::Draft => {
+                if let (Some(id), Some(storage)) = (submitted_scope, session_storage()) {
+                    if let Some(key) = persist_key(MessageBuffer::Draft, id) {
+                        let _ = storage.remove_item(&key);
+                    }
+                }
+                let still_current = self
+                    .draft_scope
+                    .with_value(|s| s.as_deref() == submitted_scope);
+                if still_current {
+                    self.commit_msg.set(String::new());
+                }
+            }
+            MessageBuffer::Amend => self.reset_amend(),
         }
     }
 
@@ -195,6 +304,13 @@ impl Dialogs {
         // is here: eleven call sites getting it right by repetition is what
         // M1.11 was cleaning up.
         self.confirm_armed.set(false);
+        // Same rule for the amend attempt (#224): a fresh open must not
+        // inherit the previous amend's banner, its half-finished re-check, or
+        // a pre-fill taken from a tip that is no longer what the dialog is
+        // pointed at. Note what does *not* route through here — the guided
+        // re-check retargets the open dialog without calling `open`, precisely
+        // so the message survives it.
+        self.reset_amend();
     }
 
     /// Press the confirm modal's second-step arm control (#220). One-way
