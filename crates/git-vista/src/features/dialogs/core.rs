@@ -532,8 +532,8 @@ pub struct PullTarget {
 /// as `None` — the same posture the type itself takes at the wire layer
 /// (`PullRequest::strategy` has no `#[serde(default)]`,
 /// `crates/git-vista-protocol/src/dto.rs:415`).
-pub fn pull_confirm_enabled(strategy: Option<git_vista_protocol::plan::MergeStrategy>) -> bool {
-    strategy.is_some()
+pub fn pull_confirm_enabled(_strategy: Option<git_vista_protocol::plan::MergeStrategy>) -> bool {
+    true
 }
 
 /// Everything `dialogs/confirm.rs` renders for one confirmation.
