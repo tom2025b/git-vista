@@ -955,14 +955,16 @@ async fn revert_commit_executes_through_the_pipeline() {
 #[tokio::test]
 async fn revert_of_an_empty_commit_succeeds_with_an_inverse_empty_commit() {
     let (_dir, repo) = seeded_repo();
-    run(&repo, &["commit", "-q", "--allow-empty", "-m", "noop change"]);
+    run(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "noop change"],
+    );
     let noop = tip(&repo, "HEAD");
     let before_count: u32 = out(&repo, &["rev-list", "--count", "HEAD"])
         .parse()
         .unwrap();
 
-    let (status, body) =
-        pipeline(&repo, GitOperation::RevertCommit { commit: oid(&noop) }).await;
+    let (status, body) = pipeline(&repo, GitOperation::RevertCommit { commit: oid(&noop) }).await;
     assert_ok(status, &body);
 
     assert_ne!(
@@ -1052,8 +1054,7 @@ async fn reverting_an_already_reverted_commit_succeeds_again() {
 
     // First revert: non-empty diff, already works on today's code — not the
     // regression under test, just fixture setup for the second one.
-    let (status1, body1) =
-        pipeline(&repo, GitOperation::RevertCommit { commit: oid(&c) }).await;
+    let (status1, body1) = pipeline(&repo, GitOperation::RevertCommit { commit: oid(&c) }).await;
     assert_ok(status1, &body1);
     assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
     let after_first = tip(&repo, "HEAD");
@@ -1062,8 +1063,7 @@ async fn reverting_an_already_reverted_commit_succeeds_again() {
         .unwrap();
 
     // Second revert of the SAME commit: the diff against HEAD is now empty.
-    let (status2, body2) =
-        pipeline(&repo, GitOperation::RevertCommit { commit: oid(&c) }).await;
+    let (status2, body2) = pipeline(&repo, GitOperation::RevertCommit { commit: oid(&c) }).await;
     assert_ok(status2, &body2);
     assert_ne!(
         tip(&repo, "HEAD"),
@@ -1100,7 +1100,10 @@ async fn reverting_an_already_reverted_commit_succeeds_again() {
 #[tokio::test]
 async fn a_hook_rejected_commit_step_is_cleaned_up_after_the_hook_actually_ran() {
     let (_dir, repo) = seeded_repo();
-    run(&repo, &["commit", "-q", "--allow-empty", "-m", "noop change"]);
+    run(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "noop change"],
+    );
     let noop = tip(&repo, "HEAD");
     let commit_count = out(&repo, &["rev-list", "--count", "HEAD"]);
 
@@ -1113,8 +1116,7 @@ async fn a_hook_rejected_commit_step_is_cleaned_up_after_the_hook_actually_ran()
     make_executable(&repo.join(".git/hooks/pre-commit"));
     assert!(!marker.exists(), "the marker must start absent");
 
-    let (status, body) =
-        pipeline(&repo, GitOperation::RevertCommit { commit: oid(&noop) }).await;
+    let (status, body) = pipeline(&repo, GitOperation::RevertCommit { commit: oid(&noop) }).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(
@@ -1137,7 +1139,11 @@ async fn a_hook_rejected_commit_step_is_cleaned_up_after_the_hook_actually_ran()
          failed step-2 commit means `git revert --abort` was skipped for \
          that failure arm"
     );
-    assert_eq!(tip(&repo, "HEAD"), noop, "a failed revert must not move HEAD");
+    assert_eq!(
+        tip(&repo, "HEAD"),
+        noop,
+        "a failed revert must not move HEAD"
+    );
     assert_eq!(
         out(&repo, &["rev-list", "--count", "HEAD"]),
         commit_count,
