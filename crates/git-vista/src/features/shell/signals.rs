@@ -41,6 +41,7 @@ use crate::gestures;
 use super::sheet::{InspectorPlacement, SheetGeometry, SheetState};
 use super::{sheet_render_metrics, SheetDrag, SheetRenderMetrics};
 use crate::features::activity::signals::Activity;
+use crate::features::dialogs::core::ErrorNotice;
 use crate::features::shell::core::{
     ConnectivityCore, ModeSettler, Overlay, OverlayStack, ShellMode,
 };
@@ -351,6 +352,8 @@ pub struct Shell {
     menu: RwSignal<Option<MenuData>>,
     commit_dialog: RwSignal<Option<CommitIntent>>,
     confirm_op: RwSignal<Option<PendingOp>>,
+    /// The write-failure notice (#316), rendered by `error_modal_view`.
+    error_notice: RwSignal<Option<ErrorNotice>>,
     detail_id: RwSignal<Option<String>>,
     viewer_doc: RwSignal<Option<ViewerDoc>>,
     /// The Activity panel's visibility still lives in its own feature — it has a core with
@@ -372,6 +375,7 @@ impl Shell {
             menu: create_rw_signal(None::<MenuData>),
             commit_dialog: create_rw_signal(None::<CommitIntent>),
             confirm_op: create_rw_signal(None::<PendingOp>),
+            error_notice: create_rw_signal(None::<ErrorNotice>),
             detail_id: create_rw_signal(None::<String>),
             viewer_doc: create_rw_signal(None::<ViewerDoc>),
             activity,
@@ -401,6 +405,14 @@ impl Shell {
     pub fn open_confirm(&self, op: PendingOp) {
         self.present(Overlay::Confirm);
         self.confirm_op.set(Some(op));
+    }
+
+    /// Show the write-failure notice modal (#316). The caller stamps the
+    /// ghost-click guard (`dialogs.open(Dialog::Error)`) right before this,
+    /// matching the existing convention for Commit/Confirm.
+    pub fn open_error(&self, notice: ErrorNotice) {
+        self.present(Overlay::Error);
+        self.error_notice.set(Some(notice));
     }
 
     /// Show the commit detail panel on `id`, optionally scrolling to its Changes section.
@@ -462,6 +474,10 @@ impl Shell {
         self.dismiss(Overlay::Confirm);
     }
 
+    pub fn close_error(&self) {
+        self.dismiss(Overlay::Error);
+    }
+
     pub fn close_detail(&self) {
         self.dismiss(Overlay::Detail);
     }
@@ -499,6 +515,11 @@ impl Shell {
     /// An untracked read, for the confirm handler that must not subscribe.
     pub fn confirm_op_untracked(&self) -> Option<PendingOp> {
         self.confirm_op.get_untracked()
+    }
+
+    /// A tracked read — the error modal re-renders from it.
+    pub fn error_notice(&self) -> Option<ErrorNotice> {
+        self.error_notice.get()
     }
 
     /// A tracked read — the detail panel and its two `Resource` keys read it.
@@ -561,6 +582,7 @@ impl Shell {
             Overlay::Menu => self.menu.set(None),
             Overlay::CommitDialog => self.commit_dialog.set(None),
             Overlay::Confirm => self.confirm_op.set(None),
+            Overlay::Error => self.error_notice.set(None),
             Overlay::Detail => self.detail_id.set(None),
             Overlay::Viewer => self.viewer_doc.set(None),
             Overlay::Activity => self.activity.close(),

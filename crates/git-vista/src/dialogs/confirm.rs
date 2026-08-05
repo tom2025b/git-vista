@@ -368,3 +368,66 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
         })
     }
 }
+
+/// The write-failure notice modal (#316) — the error path finally meeting the
+/// bar this file's confirmation path set. Same backdrop, card, ghost-click
+/// guard and 44x44 buttons as `confirm_modal_view`; one OK button instead of
+/// Cancel/Confirm, because an error is never "confirmed", only read.
+///
+/// What lands in `shell.error_notice()` is the server's `error.message`,
+/// already unwrapped from the wire envelope by
+/// `features::dialogs::core::split_error_response` — the request id went to
+/// the console at the call site, never here.
+pub fn error_modal_view(features: Features) -> impl IntoView {
+    let Features { dialogs, shell, .. } = features;
+
+    move || {
+        shell.error_notice().map(|notice| {
+            let title = notice.title;
+            let body = notice.body;
+            view! {
+                <div
+                    style="position:fixed; top:0; left:0; width:100vw; height:100vh; \
+                           z-index:30; display:flex; align-items:center; \
+                           justify-content:center; background:rgba(1,4,9,0.6);"
+                    on:click=move |_| {
+                        // Ignore the iOS ghost click that fires just after opening.
+                        if dialogs.may_dismiss() {
+                            dialogs.close(Dialog::Error);
+                            shell.close_error();
+                        }
+                    }
+                >
+                    <div
+                        style="min-width:300px; max-width:90vw; padding:16px; \
+                               background:#161b22; border:1px solid #30363d; \
+                               border-radius:10px; color:var(--fg); \
+                               box-shadow:0 12px 32px rgba(0,0,0,0.6);"
+                        on:click=move |ev| ev.stop_propagation()
+                    >
+                        <div style="font-weight:600; margin-bottom:12px;">{title}</div>
+                        // `pre-wrap`: git's stderr is often multi-line.
+                        <div style="margin-bottom:14px; line-height:1.4; \
+                                    white-space:pre-wrap; max-height:50vh; \
+                                    overflow-y:auto;">{body}</div>
+                        <div style="display:flex; justify-content:flex-end;">
+                            <button
+                                style=format!(
+                                    "{BUTTON_BASE}{TOUCH_TARGET_STYLE}color:#fff; \
+                                     background:#21262d; border:1px solid #30363d;"
+                                )
+                                aria-label="Dismiss this error"
+                                on:click=move |_| {
+                                    dialogs.close(Dialog::Error);
+                                    shell.close_error();
+                                }
+                            >
+                                "OK"
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            }
+        })
+    }
+}

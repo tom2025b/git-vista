@@ -32,6 +32,10 @@ pub enum Dialog {
     Reset,
     /// The "Open URL…" clone prompt, reachable from the topbar and from the picker.
     OpenUrl,
+    /// A write-failure notice (#316) — `Shell::error_notice`. Dismiss-only:
+    /// an error is never "confirmed", so it carries one OK button and the
+    /// same backdrop-dismiss ghost-click guard as every other modal here.
+    Error,
 }
 
 /// How long (ms) after a modal opens to ignore a backdrop dismiss.
@@ -420,6 +424,74 @@ pub struct ArmStep {
     /// Maps to `aria-pressed`: this is a toggle, and a screen-reader user
     /// needs to hear that step one has landed.
     pub pressed: bool,
+}
+
+/// Everything the error modal (#316) renders for one write failure.
+///
+/// The `body` is the server's `error.message` — already unwrapped from the
+/// wire envelope by [`split_error_response`], never the raw JSON — and the
+/// `title` names the action that failed ("Couldn't create branch").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorNotice {
+    pub title: &'static str,
+    pub body: String,
+}
+
+/// What a write failure's response body means for the UI: the words to show
+/// the user (never raw JSON, never a request id) and the id to log for
+/// server-side correlation. Mirrors `api.rs::response_error`'s
+/// envelope-or-raw-body fallback, but keeps the two audiences separate
+/// (#316) instead of concatenating them into one string the way that
+/// helper's 9 existing call sites do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserFacingError {
+    pub message: String,
+    pub request_id: Option<String>,
+}
+
+/// Parse a non-2xx `/api/*` body as the `ApiError` envelope every route
+/// sends, and split it into what the user should see and what should only
+/// reach the console. Falls back to the raw body for anything that isn't
+/// the envelope (a route that predates it, or a body reshaped by something
+/// in front of the server) — same fallback `response_error` already relies
+/// on, so an unparseable body still reaches the user rather than vanishing.
+pub fn split_error_response(status: u16, body: &str) -> UserFacingError {
+    match serde_json::from_str::<git_vista_protocol::ApiError>(body) {
+        Ok(err) => UserFacingError {
+            message: err.error.message,
+            request_id: Some(err.request_id.as_str().to_string()),
+        },
+        Err(_) if body.trim().is_empty() => UserFacingError {
+            message: format!("HTTP {status}"),
+            request_id: None,
+        },
+        // Valid JSON that is not the envelope — a reverse proxy's own error
+        // shape, say. Echoing it would be #316 wearing a different body: JSON
+        // a user cannot act on. The status line is the honest fallback.
+        Err(_) if serde_json::from_str::<serde_json::Value>(body).is_ok() => UserFacingError {
+            message: format!("HTTP {status}"),
+            request_id: None,
+        },
+        Err(_) => UserFacingError {
+            message: body.to_string(),
+            request_id: None,
+        },
+    }
+}
+
+/// Whether `name` can be sent to `/api/branch` as typed, and the fix to
+/// offer when it can't. Git's own ref-name grammar is large (no `~^:?*[`,
+/// no `..`, no leading `-`, can't end in `.lock`, ...) and reimplementing
+/// all of it here would duplicate git's own validation without ever being
+/// as correct as git's — `exec_create_branch`'s own doc comment
+/// (planner.rs:2138-2139) is explicit that git is the source of truth and
+/// its stderr is forwarded verbatim on any other rejection. This checks
+/// only the single most common typo a name-entry prompt actually produces:
+/// a space (#316's own repro was literally "test branch"). Every other
+/// invalid name still round-trips to the server and comes back through the
+/// unwrapped error path above.
+pub fn branch_name_space_fix(name: &str) -> Option<String> {
+    name.contains(' ').then(|| name.replace(' ', "-"))
 }
 
 /// Everything `dialogs/confirm.rs` renders for one confirmation.
@@ -1122,4 +1194,152 @@ mod tests {
         assert!(TOUCH_TARGET_STYLE.contains("min-height:44px"));
         assert!(TOUCH_TARGET_STYLE.contains("min-width:44px"));
     }
+
+    // `the_touch_target_style_declares_forty_four_on_both_axes` (ends line
+    // 1124), before the module's closing `}` (line 1125).
+
+    // -----------------------------------------------------------------
+    // #316: unwrap the ApiError envelope; offer a space-fix before the
+    // round-trip (branch names)
+    // -----------------------------------------------------------------
+
+    /// The exact repro from #316: `{"error":{"code":"bad_request",
+    /// "message":"fatal: 'test branch' is not a valid branch name"},
+    /// "request_id":"...","protocol":4}` reaching a native `alert()` verbatim.
+    /// `split_error_response` must pull only the human message out — never the
+    /// surrounding JSON — for a modal to ever show plain words.
+    #[test]
+    fn a_json_envelope_body_is_split_into_message_and_request_id() {
+        let err = git_vista_protocol::ApiError::new(
+            git_vista_protocol::ErrorCode::BadRequest,
+            "fatal: 'test branch' is not a valid branch name",
+            git_vista_protocol::RequestId::new("req-abc123"),
+        );
+        let body = serde_json::to_string(&err).unwrap();
+
+        let parsed = split_error_response(400, &body);
+
+        assert_eq!(
+            parsed.message,
+            "fatal: 'test branch' is not a valid branch name"
+        );
+        assert_eq!(parsed.request_id.as_deref(), Some("req-abc123"));
+        // The #316 defect in one line: the message must never be (or contain)
+        // the raw envelope this whole function exists to unwrap.
+        assert!(
+            !parsed.message.contains('{') && !parsed.message.contains("request_id"),
+            "the split message must not leak the JSON envelope: {:?}",
+            parsed.message
+        );
+    }
+
+    /// The request id must be extractable, but never folded into the message
+    /// string — #316 is explicit that it goes to the console, not the user. A
+    /// caller that wants console output uses `request_id` separately; this
+    /// pins that the two never get concatenated inside `split_error_response`
+    /// itself (which is exactly what `response_error`'s existing `"{} (request
+    /// {})"` formatting does, and deliberately why this is a new function
+    /// rather than a reuse of that one).
+    #[test]
+    fn the_request_id_never_leaks_into_the_user_facing_message() {
+        let err = git_vista_protocol::ApiError::new(
+            git_vista_protocol::ErrorCode::GitFailed,
+            "fatal: not a git repository",
+            git_vista_protocol::RequestId::new("req-should-not-appear-in-message"),
+        );
+        let body = serde_json::to_string(&err).unwrap();
+        let parsed = split_error_response(500, &body);
+        assert_eq!(parsed.message, "fatal: not a git repository");
+        assert!(
+            !parsed.message.contains("req-should-not-appear-in-message"),
+            "{:?}",
+            parsed.message
+        );
+    }
+
+    /// A body that isn't the envelope at all (a route that predates it, or
+    /// something in front of the server reshaping the response) still reaches
+    /// the user as its raw text — the same fallback `api.rs::response_error`
+    /// already relies on for its 9 existing call sites.
+    #[test]
+    fn valid_json_that_is_not_the_envelope_never_reaches_the_user() {
+        // #316 wearing a different body: a reverse proxy's own JSON error
+        // shape must fall back to the status line, not be echoed as JSON.
+        let got = split_error_response(502, r#"{"detail":"upstream refused"}"#);
+        assert_eq!(got.message, "HTTP 502");
+        assert_eq!(got.request_id, None);
+    }
+
+    #[test]
+    fn an_unparseable_body_falls_back_to_the_raw_text() {
+        let parsed = split_error_response(502, "Bad Gateway");
+        assert_eq!(parsed.message, "Bad Gateway");
+        assert_eq!(parsed.request_id, None);
+    }
+
+    /// An empty body (e.g. a bare non-2xx status with nothing behind it) falls
+    /// back to naming the status, never an empty string a modal would render as
+    /// blank.
+    #[test]
+    fn an_empty_body_falls_back_to_the_http_status() {
+        let parsed = split_error_response(400, "");
+        assert_eq!(parsed.message, "HTTP 400");
+        assert_eq!(parsed.request_id, None);
+    }
+
+    /// A name with a space is exactly #316's own repro ("test branch") — offer
+    /// the dash-joined fix rather than round-tripping to the server only to get
+    /// git's own rejection back.
+    #[test]
+    fn a_name_with_a_space_offers_the_dash_joined_fix() {
+        assert_eq!(
+            branch_name_space_fix("test branch"),
+            Some("test-branch".to_string())
+        );
+    }
+
+    /// Every space in the name gets joined, not just the first — a name typed
+    /// with multiple words must not come back half-fixed.
+    #[test]
+    fn every_space_in_the_name_is_joined() {
+        assert_eq!(branch_name_space_fix("a b c"), Some("a-b-c".to_string()));
+    }
+
+    /// A name with no space is left alone — `None` means "nothing to offer",
+    /// not "here is the same string back".
+    #[test]
+    fn a_name_without_a_space_is_left_alone() {
+        assert_eq!(branch_name_space_fix("feature-x"), None);
+        assert_eq!(branch_name_space_fix("release/1.0"), None);
+    }
+
+    /// Deliberately narrow, per the design's own scope note: this checks only
+    /// for a space, not git's full ref-name grammar. A name with some other
+    /// invalid character (no space) must NOT get a bogus "fix" offered — that
+    /// would silently propose a name whose only problem wasn't actually its
+    /// problem, and would round-trip to the server anyway (unfixably, since
+    /// this fn only fixes spaces) for no reason.
+    #[test]
+    fn a_non_space_invalid_character_is_not_treated_as_fixable() {
+        assert_eq!(branch_name_space_fix("bad~name"), None);
+        assert_eq!(branch_name_space_fix("bad^name"), None);
+    }
+
+    // NOT HOST-TESTABLE — wasm-only, needs a wasm-bindgen-test harness (none
+    // exists in this repo today, grep-confirmed) or this repo's own human-
+    // testbed step (`./dev testbed`, per Git-Vista/CLAUDE.md "Definition of
+    // done"):
+    //   - menu.rs's `on_branch` closure (lines 274-301): the Err arm (293-298)
+    //     wiring `split_error_response`'s output into `shell.open_error(...)`,
+    //     and the proposed `web_sys::Window::confirm_with_message` space-fix
+    //     pre-flight before `create_branch_request` is called (line 288).
+    //     `mod menu;` is `#[cfg(target_arch = "wasm32")]`-gated in main.rs.
+    //   - dialogs/commit.rs's `submit_commit` Err arm (line 103) — same gating.
+    //   - api.rs's three unwrap sites (`create_branch_request` 929-945,
+    //     `create_commit_request` 953-974, `reset_test_repo_request`
+    //     1352-1364) — api.rs cannot compile on the host target AT ALL,
+    //     because `gloo-net` is a `[target.'cfg(target_arch = "wasm32")'
+    //     .dependencies]`-only crate dependency (Cargo.toml line 81).
+    //   - the new `Overlay::Error`/`Dialog::Error`/`error_modal_view` render
+    //     path — Leptos view code, wasm-only by construction.
 }

@@ -44,7 +44,7 @@ use crate::api::{
 };
 use crate::features::core_traits::RequestTarget;
 use crate::features::dialogs::commit::{amend_offer, AmendOffer};
-use crate::features::dialogs::core::Dialog;
+use crate::features::dialogs::core::{branch_name_space_fix, Dialog, ErrorNotice};
 use crate::features::graph::core::disabled_menu_item_copy;
 use crate::features::operations::core::PendingIntent;
 use crate::features::shell::signals::{self as shell_state, Shell};
@@ -283,6 +283,25 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 if name.is_empty() {
                     return;
                 }
+                // The one pre-flight check worth doing client-side (#316):
+                // a space is the common typo, and catching it here means an
+                // offer to fix instead of a server round-trip to git's
+                // "not a valid branch name". Everything else stays git's
+                // call — its stderr now arrives unwrapped via the modal.
+                let name = match branch_name_space_fix(&name) {
+                    Some(fixed) => {
+                        let accepted = win
+                            .confirm_with_message(&format!(
+                                "Branch names can't contain spaces.\nUse '{fixed}' instead?"
+                            ))
+                            .unwrap_or(false);
+                        if !accepted {
+                            return;
+                        }
+                        fixed
+                    }
+                    None => name,
+                };
                 let commit = commit.clone();
                 spawn_local(async move {
                     match create_branch_request(&name, &commit).await {
@@ -290,11 +309,15 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         Ok(()) => graph.update(|g| {
                             g.force_bump();
                         }),
+                        // The failure path finally meets the confirmation
+                        // path's bar (#316): the app's own modal, showing the
+                        // envelope's message — never raw JSON in an alert().
                         Err(e) => {
-                            if let Some(w) = web_sys::window() {
-                                let _ =
-                                    w.alert_with_message(&format!("Couldn't create branch:\n{e}"));
-                            }
+                            dialogs.open(Dialog::Error);
+                            shell.open_error(ErrorNotice {
+                                title: "Couldn't create branch",
+                                body: e,
+                            });
                         }
                     }
                 });
@@ -508,12 +531,14 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     spawn_local(async move {
                         match stage_request().await {
                             Ok(()) => status.refetch(),
+                            // #316: the envelope's message in the app's own
+                            // modal — never raw JSON in a native alert().
                             Err(e) => {
-                                if let Some(w) = web_sys::window() {
-                                    let _ = w.alert_with_message(&format!(
-                                        "Couldn't stage changes:\n{e}"
-                                    ));
-                                }
+                                dialogs.open(Dialog::Error);
+                                shell.open_error(ErrorNotice {
+                                    title: "Couldn't stage changes",
+                                    body: e,
+                                });
                             }
                         }
                     });
@@ -562,12 +587,14 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     spawn_local(async move {
                         match unstage_request().await {
                             Ok(()) => status.refetch(),
+                            // #316: the envelope's message in the app's own
+                            // modal — never raw JSON in a native alert().
                             Err(e) => {
-                                if let Some(w) = web_sys::window() {
-                                    let _ = w.alert_with_message(&format!(
-                                        "Couldn't unstage changes:\n{e}"
-                                    ));
-                                }
+                                dialogs.open(Dialog::Error);
+                                shell.open_error(ErrorNotice {
+                                    title: "Couldn't unstage changes",
+                                    body: e,
+                                });
                             }
                         }
                     });
