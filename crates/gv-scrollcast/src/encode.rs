@@ -281,11 +281,13 @@ pub async fn check_ffmpeg_capabilities(ffmpeg: &Path) -> Result<()> {
     let encoders = run_capture(ffmpeg, &["-hide_banner", "-encoders"]).await?;
     let decoders = run_capture(ffmpeg, &["-hide_banner", "-decoders"]).await?;
     let muxers = run_capture(ffmpeg, &["-hide_banner", "-muxers"]).await?;
-    let missing = missing_capabilities(&encoders, &decoders, &muxers);
+    let filters = run_capture(ffmpeg, &["-hide_banner", "-filters"]).await?;
+    let missing = missing_capabilities(&encoders, &decoders, &muxers, &filters);
     if !missing.is_empty() {
         bail!(
             "ffmpeg at {} is missing required capabilities: {}. This crate needs an ffmpeg \
-             build with libx264 + aac encoders, a png decoder, and an mp4 muxer. If this is the \
+             build with libx264 + aac encoders, a png decoder, an mp4 muxer, and the lavfi \
+             anullsrc source filter (used for the default silent-audio track). If this is the \
              Playwright-bundled ffmpeg, that build is deliberately stripped down for Playwright's \
              own webm/vp8 screen-recording use and lacks all of these; point \
              $GV_SCROLLCAST_FFMPEG at a full ffmpeg build instead.",
@@ -296,15 +298,26 @@ pub async fn check_ffmpeg_capabilities(ffmpeg: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Pure capability check: given the text of `-encoders`/`-decoders`/`-muxers`,
-/// name every required capability that is absent. Matches on the *name*
-/// column of each listing line (not a raw substring search of the whole
-/// blob), so a codec's free-text description happening to mention "aac" or
-/// "png" can never produce a false pass.
+/// Pure capability check: given the text of `-encoders`/`-decoders`/`-muxers`/
+/// `-filters`, name every required capability that is absent. Matches on the
+/// *name* column of each listing line (not a raw substring search of the
+/// whole blob), so a codec's free-text description happening to mention
+/// "aac" or "png" can never produce a false pass.
+///
+/// `anullsrc` gets its own check here rather than being assumed to come free
+/// with `libx264`/`aac`/`png`/`mp4`: it is a distinct lavfi *filter*, gated
+/// independently of codec/muxer support in a minimal build, and it is what
+/// the *default* (no `--audio` flag) path depends on for its silent
+/// placeholder track. Missing this check would mean the most common
+/// invocation — the default one — could sail past this startup gate and
+/// only fail once `run_encode` is already streaming frames, which is
+/// exactly the "fails mid-encode instead of at startup" failure mode this
+/// whole function exists to prevent.
 pub(crate) fn missing_capabilities(
     encoders: &str,
     decoders: &str,
     muxers: &str,
+    filters: &str,
 ) -> Vec<&'static str> {
     let mut missing = Vec::new();
     if !listing_has_name(encoders, "libx264") {
@@ -318,6 +331,9 @@ pub(crate) fn missing_capabilities(
     }
     if !listing_has_name(muxers, "mp4") {
         missing.push("muxer:mp4");
+    }
+    if !listing_has_name(filters, "anullsrc") {
+        missing.push("filter:anullsrc (lavfi, needed for the default silent audio track)");
     }
     missing
 }
@@ -760,9 +776,13 @@ pub async fn encode_video(
     }
 
     let raw_rgb = decode_png_to_rgb24(&ffmpeg, source_png, image_width, image_height).await?;
-    // Validate crop bounds once, up front, against frame 0 and the final
-    // frame's worst case — `FrameIter` relies on this having already
-    // succeeded (see its doc comment) rather than re-checking per frame.
+    // Validate crop bounds once, up front, at y=0 — the smallest possible
+    // crop window and therefore sufficient on its own: every later frame's
+    // y comes from `clamp_crop_y`, whose `saturating_sub` guarantees it can
+    // never place a window's bottom edge past `image_height` once a y=0
+    // window already fits, so checking frame 0 here covers every frame
+    // `FrameIter` will ever produce (see its doc comment) without re-checking
+    // per frame.
     extract_frame(&raw_rgb, image_width, VIDEO_WIDTH, VIDEO_HEIGHT, 0)
         .context("source image is too short for even one camera frame")?;
 
@@ -882,6 +902,8 @@ mod tests {
     const SAMPLE_DECODERS_FULL: &str =
         " V....D png                  PNG (Portable Network Graphics) image\n";
     const SAMPLE_MUXERS_FULL: &str = "  E mp4             MP4 (MPEG-4 Part 14)\n";
+    const SAMPLE_FILTERS_FULL: &str =
+        " ... anullsrc          |->A       Null audio source, return empty audio frames.\n";
 
     #[test]
     fn a_fully_capable_ffmpeg_reports_nothing_missing() {
@@ -889,6 +911,7 @@ mod tests {
             SAMPLE_ENCODERS_FULL,
             SAMPLE_DECODERS_FULL,
             SAMPLE_MUXERS_FULL,
+            SAMPLE_FILTERS_FULL,
         );
         assert!(missing.is_empty(), "unexpected missing: {missing:?}");
     }
@@ -896,16 +919,21 @@ mod tests {
     #[test]
     fn the_stripped_playwright_ffmpeg_is_correctly_detected_as_incapable() {
         // The exact shape this module was written to catch: real
-        // `-encoders`/`-decoders`/`-muxers` output from the Playwright
-        // ffmpeg bundle, which has none of the four required capabilities.
+        // `-encoders`/`-decoders`/`-muxers`/`-filters` output from the
+        // Playwright ffmpeg bundle, which has none of the five required
+        // capabilities — including `-filters`, which lists `crop`/`scale`/
+        // `pad`/`format`/`abuffer` etc. (it needs those for its own
+        // screenshot-to-webm pipeline) but no `anullsrc`, since it never
+        // needs to synthesize audio.
         let encoders = " VF...D png                  PNG (Portable Network Graphics) image\n V..... libvpx               libvpx VP8 (codec vp8)\n";
         let decoders = " V....D mjpeg                MJPEG (Motion JPEG)\n";
         let muxers = "  E  image2          image2 sequence\n  E  webm            WebM\n";
-        let missing = missing_capabilities(encoders, decoders, muxers);
+        let filters = " ..C crop              V->V       Crop the input video.\n ... scale             V->V       Scale the input video size and/or convert the image format.\n ... abuffer           |->A       Buffer audio frames, and make them accessible to the filterchain.\n";
+        let missing = missing_capabilities(encoders, decoders, muxers, filters);
         assert_eq!(
             missing.len(),
-            4,
-            "expected all four capabilities missing, got {missing:?}"
+            5,
+            "expected all five capabilities missing, got {missing:?}"
         );
     }
 
@@ -923,8 +951,36 @@ mod tests {
     #[test]
     fn missing_libx264_alone_is_reported_precisely() {
         let encoders = " A..... aac                  AAC (Advanced Audio Coding)\n";
-        let missing = missing_capabilities(encoders, SAMPLE_DECODERS_FULL, SAMPLE_MUXERS_FULL);
+        let missing = missing_capabilities(
+            encoders,
+            SAMPLE_DECODERS_FULL,
+            SAMPLE_MUXERS_FULL,
+            SAMPLE_FILTERS_FULL,
+        );
         assert_eq!(missing, vec!["encoder:libx264 (H.264)"]);
+    }
+
+    #[test]
+    fn a_build_with_every_codec_but_no_lavfi_anullsrc_is_still_caught_at_startup() {
+        // The gap this check exists to close: libx264/aac/png/mp4 are all
+        // present (so a codec-only probe would pass), but `anullsrc` — a
+        // separate lavfi filter the *default* no-`--audio` path depends on
+        // — is missing. Without this check, the most common invocation
+        // (default silent audio) would sail past `check_ffmpeg_capabilities`
+        // and only fail once `run_encode` is already streaming frames,
+        // which is exactly the mid-encode failure this module's startup
+        // probe exists to prevent.
+        let filters_without_anullsrc = " ... abuffer           |->A       Buffer audio frames, and make them accessible to the filterchain.\n";
+        let missing = missing_capabilities(
+            SAMPLE_ENCODERS_FULL,
+            SAMPLE_DECODERS_FULL,
+            SAMPLE_MUXERS_FULL,
+            filters_without_anullsrc,
+        );
+        assert_eq!(
+            missing,
+            vec!["filter:anullsrc (lavfi, needed for the default silent audio track)"]
+        );
     }
 
     // ---- clamp_crop_y ----
