@@ -126,9 +126,7 @@ pub fn fetch_or_pull_summary(kind: &OperationKind, message: &str) -> String {
         OperationKind::Fetch { .. } => {
             fetch_summary(message).unwrap_or_else(|| message.to_string())
         }
-        OperationKind::Pull { .. } => {
-            pull_summary(message).unwrap_or_else(|| message.to_string())
-        }
+        OperationKind::Pull { .. } => pull_summary(message).unwrap_or_else(|| message.to_string()),
         _ => message.to_string(),
     }
 }
@@ -168,7 +166,10 @@ fn pull_summary(message: &str) -> Option<String> {
         // tree needs a human"), so each gets a leading tag rather than living only in the
         // trailing sentence git's own words already carry.
         PullFailureKind::Conflict => {
-            format!("Pull hit a conflict — the tree was restored. {}", err.message)
+            format!(
+                "Pull hit a conflict — the tree was restored. {}",
+                err.message
+            )
         }
         PullFailureKind::ConflictLeftInProgress => format!(
             "Pull hit a conflict and needs attention — the working tree is \
@@ -1079,8 +1080,7 @@ mod fetch_pull_summary_tests {
     fn a_fetch_success_body_reads_back_gits_own_words() {
         let success = FetchSuccess {
             remote: "origin".into(),
-            message: "Fetched from \u{2018}origin\u{2019}: 3 remote-tracking refs updated."
-                .into(),
+            message: "Fetched from \u{2018}origin\u{2019}: 3 remote-tracking refs updated.".into(),
             updated_refs: Vec::new(),
         };
         let json = serde_json::to_string(&success).unwrap();
@@ -1116,7 +1116,10 @@ mod fetch_pull_summary_tests {
         ] {
             let body = fetch_error_body(kind, "git said this");
             let line = fetch_or_pull_summary(&fetch_kind(), &body);
-            assert_eq!(line, "git said this", "{kind:?} must pass git's words through as-is");
+            assert_eq!(
+                line, "git said this",
+                "{kind:?} must pass git's words through as-is"
+            );
         }
     }
 
@@ -1141,7 +1144,10 @@ mod fetch_pull_summary_tests {
         ] {
             let body = pull_error_body(kind, "git said this", true);
             let line = fetch_or_pull_summary(&pull_kind(), &body);
-            assert_eq!(line, "git said this", "{kind:?} must pass git's words through as-is");
+            assert_eq!(
+                line, "git said this",
+                "{kind:?} must pass git's words through as-is"
+            );
         }
     }
 
@@ -1160,7 +1166,11 @@ mod fetch_pull_summary_tests {
 
     #[test]
     fn a_conflict_left_in_progress_says_the_tree_needs_attention() {
-        let body = pull_error_body(PullFailureKind::ConflictLeftInProgress, "git said this", false);
+        let body = pull_error_body(
+            PullFailureKind::ConflictLeftInProgress,
+            "git said this",
+            false,
+        );
         let line = fetch_or_pull_summary(&pull_kind(), &body);
         assert_eq!(
             line,

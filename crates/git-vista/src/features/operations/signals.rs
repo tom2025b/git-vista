@@ -21,7 +21,7 @@ use crate::api::{self, WriteReceipt};
 use crate::features::core_traits::{RequestKey, RequestTarget};
 use crate::features::graph::core::GraphCore;
 use crate::features::operations::core::{
-    escalation, latest_wins, remote_op_kind, resume_decision, IntentSeq, InFlightRemoteOp,
+    escalation, latest_wins, remote_op_kind, resume_decision, InFlightRemoteOp, IntentSeq,
     OperationsCore, PendingIntent, ResumeDecision, Settled, Settlement,
 };
 use crate::features::operations::kind::OperationKind;

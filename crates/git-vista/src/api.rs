@@ -1470,8 +1470,7 @@ pub async fn fetch_request(remote: &str, key: IdempotencyKey) -> Result<WriteRec
         remote: remote.to_string(),
     })
     .map_err(|e| e.to_string())?;
-    let (resp, _key) =
-        send_write_with_key("/api/fetch", Some(json), key, FETCH_TIMEOUT_MS).await?;
+    let (resp, _key) = send_write_with_key("/api/fetch", Some(json), key, FETCH_TIMEOUT_MS).await?;
     Ok(receipt(resp).await)
 }
 
