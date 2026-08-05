@@ -1164,7 +1164,15 @@ button.detail-file:focus-visible .detail-file-path { color: var(--accent); }
   flex: 0 0 auto;
 }
 .op-cancel-btn:hover { background: #30363d; }
-.op-cancel-btn:focus-visible { border-color: var(--accent); }
+/* The `background` is repeated deliberately, not only `border-color`: #65's
+   paired rule is that keyboard focus reproduces every visual change hover
+   makes, so a switch or keyboard user gets the same affordance a pointer user
+   does. `every_hover_rule_has_a_focus_visible_twin_declaring_the_same_
+   properties` in features/a11y/audit.rs is what caught its absence here. */
+.op-cancel-btn:focus-visible {
+  background: #30363d;
+  border-color: var(--accent);
+}
 
 /* #65 tap targets: every CSS-sized interactive control guarantees Apple's
    44x44 CSS-pixel minimum on both axes, unconditionally — not behind
