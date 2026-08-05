@@ -3356,9 +3356,28 @@ async fn exec_reset_branch(
     }
 }
 
-/// `git revert --no-edit <commit>` (`/api/undo`) — the history-preserving
-/// undo; a conflicted revert is auto-aborted (like `/api/rebase`) so a
-/// browser-only user is never left mid-revert.
+/// Two-step revert (`/api/undo`) — the history-preserving undo; a failed
+/// revert is auto-aborted (like `/api/rebase`) so a browser-only user is
+/// never left mid-revert.
+///
+/// Why two steps and not `git revert --no-edit <commit>`: whenever the
+/// revert's diff against HEAD is empty — an empty commit, a commit whose
+/// changes are not present in HEAD (orphan lineage, hit live by the owner
+/// with `84570fe`), or a change already reverted — the single-step form
+/// fails with "nothing to commit, working tree clean" (#308). The flag that
+/// fixes it, `revert --allow-empty`, landed in git 2.45; this box runs
+/// 2.43. `revert --no-commit` + `commit --allow-empty --no-edit` expresses
+/// the same intent on 2.43, and `--no-edit` reuses the message `--no-commit`
+/// staged, so the resulting commit is byte-for-byte what the single-step
+/// form produces on newer git.
+///
+/// Cleanup is `git revert --abort` at EITHER failure point, and that is a
+/// verified fact rather than an assumption: git clears `REVERT_HEAD` only on
+/// a SUCCESSFUL commit, so a step-2 failure (rejecting hook, signing
+/// failure) leaves exactly the same sequencer state a conflicted step-1
+/// does, and `--abort` restores the pre-revert tree identically in both
+/// cases. Confirmed empirically on git 2.43.0 with a rejecting pre-commit
+/// hook before this code was written.
 async fn exec_revert(
     repo: &Path,
     need: NetworkNeed,
@@ -3366,7 +3385,21 @@ async fn exec_revert(
     observed: &Observed,
 ) -> (StatusCode, String) {
     let commit = commit.as_str();
-    match git(repo, need, &["revert", "--no-edit", commit]).await {
+
+    // Step 1: compute the revert into the index without committing.
+    if let Err(msg) = git(repo, need, &["revert", "--no-commit", commit]).await {
+        // A conflicted (or otherwise failed) --no-commit leaves sequencer
+        // state (REVERT_HEAD) and possibly conflict markers; --abort is
+        // git's own cleanup for exactly that. Harmless when no revert is
+        // in progress.
+        let _ = git(repo, need, &["revert", "--abort"]).await;
+        eprintln!("git-vista: /api/undo revert (compute) failed (aborted): {msg}");
+        return (StatusCode::BAD_REQUEST, msg);
+    }
+
+    // Step 2: finish the revert as its own commit, explicitly allowing an
+    // empty one — the step the single command cannot express on git < 2.45.
+    match git(repo, need, &["commit", "--allow-empty", "--no-edit"]).await {
         Ok(()) => {
             println!("[/api/undo] reverted {}", short(commit));
             let new = Obs::from_read(rev_parse(repo, "HEAD").await);
@@ -3385,10 +3418,12 @@ async fn exec_revert(
             (StatusCode::OK, format!("Reverted {}.", short(commit)))
         }
         Err(msg) => {
-            // Back out of a conflicted half-applied revert so the tree isn't
-            // stuck. Harmless when no revert is in progress.
+            // Computed but not committed (hook/signing/other). REVERT_HEAD
+            // is still set — git only clears it on a successful commit — so
+            // --abort restores the pre-revert tree here exactly as it does
+            // for a conflicted step 1.
             let _ = git(repo, need, &["revert", "--abort"]).await;
-            eprintln!("git-vista: /api/undo revert failed (aborted): {msg}");
+            eprintln!("git-vista: /api/undo revert (commit) failed (aborted): {msg}");
             (StatusCode::BAD_REQUEST, msg)
         }
     }
