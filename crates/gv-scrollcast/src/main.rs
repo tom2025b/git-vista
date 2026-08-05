@@ -81,12 +81,34 @@
 //!    already absolute, so the directory swap cannot affect anything else in
 //!    this run.
 //!
-//! # Two review findings fixed in this same repair pass (not gaps — bugs)
+//! # Three review findings fixed in this same repair pass (not gaps — bugs)
 //!
 //! Unlike the three items above, these are not "won't fix without another
 //! lane's file" — they were confirmed defects this lane's own file set could
 //! fix outright:
 //!
+//! - **`git_ignores` silently rejected this crate's own documented `--out`
+//!   default on a fresh checkout.** Found while writing this repair pass's
+//!   tests for `resolve_out_dir_against` (Job C), not by inspection: `git
+//!   check-ignore` only honours a directory-only `.gitignore` pattern
+//!   (trailing `/`, the exact shape of this repo's own `/out/` entry) when
+//!   it can tell the queried path is a directory — either the path already
+//!   exists, or the query string itself ends in a separator.
+//!   `resolve_out_dir_against` calls `git_ignores` *before*
+//!   `std::fs::create_dir_all`, by design, so on a fresh checkout's first
+//!   run `./out` does not exist yet and the old, unfixed `git_ignores` would
+//!   report "not ignored" — wrongly refusing the exact default this whole
+//!   flag exists to make easy. Reproduced directly against this actual
+//!   repository's own `.gitignore` while diagnosing (`git check-ignore` on
+//!   the real, not-yet-created `/home/.../Git-Vista/out` returned exit 1;
+//!   appending a trailing separator made it return 0, matching the entry at
+//!   `.gitignore:73`). Fixed by always appending a trailing path separator
+//!   to the query in `git_ignores` — safe unconditionally, since every
+//!   caller of this function only ever queries a directory. See that
+//!   function's own doc comment and
+//!   `git_ignores_matches_a_directory_only_pattern_even_though_the_
+//!   directory_does_not_exist_yet` (this file's test module) for the full
+//!   before/after.
 //! - **`--duration`/captured width are validated as early as possible.**
 //!   `validate_duration` rejects non-finite or non-positive `--duration`
 //!   before Chromium is even resolved (NaN/negative would otherwise
@@ -361,27 +383,32 @@ fn resolve_out_dir_against(requested: &Path, repo_root: Option<&Path>) -> Result
     } else {
         cwd.join(requested)
     };
-    // Not `canonicalize`d: the directory may not exist yet, and canonicalize
-    // requires that it does. Component-wise joining is sufficient for the
-    // containment check below; it does not need to resolve symlinks to be a
-    // meaningful "don't write into the repo" guard.
-    let candidate = normalize_lexically(&candidate);
+    // Whole-path `canonicalize` is impossible here — the directory may not
+    // exist yet — but a purely lexical normalization is not enough either,
+    // and the first version of this guard proved it: `--out /tmp/link` where
+    // `/tmp/link` is a symlink into the repo passed the `starts_with` test
+    // below (the lexical path starts with `/tmp`, not the repo root), so the
+    // git-check-ignore arm never even ran and the write landed inside the
+    // tracked tree. The review reproduced that end-to-end. So: canonicalize
+    // the **deepest ancestor that already exists** — which resolves every
+    // symlink that could redirect the write — and re-append the not-yet-
+    // created tail lexically. The tail cannot contain a symlink, because it
+    // does not exist yet.
+    let candidate = resolve_through_existing_prefix(&normalize_lexically(&candidate));
 
     if let Some(repo_root) = repo_root {
-        let repo_root = normalize_lexically(repo_root);
+        // The root gets the same treatment for the same reason: comparing a
+        // resolved candidate against an unresolved root would just move the
+        // mismatch to the other side.
+        let repo_root = resolve_through_existing_prefix(&normalize_lexically(repo_root));
         // Inside the repo is allowed ONLY where git itself already ignores the
         // path. The rule being enforced is "never write into the *tracked*
         // tree" — not "never write under the repo root", which would reject
         // this tool's own documented default (`./out`) and leave the happy
         // path unrunnable from the one directory people actually run it from.
-        //
-        // Asking git, rather than comparing prefixes, is deliberate and fixes
-        // two things at once. It makes the answer authoritative (the
-        // `.gitignore` entry for `/out/` is what grants permission, so the
-        // rule and the permission live in one place), and it closes the
-        // symlink hole a lexical check cannot see: `--out /tmp/link` where
-        // `/tmp/link` points into the repo passes any `starts_with` test but
-        // is correctly refused here, because git resolves the real path.
+        // Asking git makes the answer authoritative: the `.gitignore` entry
+        // for `/out/` is what grants permission, so the rule and the
+        // permission live in one place.
         if candidate.starts_with(&repo_root) && !git_ignores(&repo_root, &candidate) {
             bail!(
                 "--out {} resolves to {} which is inside this repository's working tree ({}) \
@@ -398,6 +425,58 @@ fn resolve_out_dir_against(requested: &Path, repo_root: Option<&Path>) -> Result
     std::fs::create_dir_all(&candidate)
         .with_context(|| format!("--out directory is not creatable: {}", candidate.display()))?;
     Ok(candidate)
+}
+
+/// The vertical span the camera can actually traverse: the captured sheet's
+/// height minus one viewport, floored at zero for a sheet shorter than the
+/// frame.
+///
+/// Extracted to a named function — rather than inlined arithmetic at the one
+/// call site — because the second review proved the inline form had no
+/// regression test: reverting it to the bare capture height (the original
+/// frozen-tail bug, ~30 seconds of held final frame on a real sheet)
+/// survived the entire suite. A named pure function is the difference
+/// between "the fix exists" and "the fix is pinned"; the test on this
+/// function is what turns that revert red.
+fn scrollable_height(capture_height_px: u32) -> u32 {
+    capture_height_px.saturating_sub(VIDEO_HEIGHT)
+}
+
+/// Resolve `path` through its deepest ancestor that exists on disk.
+///
+/// `canonicalize` refuses paths that do not exist, and `--out` usually names
+/// a directory this run is about to create. But the *ancestors* of that
+/// directory do exist, and they are where a symlink can live — so resolving
+/// them is exactly enough to defeat `--out /tmp/link/new-dir` where
+/// `/tmp/link` points into the repository. The not-yet-existing tail is
+/// re-appended as-is: a path component that does not exist cannot be a
+/// symlink, so leaving it lexical loses nothing.
+///
+/// If even the filesystem root refuses to canonicalize (which does not
+/// happen on a healthy system), the lexical path is returned unchanged —
+/// the caller's git-check-ignore arm still applies, so degradation is
+/// toward the stricter outcome, not the looser one.
+fn resolve_through_existing_prefix(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut tail = Vec::new();
+    loop {
+        match existing.canonicalize() {
+            Ok(resolved) => {
+                let mut out = resolved;
+                for component in tail.iter().rev() {
+                    out.push(component);
+                }
+                return out;
+            }
+            Err(_) => match (existing.file_name(), existing.parent()) {
+                (Some(name), Some(parent)) => {
+                    tail.push(name.to_os_string());
+                    existing = parent.to_path_buf();
+                }
+                _ => return path.to_path_buf(),
+            },
+        }
+    }
 }
 
 /// Whether git itself ignores `path` inside `repo_root`.
@@ -591,7 +670,7 @@ async fn run_pipeline(
     // `saturating_sub` floors at 0 for a capture shorter than one viewport
     // (nothing to scroll to at all), matching the encode lane's own
     // `.max(0.0)` — done here in `u32` since both operands already are.
-    let scrollable_height_px = capture_result.height.saturating_sub(VIDEO_HEIGHT);
+    let scrollable_height_px = scrollable_height(capture_result.height);
 
     let multipliers =
         build_multipliers(&capture_result.commit_ys, scrollable_height_px, cli.linear);
@@ -1053,6 +1132,55 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// THE symlink regression — the second review's own repro, kept as a
+    /// permanent test. `--out /tmp/<link>/new-dir` where `<link>` points at
+    /// the repository must be refused: the first guard was lexical-only, so
+    /// the symlinked path never `starts_with` the repo root, the
+    /// git-check-ignore arm never ran, and the write landed inside the
+    /// tracked tree. The fix (`resolve_through_existing_prefix`) resolves
+    /// the link before the comparison; this test is what keeps it resolved.
+    #[test]
+    #[cfg(unix)]
+    fn resolve_out_dir_against_refuses_a_symlink_that_points_into_the_repo() {
+        let repo = fixture_git_repo("symlink-bypass");
+        let link = std::env::temp_dir().join("gv-scrollcast-out-dir-test-symlink-link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&repo, &link).expect("create symlink into the fixture repo");
+
+        // Through the link, into a path git does NOT ignore.
+        let requested = link.join("not-ignored-out");
+        let err = resolve_out_dir_against(&requested, Some(&repo)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("NOT gitignored"), "{msg}");
+        assert!(
+            !repo.join("not-ignored-out").exists(),
+            "the refused write must not have created anything inside the repo"
+        );
+
+        // The same link into the repo's *ignored* directory is still fine —
+        // resolving symlinks must not make the guard stricter than the rule.
+        let ignored = link.join("ignored-out");
+        let resolved = resolve_out_dir_against(&ignored, Some(&repo)).unwrap();
+        assert!(resolved.is_dir());
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Pins the frozen-tail fix itself. The second review reverted the
+    /// production arithmetic to the bare capture height and the whole suite
+    /// stayed green — encode.rs's own test proves the *mechanism* with its
+    /// own locally-built timeline, so it cannot see what this file actually
+    /// passes. This one can: mutate `scrollable_height` back to identity and
+    /// it goes red.
+    #[test]
+    fn scrollable_height_subtracts_exactly_one_viewport() {
+        assert_eq!(scrollable_height(28_080), 28_080 - VIDEO_HEIGHT);
+        // Shorter than one frame: nothing to scroll, and never an underflow.
+        assert_eq!(scrollable_height(VIDEO_HEIGHT), 0);
+        assert_eq!(scrollable_height(500), 0);
     }
 
     #[test]

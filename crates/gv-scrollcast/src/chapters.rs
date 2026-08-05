@@ -288,6 +288,115 @@ pub fn detect_pivots(rows: &[GraphRow], commit_ys: &[CommitY], max_pivots: usize
 /// place.
 pub use crate::pacing::CommitY;
 
+// ---------------------------------------------------------------------------
+// The sheet-metadata bridge (#325 repair round 2)
+// ---------------------------------------------------------------------------
+//
+// `detect_pivots` above wants real `GraphRow`s — a real `Oid`, a parent
+// list, an epoch timestamp, named refs. `capture.rs` cannot honestly produce
+// any of those: everything it knows is the *text print.rs chose to draw*
+// (`capture::CommitMeta`'s own doc comment walks through why each field is
+// weaker than its `GraphRow` counterpart). The first repair round left the
+// two sides unbridged — capture built `CommitMeta`, this module kept
+// demanding `GraphRow`, main.rs correctly refused to fabricate the
+// difference, and the result was a callout renderer that provably worked and
+// provably never ran. This entry point is the bridge, built on exactly the
+// signals the sheet really carries and nothing more:
+//
+//   - a merge glyph        -> Reason::Merge   (None = ambiguous glyph, no claim)
+//   - a ref badge          -> Reason::RefBadge — kind UNKNOWN. The sheet's
+//     markup does not say whether the badge was a tag or a branch, so this
+//     scores at branch weight, never tag weight: an unknowable claim must be
+//     scored at the weakest reading it could honestly have, or a routine
+//     branch tip would masquerade as a release.
+//   - the rendered month text changing between consecutive rows
+//                          -> Reason::MonthBoundary. Display text, compared
+//     as display text — never parsed back into an epoch.
+
+/// A ref badge whose kind the sheet does not disclose. Scored like
+/// [`Reason::Branch`] on purpose — see the bridge comment above.
+fn ref_badge_score() -> i64 {
+    reason_score(Reason::Branch)
+}
+
+/// The month token of print.rs's rendered timestamp (`"Jun 29 14:32"` ->
+/// `"Jun"`). Purely lexical: two consecutive rows whose rendered month text
+/// differs mark a boundary the *viewer can see on the sheet*, which is the
+/// only claim a callout over that sheet should make.
+fn month_token(date_text: &str) -> Option<&str> {
+    date_text.split_whitespace().next()
+}
+
+/// [`detect_pivots`]'s sibling for sheet-derived metadata: same ranking
+/// spirit, same cap, same ascending-y output contract, but consuming
+/// [`capture::CommitMeta`](crate::capture::CommitMeta) — what a rendered
+/// sheet can honestly say — instead of `GraphRow`s this crate has no way to
+/// obtain.
+pub fn detect_pivots_from_meta(
+    metas: &[crate::capture::CommitMeta],
+    commit_ys: &[CommitY],
+    max_pivots: usize,
+) -> Vec<Pivot> {
+    assert_eq!(
+        metas.len(),
+        commit_ys.len(),
+        "metas and commit_ys must be parallel (same length, same order) — \
+         capture.rs builds them from the same node walk"
+    );
+
+    let mut candidates: Vec<(f64, i64, String, String)> = Vec::new();
+    let mut prev_month: Option<&str> = None;
+
+    for (idx, meta) in metas.iter().enumerate() {
+        let month = month_token(&meta.date_text);
+        // Same first-row rule as `rank_pivots`: the top of the sheet is
+        // "the video started", not a landmark.
+        let month_changed = matches!((prev_month, month), (Some(a), Some(b)) if a != b);
+        prev_month = month;
+
+        let mut score = 0_i64;
+        let mut headline: Option<String> = None;
+
+        if meta.is_merge == Some(true) {
+            score += reason_score(Reason::Merge);
+            headline = Some(format!("Merge — {}", meta.short_sha));
+        }
+        if meta.has_refs {
+            score += ref_badge_score();
+            // A badge outranks a bare merge as the headline: it is the
+            // marker a human deliberately placed.
+            headline = Some(format!("Marked — {}", meta.short_sha));
+        }
+        if month_changed {
+            score += reason_score(Reason::MonthBoundary);
+            if headline.is_none() {
+                headline = month.map(|m| format!("Into {m}"));
+            }
+        }
+
+        if score == 0 {
+            continue;
+        }
+        let label = headline.unwrap_or_else(|| meta.short_sha.clone());
+        // The card's second line: what happened, who, when — straight off
+        // the sheet, pre-truncated by print.rs's own summary cap.
+        let detail = format!("{} · {} · {}", meta.summary, meta.author, meta.date_text);
+        candidates.push((commit_ys[idx].y, score, label, detail));
+    }
+
+    // Highest score first, ties to the earlier (smaller-y) moment — the same
+    // deterministic rule `rank_pivots` documents.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.partial_cmp(&b.0).unwrap()));
+    candidates.truncate(max_pivots);
+    // Back into video order for the timeline splice.
+    candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    candidates
+        .into_iter()
+        .map(|(y, _score, label, detail)| Pivot { y, label, detail })
+        .collect()
+}
+
 /// Short label for the callout card's title line — the "what" in one glance.
 fn render_label(row: &GraphRow, reasons: &[Reason]) -> String {
     // Priority order for the headline reason, most-specific first: a tag
