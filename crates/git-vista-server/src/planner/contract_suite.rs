@@ -10,6 +10,19 @@
 //!     against a real temporary repository and asserts the mutation landed.
 //!     [`covered_by`] matches exhaustively over the enum, so adding a new
 //!     variant refuses to compile until it gets a pipeline test. (Four
+//!     exceptions today: `FetchRemote` and `PullBranch` (M2.20a #227) and
+//!     the two *remote-reaching* tag operations, `DeleteRemoteTag` and
+//!     `PushTag` (M2.21a #235), ship no execution — their pipeline tests
+//!     assert the *stubs'* refusal and that the repository stayed
+//!     byte-identical, the honest version of this layer's claim until
+//!     #229/#230 and the later M2.21 slices of #74 wire real execution in.
+//!     `AmendCommit` was staged the same way by #222 and graduated when #223
+//!     wired `exec_amend_commit`; `CreateTag` and `DeleteLocalTag` graduated
+//!     the same way when M2.21d (#238, ADR 0048) wired theirs, and their
+//!     inertness stubs were **replaced** by real execution tests rather than
+//!     kept alongside — an inertness assertion that survives the wiring it
+//!     was guarding is a test asserting the opposite of the contract.)
+
 //!     exceptions today: the four tag operations (M2.21a #235) ship no
 //!     execution — their pipeline tests assert the *stubs'* refusal and that
 //!     the repository stayed byte-identical, the honest version of this
@@ -130,6 +143,32 @@ fn wpath(s: &str) -> WorktreePath {
 /// included — instead of a copy of it that could drift.
 async fn pipeline(repo: &Path, op: GitOperation) -> (StatusCode, String) {
     plan_and_execute_in(repo, None, tokens(), op).await
+}
+
+/// [`pipeline`] driven inside a tracked operation's progress scope — the shape
+/// production runs in, since `plan_and_execute_tracked` wraps the pipeline in
+/// `operations::with_progress`.
+///
+/// The difference that matters here is `planner::pin_recovery`: it names the
+/// recovery ref after the operation's id, so it is a no-op under the plain
+/// [`pipeline`] above (no id to name) and writes the pin under this one. A test
+/// about what the pin *does* therefore has to drive this, or it would be
+/// pinning by hand and proving nothing about production's ordering.
+async fn tracked_pipeline(repo: &Path, op: GitOperation, key: &str) -> (StatusCode, String) {
+    let hash = operation_hash(&op);
+    let (repository, worktree) = tokens();
+    let k = IdempotencyKey::new(format!("contract-{key}")).unwrap();
+    let (handle, record) = match crate::operations::admit(&k, &op, &hash, repository, worktree) {
+        crate::operations::Admission::Fresh(handle, record) => (handle, record),
+        _ => panic!("‘{key}’ must be a fresh idempotency key in this binary"),
+    };
+    let out = crate::operations::with_progress(
+        record,
+        plan_and_execute_in(repo, None, tokens(), op.clone()),
+    )
+    .await;
+    handle.finish(out.0, out.1.clone(), None);
+    out
 }
 
 /// The pipeline from `validate` on, for tests that tamper with a built plan
@@ -1798,6 +1837,10 @@ fn every_git_write_route_reaches_the_planner() {
         // M2.20d (#230): pull — a git write, funnel row below.
         ("/api/pull", "pull_branch"),
         ("/api/delete-branch", "delete_branch"),
+        // M2.21d (#238): the two local tag writes — git writes, funnel rows
+        // below. The tag *listing* is a GET and so never reaches this table.
+        ("/api/tag", "handlers::tags::create_tag"),
+        ("/api/delete-tag", "handlers::tags::delete_tag"),
         ("/api/checkout", "checkout_branch"),
         ("/api/force-delete-branch", "force_delete_branch"),
         ("/api/rebase", "rebase"),
@@ -1912,6 +1955,10 @@ fn every_git_write_route_reaches_the_planner() {
         ("src/handlers/staging.rs", "staging_apply", None),
         ("src/handlers/discard.rs", "discard_tracked_paths", None),
         ("src/handlers/discard.rs", "delete_untracked_paths", None),
+        // M2.21d (#238): both tag write handlers build their operation and
+        // call the planner directly — no `git tag` argv exists in that file.
+        ("src/handlers/tags.rs", "create_tag", None),
+        ("src/handlers/tags.rs", "delete_tag", None),
     ];
     for (file, handler, helper) in funnel {
         let src = source(file);
@@ -2012,6 +2059,70 @@ fn the_production_entry_point_composes_the_tested_stages_in_order() {
             ),
         }
     }
+}
+
+/// **The recovery pin is composed inside the guard, before execution** — in
+/// *both* compositions, and nowhere after them.
+///
+/// This is the shape half of the guarantee `lifecycle_suite`'s
+/// `the_recovery_pin_exists_before_the_tag_it_saves_is_deleted` proves
+/// behaviourally, and it is here because the behavioural test can only observe
+/// the ordering it happens to race; this one cannot be satisfied by a lucky
+/// schedule.
+///
+/// The ordering is load-bearing for `DeleteLocalTag` specifically.
+/// `refs/git-vista/recovery/<id>` is the only thing keeping a deleted annotated
+/// tag's now-dangling tag object — and, when no branch reaches it, the commit
+/// under it — alive against `git gc`. `git tag -d` removes the last other ref
+/// to that object, so a pin written afterwards is a pin written during a window
+/// in which the object it names can already have been pruned. Written after
+/// `plan_and_execute_in` *returned* — where it lived until this test existed —
+/// it was also after `_guard` dropped, so the next queued mutation of the same
+/// repository (and any `gc --auto` it fires) was free to run inside that gap.
+///
+/// The final assertion is the anti-regression one: the tracked wrapper must not
+/// write the ref at all. Restoring the old call there while leaving the new one
+/// in place would look harmless and would silently re-open nothing — but
+/// *moving* it back is exactly the regression, and only "it is not in the
+/// wrapper" catches that.
+#[test]
+fn the_recovery_pin_is_composed_inside_the_guard_before_execution() {
+    let src = source("src/planner.rs");
+    for composition in ["plan_and_execute_in", "submit_plan"] {
+        let body = fn_body(&src, composition);
+        let mut from = 0;
+        for stage in [
+            "coordinator::lock(",
+            "enforce_fresh(",
+            "pin_recovery(",
+            "execute(",
+        ] {
+            match body[from..].find(stage) {
+                Some(at) => from += at + stage.len(),
+                None => panic!(
+                    "{composition} no longer calls {stage} after the previous stage — the \
+                     recovery pin must be written while the mutation guard is held, after \
+                     the gates (so a refused plan leaves no ref) and before execute (so a \
+                     destructive command cannot outrun the pin that makes it recoverable)"
+                ),
+            }
+        }
+    }
+
+    let pin = fn_body(&src, "pin_recovery");
+    assert!(
+        pin.contains("write_recovery_ref("),
+        "pin_recovery must actually write the ref"
+    );
+
+    let tracked = fn_body(&src, "plan_and_execute_tracked");
+    assert!(
+        !tracked.contains("write_recovery_ref("),
+        "the recovery ref must NOT be written from the lifecycle wrapper: that runs \
+         after plan_and_execute_in returned, which is after the destructive command \
+         ran AND after the per-repository guard dropped — the exact gc window the pin \
+         exists to close"
+    );
 }
 
 /// The outer entry point still applies the write gate and delegates, now
@@ -3311,50 +3422,74 @@ async fn every_push_combination_reaches_a_real_executor() {
     }
 }
 
-// --- #235 (M2.21a): typed tag vocabulary, execution not yet wired ----------
+// --- #235 (M2.21a) vocabulary; #238 (M2.21d) local execution ----------------
 
 fn tname(s: &str) -> TagName {
     TagName::new(s).unwrap()
 }
 
-/// [`GitOperation::CreateTag`] proves its shape end-to-end through the real
-/// pipeline, for **both kinds**, but M2.21a ships no execution — the later
-/// M2.21 slices of #74 own it.
+fn annotation(message: &str, sign: bool) -> git_vista_protocol::TagAnnotation {
+    git_vista_protocol::TagAnnotation {
+        message: git_vista_protocol::TagMessage::new(message).unwrap(),
+        sign,
+    }
+}
+
+/// `git tag -l --format=…` for one tag, so assertions read git's own answer
+/// rather than anything git-vista computed: the ref's unpeeled value, the
+/// object type it names, the peeled commit, and the annotation body.
+fn tag_facts(repo: &Path, name: &str) -> String {
+    out(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(objecttype) %(*objectname) %(contents)",
+            &format!("refs/tags/{name}"),
+        ],
+    )
+}
+
+/// [`GitOperation::CreateTag`] end to end through the real pipeline, for
+/// **both kinds** — M2.21d (#238) replaced M2.21a's inertness stub with this.
+///
+/// The status code is the weakest possible claim here, so nothing rests on
+/// it: every assertion below reads the repository back with plain `git`. In
+/// particular the *kind* is checked by object type (`git cat-file -t`), not by
+/// the tag's mere existence — the failure this catches is an executor that
+/// drops `-a` and answers 200 having created a lightweight tag where the
+/// reviewer approved an annotated one, which no "did a tag appear?" assertion
+/// can see.
 ///
 /// Both kinds are driven for the same reason `pull_branch` drives both
-/// strategies: a stub that refused the annotated form and quietly executed
-/// the lightweight one (or vice versa) would be invisible to a single-shape
-/// test. The plan's shape is also pinned per kind — lightweight promises the
-/// ref lands exactly at `target`, annotated honestly says `Computed` (the
-/// ref will point at a tag object that does not exist yet).
+/// strategies: an executor that handled one and quietly mishandled the other
+/// would be invisible to a single-shape test. The plan's shape is pinned per
+/// kind too — lightweight promises the ref lands exactly at `target`,
+/// annotated honestly says `Computed` (the ref will point at a tag object
+/// that does not exist yet), and the annotated leg proves the ref really did
+/// land somewhere `Computed` was the only honest answer for.
 #[tokio::test]
 async fn create_tag_executes_through_the_pipeline() {
-    for annotation in [
-        None,
-        Some(git_vista_protocol::TagAnnotation {
-            message: git_vista_protocol::TagMessage::new("v1.0.0 — notes").unwrap(),
-            sign: false,
-        }),
-    ] {
+    for annotated in [false, true] {
         let (_dir, repo) = seeded_repo();
         let target = tip(&repo, "HEAD");
+        let ann = annotated.then(|| annotation("v1.0.0 — notes", false));
 
         // The shape half: risk, CAS-style absence precondition, per-kind
         // after-state, and the delete-created recovery.
         let op = GitOperation::CreateTag {
             name: tname("v1.0.0"),
             target: oid(&target),
-            annotation: annotation.clone(),
+            annotation: ann.clone(),
         };
         let (plan, _observed) = build_plan(&repo, op.clone(), tokens()).await;
-        assert_eq!(plan.risk, RiskLevel::Reversible, "{annotation:?}");
+        assert_eq!(plan.risk, RiskLevel::Reversible, "annotated={annotated}");
         assert!(
             plan.preconditions.contains(&Precondition::RefAbsent {
                 ref_name: RefName::new("refs/tags/v1.0.0").unwrap(),
             }),
             "creating a tag must be guarded on the tag not already existing"
         );
-        let expected_after = match &annotation {
+        let expected_after = match &ann {
             None => RefState::At(oid(&target)),
             Some(_) => RefState::Computed,
         };
@@ -3365,7 +3500,7 @@ async fn create_tag_executes_through_the_pipeline() {
                 before: RefState::Absent,
                 after: expected_after,
             }],
-            "{annotation:?}"
+            "annotated={annotated}"
         );
         assert_eq!(
             plan.recovery,
@@ -3374,42 +3509,279 @@ async fn create_tag_executes_through_the_pipeline() {
             }
         );
 
-        // The stub half: refused, and provably inert.
-        let before = repo_fingerprint(&repo);
+        // The execution half — asserted against git, never against the status.
+        assert_eq!(
+            out(&repo, &["tag", "-l"]),
+            "",
+            "the repository must start with no tags, or 'the tag appeared' is vacuous"
+        );
         let (status, body) = pipeline(&repo, op).await;
+        assert_ok(status, &body);
         assert_eq!(
-            status,
-            StatusCode::NOT_IMPLEMENTED,
-            "{annotation:?}: {body}"
+            out(&repo, &["tag", "-l"]),
+            "v1.0.0",
+            "annotated={annotated}: git must list the tag it was asked to create"
         );
+        // The peeled commit is the reviewed target either way.
         assert_eq!(
-            repo_fingerprint(&repo),
-            before,
-            "the {annotation:?} stub must leave the repository byte-identical — \
-             M2.21a ships no tag-create execution (#74)"
+            tip(&repo, "refs/tags/v1.0.0^{commit}"),
+            target,
+            "annotated={annotated}: the tag must speak for the reviewed commit"
         );
-        // The paired positive for the inertness claim: the very mutation the
-        // stub must not make *does* change the fingerprint when plain git
-        // makes it, so the assertion above was capable of failing.
-        run(&repo, &["tag", "v1.0.0", &target]);
-        assert_ne!(
-            repo_fingerprint(&repo),
-            before,
-            "creating the tag for real must move the fingerprint, or the \
-             inertness assertion above is vacuous"
-        );
+        if annotated {
+            assert_eq!(
+                out(&repo, &["cat-file", "-t", "refs/tags/v1.0.0"]),
+                "tag",
+                "an annotated tag's ref must name a tag OBJECT — an executor \
+                 that dropped -a would answer 200 with a lightweight tag here"
+            );
+            assert_ne!(
+                tip(&repo, "refs/tags/v1.0.0"),
+                target,
+                "the annotated ref must point at the new tag object, not at \
+                 the commit — this is what the plan's RefState::Computed said"
+            );
+            assert!(
+                out(&repo, &["cat-file", "tag", "v1.0.0"]).contains("v1.0.0 — notes"),
+                "the reviewed message must be in the tag object git wrote"
+            );
+        } else {
+            assert_eq!(
+                out(&repo, &["cat-file", "-t", "refs/tags/v1.0.0"]),
+                "commit",
+                "a lightweight tag's ref must name the commit directly — an \
+                 executor that added -a would write a tag object here"
+            );
+            assert_eq!(
+                tip(&repo, "refs/tags/v1.0.0"),
+                target,
+                "lightweight: the ref lands exactly where the plan promised"
+            );
+        }
     }
 }
 
-/// [`GitOperation::DeleteLocalTag`], same contract-only staging: the plan's
-/// shape is proven against a *real* annotated tag, execution is refused, and
-/// the tag demonstrably survives.
+/// The `RefAbsent` precondition, proven by the refusal it causes: creating a
+/// tag whose name is taken is refused, and the tag that was already there is
+/// **not** moved.
+///
+/// The second assertion is the one worth having. `git tag` without `-f`
+/// refuses a duplicate on its own, so a 400 alone would still pass if the
+/// precondition had been dropped entirely; what it would not survive is the
+/// existing tag being silently repointed, which is exactly what an executor
+/// that "helpfully" added `-f` would do.
+#[tokio::test]
+async fn create_tag_refuses_a_name_that_already_exists() {
+    let (_dir, repo) = seeded_repo();
+    let first = tip(&repo, "HEAD");
+    run(&repo, &["tag", "-a", "-m", "the original", "v1.0.0"]);
+    let original = tag_facts(&repo, "v1.0.0");
+    run(&repo, &["commit", "-q", "--allow-empty", "-m", "later"]);
+    let second = tip(&repo, "HEAD");
+    assert_ne!(first, second);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::CreateTag {
+            name: tname("v1.0.0"),
+            target: oid(&second),
+            annotation: Some(annotation("a replacement", false)),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        tag_facts(&repo, "v1.0.0"),
+        original,
+        "the existing tag must be untouched — not repointed at the new target"
+    );
+    assert_eq!(tip(&repo, "refs/tags/v1.0.0^{commit}"), first);
+}
+
+/// Asking for a **signed** tag is refused with `501` and nothing is created.
+/// M2.21e (#74) wires signing; until then the flag must not be silently
+/// dropped, because an unsigned tag handed back under a name the user
+/// believes is signed is a wrong outcome they cannot see.
+///
+/// Inertness is checked with [`repo_fingerprint`] rather than `git tag -l`:
+/// `git tag -s` on a machine with no signing key fails *after* writing
+/// nothing, but a hypothetical executor that stripped the flag and ran
+/// `git tag -a` would leave a perfectly valid unsigned tag behind — and the
+/// fingerprint sees the object store too, so even a written-then-deleted tag
+/// object would show.
+#[tokio::test]
+async fn create_tag_refuses_signing_before_running_git() {
+    let (_dir, repo) = seeded_repo();
+    let target = tip(&repo, "HEAD");
+    let before = repo_fingerprint(&repo);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::CreateTag {
+            name: tname("v1.0.0"),
+            target: oid(&target),
+            annotation: Some(annotation("signed, please", true)),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(out(&repo, &["tag", "-l"]), "", "no tag may be created");
+    assert_eq!(
+        repo_fingerprint(&repo),
+        before,
+        "the signing refusal must leave the repository byte-identical"
+    );
+    // Paired positive: the same request without `sign` really does create a
+    // tag here, so "nothing happened" above was capable of failing.
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::CreateTag {
+            name: tname("v1.0.0"),
+            target: oid(&target),
+            annotation: Some(annotation("signed, please", false)),
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+    assert_eq!(out(&repo, &["tag", "-l"]), "v1.0.0");
+}
+
+/// **The no-editor guarantee** (ADR 0048), tested three ways because the
+/// failure mode is a request that never returns.
+///
+/// `git tag -a` with no `-m` writes `.git/TAG_EDITMSG` and then launches
+/// `core.editor`. On a headless server that is either an immediate death (on
+/// whatever `$EDITOR` happens to be) or a process waiting forever for a human
+/// who cannot reach it — and `git tag` has no `--no-edit` to switch it off
+/// after the fact.
+///
+///  1. **The witness.** `.git/TAG_EDITMSG` exists if and only if git took the
+///     editor path. Both kinds of create are driven and the file must not
+///     appear. This is deterministic and needs no environment at all.
+///  2. **The clock.** Every call runs under a timeout, so a genuine hang is a
+///     test failure rather than a wedged CI job.
+///  3. **The paired positive.** Plain `git tag -a` (no `-m`) is spawned in the
+///     *same repository*, with a deliberately blocking editor set **on that
+///     child's own environment** — no process-wide `set_var`, so nothing here
+///     can race a parallel test. It must fail to finish inside the same
+///     timeout and must leave the witness behind. Without this leg, both
+///     assertions above would pass in a world where nothing could ever hang.
+#[tokio::test]
+async fn annotated_tag_creation_never_opens_an_editor() {
+    use std::time::Duration;
+
+    let (dir, repo) = seeded_repo();
+    let target = tip(&repo, "HEAD");
+    let editmsg = repo.join(".git/TAG_EDITMSG");
+    assert!(
+        !editmsg.exists(),
+        "a fresh repository has no TAG_EDITMSG, or the witness proves nothing"
+    );
+
+    for (name, ann) in [
+        ("lightweight", None),
+        ("annotated", Some(annotation("v1.0.0 — notes", false))),
+        // The message that spells a flag. It must be consumed as `-m`'s own
+        // value — proven below by reading it back out of the tag object —
+        // rather than re-entering git's option parser as `--edit`, which
+        // would put the editor back in the path this test exists to close.
+        ("option-shaped", Some(annotation("--edit", false))),
+    ] {
+        let op = GitOperation::CreateTag {
+            name: tname(name),
+            target: oid(&target),
+            annotation: ann,
+        };
+        let (status, body) = tokio::time::timeout(Duration::from_secs(30), pipeline(&repo, op))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("creating the {name} tag did not finish — it is waiting on something")
+            });
+        assert_ok(status, &body);
+        assert!(
+            !editmsg.exists(),
+            "creating the {name} tag wrote .git/TAG_EDITMSG — git took the \
+             editor path, which on this server means a request that never ends"
+        );
+    }
+    assert_eq!(
+        out(&repo, &["cat-file", "tag", "option-shaped"])
+            .lines()
+            .last(),
+        Some("--edit"),
+        "an option-shaped message must end up as the tag's text, not back in \
+         git's option parser"
+    );
+
+    // Leg 3: prove the witness fires and the editor path really does hang.
+    let marker = dir.path().join("editor-ran");
+    let editor = dir.path().join("blocking-editor.sh");
+    std::fs::write(
+        &editor,
+        format!(
+            "#!/bin/sh\ntouch {}\nsleep 3600\n",
+            marker.to_str().expect("tempdir path is utf-8")
+        ),
+    )
+    .unwrap();
+    make_executable(&editor);
+
+    let mut child = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["tag", "-a", "v-probe", &target])
+        // On this child only: `GIT_EDITOR` beats `core.editor` and every
+        // ambient `EDITOR`/`VISUAL`, so the trap is armed no matter what the
+        // developer's shell (or CI) has set — and setting it here rather than
+        // on the process cannot disturb any concurrently running test.
+        .env("GIT_EDITOR", &editor)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn git tag -a");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
+    let hung = outcome.is_err();
+    let _ = child.kill().await;
+    assert!(
+        hung,
+        "plain `git tag -a` with a blocking editor finished anyway — the trap \
+         is not armed, so the two assertions above prove nothing"
+    );
+    assert!(
+        marker.exists(),
+        "the blocking editor never ran, so this leg did not exercise the \
+         editor path it claims to"
+    );
+    assert!(
+        editmsg.exists(),
+        "the editor path must leave .git/TAG_EDITMSG — otherwise the witness \
+         the assertions above rely on can never fire"
+    );
+}
+
+/// [`GitOperation::DeleteLocalTag`] end to end — M2.21d (#238) replaced
+/// M2.21a's inertness stub with this.
+///
+/// Driven against a *real annotated* tag, because that is the case where a
+/// wrong answer is invisible: the ref is gone either way, so what the test
+/// actually pins is the pair of facts the task turns on — the tagged **commit
+/// survives** the delete, and the pre-delete unpeeled value is what the plan
+/// carried forward for recovery (checked here as the journal's before-oid, so
+/// the recovery information is proven to be *recorded*, not merely computed).
 #[tokio::test]
 async fn delete_local_tag_executes_through_the_pipeline() {
     let (_dir, repo) = seeded_repo();
     run(&repo, &["tag", "-a", "-m", "v1.0.0 — notes", "v1.0.0"]);
+    let tag_object = tip(&repo, "refs/tags/v1.0.0");
+    let tagged_commit = tip(&repo, "refs/tags/v1.0.0^{}");
+    assert_ne!(
+        tag_object, tagged_commit,
+        "an annotated tag's ref value must differ from its commit, or this \
+         test cannot tell a surviving commit from a surviving tag"
+    );
 
-    let before = repo_fingerprint(&repo);
     let (status, body) = pipeline(
         &repo,
         GitOperation::DeleteLocalTag {
@@ -3417,21 +3789,213 @@ async fn delete_local_tag_executes_through_the_pipeline() {
         },
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_ok(status, &body);
+    assert_eq!(
+        out(&repo, &["tag", "-l"]),
+        "",
+        "git must no longer list the deleted tag"
+    );
+    assert!(
+        git_ok(&repo, &["rev-parse", "--verify", "refs/tags/v1.0.0"])
+            .await
+            .is_err(),
+        "the ref itself must be gone, not merely hidden from the listing"
+    );
+    // The task's own requirement, and the reason this ranks Destructive
+    // rather than Irrecoverable: the delete takes the ref, never the commit.
+    assert_eq!(
+        out(&repo, &["cat-file", "-t", &tagged_commit]),
+        "commit",
+        "deleting a tag must never destroy the commit it spoke for"
+    );
+    assert_eq!(tip(&repo, "HEAD"), tagged_commit);
+
+    // The recovery datum was *recorded*, not just computed: the journal's
+    // before-oid is the unpeeled tag object, which is the only value from
+    // which the original tag can be restored (ADR 0048).
+    let journaled = journal::read_all(&repo)
+        .into_iter()
+        .find(|e| e.ref_name.as_deref() == Some("refs/tags/v1.0.0"))
+        .expect("the delete must be journaled against the tag's own ref");
+    assert_eq!(
+        journaled.old_oid.as_deref(),
+        Some(tag_object.as_str()),
+        "the journal must carry the UNPEELED pre-delete value; the peeled \
+         commit would restore a lightweight look-alike, not the tag"
+    );
+    assert_eq!(journaled.new_oid, None, "a deleted ref has no new value");
+    assert_eq!(
+        journaled.source,
+        git_vista_core::activity::ActivitySource::App,
+        "the delete must be attributed to the app, not left to reflog inference"
+    );
+}
+
+/// Deleting a tag that isn't there is refused, and refused for the right
+/// reason: nothing else in the repository moves.
+///
+/// The plan degrades honestly rather than inventing a CAS pin it cannot know
+/// — with no observed value there is nothing to compare-and-swap against and
+/// no restore point, so `RecoveryStrategy::NotNeeded` is the truthful answer
+/// (there is nothing to recover) and git's own refusal is what the user sees.
+#[tokio::test]
+async fn delete_local_tag_refuses_a_tag_that_does_not_exist() {
+    let (_dir, repo) = seeded_repo();
+    run(&repo, &["tag", "-a", "-m", "kept", "v0.9.0"]);
+    let before = repo_fingerprint(&repo);
+
+    let op = GitOperation::DeleteLocalTag {
+        name: tname("v1.0.0"),
+    };
+    let (plan, _observed) = build_plan(&repo, op.clone(), tokens()).await;
+    assert_eq!(
+        plan.recovery,
+        RecoveryStrategy::NotNeeded,
+        "no observed value means no restore point to promise"
+    );
+    assert!(
+        plan.expected_ref_changes.is_empty(),
+        "a plan must not claim a ref change it cannot describe"
+    );
+
+    let (status, body) = pipeline(&repo, op).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(
         repo_fingerprint(&repo),
         before,
-        "the stub must leave the repository byte-identical — M2.21a ships no \
-         tag-delete execution (#74)"
+        "a refused delete must leave the repository byte-identical — the \
+         *other* tag in particular"
     );
-    // Paired positive: really deleting the tag moves the fingerprint.
-    run(&repo, &["tag", "-d", "v1.0.0"]);
-    assert_ne!(
-        repo_fingerprint(&repo),
-        before,
-        "deleting the tag for real must move the fingerprint, or the \
-         inertness assertion above is vacuous"
-    );
+    assert_eq!(out(&repo, &["tag", "-l"]), "v0.9.0");
+}
+
+/// **The recovery decision, proven end to end** (ADR 0048): a deleted tag is
+/// restored *byte-identically* from the oid its plan carried, and the durable
+/// recovery ref is what keeps that oid — and the commit under it — alive
+/// against `git gc`.
+///
+/// The tag here is the **only** ref reaching its commit. That is deliberate
+/// and it is the whole test: with the commit also on a branch, "the target
+/// commit survives" would be true no matter what this code did, and the
+/// assertion would be vacuous. Made unreachable, the claim has teeth — and
+/// the paired negative leg proves it, by running the identical sequence
+/// *without* the recovery pin and watching both objects vanish.
+///
+/// Two distinct things are being pinned:
+///
+///  * **Unpeeled, not peeled.** Restoring at the tag object's own oid gives
+///    back the original tag object — same message, same tagger, same date,
+///    same signature. Restoring at the peeled commit would produce a
+///    *lightweight* tag: right name, right commit, and every annotation gone
+///    forever. The last two assertions check the object *type* and the
+///    message, which is the only way to tell those two outcomes apart.
+///  * **The pin is load-bearing, not decorative.** `write_recovery_ref` is
+///    what makes the dangling tag object reachable; the negative leg deletes
+///    the same tag with no pin and shows `git gc` takes both objects.
+///
+/// The pinned leg drives [`tracked_pipeline`] so that the ref is written by
+/// `planner::pin_recovery` — production's own call, in production's own place
+/// (inside the mutation guard, before `execute`). It used to be written by hand
+/// *before* calling the pipeline, which quietly made this a proof about an
+/// ordering the shipped code did not use. That the two orderings differ at all
+/// is the subject of `the_recovery_pin_is_composed_inside_the_guard_before_execution`
+/// and of `lifecycle_suite`'s
+/// `the_recovery_pin_exists_before_the_tag_it_saves_is_deleted`.
+#[tokio::test]
+async fn a_deleted_tag_is_restorable_byte_identically_and_the_pin_is_what_saves_it() {
+    for pinned in [true, false] {
+        let (_dir, repo) = seeded_repo();
+        // A commit no branch reaches: the tag is its only anchor.
+        run(&repo, &["checkout", "-q", "--detach"]);
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "released"]);
+        let released = tip(&repo, "HEAD");
+        run(
+            &repo,
+            &["tag", "-a", "-m", "v1.0.0 — release notes", "v1.0.0"],
+        );
+        run(&repo, &["checkout", "-q", "main"]);
+        let tag_object = tip(&repo, "refs/tags/v1.0.0");
+        let original = out(&repo, &["cat-file", "tag", "v1.0.0"]);
+        assert!(
+            original.contains("v1.0.0 — release notes"),
+            "the fixture's own annotation must be readable, or nothing below \
+             can prove it came back"
+        );
+
+        let op = GitOperation::DeleteLocalTag {
+            name: tname("v1.0.0"),
+        };
+        let (plan, _observed) = build_plan(&repo, op.clone(), tokens()).await;
+        let RecoveryStrategy::RecreateTag { at, .. } = plan.recovery.clone() else {
+            panic!("a delete with an observed value must promise RecreateTag");
+        };
+        assert_eq!(
+            at.as_str(),
+            tag_object,
+            "the recovery oid is the unpeeled tag object"
+        );
+
+        // The pin is *production's*, not this test's: `pin_recovery` writes it
+        // inside the mutation guard immediately before `execute`, so under
+        // `tracked_pipeline` the ref is already there when `git tag -d` runs.
+        // The unpinned leg drives the plain `pipeline`, which has no operation
+        // id to name a ref after and so writes none — which is exactly the
+        // world this test's negative half needs.
+        let (status, body) = if pinned {
+            tracked_pipeline(&repo, op, "tag-recovery-pin").await
+        } else {
+            pipeline(&repo, op).await
+        };
+        assert_ok(status, &body);
+        assert!(
+            git_ok(&repo, &["rev-parse", "--verify", "refs/tags/v1.0.0"])
+                .await
+                .is_err()
+        );
+
+        // Everything that could have kept the objects alive by accident, gone.
+        run(&repo, &["reflog", "expire", "--expire=now", "--all"]);
+        run(&repo, &["gc", "-q", "--prune=now"]);
+
+        let tag_alive = git_ok(&repo, &["cat-file", "-e", &tag_object])
+            .await
+            .is_ok();
+        let commit_alive = git_ok(&repo, &["cat-file", "-e", &released]).await.is_ok();
+        if !pinned {
+            // The negative leg: without the pin there is nothing to restore.
+            assert!(
+                !tag_alive && !commit_alive,
+                "unpinned, git gc must take both objects — otherwise the \
+                 pinned leg's survival proves nothing about the pin"
+            );
+            continue;
+        }
+        assert!(
+            tag_alive,
+            "the recovery ref must keep the dangling tag object reachable"
+        );
+        assert!(
+            commit_alive,
+            "and with it the commit the tag spoke for — this is what makes \
+             the delete recoverable rather than a quiet history loss"
+        );
+
+        // The restoration itself, exactly what `RecreateTag` prescribes.
+        run(&repo, &["update-ref", "refs/tags/v1.0.0", at.as_str()]);
+        assert_eq!(
+            out(&repo, &["cat-file", "-t", "refs/tags/v1.0.0"]),
+            "tag",
+            "restoring at the unpeeled oid gives back an ANNOTATED tag; the \
+             peeled commit would have given a lightweight look-alike"
+        );
+        assert_eq!(
+            out(&repo, &["cat-file", "tag", "v1.0.0"]),
+            original,
+            "the restored tag object must be byte-identical — message, \
+             tagger and date included"
+        );
+        assert_eq!(tip(&repo, "refs/tags/v1.0.0^{}"), released);
+    }
 }
 
 /// The decision #235 was told not to make by reflex, pinned against a real

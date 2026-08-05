@@ -486,6 +486,15 @@ fn api_router(
             // fetch has no field for.
             .route("/api/pull", post(pull_branch))
             .route("/api/delete-branch", post(delete_branch))
+            // M2.21d (#238, ADR 0048): the two **local** tag writes. Named to
+            // match the `/api/branch` + `/api/delete-branch` pair beside them,
+            // and full_routes-gated like every other write — unlike the
+            // `GET /api/tags` listing above, which the LAN router does see.
+            // Pushing a tag and deleting it on a remote are deliberately NOT
+            // here: those open a socket with credentials on it and are their
+            // own slice (#74).
+            .route("/api/tag", post(handlers::tags::create_tag))
+            .route("/api/delete-tag", post(handlers::tags::delete_tag))
             // iPad-testing follow-up: switch HEAD to a branch (`git checkout`).
             .route("/api/checkout", post(checkout_branch))
             // Issue #33 follow-up: force-delete an unmerged branch (`git branch -D`),

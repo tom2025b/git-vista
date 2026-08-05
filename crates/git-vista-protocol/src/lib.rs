@@ -74,11 +74,12 @@ pub use diff::{
 };
 pub use dto::{
     validate_clone_url, AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind,
-    BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
-    FetchError, FetchFailureKind, FetchRequest, FetchSuccess, HookPolicy, PullError,
-    PullFailureKind, PullRequest, PullSuccess, PushRequest, RebaseStatus, RemoteRefUpdate,
-    RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo, SessionRequest,
-    SignatureStatus, TagDetail, TagKind, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
+    BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, CreateTagRequest,
+    DeleteCloneRequest, DeleteTagRequest, FetchError, FetchFailureKind, FetchRequest, FetchSuccess,
+    HookPolicy, PullError, PullFailureKind, PullRequest, PullSuccess, PushRequest, RebaseStatus,
+    RemoteRefUpdate, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo,
+    SessionRequest, SignatureStatus, TagDetail, TagKind, WorktreePathsRequest,
+    CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use history::{HistoryFrame, HistoryPage};

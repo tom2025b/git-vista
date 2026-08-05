@@ -603,6 +603,23 @@ pub(crate) fn stage(stage: OperationStage) {
     let _ = PIPELINE.try_with(|record| record.set_stage(stage));
 }
 
+/// The id of the operation this task's pipeline is running under, if any.
+///
+/// `None` means the planner is being driven outside a tracked operation — the
+/// contract and coordination suites, which call `plan_and_execute_in`
+/// directly. Production always has one: `plan_and_execute` →
+/// `plan_and_execute_tracked` runs the pipeline inside [`with_progress`].
+///
+/// Exists so the guarded region of the pipeline can name the recovery ref it
+/// must write **before** a destructive command runs (`refs/git-vista/recovery/
+/// <operation id>`; see `planner::pin_recovery`). Read from the task-local
+/// rather than threaded through `plan_and_execute_in` → `submit_plan` →
+/// `execute` for the same reason [`stage`] is: the requirement belongs at the
+/// chokepoint, not in five signatures.
+pub(crate) fn current_operation_id() -> Option<OperationId> {
+    PIPELINE.try_with(|record| record.id()).ok()
+}
+
 /// Report an object-transfer step from inside the pipeline (M2.20c, #229). A
 /// no-op outside a tracked operation, so the executor can report
 /// unconditionally — exactly like [`stage`] above.

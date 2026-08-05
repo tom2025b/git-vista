@@ -40,8 +40,8 @@
 //! | `POST /api/discard-tracked-paths` | `git checkout -- <paths>` | [`GitOperation::DiscardTrackedPaths`] |
 //! | `POST /api/delete-untracked-paths` | `git clean -f -- <paths>` | [`GitOperation::DeleteUntrackedPaths`] |
 //! | `POST /api/amend-commit` | `git commit --amend [--allow-empty] -m` | [`GitOperation::AmendCommit`] |
-//! | *(planned, #74 M2.21b)* | `git tag [-a\|-s -m] <name> <target>` | [`GitOperation::CreateTag`] |
-//! | *(planned, #74 M2.21e)* | `git tag -d <name>` | [`GitOperation::DeleteLocalTag`] |
+//! | `POST /api/tag` | `git tag [-a -m <msg>] <name> <target>` | [`GitOperation::CreateTag`] |
+//! | `POST /api/delete-tag` | `git tag -d <name>` | [`GitOperation::DeleteLocalTag`] |
 //! | *(planned, #74 M2.21e)* | `git push <remote> --delete refs/tags/<name>` | [`GitOperation::DeleteRemoteTag`] |
 //! | *(planned, #74 M2.21f)* | `git push <remote> refs/tags/<name>` | [`GitOperation::PushTag`] |
 //!
@@ -56,11 +56,14 @@
 //! table already had a live handler when its variant landed.
 //! [`GitOperation::AmendCommit`] went through exactly that staging and
 //! graduated: #222 landed the contract, #223 (ADR 0040) the execution.
-//! The four tag rows (M2.21a, #235, ADR 0041) are staged the same way: the
+//! The four tag rows (M2.21a, #235, ADR 0041) were staged the same way: the
 //! typed contract — variants, `shape` wiring, network classification, golden
-//! fixture — lands and gets reviewed before any handler can build one, and
-//! `planner::execute` refuses all four with `501` until the later M2.21
-//! slices (#74) wire them.
+//! fixture — landed and was reviewed before any handler could build one, with
+//! `planner::execute` refusing all four with `501`. M2.21d (#238, ADR 0048)
+//! graduated the two **local** ones: `CreateTag` and `DeleteLocalTag` now have
+//! routes and real execution. The two remote-reaching rows below are still
+//! `501` — they are the first tag code that would open a socket with
+//! credentials on it, so they keep a slice of their own (#74).
 //!
 //! [`GitOperation::PushBranch`] is the one row that already had a handler and
 //! was **widened** anyway (M2.20a, #227: `set_upstream` and `force`). Its
@@ -393,8 +396,10 @@ pub enum ForcePublish {
 /// whether it asks for a signature, the same "make every caller state both
 /// answers" reasoning M2.20a applied to `set_upstream`/`force`. Where the
 /// signing *key and config* come from is deliberately **not** modelled here:
-/// that is #239's territory (M2.21d), and until it lands `planner::execute`
-/// refuses every `CreateTag` anyway (contract-only slice).
+/// that is M2.21e's territory (#74). Until it lands, `planner::exec_create_tag`
+/// answers `sign: true` with `501` before building any argv — M2.21d (#238)
+/// wired the unsigned halves only, and ADR 0048 records why a refusal beats
+/// silently dropping the flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TagAnnotation {
@@ -756,16 +761,32 @@ pub enum GitOperation {
         branch: BranchName,
         strategy: MergeStrategy,
     },
-    /// `git tag <name> <target>` (lightweight) or `git tag -a|-s -m <message>
-    /// <name> <target>` (annotated) — create a tag at a commit (planned, M2.21
-    /// slices of #74).
+    /// `git tag <name> <target>` (lightweight) or `git tag -a -m <message>
+    /// <name> <target>` (annotated) — create a tag at a commit.
     ///
-    /// # Contract only (M2.21a, #235, ADR 0041)
+    /// # Staged in two slices (M2.21a #235 ADR 0041, then M2.21d #238 ADR 0048)
     ///
-    /// No handler builds this yet and `planner::execute` refuses it — the
+    /// M2.21a landed the vocabulary, risk ranking, plan shape and network
+    /// classification with `planner::execute` refusing the operation — the
     /// same staging #222 used for `AmendCommit` and #227 for fetch/pull, so
-    /// the vocabulary, risk ranking and network classification are reviewed
-    /// before any tag is ever written.
+    /// all of that was reviewed before any tag could be written. M2.21d then
+    /// wired `POST /api/tag` and `planner::exec_create_tag`.
+    ///
+    /// `sign: true` is still refused with `501` (M2.21e, #74) — refused, not
+    /// ignored: handing back an ordinary annotated tag for a request that
+    /// asked for a signed one is a wrong outcome the user cannot see.
+    ///
+    /// # The annotation cannot be empty, and that is the no-editor guarantee
+    ///
+    /// [`TagAnnotation`] carries a [`TagMessage`], which cannot be empty. So
+    /// "annotated" and "has a message" are the same fact in this type, and the
+    /// executor's argv carries `-m <message>` whenever it carries `-a`. That
+    /// matters more than it looks: `git tag -a` with no message launches
+    /// `core.editor`, and a headless server has no editor and nobody to type
+    /// into one — the request would hang forever or die on whatever `$EDITOR`
+    /// happens to be. `git tag` has no `--no-edit` to close that after the
+    /// fact, so making the empty-annotation state unrepresentable *is* the
+    /// defence (ADR 0048).
     ///
     /// # One variant, kind chosen by `annotation` — not two variants
     ///
@@ -797,9 +818,8 @@ pub enum GitOperation {
         /// make silently.
         annotation: Option<TagAnnotation>,
     },
-    /// `git tag -d <name>` — delete a local tag (planned, M2.21e of #74).
-    ///
-    /// # Contract only (M2.21a, #235) — see [`GitOperation::CreateTag`]
+    /// `git tag -d <name>` — delete a local tag. Contract M2.21a (#235),
+    /// execution M2.21d (#238, ADR 0048) via `POST /api/delete-tag`.
     ///
     /// # This is `-D`-shaped, not `-d`-shaped, despite the flag
     ///

@@ -539,12 +539,19 @@ fn recover_blocking(
 /// `CheckoutPrevious`, and `Irrecoverable` name no oid — there is nothing here
 /// for those to write.
 ///
-/// Best-effort and off the response path by design: called from the detached
-/// pipeline task after the operation's own result is already recorded, so a
-/// failure here can never turn a successful git operation into a failed
-/// response. The ref is a durability *bonus* on top of the JSON `recovery`
-/// field already in the row — losing it means falling back to what the field
-/// alone tells a human, not losing the recovery information outright.
+/// Best-effort — a failure is logged, never turned into a refusal — but **not**
+/// off the critical path: the planner calls this from inside the per-repository
+/// mutation guard, immediately before `execute`, precisely so the pin exists
+/// before the command that makes it necessary runs. See `planner::pin_recovery`
+/// for why the earlier arrangement (write it in the tracked wrapper, after the
+/// pipeline returned) was a real gc race and not merely a late bonus.
+///
+/// "Best-effort" here therefore means *this write may fail*, not *this write may
+/// be late*. For `RecreateTag` the ref is the only thing keeping the deleted
+/// annotated tag's object reachable; the JSON `recovery` field in the row names
+/// an oid, and an oid `git gc` has already pruned is not something a human or an
+/// `update-ref` can restore. The field is a *record* of the decision, not a
+/// second copy of the object.
 pub(crate) async fn write_recovery_ref(
     repo: &Path,
     operation: &OperationId,

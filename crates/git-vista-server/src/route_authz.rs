@@ -131,6 +131,12 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // on the user's branch.
     ("/api/pull", Method::POST, Authz::SessionAndCsrf),
     ("/api/delete-branch", Method::POST, Authz::SessionAndCsrf),
+    // M2.21d (#238): the local tag writes. Note the split from
+    // `GET /api/tags` above — that read is registered on both listeners
+    // because it discloses only committed history; these mutate refs, so they
+    // are `full_routes`-only with the full write posture (ADR 0005).
+    ("/api/tag", Method::POST, Authz::SessionAndCsrf),
+    ("/api/delete-tag", Method::POST, Authz::SessionAndCsrf),
     ("/api/checkout", Method::POST, Authz::SessionAndCsrf),
     (
         "/api/force-delete-branch",
@@ -181,7 +187,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 46;
+const EXPECTED_ROUTE_COUNT: usize = 48;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

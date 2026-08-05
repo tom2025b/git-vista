@@ -63,10 +63,14 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // (`worktree_status`) now goes through `crate::git_cmd::git_output`
     // (#66 Task 6); this entry now covers only its `#[cfg(test)]` fixtures.
     "src/handlers/read.rs",
-    // M2.21b (#236): `#[cfg(test)]` fixture setup only. `GET /api/tags` runs
-    // no subprocess at all in production — `git_vista_git::read_tags` opens
-    // the repository with `gix` and decodes tag objects out of the mapped
-    // object database — so every `Command::new` in this file builds a
+    // M2.21b (#236): `#[cfg(test)]` fixture setup only. No handler in this
+    // file runs a subprocess in production. `GET /api/tags` runs none at all —
+    // `git_vista_git::read_tags` opens the repository with `gix` and decodes
+    // tag objects out of the mapped object database — and M2.21d's (#238)
+    // `POST /api/tag` / `POST /api/delete-tag` build a typed `GitOperation`
+    // and hand it to the planner, so their `git tag` / `git tag -d` argvs are
+    // constructed in `planner.rs` like every other client-requested mutation
+    // (ADR 0016). Every `Command::new` in this file therefore builds a
     // throwaway tagged repository for the tests. It lives here rather than in
     // `main.rs` precisely because `main.rs` must keep constructing no
     // `Command` at all (see `every_allowlist_entry_names_a_live_spawn_site`,
@@ -1113,7 +1117,7 @@ fn bounded_read_source_boundary_is_streaming_and_exactly_four() {
 fn write_dtos_reject_smuggled_args_and_wrong_shapes() {
     use git_vista_protocol::{
         BranchName, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
-        DeleteCloneRequest, SelectRequest,
+        CreateTagRequest, DeleteCloneRequest, DeleteTagRequest, SelectRequest, TagName,
     };
 
     // An extra freeform-args field beside legitimate fields: refused.
@@ -1155,11 +1159,37 @@ fn write_dtos_reject_smuggled_args_and_wrong_shapes() {
             serde_json::from_str::<DeleteCloneRequest>(r#"{"worktree":"w","recursive":true}"#)
                 .err(),
         ),
+        // M2.21d (#238): `-f` is the field a tag-create body would most like
+        // to smuggle — it turns "create this tag" into "silently repoint an
+        // existing one", past the plan's own `RefAbsent` precondition.
+        (
+            "tag+force",
+            serde_json::from_str::<CreateTagRequest>(
+                r#"{"name":"v1","commit":"HEAD","force":true}"#,
+            )
+            .err(),
+        ),
+        (
+            "delete-tag+remote",
+            serde_json::from_str::<DeleteTagRequest>(r#"{"tag":"v1","remote":"origin"}"#).err(),
+        ),
     ] {
         assert!(err.is_some(), "{what}: unknown field was accepted");
     }
 
     // A raw argv array where an object is expected: refused.
+    //
+    // **What this does and does not say.** serde_json can also fill a struct
+    // *positionally* from a JSON array, and a body whose element count and
+    // types happen to line up with the fields does deserialize — the two
+    // arrays above are refused on arity, not on being arrays. That affordance
+    // is checked, deliberately and separately, in
+    // [`a_positional_array_body_is_the_object_body_and_smuggles_nothing`]:
+    // the point of this whole module is that no client string becomes an
+    // argv element it was not declared to be, and a positional array cannot
+    // reach a field the object form does not already expose, nor skip the
+    // validation that field carries. Asserting "arrays are refused" as if it
+    // were universal would have been a comfortable falsehood.
     assert!(serde_json::from_str::<CreateBranchRequest>(r#"["git","push","--force"]"#).is_err());
     assert!(serde_json::from_str::<BranchRequest>(r#"["--delete","main"]"#).is_err());
 
@@ -1175,6 +1205,67 @@ fn write_dtos_reject_smuggled_args_and_wrong_shapes() {
     assert!(BranchName::new("-force").is_err());
     assert!(BranchName::new("--exec=/bin/sh").is_err());
     assert!(BranchName::new("").is_err());
+    // Same gate on the tag namespace (M2.21d, #238): `git tag -d <name>` puts
+    // the name straight after a flag, so an option-shaped name is exactly the
+    // shape that would turn a delete into something else.
+    assert!(TagName::new("-d").is_err());
+    assert!(TagName::new("--points-at=HEAD").is_err());
+    assert!(TagName::new("").is_err());
+}
+
+/// The serde_json affordance the assertion above is careful *not* to claim
+/// away: a write DTO can be filled positionally from a JSON array, and that is
+/// harmless here — but only for a reason worth writing down and testing,
+/// because "the body was an array" reads like an attack and is not one.
+///
+/// A positional array is fixed by the struct's own field order. It can name no
+/// field the object form does not have, add none, reorder none, and skip none
+/// of the validation each field carries downstream. So the two forms are the
+/// *same request*, which is exactly what is asserted: array and object
+/// deserialize to equal values, and the smuggling that would matter — an extra
+/// key — is still refused in the object form (an array cannot express one at
+/// all, since it has no keys).
+///
+/// Found while wiring M2.21d (#238): `["tag","-d","v1"]` deserializes into
+/// [`CreateTagRequest`] as `name: "tag", commit: "-d", message: Some("v1")`,
+/// with `sign` defaulted. It then dies at `resolve_commit_oid` ("-d" is not an
+/// object), which is the ordinary path any bad `commit` takes.
+#[test]
+fn a_positional_array_body_is_the_object_body_and_smuggles_nothing() {
+    use git_vista_protocol::{CreateTagRequest, DeleteTagRequest};
+
+    let positional: CreateTagRequest = serde_json::from_str(r#"["v1","HEAD","notes",false]"#)
+        .expect("serde_json fills a struct positionally from an array");
+    let keyed: CreateTagRequest =
+        serde_json::from_str(r#"{"name":"v1","commit":"HEAD","message":"notes","sign":false}"#)
+            .unwrap();
+    assert_eq!(
+        positional, keyed,
+        "the positional form must be the very same request, field for field"
+    );
+    assert_eq!(
+        positional.name, "v1",
+        "position 0 is `name` — an array cannot choose which field it fills"
+    );
+
+    // The one shape that would actually smuggle something is an extra key,
+    // and that has no positional spelling: there are four fields, so a fifth
+    // element is an arity error, and a key is only expressible in the object
+    // form, where `deny_unknown_fields` refuses it.
+    assert!(
+        serde_json::from_str::<CreateTagRequest>(r#"["v1","HEAD","notes",false,"--force"]"#)
+            .is_err(),
+        "an array longer than the struct has fields is refused"
+    );
+    assert!(
+        serde_json::from_str::<CreateTagRequest>(r#"{"name":"v1","commit":"HEAD","force":true}"#)
+            .is_err(),
+        "and the keyed spelling of the same extra is refused too"
+    );
+    assert!(
+        serde_json::from_str::<DeleteTagRequest>(r#"["v1","origin"]"#).is_err(),
+        "one field, two elements: refused"
+    );
 }
 
 /// Layer 2b: the clone URL gate. The URL is the one client string that becomes
@@ -1217,8 +1308,8 @@ mod wire {
     };
     use git_vista_core::activity::UndoAction;
     use git_vista_protocol::{
-        validate_clone_url, BranchRequest, CloneRequest, CreateBranchRequest, SessionInfo,
-        CSRF_HEADER,
+        validate_clone_url, BranchRequest, CloneRequest, CreateBranchRequest, CreateTagRequest,
+        SessionInfo, CSRF_HEADER,
     };
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -1254,6 +1345,12 @@ mod wire {
             .route(
                 "/api/undo",
                 post(|Json(_): Json<UndoAction>| async { REACHED }),
+            )
+            // M2.21d (#238): the tag-create body, whose extra fields are the
+            // interesting attack surface (`force`, `annotated`).
+            .route(
+                "/api/tag",
+                post(|Json(_): Json<CreateTagRequest>| async { REACHED }),
             )
             // Mirrors the real clone handler's order: the gate runs before any
             // spawn could (clone.rs validates, then passes the URL as its own
@@ -1359,6 +1456,16 @@ mod wire {
             // A smuggled exec request that matches no UndoAction variant.
             ("/api/undo", r#"{"exec":"rm -rf /"}"#),
             ("/api/undo", r#"["sh","-c","id"]"#),
+            // M2.21d (#238). `force` would repoint an existing tag past the
+            // plan's `RefAbsent` precondition; `annotated` without a message
+            // is the request that makes `git tag -a` open an editor a
+            // headless server has no way to finish (ADR 0048). Neither key
+            // exists on the DTO, so both die here.
+            ("/api/tag", r#"{"name":"v1","commit":"HEAD","force":true}"#),
+            (
+                "/api/tag",
+                r#"{"name":"v1","commit":"HEAD","annotated":true}"#,
+            ),
             // Not JSON at all.
             ("/api/branch", "name=x; git push --mirror"),
         ] {
