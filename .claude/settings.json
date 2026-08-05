@@ -13,6 +13,23 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/rs-fmt-check.sh",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/route-census-check.sh",
+            "timeout": 300
+          }
+        ]
+      }
     ]
   }
 }
