@@ -22,12 +22,15 @@ use leptos::*;
 
 use git_vista_core::activity::{ActivityEvent, ActivitySource};
 
-use crate::api::fetch_activity;
+use crate::api::{fetch_activity, fetch_tags};
 use crate::datetime::time_ago;
 use crate::features::activity::core::{event_commit, kind_glyph, kind_label};
 use crate::features::dialogs::core::Dialog;
 use crate::features::shell::signals as shell_state;
 use crate::features::status::signals as status_seam;
+use crate::features::tags::core::{
+    tag_list_view, tag_row_lines, TagListView, TagRow, LOADING_TAGS, NO_TAGS,
+};
 use crate::icons::icon_set;
 use crate::menu;
 use crate::state::{Features, PendingOp, Settings};
@@ -63,6 +66,21 @@ pub fn activity_panel_view(
         |(open, _)| async move {
             if open {
                 Some(fetch_activity(FEED_LIMIT).await)
+            } else {
+                None
+            }
+        },
+    );
+
+    // The tag list (M2.21b, #236), keyed exactly like the feed above: open the
+    // panel and it is read fresh, and any operation that bumps the graph epoch
+    // — including one that creates or deletes a tag — refreshes it in place.
+    // Same key, one fetch each, no second "is the panel open" to drift.
+    let tags = create_local_resource(
+        move || (shell.activity_is_open(), graph.get().epoch()),
+        |(open, _)| async move {
+            if open {
+                Some(fetch_tags().await)
             } else {
                 None
             }
@@ -168,6 +186,27 @@ pub fn activity_panel_view(
                 })
             };
 
+            // -- The tag list (M2.21b, #236). --------------------------------
+            // Which of the four states we are in is decided in the host-tested
+            // `features::tags::core`, not here: this file is
+            // `#[cfg(target_arch = "wasm32")]`, so a `match` written here is
+            // compiled by `trunk build` and by nothing that asserts anything.
+            // What is left below is one arm per variant with no condition of
+            // its own — the mapping a reader can check by eye.
+            let tags_section = move || match tag_list_view(tags.get().flatten()) {
+                TagListView::Loading => {
+                    view! { <p class="detail-status">{LOADING_TAGS}</p> }.into_view()
+                }
+                TagListView::Failed(line) => {
+                    view! { <p class="detail-status detail-error">{line}</p> }.into_view()
+                }
+                TagListView::Empty => view! { <p class="detail-status">{NO_TAGS}</p> }.into_view(),
+                TagListView::Rows(rows) => rows
+                    .into_iter()
+                    .map(|row| tag_row_view(row, nerd_icons))
+                    .collect_view(),
+            };
+
             // -- The feed itself. --------------------------------------------
             let feed_section = move || match feed.get().flatten() {
                 None => view! { <p class="detail-status">"Loading activity…"</p> }.into_view(),
@@ -221,6 +260,10 @@ pub fn activity_panel_view(
                     <div class="detail-body">
                         {status_section}
                         <div class="detail-section-title act-feed-title">
+                            "Tags"
+                        </div>
+                        {tags_section}
+                        <div class="detail-section-title act-feed-title">
                             "History"
                         </div>
                         {feed_section}
@@ -228,6 +271,62 @@ pub fn activity_panel_view(
                 </aside>
             }
         })
+    }
+}
+
+/// One tag row (M2.21b, #236): the tag icon, its name, a pill saying which
+/// **kind** of tag it is, the tagged commit's short id, and — for an annotated
+/// tag — the tagger and the message's first line.
+///
+/// Every "what does absence look like" decision was already made in
+/// `features::tags::core`, which is host-tested; this function only spends
+/// what it is handed.
+///
+/// That is why the sub-lines arrive as a `Vec<TagRowLine>` from
+/// [`tag_row_lines`] rather than as three `Option` fields this file unwraps:
+/// this module is `#[cfg(target_arch = "wasm32")]` and never compiles under
+/// `cargo test --workspace`, so an `Option::unwrap_or_default()` written here
+/// — which would put an *empty* "tagger" line on screen, the exact false claim
+/// the `None`-not-`""` design exists to prevent — would be caught by nothing
+/// but a human reading the diff. With the vector, an absent field is a line
+/// that is not in it, and `a_lightweight_tag_contributes_no_lines_at_all`
+/// tests that on the host. What is left here is a per-variant class choice.
+///
+/// Reuses the `act-file` / `act-pill` / `detail-muted` classes the working-tree
+/// section above already styles, so the list needs no new CSS (and so the
+/// a11y stylesheet census keeps covering it).
+fn tag_row_view(row: TagRow, nerd_icons: RwSignal<bool>) -> impl IntoView {
+    let ic = icon_set(nerd_icons.get_untracked());
+    let lines = tag_row_lines(&row)
+        .into_iter()
+        .map(|line| {
+            let class = if line.muted() {
+                "act-file detail-muted"
+            } else {
+                "act-file"
+            };
+            let text = line.text().to_string();
+            view! { <div class=class><span class="act-file-path">{text}</span></div> }
+        })
+        .collect_view();
+    let TagRow {
+        name,
+        kind_label,
+        target_short,
+        target,
+        signature_badge,
+        ..
+    } = row;
+    let signature = signature_badge.map(|s| view! { <span class="act-pill">{s}</span> });
+    view! {
+        <div class="act-file" title=format!("{name} → {target}")>
+            <span class="nf ctx-icon">{ic.tag}</span>
+            <span class="act-file-path">{name}</span>
+            <span class="act-pill">{kind_label}</span>
+            <span class="detail-muted">{target_short}</span>
+            {signature}
+        </div>
+        {lines}
     }
 }
 

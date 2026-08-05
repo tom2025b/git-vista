@@ -408,6 +408,12 @@ fn api_router(
         // alongside the v1 shape above — not a replacement. See handlers::read
         // for why both exist side by side.
         .route("/api/status/v2", get(worktree_status_v2))
+        // M2.21b (#236): every tag with the metadata the `/api/frame` ref
+        // badges throw away — lightweight vs annotated, the peeled target, and
+        // an annotated tag's own object, tagger and message. A read of
+        // committed, published history like `/api/frame`, so it is registered
+        // on the LAN router too; it never discloses working-tree state.
+        .route("/api/tags", get(handlers::tags::tag_list))
         // Activity/Undo feature, step 3: the chronological event feed —
         // journal + reflogs + snapshot diffs, folded and attributed.
         .route("/api/activity", get(activity::activity_feed))
@@ -743,5 +749,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// M2.21b (#236) end to end: a real request through the real router — auth
+    /// gate, contract layer, route table, handler, `git_vista_git::read_tags`,
+    /// and the `TagDetail` mapping — against a repository on disk.
+    ///
+    /// The expectations are written as literal wire JSON compared against
+    /// values read back out of git itself (`rev-parse`, `cat-file`), never
+    /// against anything the mapping code produced, so the assertion cannot be
+    /// satisfied by a mapping that is merely self-consistent.
+    #[tokio::test]
+    async fn api_tags_reports_both_tag_kinds_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = handlers::tags::tests::build_tagged_fixture(dir.path());
+        let repo_id = &fixture.repo_id;
+
+        let sessions = Arc::new(SessionManager::new(None));
+        let token = sessions.current_bootstrap();
+        let session_state = SessionState {
+            manager: sessions,
+            via_lan: false,
+            rate_limiter: None,
+        };
+        let router = api_router(
+            session_state,
+            HostPolicy::loopback(PORT),
+            true,
+            Arc::new(CursorCodec::new()),
+        );
+        let cookie = bootstrap_cookie(router.clone(), "localhost:8080", &token).await;
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/tags?repo={repo_id}"))
+                    .header(header::HOST, "localhost:8080")
+                    .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "as the client sees it, a tag listing is never cacheable. Note this \
+             is `security::require_auth`'s doing — it overwrites Cache-Control \
+             on every authenticated API response — so this cannot fail if the \
+             handler alone stops setting it; that case is covered by \
+             `handlers::tags::tests::the_handler_itself_marks_the_listing_no_store`"
+        );
+        let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            body,
+            serde_json::json!([
+                {
+                    "name": "tip-marker",
+                    "kind": "lightweight",
+                    "target": fixture.tip,
+                    // Absence as absence: a lightweight tag genuinely has no
+                    // object, no tagger and no message.
+                    "tag_object": null,
+                    "tagger": null,
+                    "message": null,
+                    "signature": "unsigned",
+                },
+                {
+                    "name": "v1.0",
+                    "kind": "annotated",
+                    // The peeled commit, not the tag object — the two are
+                    // asserted to differ below.
+                    "target": fixture.root,
+                    "tag_object": fixture.tag_object,
+                    "tagger": fixture.tagger,
+                    "message": "one\n\nrelease notes",
+                    "signature": "unsigned",
+                }
+            ])
+        );
+        assert_ne!(
+            fixture.tag_object, fixture.root,
+            "an annotated tag's object and its target must be different objects, \
+             or the assertion above would pass for a handler that never peeled"
+        );
     }
 }
