@@ -566,6 +566,7 @@ async fn journal_unobserved(repo: &Path, remote: &RemoteName, why: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git_vista_core::activity::ActivitySource;
 
     #[test]
     fn classification_names_the_actionable_cause() {
@@ -680,6 +681,138 @@ mod tests {
                 "some future gh: open /home/tom/.config/gh/config.yml: permission denied"
             ),
             FetchFailureKind::CredentialHelperBlocked
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #329: journal_updates journals ONE event per fetch, not one per ref.
+    //
+    // These exercise `journal_updates` directly against a real `.git` dir
+    // (`crate::journal` requires one) rather than through the full
+    // `POST /api/fetch` pipeline — that pipeline, and the response-shape
+    // assertions for it, live in `fetch_suite.rs`, a sibling module outside
+    // this fix's file set. What belongs here is proof of the one contract
+    // this file changed: N observed ref updates in → exactly one journal
+    // entry out, naming N. A test asserting only "an event was written"
+    // would stay green under the very bug this fixes (the old per-ref
+    // `journal_updates` also wrote "an event", 94 of them) — see this
+    // module's other doc comments for that measurement — so every assertion
+    // below is about the *count* and what the surviving entry *names*, never
+    // merely its existence.
+    // -----------------------------------------------------------------------
+
+    /// A repo with a real `.git` directory, since `crate::journal::state_dir`
+    /// deliberately requires one (mirrors `journal.rs`'s own `repo()` test
+    /// helper — duplicated rather than shared because the two `#[cfg(test)]`
+    /// modules don't share a `dev-dependencies`-only test-support crate).
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git runs")
+            .success());
+        dir
+    }
+
+    fn update(short_name: &str, old: Option<&str>, new: &str) -> RemoteRefUpdate {
+        RemoteRefUpdate {
+            ref_name: format!("refs/remotes/origin/{short_name}"),
+            old_oid: old.map(str::to_string),
+            new_oid: Some(new.to_string()),
+        }
+    }
+
+    /// The headline property #329 asks for: a fetch that moved N refs
+    /// journals **exactly one** `Fetch` event, and that event's payload
+    /// *names* N — not merely "an event exists". Mutating the mechanism this
+    /// protects (e.g. reverting `journal_updates` to loop-and-append one
+    /// entry per ref) must turn this red; asserting only `len() >= 1` or
+    /// only that a `Fetch`-kind entry is present would not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_that_moves_many_refs_journals_one_event_naming_the_count() {
+        let dir = repo();
+        let remote = RemoteName::new("origin").expect("valid remote name");
+        // 94 — the exact count measured in the bug report, not a round
+        // number, so this test fails the same way the field report did if
+        // the fix regresses.
+        let updated: Vec<RemoteRefUpdate> = (0..94)
+            .map(|i| update(&format!("b{i}"), None, &format!("{i:040x}")))
+            .collect();
+
+        journal_updates(dir.path(), &remote, &updated, "fetched").await;
+
+        let entries = journal::read_all(dir.path());
+        let fetches: Vec<_> = entries
+            .iter()
+            .filter(|e| e.kind == ActivityKind::Fetch)
+            .collect();
+        assert_eq!(
+            fetches.len(),
+            1,
+            "94 moved refs must journal exactly one Fetch entry, not one per \
+             ref: {fetches:?}"
+        );
+        let entry = fetches[0];
+        assert!(
+            entry.summary.contains("94"),
+            "the entry must name how many refs moved, at the same \
+             granularity `exec_fetch`'s own response message uses: {}",
+            entry.summary
+        );
+        assert!(
+            entry.summary.contains(remote.as_str()),
+            "the entry must still say which remote: {}",
+            entry.summary
+        );
+        // No single ref_name/oid pair could honestly describe a 94-ref
+        // aggregate — see `journal_updates`'s doc comment for why this is
+        // `Obs::Absent`, not a fabricated "the first ref" or "the last ref".
+        assert_eq!(entry.ref_name, None, "{entry:?}");
+        assert_eq!(entry.old_oid, None, "{entry:?}");
+        assert_eq!(entry.new_oid, None, "{entry:?}");
+        assert_eq!(entry.source, ActivitySource::App, "{entry:?}");
+    }
+
+    /// The singular case still reads naturally ("1 remote-tracking ref", not
+    /// "1 remote-tracking refs") and still journals exactly one entry — the
+    /// aggregate isn't a special case that only kicks in above some count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_that_moves_one_ref_journals_one_event_without_pluralizing() {
+        let dir = repo();
+        let remote = RemoteName::new("origin").expect("valid remote name");
+        let updated = vec![update("main", Some(&"0".repeat(40)), &"a".repeat(40))];
+
+        journal_updates(dir.path(), &remote, &updated, "fetched").await;
+
+        let entries = journal::read_all(dir.path());
+        let fetches: Vec<_> = entries
+            .iter()
+            .filter(|e| e.kind == ActivityKind::Fetch)
+            .collect();
+        assert_eq!(fetches.len(), 1, "{fetches:?}");
+        assert!(
+            fetches[0].summary.contains("1 remote-tracking ref "),
+            "singular ref count must not pluralize: {}",
+            fetches[0].summary
+        );
+    }
+
+    /// The paired negative, at this same direct-call layer: nothing moved →
+    /// nothing journaled. Without this, a `journal_updates` that always wrote
+    /// an entry (even an empty-summary one) would still pass the two tests
+    /// above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_that_moves_nothing_journals_nothing() {
+        let dir = repo();
+        let remote = RemoteName::new("origin").expect("valid remote name");
+
+        journal_updates(dir.path(), &remote, &[], "fetched").await;
+
+        assert!(
+            journal::read_all(dir.path()).is_empty(),
+            "an up-to-date fetch must leave no trace in the journal"
         );
     }
 }
