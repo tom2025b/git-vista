@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use git_vista_core::model::{Edge, FrameStub, GitRef, GraphRow, Oid};
-use git_vista_protocol::{GenerationToken, HistoryFrame, HistoryPage};
+use git_vista_protocol::{GenerationToken, HistoryFrame, HistoryPage, RepoMode};
 
 use crate::geometry::{node_cx, LABEL_GAP, ROW_HEIGHT};
 
@@ -768,6 +768,51 @@ pub fn print_button_copy(complete: bool) -> (&'static str, &'static str) {
 /// test can pin.
 pub fn disabled_menu_item_copy(label: &str, reason: &str) -> (String, String) {
     (format!("{label}: {reason}"), reason.to_string())
+}
+
+/// The picker's Visualize/Active button label for a given `mode` while
+/// `opening` tracks which mode (if any) is mid-request (#244 follow-up).
+///
+/// Before this, both buttons bound to one shared `busy` flag: click either
+/// one and BOTH went inert with no visual change, for up to two minutes on a
+/// slow retry (`send_write_with_key`'s 60s-times-two design). Indistinguishable
+/// from the app being broken. Now only the clicked button's label changes —
+/// the other stays disabled but keeps its normal wording, since it isn't the
+/// one doing anything. Pure so the mapping is testable without a DOM: the
+/// view (wasm-only, `picker.rs`) supplies `mode`/`opening` and renders the
+/// string as-is.
+pub fn mode_button_label(mode: RepoMode, opening: Option<RepoMode>) -> &'static str {
+    match (mode, opening) {
+        (RepoMode::Visualize, Some(RepoMode::Visualize)) => "Visualize — opening…",
+        (RepoMode::Visualize, _) => "Visualize — look only, with links out",
+        (RepoMode::Active, Some(RepoMode::Active)) => "Active — opening…",
+        (RepoMode::Active, _) => "Active — full git operations",
+    }
+}
+
+/// The "Pull" context-menu item's label (#325 follow-up): unlike its `Rebase
+/// onto {base}` sibling, Pull named no subject at all — a bare "Pull" gave no
+/// hint which branch or remote a tap would act on. `menu.rs` already reads a
+/// live checked-out-branch name for `rebase_item` (`RebaseStatus::branch`,
+/// fetched by `fetch_rebase_status()` under the same `!m.is_branch` gate Pull
+/// itself renders behind) — reusing that signal here costs no new endpoint or
+/// poll. `branch` is `None` while the resource is still loading, or on a
+/// genuinely detached HEAD; the label degrades to naming just the remote
+/// rather than showing nothing or a placeholder. `remote` is passed in rather
+/// than hardcoded so a future remote picker doesn't have to touch this
+/// function again — today `menu.rs`'s only caller always passes `"origin"`,
+/// the same static value `fetch_item`'s confirm dialog uses. Pure so the
+/// wasm-only view (which cannot itself be host-tested) supplies `branch`/
+/// `remote` and this function only composes the string — the same split
+/// `disabled_menu_item_copy` and `print_button_copy` above use. Wording
+/// mirrors `dialogs/confirm.rs`'s own "Pull '{branch}' from '{remote}'..."
+/// prompt for the same operation, so the menu names what the confirm dialog
+/// is about to ask.
+pub fn pull_label(branch: Option<&str>, remote: &str) -> String {
+    match branch {
+        Some(b) => format!("Pull ‘{b}’ from ‘{remote}’"),
+        None => format!("Pull from ‘{remote}’"),
+    }
 }
 
 #[cfg(test)]
@@ -1540,6 +1585,77 @@ mod tests {
             visible_line, "Nothing to stage",
             "the visible second line is the reason verbatim — this is what a \
              finger sees without needing hover"
+        );
+    }
+
+    // #244 follow-up: both picker buttons used to share one `busy` flag, so
+    // clicking either went inert with no visible change for up to two minutes
+    // on a slow retry — indistinguishable from a broken app. The clicked
+    // button must show distinct "opening…" wording; the other button, if
+    // reverted to always return the plain label regardless of `opening`,
+    // fails the first assertion here.
+    #[test]
+    fn mode_button_label_shows_opening_only_for_the_clicked_button() {
+        let clicked = mode_button_label(RepoMode::Visualize, Some(RepoMode::Visualize));
+        let idle = mode_button_label(RepoMode::Visualize, None);
+        assert_ne!(
+            clicked, idle,
+            "the clicked button's label must change while its request is in \
+             flight — a silently-disabled button reads as a broken app"
+        );
+        assert!(
+            clicked.contains("opening"),
+            "the in-flight label should say what's happening, not just differ"
+        );
+    }
+
+    #[test]
+    fn mode_button_label_leaves_the_other_button_alone() {
+        // Visualize was clicked (opening = Some(Visualize)); Active's label
+        // must stay its normal wording, not also claim to be opening.
+        let other = mode_button_label(RepoMode::Active, Some(RepoMode::Visualize));
+        let idle = mode_button_label(RepoMode::Active, None);
+        assert_eq!(
+            other, idle,
+            "only the button the user actually clicked should announce \
+             itself as opening — the other one is just disabled"
+        );
+        assert!(!other.contains("opening"));
+    }
+
+    #[test]
+    fn mode_button_label_covers_the_active_button_too() {
+        let clicked = mode_button_label(RepoMode::Active, Some(RepoMode::Active));
+        assert!(clicked.contains("opening"));
+        assert!(clicked.contains("Active"));
+    }
+
+    /// #325 follow-up: pins Pull's label to actually name the branch once
+    /// one is known, the same shape
+    /// `print_button_copy_surfaces_a_visible_reason_when_disabled` pins for
+    /// Print Graph above — the two labels must differ, or the branch never
+    /// reached the string.
+    #[test]
+    fn pull_label_names_the_branch_when_known() {
+        let with_branch = pull_label(Some("feature/x"), "origin");
+        let without_branch = pull_label(None, "origin");
+        assert_ne!(
+            with_branch, without_branch,
+            "the branch must show up in the label — otherwise every Pull \
+             item reads identically regardless of what's checked out"
+        );
+        assert!(with_branch.contains("feature/x"));
+        assert!(with_branch.contains("origin"));
+    }
+
+    #[test]
+    fn pull_label_falls_back_to_the_remote_when_branch_is_unknown() {
+        let label = pull_label(None, "origin");
+        assert_eq!(
+            label, "Pull from ‘origin’",
+            "while `rebase_status` is still loading (or HEAD is detached) \
+             the label degrades to naming just the remote, never a blank or \
+             placeholder subject"
         );
     }
 

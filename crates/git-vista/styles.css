@@ -1147,6 +1147,33 @@ button.detail-file:focus-visible .detail-file-path { color: var(--accent); }
 .viewer-btn:focus-visible { border-color: var(--accent); }
 .scale-btn:focus-visible { border-color: var(--accent); }
 
+/* #232: the Fetch/Pull cancel button in the operations status strip. Was
+   inline-styled like the neighbouring Dismiss button, which left it
+   invisible to the stylesheet census below (`interactive_selectors` can
+   only see CSS selectors) and stuck at a 32px min-height. Given its own
+   class to fix both: `cursor: pointer` here is what the census picks up,
+   and `.op-cancel-btn` joins the shared #65 44x44 list below. */
+.op-cancel-btn {
+  padding: 2px 10px;
+  font: inherit;
+  color: var(--fg);
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.op-cancel-btn:hover { background: #30363d; }
+/* The `background` is repeated deliberately, not only `border-color`: #65's
+   paired rule is that keyboard focus reproduces every visual change hover
+   makes, so a switch or keyboard user gets the same affordance a pointer user
+   does. `every_hover_rule_has_a_focus_visible_twin_declaring_the_same_
+   properties` in features/a11y/audit.rs is what caught its absence here. */
+.op-cancel-btn:focus-visible {
+  background: #30363d;
+  border-color: var(--accent);
+}
+
 /* #65 tap targets: every CSS-sized interactive control guarantees Apple's
    44x44 CSS-pixel minimum on both axes, unconditionally — not behind
    `@media (pointer: coarse)` — because docs/IPAD_DESIGN.md's External
@@ -1168,7 +1195,8 @@ button.detail-file:focus-visible .detail-file-path { color: var(--accent); }
 button.detail-file,
 .detail-expand,
 .viewer-btn,
-.scale-btn {
+.scale-btn,
+.op-cancel-btn {
   min-height: 44px;
   min-width: 44px;
 }

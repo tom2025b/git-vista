@@ -12,11 +12,13 @@
 use leptos::*;
 
 use git_vista_core::activity::UndoAction;
+use git_vista_protocol::MergeStrategy;
 
 use crate::features::dialogs::core::{
-    worktree_confirm, ConfirmPrompt, Dialog, WorktreeAction, TOUCH_TARGET_STYLE,
+    worktree_confirm, ConfirmPrompt, Dialog, PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
 };
 use crate::features::graph::core::disabled_menu_item_copy;
+use crate::features::operations::kind::OperationKind;
 use crate::state::{Features, PendingOp};
 
 /// The confirm/cancel button base style, with #65's 44x44 floor.
@@ -232,6 +234,60 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                         false,
                     ),
                 },
+                // "Fetch" (#232, M2.20f) — the mildest confirmation in this
+                // match, and the only new arm here that is actually reached:
+                // `menu.rs`'s `fetch_item` opens this modal directly, because
+                // unlike merge/checkout/delete a fetch has no branch a live
+                // pre-check could find it wrong about. Single tap, never
+                // danger-styled, and the body says what it does *not* touch —
+                // the whole reason a fetch is the safe half of the pair.
+                PendingOp::Fetch { remote } => ConfirmPrompt::plain(
+                    "Fetch from remote",
+                    format!(
+                        "Fetch from ‘{remote}’? This updates what this repository knows about \
+                         the remote's branches. Nothing local moves — not the branch you're on, \
+                         not the working tree, not a single commit."
+                    ),
+                    "Fetch",
+                    false,
+                    true,
+                ),
+                // "Pull" (#232, M2.20f, ADR 0044) — **not reached today.**
+                // `menu.rs`'s `pull_item` opens `Dialog::PullStrategy`
+                // instead, because `MergeStrategy` carries no "not yet
+                // chosen" value this modal could show (see `pull_picker_view`
+                // below, and `features::dialogs::core::PullTarget`).
+                //
+                // The arm exists because this match is exhaustive and a
+                // `unreachable!()` in a view is a panic in the browser, not a
+                // diagnostic. It is written to be *correct* rather than a
+                // placeholder: a future opener that does route a fully-formed
+                // pull here gets a true prompt naming the strategy that would
+                // actually run, not a lie that says "merge" while a rebase is
+                // dispatched — which is precisely the class of silent default
+                // ADR 0044 exists to forbid.
+                PendingOp::Pull {
+                    remote,
+                    branch,
+                    strategy,
+                } => ConfirmPrompt::plain(
+                    "Pull branch",
+                    match strategy {
+                        MergeStrategy::Merge => format!(
+                            "Pull ‘{branch}’ from ‘{remote}’ and merge? New commits on the \
+                             remote are fetched and merged into ‘{branch}’, making a merge \
+                             commit if the two have diverged."
+                        ),
+                        MergeStrategy::Rebase => format!(
+                            "Pull ‘{branch}’ from ‘{remote}’ and rebase? New commits on the \
+                             remote are fetched, then ‘{branch}’’s own commits are replayed on \
+                             top of them — which rewrites their history."
+                        ),
+                    },
+                    "Pull",
+                    false,
+                    true,
+                ),
                 // The two working-tree operations (M2.18b, #220). Both prompts —
                 // wording, which ceremony, what is enabled — come from the pure
                 // core, so the asymmetry between them is decided somewhere a host
@@ -360,6 +416,209 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                                 }
                             >
                                 {confirm_label}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            }
+        })
+    }
+}
+
+/// The pull merge/rebase strategy picker (#232, M2.20f, ADR 0044).
+///
+/// A separate modal rather than a tenth arm of [`confirm_modal_view`] above,
+/// for a reason the type system states outright: every arm of that match
+/// destructures a `PendingOp`, and there is no `PendingOp::Pull` this dialog
+/// could be built from — `MergeStrategy` has exactly two variants, derives no
+/// `Default`, and carries no sentinel "not yet chosen" value
+/// (`git-vista-protocol/src/plan.rs`). The missing field is supplied by a tap
+/// *inside* this dialog, and `OperationKind::Pull` is constructed for the
+/// first time at the same instant it is dispatched.
+///
+/// Everything else is deliberately the same recipe as the two modals around
+/// it — full-viewport backdrop, the iOS ghost-click guard, the `#161b22` card,
+/// [`BUTTON_BASE`] + [`TOUCH_TARGET_STYLE`] on every control — because that
+/// recipe is what this app has proven on the iPad it is used from, and a new
+/// modal is not the place to re-litigate it.
+///
+/// # ADR 0044's acceptance criterion, and where it is enforced
+///
+/// "No pre-selected option" is not a styling choice here. Three separate
+/// layers hold it:
+///
+/// * the wire type refuses an omitted `strategy` (a deserialize error, never
+///   a fallback);
+/// * `Dialogs::open` resets `confirm_strategy` to `None` on **every** open, so
+///   a remembered last choice cannot become a delayed default;
+/// * this view renders the two toggles identically until one is tapped, and
+///   the Pull button is inert while
+///   `features::dialogs::core::pull_confirm_enabled` says nothing is chosen.
+///
+/// That last gate is `aria-disabled` + a refusal in the handler, **not**
+/// `prop:disabled` — the same distinction M2.18b drew for the two-tap delete
+/// ceremony, and for the same #65 reason: a genuinely disabled button leaves
+/// the tab order, which would make its explanation unreachable by exactly the
+/// user it was written for. #232's device checklist asks for VoiceOver to
+/// focus *every* control in this dialog and hear something meaningful; a
+/// button the browser has removed from the tab order cannot answer that.
+pub fn pull_picker_view(features: Features) -> impl IntoView {
+    let Features {
+        dialogs,
+        operations,
+        ..
+    } = features;
+
+    move || {
+        // A tracked read that doubles as the picker's visibility: `Some`
+        // exactly while it is up, cleared by `close_pull_picker`.
+        dialogs.pull_target().map(|PullTarget { remote, branch }| {
+            // Tracked too: both toggles' pressed state and the Pull button's
+            // enabled state re-render the moment a strategy is chosen.
+            let chosen = dialogs.pull_strategy();
+            let enabled = dialogs.pull_enabled();
+
+            // The two toggles are styled *identically* until one is tapped —
+            // ADR 0044's "neither pre-selected, highlighted or bolded", which
+            // the device checklist inspects by eye. The selected state is a
+            // blue tint, not the green of a confirm or the red of a danger:
+            // choosing a strategy is neither, it only unlocks the choice.
+            let toggle_style = |is: bool| {
+                if is {
+                    format!(
+                        "{BUTTON_BASE}{TOUCH_TARGET_STYLE}width:100%; text-align:left; \
+                         margin-bottom:8px; color:#f0f6fc; background:#1c2f4a; \
+                         border:1px solid #388bfd;"
+                    )
+                } else {
+                    format!(
+                        "{BUTTON_BASE}{TOUCH_TARGET_STYLE}width:100%; text-align:left; \
+                         margin-bottom:8px; color:var(--fg); background:#21262d; \
+                         border:1px solid #30363d;"
+                    )
+                }
+            };
+            let merge_chosen = chosen == Some(MergeStrategy::Merge);
+            let rebase_chosen = chosen == Some(MergeStrategy::Rebase);
+
+            let confirm_style = if enabled {
+                format!(
+                    "{BUTTON_BASE}{TOUCH_TARGET_STYLE}color:#fff; background:#238636; \
+                     border:1px solid #2ea043;"
+                )
+            } else {
+                format!(
+                    "{BUTTON_BASE}{TOUCH_TARGET_STYLE}color:var(--muted); background:#21262d; \
+                     border:1px solid #30363d; opacity:0.6;"
+                )
+            };
+            // #65 again: the reason goes on the screen *and* into the label,
+            // never only into a `title=` no tap ever surfaces.
+            let (confirm_aria, blocked_line) = if enabled {
+                ("Pull".to_string(), None)
+            } else {
+                let reason = "Choose Merge or Rebase first — git-vista never picks one for you.";
+                (
+                    disabled_menu_item_copy("Pull", reason).0,
+                    Some(reason.to_string()),
+                )
+            };
+
+            // Captured for the dispatch below: the picker closes before the
+            // operation is raised, so these cannot be read back off the
+            // signal at that point.
+            let dispatch_remote = remote.clone();
+            let dispatch_branch = branch.clone();
+
+            view! {
+                <div
+                    style="position:fixed; top:0; left:0; width:100vw; height:100vh; \
+                           z-index:30; display:flex; align-items:center; \
+                           justify-content:center; background:rgba(1,4,9,0.6);"
+                    on:click=move |_| {
+                        // Ignore the iOS ghost click that fires just after opening.
+                        if dialogs.may_dismiss() {
+                            dialogs.close_pull_picker();
+                        }
+                    }
+                >
+                    <div
+                        style="min-width:300px; max-width:90vw; padding:16px; \
+                               background:#161b22; border:1px solid #30363d; \
+                               border-radius:10px; color:var(--fg); \
+                               box-shadow:0 12px 32px rgba(0,0,0,0.6);"
+                        on:click=move |ev| ev.stop_propagation()
+                    >
+                        <div style="font-weight:600; margin-bottom:12px;">"Pull branch"</div>
+                        <div style="margin-bottom:14px; line-height:1.4;">
+                            {format!(
+                                "Fetch ‘{branch}’ from ‘{remote}’ and integrate it. \
+                                 How should the two histories be joined?"
+                            )}
+                        </div>
+                        // Two buttons, not a `<select>` or a pair of radios: this
+                        // modal takes no form controls at all (see the module doc
+                        // — a void `<input>` panics Leptos' CSR node-walk on iOS
+                        // WebKit), and `aria-pressed` is what announces the choice.
+                        <button
+                            style=toggle_style(merge_chosen)
+                            aria-pressed=if merge_chosen { "true" } else { "false" }
+                            on:click=move |_| dialogs.set_pull_strategy(MergeStrategy::Merge)
+                        >
+                            "Merge — keep both histories, adding a merge commit if they diverged"
+                        </button>
+                        <button
+                            style=toggle_style(rebase_chosen)
+                            aria-pressed=if rebase_chosen { "true" } else { "false" }
+                            on:click=move |_| dialogs.set_pull_strategy(MergeStrategy::Rebase)
+                        >
+                            "Rebase — replay your commits on top, rewriting their history"
+                        </button>
+                        {blocked_line.map(|reason| view! {
+                            <div style="margin:10px 0; color:var(--muted); \
+                                        line-height:1.4;">{reason}</div>
+                        })}
+                        <div style="display:flex; gap:8px; justify-content:flex-end; \
+                                    margin-top:6px;">
+                            <button
+                                style=format!("{BUTTON_BASE}{TOUCH_TARGET_STYLE}\
+                                               color:var(--fg); background:#21262d; \
+                                               border:1px solid #30363d;")
+                                on:click=move |_| dialogs.close_pull_picker()
+                            >
+                                "Cancel"
+                            </button>
+                            // Focusable even when inert, and refused here rather
+                            // than by the browser — see this function's doc
+                            // comment for why that is the a11y-correct shape and
+                            // not a missing `prop:disabled`.
+                            <button
+                                style=confirm_style
+                                aria-disabled=if enabled { "false" } else { "true" }
+                                aria-label=confirm_aria
+                                on:click=move |_| {
+                                    // Untracked by construction: `pull_strategy`
+                                    // is read again here rather than trusting the
+                                    // `chosen` captured at render time, so the tap
+                                    // dispatches what is on screen *now*.
+                                    let Some(strategy) = dialogs.pull_strategy() else {
+                                        return;
+                                    };
+                                    // The one place in the client an
+                                    // `OperationKind::Pull` is ever built — and it
+                                    // is dispatched in the same breath, so a
+                                    // half-decided pull has no moment in which to
+                                    // exist.
+                                    let op = OperationKind::Pull {
+                                        remote: dispatch_remote.clone(),
+                                        branch: dispatch_branch.clone(),
+                                        strategy,
+                                    };
+                                    dialogs.close_pull_picker();
+                                    operations.dispatch(op);
+                                }
+                            >
+                                "Pull"
                             </button>
                         </div>
                     </div>

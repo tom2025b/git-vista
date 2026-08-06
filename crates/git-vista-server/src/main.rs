@@ -519,6 +519,20 @@ fn api_router(
             // a report), and a LAN visualize session must never see one
             // (ADR 0005). Executing an approved plan is #249's own route.
             .route("/api/plan", post(plan_operation))
+            // M2.20f (#232): what operation id was admitted for an
+            // idempotency key, readable while the operation it names may
+            // still be running — closes the race where `POST /api/fetch`
+            // (or any tracked write) doesn't answer with `OPERATION_HEADER`
+            // until the operation is already terminal
+            // (`planner::plan_and_execute_tracked` ends with
+            // `record.wait_terminal().await`). Registered here, with the
+            // writes, for the same ADR 0005 reason as `/api/operations/{id}`
+            // immediately below: this describes an in-flight write's
+            // identity, so the LAN router must never see it either.
+            .route(
+                "/api/operations/by-key/{key}",
+                get(handlers::operations::operation_by_key),
+            )
             // M1.08 (#61): what happened to one write, and its live progress.
             // Registered with the writes, not the reads — these describe write
             // outcomes, so the LAN router must never see them either (ADR 0005).

@@ -13,6 +13,7 @@ use leptos::*;
 
 use git_vista_protocol::operation::{OperationStage, OperationState};
 
+use crate::features::operations::core::{fetch_or_pull_summary, progress_line};
 use crate::features::operations::signals::Operations;
 
 /// What the pipeline is doing, in words the user did not have to learn.
@@ -34,20 +35,42 @@ fn stage_text(stage: OperationStage) -> &'static str {
 pub fn operations_status_view(operations: Operations) -> impl IntoView {
     let core = operations.core();
     move || {
+        // The id, cancellability and cancel-requested flag ride along beside
+        // the describe/stage text so the Cancel button (#232) can be built
+        // per row without a second pass over `in_flight()`.
         let live: Vec<_> = core.with(|c| {
             c.in_flight()
-                .map(|e| (e.kind.describe(), stage_text(e.stage)))
+                .map(|e| {
+                    (
+                        e.id.clone(),
+                        e.kind.describe(),
+                        stage_text(e.stage),
+                        e.kind.is_cancellable(),
+                        e.cancel_requested,
+                        // `progress_line` is only ever called on the `Some` case (M2.20g,
+                        // #232) — a progress-free operation (`InFlight::progress` is `None`
+                        // for anything that transfers nothing, per its own doc comment in
+                        // `core.rs`) renders no progress fragment at all, never a fabricated
+                        // "0%".
+                        e.progress.as_ref().map(progress_line),
+                    )
+                })
                 .collect()
         });
         let settled: Vec<_> = core.with(|c| {
             c.recent()
                 .map(|s| {
-                    (
-                        s.id.clone(),
-                        s.kind.describe(),
-                        s.outcome.state,
-                        s.outcome.message.clone().unwrap_or_default(),
-                    )
+                    // Fetch/Pull settle with the operation record's raw JSON body in
+                    // `message` (see `fetch_or_pull_summary`'s own doc comment for why);
+                    // every other kind's `message` is already prose, and the function is
+                    // a no-op pass-through for them.
+                    let message = s
+                        .outcome
+                        .message
+                        .as_deref()
+                        .map(|m| fetch_or_pull_summary(&s.kind, m))
+                        .unwrap_or_default();
+                    (s.id.clone(), s.kind.describe(), s.outcome.state, message)
                 })
                 .collect()
         });
@@ -58,12 +81,88 @@ pub fn operations_status_view(operations: Operations) -> impl IntoView {
                             gap:6px; max-width:min(560px, 92vw);">
                     {live
                         .into_iter()
-                        .map(|(what, stage)| {
+                        .map(|(id, what, stage, cancellable, cancel_requested, progress)| {
+                            // "Cancelling…" is a distinct rendered state, never a
+                            // silent removal (#232's own acceptance criterion): the
+                            // row stays in the in-flight list, showing that the ask
+                            // landed, until the real terminal event arrives through
+                            // the existing subscribe()/commit_settlement path — this
+                            // view never terminalises anything on its own initiative.
+                            let stage_line = if cancel_requested {
+                                "cancelling…".to_string()
+                            } else {
+                                match &progress {
+                                    // The detail #232's acceptance criterion asks for:
+                                    // "show live progress ... rather than a spinner with
+                                    // no detail". `progress_line` (core.rs) is the pure,
+                                    // host-testable formatter; this view only places its
+                                    // output beside the existing stage word, never
+                                    // recomputes it.
+                                    //
+                                    // KNOWN HAZARD, not fixed here: this whole row sits
+                                    // inside the `.map(...).collect_view()` that redraws
+                                    // on every signal change, and on Leptos 0.6 that
+                                    // rebuilds the strip's entire DOM subtree per tick —
+                                    // there is no fine-grained `DynChild` isolating just
+                                    // this text node. A fast-ticking fetch will steal
+                                    // focus from the Cancel button below and re-announce
+                                    // the whole row to a screen reader on every percent
+                                    // change, not just when the number actually moves.
+                                    // Fixing that means giving the progress text its own
+                                    // reactive scope; out of scope for #232.
+                                    Some(detail) => format!("{stage}… — {detail}"),
+                                    None => format!("{stage}…"),
+                                }
+                            };
+                            // `OperationKind::is_cancellable()` is **narrower than the
+                            // server on purpose, and is not a mirror** — this comment
+                            // used to claim it was one, which was false. The server's
+                            // `planner::honours_cancellation` (planner.rs:4294-4299)
+                            // returns true for `FetchRemote`, `PullBranch` **and**
+                            // `PushBranch`; the client offers Cancel for Fetch and Pull
+                            // only, because #232 scoped itself there and a cancelled
+                            // push carries a weaker promise the UI does not yet explain
+                            // (the transfer stops; it does not mean nothing was
+                            // published). See `kind.rs::is_cancellable`, where that
+                            // decision is recorded and pinned by its test. And
+                            // there is nothing to cancel before the write response has
+                            // bound a server id (`InFlight::id` is `None` in that
+                            // window) — both gate the button so it is never offered
+                            // where the server would refuse it.
+                            let show_cancel = cancellable && !cancel_requested && id.is_some();
+                            let cancel_id = id.clone();
+                            let on_cancel = move |_| {
+                                if let Some(id) = cancel_id.clone() {
+                                    operations.cancel(&id);
+                                }
+                            };
                             view! {
-                                <div style="padding:8px 14px; background:#161b22; \
+                                <div
+                                    role="status"
+                                    aria-live="polite"
+                                    style="padding:8px 14px; background:#161b22; \
                                             border:1px solid #30363d; border-radius:8px; \
-                                            color:var(--fg); font-size:0.9em;">
-                                    {format!("{what} — {stage}…")}
+                                            color:var(--fg); font-size:0.9em; display:flex; \
+                                            gap:10px; align-items:center; \
+                                            justify-content:space-between;">
+                                    <span>{format!("{what} — {stage_line}")}</span>
+                                    {show_cancel.then(|| view! {
+                                        // Its own `.op-cancel-btn` class (styles.css),
+                                        // not inline styles like the settled cards'
+                                        // Dismiss button below — that is what makes
+                                        // this control visible to
+                                        // `features::a11y::audit`'s stylesheet census
+                                        // and gets it a real 44x44 tap target via the
+                                        // shared #65 rule, instead of the 32px this
+                                        // button used to be stuck at (#232).
+                                        <button
+                                            class="op-cancel-btn"
+                                            aria-label=format!("Cancel: {what}")
+                                            on:click=on_cancel
+                                        >
+                                            "Cancel"
+                                        </button>
+                                    })}
                                 </div>
                             }
                         })

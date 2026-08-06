@@ -220,6 +220,28 @@ async fn rewrap_error(response: Response, request_id: &RequestId) -> Response {
     let bytes = to_bytes(response.into_body(), MAX_ERROR_BODY)
         .await
         .unwrap_or_default();
+
+    // #323: a handler's own typed error DTO — `AmendCommitError`,
+    // `FetchError`, `PullError` — travels out of `execute()` through the exact
+    // same `(StatusCode, String)` shape a plain-text refusal uses, because
+    // that dispatcher's return type is shared by ~30 operation kinds and can't
+    // vary per handler (see `planner::execute`). Axum's blanket `impl
+    // IntoResponse for String` always stamps `text/plain` (axum-core
+    // `into_response.rs`'s `Cow<'static, str>` impl), so the content-type
+    // header the `is_json` check above relies on can never distinguish a
+    // pre-serialized JSON body from an actual plain-text message here — only
+    // the bytes can. Without this, a body like
+    // `{"kind":"StaleTip","message":"…"}` was read as plain text and escaped
+    // whole into *this* envelope's own `message` field: the client parses the
+    // outer `ApiError` fine, then finds literal wire JSON where it expected to
+    // parse `AmendCommitError` — exactly the never-show-raw-JSON regression
+    // #316 already fixed once on the frontend. A JSON *object* is unambiguous
+    // enough to trust as "already carrying JSON": git's own stderr/stdout text
+    // and this server's plain refusal prose never happen to parse as one.
+    if let Ok(serde_json::Value::Object(_)) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        return (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+    }
+
     let message = String::from_utf8_lossy(&bytes).trim().to_string();
     let message = if message.is_empty() {
         status
@@ -267,7 +289,7 @@ mod tests {
         routing::{get, post},
         Router,
     };
-    use git_vista_protocol::ApiError;
+    use git_vista_protocol::{AmendCommitError, AmendFailureKind, ApiError};
     use tower::ServiceExt;
 
     // A tiny router carrying the contract layer over a few representative routes:
@@ -282,17 +304,23 @@ mod tests {
                 "/api/boom",
                 get(|| async { (StatusCode::NOT_FOUND, "No such commit.") }),
             )
-            // #323: the real `/api/amend-commit` refusal constructor,
-            // reached through this layer rather than by calling it directly
-            // — the gap that let the double-encoding defect sit unnoticed
-            // before the fix (see
-            // `a_hand_serialized_refusal_is_not_double_encoded` below).
+            // Mimics `planner::amend_refusal`'s exact shape (#323): a handler
+            // returning `(StatusCode, String)` where the `String` is already a
+            // pre-serialized JSON DTO, produced the same way
+            // `serde_json::to_string(&AmendCommitError { .. })` is. Axum's
+            // blanket `String` impl stamps this `text/plain`, same as
+            // `/api/boom` above — the two routes are otherwise identical at
+            // the wire, and only the *body's own shape* tells them apart.
             .route(
-                "/api/amend-refusal",
+                "/api/typed-refusal",
                 get(|| async {
-                    crate::planner::amend_refusal(
-                        git_vista_protocol::AmendFailureKind::Other,
-                        "Commit message can't be empty.",
+                    (
+                        StatusCode::BAD_REQUEST,
+                        serde_json::to_string(&AmendCommitError {
+                            kind: AmendFailureKind::StaleTip,
+                            message: "HEAD has moved since this amend was reviewed.".to_string(),
+                        })
+                        .unwrap(),
                     )
                 }),
             )
@@ -395,53 +423,57 @@ mod tests {
         assert_eq!(err.error.message, "No such commit.");
     }
 
-    /// #323: a hand-serialized JSON body must reach the client as **one** JSON
-    /// object, not as an `ApiError` envelope with the real payload buried in
-    /// its `message` field as an escaped string.
-    ///
-    /// Fixed by giving the amend route a JSON-typed response end to end
-    /// rather than teaching the middleware to sniff bodies:
-    /// `planner::amend_refusal` (the handler-level constructor) now builds
-    /// the `Response` directly via `axum::Json`, so it carries a real
-    /// `application/json` content-type and `rewrap_error`'s `is_json` check
-    /// passes it through untouched. `exec_amend_commit`'s own callers keep
-    /// the old `(StatusCode, String)` shape through the new
-    /// `planner::amend_refusal_body` sibling (that channel is a *prose*
-    /// channel by design elsewhere — `unmet_at_build` returns a sentence,
-    /// `exec_stage_all` returns "Staged changes." — so widening it crate-wide
-    /// would be wrong); `handlers::commit::amend_route_response` re-labels
-    /// that channel's output as JSON at the final hop instead, only when the
-    /// body actually is a JSON object — the shared pipeline `plan_and_execute`
-    /// runs before `exec_amend_commit` can still answer with its own prose
-    /// (read-only, idempotency, staleness-gate refusals), which must reach
-    /// this same route's client still labeled `text/plain` so `rewrap_error`
-    /// keeps enveloping it correctly.
-    ///
-    /// This can only be seen through the layer. The existing contract-suite
-    /// test calls the planner function directly, so it agreed with the old
-    /// docstring and missed the defect entirely — this is that missing leg.
+    /// #323 regression: a handler's own typed error DTO — the exact shape
+    /// `planner::amend_refusal` produces — must reach the client as that DTO,
+    /// not get read as plain text and escaped into the generic envelope's
+    /// `message` field a second time. Both halves of the contract are checked
+    /// deliberately: the shape alone (a) would still pass even if the
+    /// content-type fix were missing, since `serde_json::from_str` doesn't
+    /// look at headers; only (b) proves the double-encoding is actually gone.
     #[tokio::test]
-    async fn a_hand_serialized_refusal_is_not_double_encoded() {
+    async fn a_handlers_typed_json_body_reaches_the_client_unescaped() {
         let resp = app()
             .oneshot(get_req(
-                "/api/amend-refusal",
+                "/api/typed-refusal",
                 Some(&PROTOCOL_VERSION.to_string()),
             ))
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let body = body_string(resp).await;
 
-        // The contract: it parses as the payload type, directly.
-        let refusal: git_vista_protocol::AmendCommitError = serde_json::from_str(&body)
-            .unwrap_or_else(|e| panic!("400 body did not parse as AmendCommitError ({e}): {body}"));
-        assert_eq!(refusal.message, "Commit message can't be empty.");
-
-        // And the failure mode, named explicitly: not an envelope carrying the
-        // real body as an escaped string.
+        // (a) The client's own `classify_amend_response` parses this shape
+        // directly — not as `ApiError` — so it must still deserialize as
+        // `AmendCommitError` after passing through the contract layer.
+        let parsed: AmendCommitError = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("body was not a bare AmendCommitError: {e}\nbody={body}"));
+        assert_eq!(parsed.kind, AmendFailureKind::StaleTip);
+        assert_eq!(
+            parsed.message,
+            "HEAD has moved since this amend was reviewed."
+        );
+        // Before the fix, this body was `{"code":...,"message":"{\"kind\":...","request_id":...}`
+        // — still valid JSON, so parsing it as `AmendCommitError` would fail
+        // loudly rather than silently, but let's also pin the un-escaped
+        // shape directly: the raw wire text must never contain the outer
+        // envelope's own field names doubled around the inner one.
         assert!(
-            serde_json::from_str::<ApiError>(&body).is_err(),
-            "the refusal was rewrapped into an ApiError envelope — double-encoded: {body}"
+            !body.contains("\\\"kind\\\""),
+            "the inner DTO must not be escaped into an outer string field: {body}"
+        );
+
+        // (b) The content-type must say JSON — this is what lets `is_json`
+        // recognise the body as already-JSON on any future pass through this
+        // middleware, and it's the half a shape-only assertion can't catch.
+        assert!(
+            content_type.starts_with("application/json"),
+            "expected an application/json content-type, got {content_type:?}"
         );
     }
 

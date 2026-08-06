@@ -444,6 +444,34 @@ pub(crate) fn lookup(id: &OperationId) -> Option<Arc<Record>> {
     reg.by_id.get(id).map(Arc::clone)
 }
 
+/// Look up the id minted for `key`, without waiting for the operation it
+/// names to finish (M2.20f, #232).
+///
+/// This is what closes the race `plan_and_execute_tracked` opens: that
+/// function does not answer `POST /api/fetch` (or any other tracked write)
+/// until `record.wait_terminal().await` resolves (planner.rs), so a client
+/// cannot learn its `OperationId` from the response header until the
+/// operation is already over — too late for a cancel button, live progress,
+/// or a reload mid-transfer to ever see it. `note_minted` already runs right
+/// after `admit` (planner.rs), so the id exists in this registry the whole
+/// time the client would otherwise be stuck waiting; this is the read side
+/// that lets a client reach it early, by the one name it already holds
+/// before it POSTs at all — the key it mints client-side.
+///
+/// `None` covers two situations this function deliberately does not
+/// distinguish: the key has not reached `admit` yet (the client is polling
+/// faster than its own POST reached the handler — the expected shape of the
+/// race, since this is meant to be called *immediately* after firing the
+/// write, not after it), or it never will (a wrong key, or one so old its
+/// record already aged out of `evict`). Both answer "keep polling, or give
+/// up" identically to a caller, and a 404 is safe to retry either way: it
+/// never runs git, never mutates the registry, and reading it costs nothing
+/// an admitted record wouldn't have paid anyway.
+pub(crate) fn lookup_by_key(key: &IdempotencyKey) -> Option<OperationId> {
+    let reg = registry().lock().expect("operation registry lock");
+    reg.by_key.get(key).map(|record| record.id())
+}
+
 /// Repopulate the registry from journal rows read at startup (M1.09, #62).
 ///
 /// Called once, before the server accepts requests, with the durable layer's
@@ -834,6 +862,30 @@ mod tests {
             "a record still running must survive any amount of pressure"
         );
         handle.finish(StatusCode::OK, "done".into(), None);
+    }
+
+    /// The read that closes the #232 race: a key resolves to its minted id
+    /// while the operation is still running, not only after it finishes.
+    #[test]
+    fn lookup_by_key_finds_the_id_while_the_operation_is_still_running() {
+        let k = key("by-key-running");
+        let Admission::Fresh(handle, record) = admit_op(&k, &op("still going"), &hash('d')) else {
+            panic!("admission");
+        };
+        assert_eq!(lookup_by_key(&k), Some(record.id()));
+        handle.finish(StatusCode::OK, "done".into(), None);
+        // Still resolvable once terminal — a client that polled a little late
+        // must not lose the answer.
+        assert_eq!(lookup_by_key(&k), Some(record.id()));
+    }
+
+    /// A key nothing was ever admitted under answers `None`, not a panic or a
+    /// stale id — this is the case a client polling immediately after its own
+    /// POST will hit constantly, and it must be an unremarkable retry signal.
+    #[test]
+    fn lookup_by_key_of_an_unknown_key_is_none() {
+        let k = key("by-key-unknown");
+        assert_eq!(lookup_by_key(&k), None);
     }
 
     #[test]

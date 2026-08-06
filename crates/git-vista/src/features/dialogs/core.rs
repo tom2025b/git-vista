@@ -36,6 +36,15 @@ pub enum Dialog {
     /// an error is never "confirmed", so it carries one OK button and the
     /// same backdrop-dismiss ghost-click guard as every other modal here.
     Error,
+    /// The pull merge/rebase strategy picker (#232, ADR 0044). Deliberately
+    /// its own variant rather than a reuse of [`Dialog::Confirm`]: the
+    /// picker's content — `Dialogs::pull_target`/`Dialogs::confirm_strategy`
+    /// — cannot be represented as a `PendingOp` until a strategy is chosen
+    /// (`MergeStrategy` derives no `Default` and has no "unset" arm,
+    /// `crates/git-vista-protocol/src/plan.rs:307-316`), so it cannot share
+    /// `Shell::confirm_op`, the signal every other `Dialog::Confirm` opener
+    /// writes to. It still shares this guard, same as every other modal.
+    PullStrategy,
 }
 
 /// How long (ms) after a modal opens to ignore a backdrop dismiss.
@@ -494,6 +503,39 @@ pub fn branch_name_space_fix(name: &str) -> Option<String> {
     name.contains(' ').then(|| name.replace(' ', "-"))
 }
 
+// ---------------------------------------------------------------------------
+// The pull strategy picker (#232, M2.20f, ADR 0044)
+// ---------------------------------------------------------------------------
+
+/// The `{remote, branch}` a pull's strategy is being chosen for.
+///
+/// Resolved live on click, exactly like `rebase_item`'s
+/// `fetch_head_branch()` pre-check in `menu.rs` — never taken from the
+/// possibly-stale graph. Holding only this pair (never a `MergeStrategy`) is
+/// the point: it is the one piece of picker state that exists *before* the
+/// user has decided anything, so it is the only piece a pre-decision struct
+/// may carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullTarget {
+    pub remote: String,
+    pub branch: String,
+}
+
+/// Whether the pull picker's Pull button may run yet.
+///
+/// Literally `strategy.is_some()` — but named and host-tested so ADR 0044's
+/// "no pre-selected option" acceptance criterion is a checked fact rather
+/// than a convention a future edit could quietly break. `MergeStrategy`
+/// derives no `Default` and carries no sentinel "not yet chosen" variant on
+/// purpose (`crates/git-vista-protocol/src/plan.rs:307-316`); this function,
+/// not the type, is where "nothing chosen yet" is represented, and only ever
+/// as `None` — the same posture the type itself takes at the wire layer
+/// (`PullRequest::strategy` has no `#[serde(default)]`,
+/// `crates/git-vista-protocol/src/dto.rs:415`).
+pub fn pull_confirm_enabled(strategy: Option<git_vista_protocol::plan::MergeStrategy>) -> bool {
+    strategy.is_some()
+}
+
 /// Everything `dialogs/confirm.rs` renders for one confirmation.
 ///
 /// The first five fields are exactly the `(title, body, confirm_label,
@@ -679,6 +721,18 @@ mod tests {
         d.open(Dialog::Reset, 9_000.0);
         assert_eq!(d.open_dialog(), Some(Dialog::Reset));
         assert!(!d.may_confirm(9_000.0 + GUARD_MS - 1.0));
+    }
+
+    /// The pull picker (#232) is a new `Dialog` variant, not a special case:
+    /// it must consult the same guard as every other modal, with no
+    /// exhaustive match anywhere in this core to have missed.
+    #[test]
+    fn the_pull_picker_shares_the_same_guard_as_every_other_dialog() {
+        let mut d = DialogsCore::default();
+        d.open(Dialog::PullStrategy, 1_000.0);
+        assert_eq!(d.open_dialog(), Some(Dialog::PullStrategy));
+        assert!(!d.may_confirm(1_000.0 + GUARD_MS - 1.0));
+        assert!(d.may_confirm(1_000.0 + GUARD_MS + 1.0));
     }
 
     #[test]
@@ -1323,6 +1377,30 @@ mod tests {
     fn a_non_space_invalid_character_is_not_treated_as_fixable() {
         assert_eq!(branch_name_space_fix("bad~name"), None);
         assert_eq!(branch_name_space_fix("bad^name"), None);
+    }
+
+    // -----------------------------------------------------------------
+    // #232 (M2.20f): the pull strategy picker's "no pre-selected default"
+    // invariant, ADR 0044
+    // -----------------------------------------------------------------
+
+    /// The acceptance criterion itself, at the type boundary: nothing chosen
+    /// yet must never read as enabled, or the Pull button would be runnable
+    /// before ADR 0044's typed vocabulary can represent what strategy to
+    /// send.
+    #[test]
+    fn the_pull_button_is_disabled_until_a_strategy_is_chosen() {
+        assert!(!pull_confirm_enabled(None));
+    }
+
+    /// The other half: once *either* strategy is picked, the button enables
+    /// — proving `None` is the only disabling value, not some accident of
+    /// one particular variant.
+    #[test]
+    fn either_strategy_enables_the_pull_button_and_neither_is_favoured() {
+        use git_vista_protocol::plan::MergeStrategy;
+        assert!(pull_confirm_enabled(Some(MergeStrategy::Merge)));
+        assert!(pull_confirm_enabled(Some(MergeStrategy::Rebase)));
     }
 
     // NOT HOST-TESTABLE — wasm-only, needs a wasm-bindgen-test harness (none

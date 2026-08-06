@@ -21,7 +21,10 @@ use crate::features::dialogs::commit::{
     seed_outcome, AmendPhase, CommitIntent, DetailUse, MessageBuffer, PreflightKnowledge,
     SeedOutcome,
 };
-use crate::features::dialogs::core::{draft_scope_action, Dialog, DialogsCore, DraftScopeAction};
+use crate::features::dialogs::core::{
+    draft_scope_action, pull_confirm_enabled, Dialog, DialogsCore, DraftScopeAction, PullTarget,
+};
+use git_vista_protocol::plan::MergeStrategy;
 
 /// Best-effort handle on the tab's `sessionStorage`, the `prefs.rs`
 /// convention: private browsing can refuse storage, in which case drafts
@@ -123,6 +126,27 @@ pub struct Dialogs {
     /// landing late changes what the next press does, not what is currently on
     /// screen, and gives no reason to re-render the modal underneath the user.
     amend_preflight: StoredValue<PreflightKnowledge>,
+    /// The `{remote, branch}` a pull's strategy is being chosen for, and the
+    /// picker's own visibility (#232, ADR 0044): `Some` while the picker is
+    /// up, `None` otherwise.
+    ///
+    /// A tracked `RwSignal`, not the `StoredValue` most of this bundle's
+    /// bookkeeping uses, because the picker's view renders straight from it
+    /// — the same role `Shell::confirm_op` plays for the branch-op modal.
+    /// It lives here rather than in `Shell` because a pull's target is
+    /// picker-only state with no server round trip until a strategy is
+    /// chosen: nothing outside this dialog's own lifecycle needs to see it.
+    pull_target: RwSignal<Option<PullTarget>>,
+    /// The strategy chosen in the picker so far. `None` until the user taps
+    /// Merge or Rebase — ADR 0044 rejected any default, so this is the only
+    /// representation anywhere in the client of "not yet decided", and
+    /// nothing ever seeds it with a guess.
+    ///
+    /// Reset on every [`Dialogs::open`], same chokepoint as `confirm_armed`
+    /// above, so "no pre-selected option" holds on *every* pull, not only
+    /// the first (a remembered last choice would be the same defaulting ADR
+    /// 0044 forbids, just delayed by one pull).
+    confirm_strategy: RwSignal<Option<MergeStrategy>>,
 }
 
 impl Dialogs {
@@ -138,6 +162,8 @@ impl Dialogs {
             amend_seed: store_value(String::new()),
             amend_phase: create_rw_signal(AmendPhase::Idle),
             amend_preflight: store_value(PreflightKnowledge::default()),
+            pull_target: create_rw_signal(None::<PullTarget>),
+            confirm_strategy: create_rw_signal(None::<MergeStrategy>),
         }
     }
 
@@ -394,6 +420,55 @@ impl Dialogs {
         }
     }
 
+    /// Open the pull strategy picker (#232, ADR 0044) targeting the live
+    /// `remote`/`branch` the caller resolved — exactly like `rebase_item`'s
+    /// `fetch_head_branch()` pre-check, never a possibly-stale graph read.
+    ///
+    /// Starts the ghost-click guard the same as any other [`Dialogs::open`]
+    /// call first (which also resets `confirm_strategy` to `None`, below),
+    /// then sets the target — in that order, so the reset can never clobber
+    /// the target it is about to receive.
+    pub fn open_pull_picker(&self, remote: String, branch: String) {
+        self.open(Dialog::PullStrategy);
+        self.pull_target.set(Some(PullTarget { remote, branch }));
+    }
+
+    /// The picker's target, and its own visibility: a tracked read, `Some`
+    /// exactly while the picker is up.
+    pub fn pull_target(&self) -> Option<PullTarget> {
+        self.pull_target.get()
+    }
+
+    /// Record the strategy chosen in the picker (ADR 0044). Only ever called
+    /// from a tap on one of the two toggle buttons — never seeded, never
+    /// defaulted, and nothing else in this bundle writes it.
+    pub fn set_pull_strategy(&self, strategy: MergeStrategy) {
+        self.confirm_strategy.set(Some(strategy));
+    }
+
+    /// The strategy chosen so far, if any — a tracked read: the two toggle
+    /// buttons' `aria-pressed` and the Pull button's enabled state both
+    /// render from it.
+    pub fn pull_strategy(&self) -> Option<MergeStrategy> {
+        self.confirm_strategy.get()
+    }
+
+    /// Whether the picker's Pull button may run yet — literally ADR 0044's
+    /// acceptance criterion, computed the same way every other confirm
+    /// button in this app is gated. Delegates to [`pull_confirm_enabled`],
+    /// which is where the rule is host-tested.
+    pub fn pull_enabled(&self) -> bool {
+        pull_confirm_enabled(self.confirm_strategy.get())
+    }
+
+    /// Close the picker without dispatching anything — the Cancel tap, or a
+    /// guarded backdrop dismiss. Clears the target too, so a stray re-render
+    /// between this call and the next open can never show a stale one.
+    pub fn close_pull_picker(&self) {
+        self.close(Dialog::PullStrategy);
+        self.pull_target.set(None);
+    }
+
     /// Record that `d` is opening now, and start its guard window.
     ///
     /// Call this immediately *before* setting the modal's own signal, and — where the
@@ -415,6 +490,12 @@ impl Dialogs {
         // re-check retargets the open dialog without calling `open`, precisely
         // so the message survives it.
         self.reset_amend();
+        // ADR 0044: "no pre-selected option" has to mean every pull, not
+        // only the first — reset unconditionally here, the same chokepoint
+        // as `confirm_armed` above, rather than trusting each opener to
+        // remember to clear it. Harmless for every dialog that isn't the
+        // pull picker.
+        self.confirm_strategy.set(None);
     }
 
     /// Press the confirm modal's second-step arm control (#220). One-way
