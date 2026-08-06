@@ -15,7 +15,7 @@ use git_vista_protocol::{RepoMode, RepositoryDescriptor, RepositoryKind};
 
 use crate::features::dialogs::core::Dialog;
 use crate::features::dialogs::signals::Dialogs;
-use crate::features::graph::core::GraphCore;
+use crate::features::graph::core::{mode_button_label, GraphCore};
 use crate::features::operations::core::{result_is_newest, IntentSeq};
 use crate::features::operations::signals as ops;
 use crate::features::session::core::SessionEvent;
@@ -347,7 +347,10 @@ pub fn mode_view(
     picker_open: RwSignal<bool>,
     graph: RwSignal<GraphCore>,
 ) -> impl IntoView {
-    let busy = create_rw_signal(false);
+    // Tracks which mode (if any) is mid-request, so only the button the user
+    // actually clicked can show "opening…" (#244 follow-up) — the other stays
+    // disabled but doesn't falsely claim to be doing something.
+    let opening = create_rw_signal(None::<RepoMode>);
     let err = create_rw_signal(String::new());
     move || {
         mode_for.get().map(|d| {
@@ -360,10 +363,10 @@ pub fn mode_view(
             let choose = move |mode: RepoMode| {
                 let worktree = d.worktree.clone();
                 move |_| {
-                    if busy.get_untracked() {
+                    if opening.get_untracked().is_some() {
                         return;
                     }
-                    busy.set(true);
+                    opening.set(Some(mode));
                     err.set(String::new());
                     let worktree = worktree.clone();
                     spawn_local(async move {
@@ -382,7 +385,7 @@ pub fn mode_view(
                             }
                             Err(e) => err.set(e),
                         }
-                        busy.set(false);
+                        opening.set(None);
                     });
                 }
             };
@@ -408,10 +411,10 @@ pub fn mode_view(
                                    font:inherit; font-size:1.05em; color:#fff; \
                                    background:#1f6feb; border:1px solid #388bfd; \
                                    border-radius:8px;"
-                            disabled=move || busy.get()
+                            disabled=move || opening.get().is_some()
                             on:click=choose(RepoMode::Visualize)
                         >
-                            "Visualize — look only, with links out"
+                            {move || mode_button_label(RepoMode::Visualize, opening.get())}
                         </button>
                         {(!session_state::is_lan()).then(|| view! {
                             <button
@@ -419,10 +422,10 @@ pub fn mode_view(
                                        font:inherit; font-size:1.05em; color:#fff; \
                                        background:#238636; border:1px solid #2ea043; \
                                        border-radius:8px;"
-                                disabled=move || busy.get()
+                                disabled=move || opening.get().is_some()
                                 on:click=choose(RepoMode::Active)
                             >
-                                "Active — full git operations"
+                                {move || mode_button_label(RepoMode::Active, opening.get())}
                             </button>
                         })}
                         {move || {
