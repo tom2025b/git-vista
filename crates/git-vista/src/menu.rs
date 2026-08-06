@@ -45,7 +45,7 @@ use crate::api::{
 use crate::features::core_traits::RequestTarget;
 use crate::features::dialogs::commit::{amend_offer, AmendOffer};
 use crate::features::dialogs::core::{branch_name_space_fix, Dialog, ErrorNotice};
-use crate::features::graph::core::disabled_menu_item_copy;
+use crate::features::graph::core::{disabled_menu_item_copy, pull_label};
 use crate::features::operations::core::PendingIntent;
 use crate::features::shell::signals::{self as shell_state, Shell};
 use crate::features::status::core::{deletable_untracked_paths, discardable_tracked_paths};
@@ -1112,12 +1112,25 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
             // to satisfy `PendingIntent`'s shape and is discarded the
             // instant `admit_intent` returns; it never reaches the picker,
             // the wire, or the screen.
+            //
+            // The label (#325 follow-up) names the branch the same way
+            // `rebase_item`'s does — read from `rebase_status` above, which
+            // already carries the checked-out branch (`RebaseStatus::branch`,
+            // itself `git_vista_git::read_head_branch`) under the identical
+            // `!m.is_branch` gate this item renders behind, so this costs no
+            // new resource or poll. `pull_label` (features::graph::core) is
+            // pure so the composition is host-tested; `None` (status still
+            // loading, or a detached HEAD) degrades to naming just the
+            // remote rather than the bare "Pull" this replaces.
+            //
             // Disabled (with reason, #65) while a Fetch or Pull is already
             // in flight — see `remote_op_running` above `fetch_item`.
             let pull_item = (!m.is_branch).then(|| {
+                let branch = rebase_status.get().flatten().and_then(|s| s.branch);
+                let label = pull_label(branch.as_deref(), "origin");
                 if let Some(running) = remote_op_running() {
                     let reason = format!("{running} — only one Fetch or Pull can run at a time");
-                    let (aria_label, visible_reason) = disabled_menu_item_copy("Pull", &reason);
+                    let (aria_label, visible_reason) = disabled_menu_item_copy(&label, &reason);
                     return view! {
                         <button
                             class="ctx-item disabled"
@@ -1126,7 +1139,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                             aria-label=aria_label
                         >
                             <span class="nf ctx-icon">{ic.merge}</span>
-                            "Pull"
+                            {label}
                             <span class="ctx-item-reason">{visible_reason}</span>
                         </button>
                     }
@@ -1171,7 +1184,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 view! {
                     <button class="ctx-item" on:click=on>
                         <span class="nf ctx-icon">{ic.merge}</span>
-                        "Pull"
+                        {label}
                     </button>
                 }
                 .into_view()
