@@ -168,6 +168,72 @@ pub fn session_retry_delay_ms(attempt: u32) -> Option<u32> {
     BACKOFF_MS.get(attempt as usize).copied()
 }
 
+/// How long to wait before retrying a `HistoryPhase::SeedError` (#218's
+/// residual gap — the two `send_read`-backed calls inside `seed_for_epoch`
+/// each get one immediate retry with no backoff, so a tunnel drop that
+/// outlasts both attempts previously left the user stuck on a single error
+/// line with no automatic recovery), or `None` once this failure chain's
+/// retry budget is spent.
+///
+/// # Why a second function rather than reusing `session_retry_delay_ms`
+///
+/// The session bootstrap and the seed fetch are different resources with
+/// different retry mechanics: a session retry drives a plain attempt
+/// counter, while a seed retry drives `GraphCore::force_bump`, which
+/// advances the epoch on every call (see `seed_retry_attempts_for` below for
+/// why that matters to the budget). Naming the policies separately keeps
+/// each independently tunable and stops a change meant for one from
+/// silently retuning the other. Same shape and same total (~12s across
+/// three tries) is deliberate, not copy-paste: both exist to ride out the
+/// identical silent-tunnel-death failure mode (`api.rs`'s own doc comment
+/// on `REQUEST_TIMEOUT_MS`), so there is no reason the user-visible wait
+/// should differ between them.
+pub fn seed_retry_delay_ms(attempt: u32) -> Option<u32> {
+    const BACKOFF_MS: [u32; 3] = [1_000, 3_000, 8_000];
+    BACKOFF_MS.get(attempt as usize).copied()
+}
+
+/// Decide how many attempts a newly-observed `HistoryPhase::SeedError`
+/// should be priced against, given this retry chain's own bookkeeping.
+///
+/// - `expected_epoch` is the epoch this retry mechanism itself produced with
+///   its last `force_bump` (or the app's initial epoch, before any retry has
+///   run).
+/// - `observed_epoch` is the epoch the just-arrived `SeedError` names.
+/// - `attempts_used` is how many retries this chain has already spent.
+///
+/// # Why equality, not "did the epoch change"
+///
+/// Every retry this mechanism schedules calls `GraphCore::force_bump`, which
+/// *unconditionally* advances the epoch
+/// (`force_bump_always_advances_regardless_of_generation_and_reports_the_new_epoch`
+/// in `features/graph/core.rs`) — so a retry's own failure always arrives on
+/// a "changed" epoch relative to the one that failed before it. A naive
+/// "reset the counter whenever the epoch changes" rule would therefore reset
+/// the budget on every single retry, turning a bounded backoff into an
+/// unbounded one: exactly the request storm this mechanism exists to
+/// prevent (see `session_retry_delay_ms`'s doc comment on why bounded).
+///
+/// So the reset condition is inverted: continue the existing count only
+/// when the observed epoch is the one *this chain itself produced*;
+/// otherwise treat it as a fresh failure — the first load, a user-clicked
+/// Refresh, a drift reload, or any other `force_bump` this mechanism did not
+/// schedule — and start its budget at zero. That is what "per-epoch" means
+/// here: each independent failure *chain* gets its own budget, not each raw
+/// epoch number, and a chain this mechanism did not itself extend can never
+/// inherit an old, already-exhausted budget.
+pub fn seed_retry_attempts_for(
+    expected_epoch: u64,
+    observed_epoch: u64,
+    attempts_used: u32,
+) -> u32 {
+    if observed_epoch == expected_epoch {
+        attempts_used
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -185,6 +251,44 @@ mod tests {
         // same rate as a momentary blip.
         let d: Vec<u32> = (0..3).filter_map(super::session_retry_delay_ms).collect();
         assert!(d.windows(2).all(|w| w[0] < w[1]), "{d:?}");
+    }
+
+    #[test]
+    fn the_seed_retry_budget_backs_off_and_then_gives_up() {
+        // Same shape as the session budget above, checked independently so a
+        // change to one policy can never silently retune the other.
+        assert_eq!(super::seed_retry_delay_ms(0), Some(1_000));
+        assert_eq!(super::seed_retry_delay_ms(1), Some(3_000));
+        assert_eq!(super::seed_retry_delay_ms(2), Some(8_000));
+        // Bounded: the give-up must actually fire, not just get shorter.
+        assert_eq!(super::seed_retry_delay_ms(3), None);
+        assert_eq!(super::seed_retry_delay_ms(99), None);
+        // Strictly increasing: a mutation collapsing this to a constant
+        // delay must fail here.
+        let d: Vec<u32> = (0..3).filter_map(super::seed_retry_delay_ms).collect();
+        assert!(d.windows(2).all(|w| w[0] < w[1]), "{d:?}");
+    }
+
+    #[test]
+    fn a_retry_this_chain_produced_continues_its_own_budget() {
+        // The retry's own `force_bump` always advances the epoch, so
+        // "observed == expected" is what identifies a continuation of the
+        // same chain — not "the epoch is unchanged". A mutation that always
+        // returns 0 here (ignoring the epochs entirely) would fail this by
+        // silently granting the user two extra retries every time.
+        assert_eq!(super::seed_retry_attempts_for(6, 6, 2), 2);
+        assert_eq!(super::seed_retry_attempts_for(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_failure_on_an_epoch_this_chain_did_not_produce_starts_a_fresh_budget() {
+        // A user-clicked Refresh, a drift reload, or any other `force_bump`
+        // this mechanism did not itself schedule must not inherit an old,
+        // already-exhausted chain's budget — otherwise a brand new failure
+        // could arrive with zero retries left. A mutation that always
+        // returns `attempts_used` (ignoring the epochs) would fail this.
+        assert_eq!(super::seed_retry_attempts_for(6, 9, 3), 0);
+        assert_eq!(super::seed_retry_attempts_for(8, 9, 3), 0);
     }
 
     use super::*;

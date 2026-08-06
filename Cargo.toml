@@ -23,6 +23,7 @@ members = [
     "crates/git-vista-server",
     "crates/git-vista",
     "crates/git-vista-mcp",
+    "crates/gv-scrollcast",
 ]
 
 [workspace.package]

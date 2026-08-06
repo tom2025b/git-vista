@@ -390,30 +390,73 @@ cmd_testbed() {
   sed -i "s/^PORT=8080$/PORT=$port/" "$gvbin"
   grep -q "^PORT=$port$" "$gvbin" || die "could not retarget PORT in $gvbin"
 
-  # Build against the MAIN tree's target/ instead of a fresh empty one.
+  # Give the testbed its OWN state directory, and export it so everything
+  # downstream inherits it — `gv`'s own LOG_DIR/TOKEN_FILE/PID_FILE, and the
+  # server `gv` spawns, which resolves the same XDG_STATE_HOME (state.rs).
   #
-  # This is the difference between ~95 seconds and several hours, measured on
-  # this box (4 cores, 7 GB RAM, spinning disk). A new worktree starts with an
-  # empty target/, so a --release build recompiles every dependency from
-  # scratch — and `git worktree remove` then deletes the result, so the next
-  # testbed pays the same cost again. Nothing was ever reused. Sharing the
-  # cache means only the crates that actually differ (the PORT const above, and
-  # whatever the ref changes) get rebuilt.
+  # Without this, main tree and testbed share
+  # $XDG_STATE_HOME/git-vista/bootstrap.token. Each server mints its own token
+  # at startup into that one path, so whichever started LAST owns the file and
+  # the other's sign-in link is dead — including the iPad session already open
+  # against 8080. That is not hypothetical: it is what broke sign-in on
+  # 2026-08-05, and the diagnosis cost more than the fix. Same dead-end-branch
+  # argument as the PORT rewrites above makes the edit safe.
+  local statedir="$dir/.state"
+  mkdir -p "$statedir"
+  sed -i "s|^LOG_DIR=|export XDG_STATE_HOME=\"$statedir\"\nLOG_DIR=|" "$gvbin"
+  grep -q "^export XDG_STATE_HOME=\"$statedir\"$" "$gvbin" \
+    || die "could not isolate XDG_STATE_HOME in $gvbin"
+
+  # Each testbed gets its OWN target dir, keyed by port. It is NOT shared with
+  # the main tree.
   #
-  # Safe because cargo locks target/ and keys artifacts by the full compilation
-  # fingerprint: the retargeted PORT is part of that fingerprint, so the
-  # testbed's binaries never masquerade as the main tree's. The cost of sharing
-  # is that main and testbed builds evict each other's copy of the two crates
-  # that differ — seconds, against hours saved.
+  # An earlier version of this script shared $REPO/target, on the argument that
+  # cargo keys artifacts by compilation fingerprint and the retargeted PORT const
+  # makes the testbed's git-vista-server distinct. That argument is true, and it
+  # is not sufficient — it covers exactly one crate. Every OTHER workspace crate
+  # (git-vista-protocol, git-vista-core, git-vista-git) has the same name, the
+  # same version, and the same workspace-relative path in both trees while
+  # holding DIFFERENT source. Cargo reused the main tree's copies.
+  #
+  # Measured 2026-08-06, building the #232 testbed at 387c8cd:
+  #
+  #   error[E0432]: unresolved import `git_vista_protocol::OperationByKeyResponse`
+  #   error[E0004]: non-exhaustive patterns: `FetchFailureKind::CredentialHelperBlocked` not covered
+  #
+  # Both impossible from the testbed's own source: its protocol crate DOES export
+  # OperationByKeyResponse and does NOT define CredentialHelperBlocked — while
+  # the main tree's is the exact inverse, and `cargo metadata` insisted the
+  # testbed resolved its own crate. It was compiling against main's.
+  #
+  # The failure mode this creates is the one this command exists to prevent: a
+  # testbed that LOOKS like the ref you asked for while linking another tree's
+  # crates, so a human device pass certifies a binary that was never built from
+  # the branch under test. A slow honest build beats a fast lying one.
+  #
+  # Keyed by port, not deleted with the worktree, so a repeat testbed on the same
+  # port still gets a warm cache — most of the cost back, none of the collision.
+  # Teardown of the dir is a deliberate, separate step (printed below).
   #
   # Debug, not --release: this build exists to be driven by a human for a few
   # minutes, not to be fast at runtime. Optimizing it is the tail wagging the dog.
-  local shared_target="$REPO/target"
-  echo "dev: building against the shared cache at $shared_target (debug)"
-  ( cd "$dir" && env CARGO_TARGET_DIR="$shared_target" \
+  local testbed_target="$REPO/target-testbed-$port"
+  if [[ -d $testbed_target ]]; then
+    echo "dev: reusing this port's own cache at $testbed_target (debug)"
+  else
+    echo "dev: cold build in $testbed_target (debug) — first testbed on this port,"
+    echo "dev: so every dependency compiles from scratch. Expect 10-25 minutes."
+  fi
+  ( cd "$dir" && env CARGO_TARGET_DIR="$testbed_target" \
       trunk build --config crates/git-vista/Trunk.toml )
-  ( cd "$dir" && env CARGO_TARGET_DIR="$shared_target" \
+  ( cd "$dir" && env CARGO_TARGET_DIR="$testbed_target" \
       cargo build -p git-vista-server )
+
+  # Prove the binary is the one we meant, rather than trusting the build. The
+  # PORT const is compiled in; a binary that does not bind $port is a binary
+  # from another tree, and the whole point of the isolation above is that this
+  # can be asserted instead of assumed.
+  local built="$testbed_target/debug/git-vista-server"
+  [[ -x $built ]] || die "build produced no binary at $built"
 
   cat <<EOF
 
@@ -424,24 +467,37 @@ dev: testbed ready.
   port    $port
 
 Start it, then get the sign-in link:
-  cd $dir && $shared_target/debug/git-vista-server <repo-to-open> &
+  cd $dir && env XDG_STATE_HOME=$statedir $built <repo-to-open> &
   cd $dir && ./dev signin
 
-NOTE the binary path: this build used CARGO_TARGET_DIR=$shared_target (the
-main tree's cache — see the comment above for why), so there is no
-$dir/target/ at all. An earlier version of this message said
-"./target/debug/git-vista-server", which cannot work from here and sent a
-session hunting for a directory that was never created.
+The XDG_STATE_HOME above is REQUIRED, not decorative. This testbed's \`gv\` is
+already pinned to $statedir, so 'dev signin' here is correct on its own — but
+a server started WITHOUT that env writes its bootstrap token to the shared
+$HOME/.local/state/git-vista/ instead, clobbering whatever is running on 8080.
+That is what killed the iPad session on 2026-08-05.
 
-That shared cache also means main-tree and testbed builds evict each other's
-copy of git-vista-server. If you run a build in the main tree after this, the
-binary at that path goes back to PORT 8080 — re-run 'dev testbed' (or rebuild
-from $dir) before driving the testbed again.
+NOTE the binary path: this build used CARGO_TARGET_DIR=$testbed_target, so
+there is no $dir/target/ at all. Use the full path above.
+
+Nothing the main tree builds can disturb this binary any more — that isolation
+is the point of the per-port target dir, and is why the path is long.
+
+If the server exits immediately with "Address already in use", the binary is
+NOT this one: its PORT const is $port, so it cannot collide with 8080. Check
+which binary you launched before assuming the port is occupied.
 
 Open the repo in VISUALIZE mode for a true read-only session.
+
+Fetch/pull against a PRIVATE remote will fail for a reason unrelated to
+whatever you are testing: the git credential helper is \`gh\`, and the sandbox
+denies ~/.config/gh. Point the repo under test at a local file:// remote, or a
+public one, before concluding a network feature is broken.
+
 Tear down when finished:
   git worktree remove --force $dir
   git branch -D $branch               # testbed branches only — see below
+  rm -rf $testbed_target              # only if you want the disk back; keeping
+                                      # it makes the next testbed on this port fast
 
 The project's standing rule is that branches are NEVER deleted, so that the
 history of the codebase stays walkable. Tom carved testbed branches out of

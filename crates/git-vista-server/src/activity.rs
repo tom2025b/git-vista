@@ -32,6 +32,7 @@ use git_vista_core::model::RefKind;
 use git_vista_git::{read_commit, read_reflogs, read_refs, read_remote_commits, RepoError};
 use git_vista_protocol::{BranchName, CommitOid, GitOperation};
 
+use crate::git_cmd;
 use crate::journal;
 
 /// How many events the feed returns by default, and at most. The panel shows
@@ -166,9 +167,37 @@ fn is_safe_branch_name(name: &str) -> bool {
 ///    snapshot upkeep — that single-writer invariant belongs to the feed
 ///    handler): a reset-style undo whose result is this commit, or a deleted
 ///    branch whose lost tip was this commit;
-///  * a revert offer for any non-merge commit — the history-preserving undo,
-///    valid even for commits buried deep or already pushed. (Reverting a
-///    merge needs a `-m` parent choice, so merges don't get the offer.)
+///  * a revert offer for any non-merge commit **whose revert is established,
+///    live, to actually apply** — the history-preserving undo, valid even for
+///    commits buried deep or already pushed. (Reverting a merge needs a `-m`
+///    parent choice, so merges don't get the offer.)
+///
+/// # #327: availability is established, not asserted
+///
+/// This used to offer a revert for every non-merge commit unconditionally —
+/// "available" asserted, never checked. Reverting a commit that later work
+/// depends on conflicts, and git refuses; the owner's own session log is
+/// exactly this bug: `undoables` said one action existed, the tap failed with
+/// `error: could not revert f993ba6… \n hint: after resolving the conflicts,
+/// mark the corrected paths`. To the user that reads as a button that lights
+/// up and then greys out.
+///
+/// The fix is a **lazy, real precheck**: [`revert_would_conflict`] runs the
+/// exact three-way merge `git revert` itself would perform —
+/// `git merge-tree --write-tree --merge-base=<commit> HEAD <parent>` — read
+/// straight from the object database (no worktree, no index, no ref ever
+/// moves) and classified from git's own exit code (`0`/`1`), not a text
+/// heuristic. It is lazy in the sense that matters: this handler is already
+/// called once per menu-open, for the one commit tapped — never for the
+/// whole graph (see the module doc's cost note) — so one extra sandboxed git
+/// call per click is the entire cost, not one per node on screen. An eager
+/// version that prechecked every candidate commit on every graph render was
+/// considered and rejected for exactly that reason.
+///
+/// A precheck that can't be run at all (HEAD won't resolve, the commit is a
+/// root with no parent to diff against, the sandboxed spawn itself fails) is
+/// **not** offered — "couldn't tell" must not read as "yes", same posture
+/// [`crate::planner`]'s pull executor documents for `restored`.
 ///
 /// A read-only clone gets an empty list: `/api/undo` would refuse anyway, so
 /// the UI never shows a section it can't act on.
@@ -224,21 +253,113 @@ pub async fn undoables(
             out.push(undoable);
         }
     }
-    if detail.parents.len() <= 1 {
-        out.push(Undoable {
-            action: UndoAction::RevertCommit {
-                commit: full.clone(),
-            },
-            label: format!("Revert {} (adds an inverse commit)", short(&full)),
-            warn_pushed: false,
-        });
+    // #327 defect A: offer the revert only once it is established live that
+    // it will actually apply — see this function's doc comment for why the
+    // check runs here, lazily, for this one commit.
+    //
+    // A merge commit (`parents.len() > 1`) never reaches the precheck at
+    // all, same as before this fix — reverting one needs a `-m` parent
+    // choice this UI doesn't collect.
+    if detail.parents.len() == 1 {
+        let parent = detail.parents[0].0.as_str();
+        if revert_offer_established(&repo, &full, parent).await {
+            out.push(Undoable {
+                action: UndoAction::RevertCommit {
+                    commit: full.clone(),
+                },
+                label: format!("Revert {} (adds an inverse commit)", short(&full)),
+                warn_pushed: false,
+            });
+        }
     }
+    // A root commit (`parents.len() == 0`) has nothing to diff the revert
+    // against — `merge-tree` needs a parent commit as `theirs`, and a
+    // synthetic empty-tree stand-in isn't a commit `--merge-base` will
+    // accept (verified: git refuses it, "expected commit type"). Reverting
+    // the very first commit is a rare, almost always self-conflicting
+    // operation in any repository with real history on top of it, so this
+    // falls out of the same fail-closed rule rather than needing its own
+    // arm: no established answer, no offer.
     println!(
         "[/api/undoables] {} → {} action(s)",
         short(&full),
         out.len()
     );
     Ok((no_store, Json(out)))
+}
+
+/// Whether reverting `commit` (whose sole parent is `parent`) onto `head`
+/// would conflict — established, not guessed (#327 defect A).
+///
+/// `git merge-tree --write-tree --merge-base=<commit> <head> <parent>`
+/// computes exactly the three-way merge `git revert` performs internally:
+/// base = the commit being reverted, ours = `head`, theirs = `parent` (the
+/// tree as it looked immediately before `commit`). It reads straight from the
+/// object database — no worktree is created, no index is touched, no ref
+/// moves — so it is safe to run on a live, served repository on every
+/// menu-open. (It does write a merged tree/blob objects to the object
+/// database on a clean result, same as any other content-addressed git
+/// plumbing — no different from the loose objects `git diff`, `git stash`,
+/// or a dry-run `git merge-tree` a user runs by hand already leave behind;
+/// nothing references them, and normal `git gc --auto` reclaims them.)
+///
+/// The answer is git's own exit code, not a text heuristic: `--write-tree`
+/// documents `0` for a clean merge and `1` for a real conflict, and that
+/// contract — unlike git's prose — doesn't shift with locale or version.
+/// Verified against this server's git (2.43.0; see the tests).
+///
+/// `Err` means the check itself did not produce an answer (the sandboxed
+/// spawn failed, or `merge-tree` exited some other way, e.g. a genuinely bad
+/// revision). The caller's job is to treat that exactly like a conflict —
+/// "couldn't tell" must never read as "safe to offer".
+async fn revert_would_conflict(
+    repo: &Path,
+    commit: &str,
+    parent: &str,
+    head: &str,
+) -> Result<bool, String> {
+    let merge_base = format!("--merge-base={commit}");
+    let output = git_cmd::git_output(
+        repo,
+        &["merge-tree", "--write-tree", &merge_base, head, parent],
+    )
+    .await
+    .map_err(|e| format!("couldn't run git merge-tree: {e}"))?;
+    match output.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+    }
+}
+
+/// The wiring `undoables` depends on for its offer decision (#327 defect A):
+/// resolve `HEAD`, then run [`revert_would_conflict`] against it — offering
+/// only when both steps ran **and** answered "clean".
+///
+/// Pulled out of `undoables` on its own, rather than left inline, so this
+/// decision is a fact a test can pin without a `crate::state::current()`
+/// fixture: it takes `repo`/`commit`/`parent` directly and returns a plain
+/// `bool`, same shape as [`revert_would_conflict`] beside it.
+///
+/// This is exactly the kind of single-character inversion defect A is
+/// about — `.map(|conflicts| !conflicts)` flipped, or the `unwrap_or`
+/// changed from `false` to `true`, silently reintroduces "available
+/// asserted, never established". See the tests for the mutation this
+/// proves.
+///
+/// Three ways to land on `false` (don't offer), all fail-closed for the same
+/// reason: `HEAD` doesn't resolve (`Ok(None)`), resolving it couldn't even
+/// run (`Err`), or it resolved but [`revert_would_conflict`] itself couldn't
+/// produce an answer (its own `Err` arm). None of these is "no conflict" —
+/// they're "no fact", and a fact we don't have is never grounds to offer.
+async fn revert_offer_established(repo: &Path, commit: &str, parent: &str) -> bool {
+    match git_cmd::rev_parse(repo, "HEAD").await {
+        Ok(Some(head)) => revert_would_conflict(repo, commit, parent, &head)
+            .await
+            .map(|conflicts| !conflicts)
+            .unwrap_or(false),
+        Ok(None) | Err(_) => false,
+    }
 }
 
 /// `POST /api/undo` — execute one [`UndoAction`] (step 5). The body is the
@@ -365,5 +486,155 @@ async fn undo_commit_oid(repo: &Path, given: &str) -> Result<CommitOid, (StatusC
             "/api/undo",
             &format!("couldn't resolve ‘{given}’: {e}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn run(repo: &Path, args: &[&str]) {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?} failed in {repo:?}"
+        );
+    }
+
+    /// `git rev-parse <rev>` in `repo`, trimmed — plain and unsandboxed, since
+    /// these tests are pinning `revert_would_conflict`'s own answer, not
+    /// exercising the sandbox.
+    fn rev_parse_plain(repo: &Path, rev: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git rev-parse {rev} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A fresh repository on `main` with one committed file and a clean
+    /// working tree — same shape `planner.rs`'s own `seeded_repo` uses.
+    fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@example.invalid"]);
+        run(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "line1\n").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["commit", "-q", "-m", "base"]);
+        (dir, repo)
+    }
+
+    /// #327 defect A: the exact repro shape from the owner's session log —
+    /// an earlier commit that later work still depends on must be reported
+    /// as conflicting, not offered as a clean revert.
+    ///
+    /// Mutation this proves: flip `Some(0) => Ok(false), Some(1) => Ok(true)`
+    /// to the opposite pair, or replace the whole match with `Ok(false)`, and
+    /// this test goes red — the classification is load-bearing, not a
+    /// round-trip.
+    #[tokio::test]
+    async fn a_commit_later_work_depends_on_is_reported_as_conflicting() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("f.txt"), "line1\nline2\n").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add line2"]);
+        let to_revert = rev_parse_plain(&repo, "HEAD");
+        let parent_of_to_revert = rev_parse_plain(&repo, "HEAD^");
+
+        std::fs::write(repo.join("f.txt"), "line1\nline2\nline3\n").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add line3, needs line2"]);
+        let head_now = rev_parse_plain(&repo, "HEAD");
+
+        let conflicts = revert_would_conflict(&repo, &to_revert, &parent_of_to_revert, &head_now)
+            .await
+            .expect("the check itself must run cleanly against a real repo");
+        assert!(
+            conflicts,
+            "reverting a commit later work depends on must be flagged conflicting"
+        );
+    }
+
+    /// The mirror case, in the same repo shape: reverting the current tip —
+    /// nothing is built on top of it yet — must be reported clean. Proves
+    /// the function distinguishes the two cases rather than always agreeing
+    /// with one answer (the failure mode a test that only checks the
+    /// conflicting case would miss entirely).
+    #[tokio::test]
+    async fn reverting_the_current_tip_with_no_dependents_is_clean() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("f.txt"), "line1\nline2\n").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add line2"]);
+        let tip = rev_parse_plain(&repo, "HEAD");
+        let parent = rev_parse_plain(&repo, "HEAD^");
+
+        let conflicts = revert_would_conflict(&repo, &tip, &parent, &tip)
+            .await
+            .expect("the check itself must run cleanly against a real repo");
+        assert!(
+            !conflicts,
+            "reverting the tip with nothing built on top must be clean"
+        );
+    }
+
+    /// The wiring itself, not just `revert_would_conflict`'s raw answer:
+    /// `revert_offer_established` must say `false` for the exact conflicting
+    /// shape above — the owner's repro. Where the two prior tests pin the
+    /// classifier, this one pins the decision that actually reaches
+    /// `undoables`'s `if` — the one place a flipped `!` or a wrong
+    /// `unwrap_or` would silently reintroduce defect A with every other test
+    /// in this file still green.
+    ///
+    /// Mutation this proves: change `.map(|conflicts| !conflicts)` to
+    /// `.map(|conflicts| conflicts)`, or `unwrap_or(false)` to
+    /// `unwrap_or(true)`, and this test goes red.
+    #[tokio::test]
+    async fn the_offer_decision_says_no_for_a_real_conflict() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("f.txt"), "line1\nline2\n").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add line2"]);
+        let to_revert = rev_parse_plain(&repo, "HEAD");
+        let parent_of_to_revert = rev_parse_plain(&repo, "HEAD^");
+
+        std::fs::write(repo.join("f.txt"), "line1\nline2\nline3\n").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add line3, needs line2"]);
+
+        assert!(
+            !revert_offer_established(&repo, &to_revert, &parent_of_to_revert).await,
+            "the offer decision must say no for a commit later work depends on"
+        );
+    }
+
+    /// The mirror case for the wiring: a clean revert (the tip, nothing
+    /// built on it) must be offered. Without this leg,
+    /// `revert_offer_established` could be hardcoded to `false` and the test
+    /// above would still pass — proving `false` alone is not proof the
+    /// wiring works.
+    #[tokio::test]
+    async fn the_offer_decision_says_yes_for_a_clean_revert() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("f.txt"), "line1\nline2\n").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add line2"]);
+        let tip = rev_parse_plain(&repo, "HEAD");
+        let parent = rev_parse_plain(&repo, "HEAD^");
+
+        assert!(
+            revert_offer_established(&repo, &tip, &parent).await,
+            "the offer decision must say yes for a clean revert of the tip"
+        );
     }
 }

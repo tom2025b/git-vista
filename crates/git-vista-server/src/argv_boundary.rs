@@ -78,6 +78,21 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // `sandbox::escape_contract`'s R7 pins `main.rs`'s `GIT_*` surface to two
     // variables.
     "src/handlers/tags.rs",
+    // #327: `#[cfg(test)]` fixture setup only. The production probe —
+    // `revert_would_conflict`'s `git merge-tree --write-tree`, which
+    // establishes whether a revert can actually apply before the UI offers it
+    // — goes through `crate::git_cmd::git_output`, the sealed sandbox
+    // launcher, exactly like every other production read in this crate. The
+    // two `Command::new("git")` calls left in this file build throwaway
+    // repositories for the tests that pin that probe's classification.
+    //
+    // This entry exists because the tripwire below caught the addition and
+    // refused the build until it was reviewed — which is the mechanism
+    // working, not a formality. Do not widen it to cover a production spawn:
+    // if `revert_would_conflict` ever stops going through `git_output`, that
+    // is a boundary change needing its own decision, and this comment is the
+    // record that it was not one when the entry was added.
+    "src/activity.rs",
     // `#[cfg(test)]` fixture setup only — `git init -q`, to build repositories
     // `read_repo_facts` can classify. This entry used to read "static-arg read
     // at registration", which stopped being true when registration moved to the

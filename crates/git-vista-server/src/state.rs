@@ -818,6 +818,170 @@ mod tests {
             msg.to_lowercase().contains("managed root"),
             "the refusal should name why: {msg}"
         );
+
+        // --- #323: the real HTTP path for `POST /api/amend-commit` ----------
+        //
+        // Everything above calls a handler directly or drives the planner's
+        // own pipeline stages (`contract_suite::pipeline`) — never through
+        // the axum `Router` + middleware stack, so nothing in the crate has
+        // proven what a client actually receives on the wire for this route.
+        // This test is the crate's one legitimate owner of `CURRENT` (see the
+        // module comment at the top of this fn); a second test elsewhere
+        // calling `set_current` would race it under cargo's default parallel
+        // test execution, so the new checks live here instead of in
+        // `middleware.rs` alongside its own router-level tests.
+        use axum::{
+            body::{to_bytes, Body},
+            http::{header, Request as HttpRequest},
+            middleware::from_fn,
+            routing::post,
+            Router,
+        };
+        use git_vista_protocol::{
+            AmendCommitError, AmendCommitSuccess, AmendFailureKind, ApiError, IDEMPOTENCY_HEADER,
+            PROTOCOL_HEADER, PROTOCOL_VERSION,
+        };
+        use tower::ServiceExt;
+
+        fn amend_router() -> Router {
+            Router::new()
+                .route(
+                    "/api/amend-commit",
+                    post(crate::handlers::commit::amend_commit),
+                )
+                .layer(from_fn(crate::middleware::idempotency))
+                .layer(from_fn(crate::middleware::api_contract))
+        }
+
+        fn amend_req(body: String, key: &str) -> HttpRequest<Body> {
+            HttpRequest::post("/api/amend-commit")
+                .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                .header(IDEMPOTENCY_HEADER, key)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        async fn resp_body(resp: axum::response::Response) -> String {
+            let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        // `repo` (this fn's own fixture, above) never grew a commit — an
+        // unborn HEAD, which is exactly one of `exec_amend_commit`'s two
+        // `StaleTip` sources ("There is no commit here to amend", the D5
+        // case its own doc comment names). Reusing it drives a genuine
+        // executor-side refusal with no extra fixture, through the real
+        // handler and the real `state::CURRENT`.
+        set_current(&repo, RepoMode::Active);
+        let refusal_body = format!(
+            r#"{{"message":"does not matter","allow_empty":false,"expected_tip":"{}"}}"#,
+            "0".repeat(40)
+        );
+        let resp = amend_router()
+            .oneshot(amend_req(refusal_body, "amend-refusal-323"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("application/json")),
+            "the refusal must be labeled JSON so `middleware::rewrap_error` \
+             passes it through untouched instead of re-enveloping it"
+        );
+        let body = resp_body(resp).await;
+        let refusal: AmendCommitError = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("400 body did not parse as AmendCommitError ({e}): {body}"));
+        assert_eq!(refusal.kind, AmendFailureKind::StaleTip);
+        assert!(
+            serde_json::from_str::<ApiError>(&body).is_err(),
+            "the refusal was rewrapped into an ApiError envelope — double-encoded: {body}"
+        );
+
+        // The success path (200): zero coverage before this test existed.
+        let success_root = tempfile::tempdir().unwrap();
+        let success_repo = success_root.path().join("repo");
+        std::fs::create_dir_all(&success_repo).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@example.invalid"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "-q", "--allow-empty", "-m", "seed"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&success_repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        set_current(&success_repo, RepoMode::Active);
+        let tip_out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&success_repo)
+            .output()
+            .unwrap();
+        let tip = String::from_utf8_lossy(&tip_out.stdout).trim().to_string();
+        let success_body =
+            format!(r#"{{"message":"amended","allow_empty":true,"expected_tip":"{tip}"}}"#);
+        let resp = amend_router()
+            .oneshot(amend_req(success_body, "amend-success-323"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("application/json")),
+            "the success body had zero content-type coverage before this test"
+        );
+        let body = resp_body(resp).await;
+        let success: AmendCommitSuccess = serde_json::from_str(&body).unwrap_or_else(|e| {
+            panic!("200 body did not parse as AmendCommitSuccess ({e}): {body}")
+        });
+        assert_eq!(success.message, "Amended commit.");
+
+        // A third case, proving the *other* direction of the fix:
+        // `amend_route_response` must NOT label every `plan_and_execute`
+        // output JSON, only the ones that actually are. `plan_and_execute`
+        // itself refuses with plain English when the idempotency header is
+        // absent (`middleware::idempotency` just forwards the request
+        // untouched when the header is missing — see its own doc comment —
+        // so nothing upstream of the handler catches this one). If
+        // `amend_route_response` mislabeled that prose `application/json`,
+        // `middleware::rewrap_error`'s `is_json` check would pass it through
+        // untouched and the client would receive a raw English sentence
+        // that fails to parse as `ApiError` despite the header claiming
+        // JSON — worse than the double-encoding #323 set out to fix, not
+        // better. With the fix, the prose stays `text/plain` through
+        // `amend_route_response`, and `api_contract`'s `rewrap_error` still
+        // wraps it into a proper envelope, same as any other route's plain
+        // refusal.
+        let no_key_body =
+            format!(r#"{{"message":"amended","allow_empty":true,"expected_tip":"{tip}"}}"#);
+        let req_no_key = HttpRequest::post("/api/amend-commit")
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+            .header("content-type", "application/json")
+            .body(Body::from(no_key_body))
+            .unwrap();
+        let resp = amend_router().oneshot(req_no_key).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_body(resp).await;
+        let err: ApiError = serde_json::from_str(&body).unwrap_or_else(|e| {
+            panic!(
+                "the idempotency-gate's plain-English refusal must reach the client as a \
+                 correctly-enveloped ApiError, not a raw sentence mislabeled application/json \
+                 ({e}): {body}"
+            )
+        });
+        assert!(
+            err.error.message.to_lowercase().contains("header"),
+            "the enveloped message should still name what was missing: {}",
+            err.error.message
+        );
     }
 
     #[test]

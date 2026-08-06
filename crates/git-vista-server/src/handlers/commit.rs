@@ -9,6 +9,7 @@
 //! planner's executor.
 
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use git_vista_protocol::{
@@ -89,12 +90,22 @@ pub(crate) async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (Stat
 ///
 /// The two validation refusals here answer with the same
 /// [`git_vista_protocol::AmendCommitError`] JSON shape the executor's
-/// classified failures use (via the shared [`planner::amend_refusal`]
-/// constructor), so the endpoint's contract stays simple for M2.19d:
-/// **every** 400 body from this route parses as `AmendCommitError`.
-pub(crate) async fn amend_commit(Json(req): Json<AmendCommitRequest>) -> (StatusCode, String) {
+/// classified failures use — this route's own checks go straight through
+/// [`planner::amend_refusal`], which builds the `Response` itself (#323);
+/// `exec_amend_commit`'s callers build the same JSON through the
+/// `(StatusCode, String)`-shaped [`planner::amend_refusal_body`] instead,
+/// re-labeled `application/json` at the final hop by
+/// [`amend_route_response`] — so the endpoint's contract stays simple for
+/// M2.19d: **every** 400 body from this route parses as `AmendCommitError`.
+pub(crate) async fn amend_commit(Json(req): Json<AmendCommitRequest>) -> Response {
     if let Some(rejected) = reject_if_read_only() {
-        return rejected;
+        // Prose, like every other write handler's read-only refusal —
+        // `amend_route_response` (below) is only for `plan_and_execute`'s
+        // output, where an already-JSON `AmendCommitError` body needs
+        // re-labeling. This one stays `text/plain` so `middleware::rewrap_error`
+        // envelopes it the same way it envelopes every other route's
+        // read-only refusal.
+        return rejected.into_response();
     }
     let message = req.message.trim();
     if message.is_empty() {
@@ -124,12 +135,60 @@ pub(crate) async fn amend_commit(Json(req): Json<AmendCommitRequest>) -> (Status
             )
         }
     };
-    planner::plan_and_execute(GitOperation::AmendCommit {
+    let (status, body) = planner::plan_and_execute(GitOperation::AmendCommit {
         message,
         expected_tip,
         allow_empty: req.allow_empty,
     })
-    .await
+    .await;
+    amend_route_response(status, body)
+}
+
+/// Re-labels [`planner::plan_and_execute`]'s `(StatusCode, String)` result as
+/// `application/json` at the final hop of this route, but *only* when the
+/// body actually is JSON — the executor side of the #323 fix.
+///
+/// `plan_and_execute` is not exclusively the two JSON-shaped outcomes this
+/// route cares about (`AmendCommitSuccess` on success, `amend_refusal_body`'s
+/// `AmendCommitError` on an executor-classified refusal): the shared pipeline
+/// it runs before `exec_amend_commit` ever sees the request can also answer
+/// with plain English, by design, from several places that have nothing to
+/// do with amend specifically — [`crate::state::reject_if_read_only`]'s
+/// "Visualize mode" 403 (re-checked here as defense in depth even though
+/// `amend_commit` already checks it first), the idempotency gate's
+/// missing-header 400, and — the one that matters most, because it is a real
+/// race and not just a defensive check — the staleness gate's re-verification
+/// of this operation's own `RefAt`/`BranchCheckedOut` preconditions if the
+/// branch tip or checkout moves between this plan being built and executed
+/// (`"'refs/heads/…' moved while this plan was pending — refresh and try
+/// again."`, a `409` from `verify_precondition`, distinct from
+/// `exec_amend_commit`'s own `StaleTip` JSON refusal for the same kind of
+/// staleness).
+///
+/// Labeling *those* `application/json` would be a regression, not a fix:
+/// `middleware::rewrap_error` would see the (forged) JSON content-type, skip
+/// enveloping, and the client would receive a plain English sentence
+/// claiming to be JSON — unparseable, and worse than the double-encoding this
+/// issue set out to fix. So this sniffs the body instead of trusting the
+/// route: only a body that actually parses as a JSON *object* gets
+/// re-labeled; anything else is returned as `plan_and_execute` built it
+/// (`String`'s default `text/plain`), which is exactly what
+/// `rewrap_error` needs to keep enveloping it correctly.
+fn amend_route_response(status: StatusCode, body: String) -> Response {
+    let is_json_object = matches!(
+        serde_json::from_str::<serde_json::Value>(&body),
+        Ok(serde_json::Value::Object(_))
+    );
+    if is_json_object {
+        (
+            status,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response()
+    } else {
+        (status, body).into_response()
+    }
 }
 
 /// Stage all working-tree changes (`POST /api/stage`):

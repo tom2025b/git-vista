@@ -1,0 +1,37 @@
+# gv-scrollcast (#325) — offline CLI, not app functionality.
+#
+# Deliberately outside the axum/Leptos dependency graph: this tool renders the
+# print view headless, paces a scroll over the result, and shells out to
+# ffmpeg. None of that reaches a served route, so it carries its own
+# dependencies rather than growing git-vista-server's or git-vista's surface
+# for a one-shot video export.
+[package]
+name = "gv-scrollcast"
+description = "Renders git-vista's Print Graph view as a paced vertical-scroll time-lapse video."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gv-scrollcast"
+path = "src/main.rs"
+
+[dependencies]
+git-vista-core = { workspace = true }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# CDP client for headless capture. Talks to Chromium over a WebSocket (CDP),
+# not the kernel ABI directly, so this does not belong in
+# docs/NATIVE_DEPENDENCIES.md's register — that register is scoped to crates
+# that speak the kernel ABI directly (Landlock, seccomp), which this is not.
+chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
+futures = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "time"] }
+
+[dev-dependencies]
+proptest = "1"

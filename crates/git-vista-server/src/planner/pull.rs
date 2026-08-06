@@ -143,6 +143,7 @@ fn from_fetch_failure(kind: FetchFailureKind) -> PullFailureKind {
         FetchFailureKind::AuthenticationFailed => PullFailureKind::AuthenticationFailed,
         FetchFailureKind::RemoteUnreachable => PullFailureKind::RemoteUnreachable,
         FetchFailureKind::RemoteRejected => PullFailureKind::RemoteRejected,
+        FetchFailureKind::CredentialHelperBlocked => PullFailureKind::CredentialHelperBlocked,
         FetchFailureKind::Cancelled => PullFailureKind::Cancelled,
         FetchFailureKind::Other => PullFailureKind::Other,
     }
@@ -631,18 +632,22 @@ mod tests {
                 FetchFailureKind::RemoteRejected,
                 PullFailureKind::RemoteRejected,
             ),
+            (
+                FetchFailureKind::CredentialHelperBlocked,
+                PullFailureKind::CredentialHelperBlocked,
+            ),
             (FetchFailureKind::Cancelled, PullFailureKind::Cancelled),
             (FetchFailureKind::Other, PullFailureKind::Other),
         ];
         for (fetch, pull) in table {
             assert_eq!(from_fetch_failure(fetch), pull, "for {fetch:?}");
         }
-        // The census: the whole fetch vocabulary is covered, so a sixth
+        // The census: the whole fetch vocabulary is covered, so a seventh
         // variant fails the exhaustive `match` in `from_fetch_failure` at
         // compile time *and* leaves this count stale.
         assert_eq!(
             table.len(),
-            5,
+            6,
             "FetchFailureKind grew — decide what a pull calls the new one"
         );
         // No pull-only kind may be produced by this mapping: `Conflict` and
