@@ -282,6 +282,19 @@ mod tests {
                 "/api/boom",
                 get(|| async { (StatusCode::NOT_FOUND, "No such commit.") }),
             )
+            // #323: a handler that *hand-serializes* its own JSON body. The
+            // real `/api/amend-commit` refusal path, reached through this
+            // layer rather than by calling the planner function directly —
+            // which is precisely the gap that let the defect sit unnoticed.
+            .route(
+                "/api/amend-refusal",
+                get(|| async {
+                    crate::planner::amend_refusal(
+                        git_vista_protocol::AmendFailureKind::Other,
+                        "Commit message can't be empty.",
+                    )
+                }),
+            )
             .route("/api/branch", post(crate::handlers::branch::create_branch))
             // The M1.08 stream route: the one path that may negotiate through
             // the query string, and the one whose id echoes the key in scope.
@@ -379,6 +392,44 @@ mod tests {
         let err: ApiError = serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(err.error.code, ErrorCode::NotFound);
         assert_eq!(err.error.message, "No such commit.");
+    }
+
+    /// #323: a hand-serialized JSON body must reach the client as **one** JSON
+    /// object, not as an `ApiError` envelope with the real payload buried in
+    /// its `message` field as an escaped string.
+    ///
+    /// `amend_refusal` builds an `AmendCommitError` and serializes it itself,
+    /// returning a `String` — which axum labels `text/plain`. `rewrap_error`
+    /// keys on content-type, sees a non-JSON body, and wraps it. The endpoint's
+    /// documented contract ("**every** 400 body from this route parses as
+    /// `AmendCommitError`") is then false at the wire.
+    ///
+    /// This can only be seen through the layer. The existing contract-suite
+    /// test calls the planner function directly, so it agrees with the
+    /// docstring and misses the defect entirely.
+    #[tokio::test]
+    async fn a_hand_serialized_refusal_is_not_double_encoded() {
+        let resp = app()
+            .oneshot(get_req(
+                "/api/amend-refusal",
+                Some(&PROTOCOL_VERSION.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body = body_string(resp).await;
+
+        // The contract: it parses as the payload type, directly.
+        let refusal: git_vista_protocol::AmendCommitError = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("400 body did not parse as AmendCommitError ({e}): {body}"));
+        assert_eq!(refusal.message, "Commit message can't be empty.");
+
+        // And the failure mode, named explicitly: not an envelope carrying the
+        // real body as an escaped string.
+        assert!(
+            serde_json::from_str::<ApiError>(&body).is_err(),
+            "the refusal was rewrapped into an ApiError envelope — double-encoded: {body}"
+        );
     }
 
     // --- The "no path-based repository selection" guard, at the wire ------------
