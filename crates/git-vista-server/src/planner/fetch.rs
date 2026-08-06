@@ -452,81 +452,43 @@ pub(crate) fn error_body(
     .expect("FetchError serialization cannot fail")
 }
 
-/// Journal **one** entry per fetch operation, naming how many remote-tracking
-/// refs moved — not one entry per ref.
+/// Journal one entry per remote-tracking ref that actually moved.
 ///
-/// # #329: this used to be one entry per ref, and that was the bug
-///
-/// A single `git fetch` against an active upstream can move dozens of
-/// remote-tracking refs at once (measured: 94, on the first fetch of a repo
-/// the owner actually uses). Journaling one `ActivityKind::Fetch` per ref
-/// buried the one event a reader cared about among 94 that all say "a fetch
-/// happened" — the feed became noise exactly when a fetch did the most work.
-///
-/// The fix matches the granularity `exec_fetch`'s own response already
-/// settled on: `POST /api/fetch` never told the client "origin/main moved
-/// from X to Y" for each ref — it says "Fetched from ‘origin’: 94
-/// remote-tracking refs updated." (see `exec_fetch`'s `message`). One
-/// journal entry at that same granularity is what lets the feed say the same
-/// thing the endpoint already says, instead of reconstructing it 94 times.
-///
-/// `ref_name`/`old_oid`/`new_oid` are `None` on the journaled entry — not
-/// `Obs::Unknown` (that means "git could not be read"; here git was read
-/// fine, there is just no *one* ref this event is about) but `Obs::Absent`,
-/// same as `journal_app_event` already uses to mean "nothing here to name".
-/// This is a deliberate, scope-bounded drop of detail, not an oversight:
-/// `ActivityEvent` (`git_vista_core::activity`) has exactly one `ref_name`
-/// and one `old_oid`/`new_oid` pair — a schema shaped for "one ref moved",
-/// shared with every journal line already on disk. Widening it to carry a
-/// list of refs is a `git-vista-core` change, outside this fix's file set
-/// (journal.rs + this file), and arguably shouldn't happen here anyway: the
-/// per-ref detail is not lost, it is available for the moment it happens in
-/// `FetchSuccess::updated_refs` (the response body `exec_fetch` already
-/// returns) — a future drill-down UI has a source for it that isn't "94 rows
-/// in the activity feed". Stuffing 94 ref names into one `summary` string
-/// would just move the noise from "94 rows" to "1 unreadable row".
-///
-/// Nothing is journaled when nothing moved, so an up-to-date fetch leaves no
-/// trace — the same posture `exec_checkout` takes towards a no-op checkout.
-///
-/// # Known gap this fix does not close (outside journal.rs/fetch.rs)
-///
-/// `assemble_feed` (`git_vista_core::activity`) also reads git's own
-/// per-ref reflogs for every remote-tracking branch and de-duplicates a
-/// reflog line against a journal entry **only when their `new_oid`s match
-/// exactly**. The 94 per-ref journal entries this fix removes were, in
-/// effect, doing double duty: they were also the mechanism that made the 94
-/// per-ref reflog lines a `git fetch` writes disappear from the feed. A
-/// single aggregate journal entry has no one `new_oid`, so it cannot match
-/// any of them. Left alone, `assemble_feed` would show the 94
-/// `ActivitySource::External` reflog rows *plus* this one
-/// `ActivitySource::App` summary row — 95 rows, not 1. Fixing that needs a
-/// change in `assemble_feed` (`crates/git-vista-core/src/activity.rs`),
-/// which is not in this lane's file set; flagging it rather than reaching
-/// for it.
+/// Per ref rather than one summary entry: the activity feed is keyed on refs,
+/// and `ActivityKind::Fetch` with a `ref_name` is what lets a later view say
+/// "origin/main moved from X to Y" instead of "a fetch happened". Nothing is
+/// journaled when nothing moved, so an up-to-date fetch leaves no trace —
+/// the same posture `exec_checkout` takes towards a no-op checkout.
 async fn journal_updates(
     repo: &Path,
     remote: &RemoteName,
     updated: &[RemoteRefUpdate],
     verb: &str,
 ) {
-    if updated.is_empty() {
-        return;
+    for update in updated {
+        let short_name = update
+            .ref_name
+            .strip_prefix("refs/remotes/")
+            .unwrap_or(&update.ref_name);
+        journal_app_event(
+            repo,
+            ActivityKind::Fetch,
+            Some(update.ref_name.clone()),
+            // Observed, not read back through `Obs::from_read`: these come
+            // from the before/after listings this module took itself, so
+            // "absent" genuinely means the ref did not exist.
+            match &update.old_oid {
+                Some(oid) => Obs::Known(oid.clone()),
+                None => Obs::Absent,
+            },
+            match &update.new_oid {
+                Some(oid) => Obs::Known(oid.clone()),
+                None => Obs::Absent,
+            },
+            format!("{verb} ‘{short_name}’ from {}", remote.as_str()),
+        )
+        .await;
     }
-    journal_app_event(
-        repo,
-        ActivityKind::Fetch,
-        None,
-        Obs::Absent,
-        Obs::Absent,
-        format!(
-            "{verb} {} remote-tracking ref{} from {}",
-            updated.len(),
-            if updated.len() == 1 { "" } else { "s" },
-            remote.as_str()
-        ),
-    )
-    .await;
 }
 
 /// Journal the one fetch outcome this module cannot name: `git fetch` ran to
@@ -566,7 +528,6 @@ async fn journal_unobserved(repo: &Path, remote: &RemoteName, why: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git_vista_core::activity::ActivitySource;
 
     #[test]
     fn classification_names_the_actionable_cause() {
@@ -681,138 +642,6 @@ mod tests {
                 "some future gh: open /home/tom/.config/gh/config.yml: permission denied"
             ),
             FetchFailureKind::CredentialHelperBlocked
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // #329: journal_updates journals ONE event per fetch, not one per ref.
-    //
-    // These exercise `journal_updates` directly against a real `.git` dir
-    // (`crate::journal` requires one) rather than through the full
-    // `POST /api/fetch` pipeline — that pipeline, and the response-shape
-    // assertions for it, live in `fetch_suite.rs`, a sibling module outside
-    // this fix's file set. What belongs here is proof of the one contract
-    // this file changed: N observed ref updates in → exactly one journal
-    // entry out, naming N. A test asserting only "an event was written"
-    // would stay green under the very bug this fixes (the old per-ref
-    // `journal_updates` also wrote "an event", 94 of them) — see this
-    // module's other doc comments for that measurement — so every assertion
-    // below is about the *count* and what the surviving entry *names*, never
-    // merely its existence.
-    // -----------------------------------------------------------------------
-
-    /// A repo with a real `.git` directory, since `crate::journal::state_dir`
-    /// deliberately requires one (mirrors `journal.rs`'s own `repo()` test
-    /// helper — duplicated rather than shared because the two `#[cfg(test)]`
-    /// modules don't share a `dev-dependencies`-only test-support crate).
-    fn repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert!(std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir.path())
-            .status()
-            .expect("git runs")
-            .success());
-        dir
-    }
-
-    fn update(short_name: &str, old: Option<&str>, new: &str) -> RemoteRefUpdate {
-        RemoteRefUpdate {
-            ref_name: format!("refs/remotes/origin/{short_name}"),
-            old_oid: old.map(str::to_string),
-            new_oid: Some(new.to_string()),
-        }
-    }
-
-    /// The headline property #329 asks for: a fetch that moved N refs
-    /// journals **exactly one** `Fetch` event, and that event's payload
-    /// *names* N — not merely "an event exists". Mutating the mechanism this
-    /// protects (e.g. reverting `journal_updates` to loop-and-append one
-    /// entry per ref) must turn this red; asserting only `len() >= 1` or
-    /// only that a `Fetch`-kind entry is present would not.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_fetch_that_moves_many_refs_journals_one_event_naming_the_count() {
-        let dir = repo();
-        let remote = RemoteName::new("origin").expect("valid remote name");
-        // 94 — the exact count measured in the bug report, not a round
-        // number, so this test fails the same way the field report did if
-        // the fix regresses.
-        let updated: Vec<RemoteRefUpdate> = (0..94)
-            .map(|i| update(&format!("b{i}"), None, &format!("{i:040x}")))
-            .collect();
-
-        journal_updates(dir.path(), &remote, &updated, "fetched").await;
-
-        let entries = journal::read_all(dir.path());
-        let fetches: Vec<_> = entries
-            .iter()
-            .filter(|e| e.kind == ActivityKind::Fetch)
-            .collect();
-        assert_eq!(
-            fetches.len(),
-            1,
-            "94 moved refs must journal exactly one Fetch entry, not one per \
-             ref: {fetches:?}"
-        );
-        let entry = fetches[0];
-        assert!(
-            entry.summary.contains("94"),
-            "the entry must name how many refs moved, at the same \
-             granularity `exec_fetch`'s own response message uses: {}",
-            entry.summary
-        );
-        assert!(
-            entry.summary.contains(remote.as_str()),
-            "the entry must still say which remote: {}",
-            entry.summary
-        );
-        // No single ref_name/oid pair could honestly describe a 94-ref
-        // aggregate — see `journal_updates`'s doc comment for why this is
-        // `Obs::Absent`, not a fabricated "the first ref" or "the last ref".
-        assert_eq!(entry.ref_name, None, "{entry:?}");
-        assert_eq!(entry.old_oid, None, "{entry:?}");
-        assert_eq!(entry.new_oid, None, "{entry:?}");
-        assert_eq!(entry.source, ActivitySource::App, "{entry:?}");
-    }
-
-    /// The singular case still reads naturally ("1 remote-tracking ref", not
-    /// "1 remote-tracking refs") and still journals exactly one entry — the
-    /// aggregate isn't a special case that only kicks in above some count.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_fetch_that_moves_one_ref_journals_one_event_without_pluralizing() {
-        let dir = repo();
-        let remote = RemoteName::new("origin").expect("valid remote name");
-        let updated = vec![update("main", Some(&"0".repeat(40)), &"a".repeat(40))];
-
-        journal_updates(dir.path(), &remote, &updated, "fetched").await;
-
-        let entries = journal::read_all(dir.path());
-        let fetches: Vec<_> = entries
-            .iter()
-            .filter(|e| e.kind == ActivityKind::Fetch)
-            .collect();
-        assert_eq!(fetches.len(), 1, "{fetches:?}");
-        assert!(
-            fetches[0].summary.contains("1 remote-tracking ref "),
-            "singular ref count must not pluralize: {}",
-            fetches[0].summary
-        );
-    }
-
-    /// The paired negative, at this same direct-call layer: nothing moved →
-    /// nothing journaled. Without this, a `journal_updates` that always wrote
-    /// an entry (even an empty-summary one) would still pass the two tests
-    /// above.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_fetch_that_moves_nothing_journals_nothing() {
-        let dir = repo();
-        let remote = RemoteName::new("origin").expect("valid remote name");
-
-        journal_updates(dir.path(), &remote, &[], "fetched").await;
-
-        assert!(
-            journal::read_all(dir.path()).is_empty(),
-            "an up-to-date fetch must leave no trace in the journal"
         );
     }
 }
