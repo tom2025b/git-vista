@@ -47,6 +47,7 @@ use crate::features::dialogs::commit::{amend_offer, AmendOffer};
 use crate::features::dialogs::core::{branch_name_space_fix, Dialog, ErrorNotice};
 use crate::features::graph::core::disabled_menu_item_copy;
 use crate::features::operations::core::PendingIntent;
+use crate::features::operations::kind::rebase_item_label;
 use crate::features::shell::signals::{self as shell_state, Shell};
 use crate::features::status::core::{deletable_untracked_paths, discardable_tracked_paths};
 use crate::geometry::menu_placement;
@@ -952,12 +953,29 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
             // nothing to replay, and the item would silently target the checked-
             // out branch instead ("Rebase ‘main’ onto main?" from the stub's own
             // menu).
+            //
+            // Issue #328: the label itself must say *what* it rebases, not only
+            // `base`. This item sits in the per-commit menu next to Merge/Checkout/
+            // Undo, which all act on the commit that was clicked — Rebase is the one
+            // exception, and a bare "Rebase onto {base}" read as if it were another
+            // one, so a click here silently ignored the clicked commit and rebased
+            // the checked-out branch instead. `rebase_item_label` (kind.rs, host-
+            // tested) restates the same subject the confirm dialog already names
+            // afterward, one step earlier — visible before the click, not only in
+            // the modal that follows it. Chose this over moving the item to a
+            // repo-scoped surface (option 2) because no such surface exists yet in
+            // this app (checked: no toolbar/header component, nothing else calls
+            // this "repo-scoped") and building one is out of this lane's file set;
+            // over a real per-commit rebase (option 1) because that needs a new
+            // operation variant, planner support and its own risk classification —
+            // too large for a menu-label fix.
             let rebase_item = (!m.is_branch).then(|| {
                 let status = rebase_status.get().flatten();
                 let base = status
                     .as_ref()
                     .map_or_else(|| "main".to_string(), |s| s.base.clone());
-                let label = format!("Rebase onto {base}");
+                let branch = status.as_ref().and_then(|s| s.branch.clone());
+                let label = rebase_item_label(branch.as_deref(), &base);
                 let reason = status.as_ref().and_then(|s| {
                     if s.branch.is_none() {
                         Some("HEAD is detached — no branch to rebase".to_string())

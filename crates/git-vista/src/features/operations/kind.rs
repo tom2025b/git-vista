@@ -123,6 +123,35 @@ fn file_count(n: usize) -> String {
     }
 }
 
+/// The per-commit menu's "Rebase" item label (Issue #328).
+///
+/// Every other item in that menu — Merge, Checkout, Undo — acts on the node
+/// the user clicked. Rebase never has: it always replays the *checked-out*
+/// branch onto `base` (see [`OperationKind::Rebase`]'s doc comment), which
+/// the confirm dialog already states correctly ("Rebase 'main' onto
+/// origin/main?", `dialogs/confirm.rs`). The bug wasn't the rebase itself —
+/// it was that the menu item's own label, built before the confirm dialog
+/// ever opens, read as plain "Rebase onto {base}" with no subject at all, so
+/// a user who clicked a specific commit had no way to tell — before
+/// clicking — that the item would ignore that commit entirely. This
+/// restates the same subject the confirm dialog names, one step earlier, so
+/// the scope is visible before the click rather than only after it.
+///
+/// `branch` is `None` for two situations the caller can't yet distinguish
+/// at label-build time: the live `/api/rebase-status` fetch hasn't resolved
+/// yet (menu.rs's `rebase_status` resource starts `None` and the item stays
+/// enabled while loading), or HEAD is detached (a case menu.rs disables the
+/// item for separately, once the fetch *has* resolved). Either way "the
+/// current branch" is the honest word for the label to use: it doesn't
+/// invent a name it doesn't have, and it still states scope up front instead
+/// of implying "this commit" the way the bare `Some(base)`-only label did.
+pub fn rebase_item_label(branch: Option<&str>, base: &str) -> String {
+    match branch {
+        Some(b) => format!("Rebase \u{2018}{b}\u{2019} onto {base}"),
+        None => format!("Rebase current branch onto {base}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +244,44 @@ mod tests {
         }
         .describe();
         assert!(two.contains("2 files"), "{two}");
+    }
+
+    /// Issue #328: the menu item must name its subject (the checked-out
+    /// branch) before the click, matching what the confirm dialog already
+    /// says afterward. A mutation back to the old `format!("Rebase onto
+    /// {base}")` — dropping the branch name entirely — would leave this
+    /// failing on the exact-equality check, not just a substring probe, so
+    /// it can't survive by accident.
+    #[test]
+    fn rebase_label_names_the_checked_out_branch_before_the_click() {
+        assert_eq!(
+            rebase_item_label(Some("feature"), "origin/main"),
+            "Rebase \u{2018}feature\u{2019} onto origin/main"
+        );
+    }
+
+    /// Detached HEAD, or the live status fetch simply hasn't resolved yet —
+    /// either way the label must still say the item acts on a branch, not on
+    /// whatever commit was clicked. This is the case the original bug shipped
+    /// in: `rebase_status` starts `None` on every menu open, so the very
+    /// first render of this item always takes this branch of the label.
+    #[test]
+    fn rebase_label_states_scope_even_without_a_resolved_branch_name() {
+        let label = rebase_item_label(None, "main");
+        assert_eq!(label, "Rebase current branch onto main");
+        assert!(
+            label.contains("current branch"),
+            "label must name its subject even when the branch name isn't \
+             known yet: {label}"
+        );
+    }
+
+    /// The two arms must actually differ — proves the branch argument is
+    /// read, not a shared template that ignores it.
+    #[test]
+    fn rebase_label_known_and_unknown_branch_are_not_the_same_string() {
+        let known = rebase_item_label(Some("main"), "origin/main");
+        let unknown = rebase_item_label(None, "origin/main");
+        assert_ne!(known, unknown);
     }
 }
