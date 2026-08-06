@@ -790,6 +790,31 @@ pub fn mode_button_label(mode: RepoMode, opening: Option<RepoMode>) -> &'static 
     }
 }
 
+/// The "Pull" context-menu item's label (#325 follow-up): unlike its `Rebase
+/// onto {base}` sibling, Pull named no subject at all — a bare "Pull" gave no
+/// hint which branch or remote a tap would act on. `menu.rs` already reads a
+/// live checked-out-branch name for `rebase_item` (`RebaseStatus::branch`,
+/// fetched by `fetch_rebase_status()` under the same `!m.is_branch` gate Pull
+/// itself renders behind) — reusing that signal here costs no new endpoint or
+/// poll. `branch` is `None` while the resource is still loading, or on a
+/// genuinely detached HEAD; the label degrades to naming just the remote
+/// rather than showing nothing or a placeholder. `remote` is passed in rather
+/// than hardcoded so a future remote picker doesn't have to touch this
+/// function again — today `menu.rs`'s only caller always passes `"origin"`,
+/// the same static value `fetch_item`'s confirm dialog uses. Pure so the
+/// wasm-only view (which cannot itself be host-tested) supplies `branch`/
+/// `remote` and this function only composes the string — the same split
+/// `disabled_menu_item_copy` and `print_button_copy` above use. Wording
+/// mirrors `dialogs/confirm.rs`'s own "Pull '{branch}' from '{remote}'..."
+/// prompt for the same operation, so the menu names what the confirm dialog
+/// is about to ask.
+pub fn pull_label(branch: Option<&str>, remote: &str) -> String {
+    match branch {
+        Some(b) => format!("Pull ‘{b}’ from ‘{remote}’"),
+        None => format!("Pull from ‘{remote}’"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1603,6 +1628,35 @@ mod tests {
         let clicked = mode_button_label(RepoMode::Active, Some(RepoMode::Active));
         assert!(clicked.contains("opening"));
         assert!(clicked.contains("Active"));
+    }
+
+    /// #325 follow-up: pins Pull's label to actually name the branch once
+    /// one is known, the same shape
+    /// `print_button_copy_surfaces_a_visible_reason_when_disabled` pins for
+    /// Print Graph above — the two labels must differ, or the branch never
+    /// reached the string.
+    #[test]
+    fn pull_label_names_the_branch_when_known() {
+        let with_branch = pull_label(Some("feature/x"), "origin");
+        let without_branch = pull_label(None, "origin");
+        assert_ne!(
+            with_branch, without_branch,
+            "the branch must show up in the label — otherwise every Pull \
+             item reads identically regardless of what's checked out"
+        );
+        assert!(with_branch.contains("feature/x"));
+        assert!(with_branch.contains("origin"));
+    }
+
+    #[test]
+    fn pull_label_falls_back_to_the_remote_when_branch_is_unknown() {
+        let label = pull_label(None, "origin");
+        assert_eq!(
+            label, "Pull from ‘origin’",
+            "while `rebase_status` is still loading (or HEAD is detached) \
+             the label degrades to naming just the remote, never a blank or \
+             placeholder subject"
+        );
     }
 
     /// Paired negative: proves the property above is not vacuous by showing
