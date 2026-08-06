@@ -282,10 +282,11 @@ mod tests {
                 "/api/boom",
                 get(|| async { (StatusCode::NOT_FOUND, "No such commit.") }),
             )
-            // #323: a handler that *hand-serializes* its own JSON body. The
-            // real `/api/amend-commit` refusal path, reached through this
-            // layer rather than by calling the planner function directly —
-            // which is precisely the gap that let the defect sit unnoticed.
+            // #323: the real `/api/amend-commit` refusal constructor,
+            // reached through this layer rather than by calling it directly
+            // — the gap that let the double-encoding defect sit unnoticed
+            // before the fix (see
+            // `a_hand_serialized_refusal_is_not_double_encoded` below).
             .route(
                 "/api/amend-refusal",
                 get(|| async {
@@ -398,15 +399,27 @@ mod tests {
     /// object, not as an `ApiError` envelope with the real payload buried in
     /// its `message` field as an escaped string.
     ///
-    /// `amend_refusal` builds an `AmendCommitError` and serializes it itself,
-    /// returning a `String` — which axum labels `text/plain`. `rewrap_error`
-    /// keys on content-type, sees a non-JSON body, and wraps it. The endpoint's
-    /// documented contract ("**every** 400 body from this route parses as
-    /// `AmendCommitError`") is then false at the wire.
+    /// Fixed by giving the amend route a JSON-typed response end to end
+    /// rather than teaching the middleware to sniff bodies:
+    /// `planner::amend_refusal` (the handler-level constructor) now builds
+    /// the `Response` directly via `axum::Json`, so it carries a real
+    /// `application/json` content-type and `rewrap_error`'s `is_json` check
+    /// passes it through untouched. `exec_amend_commit`'s own callers keep
+    /// the old `(StatusCode, String)` shape through the new
+    /// `planner::amend_refusal_body` sibling (that channel is a *prose*
+    /// channel by design elsewhere — `unmet_at_build` returns a sentence,
+    /// `exec_stage_all` returns "Staged changes." — so widening it crate-wide
+    /// would be wrong); `handlers::commit::amend_route_response` re-labels
+    /// that channel's output as JSON at the final hop instead, only when the
+    /// body actually is a JSON object — the shared pipeline `plan_and_execute`
+    /// runs before `exec_amend_commit` can still answer with its own prose
+    /// (read-only, idempotency, staleness-gate refusals), which must reach
+    /// this same route's client still labeled `text/plain` so `rewrap_error`
+    /// keeps enveloping it correctly.
     ///
     /// This can only be seen through the layer. The existing contract-suite
-    /// test calls the planner function directly, so it agrees with the
-    /// docstring and misses the defect entirely.
+    /// test calls the planner function directly, so it agreed with the old
+    /// docstring and missed the defect entirely — this is that missing leg.
     #[tokio::test]
     async fn a_hand_serialized_refusal_is_not_double_encoded() {
         let resp = app()
