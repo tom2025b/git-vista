@@ -84,9 +84,9 @@ pub use dto::{
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use history::{HistoryFrame, HistoryPage};
 pub use operation::{
-    IdempotencyKey, OperationId, OperationStage, OperationState, OperationStatus, ProgressEvent,
-    TransferPhase, TransferProgress, MAX_IDEMPOTENCY_KEY_LEN, MAX_OPERATION_ID_LEN, PROGRESS_EVENT,
-    RESULT_EVENT,
+    IdempotencyKey, OperationByKeyResponse, OperationId, OperationStage, OperationState,
+    OperationStatus, ProgressEvent, TransferPhase, TransferProgress, MAX_IDEMPOTENCY_KEY_LEN,
+    MAX_OPERATION_ID_LEN, PROGRESS_EVENT, RESULT_EVENT,
 };
 pub use patch_build::{build_selected_patch, canonical_path, SelectedPatch, SelectionMismatch};
 pub use patch_plan::{

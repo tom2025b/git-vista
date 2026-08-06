@@ -294,6 +294,24 @@ pub struct ProgressEvent {
     pub progress: Option<TransferProgress>,
 }
 
+/// The response of `GET /api/operations/by-key/{key}` (M2.20f, #232): the
+/// [`OperationId`] admitted for one idempotency key, so a client can learn its
+/// operation's id *while the operation is still running* rather than only
+/// from the [`OPERATION_HEADER`](crate::version::OPERATION_HEADER) on the
+/// tracked write's own response — which does not answer until the operation
+/// is already terminal (`plan_and_execute_tracked` ends with
+/// `record.wait_terminal().await`). A client fires its write, then polls this
+/// route with the same key it already minted, and binds its cancel button /
+/// progress stream / reload-recovery state to the id the moment this answers,
+/// instead of only after the transfer is over.
+///
+/// A response DTO, so no `deny_unknown_fields` (M1.02 additive rule).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationByKeyResponse {
+    /// The id admitted for the key named in the request path.
+    pub id: OperationId,
+}
+
 /// The SSE `event:` name carrying a [`ProgressEvent`].
 pub const PROGRESS_EVENT: &str = "progress";
 
@@ -416,6 +434,22 @@ mod tests {
             .unwrap()
             .insert("something_new".into(), serde_json::json!(true));
         assert!(serde_json::from_value::<OperationStatus>(value).is_ok());
+    }
+
+    /// M2.20f (#232): the by-key response round-trips, and its wire shape is
+    /// just the bare id — a client polling before an operation finishes needs
+    /// nothing else from this route.
+    #[test]
+    fn operation_by_key_response_round_trips() {
+        let r = OperationByKeyResponse {
+            id: OperationId::new("op_0123456789abcdef").unwrap(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(json, r#"{"id":"op_0123456789abcdef"}"#);
+        assert_eq!(
+            serde_json::from_str::<OperationByKeyResponse>(&json).unwrap(),
+            r
+        );
     }
 
     #[test]

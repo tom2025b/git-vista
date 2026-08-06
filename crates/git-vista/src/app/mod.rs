@@ -208,6 +208,14 @@ pub fn App() -> impl IntoView {
     // change (acceptance criterion 2).
     let operations_core = create_rw_signal(OperationsCore::default());
     let operations = Operations::new(operations_core, graph);
+    // #232, M2.20f: resume watching a Fetch/Pull that was still in flight
+    // when this tab reloaded or was suspended and resumed — before
+    // anything else reads `operations_core`, so `menu.rs`'s
+    // `remote_op_running` gate (which disables Fetch/Pull, with a reason,
+    // while either is in flight) sees the resumed entry from the first
+    // render, rather than a render-or-two where the resumed op is real but
+    // the menu still offers a second one.
+    operations.resume_from_storage();
 
     // The history signals the App owns (M1.10, #63). `print_graph_open` opens the
     // full static print view (crate::print) from the topbar; `history_complete`
@@ -405,6 +413,20 @@ pub fn App() -> impl IntoView {
     // this is where Task 6's deferred "move the overlay signals out of canvas scope" step
     // actually lands, rather than migrating them twice.
     let shell = Shell::new(activity);
+
+    // #232 follow-up: give `operations` the handles it needs to put its own
+    // failures on screen. It is created ~200 lines above this, deliberately —
+    // above `graph_canvas`, so an in-flight write survives the epoch bump its
+    // completion causes (M1.11) — but `Shell` and `Dialogs` cannot exist that
+    // early, so the wiring is a second step rather than a constructor argument.
+    //
+    // Without this line every refusal `Operations::cancel` receives (offline,
+    // an evicted id, either 409, a dropped tunnel) reaches the browser console
+    // and nobody else: the user taps Cancel on a stalled fetch and gets
+    // silence. The review that caught it found the sink installed nowhere at
+    // all — a finished feature shipped inert because its one wiring line fell
+    // between two work boundaries, and no test could see it.
+    operations.install_error_sink(shell, dialogs_guard);
 
     // The window's current layout mode (M1.12, #65). Created here, not in
     // graph_canvas, for the same reason `shell` is: an epoch bump's rebuild must

@@ -34,6 +34,12 @@ const COMMIT_MODAL: &str = include_str!("../../dialogs/commit.rs");
 /// `cargo test --workspace` never compiles a line of it either. It owns the
 /// amend state that #225's ceremony rests on.
 const DIALOG_SIGNALS: &str = include_str!("../dialogs/signals.rs");
+/// The operations status strip (M1.11, #64; the Cancel button and its live
+/// region are #232, M2.20f). `#[cfg(target_arch = "wasm32")]` upstream
+/// (`features/operations/mod.rs`), so `cargo test --workspace` never
+/// compiles a line of it either — same reason `DIALOG_SIGNALS` above is
+/// read as source text rather than exercised directly.
+const OPERATIONS_VIEW: &str = include_str!("../operations/view.rs");
 
 fn stylesheet() -> Vec<Rule> {
     parse(STYLES)
@@ -260,6 +266,12 @@ const INTERACTIVE_CENSUS: &[(&str, bool)] = &[
     // `features::diff::selection`'s module doc for why they're split.
     (".stage-hunk-text", true),
     (".stage-hunk-check", true),
+    // The Fetch/Pull cancel button in the operations status strip (#232):
+    // used to be inline-styled like its neighbouring Dismiss button,
+    // which made it invisible to this census (`interactive_selectors` can
+    // only see CSS selectors) — given its own class specifically to close
+    // that gap, and picked up the shared #65 44x44 rule at the same time.
+    (".op-cancel-btn", true),
 ];
 
 #[test]
@@ -441,6 +453,44 @@ fn node_hit_padding_still_matches_the_render_code() {
              now wrong (#65)"
         );
     }
+}
+
+// ── Operations status strip (#232, M2.20f) ──────────────────────────────────────
+
+/// The Cancel button is a real interactive control with a per-row
+/// accessible name, not a decoration: `aria-label` names the operation it
+/// targets, so a screen reader hears "Cancel: Fetching 'origin'" rather
+/// than the bare word "Cancel" repeated once per in-flight row when more
+/// than one write is running at once.
+#[test]
+fn the_operations_cancel_button_carries_an_accessible_label() {
+    assert!(
+        OPERATIONS_VIEW.contains("aria-label=format!(\"Cancel: {what}\")"),
+        "features/operations/view.rs's Cancel button lost its per-row \
+         accessible name — without it every Cancel button in a multi-\
+         operation strip reads identically to a screen reader (#232)"
+    );
+}
+
+/// The in-flight row is a live region: a Cancel tap's "cancelling…" text,
+/// and every stage transition before it, must reach a screen reader
+/// without the user re-focusing the strip — the a11y face of #232's own
+/// acceptance criterion that a cancel produces a *visible* state change,
+/// not a silent one.
+#[test]
+fn the_inflight_operation_row_is_an_announced_live_region() {
+    assert!(
+        OPERATIONS_VIEW.contains("role=\"status\""),
+        "features/operations/view.rs's in-flight row has no `role=\"status\"` \
+         — a screen reader has no reason to announce its stage or progress \
+         text changing (#232)"
+    );
+    assert!(
+        OPERATIONS_VIEW.contains("aria-live=\"polite\""),
+        "features/operations/view.rs's in-flight row is missing \
+         `aria-live=\"polite\"` — without it a stage change or a cancel \
+         request updates the DOM silently (#232)"
+    );
 }
 
 // ── Reduced motion ──────────────────────────────────────────────────────────────
