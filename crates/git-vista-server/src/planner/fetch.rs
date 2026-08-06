@@ -93,11 +93,13 @@ pub(super) fn classify_failure(stderr: &str) -> FetchFailureKind {
     // helper" — advice that is false here, since one is configured. `gh`'s
     // crash text is the more specific, and more true, signal, so it is
     // checked first and wins.
-    // Two independent markers: gh's own Cobra-wrapper crash text (stable
-    // across the versions checked, but a future `gh` release could reword
-    // it), and the underlying mechanism — the excluded directory's name next
-    // to a permission refusal — which stays true regardless of gh's wording
-    // as long as the sandbox is what is doing the excluding.
+    //
+    // Two independent markers, checked together: `gh`'s own Cobra-wrapper
+    // crash text (stable across the version checked, `2.63.2`, but a future
+    // release could reword it), and the underlying mechanism — the excluded
+    // directory's name next to a permission refusal — which stays true
+    // regardless of `gh`'s wording as long as the sandbox is what is doing
+    // the excluding.
     if s.contains("failed to create root command")
         || (s.contains(".config/gh") && s.contains("permission denied"))
     {
