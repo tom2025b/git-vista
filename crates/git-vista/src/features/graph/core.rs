@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use git_vista_core::model::{Edge, FrameStub, GitRef, GraphRow, Oid};
-use git_vista_protocol::{GenerationToken, HistoryFrame, HistoryPage};
+use git_vista_protocol::{GenerationToken, HistoryFrame, HistoryPage, RepoMode};
 
 use crate::geometry::{node_cx, LABEL_GAP, ROW_HEIGHT};
 
@@ -768,6 +768,26 @@ pub fn print_button_copy(complete: bool) -> (&'static str, &'static str) {
 /// test can pin.
 pub fn disabled_menu_item_copy(label: &str, reason: &str) -> (String, String) {
     (format!("{label}: {reason}"), reason.to_string())
+}
+
+/// The picker's Visualize/Active button label for a given `mode` while
+/// `opening` tracks which mode (if any) is mid-request (#244 follow-up).
+///
+/// Before this, both buttons bound to one shared `busy` flag: click either
+/// one and BOTH went inert with no visual change, for up to two minutes on a
+/// slow retry (`send_write_with_key`'s 60s-times-two design). Indistinguishable
+/// from the app being broken. Now only the clicked button's label changes —
+/// the other stays disabled but keeps its normal wording, since it isn't the
+/// one doing anything. Pure so the mapping is testable without a DOM: the
+/// view (wasm-only, `picker.rs`) supplies `mode`/`opening` and renders the
+/// string as-is.
+pub fn mode_button_label(mode: RepoMode, opening: Option<RepoMode>) -> &'static str {
+    match (mode, opening) {
+        (RepoMode::Visualize, Some(RepoMode::Visualize)) => "Visualize — opening…",
+        (RepoMode::Visualize, _) => "Visualize — look only, with links out",
+        (RepoMode::Active, Some(RepoMode::Active)) => "Active — opening…",
+        (RepoMode::Active, _) => "Active — full git operations",
+    }
 }
 
 #[cfg(test)]
@@ -1541,6 +1561,48 @@ mod tests {
             "the visible second line is the reason verbatim — this is what a \
              finger sees without needing hover"
         );
+    }
+
+    // #244 follow-up: both picker buttons used to share one `busy` flag, so
+    // clicking either went inert with no visible change for up to two minutes
+    // on a slow retry — indistinguishable from a broken app. The clicked
+    // button must show distinct "opening…" wording; the other button, if
+    // reverted to always return the plain label regardless of `opening`,
+    // fails the first assertion here.
+    #[test]
+    fn mode_button_label_shows_opening_only_for_the_clicked_button() {
+        let clicked = mode_button_label(RepoMode::Visualize, Some(RepoMode::Visualize));
+        let idle = mode_button_label(RepoMode::Visualize, None);
+        assert_ne!(
+            clicked, idle,
+            "the clicked button's label must change while its request is in \
+             flight — a silently-disabled button reads as a broken app"
+        );
+        assert!(
+            clicked.contains("opening"),
+            "the in-flight label should say what's happening, not just differ"
+        );
+    }
+
+    #[test]
+    fn mode_button_label_leaves_the_other_button_alone() {
+        // Visualize was clicked (opening = Some(Visualize)); Active's label
+        // must stay its normal wording, not also claim to be opening.
+        let other = mode_button_label(RepoMode::Active, Some(RepoMode::Visualize));
+        let idle = mode_button_label(RepoMode::Active, None);
+        assert_eq!(
+            other, idle,
+            "only the button the user actually clicked should announce \
+             itself as opening — the other one is just disabled"
+        );
+        assert!(!other.contains("opening"));
+    }
+
+    #[test]
+    fn mode_button_label_covers_the_active_button_too() {
+        let clicked = mode_button_label(RepoMode::Active, Some(RepoMode::Active));
+        assert!(clicked.contains("opening"));
+        assert!(clicked.contains("Active"));
     }
 
     /// Paired negative: proves the property above is not vacuous by showing
