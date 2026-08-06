@@ -231,6 +231,19 @@ const JOURNAL_MATCH_SLACK: i64 = 5;
 /// and new oid to count as the same movement (one `git commit` logs on both).
 const HEAD_MATCH_SLACK: i64 = 2;
 
+/// The largest gap (seconds) between two consecutive `Fetch` events that still
+/// counts as *one* fetch. One `git fetch` updates every stale remote-tracking
+/// ref, and both sources record it per-ref: the app journals one entry per ref
+/// it watched change, and git writes one reflog line per ref. The ref-update
+/// phase is fast but not instantaneous, so a burst chains by gap rather than
+/// sitting inside a fixed window — 94 refs spanning several seconds is still
+/// one burst, while two fetches half a minute apart are two.
+///
+/// The cost of the heuristic, stated plainly: two *deliberate* fetches within
+/// five seconds of each other read as one. That is the same trade the rebase
+/// coalescing makes, and it errs toward the reading a person would give it.
+const FETCH_BURST_GAP: i64 = 5;
+
 /// Fold the journal and the raw reflogs into the final feed: parse, coalesce
 /// rebases, collapse HEAD/branch duplicates, attribute app events, attach undo
 /// hints, sort newest-first, cap at `limit`.
@@ -340,16 +353,145 @@ pub fn assemble_feed(
 
     events.extend(journal);
 
-    // -- 4. Undo hints, computed against the repo's *current* state. ---------
+    // -- 4. Fold a burst of remote-tracking ref updates into one row. --------
+    // One `git fetch` is one user action with one outcome they care about
+    // ("N refs updated"), but it lands one entry per updated ref in *both*
+    // sources. #329: a fetch of 94 refs put 94 rows in the feed and buried the
+    // revert the user was actually looking for. A pull floods the same way,
+    // with one row that must survive — see [`fold_ref_update_bursts`].
+    let mut events = fold_ref_update_bursts(events, branches);
+
+    // -- 5. Undo hints, computed against the repo's *current* state. ---------
     for event in &mut events {
         event.undo = undo_hint(event, branches, remote);
     }
 
-    // -- 5. Newest first, capped. sort_by_key is stable, so same-second -------
+    // -- 6. Newest first, capped. sort_by_key is stable, so same-second -------
     // events keep their source order (reflog order within a ref).
     events.sort_by_key(|e| std::cmp::Reverse(e.time));
     events.truncate(limit);
     events
+}
+
+/// True when this event's ref is a *local branch* rather than a
+/// remote-tracking ref — the distinction [`fold_ref_update_bursts`] turns on.
+///
+/// The two sources spell refs differently: the journal writes them in full
+/// (`refs/heads/main`, `refs/remotes/origin/main`) and reflog entries carry the
+/// short name (`main`, `origin/main`). A short name is ambiguous on its face —
+/// a local branch may legitimately be called `origin/main` — so it is resolved
+/// against the repo's *actual* branch list rather than by guessing at the
+/// slash.
+fn names_a_local_branch(ref_name: Option<&str>, branches: &HashMap<String, String>) -> bool {
+    let Some(name) = ref_name else {
+        return false;
+    };
+    // A full ref path answers for itself, whether or not the branch still
+    // exists; only the short form needs the branch list to disambiguate.
+    if name.starts_with("refs/heads/") {
+        return true;
+    }
+    if name.starts_with("refs/remotes/") {
+        return false;
+    }
+    branches.contains_key(name)
+}
+
+/// Collapse each run of remote-tracking ref updates — [`ActivityKind::Fetch`]
+/// and [`ActivityKind::Pull`] — that happened within [`FETCH_BURST_GAP`] of one
+/// another into a single counted row.
+///
+/// Deliberately here rather than at the write path: a fetch run from the
+/// terminal has reflog lines and no journal entry at all, so an operation id
+/// stamped by the app could never group it. Folding both sources in the pure
+/// core covers the app's fetches and everyone else's with one rule.
+///
+/// **A pull's own branch movement is never folded.** Probed against real git:
+/// one `git pull` writes `pull: Fast-forward` on the local branch *and*
+/// `pull: fast-forward` on every updated remote-tracking ref. Those parse to
+/// the same kind, but they do not mean the same thing — the branch move is the
+/// entire point of a pull and the remote-ref updates are its bookkeeping. Only
+/// the bookkeeping folds. (Git's own hint here is the capital letter on
+/// `Fast-forward`; keying on that would be far too fragile, so the local branch
+/// list decides — see [`names_a_local_branch`].)
+///
+/// A run of one is returned untouched — a single-ref fetch already says the
+/// useful thing ("fetched ‘origin/main’ from origin") and rewriting it as
+/// "1 ref updated" would lose information to no purpose. That is also what
+/// keeps the "tips unknown — git could not be read" entry intact: it is
+/// journaled *instead of* per-ref entries, never alongside them, so it is
+/// always a run of one.
+///
+/// **Safe for undo by construction, not by luck:** [`undo_hint`] has no arm for
+/// `Fetch` or `Pull`, so neither row has ever carried a hint and dropping the
+/// per-ref oids cannot take one away. The same fold would be *wrong* for, say,
+/// `BranchDeleted`, whose `old_oid` is precisely what its undo needs.
+fn fold_ref_update_bursts(
+    events: Vec<ActivityEvent>,
+    branches: &HashMap<String, String>,
+) -> Vec<ActivityEvent> {
+    let (candidates, mut out): (Vec<_>, Vec<_>) = events.into_iter().partition(|e| {
+        matches!(e.kind, ActivityKind::Fetch | ActivityKind::Pull)
+            && !names_a_local_branch(e.ref_name.as_deref(), branches)
+    });
+
+    // Fetch and Pull group separately: they are different actions, and a fetch
+    // immediately followed by a pull is two of them.
+    let (fetches, pulls): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|e| e.kind == ActivityKind::Fetch);
+    fold_one_kind(&mut out, fetches, "fetch");
+    fold_one_kind(&mut out, pulls, "pull");
+    out
+}
+
+/// Fold one kind's bursts into `out`. `noun` names the action in the counted
+/// summary ("fetch — 94 refs updated").
+fn fold_one_kind(out: &mut Vec<ActivityEvent>, mut group: Vec<ActivityEvent>, noun: &str) {
+    // Group by time, independent of where these sat among other events.
+    group.sort_by_key(|e| std::cmp::Reverse(e.time));
+
+    let mut rest = group.into_iter().peekable();
+    while let Some(first) = rest.next() {
+        let mut refs = 1usize;
+        let mut previous = first.time;
+        let mut by_app = first.source == ActivitySource::App;
+        while let Some(next) = rest.peek() {
+            // Descending, so this is a non-negative gap to the older entry.
+            if previous - next.time > FETCH_BURST_GAP {
+                break;
+            }
+            previous = next.time;
+            by_app |= next.source == ActivitySource::App;
+            refs += 1;
+            rest.next();
+        }
+        if refs == 1 {
+            out.push(first);
+            continue;
+        }
+        out.push(ActivityEvent {
+            time: first.time,
+            kind: first.kind,
+            // No single ref: the row is about the action, not about any one of
+            // the refs it moved. The per-ref detail stays in the reflog, which
+            // is where a reader who wants it can still see it.
+            ref_name: None,
+            summary: format!("{noun} — {refs} refs updated"),
+            // The tips are per-ref and there were many; asserting either here
+            // would be inventing one.
+            old_oid: None,
+            new_oid: None,
+            // Attributed to the app if the app performed any part of it — a
+            // burst is one action, and the app either ran it or it did not.
+            source: if by_app {
+                ActivitySource::App
+            } else {
+                ActivitySource::External
+            },
+            undo: None,
+        });
+    }
 }
 
 /// The undo hint for one event, if it's still undoable *now*:
@@ -734,5 +876,172 @@ mod tests {
         assert_eq!(feed.len(), 2);
         assert_eq!(feed[0].summary, "three");
         assert_eq!(feed[1].summary, "two");
+    }
+
+    /// Build the exact shape one `git fetch` leaves behind: the app journals
+    /// one entry per ref it watched change, and git writes one reflog line per
+    /// remote-tracking ref, at the same moment with the same resulting oid.
+    fn fetch_of(refs: &[&str], time: i64) -> (Vec<ActivityEvent>, Vec<ReflogEntry>) {
+        let journal = refs
+            .iter()
+            .map(|r| ActivityEvent {
+                time,
+                kind: ActivityKind::Fetch,
+                ref_name: Some(format!("refs/remotes/origin/{r}")),
+                summary: format!("fetched ‘origin/{r}’ from origin"),
+                old_oid: Some(format!("old-{r}")),
+                new_oid: Some(format!("new-{r}")),
+                source: ActivitySource::App,
+                undo: None,
+            })
+            .collect();
+        let reflog = refs
+            .iter()
+            .map(|r| {
+                entry(
+                    &format!("origin/{r}"),
+                    time,
+                    &format!("old-{r}"),
+                    &format!("new-{r}"),
+                    "fetch origin: fast-forward",
+                )
+            })
+            .collect();
+        (journal, reflog)
+    }
+
+    #[test]
+    fn one_fetch_is_one_row_however_many_refs_moved() {
+        // #329: a fetch that updated 94 remote-tracking refs put 94 rows in the
+        // feed and buried the one revert the user actually cared about. One
+        // user action, one outcome they care about ("N refs updated"), one row.
+        let (journal, reflog) = fetch_of(&["main", "dev", "topic", "release"], 100);
+        let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 50);
+
+        let fetches: Vec<_> = feed
+            .iter()
+            .filter(|e| e.kind == ActivityKind::Fetch)
+            .collect();
+        assert_eq!(fetches.len(), 1, "one fetch is one row, got {feed:#?}");
+        assert_eq!(fetches[0].summary, "fetch — 4 refs updated");
+        assert_eq!(
+            fetches[0].source,
+            ActivitySource::App,
+            "the app performed it, so the row is attributed to the app"
+        );
+        assert_eq!(
+            fetches[0].ref_name, None,
+            "a multi-ref row is about no single ref"
+        );
+        assert_eq!(feed.len(), 1, "nothing else invented: {feed:#?}");
+    }
+
+    #[test]
+    fn a_fetch_that_moved_one_ref_keeps_its_own_words() {
+        // The common case must not be flattened into the counted phrasing: a
+        // single-ref fetch already says the useful thing.
+        let (journal, reflog) = fetch_of(&["main"], 100);
+        let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 1, "one fetch, one row: {feed:#?}");
+        assert_eq!(feed[0].summary, "fetched ‘origin/main’ from origin");
+        assert_eq!(
+            feed[0].ref_name.as_deref(),
+            Some("refs/remotes/origin/main"),
+            "one ref moved, so the row still names it"
+        );
+    }
+
+    #[test]
+    fn two_separate_fetches_stay_two_rows() {
+        // Folding groups a burst, not the kind. Two fetches minutes apart are
+        // two user actions and must not collapse into each other.
+        let (mut journal, mut reflog) = fetch_of(&["main", "dev"], 100);
+        let (j2, r2) = fetch_of(&["topic", "release"], 400);
+        journal.extend(j2);
+        reflog.extend(r2);
+
+        let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 50);
+        let fetches: Vec<_> = feed
+            .iter()
+            .filter(|e| e.kind == ActivityKind::Fetch)
+            .collect();
+        assert_eq!(fetches.len(), 2, "two actions, two rows: {feed:#?}");
+        assert_eq!(fetches[0].time, 400, "newest first");
+        assert_eq!(fetches[1].time, 100);
+    }
+
+    #[test]
+    fn a_fetch_burst_does_not_swallow_the_events_around_it() {
+        // The whole point of #329: the flood buried an undoable revert. The
+        // fold must leave every non-fetch event of that moment untouched.
+        let (mut journal, reflog) = fetch_of(&["main", "dev", "topic"], 100);
+        journal.push(ActivityEvent {
+            time: 100,
+            kind: ActivityKind::Revert,
+            ref_name: Some("main".into()),
+            summary: "reverted ‘bad commit’".into(),
+            old_oid: Some("a".into()),
+            new_oid: Some("b".into()),
+            source: ActivitySource::App,
+            undo: None,
+        });
+
+        let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 50);
+        assert_eq!(feed.len(), 2, "one fetch row + the revert: {feed:#?}");
+        assert!(feed
+            .iter()
+            .any(|e| e.kind == ActivityKind::Revert && e.summary == "reverted ‘bad commit’"));
+        assert!(feed
+            .iter()
+            .any(|e| e.kind == ActivityKind::Fetch && e.summary == "fetch — 3 refs updated"));
+    }
+
+    #[test]
+    fn a_pull_folds_its_ref_updates_but_keeps_the_branch_move() {
+        // #329 asked whether Pull has the same shape. Probed against real git:
+        // one `git pull` writes "pull: Fast-forward" on the local branch AND
+        // "pull: fast-forward" on every updated remote-tracking ref — same
+        // flood, but with one row that must survive. The branch move is the
+        // whole point of a pull; only the remote-ref updates are noise.
+        let reflog = vec![
+            entry("main", 100, "a", "b", "pull: Fast-forward"),
+            entry("origin/main", 100, "a", "b", "pull: fast-forward"),
+            entry("origin/feat-a", 100, "p", "q", "pull: fast-forward"),
+            entry("origin/feat-b", 100, "r", "s", "pull: fast-forward"),
+            entry("origin/feat-c", 100, "t", "u", "pull: fast-forward"),
+        ];
+        let branches = HashMap::from([("main".to_string(), "b".to_string())]);
+        let feed = assemble_feed(vec![], reflog, &branches, &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 2, "branch move + one counted row: {feed:#?}");
+        let branch_move = feed
+            .iter()
+            .find(|e| e.ref_name.as_deref() == Some("main"))
+            .expect("the branch move survives the fold");
+        assert_eq!(branch_move.summary, "pull: Fast-forward");
+        assert_eq!(branch_move.new_oid.as_deref(), Some("b"));
+        assert!(
+            feed.iter()
+                .any(|e| e.summary == "pull — 4 refs updated" && e.ref_name.is_none()),
+            "the four remote-tracking updates fold: {feed:#?}"
+        );
+    }
+
+    #[test]
+    fn a_terminal_fetch_folds_too_even_with_no_journal() {
+        // A fetch run outside the app has reflog lines and no journal entry —
+        // the case an operation-id scheme could never cover, and the reason the
+        // fold lives here rather than in the write path.
+        let (_, reflog) = fetch_of(&["main", "dev", "topic"], 100);
+        let feed = assemble_feed(vec![], reflog, &HashMap::new(), &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 1, "one external fetch is one row: {feed:#?}");
+        assert_eq!(feed[0].summary, "fetch — 3 refs updated");
+        assert_eq!(
+            feed[0].source,
+            ActivitySource::External,
+            "nothing claimed the app did it"
+        );
     }
 }
