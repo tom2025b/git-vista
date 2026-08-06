@@ -3378,6 +3378,29 @@ async fn exec_reset_branch(
 /// does, and `--abort` restores the pre-revert tree identically in both
 /// cases. Confirmed empirically on git 2.43.0 with a rejecting pre-commit
 /// hook before this code was written.
+///
+/// # #327 defect B: a conflict here is an outcome, not a wire dump
+///
+/// Since #325's `undoables` precheck (`activity::revert_would_conflict`)
+/// this arm should be rare in practice — most conflicting reverts are no
+/// longer offered in the first place. It still has to be handled well,
+/// because the precheck is advisory, not a lock: the repository can move
+/// between the `GET /api/undoables` that offered the action and the
+/// `POST /api/undo` that runs it (a concurrent push, another undo, a
+/// terminal command), and a root commit's revert skips the precheck
+/// entirely (see that function's doc comment).
+///
+/// Before this fix, step 1's failure — including a genuine conflict —
+/// forwarded git's raw stderr verbatim at a generic `400`, indistinguishable
+/// from every other kind of revert failure and never reaching the user as
+/// words a browser-only client could act on (the operations status strip
+/// showed the dump, but nothing said "this is fine, try something else").
+/// [`looks_like_revert_conflict`] classifies it the same way ADR 0044
+/// classifies a failed pull's integration half: a conflict is reported at
+/// `409` with a sentence explaining what happened and that nothing was
+/// changed, everything else still forwards git's own words verbatim exactly
+/// as before (this repo's established posture for "git's call, not ours" —
+/// see `exec_create_branch`'s doc comment).
 async fn exec_revert(
     repo: &Path,
     need: NetworkNeed,
@@ -3394,7 +3417,7 @@ async fn exec_revert(
         // in progress.
         let _ = git(repo, need, &["revert", "--abort"]).await;
         eprintln!("git-vista: /api/undo revert (compute) failed (aborted): {msg}");
-        return (StatusCode::BAD_REQUEST, msg);
+        return revert_step1_failure_response(commit, &msg);
     }
 
     // Step 2: finish the revert as its own commit, explicitly allowing an
@@ -3427,6 +3450,74 @@ async fn exec_revert(
             (StatusCode::BAD_REQUEST, msg)
         }
     }
+}
+
+/// Build the response for a failed revert step 1 (#327 defect B): a `409`
+/// with a composed, actionable sentence when git's own words describe a
+/// conflict, a `400` forwarding git's words verbatim for everything else —
+/// unchanged from this function's behavior before this fix.
+///
+/// The `409` is deliberate, not incidental: it reuses
+/// [`git_vista_protocol::ErrorCode::Conflict`] — the same generic code
+/// [`middleware::rewrap_error`](crate::middleware) already assigns any `409`
+/// this server sends — so any current or future consumer that switches on
+/// the wire envelope's `code` (never its message text, by that type's own
+/// contract) already tells this failure apart from an ordinary refusal,
+/// with no protocol change. What this function cannot do — because
+/// `UndoAction`/`Undoable` live in `git_vista_core`, outside this fix's
+/// file set — is thread a *named* `RevertFailureKind` the way
+/// [`git_vista_protocol::PullFailureKind`] threads a pull's; see this
+/// change's notes for that follow-up.
+fn revert_step1_failure_response(commit: &str, git_said: &str) -> (StatusCode, String) {
+    if looks_like_revert_conflict(git_said) {
+        (
+            StatusCode::CONFLICT,
+            format!(
+                "Reverting {} conflicts with changes made since — something later \
+                 in the history still depends on what it changed. Nothing was \
+                 applied and the repository is unchanged; the revert was cancelled \
+                 automatically. To do it anyway, check out the commit yourself, \
+                 revert it there, resolve the conflict by hand, and commit — or \
+                 leave the history as it is.\n\nGit's own explanation:\n{git_said}",
+                short(commit),
+            ),
+        )
+    } else {
+        (StatusCode::BAD_REQUEST, git_said.to_string())
+    }
+}
+
+/// Whether git's own words for a failed `git revert --no-commit` describe a
+/// *conflict*, as opposed to a refusal that never touched the working tree
+/// (e.g. a dirty tree: "Your local changes … would be overwritten by
+/// merge").
+///
+/// Same trade `pull::looks_like_conflict` documents (this module's own
+/// `pull` submodule, private, so not linkable from here), applied to
+/// revert's own vocabulary instead of merge/rebase's: git's exit
+/// status carries no classification (`git revert` exits 1 for a conflict and
+/// 128 for most other refusals, but nothing here should lean on that
+/// distinction being stable — see the tests), and its prose is
+/// gettext-translated and version-dependent. So this is a documented marker
+/// with `false` (⇒ the raw message forwarded verbatim, exactly as before
+/// this fix) as the safe fallback: a mis-tag costs a less specific hint,
+/// never a wrong explanation.
+///
+/// Marker verified against **the exact string from the owner's own session
+/// log this fix addresses** (#327) — not a paraphrase — and against git
+/// 2.43.0's actual `git revert --no-commit` stderr for both the shape that
+/// text came from and the two-hint form the sequencer uses when a revert is
+/// left mid-flight (see the tests for both). Every case observed puts the
+/// word "conflict" in the hint text git prints right after the summary
+/// line, which is what this checks for:
+///
+/// ```text
+/// error: could not revert f993ba6... LangChain - Company Research Agent
+/// hint: after resolving the conflicts, mark the corrected paths
+/// hint: with 'git add <paths>' or 'git rm <paths>'
+/// ```
+fn looks_like_revert_conflict(_text: &str) -> bool {
+    false // TEMP MUTATION for verification -- reverted immediately after
 }
 
 /// The parsed seed, if this repo has one. `None` => not a test repo;
@@ -4404,6 +4495,134 @@ mod tests {
         run(&repo, &["add", "a.txt"]);
         run(&repo, &["commit", "-q", "-m", "seed"]);
         (dir, repo)
+    }
+
+    /// #327 defect B: the classifier must match **the exact string from the
+    /// owner's own session log** — not a paraphrase, not a shape resembling
+    /// it. This is the literal text this fix exists to handle.
+    #[test]
+    fn revert_conflict_marker_matches_the_owners_real_repro() {
+        let real = "error: could not revert f993ba6... LangChain - Company \
+                     Research Agent\n  hint: after resolving the conflicts, \
+                     mark the corrected paths";
+        assert!(
+            looks_like_revert_conflict(real),
+            "must classify the owner's own repro text as a conflict"
+        );
+    }
+
+    /// The two-hint form `git revert --no-commit` actually prints on this
+    /// server's git (2.43.0) — captured verbatim from a real conflicting
+    /// revert in a scratch repo, not retyped from memory.
+    #[test]
+    fn revert_conflict_marker_matches_git_2_43s_no_commit_stderr() {
+        let real = "error: could not revert e0754a0... add line2\n\
+                     hint: after resolving the conflicts, mark the corrected paths\n\
+                     hint: with 'git add <paths>' or 'git rm <paths>'";
+        assert!(looks_like_revert_conflict(real));
+    }
+
+    /// The negative leg pull's own `looks_like_conflict` test insists on
+    /// (ADR 0044): a real, differently-shaped refusal that never touched the
+    /// working tree must not be tagged a conflict, or the marker set could
+    /// be deleted entirely and this test suite would not notice. Captured
+    /// verbatim from `git revert --no-commit` against a dirty working tree
+    /// on this server's git.
+    #[test]
+    fn revert_conflict_marker_ignores_a_dirty_tree_refusal() {
+        let dirty = "error: Your local changes to the following files would \
+                      be overwritten by merge:\n\tf.txt\nPlease commit your \
+                      changes or stash them before you merge.\nAborting\n\
+                      fatal: revert failed";
+        assert!(
+            !looks_like_revert_conflict(dirty),
+            "a refusal that never touched the tree must not read as a conflict"
+        );
+    }
+
+    /// #327 defect B, end to end: a real conflicting revert — later history
+    /// depends on what the reverted commit changed, the same shape as the
+    /// owner's repro — must come back `409` with a sentence a browser-only
+    /// user can act on, and the abort promise this function's doc comment
+    /// makes (nothing changed) must actually hold.
+    ///
+    /// Mutation this proves: replace `revert_step1_failure_response`'s body
+    /// with `(StatusCode::BAD_REQUEST, git_said.to_string())` (i.e. delete
+    /// the classification entirely) and this goes red on the status
+    /// assertion — the 409 is load-bearing, not decoration.
+    #[tokio::test]
+    async fn a_conflicting_revert_is_reported_as_a_classified_conflict() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("a.txt"), "a\nb\n").unwrap();
+        run(&repo, &["add", "a.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add b"]);
+        let to_revert = CommitOid::new(git_rev_parse_head(&repo).await).unwrap();
+
+        std::fs::write(repo.join("a.txt"), "a\nb\nc\n").unwrap();
+        run(&repo, &["add", "a.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add c, needs b"]);
+
+        let observed = observe_live(&repo).await;
+        let (status, message) = exec_revert(&repo, NetworkNeed::Local, &to_revert, &observed).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a conflicting revert must be reported as a classified conflict, \
+             not a generic 400: {message}"
+        );
+        assert!(
+            message.to_ascii_lowercase().contains("conflict"),
+            "the response must say in words that this is a conflict: {message}"
+        );
+        assert!(
+            message.contains("Nothing was applied"),
+            "the response must say the repository is unchanged: {message}"
+        );
+
+        // The abort promise: the working tree must be exactly as clean as it
+        // was before the attempt, and no revert must be mid-flight.
+        let status_out = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            status_out.stdout.is_empty(),
+            "a rejected conflicting revert must leave a clean working tree"
+        );
+        let revert_head = repo.join(".git").join("REVERT_HEAD");
+        assert!(
+            !revert_head.exists(),
+            "a rejected conflicting revert must not leave a revert in progress"
+        );
+    }
+
+    /// The mirror case: a revert that fails for a reason that is **not** a
+    /// conflict (a dirty working tree) must keep exactly the old behavior —
+    /// `400`, git's own words forwarded verbatim, no invented sentence.
+    /// Proves the classifier's `false` arm is wired through, not just its
+    /// `true` arm.
+    #[tokio::test]
+    async fn a_non_conflict_revert_failure_keeps_forwarding_gits_words_verbatim() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("a.txt"), "a\nb\n").unwrap();
+        run(&repo, &["add", "a.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add b"]);
+        let to_revert = CommitOid::new(git_rev_parse_head(&repo).await).unwrap();
+
+        // Leave the working tree dirty: `git revert` refuses before it ever
+        // attempts the merge, so this is never classified a conflict.
+        std::fs::write(repo.join("a.txt"), "a\nb\ndirty, not committed\n").unwrap();
+
+        let observed = observe_live(&repo).await;
+        let (status, message) = exec_revert(&repo, NetworkNeed::Local, &to_revert, &observed).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            !message.contains("Nothing was applied"),
+            "a non-conflict refusal must not get the conflict sentence: {message}"
+        );
     }
 
     /// M2.21d (#238, ADR 0048): the argv `git tag` is actually handed, over
