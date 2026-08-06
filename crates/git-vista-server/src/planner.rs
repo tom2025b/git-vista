@@ -3516,8 +3516,8 @@ fn revert_step1_failure_response(commit: &str, git_said: &str) -> (StatusCode, S
 /// hint: after resolving the conflicts, mark the corrected paths
 /// hint: with 'git add <paths>' or 'git rm <paths>'
 /// ```
-fn looks_like_revert_conflict(_text: &str) -> bool {
-    false // TEMP MUTATION for verification -- reverted immediately after
+fn looks_like_revert_conflict(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("conflict")
 }
 
 /// The parsed seed, if this repo has one. `None` => not a test repo;

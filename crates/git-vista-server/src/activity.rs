@@ -262,17 +262,7 @@ pub async fn undoables(
     // choice this UI doesn't collect.
     if detail.parents.len() == 1 {
         let parent = detail.parents[0].0.as_str();
-        let offer = match git_cmd::rev_parse(&repo, "HEAD").await {
-            Ok(Some(head)) => revert_would_conflict(&repo, &full, parent, &head)
-                .await
-                .map(|conflicts| !conflicts)
-                // The check itself didn't run (spawn failure, sandbox
-                // refusal): a fact we don't have, not a "no" we can promise.
-                .unwrap_or(false),
-            // No resolvable HEAD, or `rev_parse` couldn't run: same posture.
-            Ok(None) | Err(_) => false,
-        };
-        if offer {
+        if revert_offer_established(&repo, &full, parent).await {
             out.push(Undoable {
                 action: UndoAction::RevertCommit {
                     commit: full.clone(),
@@ -339,6 +329,36 @@ async fn revert_would_conflict(
         Some(0) => Ok(false),
         Some(1) => Ok(true),
         _ => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+    }
+}
+
+/// The wiring `undoables` depends on for its offer decision (#327 defect A):
+/// resolve `HEAD`, then run [`revert_would_conflict`] against it — offering
+/// only when both steps ran **and** answered "clean".
+///
+/// Pulled out of `undoables` on its own, rather than left inline, so this
+/// decision is a fact a test can pin without a `crate::state::current()`
+/// fixture: it takes `repo`/`commit`/`parent` directly and returns a plain
+/// `bool`, same shape as [`revert_would_conflict`] beside it.
+///
+/// This is exactly the kind of single-character inversion defect A is
+/// about — `.map(|conflicts| !conflicts)` flipped, or the `unwrap_or`
+/// changed from `false` to `true`, silently reintroduces "available
+/// asserted, never established". See the tests for the mutation this
+/// proves.
+///
+/// Three ways to land on `false` (don't offer), all fail-closed for the same
+/// reason: `HEAD` doesn't resolve (`Ok(None)`), resolving it couldn't even
+/// run (`Err`), or it resolved but [`revert_would_conflict`] itself couldn't
+/// produce an answer (its own `Err` arm). None of these is "no conflict" —
+/// they're "no fact", and a fact we don't have is never grounds to offer.
+async fn revert_offer_established(repo: &Path, commit: &str, parent: &str) -> bool {
+    match git_cmd::rev_parse(repo, "HEAD").await {
+        Ok(Some(head)) => revert_would_conflict(repo, commit, parent, &head)
+            .await
+            .map(|conflicts| !conflicts)
+            .unwrap_or(false),
+        Ok(None) | Err(_) => false,
     }
 }
 
@@ -565,6 +585,56 @@ mod tests {
         assert!(
             !conflicts,
             "reverting the tip with nothing built on top must be clean"
+        );
+    }
+
+    /// The wiring itself, not just `revert_would_conflict`'s raw answer:
+    /// `revert_offer_established` must say `false` for the exact conflicting
+    /// shape above — the owner's repro. Where the two prior tests pin the
+    /// classifier, this one pins the decision that actually reaches
+    /// `undoables`'s `if` — the one place a flipped `!` or a wrong
+    /// `unwrap_or` would silently reintroduce defect A with every other test
+    /// in this file still green.
+    ///
+    /// Mutation this proves: change `.map(|conflicts| !conflicts)` to
+    /// `.map(|conflicts| conflicts)`, or `unwrap_or(false)` to
+    /// `unwrap_or(true)`, and this test goes red.
+    #[tokio::test]
+    async fn the_offer_decision_says_no_for_a_real_conflict() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("f.txt"), "line1\nline2\n").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add line2"]);
+        let to_revert = rev_parse_plain(&repo, "HEAD");
+        let parent_of_to_revert = rev_parse_plain(&repo, "HEAD^");
+
+        std::fs::write(repo.join("f.txt"), "line1\nline2\nline3\n").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add line3, needs line2"]);
+
+        assert!(
+            !revert_offer_established(&repo, &to_revert, &parent_of_to_revert).await,
+            "the offer decision must say no for a commit later work depends on"
+        );
+    }
+
+    /// The mirror case for the wiring: a clean revert (the tip, nothing
+    /// built on it) must be offered. Without this leg,
+    /// `revert_offer_established` could be hardcoded to `false` and the test
+    /// above would still pass — proving `false` alone is not proof the
+    /// wiring works.
+    #[tokio::test]
+    async fn the_offer_decision_says_yes_for_a_clean_revert() {
+        let (_dir, repo) = seeded_repo();
+        std::fs::write(repo.join("f.txt"), "line1\nline2\n").unwrap();
+        run(&repo, &["add", "f.txt"]);
+        run(&repo, &["commit", "-q", "-m", "add line2"]);
+        let tip = rev_parse_plain(&repo, "HEAD");
+        let parent = rev_parse_plain(&repo, "HEAD^");
+
+        assert!(
+            revert_offer_established(&repo, &tip, &parent).await,
+            "the offer decision must say yes for a clean revert of the tip"
         );
     }
 }

@@ -452,43 +452,81 @@ pub(crate) fn error_body(
     .expect("FetchError serialization cannot fail")
 }
 
-/// Journal one entry per remote-tracking ref that actually moved.
+/// Journal **one** entry per fetch operation, naming how many remote-tracking
+/// refs moved — not one entry per ref.
 ///
-/// Per ref rather than one summary entry: the activity feed is keyed on refs,
-/// and `ActivityKind::Fetch` with a `ref_name` is what lets a later view say
-/// "origin/main moved from X to Y" instead of "a fetch happened". Nothing is
-/// journaled when nothing moved, so an up-to-date fetch leaves no trace —
-/// the same posture `exec_checkout` takes towards a no-op checkout.
+/// # #329: this used to be one entry per ref, and that was the bug
+///
+/// A single `git fetch` against an active upstream can move dozens of
+/// remote-tracking refs at once (measured: 94, on the first fetch of a repo
+/// the owner actually uses). Journaling one `ActivityKind::Fetch` per ref
+/// buried the one event a reader cared about among 94 that all say "a fetch
+/// happened" — the feed became noise exactly when a fetch did the most work.
+///
+/// The fix matches the granularity `exec_fetch`'s own response already
+/// settled on: `POST /api/fetch` never told the client "origin/main moved
+/// from X to Y" for each ref — it says "Fetched from ‘origin’: 94
+/// remote-tracking refs updated." (see `exec_fetch`'s `message`). One
+/// journal entry at that same granularity is what lets the feed say the same
+/// thing the endpoint already says, instead of reconstructing it 94 times.
+///
+/// `ref_name`/`old_oid`/`new_oid` are `None` on the journaled entry — not
+/// `Obs::Unknown` (that means "git could not be read"; here git was read
+/// fine, there is just no *one* ref this event is about) but `Obs::Absent`,
+/// same as `journal_app_event` already uses to mean "nothing here to name".
+/// This is a deliberate, scope-bounded drop of detail, not an oversight:
+/// `ActivityEvent` (`git_vista_core::activity`) has exactly one `ref_name`
+/// and one `old_oid`/`new_oid` pair — a schema shaped for "one ref moved",
+/// shared with every journal line already on disk. Widening it to carry a
+/// list of refs is a `git-vista-core` change, outside this fix's file set
+/// (journal.rs + this file), and arguably shouldn't happen here anyway: the
+/// per-ref detail is not lost, it is available for the moment it happens in
+/// `FetchSuccess::updated_refs` (the response body `exec_fetch` already
+/// returns) — a future drill-down UI has a source for it that isn't "94 rows
+/// in the activity feed". Stuffing 94 ref names into one `summary` string
+/// would just move the noise from "94 rows" to "1 unreadable row".
+///
+/// Nothing is journaled when nothing moved, so an up-to-date fetch leaves no
+/// trace — the same posture `exec_checkout` takes towards a no-op checkout.
+///
+/// # Known gap this fix does not close (outside journal.rs/fetch.rs)
+///
+/// `assemble_feed` (`git_vista_core::activity`) also reads git's own
+/// per-ref reflogs for every remote-tracking branch and de-duplicates a
+/// reflog line against a journal entry **only when their `new_oid`s match
+/// exactly**. The 94 per-ref journal entries this fix removes were, in
+/// effect, doing double duty: they were also the mechanism that made the 94
+/// per-ref reflog lines a `git fetch` writes disappear from the feed. A
+/// single aggregate journal entry has no one `new_oid`, so it cannot match
+/// any of them. Left alone, `assemble_feed` would show the 94
+/// `ActivitySource::External` reflog rows *plus* this one
+/// `ActivitySource::App` summary row — 95 rows, not 1. Fixing that needs a
+/// change in `assemble_feed` (`crates/git-vista-core/src/activity.rs`),
+/// which is not in this lane's file set; flagging it rather than reaching
+/// for it.
 async fn journal_updates(
     repo: &Path,
     remote: &RemoteName,
     updated: &[RemoteRefUpdate],
     verb: &str,
 ) {
-    for update in updated {
-        let short_name = update
-            .ref_name
-            .strip_prefix("refs/remotes/")
-            .unwrap_or(&update.ref_name);
-        journal_app_event(
-            repo,
-            ActivityKind::Fetch,
-            Some(update.ref_name.clone()),
-            // Observed, not read back through `Obs::from_read`: these come
-            // from the before/after listings this module took itself, so
-            // "absent" genuinely means the ref did not exist.
-            match &update.old_oid {
-                Some(oid) => Obs::Known(oid.clone()),
-                None => Obs::Absent,
-            },
-            match &update.new_oid {
-                Some(oid) => Obs::Known(oid.clone()),
-                None => Obs::Absent,
-            },
-            format!("{verb} ‘{short_name}’ from {}", remote.as_str()),
-        )
-        .await;
+    if updated.is_empty() {
+        return;
     }
+    journal_app_event(
+        repo,
+        ActivityKind::Fetch,
+        None,
+        Obs::Absent,
+        Obs::Absent,
+        format!(
+            "{verb} {} remote-tracking ref{} from {}",
+            updated.len(),
+            if updated.len() == 1 { "" } else { "s" },
+            remote.as_str()
+        ),
+    )
+    .await;
 }
 
 /// Journal the one fetch outcome this module cannot name: `git fetch` ran to
