@@ -91,7 +91,53 @@ pub(crate) async fn plan_and_execute(op: GitOperation) -> (StatusCode, String) {
         Err(rejected) => return rejected,
     };
     let repo_id = Some(entry.handle.repository);
-    plan_and_execute_tracked(key, repo, repo_id, selection_tokens(), op).await
+    plan_and_execute_tracked(
+        key,
+        repo,
+        repo_id,
+        selection_tokens(),
+        PlanSource::Build(op),
+    )
+    .await
+}
+
+/// What [`plan_and_execute_tracked`] runs once admitted: build a plan from a
+/// bare operation (the composed path, #143) or execute a plan that already
+/// arrived from outside (the submit path, #249). Both admit/spawn/terminalise
+/// identically — this enum is the whole seam that lets them share
+/// [`plan_and_execute_tracked`] instead of each re-deriving it, which is ADR
+/// 0016's funnel extended to plans that arrive pre-built.
+enum PlanSource {
+    /// The composed path: build the plan from this operation, still inside
+    /// the guard, then execute it — [`plan_and_execute_in`].
+    Build(GitOperation),
+    /// The submit path: this plan already exists (minted earlier by
+    /// [`build_plan_only`], possibly reviewed across a roundtrip) — take the
+    /// guard and run `validate → enforce_fresh → execute` against it as-is —
+    /// [`submit_plan`].
+    Submit(Plan),
+}
+
+impl PlanSource {
+    /// The operation [`crate::operations::admit`] keys the idempotency
+    /// registry on, regardless of which path produced it.
+    fn operation(&self) -> &GitOperation {
+        match self {
+            PlanSource::Build(op) => op,
+            PlanSource::Submit(plan) => &plan.operation,
+        }
+    }
+
+    /// The hash `admit` compares a reused key's second request against. A
+    /// submitted plan already carries its own — computed once, at build time
+    /// — so this reuses it rather than recomputing: for `Submit`, hashing
+    /// again here would just reproduce the plan's own `operation_hash` field.
+    fn hash(&self) -> OperationHash {
+        match self {
+            PlanSource::Build(op) => operation_hash(op),
+            PlanSource::Submit(plan) => plan.operation_hash.clone(),
+        }
+    }
 }
 
 /// Run one operation under a recorded lifecycle (M1.08, #61): admit it to the
@@ -118,27 +164,28 @@ async fn plan_and_execute_tracked(
     repo: PathBuf,
     repo_id: Option<RepositoryId>,
     tokens: (RepositoryToken, WorktreeToken),
-    op: GitOperation,
+    source: PlanSource,
 ) -> (StatusCode, String) {
-    let hash = operation_hash(&op);
+    let hash = source.hash();
     let (repository, worktree) = tokens.clone();
 
-    let (handle, record) = match crate::operations::admit(&key, &op, &hash, repository, worktree) {
-        crate::operations::Admission::Fresh(handle, record) => (handle, record),
-        crate::operations::Admission::Existing(record) => {
-            // The same intent, already in flight or already answered.
-            crate::operations::note_minted(&record.id());
-            return record.wait_terminal().await;
-        }
-        crate::operations::Admission::Conflict => {
-            return (
-                StatusCode::CONFLICT,
-                "That idempotency key was already used for a different operation. \
+    let (handle, record) =
+        match crate::operations::admit(&key, source.operation(), &hash, repository, worktree) {
+            crate::operations::Admission::Fresh(handle, record) => (handle, record),
+            crate::operations::Admission::Existing(record) => {
+                // The same intent, already in flight or already answered.
+                crate::operations::note_minted(&record.id());
+                return record.wait_terminal().await;
+            }
+            crate::operations::Admission::Conflict => {
+                return (
+                    StatusCode::CONFLICT,
+                    "That idempotency key was already used for a different operation. \
                  Reload and try again."
-                    .to_string(),
-            );
-        }
-    };
+                        .to_string(),
+                );
+            }
+        };
 
     crate::operations::note_minted(&record.id());
 
@@ -164,7 +211,10 @@ async fn plan_and_execute_tracked(
         async move {
             crate::durable::persist(durable_key.clone(), durable_record.status()).await;
 
-            let (status, message) = plan_and_execute_in(&repo, repo_id, tokens, op).await;
+            let (status, message) = match source {
+                PlanSource::Build(op) => plan_and_execute_in(&repo, repo_id, tokens, op).await,
+                PlanSource::Submit(plan) => submit_plan(&repo, repo_id, tokens, plan).await,
+            };
             // The generation *after* execution: the datum a reconnecting client
             // uses to decide whether its cached graph is stale, without re-reading
             // the repository. Best-effort, like every other observation here.
@@ -380,7 +430,6 @@ pub(crate) async fn build_plan_only(
 ///   `a_generation_invisible_break_while_queued_is_refused_by_the_gates_live_recheck`
 ///   proves the re-derivation itself is load-bearing (emptying it passed the
 ///   whole suite before that test existed).
-#[cfg_attr(not(test), allow(dead_code))] // routed by #249; contract-suite-only until then
 pub(crate) async fn submit_plan(
     repo: &Path,
     repo_id: Option<RepositoryId>,
