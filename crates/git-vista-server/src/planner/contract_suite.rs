@@ -3869,38 +3869,78 @@ async fn create_tag_refuses_a_name_that_already_exists() {
     assert_eq!(tip(&repo, "refs/tags/v1.0.0^{commit}"), first);
 }
 
-/// Asking for a **signed** tag is refused with `501` and nothing is created.
-/// M2.21e (#74) wires signing; until then the flag must not be silently
-/// dropped, because an unsigned tag handed back under a name the user
-/// believes is signed is a wrong outcome they cannot see.
+/// Asking for a **signed** tag runs a real, sandboxed `git tag -s` (M2.21e,
+/// #239) and — as this server's sandbox is built today — that fails, with a
+/// typed [`SignTagError`] and nothing created. This used to be a `501`
+/// answered *before* any argv was built at all; the whole point of #239 is
+/// that a client asking for a signed tag now gets a real attempt and a
+/// specific, actionable reason instead, never a raw gpg stderr dump and never
+/// a hang past the bound `run_signed_tag`'s own doc comment argues for.
 ///
 /// Inertness is checked with [`repo_fingerprint`] rather than `git tag -l`:
-/// `git tag -s` on a machine with no signing key fails *after* writing
-/// nothing, but a hypothetical executor that stripped the flag and ran
-/// `git tag -a` would leave a perfectly valid unsigned tag behind — and the
-/// fingerprint sees the object store too, so even a written-then-deleted tag
-/// object would show.
+/// `git tag -s` on this host fails *after* writing nothing, but a
+/// hypothetical executor that stripped the flag and ran `git tag -a` would
+/// leave a perfectly valid unsigned tag behind — and the fingerprint sees the
+/// object store too, so even a written-then-deleted tag object would show.
+///
+/// Wrapped in an outer bound well past [`SIGN_TIMEOUT`]: a regression to an
+/// actual hang must fail this test loudly rather than wedging the suite.
 #[tokio::test]
-async fn create_tag_refuses_signing_before_running_git() {
+async fn create_tag_signing_fails_fast_with_a_typed_reason_and_touches_nothing() {
     let (_dir, repo) = seeded_repo();
     let target = tip(&repo, "HEAD");
     let before = repo_fingerprint(&repo);
 
-    let (status, body) = pipeline(
-        &repo,
-        GitOperation::CreateTag {
-            name: tname("v1.0.0"),
-            target: oid(&target),
-            annotation: Some(annotation("signed, please", true)),
-        },
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        pipeline(
+            &repo,
+            GitOperation::CreateTag {
+                name: tname("v1.0.0"),
+                target: oid(&target),
+                annotation: Some(annotation("signed, please", true)),
+            },
+        ),
     )
-    .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    .await
+    .expect(
+        "a signing attempt must return within 20s — its own bound is 10s; a hang here \
+         is exactly the defect #239 exists to prevent",
+    );
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a signing failure is a refusal, not a 5xx or a raw pass-through: {body}"
+    );
+    let parsed: SignTagError = serde_json::from_str(&body).unwrap_or_else(|e| {
+        panic!(
+            "signing failure body must be the typed SignTagError, not raw text: {e}\nbody={body}"
+        )
+    });
+    // NOT pinned to a specific closed-set reason — see
+    // `planner::tests::a_signing_attempt_with_no_usable_key_fails_fast_with_a_typed_reason`
+    // for why. The specific bucket a keyless attempt lands in is genuinely
+    // host-dependent (measured on three separate hosts, including this
+    // project's own CI runner, which reaches `Other` here via a real
+    // `[GNUPG:]`-line-free git wrapper message rather than a broken
+    // classifier). What must hold everywhere is checked below: never
+    // TimedOut, never raw gpg/git text in the message.
+    assert_ne!(
+        parsed.kind,
+        SignTagFailureKind::TimedOut,
+        "a keyless signing attempt must fail fast, not via the timeout backstop: {}",
+        parsed.message
+    );
+    assert!(
+        !parsed.message.contains("gpg:") && !parsed.message.contains("[GNUPG:]"),
+        "the client-facing message must never carry raw gpg output: {}",
+        parsed.message
+    );
     assert_eq!(out(&repo, &["tag", "-l"]), "", "no tag may be created");
     assert_eq!(
         repo_fingerprint(&repo),
         before,
-        "the signing refusal must leave the repository byte-identical"
+        "a failed signing attempt must leave the repository byte-identical"
     );
     // Paired positive: the same request without `sign` really does create a
     // tag here, so "nothing happened" above was capable of failing.

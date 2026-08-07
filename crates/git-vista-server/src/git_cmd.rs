@@ -297,6 +297,80 @@ pub(crate) async fn git_output_for(
     Ok(redact_if_remote(output, declared))
 }
 
+/// What [`git_output_bounded`] returns: either the spawn completed inside its
+/// wall-clock budget (an ordinary [`Output`], success or failure, exactly as
+/// [`git_output_for`] would hand back), or the budget elapsed first and the
+/// child was killed before it ever produced one.
+///
+/// A dedicated enum rather than `Option<Output>` on purpose: `None` reads as
+/// "there is no output", which is true either way at the type level but
+/// invites a caller to treat a timeout as just another kind of empty
+/// response. `TimedOut` is a distinct fact — the process was still running
+/// and was stopped — and callers that must tell it apart from "git ran and
+/// failed" (a mutation guard that needs to know how long it was really held,
+/// a typed wire reason that must not claim git ran to completion) get that
+/// for free from the match instead of reconstructing it from an absence.
+pub(crate) enum BoundedOutput {
+    Completed(Output),
+    TimedOut,
+}
+
+/// [`git_output_for`] with a wall-clock bound and a severed stdin — for
+/// spawns that may shell out to something whose own waiting is not under
+/// this server's control, the way `git tag -s` shells out to `gpg` and,
+/// through it, potentially to `gpg-agent`.
+///
+/// Two things beyond the bound itself: `.stdin(Stdio::null())` closes the one
+/// fd `git_output_for`'s plain `cmd.output()` leaves at its default
+/// (`Stdio::inherit()`, tokio's own default when nothing sets it) — so a
+/// child that tries to read a prompt from stdin gets immediate EOF rather
+/// than whatever the server process's own stdin happens to be. `.kill_on_drop(true)`
+/// is what makes the timeout actually a timeout rather than a detach:
+/// dropping the `cmd.output()` future when [`tokio::time::timeout`] elapses
+/// sends a `SIGKILL` instead of leaving the process running unobserved.
+///
+/// **What that SIGKILL actually reaches is more indirect than "the child",
+/// singular.** [`sandboxed`] wraps every spawn in `bwrap`, so the process
+/// `kill_on_drop` directly signals is **`bwrap`**, not git — captured by
+/// strace, not assumed. git, and gpg beneath it, are grandchildren inside
+/// the sandbox's own PID namespace. Whether killing `bwrap` reaps that whole
+/// tree — rather than leaving git/gpg orphaned and still running — is a
+/// property of the sandbox *tier*, not of `kill_on_drop` itself:
+/// [`crate::sandbox::lifecycle::strict_reaps_a_double_forked_setsid_orphan_that_the_network_tier_does_not`]
+/// measures, via a control/subject pair, that the Strict tier's PID
+/// namespace reaps exactly this shape of orphan (a double-forked,
+/// `setsid`-detached grandchild) on supervisor kill — and that the Network
+/// tier does **not**. `run_signed_tag`'s `CreateTag` path always resolves to
+/// `NetworkNeed::Local`, which maps to `Tier::Strict` for the untrusted-repo
+/// case that test proves reaping for. The one case that test does not cover:
+/// an **operator-trusted** repository resolves to `Tier::Unsandboxed`
+/// (`sandbox::tier_for`'s `(true, _)` arm) with no sandbox at all, where this
+/// reasoning is void and only the timeout — not the reaping — bounds
+/// anything. See `run_signed_tag`'s own doc comment for why that path is
+/// unreachable in production today.
+///
+/// Callers that need to know whether a killed child's partial work left a
+/// trace behind (a half-written ref, say) must check for it themselves —
+/// killing a process does not undo what it already did before the signal
+/// landed.
+pub(crate) async fn git_output_bounded(
+    repo: &Path,
+    args: &[&str],
+    declared: crate::sandbox::NetworkNeed,
+    limit: std::time::Duration,
+) -> std::io::Result<BoundedOutput> {
+    let cmd = sandboxed(repo, args, declared)
+        .map_err(std::io::Error::other)?
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    match tokio::time::timeout(limit, cmd.output()).await {
+        Ok(result) => Ok(BoundedOutput::Completed(redact_if_remote(
+            result?, declared,
+        ))),
+        Err(_elapsed) => Ok(BoundedOutput::TimedOut),
+    }
+}
+
 /// The redact-or-pass-through decision [`git_output_for`] and
 /// [`git_output_with_stdin`] both make, pulled out as a pure function so it
 /// is directly unit-testable against a hand-built `Output` — no process
@@ -1527,6 +1601,71 @@ mod tests {
             "Local-declared Output must pass through unchanged"
         );
         assert!(String::from_utf8_lossy(&local.stderr).contains("hunter2"));
+    }
+
+    /// The ordinary leg: a bound with real room in it lets a fast git command
+    /// complete normally — [`BoundedOutput::Completed`], not `TimedOut`,
+    /// carrying the same `Output` [`git_output_for`] would have produced.
+    /// Runs through [`sandboxed`], the real production chokepoint — not a
+    /// mock — exactly like every other test in this module.
+    #[tokio::test]
+    async fn git_output_bounded_completes_normally_with_a_generous_bound() {
+        let (_dir, repo) = seeded_repo();
+        let result = git_output_bounded(
+            &repo,
+            &["status", "--short"],
+            crate::sandbox::NetworkNeed::Local,
+            std::time::Duration::from_secs(20),
+        )
+        .await
+        .expect("the bounded wrapper builds and runs a policy for a real repo");
+        match result {
+            BoundedOutput::Completed(out) => {
+                assert!(
+                    out.status.success(),
+                    "stderr={}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            BoundedOutput::TimedOut => panic!("a 20s bound must not fire for `git status`"),
+        }
+    }
+
+    /// The bound itself, exercised against the real sandboxed spawn path —
+    /// not a synthetic hang, a real one: the budget is too small for even a
+    /// fast `git status` on a tiny repository to complete inside it, so
+    /// [`tokio::time::timeout`] elapses first and `git_output_bounded` must
+    /// report [`BoundedOutput::TimedOut`] rather than the test itself
+    /// hanging alongside a regression.
+    ///
+    /// This is the property M2.21e (#239) exists to prove: a bounded spawn
+    /// that does not finish in time is reported, not waited on forever. The
+    /// outer `tokio::time::timeout` here is the belt to `git_output_bounded`'s
+    /// own suspenders — if the function under test ever stopped enforcing
+    /// its bound, this test must still fail in bounded time rather than
+    /// wedging the suite.
+    #[tokio::test]
+    async fn git_output_bounded_reports_timed_out_when_the_bound_is_too_tight() {
+        let (_dir, repo) = seeded_repo();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            git_output_bounded(
+                &repo,
+                &["status", "--short"],
+                crate::sandbox::NetworkNeed::Local,
+                std::time::Duration::from_nanos(1),
+            ),
+        )
+        .await
+        .expect(
+            "git_output_bounded must return within 15s on its own — it is not this test's \
+             job to enforce that bound, only to fail loudly if it is ever missing",
+        )
+        .expect("the bounded wrapper builds a policy for a real repo");
+        assert!(
+            matches!(outcome, BoundedOutput::TimedOut),
+            "a 1ns bound must elapse before any real git spawn can complete"
+        );
     }
 
     #[tokio::test]

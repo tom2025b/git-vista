@@ -184,11 +184,15 @@ pub struct BranchRequest {
 ///
 /// # `sign`
 ///
-/// Accepted so a client can ask, and **refused** by the executor until M2.21e
-/// wires signing (#74). Refused rather than silently ignored: quietly
-/// producing an unsigned tag for a request that asked for a signed one is a
-/// wrong outcome the user cannot see. `sign: true` with no `message` is
-/// refused by the handler — a signed tag is annotated by definition.
+/// `git tag -s` (M2.21e, #239): the executor runs a real signing attempt
+/// rather than refusing outright. `sign: true` with no `message` is still
+/// refused by the handler — a signed tag is annotated by definition, and a
+/// signature has nowhere to live without a tag object. A signing attempt
+/// that fails answers with a typed [`SignTagError`], never a raw gpg/git
+/// stderr dump — see that type's doc comment for the closed set of reasons
+/// and [`crate::TagAnnotation`]'s doc comment for why this server's own
+/// sandbox makes `AgentUnreachable`/`NoSecretKey` the expected outcomes, not
+/// edge cases.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateTagRequest {
@@ -198,6 +202,55 @@ pub struct CreateTagRequest {
     pub message: Option<String>,
     #[serde(default)]
     pub sign: bool,
+}
+
+/// Why a `POST /api/tag` **signing** attempt failed, as a typed tag the
+/// client can branch on (M2.21e, #239) — the same posture [`AmendFailureKind`]
+/// already set for `/api/amend-commit`: the server owns the (documented,
+/// tested) classification, the wire carries only this tag plus a message fit
+/// to show as-is, and the client never regex-sniffs gpg's own — untranslated
+/// nowhere, version-dependent everywhere — stderr.
+///
+/// This set is deliberately small and closed, and two of its five members are
+/// not edge cases on this server: `AgentUnreachable` and `NoSecretKey` are the
+/// two ways the sandbox that runs git denies gpg-agent access at all —
+/// `AF_UNIX` sockets refused outright under the Strict tier, and `~/.gnupg`
+/// withheld by Landlock the same way `~/.ssh` is — so a signing request
+/// against this server reliably lands on one of them (see
+/// `docs/SECURITY_MODEL.md` and `seccomp_filter.rs`'s `af_unix_rule` for the
+/// mechanism, and #188 for the analogous, still-open ssh-agent gap this
+/// deliberately does not close).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignTagFailureKind {
+    /// gpg found no secret key to sign with. On this server that is the
+    /// **expected**, fast failure: `~/.gnupg` is excluded from the sandbox's
+    /// read grant, so gpg's key lookup fails before it ever tries to reach
+    /// an agent — regardless of what the server's real keyring holds.
+    NoSecretKey,
+    /// gpg could not reach `gpg-agent` at all. Reachable if gpg ever finds a
+    /// key some other way and only then hits the sandbox's `AF_UNIX` denial;
+    /// `NoSecretKey` above is the more common path to the same wall.
+    AgentUnreachable,
+    /// No `gpg` executable exists on the server's own `PATH`.
+    GpgNotInstalled,
+    /// The bounded signing spawn did not finish in time and was killed.
+    /// `message` says whether the tag ended up existing anyway — the kill
+    /// races git's own ref write, so both outcomes are possible.
+    TimedOut,
+    /// A non-zero exit this server's classifier does not recognise. The
+    /// server logs the real stderr; the client never sees it.
+    Other,
+}
+
+/// Body of a **failed** signed `POST /api/tag` (status 400): the typed
+/// classification plus a message fit to show the user directly. A response
+/// DTO, so no `deny_unknown_fields` (M1.02 additive rule) — same posture as
+/// [`AmendCommitError`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignTagError {
+    pub kind: SignTagFailureKind,
+    pub message: String,
 }
 
 /// Body of a `POST /api/delete-tag` request (M2.21d, #238): delete the **local**
@@ -1205,6 +1258,78 @@ mod tests {
         )
         .is_err());
         assert!(serde_json::from_str::<DeleteTagRequest>(r#"{"tag":"v1","repo":"/etc"}"#).is_err());
+    }
+
+    /// M2.21e (#239): every [`SignTagFailureKind`] must reach the wire as the
+    /// exact `snake_case` spelling the frontend's own parser matches on
+    /// (`api::create_tag_request` tries `SignTagError` before falling back to
+    /// the generic envelope parse) — the same posture
+    /// `adr_0025_wire_strings_still_deserialize_and_never_serialize` and the
+    /// `AmendFailureKind` pin in `dto_golden.rs` already hold for their own
+    /// closed sets, applied here so a renamed variant is a compile-time-typed
+    /// change but a *re-spelled* one is still caught.
+    #[test]
+    fn sign_tag_failure_kind_uses_stable_snake_case_wire_names() {
+        let pairs = [
+            (SignTagFailureKind::NoSecretKey, "no_secret_key"),
+            (SignTagFailureKind::AgentUnreachable, "agent_unreachable"),
+            (SignTagFailureKind::GpgNotInstalled, "gpg_not_installed"),
+            (SignTagFailureKind::TimedOut, "timed_out"),
+            (SignTagFailureKind::Other, "other"),
+        ];
+        for (kind, wire) in pairs {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::Value::String(wire.to_string()),
+                "{kind:?} must serialize as {wire:?}"
+            );
+            assert_eq!(
+                serde_json::from_value::<SignTagFailureKind>(serde_json::Value::String(
+                    wire.to_string()
+                ))
+                .unwrap(),
+                kind,
+                "{wire:?} must deserialize back to {kind:?}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<SignTagFailureKind>(serde_json::json!("no_such_reason"))
+                .is_err(),
+            "the set is closed: an unrecognised wire string must not silently pick a variant"
+        );
+    }
+
+    /// [`SignTagError`] round-trips as a plain `{kind, message}` object — no
+    /// envelope, no `deny_unknown_fields` (it is a response DTO the server
+    /// may grow fields on later, M1.02's additive rule) — and the frontend's
+    /// `create_tag_request` depends on parsing exactly this shape before
+    /// falling back to the generic `ApiError` envelope every other refusal
+    /// uses.
+    #[test]
+    fn sign_tag_error_roundtrips_as_a_plain_object_and_tolerates_new_fields() {
+        let err = SignTagError {
+            kind: SignTagFailureKind::AgentUnreachable,
+            message: "gpg could not reach the agent".to_string(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(serde_json::from_str::<SignTagError>(&json).unwrap(), err);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "agent_unreachable",
+                "message": "gpg could not reach the agent",
+            })
+        );
+
+        // A field a future server adds must not break an older client.
+        let forward_compatible = serde_json::from_value::<SignTagError>(serde_json::json!({
+            "kind": "no_secret_key",
+            "message": "no key",
+            "hint": "install gpg",
+        }))
+        .unwrap();
+        assert_eq!(forward_compatible.kind, SignTagFailureKind::NoSecretKey);
     }
 
     #[test]

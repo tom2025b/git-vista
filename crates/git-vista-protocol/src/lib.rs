@@ -78,8 +78,8 @@ pub use dto::{
     DeleteCloneRequest, DeleteRemoteTagRequest, DeleteTagRequest, FetchError, FetchFailureKind,
     FetchRequest, FetchSuccess, HookPolicy, PullError, PullFailureKind, PullRequest, PullSuccess,
     PushRequest, PushTagRequest, RebaseStatus, RemoteRefUpdate, RepoMode, RepositoryDescriptor,
-    RepositoryKind, SelectRequest, SessionInfo, SessionRequest, SignatureStatus, TagDetail,
-    TagKind, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
+    RepositoryKind, SelectRequest, SessionInfo, SessionRequest, SignTagError, SignTagFailureKind,
+    SignatureStatus, TagDetail, TagKind, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use history::{HistoryFrame, HistoryPage};

@@ -25,9 +25,9 @@ use git_vista_protocol::{
     CreateTagRequest, DeleteCloneRequest, DeleteTagRequest, FetchRequest, ForcePublish,
     GitOperation, MergeStrategy, OperationByKeyResponse, PatchPlan, PatchPreview, Plan,
     ProtocolInfo, PullRequest, PushRequest, RebaseStatus, RemoteName, RepoMode,
-    RepositoryDescriptor, SelectRequest, SessionInfo, SessionRequest, StageDirection, StagingDiff,
-    WorktreePathsRequest, WorktreeStatus, CSRF_HEADER, IDEMPOTENCY_HEADER, OPERATION_HEADER,
-    PROTOCOL_HEADER, PROTOCOL_VERSION,
+    RepositoryDescriptor, SelectRequest, SessionInfo, SessionRequest, SignTagError, StageDirection,
+    StagingDiff, WorktreePathsRequest, WorktreeStatus, CSRF_HEADER, IDEMPOTENCY_HEADER,
+    OPERATION_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
 use crate::features::dialogs::commit::{amend_body, classify_amend_response, AmendOutcome};
@@ -1062,22 +1062,32 @@ pub async fn create_branch_request(name: &str, commit: &str) -> Result<(), Strin
     }
 }
 
-/// Ask the backend to create a tag (M2.21d, #238, `POST /api/tag`), mirroring
-/// [`create_branch_request`] just above. `message` is what the DTO's own doc
-/// comment uses to choose the tag's *kind*: `None` is a lightweight tag,
-/// `Some(text)` is annotated with `text` — the caller builds this with
-/// `features::graph::core::tag_annotation_from_prompt` rather than deciding
-/// it inline, so "cancelled" and "typed nothing" can't diverge from one
-/// another by accident. `sign` is always `false` here: M2.21d wires create
-/// and delete only, and the server refuses `sign: true` until M2.21e (#74)
-/// gives it something to do.
+/// Ask the backend to create a tag (M2.21d #238 / M2.21e #239, `POST
+/// /api/tag`), mirroring [`create_branch_request`] just above. `message` is
+/// what the DTO's own doc comment uses to choose the tag's *kind*: `None` is
+/// a lightweight tag, `Some(text)` is annotated with `text` — the caller
+/// builds this with `features::graph::core::tag_annotation_from_prompt`
+/// rather than deciding it inline, so "cancelled" and "typed nothing" can't
+/// diverge from one another by accident. `sign` asks for `git tag -s`
+/// (M2.21e wires real execution; it reliably fails against this server's own
+/// sandbox today — see [`SignTagError`]'s doc comment for why).
 ///
-/// On a non-2xx response the envelope's `error.message` is returned as `Err`
-/// (#316), same posture as every other write in this file.
+/// # Two error shapes, tried in order
+///
+/// A signing failure carries a typed [`SignTagError`] (`kind` + `message`) —
+/// a JSON *object* that is not the `ApiError` envelope every other refusal
+/// uses, so it is parsed first; `user_facing_error`'s generic
+/// `split_error_response` cannot read it (a JSON object it does not
+/// recognise as the envelope falls back to a bare `HTTP <status>`, which
+/// would throw away the one part of a `SignTagError` worth showing). Every
+/// other refusal — a bad name, an existing tag, git couldn't run — keeps the
+/// server-wide prose/envelope contract and falls through to the same
+/// `user_facing_error` path every other write in this file uses (#316).
 pub async fn create_tag_request(
     name: &str,
     commit: &str,
     message: Option<&str>,
+    sign: bool,
 ) -> Result<(), String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
@@ -1085,14 +1095,31 @@ pub async fn create_tag_request(
         name: name.to_string(),
         commit: commit.to_string(),
         message: message.map(str::to_string),
-        sign: false,
+        sign,
     };
     let (resp, _key) = write_json("/api/tag", &body).await?;
     if resp.ok() {
-        Ok(())
-    } else {
-        Err(user_facing_error("/api/tag", resp).await)
+        return Ok(());
     }
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if let Ok(refusal) = serde_json::from_str::<SignTagError>(&text) {
+        web_sys::console::error_1(
+            &format!("git-vista: POST /api/tag signing refused: {refusal:?}").into(),
+        );
+        return Err(refusal.message);
+    }
+    let parsed = crate::features::dialogs::core::split_error_response(status, &text);
+    if let Some(id) = &parsed.request_id {
+        web_sys::console::error_1(
+            &format!(
+                "git-vista: POST /api/tag failed (request {id}): {}",
+                parsed.message
+            )
+            .into(),
+        );
+    }
+    Err(parsed.message)
 }
 
 /// Ask the backend to create a commit (Issue #33, `POST /api/commit`).
