@@ -51,6 +51,7 @@ use crate::features::session::signals as session_state;
 use crate::features::shell::signals::{
     install_connectivity_signal, install_mode_signal, SheetController, Shell,
 };
+use crate::features::status::core as status_core;
 use crate::features::status::signals as status_seam;
 use crate::hook_policy_banner::hook_policy_banner_view;
 use crate::icons::icon_set;
@@ -654,23 +655,24 @@ pub fn App() -> impl IntoView {
                 // hover title carries the full breakdown.
                 {move || status.get().flatten().map(|s| {
                     let ic = icon_set(nerd_icons.get());
-                    let (class, icon, label) = if !s.conflicted.is_empty() {
-                        ("status-chip conflict", ic.conflict,
-                         format!("{} conflicted", s.conflicted.len()))
+                    // The label's grouping is decided in one host-tested place
+                    // (`features::status::core::chip_label`), shared with the
+                    // Activity panel's status sections. Before #348 this arm
+                    // folded untracked into "unstaged" while the panel gave it
+                    // its own section, so the two disagreed on screen about the
+                    // same worktree.
+                    let label = status_core::chip_label(
+                        s.staged.len(),
+                        s.unstaged.len(),
+                        s.untracked.len(),
+                        s.conflicted.len(),
+                    );
+                    let (class, icon) = if !s.conflicted.is_empty() {
+                        ("status-chip conflict", ic.conflict)
                     } else if !s.is_clean() {
-                        // Split into staged vs the rest, so clicking "Stage
-                        // Changes" visibly flips the chip ("2 changes" → "2
-                        // staged"), then to "clean" once committed.
-                        let staged = s.staged.len();
-                        let unstaged = s.unstaged.len() + s.untracked.len();
-                        let label = match (staged, unstaged) {
-                            (st, 0) => format!("{st} staged"),
-                            (0, un) => format!("{un} change{}", if un == 1 { "" } else { "s" }),
-                            (st, un) => format!("{st} staged · {un} unstaged"),
-                        };
-                        ("status-chip dirty", ic.dirty, label)
+                        ("status-chip dirty", ic.dirty)
                     } else {
-                        ("status-chip clean", ic.clean, "clean".to_string())
+                        ("status-chip clean", ic.clean)
                     };
                     let mut sync = String::new();
                     if s.ahead > 0 { sync.push_str(&format!(" ↑{}", s.ahead)); }

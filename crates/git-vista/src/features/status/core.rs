@@ -212,6 +212,49 @@ pub enum StatusHeadline {
     Clean,
 }
 
+/// The topbar chip's short label, from the four counts every status read can
+/// supply — **the one place the chip's grouping is decided** (#348).
+///
+/// # Why this takes counts rather than a `StatusSections`
+///
+/// The chip and the Activity panel read *different endpoints*: the panel uses
+/// the v2 [`WorktreeStatus`] this module's sections are built from, while the
+/// chip reads the older v1 `RepoStatus`, which `dialogs/commit.rs` also needs
+/// for the per-entry `ChangeKind` detail v2 does not carry
+/// (`staged_breadth`, `dialog_copy`). Migrating the chip wholesale would drag
+/// that dialog along with it. Taking bare counts lets **both** surfaces route
+/// their label through this one function today, so the grouping cannot drift
+/// between them, without pretending the two reads are one.
+///
+/// # The grouping rule itself
+///
+/// Untracked is its own bucket, never folded into "unstaged" — matching
+/// [`StatusSection`]'s own five-way split. #348 was filed because the chip
+/// used to fold them together and read `1 staged · 3 unstaged` beside a panel
+/// reading `1 staged / 1 unstaged / 2 untracked`, for the same worktree.
+///
+/// Conflicts take priority over everything, same as [`StatusSections::headline`].
+pub fn chip_label(staged: usize, unstaged: usize, untracked: usize, conflicted: usize) -> String {
+    if conflicted > 0 {
+        return format!("{conflicted} conflicted");
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if staged > 0 {
+        parts.push(format!("{staged} staged"));
+    }
+    if unstaged > 0 {
+        parts.push(format!("{unstaged} unstaged"));
+    }
+    if untracked > 0 {
+        parts.push(format!("{untracked} untracked"));
+    }
+    if parts.is_empty() {
+        "clean".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
 fn rows_for_entry(entry: &StatusEntry) -> Vec<(StatusSection, StatusRow)> {
     match entry {
         StatusEntry::Changed {
@@ -991,6 +1034,87 @@ mod tests {
         )]);
         let sections = StatusSections::from_worktree_status(&s);
         assert_eq!(sections.headline(), StatusHeadline::Dirty(2));
+    }
+
+    // -----------------------------------------------------------------
+    // chip_label() — #348, the one place the chip's grouping is decided
+    // -----------------------------------------------------------------
+
+    /// The exact worktree from #348's report: one staged file, one modified
+    /// tracked file, two untracked. The chip used to render this as
+    /// `1 staged · 3 unstaged` while the panel showed three separate
+    /// sections — the disagreement the shared function exists to prevent.
+    #[test]
+    fn the_reported_worktree_no_longer_folds_untracked_into_unstaged() {
+        assert_eq!(
+            chip_label(1, 1, 2, 0),
+            "1 staged · 1 unstaged · 2 untracked"
+        );
+    }
+
+    /// The chip and the panel must produce the same label from the same
+    /// worktree — the actual property #348 asks for, checked end to end
+    /// through `StatusSections` rather than by passing the same four
+    /// integers to one function twice.
+    #[test]
+    fn the_chip_and_the_panel_agree_on_the_same_worktree() {
+        let s = status(vec![
+            changed(
+                "staged.rs",
+                ChangeSides::StagedOnly {
+                    staged: ChangeKind::Added,
+                },
+            ),
+            changed(
+                "modified.rs",
+                ChangeSides::UnstagedOnly {
+                    unstaged: ChangeKind::Modified,
+                },
+            ),
+            StatusEntry::Untracked {
+                path: "a.txt".to_string(),
+                binary: false,
+            },
+            StatusEntry::Untracked {
+                path: "b.txt".to_string(),
+                binary: false,
+            },
+        ]);
+        let sections = StatusSections::from_worktree_status(&s);
+
+        // What the panel renders, from the v2 sections.
+        let panel = chip_label(
+            sections.count(StatusSection::Staged),
+            sections.count(StatusSection::Unstaged),
+            sections.count(StatusSection::Untracked),
+            sections.count(StatusSection::Conflicted),
+        );
+        // What the chip renders, from the v1 read's own four counts — the
+        // same worktree seen through the older endpoint.
+        let chip = chip_label(1, 1, 2, 0);
+
+        assert_eq!(panel, chip);
+        assert_eq!(panel, "1 staged · 1 unstaged · 2 untracked");
+    }
+
+    #[test]
+    fn a_clean_worktree_labels_clean() {
+        assert_eq!(chip_label(0, 0, 0, 0), "clean");
+    }
+
+    #[test]
+    fn a_single_bucket_reads_alone_without_separators() {
+        assert_eq!(chip_label(2, 0, 0, 0), "2 staged");
+        assert_eq!(chip_label(0, 3, 0, 0), "3 unstaged");
+        assert_eq!(chip_label(0, 0, 1, 0), "1 untracked");
+    }
+
+    #[test]
+    fn conflicts_suppress_the_other_buckets_entirely() {
+        // Same priority rule as headline(): a conflict is the only thing
+        // worth saying until it is resolved, so the label must not read
+        // "1 staged · 2 conflicted" and bury it mid-string.
+        assert_eq!(chip_label(1, 5, 3, 2), "2 conflicted");
     }
 
     #[test]
