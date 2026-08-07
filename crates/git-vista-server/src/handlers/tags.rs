@@ -25,21 +25,35 @@
 //! "Tagger" field shows a blank tagger, which is a different (and false)
 //! claim from "this kind of tag has no tagger".
 //!
-//! # No new spawn path
+//! # One spawn path, added for real signature verification (M2.21c, #237)
 //!
-//! There is no subprocess **in this file**. `read_tags` opens the repository
-//! once with `gix::open_opts(.., isolated())` — the same posture as every other
+//! `read_tags` itself still spawns nothing: it opens the repository once with
+//! `gix::open_opts(.., isolated())` — the same posture as every other
 //! `git-vista-git` read — and decodes each tag object out of the mapped object
-//! database. So there is nothing for the Tier::Strict `sandbox::spawn`
-//! chokepoint to classify here, and in particular nothing that could become a
-//! spawn *per tag*; #221's held-open `cat-file --batch` would be strictly more
-//! expensive than reading the odb we already have open.
+//! database, including whether a PGP armour block is present at all. But
+//! *whether that armour checks out* is not something `gix` (or this crate)
+//! computes; only `gpg`, via `git verify-tag`, can say GOODSIG from BADSIG
+//! from "no key to check against". [`verify_tag_signature`] therefore runs
+//! one `git verify-tag --raw <name>` per **signed** tag — never per unsigned
+//! or lightweight tag — through [`crate::git_cmd::git_output`], the same
+//! `NetworkNeed::Local` chokepoint every other local read in this crate uses
+//! (`git_cmd::rev_parse`, `is_ancestor`, `git_ref_exists`), which resolves to
+//! the one sealed launcher, `sandbox::spawn::command_async`. Not a new spawn
+//! path — the existing one, declared honestly: verify-tag reads the object
+//! database and the operator's GPG keyring, never a remote.
 //!
-//! The two write handlers keep that true: like every other write handler since
-//! M1.06b (#143) they validate their request, build one typed
+//! That keyring read is where the sandbox's own posture becomes visible in
+//! the result: `~/.gnupg` is one of `sandbox::DEFAULT_SECRET_EXCLUDES`, so on
+//! an untrusted repository (`Tier::Strict`, the default) `gpg` cannot open
+//! it. See [`verify_tag_signature`]'s doc comment for what that does to the
+//! answer.
+//!
+//! The two write handlers keep the pre-existing shape: like every other write
+//! handler since M1.06b (#143) they validate their request, build one typed
 //! [`GitOperation`], and hand it to [`crate::planner`] — the one place a
-//! mutating git argv is constructed. `git tag` / `git tag -d` run in
-//! `planner::exec_create_tag` / `planner::exec_delete_local_tag`, not here.
+//! *mutating* git argv is constructed. `git tag` / `git tag -d` run in
+//! `planner::exec_create_tag` / `planner::exec_delete_local_tag`, not here;
+//! `verify_tag_signature`'s spawn is read-only and outside that path.
 
 use axum::extract::Query;
 use axum::http::{header, HeaderValue, StatusCode};
@@ -100,8 +114,10 @@ pub(crate) async fn tag_list(
     let repo = resolve_repo(q.repo.as_deref())?.0;
     // `read_tags` opens a repository and mmaps packs — blocking work, so it
     // goes off the async workers exactly as `read_head_branch` does in
-    // `planner::current_branch`.
-    let records = tokio::task::spawn_blocking(move || git_vista_git::read_tags(&repo))
+    // `planner::current_branch`. Cloned rather than moved: `repo` is needed
+    // again below, to run `git verify-tag` against the same path.
+    let read_repo = repo.clone();
+    let records = tokio::task::spawn_blocking(move || git_vista_git::read_tags(&read_repo))
         .await
         .map_err(|e| {
             eprintln!("git-vista: /api/tags panicked while reading tags: {e}");
@@ -118,7 +134,22 @@ pub(crate) async fn tag_list(
             )
         })?;
 
-    let tags: Vec<TagDetail> = records.iter().filter_map(tag_detail).collect();
+    // `tag_detail` gives every signed tag a structural `Unverifiable`
+    // placeholder (see its doc comment); this is where that placeholder
+    // becomes `verify_tag_signature`'s real answer. Sequential on purpose —
+    // one `git verify-tag` per **signed** tag, never per unsigned or
+    // lightweight one, and a repository's tag count is not attacker-chosen
+    // input this endpoint needs to bound concurrency against.
+    let mut tags: Vec<TagDetail> = Vec::with_capacity(records.len());
+    for record in &records {
+        let Some(mut detail) = tag_detail(record) else {
+            continue;
+        };
+        if record.signed {
+            detail.signature = verify_tag_signature(&repo, &detail.name).await;
+        }
+        tags.push(detail);
+    }
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
     Ok((no_store, Json(tags)))
 }
@@ -306,10 +337,14 @@ pub(crate) async fn delete_tag(Json(req): Json<DeleteTagRequest>) -> (StatusCode
 /// tag is a false negative in exactly the direction
 /// [`SignatureStatus`]'s own doc warns about. A tag whose object *does* carry
 /// armour gets [`SignatureStatus::Unverifiable`] — "a signature is present but
-/// verification could not run at all" — which is a true statement in a slice
-/// where the verifier does not exist yet. No gpg is invoked either way; the
-/// presence bit comes from the object parser splitting the armour off the
-/// message. M2.21c narrows `Unverifiable` to valid / invalid / unknown-key and
+/// verification could not run at all" — which is exactly this function's own
+/// truth: `tag_detail` never invokes gpg itself (the presence bit comes from
+/// the object parser splitting the armour off the message), so from this
+/// function's point of view verification genuinely has not run yet. It is a
+/// **placeholder**, not the caller's last word: [`tag_list`] overwrites it
+/// with [`verify_tag_signature`]'s real answer for every tag reported signed
+/// here, and never touches one reported [`SignatureStatus::Unsigned`] — so
+/// this function still only ever narrows toward the signed minority and
 /// never has to widen `Unsigned` back out.
 fn tag_detail(record: &TagRecord) -> Option<TagDetail> {
     let name = match TagName::new(&record.name) {
@@ -366,6 +401,141 @@ fn tag_detail(record: &TagRecord) -> Option<TagDetail> {
             SignatureStatus::Unsigned
         },
     })
+}
+
+/// Run `git verify-tag --raw <name>` and classify the result — the real
+/// signature check M2.21c (#237) owns, replacing the `Unverifiable`
+/// placeholder [`tag_detail`] gives every signed tag before this runs.
+///
+/// Only called (by [`tag_list`]) for a tag [`TagRecord::signed`] already
+/// found `true`: an unsigned tag has nothing for `verify-tag` to check, and
+/// calling it anyway would spawn a process this server never needs to spawn.
+///
+/// # Goes through the same chokepoint as every other git this server runs
+///
+/// [`crate::git_cmd::git_output`] — not a new spawn path — which resolves to
+/// `sandbox::spawn::command_async` exactly like every other `Local`-declared
+/// read here (`git_cmd::rev_parse`, `is_ancestor`, `git_ref_exists`).
+/// `verify-tag` never reaches a remote — it reads the object database and,
+/// for the `gpg` subprocess it launches internally, the operator's GPG
+/// keyring — so `NetworkNeed::Local` is the truthful declaration, exactly
+/// like `rev_parse`'s.
+///
+/// # The sandbox denies gpg its keyring, on purpose, in the tier this runs at
+///
+/// A tag read on an untrusted repository (the default) runs the `Strict`
+/// tier, whose `$HOME` grant withholds `~/.gnupg` via
+/// `sandbox::DEFAULT_SECRET_EXCLUDES` — the very keyring `verify-tag`'s
+/// internal `gpg` needs to resolve a signer's public key. Measured *outside*
+/// the sandbox, directly against a real signed tag with `GNUPGHOME` pointed
+/// at an inaccessible directory: `gpg` still emits a well-formed
+/// `ERRSIG`/`NO_PUBKEY` pair rather than failing outright, which this
+/// function classifies as [`SignatureStatus::UnknownKey`] — a true statement
+/// ("nothing can be said about the bytes either way") even though the actual
+/// cause is sandbox policy, not an absent key.
+///
+/// **What the exact status is *inside* `Tier::Strict` is inferred, not
+/// separately measured.** `Strict`'s seccomp filter denies
+/// `socket(AF_UNIX)` unconditionally (`bin/gv-sandbox/seccomp_filter.rs`) —
+/// the call `gpg` makes to reach `gpg-agent` at all — so `gpg` may never get
+/// as far as emitting a status-protocol line, in which case this classifies
+/// as [`SignatureStatus::Unverifiable`] (no recognised line) rather than
+/// `UnknownKey`. Both are honest answers to "can this be verified here", and
+/// either way the load-bearing claim holds: for the common case (an
+/// untrusted repository), **no tag can ever classify as [`Valid`] or
+/// [`Invalid`]** — every signed tag reports `UnknownKey` or `Unverifiable`
+/// regardless of whether the signature is genuine, unless the operator has
+/// explicitly trusted the repository (`Tier::Unsandboxed`, which applies no
+/// exclude at all). This is a real, reachable limitation of the current
+/// sandbox posture, not a bug in this function's parsing.
+///
+/// # Known cost, not yet addressed here (flagged for follow-up)
+///
+/// This runs once per **signed** tag, sequentially, inline in a `GET`
+/// handler — so on the common untrusted-repository path it is N sandboxed
+/// spawns (bwrap + Landlock + seccomp each) that are provably going to
+/// answer `UnknownKey` before a single one of them runs, on a repository
+/// that could carry thousands of release tags. A guard ahead of the loop —
+/// untrusted repository skips straight to `UnknownKey`, no spawn — would
+/// remove all of them, but the trust check this would need
+/// (`sandbox::repo_is_trusted`) is a private `fn` in `sandbox::mod`, not
+/// reachable from this module today, and widening a security-sensitive
+/// visibility boundary is out of scope for this change. Left as drafted;
+/// the cost is real and should be fixed by whoever next touches this path,
+/// not silently absorbed.
+///
+/// [`Valid`]: SignatureStatus::Valid
+/// [`Invalid`]: SignatureStatus::Invalid
+async fn verify_tag_signature(repo: &std::path::Path, name: &TagName) -> SignatureStatus {
+    let output =
+        match crate::git_cmd::git_output(repo, &["verify-tag", "--raw", name.as_str()]).await {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!(
+                    "git-vista: couldn't run `git verify-tag` for {:?}: {e}",
+                    name.as_str()
+                );
+                return SignatureStatus::Unverifiable;
+            }
+        };
+    // `--raw` writes gpg's status-protocol lines to stderr, never stdout —
+    // see `git help verify-tag`. Lossy on purpose: the status protocol is
+    // ASCII keywords and hex, so a non-UTF-8 byte here would be gpg's own
+    // corruption, not information this classification needs.
+    classify_verify_tag_output(&output.stderr)
+}
+
+/// Classify one `git verify-tag --raw` run from its captured stderr.
+///
+/// Split from [`verify_tag_signature`] so the mapping is testable against
+/// **exact bytes gpg was measured to emit** — for a genuine good signature, a
+/// tampered one (same key, altered tag content), and a signature checked
+/// with no matching public key in the keyring — rather than requiring a real
+/// gpg keypair and a spawned process in this crate's test suite.
+///
+/// # Why `BADSIG` is checked first and wins unconditionally
+///
+/// This is the distinction [`verify_tag_signature`] exists for: a `BADSIG`
+/// line means gpg ran, found the claimed key, and the bytes provably do
+/// **not** match — a forged or corrupted signature. `NO_PUBKEY`/`ERRSIG`
+/// mean the opposite kind of "no" — gpg never got far enough to say anything
+/// about the bytes at all. Collapsing those into one status, or letting an
+/// unrelated line downgrade a `BADSIG` to `UnknownKey`, is exactly the
+/// false-negative this exists to prevent (a forged tag reported as merely
+/// "unverifiable" reads as far less alarming than what it is). So this scans
+/// every line before deciding, and `BADSIG` outranks everything else
+/// regardless of what order the lines arrived in.
+fn classify_verify_tag_output(stderr: &[u8]) -> SignatureStatus {
+    let text = String::from_utf8_lossy(stderr);
+    let mut good = false;
+    let mut no_pubkey = false;
+    for line in text.lines() {
+        let Some(status) = line.strip_prefix("[GNUPG:] ") else {
+            continue;
+        };
+        match status.split_whitespace().next().unwrap_or("") {
+            "BADSIG" => return SignatureStatus::Invalid,
+            // EXPKEYSIG/EXPSIG: the cryptographic check itself passed (gpg
+            // emits them exactly where it would emit GOODSIG); the key or
+            // signature having since expired has no variant of its own in
+            // `SignatureStatus`, so this reports the same fact GOODSIG does
+            // rather than inventing a false `Invalid` or `Unverifiable`.
+            "GOODSIG" | "EXPKEYSIG" | "EXPSIG" => good = true,
+            "NO_PUBKEY" => no_pubkey = true,
+            _ => {}
+        }
+    }
+    if good {
+        SignatureStatus::Valid
+    } else if no_pubkey {
+        SignatureStatus::UnknownKey
+    } else {
+        // No recognised status line at all: gpg didn't run (missing binary,
+        // misconfigured `gpg.program`) or produced output this function does
+        // not understand. "Could not run/complete verification" is the
+        // honest bucket for both.
+        SignatureStatus::Unverifiable
+    }
 }
 
 /// Fit a tag's annotation into a [`TagMessage`], appending [`TRUNCATION_NOTE`]
@@ -836,5 +1006,92 @@ pub(crate) mod tests {
             fitted.as_str(),
             "head\n\n[git-vista: this tag's message is longer than 16 KiB; it was cut here]"
         );
+    }
+
+    /// Real bytes captured from `git verify-tag --raw` (git 2.43, gpg 2.4.4)
+    /// against a genuinely signed, unmodified tag, with the signer's public
+    /// key present in the keyring — the case that must classify `Valid`.
+    #[test]
+    fn a_verified_signature_classifies_valid() {
+        let raw = b"[GNUPG:] NEWSIG\n\
+                     [GNUPG:] KEY_CONSIDERED 55D729CA8C0B4F896D1053CC41815B16FFE44E12 0\n\
+                     [GNUPG:] SIG_ID 2J09+YBlXtuNyycCev8X5A6r47Q 2026-08-06 1786044942\n\
+                     [GNUPG:] GOODSIG 41815B16FFE44E12 Test Signer <signer@example.com>\n\
+                     [GNUPG:] VALIDSIG 55D729CA8C0B4F896D1053CC41815B16FFE44E12 2026-08-06 1786044942 0 4 0 22 10 00 55D729CA8C0B4F896D1053CC41815B16FFE44E12\n\
+                     [GNUPG:] TRUST_ULTIMATE 0 pgp\n";
+        assert_eq!(classify_verify_tag_output(raw), SignatureStatus::Valid);
+    }
+
+    /// # The critical distinction (issue #237)
+    ///
+    /// Real bytes captured the same way, but against a **tampered** tag
+    /// object: the same signature, the same known key, and a message byte
+    /// flipped after signing. `gpg` still finds the key (`KEY_CONSIDERED`)
+    /// and still runs the check — it just fails it. This must classify
+    /// `Invalid`, and — the assertion that matters — it must **not**
+    /// classify the same as "we have no public key to check against"
+    /// ([`SignatureStatus::UnknownKey`]) or "verification could not run"
+    /// ([`SignatureStatus::Unverifiable`]). Conflating a provably forged
+    /// signature with either of those is the security defect this test
+    /// exists to catch.
+    #[test]
+    fn a_forged_signature_classifies_invalid_never_unknown_key_or_unverifiable() {
+        let raw = b"[GNUPG:] NEWSIG\n\
+                     [GNUPG:] KEY_CONSIDERED 55D729CA8C0B4F896D1053CC41815B16FFE44E12 0\n\
+                     [GNUPG:] BADSIG 41815B16FFE44E12 Test Signer <signer@example.com>\n\
+                     [GNUPG:] FAILURE gpg-exit 33554433\n";
+        let status = classify_verify_tag_output(raw);
+        assert_eq!(status, SignatureStatus::Invalid);
+        assert_ne!(status, SignatureStatus::UnknownKey);
+        assert_ne!(status, SignatureStatus::Unverifiable);
+    }
+
+    /// Real bytes captured verifying the same genuine, untampered signature
+    /// against an **empty keyring** — precisely what this server's `Strict`
+    /// sandbox tier produces for every signed tag on an untrusted repository
+    /// (`~/.gnupg` is withheld by `sandbox::DEFAULT_SECRET_EXCLUDES`). `gpg`
+    /// never gets to say whether the bytes check out, so this must classify
+    /// `UnknownKey` — and, the other half of the same distinction, it must
+    /// never read as `Invalid`: an absent key is not evidence of forgery.
+    #[test]
+    fn a_signature_with_no_matching_pubkey_classifies_unknown_key_never_invalid() {
+        let raw = b"[GNUPG:] NEWSIG\n\
+                     [GNUPG:] ERRSIG 41815B16FFE44E12 22 10 00 1786044942 9 55D729CA8C0B4F896D1053CC41815B16FFE44E12\n\
+                     [GNUPG:] NO_PUBKEY 41815B16FFE44E12\n\
+                     [GNUPG:] FAILURE gpg-exit 33554433\n";
+        let status = classify_verify_tag_output(raw);
+        assert_eq!(status, SignatureStatus::UnknownKey);
+        assert_ne!(status, SignatureStatus::Invalid);
+    }
+
+    /// No `[GNUPG:] ` status line at all — `gpg` did not run (missing
+    /// binary, broken `gpg.program`) or the sandbox denied it something more
+    /// fundamental than a missing key. The honest answer is "verification
+    /// could not run", not a guess at which of the other four states
+    /// applies.
+    #[test]
+    fn output_with_no_status_lines_classifies_unverifiable() {
+        assert_eq!(
+            classify_verify_tag_output(b"fatal: cannot exec 'gpg': No such file or directory\n"),
+            SignatureStatus::Unverifiable
+        );
+        assert_eq!(
+            classify_verify_tag_output(b""),
+            SignatureStatus::Unverifiable
+        );
+    }
+
+    /// Adversarial ordering: a `BADSIG` line arriving *after* a
+    /// `GOODSIG`-shaped line in the same run must still win. Real `gpg`
+    /// never emits both for one signature, but `classify_verify_tag_output`
+    /// makes no assumption about line order — scanning the whole output and
+    /// letting `BADSIG` outrank everything else, unconditionally, is what
+    /// its own doc comment claims; this pins that claim against the one
+    /// input shape that would expose a short-circuit-on-first-match bug.
+    #[test]
+    fn a_badsig_line_outranks_a_goodsig_line_appearing_earlier_in_the_same_run() {
+        let raw = b"[GNUPG:] GOODSIG 41815B16FFE44E12 Test Signer <signer@example.com>\n\
+                     [GNUPG:] BADSIG 41815B16FFE44E12 Test Signer <signer@example.com>\n";
+        assert_eq!(classify_verify_tag_output(raw), SignatureStatus::Invalid);
     }
 }
