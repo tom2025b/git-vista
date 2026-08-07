@@ -43,12 +43,32 @@ fn git_vista_mcp_never_depends_on_git_vista_server_even_transitively() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let manifest_path = format!("{manifest_dir}/Cargo.toml");
 
+    // `--filter-platform` is what keeps this test deterministic in CI, and the
+    // reason is not obvious. Without it, `cargo metadata` resolves the graph for
+    // EVERY platform, including Windows-only crates like `anstyle-wincon` that a
+    // Linux build never downloads. `--offline` then cannot find them in the local
+    // cache and the whole command fails — so this test failed on the CI runner
+    // while passing on any developer machine whose cache happened to hold them.
+    //
+    // That is exactly what happened: `main`'s "Core (check + test)" job was red
+    // with `failed to download anstyle-wincon v3.0.11`, intermittently, for a
+    // day — the same commit passing on one run and failing on another, because
+    // the outcome depended on cache state rather than on the code. Restricting
+    // resolution to the host platform removes the whole class.
+    //
+    // This does not weaken what the test proves. The dependency it guards
+    // against — `git-vista-mcp` reaching `git-vista-server` — is not
+    // platform-gated in any manifest, so the host graph is the graph that
+    // matters. A future platform-specific edge would need its own check.
+    let host_triple = host_triple();
     let output = std::process::Command::new(env!("CARGO"))
         .args([
             "metadata",
             "--format-version",
             "1",
             "--offline",
+            "--filter-platform",
+            &host_triple,
             "--manifest-path",
             &manifest_path,
         ])
@@ -147,4 +167,22 @@ fn git_vista_mcp_never_depends_on_git_vista_server_even_transitively() {
         "sanity check failed: git-vista-core was not found in the resolved \
          graph at all — the graph walk above is not exercising anything"
     );
+}
+
+/// The host's target triple, asked of `rustc` rather than assembled from
+/// `std::env::consts` — those give arch and OS separately and reassembling them
+/// into a triple is guesswork that differs from what cargo expects (`gnu` vs
+/// `musl`, `pc` vs `unknown`). `rustc -vV` prints the authoritative one.
+fn host_triple() -> String {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let out = std::process::Command::new(rustc)
+        .arg("-vV")
+        .output()
+        .expect("could not run `rustc -vV` — is rustc on PATH?");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .expect("`rustc -vV` printed no `host:` line")
+        .trim()
+        .to_string()
 }
