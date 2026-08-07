@@ -15,10 +15,27 @@
 //! returns it, executing nothing**: the only endpoint they can reach is
 //! `POST /api/plan`, which on the server side reaches only
 //! `planner::build_plan_only` — no mutation guard, no executor, no argv.
-//! Submitting an approved plan is #249's `execute_plan` on its own endpoint;
+//! Submitting an approved plan was #249's `execute_plan` on its own endpoint;
 //! the separation is the point of the funnel, and
 //! `plan_tools::tests::every_plan_tool_posts_only_to_api_plan` is what keeps
 //! it a fact rather than an intention.
+//!
+//! # Write capability, exactly once (M2.23e, #249)
+//!
+//! [`execute_tool`] adds the one tool that can mutate: `execute_plan`. It
+//! takes the exact `plan` object a `plan_*` tool call returned and POSTs it
+//! to `POST /api/execute-plan`, which on the server side reaches
+//! `planner::submit_plan_tracked` — the stage that re-validates a plan
+//! against the *live* repository (operation hash, expiry, generation, every
+//! precondition) before running anything. A tampered, expired, or stale plan
+//! is refused there, in the server's own words, and this bridge passes that
+//! refusal through unparaphrased (see [`execute_tool`]'s module doc). A
+//! retry of the identical `plan` object is replay-safe: the idempotency key
+//! this tool sends is derived deterministically from the plan itself, not
+//! randomly minted, so a second submission of the same plan reproduces the
+//! same key and the server replays its recorded result instead of running
+//! git twice. Auth is the same bootstrap-token exchange every other tool
+//! here uses — no second path.
 //!
 //! # Transport choice, recorded per #245's scope
 //!
@@ -33,6 +50,7 @@
 //! surface (#246–#249) makes the framing the bigger half of the crate.
 
 mod auth;
+mod execute_tool;
 mod http;
 mod plan_tools;
 mod tools;
