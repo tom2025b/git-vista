@@ -9,32 +9,35 @@
 //!     the real `build_plan → validate → enforce_fresh → execute` composition
 //!     against a real temporary repository and asserts the mutation landed.
 //!     [`covered_by`] matches exhaustively over the enum, so adding a new
-//!     variant refuses to compile until it gets a pipeline test. (Four
-//!     exceptions today: `FetchRemote` and `PullBranch` (M2.20a #227) and
-//!     the two *remote-reaching* tag operations, `DeleteRemoteTag` and
-//!     `PushTag` (M2.21a #235), ship no execution — their pipeline tests
-//!     assert the *stubs'* refusal and that the repository stayed
-//!     byte-identical, the honest version of this layer's claim until
-//!     #229/#230 and the later M2.21 slices of #74 wire real execution in.
-//!     `AmendCommit` was staged the same way by #222 and graduated when #223
-//!     wired `exec_amend_commit`; `CreateTag` and `DeleteLocalTag` graduated
-//!     the same way when M2.21d (#238, ADR 0048) wired theirs, and their
-//!     inertness stubs were **replaced** by real execution tests rather than
-//!     kept alongside — an inertness assertion that survives the wiring it
-//!     was guarding is a test asserting the opposite of the contract.)
-
-//!     exceptions today: the four tag operations (M2.21a #235) ship no
+//!     variant refuses to compile until it gets a pipeline test. (Two
+//!     exceptions today: `FetchRemote` and `PullBranch` (M2.20a #227) ship no
 //!     execution — their pipeline tests assert the *stubs'* refusal and that
 //!     the repository stayed byte-identical, the honest version of this
-//!     layer's claim until the later M2.21 slices of #74 wire real execution
-//!     in. `AmendCommit` was staged the same way by #222 and graduated to a
-//!     real execution test when #223 wired `exec_amend_commit`; `FetchRemote`
-//!     graduated the same way when M2.20c #229 wired `planner::fetch`, and
-//!     `PullBranch` when M2.20d #230 wired `planner::pull`. Their heavier
-//!     behavioural coverage — live progress, a cancel that kills the child,
-//!     the dropped-connection replay, redaction on the streaming path, the
-//!     merge-vs-rebase history difference, the conflict abort — lives in the
-//!     siblings [`super::fetch_suite`] and [`super::pull_suite`].)
+//!     layer's claim until #229/#230 wire real execution in. `AmendCommit`
+//!     was staged the same way by #222 and graduated when #223 wired
+//!     `exec_amend_commit`; all four M2.21a (#235) tag operations graduated
+//!     the same way — `CreateTag`/`DeleteLocalTag` when M2.21d (#238, ADR
+//!     0048) wired theirs, `DeleteRemoteTag`/`PushTag` when M2.21f (#240)
+//!     wired theirs — and every one of those inertness stubs was **replaced**
+//!     by a real execution test rather than kept alongside, since an
+//!     inertness assertion that survives the wiring it was guarding is a
+//!     test asserting the opposite of the contract.)
+
+//!     exceptions today: none remain among the tag operations — all four
+//!     M2.21a (#235) tag variants now execute for real, most recently
+//!     `DeleteRemoteTag`/`PushTag` when M2.21f (#240) wired theirs. Their
+//!     pipeline tests used to assert the *stubs'* refusal and that the
+//!     repository stayed byte-identical; each was **replaced** by a real
+//!     execution test on graduation, the honest version of this layer's
+//!     claim, not kept alongside it. `AmendCommit` was staged the same way
+//!     by #222 and graduated to a real execution test when #223 wired
+//!     `exec_amend_commit`; `FetchRemote` graduated the same way when M2.20c
+//!     #229 wired `planner::fetch`, and `PullBranch` when M2.20d #230 wired
+//!     `planner::pull`. Their heavier behavioural coverage — live progress, a
+//!     cancel that kills the child, the dropped-connection replay, redaction
+//!     on the streaming path, the merge-vs-rebase history difference, the
+//!     conflict abort — lives in the siblings [`super::fetch_suite`] and
+//!     [`super::pull_suite`].)
 //!  2. **Single-funnel proof** — a source-level test walks the router's POST
 //!     table and every git-write handler, asserting each one reaches
 //!     [`plan_and_execute`] (directly or through its named local helper) and
@@ -2056,9 +2059,15 @@ fn every_git_write_route_reaches_the_planner() {
         ("/api/pull", "pull_branch"),
         ("/api/delete-branch", "delete_branch"),
         // M2.21d (#238): the two local tag writes — git writes, funnel rows
-        // below. The tag *listing* is a GET and so never reaches this table.
+        // below. M2.21f (#240) added the two remote ones right after. The
+        // tag *listing* is a GET and so never reaches this table.
         ("/api/tag", "handlers::tags::create_tag"),
         ("/api/delete-tag", "handlers::tags::delete_tag"),
+        ("/api/push-tag", "handlers::tags::push_tag"),
+        (
+            "/api/delete-remote-tag",
+            "handlers::tags::delete_remote_tag",
+        ),
         ("/api/checkout", "checkout_branch"),
         ("/api/force-delete-branch", "force_delete_branch"),
         ("/api/rebase", "rebase"),
@@ -2185,6 +2194,10 @@ fn every_git_write_route_reaches_the_planner() {
         // call the planner directly — no `git tag` argv exists in that file.
         ("src/handlers/tags.rs", "create_tag", None),
         ("src/handlers/tags.rs", "delete_tag", None),
+        // M2.21f (#240): the two remote tag write handlers, same shape —
+        // build the operation, call the planner directly.
+        ("src/handlers/tags.rs", "push_tag", None),
+        ("src/handlers/tags.rs", "delete_remote_tag", None),
     ];
     for (file, handler, helper) in funnel {
         let src = source(file);
@@ -4314,11 +4327,13 @@ async fn delete_local_tag_recovery_carries_the_unpeeled_tag_object() {
     );
 }
 
-/// [`GitOperation::DeleteRemoteTag`], contract-only like the fetch/pull stubs
-/// above and with the same reason to prove inertness hard: the remote here is
-/// real, reachable, and holds the tag — a stub that answered `501` *after*
-/// pushing the deletion would pass a status-only assertion while having
-/// destroyed the remote's ref.
+/// M2.21f (#240): `GitOperation::DeleteRemoteTag` now executes for real —
+/// `git push <remote> --delete refs/tags/<name>` against a real, reachable
+/// remote over the daemon fixture `push_branch_executes_through_the_pipeline`
+/// above uses, for the same reason: a filesystem-path remote is dead under
+/// the Network sandbox tier (receive-pack's quarantine migration is a
+/// cross-directory rename the shim denies), so this test cannot use the
+/// filesystem-path bare remote M2.21a's stub version of this test used.
 #[tokio::test]
 async fn delete_remote_tag_executes_through_the_pipeline() {
     let (dir, repo) = seeded_repo();
@@ -4326,11 +4341,48 @@ async fn delete_remote_tag_executes_through_the_pipeline() {
     let remote = dir.path().join("remote.git");
     std::fs::create_dir_all(&remote).unwrap();
     run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+
+    let _port_claim = crate::test_ports::PortClaim::acquire();
+    let port = crate::test_ports::PortClaim::PORT;
+    let daemon = {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("git")
+            .args([
+                "daemon",
+                "--reuseaddr",
+                "--listen=127.0.0.1",
+                &format!("--port={port}"),
+                "--export-all",
+                "--enable=receive-pack",
+                &format!("--base-path={}", dir.path().display()),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("git daemon spawns")
+    };
+    let _daemon = DaemonGuard(daemon);
+    let ready = (0..50).any(|_| {
+        std::net::TcpStream::connect(("127.0.0.1", port))
+            .map(|_| true)
+            .unwrap_or_else(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            })
+    });
+    assert!(ready, "git daemon never came up on 127.0.0.1:{port}");
+
     run(
         &repo,
-        &["remote", "add", "origin", &remote.display().to_string()],
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("git://127.0.0.1:{port}/remote.git"),
+        ],
     );
-    run(&repo, &["push", "-q", "origin", "main", "v1.0.0"]);
+    run(&repo, &["push", "-q", "origin", "main", "refs/tags/v1.0.0"]);
     let remote_tags_before = out(&remote, &["for-each-ref", "refs/tags"]);
     assert!(
         remote_tags_before.contains("v1.0.0"),
@@ -4346,22 +4398,26 @@ async fn delete_remote_tag_executes_through_the_pipeline() {
         },
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_ok(status, &body);
     assert_eq!(
         out(&remote, &["for-each-ref", "refs/tags"]),
-        remote_tags_before,
-        "the remote's tag must survive the stub — M2.21a ships no execution (#74)"
+        "",
+        "the remote's tag must really be gone after a real delete"
     );
     assert_eq!(
         repo_fingerprint(&repo),
         before,
-        "the stub must leave the local repository byte-identical too"
+        "deleting a REMOTE tag must not touch anything local — there is \
+         no remote-tracking ref for a tag to move (D5, see \
+         DeleteRemoteTag's doc in plan.rs)"
     );
 }
 
-/// [`GitOperation::PushTag`], contract-only: the remote is real and reachable
-/// and does *not* have the tag, so a stub that pushed before refusing would
-/// demonstrably leave `refs/tags/v1.0.0` on it.
+/// M2.21f (#240): `GitOperation::PushTag` now executes for real —
+/// `git push <remote> refs/tags/<name>` against the same real daemon
+/// fixture the delete test above uses, over the shared `PortClaim` (the
+/// three daemon-needing tests in this binary run it sequentially, never
+/// concurrently — see `test_ports`'s own doc).
 #[tokio::test]
 async fn push_tag_executes_through_the_pipeline() {
     let (dir, repo) = seeded_repo();
@@ -4369,9 +4425,46 @@ async fn push_tag_executes_through_the_pipeline() {
     let remote = dir.path().join("remote.git");
     std::fs::create_dir_all(&remote).unwrap();
     run(&remote, &["init", "-q", "--bare", "-b", "main"]);
+
+    let _port_claim = crate::test_ports::PortClaim::acquire();
+    let port = crate::test_ports::PortClaim::PORT;
+    let daemon = {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("git")
+            .args([
+                "daemon",
+                "--reuseaddr",
+                "--listen=127.0.0.1",
+                &format!("--port={port}"),
+                "--export-all",
+                "--enable=receive-pack",
+                &format!("--base-path={}", dir.path().display()),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("git daemon spawns")
+    };
+    let _daemon = DaemonGuard(daemon);
+    let ready = (0..50).any(|_| {
+        std::net::TcpStream::connect(("127.0.0.1", port))
+            .map(|_| true)
+            .unwrap_or_else(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            })
+    });
+    assert!(ready, "git daemon never came up on 127.0.0.1:{port}");
+
     run(
         &repo,
-        &["remote", "add", "origin", &remote.display().to_string()],
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("git://127.0.0.1:{port}/remote.git"),
+        ],
     );
     run(&repo, &["push", "-q", "origin", "main"]);
     assert_eq!(
@@ -4389,16 +4482,18 @@ async fn push_tag_executes_through_the_pipeline() {
         },
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
-    assert_eq!(
-        out(&remote, &["for-each-ref", "refs/tags"]),
-        "",
-        "no tag may reach the remote — M2.21a ships no push-tag execution (#74)"
+    assert_ok(status, &body);
+    let remote_tags = out(&remote, &["for-each-ref", "refs/tags"]);
+    assert!(
+        remote_tags.contains("v1.0.0"),
+        "the tag must really reach the remote: {remote_tags}"
     );
     assert_eq!(
         repo_fingerprint(&repo),
         before,
-        "the stub must leave the local repository byte-identical too"
+        "pushing a tag must not touch anything local — there is no \
+         remote-tracking ref for a tag to move (D5, see PushTag's doc in \
+         plan.rs)"
     );
 }
 

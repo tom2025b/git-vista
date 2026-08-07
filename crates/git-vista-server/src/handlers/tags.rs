@@ -1,6 +1,7 @@
-//! The tag endpoints: `GET /api/tags` (the listing, M2.21b #236) and the two
-//! **local** tag writes, `POST /api/tag` and `POST /api/delete-tag` (M2.21d
-//! #238, ADR 0048).
+//! The tag endpoints: `GET /api/tags` (the listing, M2.21b #236), the two
+//! **local** tag writes `POST /api/tag` and `POST /api/delete-tag` (M2.21d
+//! #238, ADR 0048), and the two **remote** tag writes `POST /api/push-tag`
+//! and `POST /api/delete-remote-tag` (M2.21f #240).
 //!
 //! The read half of M2.21: what `GET /api/frame`'s ref badges throw away.
 //! `read_refs` peels every `refs/tags/*` straight to a commit, so a badge can
@@ -62,7 +63,8 @@ use axum::Json;
 
 use git_vista_git::TagRecord;
 use git_vista_protocol::dto::{
-    CreateTagRequest, DeleteTagRequest, SignatureStatus, TagDetail, TagKind,
+    CreateTagRequest, DeleteRemoteTagRequest, DeleteTagRequest, PushTagRequest, SignatureStatus,
+    TagDetail, TagKind,
 };
 use git_vista_protocol::plan::{
     CommitOid, TagAnnotation, TagMessage, TagName, MAX_TAG_MESSAGE_LEN,
@@ -275,10 +277,11 @@ fn annotation_for(message: Option<&str>, sign: bool) -> Result<Option<TagAnnotat
 /// `git tag -d <tag>` via [`GitOperation::DeleteLocalTag`].
 ///
 /// Local only. Deleting the tag from a remote is
-/// [`GitOperation::DeleteRemoteTag`] — a separate operation, on a separate
-/// route still to come (#74), because it opens a socket with credentials on
-/// it. A user who deletes here and expects the remote to follow is wrong, but
-/// they are wrong in the safe direction: nothing left the machine.
+/// [`GitOperation::DeleteRemoteTag`] — a separate operation, on its own
+/// route ([`delete_remote_tag`], `POST /api/delete-remote-tag`, M2.21f
+/// #240), because it opens a socket with credentials on it. A caller who
+/// deletes here and expects the remote to follow is wrong, but they are
+/// wrong in the safe direction: nothing left the machine.
 ///
 /// The plan this builds carries [`RiskLevel::Destructive`] and a
 /// [`RecoveryStrategy::RecreateTag`] pinned to the tag ref's *unpeeled* value;
@@ -311,6 +314,90 @@ pub(crate) async fn delete_tag(Json(req): Json<DeleteTagRequest>) -> (StatusCode
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()),
     };
     planner::plan_and_execute(GitOperation::DeleteLocalTag { name }).await
+}
+
+/// Publish a tag to a configured remote (`POST /api/push-tag`, M2.21f #240):
+/// `git push <remote> refs/tags/<name>` via [`GitOperation::PushTag`].
+///
+/// # Never `--tags`, never `--force`
+///
+/// This endpoint can publish exactly the one tag it names. Publishing every
+/// local tag, or force-overwriting one that already differs on the remote,
+/// is not an operation this vocabulary can express — see `PushTag`'s doc in
+/// plan.rs for why both are structurally absent rather than merely unused
+/// here.
+///
+/// The two gates before the name reaches a validated [`TagName`] are the
+/// same ones [`create_tag`] and [`delete_tag`] already apply — non-empty,
+/// not option-shaped — and `remote` clears
+/// [`crate::handlers::fetch::validate_remote`], the one gate every
+/// remote-naming endpoint in this server shares.
+pub(crate) async fn push_tag(Json(req): Json<PushTagRequest>) -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    let tag = req.tag.trim();
+    if tag.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Tag name can't be empty.".to_string(),
+        );
+    }
+    if tag.starts_with('-') {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Tag name can't start with '-'.".to_string(),
+        );
+    }
+    let name = match TagName::new(tag) {
+        Ok(name) => name,
+        // Unreachable after the two checks above; kept total rather than panic.
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()),
+    };
+    let remote = match crate::handlers::fetch::validate_remote(&req.remote) {
+        Ok(remote) => remote,
+        Err(refused) => return refused,
+    };
+    planner::plan_and_execute(GitOperation::PushTag { name, remote }).await
+}
+
+/// Delete a tag from a configured remote (`POST /api/delete-remote-tag`,
+/// M2.21f #240): `git push <remote> --delete refs/tags/<name>` via
+/// [`GitOperation::DeleteRemoteTag`].
+///
+/// The **local** counterpart is [`delete_tag`] — a separate operation on a
+/// separate route, because this one opens a socket with credentials on it.
+/// Deleting here never touches the local tag; a caller that wants both
+/// calls both.
+pub(crate) async fn delete_remote_tag(
+    Json(req): Json<DeleteRemoteTagRequest>,
+) -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    let tag = req.tag.trim();
+    if tag.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Tag name can't be empty.".to_string(),
+        );
+    }
+    if tag.starts_with('-') {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Tag name can't start with '-'.".to_string(),
+        );
+    }
+    let name = match TagName::new(tag) {
+        Ok(name) => name,
+        // Unreachable after the two checks above; kept total rather than panic.
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()),
+    };
+    let remote = match crate::handlers::fetch::validate_remote(&req.remote) {
+        Ok(remote) => remote,
+        Err(refused) => return refused,
+    };
+    planner::plan_and_execute(GitOperation::DeleteRemoteTag { name, remote }).await
 }
 
 /// Map one [`TagRecord`] onto the wire DTO, or `None` when it cannot be

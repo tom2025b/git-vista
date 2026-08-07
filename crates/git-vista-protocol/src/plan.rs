@@ -42,18 +42,19 @@
 //! | `POST /api/amend-commit` | `git commit --amend [--allow-empty] -m` | [`GitOperation::AmendCommit`] |
 //! | `POST /api/tag` | `git tag [-a -m <msg>] <name> <target>` | [`GitOperation::CreateTag`] |
 //! | `POST /api/delete-tag` | `git tag -d <name>` | [`GitOperation::DeleteLocalTag`] |
-//! | *(planned, #74 M2.21e)* | `git push <remote> --delete refs/tags/<name>` | [`GitOperation::DeleteRemoteTag`] |
-//! | *(planned, #74 M2.21f)* | `git push <remote> refs/tags/<name>` | [`GitOperation::PushTag`] |
+//! | `POST /api/delete-remote-tag` | `git push <remote> --delete refs/tags/<name>` | [`GitOperation::DeleteRemoteTag`] |
+//! | `POST /api/push-tag` | `git push <remote> refs/tags/<name>` | [`GitOperation::PushTag`] |
 //!
-//! The *(planned)* rows are deliberate exceptions to "one variant per
-//! real mutation found by auditing the write handlers": M2.19a (#222) and
-//! M2.20a (#227) land the typed contract — the variant, its plan-building
-//! wiring in `git-vista-server`'s `planner::shape`, its `sandbox` network
-//! classification, and the golden fixture — ahead of any handler that could
-//! build one, so the dangerous part of each (rewriting history; opening a
-//! socket with credentials on it) is reviewed as its own slice. See each
-//! variant's own doc comment for the full reasoning; every other row in this
-//! table already had a live handler when its variant landed.
+//! Some rows above were staged as *(planned)* before any handler could reach
+//! them: M2.19a (#222) and M2.20a (#227) land a typed contract — the
+//! variant, its plan-building wiring in `git-vista-server`'s
+//! `planner::shape`, its `sandbox` network classification, and the golden
+//! fixture — ahead of any handler that could build one, so the dangerous
+//! part of each (rewriting history; opening a socket with credentials on it)
+//! is reviewed as its own slice. See each variant's own doc comment for the
+//! full reasoning. M2.21f (#240) graduated the last two rows still marked
+//! that way (`DeleteRemoteTag`, `PushTag`), so the table above carries no
+//! `*(planned)*` row today — every variant now has a live route.
 //! [`GitOperation::AmendCommit`] went through exactly that staging and
 //! graduated: #222 landed the contract, #223 (ADR 0040) the execution.
 //! The four tag rows (M2.21a, #235, ADR 0041) were staged the same way: the
@@ -61,9 +62,10 @@
 //! fixture — landed and was reviewed before any handler could build one, with
 //! `planner::execute` refusing all four with `501`. M2.21d (#238, ADR 0048)
 //! graduated the two **local** ones: `CreateTag` and `DeleteLocalTag` now have
-//! routes and real execution. The two remote-reaching rows below are still
-//! `501` — they are the first tag code that would open a socket with
-//! credentials on it, so they keep a slice of their own (#74).
+//! routes and real execution. M2.21f (#240) graduated the remaining two,
+//! `DeleteRemoteTag` and `PushTag` — the first tag code that opens a socket
+//! with credentials on it, which is why they waited for a slice of their own
+//! rather than landing with the other two.
 //!
 //! [`GitOperation::PushBranch`] is the one row that already had a handler and
 //! was **widened** anyway (M2.20a, #227: `set_upstream` and `force`). Its
@@ -838,9 +840,9 @@ pub enum GitOperation {
     /// [`ForceDeleteBranch`]: GitOperation::ForceDeleteBranch
     DeleteLocalTag { name: TagName },
     /// `git push <remote> --delete refs/tags/<name>` — delete a tag from a
-    /// remote (planned, M2.21e of #74).
+    /// remote, via `POST /api/delete-remote-tag` (M2.21f, #240).
     ///
-    /// # Contract only (M2.21a, #235) — see [`GitOperation::CreateTag`]
+    /// # Classified M2.21a (#235); executed M2.21f (#240) — see [`GitOperation::CreateTag`]
     ///
     /// A **separate variant** from [`GitOperation::DeleteLocalTag`], never
     /// one operation parameterised by a "where" flag: one is a local ref
@@ -860,10 +862,10 @@ pub enum GitOperation {
     /// [`GitOperation::DiscardTrackedPaths`]'s posture of putting nuance in
     /// prose rather than optimism in the tag.
     DeleteRemoteTag { name: TagName, remote: RemoteName },
-    /// `git push <remote> refs/tags/<name>` — publish one tag (planned,
-    /// M2.21f of #74).
+    /// `git push <remote> refs/tags/<name>` — publish one tag, via
+    /// `POST /api/push-tag` (M2.21f, #240).
     ///
-    /// # Contract only (M2.21a, #235) — see [`GitOperation::CreateTag`]
+    /// # Classified M2.21a (#235); executed M2.21f (#240) — see [`GitOperation::CreateTag`]
     ///
     /// Pushes exactly the named tag — never `--tags` (publishing every local
     /// tag is not an operation this vocabulary can express, deliberately) and
