@@ -944,12 +944,38 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     // oid or a server risk classification).
                     //
                     // Async and therefore raced like `merge_item`/`pull_item`
-                    // above: a `PendingIntent` is admitted with a throwaway
-                    // placeholder `kind` before either network call, purely
-                    // so a slower response from an earlier tap can't reopen
-                    // this dialog over a later tap's — see `pull_item`'s
-                    // identical pattern and its doc comment for why the
-                    // placeholder is safe to discard.
+                    // above — but with a longer window than either, and the
+                    // guard has to be placed accordingly.
+                    //
+                    // `admit_intent` can only ever *refuse* an intent at the
+                    // moment it is offered (`latest_wins` is a plain
+                    // `incoming.seq >= cur.seq`); it cannot retract a
+                    // continuation that already passed it. So admitting
+                    // *before* the network calls — as an earlier draft of this
+                    // handler did — buys nothing: an earlier tap's continuation
+                    // sails past the gate it already cleared and clobbers a
+                    // later tap's dialog, because `open_confirm` is an
+                    // unguarded `set`. The failure that makes this worth the
+                    // words: tap Force Push on `a`, tap it again on `b`, and
+                    // `a`'s slower plans can leave a danger-styled confirm on
+                    // screen that reads `b` but dispatches a force-with-lease
+                    // against `a`.
+                    //
+                    // Hence `still_current` below, re-offered after *every*
+                    // await and before *any* signal write. That is what
+                    // `merge_item`/`pull_item` get for free by admitting after
+                    // their single await; this handler makes two sequential
+                    // `/api/plan` round trips with the menu already closed and
+                    // nothing on screen — precisely the silent window that
+                    // invites the second tap — so it has to re-check
+                    // explicitly rather than inherit their shape.
+                    //
+                    // Re-offering is safe and idempotent: an un-superseded
+                    // continuation offers its own `seq` back and `seq >= seq`
+                    // holds. It also re-runs the key's epoch check, so a repo
+                    // that moved mid-flight (Refresh, repo switch, drift
+                    // reload) drops the continuation too — the same fencing
+                    // `RequestKey` exists for.
                     //
                     // Two `/api/plan` calls, not one: the first reads what
                     // origin/`b` currently points at (a *plain*-push plan,
@@ -979,6 +1005,10 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                                 if !operations.admit_intent(&intent) {
                                     return;
                                 }
+                                // Re-offer after each await; see the ordering
+                                // note above this item for why admitting once,
+                                // up front, does not hold.
+                                let still_current = move || operations.admit_intent(&intent);
                                 let plain = preview_push(
                                     "origin",
                                     &branch,
@@ -986,6 +1016,9 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                                     git_vista_protocol::ForcePublish::None,
                                 )
                                 .await;
+                                if !still_current() {
+                                    return;
+                                }
                                 let oid = match plain
                                     .map(|p| remote_tip_from_plan(&p.expected_ref_changes))
                                 {
@@ -1030,6 +1063,9 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                                     },
                                 )
                                 .await;
+                                if !still_current() {
+                                    return;
+                                }
                                 let risk = match leased {
                                     Ok(plan) => plan.risk,
                                     Err(e) => {
