@@ -136,11 +136,31 @@ impl PlanSource {
     /// submitted plan already carries its own — computed once, at build time
     /// — so this reuses it rather than recomputing: for `Submit`, hashing
     /// again here would just reproduce the plan's own `operation_hash` field.
+    /// Always **derived from the operation**, never read off the plan — for
+    /// `Submit` as much as for `Build`.
+    ///
+    /// The distinction is a trust boundary, and getting it wrong is exploitable.
+    /// `admit()` uses this hash to decide Fresh/Existing/Conflict, and it runs
+    /// *before* `validate()` — which is the thing that checks
+    /// `operation_hash(&plan.operation) == plan.operation_hash`. A submitted
+    /// plan arrives from outside (today, from an LLM's raw tool-call argument
+    /// via the MCP bridge), so its `operation_hash` field is client-supplied
+    /// data that nothing has verified at the moment admission needs it.
+    ///
+    /// Trusting that field would let a plan whose declared hash collides with
+    /// an already-admitted key take `Admission::Existing` and replay the *first*
+    /// operation's terminal result — the second operation never validated, never
+    /// executed, and the caller told it succeeded. The inverse poisons a key:
+    /// a first submission carrying a mismatched hash makes every later,
+    /// correctly-hashed resubmission `Admission::Conflict` forever.
+    ///
+    /// Recomputing here costs one hash and removes the whole class. `validate()`
+    /// still runs later and still rejects a plan whose declared hash disagrees
+    /// with its operation — that check is about the plan's own integrity, and it
+    /// is not a substitute for this one, because it happens after admission has
+    /// already committed.
     fn hash(&self) -> OperationHash {
-        match self {
-            PlanSource::Build(op) => operation_hash(op),
-            PlanSource::Submit(plan) => plan.operation_hash.clone(),
-        }
+        operation_hash(self.operation())
     }
 }
 
@@ -4880,6 +4900,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #249: the admission hash for a **submitted** plan is derived from its
+    /// operation, never read off the plan's own `operation_hash` field.
+    ///
+    /// Found by adversarial review before this shipped. A submitted plan comes
+    /// from outside — today from an LLM's raw tool-call argument through the
+    /// MCP bridge — so `plan.operation_hash` is unverified client data at the
+    /// moment `admit()` needs a hash. And `admit()` runs *before* `validate()`,
+    /// which is the check that would catch a mismatch.
+    ///
+    /// Trusting the field is exploitable two ways. A plan whose declared hash
+    /// collides with an already-admitted key takes `Admission::Existing` and
+    /// replays the **first** operation's terminal result — the second operation
+    /// never validated, never executed, caller told it succeeded. And a first
+    /// submission carrying a mismatched hash poisons that key: every later,
+    /// correctly-hashed resubmission gets `Admission::Conflict` forever.
+    ///
+    /// This pins the fix at the seam where it matters. `validate()` rejecting a
+    /// mismatched plan is a different guarantee and does not cover this one —
+    /// it happens after admission has already committed.
+    #[tokio::test]
+    async fn a_submitted_plans_admission_hash_ignores_the_hash_the_plan_declares() {
+        let (_dir, repo) = seeded_repo();
+        let (plan, _observed) = build_plan(&repo, GitOperation::StageAll, tokens()).await;
+        let honest = operation_hash(&plan.operation);
+
+        // A plan that lies about its own operation — the shape a hostile or
+        // simply buggy caller can put on the wire.
+        let mut tampered = plan.clone();
+        tampered.operation_hash = OperationHash::new("0".repeat(64)).unwrap();
+        assert_ne!(
+            tampered.operation_hash.as_str(),
+            honest.as_str(),
+            "the tampered fixture must actually differ, or this test proves nothing"
+        );
+
+        let admitted = PlanSource::Submit(Box::new(tampered)).hash();
+        assert_eq!(
+            admitted.as_str(),
+            honest.as_str(),
+            "admission must key on the hash derived from the operation, not the one \
+             the plan declares — otherwise a colliding declared hash replays a \
+             different operation's result"
+        );
     }
 
     /// #145 acceptance 1 + 4 (the race): a plan built against generation N is
