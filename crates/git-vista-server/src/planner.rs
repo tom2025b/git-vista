@@ -3044,12 +3044,40 @@ async fn run_signed_tag(
                  {SIGN_TIMEOUT:?} and was killed"
             );
             // The kill races git's own ref write, so the honest next step is
-            // to look rather than assume either outcome.
-            let tail = match rev_parse_ref_unpeeled(repo, &format!("refs/tags/{name}")).await {
-                Ok(Some(_)) => {
+            // to look rather than assume either outcome. This read MUST use
+            // git_output_bounded, not rev_parse_ref_unpeeled's plain
+            // git_output: it runs on a repository that just proved a git
+            // child can block past SIGN_TIMEOUT, and a bare
+            // `tokio::time::timeout` around an unbounded spawn does not kill
+            // that spawn — per git_output_bounded's own doc, dropping the
+            // future without kill_on_drop detaches the child rather than
+            // stopping it, leaving it running unobserved. Without a spawn
+            // that is actually killed, a hung repo turns a bounded signing
+            // failure into an unbounded recovery read — the mutation guard
+            // this function runs under (coordinator::lock in execute()) is
+            // still held here, so that would hold it forever, undoing the
+            // entire point of SIGN_TIMEOUT above. Same bound, reused rather
+            // than a second constant: the property is "the whole function
+            // returns within SIGN_TIMEOUT", not "each half does".
+            let ref_name = format!("refs/tags/{name}");
+            let tail = match crate::git_cmd::git_output_bounded(
+                repo,
+                &["rev-parse", "--verify", "--quiet", &ref_name],
+                need,
+                SIGN_TIMEOUT,
+            )
+            .await
+            {
+                Ok(crate::git_cmd::BoundedOutput::Completed(out)) if out.status.success() => {
                     format!("Warning: refs/tags/{name} now exists — inspect it before trusting it.")
                 }
-                _ => "The tag was not created.".to_string(),
+                Ok(crate::git_cmd::BoundedOutput::Completed(_)) => {
+                    "The tag was not created.".to_string()
+                }
+                Ok(crate::git_cmd::BoundedOutput::TimedOut) | Err(_) => format!(
+                    "Couldn't confirm whether refs/tags/{name} was created — the check itself \
+                     didn't finish in time. Run `git tag -l {name}` on the server to be sure."
+                ),
             };
             Err(sign_refusal_body(
                 SignTagFailureKind::TimedOut,
@@ -3071,11 +3099,27 @@ async fn run_signed_tag(
 /// with `--status-fd=2`), so every line this function looks for is really
 /// there to find.
 ///
-/// `gpg_on_path` disambiguates the one case with no `[GNUPG:]` line at all:
-/// gpg was never invoked because it does not exist on the server's `PATH`
-/// ([`GpgNotInstalled`](SignTagFailureKind::GpgNotInstalled)), versus some
-/// other non-zero exit this classifier does not recognise
-/// ([`Other`](SignTagFailureKind::Other)).
+/// `gpg_on_path` disambiguates the two cases with no `[GNUPG:]` line at all.
+///
+/// Measured directly (plain gpg 2.4.4, no sandbox, both a missing and a
+/// permission-denied `GNUPGHOME`): every invocation that actually runs —
+/// including ones that fail on a keydb resource error before ever reaching
+/// key lookup — emits at least one `[GNUPG:] ERROR …` or `[GNUPG:] FAILURE …`
+/// line. Git captures the whole status-fd stream into its own stderr on a
+/// signing failure (`gpg-interface.c` invokes gpg with `--status-fd=2`), so
+/// completely empty stderr from a gpg that IS on `PATH` means gpg was
+/// prevented from running its protocol engine at all — plausibly stopped by
+/// the sandbox before it could write anything, the same shape
+/// [`AgentUnreachable`](SignTagFailureKind::AgentUnreachable) already names —
+/// rather than "ran and failed for some unrecognised reason", which is what
+/// [`Other`](SignTagFailureKind::Other) is for. Non-empty, unrecognised
+/// stderr still falls to `Other`: that case really did produce output this
+/// classifier could not place, and guessing beyond it would be exactly the
+/// kind of assumption this codebase's standing caution warns against
+/// ("measure sandbox behaviour; never assert it") — this fallback is not
+/// verified against the real sandboxed spawn's empty-stderr shape, only
+/// against gpg's own behaviour outside it, and is a best-effort narrowing on
+/// that basis rather than a proven mapping.
 ///
 /// The two GnuPG status codes this cares about (from libgpg-error's own
 /// `err-codes.h.in`, not guessed): `17` is `GPG_ERR_NO_SECKEY`, and `77`/`78`
@@ -3110,6 +3154,8 @@ fn classify_sign_failure(stderr: &str, gpg_on_path: bool) -> SignTagFailureKind 
     }
     if !saw_status_line && !gpg_on_path {
         SignTagFailureKind::GpgNotInstalled
+    } else if !saw_status_line && stderr.trim().is_empty() {
+        SignTagFailureKind::AgentUnreachable
     } else {
         SignTagFailureKind::Other
     }
@@ -5263,11 +5309,28 @@ mod tests {
             classify_sign_failure("exec: gpg: command not found", false),
             SignTagFailureKind::GpgNotInstalled
         );
-        // No status line but gpg IS on PATH: an unrecognised failure, not a
-        // false claim that gpg is missing.
+        // No status line but gpg IS on PATH, and stderr is genuinely
+        // non-empty and unrecognised: real content this classifier could
+        // not place, so it must stay Other rather than being guessed into
+        // one of the named cases.
         assert_eq!(
             classify_sign_failure("fatal: some other git failure entirely", true),
             SignTagFailureKind::Other
+        );
+        // No status line, gpg on PATH, and stderr is EMPTY — the one case a
+        // real invocation cannot produce on its own (measured: even a gpg
+        // that fails on a missing/permission-denied GNUPGHOME emits status
+        // lines before failing). Empty output means gpg was stopped before
+        // it could run its protocol engine at all, which is the same shape
+        // AgentUnreachable already names, so this must not fall to the
+        // useless Other message on hosts where ~/.gnupg never existed.
+        assert_eq!(
+            classify_sign_failure("", true),
+            SignTagFailureKind::AgentUnreachable
+        );
+        assert_eq!(
+            classify_sign_failure("   \n  ", true),
+            SignTagFailureKind::AgentUnreachable
         );
     }
 
@@ -5281,6 +5344,56 @@ mod tests {
         assert_ne!(no_key, no_agent);
         assert_eq!(no_key, SignTagFailureKind::NoSecretKey);
         assert_eq!(no_agent, SignTagFailureKind::AgentUnreachable);
+    }
+
+    /// Byte-census guard on [`run_signed_tag`]'s `TimedOut` arm, in the
+    /// style `offline_guard_audit.rs` and `route_authz.rs` already use for a
+    /// fact a runtime test cannot cheaply reach: an integration test that
+    /// forces BOTH the signing spawn and the recovery read to hang would
+    /// need to arm a hang on the same repository's git config twice without
+    /// the first arming also blocking the earlier `git tag -s` invocation —
+    /// fragile to build reliably. What this pins instead: the recovery read
+    /// inside the `TimedOut` arm calls the bounded primitive, not the plain
+    /// one. [`crate::git_cmd::git_output_bounded`]'s own bound is already
+    /// proven against a real hung spawn by
+    /// `git_output_bounded_reports_timed_out_when_the_bound_is_too_tight`
+    /// in `git_cmd.rs`; this test's job is only to prove `run_signed_tag`
+    /// still calls that primitive rather than the unbounded
+    /// `rev_parse_ref_unpeeled` a future edit could revert to.
+    #[test]
+    fn the_timed_out_arms_recovery_read_uses_the_bounded_primitive() {
+        const PLANNER_SRC: &str = include_str!("planner.rs");
+        let start = PLANNER_SRC
+            .find("async fn run_signed_tag(")
+            .expect("run_signed_tag must exist in planner.rs — this test's own anchor moved");
+        let end = start
+            + PLANNER_SRC[start..]
+                .find("\n/// Map a failed signing spawn's stderr")
+                .expect("run_signed_tag's end anchor (classify_sign_failure's doc) moved");
+        let body = &PLANNER_SRC[start..end];
+
+        assert!(
+            body.contains("BoundedOutput::TimedOut) => {"),
+            "run_signed_tag must still have a TimedOut arm — this test's premise moved"
+        );
+        let timed_out_arm_start = body
+            .find("BoundedOutput::TimedOut) => {")
+            .expect("checked above");
+        let recovery_read_region = &body[timed_out_arm_start..];
+
+        assert!(
+            recovery_read_region.contains("git_output_bounded(")
+                && recovery_read_region.matches("git_output_bounded(").count() >= 1,
+            "the TimedOut arm's recovery read must call git_output_bounded — the plain \
+             git_output/rev_parse_ref_unpeeled path has no kill_on_drop, so a hung repo turns \
+             a bounded signing failure into an unbounded recovery read while the mutation \
+             guard is still held. Body:\n{recovery_read_region}"
+        );
+        assert!(
+            !recovery_read_region.contains("rev_parse_ref_unpeeled("),
+            "the TimedOut arm must not call the unbounded rev_parse_ref_unpeeled directly — \
+             that is precisely the regression this test exists to catch"
+        );
     }
 
     /// The end-to-end path, against the **real sandboxed spawn** — not a

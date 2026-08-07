@@ -327,11 +327,32 @@ pub(crate) enum BoundedOutput {
 /// than whatever the server process's own stdin happens to be. `.kill_on_drop(true)`
 /// is what makes the timeout actually a timeout rather than a detach:
 /// dropping the `cmd.output()` future when [`tokio::time::timeout`] elapses
-/// sends the child (and, since it is the direct child, gpg as its own child
-/// in turn) a `SIGKILL` instead of leaving it running unobserved. Callers
-/// that need to know whether a killed child's partial work left a trace
-/// behind (a half-written ref, say) must check for it themselves — killing a
-/// process does not undo what it already did before the signal landed.
+/// sends a `SIGKILL` instead of leaving the process running unobserved.
+///
+/// **What that SIGKILL actually reaches is more indirect than "the child",
+/// singular.** [`sandboxed`] wraps every spawn in `bwrap`, so the process
+/// `kill_on_drop` directly signals is **`bwrap`**, not git — captured by
+/// strace, not assumed. git, and gpg beneath it, are grandchildren inside
+/// the sandbox's own PID namespace. Whether killing `bwrap` reaps that whole
+/// tree — rather than leaving git/gpg orphaned and still running — is a
+/// property of the sandbox *tier*, not of `kill_on_drop` itself:
+/// [`crate::sandbox::lifecycle::strict_reaps_a_double_forked_setsid_orphan_that_the_network_tier_does_not`]
+/// measures, via a control/subject pair, that the Strict tier's PID
+/// namespace reaps exactly this shape of orphan (a double-forked,
+/// `setsid`-detached grandchild) on supervisor kill — and that the Network
+/// tier does **not**. `run_signed_tag`'s `CreateTag` path always resolves to
+/// `NetworkNeed::Local`, which maps to `Tier::Strict` for the untrusted-repo
+/// case that test proves reaping for. The one case that test does not cover:
+/// an **operator-trusted** repository resolves to `Tier::Unsandboxed`
+/// (`sandbox::tier_for`'s `(true, _)` arm) with no sandbox at all, where this
+/// reasoning is void and only the timeout — not the reaping — bounds
+/// anything. See `run_signed_tag`'s own doc comment for why that path is
+/// unreachable in production today.
+///
+/// Callers that need to know whether a killed child's partial work left a
+/// trace behind (a half-written ref, say) must check for it themselves —
+/// killing a process does not undo what it already did before the signal
+/// landed.
 pub(crate) async fn git_output_bounded(
     repo: &Path,
     args: &[&str],
