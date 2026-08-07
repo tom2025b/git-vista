@@ -27,7 +27,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use git_vista_protocol::{PROTOCOL_HEADER, PROTOCOL_VERSION};
+use git_vista_protocol::{IDEMPOTENCY_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION};
 
 /// The server's fixed loopback endpoint. Mirrors `state::PORT` (8080), which
 /// is a compile-time constant on the server side by design (loopback-only,
@@ -91,7 +91,7 @@ impl HttpResponse {
 
 /// `GET <path>` with the standing headers plus an optional session cookie.
 pub fn get(path: &str, cookie: Option<&str>) -> Result<HttpResponse, String> {
-    request("GET", path, None, cookie, None)
+    request("GET", path, None, cookie, None, None)
 }
 
 /// `POST <path>` with a JSON body, optional cookie, optional CSRF token.
@@ -101,7 +101,27 @@ pub fn post_json(
     cookie: Option<&str>,
     csrf: Option<&str>,
 ) -> Result<HttpResponse, String> {
-    request("POST", path, Some(body), cookie, csrf)
+    request("POST", path, Some(body), cookie, csrf, None)
+}
+
+/// [`post_json`]'s sibling for the one write in this bridge that must be
+/// replay-safe: the same cookie/CSRF pair, plus an [`IDEMPOTENCY_HEADER`]
+/// carrying the caller's key.
+///
+/// Kept as its own function rather than widening `post_json`'s signature:
+/// every other caller here — the session exchange, every `plan_*` build
+/// call, `/api/select` — has no idempotency key to send and would gain
+/// nothing from a parameter it would always pass `None` for. See
+/// `execute_tool.rs`'s module doc for the fuller version of this tradeoff,
+/// which is the same reasoning applied one layer up at `tools::PostFn`.
+pub fn post_json_idempotent(
+    path: &str,
+    body: &[u8],
+    cookie: Option<&str>,
+    csrf: Option<&str>,
+    key: &str,
+) -> Result<HttpResponse, String> {
+    request("POST", path, Some(body), cookie, csrf, Some(key))
 }
 
 fn request(
@@ -110,6 +130,7 @@ fn request(
     body: Option<&[u8]>,
     cookie: Option<&str>,
     csrf: Option<&str>,
+    idempotency_key: Option<&str>,
 ) -> Result<HttpResponse, String> {
     let mut stream = TcpStream::connect(SERVER)
         .map_err(|e| format!("could not connect to git-vista-server at {SERVER}: {e}"))?;
@@ -127,6 +148,9 @@ fn request(
     }
     if let Some(t) = csrf {
         req.push_str(&format!("{}: {t}\r\n", git_vista_protocol::CSRF_HEADER));
+    }
+    if let Some(k) = idempotency_key {
+        req.push_str(&format!("{IDEMPOTENCY_HEADER}: {k}\r\n"));
     }
     if let Some(b) = body {
         req.push_str(&format!(
