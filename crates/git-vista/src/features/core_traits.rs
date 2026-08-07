@@ -27,6 +27,7 @@ pub trait FeatureCore {
 pub enum RequestTarget {
     Repository,
     Branch(String),
+    Tag(String),
     Commit(String),
     Page(u64),
     Operation(String),

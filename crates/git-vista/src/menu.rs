@@ -39,15 +39,19 @@ use leptos::*;
 use git_vista_core::activity::UndoAction;
 
 use crate::api::{
-    create_branch_request, fetch_commit_detail, fetch_head_branch, fetch_rebase_status,
-    fetch_status, fetch_undoables, fetch_worktree_status, stage_request, unstage_request,
+    create_branch_request, create_tag_request, fetch_commit_detail, fetch_head_branch,
+    fetch_rebase_status, fetch_status, fetch_undoables, fetch_worktree_status, preview_push,
+    stage_request, unstage_request,
 };
 use crate::features::core_traits::RequestTarget;
 use crate::features::dialogs::commit::{amend_offer, AmendOffer};
 use crate::features::dialogs::core::{branch_name_space_fix, Dialog, ErrorNotice};
-use crate::features::graph::core::{disabled_menu_item_copy, pull_label};
+use crate::features::graph::core::{
+    create_tag_item_label, disabled_menu_item_copy, pull_label, remote_tip_from_plan,
+    tag_annotation_from_prompt, RemoteTipKnowledge,
+};
 use crate::features::operations::core::PendingIntent;
-use crate::features::operations::kind::rebase_item_label;
+use crate::features::operations::kind::{rebase_item_label, ForceWithLease};
 use crate::features::shell::signals::{self as shell_state, Shell};
 use crate::features::status::core::{deletable_untracked_paths, discardable_tracked_paths};
 use crate::geometry::menu_placement;
@@ -75,6 +79,7 @@ pub fn open_for_commit(shell: Shell, commit: String, header: String, x: f64, y: 
         create_label: "Create branch from this commit…",
         is_head: false,
         branches: Vec::new(),
+        tags: Vec::new(),
         is_branch: false,
         repo_url: None,
         remote_web_url: None,
@@ -324,6 +329,66 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 });
             };
             let create_label = m.create_label;
+            // "Create tag from this commit": the same prompt-then-POST shape
+            // as "Create branch" just above (M2.21d, #238), plus a second
+            // prompt for an optional annotation message. The second prompt's
+            // raw answer goes through `tag_annotation_from_prompt` rather
+            // than being read inline here — the "cancel vs empty vs typed
+            // text" mapping onto "lightweight vs annotated" is exactly the
+            // sort of decision this wasm-only file cannot itself pin with a
+            // test (see that function's own doc comment).
+            let create_tag_label = create_tag_item_label(m.is_branch);
+            let tag_commit = m.commit.clone();
+            let on_tag = move |_| {
+                shell.close_menu();
+                let Some(win) = web_sys::window() else { return };
+                let name = match win.prompt_with_message("Name for the new tag:") {
+                    Ok(Some(n)) => n.trim().to_string(),
+                    _ => return,
+                };
+                if name.is_empty() {
+                    return;
+                }
+                // Same space pre-flight as branch names (#316) — the check
+                // is generic to any git ref name, not branch-specific.
+                let name = match branch_name_space_fix(&name) {
+                    Some(fixed) => {
+                        let accepted = win
+                            .confirm_with_message(&format!(
+                                "Tag names can't contain spaces.\nUse '{fixed}' instead?"
+                            ))
+                            .unwrap_or(false);
+                        if !accepted {
+                            return;
+                        }
+                        fixed
+                    }
+                    None => name,
+                };
+                let raw_message = win
+                    .prompt_with_message(
+                        "Optional annotation message (leave blank for a lightweight tag):",
+                    )
+                    .ok()
+                    .flatten();
+                let message = tag_annotation_from_prompt(raw_message);
+                let commit = tag_commit.clone();
+                spawn_local(async move {
+                    match create_tag_request(&name, &commit, message.as_deref()).await {
+                        // Bump the fetch counter so the new tag's badge appears.
+                        Ok(()) => graph.update(|g| {
+                            g.force_bump();
+                        }),
+                        Err(e) => {
+                            dialogs.open(Dialog::Error);
+                            shell.open_error(ErrorNotice {
+                                title: "Couldn't create tag",
+                                body: e,
+                            });
+                        }
+                    }
+                });
+            };
             // The two "Commit …" items (Issue #33). Clicking one closes the menu
             // and opens the commit-message modal (below); the actual POST + refresh
             // happens when the user confirms there.
@@ -833,12 +898,30 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         .into_view()
                     };
                     // Push: always available; git reports if there's no origin/upstream.
+                    // #233: also offers `--set-upstream` when `b` is the
+                    // checked-out branch and `/api/rebase-status` said it
+                    // has none — `rebase_status` (above) already fetched
+                    // this under the same `!m.is_branch` gate `pull_item`
+                    // reads it behind, so this costs no new poll. Scoped to
+                    // the checked-out branch only: `RebaseStatus::has_upstream`
+                    // answers for HEAD alone (`OperationKind::Push`'s own doc
+                    // comment says why), so pushing any other branch from
+                    // this menu still gets `set_upstream: false`, matching
+                    // pre-#233 behaviour exactly.
                     let push_item = {
                         let branch = b.clone();
                         let on = move |_| {
+                            let set_upstream = rebase_status
+                                .get()
+                                .flatten()
+                                .filter(|s| s.branch.as_deref() == Some(branch.as_str()))
+                                .and_then(|s| s.has_upstream)
+                                == Some(false);
                             dialogs.open(Dialog::Confirm);
                             shell.open_confirm(PendingOp::Push {
                                 branch: branch.clone(),
+                                set_upstream,
+                                force: None,
                             });
                             shell.close_menu();
                         };
@@ -847,6 +930,193 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                                 // Push updates the *remote* branch — its glyph.
                                 <span class="nf ctx-icon">{ic.branch_alt}</span>
                                 {format!("Push ‘{b}’")}
+                            </button>
+                        }
+                        .into_view()
+                    };
+                    // Force-push (#233): a *separate* entry point from Push
+                    // above, on purpose — the acceptance criterion is that a
+                    // force-with-lease is "unreachable from the normal
+                    // one-tap push button", so this cannot be an escalation
+                    // Push falls into (unlike Delete → ForceDelete,
+                    // `operations::core::escalation` can't apply here: it
+                    // takes only `(kind, &str)` and has no way to produce an
+                    // oid or a server risk classification).
+                    //
+                    // Async and therefore raced like `merge_item`/`pull_item`
+                    // above — but with a longer window than either, and the
+                    // guard has to be placed accordingly.
+                    //
+                    // `admit_intent` can only ever *refuse* an intent at the
+                    // moment it is offered (`latest_wins` is a plain
+                    // `incoming.seq >= cur.seq`); it cannot retract a
+                    // continuation that already passed it. So admitting
+                    // *before* the network calls — as an earlier draft of this
+                    // handler did — buys nothing: an earlier tap's continuation
+                    // sails past the gate it already cleared and clobbers a
+                    // later tap's dialog, because `open_confirm` is an
+                    // unguarded `set`. The failure that makes this worth the
+                    // words: tap Force Push on `a`, tap it again on `b`, and
+                    // `a`'s slower plans can leave a danger-styled confirm on
+                    // screen that reads `b` but dispatches a force-with-lease
+                    // against `a`.
+                    //
+                    // Hence `still_current` below, re-offered after *every*
+                    // await and before *any* signal write. That is what
+                    // `merge_item`/`pull_item` get for free by admitting after
+                    // their single await; this handler makes two sequential
+                    // `/api/plan` round trips with the menu already closed and
+                    // nothing on screen — precisely the silent window that
+                    // invites the second tap — so it has to re-check
+                    // explicitly rather than inherit their shape.
+                    //
+                    // Re-offering is safe and idempotent: an un-superseded
+                    // continuation offers its own `seq` back and `seq >= seq`
+                    // holds. It also re-runs the key's epoch check, so a repo
+                    // that moved mid-flight (Refresh, repo switch, drift
+                    // reload) drops the continuation too — the same fencing
+                    // `RequestKey` exists for.
+                    //
+                    // Two `/api/plan` calls, not one: the first reads what
+                    // origin/`b` currently points at (a *plain*-push plan,
+                    // since the lease oid isn't known yet); the second reads
+                    // the server's actual `RiskLevel` for the lease plan
+                    // built from that oid, so the confirmation's danger
+                    // styling reflects the planner's own classification
+                    // rather than an assumption baked in here
+                    // (`push_confirm_copy`'s doc comment, `graph::core`).
+                    let force_push_item = {
+                        let branch = b.clone();
+                        let on = move |_| {
+                            let branch = branch.clone();
+                            shell.close_menu();
+                            let seq = operations.next_seq();
+                            let key = operations.request_key(RequestTarget::Branch(branch.clone()));
+                            spawn_local(async move {
+                                let intent = PendingIntent {
+                                    seq,
+                                    key,
+                                    kind: PendingOp::Push {
+                                        branch: branch.clone(),
+                                        set_upstream: false,
+                                        force: None,
+                                    },
+                                };
+                                if !operations.admit_intent(&intent) {
+                                    return;
+                                }
+                                // Re-offer after each await; see the ordering
+                                // note above this item for why admitting once,
+                                // up front, does not hold.
+                                let still_current = move || operations.admit_intent(&intent);
+                                let plain = preview_push(
+                                    "origin",
+                                    &branch,
+                                    false,
+                                    git_vista_protocol::ForcePublish::None,
+                                )
+                                .await;
+                                if !still_current() {
+                                    return;
+                                }
+                                let oid = match plain
+                                    .map(|p| remote_tip_from_plan(&p.expected_ref_changes))
+                                {
+                                    Ok(RemoteTipKnowledge::Known(oid)) => oid,
+                                    Ok(RemoteTipKnowledge::NotYetPushed) => {
+                                        dialogs.open(Dialog::Error);
+                                        shell.open_error(ErrorNotice {
+                                            title: "Nothing to force-push",
+                                            // Says "no local record of", not
+                                            // "isn't on origin". The planner
+                                            // decides this from the local
+                                            // remote-tracking ref and never
+                                            // reads origin live — that is
+                                            // force-with-lease working as
+                                            // designed (planner.rs, the lease
+                                            // is *by definition* what we last
+                                            // saw). But it means a pruned or
+                                            // stale tracking ref lands here
+                                            // too, and telling the user the
+                                            // branch "isn't on origin" would
+                                            // then be a flat lie. Hence the
+                                            // hedge, and the Fetch escape
+                                            // hatch: this notice is one of the
+                                            // few places the app can be wrong
+                                            // about the remote and still be
+                                            // behaving correctly.
+                                            body: format!(
+                                                "There's no local record of ‘{branch}’ on origin, \
+                                                 so there's no remote commit to lease against — a \
+                                                 plain Push already does everything a \
+                                                 force-with-lease would. If you expect it to be \
+                                                 there, Fetch first and try again."
+                                            ),
+                                        });
+                                        return;
+                                    }
+                                    Ok(RemoteTipKnowledge::Unreadable) => {
+                                        dialogs.open(Dialog::Error);
+                                        shell.open_error(ErrorNotice {
+                                            title: "Couldn't preview force push",
+                                            body: format!(
+                                                "Couldn't read what origin/{branch} currently \
+                                                 points at."
+                                            ),
+                                        });
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        dialogs.open(Dialog::Error);
+                                        shell.open_error(ErrorNotice {
+                                            title: "Couldn't preview force push",
+                                            body: e,
+                                        });
+                                        return;
+                                    }
+                                };
+                                let leased = preview_push(
+                                    "origin",
+                                    &branch,
+                                    false,
+                                    git_vista_protocol::ForcePublish::WithLease {
+                                        expected_remote_tip: oid.clone(),
+                                    },
+                                )
+                                .await;
+                                if !still_current() {
+                                    return;
+                                }
+                                let risk = match leased {
+                                    Ok(plan) => plan.risk,
+                                    Err(e) => {
+                                        dialogs.open(Dialog::Error);
+                                        shell.open_error(ErrorNotice {
+                                            title: "Couldn't preview force push",
+                                            body: e,
+                                        });
+                                        return;
+                                    }
+                                };
+                                dialogs.open(Dialog::Confirm);
+                                shell.open_confirm(PendingOp::Push {
+                                    branch,
+                                    set_upstream: false,
+                                    force: Some(ForceWithLease {
+                                        expected_remote_tip: oid,
+                                        risk,
+                                    }),
+                                });
+                            });
+                        };
+                        view! {
+                            <button class="ctx-item" on:click=on>
+                                // #233: a distinct glyph from Push's
+                                // `ic.branch_alt`, so the danger-adjacent
+                                // item reads as a different action at a
+                                // glance, not a variant of the same one.
+                                <span class="nf ctx-icon">{ic.push}</span>
+                                {format!("Force Push ‘{b}’…")}
                             </button>
                         }
                         .into_view()
@@ -891,7 +1161,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     // link, not a scripted `window.open`, which iOS WebKit blocks
                     // (same reason as "Open on GitHub"). Shown only on a GitHub repo;
                     // omitted otherwise, since there's no compare page to point at.
-                    let mut items = vec![checkout_item, merge_item, push_item];
+                    let mut items = vec![checkout_item, merge_item, push_item, force_push_item];
                     // Non-GitHub forge branch link (ADR 0010): only when there is
                     // no GitHub base, so it never duplicates the GitHub items.
                     if m.repo_url.is_none() {
@@ -938,6 +1208,55 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     }
                     items.push(delete_item);
                     items
+                })
+                .collect_view();
+            // The tag operations (M2.21d, #238): one "Delete tag" item per
+            // local tag living at this target, the same one-badge-one-item
+            // shape `branch_items` uses just above — but delete only. A tag
+            // carries no merge/push/checkout target the way a branch does,
+            // and "Create tag" is offered once per menu by `on_tag` above
+            // rather than once per existing tag. Unlike the branch delete
+            // item, there is no live "is this the checked-out branch?"
+            // pre-check to await — a tag has no "checked out" concept — so
+            // this handler stays synchronous and, per this file's ordering
+            // rule (module doc above), writes `dialogs`/`shell.open_confirm`
+            // *before* `shell.close_menu()` rather than after (contrast
+            // `delete_item` above, whose writes happen inside a
+            // `spawn_local` continuation that runs after the synchronous
+            // handler — and hence after `close_menu` — has already
+            // returned).
+            let tag_items = m
+                .tags
+                .iter()
+                .map(|t| {
+                    let t = t.clone();
+                    let tag = t.clone();
+                    let on = move |_| {
+                        let tag = tag.clone();
+                        let seq = operations.next_seq();
+                        let key = operations.request_key(RequestTarget::Tag(tag.clone()));
+                        let intent = PendingIntent {
+                            seq,
+                            key,
+                            kind: PendingOp::DeleteLocalTag { tag },
+                        };
+                        if !operations.admit_intent(&intent) {
+                            return;
+                        }
+                        // Start the ghost-click guard when the modal opens —
+                        // before closing the menu, per the ordering note above.
+                        dialogs.open(Dialog::Confirm);
+                        shell.open_confirm(intent.kind);
+                        shell.close_menu();
+                    };
+                    view! {
+                        <button class="ctx-item danger" on:click=on>
+                            // The diff-removed glyph, inheriting the item's
+                            // red — same choice `delete_item` makes above.
+                            <span class="nf ctx-icon">{ic.deleted}</span>
+                            {format!("Delete tag ‘{t}’")}
+                        </button>
+                    }
                 })
                 .collect_view();
             // "Rebase onto main" (Issue #33 follow-up). Rebase acts on the *checked-
@@ -1262,6 +1581,12 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         <span class="nf ctx-icon">{ic.branch}</span>
                         {create_label}
                     </button>
+                    <button class="ctx-item" on:click=on_tag>
+                        // Creating a tag — the tag glyph, shared with tag
+                        // badges and the Activity panel's tag list.
+                        <span class="nf ctx-icon">{ic.tag}</span>
+                        {create_tag_label}
+                    </button>
                     {stage_changes}
                     {unstage_changes}
                     {select_stage}
@@ -1272,6 +1597,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     {commit_empty}
                     {amend_item}
                     {branch_items}
+                    {tag_items}
                     {rebase_item}
                     {fetch_item}
                     {pull_item}

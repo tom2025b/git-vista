@@ -142,6 +142,11 @@ pub fn stubs(ctx: StoredValue<RenderCtx>, shell: Shell, moved: StoredValue<bool>
                     is_head: false,
                     // The stub *is* one branch, so its ops act on that single name.
                     branches: vec![branch_name.clone()],
+                    // A stub represents the branch, not the commit it happens
+                    // to sit on (see `MenuData::tags`'s doc comment) — no
+                    // per-tag delete items here, regardless of what the
+                    // anchor commit itself carries.
+                    tags: Vec::new(),
                     // …and its menu header shows the branch glyph, not the commit's.
                     is_branch: true,
                     repo_url: repo_url.clone(),

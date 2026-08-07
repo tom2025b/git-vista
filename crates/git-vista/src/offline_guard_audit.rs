@@ -143,6 +143,27 @@ const OFFLINE_GUARDED: &[&str] = &[
     "delete_clone_request",
     "staging_preview_request",
     "staging_apply_request",
+    // M2.21d (#238). Both create and delete a local tag ref through the
+    // shared planner, and both call the guard as their first action. Listed
+    // here rather than exempted because a tag is a ref write like any other:
+    // an offline attempt would fail at the transport with a network error
+    // instead of the guard's own refusal text.
+    "create_tag_request",
+    "delete_tag_request",
+    // M2.20g (#233). Not an execution — it POSTs to /api/plan and returns a
+    // Plan, changing nothing. It is classified guarded rather than exempt
+    // because it *does* call the guard first, and that is the right call:
+    // a plan built offline is useless, and the guard's own refusal text is
+    // more actionable than the transport error the fetch would raise. The
+    // force-with-lease ceremony calls it twice before showing a dialog, so
+    // failing early here is also what keeps that dialog from opening on
+    // data it could never have obtained.
+    "preview_push",
+    // M2.20g (#233). The execution half of the force-with-lease ceremony —
+    // POST /api/push, carrying the ForcePublish the confirmed plan named.
+    // The most consequential write in this table: an irreversible remote
+    // publish. Guarded first thing.
+    "push_request",
 ];
 
 /// The pinned, argued exception list — mirrors `route_authz`'s
