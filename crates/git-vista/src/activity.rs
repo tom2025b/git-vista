@@ -28,7 +28,7 @@ use crate::datetime::time_ago;
 use crate::features::activity::core::{event_commit, kind_glyph, kind_label};
 use crate::features::dialogs::core::Dialog;
 use crate::features::shell::signals as shell_state;
-use crate::features::status::core::{StatusHeadline, StatusSection, StatusSections};
+use crate::features::status::core::{chip_label, StatusHeadline, StatusSection, StatusSections};
 use crate::features::tags::core::{
     tag_list_view, tag_row_lines, TagListView, TagRow, LOADING_TAGS, NO_TAGS,
 };
@@ -124,22 +124,19 @@ pub fn activity_panel_view(
                 worktree_status.get().flatten().map(|s| {
                     let ic = icon_set(nerd_icons.get());
                     let sections = StatusSections::from_worktree_status(&s);
-                    let (glyph, class, headline) = match sections.headline() {
-                        StatusHeadline::Conflicted(n) => (
-                            ic.conflict,
-                            "act-status conflict",
-                            format!("{n} conflicted file(s)"),
-                        ),
-                        StatusHeadline::Dirty(n) => (
-                            ic.dirty,
-                            "act-status dirty",
-                            format!("{n} uncommitted change{}", if n == 1 { "" } else { "s" }),
-                        ),
-                        StatusHeadline::Clean => (
-                            ic.clean,
-                            "act-status clean",
-                            "working tree clean".to_string(),
-                        ),
+                    // Same grouping rule as the topbar chip — one host-tested
+                    // function, so the two can no longer disagree about the
+                    // same worktree the way #348 caught them doing.
+                    let headline = chip_label(
+                        sections.count(StatusSection::Staged),
+                        sections.count(StatusSection::Unstaged),
+                        sections.count(StatusSection::Untracked),
+                        sections.count(StatusSection::Conflicted),
+                    );
+                    let (glyph, class) = match sections.headline() {
+                        StatusHeadline::Conflicted(_) => (ic.conflict, "act-status conflict"),
+                        StatusHeadline::Dirty(_) => (ic.dirty, "act-status dirty"),
+                        StatusHeadline::Clean => (ic.clean, "act-status clean"),
                     };
                     let sync = (s.ahead > 0 || s.behind > 0).then(|| {
                         let mut t = String::new();
@@ -181,7 +178,8 @@ pub fn activity_panel_view(
                                 StatusSection::Conflicted => ic.conflict,
                                 StatusSection::Staged => ic.added,
                                 StatusSection::Unstaged => ic.modified,
-                                StatusSection::Untracked | StatusSection::Ignored => ic.untracked,
+                                StatusSection::Untracked => ic.untracked,
+                                StatusSection::Ignored => ic.ignored,
                             };
                             let taken = rows.iter().take(cap);
                             let card_count = taken.len();

@@ -67,6 +67,12 @@ pub struct GitIcons {
     pub renamed: &'static str,
     /// Untracked file.
     pub untracked: &'static str,
+    /// Ignored file (matched by `.gitignore`). Distinct from
+    /// [`untracked`](Self::untracked): both are outside the index, but an
+    /// untracked file is one git is asking about and an ignored one is a
+    /// decision already made. The status list (M2.15, #68) shows them as
+    /// separate sections, so they must not share a glyph.
+    pub ignored: &'static str,
     /// Merge conflict / something needs attention — also the error status line.
     pub conflict: &'static str,
 
@@ -108,6 +114,7 @@ pub const ICONS: GitIcons = GitIcons {
     deleted: "\u{F458}",      // nf-oct-diff_removed
     renamed: "\u{F45A}",      // nf-oct-diff_renamed
     untracked: "\u{F128}",    // nf-fa-question
+    ignored: "\u{F070}",      // nf-fa-eye_slash — deliberately not looking
     conflict: "\u{F071}",     // nf-fa-warning
     clean: "\u{F058}",        // nf-fa-check_circle
     dirty: "\u{25CF}",        // ● black circle (not PUA, but themed with the set)
@@ -137,6 +144,7 @@ pub const TEXT_ICONS: GitIcons = GitIcons {
     deleted: "-",
     renamed: "\u{2192}", // →
     untracked: "?",      // `git status --short` shows untracked as ??
+    ignored: "\u{2205}", // ∅ — the empty set: present, deliberately disregarded
     conflict: "!",
     clean: "\u{2713}",    // ✓
     dirty: "*",           // `__git_ps1` marks a dirty tree with *
@@ -180,6 +188,7 @@ mod tests {
             ("deleted", set.deleted),
             ("renamed", set.renamed),
             ("untracked", set.untracked),
+            ("ignored", set.ignored),
             ("conflict", set.conflict),
             ("clean", set.clean),
             ("dirty", set.dirty),
