@@ -814,7 +814,6 @@ async fn held_now(repo: &Path, preconditions: &[Precondition], observed: &Observ
 /// re-observation is safe (the plan's build-time generation, not this read,
 /// is what `enforce_fresh` anchors staleness on) and for the one semantic
 /// wrinkle (`RemoteConfigured`/`SeedRecorded` drift reads as built-stale).
-#[cfg_attr(not(test), allow(dead_code))] // routed by #249; contract-suite-only until then
 async fn observe_for_submission(repo: &Path, plan: &Plan) -> Observed {
     let mut observed = observe_operation(repo, &plan.operation).await;
     observed.held_at_build = held_now(repo, &plan.preconditions, &observed).await;

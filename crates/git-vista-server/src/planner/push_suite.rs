@@ -1673,3 +1673,60 @@ async fn the_upstream_is_read_from_the_repository_not_assumed() {
         "the read must be per-branch"
     );
 }
+
+/// [`super::upstream_of`] (#233) — the `pub(crate)` wrapper `/api/rebase-status`
+/// calls — collapses [`super::push::upstream_of`]'s three-state [`super::Obs`]
+/// into `Result<Option<String>, ExecUnavailable>`. This pins the mapping this
+/// slice's whole correctness rests on: `Obs::Absent` ("git ran and reported no
+/// upstream" — the ordinary state of any fresh local branch) must become
+/// `Ok(None)`, NOT an `Err`. Getting this backwards would turn
+/// `/api/rebase-status` into a 500 for every repository whose checked-out
+/// branch simply has no upstream configured yet — the common case, not an edge
+/// one — which is exactly the kind of regression `push_suite`'s neighbouring
+/// test above already proves `push::upstream_of` itself does not make (it
+/// returns `Absent`, never `Unknown`, when git runs and finds none); this test
+/// proves the wrapper on top of it preserves that distinction rather than
+/// collapsing `Absent` into the `Unknown`/error leg by accident.
+#[tokio::test]
+async fn the_crate_visible_wrapper_reports_no_upstream_as_ok_none_not_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().to_path_buf();
+    run(&repo, &["init", "-q", "-b", "main"]);
+    run(&repo, &["config", "user.email", "t@example.invalid"]);
+    run(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    run(&repo, &["add", "a.txt"]);
+    run(&repo, &["commit", "-q", "-m", "seed"]);
+
+    let main = BranchName::new("main").unwrap();
+
+    // The regression this test exists to catch: a fresh branch with no
+    // upstream must be a successful `None`, not an `Err`.
+    assert_eq!(
+        super::upstream_of(&repo, &main).await.unwrap(),
+        None,
+        "a branch with no upstream must be Ok(None), never an Err — an Err here \
+         is what turns /api/rebase-status into a 500 for the ordinary case of a \
+         fresh local branch"
+    );
+
+    // The paired positive, so the negative above is not merely "always Ok":
+    // a genuinely configured upstream still comes through as `Some`.
+    let bare = repo.join("up.git");
+    std::fs::create_dir_all(&bare).unwrap();
+    run(&bare, &["init", "-q", "--bare", "-b", "main"]);
+    run(
+        &repo,
+        &["remote", "add", "origin", &bare.display().to_string()],
+    );
+    run(
+        &repo,
+        &["update-ref", "refs/remotes/origin/main", "refs/heads/main"],
+    );
+    run(&repo, &["config", "branch.main.remote", "origin"]);
+    run(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
+    assert_eq!(
+        super::upstream_of(&repo, &main).await.unwrap(),
+        Some("origin/main".to_string())
+    );
+}
