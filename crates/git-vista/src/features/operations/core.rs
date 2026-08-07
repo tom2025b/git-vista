@@ -186,8 +186,11 @@ fn pull_summary(message: &str) -> Option<String> {
         ),
         // The fetch half's own cancellation tag, for the same scannability reason.
         PullFailureKind::Cancelled => format!("Pull cancelled — {}", err.message),
+        // `CredentialHelperBlocked` mirrors the fetch half above — the server's
+        // own sentence already carries the whole explanation.
         PullFailureKind::StrategyRequired
         | PullFailureKind::AuthenticationFailed
+        | PullFailureKind::CredentialHelperBlocked
         | PullFailureKind::RemoteUnreachable
         | PullFailureKind::RemoteRejected
         | PullFailureKind::NoSuchRemoteBranch
