@@ -4374,6 +4374,32 @@ pub(crate) use fetch::error_body as fetch_error_body;
 /// endpoint's one error type, exactly like the executor's do.
 pub(crate) use pull::error_body as pull_error_body;
 
+/// Whether `branch` has a recorded upstream (`<branch>@{upstream}`), exposed
+/// to callers outside `planner` (#233). `push::upstream_of` itself stays
+/// `pub(super)` — its own doc comment explains why (only `push_suite`'s test
+/// needs it) — and this wrapper exists because that function returns [`Obs`],
+/// which is private to this module: a `pub(crate)` function may not return a
+/// private type (E0446), and widening `Obs` itself would give it a much wider
+/// audience than one read endpoint needs. So this collapses the three-state
+/// read into the `Result<Option<_>, ExecUnavailable>` shape
+/// `/api/rebase-status`'s own reads already use: `Known`/`Absent` are both
+/// real observations (`Some`/`None`), and `Unknown` — git could not be run —
+/// becomes `Err`, so a failed read fails the whole response instead of
+/// reporting a silent `false`.
+pub(crate) async fn upstream_of(
+    repo: &Path,
+    branch: &BranchName,
+) -> Result<Option<String>, ExecUnavailable> {
+    match push::upstream_of(repo, branch).await {
+        Obs::Known(upstream) => Ok(Some(upstream)),
+        Obs::Absent => Ok(None),
+        Obs::Unknown => Err(ExecUnavailable::new(format!(
+            "couldn't resolve the upstream of '{}'",
+            branch.as_str()
+        ))),
+    }
+}
+
 /// Whether cancelling this operation can actually stop it (M2.20c, #229).
 ///
 /// **This is a claim about [`execute`], not a wish.** An arm answering `true`

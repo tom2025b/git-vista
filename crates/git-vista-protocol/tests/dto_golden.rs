@@ -322,11 +322,14 @@ fn golden_set() -> DtoGoldenSet {
             via_lan: false,
             hook_policy: HookPolicy::Unsandboxed,
         },
+        // `has_upstream: Some(true)` exercises the additive field's present
+        // shape (#233), same posture as `via_lan`/`hook_policy` above.
         rebase_status: RebaseStatus {
             branch: Some("feature/idea".to_string()),
             base: "origin/main".to_string(),
             base_exists: true,
             up_to_date: false,
+            has_upstream: Some(true),
         },
         // `path`, `remote_web_url` and `hook_policy` all absent — the default
         // capability report shape, which must never leak the server's

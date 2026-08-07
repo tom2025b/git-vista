@@ -1355,6 +1355,7 @@ mod tests {
             base: "origin/main".into(),
             base_exists: true,
             up_to_date: false,
+            has_upstream: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(serde_json::from_str::<RebaseStatus>(&json).unwrap(), status);

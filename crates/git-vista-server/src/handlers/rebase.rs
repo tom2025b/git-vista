@@ -9,7 +9,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 
-use git_vista_protocol::{GitOperation, RebaseStatus, RefName};
+use git_vista_protocol::{BranchName, GitOperation, RebaseStatus, RefName};
 
 use crate::git_cmd::{git_ref_exists, is_ancestor, rev_parse, ExecUnavailable};
 use crate::planner;
@@ -91,17 +91,30 @@ pub(crate) async fn rebase_status() -> axum::response::Response {
     let branch = git_vista_git::read_head_branch(&repo);
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
 
-    // One fallible block: any of the three reads failing means the answer is
-    // unknown, and `?` keeps that from being written any other way.
+    // One fallible block: any of the four reads failing means the answer is
+    // unknown, and `?` keeps that from being written any other way. This now
+    // includes `has_upstream` (#233) — an unreadable upstream fails the whole
+    // response the same as an unreadable `base`/`up_to_date`, per
+    // `RebaseStatus::has_upstream`'s own doc comment.
     let observed = async {
         let base = rebase_base(&repo).await?;
         let base_exists = rev_parse(&repo, base).await?.is_some();
         let up_to_date = base_exists && is_ancestor(&repo, base, "HEAD").await?;
-        Ok::<_, ExecUnavailable>((base, base_exists, up_to_date))
+        let has_upstream = match &branch {
+            Some(name) => {
+                // `read_head_branch` shortens a real `refs/heads/...` ref
+                // git itself resolved, so it is always git-safe.
+                let branch = BranchName::new(name.as_str())
+                    .expect("a checked-out branch's own name is git-safe");
+                Some(planner::upstream_of(&repo, &branch).await?.is_some())
+            }
+            None => None,
+        };
+        Ok::<_, ExecUnavailable>((base, base_exists, up_to_date, has_upstream))
     }
     .await;
 
-    let (base, base_exists, up_to_date) = match observed {
+    let (base, base_exists, up_to_date, has_upstream) = match observed {
         Ok(observed) => observed,
         Err(e) => {
             return (
@@ -121,6 +134,7 @@ pub(crate) async fn rebase_status() -> axum::response::Response {
             base: base.to_string(),
             base_exists,
             up_to_date,
+            has_upstream,
         }),
     )
         .into_response()
