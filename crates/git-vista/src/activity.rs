@@ -14,20 +14,21 @@
 //! Same chrome recipe as the detail panel (it shares the `.detail-panel` CSS
 //! family): an explicit ✕ close button — never Esc-only, the iPad keyboard
 //! has no Esc — and it never shows a stale feed (the issue-16 lesson): the feed
-//! re-fetches every time the panel opens, and the working-tree status does too,
-//! now via the one shared read in `features/status` rather than a second private
-//! copy of the topbar's (M1.11, #64).
+//! re-fetches every time the panel opens, and so does the working-tree status,
+//! via its own v2 `WorktreeStatus` read (M2.15, #68) — grouped into touch-card
+//! sections with accessible labels, not the flat v1 list the topbar chip still
+//! reads separately (M1.11, #64).
 
 use leptos::*;
 
 use git_vista_core::activity::{ActivityEvent, ActivitySource};
 
-use crate::api::{fetch_activity, fetch_tags};
+use crate::api::{fetch_activity, fetch_tags, fetch_worktree_status};
 use crate::datetime::time_ago;
 use crate::features::activity::core::{event_commit, kind_glyph, kind_label};
 use crate::features::dialogs::core::Dialog;
 use crate::features::shell::signals as shell_state;
-use crate::features::status::signals as status_seam;
+use crate::features::status::core::{StatusHeadline, StatusSection, StatusSections};
 use crate::features::tags::core::{
     tag_list_view, tag_row_lines, TagListView, TagRow, LOADING_TAGS, NO_TAGS,
 };
@@ -48,24 +49,35 @@ pub fn activity_panel_view(
     settings: Settings,
     read_only: bool,
 ) -> impl IntoView {
-    let Features {
-        graph,
-        status,
-        shell,
-        ..
-    } = features;
+    let Features { graph, shell, .. } = features;
     let nerd_icons = settings.nerd_icons;
 
     // The feed keys on (open, reload): opening the panel fetches fresh, and any
     // post-operation reload — an undo confirmed from this very panel, a branch created
     // from a row's menu — refreshes it in place. Closed → resolve to None without
-    // touching the network. The working-tree status is no longer fetched here at all:
-    // `status` is the app's one read, passed in (M1.11, #64, Task 7).
+    // touching the network.
     let feed = create_local_resource(
         move || (shell.activity_is_open(), graph.get().epoch()),
         |(open, _)| async move {
             if open {
                 Some(fetch_activity(FEED_LIMIT).await)
+            } else {
+                None
+            }
+        },
+    );
+
+    // The v2 working-tree status (M2.15, #68), keyed exactly like the feed
+    // above: open the panel and it is read fresh, and any operation that
+    // bumps the graph epoch refreshes it in place. This is the panel's own
+    // read now, not the shared v1 resource the topbar chip still uses —
+    // #68d's grouped `StatusSections` needs the entry-level detail
+    // (`WorktreeStatus::entries`) v1's `RepoStatus` never carried.
+    let worktree_status = create_local_resource(
+        move || (shell.activity_is_open(), graph.get().epoch()),
+        |(open, _)| async move {
+            if open {
+                fetch_worktree_status().await.ok()
             } else {
                 None
             }
@@ -100,29 +112,34 @@ pub fn activity_panel_view(
             // if the icon style is toggled while it's open.
             let ic = icon_set(nerd_icons.get());
 
-            // -- The working-tree status section (step 1's data, richer). ----
+            // -- The working-tree status section (M2.15, #68) ----------------
+            //
+            // Built on the v2 grouped `StatusSections` (#68d), not a hand-rolled
+            // flat list over v1 fields: each section renders as its own
+            // touch-card list, `role="list"`/`role="listitem"` with the
+            // pre-computed `accessible_label` per card — #68's own acceptance
+            // criterion, satisfied by consuming the data #68d built for exactly
+            // this rather than re-deriving labels here.
             let status_section = move || {
-                status_seam::read(status).map(|s| {
+                worktree_status.get().flatten().map(|s| {
                     let ic = icon_set(nerd_icons.get());
-                    let (glyph, class, headline) = if !s.conflicted.is_empty() {
-                        (
+                    let sections = StatusSections::from_worktree_status(&s);
+                    let (glyph, class, headline) = match sections.headline() {
+                        StatusHeadline::Conflicted(n) => (
                             ic.conflict,
                             "act-status conflict",
-                            format!("{} conflicted file(s)", s.conflicted.len()),
-                        )
-                    } else if !s.is_clean() {
-                        let n = s.change_count();
-                        (
+                            format!("{n} conflicted file(s)"),
+                        ),
+                        StatusHeadline::Dirty(n) => (
                             ic.dirty,
                             "act-status dirty",
                             format!("{n} uncommitted change{}", if n == 1 { "" } else { "s" }),
-                        )
-                    } else {
-                        (
+                        ),
+                        StatusHeadline::Clean => (
                             ic.clean,
                             "act-status clean",
                             "working tree clean".to_string(),
-                        )
+                        ),
                     };
                     let sync = (s.ahead > 0 || s.behind > 0).then(|| {
                         let mut t = String::new();
@@ -137,51 +154,92 @@ pub fn activity_panel_view(
                         }
                         view! { <span class="detail-muted">{t}</span> }
                     });
-                    // The dirty files, one compact row each, capped so a huge
-                    // tree doesn't bury the feed this panel is really for.
+
+                    // One touch-card list per non-empty section, in urgency
+                    // order (`StatusSection::ALL`). Conflicted/Staged/Unstaged/
+                    // Untracked are capped together — a huge tree should not
+                    // bury the feed this panel is really for; Ignored gets its
+                    // own, smaller cap and a compact summary rather than every
+                    // path, since an ignored tree (`node_modules`-shaped) can
+                    // be arbitrarily large and none of those paths are
+                    // actionable here.
                     const FILE_CAP: usize = 12;
-                    let mut rows: Vec<(String, &'static str, &'static str)> = Vec::new();
-                    for f in &s.staged {
-                        rows.push((f.path.clone(), "staged", ic.added));
-                    }
-                    for f in &s.unstaged {
-                        rows.push((f.path.clone(), "modified", ic.modified));
-                    }
-                    for p in &s.untracked {
-                        rows.push((p.clone(), "untracked", ic.untracked));
-                    }
-                    for p in &s.conflicted {
-                        rows.push((p.clone(), "conflict", ic.conflict));
-                    }
-                    let overflow = rows.len().saturating_sub(FILE_CAP);
-                    rows.truncate(FILE_CAP);
-                    let files = rows
+                    const IGNORED_CAP: usize = 4;
+                    let mut shown = 0usize;
+                    let sections_view = StatusSection::ALL
                         .into_iter()
-                        .map(|(path, tag, glyph)| {
+                        .filter(|&sec| sections.count(sec) > 0)
+                        .map(|sec| {
+                            let rows = sections.rows(sec);
+                            let count = rows.len();
+                            let cap = if sec == StatusSection::Ignored {
+                                IGNORED_CAP
+                            } else {
+                                FILE_CAP.saturating_sub(shown)
+                            };
+                            let glyph = match sec {
+                                StatusSection::Conflicted => ic.conflict,
+                                StatusSection::Staged => ic.added,
+                                StatusSection::Unstaged => ic.modified,
+                                StatusSection::Untracked | StatusSection::Ignored => ic.untracked,
+                            };
+                            let taken = rows.iter().take(cap);
+                            let card_count = taken.len();
+                            if sec != StatusSection::Ignored {
+                                shown += card_count;
+                            }
+                            let cards = taken
+                                .map(|row| {
+                                    view! {
+                                        <div
+                                            role="listitem"
+                                            class="act-status-card"
+                                            aria-label=row.accessible_label.clone()
+                                        >
+                                            <span class="nf ctx-icon">{glyph}</span>
+                                            <span class="act-file-path">
+                                                {row.path.clone()}
+                                            </span>
+                                            {row.secondary.clone().map(|sec| {
+                                                view! {
+                                                    <span class="detail-muted act-file-secondary">
+                                                        {sec}
+                                                    </span>
+                                                }
+                                            })}
+                                        </div>
+                                    }
+                                })
+                                .collect_view();
+                            let overflow = count.saturating_sub(card_count);
+                            let more = (overflow > 0).then(|| {
+                                view! {
+                                    <div class="detail-muted act-file">
+                                        {format!("… and {overflow} more")}
+                                    </div>
+                                }
+                            });
                             view! {
-                                <div class="act-file">
-                                    <span class="nf ctx-icon">{glyph}</span>
-                                    <span class="act-file-path">{path}</span>
-                                    <span class="act-pill">{tag}</span>
+                                <div class="act-status-section">
+                                    <p class="act-status-heading">
+                                        {format!("{} ({})", sec.heading(), count)}
+                                    </p>
+                                    <div role="list" aria-label=sec.heading()>
+                                        {cards}
+                                        {more}
+                                    </div>
                                 </div>
                             }
                         })
                         .collect_view();
-                    let more = (overflow > 0).then(|| {
-                        view! {
-                            <div class="detail-muted act-file">
-                                {format!("… and {overflow} more")}
-                            </div>
-                        }
-                    });
+
                     view! {
                         <div class=class>
                             <span class="nf ctx-icon">{glyph}</span>
                             {headline}
                             {sync}
                         </div>
-                        {files}
-                        {more}
+                        {sections_view}
                     }
                 })
             };

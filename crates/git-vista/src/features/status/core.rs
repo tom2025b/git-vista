@@ -168,6 +168,48 @@ impl StatusSections {
     pub fn is_clean(&self) -> bool {
         StatusSection::ALL.iter().all(|&s| self.count(s) == 0)
     }
+
+    /// The three-way decision a status headline (topbar chip, Activity
+    /// panel's summary line) makes over these sections, pulled out here so
+    /// it is host-testable rather than left inline in `activity.rs`, which
+    /// is wasm-only. Conflicted takes priority over an ordinary dirty count
+    /// even when both are non-zero — a conflict needs resolving first,
+    /// matching [`StatusSection::ALL`]'s own urgency ordering.
+    pub fn headline(&self) -> StatusHeadline {
+        let conflicted = self.count(StatusSection::Conflicted);
+        if conflicted > 0 {
+            return StatusHeadline::Conflicted(conflicted);
+        }
+        // Section-membership count, not distinct paths: a path dirty on
+        // both sides counts toward both Staged and Unstaged — see the
+        // module doc's "Consequence for counts" — matching v1
+        // `RepoStatus::change_count()`'s identical semantics, which this
+        // replaces. Ignored is deliberately excluded, same as v1: an
+        // ignored file is not a "change" in the sense this headline reports.
+        let dirty = self.count(StatusSection::Staged)
+            + self.count(StatusSection::Unstaged)
+            + self.count(StatusSection::Untracked);
+        if dirty > 0 {
+            StatusHeadline::Dirty(dirty)
+        } else {
+            StatusHeadline::Clean
+        }
+    }
+}
+
+/// The three states a status headline can show, in priority order —
+/// [`StatusSections::headline`]'s pure result, before a view attaches an
+/// icon or CSS class to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusHeadline {
+    /// At least one conflicted path — takes priority over `Dirty` even when
+    /// both counts are non-zero.
+    Conflicted(usize),
+    /// No conflicts, but at least one staged, unstaged, or untracked path.
+    /// The count is section-membership, not distinct paths.
+    Dirty(usize),
+    /// Every section (including Ignored) is empty.
+    Clean,
 }
 
 fn rows_for_entry(entry: &StatusEntry) -> Vec<(StatusSection, StatusRow)> {
@@ -885,5 +927,92 @@ mod tests {
         let s = status(vec![]);
         assert!(discardable_tracked_paths(&s).is_empty());
         assert!(deletable_untracked_paths(&s).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // headline() — M2.15 (#68), the Activity panel's status summary line
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_clean_worktree_headlines_clean() {
+        let sections = StatusSections::from_worktree_status(&status(vec![]));
+        assert_eq!(sections.headline(), StatusHeadline::Clean);
+    }
+
+    #[test]
+    fn ignored_files_alone_still_headline_clean() {
+        // Ignored is a real section (housekeeping, per the module doc) but
+        // must not count as "dirty" — an ignored-only tree reads the same
+        // as an empty one at the headline level, matching v1's behaviour
+        // (ignored paths were never part of `RepoStatus::change_count()`).
+        let s = status(vec![StatusEntry::Ignored {
+            path: "target/".to_string(),
+        }]);
+        let sections = StatusSections::from_worktree_status(&s);
+        assert_eq!(sections.headline(), StatusHeadline::Clean);
+        assert!(!sections.is_clean(), "is_clean() sees the ignored entry");
+    }
+
+    #[test]
+    fn staged_unstaged_and_untracked_all_headline_dirty_and_sum() {
+        let s = status(vec![
+            changed(
+                "a.rs",
+                ChangeSides::StagedOnly {
+                    staged: ChangeKind::Added,
+                },
+            ),
+            changed(
+                "b.rs",
+                ChangeSides::UnstagedOnly {
+                    unstaged: ChangeKind::Modified,
+                },
+            ),
+            StatusEntry::Untracked {
+                path: "c.txt".to_string(),
+                binary: false,
+            },
+        ]);
+        let sections = StatusSections::from_worktree_status(&s);
+        assert_eq!(sections.headline(), StatusHeadline::Dirty(3));
+    }
+
+    #[test]
+    fn a_path_dirty_on_both_sides_counts_twice_in_the_headline() {
+        // Same section-membership semantics as StatusSections::count itself
+        // (see the module doc's "Consequence for counts") — the headline
+        // must not silently switch to a distinct-path count.
+        let s = status(vec![changed(
+            "both.rs",
+            ChangeSides::Both {
+                staged: ChangeKind::Added,
+                unstaged: ChangeKind::Modified,
+            },
+        )]);
+        let sections = StatusSections::from_worktree_status(&s);
+        assert_eq!(sections.headline(), StatusHeadline::Dirty(2));
+    }
+
+    #[test]
+    fn conflicted_takes_priority_over_dirty_even_when_both_are_present() {
+        let s = status(vec![
+            changed(
+                "staged.rs",
+                ChangeSides::StagedOnly {
+                    staged: ChangeKind::Added,
+                },
+            ),
+            StatusEntry::Conflicted {
+                path: "clash.rs".to_string(),
+                kind: ConflictKind::BothModified,
+                submodule: None,
+            },
+        ]);
+        let sections = StatusSections::from_worktree_status(&s);
+        // A conflict is not just "shown first" — the ordinary dirty count
+        // must not leak into the headline at all while one exists, or a
+        // caller matching on the variant loses the staged file's presence
+        // silently rather than seeing it once the conflict is resolved.
+        assert_eq!(sections.headline(), StatusHeadline::Conflicted(1));
     }
 }

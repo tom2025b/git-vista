@@ -157,8 +157,13 @@ pub struct Features {
     pub dialogs: Dialogs,
     /// Where writes go.
     pub operations: Operations,
-    /// The app's one working-tree status read — the topbar chip and the Activity
-    /// panel's status section both render from it.
+    /// The app's one v1 working-tree status read — the topbar chip renders from
+    /// it, and several write handlers (`menu.rs`, `dialogs/commit.rs`, `viewer.rs`)
+    /// call `.refetch()` on it after a mutation so the chip updates without
+    /// waiting for its own key to change. The Activity panel's status *section*
+    /// no longer reads this one (M2.15, #68 gave it its own v2 `WorktreeStatus`
+    /// resource, local to `activity.rs`) — this field's remaining job is the
+    /// chip plus the refetch triggers, not panel rendering.
     pub status: StatusResource,
     /// Every overlay the app can put on screen, and the order they were raised in
     /// (M1.11, #64, Task 8). Replaces the `Overlays` bundle: the six overlay signals are
