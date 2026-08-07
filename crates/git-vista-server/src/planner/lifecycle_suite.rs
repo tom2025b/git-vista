@@ -94,7 +94,14 @@ async fn tracked(
     op: GitOperation,
 ) -> (axum::http::StatusCode, String) {
     let id = repo_id(repo);
-    plan_and_execute_tracked(key, repo.to_path_buf(), Some(id), tokens(), op).await
+    plan_and_execute_tracked(
+        key,
+        repo.to_path_buf(),
+        Some(id),
+        tokens(),
+        PlanSource::Build(op),
+    )
+    .await
 }
 
 /// The record admitted under `key`, found the way a second request finds it.

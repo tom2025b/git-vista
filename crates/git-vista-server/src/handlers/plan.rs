@@ -5,9 +5,9 @@
 //! running it. Its whole reason to exist is the client-review roundtrip an
 //! agent needs: ask what an operation would do, read the risk / preconditions /
 //! expected ref changes / recovery, and only then decide. Execution of an
-//! approved plan is a separate endpoint in a separate slice (#249) — keeping
-//! them apart is what makes "an agent submits a reviewable plan, never argv"
-//! a structural fact rather than a convention.
+//! approved plan is [`execute_plan`]'s own endpoint, `POST /api/execute-plan`
+//! (#249) — keeping them apart is what makes "an agent submits a reviewable
+//! plan, never argv" a structural fact rather than a convention.
 //!
 //! # Why the body is a bare [`GitOperation`], not a wrapper DTO
 //!
@@ -82,4 +82,29 @@ pub(crate) async fn plan_only_in(
     op: GitOperation,
 ) -> Plan {
     planner::build_plan_only(repo, op, tokens).await
+}
+
+/// `POST /api/execute-plan` — submit a [`Plan`] built by `POST /api/plan` for
+/// execution (M2.23e, #249; ADR 0046 continued). The back half of the
+/// #248/#249 pair.
+///
+/// # Why the body is a bare [`Plan`], not a wrapper DTO
+///
+/// Symmetric with [`plan_operation`] above, for the same reason: `Plan` is
+/// already the closed, validating shape, and there is nothing else this
+/// endpoint needs from the request — it is exactly what `/api/plan` hands
+/// back.
+///
+/// # Why this reaches `submit_plan_tracked`, never `plan_and_execute`
+///
+/// `plan_and_execute` builds its own plan from a bare `GitOperation`; this
+/// endpoint already has one, built earlier and possibly reviewed across a
+/// roundtrip. Running it through `plan_and_execute` would silently rebuild
+/// (and re-approve) it from an operation this route never received.
+/// `planner::submit_plan_tracked` is the tracked entry that takes the given
+/// plan's own hash/generation as the approval instead, and shares
+/// `plan_and_execute_tracked`'s admit/spawn/terminalise with the composed
+/// path rather than duplicating it (ADR 0016).
+pub(crate) async fn execute_plan(Json(plan): Json<Plan>) -> (StatusCode, String) {
+    planner::submit_plan_tracked(plan).await
 }

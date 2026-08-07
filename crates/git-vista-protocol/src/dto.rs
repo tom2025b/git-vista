@@ -801,6 +801,18 @@ pub struct RebaseStatus {
     /// True when HEAD already contains the base tip — the branch is already
     /// based on the latest `base`, so a rebase would change nothing.
     pub up_to_date: bool,
+    /// Whether `branch` has a recorded upstream (`<branch>@{upstream}`), as
+    /// git resolves it — not merely whether a same-named remote-tracking ref
+    /// exists, which is a different and weaker question (#233). `None` when
+    /// there is no `branch` to ask (detached HEAD); `Some(false)` is a real,
+    /// reportable absence, not "unknown" — an unreadable repository fails the
+    /// whole response, same as `base_exists`/`up_to_date` above, rather than
+    /// reporting a silent `false` here. Additive field: this DTO carries no
+    /// `deny_unknown_fields` (response DTOs never do), and `#[serde(default)]`
+    /// keeps a newer frontend working against an older server that doesn't
+    /// send it yet.
+    #[serde(default)]
+    pub has_upstream: Option<bool>,
 }
 
 /// How a servable repository entry relates to git's on-disk layout (M1.03). The
@@ -1343,6 +1355,7 @@ mod tests {
             base: "origin/main".into(),
             base_exists: true,
             up_to_date: false,
+            has_upstream: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(serde_json::from_str::<RebaseStatus>(&json).unwrap(), status);

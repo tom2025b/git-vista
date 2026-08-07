@@ -2080,6 +2080,14 @@ fn every_git_write_route_reaches_the_planner() {
         // `plan_and_execute`. The `build_only` block after the funnel loop
         // states the inverse requirement and checks it.
         ("/api/plan", "plan_operation"),
+        // M2.23e (#249, ADR 0046 continued): submit a plan for execution. Not
+        // a funnel row either — it reaches the planner through
+        // `submit_plan_tracked`, the submit path's own tracked entry, never
+        // `plan_and_execute` (which would rebuild the operation instead of
+        // executing the plan that was actually approved). The
+        // `submit_execute` block right after the `build_only` one below
+        // checks this route's own chain.
+        ("/api/execute-plan", "execute_plan"),
     ];
     assert_eq!(
         posts.len(),
@@ -2242,6 +2250,38 @@ fn every_git_write_route_reaches_the_planner() {
     // would pass vacuously. The two positive `contains` assertions just made
     // are that proof — they read real call sites out of the same blanked
     // string the negatives are checked against.
+
+    // The submit-execute chain (M2.23e, #249): `execute_plan` is the second
+    // funnel entry point, alongside `plan_and_execute` — it must reach
+    // `submit_plan_tracked`, the submit path's own tracked entry, and that
+    // entry must itself reach `plan_and_execute_tracked`, the shared
+    // admit/spawn/terminalise layer every write funnels through (ADR 0016),
+    // rather than growing a second undischarged copy of that machinery. It
+    // must NOT reach `plan_and_execute` or a bare `submit_plan(` directly:
+    // the first would rebuild the operation instead of executing the plan
+    // that was actually approved, and the second would skip the
+    // idempotency/lifecycle layer entirely — exactly the two mistakes the
+    // `build_only` block above rules out for `/api/plan`.
+    let execute_body = fn_body(&plan_src, "execute_plan");
+    for forbidden in ["plan_and_execute(", "submit_plan("] {
+        assert!(
+            !execute_body.contains(forbidden),
+            "src/handlers/plan.rs::execute_plan calls {forbidden} — it must reach \
+             submit_plan_tracked, not the composed path or a bare submit_plan"
+        );
+    }
+    assert!(
+        execute_body.contains("submit_plan_tracked("),
+        "src/handlers/plan.rs::execute_plan no longer calls submit_plan_tracked — \
+         POST /api/execute-plan must reach the submit path's own tracked entry"
+    );
+    let planner_src = crate::argv_boundary::code_only(&source("src/planner.rs"));
+    assert!(
+        fn_body(&planner_src, "submit_plan_tracked").contains("plan_and_execute_tracked("),
+        "planner::submit_plan_tracked no longer calls plan_and_execute_tracked — the \
+         submit path must share the composed path's admit/spawn/terminalise layer \
+         (ADR 0016), not duplicate it"
+    );
 }
 
 /// The production composition itself: [`plan_and_execute`]'s body must call

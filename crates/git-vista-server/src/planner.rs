@@ -91,7 +91,77 @@ pub(crate) async fn plan_and_execute(op: GitOperation) -> (StatusCode, String) {
         Err(rejected) => return rejected,
     };
     let repo_id = Some(entry.handle.repository);
-    plan_and_execute_tracked(key, repo, repo_id, selection_tokens(), op).await
+    plan_and_execute_tracked(
+        key,
+        repo,
+        repo_id,
+        selection_tokens(),
+        PlanSource::Build(op),
+    )
+    .await
+}
+
+/// What [`plan_and_execute_tracked`] runs once admitted: build a plan from a
+/// bare operation (the composed path, #143) or execute a plan that already
+/// arrived from outside (the submit path, #249). Both admit/spawn/terminalise
+/// identically — this enum is the whole seam that lets them share
+/// [`plan_and_execute_tracked`] instead of each re-deriving it, which is ADR
+/// 0016's funnel extended to plans that arrive pre-built.
+enum PlanSource {
+    /// The composed path: build the plan from this operation, still inside
+    /// the guard, then execute it — [`plan_and_execute_in`].
+    Build(GitOperation),
+    /// The submit path: this plan already exists (minted earlier by
+    /// [`build_plan_only`], possibly reviewed across a roundtrip) — take the
+    /// guard and run `validate → enforce_fresh → execute` against it as-is —
+    /// [`submit_plan`]. Boxed: `Plan` is ~4x the size of `GitOperation`, and
+    /// clippy's `large_enum_variant` is right that an unboxed `Plan` here
+    /// would make every `PlanSource` (including every `Build` one, which is
+    /// on the hot path) pay `Plan`'s stack size for a variant most values
+    /// never use.
+    Submit(Box<Plan>),
+}
+
+impl PlanSource {
+    /// The operation [`crate::operations::admit`] keys the idempotency
+    /// registry on, regardless of which path produced it.
+    fn operation(&self) -> &GitOperation {
+        match self {
+            PlanSource::Build(op) => op,
+            PlanSource::Submit(plan) => &plan.operation,
+        }
+    }
+
+    /// The hash `admit` compares a reused key's second request against. A
+    /// submitted plan already carries its own — computed once, at build time
+    /// — so this reuses it rather than recomputing: for `Submit`, hashing
+    /// again here would just reproduce the plan's own `operation_hash` field.
+    /// Always **derived from the operation**, never read off the plan — for
+    /// `Submit` as much as for `Build`.
+    ///
+    /// The distinction is a trust boundary, and getting it wrong is exploitable.
+    /// `admit()` uses this hash to decide Fresh/Existing/Conflict, and it runs
+    /// *before* `validate()` — which is the thing that checks
+    /// `operation_hash(&plan.operation) == plan.operation_hash`. A submitted
+    /// plan arrives from outside (today, from an LLM's raw tool-call argument
+    /// via the MCP bridge), so its `operation_hash` field is client-supplied
+    /// data that nothing has verified at the moment admission needs it.
+    ///
+    /// Trusting that field would let a plan whose declared hash collides with
+    /// an already-admitted key take `Admission::Existing` and replay the *first*
+    /// operation's terminal result — the second operation never validated, never
+    /// executed, and the caller told it succeeded. The inverse poisons a key:
+    /// a first submission carrying a mismatched hash makes every later,
+    /// correctly-hashed resubmission `Admission::Conflict` forever.
+    ///
+    /// Recomputing here costs one hash and removes the whole class. `validate()`
+    /// still runs later and still rejects a plan whose declared hash disagrees
+    /// with its operation — that check is about the plan's own integrity, and it
+    /// is not a substitute for this one, because it happens after admission has
+    /// already committed.
+    fn hash(&self) -> OperationHash {
+        operation_hash(self.operation())
+    }
 }
 
 /// Run one operation under a recorded lifecycle (M1.08, #61): admit it to the
@@ -118,27 +188,28 @@ async fn plan_and_execute_tracked(
     repo: PathBuf,
     repo_id: Option<RepositoryId>,
     tokens: (RepositoryToken, WorktreeToken),
-    op: GitOperation,
+    source: PlanSource,
 ) -> (StatusCode, String) {
-    let hash = operation_hash(&op);
+    let hash = source.hash();
     let (repository, worktree) = tokens.clone();
 
-    let (handle, record) = match crate::operations::admit(&key, &op, &hash, repository, worktree) {
-        crate::operations::Admission::Fresh(handle, record) => (handle, record),
-        crate::operations::Admission::Existing(record) => {
-            // The same intent, already in flight or already answered.
-            crate::operations::note_minted(&record.id());
-            return record.wait_terminal().await;
-        }
-        crate::operations::Admission::Conflict => {
-            return (
-                StatusCode::CONFLICT,
-                "That idempotency key was already used for a different operation. \
+    let (handle, record) =
+        match crate::operations::admit(&key, source.operation(), &hash, repository, worktree) {
+            crate::operations::Admission::Fresh(handle, record) => (handle, record),
+            crate::operations::Admission::Existing(record) => {
+                // The same intent, already in flight or already answered.
+                crate::operations::note_minted(&record.id());
+                return record.wait_terminal().await;
+            }
+            crate::operations::Admission::Conflict => {
+                return (
+                    StatusCode::CONFLICT,
+                    "That idempotency key was already used for a different operation. \
                  Reload and try again."
-                    .to_string(),
-            );
-        }
-    };
+                        .to_string(),
+                );
+            }
+        };
 
     crate::operations::note_minted(&record.id());
 
@@ -164,7 +235,10 @@ async fn plan_and_execute_tracked(
         async move {
             crate::durable::persist(durable_key.clone(), durable_record.status()).await;
 
-            let (status, message) = plan_and_execute_in(&repo, repo_id, tokens, op).await;
+            let (status, message) = match source {
+                PlanSource::Build(op) => plan_and_execute_in(&repo, repo_id, tokens, op).await,
+                PlanSource::Submit(plan) => submit_plan(&repo, repo_id, tokens, *plan).await,
+            };
             // The generation *after* execution: the datum a reconnecting client
             // uses to decide whether its cached graph is stale, without re-reading
             // the repository. Best-effort, like every other observation here.
@@ -380,7 +454,6 @@ pub(crate) async fn build_plan_only(
 ///   `a_generation_invisible_break_while_queued_is_refused_by_the_gates_live_recheck`
 ///   proves the re-derivation itself is load-bearing (emptying it passed the
 ///   whole suite before that test existed).
-#[cfg_attr(not(test), allow(dead_code))] // routed by #249; contract-suite-only until then
 pub(crate) async fn submit_plan(
     repo: &Path,
     repo_id: Option<RepositoryId>,
@@ -421,6 +494,59 @@ pub(crate) async fn submit_plan(
     crate::operations::stage(OperationStage::Executing);
     execute(repo, plan, observed).await
     // `_guard` drops here, exactly as in `plan_and_execute_in`.
+}
+
+/// The submit path's own outer entry (M2.23e, #249): the same gate-then-
+/// delegate shape [`plan_and_execute`] has, for a [`Plan`] that arrives from
+/// outside rather than a bare [`GitOperation`] built fresh. Routed by
+/// `POST /api/execute-plan` (`handlers::plan::execute_plan`).
+///
+/// Reaches the identical [`plan_and_execute_tracked`] lifecycle layer via
+/// [`PlanSource::Submit`] — the same admission, detached spawn and terminal
+/// wait every other write gets, so the submit path cannot drift from the
+/// composed path on idempotency (ADR 0016's funnel, extended to plans
+/// instead of bare operations). What `plan_and_execute_tracked` does with
+/// the `PlanSource` once admitted is call [`submit_plan`] — never a second
+/// copy of validate/enforce_fresh/execute.
+///
+/// One admission subtlety: `admit` keys the idempotency registry on this
+/// *request's* live selection tokens (via `selection_tokens()` below), not
+/// the plan's own `repository`/`worktree` fields — those are compared inside
+/// `submit_plan` itself, after admission. So a retried cross-worktree
+/// submission under the same key replays the original 409 rather than
+/// re-deriving it; that is the correct idempotent behavior, not a gap.
+pub(crate) async fn submit_plan_tracked(plan: Plan) -> (StatusCode, String) {
+    // The write gate, exactly as `plan_and_execute` takes it — a plan is an
+    // approval token for a mutation, so executing it is refused the same way
+    // building one already is (see `handlers::plan`'s module doc).
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    let Some(key) = crate::operations::current_key() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "This request needs the {IDEMPOTENCY_HEADER} header, so a retry \
+                 can be recognised as a retry. Reload the app to update."
+            ),
+        );
+    };
+    // D2 (#66, Task 7): the same validated resolution every write handler
+    // uses. `submit_plan` re-checks this request's tokens against the plan's
+    // own below; this call is what produces them.
+    let (repo, entry) = match crate::state::resolve_target() {
+        Ok(v) => v,
+        Err(rejected) => return rejected,
+    };
+    let repo_id = Some(entry.handle.repository);
+    plan_and_execute_tracked(
+        key,
+        repo,
+        repo_id,
+        selection_tokens(),
+        PlanSource::Submit(Box::new(plan)),
+    )
+    .await
 }
 
 /// Resolve arbitrary request input to an exact [`CommitOid`]. A full 40/64
@@ -708,7 +834,6 @@ async fn held_now(repo: &Path, preconditions: &[Precondition], observed: &Observ
 /// re-observation is safe (the plan's build-time generation, not this read,
 /// is what `enforce_fresh` anchors staleness on) and for the one semantic
 /// wrinkle (`RemoteConfigured`/`SeedRecorded` drift reads as built-stale).
-#[cfg_attr(not(test), allow(dead_code))] // routed by #249; contract-suite-only until then
 async fn observe_for_submission(repo: &Path, plan: &Plan) -> Observed {
     let mut observed = observe_operation(repo, &plan.operation).await;
     observed.held_at_build = held_now(repo, &plan.preconditions, &observed).await;
@@ -4374,6 +4499,32 @@ pub(crate) use fetch::error_body as fetch_error_body;
 /// endpoint's one error type, exactly like the executor's do.
 pub(crate) use pull::error_body as pull_error_body;
 
+/// Whether `branch` has a recorded upstream (`<branch>@{upstream}`), exposed
+/// to callers outside `planner` (#233). `push::upstream_of` itself stays
+/// `pub(super)` — its own doc comment explains why (only `push_suite`'s test
+/// needs it) — and this wrapper exists because that function returns [`Obs`],
+/// which is private to this module: a `pub(crate)` function may not return a
+/// private type (E0446), and widening `Obs` itself would give it a much wider
+/// audience than one read endpoint needs. So this collapses the three-state
+/// read into the `Result<Option<_>, ExecUnavailable>` shape
+/// `/api/rebase-status`'s own reads already use: `Known`/`Absent` are both
+/// real observations (`Some`/`None`), and `Unknown` — git could not be run —
+/// becomes `Err`, so a failed read fails the whole response instead of
+/// reporting a silent `false`.
+pub(crate) async fn upstream_of(
+    repo: &Path,
+    branch: &BranchName,
+) -> Result<Option<String>, ExecUnavailable> {
+    match push::upstream_of(repo, branch).await {
+        Obs::Known(upstream) => Ok(Some(upstream)),
+        Obs::Absent => Ok(None),
+        Obs::Unknown => Err(ExecUnavailable::new(format!(
+            "couldn't resolve the upstream of '{}'",
+            branch.as_str()
+        ))),
+    }
+}
+
 /// Whether cancelling this operation can actually stop it (M2.20c, #229).
 ///
 /// **This is a claim about [`execute`], not a wish.** An arm answering `true`
@@ -4749,6 +4900,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #249: the admission hash for a **submitted** plan is derived from its
+    /// operation, never read off the plan's own `operation_hash` field.
+    ///
+    /// Found by adversarial review before this shipped. A submitted plan comes
+    /// from outside — today from an LLM's raw tool-call argument through the
+    /// MCP bridge — so `plan.operation_hash` is unverified client data at the
+    /// moment `admit()` needs a hash. And `admit()` runs *before* `validate()`,
+    /// which is the check that would catch a mismatch.
+    ///
+    /// Trusting the field is exploitable two ways. A plan whose declared hash
+    /// collides with an already-admitted key takes `Admission::Existing` and
+    /// replays the **first** operation's terminal result — the second operation
+    /// never validated, never executed, caller told it succeeded. And a first
+    /// submission carrying a mismatched hash poisons that key: every later,
+    /// correctly-hashed resubmission gets `Admission::Conflict` forever.
+    ///
+    /// This pins the fix at the seam where it matters. `validate()` rejecting a
+    /// mismatched plan is a different guarantee and does not cover this one —
+    /// it happens after admission has already committed.
+    #[tokio::test]
+    async fn a_submitted_plans_admission_hash_ignores_the_hash_the_plan_declares() {
+        let (_dir, repo) = seeded_repo();
+        let (plan, _observed) = build_plan(&repo, GitOperation::StageAll, tokens()).await;
+        let honest = operation_hash(&plan.operation);
+
+        // A plan that lies about its own operation — the shape a hostile or
+        // simply buggy caller can put on the wire.
+        let mut tampered = plan.clone();
+        tampered.operation_hash = OperationHash::new("0".repeat(64)).unwrap();
+        assert_ne!(
+            tampered.operation_hash.as_str(),
+            honest.as_str(),
+            "the tampered fixture must actually differ, or this test proves nothing"
+        );
+
+        let admitted = PlanSource::Submit(Box::new(tampered)).hash();
+        assert_eq!(
+            admitted.as_str(),
+            honest.as_str(),
+            "admission must key on the hash derived from the operation, not the one \
+             the plan declares — otherwise a colliding declared hash replays a \
+             different operation's result"
+        );
     }
 
     /// #145 acceptance 1 + 4 (the race): a plan built against generation N is

@@ -61,10 +61,13 @@ pub enum ToolError {
 /// appended from [`crate::plan_tools`].
 pub fn tool_catalog() -> serde_json::Value {
     let mut catalog = read_tool_catalog();
-    catalog
+    let array = catalog
         .as_array_mut()
-        .expect("the read catalog is a JSON array")
-        .extend(crate::plan_tools::plan_tool_catalog());
+        .expect("the read catalog is a JSON array");
+    array.extend(crate::plan_tools::plan_tool_catalog());
+    // M2.23e (#249): the one write tool, appended last so it is always the
+    // catalog's final entry — see `tools::tests::the_tool_catalog_lists_exactly_the_six_read_tools`.
+    array.extend(crate::execute_tool::execute_tool_catalog());
     catalog
 }
 
@@ -347,11 +350,14 @@ pub fn call_tool(
             let path = format!("/api/activity{qs}");
             get_json::<Vec<git_vista_core::activity::ActivityEvent>>(&path, session)
         }
-        // M2.23d (#248): the `plan_*` build-only surface. Tried *after* the
-        // read tools and before the unknown-tool refusal, so a plan tool's
-        // name can never shadow a read tool's, and an unrecognised name is
-        // still `Unknown` rather than silently swallowed.
-        other => match crate::plan_tools::call_plan_tool_live(other, arguments, session) {
+        // M2.23d (#248): the `plan_*` build-only surface, then M2.23e (#249)'s
+        // one write tool. Tried *after* the read tools and before the
+        // unknown-tool refusal, so neither can shadow a read tool's name, and
+        // an unrecognised name is still `Unknown` rather than silently
+        // swallowed.
+        other => match crate::plan_tools::call_plan_tool_live(other, arguments, session)
+            .or_else(|| crate::execute_tool::call_execute_tool_live(other, arguments, session))
+        {
             Some(result) => result,
             None => Err(ToolError::Unknown(other.to_string())),
         },
@@ -722,19 +728,31 @@ mod tests {
             "get_activity",
         ];
         assert_eq!(names[..expected_reads.len()], expected_reads);
-        assert!(
-            names[expected_reads.len()..]
-                .iter()
-                .all(|n| n.starts_with("plan_")),
-            "a non-read, non-plan tool appeared in the catalog: {names:?}"
+        // M2.23e (#249) appended exactly one write tool, `execute_plan`, as
+        // the catalog's LAST entry — everything between the reads and it is
+        // still `plan_*`. Pinning it as the last name (not merely "somewhere
+        // after the reads") is what stops a second write tool from sneaking
+        // in unnoticed between two plan_* entries.
+        let after_reads = &names[expected_reads.len()..];
+        let (last, plan_names) = after_reads
+            .split_last()
+            .expect("the catalog has more than just the read tools");
+        assert_eq!(
+            *last, "execute_plan",
+            "the catalog's last tool must be execute_plan — #249's one write tool"
         );
-        // Nothing after the reads may be a *write*: this crate's whole
-        // premise is that the only mutation surface is a reviewable plan.
+        assert!(
+            plan_names.iter().all(|n| n.starts_with("plan_")),
+            "a non-read, non-plan, non-execute_plan tool appeared in the catalog: {names:?}"
+        );
+        // Nothing else after the reads may be a *write*: this crate's only
+        // mutation surface is a reviewable plan built by `plan_*` and
+        // executed by the one `execute_plan` tool pinned above.
         for forbidden in ["execute", "submit", "apply", "run"] {
             assert!(
-                !names.iter().any(|n| n.contains(forbidden)),
-                "‘{forbidden}’ appears in a tool name — #248 ships no execution \
-                 capability; that is #249's slice"
+                !plan_names.iter().any(|n| n.contains(forbidden)),
+                "‘{forbidden}’ appears in a plan_* tool name — the only execution \
+                 capability this crate ships is the single execute_plan tool"
             );
         }
     }

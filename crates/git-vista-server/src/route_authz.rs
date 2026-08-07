@@ -166,6 +166,13 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // approval for exactly that mutation, so minting one is the front half of
     // a write and belongs at the write posture, on the loopback router only.
     ("/api/plan", Method::POST, Authz::SessionAndCsrf),
+    // M2.23e (#249, ADR 0046 continued): submit a plan built by `/api/plan`
+    // for execution. The full write posture, same reasoning as `/api/plan`
+    // immediately above — this is where the mutation the plan approves
+    // actually runs, so it belongs at the write posture at least as much as
+    // the route that merely mints the approval token does. Loopback router
+    // only (ADR 0005).
+    ("/api/execute-plan", Method::POST, Authz::SessionAndCsrf),
     // M2.20f (#232): the id admitted for an idempotency key, readable while
     // the operation it names may still be running. A GET (no CSRF surface)
     // and same posture as `GET /api/operations/{id}` below — it describes an
@@ -196,7 +203,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 49;
+const EXPECTED_ROUTE_COUNT: usize = 50;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in
