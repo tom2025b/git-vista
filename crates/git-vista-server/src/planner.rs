@@ -42,8 +42,8 @@ use git_vista_protocol::{
     AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitMessage, CommitOid,
     ForcePublish, GenerationToken, GitOperation, IdempotencyKey, MergeStrategy, OperationHash,
     OperationStage, Plan, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
-    RepositoryToken, RiskLevel, TagAnnotation, TagName, UnixSeconds, WorktreePath, WorktreeToken,
-    IDEMPOTENCY_HEADER,
+    RepositoryToken, RiskLevel, SignTagError, SignTagFailureKind, TagAnnotation, TagName,
+    UnixSeconds, WorktreePath, WorktreeToken, IDEMPOTENCY_HEADER,
 };
 
 use crate::git_cmd::{git_ok, rev_parse, ExecUnavailable};
@@ -2801,12 +2801,13 @@ fn classify_amend_failure(
 /// Two properties this function exists to make checkable, both of which are
 /// the whole of ADR 0048's create half:
 ///
-///  * **`-m <message>` is present whenever `-a` is.** `git tag -a` with no
-///    message writes `.git/TAG_EDITMSG` and launches `core.editor`; on a
-///    headless server there is no editor and nobody to type into one, so that
-///    process either dies on a `true`-shaped editor or waits forever. There
-///    is no `--no-edit` on `git tag` to close this after the fact — the only
-///    defence is never to build the argv that asks for it.
+///  * **`-m <message>` is present whenever `-a` or `-s` is.** `git tag -a`
+///    (or `-s`, which implies `-a`) with no message writes `.git/TAG_EDITMSG`
+///    and launches `core.editor`; on a headless server there is no editor and
+///    nobody to type into one, so that process either dies on a
+///    `true`-shaped editor or waits forever. There is no `--no-edit` on
+///    `git tag` to close this after the fact — the only defence is never to
+///    build the argv that asks for it.
 ///  * **`--edit` is never present.** It would re-open the editor even with
 ///    `-m` given.
 ///
@@ -2814,10 +2815,34 @@ fn classify_amend_failure(
 /// tag *is* a [`TagAnnotation`], which cannot exist without a non-empty
 /// [`TagMessage`] — so this function has no failure mode to encode. That is
 /// the point: the guarantee is structural, and this is where it is visible.
+/// It holds for the signed arm too: [`TagAnnotation::sign`] lives *inside*
+/// the same struct, so a signed request is still, unconditionally, a request
+/// with a message.
 ///
-/// `-a` is passed explicitly even though `-m` alone would imply it, so the
-/// argv says which kind of tag it is building rather than relying on a git
-/// implication a reader would have to know.
+/// `-a` is passed explicitly for the unsigned annotated case even though
+/// `-m` alone would imply it, so the argv says which kind of tag it is
+/// building rather than relying on a git implication a reader would have to
+/// know. The signed case asks for `-s` instead of `-a` — `-s` already
+/// implies `-a` (git accepts both together, but that would just repeat the
+/// same implication this function otherwise avoids relying on), so the two
+/// are mutually exclusive here, not additive.
+///
+/// # No gpg flags belong in this argv, ever
+///
+/// It is tempting to think a `-c gpg.program="gpg --batch --pinentry-mode
+/// cancel"`-shaped override could force gpg to fail fast instead of prompting.
+/// It cannot: git execs `gpg.program` directly (`use_shell` is never set in
+/// git's own `gpg-interface.c`), so a program string containing spaces execs
+/// a binary *literally named* `"gpg --batch --pinentry-mode cancel"`, which
+/// does not exist, and the tag creation fails for the wrong reason before
+/// gpg ever runs. The only way to inject gpg-side flags would be a wrapper
+/// executable, which needs its own exec grant from the sandbox — out of
+/// scope for #239, and exactly the kind of "fix the sandbox" move this
+/// slice's issue explicitly forbids. This is also why the bounded timeout in
+/// [`exec_create_tag`]'s signed arm is load-bearing rather than decorative:
+/// with no gpg-side flag reachable at all, non-interactivity rests entirely
+/// on the sandbox's own denials (see that function's doc comment) plus this
+/// bound as the backstop.
 fn create_tag_argv<'a>(
     name: &'a TagName,
     target: &'a CommitOid,
@@ -2825,6 +2850,14 @@ fn create_tag_argv<'a>(
 ) -> Vec<&'a str> {
     match annotation {
         None => vec!["tag", name.as_str(), target.as_str()],
+        Some(a) if a.sign => vec![
+            "tag",
+            "-s",
+            "-m",
+            a.message.as_str(),
+            name.as_str(),
+            target.as_str(),
+        ],
         Some(a) => vec![
             "tag",
             "-a",
@@ -2836,21 +2869,28 @@ fn create_tag_argv<'a>(
     }
 }
 
-/// `git tag [-a -m <message>] <name> <target>` (`/api/tag`).
+/// `git tag [-a|-s -m <message>] <name> <target>` (`/api/tag`).
 ///
-/// Lightweight and annotated are one operation with one argv builder
-/// ([`create_tag_argv`]) rather than two executors: everything after the argv
-/// — the refusal forwarding, the journal entry, the response — is identical,
-/// and the *plan* already told the reviewer which kind they approved (an
-/// annotated create's [`RefState::Computed`] after-state versus a lightweight
-/// one's exact `At(target)`).
+/// Lightweight, annotated and signed are one operation with one argv builder
+/// ([`create_tag_argv`]) rather than three executors: everything after the
+/// argv — the journal entry, the success response — is identical for the
+/// unsigned shapes, and the *plan* already told the reviewer which kind they
+/// approved (an annotated create's [`RefState::Computed`] after-state versus
+/// a lightweight one's exact `At(target)`). Only the signed shape's *failure*
+/// path diverges, because it is the one shape whose failure is not "git
+/// refused a bad request" but "the environment could not do what was asked" —
+/// see [`classify_sign_failure`]'s doc comment.
 ///
-/// Signing is refused, not ignored. `TagAnnotation::sign` exists in the typed
-/// vocabulary since M2.21a; M2.21e (#74) wires it. Answering `501` here means
-/// a client that asked for a signed tag is told it did not get one — where
-/// dropping the flag would hand back an ordinary annotated tag under a name
-/// the user believes is signed. The refusal happens *before* the argv is
-/// built, so no `git tag` runs at all.
+/// # Why signing is attempted at all, and why it is expected to fail here
+///
+/// M2.21d (#238) answered every `sign: true` request with a `501` before
+/// building any argv. M2.21e (#239) replaces that with a real attempt,
+/// because a refusal that never runs `git tag -s` can never tell a user
+/// *why* signing does not work for them, and "why" is exactly what this
+/// server can say precisely: its own sandbox is what closes the door. See
+/// [`classify_sign_failure`] for the mechanism and [`SIGN_TIMEOUT`] for the
+/// bound that makes a fast, honest failure the *only* outcome — never a
+/// hang, and never raw gpg stderr reaching the client.
 async fn exec_create_tag(
     repo: &Path,
     need: NetworkNeed,
@@ -2858,22 +2898,35 @@ async fn exec_create_tag(
     target: &CommitOid,
     annotation: Option<&TagAnnotation>,
 ) -> (StatusCode, String) {
-    if annotation.is_some_and(|a| a.sign) {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "Signing a tag is not yet wired (M2.21e, tracked under #74). \
-             Nothing was created — retry without signing if an unsigned \
-             annotated tag is what you want."
-                .to_string(),
-        );
-    }
     let annotated = annotation.is_some();
+    let signed = annotation.is_some_and(|a| a.sign);
     let args = create_tag_argv(name, target, annotation);
-    let output = match run_git(repo, need, &args).await {
-        Ok(o) => o,
-        Err(e) => return couldnt_run("/api/tag", &e),
+
+    let output = if signed {
+        match run_signed_tag(repo, need, &args, name).await {
+            Ok(output) => output,
+            Err(refusal) => return refusal,
+        }
+    } else {
+        match run_git(repo, need, &args).await {
+            Ok(o) => o,
+            Err(e) => return couldnt_run("/api/tag", &e),
+        }
     };
+
     if !output.status.success() {
+        if signed {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let kind = classify_sign_failure(&stderr, gpg_on_path());
+            // The raw stderr goes to the server log ONLY — never to the
+            // client. This is the deliberate break from the B3
+            // verbatim-forwarding posture the unsigned arm keeps just below:
+            // gpg's own text is untranslated-nowhere, version-dependent
+            // noise a browser-only user cannot act on, and forwarding it is
+            // the issue's named second-worst outcome after a hang.
+            eprintln!("git-vista: /api/tag signing failed ({kind:?}): {stderr}");
+            return sign_refusal_body(kind, sign_failure_message(kind));
+        }
         // B3 posture, same as `/api/branch`: git owns ref-name validation and
         // the "already exists" refusal, and its stderr is forwarded verbatim.
         let msg = stderr_or(&output, "git tag failed.");
@@ -2886,7 +2939,8 @@ async fn exec_create_tag(
         "lightweight"
     };
     println!(
-        "[/api/tag] created {kind} tag '{name}' at {}",
+        "[/api/tag] created {kind}{} tag '{name}' at {}",
+        if signed { " signed" } else { "" },
         short(target.as_str())
     );
     // The ref's resulting value, read back rather than assumed: for an
@@ -2909,6 +2963,220 @@ async fn exec_create_tag(
     )
     .await;
     (StatusCode::OK, format!("Created {kind} tag '{name}'."))
+}
+
+/// The wall-clock ceiling on a signing spawn — the backstop behind every
+/// argument in [`run_signed_tag`]'s doc comment for why it *shouldn't* be
+/// needed. Ten seconds is generous for a local, keyless failure (which
+/// resolves in well under a second — measured, not assumed, by
+/// `a_signing_attempt_with_no_usable_key_fails_fast_with_a_typed_reason`
+/// below) and still short enough that the per-worktree mutation guard
+/// [`plan_and_execute_in`] holds across this call is never held for long.
+const SIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run a signed `git tag -s` under [`SIGN_TIMEOUT`], turning a bound-elapsed
+/// timeout into the same typed refusal shape [`exec_create_tag`]'s own
+/// failure branch builds for a completed-but-unsuccessful spawn — so this is
+/// the one place that knows to check whether a killed child's ref write
+/// landed anyway before deciding what to tell the client.
+///
+/// # This cannot hang — argued path by path
+///
+/// A signing `git tag -s` shells out to `gpg`, which in turn needs
+/// `gpg-agent` — over an `AF_UNIX` socket — for anything that touches the
+/// secret key: producing the signature itself, and, on a terminal, a
+/// pinentry prompt for a passphrase. Every step that could block on input is
+/// closed before this function's timeout is ever needed:
+///
+///  * **The secret key is unreachable, and this is the fast, common
+///    failure.** `~/.gnupg` sits in `sandbox::DEFAULT_SECRET_EXCLUDES`, the
+///    same Landlock exclude set that hides `~/.ssh` — so gpg's key lookup
+///    fails before it gets anywhere near an agent, regardless of what the
+///    server's real keyring holds. This is the modal case a client will see.
+///  * **The agent is unreachable independently.** `CreateTag` declares
+///    `NetworkNeed::Local`, which resolves to `Tier::Strict`
+///    (`sandbox::policy_for`), and Strict denies `socket(2)`/`socketpair(2)`
+///    for `AF_UNIX` outright (`seccomp_filter.rs`'s `af_unix_rule`, whose own
+///    doc names `gpg-agent` as one of the sockets this closes). gpg's first
+///    step toward an agent is exactly that syscall; the kernel answers
+///    `EPERM` synchronously, so there is no file descriptor to block on and
+///    no connection to wait for. An auto-launched `gpg-agent` inherits the
+///    same filter across `fork`/`execve` and fails the identical way.
+///  * **No editor can open.** `create_tag_argv` never omits `-m` when
+///    signing — a [`TagAnnotation`] cannot exist without a non-empty
+///    message — and `GIT_EDITOR=true` is set process-wide at startup
+///    (`main.rs`), so there is no argv shape and no environment shape that
+///    reaches `$EDITOR`.
+///  * **No credential or terminal prompt from git itself.** `CreateTag` is
+///    local, and `GIT_TERMINAL_PROMPT=0` (`main.rs`) closes that regardless.
+///  * **Stdin cannot carry a prompt.** git pipes the tag payload to gpg on a
+///    pipe it controls, never a terminal — and [`crate::git_cmd::git_output_bounded`],
+///    which this function calls, additionally nulls the spawn's own stdin,
+///    so even an inherited terminal fd cannot reach the child. `GPG_TTY` is
+///    also cleared process-wide at startup (`main.rs`), so a stray ttyname
+///    cannot route a pinentry attempt anywhere even if one somehow launched.
+///
+/// None of that is a proof that survives every future GnuPG version, host
+/// configuration, or sandbox change — an internal retry loop's own bound
+/// inside gpg-agent's startup code, for one, is not this codebase's to
+/// guarantee. So: [`crate::git_cmd::git_output_bounded`] wraps the spawn in
+/// [`SIGN_TIMEOUT`] with `kill_on_drop`, so the worst case — every bullet
+/// above turning out to be wrong at once, on some future host — is a
+/// **ten-second-bounded** hold of the per-worktree mutation guard instead of
+/// an unbounded one. The bullets above are why this *shouldn't* need the
+/// timeout in practice; the timeout is why it does not matter if one of them
+/// is ever wrong.
+async fn run_signed_tag(
+    repo: &Path,
+    need: NetworkNeed,
+    args: &[&str],
+    name: &TagName,
+) -> Result<Output, (StatusCode, String)> {
+    match crate::git_cmd::git_output_bounded(repo, args, need, SIGN_TIMEOUT).await {
+        Err(e) => Err(couldnt_run("/api/tag", &e)),
+        Ok(crate::git_cmd::BoundedOutput::Completed(output)) => Ok(output),
+        Ok(crate::git_cmd::BoundedOutput::TimedOut) => {
+            eprintln!(
+                "git-vista: /api/tag signing on '{name}' did not finish within \
+                 {SIGN_TIMEOUT:?} and was killed"
+            );
+            // The kill races git's own ref write, so the honest next step is
+            // to look rather than assume either outcome.
+            let tail = match rev_parse_ref_unpeeled(repo, &format!("refs/tags/{name}")).await {
+                Ok(Some(_)) => {
+                    format!("Warning: refs/tags/{name} now exists — inspect it before trusting it.")
+                }
+                _ => "The tag was not created.".to_string(),
+            };
+            Err(sign_refusal_body(
+                SignTagFailureKind::TimedOut,
+                &format!(
+                    "Signing didn't finish within {} seconds and was stopped so this \
+                     repository wouldn't stay locked. {tail}",
+                    SIGN_TIMEOUT.as_secs()
+                ),
+            ))
+        }
+    }
+}
+
+/// Map a failed signing spawn's stderr onto the closed [`SignTagFailureKind`]
+/// set, using GnuPG's own machine-readable `[GNUPG:] …` status-fd protocol —
+/// never git's or gpg's human-facing prose, which is gettext-translated and
+/// changes wording across versions. Git captures the whole status-fd stream
+/// into its own stderr on a signing failure (`gpg-interface.c` invokes gpg
+/// with `--status-fd=2`), so every line this function looks for is really
+/// there to find.
+///
+/// `gpg_on_path` disambiguates the one case with no `[GNUPG:]` line at all:
+/// gpg was never invoked because it does not exist on the server's `PATH`
+/// ([`GpgNotInstalled`](SignTagFailureKind::GpgNotInstalled)), versus some
+/// other non-zero exit this classifier does not recognise
+/// ([`Other`](SignTagFailureKind::Other)).
+///
+/// The two GnuPG status codes this cares about (from libgpg-error's own
+/// `err-codes.h.in`, not guessed): `17` is `GPG_ERR_NO_SECKEY`, and `77`/`78`
+/// (`GPG_ERR_NO_AGENT`/`GPG_ERR_AGENT`) plus the `257..=281` libassuan IPC
+/// range (which includes `259`, `ASS_CONNECT_FAILED`) all mean the same
+/// thing from this server's own vantage point: the sandbox denied the
+/// connection [`AgentUnreachable`](SignTagFailureKind::AgentUnreachable)
+/// exists to name.
+fn classify_sign_failure(stderr: &str, gpg_on_path: bool) -> SignTagFailureKind {
+    let mut saw_status_line = false;
+    for line in stderr.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("[GNUPG:] FAILURE ") {
+            saw_status_line = true;
+            if let Some(code) = rest
+                .split_whitespace()
+                .last()
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                return match (code as u64) & 0xFFFF {
+                    17 => SignTagFailureKind::NoSecretKey,
+                    77 | 78 => SignTagFailureKind::AgentUnreachable,
+                    257..=281 => SignTagFailureKind::AgentUnreachable,
+                    _ => SignTagFailureKind::Other,
+                };
+            }
+        } else if line.starts_with("[GNUPG:] INV_SGNR") {
+            return SignTagFailureKind::NoSecretKey;
+        } else if line.starts_with("[GNUPG:]") {
+            saw_status_line = true;
+        }
+    }
+    if !saw_status_line && !gpg_on_path {
+        SignTagFailureKind::GpgNotInstalled
+    } else {
+        SignTagFailureKind::Other
+    }
+}
+
+/// Whether an executable named `gpg` exists anywhere on the server's own
+/// `PATH` — a pure filesystem walk, never a spawn, so it cannot itself hang
+/// or need a sandbox policy. Only consulted by [`classify_sign_failure`] when
+/// there was no `[GNUPG:]` status line to read at all, which is the one
+/// ambiguous case: "gpg was never invoked" and "gpg ran and failed before
+/// printing anything" look identical from stderr alone.
+fn gpg_on_path() -> bool {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .iter()
+        .any(|dir| dir.join("gpg").is_file())
+}
+
+/// The client-facing sentence for each [`SignTagFailureKind`] — closed-set
+/// prose, never git's or gpg's own words. [`SignTagFailureKind::TimedOut`]'s
+/// real message is built at its one call site in [`run_signed_tag`], where
+/// the ref's post-kill state is known; the text here exists only so this
+/// match stays exhaustive and is never actually shown.
+fn sign_failure_message(kind: SignTagFailureKind) -> &'static str {
+    match kind {
+        SignTagFailureKind::NoSecretKey => {
+            "gpg couldn't find a secret key to sign with — and on this server that is \
+             expected: the sandbox that runs git deliberately hides ~/.gnupg (the same \
+             boundary that hides ~/.ssh), so signing can't work here even with a \
+             perfectly good key. This is not a problem with your configuration. The tag \
+             was NOT created. Create it unsigned, or follow #74 for real signing support."
+        }
+        SignTagFailureKind::AgentUnreachable => {
+            "Signing is blocked by this server's sandbox: local git operations have no \
+             access to gpg-agent's socket, by design (the same boundary tracked for \
+             ssh-agent under #188). gpg could not reach the agent and never will as the \
+             sandbox is built today. This is not a problem with your keys or your gpg \
+             setup. The tag was NOT created. Create it unsigned, or follow #74 for \
+             signing support."
+        }
+        SignTagFailureKind::GpgNotInstalled => {
+            "gpg isn't installed on the server, so git has nothing to sign with. The tag \
+             was NOT created. Install GnuPG on the server, or create the tag unsigned."
+        }
+        SignTagFailureKind::Other => {
+            "Signing failed for a reason outside the set this server recognises. The tag \
+             was NOT created. The full detail is in the server log."
+        }
+        SignTagFailureKind::TimedOut => "Signing didn't finish in time and was stopped.",
+    }
+}
+
+/// Build a signed `/api/tag` refusal's `(StatusCode, String)` — the typed
+/// [`SignTagError`] JSON, serialized into the same shared prose channel every
+/// other operation's executor returns. #323 already taught `middleware`'s
+/// `rewrap_error` to recognise a JSON *object* body and pass it through with
+/// `application/json` set rather than re-wrapping it as escaped text inside
+/// an `ApiError`, so this needs no `Response`-returning sibling the way
+/// [`amend_refusal`]/[`amend_refusal_body`] split into two — one plain
+/// function covers both this pipeline's callers and any future direct one.
+fn sign_refusal_body(kind: SignTagFailureKind, message: &str) -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        serde_json::to_string(&SignTagError {
+            kind,
+            message: message.to_string(),
+        })
+        .expect("SignTagError serialization cannot fail"),
+    )
 }
 
 /// `git tag -d <name>` (`/api/delete-tag`) — the **local** delete only;
@@ -4812,22 +5080,23 @@ mod tests {
         );
     }
 
-    /// M2.21d (#238, ADR 0048): the argv `git tag` is actually handed, over
-    /// every shape the type system admits.
+    /// M2.21d (#238) / M2.21e (#239, ADR 0048): the argv `git tag` is
+    /// actually handed, over every shape the type system admits — now
+    /// including the signed one.
     ///
     /// The claim being pinned is a *property*, not a spelling: **whenever
-    /// `-a` appears, `-m <message>` appears too, and `--edit` never appears
-    /// at all**. `git tag -a` with neither is what launches `core.editor`,
-    /// and there is no `--no-edit` on `git tag` to undo that later — so this
-    /// is the only place the guarantee can be checked before a process
-    /// exists. The behavioural half (nothing ever writes `.git/TAG_EDITMSG`,
-    /// and a blocking editor really would hang) is
+    /// `-a` or `-s` appears, `-m <message>` appears too, and `--edit` never
+    /// appears at all**. `git tag -a`/`-s` with neither is what launches
+    /// `core.editor`, and there is no `--no-edit` on `git tag` to undo that
+    /// later — so this is the only place the guarantee can be checked before
+    /// a process exists. The behavioural half (nothing ever writes
+    /// `.git/TAG_EDITMSG`, and a blocking editor really would hang) is
     /// `contract_suite::annotated_tag_creation_never_opens_an_editor`.
     ///
-    /// Note the shapes iterated: an annotated tag *is* a `TagAnnotation`,
-    /// which cannot hold an empty `TagMessage`, so "annotated with no
-    /// message" is not among them — that is the guarantee, expressed as a
-    /// type rather than as a check.
+    /// Note the shapes iterated: an annotated (signed or not) tag *is* a
+    /// `TagAnnotation`, which cannot hold an empty `TagMessage`, so
+    /// "annotated with no message" is not among them — that is the
+    /// guarantee, expressed as a type rather than as a check.
     #[test]
     fn a_tag_argv_never_asks_for_an_editor() {
         let name = TagName::new("v1.0.0").unwrap();
@@ -4844,10 +5113,16 @@ mod tests {
                 message: git_vista_protocol::TagMessage::new("--edit").unwrap(),
                 sign: false,
             }),
+            // M2.21e (#239): the signed shape.
+            Some(TagAnnotation {
+                message: git_vista_protocol::TagMessage::new("signed release").unwrap(),
+                sign: true,
+            }),
         ];
-        for annotation in annotations {
+        for annotation in &annotations {
             let argv = create_tag_argv(&name, &target, annotation.as_ref());
             assert_eq!(argv[0], "tag");
+            let signed = annotation.as_ref().is_some_and(|a| a.sign);
             // Scan *flag* positions only. The entry after `-m` is that
             // option's value, and git's own parser consumes it as one no
             // matter what it spells — which is precisely why an
@@ -4872,13 +5147,35 @@ mod tests {
                     "{argv:?} would repoint an existing tag past the plan's \
                      RefAbsent precondition"
                 );
-                assert!(
-                    !matches!(*arg, "-s" | "--sign" | "-u" | "--local-user"),
-                    "{argv:?} asks for a signature this slice does not wire"
-                );
+                // A signed request is expected to carry `-s`; only an
+                // *unsigned* argv must never carry a signing flag.
+                if !signed {
+                    assert!(
+                        !matches!(*arg, "-s" | "--sign" | "-u" | "--local-user"),
+                        "{argv:?} asks for a signature this request never requested"
+                    );
+                }
             }
             match annotation.as_ref() {
                 None => assert_eq!(argv, vec!["tag", "v1.0.0", &"a".repeat(40)]),
+                Some(a) if a.sign => {
+                    assert_eq!(
+                        argv.get(1),
+                        Some(&"-s"),
+                        "a signed create must ask git to sign: {argv:?}"
+                    );
+                    assert!(
+                        !argv.contains(&"-a"),
+                        "-s already implies -a; this pins the argv this function \
+                         actually emits, not merely a git behavior: {argv:?}"
+                    );
+                    let dash_m = argv
+                        .iter()
+                        .position(|x| *x == "-m")
+                        .expect("a signed tag is annotated by definition — -s with no -m is exactly the editor case");
+                    assert_eq!(argv.get(dash_m + 1).copied(), Some(a.message.as_str()));
+                    assert_eq!(argv[argv.len() - 2..], ["v1.0.0", &"a".repeat(40)]);
+                }
                 Some(a) => {
                     let dash_a = argv
                         .iter()
@@ -4900,6 +5197,152 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // M2.21e (#239): signed tag execution
+    // -------------------------------------------------------------------
+
+    /// [`classify_sign_failure`] over fixtures captured from a real gpg 2.4.4
+    /// run (this host), plus synthetic status lines built from
+    /// libgpg-error's own numbering so the libassuan IPC range is covered
+    /// without needing to reproduce every specific failure by hand.
+    #[test]
+    fn classify_sign_failure_reads_the_gnupg_status_protocol_not_prose() {
+        // Measured: `git tag -s` against a repo with an empty, keyless
+        // GNUPGHOME prints `INV_SGNR` with no later `FAILURE` line on some
+        // gpg versions.
+        assert_eq!(
+            classify_sign_failure(
+                "[GNUPG:] INV_SGNR 9 nokey\ngpg: skipped \"nokey\": No secret key",
+                true
+            ),
+            SignTagFailureKind::NoSecretKey
+        );
+        // The `FAILURE sign 17` shape (GPG_ERR_NO_SECKEY, masked from a
+        // larger source-tagged code the same way `67108941 & 0xFFFF == 77`
+        // below is).
+        assert_eq!(
+            classify_sign_failure("[GNUPG:] FAILURE sign 17", true),
+            SignTagFailureKind::NoSecretKey
+        );
+        // 67108941 = (4 << 24) | 77 — an arbitrary non-zero source tag (real
+        // gpg-error codes carry the erroring component in bits 24+) over
+        // GPG_ERR_NO_AGENT, masked back down to 77 by `& 0xFFFF`.
+        assert_eq!(
+            classify_sign_failure("[GNUPG:] FAILURE sign 67108941", true),
+            SignTagFailureKind::AgentUnreachable
+        );
+        // 67109123 = (4 << 24) | 259 (ASS_CONNECT_FAILED), inside the
+        // 257..=281 libassuan range.
+        assert_eq!(
+            classify_sign_failure("[GNUPG:] FAILURE sign 67109123", true),
+            SignTagFailureKind::AgentUnreachable
+        );
+        // An unmapped code must not be guessed into one of the named cases.
+        assert_eq!(
+            classify_sign_failure("[GNUPG:] FAILURE sign 99999999", true),
+            SignTagFailureKind::Other
+        );
+        // No status line and no gpg on PATH: the one case this function
+        // needs `gpg_on_path` to disambiguate.
+        assert_eq!(
+            classify_sign_failure("exec: gpg: command not found", false),
+            SignTagFailureKind::GpgNotInstalled
+        );
+        // No status line but gpg IS on PATH: an unrecognised failure, not a
+        // false claim that gpg is missing.
+        assert_eq!(
+            classify_sign_failure("fatal: some other git failure entirely", true),
+            SignTagFailureKind::Other
+        );
+    }
+
+    /// Mutation-shaped guard: swapping the `17` arm for `AgentUnreachable`
+    /// must be distinguishable from the real thing — the two closed-set
+    /// reasons must not collapse into each other from this fixture alone.
+    #[test]
+    fn classify_sign_failure_distinguishes_no_secret_key_from_agent_unreachable() {
+        let no_key = classify_sign_failure("[GNUPG:] FAILURE sign 17", true);
+        let no_agent = classify_sign_failure("[GNUPG:] FAILURE sign 67108941", true);
+        assert_ne!(no_key, no_agent);
+        assert_eq!(no_key, SignTagFailureKind::NoSecretKey);
+        assert_eq!(no_agent, SignTagFailureKind::AgentUnreachable);
+    }
+
+    /// The end-to-end path, against the **real sandboxed spawn** — not a
+    /// mock — with no usable key. `~/.gnupg` is Landlock-excluded under the
+    /// Strict tier regardless of what that directory holds
+    /// (`sandbox::DEFAULT_SECRET_EXCLUDES`), so this test needs no
+    /// throwaway `GNUPGHOME` at all: the sandbox itself is what makes the
+    /// key unreachable, on any host, always — which is precisely the
+    /// property `run_signed_tag`'s doc comment argues for.
+    ///
+    /// The outer `tokio::time::timeout` is the test's own bound, strictly
+    /// larger than [`SIGN_TIMEOUT`]: if `exec_create_tag` ever regressed to
+    /// an actual hang, this test must still fail loudly in bounded time
+    /// rather than wedging the suite alongside the defect it exists to
+    /// catch.
+    #[tokio::test]
+    async fn a_signing_attempt_with_no_usable_key_fails_fast_with_a_typed_reason() {
+        let (_dir, repo) = seeded_repo();
+        let target = CommitOid::new(git_rev_parse_head(&repo).await).unwrap();
+        let name = TagName::new("v-signed").unwrap();
+        let annotation = TagAnnotation {
+            message: git_vista_protocol::TagMessage::new("release").unwrap(),
+            sign: true,
+        };
+
+        let started = std::time::Instant::now();
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            exec_create_tag(&repo, NetworkNeed::Local, &name, &target, Some(&annotation)),
+        )
+        .await
+        .expect(
+            "exec_create_tag must return within 20s on its own — its own bound is 10s; a \
+             hang here is exactly the defect this test exists to catch",
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a signing failure must be a refusal, not a 5xx or a raw pass-through: {body}"
+        );
+        let parsed: SignTagError = serde_json::from_str(&body).unwrap_or_else(|e| {
+            panic!("signing failure body must be the typed SignTagError, not raw text: {e}\nbody={body}")
+        });
+        assert_ne!(
+            parsed.kind,
+            SignTagFailureKind::TimedOut,
+            "this leg must fail FAST — well inside the 10s bound, never by timing out: {}",
+            parsed.message
+        );
+        assert!(
+            elapsed < SIGN_TIMEOUT,
+            "a keyless signing failure took {elapsed:?}, at or past the {SIGN_TIMEOUT:?} \
+             bound — it should fail fast, not via the timeout backstop"
+        );
+        assert!(
+            !parsed.message.contains("gpg:")
+                && !parsed.message.contains("[GNUPG:]")
+                && !parsed.message.contains("GNUPGHOME"),
+            "the client-facing message must never carry raw gpg/git status output: {}",
+            parsed.message
+        );
+
+        // The failed attempt must not have left a tag behind.
+        let exists = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", "refs/tags/v-signed"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !exists,
+            "a failed signing attempt must not leave a tag behind"
+        );
     }
 
     /// #249: the admission hash for a **submitted** plan is derived from its

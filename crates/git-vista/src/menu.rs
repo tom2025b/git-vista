@@ -331,12 +331,15 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
             let create_label = m.create_label;
             // "Create tag from this commit": the same prompt-then-POST shape
             // as "Create branch" just above (M2.21d, #238), plus a second
-            // prompt for an optional annotation message. The second prompt's
-            // raw answer goes through `tag_annotation_from_prompt` rather
-            // than being read inline here — the "cancel vs empty vs typed
-            // text" mapping onto "lightweight vs annotated" is exactly the
-            // sort of decision this wasm-only file cannot itself pin with a
-            // test (see that function's own doc comment).
+            // prompt for an optional annotation message and, when that
+            // produces one, a third confirm asking whether to sign it
+            // (M2.21e, #239). Both the "cancel vs empty vs typed text"
+            // mapping onto "lightweight vs annotated" and the "message
+            // present + confirmed" mapping onto "sign" go through
+            // `tag_annotation_from_prompt`/`tag_sign_choice` rather than
+            // being read inline here — exactly the sort of decision this
+            // wasm-only file cannot itself pin with a test (see those
+            // functions' own doc comments).
             let create_tag_label = create_tag_item_label(m.is_branch);
             let tag_commit = m.commit.clone();
             let on_tag = move |_| {
@@ -372,9 +375,19 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     .ok()
                     .flatten();
                 let message = tag_annotation_from_prompt(raw_message);
+                // Only offer to sign once there is a message to attach one
+                // to — a lightweight tag has no tag object to carry it.
+                let confirmed_sign = message.is_some()
+                    && win
+                        .confirm_with_message(
+                            "Sign this tag with GPG?\n\n\
+                             OK = signed tag, Cancel = unsigned annotated tag",
+                        )
+                        .unwrap_or(false);
+                let sign = tag_sign_choice(message.is_some(), confirmed_sign);
                 let commit = tag_commit.clone();
                 spawn_local(async move {
-                    match create_tag_request(&name, &commit, message.as_deref()).await {
+                    match create_tag_request(&name, &commit, message.as_deref(), sign).await {
                         // Bump the fetch counter so the new tag's badge appears.
                         Ok(()) => graph.update(|g| {
                             g.force_bump();
@@ -382,7 +395,11 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         Err(e) => {
                             dialogs.open(Dialog::Error);
                             shell.open_error(ErrorNotice {
-                                title: "Couldn't create tag",
+                                title: if sign {
+                                    "Couldn't sign the tag"
+                                } else {
+                                    "Couldn't create tag"
+                                },
                                 body: e,
                             });
                         }

@@ -184,11 +184,15 @@ pub struct BranchRequest {
 ///
 /// # `sign`
 ///
-/// Accepted so a client can ask, and **refused** by the executor until M2.21e
-/// wires signing (#74). Refused rather than silently ignored: quietly
-/// producing an unsigned tag for a request that asked for a signed one is a
-/// wrong outcome the user cannot see. `sign: true` with no `message` is
-/// refused by the handler — a signed tag is annotated by definition.
+/// `git tag -s` (M2.21e, #239): the executor runs a real signing attempt
+/// rather than refusing outright. `sign: true` with no `message` is still
+/// refused by the handler — a signed tag is annotated by definition, and a
+/// signature has nowhere to live without a tag object. A signing attempt
+/// that fails answers with a typed [`SignTagError`], never a raw gpg/git
+/// stderr dump — see that type's doc comment for the closed set of reasons
+/// and [`crate::TagAnnotation`]'s doc comment for why this server's own
+/// sandbox makes `AgentUnreachable`/`NoSecretKey` the expected outcomes, not
+/// edge cases.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateTagRequest {
@@ -198,6 +202,55 @@ pub struct CreateTagRequest {
     pub message: Option<String>,
     #[serde(default)]
     pub sign: bool,
+}
+
+/// Why a `POST /api/tag` **signing** attempt failed, as a typed tag the
+/// client can branch on (M2.21e, #239) — the same posture [`AmendFailureKind`]
+/// already set for `/api/amend-commit`: the server owns the (documented,
+/// tested) classification, the wire carries only this tag plus a message fit
+/// to show as-is, and the client never regex-sniffs gpg's own — untranslated
+/// nowhere, version-dependent everywhere — stderr.
+///
+/// This set is deliberately small and closed, and two of its five members are
+/// not edge cases on this server: `AgentUnreachable` and `NoSecretKey` are the
+/// two ways the sandbox that runs git denies gpg-agent access at all —
+/// `AF_UNIX` sockets refused outright under the Strict tier, and `~/.gnupg`
+/// withheld by Landlock the same way `~/.ssh` is — so a signing request
+/// against this server reliably lands on one of them (see
+/// `docs/SECURITY_MODEL.md` and `seccomp_filter.rs`'s `af_unix_rule` for the
+/// mechanism, and #188 for the analogous, still-open ssh-agent gap this
+/// deliberately does not close).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignTagFailureKind {
+    /// gpg found no secret key to sign with. On this server that is the
+    /// **expected**, fast failure: `~/.gnupg` is excluded from the sandbox's
+    /// read grant, so gpg's key lookup fails before it ever tries to reach
+    /// an agent — regardless of what the server's real keyring holds.
+    NoSecretKey,
+    /// gpg could not reach `gpg-agent` at all. Reachable if gpg ever finds a
+    /// key some other way and only then hits the sandbox's `AF_UNIX` denial;
+    /// `NoSecretKey` above is the more common path to the same wall.
+    AgentUnreachable,
+    /// No `gpg` executable exists on the server's own `PATH`.
+    GpgNotInstalled,
+    /// The bounded signing spawn did not finish in time and was killed.
+    /// `message` says whether the tag ended up existing anyway — the kill
+    /// races git's own ref write, so both outcomes are possible.
+    TimedOut,
+    /// A non-zero exit this server's classifier does not recognise. The
+    /// server logs the real stderr; the client never sees it.
+    Other,
+}
+
+/// Body of a **failed** signed `POST /api/tag` (status 400): the typed
+/// classification plus a message fit to show the user directly. A response
+/// DTO, so no `deny_unknown_fields` (M1.02 additive rule) — same posture as
+/// [`AmendCommitError`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignTagError {
+    pub kind: SignTagFailureKind,
+    pub message: String,
 }
 
 /// Body of a `POST /api/delete-tag` request (M2.21d, #238): delete the **local**

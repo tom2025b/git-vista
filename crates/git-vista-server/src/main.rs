@@ -143,6 +143,15 @@ async fn main() {
     // "Load failed" a dead server does.
     std::env::set_var("GIT_TERMINAL_PROMPT", "0");
     std::env::set_var("GIT_EDITOR", "true");
+    // M2.21e (#239): a signed `git tag -s` shells out to gpg, which — if it
+    // ever got far enough to try a curses pinentry, which it cannot today
+    // (the Strict-tier sandbox denies gpg-agent's AF_UNIX socket outright;
+    // see `seccomp_filter.rs`'s `af_unix_rule`) — would take the tty name to
+    // attach from this variable. Clearing it process-wide is defense in
+    // depth: without a `GPG_TTY`, the agent has no terminal to open a
+    // pinentry prompt on and fails with an error instead, even in a future
+    // where some carve-out reopens the socket this line does not depend on.
+    std::env::remove_var("GPG_TTY");
 
     // M1.13b (#66) Task 9 — INV-13 / Global Constraint 15's boot gate. This
     // must run before ANYTHING in this process spawns a git process — the

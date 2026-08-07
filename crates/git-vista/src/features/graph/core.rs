@@ -853,6 +853,19 @@ pub fn tag_annotation_from_prompt(raw: Option<String>) -> Option<String> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
+/// Whether the "Create tag" flow's sign offer applies at all, and — if it
+/// does — whether the user accepted it (M2.21e, #239).
+///
+/// A lightweight tag has no tag object for a signature to live in, so the
+/// sign offer only makes sense once [`tag_annotation_from_prompt`] has
+/// already produced a message; this is the same "decide it once, in a
+/// host-testable function" posture that function's own doc comment argues
+/// for, applied to the one extra branch `menu.rs` (wasm-only, cannot itself
+/// be host-tested) cannot pin on its own.
+pub fn tag_sign_choice(has_message: bool, confirmed_sign: bool) -> bool {
+    has_message && confirmed_sign
+}
+
 // ---------------------------------------------------------------------------
 // The Push / force-with-lease confirmation (#233, M2.20g)
 // ---------------------------------------------------------------------------
@@ -1989,5 +2002,22 @@ mod tests {
             tag_annotation_from_prompt(None),
             tag_annotation_from_prompt(Some(String::new()))
         );
+    }
+
+    /// M2.21e (#239): signing requires both an annotation and the user's
+    /// yes — either alone is not enough.
+    #[test]
+    fn tag_sign_choice_requires_both_a_message_and_confirmation() {
+        assert!(tag_sign_choice(true, true));
+        assert!(
+            !tag_sign_choice(false, true),
+            "a lightweight tag has no object to carry a signature, however the \
+             sign prompt was answered"
+        );
+        assert!(
+            !tag_sign_choice(true, false),
+            "declining the sign offer must produce an unsigned annotated tag"
+        );
+        assert!(!tag_sign_choice(false, false));
     }
 }

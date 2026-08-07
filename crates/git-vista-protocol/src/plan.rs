@@ -395,18 +395,31 @@ pub enum ForcePublish {
 /// unsigned tag by silent default — every annotated-tag request states
 /// whether it asks for a signature, the same "make every caller state both
 /// answers" reasoning M2.20a applied to `set_upstream`/`force`. Where the
-/// signing *key and config* come from is deliberately **not** modelled here:
-/// that is M2.21e's territory (#74). Until it lands, `planner::exec_create_tag`
-/// answers `sign: true` with `501` before building any argv — M2.21d (#238)
-/// wired the unsigned halves only, and ADR 0048 records why a refusal beats
-/// silently dropping the flag.
+/// signing *key* comes from is still not modelled here: `-u <keyid>` is not
+/// wired (M2.21e, #239, wires `-s` only — git resolves `user.signingkey`
+/// itself), because the wire carries no key field for a value to come from.
+///
+/// M2.21e (#239) replaced `planner::exec_create_tag`'s old `501` refusal with
+/// a real signing attempt. It reliably fails on this server today, and not
+/// by accident: the same sandbox that runs every other git mutation denies
+/// `AF_UNIX` sockets under the Strict tier (closing `gpg-agent`, among
+/// others — see `seccomp_filter.rs`'s `af_unix_rule`) and excludes
+/// `~/.gnupg` from its read grant the same way it excludes `~/.ssh`. Opening
+/// either of those is explicitly out of scope for #239, the same way #188
+/// leaves the analogous `ssh-agent` gap open — so a signing request answers
+/// with a typed, actionable [`crate::dto::SignTagError`] (never a raw gpg
+/// stderr dump, and never a hang past its own bounded window) rather than
+/// with a working signature. ADR 0048 records why a refusal beats silently
+/// dropping the flag; this is that same posture applied to a request that
+/// *tried*, rather than one refused up front.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TagAnnotation {
     /// The tag object's message body (`git tag -a|-s -m <message>`).
     pub message: TagMessage,
-    /// Ask git to GPG-sign the tag object (`git tag -s`). Carried in the
-    /// reviewed contract now; execution and signing config are #239's.
+    /// Ask git to GPG-sign the tag object (`git tag -s`). M2.21e (#239)
+    /// wires execution; see this struct's doc comment for why it reliably
+    /// fails against this server's sandbox as built today.
     pub sign: bool,
 }
 
