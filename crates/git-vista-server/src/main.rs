@@ -112,7 +112,7 @@ use handlers::clone::{clone_repo, clone_status, delete_clone_repo};
 use handlers::commit::{amend_commit, create_commit, stage_all, unstage_all};
 use handlers::discard::{delete_untracked_paths, discard_tracked_paths};
 use handlers::fetch::fetch_remote;
-use handlers::plan::plan_operation;
+use handlers::plan::{execute_plan, plan_operation};
 use handlers::protocol::protocol_info;
 use handlers::pull::pull_branch;
 use handlers::read::{

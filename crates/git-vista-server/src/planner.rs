@@ -472,6 +472,59 @@ pub(crate) async fn submit_plan(
     // `_guard` drops here, exactly as in `plan_and_execute_in`.
 }
 
+/// The submit path's own outer entry (M2.23e, #249): the same gate-then-
+/// delegate shape [`plan_and_execute`] has, for a [`Plan`] that arrives from
+/// outside rather than a bare [`GitOperation`] built fresh. Routed by
+/// `POST /api/execute-plan` (`handlers::plan::execute_plan`).
+///
+/// Reaches the identical [`plan_and_execute_tracked`] lifecycle layer via
+/// [`PlanSource::Submit`] — the same admission, detached spawn and terminal
+/// wait every other write gets, so the submit path cannot drift from the
+/// composed path on idempotency (ADR 0016's funnel, extended to plans
+/// instead of bare operations). What `plan_and_execute_tracked` does with
+/// the `PlanSource` once admitted is call [`submit_plan`] — never a second
+/// copy of validate/enforce_fresh/execute.
+///
+/// One admission subtlety: `admit` keys the idempotency registry on this
+/// *request's* live selection tokens (via `selection_tokens()` below), not
+/// the plan's own `repository`/`worktree` fields — those are compared inside
+/// `submit_plan` itself, after admission. So a retried cross-worktree
+/// submission under the same key replays the original 409 rather than
+/// re-deriving it; that is the correct idempotent behavior, not a gap.
+pub(crate) async fn submit_plan_tracked(plan: Plan) -> (StatusCode, String) {
+    // The write gate, exactly as `plan_and_execute` takes it — a plan is an
+    // approval token for a mutation, so executing it is refused the same way
+    // building one already is (see `handlers::plan`'s module doc).
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    let Some(key) = crate::operations::current_key() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "This request needs the {IDEMPOTENCY_HEADER} header, so a retry \
+                 can be recognised as a retry. Reload the app to update."
+            ),
+        );
+    };
+    // D2 (#66, Task 7): the same validated resolution every write handler
+    // uses. `submit_plan` re-checks this request's tokens against the plan's
+    // own below; this call is what produces them.
+    let (repo, entry) = match crate::state::resolve_target() {
+        Ok(v) => v,
+        Err(rejected) => return rejected,
+    };
+    let repo_id = Some(entry.handle.repository);
+    plan_and_execute_tracked(
+        key,
+        repo,
+        repo_id,
+        selection_tokens(),
+        PlanSource::Submit(plan),
+    )
+    .await
+}
+
 /// Resolve arbitrary request input to an exact [`CommitOid`]. A full 40/64
 /// lowercase-hex id — what the UI always sends — is taken as-is; anything else
 /// (a hand-crafted symbolic or abbreviated start point) is resolved through

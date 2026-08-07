@@ -50,7 +50,7 @@ use git_vista_protocol::{
     RepositoryToken, TransferPhase, WorktreeToken,
 };
 
-use super::operation_hash;
+use super::{operation_hash, PlanSource};
 use crate::operations::{Admission, Record};
 
 // ---------------------------------------------------------------------------
@@ -757,7 +757,13 @@ async fn a_dropped_connection_replays_instead_of_fetching_twice() {
     // waiting. One millisecond is far shorter than any fetch.
     let dropped = tokio::time::timeout(
         Duration::from_millis(1),
-        super::plan_and_execute_tracked(k.clone(), repo.clone(), None, tokens(), fetch_op()),
+        super::plan_and_execute_tracked(
+            k.clone(),
+            repo.clone(),
+            None,
+            tokens(),
+            PlanSource::Build(fetch_op()),
+        ),
     )
     .await;
     assert!(
@@ -769,7 +775,13 @@ async fn a_dropped_connection_replays_instead_of_fetching_twice() {
     // The retry, same key.
     let (status, replayed) = tokio::time::timeout(
         Duration::from_secs(30),
-        super::plan_and_execute_tracked(k.clone(), repo.clone(), None, tokens(), fetch_op()),
+        super::plan_and_execute_tracked(
+            k.clone(),
+            repo.clone(),
+            None,
+            tokens(),
+            PlanSource::Build(fetch_op()),
+        ),
     )
     .await
     .expect("the retry must resolve once the detached pipeline finishes");
@@ -786,8 +798,14 @@ async fn a_dropped_connection_replays_instead_of_fetching_twice() {
     assert_eq!(success.updated_refs[0].ref_name, "refs/remotes/origin/main");
 
     // And a third request under the same key is byte-identical again.
-    let (again_status, again) =
-        super::plan_and_execute_tracked(k, repo.clone(), None, tokens(), fetch_op()).await;
+    let (again_status, again) = super::plan_and_execute_tracked(
+        k,
+        repo.clone(),
+        None,
+        tokens(),
+        PlanSource::Build(fetch_op()),
+    )
+    .await;
     assert_eq!(again_status, status);
     assert_eq!(again, replayed, "replay must be verbatim, every time");
 }
