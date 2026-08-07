@@ -114,8 +114,12 @@ enum PlanSource {
     /// The submit path: this plan already exists (minted earlier by
     /// [`build_plan_only`], possibly reviewed across a roundtrip) — take the
     /// guard and run `validate → enforce_fresh → execute` against it as-is —
-    /// [`submit_plan`].
-    Submit(Plan),
+    /// [`submit_plan`]. Boxed: `Plan` is ~4x the size of `GitOperation`, and
+    /// clippy's `large_enum_variant` is right that an unboxed `Plan` here
+    /// would make every `PlanSource` (including every `Build` one, which is
+    /// on the hot path) pay `Plan`'s stack size for a variant most values
+    /// never use.
+    Submit(Box<Plan>),
 }
 
 impl PlanSource {
@@ -213,7 +217,7 @@ async fn plan_and_execute_tracked(
 
             let (status, message) = match source {
                 PlanSource::Build(op) => plan_and_execute_in(&repo, repo_id, tokens, op).await,
-                PlanSource::Submit(plan) => submit_plan(&repo, repo_id, tokens, plan).await,
+                PlanSource::Submit(plan) => submit_plan(&repo, repo_id, tokens, *plan).await,
             };
             // The generation *after* execution: the datum a reconnecting client
             // uses to decide whether its cached graph is stale, without re-reading
@@ -520,7 +524,7 @@ pub(crate) async fn submit_plan_tracked(plan: Plan) -> (StatusCode, String) {
         repo,
         repo_id,
         selection_tokens(),
-        PlanSource::Submit(plan),
+        PlanSource::Submit(Box::new(plan)),
     )
     .await
 }
