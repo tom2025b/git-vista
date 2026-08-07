@@ -789,6 +789,34 @@ byte-identically; the paired leg without the pin loses both. That is why `Delete
 keeps its `Destructive` rank — the recovery exists, but it is a recovery, not the
 automatic guard `git branch -d` provides.)*
 
+*(Signed tag creation now attempted, not refused: #239, M2.21e — amends the paragraph
+above's `sign: true` clause, the last `501` this row still had. `exec_create_tag` runs a
+real `git tag -s` rather than refusing before any argv exists; `create_tag_argv` grows a
+signed arm (`-s` in place of `-a`, `-m <message>` still structurally guaranteed by the same
+non-empty-`TagMessage` invariant the paragraph above records). **This does not open the
+AF_UNIX gap** the strict-tier paragraph above (§ "`AF_UNIX` in the strict tier is denied by
+seccomp") describes — that denial is exactly what makes signing fail on this server today,
+by design, not a side effect worked around here: gpg's own agent handshake is a
+`socket(AF_UNIX, …)` call, seccomp answers `EPERM` synchronously, and `~/.gnupg` sits in
+`sandbox::DEFAULT_SECRET_EXCLUDES` (the same Landlock exclude that withholds `~/.ssh`), so
+the dominant failure — measured on this host, not assumed — is git failing on a keyless
+lookup before it ever reaches the agent. Every failure lands in one of a small closed set,
+`SignTagFailureKind` (`no_secret_key` / `agent_unreachable` / `gpg_not_installed` /
+`timed_out` / `other`), reported as a typed `SignTagError` — never raw gpg stderr, which
+`classify_sign_failure` reads only from GnuPG's own machine-readable `[GNUPG:] …` status-fd
+protocol, never from translated prose. **The property this slice cannot compromise on:** a
+signing spawn must never hang past a bound, because the per-worktree mutation guard
+(`coordinator::lock`) is held across it. `run_signed_tag` wraps the spawn in a 10-second
+`tokio::time::timeout` with `kill_on_drop`, argued in that function's own doc comment to be
+belt-and-braces rather than the primary defence — the sandbox's own denials close every
+input-blocking path (agent, pinentry, editor, terminal prompt, stdin) before the timeout is
+ever needed, but no gpg-side flag can be delivered through `gpg.program` to make that a
+contractual guarantee (git execs it directly, no shell, so a flag-bearing program string
+just fails to exec) — so the bound is what makes "never hangs" true regardless.
+`DeleteRemoteTag`/`PushTag` are unaffected and still `501` for the reason above; opening
+`AF_UNIX` for either signing or the analogous ssh-agent gap (#188) remains explicitly out of
+scope.)*
+
 No gesture, pressure threshold, swipe, or double-tap directly executes a destructive
 operation. Touch gestures may select or open a plan; final confirmation is explicit.
 

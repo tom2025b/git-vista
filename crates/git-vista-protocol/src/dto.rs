@@ -1232,6 +1232,78 @@ mod tests {
         assert!(serde_json::from_str::<DeleteTagRequest>(r#"{"tag":"v1","repo":"/etc"}"#).is_err());
     }
 
+    /// M2.21e (#239): every [`SignTagFailureKind`] must reach the wire as the
+    /// exact `snake_case` spelling the frontend's own parser matches on
+    /// (`api::create_tag_request` tries `SignTagError` before falling back to
+    /// the generic envelope parse) — the same posture
+    /// `adr_0025_wire_strings_still_deserialize_and_never_serialize` and the
+    /// `AmendFailureKind` pin in `dto_golden.rs` already hold for their own
+    /// closed sets, applied here so a renamed variant is a compile-time-typed
+    /// change but a *re-spelled* one is still caught.
+    #[test]
+    fn sign_tag_failure_kind_uses_stable_snake_case_wire_names() {
+        let pairs = [
+            (SignTagFailureKind::NoSecretKey, "no_secret_key"),
+            (SignTagFailureKind::AgentUnreachable, "agent_unreachable"),
+            (SignTagFailureKind::GpgNotInstalled, "gpg_not_installed"),
+            (SignTagFailureKind::TimedOut, "timed_out"),
+            (SignTagFailureKind::Other, "other"),
+        ];
+        for (kind, wire) in pairs {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::Value::String(wire.to_string()),
+                "{kind:?} must serialize as {wire:?}"
+            );
+            assert_eq!(
+                serde_json::from_value::<SignTagFailureKind>(serde_json::Value::String(
+                    wire.to_string()
+                ))
+                .unwrap(),
+                kind,
+                "{wire:?} must deserialize back to {kind:?}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<SignTagFailureKind>(serde_json::json!("no_such_reason"))
+                .is_err(),
+            "the set is closed: an unrecognised wire string must not silently pick a variant"
+        );
+    }
+
+    /// [`SignTagError`] round-trips as a plain `{kind, message}` object — no
+    /// envelope, no `deny_unknown_fields` (it is a response DTO the server
+    /// may grow fields on later, M1.02's additive rule) — and the frontend's
+    /// `create_tag_request` depends on parsing exactly this shape before
+    /// falling back to the generic `ApiError` envelope every other refusal
+    /// uses.
+    #[test]
+    fn sign_tag_error_roundtrips_as_a_plain_object_and_tolerates_new_fields() {
+        let err = SignTagError {
+            kind: SignTagFailureKind::AgentUnreachable,
+            message: "gpg could not reach the agent".to_string(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(serde_json::from_str::<SignTagError>(&json).unwrap(), err);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "agent_unreachable",
+                "message": "gpg could not reach the agent",
+            })
+        );
+
+        // A field a future server adds must not break an older client.
+        let forward_compatible = serde_json::from_value::<SignTagError>(serde_json::json!({
+            "kind": "no_secret_key",
+            "message": "no key",
+            "hint": "install gpg",
+        }))
+        .unwrap();
+        assert_eq!(forward_compatible.kind, SignTagFailureKind::NoSecretKey);
+    }
+
     #[test]
     fn request_bodies_reject_unknown_fields() {
         // The core of the "no path-based repository selection" guarantee at the

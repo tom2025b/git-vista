@@ -210,7 +210,10 @@ pub(crate) async fn create_tag(Json(req): Json<CreateTagRequest>) -> (StatusCode
 ///   reading: the caller asked for release notes, so quietly producing a tag
 ///   without them is a wrong outcome, not a forgiving one.
 /// * **present with text** — an annotated tag, `sign` carried through for the
-///   executor to accept (M2.21e) or refuse (today).
+///   executor to attempt (M2.21e, #239): a real `git tag -s`, which this
+///   server's own sandbox reliably fails today with a typed, actionable
+///   reason rather than a silent drop or a raw stderr dump — see
+///   `planner::classify_sign_failure`'s doc comment for the mechanism.
 ///
 /// `sign` without a message is refused separately: a signature lives *in* the
 /// tag object, so a signed lightweight tag is not a thing git can make. The

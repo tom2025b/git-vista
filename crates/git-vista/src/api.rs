@@ -25,9 +25,9 @@ use git_vista_protocol::{
     CreateTagRequest, DeleteCloneRequest, DeleteTagRequest, FetchRequest, ForcePublish,
     GitOperation, MergeStrategy, OperationByKeyResponse, PatchPlan, PatchPreview, Plan,
     ProtocolInfo, PullRequest, PushRequest, RebaseStatus, RemoteName, RepoMode,
-    RepositoryDescriptor, SelectRequest, SessionInfo, SessionRequest, SignTagError,
-    StageDirection, StagingDiff, WorktreePathsRequest, WorktreeStatus, CSRF_HEADER,
-    IDEMPOTENCY_HEADER, OPERATION_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
+    RepositoryDescriptor, SelectRequest, SessionInfo, SessionRequest, SignTagError, StageDirection,
+    StagingDiff, WorktreePathsRequest, WorktreeStatus, CSRF_HEADER, IDEMPOTENCY_HEADER,
+    OPERATION_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
 use crate::features::dialogs::commit::{amend_body, classify_amend_response, AmendOutcome};
@@ -1112,7 +1112,11 @@ pub async fn create_tag_request(
     let parsed = crate::features::dialogs::core::split_error_response(status, &text);
     if let Some(id) = &parsed.request_id {
         web_sys::console::error_1(
-            &format!("git-vista: POST /api/tag failed (request {id}): {}", parsed.message).into(),
+            &format!(
+                "git-vista: POST /api/tag failed (request {id}): {}",
+                parsed.message
+            )
+            .into(),
         );
     }
     Err(parsed.message)

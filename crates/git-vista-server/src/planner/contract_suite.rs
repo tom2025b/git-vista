@@ -3904,10 +3904,17 @@ async fn create_tag_signing_fails_fast_with_a_typed_reason_and_touches_nothing()
             "signing failure body must be the typed SignTagError, not raw text: {e}\nbody={body}"
         )
     });
-    assert_ne!(
+    // Pinned to the actual closed-set reason, not merely "isn't TimedOut" —
+    // see `planner::tests::a_signing_attempt_with_no_usable_key_fails_fast_with_a_typed_reason`
+    // for why `Other` must not silently pass this assertion too.
+    assert!(
+        matches!(
+            parsed.kind,
+            SignTagFailureKind::NoSecretKey | SignTagFailureKind::AgentUnreachable
+        ),
+        "a keyless signing attempt against this server's own sandbox must classify as \
+         NoSecretKey or AgentUnreachable, never {:?}: {}",
         parsed.kind,
-        SignTagFailureKind::TimedOut,
-        "a keyless signing failure must fail fast, not via the timeout backstop: {}",
         parsed.message
     );
     assert!(

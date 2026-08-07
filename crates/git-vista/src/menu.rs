@@ -48,7 +48,7 @@ use crate::features::dialogs::commit::{amend_offer, AmendOffer};
 use crate::features::dialogs::core::{branch_name_space_fix, Dialog, ErrorNotice};
 use crate::features::graph::core::{
     create_tag_item_label, disabled_menu_item_copy, pull_label, remote_tip_from_plan,
-    tag_annotation_from_prompt, RemoteTipKnowledge,
+    tag_annotation_from_prompt, tag_sign_choice, RemoteTipKnowledge,
 };
 use crate::features::operations::core::PendingIntent;
 use crate::features::operations::kind::{rebase_item_label, ForceWithLease};

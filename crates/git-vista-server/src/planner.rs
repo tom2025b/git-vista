@@ -3019,13 +3019,23 @@ const SIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// None of that is a proof that survives every future GnuPG version, host
 /// configuration, or sandbox change — an internal retry loop's own bound
 /// inside gpg-agent's startup code, for one, is not this codebase's to
-/// guarantee. So: [`crate::git_cmd::git_output_bounded`] wraps the spawn in
-/// [`SIGN_TIMEOUT`] with `kill_on_drop`, so the worst case — every bullet
-/// above turning out to be wrong at once, on some future host — is a
-/// **ten-second-bounded** hold of the per-worktree mutation guard instead of
-/// an unbounded one. The bullets above are why this *shouldn't* need the
-/// timeout in practice; the timeout is why it does not matter if one of them
-/// is ever wrong.
+/// guarantee. Nor does the AF_UNIX bullet above hold for every *tier*: it is
+/// `sandbox::tier_for`'s `(false, NetworkNeed::Local) => Tier::Strict` arm —
+/// an **operator-trusted** repository instead gets `(true, _) => Unsandboxed`
+/// (no seccomp, no Landlock), where AF_UNIX is open and a graphical pinentry
+/// keying off `DISPLAY`/`WAYLAND_DISPLAY` is not closed by the cleared
+/// `GPG_TTY` or the nulled stdin above. That path is unreachable *today* —
+/// `sandbox::trust::grant`, the only marker writer `is_trusted` can ever see,
+/// is `#[cfg(test)]`-gated with no production caller — but it is one future
+/// operator-trust handler away from existing, and the bullets above say
+/// nothing about it. So: [`crate::git_cmd::git_output_bounded`] wraps the
+/// spawn in [`SIGN_TIMEOUT`] with `kill_on_drop`, and that bound is the
+/// **primary** guarantee this function makes, not a backstop behind the
+/// bullets above — it is what makes "never hangs" true in Unsandboxed too,
+/// where none of the sandbox-specific reasoning applies at all. The bullets
+/// above explain why the *common* failure is fast and its reason nameable;
+/// the timeout is what makes the property hold regardless of whether any of
+/// them turn out to be wrong, or inapplicable, on a given repository.
 async fn run_signed_tag(
     repo: &Path,
     need: NetworkNeed,
@@ -5313,10 +5323,28 @@ mod tests {
         let parsed: SignTagError = serde_json::from_str(&body).unwrap_or_else(|e| {
             panic!("signing failure body must be the typed SignTagError, not raw text: {e}\nbody={body}")
         });
-        assert_ne!(
+        // Not merely "not TimedOut": the whole point of #239's classifier is
+        // that this server's real, measured failure mode lands on one of the
+        // two sandbox-caused reasons — never the catch-all `Other`, which
+        // `classify_sign_failure` would also produce for an unrecognised
+        // status line and which would silently defeat the "small closed set
+        // of *actionable* reasons" requirement while staying green under a
+        // looser `!= TimedOut` assertion. Measured on this host (gpg 2.4.4):
+        // `~/.gnupg` is present but Landlock-withheld, so gpg's own lock/keydb
+        // lookups fail with permission errors and an `INV_SGNR` status line —
+        // `NoSecretKey`, not `AgentUnreachable` (which needs gpg to get past
+        // key lookup first) — but either sandbox-caused reason is a pass here
+        // since both are the *expected* outcome this slice exists to name.
+        assert!(
+            matches!(
+                parsed.kind,
+                SignTagFailureKind::NoSecretKey | SignTagFailureKind::AgentUnreachable
+            ),
+            "a keyless signing attempt against this server's own sandbox must classify as \
+             NoSecretKey or AgentUnreachable, never {:?} (Other means the GNUPG status-fd \
+             protocol assumption broke, or the message doesn't say why signing failed) and \
+             never TimedOut (that would mean it failed slow, not fast): {}",
             parsed.kind,
-            SignTagFailureKind::TimedOut,
-            "this leg must fail FAST — well inside the 10s bound, never by timing out: {}",
             parsed.message
         );
         assert!(
