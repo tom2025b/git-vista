@@ -145,7 +145,15 @@ fn fetch_summary(message: &str) -> Option<String> {
         // is the one outcome worth a leading tag, so a glance at the strip finds it
         // without reading the whole line.
         FetchFailureKind::Cancelled => format!("Fetch cancelled — {}", err.message),
+        // `CredentialHelperBlocked` joins this group rather than earning a tag:
+        // the server's message for it already names the sandbox exclusion and
+        // what it means, so a leading tag would only shorten the room the
+        // sentence needs. Added here because the protocol gained the variant
+        // while this match still listed the original four — the match is
+        // exhaustive by design so that a new failure kind cannot reach the UI
+        // as a silently-dropped case, and this is that guard doing its job.
         FetchFailureKind::AuthenticationFailed
+        | FetchFailureKind::CredentialHelperBlocked
         | FetchFailureKind::RemoteUnreachable
         | FetchFailureKind::RemoteRejected
         | FetchFailureKind::Other => err.message,
