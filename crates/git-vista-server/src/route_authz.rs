@@ -137,6 +137,17 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // are `full_routes`-only with the full write posture (ADR 0005).
     ("/api/tag", Method::POST, Authz::SessionAndCsrf),
     ("/api/delete-tag", Method::POST, Authz::SessionAndCsrf),
+    // M2.21f (#240): the two remote tag writes. Same CSRF-matters-more
+    // reasoning `/api/fetch` and `/api/pull` carry above — each opens a
+    // socket with whatever credentials this server's host offers, so a
+    // cross-origin trigger would make *this server's* credentials talk to a
+    // remote (and, for the delete, remove a ref from it).
+    ("/api/push-tag", Method::POST, Authz::SessionAndCsrf),
+    (
+        "/api/delete-remote-tag",
+        Method::POST,
+        Authz::SessionAndCsrf,
+    ),
     ("/api/checkout", Method::POST, Authz::SessionAndCsrf),
     (
         "/api/force-delete-branch",
@@ -203,7 +214,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 50;
+const EXPECTED_ROUTE_COUNT: usize = 52;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

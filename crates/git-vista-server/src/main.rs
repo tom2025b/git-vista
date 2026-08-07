@@ -490,11 +490,18 @@ fn api_router(
             // match the `/api/branch` + `/api/delete-branch` pair beside them,
             // and full_routes-gated like every other write — unlike the
             // `GET /api/tags` listing above, which the LAN router does see.
-            // Pushing a tag and deleting it on a remote are deliberately NOT
-            // here: those open a socket with credentials on it and are their
-            // own slice (#74).
             .route("/api/tag", post(handlers::tags::create_tag))
             .route("/api/delete-tag", post(handlers::tags::delete_tag))
+            // M2.21f (#240): the two **remote** tag writes — each opens a
+            // socket with credentials on it, the same posture `/api/fetch`
+            // and `/api/pull` document below, so full_routes-only like every
+            // write here (a LAN visualize session must never publish or
+            // delete a tag on a remote).
+            .route("/api/push-tag", post(handlers::tags::push_tag))
+            .route(
+                "/api/delete-remote-tag",
+                post(handlers::tags::delete_remote_tag),
+            )
             // iPad-testing follow-up: switch HEAD to a branch (`git checkout`).
             .route("/api/checkout", post(checkout_branch))
             // Issue #33 follow-up: force-delete an unmerged branch (`git branch -D`),
