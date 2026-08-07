@@ -180,6 +180,170 @@ pub fn hunk_nav(patch: &str) -> Vec<HunkNavEntry> {
     entries
 }
 
+// ---------------------------------------------------------------------------
+// Virtualized rendering (M2.16g, #350) — the consumer #69c's primitive lacked
+// ---------------------------------------------------------------------------
+
+/// How a diff line's on-screen height is decided, which differs between the
+/// app's two diff surfaces and is **not** a detail a caller may guess at.
+///
+/// Measured from the stylesheet, not assumed:
+///
+/// * `.detail-diff` (the commit detail panel) is `white-space: pre` with
+///   `overflow-x: auto` — a long line scrolls sideways and every line is
+///   exactly one row tall.
+/// * `.viewer-pre` (the full-screen viewer) adds `white-space: pre-wrap` and
+///   `word-break: break-word` — a long line *wraps*, so its height depends on
+///   its own length and the container's width.
+///
+/// Feeding uniform heights for the wrapping surface would put every row after
+/// the first wrapped line at the wrong offset — the scroll position and the
+/// rendered window would disagree, which is the whole failure mode
+/// virtualization is supposed to avoid. [`CumulativeHeights`] takes an
+/// arbitrary heights array precisely so both cases can be expressed.
+///
+/// [`CumulativeHeights`]: git_vista_core::virtualize::CumulativeHeights
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineWrap {
+    /// One row per line regardless of length (`white-space: pre`).
+    Never,
+    /// Lines wrap at `columns` characters (`white-space: pre-wrap`), so a
+    /// line occupies `ceil(len / columns)` rows, minimum one.
+    ///
+    /// `columns` is an **estimate** derived from container width divided by
+    /// monospace character width — this module cannot measure the DOM. It is
+    /// good enough for windowing (an off-by-a-little estimate shifts the
+    /// window slightly, it does not corrupt it) but it is an estimate, and
+    /// the device pass is what confirms it looks right.
+    Wrapped { columns: usize },
+}
+
+/// Per-line heights for a patch, ready to hand to [`CumulativeHeights::new`].
+///
+/// Counts **characters, not bytes**, for the wrapped case: a patch carrying
+/// non-ASCII text would otherwise over-estimate its own height and leave a
+/// visible gap at the bottom of the scroll range.
+///
+/// [`CumulativeHeights::new`]: git_vista_core::virtualize::CumulativeHeights::new
+pub fn line_heights(patch: &str, line_height: f64, wrap: LineWrap) -> Vec<f64> {
+    patch
+        .lines()
+        .map(|line| match wrap {
+            LineWrap::Never => line_height,
+            LineWrap::Wrapped { columns } => {
+                if columns == 0 {
+                    // A zero-width container is not a real layout; treat it
+                    // as one row rather than dividing by zero.
+                    return line_height;
+                }
+                let chars = line.chars().count().max(1);
+                let rows = chars.div_ceil(columns);
+                rows as f64 * line_height
+            }
+        })
+        .collect()
+}
+
+/// The slice of a patch to actually render, plus the spacer heights that keep
+/// the scrollbar honest about the un-rendered remainder.
+///
+/// `pad_top`/`pad_bottom` exist because a virtualized list must still occupy
+/// its full scroll height — otherwise the scrollbar reports the height of the
+/// rendered window rather than the document, and scrolling jumps.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RenderWindow {
+    /// First line index to render (inclusive).
+    pub start: usize,
+    /// One past the last line index to render (exclusive).
+    pub end: usize,
+    /// Height of the un-rendered block above `start`.
+    pub pad_top: f64,
+    /// Height of the un-rendered block below `end`.
+    pub pad_bottom: f64,
+}
+
+impl RenderWindow {
+    /// Number of lines this window renders.
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// Whether line `index` is inside the rendered window — the question a
+    /// focus handler asks before assuming the element it wants to focus
+    /// exists in the DOM at all.
+    pub fn contains(&self, index: usize) -> bool {
+        index >= self.start && index < self.end
+    }
+}
+
+/// Which lines to render for a viewport, and the spacer heights around them.
+///
+/// A thin wrapper over [`visible_range`] that adds the padding arithmetic —
+/// kept here rather than in `git-vista-core` because the spacer concept is a
+/// rendering decision, while the primitive stays purely "heights and a scroll
+/// offset in, indices out."
+///
+/// [`visible_range`]: git_vista_core::virtualize::CumulativeHeights::visible_range
+pub fn render_window(
+    heights: &git_vista_core::virtualize::CumulativeHeights,
+    viewport_height: f64,
+    scroll_offset: f64,
+    overscan: usize,
+) -> RenderWindow {
+    let range = heights.visible_range(viewport_height, scroll_offset, overscan);
+    let total = heights.total_height();
+    let pad_top = range.start_offset;
+    let pad_bottom = (total - heights.offset_of(range.end)).max(0.0);
+    RenderWindow {
+        start: range.start,
+        end: range.end,
+        pad_top,
+        pad_bottom,
+    }
+}
+
+/// The scroll offset that brings line `index` into a `viewport_height`
+/// viewport, given where the view is scrolled now — **the piece that keeps
+/// #210's keyboard hunk navigation working once the list is windowed.**
+///
+/// Without this, tabbing to a hunk header outside the rendered window focuses
+/// an element that does not exist in the DOM: focus is silently lost and the
+/// view does not move. That is the specific regression #350 names as most
+/// likely to make a naive windowing implementation wrong.
+///
+/// Returns `None` when the line is already fully visible, so a caller can skip
+/// a redundant scroll write (which would fight a user's in-progress scroll).
+/// Otherwise returns the minimal scroll that reveals it: aligned to the top
+/// when scrolling up to it, to the bottom when scrolling down — the same
+/// "scroll the least that works" behaviour `Element::scrollIntoView` has with
+/// `block: "nearest"`, chosen so keyboard navigation does not yank the
+/// viewport further than the user's own step.
+pub fn scroll_to_reveal(
+    heights: &git_vista_core::virtualize::CumulativeHeights,
+    index: usize,
+    viewport_height: f64,
+    current_scroll: f64,
+) -> Option<f64> {
+    if index >= heights.item_count() {
+        return None;
+    }
+    let top = heights.offset_of(index);
+    let bottom = heights.offset_of(index + 1);
+    if top < current_scroll {
+        Some(top)
+    } else if bottom > current_scroll + viewport_height {
+        // Align the item's bottom edge to the viewport's, never scrolling
+        // past the top of the document.
+        Some((bottom - viewport_height).max(0.0))
+    } else {
+        None
+    }
+}
+
 /// One selectable hunk header, addressed the way `git_vista_protocol`'s
 /// `HunkRef`/`FileSelection` need it (M2.17d, #215): canonical file path,
 /// 0-based per-file ordinal, and the header's own declared anchors.
@@ -691,5 +855,177 @@ diff --git a/bar.txt b/bar.txt
              regression, not flakiness, unless the CI runner is unusually \
              loaded"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Virtualized rendering (M2.16g, #350)
+    // -------------------------------------------------------------------
+
+    use git_vista_core::virtualize::CumulativeHeights;
+
+    const LH: f64 = 20.0;
+
+    #[test]
+    fn a_non_wrapping_surface_gives_every_line_one_row() {
+        let patch = "short\na much longer line than the others\nx";
+        let h = line_heights(patch, LH, LineWrap::Never);
+        assert_eq!(h, vec![LH, LH, LH]);
+    }
+
+    #[test]
+    fn a_wrapping_surface_charges_long_lines_for_the_rows_they_take() {
+        // 10 columns: 5 chars = 1 row, 25 chars = 3 rows, 20 chars = 2 rows.
+        let patch = format!("{}\n{}\n{}", "x".repeat(5), "y".repeat(25), "z".repeat(20));
+        let h = line_heights(&patch, LH, LineWrap::Wrapped { columns: 10 });
+        assert_eq!(h, vec![LH, 3.0 * LH, 2.0 * LH]);
+    }
+
+    #[test]
+    fn an_empty_line_still_occupies_one_row_when_wrapping() {
+        // A blank line is a real row on screen; charging it zero height
+        // would make every offset below it wrong.
+        let h = line_heights("\n\n", LH, LineWrap::Wrapped { columns: 10 });
+        assert_eq!(h, vec![LH, LH]);
+    }
+
+    #[test]
+    fn wrapping_counts_characters_not_bytes() {
+        // 10 non-ASCII characters (3 bytes each in UTF-8) must be one row at
+        // 10 columns, not three — byte-counting would over-estimate the
+        // height and leave a gap at the end of the scroll range.
+        let line = "\u{4e2d}".repeat(10);
+        let h = line_heights(&line, LH, LineWrap::Wrapped { columns: 10 });
+        assert_eq!(h, vec![LH], "counted bytes instead of characters");
+    }
+
+    #[test]
+    fn a_zero_width_container_does_not_divide_by_zero() {
+        let h = line_heights("abc", LH, LineWrap::Wrapped { columns: 0 });
+        assert_eq!(h, vec![LH]);
+    }
+
+    #[test]
+    fn the_window_renders_a_slice_and_pads_the_rest_to_full_height() {
+        // 100 lines x 20px = 2000px total; a 200px viewport at the top.
+        let heights = CumulativeHeights::new(&vec![LH; 100]);
+        let w = render_window(&heights, 200.0, 0.0, 0);
+        assert_eq!(w.start, 0);
+        assert!(
+            w.len() < 100,
+            "a window must render fewer lines than the whole patch"
+        );
+        assert_eq!(w.pad_top, 0.0);
+        // The padding plus the rendered block must still add up to the full
+        // document height, or the scrollbar lies about how much there is.
+        let rendered = (w.end - w.start) as f64 * LH;
+        assert!(
+            (w.pad_top + rendered + w.pad_bottom - 2000.0).abs() < f64::EPSILON,
+            "pad_top {} + rendered {} + pad_bottom {} != total 2000",
+            w.pad_top,
+            rendered,
+            w.pad_bottom
+        );
+    }
+
+    #[test]
+    fn scrolling_down_moves_the_window_and_shifts_the_top_pad() {
+        let heights = CumulativeHeights::new(&vec![LH; 100]);
+        let top = render_window(&heights, 200.0, 0.0, 0);
+        let mid = render_window(&heights, 200.0, 1000.0, 0);
+        assert!(
+            mid.start > top.start,
+            "window did not advance with the scroll"
+        );
+        assert!(
+            mid.pad_top > 0.0,
+            "scrolled-past content must still occupy height"
+        );
+        let rendered = (mid.end - mid.start) as f64 * LH;
+        assert!(
+            (mid.pad_top + rendered + mid.pad_bottom - 2000.0).abs() < 0.001,
+            "document height not conserved while scrolled"
+        );
+    }
+
+    #[test]
+    fn a_patch_shorter_than_the_viewport_renders_whole_with_no_padding() {
+        let heights = CumulativeHeights::new(&vec![LH; 3]);
+        let w = render_window(&heights, 500.0, 0.0, 0);
+        assert_eq!((w.start, w.end), (0, 3));
+        assert_eq!(w.pad_top, 0.0);
+        assert_eq!(w.pad_bottom, 0.0);
+    }
+
+    #[test]
+    fn an_empty_patch_produces_an_empty_window() {
+        let heights = CumulativeHeights::new(&[]);
+        let w = render_window(&heights, 500.0, 0.0, 2);
+        assert!(w.is_empty());
+        assert_eq!(w.pad_top, 0.0);
+        assert_eq!(w.pad_bottom, 0.0);
+    }
+
+    // --- The focus/navigation interaction #350 flags as the risky part ---
+
+    #[test]
+    fn a_line_already_on_screen_needs_no_scroll() {
+        let heights = CumulativeHeights::new(&vec![LH; 100]);
+        // Viewport 0..200 shows lines 0..10.
+        assert_eq!(scroll_to_reveal(&heights, 5, 200.0, 0.0), None);
+    }
+
+    #[test]
+    fn a_hunk_below_the_window_scrolls_just_far_enough_to_show_it() {
+        let heights = CumulativeHeights::new(&vec![LH; 100]);
+        // Line 20 spans 400..420; a 200px viewport at 0 must scroll so the
+        // line's bottom edge (420) meets the viewport bottom.
+        assert_eq!(scroll_to_reveal(&heights, 20, 200.0, 0.0), Some(220.0));
+    }
+
+    #[test]
+    fn a_hunk_above_the_window_scrolls_up_to_its_top_edge() {
+        let heights = CumulativeHeights::new(&vec![LH; 100]);
+        // Scrolled to 1000 (lines 50..60 visible); line 10 starts at 200.
+        assert_eq!(scroll_to_reveal(&heights, 10, 200.0, 1000.0), Some(200.0));
+    }
+
+    #[test]
+    fn revealing_a_hunk_actually_puts_it_in_the_rendered_window() {
+        // The property that matters end to end: whatever scroll_to_reveal
+        // returns must make render_window include that line. Without this,
+        // keyboard navigation focuses an element that is not in the DOM —
+        // the exact regression #350 names.
+        let heights = CumulativeHeights::new(&vec![LH; 500]);
+        let viewport = 200.0;
+        for &target in &[0usize, 1, 37, 250, 498, 499] {
+            let scroll = scroll_to_reveal(&heights, target, viewport, 0.0).unwrap_or(0.0);
+            let w = render_window(&heights, viewport, scroll, 0);
+            assert!(
+                w.contains(target),
+                "line {target} not in window {}..{} after scrolling to {scroll}",
+                w.start,
+                w.end
+            );
+        }
+    }
+
+    #[test]
+    fn revealing_works_with_wrapped_lines_of_uneven_height() {
+        // The uneven-height case is where a uniform-height shortcut would
+        // silently break: line 3 is 4 rows tall, so every later offset is
+        // shifted and a naive index*line_height calculation lands wrong.
+        let mut hs = vec![LH; 20];
+        hs[3] = 4.0 * LH;
+        let heights = CumulativeHeights::new(&hs);
+        let scroll = scroll_to_reveal(&heights, 10, 100.0, 0.0).unwrap();
+        let w = render_window(&heights, 100.0, scroll, 0);
+        assert!(w.contains(10), "wrapped-height offsets not respected");
+    }
+
+    #[test]
+    fn a_line_index_past_the_end_is_not_scrolled_to() {
+        let heights = CumulativeHeights::new(&vec![LH; 10]);
+        assert_eq!(scroll_to_reveal(&heights, 10, 200.0, 0.0), None);
+        assert_eq!(scroll_to_reveal(&heights, 999, 200.0, 0.0), None);
     }
 }
