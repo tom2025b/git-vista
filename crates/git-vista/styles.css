@@ -790,6 +790,41 @@ html, body {
 .act-pill.act-terminal { color: var(--muted); }
 .act-pill.act-ref { color: #3fb950; border-color: #238636; }
 
+/* M2.15 (#68): the status list's per-section grouping and touch cards, built
+   on the v2 StatusSections in activity.rs — replaces the old flat .act-file
+   list, which stays defined above for anything else still rendering rows
+   that shape. */
+.act-status-section { margin-top: 0.5rem; }
+.act-status-section:first-of-type { margin-top: 0; }
+.act-status-heading {
+  margin: 0 0 0.2rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+/* One status row, sized as a real touch target rather than the compact
+   .act-file line it replaces here — matching .act-row's "keep the tap
+   target comfortable (iPad)" reasoning. Not interactive (no tabindex, no
+   handler — the same information-only role .act-file always had), so
+   deliberately no :hover here either: a hover state on a card nothing can
+   focus or activate is exactly the invisible-to-keyboard-users defect the
+   a11y census exists to catch (#65's every_hover_rule_has_a_focus_visible_twin
+   check), not real affordance. */
+.act-status-card {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.35rem 0.4rem;
+  font-size: 0.82rem;
+  border-radius: 6px;
+}
+.act-file-secondary {
+  font-size: 0.74rem;
+  white-space: nowrap;
+}
+
 .act-feed-title { margin-bottom: 4px; }
 
 /* One feed row. Also a <button> when the event references a commit (it opens

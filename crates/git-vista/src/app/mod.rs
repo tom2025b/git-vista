@@ -496,12 +496,14 @@ pub fn App() -> impl IntoView {
     // menu/picker/Activity views gate through `shell_state::online_signal()`.
     let online = install_connectivity_signal();
 
-    // The live working-tree status: the topbar chip (Activity/Undo step 1) and the
-    // Activity panel's own status section both read THIS one resource — until M1.11
-    // (#64, Task 7) the panel kept a second, independently-fetched copy. Owned by
-    // `features/status`, which is where M2.15 (#68) will find a single owner waiting for
-    // it rather than two to reconcile. See that module for the key's two halves and for
-    // the one extra fetch collapsing them costs.
+    // The topbar chip's status summary (Activity/Undo step 1), plus the shared
+    // refetch trigger several write handlers pull after a mutation. Until M1.11
+    // (#64, Task 7) the Activity panel kept a second, independently-fetched copy
+    // of this same v1 `RepoStatus` read for its own status *section*; M2.15
+    // (#68) gave that section its own v2 `WorktreeStatus` read instead (grouped
+    // sections, accessible labels — `activity.rs`'s `worktree_status` resource),
+    // so the panel's rendering no longer depends on this one. This resource's
+    // job is now just the chip and the `.refetch()` calls, not panel rendering.
     let status = status_seam::create(graph, activity);
 
     // Icon style (icons.rs): Nerd Font glyphs vs the plain-text fallback. A
