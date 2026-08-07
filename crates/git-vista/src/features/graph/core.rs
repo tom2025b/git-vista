@@ -13,7 +13,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use git_vista_core::model::{Edge, FrameStub, GitRef, GraphRow, Oid};
-use git_vista_protocol::{GenerationToken, HistoryFrame, HistoryPage, RepoMode};
+use git_vista_protocol::{
+    CommitOid, GenerationToken, HistoryFrame, HistoryPage, RefChange, RefState, RepoMode, RiskLevel,
+};
 
 use crate::geometry::{node_cx, LABEL_GAP, ROW_HEIGHT};
 
@@ -812,6 +814,265 @@ pub fn pull_label(branch: Option<&str>, remote: &str) -> String {
     match branch {
         Some(b) => format!("Pull ‘{b}’ from ‘{remote}’"),
         None => format!("Pull from ‘{remote}’"),
+    }
+}
+
+/// The "Create tag…" context-menu item's label (M2.21d, #238): the same
+/// stub-vs-commit-dot wording split `MenuData::create_label` makes for
+/// "Create branch…", pulled into one pure, host-tested function instead of
+/// being duplicated as a literal at each of the three `MenuData`
+/// construction sites — the same move `mode_button_label` above already
+/// makes for its own pair of wordings. `is_branch` is `MenuData::is_branch`
+/// itself: `true` for a stub's own menu (its subject is the branch, so
+/// tagging reads "from this branch"), `false` for a commit dot ("from this
+/// commit").
+pub fn create_tag_item_label(is_branch: bool) -> &'static str {
+    if is_branch {
+        "Create tag from this branch"
+    } else {
+        "Create tag from this commit"
+    }
+}
+
+/// Turns the "Create tag" flow's second native prompt — the optional
+/// annotation message — into the `message` field `CreateTagRequest` sends
+/// (#238, M2.21d, mirroring `CreateTagRequest`'s own doc comment in
+/// `git-vista-protocol`).
+///
+/// This is the one decision in the whole create-tag flow worth pinning
+/// somewhere a host test can check it: `None` (or `Some(text)` where `text`
+/// is empty/whitespace-only — cancelling the second prompt and dismissing it
+/// with nothing typed read the same to a user) means a **lightweight** tag;
+/// anything else, trimmed, means an **annotated** one. Getting this backwards
+/// silently changes which *kind* of tag gets created — exactly the class of
+/// wrong-outcome-with-no-error the DTO's own doc comment (ADR 0048) warns
+/// about — so `menu.rs` (wasm-only, cannot itself be host-tested) calls this
+/// rather than deciding it inline.
+pub fn tag_annotation_from_prompt(raw: Option<String>) -> Option<String> {
+    let trimmed = raw?.trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+// ---------------------------------------------------------------------------
+// The Push / force-with-lease confirmation (#233, M2.20g)
+// ---------------------------------------------------------------------------
+
+/// The three distinct facts a `POST /api/plan` response's
+/// `expected_ref_changes[0].before` can carry for a `PushBranch` preview —
+/// see `planner.rs`'s D5 comment (around line 1595), which is explicit that
+/// "the read failed" and "the branch was never pushed" must not share one
+/// `None`. Collapsing them here would repeat exactly the mistake that
+/// comment forbids server-side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteTipKnowledge {
+    /// The live read succeeded and origin/`<branch>` is at this commit —
+    /// the oid a force-with-lease would pin.
+    Known(CommitOid),
+    /// origin/`<branch>` doesn't exist yet — nothing to overwrite, so a
+    /// force-with-lease is meaningless; a plain push already does
+    /// everything a lease-force would.
+    NotYetPushed,
+    /// The live read itself failed (the plan's `before` field is
+    /// unknowable, `planner.rs`'s `Obs::Unknown` case) — the honest answer
+    /// is "we don't know", never a guess in either direction.
+    Unreadable,
+}
+
+/// Read [`RemoteTipKnowledge`] off a `POST /api/plan` response built for a
+/// *plain* `GitOperation::PushBranch` (`ForcePublish::None`) — see
+/// `api::preview_push`'s doc comment for why the menu reads a plain-push
+/// plan first, before it has an oid to build the real lease plan from.
+///
+/// Reads only `changes.first()`: `planner.rs`'s `PushBranch` arm never
+/// produces more than one `RefChange` (the remote-tracking ref), so a
+/// second entry is not a case this function has to account for.
+pub fn remote_tip_from_plan(changes: &[RefChange]) -> RemoteTipKnowledge {
+    match changes.first().map(|c| &c.before) {
+        Some(RefState::At(oid)) => RemoteTipKnowledge::Known(oid.clone()),
+        Some(RefState::Absent) => RemoteTipKnowledge::NotYetPushed,
+        // `Symbolic`/`Computed` never occur for a `PushBranch`'s
+        // remote-tracking `before` — folded into the same "unreadable"
+        // answer as a missing entry, rather than a `_ => unreachable!()`
+        // that would panic the one caller (a wasm view) least able to
+        // afford it.
+        Some(RefState::Symbolic(_) | RefState::Computed) | None => RemoteTipKnowledge::Unreadable,
+    }
+}
+
+/// Everything `dialogs/confirm.rs` needs to render one `PendingOp::Push`
+/// confirmation (#233): the plain single-tap ceremony this operation has
+/// always had, or the danger tier `ForceDelete`/`Undo` already set the bar
+/// for. A named struct, not the bare `(title, body, label, danger)` tuple
+/// `pull_label` returns elsewhere in this file — `confirm.rs` also needs
+/// `enabled`, which every existing Push confirmation has always hardcoded
+/// `true` (there is no "can't push" precondition this dialog itself
+/// checks), so that field is left for the caller rather than carried here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushConfirmCopy {
+    pub title: &'static str,
+    pub body: String,
+    pub confirm_label: &'static str,
+    pub danger: bool,
+}
+
+/// `force`: `None` for a plain push. `Some((remote_tip, risk))` for a
+/// force-with-lease already resolved to a concrete oid — the menu's
+/// force-push entry point only reaches this function once
+/// [`RemoteTipKnowledge`] came back [`RemoteTipKnowledge::Known`], so this
+/// function never has to render the "couldn't read"/"nothing to overwrite"
+/// cases itself (those are shown as their own error notice, `menu.rs`).
+///
+/// `risk` is the server's `POST /api/plan` classification for *that exact
+/// plan* — `danger` below is `risk == RiskLevel::Destructive`, never
+/// `force.is_some()`. That is #233's explicit requirement: the danger
+/// styling must be driven by what the planner actually answered, not by a
+/// client-side assumption that every lease is destructive (true today, per
+/// `planner.rs`'s `ForcePublish::WithLease => RiskLevel::Destructive`
+/// match, but this function does not re-derive that match — it reads the
+/// field the caller already fetched).
+pub fn push_confirm_copy(
+    branch: &str,
+    set_upstream: bool,
+    force: Option<(&CommitOid, RiskLevel)>,
+) -> PushConfirmCopy {
+    let upstream_line = if set_upstream {
+        format!(
+            "\n\nThis also records ‘origin/{branch}’ as ‘{branch}’’s upstream \
+             (--set-upstream), so future pushes and pulls need no remote named."
+        )
+    } else {
+        String::new()
+    };
+    match force {
+        None => PushConfirmCopy {
+            title: "Push branch",
+            body: format!("Push ‘{branch}’ to origin?{upstream_line}"),
+            confirm_label: "Push",
+            danger: false,
+        },
+        Some((oid, risk)) => PushConfirmCopy {
+            title: "Force-push branch",
+            body: format!(
+                "Force-push ‘{branch}’ to origin? This overwrites origin/{branch} — \
+                 currently at {} — with what's here. If anyone else pushed to \
+                 ‘{branch}’ since you last looked, their commits become unreachable \
+                 there. This can't be undone.{upstream_line}",
+                short_oid(oid.as_str()),
+            ),
+            confirm_label: "Force Push",
+            danger: risk == RiskLevel::Destructive,
+        },
+    }
+}
+
+/// The conventional 7-char short id, for confirmation copy (#233) —
+/// mirrors the server's own `planner::short`/`planner::push::short`
+/// (`crates/git-vista-server/src/planner.rs:2258`,
+/// `crates/git-vista-server/src/planner/push.rs:667`), so the truncation
+/// this client shows matches the one the server's own journal and undo
+/// labels already use.
+fn short_oid(oid: &str) -> &str {
+    &oid[..oid.len().min(7)]
+}
+
+#[cfg(test)]
+mod push_confirm_tests {
+    use super::*;
+    use git_vista_protocol::RefName;
+
+    fn commit_oid(c: char) -> CommitOid {
+        CommitOid::new(c.to_string().repeat(40)).unwrap()
+    }
+
+    fn ref_change(before: RefState) -> RefChange {
+        RefChange {
+            ref_name: RefName::new("refs/remotes/origin/feature").unwrap(),
+            before,
+            after: RefState::At(commit_oid('b')),
+        }
+    }
+
+    /// Mutation this catches: reading `changes.last()` instead of
+    /// `.first()`, or losing the oid on the way through `.clone()`.
+    #[test]
+    fn remote_tip_from_plan_reads_a_known_tip() {
+        let changes = [ref_change(RefState::At(commit_oid('a')))];
+        assert_eq!(
+            remote_tip_from_plan(&changes),
+            RemoteTipKnowledge::Known(commit_oid('a'))
+        );
+    }
+
+    /// D5's distinction (`planner.rs` around line 1595): "never pushed"
+    /// must not collapse into the same answer as "couldn't read".
+    #[test]
+    fn remote_tip_from_plan_distinguishes_absent_from_unreadable() {
+        let absent = [ref_change(RefState::Absent)];
+        assert_eq!(
+            remote_tip_from_plan(&absent),
+            RemoteTipKnowledge::NotYetPushed
+        );
+        assert_eq!(remote_tip_from_plan(&[]), RemoteTipKnowledge::Unreadable);
+    }
+
+    /// A plain push never carries the danger tier, regardless of what
+    /// `set_upstream` says — mutation this catches: `danger` hardcoded
+    /// `true`, or the `None` arm falling through to the force-push wording.
+    #[test]
+    fn push_confirm_copy_plain_push_is_never_danger() {
+        let copy = push_confirm_copy("feature", false, None);
+        assert!(!copy.danger);
+        assert_eq!(copy.title, "Push branch");
+        assert_eq!(copy.confirm_label, "Push");
+        assert!(copy.body.contains("feature"));
+    }
+
+    /// #233's explicit requirement: `danger` must come from `risk`, not
+    /// from `force.is_some()`. Constructing this with a `Remote` risk
+    /// (never actually returned by the server for a lease today, but not
+    /// impossible for this *function* to be called with) proves the
+    /// distinction is real rather than accidental — a hardcoded
+    /// `danger: force.is_some()` would fail this exact case.
+    #[test]
+    fn push_confirm_copy_danger_is_driven_by_risk_not_by_force_alone() {
+        let oid = commit_oid('a');
+        let destructive = push_confirm_copy("feature", false, Some((&oid, RiskLevel::Destructive)));
+        assert!(destructive.danger);
+        let non_destructive = push_confirm_copy("feature", false, Some((&oid, RiskLevel::Remote)));
+        assert!(!non_destructive.danger);
+    }
+
+    /// The confirmation must name what would be overwritten — mutation this
+    /// catches: the oid never reaching the body at all.
+    #[test]
+    fn push_confirm_copy_names_the_oid_being_overwritten() {
+        let oid = commit_oid('a');
+        let copy = push_confirm_copy("feature", false, Some((&oid, RiskLevel::Destructive)));
+        assert!(copy.body.contains(&oid.as_str()[..7]));
+        assert_eq!(copy.title, "Force-push branch");
+        assert_eq!(copy.confirm_label, "Force Push");
+    }
+
+    /// `set_upstream` adds a line without flipping which tier applies —
+    /// mutation this catches: the upstream line silently overwriting the
+    /// whole body, or `danger` accidentally keyed off `set_upstream`.
+    #[test]
+    fn push_confirm_copy_set_upstream_is_orthogonal_to_danger() {
+        let plain = push_confirm_copy("feature", true, None);
+        assert!(!plain.danger);
+        assert!(plain.body.contains("--set-upstream"));
+
+        let oid = commit_oid('a');
+        let forced = push_confirm_copy("feature", true, Some((&oid, RiskLevel::Destructive)));
+        assert!(forced.danger);
+        assert!(forced.body.contains("--set-upstream"));
+    }
+
+    #[test]
+    fn short_oid_truncates_to_seven_chars() {
+        let oid = commit_oid('a');
+        assert_eq!(short_oid(oid.as_str()).len(), 7);
+        assert_eq!(short_oid("abc"), "abc");
     }
 }
 
@@ -1671,6 +1932,62 @@ mod tests {
         assert!(
             !title_only_label.contains("Nothing to stage"),
             "this is what the bug looked like: the label carries no reason at all"
+        );
+    }
+
+    /// #238: the label names the branch as the tag's subject on a stub's
+    /// own menu, mirroring `create_label`'s "from this branch" wording.
+    #[test]
+    fn create_tag_item_label_names_the_branch_on_a_stub() {
+        assert_eq!(create_tag_item_label(true), "Create tag from this branch");
+    }
+
+    /// …and the commit on a commit dot's menu.
+    #[test]
+    fn create_tag_item_label_names_the_commit_on_a_dot() {
+        assert_eq!(create_tag_item_label(false), "Create tag from this commit");
+    }
+
+    /// #238: a typed message becomes an annotated tag's text, trimmed of
+    /// surrounding whitespace the prompt UI doesn't strip on its own.
+    #[test]
+    fn tag_annotation_from_prompt_keeps_trimmed_text() {
+        assert_eq!(
+            tag_annotation_from_prompt(Some("  first stable release  ".to_string())),
+            Some("first stable release".to_string())
+        );
+    }
+
+    /// Cancelling the second prompt (`None`) must read as "no annotation" —
+    /// a lightweight tag — the same as every other case below.
+    #[test]
+    fn tag_annotation_from_prompt_none_on_cancel() {
+        assert_eq!(tag_annotation_from_prompt(None), None);
+    }
+
+    /// The bug this function exists to prevent: dismissing the prompt with
+    /// nothing typed (`Some("")`) must NOT silently produce an annotated tag
+    /// with an empty message — it has to collapse to the same lightweight
+    /// outcome as an outright cancel.
+    #[test]
+    fn tag_annotation_from_prompt_empty_string_is_lightweight_not_annotated() {
+        assert_eq!(tag_annotation_from_prompt(Some(String::new())), None);
+        assert_eq!(
+            tag_annotation_from_prompt(Some("   ".to_string())),
+            None,
+            "whitespace-only input is the same case, typed with a stray space"
+        );
+    }
+
+    /// Cancel and empty-string-typed must be indistinguishable at this
+    /// function's output — that's the whole point of collapsing them —
+    /// stated as an explicit equality so a future change can't quietly
+    /// reintroduce a difference.
+    #[test]
+    fn tag_annotation_from_prompt_cancel_and_empty_agree() {
+        assert_eq!(
+            tag_annotation_from_prompt(None),
+            tag_annotation_from_prompt(Some(String::new()))
         );
     }
 }

@@ -4,15 +4,17 @@
 //! already map 1:1 onto `api.rs` functions — `dialogs/confirm.rs` has one match arm each —
 //! so this is a re-home and a rename, not a redesign.
 //!
-//! Framework-free by construction: the only payloads are `String`, `Option<String>` and
-//! `git_vista_core::activity::Undoable`, so the operations core is host-testable.
+//! Framework-free by construction: the payloads are `String`, `Option<String>`, `bool`,
+//! `git_vista_core::activity::Undoable`, and (since #233's `ForceWithLease`)
+//! `git_vista_protocol`'s own validated `CommitOid`/`RiskLevel` — none of them tied to a
+//! UI framework, so the operations core stays host-testable.
 //!
 //! `Debug`/`PartialEq`/`Eq` are new (the old `PendingOp` derived only `Clone`). The core
 //! needs equality to enforce ADR 0020's rule that one idempotency key may not be rebound to
 //! a *different* operation, and needs `Debug` for the assertions that prove it.
 
 use git_vista_core::activity::Undoable;
-use git_vista_protocol::MergeStrategy;
+use git_vista_protocol::{CommitOid, MergeStrategy, RiskLevel};
 
 /// A branch operation awaiting confirmation in the modal (Issue #33 follow-up).
 /// Merge and delete change history/refs and push reaches the network, so each is
@@ -27,8 +29,28 @@ pub enum OperationKind {
         branch: String,
         into: Option<String>,
     },
-    /// Push `branch` to origin (`git push origin <branch>`).
-    Push { branch: String },
+    /// Push `branch` to origin (`git push origin <branch>`), optionally
+    /// recording it as the upstream and/or forcing it with a reviewed lease
+    /// (M2.20g, #233 — widened from the bare `{ branch }` M1 shape).
+    ///
+    /// A plain push (`force: None`) keeps the single-tap confirmation this
+    /// operation has always had. `force: Some(_)` is reached only through
+    /// the menu's separate force-push entry point — never from the normal
+    /// one-tap Push button, per #233's acceptance criterion — after that
+    /// entry point has already reviewed a `POST /api/plan` response for the
+    /// lease; see [`ForceWithLease`]'s doc comment for why the values it
+    /// carries are read off that response rather than assumed here.
+    Push {
+        branch: String,
+        /// `--set-upstream`, offered — never auto-applied — when
+        /// `/api/rebase-status` reported the checked-out branch has none.
+        /// Always `false` when `branch` isn't the branch currently checked
+        /// out: there is no live upstream read for an arbitrary branch yet
+        /// (`RebaseStatus::has_upstream` only ever answers for HEAD).
+        set_upstream: bool,
+        /// `Some` for a force-with-lease publish under review.
+        force: Option<ForceWithLease>,
+    },
     /// Delete `branch` (`git branch -d <branch>`). `current` is the live HEAD branch,
     /// fetched on click; when it equals `branch` the confirm button is disabled (git
     /// refuses to delete the checked-out branch). `None` => detached HEAD (deletable).
@@ -106,6 +128,33 @@ pub enum OperationKind {
     /// tap, and why nothing in its user-facing copy — or in `describe`
     /// below — says "undo", "restore" or "recover".
     DeleteUntrackedPaths { paths: Vec<String> },
+    /// Delete the local tag `tag` (`git tag -d <tag>`, M2.21d/#238, `POST
+    /// /api/delete-tag`). Local only — deleting a tag already pushed to a
+    /// remote is a separate operation with its own route still to come
+    /// (#74), because it opens a socket with credentials on it. Named for
+    /// the server's own `GitOperation::DeleteLocalTag`, the same naming
+    /// rule `DiscardTrackedPaths`/`DeleteUntrackedPaths` above follow.
+    DeleteLocalTag { tag: String },
+}
+
+/// A force-with-lease push under review (#233): what the danger-styled
+/// confirmation names and what the request carries once confirmed.
+///
+/// Both fields come from a `POST /api/plan` response the menu's force-push
+/// entry point already fetched before opening the modal — `expected_remote_tip`
+/// is `Plan::expected_ref_changes[0]`'s `before` oid (the value
+/// `--force-with-lease=<branch>:<oid>` pins the remote to, and the same oid
+/// the confirmation names as "what this will overwrite"), and `risk` is
+/// `Plan::risk` for that exact plan. Neither is derived here or in
+/// `dialogs/confirm.rs` by mirroring `planner.rs`'s
+/// `ForcePublish::WithLease => RiskLevel::Destructive` match — carrying
+/// `risk` as a field, read off the server's own answer, is what keeps the
+/// confirmation from drifting out of sync with the planner's actual
+/// classification if that match is ever widened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForceWithLease {
+    pub expected_remote_tip: CommitOid,
+    pub risk: RiskLevel,
 }
 
 impl OperationKind {
@@ -115,7 +164,12 @@ impl OperationKind {
     pub fn describe(&self) -> String {
         match self {
             Self::Merge { branch, .. } => format!("Merging \u{2018}{branch}\u{2019}"),
-            Self::Push { branch } => format!("Pushing \u{2018}{branch}\u{2019}"),
+            Self::Push {
+                branch,
+                force: Some(_),
+                ..
+            } => format!("Force-pushing \u{2018}{branch}\u{2019}"),
+            Self::Push { branch, .. } => format!("Pushing \u{2018}{branch}\u{2019}"),
             Self::Delete { branch, .. } => format!("Deleting \u{2018}{branch}\u{2019}"),
             Self::ForceDelete { branch } => format!("Force-deleting \u{2018}{branch}\u{2019}"),
             Self::Checkout { branch, .. } => format!("Checking out \u{2018}{branch}\u{2019}"),
@@ -144,6 +198,9 @@ impl OperationKind {
             Self::DeleteUntrackedPaths { paths } => {
                 format!("Deleting {} permanently", file_count(paths.len()))
             }
+            // Mirrors the branch `Delete`/`ForceDelete` arms' wording —
+            // named subject, no type-name leak.
+            Self::DeleteLocalTag { tag } => format!("Deleting tag \u{2018}{tag}\u{2019}"),
         }
     }
 
@@ -214,6 +271,10 @@ pub fn rebase_item_label(branch: Option<&str>, base: &str) -> String {
 mod tests {
     use super::*;
 
+    fn oid(c: char) -> CommitOid {
+        CommitOid::new(c.to_string().repeat(40)).unwrap()
+    }
+
     #[test]
     fn every_variant_describes_itself_without_naming_its_enum() {
         // A status strip reading "ForceDelete" would be leaking the type name at the user.
@@ -224,6 +285,16 @@ mod tests {
             },
             OperationKind::Push {
                 branch: "feature".into(),
+                set_upstream: false,
+                force: None,
+            },
+            OperationKind::Push {
+                branch: "feature".into(),
+                set_upstream: false,
+                force: Some(ForceWithLease {
+                    expected_remote_tip: oid('a'),
+                    risk: RiskLevel::Destructive,
+                }),
             },
             OperationKind::Delete {
                 branch: "feature".into(),
@@ -254,6 +325,7 @@ mod tests {
             OperationKind::DeleteUntrackedPaths {
                 paths: vec!["scratch.txt".into(), "note.md".into()],
             },
+            OperationKind::DeleteLocalTag { tag: "v1.0".into() },
         ];
         for k in kinds {
             let text = k.describe();
@@ -265,6 +337,33 @@ mod tests {
                 "leaked a type name: {text}"
             );
         }
+    }
+
+    /// #233: the status strip must say which push actually ran — a
+    /// force-with-lease and a plain fast-forward are different enough
+    /// operations (one can discard a colleague's commits, the other never
+    /// can) that collapsing them onto the same "Pushing '…'" line would
+    /// hide the one distinction this strip exists to surface.
+    #[test]
+    fn describe_distinguishes_a_force_with_lease_push_from_a_plain_one() {
+        let plain = OperationKind::Push {
+            branch: "feature".into(),
+            set_upstream: false,
+            force: None,
+        }
+        .describe();
+        let forced = OperationKind::Push {
+            branch: "feature".into(),
+            set_upstream: false,
+            force: Some(ForceWithLease {
+                expected_remote_tip: oid('a'),
+                risk: RiskLevel::Destructive,
+            }),
+        }
+        .describe();
+        assert_ne!(plain, forced);
+        assert!(plain.contains("feature") && !plain.to_lowercase().contains("force"));
+        assert!(forced.contains("feature") && forced.to_lowercase().contains("force"));
     }
 
     /// The status strip is the only place the delete is named once its modal
@@ -350,6 +449,14 @@ mod tests {
         let unknown = rebase_item_label(None, "origin/main");
         assert_ne!(known, unknown);
     }
+
+    /// The tag-delete confirmation strip names the tag, the same way the
+    /// branch delete/undo arms name their subject — never a bare "Deleting".
+    #[test]
+    fn delete_local_tag_names_the_tag() {
+        let text = OperationKind::DeleteLocalTag { tag: "v1.0".into() }.describe();
+        assert_eq!(text, "Deleting tag \u{2018}v1.0\u{2019}");
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +506,8 @@ mod fetch_pull_tests {
             // comment on `is_cancellable` above.
             OperationKind::Push {
                 branch: "feature".into(),
+                set_upstream: false,
+                force: None,
             },
             OperationKind::Delete {
                 branch: "feature".into(),
@@ -421,6 +530,7 @@ mod fetch_pull_tests {
             OperationKind::DeleteUntrackedPaths {
                 paths: vec!["scratch.txt".into()],
             },
+            OperationKind::DeleteLocalTag { tag: "v1.0".into() },
         ];
         for k in not_cancellable {
             assert!(!k.is_cancellable(), "{k:?} should not be cancellable");

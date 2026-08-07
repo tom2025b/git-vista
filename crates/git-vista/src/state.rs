@@ -60,6 +60,15 @@ pub struct MenuData {
     /// (Issue #33 follow-up). Empty => the target carries no branch, so no branch
     /// operations are shown.
     pub branches: Vec<String>,
+    /// Tag badges living at this target (M2.21d, #238) — every `RefKind::Tag`
+    /// on a commit dot, mirroring [`Self::branches`] one field up. Each
+    /// yields a "Delete tag" item; there is no per-tag merge/push/checkout,
+    /// unlike a branch. Always empty for a branch stub: a stub represents the
+    /// *branch*, not the commit it happens to sit on, and offering to delete
+    /// a tag from a menu whose header names a branch would be confusing about
+    /// which ref is actually being acted on — `render/stubs.rs` degrades this
+    /// the same considered way `open_for_commit`'s other degraded fields do.
+    pub tags: Vec<String>,
     /// True when the menu belongs to a branch stub rather than a commit dot —
     /// picks the branch icon (vs the commit icon) for the menu header, so the
     /// header's glyph matches what the header names.

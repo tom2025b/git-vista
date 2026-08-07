@@ -18,7 +18,7 @@ use git_vista_protocol::operation::{
     IdempotencyKey, OperationId, OperationState, OperationStatus, ProgressEvent, PROGRESS_EVENT,
     RESULT_EVENT,
 };
-use git_vista_protocol::PROTOCOL_VERSION;
+use git_vista_protocol::{ForcePublish, PROTOCOL_VERSION};
 
 use crate::api::{self, WriteReceipt};
 use crate::features::core_traits::{RequestKey, RequestTarget};
@@ -565,7 +565,22 @@ async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt,
         OperationKind::Merge { branch, .. } => {
             api::branch_op_request("/api/merge", branch, key).await
         }
-        OperationKind::Push { branch } => api::branch_op_request("/api/push", branch, key).await,
+        // #233: widened from `branch_op_request` (the shared `{branch}`-only
+        // shape merge/checkout/delete still use) once `Push` gained
+        // `set_upstream`/`force` — `api::push_request` is the dedicated
+        // function that serializes them into `PushRequest`, mirroring how
+        // `Pull` already has its own `api::pull_request` rather than
+        // reusing `branch_op_request`.
+        OperationKind::Push {
+            branch,
+            set_upstream,
+            force,
+        } => {
+            let force = force.as_ref().map(|f| ForcePublish::WithLease {
+                expected_remote_tip: f.expected_remote_tip.clone(),
+            });
+            api::push_request(branch, *set_upstream, force, key).await
+        }
         OperationKind::Checkout { branch, .. } => {
             api::branch_op_request("/api/checkout", branch, key).await
         }
@@ -592,6 +607,7 @@ async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt,
         OperationKind::DeleteUntrackedPaths { paths } => {
             api::delete_untracked_paths_request(paths.clone(), key).await
         }
+        OperationKind::DeleteLocalTag { tag } => api::delete_tag_request(tag, key).await,
     }
 }
 
