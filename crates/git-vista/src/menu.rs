@@ -39,15 +39,16 @@ use leptos::*;
 use git_vista_core::activity::UndoAction;
 
 use crate::api::{
-    create_branch_request, fetch_commit_detail, fetch_head_branch, fetch_rebase_status,
-    fetch_status, fetch_undoables, fetch_worktree_status, preview_push, stage_request,
-    unstage_request,
+    create_branch_request, create_tag_request, fetch_commit_detail, fetch_head_branch,
+    fetch_rebase_status, fetch_status, fetch_undoables, fetch_worktree_status, preview_push,
+    stage_request, unstage_request,
 };
 use crate::features::core_traits::RequestTarget;
 use crate::features::dialogs::commit::{amend_offer, AmendOffer};
 use crate::features::dialogs::core::{branch_name_space_fix, Dialog, ErrorNotice};
 use crate::features::graph::core::{
-    disabled_menu_item_copy, pull_label, remote_tip_from_plan, RemoteTipKnowledge,
+    create_tag_item_label, disabled_menu_item_copy, pull_label, remote_tip_from_plan,
+    tag_annotation_from_prompt, RemoteTipKnowledge,
 };
 use crate::features::operations::core::PendingIntent;
 use crate::features::operations::kind::{rebase_item_label, ForceWithLease};
@@ -78,6 +79,7 @@ pub fn open_for_commit(shell: Shell, commit: String, header: String, x: f64, y: 
         create_label: "Create branch from this commit…",
         is_head: false,
         branches: Vec::new(),
+        tags: Vec::new(),
         is_branch: false,
         repo_url: None,
         remote_web_url: None,
@@ -327,6 +329,66 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                 });
             };
             let create_label = m.create_label;
+            // "Create tag from this commit": the same prompt-then-POST shape
+            // as "Create branch" just above (M2.21d, #238), plus a second
+            // prompt for an optional annotation message. The second prompt's
+            // raw answer goes through `tag_annotation_from_prompt` rather
+            // than being read inline here — the "cancel vs empty vs typed
+            // text" mapping onto "lightweight vs annotated" is exactly the
+            // sort of decision this wasm-only file cannot itself pin with a
+            // test (see that function's own doc comment).
+            let create_tag_label = create_tag_item_label(m.is_branch);
+            let tag_commit = m.commit.clone();
+            let on_tag = move |_| {
+                shell.close_menu();
+                let Some(win) = web_sys::window() else { return };
+                let name = match win.prompt_with_message("Name for the new tag:") {
+                    Ok(Some(n)) => n.trim().to_string(),
+                    _ => return,
+                };
+                if name.is_empty() {
+                    return;
+                }
+                // Same space pre-flight as branch names (#316) — the check
+                // is generic to any git ref name, not branch-specific.
+                let name = match branch_name_space_fix(&name) {
+                    Some(fixed) => {
+                        let accepted = win
+                            .confirm_with_message(&format!(
+                                "Tag names can't contain spaces.\nUse '{fixed}' instead?"
+                            ))
+                            .unwrap_or(false);
+                        if !accepted {
+                            return;
+                        }
+                        fixed
+                    }
+                    None => name,
+                };
+                let raw_message = win
+                    .prompt_with_message(
+                        "Optional annotation message (leave blank for a lightweight tag):",
+                    )
+                    .ok()
+                    .flatten();
+                let message = tag_annotation_from_prompt(raw_message);
+                let commit = tag_commit.clone();
+                spawn_local(async move {
+                    match create_tag_request(&name, &commit, message.as_deref()).await {
+                        // Bump the fetch counter so the new tag's badge appears.
+                        Ok(()) => graph.update(|g| {
+                            g.force_bump();
+                        }),
+                        Err(e) => {
+                            dialogs.open(Dialog::Error);
+                            shell.open_error(ErrorNotice {
+                                title: "Couldn't create tag",
+                                body: e,
+                            });
+                        }
+                    }
+                });
+            };
             // The two "Commit …" items (Issue #33). Clicking one closes the menu
             // and opens the commit-message modal (below); the actual POST + refresh
             // happens when the user confirms there.
@@ -1091,6 +1153,55 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     items
                 })
                 .collect_view();
+            // The tag operations (M2.21d, #238): one "Delete tag" item per
+            // local tag living at this target, the same one-badge-one-item
+            // shape `branch_items` uses just above — but delete only. A tag
+            // carries no merge/push/checkout target the way a branch does,
+            // and "Create tag" is offered once per menu by `on_tag` above
+            // rather than once per existing tag. Unlike the branch delete
+            // item, there is no live "is this the checked-out branch?"
+            // pre-check to await — a tag has no "checked out" concept — so
+            // this handler stays synchronous and, per this file's ordering
+            // rule (module doc above), writes `dialogs`/`shell.open_confirm`
+            // *before* `shell.close_menu()` rather than after (contrast
+            // `delete_item` above, whose writes happen inside a
+            // `spawn_local` continuation that runs after the synchronous
+            // handler — and hence after `close_menu` — has already
+            // returned).
+            let tag_items = m
+                .tags
+                .iter()
+                .map(|t| {
+                    let t = t.clone();
+                    let tag = t.clone();
+                    let on = move |_| {
+                        let tag = tag.clone();
+                        let seq = operations.next_seq();
+                        let key = operations.request_key(RequestTarget::Tag(tag.clone()));
+                        let intent = PendingIntent {
+                            seq,
+                            key,
+                            kind: PendingOp::DeleteLocalTag { tag },
+                        };
+                        if !operations.admit_intent(&intent) {
+                            return;
+                        }
+                        // Start the ghost-click guard when the modal opens —
+                        // before closing the menu, per the ordering note above.
+                        dialogs.open(Dialog::Confirm);
+                        shell.open_confirm(intent.kind);
+                        shell.close_menu();
+                    };
+                    view! {
+                        <button class="ctx-item danger" on:click=on>
+                            // The diff-removed glyph, inheriting the item's
+                            // red — same choice `delete_item` makes above.
+                            <span class="nf ctx-icon">{ic.deleted}</span>
+                            {format!("Delete tag ‘{t}’")}
+                        </button>
+                    }
+                })
+                .collect_view();
             // "Rebase onto main" (Issue #33 follow-up). Rebase acts on the *checked-
             // out* branch, not the clicked target — like the "Commit …" items — so
             // it's a single entry, not one per branch. Gated on the live
@@ -1413,6 +1524,12 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         <span class="nf ctx-icon">{ic.branch}</span>
                         {create_label}
                     </button>
+                    <button class="ctx-item" on:click=on_tag>
+                        // Creating a tag — the tag glyph, shared with tag
+                        // badges and the Activity panel's tag list.
+                        <span class="nf ctx-icon">{ic.tag}</span>
+                        {create_tag_label}
+                    </button>
                     {stage_changes}
                     {unstage_changes}
                     {select_stage}
@@ -1423,6 +1540,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     {commit_empty}
                     {amend_item}
                     {branch_items}
+                    {tag_items}
                     {rebase_item}
                     {fetch_item}
                     {pull_item}

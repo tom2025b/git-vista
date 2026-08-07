@@ -607,6 +607,7 @@ async fn send(kind: &OperationKind, key: IdempotencyKey) -> Result<WriteReceipt,
         OperationKind::DeleteUntrackedPaths { paths } => {
             api::delete_untracked_paths_request(paths.clone(), key).await
         }
+        OperationKind::DeleteLocalTag { tag } => api::delete_tag_request(tag, key).await,
     }
 }
 

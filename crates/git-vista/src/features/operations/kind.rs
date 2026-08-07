@@ -128,6 +128,13 @@ pub enum OperationKind {
     /// tap, and why nothing in its user-facing copy — or in `describe`
     /// below — says "undo", "restore" or "recover".
     DeleteUntrackedPaths { paths: Vec<String> },
+    /// Delete the local tag `tag` (`git tag -d <tag>`, M2.21d/#238, `POST
+    /// /api/delete-tag`). Local only — deleting a tag already pushed to a
+    /// remote is a separate operation with its own route still to come
+    /// (#74), because it opens a socket with credentials on it. Named for
+    /// the server's own `GitOperation::DeleteLocalTag`, the same naming
+    /// rule `DiscardTrackedPaths`/`DeleteUntrackedPaths` above follow.
+    DeleteLocalTag { tag: String },
 }
 
 /// A force-with-lease push under review (#233): what the danger-styled
@@ -191,6 +198,9 @@ impl OperationKind {
             Self::DeleteUntrackedPaths { paths } => {
                 format!("Deleting {} permanently", file_count(paths.len()))
             }
+            // Mirrors the branch `Delete`/`ForceDelete` arms' wording —
+            // named subject, no type-name leak.
+            Self::DeleteLocalTag { tag } => format!("Deleting tag \u{2018}{tag}\u{2019}"),
         }
     }
 
@@ -315,6 +325,7 @@ mod tests {
             OperationKind::DeleteUntrackedPaths {
                 paths: vec!["scratch.txt".into(), "note.md".into()],
             },
+            OperationKind::DeleteLocalTag { tag: "v1.0".into() },
         ];
         for k in kinds {
             let text = k.describe();
@@ -438,6 +449,14 @@ mod tests {
         let unknown = rebase_item_label(None, "origin/main");
         assert_ne!(known, unknown);
     }
+
+    /// The tag-delete confirmation strip names the tag, the same way the
+    /// branch delete/undo arms name their subject — never a bare "Deleting".
+    #[test]
+    fn delete_local_tag_names_the_tag() {
+        let text = OperationKind::DeleteLocalTag { tag: "v1.0".into() }.describe();
+        assert_eq!(text, "Deleting tag \u{2018}v1.0\u{2019}");
+    }
 }
 
 #[cfg(test)]
@@ -511,6 +530,7 @@ mod fetch_pull_tests {
             OperationKind::DeleteUntrackedPaths {
                 paths: vec!["scratch.txt".into()],
             },
+            OperationKind::DeleteLocalTag { tag: "v1.0".into() },
         ];
         for k in not_cancellable {
             assert!(!k.is_cancellable(), "{k:?} should not be cancellable");

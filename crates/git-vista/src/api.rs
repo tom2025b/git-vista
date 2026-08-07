@@ -22,11 +22,12 @@ use git_vista_protocol::dto::TagDetail;
 use git_vista_protocol::operation::{IdempotencyKey, OperationId, OperationStatus};
 use git_vista_protocol::{
     BranchName, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
-    DeleteCloneRequest, FetchRequest, ForcePublish, GitOperation, MergeStrategy,
-    OperationByKeyResponse, PatchPlan, PatchPreview, Plan, ProtocolInfo, PullRequest, PushRequest,
-    RebaseStatus, RemoteName, RepoMode, RepositoryDescriptor, SelectRequest, SessionInfo,
-    SessionRequest, StageDirection, StagingDiff, WorktreePathsRequest, WorktreeStatus, CSRF_HEADER,
-    IDEMPOTENCY_HEADER, OPERATION_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
+    CreateTagRequest, DeleteCloneRequest, DeleteTagRequest, FetchRequest, ForcePublish,
+    GitOperation, MergeStrategy, OperationByKeyResponse, PatchPlan, PatchPreview, Plan,
+    ProtocolInfo, PullRequest, PushRequest, RebaseStatus, RemoteName, RepoMode,
+    RepositoryDescriptor, SelectRequest, SessionInfo, SessionRequest, StageDirection, StagingDiff,
+    WorktreePathsRequest, WorktreeStatus, CSRF_HEADER, IDEMPOTENCY_HEADER, OPERATION_HEADER,
+    PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
 use crate::features::dialogs::commit::{amend_body, classify_amend_response, AmendOutcome};
@@ -1061,6 +1062,39 @@ pub async fn create_branch_request(name: &str, commit: &str) -> Result<(), Strin
     }
 }
 
+/// Ask the backend to create a tag (M2.21d, #238, `POST /api/tag`), mirroring
+/// [`create_branch_request`] just above. `message` is what the DTO's own doc
+/// comment uses to choose the tag's *kind*: `None` is a lightweight tag,
+/// `Some(text)` is annotated with `text` — the caller builds this with
+/// `features::graph::core::tag_annotation_from_prompt` rather than deciding
+/// it inline, so "cancelled" and "typed nothing" can't diverge from one
+/// another by accident. `sign` is always `false` here: M2.21d wires create
+/// and delete only, and the server refuses `sign: true` until M2.21e (#74)
+/// gives it something to do.
+///
+/// On a non-2xx response the envelope's `error.message` is returned as `Err`
+/// (#316), same posture as every other write in this file.
+pub async fn create_tag_request(
+    name: &str,
+    commit: &str,
+    message: Option<&str>,
+) -> Result<(), String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let body = CreateTagRequest {
+        name: name.to_string(),
+        commit: commit.to_string(),
+        message: message.map(str::to_string),
+        sign: false,
+    };
+    let (resp, _key) = write_json("/api/tag", &body).await?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(user_facing_error("/api/tag", resp).await)
+    }
+}
+
 /// Ask the backend to create a commit (Issue #33, `POST /api/commit`).
 /// `allow_empty` picks `git commit --allow-empty` (empty commit) vs a plain
 /// `git commit` (staged changes). `branch` targets a branch other than the
@@ -1694,6 +1728,32 @@ pub async fn branch_op_request(
     };
     let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
     let (resp, _key) = send_write_with_key(path, Some(json), key, REQUEST_TIMEOUT_MS).await?;
+    Ok(receipt(resp).await)
+}
+
+/// Ask the backend to delete the **local** tag `tag` (M2.21d, #238, `POST
+/// /api/delete-tag`, `git tag -d`). Not [`branch_op_request`]'s `BranchRequest`
+/// shape reused: the wire body's key is `tag`, not `branch` — its own DTO,
+/// [`DeleteTagRequest`], exists precisely so a tag-delete body can't be typo'd
+/// into deleting a branch of the same name (see that type's own doc comment).
+///
+/// Operation-tracked like `branch_op_request`, so it takes and forwards the
+/// same idempotency `key` the confirm-modal dispatch path mints — this is the
+/// destructive half of the pair, reached only from the danger-styled confirm
+/// modal, never the direct-POST path [`create_tag_request`] takes.
+///
+/// Local only — deleting a tag already pushed to a remote reaches a different
+/// route, still to come (#74), because that one opens a socket with
+/// credentials on it.
+pub async fn delete_tag_request(tag: &str, key: IdempotencyKey) -> Result<WriteReceipt, String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let body = DeleteTagRequest {
+        tag: tag.to_string(),
+    };
+    let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+    let (resp, _key) =
+        send_write_with_key("/api/delete-tag", Some(json), key, REQUEST_TIMEOUT_MS).await?;
     Ok(receipt(resp).await)
 }
 

@@ -181,6 +181,23 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                     true,
                     true,
                 ),
+                // Delete a local tag (M2.21d, #238). Danger-styled like the
+                // branch delete arm above, but with no "is this the one
+                // you're on?" gate — a tag has no checked-out state, so
+                // there's nothing here to disable the button over, unlike
+                // `PendingOp::Delete`'s `current == branch` case. The body
+                // makes no reversibility claim either way: the server keeps
+                // a recovery pin (`lifecycle_suite.rs`, ranked `Destructive`
+                // not `Irreversible`), but there is no frontend Undo
+                // affordance for it today, so claiming recoverability here
+                // would promise a button that doesn't exist.
+                PendingOp::DeleteLocalTag { tag } => ConfirmPrompt::plain(
+                    "Delete tag",
+                    format!("Delete tag ‘{tag}’? This removes it from this repository only — a copy already pushed to a remote is untouched."),
+                    "Delete",
+                    true,
+                    true,
+                ),
                 // The undo confirmation (step 5). The server-built label already
                 // says exactly what will happen ("Undo merge — reset ‘main’ to
                 // abc1234"); the body adds what that means for history, and the

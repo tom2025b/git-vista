@@ -76,6 +76,16 @@ pub fn build_node(
             .filter(|r| r.kind == RefKind::Branch)
             .map(|r| r.name.clone())
             .collect();
+        // Tag badges on this commit (M2.21d, #238) — the exact same
+        // extraction as `branches` just above, filtered on the other ref
+        // kind. Each offers a "Delete tag" item; unlike a branch there is no
+        // per-tag merge/push/checkout.
+        let tags: Vec<String> = gr
+            .refs
+            .iter()
+            .filter(|r| r.kind == RefKind::Tag)
+            .map(|r| r.name.clone())
+            .collect();
         // Link target only when the repo is on GitHub *and* this commit is
         // pushed — same rule the labels use, so the menu never offers a 404.
         // The row carries its own exact answer (`on_remote`): paged history has
@@ -101,6 +111,7 @@ pub fn build_node(
             let short = short.clone();
             let github_url = github_url.clone();
             let branches = branches.clone();
+            let tags = tags.clone();
             let repo_url = repo_url.clone();
             let remote_web_url = remote_web_url.clone();
             move |x: f64, y: f64| {
@@ -114,6 +125,7 @@ pub fn build_node(
                     create_label: "Create branch from this commit",
                     is_head,
                     branches: branches.clone(),
+                    tags: tags.clone(),
                     // A commit dot: the menu header shows the commit glyph.
                     is_branch: false,
                     repo_url: repo_url.clone(),

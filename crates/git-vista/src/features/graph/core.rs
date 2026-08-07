@@ -817,6 +817,42 @@ pub fn pull_label(branch: Option<&str>, remote: &str) -> String {
     }
 }
 
+/// The "Create tag…" context-menu item's label (M2.21d, #238): the same
+/// stub-vs-commit-dot wording split `MenuData::create_label` makes for
+/// "Create branch…", pulled into one pure, host-tested function instead of
+/// being duplicated as a literal at each of the three `MenuData`
+/// construction sites — the same move `mode_button_label` above already
+/// makes for its own pair of wordings. `is_branch` is `MenuData::is_branch`
+/// itself: `true` for a stub's own menu (its subject is the branch, so
+/// tagging reads "from this branch"), `false` for a commit dot ("from this
+/// commit").
+pub fn create_tag_item_label(is_branch: bool) -> &'static str {
+    if is_branch {
+        "Create tag from this branch"
+    } else {
+        "Create tag from this commit"
+    }
+}
+
+/// Turns the "Create tag" flow's second native prompt — the optional
+/// annotation message — into the `message` field `CreateTagRequest` sends
+/// (#238, M2.21d, mirroring `CreateTagRequest`'s own doc comment in
+/// `git-vista-protocol`).
+///
+/// This is the one decision in the whole create-tag flow worth pinning
+/// somewhere a host test can check it: `None` (or `Some(text)` where `text`
+/// is empty/whitespace-only — cancelling the second prompt and dismissing it
+/// with nothing typed read the same to a user) means a **lightweight** tag;
+/// anything else, trimmed, means an **annotated** one. Getting this backwards
+/// silently changes which *kind* of tag gets created — exactly the class of
+/// wrong-outcome-with-no-error the DTO's own doc comment (ADR 0048) warns
+/// about — so `menu.rs` (wasm-only, cannot itself be host-tested) calls this
+/// rather than deciding it inline.
+pub fn tag_annotation_from_prompt(raw: Option<String>) -> Option<String> {
+    let trimmed = raw?.trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 // ---------------------------------------------------------------------------
 // The Push / force-with-lease confirmation (#233, M2.20g)
 // ---------------------------------------------------------------------------
@@ -1896,6 +1932,62 @@ mod tests {
         assert!(
             !title_only_label.contains("Nothing to stage"),
             "this is what the bug looked like: the label carries no reason at all"
+        );
+    }
+
+    /// #238: the label names the branch as the tag's subject on a stub's
+    /// own menu, mirroring `create_label`'s "from this branch" wording.
+    #[test]
+    fn create_tag_item_label_names_the_branch_on_a_stub() {
+        assert_eq!(create_tag_item_label(true), "Create tag from this branch");
+    }
+
+    /// …and the commit on a commit dot's menu.
+    #[test]
+    fn create_tag_item_label_names_the_commit_on_a_dot() {
+        assert_eq!(create_tag_item_label(false), "Create tag from this commit");
+    }
+
+    /// #238: a typed message becomes an annotated tag's text, trimmed of
+    /// surrounding whitespace the prompt UI doesn't strip on its own.
+    #[test]
+    fn tag_annotation_from_prompt_keeps_trimmed_text() {
+        assert_eq!(
+            tag_annotation_from_prompt(Some("  first stable release  ".to_string())),
+            Some("first stable release".to_string())
+        );
+    }
+
+    /// Cancelling the second prompt (`None`) must read as "no annotation" —
+    /// a lightweight tag — the same as every other case below.
+    #[test]
+    fn tag_annotation_from_prompt_none_on_cancel() {
+        assert_eq!(tag_annotation_from_prompt(None), None);
+    }
+
+    /// The bug this function exists to prevent: dismissing the prompt with
+    /// nothing typed (`Some("")`) must NOT silently produce an annotated tag
+    /// with an empty message — it has to collapse to the same lightweight
+    /// outcome as an outright cancel.
+    #[test]
+    fn tag_annotation_from_prompt_empty_string_is_lightweight_not_annotated() {
+        assert_eq!(tag_annotation_from_prompt(Some(String::new())), None);
+        assert_eq!(
+            tag_annotation_from_prompt(Some("   ".to_string())),
+            None,
+            "whitespace-only input is the same case, typed with a stray space"
+        );
+    }
+
+    /// Cancel and empty-string-typed must be indistinguishable at this
+    /// function's output — that's the whole point of collapsing them —
+    /// stated as an explicit equality so a future change can't quietly
+    /// reintroduce a difference.
+    #[test]
+    fn tag_annotation_from_prompt_cancel_and_empty_agree() {
+        assert_eq!(
+            tag_annotation_from_prompt(None),
+            tag_annotation_from_prompt(Some(String::new()))
         );
     }
 }
