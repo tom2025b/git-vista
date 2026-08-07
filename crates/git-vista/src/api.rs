@@ -21,9 +21,10 @@ use git_vista_core::status::RepoStatus;
 use git_vista_protocol::dto::TagDetail;
 use git_vista_protocol::operation::{IdempotencyKey, OperationId, OperationStatus};
 use git_vista_protocol::{
-    BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
-    FetchRequest, MergeStrategy, OperationByKeyResponse, PatchPlan, PatchPreview, ProtocolInfo,
-    PullRequest, RebaseStatus, RepoMode, RepositoryDescriptor, SelectRequest, SessionInfo,
+    BranchName, BranchRequest, CloneRequest, CreateBranchRequest, CreateCommitRequest,
+    DeleteCloneRequest, FetchRequest, ForcePublish, GitOperation, MergeStrategy,
+    OperationByKeyResponse, PatchPlan, PatchPreview, Plan, ProtocolInfo, PullRequest, PushRequest,
+    RebaseStatus, RemoteName, RepoMode, RepositoryDescriptor, SelectRequest, SessionInfo,
     SessionRequest, StageDirection, StagingDiff, WorktreePathsRequest, WorktreeStatus, CSRF_HEADER,
     IDEMPOTENCY_HEADER, OPERATION_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
@@ -1672,11 +1673,15 @@ pub async fn reset_test_repo_request() -> Result<String, String> {
 }
 
 /// Ask the backend to run a branch operation on `branch` (Issue #33 follow-up).
-/// `path` is the endpoint — `/api/merge`, `/api/push`, `/api/delete-branch`, or
+/// `path` is the endpoint — `/api/merge`, `/api/delete-branch`, or
 /// `/api/force-delete-branch` — all of which take the same `{ branch }` body. As with the other requests, a
 /// non-2xx body is git's own error text, returned as `Err` for the caller to show.
 /// `Ok` carries the server's success line — most callers ignore it, but the merge
 /// flow reads it to tell a real merge from git's "Already up to date" no-op.
+///
+/// `/api/push` moved off this shared function in #233, once `PushRequest` grew
+/// `set_upstream`/`force` beyond the bare `{ branch }` shape every other caller
+/// here still sends — see [`push_request`].
 pub async fn branch_op_request(
     path: &str,
     branch: &str,
@@ -1742,6 +1747,98 @@ pub async fn pull_request(
     .map_err(|e| e.to_string())?;
     let (resp, _key) = send_write_with_key("/api/pull", Some(json), key, PULL_TIMEOUT_MS).await?;
     Ok(receipt(resp).await)
+}
+
+/// Ask the backend to push `branch` to origin, optionally recording it as
+/// the upstream and/or forcing it with a reviewed lease (`POST /api/push`,
+/// #233 — `Push` outgrew [`branch_op_request`]'s shared `{ branch }` shape
+/// the same way `Pull` already had its own [`pull_request`] rather than
+/// reusing it).
+///
+/// `force` is `None` for the ordinary fast-forward path every push before
+/// #233 ran; `Some(ForcePublish::WithLease { .. })` only after the caller
+/// has already walked the danger-styled confirmation `dialogs/confirm.rs`
+/// gates a lease behind (`OperationKind::Push`'s own doc comment) — this
+/// function sends exactly what it is given and gates nothing itself.
+pub async fn push_request(
+    branch: &str,
+    set_upstream: bool,
+    force: Option<ForcePublish>,
+    key: IdempotencyKey,
+) -> Result<WriteReceipt, String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let json = serde_json::to_string(&PushRequest {
+        branch: branch.to_string(),
+        set_upstream,
+        force,
+    })
+    .map_err(|e| e.to_string())?;
+    let (resp, _key) =
+        send_write_with_key("/api/push", Some(json), key, REQUEST_TIMEOUT_MS).await?;
+    Ok(receipt(resp).await)
+}
+
+/// Preview a `GitOperation::PushBranch` without executing it
+/// (`POST /api/plan`, #233) — the server's build-only endpoint
+/// (`handlers::plan::plan_operation`; `git-vista-mcp` was its only caller
+/// before this). The menu's force-push entry point calls this twice: once
+/// with `ForcePublish::None` to read the remote-tracking ref's live tip
+/// (`Plan::expected_ref_changes`, via
+/// `features::graph::core::remote_tip_from_plan`), and again with
+/// `ForcePublish::WithLease` built from that tip, to read the server's own
+/// `RiskLevel` for exactly the plan about to be confirmed — never assumed
+/// client-side from the `ForcePublish` variant alone
+/// (`push_confirm_copy`'s doc comment says why).
+///
+/// Sends no idempotency key, unlike every other function in this file:
+/// `/api/plan` never reaches `operations::admit` (checked against
+/// `handlers/plan.rs` and `middleware::idempotency`, which treats an absent
+/// header as a plain pass-through, not a refusal), so there is no operation
+/// to track and nothing a retried key would replay differently. It is a
+/// read in every sense but the HTTP verb the CSRF gate demands
+/// (`route_authz.rs`: `SessionAndCsrf`, same as every other `POST`), which
+/// is why the offline/visualize guards below still apply — a plan build is
+/// the first half of a write by ADR 0046's own reasoning, even though this
+/// one is never executed.
+pub async fn preview_push(
+    remote: &str,
+    branch: &str,
+    set_upstream: bool,
+    force: ForcePublish,
+) -> Result<Plan, String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let branch = BranchName::new(branch).map_err(|e| e.to_string())?;
+    let remote = RemoteName::new(remote).map_err(|e| e.to_string())?;
+    let op = GitOperation::PushBranch {
+        branch,
+        remote,
+        set_upstream,
+        force,
+    };
+    let attempt = || async {
+        let sent = async {
+            req_post("/api/plan")
+                .json(&op)
+                .map_err(|e| e.to_string())?
+                .send()
+                .await
+                .map_err(network_error)
+        };
+        with_deadline(sent, REQUEST_TIMEOUT_MS)
+            .await
+            .unwrap_or_else(|| Err(timeout_error()))
+    };
+    let resp = match attempt().await {
+        Ok(resp) => resp,
+        Err(_) => attempt().await?,
+    };
+    if resp.ok() {
+        resp.json::<Plan>().await.map_err(|e| e.to_string())
+    } else {
+        Err(user_facing_error("/api/plan", resp).await)
+    }
 }
 
 /// What the server said in answer to `POST /api/operations/{id}/cancel`

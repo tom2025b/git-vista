@@ -40,14 +40,17 @@ use git_vista_core::activity::UndoAction;
 
 use crate::api::{
     create_branch_request, fetch_commit_detail, fetch_head_branch, fetch_rebase_status,
-    fetch_status, fetch_undoables, fetch_worktree_status, stage_request, unstage_request,
+    fetch_status, fetch_undoables, fetch_worktree_status, preview_push, stage_request,
+    unstage_request,
 };
 use crate::features::core_traits::RequestTarget;
 use crate::features::dialogs::commit::{amend_offer, AmendOffer};
 use crate::features::dialogs::core::{branch_name_space_fix, Dialog, ErrorNotice};
-use crate::features::graph::core::{disabled_menu_item_copy, pull_label};
+use crate::features::graph::core::{
+    disabled_menu_item_copy, pull_label, remote_tip_from_plan, RemoteTipKnowledge,
+};
 use crate::features::operations::core::PendingIntent;
-use crate::features::operations::kind::rebase_item_label;
+use crate::features::operations::kind::{rebase_item_label, ForceWithLease};
 use crate::features::shell::signals::{self as shell_state, Shell};
 use crate::features::status::core::{deletable_untracked_paths, discardable_tracked_paths};
 use crate::geometry::menu_placement;
@@ -833,12 +836,30 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         .into_view()
                     };
                     // Push: always available; git reports if there's no origin/upstream.
+                    // #233: also offers `--set-upstream` when `b` is the
+                    // checked-out branch and `/api/rebase-status` said it
+                    // has none — `rebase_status` (above) already fetched
+                    // this under the same `!m.is_branch` gate `pull_item`
+                    // reads it behind, so this costs no new poll. Scoped to
+                    // the checked-out branch only: `RebaseStatus::has_upstream`
+                    // answers for HEAD alone (`OperationKind::Push`'s own doc
+                    // comment says why), so pushing any other branch from
+                    // this menu still gets `set_upstream: false`, matching
+                    // pre-#233 behaviour exactly.
                     let push_item = {
                         let branch = b.clone();
                         let on = move |_| {
+                            let set_upstream = rebase_status
+                                .get()
+                                .flatten()
+                                .filter(|s| s.branch.as_deref() == Some(branch.as_str()))
+                                .and_then(|s| s.has_upstream)
+                                == Some(false);
                             dialogs.open(Dialog::Confirm);
                             shell.open_confirm(PendingOp::Push {
                                 branch: branch.clone(),
+                                set_upstream,
+                                force: None,
                             });
                             shell.close_menu();
                         };
@@ -847,6 +868,136 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                                 // Push updates the *remote* branch — its glyph.
                                 <span class="nf ctx-icon">{ic.branch_alt}</span>
                                 {format!("Push ‘{b}’")}
+                            </button>
+                        }
+                        .into_view()
+                    };
+                    // Force-push (#233): a *separate* entry point from Push
+                    // above, on purpose — the acceptance criterion is that a
+                    // force-with-lease is "unreachable from the normal
+                    // one-tap push button", so this cannot be an escalation
+                    // Push falls into (unlike Delete → ForceDelete,
+                    // `operations::core::escalation` can't apply here: it
+                    // takes only `(kind, &str)` and has no way to produce an
+                    // oid or a server risk classification).
+                    //
+                    // Async and therefore raced like `merge_item`/`pull_item`
+                    // above: a `PendingIntent` is admitted with a throwaway
+                    // placeholder `kind` before either network call, purely
+                    // so a slower response from an earlier tap can't reopen
+                    // this dialog over a later tap's — see `pull_item`'s
+                    // identical pattern and its doc comment for why the
+                    // placeholder is safe to discard.
+                    //
+                    // Two `/api/plan` calls, not one: the first reads what
+                    // origin/`b` currently points at (a *plain*-push plan,
+                    // since the lease oid isn't known yet); the second reads
+                    // the server's actual `RiskLevel` for the lease plan
+                    // built from that oid, so the confirmation's danger
+                    // styling reflects the planner's own classification
+                    // rather than an assumption baked in here
+                    // (`push_confirm_copy`'s doc comment, `graph::core`).
+                    let force_push_item = {
+                        let branch = b.clone();
+                        let on = move |_| {
+                            let branch = branch.clone();
+                            shell.close_menu();
+                            let seq = operations.next_seq();
+                            let key = operations.request_key(RequestTarget::Branch(branch.clone()));
+                            spawn_local(async move {
+                                let intent = PendingIntent {
+                                    seq,
+                                    key,
+                                    kind: PendingOp::Push {
+                                        branch: branch.clone(),
+                                        set_upstream: false,
+                                        force: None,
+                                    },
+                                };
+                                if !operations.admit_intent(&intent) {
+                                    return;
+                                }
+                                let plain = preview_push(
+                                    "origin",
+                                    &branch,
+                                    false,
+                                    git_vista_protocol::ForcePublish::None,
+                                )
+                                .await;
+                                let oid = match plain
+                                    .map(|p| remote_tip_from_plan(&p.expected_ref_changes))
+                                {
+                                    Ok(RemoteTipKnowledge::Known(oid)) => oid,
+                                    Ok(RemoteTipKnowledge::NotYetPushed) => {
+                                        dialogs.open(Dialog::Error);
+                                        shell.open_error(ErrorNotice {
+                                            title: "Nothing to force-push",
+                                            body: format!(
+                                                "‘{branch}’ isn't on origin yet — a plain Push \
+                                                 already does everything a force-with-lease would."
+                                            ),
+                                        });
+                                        return;
+                                    }
+                                    Ok(RemoteTipKnowledge::Unreadable) => {
+                                        dialogs.open(Dialog::Error);
+                                        shell.open_error(ErrorNotice {
+                                            title: "Couldn't preview force push",
+                                            body: format!(
+                                                "Couldn't read what origin/{branch} currently \
+                                                 points at."
+                                            ),
+                                        });
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        dialogs.open(Dialog::Error);
+                                        shell.open_error(ErrorNotice {
+                                            title: "Couldn't preview force push",
+                                            body: e,
+                                        });
+                                        return;
+                                    }
+                                };
+                                let leased = preview_push(
+                                    "origin",
+                                    &branch,
+                                    false,
+                                    git_vista_protocol::ForcePublish::WithLease {
+                                        expected_remote_tip: oid.clone(),
+                                    },
+                                )
+                                .await;
+                                let risk = match leased {
+                                    Ok(plan) => plan.risk,
+                                    Err(e) => {
+                                        dialogs.open(Dialog::Error);
+                                        shell.open_error(ErrorNotice {
+                                            title: "Couldn't preview force push",
+                                            body: e,
+                                        });
+                                        return;
+                                    }
+                                };
+                                dialogs.open(Dialog::Confirm);
+                                shell.open_confirm(PendingOp::Push {
+                                    branch,
+                                    set_upstream: false,
+                                    force: Some(ForceWithLease {
+                                        expected_remote_tip: oid,
+                                        risk,
+                                    }),
+                                });
+                            });
+                        };
+                        view! {
+                            <button class="ctx-item" on:click=on>
+                                // #233: a distinct glyph from Push's
+                                // `ic.branch_alt`, so the danger-adjacent
+                                // item reads as a different action at a
+                                // glance, not a variant of the same one.
+                                <span class="nf ctx-icon">{ic.push}</span>
+                                {format!("Force Push ‘{b}’…")}
                             </button>
                         }
                         .into_view()
@@ -891,7 +1042,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     // link, not a scripted `window.open`, which iOS WebKit blocks
                     // (same reason as "Open on GitHub"). Shown only on a GitHub repo;
                     // omitted otherwise, since there's no compare page to point at.
-                    let mut items = vec![checkout_item, merge_item, push_item];
+                    let mut items = vec![checkout_item, merge_item, push_item, force_push_item];
                     // Non-GitHub forge branch link (ADR 0010): only when there is
                     // no GitHub base, so it never duplicates the GitHub items.
                     if m.repo_url.is_none() {

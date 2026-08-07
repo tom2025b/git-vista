@@ -17,7 +17,7 @@ use git_vista_protocol::MergeStrategy;
 use crate::features::dialogs::core::{
     worktree_confirm, ConfirmPrompt, Dialog, PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
 };
-use crate::features::graph::core::disabled_menu_item_copy;
+use crate::features::graph::core::{disabled_menu_item_copy, push_confirm_copy};
 use crate::features::operations::kind::OperationKind;
 use crate::state::{Features, PendingOp};
 
@@ -111,13 +111,33 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                         false,
                     ),
                 },
-                PendingOp::Push { branch } => ConfirmPrompt::plain(
-                    "Push branch",
-                    format!("Push ‘{branch}’ to origin?"),
-                    "Push",
-                    false,
-                    true,
-                ),
+                // #233: a plain push keeps the single-tap ceremony this
+                // operation has always had; a force-with-lease push (reached
+                // only through the menu's separate force-push entry point,
+                // never this button) escalates to the danger tier
+                // `ForceDelete`/`Undo` above already set the bar for. All
+                // string composition — including which tier applies — lives
+                // in `push_confirm_copy` (features::graph::core, pure and
+                // host-tested); this arm only plugs its answer into the
+                // shape every other arm here already builds.
+                PendingOp::Push {
+                    branch,
+                    set_upstream,
+                    force,
+                } => {
+                    let copy = push_confirm_copy(
+                        branch,
+                        *set_upstream,
+                        force.as_ref().map(|f| (&f.expected_remote_tip, f.risk)),
+                    );
+                    ConfirmPrompt::plain(
+                        copy.title,
+                        copy.body,
+                        copy.confirm_label,
+                        copy.danger,
+                        true,
+                    )
+                }
                 PendingOp::Checkout { branch, current } => match current {
                     Some(current) if current == branch => ConfirmPrompt::plain(
                         "Checkout branch",
