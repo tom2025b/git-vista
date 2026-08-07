@@ -517,8 +517,13 @@ fn api_router(
             // writes, not with the reads, for two independent reasons: it is
             // the front half of a mutation (a plan is an approval token, not
             // a report), and a LAN visualize session must never see one
-            // (ADR 0005). Executing an approved plan is #249's own route.
+            // (ADR 0005). Executing an approved plan is the route below.
             .route("/api/plan", post(plan_operation))
+            // M2.23e (#249, ADR 0046 continued): submit a plan `/api/plan`
+            // built for execution. Same registration reasoning as `/api/plan`
+            // immediately above — a plan submission is itself a mutation, and
+            // a LAN visualize session must never reach it either (ADR 0005).
+            .route("/api/execute-plan", post(execute_plan))
             // M2.20f (#232): what operation id was admitted for an
             // idempotency key, readable while the operation it names may
             // still be running — closes the race where `POST /api/fetch`
