@@ -255,9 +255,10 @@ pub struct SignTagError {
 
 /// Body of a `POST /api/delete-tag` request (M2.21d, #238): delete the **local**
 /// tag `tag` (`git tag -d`). Nothing here reaches a remote — deleting a
-/// remote tag is [`crate::GitOperation::DeleteRemoteTag`], its own operation
-/// with its own route still to come (#74), because it opens a socket with
-/// credentials on it.
+/// remote tag is [`DeleteRemoteTagRequest`] /
+/// [`crate::GitOperation::DeleteRemoteTag`], its own operation on its own
+/// route (`POST /api/delete-remote-tag`, M2.21f, #240), because it opens a
+/// socket with credentials on it.
 ///
 /// Its own type rather than a reuse of [`BranchRequest`]: the field names the
 /// thing being deleted, and a body whose key is `branch` on a tag endpoint
@@ -266,6 +267,33 @@ pub struct SignTagError {
 #[serde(deny_unknown_fields)]
 pub struct DeleteTagRequest {
     pub tag: String,
+}
+
+/// Body of a `POST /api/push-tag` request (M2.21f, #240): publish tag `tag`
+/// to the named configured remote, via [`crate::GitOperation::PushTag`].
+///
+/// A remote *name*, the same posture [`FetchRequest`] documents below: never
+/// a URL, resolved through the repository's own configuration and the
+/// plan's `Precondition::RemoteConfigured` gate — not `/api/push`'s posture
+/// of hardcoding `origin`, because `PushTag`'s vocabulary has carried a
+/// `remote` field since M2.21a (#235) and there is no pre-existing client
+/// this endpoint has to stay byte-compatible with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushTagRequest {
+    pub tag: String,
+    pub remote: String,
+}
+
+/// Body of a `POST /api/delete-remote-tag` request (M2.21f, #240): delete tag
+/// `tag` from the named configured remote, via
+/// [`crate::GitOperation::DeleteRemoteTag`]. Same remote-name posture as
+/// [`PushTagRequest`] just above.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRemoteTagRequest {
+    pub tag: String,
+    pub remote: String,
 }
 
 /// Body of a `POST /api/push` request (M2.20e, #231): publish the local branch

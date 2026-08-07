@@ -752,15 +752,15 @@ pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         GitOperation::PullBranch { .. } => NetworkNeed::Remote,
         // M2.21a (#235): both tag operations that reach a remote are pushes
         // under the hood — `git push <remote> refs/tags/<name>` and
-        // `git push <remote> --delete refs/tags/<name>`. Contract-only today
-        // (no execution until the later M2.21 slices of #74), classified
-        // `Remote` now for exactly the reason the M2.20a comment above spells
-        // out: the declaration is what picks the tier for the spawn, so a
-        // `Local` placeholder would be a wrong answer waiting in the live
-        // data path for execution to arrive. That `DeleteRemoteTag` never
-        // says "push" in its name changes nothing — this match keys on what
-        // the server decided to do, and deleting a ref *on a remote* is a
-        // network round trip with credentials on it.
+        // `git push <remote> --delete refs/tags/<name>`. M2.21f (#240) wired
+        // both for real execution, riding this same declaration unchanged —
+        // exactly the reason the M2.20a comment above spells out: the
+        // declaration is what picks the tier for the spawn, so classifying
+        // it ahead of execution meant no change was needed here when the
+        // execution arrived. That `DeleteRemoteTag` never says "push" in its
+        // name changes nothing — this match keys on what the server decided
+        // to do, and deleting a ref *on a remote* is a network round trip
+        // with credentials on it.
         GitOperation::DeleteRemoteTag { .. } => NetworkNeed::Remote,
         GitOperation::PushTag { .. } => NetworkNeed::Remote,
 

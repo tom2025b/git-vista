@@ -44,6 +44,11 @@ mod viewport;
 // fetches real history from the backend), but kept for tests/fixtures.
 #[cfg(test)]
 mod graph;
+// #340: a structural census over api.rs's offline write-guard, proving in
+// the host test suite what `mod api` below being wasm32-gated otherwise
+// leaves completely untested. Test-only, like `graph` above.
+#[cfg(test)]
+mod offline_guard_audit;
 
 // The frontend, split out of the former monolithic `app.rs`. Every one of these
 // pulls in Leptos / web-sys (wasm-only deps), so — like `app` — they compile only

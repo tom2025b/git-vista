@@ -62,3 +62,4 @@ it, and note the link in both.
 | [0048](0048-local-tag-execution.md) | Local tag execution: the annotation that cannot be empty, and the pin that outlives the tag | Accepted — implemented and tested; signing and the two remote-reaching tag operations still refuse (M2.21e/f of #74) |
 | [0049](0049-v1-scope-freeze.md) | V1 scope freeze: eighteen never-started issues closed as won't-do, M6/M7 retired, M8 deleted | Accepted — tracker changes only; no code or protocol touched |
 | [0050](0050-operation-by-key-lookup.md) | Learning an operation's id before it finishes: an additive `GET /api/operations/by-key/{key}` | Accepted — implemented and tested |
+| [0051](0051-intent-admission-after-the-await.md) | Intent admission belongs *after* every await, not once before them | Accepted — implemented, confirmed on a device |

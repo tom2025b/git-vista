@@ -2146,25 +2146,18 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         GitOperation::DeleteLocalTag { name } => {
             exec_delete_local_tag(repo, need, &name, &observed).await
         }
-        // The two remote-reaching tag operations stay contract-only: they are
-        // the first tag code that would open a socket with credentials on it,
-        // which earns a review of its own (the same staging fetch/pull got
-        // above). These arms exist because this match must stay exhaustive
-        // over the closed vocabulary (#142); reached, they refuse rather than
-        // no-op silently or improvise a git command.
-        GitOperation::DeleteRemoteTag { .. } => (
-            StatusCode::NOT_IMPLEMENTED,
-            "Deleting a remote tag is not yet wired for execution (M2.21, \
-             tracked under #74) — this plan's contract exists, but nothing \
-             executed it."
-                .to_string(),
-        ),
-        GitOperation::PushTag { .. } => (
-            StatusCode::NOT_IMPLEMENTED,
-            "Pushing a tag is not yet wired for execution (M2.21, tracked \
-             under #74) — this plan's contract exists, but nothing executed it."
-                .to_string(),
-        ),
+        // M2.21f (#240): the two remote-reaching tag operations wired to
+        // real execution — the same Network-tier chokepoint `push::exec_push`
+        // already runs through (askpass hardening, streamed progress,
+        // cancellation, redaction all come free from `git_streamed_for`).
+        // `handlers::tags::delete_remote_tag`/`push_tag` build these from
+        // `POST /api/delete-remote-tag` and `POST /api/push-tag`.
+        GitOperation::DeleteRemoteTag { name, remote } => {
+            remote_tags::exec_delete_remote_tag(repo, need, &name, &remote).await
+        }
+        GitOperation::PushTag { name, remote } => {
+            remote_tags::exec_push_tag(repo, need, &name, &remote).await
+        }
     }
 }
 
@@ -4767,6 +4760,16 @@ mod pull;
 /// decides whether it may is worth reading in one piece.
 mod push;
 
+/// M2.21f (#240, closes a slice of #74): the two remote-reaching tag
+/// executors — `git push <remote> refs/tags/<name>` and
+/// `git push <remote> --delete refs/tags/<name>`. Own file for the reason
+/// `push` has one: each runs through the same Network-tier chokepoint
+/// (`git_cmd::git_streamed_for`) but, unlike a branch push, diffs no local
+/// ref before/after (D5 — see `GitOperation::DeleteRemoteTag`'s doc in
+/// plan.rs), which is different enough from `push`'s remote-tracking-ref
+/// bookkeeping to earn its own file rather than a third shape crammed in.
+mod remote_tags;
+
 /// `POST /api/fetch`'s error-body constructor, re-exported so the handler's
 /// own request-shape refusals carry the same contract the executor's do.
 pub(crate) use fetch::error_body as fetch_error_body;
@@ -6860,6 +6863,87 @@ mod tests {
         // either way.
         assert_eq!(plain.recovery, RecoveryStrategy::Irrecoverable);
         assert_eq!(leased.recovery, RecoveryStrategy::Irrecoverable);
+    }
+
+    /// M2.21a (#235) classified the two remote-reaching tag operations ahead
+    /// of their execution; M2.21f (#240) wires the execution but must not
+    /// re-litigate the classification — this pins it as literal values on a
+    /// plan `build_plan` actually produced, the tag-shaped twin of
+    /// `only_a_lease_force_push_pins_the_remote_tracking_ref` above.
+    ///
+    /// # The two risk values deliberately differ from each other
+    ///
+    /// #240's own issue text asks for `RiskLevel::Remote` on **both**; the
+    /// shipped `shape()` arms disagree, and the `RiskLevel` enum's own
+    /// ranking rule (plan.rs) says the shipped arms are right: a remote ref
+    /// disappearing (`DeleteRemoteTag`) outranks a remote ref merely gaining
+    /// a tag (`PushTag`), so only the delete is `Destructive`. Asserting both
+    /// values in one test — rather than one value per test — is what a
+    /// mutation collapsing the two onto a single `RiskLevel` cannot survive:
+    /// asserting `Remote` alone would still pass against a classifier that
+    /// answered `Remote` for everything.
+    #[tokio::test]
+    async fn remote_tag_operations_are_classified_remote_and_destructive_never_the_same() {
+        let (_dir, repo) = seeded_repo_with_remote().await;
+        run(&repo, &["tag", "-a", "-m", "v1", "v1.0.0"]);
+
+        let (deleted, _) = build_plan(
+            &repo,
+            GitOperation::DeleteRemoteTag {
+                name: TagName::new("v1.0.0").unwrap(),
+                remote: RemoteName::new("origin").unwrap(),
+            },
+            tokens(),
+        )
+        .await;
+        assert_eq!(
+            deleted.risk,
+            RiskLevel::Destructive,
+            "a remote ref disappearing outranks a remote ref merely gaining \
+             a tag — see plan.rs's RiskLevel ranking rule"
+        );
+        assert_eq!(deleted.recovery, RecoveryStrategy::Irrecoverable);
+        assert!(
+            deleted.expected_ref_changes.is_empty(),
+            "a remote tag has no local remote-tracking ref to show moving \
+             (D5) — {:?}",
+            deleted.expected_ref_changes
+        );
+
+        let (pushed, _) = build_plan(
+            &repo,
+            GitOperation::PushTag {
+                name: TagName::new("v1.0.0").unwrap(),
+                remote: RemoteName::new("origin").unwrap(),
+            },
+            tokens(),
+        )
+        .await;
+        assert_eq!(
+            pushed.risk,
+            RiskLevel::Remote,
+            "publishing a tag is additive, like a fast-forward branch push"
+        );
+        assert_eq!(pushed.recovery, RecoveryStrategy::Irrecoverable);
+        assert!(
+            pushed.expected_ref_changes.is_empty(),
+            "{:?}",
+            pushed.expected_ref_changes
+        );
+        assert_eq!(
+            pushed.preconditions,
+            vec![
+                Precondition::RemoteConfigured {
+                    remote: RemoteName::new("origin").unwrap(),
+                },
+                Precondition::RefExists {
+                    ref_name: RefName::new("refs/tags/v1.0.0").unwrap(),
+                },
+            ],
+            "PushTag's preconditions are richer than #240's issue text states \
+             — both RemoteConfigured and RefExists must hold, and neither is \
+             optional"
+        );
     }
 
     // -----------------------------------------------------------------------
