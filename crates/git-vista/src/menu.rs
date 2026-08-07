@@ -1027,9 +1027,30 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                                         dialogs.open(Dialog::Error);
                                         shell.open_error(ErrorNotice {
                                             title: "Nothing to force-push",
+                                            // Says "no local record of", not
+                                            // "isn't on origin". The planner
+                                            // decides this from the local
+                                            // remote-tracking ref and never
+                                            // reads origin live — that is
+                                            // force-with-lease working as
+                                            // designed (planner.rs, the lease
+                                            // is *by definition* what we last
+                                            // saw). But it means a pruned or
+                                            // stale tracking ref lands here
+                                            // too, and telling the user the
+                                            // branch "isn't on origin" would
+                                            // then be a flat lie. Hence the
+                                            // hedge, and the Fetch escape
+                                            // hatch: this notice is one of the
+                                            // few places the app can be wrong
+                                            // about the remote and still be
+                                            // behaving correctly.
                                             body: format!(
-                                                "‘{branch}’ isn't on origin yet — a plain Push \
-                                                 already does everything a force-with-lease would."
+                                                "There's no local record of ‘{branch}’ on origin, \
+                                                 so there's no remote commit to lease against — a \
+                                                 plain Push already does everything a \
+                                                 force-with-lease would. If you expect it to be \
+                                                 there, Fetch first and try again."
                                             ),
                                         });
                                         return;
