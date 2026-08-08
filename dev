@@ -7,7 +7,8 @@
 # checkpoint on GitHub that any later session, on either account, can resume from
 # (`dev resume`). Uncommitted work is the only work that gets lost.
 #
-#   dev gate              run the full CI gate (fmt, clippy x2, test, trunk build)
+#   dev gate              run the full CI gate (fmt, clippy x2, test, trunk build, browser)
+#   dev browser [filter]  render-path browser tests (what cargo test cannot reach)
 #   dev verify            the sandbox checks gate does NOT run: escape report, census
 #                          both directions, mutants apply, no leaked daemon
 #   dev roadmap           print milestones + open issues, grouped by M-band
@@ -51,7 +52,7 @@ trunk_build() {
 }
 
 cmd_gate() {
-  echo "dev: running the CI gate (fmt → clippy → wasm-clippy → test → trunk build)…"
+  echo "dev: running the CI gate (fmt → clippy → wasm-clippy → test → trunk build → browser)…"
   echo "── fmt ─────────────────────────────────────────────"
   cargo fmt --all -- --check
   echo "── clippy (native) ─────────────────────────────────"
@@ -62,7 +63,38 @@ cmd_gate() {
   cargo test --workspace
   echo "── trunk build ─────────────────────────────────────"
   trunk_build
+  cmd_browser
   echo "dev: ✅ gate green"
+}
+
+# dev browser — the render-path tests `cargo test` structurally cannot reach.
+#
+# `cargo test` never compiles code behind `#[cfg(target_arch = "wasm32")]`, and
+# every UI defect found in August 2026 lived exactly there — each beside a fully
+# green gate. The Rust suite proves the pure core is correct; this proves it is
+# reached. See ci/browser/README.md.
+#
+# Part of `dev gate`, deliberately. A suite built to catch code that nothing
+# calls is worthless if nothing calls the suite — that is the same orphaning
+# failure one level up, and it was caught in adversarial review of this very
+# harness.
+#
+# Fail-closed, matching `dev verify`'s posture: a missing prerequisite is a
+# FAILURE with instructions, never a silent skip. A skipped browser check reads
+# identically to a passing one in a gate log, which is how the defects it exists
+# to catch survived in the first place.
+cmd_browser() {
+  echo "── browser (render path) ───────────────────────────"
+  if ! command -v node >/dev/null 2>&1; then
+    die "browser tests need node (not found). Install it, or run the rest with 'dev gate' on a host that has it."
+  fi
+  if [[ ! -d ~/.cache/ms-playwright ]]; then
+    die "browser tests need a Playwright browser: npx playwright install chromium"
+  fi
+  # `dev gate` has already run trunk_build, so dist exists; the server binary is
+  # NOT a by-product of `cargo test`, so build it explicitly.
+  cargo build -p git-vista-server
+  ./ci/browser/run.sh "$@"
 }
 
 # dev verify — the sandbox-specific checks `dev gate` does NOT run.
@@ -514,6 +546,7 @@ cmd_handoff() {
 
 case "${1:-}" in
   gate)    shift; cmd_gate "$@" ;;
+  browser) shift; cmd_browser "$@" ;;
   verify)  shift; cmd_verify "$@" ;;
   roadmap) shift; cmd_roadmap "$@" ;;
   roadmap-page) shift; cmd_roadmap_page "$@" ;;

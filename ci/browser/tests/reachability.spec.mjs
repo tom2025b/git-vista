@@ -8,6 +8,12 @@ import { expect, test } from '@playwright/test'
 
 import { DIFF_SCROLLER, openApp, openDiff, runtime } from './helpers.mjs'
 
+/** Fixture commit indices, newest first. Index 0 is HEAD, the SHORT
+ *  positive-control patch; index 1 is the long multi-hunk one. Named
+ *  constants because a bare `0` here silently became the wrong commit
+ *  when the fixture gained a commit, making a test unfalsifiable. */
+const LONG_PATCH = 1
+
 test.describe('status surfaces', () => {
   // #68d: `StatusSections` shipped with 20+ tests and zero consumers, so #68's
   // "touch cards and accessible list semantics" was false for weeks while the
@@ -82,30 +88,63 @@ test.describe('diff rendering', () => {
   // that; counting mounted elements can.
   test('a long patch renders a bounded window, not every line', async ({ page }) => {
     await openApp(page)
-    await openDiff(page, 0)
+    // Index 1, NOT 0. Index 0 is HEAD, the SHORT positive-control patch, on
+    // which a bound of "fewer than 600 mounted rows" passes whether or not
+    // virtualization exists at all. An earlier version of this test opened 0
+    // and was therefore vacuous -- it could not have failed. Caught in
+    // adversarial review, and worth the comment: the constant was correct when
+    // written and became wrong when the fixture gained a commit.
+    await openDiff(page, LONG_PATCH)
 
-    const counts = await page.evaluate(async (sel) => {
+    const observed = await page.evaluate(async (sel) => {
       const scroller = document.querySelector(sel)
       const at = async (top) => {
         scroller.scrollTop = top
-        await new Promise((r) => setTimeout(r, 300))
-        return document.querySelectorAll(`${sel} .diff-line, ${sel} span`).length
+        await new Promise((r) => setTimeout(r, 350))
+        const rows = document.querySelectorAll(`${sel} span`).length
+        return { top: scroller.scrollTop, rows, text: scroller.textContent }
       }
       const total = scroller.scrollHeight
       return {
         total,
-        samples: [await at(0), await at(total / 2), await at(total)],
+        top: await at(0),
+        middle: await at(Math.floor(total / 2)),
+        bottom: await at(total),
       }
     }, DIFF_SCROLLER)
 
-    // The window is a function of viewport height, not patch length, so the
-    // bound holds at every scroll position rather than only at the top.
-    for (const n of counts.samples) {
-      expect(n, 'rendered element count must stay bounded').toBeLessThan(600)
+    // 1. PRECONDITION: this really is a long patch. Without this the bound
+    //    below is unfalsifiable -- the whole failure the old version had.
+    //    2000 bulk lines at ~18.1px is ~36000px; require well over a screenful.
+    expect(
+      observed.total,
+      'precondition: the patch under test must be long enough for windowing to matter',
+    ).toBeGreaterThan(10_000)
+
+    // 2. The window stays bounded at every scroll position, not just the top.
+    for (const s of [observed.top, observed.middle, observed.bottom]) {
+      expect(s.rows, `mounted rows at scrollTop ${s.top} must stay bounded`).toBeLessThan(600)
+      // A selector matching nothing would satisfy the bound while proving
+      // nothing, so require real content too.
+      expect(s.rows, `something must be mounted at scrollTop ${s.top}`).toBeGreaterThan(10)
     }
-    // Guard against the opposite failure: a selector that matches nothing would
-    // satisfy the bound above while proving nothing at all.
-    expect(Math.max(...counts.samples)).toBeGreaterThan(0)
+
+    // 3. CONTENT IS PRESERVED, not merely bounded. A renderer that dropped the
+    //    body of the patch would pass 1 and 2 handsomely. The fixture writes
+    //    `bulk line N` for N in 0..2000, so each region has a known sentinel.
+    expect(observed.top.text, 'the start of the patch should be rendered at the top').toContain(
+      'bulk line 0',
+    )
+    expect(
+      observed.bottom.text,
+      'the end of the patch should be rendered at the bottom',
+    ).toContain('bulk line 1999')
+    // The middle must show middle content AND must NOT still be showing the
+    // start -- that difference is what distinguishes a real window from a
+    // static render of the first screenful.
+    expect(observed.middle.text, 'the middle of the patch should be rendered').not.toContain(
+      'bulk line 0',
+    )
   })
 
   // #350: `scroll_to_reveal` was built and mutation-proven, then never called

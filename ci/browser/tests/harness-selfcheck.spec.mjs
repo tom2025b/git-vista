@@ -17,14 +17,32 @@ import { expect, test } from '@playwright/test'
 
 import { DIFF_SCROLLER, openApp, openDiff } from './helpers.mjs'
 
-/** Run `fn` and report whether it threw. Used to assert that an assertion fails. */
-async function fails(fn) {
+/**
+ * Run `fn` and return the message it threw, or `null` if it did not throw.
+ *
+ * Returning the MESSAGE rather than a boolean is the whole point. A bare
+ * "did it throw" check accepts any exception at all -- a navigation timeout, a
+ * typo in a selector, a missing fixture -- as proof that the named assertion
+ * detected the named defect. It does not. Each caller below therefore matches
+ * the failure it expected, so a self-check can only pass for the right reason.
+ * Raised in adversarial review of this file.
+ */
+async function failureMessage(fn) {
   try {
     await fn()
-    return false
-  } catch {
-    return true
+    return null
+  } catch (e) {
+    return String(e?.message ?? e)
   }
+}
+
+/** Assert `fn` failed, AND failed with the expected signature. */
+function expectFailedBecause(message, pattern, what) {
+  expect(message, `${what} must FAIL after the mutation, but it passed`).not.toBeNull()
+  expect(
+    message,
+    `${what} failed, but for the wrong reason — expected ${pattern}, got:\n${message}`,
+  ).toMatch(pattern)
 }
 
 test.describe('harness self-check — every assertion must be able to go red', () => {
@@ -40,13 +58,13 @@ test.describe('harness self-check — every assertion must be able to go red', (
       }
     })
 
-    const wentRed = await fails(async () => {
+    const msg = await failureMessage(async () => {
       const labels = await page
         .getByRole('listitem')
         .evaluateAll((els) => els.map((e) => e.getAttribute('aria-label')))
-      for (const l of labels) expect(l).toBeTruthy()
+      for (const l of labels) expect(l, 'every status row needs an aria-label').toBeTruthy()
     })
-    expect(wentRed, 'stripping aria-label must fail the status-row assertion').toBe(true)
+    expectFailedBecause(msg, /every status row needs an aria-label/, 'the status-row assertion')
   })
 
   test('the bounded-window assertion fails when the window is unbounded', async ({ page }) => {
@@ -67,14 +85,14 @@ test.describe('harness self-check — every assertion must be able to go red', (
       host.appendChild(frag)
     }, DIFF_SCROLLER)
 
-    const wentRed = await fails(async () => {
+    const msg = await failureMessage(async () => {
       const n = await page.evaluate(
-        (sel) => document.querySelectorAll(`${sel} .diff-line, ${sel} span`).length,
+        (sel) => document.querySelectorAll(`${sel} span`).length,
         DIFF_SCROLLER,
       )
-      expect(n).toBeLessThan(600)
+      expect(n, 'mounted rows must stay bounded').toBeLessThan(600)
     })
-    expect(wentRed, 'an unbounded render must fail the windowing assertion').toBe(true)
+    expectFailedBecause(msg, /mounted rows must stay bounded/, 'the windowing assertion')
   })
 
   test('the keyboard assertion fails when focus is taken away', async ({ page }) => {
@@ -93,13 +111,13 @@ test.describe('harness self-check — every assertion must be able to go red', (
     // unmounts.
     await page.evaluate(() => document.activeElement.blur())
 
-    const wentRed = await fails(async () => {
+    const msg = await failureMessage(async () => {
       const isHunk = await page.evaluate(
         () => document.activeElement.classList?.contains('diff-hunk') ?? false,
       )
-      expect(isHunk).toBe(true)
+      expect(isHunk, 'focus must be on a hunk header').toBe(true)
     })
-    expect(wentRed, 'losing focus must fail the hunk-focus assertion').toBe(true)
+    expectFailedBecause(msg, /focus must be on a hunk header/, 'the hunk-focus assertion')
   })
 
   test('the chip assertion fails when the chip carries no name', async ({ page }) => {
@@ -114,7 +132,7 @@ test.describe('harness self-check — every assertion must be able to go red', (
       }
     })
 
-    const wentRed = await fails(async () => {
+    const msg = await failureMessage(async () => {
       const name = await chip.evaluate((el) => {
         for (let e = el; e && e !== document.body; e = e.parentElement) {
           const n = e.getAttribute('aria-label') || e.getAttribute('title')
@@ -122,8 +140,8 @@ test.describe('harness self-check — every assertion must be able to go red', (
         }
         return null
       })
-      expect(name).toBeTruthy()
+      expect(name, 'the chip must be announceable').toBeTruthy()
     })
-    expect(wentRed, 'a nameless chip must fail the announceability assertion').toBe(true)
+    expectFailedBecause(msg, /the chip must be announceable/, 'the announceability assertion')
   })
 })
