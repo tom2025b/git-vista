@@ -40,6 +40,17 @@ const DIALOG_SIGNALS: &str = include_str!("../dialogs/signals.rs");
 /// compiles a line of it either — same reason `DIALOG_SIGNALS` above is
 /// read as source text rather than exercised directly.
 const OPERATIONS_VIEW: &str = include_str!("../operations/view.rs");
+/// The detail panel — home of the roving-tabindex diff hunk headers (#210,
+/// windowed by #350). `#[cfg(target_arch = "wasm32")]` upstream, same as
+/// `DIALOG_SIGNALS`/`OPERATIONS_VIEW` above, so this file's DOM wiring is
+/// otherwise invisible to `cargo test --workspace` — precisely how the
+/// arrow-key-scrolls-instead-of-navigates defect (fixed alongside this
+/// const) shipped and stayed shipped.
+const DETAIL_RS: &str = include_str!("../../detail.rs");
+/// The full-screen diff/file viewer — shares `DETAIL_RS`'s hunk-header
+/// wiring under the `"viewer"` scope and needs the same scroll-container
+/// opt-out.
+const VIEWER_RS: &str = include_str!("../../viewer.rs");
 
 fn stylesheet() -> Vec<Rule> {
     parse(STYLES)
@@ -434,6 +445,60 @@ fn the_commit_row_hit_circle_is_keyboard_reachable() {
          — without it, focusing the circle does nothing: arrow keys, Home/End, and \
          Enter/Space all fall through to the browser default (#65)"
     );
+}
+
+/// The roving-tabindex diff hunk headers (`detail.rs`'s `hunk_header_span`, #210)
+/// sit inside `overflow: auto` scroll containers. Per the CSS Overflow / HTML
+/// focus resolution that Chromium shipped starting M89 (and other engines
+/// followed), any actually-overflowing `overflow:auto` element is keyboard-
+/// focusable **on its own**, with no `tabindex` needed — which inserts it into
+/// sequential (Tab) focus order ahead of anything nested inside it. Left
+/// un-opted-out, `Tab` lands on the scroll container itself rather than on a
+/// header span, and the browser's native keydown handling for a focused
+/// scrollable element is exactly "arrow keys scroll it" — matching the
+/// regression this test exists to pin: arrows scrolling the diff pane instead
+/// of moving hunk focus, because `hunk_header_span`'s `on_keydown` never ran
+/// (DOM focus was never on a header).
+///
+/// `tabindex="-1"` on the container opts it out of that auto-focusability
+/// without touching the roving stop itself — `.focus()` calls in
+/// `detail.rs`/`viewer.rs` always target a header span via
+/// `[data-hunk-scope][data-hunk-index]`, never the container, so this does
+/// not change what gets focused, only what Tab can land on beside it.
+///
+/// Checked as source text, same honesty caveat as every other test in this
+/// file: this proves the attribute is present in the file the wasm build
+/// compiles, not that a real browser's focus order behaves as described —
+/// that needs a device (see the task's own `what_is_unproven`).
+#[test]
+fn diff_scroll_containers_opt_out_of_native_tab_focus() {
+    for (label, src, needle) in [
+        (
+            "detail.rs's .detail-diff-scroll",
+            DETAIL_RS,
+            "class=\"detail-diff-scroll\"",
+        ),
+        (
+            "detail.rs's .detail-body",
+            DETAIL_RS,
+            "<div class=\"detail-body\"",
+        ),
+        (
+            "viewer.rs's .viewer-body",
+            VIEWER_RS,
+            "<div class=\"viewer-body\"",
+        ),
+    ] {
+        let tag = opening_tag(src, needle)
+            .unwrap_or_else(|| panic!("{label}: opening tag not found — has the markup moved?"));
+        assert!(
+            tag.contains("tabindex=\"-1\""),
+            "{label} carries no `tabindex=\"-1\"` — without it this `overflow:auto` \
+             container is natively Tab-focusable, and Tab will land on it instead of \
+             on the roving-tabindex hunk header span nested inside, reintroducing the \
+             arrow-keys-scroll-not-navigate regression. Found: {tag}"
+        );
+    }
 }
 
 /// `core::NODE_HIT_PADDING` mirrors a literal in two wasm-only modules that a host test
