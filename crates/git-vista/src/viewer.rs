@@ -16,9 +16,10 @@
 use leptos::*;
 
 use git_vista_core::diff::{CommitDiff, FileContent};
+use git_vista_protocol::diff::{DiffSpec, SpecDiff};
 use git_vista_protocol::{PatchPlan, PatchPreview, StageDirection, StagingDiff};
 
-use crate::api::{fetch_diff_full, fetch_file, staging_diff_request};
+use crate::api::{fetch_diff_full, fetch_file, fetch_spec_diff, staging_diff_request};
 use crate::detail::{accessible_patch_view, file_change_marker};
 use crate::features::a11y::focus::GraphFocus;
 use crate::features::diff::selection::DiffSelection;
@@ -102,6 +103,9 @@ pub fn viewer_view(
                     staging_previewed_plan.set(None);
                     Some(DocResult::Staging(staging_diff_request(direction).await))
                 }
+                Some(ViewerDoc::Spec { spec }) => {
+                    Some(DocResult::Spec(fetch_spec_diff(&spec).await))
+                }
             }
         },
     );
@@ -121,13 +125,15 @@ pub fn viewer_view(
                     StageDirection::Stage => "Stage selected changes".to_string(),
                     StageDirection::Unstage => "Unstage selected changes".to_string(),
                 },
+                ViewerDoc::Spec { spec } => spec_title(spec),
             };
             let which_for_body = which.clone();
             let body = move || match doc.get().flatten() {
                 None => view! { <p class="detail-status">"Loading…"</p> }.into_view(),
                 Some(DocResult::Diff(Err(e)))
                 | Some(DocResult::File(Err(e)))
-                | Some(DocResult::Staging(Err(e))) => view! {
+                | Some(DocResult::Staging(Err(e)))
+                | Some(DocResult::Spec(Err(e))) => view! {
                     <p class="detail-status detail-error">{format!("Couldn't load: {e}")}</p>
                 }
                 .into_view(),
@@ -145,6 +151,16 @@ pub fn viewer_view(
                         return view! { <p class="detail-status">"Loading…"</p> }.into_view();
                     }
                     file_body(&f)
+                }
+                Some(DocResult::Spec(Ok(d))) => {
+                    // The staleness echo ADR 0053 relies on: a response whose
+                    // spec is not the one currently open is a late answer to a
+                    // superseded request, and is dropped rather than painted.
+                    // Same rule as the `Diff`/`File` arms above.
+                    if !matches!(&which_for_body, ViewerDoc::Spec { spec } if *spec == d.spec) {
+                        return view! { <p class="detail-status">"Loading…"</p> }.into_view();
+                    }
+                    spec_body(&d, hunk_focus)
                 }
                 Some(DocResult::Staging(Ok(d))) => {
                     let ViewerDoc::Staging { direction } = which_for_body else {
@@ -213,6 +229,63 @@ enum DocResult {
     Diff(Result<CommitDiff, String>),
     File(Result<FileContent, String>),
     Staging(Result<StagingDiff, String>),
+    Spec(Result<SpecDiff, String>),
+}
+
+/// The viewer title for an explicit source/target diff (M2.16, #69).
+///
+/// Reads as the comparison rather than as the mode name: a user picking
+/// "compare with main" wants to see those two names, not the words
+/// "RefVsRef". Commit ids are shortened the same way the `Diff` title does.
+fn spec_title(spec: &DiffSpec) -> String {
+    fn short(id: &str) -> &str {
+        &id[..id.len().min(7)]
+    }
+    match spec {
+        DiffSpec::WorktreeVsIndex => "Working tree vs index".to_string(),
+        DiffSpec::IndexVsCommit { commit } => {
+            format!("Index vs {}", short(commit.as_str()))
+        }
+        DiffSpec::CommitVsCommit { base, target } => {
+            format!("{} → {}", short(base.as_str()), short(target.as_str()))
+        }
+        DiffSpec::RefVsRef { base, target } => {
+            format!("{} → {}", base.as_str(), target.as_str())
+        }
+    }
+}
+
+/// An explicit source/target diff document (M2.16, #69).
+///
+/// Simpler than [`diff_body`] because [`SpecDiff`] carries no per-file stat
+/// list — see its own doc for why that is a deliberate scope decision rather
+/// than an omission (naming core's `DiffFile` from the protocol crate would
+/// break the wasm build this crate exists to stay compatible with).
+///
+/// The patch renders through the same `accessible_patch_view` the other diff
+/// surfaces use, so hunk navigation, the screen-reader prefixes and the roving
+/// tab stop all behave identically here. Not windowed, for the same reason the
+/// rest of this viewer is not — see the comment at the bottom of `diff_body`
+/// and #362.
+fn spec_body(d: &SpecDiff, hunk_focus: RwSignal<GraphFocus>) -> View {
+    let truncated_note = d.truncated.then(|| {
+        view! {
+            <p class="detail-status">
+                "Diff truncated at the server\u{2019}s size cap \u{2014} showing the first part only."
+            </p>
+        }
+    });
+    let empty_note = d.patch.trim().is_empty().then(|| {
+        view! { <p class="detail-status">"No differences."</p> }
+    });
+    view! {
+        {empty_note}
+        {truncated_note}
+        <pre class="detail-diff viewer-pre">
+            {accessible_patch_view(&d.patch, hunk_focus, "viewer")}
+        </pre>
+    }
+    .into_view()
 }
 
 /// The full-diff document: the per-file stat list, then the whole unified

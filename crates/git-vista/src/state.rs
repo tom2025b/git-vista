@@ -22,6 +22,7 @@
 use leptos::{Resource, RwSignal};
 
 use git_vista_core::model::CommitDetail;
+use git_vista_protocol::diff::DiffSpec;
 use git_vista_protocol::StageDirection;
 
 /// State for the per-commit context menu (Issue #18): which commit was tapped,
@@ -129,6 +130,19 @@ pub enum ViewerDoc {
     /// Reuses this overlay rather than a new one — same close/Escape/print
     /// suppression wiring the other two variants already have.
     Staging { direction: StageDirection },
+    /// An explicit source/target diff (M2.16, #69) — `POST /api/diff/spec`.
+    ///
+    /// The capability the other variants cannot express: comparing two
+    /// arbitrary points. `Diff` shows one commit against its parent; `Staging`
+    /// shows the two live worktree/index diffs. Neither can answer "what
+    /// changed between these two branches", which is [`DiffSpec::RefVsRef`].
+    ///
+    /// Note this deliberately does **not** become the route for
+    /// `WorktreeVsIndex`/`IndexVsCommit`, even though `DiffSpec` can express
+    /// them: `Staging` already shows exactly those two diffs, with selection
+    /// and apply on top. Two ways to reach one view is how a surface starts
+    /// disagreeing with itself.
+    Spec { spec: DiffSpec },
 }
 
 /// The persisted display settings, shared into every icon-drawing view so a

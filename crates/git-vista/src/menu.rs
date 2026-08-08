@@ -1178,7 +1178,57 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                     // link, not a scripted `window.open`, which iOS WebKit blocks
                     // (same reason as "Open on GitHub"). Shown only on a GitHub repo;
                     // omitted otherwise, since there's no compare page to point at.
-                    let mut items = vec![checkout_item, merge_item, push_item, force_push_item];
+                    // "Compare with HEAD" (M2.16, #69): the explicit-source/target
+                    // diff, `DiffSpec::RefVsRef`. This is the capability nothing
+                    // else in the app has — `Diff` shows one commit against its
+                    // parent and `Staging` shows the two live worktree/index
+                    // diffs, so "what changed between these two branches" had no
+                    // surface until now.
+                    //
+                    // A read, so unlike its neighbours here it raises no confirm
+                    // dialog and mints no operation: it opens the viewer directly.
+                    // `base` is the branch tapped and `target` is HEAD, so the
+                    // title reads "<branch> → <head>" — the direction a user
+                    // asking "what does HEAD have that this branch does not"
+                    // expects.
+                    let compare_item = {
+                        let branch = b.clone();
+                        let on = move |_| {
+                            let branch = branch.clone();
+                            shell.close_menu();
+                            spawn_local(async move {
+                                let Ok(Some(head)) = fetch_head_branch().await else {
+                                    // Detached HEAD, or the read failed. Nothing
+                                    // sensible to compare against, and inventing
+                                    // a target would show a diff the user did not
+                                    // ask for — so this does nothing rather than
+                                    // guessing.
+                                    return;
+                                };
+                                let (Ok(base), Ok(target)) =
+                                    (RefName::new(&branch), RefName::new(&head))
+                                else {
+                                    return;
+                                };
+                                shell.open_viewer(ViewerDoc::Spec {
+                                    spec: DiffSpec::RefVsRef { base, target },
+                                });
+                            });
+                        };
+                        view! {
+                            <button class="ctx-item" on:click=on>
+                                <span class="nf ctx-icon">{ic.diff}</span>
+                                {format!("Compare {b} with HEAD")}
+                            </button>
+                        }
+                    };
+                    let mut items = vec![
+                        checkout_item,
+                        compare_item,
+                        merge_item,
+                        push_item,
+                        force_push_item,
+                    ];
                     // Non-GitHub forge branch link (ADR 0010): only when there is
                     // no GitHub base, so it never duplicates the GitHub items.
                     if m.repo_url.is_none() {
