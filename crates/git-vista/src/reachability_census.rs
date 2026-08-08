@@ -826,7 +826,12 @@ const EXEMPT: &[(&str, &str)] = &[
     ),
     ("git-vista/src/features/tags/core.rs", "tag_row"),
     ("git-vista/src/features/dialogs/commit.rs", "staged_breadth"),
-    ("git-vista-core/src/request_generation.rs", "issue"),
+    // `git-vista-core/src/request_generation.rs`'s `issue` used to sit here.
+    // The census asked whoever found it to "wire it up or remove"; ADR 0053
+    // answered *remove* — Leptos 0.6.15's own resource already drops
+    // out-of-order completions, and every diff/detail response echoes its id
+    // for the view to re-check before painting, so a third layer defended
+    // nothing. The module is gone, so the exemption has nothing to exempt.
     ("git-vista-core/src/identity.rs", "hex_len"),
     ("git-vista-core/src/identity.rs", "algorithm"),
     ("git-vista-core/src/identity.rs", "from_raw"),
