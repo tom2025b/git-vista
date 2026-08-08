@@ -43,6 +43,15 @@
 /*.png
 /Test/
 
+# The browser test suite (ci/browser) is tracked; everything it GENERATES is
+# not. `.runtime.json` and `.storage.json` carry a live server's port and a real
+# session cookie, so they are per-run secrets as well as noise.
+/ci/browser/node_modules/
+/ci/browser/test-results/
+/ci/browser/playwright-report/
+/ci/browser/.runtime.json
+/ci/browser/.storage.json
+
 # Rendered PDFs are TRACKED, and they all live in one place:
 # docs/superpowers/pdf/. Keeping them out of docs/adr/ stops a rendered twin
 # sitting beside its source and being mistaken for the record — the `.md` is
@@ -75,3 +84,4 @@
 # PDF twins never sit beside their .md — the .md is the record (standing rule).
 crates/**/README.pdf
 target-testbed-*/
+/ci/browser/*.pdf
