@@ -298,20 +298,44 @@ fn hunk_header_span(
 /// tick, the focus call is deferred one animation frame — the scroll-then-RAF
 /// dance the old doc comment was able to say it did not need.
 fn focus_hunk_revealed(scope: &'static str, idx: usize, reveal: Option<Callback<usize>>) {
-    // Already mounted (the common case: the next hunk is usually inside the
-    // overscan) — focus it directly, no frame delay, no scroll write to
-    // fight a user's in-progress scrolling.
-    if find_hunk(scope, idx).is_some() {
-        focus_hunk(scope, idx);
-        return;
-    }
     let Some(reveal) = reveal else {
         // No windowing in this scope (the full-screen viewer renders every
-        // line), so an unfound element means it genuinely does not exist.
+        // line), so nothing can unmount underneath us and a direct focus is
+        // both sufficient and side-effect-free.
         focus_hunk(scope, idx);
         return;
     };
+
+    // Reveal FIRST, unconditionally — including when the element is already
+    // mounted.
+    //
+    // The obvious optimisation here is to skip the reveal when `find_hunk`
+    // already returns the element, and that optimisation is what broke #210.
+    // "Mounted" is not "visible": the overscan mounts ~20 lines beyond the
+    // viewport in each direction, so the next hunk is routinely present in the
+    // DOM and *off-screen*. Calling `.focus()` on an off-screen element makes
+    // the browser scroll it into view on our behalf — that scroll fires
+    // `on_diff_scroll`, the window re-renders, and the freshly focused node is
+    // replaced by a new one at the same index. Focus lands on the old node,
+    // which no longer exists, so it falls back to `<body>` and every subsequent
+    // arrow key is the container's native scrolling.
+    //
+    // Observed directly in the browser: `focusin` on the target hunk, then
+    // `focusout` with `relatedTarget: null` one frame later, `scrollTop` 82 to
+    // 598, `document.activeElement` BODY.
+    //
+    // Doing the scroll ourselves makes it deterministic and lets the re-render
+    // happen before we assert focus, rather than because of it. `reveal` is a
+    // no-op when the hunk is already fully visible (`scroll_to_reveal` returns
+    // `None`), so this costs nothing in the case the old fast path optimised
+    // for.
     reveal.call(idx);
+    focus_hunk(scope, idx);
+    // Re-assert after the frame commits. The reveal's re-render can replace the
+    // node we just focused with a fresh element at the same index, and focus
+    // does not survive that; `focus_hunk` is a query-by-index, so it finds
+    // whichever node now holds the position. Focusing an already-focused
+    // element is a no-op, so the common path pays only one wasted query.
     request_animation_frame(move || focus_hunk(scope, idx));
 }
 
@@ -327,9 +351,17 @@ fn find_hunk(scope: &str, idx: usize) -> Option<web_sys::HtmlElement> {
         .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
 }
 
-/// Move DOM focus to hunk `idx` in `scope`. Every line of the flat rendering
-/// is mounted, so this is a direct query + focus — no scroll-then-RAF dance
-/// like the virtualized graph needs (`gestures::focus_row_next_frame`).
+/// Move DOM focus to hunk `idx` in `scope`, by position rather than by holding
+/// a node reference — deliberately, because the node at a given index is not
+/// stable across a windowed re-render.
+///
+/// This comment used to claim that "every line of the flat rendering is
+/// mounted, so this is a direct query + focus — no scroll-then-RAF dance like
+/// the virtualized graph needs". That stopped being true when #350 landed and
+/// the claim outlived the fact by long enough to send an investigation down the
+/// wrong path. Callers that can be re-rendered must go through
+/// [`focus_hunk_revealed`], which does exactly the dance this once said was
+/// unnecessary.
 fn focus_hunk(scope: &str, idx: usize) {
     if let Some(el) = document()
         .query_selector(&format!(
