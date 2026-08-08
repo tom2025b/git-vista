@@ -20,7 +20,9 @@ use git_vista_core::status::ChangeKind;
 use crate::api::fetch_diff;
 use crate::datetime::local_timestamp;
 use crate::features::a11y::focus::{FocusMove, GraphFocus};
-use crate::features::diff::core::{hunk_nav, line_heights, render_window, LineWrap};
+use crate::features::diff::core::{
+    hunk_nav, line_heights, render_window, scroll_to_reveal, LineWrap,
+};
 use git_vista_core::virtualize::CumulativeHeights;
 
 /// One rendered diff line's height in CSS pixels: `.detail-diff`'s
@@ -110,7 +112,7 @@ pub(crate) fn accessible_patch_view(
     focus: RwSignal<GraphFocus>,
     scope: &'static str,
 ) -> View {
-    accessible_patch_window(patch, focus, scope, None)
+    accessible_patch_window(patch, focus, scope, None, None)
 }
 
 /// [`accessible_patch_view`], rendering only `window`'s slice of the patch
@@ -131,6 +133,7 @@ pub(crate) fn accessible_patch_window(
     focus: RwSignal<GraphFocus>,
     scope: &'static str,
     window: Option<std::ops::Range<usize>>,
+    reveal: Option<Callback<usize>>,
 ) -> View {
     let nav = hunk_nav(patch);
     // `update_untracked`: this runs while a render closure is already
@@ -154,7 +157,9 @@ pub(crate) fn accessible_patch_window(
             let class = diff_line_class(l);
             let text = format!("{l}\n");
             match nav_at.remove(&i) {
-                Some((idx, label)) => hunk_header_span(class, text, idx, label, focus, scope),
+                Some((idx, label)) => {
+                    hunk_header_span(class, text, idx, label, focus, scope, reveal)
+                }
                 // An `@@` line that is not a navigation stop is a combined
                 // (`@@@`) merge header — header-coloured but inert, so it
                 // must not wear .diff-hunk's interactive styling (pointer
@@ -193,6 +198,7 @@ fn hunk_header_span(
     label: String,
     focus: RwSignal<GraphFocus>,
     scope: &'static str,
+    reveal: Option<Callback<usize>>,
 ) -> View {
     // Exactly one header carries `tabindex="0"` — the roving stop. Reactive,
     // so every keydown/tap that moves the model retargets the tab stop.
@@ -246,7 +252,7 @@ fn hunk_header_span(
         ev.prevent_default();
         ev.stop_propagation();
         if let Some(next) = focus.try_update(|f| f.mv(dir)).flatten() {
-            focus_hunk(scope, next);
+            focus_hunk_revealed(scope, next, reveal);
         }
     };
     // Tap parity: iOS Safari does not reliably focus a tabindexed span on
@@ -255,7 +261,7 @@ fn hunk_header_span(
     // fire).
     let on_click = move |_| {
         focus.update(|f| f.focus_landed(idx));
-        focus_hunk(scope, idx);
+        focus_hunk_revealed(scope, idx, reveal);
     };
     let on_focus = move |_| focus.update(|f| f.focus_landed(idx));
     view! {
@@ -274,6 +280,51 @@ fn hunk_header_span(
         </span>
     }
     .into_view()
+}
+
+/// Move DOM focus to hunk `idx` in `scope`, **first scrolling it into the
+/// rendered window if windowing has left it unmounted** (M2.16g, #350).
+///
+/// Before windowing, every patch line was in the DOM and a bare
+/// `query_selector` + `focus()` always found its target. That premise died
+/// with #350: a hunk outside the rendered slice does not exist as an element,
+/// so the query returns `None` and focus silently goes nowhere — the
+/// navigation regression #350 explicitly warns about, and one this function
+/// would have shipped if `reveal` were not threaded in.
+///
+/// `reveal` is the caller's "make line `line` renderable" hook (it sets the
+/// scroll position via `features::diff::core::scroll_to_reveal`). Because the
+/// re-render that mounts the newly-revealed line happens *after* the current
+/// tick, the focus call is deferred one animation frame — the scroll-then-RAF
+/// dance the old doc comment was able to say it did not need.
+fn focus_hunk_revealed(scope: &'static str, idx: usize, reveal: Option<Callback<usize>>) {
+    // Already mounted (the common case: the next hunk is usually inside the
+    // overscan) — focus it directly, no frame delay, no scroll write to
+    // fight a user's in-progress scrolling.
+    if find_hunk(scope, idx).is_some() {
+        focus_hunk(scope, idx);
+        return;
+    }
+    let Some(reveal) = reveal else {
+        // No windowing in this scope (the full-screen viewer renders every
+        // line), so an unfound element means it genuinely does not exist.
+        focus_hunk(scope, idx);
+        return;
+    };
+    reveal.call(idx);
+    request_animation_frame(move || focus_hunk(scope, idx));
+}
+
+/// The hunk element for `idx` in `scope`, or `None` when windowing has not
+/// mounted it.
+fn find_hunk(scope: &str, idx: usize) -> Option<web_sys::HtmlElement> {
+    document()
+        .query_selector(&format!(
+            "[data-hunk-scope=\"{scope}\"][data-hunk-index=\"{idx}\"]"
+        ))
+        .ok()
+        .flatten()
+        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
 }
 
 /// Move DOM focus to hunk `idx` in `scope`. Every line of the flat rendering
@@ -573,6 +624,35 @@ pub fn detail_panel_view(
                         // — the full-screen viewer wraps and is deliberately
                         // left un-windowed for now (see `viewer.rs`).
                         let patch_text = d.patch.clone();
+                        // #350: make hunk `idx` renderable before focus moves
+                        // to it. Without this the roving focus can address a
+                        // hunk that windowing has not mounted, and `.focus()`
+                        // lands on nothing — see `focus_hunk_revealed`.
+                        let reveal_patch = d.patch.clone();
+                        let reveal = Callback::new(move |idx: usize| {
+                            let nav = hunk_nav(&reveal_patch);
+                            let Some(entry) = nav.get(idx) else { return };
+                            let heights = CumulativeHeights::new(&line_heights(
+                                &reveal_patch,
+                                DIFF_LINE_PX,
+                                LineWrap::Never,
+                            ));
+                            let (scroll, viewport) = diff_scroll.get_untracked();
+                            let viewport = if viewport > 0.0 { viewport } else { 800.0 };
+                            if let Some(next) = scroll_to_reveal(
+                                &heights, entry.line_index, viewport, scroll,
+                            ) {
+                                // Move the real scroll container too, not just
+                                // the signal: the signal drives which lines
+                                // render, the element drives what the user
+                                // sees, and letting them disagree would render
+                                // the right window somewhere off-screen.
+                                if let Some(el) = diff_box.get_untracked() {
+                                    el.set_scroll_top(next as i32);
+                                }
+                                diff_scroll.set((next, viewport));
+                            }
+                        });
                         let patch = view! {
                             <div class="detail-diff-scroll" node_ref=diff_box on:scroll=on_diff_scroll>
                                 {move || {
@@ -593,7 +673,7 @@ pub fn detail_panel_view(
                                         <pre class="detail-diff">
                                             {accessible_patch_window(
                                                 &patch_text, hunk_focus, "detail",
-                                                Some(w.start..w.end),
+                                                Some(w.start..w.end), Some(reveal),
                                             )}
                                         </pre>
                                         <div style=format!("height:{}px", w.pad_bottom)></div>
