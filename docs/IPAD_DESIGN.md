@@ -216,11 +216,25 @@ Every release candidate should cover:
 > **Note on #75's cache criteria.** #75's original acceptance criteria "Private
 > diffs are not cached by default" and "Cache clear and export controls exist"
 > are satisfied *vacuously* here: the frontend has no client-side cache of
-> `/api` data to clear or export in the first place. Verified against
-> `crates/git-vista/src` (2026-07-31): the only client-side storage is two
-> `localStorage` UI-preference booleans in `prefs.rs` (icon style, per-node
-> icons); `grep -rn "IndexedDb\|caches\.\|Blob\|localStorage" crates/git-vista/src`
-> turns up nothing else. ADR 0032 forbids adding a cache of `/api` data, so this
+> `/api` data (diffs, commits, graph payloads) to clear or export in the first
+> place. Verified against `crates/git-vista/src` (2026-08-07, corrected count):
+> `grep -rn "localStorage\|sessionStorage" crates/git-vista/src` turns up
+> **three** `localStorage` entries plus `sessionStorage` use, not the two
+> booleans this note previously claimed:
+> - `prefs.rs` — two UI-preference booleans in `localStorage` (icon style,
+>   per-node icons).
+> - `prefs.rs` `INFLIGHT_REMOTE_OP_KEY` — a third `localStorage` entry (#232,
+>   M2.20f): a small JSON record (`remote`, `branch`, merge `strategy`) naming
+>   the one Fetch/Pull in flight, so a reload can resume tracking it. Not `/api`
+>   response data and not a diff, but it is more than a UI toggle, so it belongs
+>   in this inventory.
+> - `features/dialogs/{signals,commit}.rs` and `core.rs` — commit-message
+>   drafts in `sessionStorage` (#226), deliberately session-scoped rather than
+>   `localStorage` so the draft dies with the tab.
+>
+> None of these cache `/api` diff or commit data, so the "private diffs are not
+> cached" reading still holds. `grep -rn "IndexedDb\|caches\." crates/git-vista/src`
+> turns up nothing. ADR 0032 forbids adding a cache of `/api` data, so that part
 > is expected to stay true, not a gap to close.
 >
 > This is the narrower, ADR-consistent reading: ADR 0032 rules out a service

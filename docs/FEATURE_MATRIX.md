@@ -32,6 +32,19 @@
 >
 > **Explain mode row is NOT cut** — #92 is explicitly kept; its "Event
 >   vocabulary" (V1) / "Target" (V2) cells still describe live scope.
+>
+> **Fetch/pull/push/upstream row is SHIPPED, ahead of this table's cell
+>   values** — #73 (M2.20) landed and closed out (#234). Fetch, pull, push,
+>   and upstream management work over the SSH tunnel today: typed operations
+>   with progress streaming and cancellation, an explicit pull strategy (no
+>   silent merge/rebase default), force-with-lease-only force publishing (no
+>   bare `--force`/`-f` path), and idempotent reconnect/retry. Credentialed
+>   HTTPS remotes are explicitly **not** shipped — auth reuses the host's Git
+>   credential helper and SSH agent only; there is no in-app HTTPS credential
+>   prompt. The `Current` cell below is updated to `Yes` for the SSH path;
+>   the `V1 foundation`/`V2 professional` cells stay for HTTPS credential
+>   support and multi-remote polish, which remain future work.
+>
 > **GitHub pull requests row is NOT cut** — #89 is kept (re-scoped to absorb
 >   what it needs from #88).
 
@@ -60,7 +73,7 @@ that horizon, and `Later` intentionally deferred.
 | Stage/unstage/partial stage | Partial (all only) | Target | Refine | - |
 | Discard changes | No | Safe plan only | Refine | - |
 | Commit/amend/sign | Partial | Target | Signing polish | Enterprise policy |
-| Fetch/pull/push/upstream | Partial | Target | Multi-remote polish | Provider policy |
+| Fetch/pull/push/upstream | Yes (SSH) | Credentialed HTTPS | Multi-remote polish | Provider policy |
 | Tags | Read display | Create/delete | Signed/annotated workflows | - |
 | Stash | No | - | Target | - |
 | Worktrees | No | Foundation model | Target | Cross-host views |

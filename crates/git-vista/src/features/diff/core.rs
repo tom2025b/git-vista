@@ -1028,4 +1028,242 @@ diff --git a/bar.txt b/bar.txt
         assert_eq!(scroll_to_reveal(&heights, 10, 200.0, 0.0), None);
         assert_eq!(scroll_to_reveal(&heights, 999, 200.0, 0.0), None);
     }
+
+    // ---------------------------------------------------------------------
+    // Virtualization performance ladder (#211, M2.16f) — the real target.
+    //
+    // #211 asks to measure "the virtualized diff view (69c)." Until PR #351
+    // (M2.16g, #350, merged this session) that view did not exist: #69c's
+    // `CumulativeHeights`/`visible_range` had zero consumers, and the panel
+    // rendered every patch line as one flat `<pre>` — see the `hunk_nav`
+    // budget section above and its `docs/PERFORMANCE_BUDGETS.md` entry for
+    // the full history of that gap. `detail.rs` now builds `CumulativeHeights`
+    // and calls `render_window`/`scroll_to_reveal` in its real render
+    // closure — this ladder measures exactly those calls, with the exact
+    // constants `detail.rs` uses.
+    //
+    // **What this does NOT cover, stated plainly:** the actual DOM/`<pre>`
+    // construction in `detail.rs` is `#[cfg(target_arch = "wasm32")]`-gated
+    // (`main.rs`: `#[cfg(target_arch = "wasm32")] mod detail;`); `cargo
+    // test` never compiles it and this repo has no wasm test harness. This
+    // ladder measures the windowing *math* — the same `line_heights` /
+    // `CumulativeHeights::new` / `render_window` calls `detail.rs` makes on
+    // every scroll frame — not paint, layout, or the browser's own
+    // scroll-event dispatch cost.
+
+    /// One line of realistic-ish diff text: alternating context/add/remove
+    /// prefixes, length varying with `i`'s digit count rather than a fixed
+    /// filler string, so `LineWrap::Wrapped` has something real to wrap.
+    fn generate_diff_lines(num_lines: usize) -> String {
+        let mut s = String::with_capacity(num_lines * 48);
+        for i in 0..num_lines {
+            let prefix = match i % 3 {
+                0 => ' ',
+                1 => '+',
+                _ => '-',
+            };
+            s.push(prefix);
+            s.push_str(&format!(
+                "let value_{i} = compute(arg_one, arg_two, arg_three); // line {i}\n"
+            ));
+        }
+        s
+    }
+
+    /// The shipped configuration this ladder measures against — copied, not
+    /// imported, from `detail.rs`'s `DIFF_LINE_PX`/`DIFF_OVERSCAN`: that
+    /// module is wasm-gated (see the block comment above) and never
+    /// compiles under `cargo test`, so there is no compiler tie keeping
+    /// these in sync — if `detail.rs` changes either constant, this ladder
+    /// silently measures the old configuration until someone notices the
+    /// drift by re-reading both files side by side.
+    const LADDER_LINE_PX: f64 = 18.1;
+    const LADDER_OVERSCAN: usize = 20;
+    /// The same "not yet measured" fallback `detail.rs` uses before the
+    /// scroll container's first `scroll` event: `let viewport = if
+    /// viewport > 0.0 { viewport } else { 800.0 };`.
+    const LADDER_VIEWPORT: f64 = 800.0;
+    /// Column estimate for `LineWrap::Wrapped`, for measurement purposes
+    /// only — no real value is wired anywhere in the app yet. The
+    /// full-screen viewer that would use `Wrapped` is deliberately *not*
+    /// windowed today (`viewer.rs`'s own comment: "the column count it
+    /// needs is an estimate this file cannot measure without a layout
+    /// read"). 80 is a plausible desktop-width estimate, not a shipped
+    /// constant; this row exists so the number is on record for whoever
+    /// wires the viewer up next, not because `Wrapped` runs in production.
+    const LADDER_WRAP_COLUMNS: usize = 80;
+
+    /// One measurement: the once-per-patch `CumulativeHeights::new` build
+    /// cost, one `render_window` query cost, and the resulting window size,
+    /// for a `num_lines`-line synthetic patch under `wrap`.
+    ///
+    /// Two `Instant`s, not one: build and query are not the same cost paid
+    /// at the same frequency — build happens once when the patch changes,
+    /// query happens on every scroll event. Folding them into one number
+    /// would hide whether a regression is in the O(n) build or the O(log n)
+    /// query, which is exactly the distinction #211's "frame/render time"
+    /// budget needs to state separately.
+    ///
+    /// The query is measured at a **mid-document** scroll offset, not 0.0 —
+    /// scrolling to the very top would let a broken implementation that
+    /// always returns index 0 pass unnoticed; a real mid-scroll query
+    /// exercises the binary search `visible_range` actually does.
+    fn time_virtualize(
+        num_lines: usize,
+        wrap: LineWrap,
+    ) -> (std::time::Duration, std::time::Duration, usize) {
+        let patch = generate_diff_lines(num_lines);
+        let heights_vec = line_heights(&patch, LADDER_LINE_PX, wrap);
+        assert_eq!(
+            heights_vec.len(),
+            num_lines,
+            "line_heights returned {} heights for a {num_lines}-line patch \
+             — the measurement below is not trustworthy if this fails",
+            heights_vec.len()
+        );
+
+        let build_start = std::time::Instant::now();
+        let heights = CumulativeHeights::new(&heights_vec);
+        let build_elapsed = build_start.elapsed();
+
+        let mid_scroll = (heights.total_height() - LADDER_VIEWPORT).max(0.0) / 2.0;
+        let query_start = std::time::Instant::now();
+        let window = render_window(&heights, LADDER_VIEWPORT, mid_scroll, LADDER_OVERSCAN);
+        let query_elapsed = query_start.elapsed();
+
+        (build_elapsed, query_elapsed, window.len())
+    }
+
+    /// The real measurement behind #211's `docs/PERFORMANCE_BUDGETS.md`
+    /// section — **not** part of the normal test run, for the same reason
+    /// `hunk_nav_ladder` above isn't: a 50,000-line synthetic patch (~2.4 MB
+    /// generated twice, once per wrap mode) has no place in every `cargo
+    /// test`/CI run. `virtualize_query_budget_holds_at_50k_lines` below is
+    /// the fast, always-on regression check derived from what this finds.
+    ///
+    /// Run explicitly to reproduce or update the recorded numbers:
+    /// `cargo test -p git-vista -- --ignored --nocapture virtualize_ladder`
+    ///
+    /// One host, one run each — not a statistically controlled benchmark
+    /// suite, same caveat `docs/PERFORMANCE_BUDGETS.md` states up front.
+    #[test]
+    #[ignore = "generates up to a ~2.4MB synthetic patch per wrap mode; run explicitly, see doc comment"]
+    fn virtualize_ladder() {
+        println!("\n#211 virtualization ladder (one host, one run each):");
+        println!(
+            "{:>8}  {:>13}  {:>10}  {:>10}  {:>8}",
+            "lines", "wrap", "build", "query", "window"
+        );
+        for &n in &[1_000usize, 10_000, 50_000] {
+            for (label, wrap) in [
+                ("Never", LineWrap::Never),
+                (
+                    "Wrapped{80}",
+                    LineWrap::Wrapped {
+                        columns: LADDER_WRAP_COLUMNS,
+                    },
+                ),
+            ] {
+                let (build, query, window_len) = time_virtualize(n, wrap);
+                println!("{n:>8}  {label:>13}  {build:>10?}  {query:>10?}  {window_len:>8}");
+            }
+        }
+    }
+
+    /// The always-on regression check derived from the ladder above: at
+    /// 50,000 lines (past both `DIFF_PATCH_CAP_FULL` at ~18.1px/line and
+    /// anything a real commit's panel would show), the per-scroll-frame
+    /// query must stay fast, the once-per-patch build must not stall the
+    /// panel opening, and — the property virtualization exists to provide —
+    /// the rendered window must stay bounded rather than growing with the
+    /// patch. Not `#[ignore]`d: 50,000 lines of ~48 bytes each is ~2.4 MB,
+    /// generated and measured once, well inside a normal `cargo test` run.
+    #[test]
+    fn virtualize_query_budget_holds_at_50k_lines() {
+        let (build, query, window_len) = time_virtualize(50_000, LineWrap::Never);
+        assert!(
+            query < std::time::Duration::from_millis(5),
+            "render_window over a 50,000-line patch took {query:?}, budget \
+             is 5ms (see docs/PERFORMANCE_BUDGETS.md) — render_window is \
+             meant to be O(log n) via binary search over \
+             CumulativeHeights's prefix sums; this is a real regression, \
+             not flakiness, unless the runner is unusually loaded"
+        );
+        assert!(
+            build < std::time::Duration::from_millis(50),
+            "CumulativeHeights::new over a 50,000-line patch took {build:?}, \
+             budget is 50ms — this runs once per patch change (not once per \
+             scroll frame), but it still must not stall the panel opening"
+        );
+        // DIFF_OVERSCAN=20 on each side plus whatever fits an 800px
+        // viewport at 18.1px/line (ceil(800/18.1) = 45) is roughly 85 lines
+        // regardless of how many lines the patch has; a generous ceiling
+        // catches "windowing silently disabled" (which would fail this at
+        // 50,000, not ~85) without being a tight fit to today's exact
+        // number.
+        assert!(
+            window_len < 200,
+            "render_window rendered {window_len} lines for a 50,000-line \
+             patch at an 800px viewport — a bounded window should stay \
+             under 200 lines regardless of patch size; a window that grows \
+             with the patch means windowing is not actually engaged"
+        );
+    }
+
+    /// The property #211's scope item 3 actually names — "a 50,000-line
+    /// patch and a 1,000-line patch must render a comparable, small
+    /// window" — and one the budget above leaves a real gap in:
+    /// `window_len < 200` is a **one-sided** ceiling. It is satisfied just
+    /// as well by `window_len == 0` as by a correctly bounded window, and
+    /// it only ever samples 50,000 lines, so it can't tell "small and
+    /// constant" apart from "small this once." This test closes both: a
+    /// floor (a window this small is blank screen, not virtualization) and
+    /// a direct 1,000-vs-50,000 comparison at the same viewport/overscan
+    /// and an equivalent mid-document scroll.
+    ///
+    /// The two `time_virtualize` calls land at genuinely different absolute
+    /// scroll offsets (`mid_scroll` scales with each patch's own total
+    /// height), but that does not make the comparison approximate: with
+    /// `LineWrap::Never`'s uniform per-line height, `mid_scroll / LADDER_
+    /// LINE_PX`'s fractional part — which is what actually determines how
+    /// the top/bottom edge lines split — is identical for both `n` (each
+    /// mid_scroll is `n * H / 2 - LADDER_VIEWPORT / 2`, and `n / 2` is a
+    /// whole number for both 1,000 and 50,000, so it cancels out of the
+    /// fraction). `small_len == large_len` below is an exact equality, not
+    /// a tolerance check.
+    #[test]
+    fn render_window_size_has_a_floor_and_does_not_grow_with_the_patch() {
+        // ~44 lines fully or partially fit an 800px viewport at
+        // 18.1px/line; fewer than that is visible blank space, not a
+        // correctly bounded window — the same arithmetic
+        // `virtualize_query_budget_holds_at_50k_lines`'s comment states for
+        // its own ceiling, applied here as a floor instead.
+        let min_len = (LADDER_VIEWPORT / LADDER_LINE_PX).floor() as usize;
+
+        let (_, _, small_len) = time_virtualize(1_000, LineWrap::Never);
+        let (_, _, large_len) = time_virtualize(50_000, LineWrap::Never);
+
+        for (n, len) in [(1_000, small_len), (50_000, large_len)] {
+            assert!(
+                len >= min_len,
+                "render_window over a {n}-line patch rendered only {len} \
+                 lines at an 800px viewport (expected at least {min_len}) \
+                 — a window this small means blank screen, not bounded \
+                 rendering. `virtualize_query_budget_holds_at_50k_lines`'s \
+                 `window_len < 200` check cannot catch this: it is \
+                 satisfied by `window_len == 0` too."
+            );
+        }
+        assert_eq!(
+            small_len, large_len,
+            "a 1,000-line patch rendered {small_len} lines but a \
+             50,000-line patch rendered {large_len} lines, at the same \
+             viewport/overscan and an equivalent mid-document scroll — \
+             window size must not scale with total patch length, or \
+             virtualization is not decoupling render cost from patch \
+             size. This is the direct 1,000-vs-50,000 comparison #211 \
+             names ('a comparable, small window'); the budget above only \
+             ever samples 50,000 alone."
+        );
+    }
 }
