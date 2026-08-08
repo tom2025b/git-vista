@@ -100,39 +100,25 @@ still catching an actual regression (e.g. the generation derivation's ref
 walk becoming accidentally quadratic, which would show up as a
 multi-second stall at a mere 1,000 files, nowhere close to this budget).
 
-## `hunk_nav` — diff view hunk-navigation walk (partial progress on #211, M2.16f)
+## `hunk_nav` — diff view hunk-navigation walk (one component of #211, M2.16f)
 
-**Status: partial delivery, #211 stays open.** This section covers 1 of
-#211's 4 scope items (a regression test) against a *substitute* target, not
-the one the issue names. It does **not** measure "the virtualized diff view
-(69c)" (still stale — see below), is not the "real measurement... not a
-synthetic microbenchmark" the issue asks for (the generator below is exactly
-that synthetic microbenchmark, by design — see "What this does NOT cover"),
-and was not landed after 69e as the issue recommends (69e hasn't landed;
-there is no such issue/PR in this repo as of this writing). Do not treat
-this section, its heading, or its commit (`ad7fba9`) as closing #211 — the
-issue tracks the remaining three items and should stay open until a future
-change wires `CumulativeHeights` into the render path and this budget is
-redone against that real shape.
+**Status: this is one component of the diff view's total cost, not a
+substitute for the windowed-render measurement.** `hunk_nav` runs on every
+diff render, windowed or not — it walks the raw patch text to build
+hunk-selection labels and navigation targets, upstream of and independent
+from `CumulativeHeights`/`render_window`. The "Windowed diff render" section
+below covers the part of #211 this section always disclaimed: measuring the
+actual virtualized render path now that it exists. This section's own budget stands
+on its own merits and needed no rework once that path landed — it is kept
+here unchanged, reframed only as one piece of the picture rather than a
+placeholder for the whole of it.
 
-**Stale premise in #211's own text, corrected here rather than silently
-worked around.** The issue asks to measure "the virtualized diff view
-(69c)." As of this writing that shape does not exist: the diff view renders
-`CommitDiff.patch` as one flat `<pre>` of every line
-(`crates/git-vista/src/detail.rs::accessible_patch_view`, mirrored
-full-screen in `viewer.rs`) — no virtualization is wired into it. #69c's
-`CumulativeHeights`/`visible_range` (`git_vista_core::virtualize`) is a real,
-already-tested primitive (`crates/git-vista-core/src/virtualize.rs`, 9 tests
-of its own from PR #179), but it has **zero consumers** anywhere in the tree
-— verified by grep, not assumed. There is nothing "virtualized diff view"
-shaped to benchmark yet; a budget claiming to cover one would be fiction.
-
-**What was measured instead, and why it's the honest substitute.** `hunk_nav`
-(`crates/git-vista/src/features/diff/core.rs`) is real, host-tested
-(`features/diff/core.rs` is not wasm-gated — only `staging_view.rs` inside
-that module is), and runs on **every** diff render today regardless of
-virtualization: a full walk of the raw patch text that both
-`accessible_patch_view` (panel + full-screen viewer) and
+**What was measured, and why it's a real, independent cost center.**
+`hunk_nav` (`crates/git-vista/src/features/diff/core.rs`) is real,
+host-tested (`features/diff/core.rs` is not wasm-gated — only
+`staging_view.rs` inside that module is), and runs on **every** diff render
+today regardless of virtualization: a full walk of the raw patch text that
+both `accessible_patch_view` (panel + full-screen viewer) and
 `staging_view.rs`'s hunk-selection labels call directly. The function's own
 doc comment already names the failure mode this budget pins down: "a 5 MB
 refactor diff can carry tens of thousands of hunks, and a rescan-per-hunk
@@ -146,10 +132,9 @@ exists so it's caught immediately if a future edit reintroduces it.
   `#[cfg(target_arch = "wasm32")]`-gated; `cargo test --workspace` never
   compiles them and this repo has no wasm test harness. Unmeasured, and no
   test here claims otherwise.
-- Whether virtualization is "engaged." It isn't wired into the diff view at
-  all, so there is nothing to prove engaged or broken — see above. A future
-  task that wires `CumulativeHeights` into the render path should add its
-  own budget alongside that wiring, not retrofit a claim onto this one.
+- The windowing math itself (`line_heights`, `CumulativeHeights`,
+  `render_window`, `scroll_to_reveal`) — that is now measured separately,
+  see the section below.
 - Real-world patch shapes (renames, binary markers, combined merge headers,
   uneven hunk sizes). The generator produces one synthetic file with
   uniformly-sized hunks — the cheapest-per-byte shape, deliberately mirroring
@@ -213,3 +198,146 @@ run in every `cargo test`):
   generator produced, so a fast-but-wrong answer (an early return, or a
   desynced countdown eating the rest of the patch) fails the test instead of
   passing it by accident.
+
+## Windowed diff render (#69c wired in, closing #211, M2.16f)
+
+**Status: this is the real measurement #211 asked for, now that the target
+exists.** PR #351 (merged 2026-08-07) wired `crates/git-vista-core::virtualize`'s
+`CumulativeHeights`/`visible_range` (#69c — 9 tests, previously zero
+consumers) into `crates/git-vista/src/detail.rs`'s render path: it now
+imports `line_heights`, `render_window`, `scroll_to_reveal`,
+`LineWrap` and `CumulativeHeights`, and builds a real window in its render
+closure (~line 635). Before that PR, "the virtualized diff view" named in
+#211 did not exist anywhere in the tree — this repo's prior session recorded
+that gap honestly in the `hunk_nav` section above rather than measuring a
+substitute and calling it done. That gap is now closed.
+
+**What the windowed path actually is** (read from source, not assumed):
+
+- `line_heights(patch, line_height, wrap) -> Vec<f64>`
+  (`crates/git-vista/src/features/diff/core.rs`) — per-line pixel heights.
+  `LineWrap::Never` (the detail panel; `.detail-diff` is `white-space: pre`)
+  gives one row per line. `LineWrap::Wrapped { columns }` (the full-screen
+  viewer; `.viewer-pre` is `white-space: pre-wrap`) gives
+  `ceil(chars/columns)` rows per line — **the full-screen viewer is not
+  currently windowed**, deliberately; see "What this does NOT cover" below.
+- `CumulativeHeights::new(&[f64])` (`crates/git-vista-core/src/virtualize.rs`)
+  — O(n) prefix sums over those heights, built once per patch change.
+- `render_window(&CumulativeHeights, viewport_height, scroll_offset,
+  overscan) -> RenderWindow { start, end, pad_top, pad_bottom }` — O(log n)
+  per scroll query via binary search over the prefix sums.
+- `scroll_to_reveal(&heights, index, viewport_height, current_scroll) ->
+  Option<f64>` — used to bring a focused line into view.
+- `crates/git-vista/src/detail.rs`: `DIFF_LINE_PX = 18.1`,
+  `DIFF_OVERSCAN = 20`; `accessible_patch_window(patch, focus, scope,
+  window, reveal)` renders only the window's slice, each line keyed on its
+  own index into the full patch (not the window's local index) so DOM
+  identity survives scrolling.
+
+**What is covered here, and what is deliberately not:**
+
+- **Covered, host-testable, measured by `cargo test`:** the pure windowing
+  math — `line_heights`, `CumulativeHeights::new`, `render_window`,
+  `scroll_to_reveal` — over patches of stated hunk/line counts, at the panel
+  viewport size. This is the O(n) build + O(log n) query cost the primitive
+  was designed to have; the numbers below confirm it holds at real sizes,
+  not just in the 9 unit tests #69c shipped.
+- **NOT covered — the wasm/DOM boundary.** Building the actual `<pre>`
+  window in the browser (`accessible_patch_window`'s DOM construction,
+  `detail.rs`/`viewer.rs`) is `#[cfg(target_arch = "wasm32")]`-gated.
+  `cargo test --workspace` never compiles that code and this repo has no
+  wasm test harness. **Paint time, layout thrash, and actual first-paint
+  latency on a real device are not measured anywhere in this document.**
+  A reader must not come away believing this budget covers what the user
+  sees on screen — it covers the arithmetic that decides which lines get
+  drawn, not the drawing.
+- **NOT covered — the full-screen viewer.** `viewer.rs`'s `LineWrap::Wrapped`
+  path is not windowed at all yet (confirmed by reading `viewer.rs`, not
+  assumed); this budget is panel-path (`LineWrap::Never`) only.
+- **Still separately covered — `hunk_nav`.** The hunk-navigation walk (see
+  above) is upstream of and independent from this windowing math; it is not
+  re-measured here.
+
+Reproduce with:
+
+```
+cargo test -p git-vista --bin git-vista-ui -- --ignored --nocapture virtualize_ladder
+```
+
+(`#[ignore]`d — it builds patches up to 50,000 lines, no place in every
+`cargo test`/CI run.)
+
+### The ladder — patch size vs. windowing cost
+
+Synthetic patches, debug build, one run each, this host. `LineWrap::Never`
+is the panel's real mode (`.detail-diff` is `white-space: pre`);
+`Wrapped{80}` is measured so a number exists for whoever wires the viewer,
+which is **not** windowed today.
+
+| patch lines | wrap | `CumulativeHeights::new` | `render_window` query | lines rendered |
+| ----------: | :--- | -----------------------: | --------------------: | -------------: |
+|       1,000 | Never       |   0.017 ms |  0.0019 ms | **86** |
+|       1,000 | Wrapped{80} |   0.016 ms |  0.0010 ms | **86** |
+|      10,000 | Never       |   0.163 ms |  0.0014 ms | **86** |
+|      10,000 | Wrapped{80} |   0.196 ms |  0.0015 ms | **86** |
+|      50,000 | Never       |   0.908 ms |  0.0024 ms | **86** |
+|      50,000 | Wrapped{80} |   0.972 ms |  0.0028 ms | **86** |
+
+**The rendered-lines column is the result that matters.** It is exactly 86 at
+every size, in both wrap modes, across a 50x range — because
+`ceil(800px / 18.1px) = 45` lines fit the viewport and `DIFF_OVERSCAN = 20`
+adds 20 each side. That total is a function of viewport height and line
+height **only**. It does not grow with the patch, which is the entire
+property virtualization exists to provide. A window that grew with `n` would
+mean windowing had been silently bypassed.
+
+The build cost scales linearly as documented: 50x the lines cost ~54x the
+time (16.75 µs → 908.08 µs), with no superlinear cost center visible. The
+per-scroll query stayed in a 1–3 µs band across the whole range, with no
+growth trend distinguishable from noise at microsecond scale — consistent
+with the documented `O(log n)` `partition_point` binary search, and
+effectively free against a 16 ms 60fps frame budget.
+
+**Where the caps sit.** The generator produces ~66.8 bytes/line, so the
+1,000-line row (~66.8 KB) is under `DIFF_PATCH_CAP` (200,000 bytes, the
+panel's cap); the 10,000-line row (~688 KB) is already **past** it. The
+panel — the only windowed surface today — could never receive the 10k or 50k
+patches, because the server truncates first. Its realistic ceiling for this
+line shape is roughly **3,000 lines**. Those larger rows exist to show the
+shape holds well past both caps, not because a real request reaches them.
+
+### Stated budget
+
+**A diff of any size the panel or viewer can hold must satisfy three
+bounds** on hardware comparable to this host:
+
+1. **The once-per-patch `CumulativeHeights::new` build completes in well
+   under 50 ms.** Measured 0.91 ms at 50,000 lines — roughly **55x
+   headroom**.
+2. **Each `render_window` query completes in well under one 16 ms frame.**
+   Measured 2.4 µs at 50,000 lines — roughly **6,000x headroom**. This is
+   the number that decides whether scrolling is smooth.
+3. **The rendered window stays bounded regardless of patch size.** Measured
+   a constant 86 lines from 1,000 to 50,000.
+
+**Regression tests**, both in `features/diff/core.rs`, neither `#[ignore]`d:
+
+- `virtualize_query_budget_holds_at_50k_lines` — asserts the query completes
+  under 5 ms, the build under 50 ms, and the window stays under 200 lines at
+  50,000 lines.
+- `render_window_size_has_a_floor_and_does_not_grow_with_the_patch` —
+  asserts the window has a **floor** as well as a ceiling.
+
+**Why two tests, and why the second is not redundant.** The wall-clock
+bounds alone would not catch the regression that matters. A naive
+implementation that abandoned windowing and returned the full range would
+still pass the 5 ms query bound at 50,000 lines — 2.4 µs has three orders of
+magnitude to spare — but fails the bounded-window assertion immediately.
+
+Both were mutation-proven, and the second exists *because* the first was
+found insufficient: an "always return an empty window" mutation leaves the
+ceiling-only assertion **green**, since zero is under 200. Verified by
+applying both mutations (always-empty, always-full-range) to
+`render_window`'s body and confirming red, then restoring and reconfirming
+30/30 green. A window that renders nothing is as broken as one that renders
+everything, and only the floor catches it.
