@@ -80,47 +80,78 @@ test.describe('#210 hunk keyboard navigation', () => {
     expect(after.activeIsHunk, 'Escape should move focus off the hunk header').toBe(false)
   })
 
-  test.describe('long patch (the open defect)', () => {
-    // `test.fail()` rather than `skip`: Playwright expects these to fail and
-    // reports an ERROR if they pass. So the day #210 is fixed, this file demands
-    // attention instead of sitting green and forgotten -- which is precisely the
-    // failure mode that let #210 survive as long as it has.
-    test.fail()
+  test.describe('long patch', () => {
+    // What the contract actually is, and what it is NOT.
+    //
+    // An earlier version of these tests asserted "the container must not
+    // scroll" and "the focused node must still be connected". Both were wrong,
+    // and wrong in a way worth recording, because they would have rejected a
+    // correct fix.
+    //
+    // Navigating to a hunk below the fold MUST scroll -- that is `reveal` doing
+    // its job, and the alternative is focusing something the user cannot see.
+    // And under virtualization, scrolling away from a node necessarily unmounts
+    // it, so demanding the original element survive is demanding that
+    // windowing not work. The distinction that matters is not "did it scroll"
+    // but "did the app move focus, or did the browser scroll because nothing
+    // handled the key".
+    //
+    // So: assert on where focus ENDS UP.
 
-    test('ArrowDown moves focus without scrolling', async ({ page }) => {
+    test('ArrowDown moves focus to the next hunk, revealing it if needed', async ({ page }) => {
       await openApp(page)
       await openDiff(page, LONG_MULTI_HUNK)
 
       const before = await focusFirstHunk(page)
       expect(before.focused, 'a hunk header should be focusable').toBe(true)
+      const beforeIdx = await page.evaluate(() =>
+        document.activeElement.getAttribute('data-hunk-index'),
+      )
 
       await page.keyboard.press('ArrowDown')
-      const after = await readFocus(page)
+      // The reveal re-renders the window and focus is re-asserted on the next
+      // frame, so read after the frame rather than synchronously.
+      await page.waitForTimeout(250)
 
-      // Expected failure today: `activeTag` is BODY, `hunksInDom` may be 0, and
-      // scrollTop has moved by roughly one viewport.
-      expect(after.activeIsHunk, `focus should stay on a hunk header, got <${after.activeTag}>`).toBe(true)
-      expect(after.scrollTop, 'the container must not scroll natively').toBe(before.scrollTop)
+      const after = await page.evaluate(() => {
+        const a = document.activeElement
+        return {
+          isHunk: !!(a.classList && a.classList.contains('diff-hunk')),
+          tag: a.tagName,
+          idx: a.getAttribute?.('data-hunk-index'),
+        }
+      })
+
+      expect(after.isHunk, `focus should be on a hunk header, got <${after.tag}>`).toBe(true)
+      expect(after.idx, 'focus should have moved to the NEXT hunk').toBe(
+        String(Number(beforeIdx) + 1),
+      )
     })
 
-    test('a focused hunk header is never unmounted out from under the user', async ({ page }) => {
+    test('the revealed hunk is actually visible in the viewport', async ({ page }) => {
       await openApp(page)
       await openDiff(page, LONG_MULTI_HUNK)
       await focusFirstHunk(page)
 
-      // Scroll the way an arrow key would, then ask whether the thing that had
-      // focus still exists. This is the mechanism itself, isolated from the
-      // keyboard: `scroll_to_reveal` exists to make this safe and is not called.
-      const survived = await page.evaluate(async (sel) => {
-        const scroller = document.querySelector(sel)
-        const focused = document.activeElement
-        scroller.scrollTop = scroller.clientHeight * 2
-        await new Promise((r) => setTimeout(r, 400))
-        return { stillConnected: focused.isConnected, active: document.activeElement.tagName }
+      await page.keyboard.press('ArrowDown')
+      await page.waitForTimeout(250)
+
+      // Focus without visibility is the failure this guards: an element can
+      // hold focus while sitting outside the scroll container's visible box,
+      // which reads to the user as "nothing happened".
+      const visible = await page.evaluate((sel) => {
+        const a = document.activeElement
+        if (!a.classList?.contains('diff-hunk')) return { ok: false, why: 'focus is not on a hunk' }
+        const box = a.getBoundingClientRect()
+        const view = document.querySelector(sel).getBoundingClientRect()
+        return {
+          ok: box.top >= view.top - 1 && box.bottom <= view.bottom + 1,
+          why: `hunk at ${Math.round(box.top)}..${Math.round(box.bottom)}, ` +
+               `viewport ${Math.round(view.top)}..${Math.round(view.bottom)}`,
+        }
       }, DIFF_SCROLLER)
 
-      expect(survived.stillConnected, 'the focused header was removed from the DOM').toBe(true)
-      expect(survived.active, 'focus fell back to the document body').not.toBe('BODY')
+      expect(visible.ok, `the focused hunk should be on screen — ${visible.why}`).toBe(true)
     })
   })
 })
