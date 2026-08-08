@@ -37,6 +37,8 @@
 use leptos::*;
 
 use git_vista_core::activity::UndoAction;
+use git_vista_protocol::diff::DiffSpec;
+use git_vista_protocol::plan::RefName;
 
 use crate::api::{
     create_branch_request, create_tag_request, fetch_commit_detail, fetch_head_branch,
@@ -57,7 +59,7 @@ use crate::features::status::core::{deletable_untracked_paths, discardable_track
 use crate::geometry::menu_placement;
 use crate::gestures::viewport_size;
 use crate::icons::icon_set;
-use crate::state::{CommitIntent, Features, MenuData, PendingOp, Settings};
+use crate::state::{CommitIntent, Features, MenuData, PendingOp, Settings, ViewerDoc};
 
 /// Open this menu on `commit`, for an entry point that knows only the commit and a
 /// header — not the richer context the graph's own dots carry (M1.11, #64).
@@ -1217,10 +1219,11 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         };
                         view! {
                             <button class="ctx-item" on:click=on>
-                                <span class="nf ctx-icon">{ic.diff}</span>
+                                <span class="nf ctx-icon">{ic.modified}</span>
                                 {format!("Compare {b} with HEAD")}
                             </button>
                         }
+                        .into_view()
                     };
                     let mut items = vec![
                         checkout_item,
