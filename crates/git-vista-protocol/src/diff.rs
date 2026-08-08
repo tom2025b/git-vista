@@ -221,6 +221,59 @@ pub enum DiffSpec {
     },
 }
 
+/// The diff of an explicit source/target pair — the response body of
+/// `POST /api/diff/spec` (M2.16, #69).
+///
+/// # Why this is not `git_vista_core::diff::CommitDiff`
+///
+/// `CommitDiff` carries two fields that only mean something for *one commit's*
+/// diff, and neither has an analogue here:
+///
+/// * `id` — one commit's hex id. A [`DiffSpec::WorktreeVsIndex`] diff has no
+///   commit at all, and a `CommitVsCommit`/`RefVsRef` diff has **two**
+///   endpoints, not one.
+/// * `against_first_parent` — a statement about how a *merge commit* was
+///   diffed. Nothing here is a merge commit.
+///
+/// Reusing it would have meant inventing values for both — an empty `id`, and
+/// a `false` that means "not applicable" rather than "diffed against every
+/// parent". Fields that lie about what they hold are worse than a second type.
+///
+/// # No file list, deliberately
+///
+/// `CommitDiff` also carries a per-file `Vec<DiffFile>` folded from two extra
+/// git reads (`--name-status -z` and `--numstat -z`). This type carries only
+/// the unified patch.
+///
+/// That is a scope decision, not an oversight: `DiffFile` lives in
+/// `git-vista-core`, which this crate depends on **only as a dev-dependency**
+/// — its own `Cargo.toml` says so, in those words: *"Never a non-dev
+/// dependency — this crate must stay pure and wasm-safe, and git-vista-core is
+/// neither."* Naming `DiffFile` here would quietly promote that dependency and
+/// break the wasm build this crate exists to stay compatible with. Adding a
+/// file list later means either a protocol-local file type or moving the shared
+/// one — a real design call, which is why this slice does not smuggle it in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecDiff {
+    /// The request this answers, echoed verbatim.
+    ///
+    /// This is the staleness guard, and it is load-bearing: ADR 0053 concluded
+    /// that #69's "cancellable" criterion is met **partly because** every diff
+    /// response echoes what it was fetched for, so a view can compare it
+    /// against what it currently wants and drop a late answer instead of
+    /// painting it. That ADR names a new fetch surface without such an echo as
+    /// something that would have to re-argue cancellation from scratch. This
+    /// field is how this endpoint inherits the existing argument rather than
+    /// reopening it.
+    pub spec: DiffSpec,
+    /// The unified diff text (`--patch --no-color --no-textconv`), possibly
+    /// truncated at the server's size cap.
+    pub patch: String,
+    /// True when the patch was cut at that cap — so a consumer says so rather
+    /// than silently showing a partial diff.
+    pub truncated: bool,
+}
+
 /// The `git diff` argv for a [`DiffSpec`] — pure, no process spawn. Matches
 /// `git_vista_core::diff::diff_argv`'s existing return shape (`Vec<String>`,
 /// argument order git expects, no leading `"git"`).

@@ -113,6 +113,16 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     ("/api/staging/diff", Method::GET, Authz::SessionRequired),
     ("/api/staging/preview", Method::POST, Authz::SessionAndCsrf),
     ("/api/staging/apply", Method::POST, Authz::SessionAndCsrf),
+    // Explicit source/target diffs (M2.16, #69). A pure read that mutates
+    // nothing — but POST, because DiffSpec is an internally-tagged enum a
+    // query string cannot carry without flattening it into loose optional
+    // parameters. `SessionAndCsrf` therefore, not `SessionRequired`: the
+    // classification follows the *method*, since it is the CSRF gate that
+    // cares about POST, not the read/write distinction. Same posture
+    // /api/plan takes for the same reason — a read wearing a write's verb.
+    // full_routes-only, with the staging reads: two of its four modes show
+    // uncommitted worktree and index content (ADR 0005).
+    ("/api/diff/spec", Method::POST, Authz::SessionAndCsrf),
     ("/api/unstage", Method::POST, Authz::SessionAndCsrf),
     ("/api/undo", Method::POST, Authz::SessionAndCsrf),
     ("/api/merge", Method::POST, Authz::SessionAndCsrf),
@@ -214,7 +224,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 52;
+const EXPECTED_ROUTE_COUNT: usize = 53;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in
