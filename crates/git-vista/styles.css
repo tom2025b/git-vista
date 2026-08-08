@@ -148,12 +148,30 @@ html, body {
 .file-modified { color: #d29922; }
 .file-deleted { color: #f85149; }
 .file-renamed { color: #2f81f7; }
-.detail-diff {
+/* M2.16g (#350): the diff's own scroll container. The patch is virtualized —
+   only a window of lines is in the DOM — so it needs an element whose
+   scrollTop and clientHeight are the window's two inputs. Scrolling the whole
+   panel instead would mean deriving the patch's offset within it on every
+   frame, and would also scroll the file list and header out of reach on a
+   long diff. Its max-height is a viewport fraction rather than a fixed pixel
+   count so it adapts to an iPad in either orientation. */
+.detail-diff-scroll {
   margin: 0.75rem 0 0;
-  padding: 0.6rem;
+  max-height: 60vh;
+  overflow-y: auto;
   background: #010409;
   border: 1px solid #21262d;
   border-radius: 6px;
+}
+/* Sits inside .detail-diff-scroll now, so it owns the padding and the
+   horizontal scroll while the parent owns the vertical. The border/background
+   moved to the parent — a border here would draw around each rendered window
+   rather than the diff. */
+.detail-diff {
+  margin: 0;
+  padding: 0.6rem;
+  background: transparent;
+  border: none;
   font-size: 0.78rem;
   line-height: 1.45;
   overflow-x: auto;
@@ -976,10 +994,16 @@ button.detail-file:hover .detail-file-path { color: var(--accent); }
 }
 /* The viewer's <pre> wraps long lines so nothing is lost off the right edge
    of a page — unlike the panel's, which scrolls horizontally instead. */
+/* The full-screen viewer reuses .detail-diff for colouring but is NOT inside
+   .detail-diff-scroll (it is not windowed — see viewer.rs), so it carries the
+   background and border .detail-diff handed to that scroll parent. */
 .viewer-pre {
   white-space: pre-wrap;
   word-break: break-word;
   overflow-x: visible;
+  background: #010409;
+  border: 1px solid #21262d;
+  border-radius: 6px;
 }
 
 /* The Print Graph preview: a white sheet (what the paper will look like)

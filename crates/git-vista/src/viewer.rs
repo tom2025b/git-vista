@@ -261,6 +261,16 @@ fn diff_body(d: &CommitDiff, nerd: bool, hunk_focus: RwSignal<GraphFocus>) -> Vi
         </div>
         {files}
         {truncated_note}
+        // NOT windowed, unlike the panel (M2.16g, #350). `.viewer-pre` is
+        // `white-space: pre-wrap` with `word-break: break-word`, so a long
+        // line wraps and its height depends on its own length *and* the
+        // container's width. `features::diff::core::line_heights` can express
+        // that (`LineWrap::Wrapped`), but the column count it needs is an
+        // estimate this file cannot measure without a layout read, and a
+        // wrong estimate here misplaces every row below the first wrapped
+        // line — worse than not windowing at all. The panel, which does not
+        // wrap, has no such ambiguity and is windowed today. Wiring this one
+        // wants the measurement first; tracked on #350.
         <pre class="detail-diff viewer-pre">{patch}</pre>
     }
     .into_view()

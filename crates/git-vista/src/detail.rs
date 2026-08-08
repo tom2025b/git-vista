@@ -20,7 +20,24 @@ use git_vista_core::status::ChangeKind;
 use crate::api::fetch_diff;
 use crate::datetime::local_timestamp;
 use crate::features::a11y::focus::{FocusMove, GraphFocus};
-use crate::features::diff::core::hunk_nav;
+use crate::features::diff::core::{hunk_nav, line_heights, render_window, LineWrap};
+use git_vista_core::virtualize::CumulativeHeights;
+
+/// One rendered diff line's height in CSS pixels: `.detail-diff`'s
+/// `font-size: 0.78rem` × `line-height: 1.45` at a 16px root ≈ 18.1px.
+///
+/// A constant, not a measurement, and the tradeoff is deliberate: measuring
+/// one rendered line would mean rendering before windowing (the cost
+/// windowing exists to avoid) or a layout read on every scroll frame. Being
+/// slightly wrong here shifts the window by a line or two at the edges, which
+/// the overscan below absorbs — it cannot corrupt the mapping, because
+/// `accessible_patch_window` keys every line on its own patch index rather
+/// than on anything derived from this number.
+const DIFF_LINE_PX: f64 = 18.1;
+
+/// Extra lines rendered above and below the visible range, so a fast scroll
+/// does not flash blank space for a frame before the next range is computed.
+const DIFF_OVERSCAN: usize = 20;
 use crate::features::graph::core::RenderCtx;
 use crate::icons::{icon_set, GitIcons};
 use crate::state::{DetailResource, Features, Settings, ViewerDoc};
@@ -93,6 +110,28 @@ pub(crate) fn accessible_patch_view(
     focus: RwSignal<GraphFocus>,
     scope: &'static str,
 ) -> View {
+    accessible_patch_window(patch, focus, scope, None)
+}
+
+/// [`accessible_patch_view`], rendering only `window`'s slice of the patch
+/// (M2.16g, #350) — `None` renders every line, which is what the full-screen
+/// viewer still does while its wrapping heights stay unmeasured.
+///
+/// **The hunk-navigation contract does not change with the window.** The
+/// focus model is told the *total* hunk count, not the windowed count, and
+/// each rendered header keeps its **global** hunk index. A windowed count
+/// would silently renumber every hunk as the user scrolls — "hunk 3 of 40"
+/// becoming "hunk 1 of 2" — and clamp the focus model to whatever happens to
+/// be on screen, which is precisely the navigation regression #350 warns
+/// about. Scrolling a hunk into view before focusing it is the caller's job
+/// (`features::diff::core::scroll_to_reveal`); this function's job is to keep
+/// the indices stable while it happens.
+pub(crate) fn accessible_patch_window(
+    patch: &str,
+    focus: RwSignal<GraphFocus>,
+    scope: &'static str,
+    window: Option<std::ops::Range<usize>>,
+) -> View {
     let nav = hunk_nav(patch);
     // `update_untracked`: this runs while a render closure is already
     // executing; the tabindex closures created below read the fresh count
@@ -103,9 +142,14 @@ pub(crate) fn accessible_patch_view(
         .enumerate()
         .map(|(idx, e)| (e.line_index, (idx, e.label)))
         .collect();
+    let range = window.unwrap_or(0..usize::MAX);
     patch
         .lines()
         .enumerate()
+        // `filter` rather than `skip`/`take`: the enumeration index must stay
+        // the patch's own line index, because that is the coordinate
+        // `nav_at` — and #210's whole focus model — is keyed on.
+        .filter(|(i, _)| range.contains(i))
         .map(|(i, l)| {
             let class = diff_line_class(l);
             let text = format!("{l}\n");
@@ -289,6 +333,21 @@ pub fn detail_panel_view(
     // the keyboard was on. Walking to a parent re-renders the patch, and
     // `accessible_patch_view` re-clamps the model to the new hunk count.
     let hunk_focus = create_rw_signal(GraphFocus::new(0));
+    // M2.16g (#350): the diff's own scroll position and measured viewport
+    // height, the two inputs `render_window` needs. Declared here, beside
+    // `hunk_focus` and for the same reason its comment gives — outside the
+    // render closures, so a re-render (icon toggle, walking to a parent)
+    // does not reset where the diff was scrolled to.
+    let diff_scroll = create_rw_signal((0.0_f64, 0.0_f64));
+    let diff_box: NodeRef<html::Div> = create_node_ref();
+    let on_diff_scroll = move |_| {
+        if let Some(el) = diff_box.get_untracked() {
+            // `get_untracked` inside an event handler: reading the ref must
+            // not subscribe this handler to it, or every scroll frame would
+            // re-run the effect that installed the handler.
+            diff_scroll.set((el.scroll_top() as f64, el.client_height() as f64));
+        }
+    };
     move || {
         shell.detail_id().map(|open_id| {
             // Tracked read, like the menu: the panel re-renders live if the icon
@@ -505,8 +564,44 @@ pub fn detail_panel_view(
                             .collect_view();
                         // The patch, coloured line by line off its prefix, with
                         // hunk headers as roving keyboard/tap stops (M2.16e,
-                        // #210 — see `accessible_patch_view`).
-                        let patch = accessible_patch_view(&d.patch, hunk_focus, "detail");
+                        // #210 — see `accessible_patch_view`), rendered a
+                        // window at a time (M2.16g, #350).
+                        //
+                        // `.detail-diff` is `white-space: pre`, so every line
+                        // is exactly one row and `LineWrap::Never` is a
+                        // measured fact about this surface, not an assumption
+                        // — the full-screen viewer wraps and is deliberately
+                        // left un-windowed for now (see `viewer.rs`).
+                        let patch_text = d.patch.clone();
+                        let patch = view! {
+                            <div class="detail-diff-scroll" node_ref=diff_box on:scroll=on_diff_scroll>
+                                {move || {
+                                    let (scroll, viewport) = diff_scroll.get();
+                                    let heights = CumulativeHeights::new(&line_heights(
+                                        &patch_text,
+                                        DIFF_LINE_PX,
+                                        LineWrap::Never,
+                                    ));
+                                    // Before the first scroll event the box has
+                                    // not been measured; fall back to a viewport
+                                    // tall enough that the first paint is never
+                                    // short of content.
+                                    let viewport = if viewport > 0.0 { viewport } else { 800.0 };
+                                    let w = render_window(&heights, viewport, scroll, DIFF_OVERSCAN);
+                                    view! {
+                                        <div style=format!("height:{}px", w.pad_top)></div>
+                                        <pre class="detail-diff">
+                                            {accessible_patch_window(
+                                                &patch_text, hunk_focus, "detail",
+                                                Some(w.start..w.end),
+                                            )}
+                                        </pre>
+                                        <div style=format!("height:{}px", w.pad_bottom)></div>
+                                    }
+                                }}
+                            </div>
+                        }
+                        .into_view();
                         let truncated_note = d.truncated.then(|| {
                             view! {
                                 <p class="detail-status">

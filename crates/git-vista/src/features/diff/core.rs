@@ -907,7 +907,7 @@ diff --git a/bar.txt b/bar.txt
     #[test]
     fn the_window_renders_a_slice_and_pads_the_rest_to_full_height() {
         // 100 lines x 20px = 2000px total; a 200px viewport at the top.
-        let heights = CumulativeHeights::new(&vec![LH; 100]);
+        let heights = CumulativeHeights::new(&[LH; 100]);
         let w = render_window(&heights, 200.0, 0.0, 0);
         assert_eq!(w.start, 0);
         assert!(
@@ -929,7 +929,7 @@ diff --git a/bar.txt b/bar.txt
 
     #[test]
     fn scrolling_down_moves_the_window_and_shifts_the_top_pad() {
-        let heights = CumulativeHeights::new(&vec![LH; 100]);
+        let heights = CumulativeHeights::new(&[LH; 100]);
         let top = render_window(&heights, 200.0, 0.0, 0);
         let mid = render_window(&heights, 200.0, 1000.0, 0);
         assert!(
@@ -949,7 +949,7 @@ diff --git a/bar.txt b/bar.txt
 
     #[test]
     fn a_patch_shorter_than_the_viewport_renders_whole_with_no_padding() {
-        let heights = CumulativeHeights::new(&vec![LH; 3]);
+        let heights = CumulativeHeights::new(&[LH; 3]);
         let w = render_window(&heights, 500.0, 0.0, 0);
         assert_eq!((w.start, w.end), (0, 3));
         assert_eq!(w.pad_top, 0.0);
@@ -969,14 +969,14 @@ diff --git a/bar.txt b/bar.txt
 
     #[test]
     fn a_line_already_on_screen_needs_no_scroll() {
-        let heights = CumulativeHeights::new(&vec![LH; 100]);
+        let heights = CumulativeHeights::new(&[LH; 100]);
         // Viewport 0..200 shows lines 0..10.
         assert_eq!(scroll_to_reveal(&heights, 5, 200.0, 0.0), None);
     }
 
     #[test]
     fn a_hunk_below_the_window_scrolls_just_far_enough_to_show_it() {
-        let heights = CumulativeHeights::new(&vec![LH; 100]);
+        let heights = CumulativeHeights::new(&[LH; 100]);
         // Line 20 spans 400..420; a 200px viewport at 0 must scroll so the
         // line's bottom edge (420) meets the viewport bottom.
         assert_eq!(scroll_to_reveal(&heights, 20, 200.0, 0.0), Some(220.0));
@@ -984,7 +984,7 @@ diff --git a/bar.txt b/bar.txt
 
     #[test]
     fn a_hunk_above_the_window_scrolls_up_to_its_top_edge() {
-        let heights = CumulativeHeights::new(&vec![LH; 100]);
+        let heights = CumulativeHeights::new(&[LH; 100]);
         // Scrolled to 1000 (lines 50..60 visible); line 10 starts at 200.
         assert_eq!(scroll_to_reveal(&heights, 10, 200.0, 1000.0), Some(200.0));
     }
@@ -995,7 +995,7 @@ diff --git a/bar.txt b/bar.txt
         // returns must make render_window include that line. Without this,
         // keyboard navigation focuses an element that is not in the DOM —
         // the exact regression #350 names.
-        let heights = CumulativeHeights::new(&vec![LH; 500]);
+        let heights = CumulativeHeights::new(&[LH; 500]);
         let viewport = 200.0;
         for &target in &[0usize, 1, 37, 250, 498, 499] {
             let scroll = scroll_to_reveal(&heights, target, viewport, 0.0).unwrap_or(0.0);
@@ -1024,7 +1024,7 @@ diff --git a/bar.txt b/bar.txt
 
     #[test]
     fn a_line_index_past_the_end_is_not_scrolled_to() {
-        let heights = CumulativeHeights::new(&vec![LH; 10]);
+        let heights = CumulativeHeights::new(&[LH; 10]);
         assert_eq!(scroll_to_reveal(&heights, 10, 200.0, 0.0), None);
         assert_eq!(scroll_to_reveal(&heights, 999, 200.0, 0.0), None);
     }
