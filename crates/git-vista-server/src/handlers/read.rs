@@ -1756,8 +1756,34 @@ mod tests {
     /// `--no-textconv` is a security property, not a formatting preference: a
     /// repository's own `.gitattributes` can bind a `diff=<driver>` textconv
     /// filter, and git *executes* that configured program to render file
-    /// contents. This proves the flag actually reaches git — the filter here
-    /// would write a marker into the patch if it ever ran.
+    /// contents. This proves the flag actually reaches git.
+    ///
+    /// # What removing the flag actually does here — measured, not assumed
+    ///
+    /// Mutation-checked by deleting `--no-textconv` from `spec_diff_for_repo`'s
+    /// argv and re-running: baseline 5 pass, mutated 4 pass and **this test
+    /// alone** fails. So it does guard the flag specifically rather than
+    /// tripping on any change.
+    ///
+    /// But it fails by a different route than the assertion below suggests, and
+    /// that is worth stating rather than leaving for someone to rediscover.
+    /// Without the flag, git tries to run the filter, needs a temp file to do
+    /// it, and **the sandbox refuses**:
+    ///
+    /// ```text
+    /// (500, "fatal: unable to create temp-file: Permission denied")
+    /// ```
+    ///
+    /// The call errors before any patch exists, so `unwrap()` panics and the
+    /// marker assertion never evaluates. That is a genuinely good finding — the
+    /// sandbox blocks textconv execution independently of this flag, so the two
+    /// are defence in depth rather than one guard. It also means **this test
+    /// would still go red if the marker assertion were deleted**, which is
+    /// exactly the kind of overlap that makes a test look stronger than it is.
+    ///
+    /// The assertion is kept because it is the one that stays meaningful if the
+    /// sandbox is ever loosened, or on a filter that needs no temp file — but
+    /// on this box, today, the sandbox fires first.
     #[tokio::test]
     async fn spec_diff_never_runs_a_repository_configured_textconv_filter() {
         let (_dir, repo, _c1, c2) = four_mode_repo();
@@ -1779,7 +1805,18 @@ mod tests {
                 },
             ),
         ] {
-            let out = spec_diff_for_repo(&repo, spec).await.unwrap();
+            // `expect`, not `unwrap`: with the flag removed this is where the
+            // failure actually lands (sandbox-denied temp file), so the message
+            // should name the cause rather than printing a bare Err.
+            let out = spec_diff_for_repo(&repo, spec).await.unwrap_or_else(|e| {
+                panic!(
+                    "{label}: the diff read failed instead of answering: {e:?}. \
+                     If this is a temp-file permission error, git attempted a \
+                     textconv filter — meaning --no-textconv is missing from \
+                     this mode's argv and the sandbox caught what the flag \
+                     should have prevented."
+                )
+            });
             assert!(
                 !out.patch.contains("TEXTCONV_RAN"),
                 "{label}: a repository-configured textconv filter executed — \
