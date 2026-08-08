@@ -166,6 +166,11 @@ Remote interaction quality is latency-sensitive even when Git runs quickly.
 ## Long-Running Operations
 
 Clone, fetch, pull, push, rebase, and some searches may outlive an HTTP request.
+**Fetch, pull, and push are shipped against this shape (#73, M2.20):** each
+streams progress over SSE, supports a genuine mid-operation cancel through the
+composed launcher, and survives a dropped connection without duplicating the
+operation on reconnect/retry — idempotent admission is a single chokepoint
+shared by all three.
 
 - Create an operation record before starting work.
 - Return `202 Accepted` with an operation ID.
@@ -190,14 +195,25 @@ a feature, not an error condition.
 
 ## Credentials
 
-Git network operations should behave like terminal Git on the Linux host:
+**Shipped (#73, M2.20):** fetch, pull, push, and upstream management over SSH
+remotes behave like terminal Git on the Linux host:
 
-- Reuse SSH agent forwarding only when the user has intentionally configured it.
-- Reuse Git credential helpers through the standard credential protocol.
-- Disable interactive terminal prompts; provide a structured challenge flow only
-  for credential types the UI explicitly supports.
-- Keep forge API tokens in server-side secure storage.
-- Never store secrets in the PWA service-worker cache or IndexedDB.
+- SSH agent forwarding is reused only when the user has intentionally
+  configured it.
+- Git credential helpers are reused through the standard credential protocol.
+- Interactive terminal prompts are disabled; there is no structured challenge
+  flow yet, because no shipped credential type needs one.
+- Command output is redacted before it reaches the caller, so no credential
+  material in a fetch/push response body, SSE stream, or log line.
+- Secrets never reach the PWA service-worker cache or IndexedDB — verified by
+  re-running the redaction test against the final merged code.
+
+**Explicitly not shipped:** credentialed HTTPS remotes. There is no in-app
+HTTPS credential prompt and no forge-API-token storage path yet; an HTTPS
+remote that needs a password fails with a message pointing the user at a
+credential helper or SSH agent instead. Keeping forge API tokens in
+server-side secure storage remains future work, tracked alongside HTTPS
+credential support rather than done.
 
 ## Reliability
 
