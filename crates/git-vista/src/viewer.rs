@@ -270,16 +270,33 @@ fn diff_body(d: &CommitDiff, nerd: bool, hunk_focus: RwSignal<GraphFocus>) -> Vi
         </div>
         {files}
         {truncated_note}
-        // NOT windowed, unlike the panel (M2.16g, #350). `.viewer-pre` is
-        // `white-space: pre-wrap` with `word-break: break-word`, so a long
-        // line wraps and its height depends on its own length *and* the
-        // container's width. `features::diff::core::line_heights` can express
-        // that (`LineWrap::Wrapped`), but the column count it needs is an
-        // estimate this file cannot measure without a layout read, and a
-        // wrong estimate here misplaces every row below the first wrapped
-        // line — worse than not windowing at all. The panel, which does not
-        // wrap, has no such ambiguity and is windowed today. Wiring this one
-        // wants the measurement first; tracked on #350.
+        // NOT windowed, unlike the panel (M2.16g, #350) — tracked on #362.
+        //
+        // `.viewer-pre` is `white-space: pre-wrap` with `word-break:
+        // break-word`, so a long line wraps and its height depends on its own
+        // length *and* the container's width. The panel, which does not wrap,
+        // has no such ambiguity and is windowed today.
+        //
+        // This comment used to say the blocker was "the column count it needs
+        // is an estimate this file cannot measure without a layout read." That
+        // understates one problem and overstates the other. Measuring width is
+        // *not* blocked: `get_bounding_client_rect` is already used in this
+        // codebase (`gestures.rs:82`, `:308`), and `features::shell::signals`'s
+        // `install_mode_signal` is a shipped precedent for keeping such a
+        // measurement current through a debounced resize listener.
+        //
+        // The real problem is that `line_heights`' `ceil(chars / columns)` is a
+        // *character*-wrap model, while this CSS wraps at *word* boundaries. A
+        // perfectly measured column count still would not track real rendered
+        // row counts on code text. And unlike the panel's `DIFF_LINE_PX` — one
+        // global scale factor whose error stays proportional — this arithmetic
+        // is quantized per line: a columns estimate off by two flips a 79-char
+        // line between one row and two. `LineWrap::Wrapped`'s own "good enough
+        // for windowing" doc claim is inherited from the panel's situation and
+        // does not hold here.
+        //
+        // Whether windowing the viewer is needed at all is also unmeasured —
+        // see #362, which puts measuring it first.
         <pre class="detail-diff viewer-pre">{patch}</pre>
     }
     .into_view()

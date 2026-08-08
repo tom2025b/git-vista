@@ -1244,6 +1244,102 @@ mod tests {
         assert_eq!(FILE_CONTENT_CAP, 2_000_000);
     }
 
+    // ---- truncate_at_line's multi-byte safety (#69, M2.16) --------------
+    //
+    // `truncate_at_line`'s own doc comment names the hazard: "The cap is first
+    // walked back to a char boundary so a multi-byte character straddling it
+    // can't panic the slice." That walk-back had no test until these — every
+    // truncation fixture in this file is pure ASCII, where the hazard cannot
+    // occur, so the guard was load-bearing and entirely unexercised. Its three
+    // call sites (`commit_diff_for_repo`, the file reader, `staging_diff_for_repo`)
+    // all feed it text decoded by `from_utf8_lossy`, which emits multi-byte
+    // U+FFFD for every invalid input byte — so non-ASCII at the cap boundary is
+    // not an exotic case, it is what malformed input decodes *to*.
+
+    /// The specific panic the walk-back exists to prevent: a cap landing
+    /// **inside** a multi-byte character. Without the boundary walk, `text[..end]`
+    /// slices mid-character and panics.
+    ///
+    /// Byte layout of the fixture, counted by hand rather than derived:
+    /// `o`=0, `k`=1, `\n`=2, then `日`=3..6, `日`=6..9, `\n`=9. A cap of 5 lands
+    /// on the *third byte* of the first `日` — not a boundary.
+    #[test]
+    fn truncate_at_line_walks_back_off_a_multibyte_char_instead_of_panicking() {
+        let mut text = String::from("ok\n日日\n");
+        assert_eq!(
+            text.len(),
+            10,
+            "fixture byte length changed; recount the cap"
+        );
+        assert!(
+            !text.is_char_boundary(5),
+            "cap 5 must land mid-character or this test proves nothing"
+        );
+
+        truncate_at_line(&mut text, 5);
+
+        // Walk 5 → 4 → 3 (the start of the first `日`), then cut at the last
+        // newline before it.
+        assert_eq!(text, "ok");
+    }
+
+    /// The control: a cap that already sits on a char boundary must behave
+    /// identically, so the test above is measuring the walk-back rather than
+    /// truncation in general.
+    #[test]
+    fn truncate_at_line_on_an_exact_char_boundary_needs_no_walk_back() {
+        let mut text = String::from("ok\n日日\n");
+        assert!(text.is_char_boundary(3), "3 is the start of the first 日");
+
+        truncate_at_line(&mut text, 3);
+
+        assert_eq!(text, "ok");
+    }
+
+    /// With no newline before the cap, the function falls back to the
+    /// walked-back byte position — which must still be a char boundary, or the
+    /// `truncate` call panics. Keeps one whole character rather than a partial.
+    #[test]
+    fn truncate_at_line_with_no_newline_keeps_whole_characters() {
+        let mut text = String::from("日日日");
+        assert_eq!(text.len(), 9);
+        assert!(!text.is_char_boundary(4));
+
+        truncate_at_line(&mut text, 4);
+
+        assert_eq!(text, "日", "cut mid-character instead of walking back");
+    }
+
+    /// The property the walk-back actually guarantees, stated directly: for
+    /// **every** cap position over multi-byte text, the call completes and
+    /// leaves valid UTF-8.
+    ///
+    /// A cap is not a value this code chooses — it is `DIFF_PATCH_CAP` measured
+    /// against whatever bytes git emitted, so which byte it lands on is
+    /// effectively arbitrary. The three cases above pin specific known-bad
+    /// offsets; this one closes the gaps between them, and is what would catch a
+    /// future rewrite that handles some boundary cases but not all.
+    #[test]
+    fn truncate_at_line_never_panics_at_any_cap_over_multibyte_text() {
+        // Deliberately mixed: ASCII, 2-byte (é), 3-byte (日), 4-byte (🦀), and
+        // U+FFFD — the character `from_utf8_lossy` actually produces from
+        // invalid input, which is how this text arises in production.
+        let original = "a\né日\n🦀b\u{FFFD}\nzz";
+
+        for cap in 0..=original.len() + 4 {
+            let mut text = String::from(original);
+            truncate_at_line(&mut text, cap);
+
+            // `String` cannot hold invalid UTF-8, so surviving the call at all
+            // is most of the proof; assert the result is a real prefix too, so
+            // a "fix" that sanitised by rewriting bytes would not pass.
+            assert!(
+                original.starts_with(text.as_str()),
+                "cap {cap} produced {text:?}, which is not a prefix of the input"
+            );
+        }
+    }
+
     /// A `--name-status -z` read that hits the metadata cap is an explicit 413.
     /// It must never come back as a *partial* file list: the `-z` parsers stop
     /// cleanly on a short record, so a silently truncated read would render as a
