@@ -64,3 +64,5 @@ it, and note the link in both.
 | [0050](0050-operation-by-key-lookup.md) | Learning an operation's id before it finishes: an additive `GET /api/operations/by-key/{key}` | Accepted — implemented and tested |
 | [0051](0051-intent-admission-after-the-await.md) | Intent admission belongs *after* every await, not once before them | Accepted — implemented, confirmed on a device |
 | [0052](0052-explicit-repo-list.md) | An explicit repo list, because "these four" is not "this folder" | Accepted — implemented and tested |
+| [0053](0053-cancellation-by-framework-not-by-our-own-tracker.md) | "Cancellable" is satisfied by the framework and an id echo, not by a tracker of our own | Accepted — implemented |
+| [0054](0054-linux-desktop-browser-is-the-verification-target.md) | The Linux desktop browser is the verification target; iPad deferred to a VNC display | Accepted |

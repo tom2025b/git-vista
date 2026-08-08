@@ -116,8 +116,8 @@ use handlers::plan::{execute_plan, plan_operation};
 use handlers::protocol::protocol_info;
 use handlers::pull::pull_branch;
 use handlers::read::{
-    commit_detail, commit_diff, commits, file_at_commit, frame, head_branch, worktree_status,
-    worktree_status_v2,
+    commit_detail, commit_diff, commits, file_at_commit, frame, head_branch, spec_diff,
+    worktree_status, worktree_status_v2,
 };
 use handlers::rebase::{rebase, rebase_status};
 use handlers::reset::reset_test_repo;
@@ -484,6 +484,21 @@ fn api_router(
             .route("/api/staging/diff", get(staging_diff))
             .route("/api/staging/preview", post(staging_preview))
             .route("/api/staging/apply", post(staging_apply))
+            // Explicit source/target diffs (M2.16, #69) — the four DiffSpec
+            // modes. POST because DiffSpec is an internally-tagged enum whose
+            // variants carry different fields; a query string can only express
+            // that by flattening it back into loose optional parameters, which
+            // is the un-explicit shape the type exists to remove (same reason
+            // /api/plan is a POST).
+            //
+            // Under full_routes with the staging reads, not beside
+            // /api/diff/{id}: two of the four modes (WorktreeVsIndex,
+            // IndexVsCommit) expose uncommitted worktree and index content,
+            // which ADR 0005's LAN profile withholds. The commit-vs-commit
+            // modes would be safe on the LAN listener, but gating by variant
+            // would put a security boundary inside a match arm — where a later
+            // variant inherits whichever side someone forgets to consider.
+            .route("/api/diff/spec", post(spec_diff))
             // …and unstage it again (`git reset HEAD`) — the exact inverse, offered
             // by the menu while anything is staged.
             .route("/api/unstage", post(unstage_all))

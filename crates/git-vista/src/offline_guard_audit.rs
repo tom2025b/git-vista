@@ -164,6 +164,16 @@ const OFFLINE_GUARDED: &[&str] = &[
     // The most consequential write in this table: an irreversible remote
     // publish. Guarded first thing.
     "push_request",
+    // M2.16 (#69). `POST /api/diff/spec` — the four explicit DiffSpec modes.
+    // A pure read that mutates nothing, so it appears in this table for the
+    // same reason `preview_push` does: it reaches the *write transport*
+    // (`req_post`) because DiffSpec is an internally-tagged enum a query
+    // string cannot carry, and this audit classifies by transport rather than
+    // by intent — deliberately, since intent is what a reader can be wrong
+    // about. Guarded first thing: a diff fetched offline is not a stale diff,
+    // it is no diff, and the guard's refusal text is more actionable than the
+    // transport error the fetch would otherwise raise.
+    "fetch_spec_diff",
 ];
 
 /// The pinned, argued exception list — mirrors `route_authz`'s

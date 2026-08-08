@@ -18,6 +18,7 @@ use git_vista_core::diff::{CommitDiff, FileContent};
 use git_vista_core::model::CommitDetail;
 use git_vista_core::net::{network_error_text, offline_refusal_text};
 use git_vista_core::status::RepoStatus;
+use git_vista_protocol::diff::{DiffSpec, SpecDiff};
 use git_vista_protocol::dto::TagDetail;
 use git_vista_protocol::operation::{IdempotencyKey, OperationId, OperationStatus};
 use git_vista_protocol::{
@@ -1327,6 +1328,39 @@ pub async fn fetch_diff(id: &str) -> Result<CommitDiff, String> {
             .text()
             .await
             .unwrap_or_else(|_| format!("HTTP {}", resp.status())))
+    }
+}
+
+/// Fetch the diff of an explicit source/target pair (`POST /api/diff/spec`,
+/// M2.16 #69) — the four modes of [`DiffSpec`].
+///
+/// POST for a read: `DiffSpec` is an internally-tagged enum whose variants
+/// carry different fields, and a query string could only carry that by
+/// flattening it into loose optional parameters — the un-explicit shape the
+/// type exists to remove. `preview_push` states the same trade-off in its own
+/// words: a read in every sense but the HTTP verb the CSRF gate demands. That
+/// verb is why [`refuse_if_visualize`] applies; the endpoint is also
+/// loopback-only server-side, so this is the client half of a boundary the
+/// server enforces independently (ADR 0005).
+///
+/// **The response echoes the request.** Callers must compare [`SpecDiff::spec`]
+/// against what they currently want before painting, exactly as the viewer
+/// compares `CommitDiff.id`. ADR 0053 concluded #69's "cancellable" criterion
+/// is met partly *because* diff responses echo their request that way; dropping
+/// the check at a call site quietly reopens that argument.
+pub async fn fetch_spec_diff(spec: &DiffSpec) -> Result<SpecDiff, String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let resp = req_post("/api/diff/spec")
+        .json(spec)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(network_error)?;
+    if resp.ok() {
+        resp.json::<SpecDiff>().await.map_err(|e| e.to_string())
+    } else {
+        Err(user_facing_error("/api/diff/spec", resp).await)
     }
 }
 

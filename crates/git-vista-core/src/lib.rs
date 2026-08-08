@@ -19,12 +19,15 @@
 //! - [`virtualize`] — the windowed-list primitive (M2.16, #69c): item heights
 //!   and a scroll offset in, the visible render range out. Knows nothing
 //!   about diffs or the commit graph, so both can share it.
-//! - [`request_generation`] — cancellation via generation-tag (M2.16, #69d):
-//!   a monotonic counter a virtualized view bumps on every scroll-driven
-//!   refetch, so a late-arriving response can identify itself as stale and
-//!   be discarded instead of painting over newer content. Same shape as
-//!   [`identity::RepositoryGeneration`] (ADR 0001) applied to view state
-//!   instead of repository state.
+//!
+//! There is deliberately **no** request-cancellation primitive here. One existed
+//! (`request_generation`, M2.16 #69d) and was removed unused in ADR 0053: Leptos
+//! 0.6.15's own `create_local_resource` already drops out-of-order completions
+//! internally, and every diff/detail response echoes the id it was fetched for so
+//! the view can re-check it against the live selection before painting. #69's
+//! "cancellable" criterion is met by those two layers. A future fetch surface that
+//! refetches per scroll range — rather than fetching one capped patch per commit —
+//! would not inherit that reasoning and must re-argue it; see ADR 0053.
 //!
 //! Reading real history (which needs `gix` and a filesystem, and so can't run in
 //! a browser) lives in the separate native-only `git-vista-git` crate. Keeping
@@ -38,7 +41,6 @@ pub mod identity;
 pub mod layout;
 pub mod model;
 pub mod net;
-pub mod request_generation;
 pub mod seed;
 pub mod status;
 pub mod virtualize;

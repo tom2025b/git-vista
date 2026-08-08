@@ -221,30 +221,122 @@ pub enum DiffSpec {
     },
 }
 
+/// The diff of an explicit source/target pair — the response body of
+/// `POST /api/diff/spec` (M2.16, #69).
+///
+/// # Why this is not `git_vista_core::diff::CommitDiff`
+///
+/// `CommitDiff` carries two fields that only mean something for *one commit's*
+/// diff, and neither has an analogue here:
+///
+/// * `id` — one commit's hex id. A [`DiffSpec::WorktreeVsIndex`] diff has no
+///   commit at all, and a `CommitVsCommit`/`RefVsRef` diff has **two**
+///   endpoints, not one.
+/// * `against_first_parent` — a statement about how a *merge commit* was
+///   diffed. Nothing here is a merge commit.
+///
+/// Reusing it would have meant inventing values for both — an empty `id`, and
+/// a `false` that means "not applicable" rather than "diffed against every
+/// parent". Fields that lie about what they hold are worse than a second type.
+///
+/// # No file list, deliberately
+///
+/// `CommitDiff` also carries a per-file `Vec<DiffFile>` folded from two extra
+/// git reads (`--name-status -z` and `--numstat -z`). This type carries only
+/// the unified patch.
+///
+/// That is a scope decision, not an oversight: `DiffFile` lives in
+/// `git-vista-core`, which this crate depends on **only as a dev-dependency**
+/// — its own `Cargo.toml` says so, in those words: *"Never a non-dev
+/// dependency — this crate must stay pure and wasm-safe, and git-vista-core is
+/// neither."* Naming `DiffFile` here would quietly promote that dependency and
+/// break the wasm build this crate exists to stay compatible with. Adding a
+/// file list later means either a protocol-local file type or moving the shared
+/// one — a real design call, which is why this slice does not smuggle it in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecDiff {
+    /// The request this answers, echoed verbatim.
+    ///
+    /// This is the staleness guard, and it is load-bearing: ADR 0053 concluded
+    /// that #69's "cancellable" criterion is met **partly because** every diff
+    /// response echoes what it was fetched for, so a view can compare it
+    /// against what it currently wants and drop a late answer instead of
+    /// painting it. That ADR names a new fetch surface without such an echo as
+    /// something that would have to re-argue cancellation from scratch. This
+    /// field is how this endpoint inherits the existing argument rather than
+    /// reopening it.
+    pub spec: DiffSpec,
+    /// The unified diff text (`--patch --no-color --no-textconv`), possibly
+    /// truncated at the server's size cap.
+    pub patch: String,
+    /// True when the patch was cut at that cap — so a consumer says so rather
+    /// than silently showing a partial diff.
+    pub truncated: bool,
+}
+
 /// The `git diff` argv for a [`DiffSpec`] — pure, no process spawn. Matches
 /// `git_vista_core::diff::diff_argv`'s existing return shape (`Vec<String>`,
 /// argument order git expects, no leading `"git"`).
+///
+/// **This is the mode mapping only — it carries no read options.** A caller
+/// that is going to hand the result to git and show a user the output wants
+/// [`diff_spec_argv_with`] instead; see its doc for why `--no-textconv` in
+/// particular is not optional.
 pub fn diff_spec_argv(spec: &DiffSpec) -> Vec<String> {
+    diff_spec_argv_with(spec, &[])
+}
+
+/// [`diff_spec_argv`] with the caller's own read options inserted, **before
+/// the revisions**.
+///
+/// # Why the position is part of the contract
+///
+/// `git_vista_core::diff::diff_argv` states the rule this follows: options go
+/// *before* the revisions "so git can never read a revision as an option's
+/// value". A caller appending its own flags after the argv this returns would
+/// silently violate that, which is exactly why inserting them is this
+/// function's job rather than the caller's.
+///
+/// Git's own mode flags stay ahead of the caller's — `--cached` belongs to the
+/// mode, not to the read — but both land before any revision.
+///
+/// # Why a caller cannot skip `--no-textconv`
+///
+/// Every production diff argv in the server sets `--no-textconv`, and it is a
+/// security property rather than a formatting preference: a repository's own
+/// `.gitattributes` can bind a `diff=<driver>` textconv filter, and git will
+/// then **execute that configured program** to render a file's contents. A
+/// diff read that omits the flag hands a repository the ability to run a
+/// command of its choosing. `--no-color` matters for a smaller reason — a
+/// `color.ui = always` config would otherwise inject ANSI escapes into text
+/// this app renders as-is.
+///
+/// This function does not force those flags in, because what to read (`--patch`
+/// vs `--name-status -z` vs `--numstat -z`) genuinely differs per call. It
+/// names them here so the omission has to be deliberate.
+pub fn diff_spec_argv_with(spec: &DiffSpec, extra: &[&str]) -> Vec<String> {
+    let mut argv = vec!["diff".to_string()];
+    let extras = |argv: &mut Vec<String>| argv.extend(extra.iter().map(|s| s.to_string()));
+
     match spec {
-        DiffSpec::WorktreeVsIndex => vec!["diff".to_string()],
-        DiffSpec::IndexVsCommit { commit } => vec![
-            "diff".to_string(),
-            "--cached".to_string(),
-            commit.as_str().to_string(),
-        ],
-        DiffSpec::CommitVsCommit { base, target } => {
-            vec![
-                "diff".to_string(),
-                base.as_str().to_string(),
-                target.as_str().to_string(),
-            ]
+        DiffSpec::WorktreeVsIndex => extras(&mut argv),
+        DiffSpec::IndexVsCommit { commit } => {
+            argv.push("--cached".to_string());
+            extras(&mut argv);
+            argv.push(commit.as_str().to_string());
         }
-        DiffSpec::RefVsRef { base, target } => vec![
-            "diff".to_string(),
-            base.as_str().to_string(),
-            target.as_str().to_string(),
-        ],
+        DiffSpec::CommitVsCommit { base, target } => {
+            extras(&mut argv);
+            argv.push(base.as_str().to_string());
+            argv.push(target.as_str().to_string());
+        }
+        DiffSpec::RefVsRef { base, target } => {
+            extras(&mut argv);
+            argv.push(base.as_str().to_string());
+            argv.push(target.as_str().to_string());
+        }
     }
+    argv
 }
 
 /// Parse the complete unified-diff text of `git show --patch --no-color` (or
@@ -1116,6 +1208,96 @@ index 333,444..555
 
         assert_eq!(commit_argv[0], ref_argv[0]);
         assert_eq!(commit_argv.len(), ref_argv.len());
+    }
+
+    // ---- diff_spec_argv_with: read options, and where they go ----------
+
+    /// The contract that matters: a caller's flags land **before** the
+    /// revisions. `git_vista_core::diff::diff_argv` states why — options after
+    /// a revision let git read the revision as an option's value.
+    #[test]
+    fn extra_options_are_inserted_before_the_revisions_never_after() {
+        let base = oid(&"a".repeat(40));
+        let target = oid(&"b".repeat(40));
+        let argv = diff_spec_argv_with(
+            &DiffSpec::CommitVsCommit {
+                base: base.clone(),
+                target: target.clone(),
+            },
+            &["--patch", "--no-color", "--no-textconv"],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "diff",
+                "--patch",
+                "--no-color",
+                "--no-textconv",
+                base.as_str(),
+                target.as_str(),
+            ]
+        );
+
+        // Stated as a position property too, so a future rewrite that keeps
+        // every element but reorders them fails here rather than at runtime.
+        let first_rev = argv.iter().position(|a| a == base.as_str()).unwrap();
+        for flag in ["--patch", "--no-color", "--no-textconv"] {
+            let at = argv.iter().position(|a| a == flag).unwrap();
+            assert!(at < first_rev, "{flag} landed after a revision");
+        }
+    }
+
+    /// `--cached` belongs to the *mode*, not to the caller's read, so it stays
+    /// ahead of the extras — but both must still precede the commit.
+    #[test]
+    fn index_vs_commit_keeps_cached_ahead_of_extras_and_both_before_the_commit() {
+        let commit = oid(&"c".repeat(40));
+        let argv = diff_spec_argv_with(
+            &DiffSpec::IndexVsCommit {
+                commit: commit.clone(),
+            },
+            &["--no-textconv"],
+        );
+        assert_eq!(
+            argv,
+            vec!["diff", "--cached", "--no-textconv", commit.as_str()]
+        );
+    }
+
+    /// The mode with no revisions at all still takes options cleanly.
+    #[test]
+    fn worktree_vs_index_appends_extras_with_no_revisions_to_precede() {
+        let argv = diff_spec_argv_with(&DiffSpec::WorktreeVsIndex, &["--patch", "--no-textconv"]);
+        assert_eq!(argv, vec!["diff", "--patch", "--no-textconv"]);
+    }
+
+    /// The no-options call must stay byte-identical to what `diff_spec_argv`
+    /// produced before it was refactored onto the shared implementation —
+    /// otherwise this refactor silently changed the argv every existing
+    /// assertion above pins.
+    #[test]
+    fn no_extras_is_identical_to_the_plain_mode_argv_for_every_variant() {
+        let commit = oid(&"c".repeat(40));
+        let base = oid(&"a".repeat(40));
+        let target = oid(&"b".repeat(40));
+        for spec in [
+            DiffSpec::WorktreeVsIndex,
+            DiffSpec::IndexVsCommit { commit },
+            DiffSpec::CommitVsCommit {
+                base: base.clone(),
+                target: target.clone(),
+            },
+            DiffSpec::RefVsRef {
+                base: refname("main"),
+                target: refname("feature/x"),
+            },
+        ] {
+            assert_eq!(
+                diff_spec_argv_with(&spec, &[]),
+                diff_spec_argv(&spec),
+                "{spec:?} diverged between the two entry points"
+            );
+        }
     }
 
     #[test]

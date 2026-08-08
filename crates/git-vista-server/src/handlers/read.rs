@@ -1069,6 +1069,84 @@ pub(crate) async fn staging_diff_for_repo(
     })
 }
 
+/// One explicit source/target diff (`POST /api/diff/spec`, M2.16 #69) — the
+/// endpoint that makes #69's *"diff source and target are explicit"* criterion
+/// real by accepting a [`DiffSpec`] rather than assuming "one commit vs its
+/// parent".
+///
+/// # Why POST for a read
+///
+/// [`DiffSpec`] is an internally-tagged enum whose variants carry different
+/// fields; a query string cannot express that shape without flattening it back
+/// into loose optional parameters — which is exactly the un-explicit form the
+/// type exists to remove. `POST /api/plan` set this precedent for the same
+/// reason (`handlers/plan.rs`), and `api.rs`'s `preview_push` states it
+/// plainly: it is a read in every sense but the HTTP verb the CSRF gate
+/// demands.
+///
+/// # Why loopback-only
+///
+/// Registered inside `main.rs`'s `full_routes` block, so a LAN visualize
+/// session cannot reach it. Two of the four modes ([`DiffSpec::WorktreeVsIndex`]
+/// and [`DiffSpec::IndexVsCommit`]) expose **uncommitted** worktree and index
+/// content, which ADR 0005's read-only LAN profile deliberately withholds —
+/// `/api/staging/diff` is gated the same way and for the same reason. The
+/// commit-vs-commit modes would be safe on the LAN listener, but splitting one
+/// endpoint across two exposure classes by variant would put a security
+/// boundary inside a match arm, where a later added variant inherits whichever
+/// side someone forgets to think about. One endpoint, the stricter placement.
+pub(crate) async fn spec_diff(
+    Query(query): Query<RepoQuery>,
+    Json(spec): Json<git_vista_protocol::diff::DiffSpec>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = resolve_repo(query.repo.as_deref())?.0;
+    let diff = spec_diff_for_repo(&repo, spec).await?;
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(diff)))
+}
+
+/// The seam [`spec_diff`] does its work through, with the repository injected
+/// rather than resolved from the process-global selection — the same shape
+/// `staging_diff_for_repo` has, and for the same reason: it is what lets a test
+/// drive the real endpoint body against a throwaway repository.
+pub(crate) async fn spec_diff_for_repo(
+    repo: &Path,
+    spec: git_vista_protocol::diff::DiffSpec,
+) -> Result<git_vista_protocol::diff::SpecDiff, (StatusCode, String)> {
+    // `diff_spec_argv_with`, not `diff_spec_argv`: the bare mode mapping
+    // carries no read options, and `--no-textconv` is not optional here. A
+    // repository's own `.gitattributes` can bind a `diff=<driver>` textconv
+    // filter, which git then *executes* to render file contents — a diff read
+    // without the flag hands a repository the ability to run a command of its
+    // choosing. `--no-color` keeps a `color.ui = always` config from injecting
+    // ANSI escapes into text rendered as-is. Same flag set every other diff
+    // read in this file uses; the helper places them before the revisions so
+    // git can never read a revision as an option's value.
+    let args = git_vista_protocol::diff::diff_spec_argv_with(
+        &spec,
+        &["--patch", "--no-color", "--no-textconv"],
+    );
+
+    let (bytes, over_cap) =
+        git_stdout_capped(repo, &args, "/api/diff/spec", DIFF_PATCH_CAP_FULL).await?;
+
+    // Same decode-then-tidy order as `commit_diff_for_repo`: `over_cap` is the
+    // reader's byte-level fact and is authoritative, never re-derived from the
+    // decoded string's length (`from_utf8_lossy` expands each invalid byte to a
+    // 3-byte U+FFFD, so a complete sub-cap patch can decode to more than the
+    // cap and would then be reported as cut when nothing was).
+    let mut patch = String::from_utf8_lossy(&bytes).into_owned();
+    if over_cap {
+        truncate_at_line(&mut patch, DIFF_PATCH_CAP_FULL);
+    }
+
+    Ok(git_vista_protocol::diff::SpecDiff {
+        spec,
+        patch,
+        truncated: over_cap,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1077,6 +1155,7 @@ mod tests {
     use git_vista_core::identity::RepositoryId;
     use git_vista_core::layout::stream::canonicalize_edges;
     use git_vista_core::model::CommitSummary;
+    use git_vista_protocol::diff::DiffSpec;
     use git_vista_protocol::{
         ApiError, ChangeKind, ChangeSides, ErrorCode, RepositoryDescriptor, StatusEntry,
         PROTOCOL_HEADER, PROTOCOL_VERSION,
@@ -1242,6 +1321,102 @@ mod tests {
         assert_eq!(DIFF_PATCH_CAP_FULL, 5_000_000);
         assert_eq!(DIFF_METADATA_CAP, 8 * 1024 * 1024);
         assert_eq!(FILE_CONTENT_CAP, 2_000_000);
+    }
+
+    // ---- truncate_at_line's multi-byte safety (#69, M2.16) --------------
+    //
+    // `truncate_at_line`'s own doc comment names the hazard: "The cap is first
+    // walked back to a char boundary so a multi-byte character straddling it
+    // can't panic the slice." That walk-back had no test until these — every
+    // truncation fixture in this file is pure ASCII, where the hazard cannot
+    // occur, so the guard was load-bearing and entirely unexercised. Its three
+    // call sites (`commit_diff_for_repo`, the file reader, `staging_diff_for_repo`)
+    // all feed it text decoded by `from_utf8_lossy`, which emits multi-byte
+    // U+FFFD for every invalid input byte — so non-ASCII at the cap boundary is
+    // not an exotic case, it is what malformed input decodes *to*.
+
+    /// The specific panic the walk-back exists to prevent: a cap landing
+    /// **inside** a multi-byte character. Without the boundary walk, `text[..end]`
+    /// slices mid-character and panics.
+    ///
+    /// Byte layout of the fixture, counted by hand rather than derived:
+    /// `o`=0, `k`=1, `\n`=2, then `日`=3..6, `日`=6..9, `\n`=9. A cap of 5 lands
+    /// on the *third byte* of the first `日` — not a boundary.
+    #[test]
+    fn truncate_at_line_walks_back_off_a_multibyte_char_instead_of_panicking() {
+        let mut text = String::from("ok\n日日\n");
+        assert_eq!(
+            text.len(),
+            10,
+            "fixture byte length changed; recount the cap"
+        );
+        assert!(
+            !text.is_char_boundary(5),
+            "cap 5 must land mid-character or this test proves nothing"
+        );
+
+        truncate_at_line(&mut text, 5);
+
+        // Walk 5 → 4 → 3 (the start of the first `日`), then cut at the last
+        // newline before it.
+        assert_eq!(text, "ok");
+    }
+
+    /// The control: a cap that already sits on a char boundary must behave
+    /// identically, so the test above is measuring the walk-back rather than
+    /// truncation in general.
+    #[test]
+    fn truncate_at_line_on_an_exact_char_boundary_needs_no_walk_back() {
+        let mut text = String::from("ok\n日日\n");
+        assert!(text.is_char_boundary(3), "3 is the start of the first 日");
+
+        truncate_at_line(&mut text, 3);
+
+        assert_eq!(text, "ok");
+    }
+
+    /// With no newline before the cap, the function falls back to the
+    /// walked-back byte position — which must still be a char boundary, or the
+    /// `truncate` call panics. Keeps one whole character rather than a partial.
+    #[test]
+    fn truncate_at_line_with_no_newline_keeps_whole_characters() {
+        let mut text = String::from("日日日");
+        assert_eq!(text.len(), 9);
+        assert!(!text.is_char_boundary(4));
+
+        truncate_at_line(&mut text, 4);
+
+        assert_eq!(text, "日", "cut mid-character instead of walking back");
+    }
+
+    /// The property the walk-back actually guarantees, stated directly: for
+    /// **every** cap position over multi-byte text, the call completes and
+    /// leaves valid UTF-8.
+    ///
+    /// A cap is not a value this code chooses — it is `DIFF_PATCH_CAP` measured
+    /// against whatever bytes git emitted, so which byte it lands on is
+    /// effectively arbitrary. The three cases above pin specific known-bad
+    /// offsets; this one closes the gaps between them, and is what would catch a
+    /// future rewrite that handles some boundary cases but not all.
+    #[test]
+    fn truncate_at_line_never_panics_at_any_cap_over_multibyte_text() {
+        // Deliberately mixed: ASCII, 2-byte (é), 3-byte (日), 4-byte (🦀), and
+        // U+FFFD — the character `from_utf8_lossy` actually produces from
+        // invalid input, which is how this text arises in production.
+        let original = "a\né日\n🦀b\u{FFFD}\nzz";
+
+        for cap in 0..=original.len() + 4 {
+            let mut text = String::from(original);
+            truncate_at_line(&mut text, cap);
+
+            // `String` cannot hold invalid UTF-8, so surviving the call at all
+            // is most of the proof; assert the result is a real prefix too, so
+            // a "fix" that sanitised by rewriting bytes would not pass.
+            assert!(
+                original.starts_with(text.as_str()),
+                "cap {cap} produced {text:?}, which is not a prefix of the input"
+            );
+        }
     }
 
     /// A `--name-status -z` read that hits the metadata cap is an explicit 413.
@@ -1410,6 +1585,235 @@ mod tests {
         }
         bytes.truncate(len);
         bytes
+    }
+
+    // ---- POST /api/diff/spec: the four explicit modes (M2.16, #69) -------
+
+    /// A repository where **each of the four `DiffSpec` modes sees a different
+    /// change**, so a test can prove a mode diffed what it claims rather than
+    /// merely returning some non-empty patch.
+    ///
+    /// `v.txt` moves through four values, each parked in a different place:
+    ///
+    /// ```text
+    ///   one    commit 1 (branch `base`)
+    ///   two    commit 2 (branch `main`, HEAD)
+    ///   three  staged in the index, not committed
+    ///   four   in the working tree, not staged
+    /// ```
+    ///
+    /// So `WorktreeVsIndex` must see three→four, `IndexVsCommit(HEAD)` two→three,
+    /// and `CommitVsCommit`/`RefVsRef` one→two. Four modes, four distinguishable
+    /// answers — a mode that silently ran the wrong argv shows up as the wrong
+    /// pair, not as a pass.
+    fn four_mode_repo() -> (tempfile::TempDir, PathBuf, String, String) {
+        let (dir, repo) = seeded_repo();
+
+        std::fs::write(repo.join("v.txt"), "one\n").unwrap();
+        run(&repo, &["add", "-A"]);
+        run(&repo, &["commit", "-q", "-m", "v = one"]);
+        let c1 = out(&repo, &["rev-parse", "HEAD"]);
+        run(&repo, &["branch", "base"]);
+
+        std::fs::write(repo.join("v.txt"), "two\n").unwrap();
+        run(&repo, &["add", "-A"]);
+        run(&repo, &["commit", "-q", "-m", "v = two"]);
+        let c2 = out(&repo, &["rev-parse", "HEAD"]);
+
+        // Staged but uncommitted.
+        std::fs::write(repo.join("v.txt"), "three\n").unwrap();
+        run(&repo, &["add", "-A"]);
+
+        // Working tree, on top of the staged value and not added.
+        std::fs::write(repo.join("v.txt"), "four\n").unwrap();
+
+        (dir, repo, c1, c2)
+    }
+
+    /// Assert a patch changes exactly `from` → `to`, and **not** any of the
+    /// other values in play. The negative half is the point: without it, a
+    /// patch containing every value (what `git diff` against the wrong base
+    /// would produce) satisfies the positive assertions too.
+    fn assert_changes(patch: &str, from: &str, to: &str, mode: &str) {
+        assert!(
+            patch.contains(&format!("-{from}")),
+            "{mode}: expected removal of {from:?}; patch was:\n{patch}"
+        );
+        assert!(
+            patch.contains(&format!("+{to}")),
+            "{mode}: expected addition of {to:?}; patch was:\n{patch}"
+        );
+        for other in ["one", "two", "three", "four"] {
+            if other == from || other == to {
+                continue;
+            }
+            assert!(
+                !patch.contains(&format!("-{other}\n")) && !patch.contains(&format!("+{other}\n")),
+                "{mode}: patch mentions {other:?}, so it diffed the wrong pair;\
+                 \npatch was:\n{patch}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spec_diff_worktree_vs_index_sees_the_unstaged_edit_only() {
+        let (_dir, repo, _c1, _c2) = four_mode_repo();
+        let out = spec_diff_for_repo(&repo, DiffSpec::WorktreeVsIndex)
+            .await
+            .expect("worktree-vs-index answers");
+        assert_changes(&out.patch, "three", "four", "WorktreeVsIndex");
+        assert!(!out.truncated);
+        assert_eq!(out.spec, DiffSpec::WorktreeVsIndex, "spec must echo back");
+    }
+
+    #[tokio::test]
+    async fn spec_diff_index_vs_commit_sees_the_staged_edit_only() {
+        let (_dir, repo, _c1, c2) = four_mode_repo();
+        let spec = DiffSpec::IndexVsCommit {
+            commit: git_vista_protocol::plan::CommitOid::new(&c2).unwrap(),
+        };
+        let out = spec_diff_for_repo(&repo, spec.clone())
+            .await
+            .expect("index-vs-commit answers");
+        assert_changes(&out.patch, "two", "three", "IndexVsCommit");
+        assert_eq!(out.spec, spec);
+    }
+
+    #[tokio::test]
+    async fn spec_diff_commit_vs_commit_sees_only_what_is_committed() {
+        let (_dir, repo, c1, c2) = four_mode_repo();
+        let spec = DiffSpec::CommitVsCommit {
+            base: git_vista_protocol::plan::CommitOid::new(&c1).unwrap(),
+            target: git_vista_protocol::plan::CommitOid::new(&c2).unwrap(),
+        };
+        let out = spec_diff_for_repo(&repo, spec.clone())
+            .await
+            .expect("commit-vs-commit answers");
+        // Neither the staged nor the worktree value may appear: this mode
+        // reads committed history only.
+        assert_changes(&out.patch, "one", "two", "CommitVsCommit");
+        assert_eq!(out.spec, spec);
+    }
+
+    #[tokio::test]
+    async fn spec_diff_ref_vs_ref_resolves_names_to_the_same_answer() {
+        let (_dir, repo, _c1, _c2) = four_mode_repo();
+        let spec = DiffSpec::RefVsRef {
+            base: git_vista_protocol::plan::RefName::new("base").unwrap(),
+            target: git_vista_protocol::plan::RefName::new("main").unwrap(),
+        };
+        let out = spec_diff_for_repo(&repo, spec.clone())
+            .await
+            .expect("ref-vs-ref answers");
+        assert_changes(&out.patch, "one", "two", "RefVsRef");
+        assert_eq!(out.spec, spec);
+    }
+
+    /// The four modes must not collapse into each other. Stated as a direct
+    /// comparison because every per-mode test above could pass while two modes
+    /// quietly ran identical argv — `CommitVsCommit` and `RefVsRef` genuinely
+    /// *do* produce identical argv shapes by design, so "they differ" cannot be
+    /// assumed from the type alone.
+    #[tokio::test]
+    async fn the_worktree_index_and_commit_modes_return_genuinely_different_patches() {
+        let (_dir, repo, c1, c2) = four_mode_repo();
+
+        let worktree = spec_diff_for_repo(&repo, DiffSpec::WorktreeVsIndex)
+            .await
+            .unwrap();
+        let index = spec_diff_for_repo(
+            &repo,
+            DiffSpec::IndexVsCommit {
+                commit: git_vista_protocol::plan::CommitOid::new(&c2).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        let committed = spec_diff_for_repo(
+            &repo,
+            DiffSpec::CommitVsCommit {
+                base: git_vista_protocol::plan::CommitOid::new(&c1).unwrap(),
+                target: git_vista_protocol::plan::CommitOid::new(&c2).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(worktree.patch, index.patch);
+        assert_ne!(index.patch, committed.patch);
+        assert_ne!(worktree.patch, committed.patch);
+    }
+
+    /// `--no-textconv` is a security property, not a formatting preference: a
+    /// repository's own `.gitattributes` can bind a `diff=<driver>` textconv
+    /// filter, and git *executes* that configured program to render file
+    /// contents. This proves the flag actually reaches git.
+    ///
+    /// # What removing the flag actually does here — measured, not assumed
+    ///
+    /// Mutation-checked by deleting `--no-textconv` from `spec_diff_for_repo`'s
+    /// argv and re-running: baseline 5 pass, mutated 4 pass and **this test
+    /// alone** fails. So it does guard the flag specifically rather than
+    /// tripping on any change.
+    ///
+    /// But it fails by a different route than the assertion below suggests, and
+    /// that is worth stating rather than leaving for someone to rediscover.
+    /// Without the flag, git tries to run the filter, needs a temp file to do
+    /// it, and **the sandbox refuses**:
+    ///
+    /// ```text
+    /// (500, "fatal: unable to create temp-file: Permission denied")
+    /// ```
+    ///
+    /// The call errors before any patch exists, so `unwrap()` panics and the
+    /// marker assertion never evaluates. That is a genuinely good finding — the
+    /// sandbox blocks textconv execution independently of this flag, so the two
+    /// are defence in depth rather than one guard. It also means **this test
+    /// would still go red if the marker assertion were deleted**, which is
+    /// exactly the kind of overlap that makes a test look stronger than it is.
+    ///
+    /// The assertion is kept because it is the one that stays meaningful if the
+    /// sandbox is ever loosened, or on a filter that needs no temp file — but
+    /// on this box, today, the sandbox fires first.
+    #[tokio::test]
+    async fn spec_diff_never_runs_a_repository_configured_textconv_filter() {
+        let (_dir, repo, _c1, c2) = four_mode_repo();
+
+        // A textconv driver that replaces any file's rendered content. If it
+        // runs, the marker appears instead of the real diff text.
+        std::fs::write(repo.join(".gitattributes"), "v.txt diff=pwned\n").unwrap();
+        run(
+            &repo,
+            &["config", "diff.pwned.textconv", "echo TEXTCONV_RAN"],
+        );
+
+        for (label, spec) in [
+            ("WorktreeVsIndex", DiffSpec::WorktreeVsIndex),
+            (
+                "IndexVsCommit",
+                DiffSpec::IndexVsCommit {
+                    commit: git_vista_protocol::plan::CommitOid::new(&c2).unwrap(),
+                },
+            ),
+        ] {
+            // `expect`, not `unwrap`: with the flag removed this is where the
+            // failure actually lands (sandbox-denied temp file), so the message
+            // should name the cause rather than printing a bare Err.
+            let out = spec_diff_for_repo(&repo, spec).await.unwrap_or_else(|e| {
+                panic!(
+                    "{label}: the diff read failed instead of answering: {e:?}. \
+                     If this is a temp-file permission error, git attempted a \
+                     textconv filter — meaning --no-textconv is missing from \
+                     this mode's argv and the sandbox caught what the flag \
+                     should have prevented."
+                )
+            });
+            assert!(
+                !out.patch.contains("TEXTCONV_RAN"),
+                "{label}: a repository-configured textconv filter executed — \
+                 --no-textconv is missing from this mode's argv"
+            );
+        }
     }
 
     /// A repository whose HEAD commit modifies both a ~50 MiB text file and a

@@ -2049,6 +2049,19 @@ fn every_git_write_route_reaches_the_planner() {
         // a plan; its refusals (400/409) happen before any operation exists.
         ("/api/staging/preview", "staging_preview"),
         ("/api/staging/apply", "staging_apply"),
+        // M2.16 (#69): the four explicit DiffSpec diff modes. A POST, and
+        // emphatically **not** a git write — it spawns a read-only `git diff`
+        // through `git_stdout_capped`, constructs no plan, and leaves the
+        // repository byte-for-byte unchanged. It has no funnel row below for
+        // the same reason `/api/staging/preview` does not.
+        //
+        // It is a POST only because `DiffSpec` is an internally-tagged enum
+        // whose variants carry different fields; a query string could carry it
+        // only by flattening it into loose optional parameters, which is the
+        // un-explicit shape the type exists to remove. `/api/plan` sits in this
+        // table for the same reason — a read wearing a write's verb because the
+        // CSRF gate keys on the method.
+        ("/api/diff/spec", "spec_diff"),
         ("/api/unstage", "unstage_all"),
         ("/api/undo", "activity::undo"),
         ("/api/merge", "merge_branch"),
