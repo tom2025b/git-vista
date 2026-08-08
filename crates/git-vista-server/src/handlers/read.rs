@@ -1587,15 +1587,6 @@ mod tests {
         bytes
     }
 
-    /// A repository whose HEAD commit modifies both a ~50 MiB text file and a
-    /// NUL-bearing binary blob.
-    ///
-    /// Two deliberate choices. `bin.dat` sorts before `zbig.txt`, so git's patch
-    /// leads with the binary section — otherwise the 200 KB panel cap would cut
-    /// away the very "Binary files … differ" line the test is about. And the
-    /// text change is an *append*: git trims the identical 50 MiB prefix in one
-    /// pass, so the fixture stays a fixture instead of a minutes-long diff,
-    /// while still producing a patch far past both patch caps.
     // ---- POST /api/diff/spec: the four explicit modes (M2.16, #69) -------
 
     /// A repository where **each of the four `DiffSpec` modes sees a different
@@ -1825,6 +1816,15 @@ mod tests {
         }
     }
 
+    /// A repository whose HEAD commit modifies both a ~50 MiB text file and a
+    /// NUL-bearing binary blob.
+    ///
+    /// Two deliberate choices. `bin.dat` sorts before `zbig.txt`, so git's patch
+    /// leads with the binary section — otherwise the 200 KB panel cap would cut
+    /// away the very "Binary files … differ" line the test is about. And the
+    /// text change is an *append*: git trims the identical 50 MiB prefix in one
+    /// pass, so the fixture stays a fixture instead of a minutes-long diff,
+    /// while still producing a patch far past both patch caps.
     fn pathological_repo() -> (tempfile::TempDir, PathBuf, String) {
         let (dir, repo) = seeded_repo();
         write_rows(&repo.join("zbig.txt"), "ZBIG\n", BIG_TEXT_BYTES, "alpha");
