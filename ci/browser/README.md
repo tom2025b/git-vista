@@ -49,6 +49,25 @@ offline guard refuses to open a repository. `helpers.mjs` forges
 offline guard**, because it fabricates the exact signal that guard reads. That
 coverage has to come from a manual device pass.
 
+## Testing a candidate bundle
+
+`DIST_DIR` is compiled in relative to the server crate, so *every* build of the
+server reads `crates/git-vista/dist` — including the one the operator is driving
+on the host's 8080. Rebuilding the bundle to verify a UI fix would swap the app
+out from under them mid-session.
+
+`run.sh` also unshares the **mount** namespace, so a candidate bundle can be bind
+-mounted over that path for the tests alone:
+
+```
+trunk build --config crates/git-vista/Trunk.toml --dist /tmp/candidate-dist
+GV_DIST=/tmp/candidate-dist ci/browser/run.sh
+```
+
+The operator's server keeps serving the real bundle from the real path, unaware.
+Verified both ways: a copied bundle runs green, and a deliberately broken one
+fails — so the mount is load-bearing, not decorative.
+
 ## What's here
 
 | file | role |

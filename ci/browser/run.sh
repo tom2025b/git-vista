@@ -39,12 +39,41 @@ if [[ ! -d $here/node_modules ]]; then
   ( cd "$here" && npm install --no-audit --no-fund --silent )
 fi
 
-# --map-root-user is what makes an unprivileged user namespace possible here; it
-# is also why `ip` can bring loopback up inside it. Without `lo` up, nothing can
-# connect to 127.0.0.1 at all -- a fresh netns starts with loopback DOWN.
-exec unshare --user --map-root-user --net -- bash -c '
+# TESTING A CANDIDATE BUNDLE WITHOUT DISTURBING A RUNNING SERVER.
+#
+# `DIST_DIR` is compiled in relative to the server crate (state.rs:
+# `concat!(env!("CARGO_MANIFEST_DIR"), "/../git-vista/dist")`), so EVERY build of
+# the server reads that one path -- including the operator's server on the host's
+# 8080. Rebuilding the bundle to verify a UI fix would swap the app out from
+# under whoever is driving it.
+#
+# `--mount` gives this process tree its own mount namespace, so a bind mount over
+# crates/git-vista/dist is visible ONLY to these tests. The operator's server
+# keeps serving the real bundle from the real path, unaware.
+#
+#   GV_DIST=/path/to/candidate/dist ci/browser/run.sh
+#
+# Unset, nothing is mounted and the tests read the normal bundle.
+dist_override="${GV_DIST:-}"
+if [[ -n $dist_override ]]; then
+  dist_override="$(cd "$dist_override" && pwd)"
+  if [[ ! -f $dist_override/index.html ]]; then
+    echo "browser tests: GV_DIST=$dist_override has no index.html" >&2
+    exit 1
+  fi
+fi
+
+# --map-root-user is what makes an unprivileged user namespace possible here. It
+# is why `ip` can bring loopback up (a fresh netns starts with `lo` DOWN, and
+# nothing reaches 127.0.0.1 until it is), and why `mount --bind` is permitted:
+# CAP_SYS_ADMIN is held inside the new user namespace only, never on the host.
+exec unshare --user --map-root-user --net --mount -- bash -c '
   set -euo pipefail
   ip link set lo up
+  if [[ -n $3 ]]; then
+    mount --bind "$3" "$2/crates/git-vista/dist"
+    echo "browser tests: serving candidate bundle from $3 (this namespace only)"
+  fi
   cd "$1"
-  exec npx playwright test -c playwright.config.mjs "${@:2}"
-' _ "$here" "$@"
+  exec npx playwright test -c playwright.config.mjs "${@:4}"
+' _ "$here" "$repo" "$dist_override" "$@"
