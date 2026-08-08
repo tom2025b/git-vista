@@ -63,3 +63,4 @@ it, and note the link in both.
 | [0049](0049-v1-scope-freeze.md) | V1 scope freeze: eighteen never-started issues closed as won't-do, M6/M7 retired, M8 deleted | Accepted — tracker changes only; no code or protocol touched |
 | [0050](0050-operation-by-key-lookup.md) | Learning an operation's id before it finishes: an additive `GET /api/operations/by-key/{key}` | Accepted — implemented and tested |
 | [0051](0051-intent-admission-after-the-await.md) | Intent admission belongs *after* every await, not once before them | Accepted — implemented, confirmed on a device |
+| [0052](0052-explicit-repo-list.md) | An explicit repo list, because "these four" is not "this folder" | Accepted — implemented and tested |

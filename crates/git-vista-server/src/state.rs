@@ -172,6 +172,49 @@ pub(crate) fn repo_root() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The operator-configured explicit repo list (ADR 0009's list form):
+/// `GIT_VISTA_REPOS`, a `:`-separated list of absolute repository paths.
+///
+/// # Why a list as well as a root
+///
+/// [`repo_root`] answers "serve everything in this folder." That is the wrong
+/// shape when the operator wants a handful of repositories that do not share a
+/// parent — the only way to express it with a root alone is to point at a
+/// common ancestor and serve every sibling too. This says exactly which ones.
+///
+/// `:` rather than `,` as the separator, matching `PATH` and every other
+/// path-list variable on this platform: a comma is a legal character in a Unix
+/// path and a colon is not meaningfully so, which makes the wrong-separator
+/// mistake fail loudly instead of silently producing one absurd path.
+///
+/// Empty entries are dropped rather than treated as `.` — a trailing colon or
+/// a doubled `::` is a typo, not a request to serve the process's working
+/// directory.
+pub(crate) fn repo_list() -> Vec<PathBuf> {
+    std::env::var_os("GIT_VISTA_REPOS")
+        .map(|v| {
+            std::env::split_paths(&v)
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Register the explicit repo list into the catalog (startup and
+/// `POST /api/rescan`). Empty list = the feature is off; `(0, 0)` then, not an
+/// error — the same soft posture [`scan_clones_root`] takes for a missing
+/// clones root.
+pub(crate) fn register_repo_list() -> (usize, usize) {
+    let paths = repo_list();
+    if paths.is_empty() {
+        return (0, 0);
+    }
+    catalog()
+        .write()
+        .expect("catalog lock")
+        .register_explicit(&paths, false)
+}
+
 /// Scan the configured root into the catalog (startup and `POST /api/rescan`).
 /// `None` = no root configured; `Some((registered, skipped))` otherwise.
 pub(crate) fn scan_repo_root() -> Option<(usize, usize)> {

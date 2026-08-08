@@ -248,6 +248,64 @@ impl Catalog {
         (registered, skipped)
     }
 
+    /// Register an explicitly-named list of repositories, each as its own
+    /// allowed root (ADR 0009's list form, `GIT_VISTA_REPOS`).
+    ///
+    /// # Why each path becomes its own root, rather than sharing one
+    ///
+    /// [`scan_direct_children`](Self::scan_direct_children) allows the *parent*
+    /// and registers what it finds beneath — the right shape when the operator
+    /// means "everything in this folder." An explicit list means the opposite:
+    /// **these exact repositories and nothing else**. Allowing a shared parent
+    /// would silently widen the boundary to every sibling, which is the thing
+    /// the operator was avoiding by naming four paths instead of a directory.
+    ///
+    /// # Symlinks
+    ///
+    /// Each path is canonicalized by [`register`](Self::register), and the
+    /// canonical form is what becomes the allowed root — so a symlink resolves
+    /// to its target and the target is what is allowed. This is deliberate and
+    /// is why a directory-of-symlinks does *not* work with a scanned root: the
+    /// canonical path escapes the declared root and `register` correctly
+    /// refuses it. Naming the real paths is the supported way to say "these
+    /// four," and it keeps the invariant that an allowed root is a real
+    /// location rather than an alias for one.
+    ///
+    /// Junk entries are skipped and logged, matching the scan's posture: a
+    /// typo in one path must not take the server down. Returns
+    /// (registered, skipped).
+    pub(crate) fn register_explicit(
+        &mut self,
+        paths: &[PathBuf],
+        read_only: bool,
+    ) -> (usize, usize) {
+        let (mut registered, mut skipped) = (0, 0);
+        for path in paths {
+            // Allow before register: `register` canonicalizes and then checks
+            // membership, so the root has to be in place first. Canonicalize
+            // here too — allowing the uncanonicalized form would leave a
+            // symlinked path allowed under a name its own canonical form does
+            // not match, and the membership check would then fail on the very
+            // path just allowed.
+            match std::fs::canonicalize(path) {
+                Ok(canonical) => self.allow_root(&canonical),
+                Err(e) => {
+                    skipped += 1;
+                    eprintln!("git-vista: skipping {} ({e})", path.display());
+                    continue;
+                }
+            }
+            match self.register(path, read_only) {
+                Ok(_) => registered += 1,
+                Err(e) => {
+                    skipped += 1;
+                    eprintln!("git-vista: skipping {} ({e})", path.display());
+                }
+            }
+        }
+        (registered, skipped)
+    }
+
     /// The capability view of the catalog: one [`RepositoryDescriptor`] per entry,
     /// addressed by id. Absolute paths are included only when `expose_paths` is
     /// set (the operator's opt-in); otherwise the descriptors carry no path.
@@ -755,5 +813,101 @@ mod tests {
         let descriptors = catalog.descriptors(false, None);
         assert_eq!(descriptors.len(), 1, "same worktree is one entry");
         assert!(descriptors[0].read_only, "the entry was updated in place");
+    }
+
+    // --- register_explicit (ADR 0009 list form, #350-adjacent) --------------
+
+    #[test]
+    fn an_explicit_list_registers_repos_that_share_no_parent() {
+        // The whole point of the list form: two repositories in unrelated
+        // places, neither reachable by scanning one directory.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let repo_a = a.path().join("alpha");
+        let repo_b = b.path().join("beta");
+        init_repo(&repo_a);
+        init_repo(&repo_b);
+
+        let mut catalog = Catalog::new();
+        let (registered, skipped) =
+            catalog.register_explicit(&[repo_a.clone(), repo_b.clone()], false);
+
+        assert_eq!((registered, skipped), (2, 0));
+        assert_eq!(catalog.entries.len(), 2);
+    }
+
+    #[test]
+    fn an_explicit_list_allows_only_what_it_names_not_the_siblings() {
+        // The security property that separates this from "point a root at the
+        // parent": naming one repo must NOT make its neighbours registrable.
+        let base = tempfile::tempdir().unwrap();
+        let named = base.path().join("named");
+        let sibling = base.path().join("sibling");
+        init_repo(&named);
+        init_repo(&sibling);
+
+        let mut catalog = Catalog::new();
+        let (registered, _) = catalog.register_explicit(std::slice::from_ref(&named), false);
+        assert_eq!(registered, 1);
+
+        // The sibling shares a parent with an allowed repo, and is still refused.
+        let err = catalog.register(&sibling, false).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::OutsideAllowedRoots),
+            "naming one repo must not widen the boundary to its parent"
+        );
+    }
+
+    #[test]
+    fn a_bad_path_in_the_list_is_skipped_not_fatal() {
+        // A typo in one entry must not cost the operator the others — same
+        // posture the directory scan takes for junk children.
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good");
+        init_repo(&good);
+        let missing = dir.path().join("does-not-exist");
+        let not_a_repo = dir.path().join("plain");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+
+        let mut catalog = Catalog::new();
+        let (registered, skipped) =
+            catalog.register_explicit(&[missing, good.clone(), not_a_repo], false);
+
+        assert_eq!(registered, 1, "the good path must still register");
+        assert_eq!(skipped, 2, "both bad paths must be counted as skipped");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_in_the_list_registers_its_target_not_its_alias() {
+        // Why a directory-of-symlinks fails with a scanned root but works when
+        // named directly: register_explicit allows the CANONICAL path, so the
+        // target is what becomes the allowed root and the membership check
+        // that follows passes against that same canonical form.
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let repo = real.path().join("project");
+        init_repo(&repo);
+        let link = links.path().join("project");
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+
+        let mut catalog = Catalog::new();
+        let (registered, skipped) = catalog.register_explicit(&[link], false);
+
+        assert_eq!(
+            (registered, skipped),
+            (1, 0),
+            "a named symlink must resolve and register its target"
+        );
+        // And the entry holds the REAL path, never the alias.
+        let entry = catalog.entries.values().next().unwrap();
+        assert_eq!(entry.path, std::fs::canonicalize(&repo).unwrap());
+    }
+
+    #[test]
+    fn an_empty_list_registers_nothing_and_is_not_an_error() {
+        let mut catalog = Catalog::new();
+        let (registered, skipped) = catalog.register_explicit(&[], false);
+        assert_eq!((registered, skipped), (0, 0));
     }
 }

@@ -192,6 +192,16 @@ async fn main() {
         println!("git-vista: repo root scan: {registered} registered, {skipped} skipped");
     }
 
+    // ADR 0009 (list form): register each explicitly-named repository. Runs
+    // alongside the root scan rather than instead of it — an operator may
+    // reasonably want "everything in ~/work, plus these two elsewhere", and
+    // registration is idempotent on identity, so a path named by both is
+    // admitted once.
+    let (listed, listed_skipped) = state::register_repo_list();
+    if listed > 0 || listed_skipped > 0 {
+        println!("git-vista: repo list: {listed} registered, {listed_skipped} skipped");
+    }
+
     // ADR 0008: clones persist across runs. Re-register every clone surviving
     // under the clones root so the picker keeps offering it after a restart.
     let (clones_registered, _) = state::scan_clones_root();
