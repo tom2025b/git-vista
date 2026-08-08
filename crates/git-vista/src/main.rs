@@ -49,6 +49,15 @@ mod graph;
 // leaves completely untested. Test-only, like `graph` above.
 #[cfg(test)]
 mod offline_guard_audit;
+// A structural census over git-vista/src and git-vista-core/src: every
+// declared pub fn must have a real (statement-shaped) call site somewhere in
+// the crates/ tree, or be argued dead in EXEMPT. Same "wasm-gated code the
+// host test suite can't link against" shape offline_guard_audit closes for
+// api.rs's write guard, generalized to catch the #68d/#69c/#350 regression
+// class (a pure-logic function shipped fully host-tested with zero real
+// callers). Test-only, like graph/offline_guard_audit above.
+#[cfg(test)]
+mod reachability_census;
 
 // The frontend, split out of the former monolithic `app.rs`. Every one of these
 // pulls in Leptos / web-sys (wasm-only deps), so — like `app` — they compile only
