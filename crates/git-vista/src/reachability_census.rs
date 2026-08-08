@@ -272,8 +272,8 @@ fn neutralize(src: &str) -> String {
             }
             if let Some(close) = close {
                 out.push('\'');
-                for idx in (i + 1)..close {
-                    out.push(if chars[idx] == '\n' { '\n' } else { ' ' });
+                for &ch in &chars[(i + 1)..close] {
+                    out.push(if ch == '\n' { '\n' } else { ' ' });
                 }
                 out.push('\'');
                 i = close + 1;

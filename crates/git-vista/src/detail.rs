@@ -339,18 +339,6 @@ fn focus_hunk_revealed(scope: &'static str, idx: usize, reveal: Option<Callback<
     request_animation_frame(move || focus_hunk(scope, idx));
 }
 
-/// The hunk element for `idx` in `scope`, or `None` when windowing has not
-/// mounted it.
-fn find_hunk(scope: &str, idx: usize) -> Option<web_sys::HtmlElement> {
-    document()
-        .query_selector(&format!(
-            "[data-hunk-scope=\"{scope}\"][data-hunk-index=\"{idx}\"]"
-        ))
-        .ok()
-        .flatten()
-        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
-}
-
 /// Move DOM focus to hunk `idx` in `scope`, by position rather than by holding
 /// a node reference — deliberately, because the node at a given index is not
 /// stable across a windowed re-render.
