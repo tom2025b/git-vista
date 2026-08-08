@@ -654,7 +654,32 @@ pub fn detail_panel_view(
                             }
                         });
                         let patch = view! {
-                            <div class="detail-diff-scroll" node_ref=diff_box on:scroll=on_diff_scroll>
+                            <div
+                                class="detail-diff-scroll"
+                                node_ref=diff_box
+                                on:scroll=on_diff_scroll
+                                // Opts this scrollable region OUT of the browser's
+                                // own default focusability. Per the CSS Overflow /
+                                // HTML focus spec, any element with `overflow:auto`
+                                // that actually overflows becomes keyboard-focusable
+                                // on its own — no explicit `tabindex` needed — so
+                                // Tab can land on it directly (Chromium has shipped
+                                // this since M89; other engines follow the same
+                                // resolution). Without this line that auto-inserted
+                                // stop sits BEFORE any hunk header in document
+                                // order, so Tab lands on the scroll container
+                                // itself, not on the roving-tabindex span in
+                                // `hunk_header_span` — and the browser's native
+                                // keydown handling on a focused scrollable element
+                                // is exactly "arrow keys scroll it", which is the
+                                // observed bug (#210's `on_keydown` never fires
+                                // because DOM focus was never on a header span).
+                                // `tabindex="-1"` keeps the element programmatically
+                                // focusable (`focus_hunk`'s `.focus()` calls target
+                                // spans, not this div, so that is moot here) while
+                                // removing it from sequential (Tab) navigation.
+                                tabindex="-1"
+                            >
                                 {move || {
                                     let (scroll, viewport) = diff_scroll.get();
                                     let heights = CumulativeHeights::new(&line_heights(
@@ -764,7 +789,14 @@ pub fn detail_panel_view(
                             "×"
                         </button>
                     </div>
-                    <div class="detail-body">{body}{changes}</div>
+                    // Same auto-focusable-scroll-container opt-out as
+                    // `.detail-diff-scroll` above (`overflow-y: auto` in
+                    // styles.css) — this outer container predates tonight's
+                    // windowing change, which is why the roving-tabindex
+                    // hunk headers have reportedly never received arrow-key
+                    // focus: Tab was landing here (or on `.detail-diff-scroll`
+                    // nested inside it) before it ever reached a header span.
+                    <div class="detail-body" tabindex="-1">{body}{changes}</div>
                 </aside>
             }
         })

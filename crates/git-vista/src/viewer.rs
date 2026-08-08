@@ -190,7 +190,16 @@ pub fn viewer_view(
                             </button>
                         </span>
                     </div>
-                    <div class="viewer-body">{body}</div>
+                    // Same fix as detail.rs's `.detail-diff-scroll`/`.detail-body`
+                    // (see that file's comment): `.viewer-body` is
+                    // `overflow: auto` (styles.css), which modern browsers make
+                    // keyboard-focusable on their own. Left unopted-out, Tab
+                    // lands here instead of on the "viewer"-scoped roving hunk
+                    // header span this file's `diff_body` renders via
+                    // `accessible_patch_view`, and arrow keys then scroll this
+                    // div natively instead of reaching `hunk_header_span`'s
+                    // `on_keydown`.
+                    <div class="viewer-body" tabindex="-1">{body}</div>
                 </div>
             }
         })
