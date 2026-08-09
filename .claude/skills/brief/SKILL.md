@@ -1,13 +1,13 @@
 ---
 name: brief
-description: Produce a fresh living-brief snapshot for this repo via the brief-mcp server - carrying the previous document forward rewritten for the new situation, storing it in SQLite, rendering md+PDF, and updating the stable current.pdf. Use after closing an issue, hitting a milestone or roadblock, before/after a workflow (pre-flights MUST be recorded here before launch), or whenever the user asks for a brief or the living doc.
+description: Produce a fresh living-brief snapshot for this repo via the brief-mcp server - carrying the previous document forward rewritten for the new situation, storing it in SQLite, rendering md+PDF, and updating the stable Git-Vista-current.pdf. Use after closing an issue, hitting a milestone or roadblock, before/after a workflow (pre-flights MUST be recorded here before launch), or whenever the user asks for a brief or the living doc.
 ---
 
 # The Living Brief
 
 One brief per repo, served by brief-mcp (registered for both Claude accounts
 and codex). The owner reads exactly one path:
-`~/Documents/briefs/Git-Vista/current.pdf` — the server overwrites it on every
+`~/Documents/briefs/Git-Vista/Git-Vista-current.pdf` — the server overwrites it on every
 render of the latest snapshot.
 
 ## Rules that are not optional
@@ -53,5 +53,7 @@ render of the latest snapshot.
    conflict reply means another agent published first: re-read, reconcile,
    retry with the new parent — never overwrite.
 4. `brief_render` (repo "Git-Vista") -> timestamped md+pdf in history plus
-   the current.pdf slot update.
+   the `Git-Vista-current.pdf` slot update. Both the history file and the
+   stable slot carry the repo in the FILENAME, not only the directory — a
+   brief that leaves the folder still has to say which repo it is about.
 5. Send the PDF to the owner when the update is one they asked about.
