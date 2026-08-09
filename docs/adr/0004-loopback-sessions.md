@@ -49,8 +49,15 @@ from the visible URL immediately".
 The token is **single-use**: a successful exchange rotates a fresh token into the
 file, so the redeemed one can never be replayed, while a second device can still
 `gv --token` for a new link. Both the token and the session **expire** (1 h unused
-bootstrap; 12 h idle session, refreshed on use). Sessions are revocable
+bootstrap; 16 h idle session, refreshed on use). Sessions are revocable
 (`DELETE /api/session`), and a restart drops every in-memory session.
+
+The idle session was 12 h until #369. Daily local use showed that a window
+shorter than a working day plus its overnight gap forced a fresh `gv --token`
+every morning; 16 h spans the day while still expiring an abandoned session
+within it. The bootstrap TTL and every check in the request gate below are
+unchanged — this bounds only how long an already-authenticated session survives
+without use.
 
 ### 2. The request gate (`require_auth`), in order
 
