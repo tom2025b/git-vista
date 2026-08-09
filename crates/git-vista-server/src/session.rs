@@ -58,7 +58,15 @@ pub(crate) const BOOTSTRAP_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// tab left open keeps working; one abandoned for this long must re-bootstrap.
 /// Also the cookie's `Max-Age`, so the browser drops the cookie in step with the
 /// server dropping the session.
-pub(crate) const SESSION_MAX_AGE_SECS: u64 = 12 * 60 * 60;
+///
+/// Sized to a working day (#369): at 12 h, closing the tab in the evening and
+/// returning the next morning always landed past the idle window, so daily local
+/// use meant re-running `gv --token` every morning. 16 h spans a day's work plus
+/// the overnight gap while still expiring an abandoned session within the day.
+/// This governs only how long an *already-authenticated* session survives idle —
+/// the bootstrap token's own [`BOOTSTRAP_TTL`], and every wire check in
+/// [`crate::security`] (Host, Origin, `SameSite=Strict`, CSRF), are unchanged.
+pub(crate) const SESSION_MAX_AGE_SECS: u64 = 16 * 60 * 60;
 
 /// [`SESSION_MAX_AGE_SECS`] as a [`Duration`], for the in-memory idle deadline.
 const SESSION_IDLE_TTL: Duration = Duration::from_secs(SESSION_MAX_AGE_SECS);
