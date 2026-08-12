@@ -321,8 +321,10 @@ mod tests {
     /// A fresh server's JSON round-trips scanned_at exactly.
     #[test]
     fn scanned_at_round_trips_through_json() {
-        let mut s = RepoStatus::default();
-        s.scanned_at = 1_755_000_000;
+        let s = RepoStatus {
+            scanned_at: 1_755_000_000,
+            ..Default::default()
+        };
         let json = serde_json::to_string(&s).unwrap();
         let back: RepoStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(back.scanned_at, 1_755_000_000);
