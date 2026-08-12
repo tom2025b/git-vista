@@ -893,7 +893,12 @@ pub(crate) async fn worktree_status(
         eprintln!("git-vista: /api/status failed: {msg}");
         return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
     }
-    let parsed = parse_porcelain_v2(&String::from_utf8_lossy(&output.stdout));
+    let mut parsed = parse_porcelain_v2(&String::from_utf8_lossy(&output.stdout));
+    // Stamped here, not in the parser: this is the instant closest to when
+    // `git status` actually ran, so the client can show how old the reading
+    // is without asking (the bug this fixes — a status held in memory with
+    // no age looks identical whether it's 1 second or 19 hours stale).
+    parsed.scanned_at = crate::activity::now_secs();
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
     Ok((no_store, Json(parsed)))
 }

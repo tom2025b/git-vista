@@ -84,6 +84,15 @@ pub struct RepoStatus {
     pub untracked: Vec<String>,
     /// Unmerged paths (`u` records) — conflict markers in the tree.
     pub conflicted: Vec<String>,
+    /// Unix seconds when this reading was collected (server-stamped, not
+    /// client-derived). `0` means "unknown" — either an older server build
+    /// that never stamped it, or a value the parser produced directly
+    /// without going through the handler. `#[serde(default)]` so an older
+    /// server's response (missing the field) deserializes to `0` rather
+    /// than failing, and a client can tell "no age given" apart from "stamp
+    /// really is unix epoch zero".
+    #[serde(default)]
+    pub scanned_at: i64,
 }
 
 impl RepoStatus {
@@ -286,6 +295,39 @@ mod tests {
     fn detached_head_has_no_branch() {
         let s = parse_porcelain_v2("# branch.oid abc\n# branch.head (detached)\n");
         assert_eq!(s.branch, None);
+    }
+
+    /// The parser itself never stamps a time — that's the handler's job
+    /// (it runs after parsing, closest to when `git status` actually ran).
+    /// Pinned so a future change can't quietly start guessing a scan time
+    /// from inside the pure parser.
+    #[test]
+    fn parser_leaves_scanned_at_unset() {
+        let s = parse_porcelain_v2("# branch.head main\n");
+        assert_eq!(s.scanned_at, 0);
+    }
+
+    /// An older server's JSON (collected before this field existed) has no
+    /// `scanned_at` key at all — `#[serde(default)]` must deserialize that
+    /// as `0` ("unknown"), not fail the whole response.
+    #[test]
+    fn missing_scanned_at_deserializes_to_zero() {
+        let json = r#"{"branch":"main","upstream":null,"ahead":0,"behind":0,
+                        "staged":[],"unstaged":[],"untracked":[],"conflicted":[]}"#;
+        let s: RepoStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(s.scanned_at, 0);
+    }
+
+    /// A fresh server's JSON round-trips scanned_at exactly.
+    #[test]
+    fn scanned_at_round_trips_through_json() {
+        let s = RepoStatus {
+            scanned_at: 1_755_000_000,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: RepoStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.scanned_at, 1_755_000_000);
     }
 
     #[test]

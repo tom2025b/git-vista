@@ -85,6 +85,40 @@ pub fn local_timestamp(epoch_secs: i64) -> String {
     )
 }
 
+/// How old a status reading can be before the UI marks it stale rather
+/// than fresh. 5 minutes: comfortably longer than a normal fetch cadence
+/// (the resource refetches on activity-panel toggle / graph epoch bump),
+/// short enough that a tab left open and untouched surfaces the problem
+/// long before it reaches the 19-hour case that motivated this.
+pub const STALE_THRESHOLD_SECS: i64 = 5 * 60;
+
+/// The status chip's visible "as of" freshness text: `"as of just now"`,
+/// `"as of 3h ago"`, `"as of over a week ago"` — or `"age unknown"` when
+/// `delta_secs` is `None`, which the caller passes for a reading with no
+/// server-stamped time at all (an older build's response, `scanned_at ==
+/// 0`). Deliberately a *different* string from any [`ago_label`] output,
+/// so "unknown" never gets mistaken for "just measured".
+pub fn freshness_label(delta_secs: Option<i64>) -> String {
+    match delta_secs {
+        None => "age unknown".to_string(),
+        Some(d) => match ago_label(d) {
+            Some(label) => format!("as of {label}"),
+            None => "as of over a week ago".to_string(),
+        },
+    }
+}
+
+/// Whether a status reading is old enough to render distinctly from a
+/// fresh one (the fix for the bug this module exists for: a stale reading
+/// and a fresh one were pixel-identical). An unknown age (`None`) counts as
+/// stale too — an undated reading gets no benefit of the doubt.
+pub fn is_stale(delta_secs: Option<i64>) -> bool {
+    match delta_secs {
+        None => true,
+        Some(d) => d > STALE_THRESHOLD_SECS,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +151,41 @@ mod tests {
     #[test]
     fn late_evening_is_pm() {
         assert_eq!(format_label(2026, 7, 1, 23, 5, 2026), "Jul 1 11:05 PM");
+    }
+
+    #[test]
+    fn unknown_age_reads_as_unknown_not_a_guessed_duration() {
+        assert_eq!(freshness_label(None), "age unknown");
+        assert!(
+            is_stale(None),
+            "no benefit of the doubt for an undated reading"
+        );
+    }
+
+    #[test]
+    fn fresh_reading_is_not_stale() {
+        assert_eq!(freshness_label(Some(5)), "as of just now");
+        assert!(!is_stale(Some(5)));
+        assert_eq!(freshness_label(Some(3 * 60)), "as of 3m ago");
+        assert!(!is_stale(Some(3 * 60)), "3 minutes is under the threshold");
+    }
+
+    #[test]
+    fn reading_past_the_threshold_is_stale() {
+        assert!(is_stale(Some(STALE_THRESHOLD_SECS + 1)));
+        assert!(
+            !is_stale(Some(STALE_THRESHOLD_SECS)),
+            "exactly at threshold is not yet stale"
+        );
+    }
+
+    #[test]
+    fn the_reported_bug_case_is_unambiguously_stale() {
+        // The live incident this fix is for: a ~19-hour-old reading shown
+        // with no indication it wasn't current.
+        let nineteen_hours = 19 * 3_600;
+        assert!(is_stale(Some(nineteen_hours)));
+        assert_eq!(freshness_label(Some(nineteen_hours)), "as of 19h ago");
     }
 
     #[test]

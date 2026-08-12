@@ -125,6 +125,15 @@ html, body {
 .status-chip.dirty { color: #d29922; border-color: #9e6a03; }
 .status-chip.conflict { color: #f85149; border-color: #da3633; }
 
+/* A reading older than datetime::STALE_THRESHOLD_SECS (or one the server
+   never stamped at all): dashed border and reduced opacity, stacked on top
+   of whichever clean/dirty/conflict colour it also carries, rather than
+   replacing it — the underlying severity still matters, but the chip now
+   visibly admits it might not be current. This is the fix for a reading
+   that looked identical whether it was 1 second or 19 hours old. */
+.status-chip.stale { border-style: dashed; opacity: 0.72; }
+.status-age { opacity: 0.75; font-style: italic; }
+
 /* The detail panel's Changes section (Activity/Undo step 2): the per-file
    stat rows and the unified patch. Diff colours follow the GitHub-dark
    palette used everywhere else: green additions, red deletions, blue hunk

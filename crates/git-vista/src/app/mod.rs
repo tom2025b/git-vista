@@ -32,6 +32,7 @@ use leptos::*;
 use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
 use crate::api::{fetch_frame, fetch_page, fetch_protocol, HistoryFetchError};
+use crate::datetime;
 use crate::dialogs;
 use crate::features::a11y::core::GRAPH_REGION_LABEL;
 use crate::features::activity::signals::Activity;
@@ -667,28 +668,42 @@ pub fn App() -> impl IntoView {
                         s.untracked.len(),
                         s.conflicted.len(),
                     );
-                    let (class, icon) = if !s.conflicted.is_empty() {
-                        ("status-chip conflict", ic.conflict)
+                    let (mut class, icon) = if !s.conflicted.is_empty() {
+                        ("status-chip conflict".to_string(), ic.conflict)
                     } else if !s.is_clean() {
-                        ("status-chip dirty", ic.dirty)
+                        ("status-chip dirty".to_string(), ic.dirty)
                     } else {
-                        ("status-chip clean", ic.clean)
+                        ("status-chip clean".to_string(), ic.clean)
                     };
+                    // How old this reading is — #the-stale-worktree-status-bug:
+                    // a reading held in memory since the last fetch looked
+                    // pixel-identical whether it was 1 second or 19 hours old.
+                    // `scanned_at == 0` means an older server never stamped a
+                    // time; that reads as "age unknown", not as a bogus huge
+                    // age computed against the unix epoch.
+                    let now = (js_sys::Date::now() / 1000.0) as i64;
+                    let age = (s.scanned_at > 0).then(|| now - s.scanned_at);
+                    let freshness = datetime::freshness_label(age);
+                    if datetime::is_stale(age) {
+                        class.push_str(" stale");
+                    }
                     let mut sync = String::new();
                     if s.ahead > 0 { sync.push_str(&format!(" ↑{}", s.ahead)); }
                     if s.behind > 0 { sync.push_str(&format!(" ↓{}", s.behind)); }
                     let title = format!(
-                        "{} staged · {} unstaged · {} untracked · {} conflicted{}",
+                        "{} staged · {} unstaged · {} untracked · {} conflicted{} · {}",
                         s.staged.len(), s.unstaged.len(), s.untracked.len(),
                         s.conflicted.len(),
                         s.upstream.as_deref()
                             .map(|u| format!(" · vs {u}"))
                             .unwrap_or_default(),
+                        freshness,
                     );
                     view! {
                         <span class=class title=title>
                             <span class="nf">{icon}</span>
                             {format!(" {label}{sync}")}
+                            <span class="status-age">{format!(" · {freshness}")}</span>
                         </span>
                     }
                 })}
