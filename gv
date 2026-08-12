@@ -10,6 +10,9 @@
 #   gv doctor           diagnose listener/session/tunnel state without secrets
 #   gv --token          print a fresh one-time localhost sign-in link
 #   gv --stop           stop the server owned by this checkout
+#   gv --repo <path|url>  add a repo to the catalog (clones if given a URL),
+#                       edits GIT_VISTA_REPOS in the systemd unit, restarts
+#                       the service. Restart briefly drops the iPad tunnel.
 #   gv --seed [path]    record a TEST repository reset point
 #   gv --root <dir>     also serve every repo directly under <dir> (the in-app
 #                       picker lists them; e.g. --root ~/projects)
@@ -317,6 +320,82 @@ doctor() {
   return "$result"
 }
 
+UNIT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/git-vista.service"
+PROJECTS_DIR="$(dirname "$REPO")"
+
+# Add `arg` (a local path or a git@/https:// clone URL) to the systemd unit's
+# GIT_VISTA_REPOS list and restart the service so it picks it up. The unit is
+# the boot-time registration path (ADR 0009); the alternative, POST
+# /api/clone (ADR 0008), needs an authenticated browser session and so isn't
+# shell-friendly. Restarting is the tradeoff — GIT_VISTA_REPOS is read once
+# at startup, not polled.
+repo_add() {
+  local arg="$1" repo_path name dest current_line current_val backup new_val new_line tmp
+  [[ -f "$UNIT_FILE" ]] || { echo "gv: no unit file at $UNIT_FILE" >&2; return 1; }
+
+  if [[ "$arg" =~ ^(https?://|git@|ssh://) ]]; then
+    name="$(basename "$arg" .git)"
+    dest="$PROJECTS_DIR/$name"
+    if [[ -d "$dest" ]]; then
+      echo "gv: $dest already exists, using it"
+    else
+      echo "gv: cloning $arg -> $dest"
+      git clone "$arg" "$dest"
+    fi
+    repo_path="$dest"
+  elif [[ "$arg" == /* || "$arg" == ./* || "$arg" == ../* ]]; then
+    repo_path="$(realpath -e "$arg")" || { echo "gv: no such path: $arg" >&2; return 1; }
+  else
+    # Bare name, no slash — try it as a sibling under ~/projects first (so
+    # `gv --repo mcp-fleet` just works), then fall back to CWD-relative.
+    if [[ -d "$PROJECTS_DIR/$arg" ]]; then
+      repo_path="$(realpath -e "$PROJECTS_DIR/$arg")"
+    else
+      repo_path="$(realpath -e "$arg")" || {
+        echo "gv: no such path: $arg (checked $PROJECTS_DIR/$arg and ./$arg)" >&2
+        return 1
+      }
+    fi
+  fi
+
+  [[ -d "$repo_path/.git" || -f "$repo_path/.git" ]] || {
+    echo "gv: $repo_path is not a git repo" >&2
+    return 1
+  }
+
+  current_line="$(grep -m1 '^Environment=GIT_VISTA_REPOS=' "$UNIT_FILE" || true)"
+  [[ -n "$current_line" ]] || { echo "gv: no GIT_VISTA_REPOS line in $UNIT_FILE" >&2; return 1; }
+  current_val="${current_line#Environment=GIT_VISTA_REPOS=}"
+
+  if [[ ":$current_val:" == *":$repo_path:"* ]]; then
+    echo "gv: $repo_path already in GIT_VISTA_REPOS — nothing to do, not restarting"
+    return 0
+  fi
+
+  backup="$UNIT_FILE.bak-$(date +%Y%m%d-%H%M%S)"
+  cp "$UNIT_FILE" "$backup"
+  echo "gv: backed up unit to $backup"
+
+  new_val="$current_val:$repo_path"
+  new_line="Environment=GIT_VISTA_REPOS=$new_val"
+  tmp="$(mktemp)"
+  awk -v old="$current_line" -v new="$new_line" \
+    '{ if ($0 == old) print new; else print }' "$UNIT_FILE" >"$tmp"
+  mv "$tmp" "$UNIT_FILE"
+  echo "gv: added $repo_path to GIT_VISTA_REPOS"
+
+  echo "gv: restarting git-vista.service (iPad tunnel will blip)"
+  systemctl --user daemon-reload
+  systemctl --user restart git-vista.service
+  sleep 1
+  if systemctl --user is-active --quiet git-vista.service; then
+    echo "gv: git-vista.service is active"
+  else
+    echo "gv: service failed to come back up — check journalctl --user -u git-vista" >&2
+    return 1
+  fi
+}
+
 build_frontend() {
   if [[ ${NO_COLOR+x} ]]; then
     ( cd "$REPO/crates/git-vista" && env -u NO_COLOR trunk build --color never )
@@ -348,6 +427,7 @@ NEXT_IS_ROOT=0
 LAN_VIEW=0
 LAN_IP=""
 NEXT_IS_LAN_IP=0
+NEXT_IS_REPO=0
 for arg in "$@"; do
   if [[ $NEXT_IS_ROOT -eq 1 ]]; then
     REPO_ROOT="$arg"
@@ -359,7 +439,12 @@ for arg in "$@"; do
     NEXT_IS_LAN_IP=0
     continue
   fi
+  if [[ $NEXT_IS_REPO -eq 1 ]]; then
+    repo_add "$arg"
+    exit $?
+  fi
   case "$arg" in
+    --repo) NEXT_IS_REPO=1 ;;
     --seed) SEED=1 ;;
     # ADR 0009: one deliberate repos root; the server scans its direct children.
     --root) NEXT_IS_ROOT=1 ;;
@@ -402,6 +487,10 @@ for arg in "$@"; do
 done
 if [[ $NEXT_IS_ROOT -eq 1 ]]; then
   echo "gv: --root needs a directory" >&2
+  exit 2
+fi
+if [[ $NEXT_IS_REPO -eq 1 ]]; then
+  echo "gv: --repo needs a path or URL" >&2
   exit 2
 fi
 if [[ -n $REPO_ROOT && ! -d $REPO_ROOT ]]; then
