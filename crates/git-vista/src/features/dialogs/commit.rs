@@ -1356,6 +1356,7 @@ mod tests {
             unstaged: staged(unstaged_paths),
             untracked: untracked.iter().map(|p| (*p).to_string()).collect(),
             conflicted: Vec::new(),
+            scanned_at: 0,
         }
     }
 
