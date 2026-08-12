@@ -197,9 +197,18 @@ signal + toggle-closure + `title=` pattern (`app/mod.rs:514-528`,
   `expanded_groups` renders as individual `Single` items instead.
 - No server-side tests needed — nothing server-side changes.
 - Existing browser tests (`reachability.spec.mjs`'s topbar-chip fixture
-  check) should be unaffected; a new Playwright test may be worth adding for
-  the collapsed-group tap-to-expand interaction, decided during
-  implementation.
+  check) checked this session — neither `.graph-row` nor `data-row-index`
+  appears in any of the 13 Playwright specs today, so none of them assume
+  raw-row semantics for those selectors. Not a source of regression risk,
+  but also not coverage for the new behavior.
+- **A Playwright test for collapse-render + tap-to-expand is a required task
+  in the implementation plan, not optional.** This project's own standing
+  lesson (ADR 0054, and repeated real incidents) is that `cargo test` never
+  executes `crates/git-vista/src` — it's wasm-gated — so a pure host test on
+  `collapse.rs`'s logic proves the *algorithm* right and proves nothing about
+  whether `canvas.rs`'s wiring, `GraphFocus`'s re-anchoring, or the tap
+  handler actually work. With this feature defaulting ON, an unverified
+  wiring bug ships to every session on first load, not behind an opt-in flag.
 
 ## ADR
 
