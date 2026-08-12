@@ -73,35 +73,95 @@ transient (not persisted across reload), and keyed by the group's
 `start_row_index` so it survives re-renders within a session but resets on
 reload (reload re-collapses everything, consistent with the pref being "on").
 
+### Correction (2026-08-12, same session) — the real blast radius
+
+The paragraphs above describe the *shape* of the transform correctly but
+understated where it has to plug in. `LoadedHistory.rows`/`.edges` are not
+read directly by one or two render functions — **five** separate `<For>`
+loops in `crates/git-vista/src/app/canvas.rs` (edges, nodes, message tier,
+meta tier, node-icon tier) all iterate a raw row-index range `(s..e)`
+produced by `viewport::visible_row_range(camera, vp_h, row_count, overscan)`,
+which itself inverts `node_cy(r) = PAD_Y + r * ROW_HEIGHT` — i.e. it
+hard-assumes row index space is `LoadedHistory.rows`'s own 0-based index,
+laid out at a uniform stride. `GraphFocus` (`features/a11y/focus.rs`) makes
+the identical assumption for keyboard roving-tabindex: its own doc comment
+says outright that `RenderCtx::loaded.rows` "already indexes them 0..
+row_count exactly the way this model expects."
+
+**Resolved design: a second, shorter index space ("display space"), not a
+patch to `LoadedHistory`.** A `DisplayProjection` is computed as a memo
+alongside `RenderCtx` — `Vec<DisplayItem>` (`Single{row_index}` or
+`WipGroup{start_row_index, count, ..}`) plus `Vec<DisplayEdge>` with
+endpoints already expressed as display-space indices. Because a `WipGroup`
+still occupies exactly one `ROW_HEIGHT` slot (same visual weight as one
+commit — this is what makes the whole approach work), `visible_row_range`
+and `node_cy` need **no changes at all**: they're already generic over "some
+row count," so the only change is what's *fed* to them —
+`display.items.len()` instead of `c.loaded.rows.len()`, in exactly one place
+(the `row_count` `RwSignal` currently set from `c.loaded.rows.len()` at
+`canvas.rs:383-384`).
+
+`LoadedHistory.rows`/`.edges`/`oid_to_row` themselves are **never modified,
+never re-synthesized, and never fed back into `apply_page`** — this was the
+one part of the original design that was right, and it's why `apply_page`'s
+contiguous-row / no-duplicate-OID / monotonic-lane invariants stay untouched
+by this feature. `oid_to_row` and its real consumers (checked this session:
+only `render/labels.rs`'s stub-anchor lookup, comparing a stub's anchor
+commit against a real `GraphRow.row` — no camera-jump-to-commit feature
+exists anywhere in the app today) operate purely in raw-row space and are
+never routed through display space at all, since branch-stub markers are a
+separate render tier from the five collapsed-row `<For>` loops. Checked and
+ruled out as a concern.
+
+Also checked and ruled out: the SVG has no `viewBox` (`camera.rs`'s own doc
+comment: "the SVG has no `viewBox`, so one user unit equals one CSS pixel"),
+and no pan-clamp bound exists tied to row count — panning is free
+translation, culling just stops rendering past the window. So a shorter
+collapsed graph does not leave dead scroll space; there's no fixed-height
+element sized off row count to leave dead space in.
+
 ### Edge projection
 
-`GraphRow.row`/`.lane` (the authoritative values `LoadedHistory` validates and
-indexes by by — `oid_to_row`, focus, menus) are **never modified**. The
-collapse layer computes its own `render_row` per `DisplayItem` purely for
-vertical position (`node_cy`), by walking `DisplayItem`s in order and
-assigning consecutive render-row slots (a `WipGroup` consumes one slot
-regardless of `count`).
-
-Edges are projected alongside:
+Edges are projected alongside the row projection, in the same memo:
 - An edge whose `from_row` and `to_row` are **both** inside one collapsed
   run's row range is dropped from rendering — it was internal to the run.
 - An edge crossing a run's boundary (entering from before the run, or leaving
-  after it) is rewritten to reference the group's `render_row` at the crossed
-  end, keeping the other end's `render_row` as computed above.
-
-This projection runs fresh on every render pass from `c.loaded.rows` /
-`c.loaded.edges` — it is never fed back into `LoadedHistory::apply_page`, so
-none of that struct's contiguous-row / no-duplicate-OID / monotonic-lane
-invariants are touched by this feature at all.
+  after it) is rewritten to a `DisplayEdge` referencing the group's
+  display-space index at the crossed end, and the other end's own
+  display-space index (computed by walking `DisplayItem`s in order — a
+  `WipGroup` consumes one display-space slot regardless of `count`).
+- Lane values (`from_lane`/`to_lane`) copy straight through from the source
+  `Edge` unchanged — lanes never change, only row/display-index does.
 
 ### Rendering
 
-`render/nodes.rs`'s `build_node` and `render/edges.rs`'s `build_edge` take a
-`DisplayItem` (or the small enum above) instead of iterating `c.loaded.rows`
-directly. A `DisplayItem::WipGroup` renders as a distinct small node — a
-different shape/label (`"⋯ 12 WIP commits ⋯"` per the earlier mockup) with a
-click handler that inserts its `start_row_index` into `expanded_groups`
-instead of opening the usual per-commit context menu.
+The five `<For>` loops in `canvas.rs` change their `each=` source from
+`(s..e)` over raw `LoadedHistory` row indices to `(s..e)` over
+`DisplayProjection` indices (`visible_row_range` itself needs no change —
+see above). `build_node`, `build_msg`, `build_meta`, and `build_node_icon`
+(all in `render/nodes.rs`/`render.rs`) each currently take a raw `i: usize`
+and do `c.loaded.rows.get(i)`; each instead takes the `DisplayProjection`
+(via a `StoredValue`, same pattern as `ctx`) plus a display-space `i`,
+resolves `display.items.get(i)`, and for `Single{row_index}` looks up
+`c.loaded.rows[row_index]` exactly as today but positions at
+`node_cy(i)` (display index) rather than `node_cy(gr.row)` (raw row) —
+color/oid/menu data still comes from the real `GraphRow` via `row_index`.
+`render/edges.rs`'s `build_edge` takes a `DisplayEdge` the same way.
+
+A `DisplayItem::WipGroup` renders as a distinct small node — a different
+shape/label (`"⋯ 12 WIP commits ⋯"` per the earlier mockup) with a click
+handler that inserts its `start_row_index` into `expanded_groups` instead of
+opening the usual per-commit context menu. Its color/lane come from its
+first member row (arbitrary but consistent choice — all members share a lane
+by construction of the grouping rule).
+
+`GraphFocus`'s `row_count`/`active` are re-anchored to
+`display.items.len()` — the same `row_count` `RwSignal` already feeds it
+(`canvas.rs:184-185`, `set_row_count`), so this is the same one-line change
+as the culler's, not a second wiring path. Tabbing onto a `WipGroup` and
+pressing Enter/Space expands it via the identical `open_menu_at`-shaped
+closure path `gestures::on_node_keydown` already calls — no new keyboard
+plumbing, just a different action bound to the same hook.
 
 ### Persistence
 
