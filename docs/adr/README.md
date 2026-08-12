@@ -66,3 +66,5 @@ it, and note the link in both.
 | [0052](0052-explicit-repo-list.md) | An explicit repo list, because "these four" is not "this folder" | Accepted — implemented and tested |
 | [0053](0053-cancellation-by-framework-not-by-our-own-tracker.md) | "Cancellable" is satisfied by the framework and an id echo, not by a tracker of our own | Accepted — implemented |
 | [0054](0054-linux-desktop-browser-is-the-verification-target.md) | The Linux desktop browser is the verification target; iPad deferred to a VNC display | Accepted |
+| [0055](0055-status-readings-carry-a-server-stamped-age.md) | Working-tree status readings carry a server-stamped `scanned_at`, additive to the v1 wire contract | Accepted — implemented |
+| [0056](0056-gv-repo-uses-the-boot-time-catalog-not-live-clone.md) | `gv --repo` registers a catalog entry via the boot-time `GIT_VISTA_REPOS` unit var, not the live `/api/clone` endpoint | Accepted — implemented |
