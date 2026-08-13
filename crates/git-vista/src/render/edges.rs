@@ -8,22 +8,23 @@ use leptos::*;
 
 use crate::geometry::edge_path;
 use git_vista_core::color::branch_color;
+use git_vista_core::model::Edge;
 
+use crate::features::graph::collapse::{DisplayItem, DisplayProjection};
 use crate::features::graph::core::RenderCtx;
 
-/// Indices of edges whose row span intersects the visible row window `[start,
-/// end)`. An edge is kept whenever any part of it could cross the viewport — even
-/// when both endpoints are off-screen (a long merge line passing through) — so an
-/// edge never visibly disappears at the window's edge. Edges always run downward
-/// (`from_row` < `to_row`), so the span is `[from_row, to_row]`.
-pub fn visible_edges(ctx: StoredValue<RenderCtx>, range: (usize, usize)) -> Vec<usize> {
+/// Indices of display edges whose row span intersects the visible display-row
+/// window `[start, end)`. Same rule as before collapsing (#374): an edge is
+/// kept whenever any part of it could cross the viewport, so a long line
+/// passing through never blinks out at the window's edge. Rows still always
+/// run downward, so the span is `[from_display, to_display]`.
+pub fn visible_edges(display: StoredValue<DisplayProjection>, range: (usize, usize)) -> Vec<usize> {
     let (start, end) = range;
-    ctx.with_value(|c| {
-        c.loaded
-            .edges
+    display.with_value(|d| {
+        d.edges
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.from_row < end && e.to_row >= start)
+            .filter(|(_, e)| e.from_display < end && e.to_display >= start)
             .map(|(i, _)| i)
             .collect()
     })
@@ -45,16 +46,42 @@ pub fn visible_edges(ctx: StoredValue<RenderCtx>, range: (usize, usize)) -> Vec<
 /// holding an index built a moment before the aggregate changed shape. Panicking
 /// on that would take the whole canvas down, so an edge whose endpoints aren't
 /// both loaded simply draws nothing until the page owning them lands.
-pub fn build_edge(ctx: StoredValue<RenderCtx>, ei: usize) -> View {
+///
+/// A group takes its first member's identity for this colour lookup (#374) —
+/// arbitrary but consistent, matching `build_wip_group`'s own choice.
+pub fn build_edge(
+    ctx: StoredValue<RenderCtx>,
+    display: StoredValue<DisplayProjection>,
+    ei: usize,
+) -> View {
+    let Some(de) = display.with_value(|d| d.edges.get(ei).copied()) else {
+        return ().into_view();
+    };
+    let (Some(from_item), Some(to_item)) = display.with_value(|d| {
+        (
+            d.items.get(de.from_display).copied(),
+            d.items.get(de.to_display).copied(),
+        )
+    }) else {
+        return ().into_view();
+    };
     ctx.with_value(|c| {
         let rows = &c.loaded.rows;
-        let Some(e) = c.loaded.edges.get(ei) else {
+        let row_of = |item: DisplayItem| match item {
+            DisplayItem::Single { row_index } => rows.get(row_index),
+            DisplayItem::WipGroup {
+                start_row_index, ..
+            } => rows.get(start_row_index),
+        };
+        let (Some(from), Some(to)) = (row_of(from_item), row_of(to_item)) else {
             return ().into_view();
         };
-        let (Some(from), Some(to)) = (rows.get(e.from_row), rows.get(e.to_row)) else {
-            return ().into_view();
-        };
-        let d = edge_path(e);
+        let d = edge_path(&Edge {
+            from_row: de.from_display,
+            from_lane: de.from_lane,
+            to_row: de.to_display,
+            to_lane: de.to_lane,
+        });
         let is_first_parent = from.commit.parents.first() == Some(&to.commit.id);
         // A first-parent link belongs to the child's own branch; a merge link to
         // the merged-in parent's — so each takes that row's colour slot.

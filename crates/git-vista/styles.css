@@ -341,6 +341,16 @@ html, body {
   user-select: none;
 }
 
+/* A folded run of auto-checkpoint commits (#374). Dimmer than a real
+   commit's label on purpose: the marker's job is to say "nothing you care
+   about is hidden here" while staying out of the way of the real history
+   around it. */
+.wip-group-label {
+  font-size: 0.75rem;
+  font-style: italic;
+  opacity: 0.7;
+}
+
 /* Phase 4: loading / error states while the history is fetched. */
 .status { color: var(--muted); padding: 1rem; }
 .status.error { color: #f78166; }
