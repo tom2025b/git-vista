@@ -146,13 +146,16 @@ pub enum ViewerDoc {
 }
 
 /// The persisted display settings, shared into every icon-drawing view so a
-/// single toggle re-renders the whole app. Both are booleans behind signals:
-/// `nerd_icons` picks the icon set (icons.rs); `show_node_icons` shows/hides the
-/// glyph beside each commit dot.
+/// single toggle re-renders the whole app. All three are booleans behind
+/// signals: `nerd_icons` picks the icon set (icons.rs); `show_node_icons`
+/// shows/hides the glyph beside each commit dot; `collapse_wip` folds runs of
+/// auto-checkpoint commits into one node (#374) — a view preference like
+/// `show_node_icons`, not a zoom level.
 #[derive(Clone, Copy)]
 pub struct Settings {
     pub nerd_icons: RwSignal<bool>,
     pub show_node_icons: RwSignal<bool>,
+    pub collapse_wip: RwSignal<bool>,
 }
 
 /// The feature handles `App` owns and hands down to the graph canvas (M1.11, #64).

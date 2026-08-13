@@ -24,6 +24,12 @@ const IDENT = [
   '-c', 'tag.gpgsign=false',
 ]
 
+/** How many `wip(#N): auto-checkpoint M` commits the fixture seeds between
+ *  commit 1 and commit 2 (#374). 3, not 2, so the fold is unambiguously a
+ *  "run" rather than the MIN_RUN boundary case. Asserted directly by the
+ *  collapse spec, so it must stay in sync with the seeding below. */
+export const WIP_RUN_COUNT = 3
+
 /** Line count of the big file. Large enough that rendering every line would be
  *  obviously different from rendering a window, small enough to stay fast. */
 export const BIG_FILE_LINES = 4000
@@ -53,6 +59,17 @@ export function buildFixture(root) {
   writeFileSync(join(root, 'multi-hunk.txt'), multiHunk.join('\n') + '\n')
   git('add', 'multi-hunk.txt')
   git('commit', '-q', '-m', 'seed: multi-hunk file')
+
+  // --- a run of WIP-checkpoint commits (#374), sitting between commit 1 and
+  // commit 2 so it never shifts the newest-first indices the other specs
+  // assert against (LONG_PATCH=1, openDiff's default nth(0)). Exact message
+  // shape the real `~/.local/bin/autocheckpoint` script produces, so
+  // `is_wip_checkpoint` matches it for real rather than by coincidence.
+  for (let n = 1; n <= WIP_RUN_COUNT; n += 1) {
+    writeFileSync(join(root, 'wip-marker.txt'), `checkpoint ${n}\n`)
+    git('add', 'wip-marker.txt')
+    git('commit', '-q', '-m', `wip(#374): auto-checkpoint ${n}`)
+  }
 
   // --- commit 2: the big file, added whole so its diff is BIG_FILE_LINES of "+".
   writeFileSync(

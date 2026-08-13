@@ -36,6 +36,7 @@ use git_vista_core::model::RefKind;
 use crate::api::{fetch_commit_detail, fetch_page, HistoryFetchError};
 use crate::camera::Camera;
 use crate::features::a11y::focus::GraphFocus;
+use crate::features::graph::collapse::{self, DisplayProjection};
 use crate::features::graph::core::{
     should_prefetch, show_fixed_loading_overlay, PageLoadState, PageRequestKey, PageRetry,
     RenderCtx, DEFAULT_PAGE_LIMIT,
@@ -173,6 +174,13 @@ pub(super) fn graph_canvas(
     let stub_epoch = create_rw_signal(0u32);
     let page_load = create_rw_signal(PageLoadState::Idle);
     let home = create_rw_signal(Camera::home(initial_headroom));
+    // Bumped once per accepted page, unconditionally (#374) — the WIP-collapse
+    // projection below must re-scan `c.loaded.rows` on every append, not only
+    // the appends that also widen a lane (`layout_epoch`'s own, narrower
+    // trigger). A fresh page can add a new run of checkpoint commits without
+    // touching any existing row's geometry at all, so reusing `layout_epoch`
+    // here would silently miss those appends.
+    let raw_row_epoch = create_rw_signal(0u32);
     // M1.13 (#65 keyboard-access gap): the roving-tabindex state for the
     // commit rows — see `features::a11y::focus`. Kept in step with
     // `row_count` by its own effect below rather than folded into the append
@@ -183,6 +191,67 @@ pub(super) fn graph_canvas(
     create_effect(move |_| {
         let n = row_count.get();
         focus.update(|f| f.set_row_count(n));
+    });
+
+    // Which folded runs the user has expanded this session (#374). Holds the
+    // raw row index the tap came from — `collapse::project` treats a run as
+    // open when *any* of its members is in here, so the index need only
+    // identify the run, not stay its first row. Deliberately not persisted: a
+    // reload re-folds everything, which is the point of the preference
+    // defaulting on.
+    let expanded_groups = create_rw_signal(HashSet::<usize>::new());
+    // The display-space projection. A `StoredValue` (not a signal) for the
+    // same reason `ctx` is one: the builders read it by value inside a
+    // `<For>` child. What tells those `<For>`s to rebuild is `display_epoch`
+    // below, never the value itself.
+    let display = StoredValue::new(DisplayProjection::default());
+    // Bumped every time the projection is replaced (#374), and carried in
+    // every `<For>` key below beside `layout_epoch`.
+    //
+    // WHY THE KEYS NEED IT, AND WHY `row_count` IS NOT ENOUGH. A row `<For>`
+    // keys on its display index. Those keys are byte-identical before and
+    // after a re-projection, so with nothing else in them Leptos matches the
+    // old children and *reuses* them — including the ones built during the
+    // very first render pass, when `row_count` was already the raw seed count
+    // but `display` still held `DisplayProjection::default()`, so every
+    // builder's `items.get(i)` missed and returned an empty `()` view. Those
+    // empty views then survive forever. Observed live (#374 browser
+    // verification): `paths: 4, circles: 0, graphRows: 0` — the edge tier
+    // repainted on its own only because its keys are edge *indices drawn from
+    // the projection*, which do change when it is filled.
+    //
+    // Every later re-projection has the same hazard — toggling the
+    // preference, expanding a group — so this is a standing invalidation
+    // signal, not a mount-time workaround.
+    let display_epoch = create_rw_signal(0u32);
+    // Recompute the projection whenever the rows, the preference, or the
+    // expanded set change, and republish the display-space row count that
+    // both the culler and `GraphFocus` read.
+    create_effect(move |_| {
+        let enabled = settings.collapse_wip.get();
+        let expanded = expanded_groups.get();
+        let _ = raw_row_epoch.get();
+        let projected = ctx
+            .with_value(|c| collapse::project(&c.loaded.rows, &c.loaded.edges, enabled, &expanded));
+        let count = projected.items.len();
+        // The value goes in before either signal: both writes below drive the
+        // `visible` memo and the `<For>` `each=` closures to re-run within
+        // this same call, and every builder reads `display` untracked at that
+        // moment.
+        display.set_value(projected);
+        // Batched so that rebuild sees one consistent state. Un-batched, the
+        // epoch bump flushes first, against the *old* `row_count` — building
+        // rows for display indices the new projection no longer has, only to
+        // drop them when `row_count` lands.
+        batch(move || {
+            display_epoch.update(|n| *n = n.wrapping_add(1));
+            row_count.set(count);
+        });
+    });
+    let on_expand = Callback::new(move |start_row_index: usize| {
+        expanded_groups.update(|s| {
+            s.insert(start_row_index);
+        });
     });
 
     // Camera (pan/zoom) state, starting at the home position so a new branch
@@ -379,9 +448,14 @@ pub(super) fn graph_canvas(
             // canvas's own aggregate accepted the page whole.
             match ctx.try_update_value(|c| c.loaded.append_page(&request_key.cursor, page)) {
                 Some(Ok(delta)) => {
-                    let (rows, complete) =
+                    let (_, complete) =
                         ctx.with_value(|c| (c.loaded.rows.len(), c.loaded.is_complete()));
-                    row_count.set(rows);
+                    // `row_count` is display-space now (#374) and is owned by
+                    // the projection effect above; bumping this unconditionally
+                    // is what makes that effect re-run against the new rows —
+                    // see its own comment for why `layout_epoch`'s narrower,
+                    // conditional bump below is not a substitute for this one.
+                    raw_row_epoch.update(|n| *n = n.wrapping_add(1));
                     history_ui.complete.set(complete);
                     // #217: latch "the user drove THIS repository's history to
                     // completeness" the moment this multi-page aggregate first
@@ -502,25 +576,40 @@ pub(super) fn graph_canvas(
                 // deliver an edge that *starts* in rows already on screen and ends
                 // far below, so the visible-edge set can change while the visible
                 // *row* window doesn't — and the memo alone would never re-run.
+                //
+                // The display epoch is in the key, not just the closure (#374):
+                // two different projections can hold the same *number* of edges
+                // (expanding one group while the viewport shows another), and an
+                // edge index alone would then match a stale path against a new
+                // projection.
                 <For
                     each=move || {
                         row_count.get();
-                        render::visible_edges(ctx, visible.get())
+                        let de = display_epoch.get();
+                        render::visible_edges(display, visible.get())
+                            .into_iter()
+                            .map(|ei| (ei, de))
+                            .collect::<Vec<_>>()
                     }
-                    key=|ei| *ei
-                    children=move |ei| render::build_edge(ctx, ei)
+                    key=|k| *k
+                    children=move |(ei, _)| render::build_edge(ctx, display, ei)
                 />
-                // Every row tier is keyed on its layout epoch as well as its index,
-                // so a later page that pushes an already-drawn row's label right
-                // rebuilds that row rather than leaving it at its old x.
+                // Every row tier is keyed on its layout epoch and the display
+                // epoch as well as its index, so a later page that pushes an
+                // already-drawn row's label right — or any re-projection that
+                // changes what a display index *means* — rebuilds that row
+                // rather than leaving it at its old x, or at its old commit.
                 <For
                     each=move || {
                         let (s, e) = visible.get();
                         let le = layout_epoch.get();
-                        (s..e).map(|i| (i, le)).collect::<Vec<_>>()
+                        let de = display_epoch.get();
+                        (s..e).map(|i| (i, le, de)).collect::<Vec<_>>()
                     }
                     key=|k| *k
-                    children=move |(i, _)| render::build_node(ctx, shell, moved, focus, camera, vp_h, i)
+                    children=move |(i, _, _)| {
+                        render::build_node(ctx, display, shell, moved, focus, camera, vp_h, on_expand, i)
+                    }
                 />
                 // Phase 9 (level of detail): the two label tiers, each hidden as the
                 // graph is zoomed out. The message tier (badges + message) drops
@@ -528,20 +617,24 @@ pub(super) fn graph_canvas(
                 // so it's shown only at the closest zoom. Hidden via `.lod-hidden`
                 // (display:none), keeping the node/edge structure readable when the
                 // text would just be an unreadable smear. Rows are keyed on
-                // (index, icon mode, layout epoch): the glyphs and the label x are
-                // read untracked inside the builders, so flipping the "Icons"
-                // toggle — or widening the lanes — changes every key and rebuilds
-                // the visible rows against the new value.
+                // (index, icon mode, layout epoch, display epoch): the glyphs, the
+                // label x and the projection are all read untracked inside the
+                // builders, so flipping the "Icons" toggle — or widening the lanes,
+                // or re-projecting — changes every key and rebuilds the visible
+                // rows against the new value.
                 <g class:lod-hidden=move || !detail_for(camera.get().scale).shows_message()>
                     <For
                         each=move || {
                             let (s, e) = visible.get();
                             let nerd = nerd_icons.get();
                             let le = layout_epoch.get();
-                            (s..e).map(|i| (i, nerd, le)).collect::<Vec<_>>()
+                            let de = display_epoch.get();
+                            (s..e).map(|i| (i, nerd, le, de)).collect::<Vec<_>>()
                         }
                         key=|k| *k
-                        children=move |(i, _, _)| render::build_msg(ctx, nerd_icons, moved, i)
+                        children=move |(i, _, _, _)| {
+                            render::build_msg(ctx, display, nerd_icons, moved, i)
+                        }
                     />
                 </g>
                 <g class:lod-hidden=move || !detail_for(camera.get().scale).shows_meta()>
@@ -550,10 +643,11 @@ pub(super) fn graph_canvas(
                             let (s, e) = visible.get();
                             let nerd = nerd_icons.get();
                             let le = layout_epoch.get();
-                            (s..e).map(|i| (i, nerd, le)).collect::<Vec<_>>()
+                            let de = display_epoch.get();
+                            (s..e).map(|i| (i, nerd, le, de)).collect::<Vec<_>>()
                         }
                         key=|k| *k
-                        children=move |(i, _, _)| render::build_meta(ctx, nerd_icons, i)
+                        children=move |(i, _, _, _)| render::build_meta(ctx, display, nerd_icons, i)
                     />
                 </g>
                 // The per-node icons: one layer holding the glyph beside every
@@ -567,10 +661,13 @@ pub(super) fn graph_canvas(
                             let (s, e) = visible.get();
                             let nerd = nerd_icons.get();
                             let le = layout_epoch.get();
-                            (s..e).map(|i| (i, nerd, le)).collect::<Vec<_>>()
+                            let de = display_epoch.get();
+                            (s..e).map(|i| (i, nerd, le, de)).collect::<Vec<_>>()
                         }
                         key=|k| *k
-                        children=move |(i, _, _)| render::build_node_icon(ctx, nerd_icons, i)
+                        children=move |(i, _, _, _)| {
+                            render::build_node_icon(ctx, display, nerd_icons, i)
+                        }
                     />
                     // The two stub layers stay eager (there are only a handful, and
                     // their cascade fans *upward* off the anchor, so they don't map

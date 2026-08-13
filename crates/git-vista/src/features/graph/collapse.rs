@@ -121,25 +121,34 @@ pub fn project(
     let mut items = Vec::with_capacity(rows.len());
     let mut i = 0;
     while i < rows.len() {
-        if collapse_enabled && !expanded.contains(&i) {
-            let mut end = i;
-            while end + 1 < rows.len() && same_run(&rows[end], &rows[end + 1]) {
-                end += 1;
-            }
-            let count = end - i + 1;
-            if count >= MIN_RUN {
-                items.push(DisplayItem::WipGroup {
-                    start_row_index: i,
-                    count,
-                    lane: rows[i].lane,
-                    color: rows[i].color,
-                });
-                i = end + 1;
-                continue;
-            }
+        // Always advance a whole run at a time, never one row at a time. A
+        // run is decided *before* the expanded set is consulted, so opening
+        // one takes its every member out of folding together. Advancing
+        // row-by-row instead re-examined the tail as a run in its own right,
+        // which is still adjacent, still all checkpoints, and still >=
+        // MIN_RUN — so a three-member run grew a fresh two-member group the
+        // moment the user opened it and the marker never went away (#374,
+        // caught by the browser spec, pinned by the two tests below).
+        let mut end = i;
+        while end + 1 < rows.len() && same_run(&rows[end], &rows[end + 1]) {
+            end += 1;
         }
-        items.push(DisplayItem::Single { row_index: i });
-        i += 1;
+        let count = end - i + 1;
+        // Membership anywhere in the run, not only at its first row: an
+        // append can put a NEWER checkpoint above a run the user already
+        // opened, moving the start index out from under the recorded one.
+        let user_expanded = (i..=end).any(|r| expanded.contains(&r));
+        if collapse_enabled && count >= MIN_RUN && !user_expanded {
+            items.push(DisplayItem::WipGroup {
+                start_row_index: i,
+                count,
+                lane: rows[i].lane,
+                color: rows[i].color,
+            });
+        } else {
+            items.extend((i..=end).map(|row_index| DisplayItem::Single { row_index }));
+        }
+        i = end + 1;
     }
 
     let projection = DisplayProjection {
@@ -346,6 +355,57 @@ mod tests {
             .items
             .iter()
             .all(|i| matches!(i, DisplayItem::Single { .. })));
+    }
+
+    #[test]
+    fn expanding_a_long_run_does_not_refold_its_tail() {
+        // The regression the 2-member case above cannot catch (#374): with
+        // three or more members, un-folding only the run's FIRST row leaves
+        // rows 2..n adjacent, still a valid run, and still >= MIN_RUN — so a
+        // second group appears the instant the first is opened and the marker
+        // never goes away. Expanding a run must expand the whole run.
+        let rows = vec![
+            row(0, "feat: real work", Some("c1")),
+            wip_row(1, 3, Some("c2")),
+            wip_row(2, 2, Some("c3")),
+            wip_row(3, 1, Some("c4")),
+            row(4, "docs: earlier real work", None),
+        ];
+        let mut expanded = HashSet::new();
+        expanded.insert(1); // the group's start_row_index, what the tap sends
+        let p = project(&rows, &[], true, &expanded);
+        assert_eq!(p.items.len(), 5, "{:?}", p.items);
+        assert!(
+            p.items
+                .iter()
+                .all(|i| matches!(i, DisplayItem::Single { .. })),
+            "{:?}",
+            p.items
+        );
+    }
+
+    #[test]
+    fn expanding_from_any_member_expands_the_whole_run() {
+        // Membership is tested across the run, not only at its start, so a
+        // run that later grows a new head (a page appending a NEWER
+        // checkpoint above an already-opened run) stays open instead of
+        // silently re-folding around the row the user opened.
+        let rows = vec![
+            wip_row(0, 3, Some("c1")),
+            wip_row(1, 2, Some("c2")),
+            wip_row(2, 1, None),
+        ];
+        let mut expanded = HashSet::new();
+        expanded.insert(1); // a middle member, not the run's first row
+        let p = project(&rows, &[], true, &expanded);
+        assert_eq!(p.items.len(), 3, "{:?}", p.items);
+        assert!(
+            p.items
+                .iter()
+                .all(|i| matches!(i, DisplayItem::Single { .. })),
+            "{:?}",
+            p.items
+        );
     }
 
     #[test]
