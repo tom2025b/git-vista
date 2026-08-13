@@ -17,6 +17,14 @@ import { openApp } from './helpers.mjs'
 // therefore renders: commit4(HEAD), commit3, commit2, one WipGroup, commit1
 // = 4 real rows + 1 group row.
 const EXPECTED_DISPLAY_ROWS = 5
+// Expanded, the group's slot is replaced by its members: 4 real + WIP_RUN_COUNT.
+// Asserted exactly, not as "more than before" — a loose assertion passes both
+// when the run opens whole AND when only its head opens and the tail re-folds
+// into a smaller group, which is precisely the defect this spec exists to
+// catch. (It is also why WIP_RUN_COUNT must stay >= 3: at 2, an
+// only-the-head-opened projection leaves a 1-commit tail, which is below
+// MIN_RUN and so is indistinguishable from a correct expansion.)
+const EXPECTED_EXPANDED_ROWS = EXPECTED_DISPLAY_ROWS - 1 + WIP_RUN_COUNT
 
 test.describe('#374 WIP-checkpoint collapsing', () => {
   test('a run of checkpoints renders as one folded marker by default', async ({ page }) => {
@@ -32,10 +40,10 @@ test.describe('#374 WIP-checkpoint collapsing', () => {
 
   test('tapping the marker expands the run into individual commits', async ({ page }) => {
     await openApp(page)
-    const before = await page.locator('.graph-row').count()
+    await expect(page.locator('.graph-row')).toHaveCount(EXPECTED_DISPLAY_ROWS)
     await page.locator('.wip-group .node-hit').click()
     await expect(page.locator('.wip-group')).toHaveCount(0)
-    expect(await page.locator('.graph-row').count()).toBeGreaterThan(before)
+    await expect(page.locator('.graph-row')).toHaveCount(EXPECTED_EXPANDED_ROWS)
   })
 
   test('the topbar toggle shows every checkpoint', async ({ page }) => {
