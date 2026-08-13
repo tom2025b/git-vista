@@ -371,6 +371,112 @@ mod tests {
         );
     }
 
+    fn edge(from_row: usize, to_row: usize) -> Edge {
+        Edge {
+            from_row,
+            from_lane: 0,
+            to_row,
+            to_lane: 0,
+        }
+    }
+
+    #[test]
+    fn edges_internal_to_a_folded_run_are_dropped() {
+        let rows = vec![
+            row(0, "feat: real work", Some("c1")),
+            wip_row(1, 3, Some("c2")),
+            wip_row(2, 2, Some("c3")),
+            wip_row(3, 1, Some("c4")),
+            row(4, "docs: earlier", None),
+        ];
+        // 0->1 (into the run), 1->2 and 2->3 (internal), 3->4 (out of it).
+        let edges = vec![edge(0, 1), edge(1, 2), edge(2, 3), edge(3, 4)];
+        let p = project(&rows, &edges, true, &HashSet::new());
+        // Display space: [Single(0), WipGroup(1..4), Single(4)] = 0, 1, 2.
+        assert_eq!(p.edges.len(), 2, "{:?}", p.edges);
+        assert_eq!(
+            p.edges[0],
+            DisplayEdge {
+                from_display: 0,
+                from_lane: 0,
+                to_display: 1,
+                to_lane: 0
+            }
+        );
+        assert_eq!(
+            p.edges[1],
+            DisplayEdge {
+                from_display: 1,
+                from_lane: 0,
+                to_display: 2,
+                to_lane: 0
+            }
+        );
+    }
+
+    #[test]
+    fn edge_lanes_pass_through_unchanged() {
+        let rows = vec![
+            row(0, "feat: real work", Some("c1")),
+            wip_row(1, 2, Some("c2")),
+            wip_row(2, 1, None),
+        ];
+        let edges = vec![Edge {
+            from_row: 0,
+            from_lane: 3,
+            to_row: 1,
+            to_lane: 7,
+        }];
+        let p = project(&rows, &edges, true, &HashSet::new());
+        assert_eq!(p.edges[0].from_lane, 3);
+        assert_eq!(p.edges[0].to_lane, 7);
+    }
+
+    /// The paired positive: with collapse OFF the same input keeps every
+    /// edge, so the dropped-edge assertion above is capable of failing
+    /// rather than passing because the fixture had no internal edges.
+    #[test]
+    fn collapse_disabled_keeps_every_edge() {
+        let rows = vec![
+            row(0, "feat: real work", Some("c1")),
+            wip_row(1, 3, Some("c2")),
+            wip_row(2, 2, Some("c3")),
+            wip_row(3, 1, Some("c4")),
+            row(4, "docs: earlier", None),
+        ];
+        let edges = vec![edge(0, 1), edge(1, 2), edge(2, 3), edge(3, 4)];
+        let p = project(&rows, &edges, false, &HashSet::new());
+        assert_eq!(p.edges.len(), 4);
+        assert_eq!(
+            p.edges[3],
+            DisplayEdge {
+                from_display: 3,
+                from_lane: 0,
+                to_display: 4,
+                to_lane: 0
+            }
+        );
+    }
+
+    #[test]
+    fn display_of_row_maps_a_member_to_its_group_slot() {
+        let rows = vec![
+            row(0, "feat: real work", Some("c1")),
+            wip_row(1, 3, Some("c2")),
+            wip_row(2, 2, Some("c3")),
+            wip_row(3, 1, Some("c4")),
+            row(4, "docs: earlier", None),
+        ];
+        let p = project(&rows, &[], true, &HashSet::new());
+        assert_eq!(p.display_of_row(0), Some(0));
+        // Every member of the run resolves to the group's one slot.
+        assert_eq!(p.display_of_row(1), Some(1));
+        assert_eq!(p.display_of_row(2), Some(1));
+        assert_eq!(p.display_of_row(3), Some(1));
+        assert_eq!(p.display_of_row(4), Some(2));
+        assert_eq!(p.display_of_row(99), None);
+    }
+
     #[test]
     fn real_checkpoint_messages_match() {
         assert!(is_wip_checkpoint("wip(#66): auto-checkpoint 690"));
