@@ -251,6 +251,10 @@ const INTERACTIVE_CENSUS: &[(&str, bool)] = &[
     // Commit-dot and stub hit circles. Sized in SVG user units by `render/`, not by
     // CSS at all — see `commit_dot_hit_target_is_thirty_pixels_at_default_zoom`.
     (".node-hit", false),
+    // #380: mindmap picker leaves. Sized in SVG user units by `repomap.rs`,
+    // not CSS — the chip rect is 184x46 in a 1200x900 viewBox that renders at
+    // >=700px wide, so the on-screen target clears 44pt on any real display.
+    (".repomap-leaf", false),
     (".ctx-item", true),
     (".reset-view", true),
     // GitHub-linked ref badges and commit messages (`render/labels.rs`). Applied to

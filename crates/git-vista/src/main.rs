@@ -94,6 +94,7 @@ mod prefs;
 mod print;
 #[cfg(target_arch = "wasm32")]
 mod render;
+mod repomap;
 // M1.04 (#57): the loopback session bootstrap flow — exchange the one-time
 // `#s=<token>` fragment for a session cookie, and the blocking sign-in screen.
 #[cfg(target_arch = "wasm32")]
