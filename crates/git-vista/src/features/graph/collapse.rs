@@ -37,7 +37,7 @@ pub fn is_wip_checkpoint(summary: &str) -> bool {
 /// `ROW_HEIGHT` slot — that uniformity is what lets `viewport::
 /// visible_row_range` and `geometry::node_cy` stay unchanged, since both
 /// only ever assume a fixed stride over *some* row count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DisplayItem {
     /// One real commit, at `row_index` in `LoadedHistory.rows`.
     Single { row_index: usize },
@@ -56,7 +56,7 @@ pub enum DisplayItem {
 /// An edge with both endpoints already resolved to display-space indices.
 /// Lanes copy through from the source `Edge` unchanged — collapsing moves
 /// rows vertically, never between lanes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DisplayEdge {
     pub from_display: usize,
     pub from_lane: usize,

@@ -202,27 +202,32 @@ pub(super) fn graph_canvas(
     let expanded_groups = create_rw_signal(HashSet::<usize>::new());
     // The display-space projection. A `StoredValue` (not a signal) for the
     // same reason `ctx` is one: the builders read it by value inside a
-    // `<For>` child. What tells those `<For>`s to rebuild is `display_epoch`
-    // below, never the value itself.
+    // `<For>` child, and each `<For>` carries the projected item itself in its
+    // key, so a row's identity is what it *shows*, not when it was built.
     let display = StoredValue::new(DisplayProjection::default());
-    // Bumped every time the projection is replaced (#374), and carried in
-    // every `<For>` key below beside `layout_epoch`.
+    // Bumped every time the projection is replaced (#374). Read inside every
+    // `<For>`'s `each=` closure below purely as the *trigger* that re-runs it;
+    // it is deliberately NOT part of any key.
     //
-    // WHY THE KEYS NEED IT, AND WHY `row_count` IS NOT ENOUGH. A row `<For>`
-    // keys on its display index. Those keys are byte-identical before and
-    // after a re-projection, so with nothing else in them Leptos matches the
-    // old children and *reuses* them — including the ones built during the
-    // very first render pass, when `row_count` was already the raw seed count
-    // but `display` still held `DisplayProjection::default()`, so every
-    // builder's `items.get(i)` missed and returned an empty `()` view. Those
-    // empty views then survive forever. Observed live (#374 browser
-    // verification): `paths: 4, circles: 0, graphRows: 0` — the edge tier
-    // repainted on its own only because its keys are edge *indices drawn from
-    // the projection*, which do change when it is filled.
+    // WHY THE KEYS CARRY THE ITEM. A row `<For>` used to key on its display
+    // index alone. Those keys are byte-identical before and after a
+    // re-projection, so Leptos matched the old children and *reused* them —
+    // including the ones built during the very first render pass, when
+    // `row_count` was already the raw seed count but `display` still held
+    // `DisplayProjection::default()`, so every builder's `items.get(i)` missed
+    // and returned an empty `()` view. Those empty views then survived
+    // forever. Observed live (#374 browser verification): `paths: 4,
+    // circles: 0, graphRows: 0` — the edge tier repainted on its own only
+    // because its keys were edge *indices drawn from the projection*, which do
+    // change when it is filled.
     //
-    // Every later re-projection has the same hazard — toggling the
-    // preference, expanding a group — so this is a standing invalidation
-    // signal, not a mount-time workaround.
+    // Putting the epoch in the key fixed that but replaced it with churn:
+    // every expand, collapse or toggle rebuilt every visible row, including
+    // rows showing the same commit at the same position. Keying on
+    // `(index, DisplayItem, …)` fixes both at once — a row whose content moved
+    // gets a new key and rebuilds, a row that did not keeps its DOM node. It
+    // also stops a click going stale mid-action against a row that had no
+    // reason to be replaced.
     let display_epoch = create_rw_signal(0u32);
     // Recompute the projection whenever the rows, the preference, or the
     // expanded set change, and republish the display-space row count that
@@ -590,34 +595,42 @@ pub(super) fn graph_canvas(
                 // far below, so the visible-edge set can change while the visible
                 // *row* window doesn't — and the memo alone would never re-run.
                 //
-                // The display epoch is in the key, not just the closure (#374):
-                // two different projections can hold the same *number* of edges
+                // The edge itself is in the key, not just its index (#374): two
+                // different projections can hold the same *number* of edges
                 // (expanding one group while the viewport shows another), and an
-                // edge index alone would then match a stale path against a new
-                // projection.
+                // index alone would match a stale path against a new projection.
+                // Carrying the value instead also leaves untouched edges alone.
                 <For
                     each=move || {
                         row_count.get();
-                        let de = display_epoch.get();
-                        render::visible_edges(display, visible.get())
-                            .into_iter()
-                            .map(|ei| (ei, de))
-                            .collect::<Vec<_>>()
+                        display_epoch.get();
+                        display.with_value(|d| {
+                            render::visible_edges(display, visible.get())
+                                .into_iter()
+                                .filter_map(|ei| d.edges.get(ei).map(|e| (ei, *e)))
+                                .collect::<Vec<_>>()
+                        })
                     }
                     key=|k| *k
                     children=move |(ei, _)| render::build_edge(ctx, display, ei)
                 />
-                // Every row tier is keyed on its layout epoch and the display
+                // Every row tier is keyed on the item it draws and its layout
                 // epoch as well as its index, so a later page that pushes an
-                // already-drawn row's label right — or any re-projection that
-                // changes what a display index *means* — rebuilds that row
+                // already-drawn row's label right — or a re-projection that
+                // changes what this display index *means* — rebuilds that row
                 // rather than leaving it at its old x, or at its old commit.
+                // A row whose item and position are both unchanged keeps its
+                // DOM node.
                 <For
                     each=move || {
                         let (s, e) = visible.get();
                         let le = layout_epoch.get();
-                        let de = display_epoch.get();
-                        (s..e).map(|i| (i, le, de)).collect::<Vec<_>>()
+                        display_epoch.get();
+                        display.with_value(|d| {
+                            (s..e)
+                                .filter_map(|i| d.items.get(i).map(|item| (i, *item, le)))
+                                .collect::<Vec<_>>()
+                        })
                     }
                     key=|k| *k
                     children=move |(i, _, _)| {
@@ -630,19 +643,23 @@ pub(super) fn graph_canvas(
                 // so it's shown only at the closest zoom. Hidden via `.lod-hidden`
                 // (display:none), keeping the node/edge structure readable when the
                 // text would just be an unreadable smear. Rows are keyed on
-                // (index, icon mode, layout epoch, display epoch): the glyphs, the
-                // label x and the projection are all read untracked inside the
-                // builders, so flipping the "Icons" toggle — or widening the lanes,
-                // or re-projecting — changes every key and rebuilds the visible
-                // rows against the new value.
+                // (index, item, icon mode, layout epoch): the glyphs, the label x
+                // and the projection are all read untracked inside the builders,
+                // so flipping the "Icons" toggle — or widening the lanes — changes
+                // every key and rebuilds the visible rows, while a re-projection
+                // rebuilds only the rows whose own item actually moved.
                 <g class:lod-hidden=move || !detail_for(camera.get().scale).shows_message()>
                     <For
                         each=move || {
                             let (s, e) = visible.get();
                             let nerd = nerd_icons.get();
                             let le = layout_epoch.get();
-                            let de = display_epoch.get();
-                            (s..e).map(|i| (i, nerd, le, de)).collect::<Vec<_>>()
+                            display_epoch.get();
+                            display.with_value(|d| {
+                                (s..e)
+                                    .filter_map(|i| d.items.get(i).map(|item| (i, *item, nerd, le)))
+                                    .collect::<Vec<_>>()
+                            })
                         }
                         key=|k| *k
                         children=move |(i, _, _, _)| {
@@ -656,8 +673,12 @@ pub(super) fn graph_canvas(
                             let (s, e) = visible.get();
                             let nerd = nerd_icons.get();
                             let le = layout_epoch.get();
-                            let de = display_epoch.get();
-                            (s..e).map(|i| (i, nerd, le, de)).collect::<Vec<_>>()
+                            display_epoch.get();
+                            display.with_value(|d| {
+                                (s..e)
+                                    .filter_map(|i| d.items.get(i).map(|item| (i, *item, nerd, le)))
+                                    .collect::<Vec<_>>()
+                            })
                         }
                         key=|k| *k
                         children=move |(i, _, _, _)| render::build_meta(ctx, display, nerd_icons, i)
@@ -674,8 +695,12 @@ pub(super) fn graph_canvas(
                             let (s, e) = visible.get();
                             let nerd = nerd_icons.get();
                             let le = layout_epoch.get();
-                            let de = display_epoch.get();
-                            (s..e).map(|i| (i, nerd, le, de)).collect::<Vec<_>>()
+                            display_epoch.get();
+                            display.with_value(|d| {
+                                (s..e)
+                                    .filter_map(|i| d.items.get(i).map(|item| (i, *item, nerd, le)))
+                                    .collect::<Vec<_>>()
+                            })
                         }
                         key=|k| *k
                         children=move |(i, _, _, _)| {

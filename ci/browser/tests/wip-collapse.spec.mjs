@@ -95,4 +95,30 @@ test.describe('#374 WIP-checkpoint collapsing', () => {
     await expect(page.locator('.ctx-menu')).toBeVisible()
     await expect(page.getByRole('button', { name: /Fold these/ })).toHaveCount(0)
   })
+
+  test('expanding a run leaves the rows above it in place', async ({ page }) => {
+    // Rows are keyed by WHAT they show, not by when the projection last
+    // changed. Keying on a global epoch instead rebuilds every visible row on
+    // every expand/collapse/toggle, which is pure DOM churn for rows whose
+    // content did not move — and it is what made a Playwright click go stale
+    // mid-action and hit-test onto the header instead of the commit.
+    await openApp(page)
+    await page.evaluate(() => {
+      document
+        .querySelectorAll('.graph-row')
+        .forEach((row, i) => {
+          row.dataset.marked = String(i)
+        })
+    })
+
+    await page.locator('.wip-group .node-hit').click()
+    await expect(page.locator('.graph-row')).toHaveCount(EXPECTED_EXPANDED_ROWS)
+
+    // The three real commits above the run show the same commits at the same
+    // display indices, so their DOM nodes must survive untouched.
+    const survivors = await page.evaluate(
+      () => [...document.querySelectorAll('.graph-row')].filter((r) => r.dataset.marked).length,
+    )
+    expect(survivors).toBe(3)
+  })
 })
