@@ -168,7 +168,7 @@ pub fn map_view(
                         (VIEW_W / 2.0 + bp.x) / 2.0, (VIEW_H / 2.0 + bp.y) / 2.0,
                         bp.x, bp.y,
                     )
-                    fill="none" stroke=hue stroke-width="3"
+                    fill="none" stroke=hue stroke-width="6" stroke-linecap="round" opacity="0.9"
                 />
             }
             .into_view(),
@@ -182,6 +182,20 @@ pub fn map_view(
             let _ = li;
             let d = entries[*mi].clone();
             let label = d.name.clone();
+            // The connector's DASH carries information, not decoration
+            // (Tom's ask): solid = a normal working repo, long dashes = a
+            // view-only clone, short dots = a linked worktree. Same encoding
+            // the KEYS box below spells out in words.
+            let dash = if d.read_only {
+                "14 9"
+            } else if matches!(
+                d.kind,
+                git_vista_protocol::dto::RepositoryKind::LinkedWorktree
+            ) {
+                "3 7"
+            } else {
+                "0"
+            };
             edges.push(
                 view! {
                     <path
@@ -191,11 +205,23 @@ pub fn map_view(
                             (bp.x + lp.x) / 2.0, (bp.y + lp.y) / 2.0,
                             lp.x, lp.y,
                         )
-                        fill="none" stroke=hue stroke-width="1.5" opacity="0.55"
+                        fill="none" stroke=hue stroke-width="3.5"
+                        stroke-linecap="round" opacity="0.7"
+                        stroke-dasharray=dash
                     />
                 }
                 .into_view(),
             );
+            let open_kb = {
+                let d = d.clone();
+                move |ev: web_sys::KeyboardEvent| {
+                    if (ev.key() == "Enter" || ev.key() == " ") && !session_state::is_lan() {
+                        ev.prevent_default();
+                        mode_for.set(Some(d.clone()));
+                    }
+                }
+            };
+            let aria = format!("Open repository {}", d.name);
             let open = move |_| {
                 if !session_state::is_lan() {
                     mode_for.set(Some(d.clone()));
@@ -203,14 +229,30 @@ pub fn map_view(
             };
             nodes.push(
                 view! {
-                    <g class="repomap-leaf" on:click=open style="cursor:pointer;">
+                    <g
+                        class="repomap-leaf"
+                        on:click=open
+                        on:keydown=open_kb
+                        tabindex="0"
+                        role="button"
+                        aria-label=aria
+                        style="cursor:pointer;"
+                    >
                         <rect
-                            x=lp.x - 85.0 y=lp.y - 20.0 width="170" height="40" rx="11"
-                            fill="#0d1117" stroke=hue stroke-width="2"
+                            class="repomap-chip"
+                            x=lp.x - 92.0 y=lp.y - 23.0 width="184" height="46" rx="14"
+                            fill="#0d1117" stroke=hue stroke-width="2.5"
+                        />
+                        // A whisper of the branch hue inside the chip — reads
+                        // as grouping from across the room without shouting.
+                        <rect
+                            x=lp.x - 92.0 y=lp.y - 23.0 width="184" height="46" rx="14"
+                            fill=hue opacity="0.10" style="pointer-events:none;"
                         />
                         <text
-                            x=lp.x y=lp.y + 5.0 text-anchor="middle"
-                            fill="var(--fg)" font-size="15"
+                            x=lp.x y=lp.y + 6.0 text-anchor="middle"
+                            fill="var(--fg)" font-size="18" font-weight="600"
+                            style="pointer-events:none;"
                         >
                             {label}
                         </text>
@@ -223,18 +265,18 @@ pub fn map_view(
             view! {
                 <g>
                     <rect
-                        x=bp.x - 78.0 y=bp.y - 26.0 width="156" height="52" rx="26"
-                        fill=hue opacity="0.92"
+                        x=bp.x - 92.0 y=bp.y - 31.0 width="184" height="62" rx="31"
+                        fill=hue opacity="0.95" filter="url(#rm-glow)"
                     />
                     <text
-                        x=bp.x y=bp.y - 2.0 text-anchor="middle"
-                        fill="#0d1117" font-size="17" font-weight="700"
+                        x=bp.x y=bp.y - 3.0 text-anchor="middle"
+                        fill="#0d1117" font-size="21" font-weight="800"
                     >
                         {g.label}
                     </text>
                     <text
-                        x=bp.x y=bp.y + 17.0 text-anchor="middle"
-                        fill="#0d1117" font-size="13"
+                        x=bp.x y=bp.y + 20.0 text-anchor="middle"
+                        fill="#0d1117" font-size="15" font-weight="600"
                     >
                         {format!("{} repos", g.members.len())}
                     </text>
@@ -250,16 +292,52 @@ pub fn map_view(
             viewBox=format!("0 0 {VIEW_W} {VIEW_H}")
             style="width:100%; height:auto; min-width:700px; display:block;"
         >
+            // 50-inch-at-two-feet treatment (#380 follow-up): a soft glow on
+            // the coloured nodes and a radial hub gradient. SVG filters, not
+            // images — a handful of nodes, so the filter cost is nothing.
+            <defs>
+                <filter id="rm-glow" x="-40%" y="-40%" width="180%" height="180%">
+                    <feGaussianBlur stdDeviation="6" result="b" />
+                    <feMerge>
+                        <feMergeNode in="b" />
+                        <feMergeNode in="SourceGraphic" />
+                    </feMerge>
+                </filter>
+                <radialGradient id="rm-hub" cx="50%" cy="42%" r="65%">
+                    <stop offset="0%" stop-color="#1f2f4a" />
+                    <stop offset="100%" stop-color="#0d1117" />
+                </radialGradient>
+            </defs>
             <g>{edges}</g>
             <g>{nodes}</g>
-            <circle cx=VIEW_W / 2.0 cy=VIEW_H / 2.0 r="76" fill="#161b22"
-                stroke="#58a6ff" stroke-width="3" />
-            <text x=VIEW_W / 2.0 y=VIEW_H / 2.0 - 4.0 text-anchor="middle"
-                fill="var(--fg)" font-size="18" font-weight="700">
+            // KEYS: the dash encoding in words (the standing diagram rule —
+            // when an encoding repeats, spell it out in the picture).
+            <g style="pointer-events:none;">
+                <rect x="18" y=VIEW_H - 118.0 width="255" height="100" rx="10"
+                    fill="#161b22" stroke="#30363d" stroke-width="1.5" opacity="0.95" />
+                <text x="34" y=VIEW_H - 92.0 fill="var(--fg)" font-size="15" font-weight="700">
+                    "KEYS — line style"
+                </text>
+                <line x1="34" y1=VIEW_H - 68.0 x2="86" y2=VIEW_H - 68.0
+                    stroke="#8b949e" stroke-width="3.5" stroke-linecap="round" />
+                <text x="96" y=VIEW_H - 63.0 fill="#8b949e" font-size="14">"working repo"</text>
+                <line x1="34" y1=VIEW_H - 46.0 x2="86" y2=VIEW_H - 46.0
+                    stroke="#8b949e" stroke-width="3.5" stroke-linecap="round"
+                    stroke-dasharray="14 9" />
+                <text x="96" y=VIEW_H - 41.0 fill="#8b949e" font-size="14">"clone (view-only)"</text>
+                <line x1="34" y1=VIEW_H - 24.0 x2="86" y2=VIEW_H - 24.0
+                    stroke="#8b949e" stroke-width="3.5" stroke-linecap="round"
+                    stroke-dasharray="3 7" />
+                <text x="96" y=VIEW_H - 19.0 fill="#8b949e" font-size="14">"linked worktree"</text>
+            </g>
+            <circle cx=VIEW_W / 2.0 cy=VIEW_H / 2.0 r="84" fill="url(#rm-hub)"
+                stroke="#58a6ff" stroke-width="3.5" filter="url(#rm-glow)" />
+            <text x=VIEW_W / 2.0 y=VIEW_H / 2.0 - 8.0 text-anchor="middle"
+                fill="var(--fg)" font-size="22" font-weight="800">
                 "Repositories"
             </text>
-            <text x=VIEW_W / 2.0 y=VIEW_H / 2.0 + 18.0 text-anchor="middle"
-                fill="#8b949e" font-size="14">
+            <text x=VIEW_W / 2.0 y=VIEW_H / 2.0 + 22.0 text-anchor="middle"
+                fill="#58a6ff" font-size="19" font-weight="700">
                 {format!("{}", entries.len())}
             </text>
         </svg>

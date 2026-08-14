@@ -1293,3 +1293,14 @@ button.detail-file,
     scroll-behavior: auto !important;
   }
 }
+
+/* #380: the mindmap picker's hover/focus response — chips lift toward the
+   pointer or the keyboard focus, identically (#65: every hover has its
+   focus-visible twin). Only the TRANSITION is motion-gated; the state change
+   itself shows for everyone, and the default focus ring is left alone. */
+.repomap-leaf { cursor: pointer; }
+.repomap-leaf:hover .repomap-chip,
+.repomap-leaf:focus-visible .repomap-chip { filter: brightness(1.5); stroke-width: 4; }
+@media (prefers-reduced-motion: no-preference) {
+  .repomap-leaf .repomap-chip { transition: filter 0.12s ease, stroke-width 0.12s ease; }
+}
