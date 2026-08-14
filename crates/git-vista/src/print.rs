@@ -41,6 +41,20 @@ const MAX_SUMMARY_CHARS: usize = 60;
 /// only to size the sheet so no label is clipped.
 const MSG_CHAR_W: i32 = 8;
 
+/// The settled commit-link rule shared by the print and interactive labels:
+/// only GitHub-backed commits known to be on the remote have a reachable page.
+pub(crate) fn commit_github_url(
+    repo_url: Option<&str>,
+    on_remote: bool,
+    commit_id: &str,
+) -> Option<String> {
+    repo_url.and_then(|base| on_remote.then(|| format!("{base}/commit/{commit_id}")))
+}
+
+fn print_commit_url(repo_url: Option<&str>, on_remote: bool, commit_id: &str) -> Option<String> {
+    commit_github_url(repo_url, on_remote, commit_id)
+}
+
 /// Stamp (or clear) `data-print` on `<html>` — shared contract with viewer.rs.
 fn set_print_attr(on: bool) {
     if let Some(root) = document().document_element() {
@@ -368,13 +382,29 @@ fn graph_sheet(c: &RenderCtx, nerd: bool) -> View {
                 gr.commit.author,
                 local_timestamp(gr.commit.time),
             );
-            view! {
-                {badges}
+            let commit_url =
+                print_commit_url(c.frame.repo_url.as_deref(), gr.on_remote, &gr.commit.id.0);
+            let commit_label = view! {
                 <text x=bx y=label_top_y(gr.row) class="label-msg pg-msg">{msg}</text>
                 <text x=tx y=label_bottom_y(gr.row) class="label-meta pg-meta">
                     <tspan class="nf">{ic.commit}</tspan>
                     {meta}
                 </text>
+            };
+            let commit_label = match commit_url {
+                Some(url) => view! {
+                    <g>
+                        <a href=url target="_blank" rel="noopener">
+                            {commit_label}
+                        </a>
+                    </g>
+                }
+                .into_view(),
+                None => commit_label.into_view(),
+            };
+            view! {
+                {badges}
+                {commit_label}
             }
         })
         .collect_view();
@@ -404,5 +434,33 @@ fn ref_icon(ic: &crate::icons::GitIcons, kind: &RefKind) -> &'static str {
         RefKind::Tag => ic.tag,
         RefKind::Branch => ic.branch,
         RefKind::RemoteBranch => ic.branch_alt,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COMMIT_ID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn pushed_commits_print_as_links() {
+        assert_eq!(
+            print_commit_url(Some("https://github.com/owner/repo"), true, COMMIT_ID),
+            Some(format!("https://github.com/owner/repo/commit/{COMMIT_ID}"))
+        );
+    }
+
+    #[test]
+    fn unpushed_commits_print_unlinked() {
+        assert_eq!(
+            print_commit_url(Some("https://github.com/owner/repo"), false, COMMIT_ID),
+            None
+        );
+    }
+
+    #[test]
+    fn no_remote_prints_unlinked_and_does_not_panic() {
+        assert_eq!(print_commit_url(None, true, COMMIT_ID), None);
     }
 }
