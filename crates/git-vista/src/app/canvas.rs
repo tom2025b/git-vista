@@ -253,6 +253,19 @@ pub(super) fn graph_canvas(
             s.insert(start_row_index);
         });
     });
+    // Fold one open run again, leaving every other run as it is (#374
+    // follow-up) — the topbar toggle is all-or-nothing, and a reader who
+    // opened one section should not have to re-fold the whole graph to close
+    // it. Clears the run's WHOLE index range rather than just the index the
+    // tap arrived on: `project` treats a run as open when ANY member is in
+    // this set, so removing one member would leave the run open.
+    let on_fold_wip = Callback::new(move |run: collapse::WipRun| {
+        expanded_groups.update(|s| {
+            for row_index in run.start_row_index..run.start_row_index + run.count {
+                s.remove(&row_index);
+            }
+        });
+    });
 
     // Camera (pan/zoom) state, starting at the home position so a new branch
     // isn't born half-clipped above the top of the canvas.
@@ -733,7 +746,7 @@ pub(super) fn graph_canvas(
         // each is `position: fixed`, so this wrapper adds no layout. Each view is a
         // reactive closure that renders only when its signal is set.
         <div class="overlays">
-            {menu::menu_view(features, settings, read_only)}
+            {menu::menu_view(features, settings, read_only, on_fold_wip)}
             {dialogs::commit_dialog_view(features)}
             {dialogs::confirm_modal_view(features)}
             // #232: the pull strategy picker is a fourth modal rather than an

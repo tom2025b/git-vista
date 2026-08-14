@@ -21,6 +21,7 @@
 
 use leptos::{Resource, RwSignal};
 
+use crate::features::graph::collapse::WipRun;
 use git_vista_core::model::CommitDetail;
 use git_vista_protocol::diff::DiffSpec;
 use git_vista_protocol::StageDirection;
@@ -30,6 +31,12 @@ use git_vista_protocol::StageDirection;
 /// part of the pan/zoomed SVG), and the commit's GitHub URL when it has one.
 #[derive(Clone)]
 pub struct MenuData {
+    /// When this commit sits inside a WIP run the user has opened, the run it
+    /// belongs to (#374 follow-up) — drives the "Fold these N checkpoints"
+    /// item, which folds that one section rather than the whole graph the way
+    /// the topbar toggle does. `None` for every other target, including a
+    /// branch stub and any commit outside an open run.
+    pub wip_run: Option<WipRun>,
     /// Full commit hash — what "Create branch" targets. For a branch stub this is
     /// its tip's commit (the branch owns no commit of its own), so branching from
     /// the stub forks off that commit.

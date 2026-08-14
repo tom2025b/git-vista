@@ -48,6 +48,7 @@ use crate::api::{
 use crate::features::core_traits::RequestTarget;
 use crate::features::dialogs::commit::{amend_offer, AmendOffer};
 use crate::features::dialogs::core::{branch_name_space_fix, Dialog, ErrorNotice};
+use crate::features::graph::collapse::WipRun;
 use crate::features::graph::core::{
     create_tag_item_label, disabled_menu_item_copy, pull_label, remote_tip_from_plan,
     tag_annotation_from_prompt, tag_sign_choice, RemoteTipKnowledge,
@@ -72,6 +73,7 @@ use crate::state::{CommitIntent, Features, MenuData, PendingOp, Settings, Viewer
 /// worse than a disabled item.
 pub fn open_for_commit(shell: Shell, commit: String, header: String, x: f64, y: f64) {
     shell.open_menu(MenuData {
+        wip_run: None,
         commit,
         header,
         x,
@@ -91,7 +93,12 @@ pub fn open_for_commit(shell: Shell, commit: String, header: String, x: f64, y: 
 /// The context menu overlay (Issue #18): a plain HTML pop-up positioned at the
 /// click, rendered outside the SVG so it never pans/zooms and isn't clipped.
 /// `read_only` (Phase 12) hides every write action on a cloned repo.
-pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> impl IntoView {
+pub fn menu_view(
+    features: Features,
+    settings: Settings,
+    read_only: bool,
+    on_fold_wip: Callback<WipRun>,
+) -> impl IntoView {
     let Features {
         graph,
         dialogs,
@@ -1697,6 +1704,26 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
             // the room actually available — anything past that scrolls
             // (.ctx-menu's overflow-y) instead of hanging offscreen where no
             // finger can reach it.
+            // "Fold these N checkpoints" (#374 follow-up). Present only for a
+            // commit inside a run the user opened, and deliberately FIRST: it is
+            // the reason a reader taps a checkpoint dot at all, and the topbar
+            // toggle is the only alternative, which folds the entire graph.
+            let fold_wip_item = match m.wip_run {
+                Some(run) => {
+                    let on_fold = move |_| {
+                        shell.close_menu();
+                        on_fold_wip.call(run);
+                    };
+                    view! {
+                        <button class="ctx-item" on:click=on_fold>
+                            <span class="nf ctx-icon">{ic.commit}</span>
+                            {format!("Fold these {} checkpoints", run.count)}
+                        </button>
+                    }
+                    .into_view()
+                }
+                None => ().into_view(),
+            };
             let (vw, vh) = viewport_size();
             let placement = menu_placement(m.x, m.y, vw, vh);
             view! {
@@ -1709,6 +1736,7 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         </span>
                         {m.header.clone()}
                     </div>
+                    {fold_wip_item}
                     {details_item}
                     {diff_item}
                     {open_github}

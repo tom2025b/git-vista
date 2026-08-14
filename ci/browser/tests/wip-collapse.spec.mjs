@@ -52,4 +52,47 @@ test.describe('#374 WIP-checkpoint collapsing', () => {
     await expect(page.locator('.wip-group')).toHaveCount(0)
     await expect(page.getByRole('button', { name: /WIP: shown/ })).toBeVisible()
   })
+
+  test('a checkpoint commit can fold just its own run, not the whole graph', async ({
+    page,
+  }) => {
+    // The topbar toggle is all-or-nothing. Once a run is open, the only way
+    // back should not be un-folding every other run in the graph too, so each
+    // member of an open run offers to fold that one section.
+    await openApp(page)
+    await page.locator('.wip-group .node-hit').click()
+    await expect(page.locator('.graph-row')).toHaveCount(EXPECTED_EXPANDED_ROWS)
+
+    // Open the menu on the MIDDLE checkpoint of the run, not its first row:
+    // the offer has to come from membership, not from being the run's head.
+    //
+    // Focus + Enter rather than a click, and not for convenience: the canvas
+    // starts with its top rows underneath the fixed topbar, so a coordinate
+    // click up there is intercepted by the header and silently lands
+    // somewhere else. Enter on a focused row opens the identical menu through
+    // the roving-tabindex path (#65), which is a real user route and needs no
+    // hit-testing.
+    await page.locator('.node-hit[data-row-index="4"]').focus()
+    await page.keyboard.press('Enter')
+    const fold = page.getByRole('button', {
+      name: new RegExp(`Fold these ${WIP_RUN_COUNT} checkpoints`),
+    })
+    await expect(fold).toBeVisible()
+    await fold.click()
+
+    await expect(page.locator('.wip-group')).toHaveCount(1)
+    await expect(page.locator('.graph-row')).toHaveCount(EXPECTED_DISPLAY_ROWS)
+  })
+
+  test('an ordinary commit is never offered the fold item', async ({ page }) => {
+    await openApp(page)
+    await page.locator('.node-hit[data-row-index="0"]').focus()
+    await page.keyboard.press('Enter')
+
+    // Assert the menu actually opened before asserting what is NOT in it —
+    // without this the absence check passes just as happily when no menu
+    // exists at all, which is exactly how it first passed.
+    await expect(page.locator('.ctx-menu')).toBeVisible()
+    await expect(page.getByRole('button', { name: /Fold these/ })).toHaveCount(0)
+  })
 })

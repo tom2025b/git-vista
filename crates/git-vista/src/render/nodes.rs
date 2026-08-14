@@ -85,6 +85,11 @@ pub fn build_node(
         // MAX_LIVE_ROWS cull is observable from outside the app at all.
         let oid = gr.commit.id.0.clone();
 
+        // If this commit sits inside a WIP run the user opened, the menu
+        // offers to fold that one section again (#374 follow-up). Membership,
+        // not headship: the offer has to come from any member, since the run's
+        // first row is not where a reader necessarily taps.
+        let wip_run = display.with_value(|d| d.run_containing_row(row_index));
         // Issue #18: tapping a dot opens a context menu. Gather this commit's
         // menu data now; the click handler clones it in (it may fire repeatedly).
         let commit_id = gr.commit.id.0.clone();
@@ -141,6 +146,7 @@ pub fn build_node(
             let remote_web_url = remote_web_url.clone();
             move |x: f64, y: f64| {
                 shell.open_menu(MenuData {
+                    wip_run,
                     commit: commit_id.clone(),
                     header: short.clone(),
                     x,

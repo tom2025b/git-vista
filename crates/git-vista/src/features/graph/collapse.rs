@@ -64,17 +64,44 @@ pub struct DisplayEdge {
     pub to_lane: usize,
 }
 
+/// A run of WIP checkpoints the user has opened, kept so one section can be
+/// folded again on its own (#374 follow-up).
+///
+/// An expanded run is emitted as ordinary `Single`s, which makes it
+/// indistinguishable from unrelated commits by the time a view sees it — so
+/// the fact that these particular rows *were* a foldable run has to be
+/// carried explicitly, or the only way back is the topbar toggle that folds
+/// the entire graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WipRun {
+    pub start_row_index: usize,
+    pub count: usize,
+}
+
 /// The whole projection for one render pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DisplayProjection {
     pub items: Vec<DisplayItem>,
     pub edges: Vec<DisplayEdge>,
+    /// Runs that would be folded but are currently open. Empty whenever
+    /// collapsing is switched off globally: with the topbar toggle off the
+    /// user has asked to see everything, and offering "fold this section"
+    /// would contradict the switch they just threw.
+    pub expanded_runs: Vec<WipRun>,
 }
 
 impl DisplayProjection {
     /// Display-space index of the slot showing raw row `row_index` — the
     /// group's own slot when that row is inside a folded run. `None` only
     /// when the row is outside the projected range entirely.
+    /// The open run this raw row belongs to, if any — what a row's own view
+    /// needs in order to offer "fold these N checkpoints".
+    pub fn run_containing_row(&self, row_index: usize) -> Option<WipRun> {
+        self.expanded_runs.iter().copied().find(|run| {
+            row_index >= run.start_row_index && row_index < run.start_row_index + run.count
+        })
+    }
+
     pub fn display_of_row(&self, row_index: usize) -> Option<usize> {
         self.items.iter().position(|item| match *item {
             DisplayItem::Single { row_index: r } => r == row_index,
@@ -119,6 +146,7 @@ pub fn project(
     expanded: &HashSet<usize>,
 ) -> DisplayProjection {
     let mut items = Vec::with_capacity(rows.len());
+    let mut expanded_runs: Vec<WipRun> = Vec::new();
     let mut i = 0;
     while i < rows.len() {
         // Always advance a whole run at a time, never one row at a time. A
@@ -146,6 +174,14 @@ pub fn project(
                 color: rows[i].color,
             });
         } else {
+            if collapse_enabled && count >= MIN_RUN {
+                // Foldable, but open: remember it so this one section can be
+                // folded again without touching the rest of the graph.
+                expanded_runs.push(WipRun {
+                    start_row_index: i,
+                    count,
+                });
+            }
             items.extend((i..=end).map(|row_index| DisplayItem::Single { row_index }));
         }
         i = end + 1;
@@ -154,6 +190,7 @@ pub fn project(
     let projection = DisplayProjection {
         items,
         edges: Vec::new(),
+        expanded_runs,
     };
     let display_edges = edges
         .iter()
@@ -406,6 +443,77 @@ mod tests {
             "{:?}",
             p.items
         );
+    }
+
+    #[test]
+    fn an_expanded_run_is_recorded_so_one_section_can_be_refolded() {
+        // #374 follow-up: the topbar toggle folds the WHOLE graph. To offer
+        // "fold just this section" the projection has to remember which runs
+        // are open, since an expanded run is emitted as ordinary Singles and
+        // is otherwise indistinguishable from unrelated commits.
+        let rows = vec![
+            row(0, "feat: real work", Some("c1")),
+            wip_row(1, 3, Some("c2")),
+            wip_row(2, 2, Some("c3")),
+            wip_row(3, 1, Some("c4")),
+            row(4, "docs: earlier real work", None),
+        ];
+        let mut expanded = HashSet::new();
+        expanded.insert(1);
+
+        let p = project(&rows, &[], true, &expanded);
+
+        assert_eq!(
+            p.expanded_runs,
+            vec![WipRun {
+                start_row_index: 1,
+                count: 3
+            }]
+        );
+        assert_eq!(
+            p.run_containing_row(2),
+            Some(WipRun {
+                start_row_index: 1,
+                count: 3
+            })
+        );
+        assert_eq!(p.run_containing_row(0), None);
+        assert_eq!(p.run_containing_row(4), None);
+    }
+
+    #[test]
+    fn a_folded_run_is_not_offered_for_refolding() {
+        let rows = vec![wip_row(0, 2, Some("c1")), wip_row(1, 1, None)];
+
+        let p = project(&rows, &[], true, &HashSet::new());
+
+        assert_eq!(p.expanded_runs, Vec::new());
+    }
+
+    #[test]
+    fn no_run_is_offered_when_collapsing_is_switched_off_globally() {
+        // With the topbar toggle off the user has asked to see everything;
+        // offering "fold this section" would contradict the switch they just
+        // threw.
+        let rows = vec![wip_row(0, 2, Some("c1")), wip_row(1, 1, None)];
+        let mut expanded = HashSet::new();
+        expanded.insert(0);
+
+        let p = project(&rows, &[], false, &expanded);
+
+        assert_eq!(p.expanded_runs, Vec::new());
+    }
+
+    #[test]
+    fn a_run_below_the_fold_threshold_is_never_offered_for_refolding() {
+        let rows = vec![row(0, "feat: real work", Some("c1")), wip_row(1, 1, None)];
+        let mut expanded = HashSet::new();
+        expanded.insert(1);
+
+        let p = project(&rows, &[], true, &expanded);
+
+        assert_eq!(p.expanded_runs, Vec::new());
+        assert_eq!(p.run_containing_row(1), None);
     }
 
     #[test]
