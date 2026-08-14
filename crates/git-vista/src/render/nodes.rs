@@ -85,11 +85,6 @@ pub fn build_node(
         // MAX_LIVE_ROWS cull is observable from outside the app at all.
         let oid = gr.commit.id.0.clone();
 
-        // If this commit sits inside a WIP run the user opened, the menu
-        // offers to fold that one section again (#374 follow-up). Membership,
-        // not headship: the offer has to come from any member, since the run's
-        // first row is not where a reader necessarily taps.
-        let wip_run = display.with_value(|d| d.run_containing_row(row_index));
         // Issue #18: tapping a dot opens a context menu. Gather this commit's
         // menu data now; the click handler clones it in (it may fire repeatedly).
         let commit_id = gr.commit.id.0.clone();
@@ -145,6 +140,26 @@ pub fn build_node(
             let repo_url = repo_url.clone();
             let remote_web_url = remote_web_url.clone();
             move |x: f64, y: f64| {
+                // If this commit sits inside a WIP run the user opened, the menu
+                // offers to fold that one section again (#374 follow-up).
+                // Membership, not headship: the offer has to come from any
+                // member, since the run's first row is not where a reader
+                // necessarily taps.
+                //
+                // Read at TAP time, never cached at build time. This row's
+                // `<For>` key is `(display index, item, layout epoch)`, and a
+                // later page appending checkpoints that chain onto an already-
+                // open run changes none of those three for the rows already
+                // drawn — so their keys stay byte-identical, Leptos reuses the
+                // children, and a value captured when the row was built would
+                // keep an out-of-date member count for the rest of the session
+                // ("Fold these 3 checkpoints" over a run that is now 5).
+                //
+                // Adding the run to the key would also fix it, at the cost of
+                // rebuilding every row in an open run on every re-projection —
+                // the exact churn the key was just narrowed to stop. Reading it
+                // here costs one lookup per tap and cannot go stale at all.
+                let wip_run = display.with_value(|d| d.run_containing_row(row_index));
                 shell.open_menu(MenuData {
                     wip_run,
                     commit: commit_id.clone(),
