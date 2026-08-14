@@ -10,8 +10,12 @@
 //! (see the WAI-ARIA Authoring Practices "grid" and "listbox" patterns), chosen
 //! over a parallel linear-list alternative because it needs no second view of
 //! the same data — the rows already *are* a linear list, top to bottom, and
-//! `RenderCtx::loaded.rows` already indexes them 0..row_count exactly the way
-//! this model expects.
+//! `row_count` already indexes them 0..row_count exactly the way this model
+//! expects. Since #374, `row_count` is the *display-space* row count (a
+//! folded WIP run occupies one slot, not one per member) rather than
+//! `RenderCtx::loaded.rows.len()` directly — this model doesn't care which
+//! space it's counting, only that the index space is contiguous and
+//! 0-based, which display space still is.
 //!
 //! **Scope.** This covers the commit-row hit circles built by
 //! `render::nodes::build_node` — the primary interactive content the earlier

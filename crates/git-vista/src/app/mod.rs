@@ -56,7 +56,10 @@ use crate::features::status::core as status_core;
 use crate::features::status::signals as status_seam;
 use crate::hook_policy_banner::hook_policy_banner_view;
 use crate::icons::icon_set;
-use crate::prefs::{load_icon_pref, load_node_icons_pref, store_icon_pref, store_node_icons_pref};
+use crate::prefs::{
+    load_collapse_wip_pref, load_icon_pref, load_node_icons_pref, store_collapse_wip_pref,
+    store_icon_pref, store_node_icons_pref,
+};
 use crate::session::{establish_session, not_connected_view, recheck_session};
 use crate::state::{Features, Settings};
 use crate::update_required::update_required_view;
@@ -528,6 +531,17 @@ pub fn App() -> impl IntoView {
         store_node_icons_pref(on);
     };
 
+    // Whether runs of auto-checkpoint commits fold into one node (#374).
+    // Default on: the checkpointer commits every 30s during a session, so
+    // real commits end up buried under dozens of near-identical dots
+    // otherwise. Persisted like the icon prefs above.
+    let collapse_wip = create_rw_signal(load_collapse_wip_pref());
+    let toggle_collapse_wip = move |_| {
+        let on = !collapse_wip.get_untracked();
+        collapse_wip.set(on);
+        store_collapse_wip_pref(on);
+    };
+
     // The two bundles `graph_canvas` takes (see `crate::state`). `features` is every
     // handle created here, above the canvas, precisely so an epoch bump's rebuild cannot
     // drop it; `settings` is the display preferences every icon-drawing view reads.
@@ -541,6 +555,7 @@ pub fn App() -> impl IntoView {
     let settings = Settings {
         nerd_icons,
         show_node_icons,
+        collapse_wip,
     };
 
     // Phase 12 — "Open URL": clone a public repo and view it read-only. `open_url`
@@ -721,6 +736,15 @@ pub fn App() -> impl IntoView {
                     title="Show or hide the small icons beside each commit dot"
                 >
                     {move || if show_node_icons.get() { "Dot icons: on" } else { "Dot icons: off" }}
+                </button>
+                <button
+                    class="refresh"
+                    on:click=toggle_collapse_wip
+                    title="Fold runs of auto-checkpoint commits into one node, so real \
+                           commits aren't buried under checkpoint noise. Turn off to see \
+                           every checkpoint."
+                >
+                    {move || if collapse_wip.get() { "WIP: folded" } else { "WIP: shown" }}
                 </button>
                 <button
                     class="refresh"

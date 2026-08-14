@@ -18,6 +18,7 @@ use crate::icons::icon_set;
 use crate::state::MenuData;
 use git_vista_core::color::branch_color;
 
+use crate::features::graph::collapse::{DisplayItem, DisplayProjection};
 use crate::features::graph::core::RenderCtx;
 
 /// Per-commit node builder — a filled dot in the branch colour plus a larger
@@ -34,23 +35,47 @@ use crate::features::graph::core::RenderCtx;
 /// docs for the design this implements and why it stops at commit rows —
 /// branch-stub rings and ref badges are named there as deliberately out of
 /// scope, not silently dropped.
+#[allow(clippy::too_many_arguments)]
 pub fn build_node(
     ctx: StoredValue<RenderCtx>,
+    display: StoredValue<DisplayProjection>,
     shell: Shell,
     moved: StoredValue<bool>,
     focus: RwSignal<GraphFocus>,
     camera: RwSignal<Camera>,
     vp_h: RwSignal<f64>,
+    on_expand: Callback<usize>,
     i: usize,
 ) -> View {
+    let Some(item) = display.with_value(|d| d.items.get(i).copied()) else {
+        return ().into_view();
+    };
+    // A folded run renders as one marker that expands on tap, not as a
+    // commit: it has no single identity, so none of the per-commit menu
+    // data below applies to it (#374).
+    if let DisplayItem::WipGroup {
+        start_row_index,
+        count,
+        lane,
+        color,
+    } = item
+    {
+        return build_wip_group(moved, on_expand, i, start_row_index, count, lane, color);
+    }
+    let DisplayItem::Single { row_index } = item else {
+        return ().into_view();
+    };
     ctx.with_value(|c| {
         // Checked, like every row lookup since paging (M1.10, #63): a `<For>`
         // key can outlive the shape it was built from by one frame.
-        let Some(gr) = c.loaded.rows.get(i) else {
+        let Some(gr) = c.loaded.rows.get(row_index) else {
             return ().into_view();
         };
         let cx = node_cx(gr.lane);
-        let cy = node_cy(gr.row);
+        // Vertical position comes from the DISPLAY index, not `gr.row`:
+        // collapsing shortens the space above this commit (#374). Everything
+        // else below still reads the real `GraphRow`.
+        let cy = node_cy(i);
         let color = branch_color(gr.color);
         let fill = color;
         let stroke_width = "2";
@@ -115,7 +140,28 @@ pub fn build_node(
             let repo_url = repo_url.clone();
             let remote_web_url = remote_web_url.clone();
             move |x: f64, y: f64| {
+                // If this commit sits inside a WIP run the user opened, the menu
+                // offers to fold that one section again (#374 follow-up).
+                // Membership, not headship: the offer has to come from any
+                // member, since the run's first row is not where a reader
+                // necessarily taps.
+                //
+                // Read at TAP time, never cached at build time. This row's
+                // `<For>` key is `(display index, item, layout epoch)`, and a
+                // later page appending checkpoints that chain onto an already-
+                // open run changes none of those three for the rows already
+                // drawn — so their keys stay byte-identical, Leptos reuses the
+                // children, and a value captured when the row was built would
+                // keep an out-of-date member count for the rest of the session
+                // ("Fold these 3 checkpoints" over a run that is now 5).
+                //
+                // Adding the run to the key would also fix it, at the cost of
+                // rebuilding every row in an open run on every re-projection —
+                // the exact churn the key was just narrowed to stop. Reading it
+                // here costs one lookup per tap and cannot go stale at all.
+                let wip_run = display.with_value(|d| d.run_containing_row(row_index));
                 shell.open_menu(MenuData {
+                    wip_run,
                     commit: commit_id.clone(),
                     header: short.clone(),
                     x,
@@ -218,12 +264,24 @@ pub fn build_node(
 /// otherwise. A separate builder (not part of build_node) so the icons live
 /// in their own <g>, shown/hidden as one layer by the "Dot icons" toggle
 /// without touching the dots themselves.
-pub fn build_node_icon(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>, i: usize) -> View {
+pub fn build_node_icon(
+    ctx: StoredValue<RenderCtx>,
+    display: StoredValue<DisplayProjection>,
+    nerd_icons: RwSignal<bool>,
+    i: usize,
+) -> View {
     ctx.with_value(|c| {
         // Untracked read, same as the other builders: the <For> keys carry
         // the icon mode, so a toggle rebuilds the rows.
         let ic = icon_set(nerd_icons.get_untracked());
-        let Some(gr) = c.loaded.rows.get(i) else {
+        // A folded group draws its own label in `build_wip_group`; the text
+        // tiers skip it entirely rather than labelling an absent commit.
+        let Some(DisplayItem::Single { row_index }) =
+            display.with_value(|d| d.items.get(i).copied())
+        else {
+            return ().into_view();
+        };
+        let Some(gr) = c.loaded.rows.get(row_index) else {
             return ().into_view();
         };
         let icon = if gr.commit.parents.len() > 1 {
@@ -234,7 +292,7 @@ pub fn build_node_icon(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>, 
         view! {
             <text
                 x=node_cx(gr.lane) - NODE_RADIUS - 5
-                y=node_cy(gr.row) + 4
+                y=node_cy(i) + 4
                 text-anchor="end"
                 class="nf node-icon"
                 fill=branch_color(gr.color)
@@ -244,4 +302,71 @@ pub fn build_node_icon(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>, 
         }
         .into_view()
     })
+}
+
+/// A folded run of WIP checkpoints (#374): one hollow, dashed marker
+/// carrying the count, which expands the run on tap or Enter/Space. Hollow
+/// and dashed so it reads as "something omitted here" rather than as a
+/// commit — a filled dot is a real commit everywhere else in this graph,
+/// and a branch stub's hollow ring is already the established "not a commit"
+/// vocabulary.
+#[allow(clippy::too_many_arguments)]
+fn build_wip_group(
+    moved: StoredValue<bool>,
+    on_expand: Callback<usize>,
+    i: usize,
+    start_row_index: usize,
+    count: usize,
+    lane: usize,
+    color: usize,
+) -> View {
+    let cx = node_cx(lane);
+    let cy = node_cy(i);
+    let stroke = branch_color(color);
+    let label = format!("⋯ {count} WIP commits ⋯");
+    let expand = move |_: web_sys::PointerEvent| {
+        if moved.get_value() {
+            return;
+        }
+        on_expand.call(start_row_index);
+    };
+    let expand_kb = move |ev: web_sys::KeyboardEvent| {
+        if ev.key() == "Enter" || ev.key() == " " {
+            ev.prevent_default();
+            on_expand.call(start_row_index);
+        }
+    };
+    view! {
+        <g class="graph-row wip-group">
+            <circle
+                cx=cx
+                cy=cy
+                r=NODE_RADIUS
+                fill="none"
+                stroke=stroke
+                stroke-width="2"
+                stroke-dasharray="3 2"
+            >
+                <title>{label.clone()}</title>
+            </circle>
+            <text x=cx + NODE_RADIUS + 8 y=cy + 4 class="wip-group-label" fill=stroke>
+                {label.clone()}
+            </text>
+            <circle
+                cx=cx
+                cy=cy
+                r=NODE_RADIUS + 15
+                fill="transparent"
+                class="node-hit"
+                data-row-index=i
+                role="button"
+                aria-label=label
+                aria-expanded="false"
+                tabindex="-1"
+                on:pointerup=expand
+                on:keydown=expand_kb
+            />
+        </g>
+    }
+    .into_view()
 }

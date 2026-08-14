@@ -47,6 +47,29 @@ pub fn store_node_icons_pref(on: bool) {
     }
 }
 
+/// localStorage key for the WIP-collapse preference: "on" (default) or "off".
+const COLLAPSE_WIP_KEY: &str = "git-vista.collapse-wip";
+
+/// Load the "fold runs of auto-checkpoint commits into one node"
+/// preference (#374). **Defaults on**: the graph is unreadable on a working
+/// branch otherwise — the checkpointer commits every 30s during a session,
+/// so real commits end up buried under dozens of near-identical dots.
+/// Turning it off shows every checkpoint, for when they matter (bisecting
+/// recent WIP history).
+pub fn load_collapse_wip_pref() -> bool {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(COLLAPSE_WIP_KEY).ok().flatten())
+        .is_none_or(|v| v != "off")
+}
+
+/// Persist the WIP-collapse preference. Best-effort, like the icon prefs.
+pub fn store_collapse_wip_pref(on: bool) {
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = s.set_item(COLLAPSE_WIP_KEY, if on { "on" } else { "off" });
+    }
+}
+
 /// localStorage key for the one Fetch/Pull the client is currently
 /// tracking across reloads (#232, M2.20f) — see
 /// `features::operations::core::InFlightRemoteOp`. At most one entry: the

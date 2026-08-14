@@ -131,6 +131,7 @@ pub fn stubs(ctx: StoredValue<RenderCtx>, shell: Shell, moved: StoredValue<bool>
             // the identical menu — same split as the commit dots in nodes.rs.
             let open_menu_at = move |x: f64, y: f64| {
                 shell.open_menu(MenuData {
+                    wip_run: None,
                     commit: commit_id.clone(),
                     header: header.clone(),
                     x,

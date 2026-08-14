@@ -19,6 +19,7 @@ use crate::icons::icon_set;
 use crate::text::truncate;
 use git_vista_core::color::{branch_color, BADGE_DARK, HEAD_BADGE, TAG_BADGE};
 
+use crate::features::graph::collapse::{DisplayItem, DisplayProjection};
 use crate::features::graph::core::RenderCtx;
 use crate::features::graph::signals::suppress;
 
@@ -36,6 +37,7 @@ const MAX_SUMMARY_CHARS: usize = 60;
 /// independent because the meta line doesn't depend on the badge layout.
 pub fn build_msg(
     ctx: StoredValue<RenderCtx>,
+    display: StoredValue<DisplayProjection>,
     nerd_icons: RwSignal<bool>,
     moved: StoredValue<bool>,
     i: usize,
@@ -44,7 +46,16 @@ pub fn build_msg(
         // Untracked read, same as build_node: the <For> keys carry the icon
         // mode, so a toggle rebuilds the rows.
         let ic = icon_set(nerd_icons.get_untracked());
-        let (Some(gr), Some(&text_x)) = (c.loaded.rows.get(i), c.loaded.text_x().get(i)) else {
+        // A folded group draws its own label in `build_wip_group`; the text
+        // tiers skip it entirely rather than labelling an absent commit.
+        let Some(DisplayItem::Single { row_index }) =
+            display.with_value(|d| d.items.get(i).copied())
+        else {
+            return ().into_view();
+        };
+        let (Some(gr), Some(&text_x)) =
+            (c.loaded.rows.get(row_index), c.loaded.text_x().get(row_index))
+        else {
             return ().into_view();
         };
         let mut bx = text_x;
@@ -126,7 +137,7 @@ pub fn build_msg(
                 let pill = view! {
                     <rect
                         x=x
-                        y=badge_top_y(gr.row)
+                        y=badge_top_y(i)
                         width=w
                         height=BADGE_HEIGHT
                         rx=BADGE_RADIUS
@@ -139,7 +150,7 @@ pub fn build_msg(
                     />
                     <text
                         x=x + badge_text_dx()
-                        y=badge_text_y(gr.row)
+                        y=badge_text_y(i)
                         class="badge-text"
                         class:clickable=clickable
                         class:unpushed=unpushed
@@ -188,7 +199,7 @@ pub fn build_msg(
         let msg_text = view! {
             <text
                 x=msg_x
-                y=label_top_y(gr.row)
+                y=label_top_y(i)
                 class="label-msg"
                 class:clickable=msg_clickable
                 class:unpushed=msg_unpushed
@@ -223,12 +234,27 @@ pub fn build_msg(
 /// Commit labels — meta tier: the dimmed `hash · author · local date+time` line,
 /// so the timeline is visible per row. Independent of the badge layout, so it
 /// doesn't recompute the badges.
-pub fn build_meta(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>, i: usize) -> View {
+pub fn build_meta(
+    ctx: StoredValue<RenderCtx>,
+    display: StoredValue<DisplayProjection>,
+    nerd_icons: RwSignal<bool>,
+    i: usize,
+) -> View {
     ctx.with_value(|c| {
         // Untracked read, same as build_node: the <For> keys carry the icon
         // mode, so a toggle rebuilds the rows.
         let ic = icon_set(nerd_icons.get_untracked());
-        let (Some(gr), Some(&text_x)) = (c.loaded.rows.get(i), c.loaded.text_x().get(i)) else {
+        // A folded group draws its own label in `build_wip_group`; the text
+        // tiers skip it entirely rather than labelling an absent commit.
+        let Some(DisplayItem::Single { row_index }) =
+            display.with_value(|d| d.items.get(i).copied())
+        else {
+            return ().into_view();
+        };
+        let (Some(gr), Some(&text_x)) = (
+            c.loaded.rows.get(row_index),
+            c.loaded.text_x().get(row_index),
+        ) else {
             return ().into_view();
         };
         // Same open-circle rule as build_msg: a stub's anchor row takes the stub's
@@ -253,7 +279,7 @@ pub fn build_meta(ctx: StoredValue<RenderCtx>, nerd_icons: RwSignal<bool>, i: us
             // (see .label-meta's opacity).
             <text
                 x=text_x
-                y=label_bottom_y(gr.row)
+                y=label_bottom_y(i)
                 class="label-meta"
                 fill=branch_color(stub_slot.unwrap_or(gr.color))
             >
