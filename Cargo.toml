@@ -29,7 +29,7 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-authors = ["Tom <thomaslane2010@gmail.com>"]
+authors = ["Tom <262510778+tom2025b@users.noreply.github.com>"]
 license = "MIT"
 repository = "https://github.com/tom2025b/git-vista"
 
