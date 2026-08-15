@@ -221,24 +221,13 @@ pub(super) fn classify_failure(stderr: &str) -> FetchFailureKind {
 // Observing what the fetch did
 // ---------------------------------------------------------------------------
 
-/// Every `refs/remotes/<remote>/*` **branch** ref and the object it points at.
+/// Every `refs/remotes/<remote>/*` ref and the object it points at.
 ///
 /// `Err` is "we could not observe", which is a refusal reason and never
 /// silently an empty map — a fetch whose before-state is unknown cannot
 /// honestly answer "did anything move?" afterwards, and that answer is the
 /// whole contract of a cancelled fetch (D5's posture: we did not observe
 /// anything, so we may not act as though we did).
-///
-/// **`refs/remotes/<remote>/HEAD` is excluded**, and that exclusion is
-/// load-bearing rather than cosmetic. It is a *symbolic* ref pointing at one
-/// of the branch refs already in this map, so counting it reports a single
-/// branch movement twice — once as `origin/main`, once as `origin/HEAD`
-/// shadowing it. Worse, whether it appears at all is a git-version
-/// difference: git 2.54 writes it during `fetch`, git 2.43 does not, so
-/// including it makes the observed result depend on the git on the host.
-/// CI (2.54) failed five fetch tests that passed locally (2.43) for exactly
-/// this reason. A remote-tracking *branch* is what a fetch moves; the symref
-/// is bookkeeping about which branch is default.
 async fn remote_tracking_refs(
     repo: &Path,
     need: NetworkNeed,
@@ -255,14 +244,10 @@ async fn remote_tracking_refs(
     if !output.status.success() {
         return Err(stderr_or(&output, "git for-each-ref failed."));
     }
-    let head_symref = format!("{prefix}HEAD");
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
             let (name, oid) = line.trim().split_once(' ')?;
-            if name == head_symref {
-                return None;
-            }
             Some((name.to_string(), oid.to_string()))
         })
         .collect())

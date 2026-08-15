@@ -77,25 +77,7 @@ cannot be edited.
 # action.yml path continues to be scanned normally in every other commit
 # including every future one. Scoping by path instead would have blinded that
 # file permanently (measured — see the header).
-#
-# 2026-08-04: the SECOND commit below is the SAME placeholder at a new SHA, not
-# a new finding. `main` was rewritten to strip 91 commits carrying a personal
-# gmail address, which rewrote every commit id in the repository — so the
-# immutable point this allowlist pinned (8e2cec7) no longer exists in the
-# rewritten history, and the identical placeholder resurfaced as 056bd42.
-# Verified by reading the blob: it is the same reworded PEM-shaped placeholder,
-# whose own body states it is not key material and is never parsed as such.
-#
-# Note the maintenance cost this implies: any future history rewrite will
-# invalidate these pins again and the finding will return under yet another id.
-# That is the price of commit-scoping, and it is still the right trade — a
-# `paths` entry would blind this file to real key material permanently, which
-# was measured and rejected in the header above.
-commits = [
-  "8e2cec76183ced717792ee84ca324fee519c88c1",
-  "056bd4282542e0eddd1dd1d4d2d32fffe7267df9",
-]
+commits = ["8e2cec76183ced717792ee84ca324fee519c88c1"]
 fingerprints = [
   "8e2cec76183ced717792ee84ca324fee519c88c1:.github/actions/host-sandbox-setup/action.yml:private-key:179",
-  "056bd4282542e0eddd1dd1d4d2d32fffe7267df9:.github/actions/host-sandbox-setup/action.yml:private-key:179",
 ]
