@@ -919,8 +919,17 @@ pub enum Preflight {
 /// whenever a request failed, training the user to click through it — and the
 /// case is already covered on the other side by [`published_advisory`], which
 /// reports an unknown answer as unknown rather than as an all-clear. The gap
-/// is real and stated: an amend whose detail read failed reaches the server
-/// with no pre-flight, and the user learns about the divergence afterwards.
+/// is real and stated: an amend whose detail read **failed** reaches the
+/// server with no pre-flight, and the user learns about the divergence
+/// afterwards.
+///
+/// What that concession does **not** cover, and what
+/// [`AmendPhase::ReadingPublication`] exists to close, is the read that has
+/// simply not answered *yet*. Opening amend mode is synchronous and the read
+/// is not, so treating "in flight" the same as "failed" would have left every
+/// amend un-gated for the length of its own detail request — the common case,
+/// not the exceptional one. "We are about to know" holds the button; "we could
+/// not find out" releases it.
 pub fn amend_preflight(target: AmendTarget, knowledge: &PreflightKnowledge) -> Preflight {
     let tip = target.expected_tip();
     match knowledge.publication(tip) {
@@ -963,6 +972,33 @@ pub enum Recheck {
 pub enum AmendPhase {
     /// Nothing attempted (or the dialog was just opened).
     Idle,
+    /// The dialog has just been pointed at `tip` and the
+    /// `GET /api/commit/{tip}` that answers "is this commit already on a
+    /// remote?" has not come back yet (M2.19d, #225). **Nothing has been
+    /// sent**, and the confirm button is inert for the duration.
+    ///
+    /// This phase exists because [`amend_preflight`] reads
+    /// [`PreflightKnowledge`], and before that read lands the knowledge
+    /// answers [`TargetPublication::Unknown`] — which *sends*. Opening amend
+    /// mode is synchronous and the read is not, so without this the window
+    /// between the menu click and the detail arriving is a window in which
+    /// pressing the green button POSTs an amend of published history with no
+    /// ceremony shown at all. That window is not the documented
+    /// failed-read gap: the read has not failed, it simply has not answered,
+    /// and "we are about to know" is a different state from "we could not
+    /// find out".
+    ///
+    /// It is a phase rather than a second flag beside
+    /// [`PreflightKnowledge`] because the phase is already what the view
+    /// renders the confirm button from — one source of truth, not two that
+    /// can drift.
+    ReadingPublication {
+        /// The commit whose detail is being read. Carried so the read's own
+        /// completion can tell "still my window" from "the dialog has since
+        /// been reopened on a different commit" — see
+        /// [`is_reading_publication_for`].
+        tip: String,
+    },
     /// Amend was pressed on a commit that is already on a remote, and
     /// **nothing has been sent**. The ceremony (#225): the press is spent on
     /// raising the warning, and a second, differently-labelled control is the
@@ -1031,6 +1067,29 @@ pub fn phase_view(phase: &AmendPhase) -> PhaseView {
         AmendPhase::Idle => PhaseView {
             notice: None,
             confirm_enabled: true,
+            busy: false,
+        },
+        AmendPhase::ReadingPublication { tip } => PhaseView {
+            notice: Some(Notice {
+                title: "Checking this commit…".to_string(),
+                body: format!(
+                    "Reading {}. Whether it is already on a remote decides whether \
+                     amending it asks you to confirm first, so nothing can be sent \
+                     until that answer is in. Nothing has been sent.",
+                    short_tip(tip),
+                ),
+                action: None,
+            }),
+            // Inert for the same reason as the ceremony below, one step
+            // earlier: the pre-flight's own input is missing, and
+            // `amend_preflight` reads a missing answer as `Unknown`, which
+            // sends. A press here would be a press that skipped the gate
+            // without anyone deciding to.
+            confirm_enabled: false,
+            // Not `busy`: no amend is in flight and nothing in the repository
+            // is being changed. `busy` is what the view shows while a write is
+            // outstanding, and showing it for a read would say the amend had
+            // started.
             busy: false,
         },
         AmendPhase::AwaitingPublishedConfirm { target } => PhaseView {
@@ -1187,6 +1246,21 @@ pub fn phase_view(phase: &AmendPhase) -> PhaseView {
             busy: false,
         },
     }
+}
+
+/// Whether `phase` is the publication-read window for `tip` specifically
+/// (M2.19d, #225).
+///
+/// The read's completion callback asks this before releasing the window back
+/// to [`AmendPhase::Idle`]. It has to ask, rather than clearing
+/// unconditionally, because it runs after an `await`: by then the dialog may
+/// have been cancelled and reopened on a *different* commit, which starts a
+/// *new* read window, and a blind clear would release that one early — handing
+/// the next commit exactly the un-gated press this phase was added to remove.
+/// Tip-scoped for the same reason [`PreflightKnowledge`] is: an answer about
+/// one commit is not an answer about another.
+pub fn is_reading_publication_for(phase: &AmendPhase, tip: &str) -> bool {
+    matches!(phase, AmendPhase::ReadingPublication { tip: open } if open == tip)
 }
 
 /// The commit HEAD points at, from a frame's ref list — the fresh tip the
@@ -2397,6 +2471,82 @@ mod tests {
             !flying.confirm_enabled,
             "a second press while the first amend is in flight is a second rewrite"
         );
+    }
+
+    /// The window the pre-flight gate cannot cover on its own (#225).
+    ///
+    /// `amend_preflight` reads `Unknown` as *send*, deliberately. Opening amend
+    /// mode is synchronous and the read that turns `Unknown` into an answer is
+    /// not, so the phase — not the knowledge — is what has to keep the button
+    /// off in between. The paired assertion below is the one that matters:
+    /// `Unknown` still sends, which is why the hold cannot be dropped.
+    #[test]
+    fn the_publication_read_holds_the_press_while_the_gate_would_still_send() {
+        let view = phase_view(&AmendPhase::ReadingPublication { tip: TIP.into() });
+        assert!(
+            !view.confirm_enabled,
+            "the confirm button is live while the pre-flight has nothing to read — \
+             a press here sends an un-gated amend"
+        );
+        assert!(
+            !view.busy,
+            "nothing is being written; `busy` would tell the user the amend had started"
+        );
+        let notice = view.notice.expect("the user is told why the button is off");
+        assert!(
+            notice.body.contains("Nothing has been sent"),
+            "{}",
+            notice.body
+        );
+        assert!(
+            notice.action.is_none(),
+            "this banner has no way past it — waiting is the only thing to do"
+        );
+        assert!(
+            notice.body.contains(&TIP[..7]),
+            "the banner names the commit being read: {}",
+            notice.body
+        );
+
+        // The reason the hold exists at all: with the read unlanded, the gate
+        // itself would let the press through.
+        assert_eq!(
+            amend_preflight(target(TIP), &PreflightKnowledge::default()),
+            Preflight::Send(target(TIP)),
+            "if this ever stops being `Send`, re-read the hold above — it may no \
+             longer be load-bearing"
+        );
+    }
+
+    /// The release is tip-scoped, and that is not decoration: it runs after an
+    /// `await`, by which point the dialog may be showing a different commit's
+    /// read window.
+    #[test]
+    fn only_the_read_that_opened_the_window_may_close_it() {
+        let mine = AmendPhase::ReadingPublication { tip: TIP.into() };
+        assert!(is_reading_publication_for(&mine, TIP));
+
+        assert!(
+            !is_reading_publication_for(&mine, NEW_TIP),
+            "a read for one commit must not release another commit's window — that \
+             hands the second commit the un-gated press this phase removes"
+        );
+
+        // Every other phase reads as "not my window", so a late-landing read
+        // cannot stamp `Idle` over a banner the user is being shown.
+        for other in [
+            AmendPhase::Idle,
+            AmendPhase::InFlight,
+            AmendPhase::AwaitingPublishedConfirm {
+                target: target(TIP),
+            },
+            AmendPhase::Unavailable("gone".into()),
+        ] {
+            assert!(
+                !is_reading_publication_for(&other, TIP),
+                "{other:?} is not a publication-read window"
+            );
+        }
     }
 
     #[test]
