@@ -10,7 +10,6 @@
 //! fetched lazily from `/api/diff/{id}` alongside the detail. The menu's
 //! "Show diff" item opens this same panel with the section scrolled into view.
 
-use std::collections::HashMap;
 
 use leptos::*;
 use wasm_bindgen::JsCast;
@@ -24,6 +23,161 @@ use crate::features::a11y::focus::{FocusMove, GraphFocus};
 use crate::features::diff::core::{render_window, scroll_to_reveal, LineWrap};
 use crate::features::diff::rows::{DiffRow, DiffRows};
 use git_vista_core::virtualize::CumulativeHeights;
+
+/// One rendered diff line's height in CSS pixels: `.detail-diff`'s
+/// `font-size: 0.78rem` × `line-height: 1.45` at a 16px root ≈ 18.1px.
+///
+/// A constant, not a measurement, and the tradeoff is deliberate: measuring
+/// one rendered line would mean rendering before windowing (the cost
+/// windowing exists to avoid) or a layout read on every scroll frame. Being
+/// slightly wrong here shifts the window by a line or two at the edges, which
+/// the overscan below absorbs — it cannot corrupt the mapping, because
+/// `accessible_patch_window` keys every line on its own patch index rather
+/// than on anything derived from this number.
+const DIFF_LINE_PX: f64 = 18.1;
+
+/// Extra lines rendered above and below the visible range, so a fast scroll
+/// does not flash blank space for a frame before the next range is computed.
+const DIFF_OVERSCAN: usize = 20;
+use crate::features::graph::core::RenderCtx;
+use crate::icons::{icon_set, GitIcons};
+use crate::state::{DetailResource, Features, Settings, ViewerDoc};
+
+/// CSS class for one line of the unified patch, keyed off its prefix. The
+/// file/hunk headers are checked *before* the bare +/- so `+++`/`---` read as
+/// metadata, not as a one-character change. Shared with the full-screen
+/// viewer (viewer.rs), which colours the same patch text.
+pub(crate) fn diff_line_class(line: &str) -> &'static str {
+    if line.starts_with("diff --git")
+        || line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("new file")
+        || line.starts_with("deleted file")
+        || line.starts_with("old mode")
+        || line.starts_with("new mode")
+        || line.starts_with("rename ")
+        || line.starts_with("similarity ")
+        || line.starts_with("copy ")
+        || line.starts_with("Binary files")
+    {
+        "diff-meta"
+    } else if line.starts_with("@@") {
+        "diff-hunk"
+    } else if line.starts_with('+') {
+        "diff-add"
+    } else if line.starts_with('-') {
+        "diff-del"
+    } else {
+        ""
+    }
+}
+
+/// [`accessible_patch_window`], driven by a structured [`DiffRows`] rather
+/// than a raw-text walk (#361).
+///
+/// **Two coordinates, and they are not interchangeable.** `window` indexes
+/// ROWS — what virtualization slices and `row_heights` measures. The focus
+/// model is told the HUNK count, globally across files, because that is what
+/// "hunk 3 of 40" means and what #210's roving tabindex ranges over. Handing
+/// focus a row count would make every body line a tab stop; handing it a
+/// windowed count would renumber hunks as the user scrolls, which is the
+/// regression #350 warns about.
+///
+/// Note that a header row keeps its **global** hunk ordinal regardless of the
+/// window, so the label a screen reader speaks is stable while scrolling.
+pub(crate) fn accessible_rows_window(
+    rows: &DiffRows,
+    focus: RwSignal<GraphFocus>,
+    scope: &'static str,
+    window: Option<std::ops::Range<usize>>,
+    reveal: Option<Callback<usize>>,
+) -> View {
+    // `update_untracked`: this runs while a render closure is already
+    // executing; the tabindex closures created below read the fresh count
+    // when they first run, so nothing needs the notification.
+    focus.update_untracked(|f| f.set_row_count(rows.hunk_count));
+    let range = window.unwrap_or(0..usize::MAX);
+    rows.rows
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| range.contains(i))
+        .map(|(_, row)| match row {
+            DiffRow::HunkHeader {
+                hunk_ordinal,
+                label,
+                text,
+                ..
+            } => hunk_header_span(
+                "diff-hunk",
+                format!("{text}\n"),
+                *hunk_ordinal,
+                label.clone(),
+                focus,
+                scope,
+                reveal,
+            ),
+            DiffRow::FileHeader { title, .. } => {
+                let text = format!("{title}\n");
+                view! { <span class="diff-meta">{text}</span> }.into_view()
+            }
+            // Notes cover binary, mode-change, rename — and a combined
+            // diff's raw text, whose `@@@` headers must stay header-coloured
+            // but INERT, never wearing .diff-hunk's interactive styling (44px
+            // band, pointer cursor) and looking tappable.
+            DiffRow::Note { text, .. } => {
+                let class = if text.starts_with("@@") {
+                    "diff-hunk-combined"
+                } else {
+                    "diff-meta"
+                };
+                let text = format!("{text}\n");
+                view! { <span class=class>{text}</span> }.into_view()
+            }
+            DiffRow::Line {
+                kind,
+                text,
+                no_newline_at_eof,
+                ..
+            } => {
+                // The marker is restored here, not carried in `text`: the
+                // parser strips it, and the rendered patch must remain
+                // byte-identical to what git printed so a copied selection
+                // still applies.
+                let marker = match kind {
+                    LineKind::Added => '+',
+                    LineKind::Removed => '-',
+                    LineKind::Context => ' ',
+                };
+                let body = if *no_newline_at_eof {
+                    format!("{marker}{text}\n\\ No newline at end of file\n")
+                } else {
+                    format!("{marker}{text}\n")
+                };
+                match kind {
+                    // The sr-only prefix is position:absolute and
+                    // user-select:none, so the visible layout inside the
+                    // <pre> — and a copied patch — is byte-identical.
+                    LineKind::Added => view! {
+                        <span class="diff-add">
+                            <span class="sr-only">"added line: "</span>
+                            {body}
+                        </span>
+                    }
+                    .into_view(),
+                    LineKind::Removed => view! {
+                        <span class="diff-del">
+                            <span class="sr-only">"removed line: "</span>
+                            {body}
+                        </span>
+                    }
+                    .into_view(),
+                    LineKind::Context => view! { <span class="diff-ctx">{body}</span> }.into_view(),
+                }
+            }
+        })
+        .collect_view()
+}
 
 /// One navigable hunk header span — see [`accessible_patch_view`].
 fn hunk_header_span(
