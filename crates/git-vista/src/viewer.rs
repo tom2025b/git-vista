@@ -20,13 +20,15 @@ use git_vista_protocol::diff::{DiffSpec, SpecDiff};
 use git_vista_protocol::{PatchPlan, PatchPreview, StageDirection, StagingDiff};
 
 use crate::api::{fetch_diff_full, fetch_file, fetch_spec_diff, staging_diff_request};
-use crate::detail::{accessible_patch_view, file_change_marker};
+use crate::detail::{accessible_rows_window, file_change_marker};
 use crate::features::a11y::focus::GraphFocus;
+use crate::features::diff::rows::flatten;
 use crate::features::diff::selection::DiffSelection;
 use crate::features::diff::staging_view::staging_body;
 use crate::features::graph::core::RenderCtx;
 use crate::icons::icon_set;
 use crate::state::{Features, Settings, ViewerDoc};
+use git_vista_protocol::diff::parse_unified_diff;
 
 /// Stamp (or clear) the `data-print` attribute on `<html>`. The print styles
 /// key off it, so a plain browser print with no viewer open still prints the
@@ -212,7 +214,7 @@ pub fn viewer_view(
                     // keyboard-focusable on their own. Left unopted-out, Tab
                     // lands here instead of on the "viewer"-scoped roving hunk
                     // header span this file's `diff_body` renders via
-                    // `accessible_patch_view`, and arrow keys then scroll this
+                    // `accessible_rows_window`, and arrow keys then scroll this
                     // div natively instead of reaching `hunk_header_span`'s
                     // `on_keydown`.
                     <div class="viewer-body" tabindex="-1">{body}</div>
@@ -262,7 +264,7 @@ fn spec_title(spec: &DiffSpec) -> String {
 /// than an omission (naming core's `DiffFile` from the protocol crate would
 /// break the wasm build this crate exists to stay compatible with).
 ///
-/// The patch renders through the same `accessible_patch_view` the other diff
+/// The patch renders through the same `accessible_rows_window` the other diff
 /// surfaces use, so hunk navigation, the screen-reader prefixes and the roving
 /// tab stop all behave identically here. Not windowed, for the same reason the
 /// rest of this viewer is not — see the comment at the bottom of `diff_body`
@@ -282,7 +284,7 @@ fn spec_body(d: &SpecDiff, hunk_focus: RwSignal<GraphFocus>) -> View {
         {empty_note}
         {truncated_note}
         <pre class="detail-diff viewer-pre">
-            {accessible_patch_view(&d.patch, hunk_focus, "viewer")}
+            {accessible_rows_window(&flatten(&parse_unified_diff(&d.patch)), hunk_focus, "viewer", None, None)}
         </pre>
     }
     .into_view()
@@ -322,7 +324,13 @@ fn diff_body(d: &CommitDiff, nerd: bool, hunk_focus: RwSignal<GraphFocus>) -> Vi
         .collect_view();
     // Same accessible flat rendering as the detail panel (M2.16e, #210),
     // under its own scope so DOM focus queries can't cross surfaces.
-    let patch = accessible_patch_view(&d.patch, hunk_focus, "viewer");
+    let patch = accessible_rows_window(
+        &flatten(&parse_unified_diff(&d.patch)),
+        hunk_focus,
+        "viewer",
+        None,
+        None,
+    );
     let truncated_note = d.truncated.then(|| {
         view! {
             <p class="detail-status">
@@ -358,7 +366,7 @@ fn diff_body(d: &CommitDiff, nerd: bool, hunk_focus: RwSignal<GraphFocus>) -> Vi
         // `install_mode_signal` is a shipped precedent for keeping such a
         // measurement current through a debounced resize listener.
         //
-        // The real problem is that `line_heights`' `ceil(chars / columns)` is a
+        // The real problem is that `row_heights`' `ceil(chars / columns)` is a
         // *character*-wrap model, while this CSS wraps at *word* boundaries. A
         // perfectly measured column count still would not track real rendered
         // row counts on code text. And unlike the panel's `DIFF_LINE_PX` — one
