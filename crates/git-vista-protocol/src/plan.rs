@@ -78,7 +78,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::newtype::{
     require_git_safe, require_hex, require_non_empty, require_non_empty_bounded,
-    require_remote_name, require_worktree_relative_path,
+    require_worktree_relative_path,
 };
 
 /// Why a plan field failed validation — see
@@ -165,41 +165,11 @@ validated_string!(
     |v| require_non_empty(v, "commit message")
 );
 
-/// The most bytes a [`RemoteName`] may carry.
-///
-/// A cap for the reason [`MAX_TAG_MESSAGE_LEN`] is one: the value is
-/// client-chosen and rides into a [`Plan`] that is hashed, journaled and
-/// persisted. 100 bytes is far past any real nickname (`origin` is six) while
-/// keeping a hostile megabyte-long "name" a wire-boundary 400.
-pub const MAX_REMOTE_NAME_LEN: usize = 100;
-
 validated_string!(
-    /// The name of a remote **configured in the repository** — `origin`,
-    /// `upstream`, `fork-2`. Never a URL and never a path.
-    ///
-    /// # This is a security boundary (ADR 0047)
-    ///
-    /// It was [`require_git_safe`] until #229's follow-up, which is
-    /// non-empty and not option-shaped — and therefore accepted
-    /// `https://attacker.example/r.git`. `git fetch` does not refuse an
-    /// argument it cannot find in the config; it falls through to treating it
-    /// as a transport target, so that value made the `remote` request field
-    /// choose which host this server opens a socket to, with whatever
-    /// credential helper or SSH agent the host offers it. The validator now
-    /// refuses every URL and path shape — see
-    /// [`newtype::require_remote_name`](crate::newtype::require_remote_name)
-    /// for the exact rule, the table of shapes it refuses, and why it is
-    /// *necessary but not sufficient* (a well-formed name can still be one the
-    /// repository never configured, which the server's `RemoteConfigured`
-    /// precondition is what actually catches).
-    ///
-    /// Running the validator from `Deserialize` — which the macro does — is
-    /// what makes this reach `PullBranch`/`PushBranch`/`PushTag`/
-    /// `DeleteRemoteTag` too: their `remote` fields are this type, so a
-    /// submitted plan carrying a URL is a hard wire error before any handler
-    /// sees it.
+    /// A configured remote's name (today always `origin` — the only remote the
+    /// push handler addresses). Non-empty and not option-shaped.
     RemoteName,
-    |v| require_remote_name(v, "remote name", MAX_REMOTE_NAME_LEN)
+    |v| require_git_safe(v, "remote name")
 );
 
 validated_string!(

@@ -502,48 +502,13 @@ stderr, with the unredacted premise asserted in the same test
 (`planner::fetch_suite::a_credential_leaked_by_the_remote_never_reaches_the_operation_record`).
 Second, `FetchRequest` carries a **configured remote name, never a URL**, so no
 request can aim this server's credential helpers or SSH agent at a host of the
-client's choosing — see the correction below, which is where that guarantee
-actually comes from. Third, a fetch can now be cancelled — `POST
+client's choosing; the name is gated by the plan's `RemoteConfigured`
+precondition. Third, a fetch can now be cancelled — `POST
 /api/operations/{id}/cancel` SIGKILLs the direct child — and what a cancelled
 fetch reports about the repository is read from `refs/remotes/<remote>/*`
 before and after, never from git's prose. Known limitation, recorded rather
 than hidden: the kill reaches the direct child only, so a grandchild transport
 process may briefly outlive it.)*
-
-### Which host a remote-reaching operation may contact (ADR 0047, #229 follow-up)
-
-The paragraph above claimed the `RemoteConfigured` precondition was what kept a
-request from choosing the host. **It was not, and neither was the type.** Both
-halves were repaired; the correction is recorded here rather than edited away,
-because the shape of the mistake is the reusable part.
-
-| What was claimed | What was true | What holds now |
-|---|---|---|
-| `RemoteName` is a name | Its validator was "non-empty, not starting with `-`", which accepts `https://attacker.example/r.git` | `require_remote_name`: ASCII letters, digits, `.`, `-`, `_`, no leading `.`, no `..`, ≤ 100 bytes. Refuses every URL, scp-style, path and `ext::` shape. Runs from `Deserialize`, so it covers pull/push/tag too |
-| `RemoteConfigured` gates it | `enforce_fresh` re-verified only preconditions that **held at build time**; one that already failed was skipped, on the assumption that the executor would refuse instead | `planner::refuses_when_unmet_at_build` names the one precondition with no such executor guard, and `enforce_fresh` refuses it directly |
-
-The assumption under the second row is the load-bearing lesson. It is sound for
-every other precondition — `git branch` refuses a name that exists, `git rebase`
-refuses a dirty tree — and it is false for remotes, because **git does not
-refuse an unknown remote; it reinterprets it as a transport target.** Verified
-against git 2.43.0: `git fetch ghost.git`, with no `ghost.git` remote, fetches
-from the *directory* `ghost.git`. The endpoint then answered `200 … already up
-to date`, because a fetch from an ad-hoc target moves no
-`refs/remotes/<remote>/*` and the before/after diff is therefore empty — a fetch
-that reached somewhere it was never authorised to, reported as a no-op.
-
-Proven by driving the real pipeline against a **live loopback listener** that
-must never be connected to, with a paired positive control on the same run that
-must connect (`planner::remote_boundary_suite`). The port is 9418 — the only
-unprivileged entry in `sandbox::DEFAULT_GIT_PORTS` — precisely so the sandbox's
-own Network-tier grant permits the connect and cannot be what makes the test
-pass.
-
-Because both halves live in the shared machinery, `POST /api/pull` inherits them
-verbatim when #230 wires its executor: `PullBranch` carries the same
-`RemoteName` and the same `RemoteConfigured` precondition, and the suite asserts
-today that a pull with an unconfigured remote is refused by the gate (409)
-*before* reaching pull's not-yet-implemented executor (501).
 
 ## Request Integrity
 

