@@ -10,7 +10,6 @@
 //! fetched lazily from `/api/diff/{id}` alongside the detail. The menu's
 //! "Show diff" item opens this same panel with the section scrolled into view.
 
-
 use leptos::*;
 use wasm_bindgen::JsCast;
 
