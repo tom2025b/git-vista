@@ -490,7 +490,11 @@ fn diff_scroll_containers_opt_out_of_native_tab_focus() {
         (
             "viewer.rs's .viewer-body",
             VIEWER_RS,
-            "<div class=\"viewer-body\"",
+            // Matched on the class attribute alone, not `<div class=...`, so
+            // the check survives the tag being wrapped across lines — which
+            // it was, when #362 added a scroll listener to it. The sibling
+            // `.detail-diff-scroll` entry above is written the same way.
+            "class=\"viewer-body\"",
         ),
     ] {
         let tag = opening_tag(src, needle)

@@ -33,11 +33,11 @@ use git_vista_core::virtualize::CumulativeHeights;
 /// the overscan below absorbs — it cannot corrupt the mapping, because
 /// `accessible_rows_window` keys every row on its own row index rather
 /// than on anything derived from this number.
-const DIFF_LINE_PX: f64 = 18.1;
+pub(crate) const DIFF_LINE_PX: f64 = 18.1;
 
 /// Extra lines rendered above and below the visible range, so a fast scroll
 /// does not flash blank space for a frame before the next range is computed.
-const DIFF_OVERSCAN: usize = 20;
+pub(crate) const DIFF_OVERSCAN: usize = 20;
 use crate::features::graph::core::RenderCtx;
 use crate::icons::{icon_set, GitIcons};
 use crate::state::{DetailResource, Features, Settings, ViewerDoc};
