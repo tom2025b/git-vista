@@ -91,6 +91,26 @@ pub struct DisplayProjection {
 }
 
 impl DisplayProjection {
+    /// How many WIP runs this projection contains, folded or open (#382).
+    ///
+    /// Counts BOTH, deliberately. The number exists to answer "are there runs
+    /// in this history at all", which an operator cannot otherwise tell from
+    /// a viewport showing twenty rows out of hundreds — a graph whose runs sit
+    /// thirty commits down looks exactly like a graph with none, and reads as
+    /// a broken feature. Dropping a run from the count when it is expanded
+    /// would report 0 over a graph plainly showing checkpoints.
+    ///
+    /// Zero when collapsing is switched off globally, because then nothing is
+    /// being hidden and a count of hidden runs would describe nothing.
+    pub fn wip_run_count(&self) -> usize {
+        let folded = self
+            .items
+            .iter()
+            .filter(|item| matches!(item, DisplayItem::WipGroup { .. }))
+            .count();
+        folded + self.expanded_runs.len()
+    }
+
     /// Display-space index of the slot showing raw row `row_index` — the
     /// group's own slot when that row is inside a folded run. `None` only
     /// when the row is outside the projected range entirely.
@@ -673,5 +693,99 @@ mod tests {
         // the last thing it writes today, but matching must not depend on
         // the line ending exactly there.
         assert!(is_wip_checkpoint("wip(#66): auto-checkpoint 690 (rebased)"));
+    }
+
+    // ── #382: the count that tells the operator runs exist off-screen ──
+
+    #[test]
+    fn a_projection_with_no_wip_runs_counts_zero() {
+        let rows = vec![
+            row(0, "feat: real work", Some("c1")),
+            row(1, "docs: more real work", None),
+        ];
+        assert_eq!(
+            project(&rows, &[], true, &HashSet::new()).wip_run_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn one_folded_run_counts_one() {
+        let rows = vec![
+            row(0, "feat: real work", Some("c1")),
+            wip_row(1, 3, Some("c2")),
+            wip_row(2, 2, Some("c3")),
+            row(3, "docs: earlier", None),
+        ];
+        assert_eq!(
+            project(&rows, &[], true, &HashSet::new()).wip_run_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn two_separated_runs_count_two() {
+        let rows = vec![
+            wip_row(0, 4, Some("c1")),
+            wip_row(1, 3, Some("c2")),
+            row(2, "feat: between the runs", Some("c3")),
+            wip_row(3, 2, Some("c4")),
+            wip_row(4, 1, None),
+        ];
+        assert_eq!(
+            project(&rows, &[], true, &HashSet::new()).wip_run_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_expanded_run_still_counts() {
+        // The whole point of the number is "runs exist here". Dropping a run
+        // from the count the moment it is opened would make the badge blink
+        // out exactly when the operator proved it was real — and would report
+        // 0 on a graph plainly showing checkpoints.
+        let rows = vec![
+            row(0, "feat: real work", Some("c1")),
+            wip_row(1, 3, Some("c2")),
+            wip_row(2, 2, Some("c3")),
+            row(3, "docs: earlier", None),
+        ];
+        let open: HashSet<usize> = [1].into_iter().collect();
+        let p = project(&rows, &[], true, &open);
+        assert!(
+            p.items.len() > 3,
+            "precondition: the run really is expanded {:?}",
+            p.items
+        );
+        assert_eq!(p.wip_run_count(), 1);
+    }
+
+    #[test]
+    fn with_collapsing_switched_off_entirely_the_count_is_zero() {
+        // Toggle off means "show me everything"; there are no runs being
+        // hidden, so a count of hidden runs would be a claim about nothing.
+        let rows = vec![
+            row(0, "feat: real work", Some("c1")),
+            wip_row(1, 3, Some("c2")),
+            wip_row(2, 2, Some("c3")),
+            row(3, "docs: earlier", None),
+        ];
+        assert_eq!(
+            project(&rows, &[], false, &HashSet::new()).wip_run_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_lone_checkpoint_is_not_a_run() {
+        let rows = vec![
+            row(0, "feat: real work", Some("c1")),
+            wip_row(1, 1, Some("c2")),
+            row(2, "docs: earlier", None),
+        ];
+        assert_eq!(
+            project(&rows, &[], true, &HashSet::new()).wip_run_count(),
+            0
+        );
     }
 }
