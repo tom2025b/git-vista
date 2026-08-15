@@ -75,6 +75,7 @@ test.describe('#366 Compare branch with HEAD', () => {
 
     await page.keyboard.press('Escape')
     await page.getByRole('button', { name: BARE_COMMIT }).click()
+    await expect(page.getByRole('button', { name: 'Show diff' })).toBeVisible()
     await expect(page.getByRole('button', { name: /Compare .* with HEAD/ })).toHaveCount(0)
   })
 
@@ -82,7 +83,7 @@ test.describe('#366 Compare branch with HEAD', () => {
     await openActiveApp(page)
     const viewer = await openBaseComparison(page)
 
-    await expect(viewer.locator('.viewer-title')).toContainText('base → main')
+    await expect(viewer.locator('.viewer-title')).toHaveText(/base → main$/)
     await assertRefVsRefAnswer(viewer)
 
     await page.keyboard.press('Escape')
