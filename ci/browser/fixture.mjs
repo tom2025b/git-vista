@@ -5,6 +5,8 @@
 //   * a very large file      -- #69c's virtualization (a window must stay bounded)
 //   * staged + unstaged + untracked, simultaneously
 //                            -- #68d's status cards and #348's chip/panel agreement
+//   * a value unique to commit 1, commit 2, the index and the worktree
+//                            -- #366's explicit diff-mode discrimination
 //
 // The repo is regenerated from scratch on every run, so the assertions can name
 // exact counts instead of matching loosely. Nothing here touches the user's
@@ -57,8 +59,10 @@ export function buildFixture(root) {
     [`region ${n} start`, ...Array.from({ length: 12 }, (_, i) => `  line ${n}.${i}`), `region ${n} end`]
   const multiHunk = Array.from({ length: MULTI_HUNK_COUNT }, (_, i) => region(i + 1)).flat()
   writeFileSync(join(root, 'multi-hunk.txt'), multiHunk.join('\n') + '\n')
-  git('add', 'multi-hunk.txt')
+  writeFileSync(join(root, 'compare-mode.txt'), 'one\n')
+  git('add', 'multi-hunk.txt', 'compare-mode.txt')
   git('commit', '-q', '-m', 'seed: multi-hunk file')
+  git('branch', 'base')
 
   // --- a run of WIP-checkpoint commits (#374), sitting between commit 1 and
   // commit 2 so it never shifts the newest-first indices the other specs
@@ -76,7 +80,8 @@ export function buildFixture(root) {
     join(root, 'big.txt'),
     Array.from({ length: BIG_FILE_LINES }, (_, i) => `line ${i} of the large file`).join('\n') + '\n',
   )
-  git('add', 'big.txt')
+  writeFileSync(join(root, 'compare-mode.txt'), 'two\n')
+  git('add', 'big.txt', 'compare-mode.txt')
   git('commit', '-q', '-m', 'seed: large file for the virtualization budget')
 
   // --- commit 3: LONG *and* multi-hunk at once. This is the shape #210 breaks
@@ -105,10 +110,13 @@ export function buildFixture(root) {
 
   // --- working state: one staged, one unstaged, two untracked. The status
   // surfaces must agree on this exact shape (#348).
-  writeFileSync(join(root, 'staged.txt'), 'staged content\n')
+  // These sentinels are deliberately different from compare-mode.txt's two
+  // committed values. A test that accidentally requests index or worktree
+  // content cannot satisfy the ref-vs-ref assertions by returning any patch.
+  writeFileSync(join(root, 'staged.txt'), 'three\n')
   git('add', 'staged.txt')
 
-  writeFileSync(join(root, 'multi-hunk.txt'), edited.join('\n') + '\nunstaged tail\n')
+  writeFileSync(join(root, 'multi-hunk.txt'), edited.join('\n') + '\nunstaged tail\nfour\n')
 
   writeFileSync(join(root, 'untracked-a.txt'), 'a\n')
   writeFileSync(join(root, 'untracked-b.txt'), 'b\n')
