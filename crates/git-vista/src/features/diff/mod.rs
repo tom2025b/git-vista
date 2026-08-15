@@ -9,6 +9,7 @@
 //! staging endpoints.
 
 pub mod core;
+pub mod rows;
 pub mod selection;
 #[cfg(target_arch = "wasm32")]
 pub mod staging_view;
