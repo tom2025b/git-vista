@@ -10,14 +10,29 @@
 //!
 //! # Why a remote *name* and not a URL
 //!
-//! [`FetchRequest`] carries a name, which the plan's
-//! `Precondition::RemoteConfigured` then requires to exist in the
-//! repository's own configuration. A request that could carry a URL would let
+//! [`FetchRequest`] carries a name. A request that could carry a URL would let
 //! any authenticated client point this server — and whatever credential
 //! helper or SSH agent the host offers it — at a host of the client's
 //! choosing. That is the same class of hazard as a request naming a
 //! repository path, which `docs/adr/0002-versioned-api-contract.md` already
 //! refuses for the same reason.
+//!
+//! **Two separate things enforce it, and both are needed** (ADR 0047 — the
+//! original version of this comment claimed the second one alone did, and it
+//! did not, which is the hole `planner::remote_boundary_suite` was written
+//! against):
+//!
+//! 1. [`RemoteName`]'s validator refuses every URL and path shape, so a
+//!    URL-shaped value cannot be constructed from wire input at all. This one
+//!    is type-level and reaches every consumer of the type, including pull,
+//!    push and the tag operations.
+//! 2. The plan's `Precondition::RemoteConfigured` requires the name to exist
+//!    in the repository's own configuration, and `planner::enforce_fresh`
+//!    now **refuses** when it does not hold rather than skipping it (see
+//!    `planner::refuses_when_unmet_at_build`). This one catches what no
+//!    string rule can: a perfectly well-formed name the repository has simply
+//!    never configured, which `git fetch` resolves as a *path* relative to
+//!    the worktree.
 
 use axum::http::StatusCode;
 use axum::Json;
@@ -55,7 +70,12 @@ pub(crate) async fn fetch_remote(Json(req): Json<FetchRequest>) -> (StatusCode, 
 /// option-shaped check matters more here than usual: this name becomes an
 /// argv element in `git fetch --progress <remote>`, and a leading `-` would
 /// be read by git as a flag.
-fn validate_remote(raw: &str) -> Result<RemoteName, (StatusCode, String)> {
+///
+/// The trim is why this exists at all rather than calling [`RemoteName::new`]
+/// directly: `RemoteName` refuses whitespace (a name is a token, and a stored
+/// `" origin "` would never match the config), so a request whose field a UI
+/// padded has to be trimmed *before* the type sees it.
+pub(crate) fn validate_remote(raw: &str) -> Result<RemoteName, (StatusCode, String)> {
     let remote = raw.trim();
     if remote.is_empty() {
         return Err(refusal("Remote name can't be empty."));

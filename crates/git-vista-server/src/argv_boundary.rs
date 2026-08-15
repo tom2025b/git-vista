@@ -99,6 +99,10 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // *unsandboxed* `git fetch` that asserts the redaction test's premise (the
     // fixture really does leak a credential when nothing redacts it).
     "src/planner/fetch_suite.rs",
+    // #[cfg(test)] git fixtures for the remote-target boundary suite (ADR
+    // 0047): a repository, an in-tree bare target the server must refuse to
+    // fetch from, and `git remote add` for the paired positive control.
+    "src/planner/remote_boundary_suite.rs",
     "src/state.rs",         // #[cfg(test)] fixture setup
     "src/argv_boundary.rs", // this file (the scan reads its own source)
     // The M1.13b spawn chokepoint (#66, Task 5). It builds a git Command from

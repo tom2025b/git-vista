@@ -54,4 +54,5 @@ it, and note the link in both.
 | [0040](0040-amend-execution.md) | Amend execution: its own route, an executor-level CAS, an advisory published-history flag, and typed failure kinds | Accepted — implemented and tested |
 | [0041](0041-tag-operation-vocabulary.md) | The typed tag vocabulary: four variants, and an undo that restores the exact tag object | Accepted — typed contract implemented and tested; execution not yet wired (M2.21 slices of #74) |
 | [0042](0042-planner-build-submit-split.md) | The planner's build / submit seam: two stages, one set of stage functions | Accepted — implemented and tested; not routed until #248/#249 |
-| [0043](0043-fetch-execution.md) | Fetch execution: progress on the lifecycle that already exists, a cancel that kills the child, and an outcome read from refs rather than prose | Accepted — implemented and tested |
+| [0043](0043-fetch-execution.md) | Fetch execution: progress on the lifecycle that already exists, a cancel that kills the child, and an outcome read from refs rather than prose | Accepted — implemented and tested; its claim about *which host* a fetch may reach is corrected by ADR 0047 |
+| [0047](0047-remote-target-boundary.md) | Which host a fetch may contact: a name-shaped newtype *and* a precondition that refuses instead of being skipped | Accepted — implemented and tested |
