@@ -34,6 +34,7 @@
 //! That matches the shipped behaviour: header-coloured, but never wearing the
 //! interactive styling that would make it look tappable.
 
+use super::core::LineWrap;
 use git_vista_protocol::diff::{DiffLine, FileDiff, Hunk, LineKind, ParsedPatch};
 
 /// One rendered row. Every variant occupies exactly one row index.
@@ -79,6 +80,62 @@ impl DiffRow {
     pub fn is_nav_stop(&self) -> bool {
         matches!(self, DiffRow::HunkHeader { .. })
     }
+}
+
+impl DiffRow {
+    /// The text this row actually renders — what a width measurement must
+    /// count. A body line renders with its marker restored, because that
+    /// character occupies a column on screen even though the parser strips
+    /// it from `text`; forgetting it under-measures every added and removed
+    /// line by one column, and a wrapped patch then reports a height slightly
+    /// short of what it draws.
+    pub fn display_text(&self) -> String {
+        match self {
+            DiffRow::FileHeader { title, .. } => title.clone(),
+            DiffRow::HunkHeader { text, .. } => text.clone(),
+            DiffRow::Note { text, .. } => text.clone(),
+            DiffRow::Line { kind, text, .. } => {
+                let marker = match kind {
+                    LineKind::Added => '+',
+                    LineKind::Removed => '-',
+                    LineKind::Context => ' ',
+                };
+                format!("{marker}{text}")
+            }
+        }
+    }
+}
+
+/// Per-ROW heights, ready for [`CumulativeHeights::new`] — the rows twin of
+/// [`super::core::line_heights`].
+///
+/// A separate function rather than a reuse, because the two walk different
+/// sequences: `line_heights` walks `patch.lines()`, which includes the
+/// `diff --git`/`index`/`---`/`+++` headers the parser drops and excludes the
+/// per-file heading rows this view adds. Measuring rows with a line-based
+/// walk would offset every height in the document, and the window would then
+/// render one slice while the scrollbar described another.
+///
+/// Counts **characters, not bytes**, matching `line_heights`: a patch
+/// carrying non-ASCII would otherwise over-estimate its height and leave a
+/// gap at the bottom of the scroll range.
+///
+/// [`CumulativeHeights::new`]: git_vista_core::virtualize::CumulativeHeights::new
+pub fn row_heights(rows: &[DiffRow], line_height: f64, wrap: LineWrap) -> Vec<f64> {
+    rows.iter()
+        .map(|row| match wrap {
+            LineWrap::Never => line_height,
+            LineWrap::Wrapped { columns } => {
+                if columns == 0 {
+                    // A zero-width container is not a real layout; treat it
+                    // as one row rather than dividing by zero.
+                    return line_height;
+                }
+                let chars = row.display_text().chars().count().max(1);
+                chars.div_ceil(columns) as f64 * line_height
+            }
+        })
+        .collect()
 }
 
 /// The flattened patch plus the hunk count focus needs.
@@ -580,5 +637,117 @@ mod tests {
             .unwrap();
         assert!(text.starts_with("@@ -12,"), "{text}");
         assert!(text.contains("+12,"), "{text}");
+    }
+    // ── heights: the rows twin of line_heights ──
+
+    #[test]
+    fn unwrapped_rows_are_all_one_line_tall() {
+        let patch = ParsedPatch {
+            files: vec![hunks_file(
+                "a.rs",
+                vec![hunk(1, vec![line(LineKind::Added, "x")])],
+            )],
+        };
+        let flat = flatten(&patch);
+        let heights = row_heights(&flat.rows, 20.0, LineWrap::Never);
+        assert_eq!(heights, vec![20.0; flat.rows.len()]);
+    }
+
+    #[test]
+    fn a_body_line_is_measured_WITH_its_marker_column() {
+        // The parser strips the leading '+'/'-'/' ' from `text`, but that
+        // character still occupies a column on screen. Measuring without it
+        // under-counts every added and removed line by one, and a patch
+        // sitting exactly on a wrap boundary then reports a height one row
+        // short of what it draws.
+        let nine = "123456789"; // 9 chars of text, 10 with the marker
+        let patch = ParsedPatch {
+            files: vec![hunks_file(
+                "a.rs",
+                vec![hunk(1, vec![line(LineKind::Added, nine)])],
+            )],
+        };
+        let flat = flatten(&patch);
+        let body = flat
+            .rows
+            .iter()
+            .find(|r| matches!(r, DiffRow::Line { .. }))
+            .unwrap();
+        assert_eq!(body.display_text(), "+123456789");
+        let heights = row_heights(
+            std::slice::from_ref(body),
+            10.0,
+            LineWrap::Wrapped { columns: 10 },
+        );
+        assert_eq!(heights, vec![10.0], "10 chars in 10 columns is one row");
+
+        let heights = row_heights(
+            std::slice::from_ref(body),
+            10.0,
+            LineWrap::Wrapped { columns: 9 },
+        );
+        assert_eq!(
+            heights,
+            vec![20.0],
+            "the marker pushes it past 9 columns onto a second row"
+        );
+    }
+
+    #[test]
+    fn a_zero_width_container_does_not_divide_by_zero() {
+        let patch = ParsedPatch {
+            files: vec![hunks_file(
+                "a.rs",
+                vec![hunk(1, vec![line(LineKind::Added, "x")])],
+            )],
+        };
+        let flat = flatten(&patch);
+        let heights = row_heights(&flat.rows, 20.0, LineWrap::Wrapped { columns: 0 });
+        assert_eq!(heights, vec![20.0; flat.rows.len()]);
+    }
+
+    #[test]
+    fn wrapping_counts_characters_not_bytes() {
+        // A non-ASCII patch measured by bytes over-estimates its height and
+        // leaves a gap at the bottom of the scroll range.
+        let patch = ParsedPatch {
+            files: vec![hunks_file(
+                "a.rs",
+                vec![hunk(1, vec![line(LineKind::Context, "ééééééééé")])],
+            )],
+        };
+        let flat = flatten(&patch);
+        let body = flat
+            .rows
+            .iter()
+            .find(|r| matches!(r, DiffRow::Line { .. }))
+            .unwrap();
+        // 9 chars + 1 marker = 10 columns exactly; by bytes it would be 19.
+        let heights = row_heights(
+            std::slice::from_ref(body),
+            10.0,
+            LineWrap::Wrapped { columns: 10 },
+        );
+        assert_eq!(heights, vec![10.0]);
+    }
+
+    #[test]
+    fn there_is_exactly_one_height_per_row() {
+        // CumulativeHeights indexes rows by position; a length mismatch
+        // silently offsets every window boundary after it.
+        let patch = ParsedPatch {
+            files: vec![
+                hunks_file("a.rs", vec![hunk(1, vec![line(LineKind::Added, "x")])]),
+                FileDiff::Binary {
+                    old_path: Some("b.png".into()),
+                    new_path: Some("b.png".into()),
+                },
+            ],
+        };
+        let flat = flatten(&patch);
+        assert_eq!(
+            row_heights(&flat.rows, 20.0, LineWrap::Never).len(),
+            flat.rows.len()
+        );
     }
 }
