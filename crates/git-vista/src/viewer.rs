@@ -48,13 +48,77 @@ fn set_print_attr(on: bool) {
     }
 }
 
+/// Follow the browser's own print lifecycle, so Ctrl+P / ⌘P / the print menu
+/// unwindow the patch too — not only the in-app button.
+///
+/// `beforeprint` fires before the print document is laid out and `afterprint`
+/// once it is done, which is the same window `print_now` brackets by hand.
+/// Both paths are wired because either alone leaves a hole: the button is the
+/// documented iPad route, and `beforeprint` is the only hook for a print the
+/// app never initiated.
+#[cfg(target_arch = "wasm32")]
+fn install_print_signal(printing: RwSignal<bool>) {
+    use wasm_bindgen::{closure::Closure, JsCast};
+    let Some(win) = web_sys::window() else { return };
+
+    let before = Closure::<dyn FnMut()>::new(move || {
+        let _ = printing.try_set(true);
+    });
+    let after = Closure::<dyn FnMut()>::new(move || {
+        let _ = printing.try_set(false);
+    });
+    let _ = win.add_event_listener_with_callback("beforeprint", before.as_ref().unchecked_ref());
+    let _ = win.add_event_listener_with_callback("afterprint", after.as_ref().unchecked_ref());
+
+    let w2 = win.clone();
+    on_cleanup(move || {
+        let _ =
+            w2.remove_event_listener_with_callback("beforeprint", before.as_ref().unchecked_ref());
+        let _ =
+            w2.remove_event_listener_with_callback("afterprint", after.as_ref().unchecked_ref());
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn install_print_signal(_printing: RwSignal<bool>) {}
+
 /// Open the browser's print flow. On iPad Safari the resulting sheet is also
 /// the "Save PDF" path (share → Save to Files, or pinch out the preview).
-fn print_now() {
-    if let Some(w) = web_sys::window() {
-        let _ = w.print();
-    }
+///
+/// `printing` is raised BEFORE `window.print()` and lowered after, because the
+/// viewer is windowed (#362): only the rows around the scroll position are
+/// mounted, and the rest of the document's height is two spacer `<div>`s. The
+/// print stylesheet un-clips `.viewer-body`, so those spacers become real,
+/// empty pages — the whole patch paginates, but only the mounted sliver
+/// carries text. Raising this flag makes `diff_body` render every row with no
+/// spacers, which is exactly the unwindowed behaviour that printed correctly
+/// before #362.
+///
+/// The deferral is required, not defensive: `window.print()` blocks
+/// synchronously while the browser lays out the print document, so the flag
+/// must reach the DOM *first*. Leptos flushes its effects on a microtask, so
+/// setting the signal and printing in the same tick would print the old,
+/// windowed DOM — the exact bug this fixes.
+#[cfg(target_arch = "wasm32")]
+fn print_now(printing: RwSignal<bool>) {
+    printing.set(true);
+    leptos::set_timeout(
+        move || {
+            if let Some(w) = web_sys::window() {
+                let _ = w.print();
+            }
+            // Back to windowed as soon as the (blocking) print sheet returns,
+            // so the on-screen viewer does not keep a whole 5MB patch mounted.
+            let _ = printing.try_set(false);
+        },
+        std::time::Duration::from_millis(50),
+    );
 }
+
+/// Native builds have no `window`; the button is wasm-only in practice, but the
+/// signature has to exist for `cargo test` to compile this module.
+#[cfg(not(target_arch = "wasm32"))]
+fn print_now(_printing: RwSignal<bool>) {}
 
 /// The full-screen viewer overlay. Renders while the shell holds a viewer document;
 /// fetches its document lazily (keyed on the open doc, like the detail panel),
@@ -96,6 +160,11 @@ pub fn viewer_view(
     // measure degrades to the behaviour that shipped before, not to something
     // new.
     let viewer_columns = crate::features::diff::measure::install_columns_signal();
+    // Raised while the browser is producing a print document. `diff_body`
+    // renders unwindowed when it is set — see `print_now` for why the window
+    // and the print stylesheet cannot both be honoured at once.
+    let printing = create_rw_signal(false);
+    install_print_signal(printing);
     let staging_selection = create_rw_signal(DiffSelection::new());
     let staging_preview = create_rw_signal(None::<Result<PatchPreview, String>>);
     // The exact plan `staging_preview` was built from (review finding,
@@ -169,6 +238,7 @@ pub fn viewer_view(
                         hunk_focus,
                         viewer_scroll,
                         viewer_columns,
+                        printing,
                     )
                 }
                 Some(DocResult::File(Ok(f))) => {
@@ -220,7 +290,7 @@ pub fn viewer_view(
                                 title="Opens the print sheet — on iPad choose the \
                                        share icon (or pinch the preview open) and \
                                        ‘Save to Files’ to keep it as a PDF"
-                                on:click=move |_| print_now()
+                                on:click=move |_| print_now(printing)
                             >
                                 "Print / Save PDF"
                             </button>
@@ -342,6 +412,7 @@ fn diff_body(
     hunk_focus: RwSignal<GraphFocus>,
     scroll: RwSignal<(f64, f64)>,
     columns: RwSignal<usize>,
+    printing: RwSignal<bool>,
 ) -> View {
     let ic = icon_set(nerd);
     let (adds, dels) = d.totals();
@@ -392,7 +463,21 @@ fn diff_body(
         // back to a viewport tall enough that the first paint is never short
         // of content. Same fallback the panel uses, same reason.
         let viewport = if viewport > 0.0 { viewport } else { 800.0 };
-        let w = render_window(&heights, viewport, top, DIFF_OVERSCAN);
+        // Printing renders the WHOLE patch with no spacers. The spacers are
+        // what make a windowed viewer's scroll range honest on screen; on
+        // paper they are blank pages, because the print stylesheet un-clips
+        // the container and every spacer pixel becomes printable area with no
+        // text in it. See `print_now`.
+        let w = if printing.get() {
+            crate::features::diff::core::RenderWindow {
+                start: 0,
+                end: flat.rows.len(),
+                pad_top: 0.0,
+                pad_bottom: 0.0,
+            }
+        } else {
+            render_window(&heights, viewport, top, DIFF_OVERSCAN)
+        };
         view! {
             <div style=format!("height:{}px", w.pad_top)></div>
             <pre class="detail-diff viewer-pre">
