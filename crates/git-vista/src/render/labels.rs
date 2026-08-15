@@ -16,6 +16,7 @@ use crate::geometry::{
     BADGE_HEIGHT, BADGE_RADIUS,
 };
 use crate::icons::icon_set;
+use crate::print::commit_github_url;
 use crate::text::truncate;
 use git_vista_core::color::{branch_color, BADGE_DARK, HEAD_BADGE, TAG_BADGE};
 
@@ -117,19 +118,22 @@ pub fn build_msg(
                 //    the same name exists.
                 //  * remote branch -> its tree page (it's on the remote by
                 //    definition); its leading "<remote>/" is stripped.
-                let badge_url = c.frame.repo_url.as_ref().and_then(|base| match r.kind {
-                    RefKind::Head | RefKind::Tag => {
-                        commit_on_remote.then(|| format!("{base}/commit/{}", gr.commit.id.0))
-                    }
-                    RefKind::Branch => c
-                        .remote_branches
-                        .contains(&r.name)
-                        .then(|| format!("{base}/tree/{}", r.name)),
-                    RefKind::RemoteBranch => {
+                let badge_url = match r.kind {
+                    RefKind::Head | RefKind::Tag => commit_github_url(
+                        c.frame.repo_url.as_deref(),
+                        commit_on_remote,
+                        &gr.commit.id.0,
+                    ),
+                    RefKind::Branch => c.frame.repo_url.as_ref().and_then(|base| {
+                        c.remote_branches
+                            .contains(&r.name)
+                            .then(|| format!("{base}/tree/{}", r.name))
+                    }),
+                    RefKind::RemoteBranch => c.frame.repo_url.as_ref().map(|base| {
                         let branch = r.name.split_once('/').map_or(r.name.as_str(), |(_, b)| b);
-                        Some(format!("{base}/tree/{branch}"))
-                    }
-                });
+                        format!("{base}/tree/{branch}")
+                    }),
+                };
                 let clickable = badge_url.is_some();
                 // A GitHub repo where this ref simply isn't pushed: show it, but
                 // dimmed and unlinked, so it's clear it has no GitHub page yet.
@@ -186,9 +190,11 @@ pub fn build_msg(
         // The message links to the commit page on GitHub (Issue #12), but only
         // when the commit is on the remote — otherwise it's dimmed and the
         // tooltip says why, rather than linking to a page that would 404.
-        let msg_url = c.frame.repo_url.as_ref().and_then(|base| {
-            commit_on_remote.then(|| format!("{base}/commit/{}", gr.commit.id.0))
-        });
+        let msg_url = commit_github_url(
+            c.frame.repo_url.as_deref(),
+            commit_on_remote,
+            &gr.commit.id.0,
+        );
         let msg_clickable = msg_url.is_some();
         let msg_unpushed = c.frame.repo_url.is_some() && msg_url.is_none();
         let title = if msg_unpushed {
