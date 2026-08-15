@@ -16,13 +16,18 @@
 use leptos::*;
 
 use git_vista_core::diff::{CommitDiff, FileContent};
+use git_vista_core::virtualize::CumulativeHeights;
 use git_vista_protocol::diff::{DiffSpec, SpecDiff};
 use git_vista_protocol::{PatchPlan, PatchPreview, StageDirection, StagingDiff};
 
 use crate::api::{fetch_diff_full, fetch_file, fetch_spec_diff, staging_diff_request};
-use crate::detail::{accessible_rows_window, file_change_marker};
+// The row-height scale and overscan are the panel's constants, shared rather
+// than duplicated: two surfaces measuring the same rendered text with
+// different numbers is how a window and its scrollbar drift apart.
+use crate::detail::{accessible_rows_window, file_change_marker, DIFF_LINE_PX, DIFF_OVERSCAN};
 use crate::features::a11y::focus::GraphFocus;
-use crate::features::diff::rows::flatten;
+use crate::features::diff::core::{render_window, LineWrap};
+use crate::features::diff::rows::{flatten, row_heights};
 use crate::features::diff::selection::DiffSelection;
 use crate::features::diff::staging_view::staging_body;
 use crate::features::graph::core::RenderCtx;
@@ -77,6 +82,20 @@ pub fn viewer_view(
     // a *fresh* staging fetch starts (see the resource below), so reopening
     // — or switching Stage↔Unstage — never carries over a selection made
     // against a different, possibly now-stale, diff.
+    // Windowing state for the full-screen patch (#362). Created here, above
+    // the render closures, for the same reason as `hunk_focus`: a re-render
+    // must not reset the scroll position or throw away the measurement.
+    //
+    // `(scroll_top, client_height)` — the two inputs `render_window` needs,
+    // read off `.viewer-body` because that is the scrolling box here (the
+    // panel reads its own `.detail-diff-scroll`).
+    let viewer_scroll = create_rw_signal((0.0_f64, 0.0_f64));
+    // How many monospace cells fit across the viewer, measured rather than
+    // assumed (#362 step 3). Falls back to 80 until the container is laid
+    // out, which is what the estimate used to be — so a build that cannot
+    // measure degrades to the behaviour that shipped before, not to something
+    // new.
+    let viewer_columns = crate::features::diff::measure::install_columns_signal();
     let staging_selection = create_rw_signal(DiffSelection::new());
     let staging_preview = create_rw_signal(None::<Result<PatchPreview, String>>);
     // The exact plan `staging_preview` was built from (review finding,
@@ -144,7 +163,13 @@ pub fn viewer_view(
                     if !matches!(&which_for_body, ViewerDoc::Diff { id } if *id == d.id) {
                         return view! { <p class="detail-status">"Loading…"</p> }.into_view();
                     }
-                    diff_body(&d, nerd_icons.get(), hunk_focus)
+                    diff_body(
+                        &d,
+                        nerd_icons.get(),
+                        hunk_focus,
+                        viewer_scroll,
+                        viewer_columns,
+                    )
                 }
                 Some(DocResult::File(Ok(f))) => {
                     if !matches!(&which_for_body, ViewerDoc::File { id, path }
@@ -217,7 +242,25 @@ pub fn viewer_view(
                     // `accessible_rows_window`, and arrow keys then scroll this
                     // div natively instead of reaching `hunk_header_span`'s
                     // `on_keydown`.
-                    <div class="viewer-body" tabindex="-1">{body}</div>
+                    <div
+                        class="viewer-body"
+                        tabindex="-1"
+                        on:scroll=move |ev| {
+                            use wasm_bindgen::JsCast;
+                            if let Some(el) = ev.target()
+                                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                            {
+                                viewer_scroll.set(
+                                    (el.scroll_top() as f64, el.client_height() as f64),
+                                );
+                            }
+                            // Re-measure on scroll as well as on resize: the
+                            // first measurement happens before this container
+                            // exists, so without this the viewer would keep the
+                            // 80-column fallback until the window was resized.
+                            crate::features::diff::measure::remeasure(viewer_columns);
+                        }
+                    >{body}</div>
                 </div>
             }
         })
@@ -293,7 +336,13 @@ fn spec_body(d: &SpecDiff, hunk_focus: RwSignal<GraphFocus>) -> View {
 /// The full-diff document: the per-file stat list, then the whole unified
 /// patch coloured line by line — the detail panel's Changes section, at
 /// full-screen scale and without the panel's patch cap.
-fn diff_body(d: &CommitDiff, nerd: bool, hunk_focus: RwSignal<GraphFocus>) -> View {
+fn diff_body(
+    d: &CommitDiff,
+    nerd: bool,
+    hunk_focus: RwSignal<GraphFocus>,
+    scroll: RwSignal<(f64, f64)>,
+    columns: RwSignal<usize>,
+) -> View {
     let ic = icon_set(nerd);
     let (adds, dels) = d.totals();
     let files = d
@@ -324,13 +373,36 @@ fn diff_body(d: &CommitDiff, nerd: bool, hunk_focus: RwSignal<GraphFocus>) -> Vi
         .collect_view();
     // Same accessible flat rendering as the detail panel (M2.16e, #210),
     // under its own scope so DOM focus queries can't cross surfaces.
-    let patch = accessible_rows_window(
-        &flatten(&parse_unified_diff(&d.patch)),
-        hunk_focus,
-        "viewer",
-        None,
-        None,
-    );
+    // Parsed and flattened ONCE, not per scroll tick: `Rc` so the closure
+    // below can hold it without re-parsing a five-megabyte patch every time
+    // the user drags the scrollbar.
+    let flat = std::rc::Rc::new(flatten(&parse_unified_diff(&d.patch)));
+    let patch = move || {
+        let (top, viewport) = scroll.get();
+        let cols = columns.get();
+        let heights = CumulativeHeights::new(&row_heights(
+            &flat.rows,
+            DIFF_LINE_PX,
+            // The viewer WRAPS (`.viewer-pre` is `pre-wrap`), unlike the panel.
+            // `row_heights` models word wrapping at this column count (#362
+            // step 2), and the count is measured rather than guessed (step 3).
+            LineWrap::Wrapped { columns: cols },
+        ));
+        // Before the first scroll event the box has not been measured; fall
+        // back to a viewport tall enough that the first paint is never short
+        // of content. Same fallback the panel uses, same reason.
+        let viewport = if viewport > 0.0 { viewport } else { 800.0 };
+        let w = render_window(&heights, viewport, top, DIFF_OVERSCAN);
+        view! {
+            <div style=format!("height:{}px", w.pad_top)></div>
+            <pre class="detail-diff viewer-pre">
+                {accessible_rows_window(
+                    &flat, hunk_focus, "viewer", Some(w.start..w.end), None,
+                )}
+            </pre>
+            <div style=format!("height:{}px", w.pad_bottom)></div>
+        }
+    };
     let truncated_note = d.truncated.then(|| {
         view! {
             <p class="detail-status">
@@ -351,34 +423,22 @@ fn diff_body(d: &CommitDiff, nerd: bool, hunk_focus: RwSignal<GraphFocus>) -> Vi
         </div>
         {files}
         {truncated_note}
-        // NOT windowed, unlike the panel (M2.16g, #350) — tracked on #362.
+        // WINDOWED as of #362. The panel was windowed by #350; this surface
+        // was deferred, and the deferral outlived its tracking issue.
         //
-        // `.viewer-pre` is `white-space: pre-wrap` with `word-break:
-        // break-word`, so a long line wraps and its height depends on its own
-        // length *and* the container's width. The panel, which does not wrap,
-        // has no such ambiguity and is windowed today.
-        //
-        // This comment used to say the blocker was "the column count it needs
-        // is an estimate this file cannot measure without a layout read." That
-        // understates one problem and overstates the other. Measuring width is
-        // *not* blocked: `get_bounding_client_rect` is already used in this
-        // codebase (`gestures.rs:82`, `:308`), and `features::shell::signals`'s
-        // `install_mode_signal` is a shipped precedent for keeping such a
-        // measurement current through a debounced resize listener.
-        //
-        // The real problem is that `row_heights`' `ceil(chars / columns)` is a
-        // *character*-wrap model, while this CSS wraps at *word* boundaries. A
-        // perfectly measured column count still would not track real rendered
-        // row counts on code text. And unlike the panel's `DIFF_LINE_PX` — one
-        // global scale factor whose error stays proportional — this arithmetic
-        // is quantized per line: a columns estimate off by two flips a 79-char
-        // line between one row and two. `LineWrap::Wrapped`'s own "good enough
-        // for windowing" doc claim is inherited from the panel's situation and
-        // does not hold here.
-        //
-        // Whether windowing the viewer is needed at all is also unmeasured —
-        // see #362, which puts measuring it first.
-        <pre class="detail-diff viewer-pre">{patch}</pre>
+        // What unblocked it, in order:
+        //   1. MEASURED first (#362 step 1). A 4000-line patch renders in
+        //      590ms unwindowed — fine. But the slope projects ~11s and
+        //      ~246k DOM nodes at the 5MB cap, past the budget. The old
+        //      argument ("the cap is 25x the panel's") was never measured.
+        //   2. `row_heights` now models WORD wrapping, matching this
+        //      element's `pre-wrap` + `break-word`, instead of
+        //      `ceil(chars/columns)`. Verified against Chromium, which is
+        //      what caught East Asian Wide characters being counted as one
+        //      cell instead of two.
+        //   3. The column count is measured off this container rather than
+        //      estimated (`features::diff::measure`).
+        {patch}
     }
     .into_view()
 }
