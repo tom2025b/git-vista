@@ -121,6 +121,15 @@ pub struct HistoryUiSignals {
     pub phase: RwSignal<HistoryPhase>,
     pub complete: RwSignal<bool>,
     pub print_open: RwSignal<bool>,
+    /// #382: how many WIP runs the current projection holds, published UP by
+    /// the canvas so the topbar can say so.
+    ///
+    /// Without it the topbar can only report the toggle's position, and a
+    /// graph whose runs sit thirty commits below the viewport is
+    /// indistinguishable from a graph with none — which is exactly how a
+    /// working feature got reported as broken. Zero is informative too: it
+    /// means this repository genuinely has no runs, not that they are hiding.
+    pub wip_runs: RwSignal<usize>,
     /// #217: the `worktree_id` of the repository whose history the user has
     /// already driven to completeness — `None` until that first happens.
     /// Unlike `complete` and `print_open` it is deliberately left out of the
@@ -235,11 +244,13 @@ pub fn App() -> impl IntoView {
     // completeness, then that repository's own `worktree_id` — see the field
     // doc on `HistoryUiSignals` for why an id and not a bool.
     let want_full_history = create_rw_signal(None::<String>);
+    let wip_runs = create_rw_signal(0usize);
     let history_ui = HistoryUiSignals {
         phase: history_phase,
         complete: history_complete,
         print_open: print_graph_open,
         want_full_history,
+        wip_runs,
     };
 
     // Frame + page 1, keyed on the epoch. `create_local_resource` because the
@@ -744,7 +755,20 @@ pub fn App() -> impl IntoView {
                            commits aren't buried under checkpoint noise. Turn off to see \
                            every checkpoint."
                 >
-                    {move || if collapse_wip.get() { "WIP: folded" } else { "WIP: shown" }}
+                    {move || {
+                        // #382: the toggle alone cannot answer "are there runs
+                        // here at all", and a graph whose runs sit thirty
+                        // commits below the fold looks exactly like a graph
+                        // with none — which is how a working feature got
+                        // reported as broken. Zero is informative too.
+                        let n = wip_runs.get();
+                        match (collapse_wip.get(), n) {
+                            (true, 0) => "WIP: folded · no runs".to_string(),
+                            (true, 1) => "WIP: folded · 1 run".to_string(),
+                            (true, n) => format!("WIP: folded · {n} runs"),
+                            (false, _) => "WIP: shown".to_string(),
+                        }
+                    }}
                 </button>
                 <button
                     class="refresh"

@@ -239,10 +239,16 @@ pub(super) fn graph_canvas(
         let projected = ctx
             .with_value(|c| collapse::project(&c.loaded.rows, &c.loaded.edges, enabled, &expanded));
         let count = projected.items.len();
+        let runs = projected.wip_run_count();
         // The value goes in before either signal: both writes below drive the
         // `visible` memo and the `<For>` `each=` closures to re-run within
         // this same call, and every builder reads `display` untracked at that
         // moment.
+        // Published from inside the projection effect, before the batch
+        // below: any other site would be describing a projection other than
+        // the one about to render, and a count that disagrees with the graph
+        // is worse than no count.
+        history_ui.wip_runs.set(runs);
         display.set_value(projected);
         // Batched so that rebuild sees one consistent state. Un-batched, the
         // epoch bump flushes first, against the *old* `row_count` — building

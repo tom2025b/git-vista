@@ -121,4 +121,26 @@ test.describe('#374 WIP-checkpoint collapsing', () => {
     )
     expect(survivors).toBe(3)
   })
+
+  // #382: a graph whose runs sit below the viewport is indistinguishable from
+  // a graph with none — the failure that got a working feature reported as
+  // broken. The topbar must say how many exist, and say it CORRECTLY: the
+  // fixture seeds exactly one run, so "1 run" is the only right answer and a
+  // hardcoded string would fail the zero case below.
+  test('the topbar reports how many WIP runs the graph holds', async ({ page }) => {
+    await openApp(page)
+    const toggle = page.getByRole('button', { name: /^WIP:/ })
+    await expect(toggle).toContainText('folded')
+    await expect(toggle).toContainText('1 run')
+  })
+
+  test('the count says nothing is hidden when the toggle is off', async ({ page }) => {
+    await openApp(page)
+    await page.getByRole('button', { name: /^WIP:/ }).click()
+    const toggle = page.getByRole('button', { name: /^WIP:/ })
+    await expect(toggle).toContainText('shown')
+    // with collapsing off nothing is being hidden, so a count of hidden runs
+    // would be a claim about nothing
+    await expect(toggle).not.toContainText('run')
+  })
 })
