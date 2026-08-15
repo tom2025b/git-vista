@@ -218,31 +218,12 @@ pub enum LineWrap {
     Wrapped { columns: usize },
 }
 
-/// Per-line heights for a patch, ready to hand to [`CumulativeHeights::new`].
-///
-/// Counts **characters, not bytes**, for the wrapped case: a patch carrying
-/// non-ASCII text would otherwise over-estimate its own height and leave a
-/// visible gap at the bottom of the scroll range.
-///
-/// [`CumulativeHeights::new`]: git_vista_core::virtualize::CumulativeHeights::new
-pub fn line_heights(patch: &str, line_height: f64, wrap: LineWrap) -> Vec<f64> {
-    patch
-        .lines()
-        .map(|line| match wrap {
-            LineWrap::Never => line_height,
-            LineWrap::Wrapped { columns } => {
-                if columns == 0 {
-                    // A zero-width container is not a real layout; treat it
-                    // as one row rather than dividing by zero.
-                    return line_height;
-                }
-                let chars = line.chars().count().max(1);
-                let rows = chars.div_ceil(columns);
-                rows as f64 * line_height
-            }
-        })
-        .collect()
-}
+// `line_heights` lived here and measured raw patch text. #361 replaced it with
+// `rows::row_heights`, which measures the DiffRows the renderer actually draws
+// — the two coordinate spaces the rest of this module keeps apart. It survived
+// the migration only because its own tests still called it, which is precisely
+// the shape the reachability census exists to catch: a function kept alive by
+// nothing but the proof that it works.
 
 /// The slice of a patch to actually render, plus the spacer heights that keep
 /// the scrollbar honest about the un-rendered remainder.
@@ -865,44 +846,11 @@ diff --git a/bar.txt b/bar.txt
 
     const LH: f64 = 20.0;
 
-    #[test]
-    fn a_non_wrapping_surface_gives_every_line_one_row() {
-        let patch = "short\na much longer line than the others\nx";
-        let h = line_heights(patch, LH, LineWrap::Never);
-        assert_eq!(h, vec![LH, LH, LH]);
-    }
-
-    #[test]
-    fn a_wrapping_surface_charges_long_lines_for_the_rows_they_take() {
-        // 10 columns: 5 chars = 1 row, 25 chars = 3 rows, 20 chars = 2 rows.
-        let patch = format!("{}\n{}\n{}", "x".repeat(5), "y".repeat(25), "z".repeat(20));
-        let h = line_heights(&patch, LH, LineWrap::Wrapped { columns: 10 });
-        assert_eq!(h, vec![LH, 3.0 * LH, 2.0 * LH]);
-    }
-
-    #[test]
-    fn an_empty_line_still_occupies_one_row_when_wrapping() {
-        // A blank line is a real row on screen; charging it zero height
-        // would make every offset below it wrong.
-        let h = line_heights("\n\n", LH, LineWrap::Wrapped { columns: 10 });
-        assert_eq!(h, vec![LH, LH]);
-    }
-
-    #[test]
-    fn wrapping_counts_characters_not_bytes() {
-        // 10 non-ASCII characters (3 bytes each in UTF-8) must be one row at
-        // 10 columns, not three — byte-counting would over-estimate the
-        // height and leave a gap at the end of the scroll range.
-        let line = "\u{4e2d}".repeat(10);
-        let h = line_heights(&line, LH, LineWrap::Wrapped { columns: 10 });
-        assert_eq!(h, vec![LH], "counted bytes instead of characters");
-    }
-
-    #[test]
-    fn a_zero_width_container_does_not_divide_by_zero() {
-        let h = line_heights("abc", LH, LineWrap::Wrapped { columns: 0 });
-        assert_eq!(h, vec![LH]);
-    }
+    // The five height-measurement tests that lived here moved with the code
+    // they were testing: `rows::row_heights` now owns per-row measurement, and
+    // its test module carries the non-wrapping, long-line, empty-line,
+    // chars-not-bytes and zero-width cases. They are not lost, and none of
+    // them were deleted without an equivalent landing first.
 
     #[test]
     fn the_window_renders_a_slice_and_pads_the_rest_to_full_height() {
@@ -1108,12 +1056,36 @@ diff --git a/bar.txt b/bar.txt
     /// scrolling to the very top would let a broken implementation that
     /// always returns index 0 pass unnoticed; a real mid-scroll query
     /// exercises the binary search `visible_range` actually does.
+    /// Per-line heights for a raw generated patch — a fixture for the
+    /// virtualization ladder below, not production measurement.
+    ///
+    /// Production measures ROWS (`rows::row_heights`), because the renderer
+    /// draws rows. The ladder deliberately keeps measuring raw lines: it is
+    /// timing `CumulativeHeights` and `visible_range` over N entries, and
+    /// routing it through the parser would fold parse cost into a number that
+    /// is supposed to isolate the binary search.
+    fn ladder_heights(patch: &str, line_height: f64, wrap: LineWrap) -> Vec<f64> {
+        patch
+            .lines()
+            .map(|line| match wrap {
+                LineWrap::Never => line_height,
+                LineWrap::Wrapped { columns } => {
+                    if columns == 0 {
+                        return line_height;
+                    }
+                    let chars = line.chars().count().max(1);
+                    chars.div_ceil(columns) as f64 * line_height
+                }
+            })
+            .collect()
+    }
+
     fn time_virtualize(
         num_lines: usize,
         wrap: LineWrap,
     ) -> (std::time::Duration, std::time::Duration, usize) {
         let patch = generate_diff_lines(num_lines);
-        let heights_vec = line_heights(&patch, LADDER_LINE_PX, wrap);
+        let heights_vec = ladder_heights(&patch, LADDER_LINE_PX, wrap);
         assert_eq!(
             heights_vec.len(),
             num_lines,

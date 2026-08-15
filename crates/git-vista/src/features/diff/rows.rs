@@ -63,24 +63,14 @@ pub enum DiffRow {
     Note { file_index: usize, text: String },
 }
 
-impl DiffRow {
-    /// The hunk this row belongs to, if any. `None` for file headers and
-    /// notes — the rows a hunk-wise reader skips over.
-    pub fn hunk_ordinal(&self) -> Option<usize> {
-        match self {
-            DiffRow::HunkHeader { hunk_ordinal, .. } | DiffRow::Line { hunk_ordinal, .. } => {
-                Some(*hunk_ordinal)
-            }
-            DiffRow::FileHeader { .. } | DiffRow::Note { .. } => None,
-        }
-    }
-
-    /// True for rows [`GraphFocus`] can land on — the navigable hunk headers,
-    /// and nothing else.
-    pub fn is_nav_stop(&self) -> bool {
-        matches!(self, DiffRow::HunkHeader { .. })
-    }
-}
+// `hunk_ordinal()` and `is_nav_stop()` were declared here and never reached
+// production: `accessible_rows_window` matches the enum directly, which is
+// shorter at the call site and exhaustive-checked by the compiler.
+// `is_nav_stop` had two callers, both assertions in this file's own tests —
+// the shape the reachability census exists to reject, since a function proved
+// correct by tests nothing else calls is scaffolding wearing a proof. The
+// invariant those tests assert (a combined merge diff is never navigable) is
+// real and still asserted, now against the enum directly.
 
 impl DiffRow {
     /// The text this row actually renders — what a width measurement must
@@ -442,7 +432,10 @@ mod tests {
             .rows
             .iter()
             .any(|r| matches!(r, DiffRow::Note { text, .. } if text.contains("binary"))));
-        assert!(!flat.rows.iter().any(DiffRow::is_nav_stop));
+        assert!(!flat
+            .rows
+            .iter()
+            .any(|r| matches!(r, DiffRow::HunkHeader { .. })));
     }
 
     #[test]
@@ -500,7 +493,10 @@ mod tests {
         };
         let flat = flatten(&patch);
         assert_eq!(flat.hunk_count, 0, "a combined diff has no navigable hunk");
-        assert!(!flat.rows.iter().any(DiffRow::is_nav_stop));
+        assert!(!flat
+            .rows
+            .iter()
+            .any(|r| matches!(r, DiffRow::HunkHeader { .. })));
         // …but its content is still rendered, one row per line, so
         // virtualization still bounds it.
         assert!(flat.rows.len() >= 4, "{:?}", flat.rows);
@@ -728,6 +724,33 @@ mod tests {
             std::slice::from_ref(body),
             10.0,
             LineWrap::Wrapped { columns: 10 },
+        );
+        assert_eq!(heights, vec![10.0]);
+    }
+
+    #[test]
+    fn an_empty_line_still_occupies_one_row_when_wrapping() {
+        // A blank context line has no text of its own, but it still draws a
+        // row. Measuring it as zero would let the scroll range fall short of
+        // the rendered patch by one row per blank line — and a diff of prose
+        // is mostly blank lines. `.max(1)` in row_heights is what prevents it;
+        // this is the test that fails if that guard is ever removed.
+        let patch = ParsedPatch {
+            files: vec![hunks_file(
+                "a.rs",
+                vec![hunk(1, vec![line(LineKind::Context, "")])],
+            )],
+        };
+        let flat = flatten(&patch);
+        let body = flat
+            .rows
+            .iter()
+            .find(|r| matches!(r, DiffRow::Line { .. }))
+            .unwrap();
+        let heights = row_heights(
+            std::slice::from_ref(body),
+            10.0,
+            LineWrap::Wrapped { columns: 80 },
         );
         assert_eq!(heights, vec![10.0]);
     }
