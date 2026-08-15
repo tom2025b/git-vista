@@ -655,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn a_body_line_is_measured_WITH_its_marker_column() {
+    fn a_body_line_is_measured_including_its_marker_column() {
         // The parser strips the leading '+'/'-'/' ' from `text`, but that
         // character still occupies a column on screen. Measuring without it
         // under-counts every added and removed line by one, and a patch
