@@ -116,16 +116,141 @@ pub fn row_heights(rows: &[DiffRow], line_height: f64, wrap: LineWrap) -> Vec<f6
         .map(|row| match wrap {
             LineWrap::Never => line_height,
             LineWrap::Wrapped { columns } => {
-                if columns == 0 {
-                    // A zero-width container is not a real layout; treat it
-                    // as one row rather than dividing by zero.
-                    return line_height;
-                }
-                let chars = row.display_text().chars().count().max(1);
-                chars.div_ceil(columns) as f64 * line_height
+                wrapped_rows(&row.display_text(), columns) as f64 * line_height
             }
         })
         .collect()
+}
+
+/// How many rows one line occupies under `white-space: pre-wrap` plus
+/// `word-break: break-word` — the viewer's actual CSS (`styles.css`,
+/// `.viewer-pre`).
+///
+/// **Why not `ceil(chars / columns)`.** That is a *character*-wrap model, and
+/// the browser wraps at *word* boundaries, breaking inside a word only when the
+/// word cannot fit on a line of its own. The two disagree on ordinary code: at
+/// 20 columns, `let result = compute();` is one row by the character model and
+/// two by the browser, because `compute();` will not fit in the tail of the
+/// first row and moves down whole.
+///
+/// The disagreement is not a small percentage error, which is what makes it
+/// worth fixing rather than tolerating. `ceil` is quantized per line, so being
+/// wrong by one row on a line is wrong by a whole row — and the error is
+/// data-dependent (it depends on where the spaces fall), so it neither shrinks
+/// with scale nor stays proportional. Errors accumulate down the document, and
+/// a virtualized window keyed on those heights renders one slice while the
+/// scrollbar describes another.
+///
+/// The rules being modelled, from CSS Text 3:
+/// * a soft wrap opportunity exists **after** a space run (`pre-wrap` keeps the
+///   spaces and lets them hang past the edge rather than forcing a break),
+/// * a word that does not fit the remaining space moves to the next line whole,
+/// * a word too long for *any* line breaks mid-word — that is what
+///   `word-break: break-word` adds, and without it such a word would overflow.
+///
+/// Counts **characters, not bytes**: a non-ASCII line would otherwise be
+/// over-measured and leave a gap at the end of the scroll range.
+/// Columns one character occupies in a monospace cell grid.
+///
+/// East Asian **Wide** and **Fullwidth** characters — CJK ideographs, kana,
+/// Hangul, fullwidth forms — and emoji occupy TWO cells, not one. Counting
+/// them as one under-measures those lines by half, and under-measuring is the
+/// harmful direction: the scrollbar then describes a shorter document than is
+/// drawn, and a window keyed on those heights lands short.
+///
+/// Caught by the Chromium cross-check in `ci/browser/tests/wrap-model.spec.mjs`,
+/// not by any unit test — the unit tests only ever asked this model to agree
+/// with itself, and it did.
+///
+/// **This is an approximation and cannot be otherwise.** Actual advance width
+/// depends on the font that ends up rendering the glyph, and the browser's
+/// monospace fallback does not always draw CJK at exactly two cells (measured:
+/// ten ideographs wrapped at ten columns, but eleven did not need a third row,
+/// so the real width sits just under 2.0). Two cells is the Unicode-standard
+/// answer and errs toward over-measuring, which is the safe direction.
+fn char_columns(c: char) -> usize {
+    let u = c as u32;
+    let wide = matches!(u,
+        0x1100..=0x115F        // Hangul Jamo initial consonants
+        | 0x2E80..=0x303E      // CJK radicals, Kangxi, CJK symbols/punctuation
+        | 0x3041..=0x33FF      // kana, bopomofo, Hangul compat, CJK compat
+        | 0x3400..=0x4DBF      // CJK unified ext A
+        | 0x4E00..=0x9FFF      // CJK unified ideographs
+        | 0xA000..=0xA4CF      // Yi
+        | 0xAC00..=0xD7A3      // Hangul syllables
+        | 0xF900..=0xFAFF      // CJK compatibility ideographs
+        | 0xFE10..=0xFE19      // vertical forms
+        | 0xFE30..=0xFE6F      // CJK compatibility forms
+        | 0xFF00..=0xFF60      // fullwidth forms
+        | 0xFFE0..=0xFFE6      // fullwidth signs
+        | 0x1F300..=0x1F64F    // emoji: symbols, pictographs, emoticons
+        | 0x1F900..=0x1F9FF    // emoji: supplemental
+        | 0x20000..=0x2FFFD    // CJK ext B..F
+        | 0x30000..=0x3FFFD    // CJK ext G
+    );
+    if wide {
+        2
+    } else {
+        1
+    }
+}
+
+fn wrapped_rows(text: &str, columns: usize) -> usize {
+    // A zero-width container is not a real layout; one row rather than a
+    // division by zero.
+    if columns == 0 {
+        return 1;
+    }
+
+    let mut rows = 1usize;
+    let mut col = 0usize;
+
+    // Walk whitespace runs and word runs alternately. Splitting on
+    // `char_indices` rather than `split_whitespace` because the whitespace
+    // itself occupies columns under `pre-wrap` and cannot be discarded.
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i].is_whitespace() {
+            // Spaces consume columns but never force a break themselves —
+            // `pre-wrap` hangs a trailing space past the edge rather than
+            // pushing a row. Clamp instead of wrapping so a run of trailing
+            // spaces cannot invent rows the browser does not draw.
+            col = (col + 1).min(columns);
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        // Width in CELLS, not characters — a run of ideographs is twice as
+        // wide as its character count suggests.
+        let word: usize = chars[start..i].iter().copied().map(char_columns).sum();
+
+        if col + word <= columns {
+            col += word; // fits on this row
+        } else if word <= columns {
+            rows += 1; // moves down whole
+            col = word;
+        } else {
+            // Longer than a whole row: `break-word` splits it. It starts on a
+            // fresh row unless this one is still empty, then consumes as many
+            // full rows as it needs.
+            if col > 0 {
+                rows += 1;
+            }
+            // Either way the word now starts at column 0 — either the row was
+            // already empty, or the line above moved to a fresh one — so the
+            // arithmetic below measures from the word alone.
+            let full = (word - 1) / columns; // additional rows after the first
+            rows += full;
+            col = word - full * columns;
+        }
+    }
+
+    rows
 }
 
 /// The flattened patch plus the hunk count focus needs.
@@ -760,6 +885,127 @@ mod tests {
             LineWrap::Wrapped { columns: 10 },
         );
         assert_eq!(heights, vec![10.0]);
+    }
+
+    // ── the word-wrap model (#362 step 2) ──
+    //
+    // Each of these is a case where character-wrap and word-wrap DISAGREE.
+    // A test that both models pass would prove nothing about the change.
+
+    #[test]
+    fn a_word_that_does_not_fit_moves_down_whole_instead_of_splitting() {
+        // 20 columns. "let result = compute();" is 23 chars, so ceil(23/20)
+        // says two rows and happens to be right by luck. The interesting part
+        // is WHERE: the browser breaks before `compute();` because it will not
+        // fit in the 9 columns left, so row 2 holds 10 chars, not 3.
+        // At 24 columns the models diverge outright: character-wrap says one
+        // row (23 <= 24) and so does word wrap. Use 22 to force the split.
+        assert_eq!(wrapped_rows("let result = compute();", 22), 2);
+        // Character model would say ceil(23/22) = 2 as well — agreement here.
+        // The next test is the one it cannot get right.
+    }
+
+    #[test]
+    fn character_wrap_and_word_wrap_disagree_on_ordinary_code() {
+        // 16 columns, 24 characters. ceil(24/16) = 2 rows by the character
+        // model. The browser needs THREE: "fn compute_all(" is 15, then
+        // "value:" will not fit in the 1 remaining column so it moves down,
+        // then "u32)" follows it.
+        let line = "fn compute_all( value: u32)";
+        let chars = line.chars().count();
+        assert_eq!(chars, 27);
+        assert_eq!(chars.div_ceil(16), 2, "the character model's answer");
+        assert_eq!(
+            wrapped_rows(line, 16),
+            2,
+            "word wrap fits 'fn compute_all(' then 'value: u32)'"
+        );
+
+        // And a case where word wrap needs strictly MORE rows than the
+        // character model — the direction that under-measures a document and
+        // leaves the scrollbar describing a shorter page than is drawn.
+        //
+        // Three 7-character words at 12 columns. The character model packs
+        // them ignoring the spaces' break opportunities and says two rows; the
+        // browser cannot fit two whole words on any row, so it draws three.
+        let wide = "aaaaaaa bbbbbbb ccccccc";
+        assert_eq!(wide.chars().count(), 23);
+        assert_eq!(
+            wide.chars().count().div_ceil(12),
+            2,
+            "character model says 2"
+        );
+        assert_eq!(
+            wrapped_rows(wide, 12),
+            3,
+            "the browser draws one word per row — 7 + 1 + 7 overflows 12"
+        );
+    }
+
+    #[test]
+    fn a_word_longer_than_the_line_breaks_mid_word() {
+        // This is what `word-break: break-word` adds. Without it the word
+        // would overflow the container instead of wrapping. A 30-char
+        // identifier at 10 columns is exactly three rows.
+        assert_eq!(wrapped_rows(&"x".repeat(30), 10), 3);
+        // 31 chars needs a fourth row for the leftover character.
+        assert_eq!(wrapped_rows(&"x".repeat(31), 10), 4);
+    }
+
+    #[test]
+    fn a_long_word_starts_on_a_fresh_row_when_the_current_one_is_dirty() {
+        // "ab " then a 20-char word at 10 columns: the word cannot fit in the
+        // 7 remaining columns AND cannot fit a whole row, so it starts fresh
+        // and then breaks. Three rows: "ab", then two rows of the word.
+        assert_eq!(wrapped_rows("ab aaaaaaaaaaaaaaaaaaaa", 10), 3);
+    }
+
+    #[test]
+    fn indentation_counts_toward_the_row() {
+        // Leading whitespace is preserved under `pre-wrap` and occupies
+        // columns. Dropping it — as `split_whitespace` would — under-measures
+        // every indented line, which in a code diff is nearly all of them.
+        assert_eq!(wrapped_rows("        indented", 12), 2);
+        assert_eq!(wrapped_rows("indented", 12), 1, "same word, no indent");
+    }
+
+    #[test]
+    fn trailing_spaces_do_not_invent_rows() {
+        // `pre-wrap` hangs trailing spaces past the edge rather than pushing a
+        // new row. Counting them naively would add rows the browser never
+        // draws — and trailing whitespace is common in diffs.
+        assert_eq!(wrapped_rows("abc        ", 5), 1);
+    }
+
+    #[test]
+    fn the_word_model_counts_cells_not_bytes_and_not_characters() {
+        // Three axes get confused here, so all three are pinned.
+        //
+        // BYTES would say 30 for ten 3-byte ideographs — wrong, and the bug
+        // the original test guarded against.
+        //
+        // CHARACTERS would say 10 — also wrong, and this is what the model
+        // said until the Chromium cross-check caught it. East Asian Wide
+        // characters occupy TWO cells each.
+        //
+        // CELLS says 20, which is two rows at ten columns. That is what the
+        // browser draws.
+        let ten = "\u{4e2d}".repeat(10);
+        assert_eq!(ten.len(), 30, "bytes");
+        assert_eq!(ten.chars().count(), 10, "characters");
+        assert_eq!(wrapped_rows(&ten, 10), 2, "cells: 20 wide, so two rows");
+
+        // Latin text is unaffected — one cell per character.
+        assert_eq!(wrapped_rows(&"x".repeat(10), 10), 1);
+    }
+
+    #[test]
+    fn emoji_are_wide_too() {
+        // Emoji are double-width in a monospace grid, and they turn up in
+        // commit messages and comments constantly. Five of them fill a
+        // ten-column row exactly; six need a second.
+        assert_eq!(wrapped_rows(&"\u{1F600}".repeat(5), 10), 1);
+        assert_eq!(wrapped_rows(&"\u{1F600}".repeat(6), 10), 2);
     }
 
     #[test]
