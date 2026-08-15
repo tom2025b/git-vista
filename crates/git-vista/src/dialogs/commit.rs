@@ -262,6 +262,18 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
             // and because `PreflightKnowledge` is tip-scoped, the moment the
             // dialog retargets, a confirmation given for the previous commit
             // stops counting whether this read lands or not.
+            //
+            // The raw `record_amend_detail`, not the guarded
+            // `Dialogs::apply_amend_detail` the menu's opener must use, and the
+            // difference is the `open_commit_dialog` two statements up: this
+            // path retargets the dialog and records the answer with **no
+            // `await` between them**, so the target and the knowledge cannot
+            // disagree. That is the proof of currency the menu's opener has no
+            // way to make — its callback resumes after an `await`, by which
+            // point the dialog may be pointed somewhere else entirely. Insert
+            // an `await` anywhere between here and the retarget above and this
+            // reasoning is void: route through `apply_amend_detail` instead,
+            // and see `features::dialogs::commit::detail_read_use`.
             dialogs.record_amend_detail(&new_tip, detail.on_remote);
             let seeded = dialogs.seed_amend_msg(&detail.message);
             dialogs.set_amend_phase(stale(Recheck::Retargeted {
