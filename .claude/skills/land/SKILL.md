@@ -27,7 +27,7 @@ This ritual was proven across ~10 merges on 2026-08-05.
 5. Any failing check: STOP and report. Never merge around a red gate.
 6. `gh pr merge <n> --merge --subject "<conventional title> (#<n>)"` —
    avoid a bare `(#NNN)` for any issue that must stay open.
-7. Refresh the app mirror: `git -C ~/projects/git-vista-mirror pull --ff-only`
+7. Refresh the app mirror: `git -C ~/projects/gv/mirror pull --ff-only`
    (the owner's big-screen view reads it).
 8. If a tracked PDF conflicted anywhere: re-render from the merged .md with
    render-md-pdf; never side-pick a binary.

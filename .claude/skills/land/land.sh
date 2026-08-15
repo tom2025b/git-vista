@@ -31,5 +31,5 @@ land() {
 }
 land 322 fix/316-error-surfacing "fix(#316): errors as words in the app's modal, never wire JSON in an alert() (#322)" || exit 1
 git checkout -q main && git pull -q --ff-only origin main
-git -C ~/projects/git-vista-mirror pull -q --ff-only && echo "mirror refreshed"
+git -C ~/projects/gv/mirror pull -q --ff-only && echo "mirror refreshed"
 echo "=== BOTH LANDED ==="
