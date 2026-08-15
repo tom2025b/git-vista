@@ -16,6 +16,7 @@ use leptos::*;
 use wasm_bindgen::JsCast;
 
 use git_vista_core::status::ChangeKind;
+use git_vista_protocol::diff::LineKind;
 
 use crate::api::fetch_diff;
 use crate::datetime::local_timestamp;
@@ -23,6 +24,7 @@ use crate::features::a11y::focus::{FocusMove, GraphFocus};
 use crate::features::diff::core::{
     hunk_nav, line_heights, render_window, scroll_to_reveal, LineWrap,
 };
+use crate::features::diff::rows::{DiffRow, DiffRows};
 use git_vista_core::virtualize::CumulativeHeights;
 
 /// One rendered diff line's height in CSS pixels: `.detail-diff`'s
@@ -185,6 +187,112 @@ pub(crate) fn accessible_patch_window(
                 }
                 .into_view(),
                 None => view! { <span class=class>{text}</span> }.into_view(),
+            }
+        })
+        .collect_view()
+}
+
+/// [`accessible_patch_window`], driven by a structured [`DiffRows`] rather
+/// than a raw-text walk (#361).
+///
+/// **Two coordinates, and they are not interchangeable.** `window` indexes
+/// ROWS — what virtualization slices and `row_heights` measures. The focus
+/// model is told the HUNK count, globally across files, because that is what
+/// "hunk 3 of 40" means and what #210's roving tabindex ranges over. Handing
+/// focus a row count would make every body line a tab stop; handing it a
+/// windowed count would renumber hunks as the user scrolls, which is the
+/// regression #350 warns about.
+///
+/// Note that a header row keeps its **global** hunk ordinal regardless of the
+/// window, so the label a screen reader speaks is stable while scrolling.
+pub(crate) fn accessible_rows_window(
+    rows: &DiffRows,
+    focus: RwSignal<GraphFocus>,
+    scope: &'static str,
+    window: Option<std::ops::Range<usize>>,
+    reveal: Option<Callback<usize>>,
+) -> View {
+    // `update_untracked`: this runs while a render closure is already
+    // executing; the tabindex closures created below read the fresh count
+    // when they first run, so nothing needs the notification.
+    focus.update_untracked(|f| f.set_row_count(rows.hunk_count));
+    let range = window.unwrap_or(0..usize::MAX);
+    rows.rows
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| range.contains(i))
+        .map(|(_, row)| match row {
+            DiffRow::HunkHeader {
+                hunk_ordinal,
+                label,
+                text,
+                ..
+            } => hunk_header_span(
+                "diff-hunk",
+                format!("{text}\n"),
+                *hunk_ordinal,
+                label.clone(),
+                focus,
+                scope,
+                reveal,
+            ),
+            DiffRow::FileHeader { title, .. } => {
+                let text = format!("{title}\n");
+                view! { <span class="diff-meta">{text}</span> }.into_view()
+            }
+            // Notes cover binary, mode-change, rename — and a combined
+            // diff's raw text, whose `@@@` headers must stay header-coloured
+            // but INERT, never wearing .diff-hunk's interactive styling (44px
+            // band, pointer cursor) and looking tappable.
+            DiffRow::Note { text, .. } => {
+                let class = if text.starts_with("@@") {
+                    "diff-hunk-combined"
+                } else {
+                    "diff-meta"
+                };
+                let text = format!("{text}\n");
+                view! { <span class=class>{text}</span> }.into_view()
+            }
+            DiffRow::Line {
+                kind,
+                text,
+                no_newline_at_eof,
+                ..
+            } => {
+                // The marker is restored here, not carried in `text`: the
+                // parser strips it, and the rendered patch must remain
+                // byte-identical to what git printed so a copied selection
+                // still applies.
+                let marker = match kind {
+                    LineKind::Added => '+',
+                    LineKind::Removed => '-',
+                    LineKind::Context => ' ',
+                };
+                let body = if *no_newline_at_eof {
+                    format!("{marker}{text}\n\\ No newline at end of file\n")
+                } else {
+                    format!("{marker}{text}\n")
+                };
+                match kind {
+                    // The sr-only prefix is position:absolute and
+                    // user-select:none, so the visible layout inside the
+                    // <pre> — and a copied patch — is byte-identical.
+                    LineKind::Added => view! {
+                        <span class="diff-add">
+                            <span class="sr-only">"added line: "</span>
+                            {body}
+                        </span>
+                    }
+                    .into_view(),
+                    LineKind::Removed => view! {
+                        <span class="diff-del">
+                            <span class="sr-only">"removed line: "</span>
+                            {body}
+                        </span>
+                    }
+                    .into_view(),
+                    LineKind::Context => view! { <span class="diff-ctx">{body}</span> }.into_view(),
+                }
             }
         })
         .collect_view()
@@ -644,23 +752,37 @@ pub fn detail_panel_view(
                         // — the full-screen viewer wraps and is deliberately
                         // left un-windowed for now (see `viewer.rs`).
                         let patch_text = d.patch.clone();
+                        // Parsed and flattened ONCE per patch. The render
+                        // closure below re-runs on every scroll event, and
+                        // re-parsing there would turn a scroll into O(patch)
+                        // work — the raw-text walk it replaces had the same
+                        // cost, which is why #211 had to bound the window in
+                        // the first place. `Rc` so both the reveal callback
+                        // and the render closure share one flattening.
+                        let flat = std::rc::Rc::new(crate::features::diff::rows::flatten(
+                            &git_vista_protocol::diff::parse_unified_diff(&patch_text),
+                        ));
+                        let flat_for_reveal = std::rc::Rc::clone(&flat);
                         // #350: make hunk `idx` renderable before focus moves
                         // to it. Without this the roving focus can address a
                         // hunk that windowing has not mounted, and `.focus()`
                         // lands on nothing — see `focus_hunk_revealed`.
-                        let reveal_patch = d.patch.clone();
                         let reveal = Callback::new(move |idx: usize| {
-                            let nav = hunk_nav(&reveal_patch);
-                            let Some(entry) = nav.get(idx) else { return };
-                            let heights = CumulativeHeights::new(&line_heights(
-                                &reveal_patch,
+                            // `idx` is a HUNK ordinal; scrolling needs the ROW
+                            // that header occupies. Conflating the two scrolls
+                            // to whatever row happens to share the number.
+                            let Some(row) = flat_for_reveal.row_of_hunk(idx) else {
+                                return;
+                            };
+                            let heights = CumulativeHeights::new(&crate::features::diff::rows::row_heights(
+                                &flat_for_reveal.rows,
                                 DIFF_LINE_PX,
                                 LineWrap::Never,
                             ));
                             let (scroll, viewport) = diff_scroll.get_untracked();
                             let viewport = if viewport > 0.0 { viewport } else { 800.0 };
                             if let Some(next) = scroll_to_reveal(
-                                &heights, entry.line_index, viewport, scroll,
+                                &heights, row, viewport, scroll,
                             ) {
                                 // Move the real scroll container too, not just
                                 // the signal: the signal drives which lines
@@ -702,11 +824,13 @@ pub fn detail_panel_view(
                             >
                                 {move || {
                                     let (scroll, viewport) = diff_scroll.get();
-                                    let heights = CumulativeHeights::new(&line_heights(
-                                        &patch_text,
-                                        DIFF_LINE_PX,
-                                        LineWrap::Never,
-                                    ));
+                                    let heights = CumulativeHeights::new(
+                                        &crate::features::diff::rows::row_heights(
+                                            &flat.rows,
+                                            DIFF_LINE_PX,
+                                            LineWrap::Never,
+                                        ),
+                                    );
                                     // Before the first scroll event the box has
                                     // not been measured; fall back to a viewport
                                     // tall enough that the first paint is never
@@ -716,8 +840,8 @@ pub fn detail_panel_view(
                                     view! {
                                         <div style=format!("height:{}px", w.pad_top)></div>
                                         <pre class="detail-diff">
-                                            {accessible_patch_window(
-                                                &patch_text, hunk_focus, "detail",
+                                            {accessible_rows_window(
+                                                &flat, hunk_focus, "detail",
                                                 Some(w.start..w.end), Some(reveal),
                                             )}
                                         </pre>

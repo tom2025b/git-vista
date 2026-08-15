@@ -35,7 +35,7 @@
 //! interactive styling that would make it look tappable.
 
 use super::core::LineWrap;
-use git_vista_protocol::diff::{DiffLine, FileDiff, Hunk, LineKind, ParsedPatch};
+use git_vista_protocol::diff::{FileDiff, Hunk, LineKind, ParsedPatch};
 
 /// One rendered row. Every variant occupies exactly one row index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +309,7 @@ fn file_title(file: &FileDiff) -> String {
 mod tests {
     use super::*;
     use git_vista_protocol::diff::parse_unified_diff;
+    use git_vista_protocol::diff::DiffLine;
 
     fn line(kind: LineKind, text: &str) -> DiffLine {
         DiffLine {
