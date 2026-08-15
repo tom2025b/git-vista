@@ -89,6 +89,10 @@ pub fn picker_view(
     // nothing has been shown yet.
     let rescan_msg = create_rw_signal((0_u64, String::new()));
     let msg_seq = store_value(IntentSeq::default());
+    // #380: the mindmap view of the same catalog. A display toggle only — the
+    // map's node click runs the exact `mode_for.set(...)` path a list row
+    // runs, so everything downstream (mode screen, LAN gating) is shared.
+    let map_mode = create_rw_signal(false);
     move || {
         open.get().then(|| {
             view! {
@@ -102,8 +106,21 @@ pub fn picker_view(
                                 display:flex; flex-direction:column; \
                                 padding:24px; background:#161b22; border:1px solid #30363d; \
                                 border-radius:10px; color:var(--fg);">
-                        <div style="font-weight:600; font-size:1.2em; margin-bottom:12px;">
-                            "Open a repository"
+                        <div style="display:flex; align-items:baseline; gap:12px; \
+                                    margin-bottom:12px;">
+                            <div style="font-weight:600; font-size:1.2em; flex:1;">
+                                "Open a repository"
+                            </div>
+                            // #380: list <-> map. One button, state in its label,
+                            // same idiom as the topbar toggles.
+                            <button
+                                style="padding:6px 14px; font:inherit; color:var(--fg); \
+                                       background:#0d1117; border:1px solid #30363d; \
+                                       border-radius:6px;"
+                                on:click=move |_| map_mode.update(|m| *m = !*m)
+                            >
+                                {move || if map_mode.get() { "View: map" } else { "View: list" }}
+                            </button>
                         </div>
                         <div style="overflow-y:auto; -webkit-overflow-scrolling:touch; \
                                     flex:1 1 auto; min-height:0;">
@@ -113,6 +130,9 @@ pub fn picker_view(
                                 <p>{format!("Couldn't list repositories: {e}")}</p>
                             }
                             .into_view(),
+                            Some(Ok(entries)) if map_mode.get() => {
+                                crate::repomap::map_view(entries, mode_for)
+                            }
                             Some(Ok(entries)) => entries
                                 .into_iter()
                                 .map(|d| {

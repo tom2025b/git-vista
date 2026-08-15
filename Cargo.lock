@@ -903,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "git-vista"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "console_error_panic_hook",
  "futures",
@@ -920,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "git-vista-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "git-vista-git"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "git-vista-core",
  "gix",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "git-vista-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "git-vista-core",
  "git-vista-protocol",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "git-vista-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "git-vista-core",
  "serde",
@@ -958,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "git-vista-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -1679,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "gv-scrollcast"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chromiumoxide",
