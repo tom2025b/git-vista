@@ -31,7 +31,7 @@ use git_vista_core::virtualize::CumulativeHeights;
 /// windowing exists to avoid) or a layout read on every scroll frame. Being
 /// slightly wrong here shifts the window by a line or two at the edges, which
 /// the overscan below absorbs — it cannot corrupt the mapping, because
-/// `accessible_patch_window` keys every line on its own patch index rather
+/// `accessible_rows_window` keys every row on its own row index rather
 /// than on anything derived from this number.
 const DIFF_LINE_PX: f64 = 18.1;
 
@@ -72,7 +72,7 @@ pub(crate) fn diff_line_class(line: &str) -> &'static str {
     }
 }
 
-/// [`accessible_patch_window`], driven by a structured [`DiffRows`] rather
+/// [`accessible_rows_window`], driven by a structured [`DiffRows`] rather
 /// than a raw-text walk (#361).
 ///
 /// **Two coordinates, and they are not interchangeable.** `window` indexes
@@ -178,7 +178,7 @@ pub(crate) fn accessible_rows_window(
         .collect_view()
 }
 
-/// One navigable hunk header span — see [`accessible_patch_view`].
+/// One navigable hunk header span — see [`accessible_rows_window`].
 fn hunk_header_span(
     class: &'static str,
     text: String,
@@ -390,7 +390,7 @@ pub fn detail_panel_view(
     // The patch's roving hunk focus (M2.16e, #210) — created here, above the
     // render closures, so an icon toggle's re-render doesn't reset which hunk
     // the keyboard was on. Walking to a parent re-renders the patch, and
-    // `accessible_patch_view` re-clamps the model to the new hunk count.
+    // `accessible_rows_window` re-clamps the model to the new hunk count.
     let hunk_focus = create_rw_signal(GraphFocus::new(0));
     // M2.16g (#350): the diff's own scroll position and measured viewport
     // height, the two inputs `render_window` needs. Declared here, beside
@@ -623,7 +623,7 @@ pub fn detail_panel_view(
                             .collect_view();
                         // The patch, coloured line by line off its prefix, with
                         // hunk headers as roving keyboard/tap stops (M2.16e,
-                        // #210 — see `accessible_patch_view`), rendered a
+                        // #210 — see `accessible_rows_window`), rendered a
                         // window at a time (M2.16g, #350).
                         //
                         // `.detail-diff` is `white-space: pre`, so every line

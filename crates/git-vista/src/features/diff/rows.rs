@@ -97,16 +97,16 @@ impl DiffRow {
 }
 
 /// Per-ROW heights, ready for [`CumulativeHeights::new`] — the rows twin of
-/// [`super::core::line_heights`].
+/// the raw-text measurement this replaced.
 ///
 /// A separate function rather than a reuse, because the two walk different
-/// sequences: `line_heights` walks `patch.lines()`, which includes the
+/// sequences: the old raw-text walk used `patch.lines()`, which includes the
 /// `diff --git`/`index`/`---`/`+++` headers the parser drops and excludes the
 /// per-file heading rows this view adds. Measuring rows with a line-based
 /// walk would offset every height in the document, and the window would then
 /// render one slice while the scrollbar described another.
 ///
-/// Counts **characters, not bytes**, matching `line_heights`: a patch
+/// Counts **characters, not bytes**, as the raw-text version did: a patch
 /// carrying non-ASCII would otherwise over-estimate its height and leave a
 /// gap at the bottom of the scroll range.
 ///
@@ -635,7 +635,7 @@ mod tests {
         assert!(text.starts_with("@@ -12,"), "{text}");
         assert!(text.contains("+12,"), "{text}");
     }
-    // ── heights: the rows twin of line_heights ──
+    // ── heights: measured over rows, not raw patch lines ──
 
     #[test]
     fn unwrapped_rows_are_all_one_line_tall() {
@@ -687,6 +687,40 @@ mod tests {
             heights,
             vec![20.0],
             "the marker pushes it past 9 columns onto a second row"
+        );
+    }
+
+    #[test]
+    fn a_long_line_is_charged_for_every_row_it_takes_not_just_two() {
+        // The 1->2 transition above can pass on an implementation that merely
+        // saturates at two rows. The deleted core::line_heights test covered a
+        // 3-row case; this restores that reach, so div_ceil is proven to keep
+        // counting rather than to notice one overflow.
+        let patch = ParsedPatch {
+            files: vec![hunks_file(
+                "a.rs",
+                vec![hunk(
+                    1,
+                    vec![
+                        line(LineKind::Context, &"x".repeat(4)), // +1 marker = 5  -> 1 row
+                        line(LineKind::Added, &"y".repeat(24)),  // +1 marker = 25 -> 3 rows
+                        line(LineKind::Removed, &"z".repeat(19)), // +1 marker = 20 -> 2 rows
+                    ],
+                )],
+            )],
+        };
+        let flat = flatten(&patch);
+        let bodies: Vec<_> = flat
+            .rows
+            .iter()
+            .filter(|r| matches!(r, DiffRow::Line { .. }))
+            .cloned()
+            .collect();
+        let heights = row_heights(&bodies, 10.0, LineWrap::Wrapped { columns: 10 });
+        assert_eq!(
+            heights,
+            vec![10.0, 30.0, 20.0],
+            "at 10 columns: 5 chars is one row, 25 is three, 20 is two"
         );
     }
 

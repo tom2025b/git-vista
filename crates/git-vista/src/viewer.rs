@@ -214,7 +214,7 @@ pub fn viewer_view(
                     // keyboard-focusable on their own. Left unopted-out, Tab
                     // lands here instead of on the "viewer"-scoped roving hunk
                     // header span this file's `diff_body` renders via
-                    // `accessible_patch_view`, and arrow keys then scroll this
+                    // `accessible_rows_window`, and arrow keys then scroll this
                     // div natively instead of reaching `hunk_header_span`'s
                     // `on_keydown`.
                     <div class="viewer-body" tabindex="-1">{body}</div>
@@ -264,7 +264,7 @@ fn spec_title(spec: &DiffSpec) -> String {
 /// than an omission (naming core's `DiffFile` from the protocol crate would
 /// break the wasm build this crate exists to stay compatible with).
 ///
-/// The patch renders through the same `accessible_patch_view` the other diff
+/// The patch renders through the same `accessible_rows_window` the other diff
 /// surfaces use, so hunk navigation, the screen-reader prefixes and the roving
 /// tab stop all behave identically here. Not windowed, for the same reason the
 /// rest of this viewer is not — see the comment at the bottom of `diff_body`
@@ -366,7 +366,7 @@ fn diff_body(d: &CommitDiff, nerd: bool, hunk_focus: RwSignal<GraphFocus>) -> Vi
         // `install_mode_signal` is a shipped precedent for keeping such a
         // measurement current through a debounced resize listener.
         //
-        // The real problem is that `line_heights`' `ceil(chars / columns)` is a
+        // The real problem is that `row_heights`' `ceil(chars / columns)` is a
         // *character*-wrap model, while this CSS wraps at *word* boundaries. A
         // perfectly measured column count still would not track real rendered
         // row counts on code text. And unlike the panel's `DIFF_LINE_PX` — one
