@@ -437,21 +437,10 @@ pub fn menu_view(features: Features, settings: Settings, read_only: bool) -> imp
                         // records nothing, and `amend_preflight` treats "not
                         // read" as unknown; see its doc comment for why unknown
                         // sends rather than escalates.
-                        //
-                        // Both answers go through `apply_amend_detail` rather
-                        // than being written here, and that is the fix for a
-                        // second window as real as the one the hold above
-                        // closes: this callback resumes after an `await`, by
-                        // which point the dialog may have been reopened on
-                        // another commit. `PreflightKnowledge` holds one read
-                        // at a time, so writing an abandoned tip's answer here
-                        // *evicts* the answer for the commit on screen and the
-                        // ceremony silently stops firing for it. The currency
-                        // check lives in `detail_read_use`, where it is
-                        // host-tested; nothing in this file is.
                         spawn_local(async move {
                             if let Ok(detail) = fetch_commit_detail(&tip).await {
-                                dialogs.apply_amend_detail(&tip, detail.on_remote, &detail.message);
+                                dialogs.record_amend_detail(&tip, detail.on_remote);
+                                dialogs.seed_amend_msg(&detail.message);
                             }
                             // Outside the `Ok` arm on purpose: a failed read
                             // has to release the button too, or one bad GET

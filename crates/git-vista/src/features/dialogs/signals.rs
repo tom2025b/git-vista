@@ -17,9 +17,8 @@ use leptos::{
 };
 
 use crate::features::dialogs::commit::{
-    adopt_seed, detail_read_use, is_reading_publication_for, message_buffer, persist_key,
-    seed_outcome, AmendPhase, CommitIntent, DetailUse, MessageBuffer, PreflightKnowledge,
-    SeedOutcome,
+    adopt_seed, is_reading_publication_for, message_buffer, persist_key, seed_outcome, AmendPhase,
+    CommitIntent, MessageBuffer, PreflightKnowledge, SeedOutcome,
 };
 use crate::features::dialogs::core::{draft_scope_action, Dialog, DialogsCore, DraftScopeAction};
 
@@ -260,39 +259,9 @@ impl Dialogs {
     /// from the context menu, and the guided re-check's retarget — because the
     /// pre-flight gate has to answer for whichever commit the dialog is
     /// currently pointed at, not for whichever one it was opened on.
-    ///
-    /// Unconditional, and therefore only safe where the caller can prove the
-    /// dialog still points at `tip`. The guided re-check can: it retargets and
-    /// records with no `await` between the two. The menu's opener cannot, and
-    /// must go through [`Dialogs::apply_amend_detail`] instead.
     pub fn record_amend_detail(&self, tip: &str, on_remote: bool) {
         self.amend_preflight
             .update_value(|k| k.record_detail(tip, on_remote));
-    }
-
-    /// Apply a resolved `GET /api/commit/{tip}` — its published flag *and* its
-    /// message — **iff that read still speaks for the dialog** (#225).
-    ///
-    /// The chokepoint for every detail read that crosses an `await`. The
-    /// decision is [`detail_read_use`], which is host-tested; this is only the
-    /// two writes it authorises, because nothing in this file compiles under
-    /// `cargo test --workspace`. A source census in `features::a11y::audit`
-    /// pins that the guard is consulted first and that both writes sit inside
-    /// it.
-    ///
-    /// Applying an abandoned tip's answer is not a harmless late write:
-    /// [`PreflightKnowledge`] holds one read at a time, so it *evicts* the
-    /// answer for the commit on screen and the published-history ceremony
-    /// stops firing for it. See [`detail_read_use`] for the whole reasoning.
-    pub fn apply_amend_detail(&self, tip: &str, on_remote: bool, message: &str) -> DetailUse {
-        match detail_read_use(&self.amend_phase.get_untracked(), tip) {
-            DetailUse::Apply => {
-                self.record_amend_detail(tip, on_remote);
-                self.seed_amend_msg(message);
-                DetailUse::Apply
-            }
-            DetailUse::Discard => DetailUse::Discard,
-        }
     }
 
     /// Hold the confirm button while `GET /api/commit/{tip}` — the read that
