@@ -719,22 +719,6 @@ html, body {
   align-items: center;
   gap: 6px;
 }
-/* Full Screen / Print, sized to the 44px tap target the rest of the app uses. */
-.detail-btn {
-  font: inherit;
-  font-size: 0.78rem;
-  color: var(--fg);
-  background: #21262d;
-  border: 1px solid #30363d;
-  border-radius: 6px;
-  padding: 6px 10px;
-  min-height: 32px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.detail-btn:hover { background: #30363d; }
-.detail-btn:focus-visible { outline: 2px solid var(--accent, #58a6ff); outline-offset: 2px; }
-
 /* Full-screen panel: the SAME element, restyled. Not a second surface — the
    content, its resources and its scroll position are already here, and a
    full-screen copy would be the copy that drifts from the sidebar. */

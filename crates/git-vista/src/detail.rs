@@ -842,7 +842,7 @@ pub fn detail_panel_view(
                         </span>
                         <span class="detail-actions">
                         <button
-                                class="detail-btn"
+                                class="viewer-btn"
                                 title="Fill the window with this panel — the same \
                                        details, room to read them"
                                 on:click=move |_| detail_full.update(|f| *f = !*f)
@@ -851,7 +851,7 @@ pub fn detail_panel_view(
                                          else { "Full Screen" }}
                             </button>
                             <button
-                                class="detail-btn"
+                                class="viewer-btn"
                                 title="Opens the print sheet — on iPad choose the \
                                        share icon (or pinch the preview open) and \
                                        ‘Save to Files’ to keep it as a PDF. Prints \
