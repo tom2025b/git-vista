@@ -270,6 +270,24 @@ impl DiffRows {
             |row| matches!(row, DiffRow::HunkHeader { hunk_ordinal, .. } if *hunk_ordinal == ordinal),
         )
     }
+
+    /// The spoken labels of every navigable hunk, in ordinal order — the
+    /// staging view's replacement for `hunk_nav`'s label list. It pairs these
+    /// with [`super::core::selectable_hunks`] **by position**, which is sound
+    /// because both enumerate exactly the ordinary (non-combined) `@@`
+    /// headers of the same patch in rendering order: `selectable_hunks` skips
+    /// `@@@` headers by parse failure, [`flatten`] skips them because a
+    /// combined file's raw text becomes inert [`DiffRow::Note`]s. The pairing
+    /// is pinned by `flattened_hunk_labels_pair_with_selectable_hunks`.
+    pub fn hunk_labels(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                DiffRow::HunkHeader { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// Flatten a parsed patch into rows.
@@ -363,25 +381,38 @@ fn hunk_header_text(hunk: &Hunk) -> String {
     }
 }
 
-/// The spoken label, matching [`super::core::hunk_nav`]'s shape: file, the
-/// per-file ordinal, the new-side range, then the counts. Leads with file and
-/// position because that is what orients a listener — the raw `-12,5 +12,8`
-/// shorthand does not.
+/// The spoken label: file, the per-file ordinal, the new-side position, then
+/// the counts. Leads with file and position because that is what orients a
+/// listener — the raw `-12,5 +12,8` shorthand does not.
+///
+/// **`, truncated` when the body is short of its header's declaration.** The
+/// server caps patches at a line boundary (`read.rs`, `truncate_at_line`), so
+/// a cap landing mid-hunk leaves the final hunk's parsed lines short of the
+/// `old_len`/`new_len` its `@@` header declared. Stating the resulting
+/// undercount as fact would be a lie a screen-reader user cannot see past;
+/// the raw-text walk this replaced flagged exactly this case, and the flag
+/// must survive the migration. Checked per hunk rather than only on the
+/// patch's last one — for well-formed input only the cut hunk can fall
+/// short, and a malformed mid-patch hunk deserves the same honesty.
 fn hunk_label(file: &str, within_file: usize, hunk: &Hunk) -> String {
-    let (added, removed) = hunk
-        .lines
-        .iter()
-        .fold((0u32, 0u32), |(a, r), line| match line.kind {
-            LineKind::Added => (a + 1, r),
-            LineKind::Removed => (a, r + 1),
-            LineKind::Context => (a, r),
-        });
+    let (added, removed, context) =
+        hunk.lines
+            .iter()
+            .fold((0u32, 0u32, 0u32), |(a, r, c), line| match line.kind {
+                LineKind::Added => (a + 1, r, c),
+                LineKind::Removed => (a, r + 1, c),
+                LineKind::Context => (a, r, c + 1),
+            });
+    // Old side draws context + removed lines, new side context + added; a
+    // body that ran out early is short on at least one of them.
+    let cut = context + removed < hunk.old_len || context + added < hunk.new_len;
     format!(
-        "{file} hunk {} at line {}, {} added, {} removed",
+        "{file} hunk {} at line {}, {} added, {} removed{}",
         within_file + 1,
         hunk.new_start,
         added,
-        removed
+        removed,
+        if cut { ", truncated" } else { "" }
     )
 }
 
@@ -738,6 +769,93 @@ mod tests {
         assert!(label.contains("42"), "{label}");
         assert!(label.contains("1 added"), "{label}");
         assert!(label.contains("1 removed"), "{label}");
+    }
+
+    #[test]
+    fn flattened_hunk_labels_pair_with_selectable_hunks() {
+        // The staging view pairs `selectable_hunks`' checkbox anchors with
+        // `hunk_labels()` BY POSITION — this is the assertion that makes that
+        // pairing sound. The fixture deliberately mixes the shapes the two
+        // walks must agree on skipping: an ordinary two-hunk file, a combined
+        // merge section (`@@@`, navigable to neither), and a trailing
+        // ordinary file.
+        let patch = "\
+diff --git a/src/foo.rs b/src/foo.rs
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -10,3 +10,4 @@
+ context
++added one
++added two
+ context
+-removed one
+@@ -30,2 +31,2 @@ fn frobnicate()
+ context
+-old line
++new line
+diff --cc merged.rs
+--- a/merged.rs
++++ b/merged.rs
+@@@ -1,2 -1,2 +1,2 @@@
+  ctx
+++both
+diff --git a/bar.txt b/bar.txt
+--- a/bar.txt
++++ b/bar.txt
+@@ -1 +1 @@
+-old
++new
+";
+        let sel = crate::features::diff::core::selectable_hunks(patch);
+        let labels = flatten(&parse_unified_diff(patch)).hunk_labels();
+        assert_eq!(
+            labels.len(),
+            sel.len(),
+            "both walks must find the same hunks: {labels:?} vs {sel:?}"
+        );
+        assert_eq!(sel.len(), 3, "fixture should carry exactly 3 ordinary hunks");
+        for (label, hunk) in labels.iter().zip(&sel) {
+            // Labels lead with the file (pinned elsewhere), so positional
+            // pairing is verifiable file-by-file.
+            assert!(
+                label.starts_with(&hunk.file),
+                "label {label:?} does not open with its paired hunk's file {:?}",
+                hunk.file
+            );
+        }
+    }
+
+    #[test]
+    fn a_patch_cut_mid_hunk_flags_the_short_hunks_label_as_truncated() {
+        // The server caps patches at a line boundary (`read.rs`,
+        // `truncate_at_line`), so a cap landing mid-hunk leaves the final
+        // hunk's body short of what its header declared. The label must say
+        // so rather than state the undercount as fact — the behaviour
+        // `hunk_nav` had (#210) and the migration to rows must not lose.
+        let patch = "\
+diff --git a/x b/x
+--- a/x
++++ b/x
+@@ -1,2 +1,2 @@
+ context
+-old
++new
+@@ -10,20 +10,22 @@
+ context
++added one
+";
+        let labels = flatten(&parse_unified_diff(patch)).hunk_labels();
+        assert_eq!(labels.len(), 2);
+        assert!(
+            !labels[0].contains("truncated"),
+            "a complete hunk must not be flagged: {:?}",
+            labels[0]
+        );
+        assert!(
+            labels[1].ends_with(", truncated"),
+            "the cut hunk's label must admit the undercount: {:?}",
+            labels[1]
+        );
     }
 
     #[test]
