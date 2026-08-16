@@ -714,6 +714,46 @@ html, body {
   cursor: pointer;
 }
 .detail-close:hover { background: #21262d; color: var(--fg); }
+.detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* Full Screen / Print, sized to the 44px tap target the rest of the app uses. */
+.detail-btn {
+  font: inherit;
+  font-size: 0.78rem;
+  color: var(--fg);
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 6px 10px;
+  min-height: 32px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.detail-btn:hover { background: #30363d; }
+.detail-btn:focus-visible { outline: 2px solid var(--accent, #58a6ff); outline-offset: 2px; }
+
+/* Full-screen panel: the SAME element, restyled. Not a second surface — the
+   content, its resources and its scroll position are already here, and a
+   full-screen copy would be the copy that drifts from the sidebar. */
+/* SPECIFICITY, deliberately: the responsive shell sizes the panel with
+   two-class selectors (`.shell-wide .detail-panel`, `.shell-ultrawide
+   .detail-panel`), which outrank a lone `.detail-panel--full` no matter how
+   late it appears — specificity beats source order. Leading with `html` makes
+   this (0,2,1) so it wins against every shell rule that exists now AND any
+   two-class rule added later, without starting an !important arms race. */
+html .detail-panel.detail-panel--full {
+  width: 100vw;
+  max-width: 100vw;
+  border-left: none;
+  box-shadow: none;
+}
+html .detail-panel.detail-panel--full .detail-body {
+  padding: 24px max(24px, calc((100vw - 1100px) / 2));
+  font-size: 1rem;
+}
 .detail-body {
   padding: 14px;
   overflow-y: auto;
@@ -1092,7 +1132,10 @@ button.detail-file:hover .detail-file-path { color: var(--accent); }
   html[data-print] .reset-view,
   html[data-print] .history-page-status,
   html[data-print] .ctx-menu,
-  html[data-print] .detail-panel { display: none !important; }
+  /* Narrowed for the detail surface: when the panel itself is what is being
+     printed it must obviously survive. Every other print surface still hides
+     it, so the viewer and the graph sheet print alone exactly as before. */
+  html[data-print]:not([data-print="detail"]) .detail-panel { display: none !important; }
   /* Un-trap the surface from the app's fixed/overflow layout: everything on
      its ancestor path must be static and unclipped or pages past the first
      come out blank. */
@@ -1146,6 +1189,60 @@ button.detail-file:hover .detail-file-path { color: var(--accent); }
   }
   html[data-print] .diff-hunk-combined { color: #0550ae; }
   html[data-print] .diff-meta { color: #57606a; }
+
+  /* ---- data-print="detail": the commit-details panel on its own ----------
+     Requested 2026-08-15: read the details full-screen, print them, and get
+     the patch separately from the viewer (which already prints it uncapped).
+
+     THE PATCH IS DELIBERATELY EXCLUDED. `.detail-diff-scroll` holds a
+     WINDOWED patch: only the rows near the scroll position are in the DOM,
+     and the rest of the document's height is spacer divs. Printing that is
+     the #390 defect — the spacers become real pages with nothing on them.
+     Hiding it is not a shortcut around that bug; it is the document the user
+     asked for, and it means this surface has no windowed content at all. */
+  html[data-print="detail"] .app,
+  html[data-print="detail"] .graph,
+  html[data-print="detail"] .viewer-modal,
+  html[data-print="detail"] .print-graph-modal { display: none !important; }
+  /* The panel's own chrome: buttons are screen affordances, not paper. */
+  html[data-print="detail"] .detail-head,
+  html[data-print="detail"] .detail-actions,
+  html[data-print="detail"] .detail-diff-scroll,
+  html[data-print="detail"] .detail-diff { display: none !important; }
+  /* Un-trap the panel from the app's fixed/overflow layout, the same way
+     .print-surface is un-trapped above: an ancestor that stays fixed or
+     clipped prints one page and drops the rest. */
+  html[data-print="detail"] .detail-panel {
+    position: static !important;
+    width: auto;
+    max-width: none;
+    height: auto;
+    display: block;
+    background: #fff;
+    color: #1f2328;
+    border-left: none;
+    box-shadow: none;
+    font-size: 12pt;
+  }
+  html[data-print="detail"] .detail-body {
+    overflow: visible;
+    height: auto;
+    padding: 0;
+    font-size: 12pt;
+  }
+  /* Paper-legible colours (GitHub light), matching the viewer surface. */
+  html[data-print="detail"] .detail-key,
+  html[data-print="detail"] .detail-muted { color: #57606a; }
+  html[data-print="detail"] .detail-val,
+  html[data-print="detail"] .detail-section-title,
+  html[data-print="detail"] .detail-file,
+  html[data-print="detail"] .detail-file-path { color: #1f2328; }
+  html[data-print="detail"] .diff-add { color: #116329; }
+  html[data-print="detail"] .diff-del { color: #a40e26; }
+  html[data-print="detail"] .file-added { color: #116329; }
+  html[data-print="detail"] .file-modified { color: #9a6700; }
+  html[data-print="detail"] .file-deleted { color: #a40e26; }
+  html[data-print="detail"] .file-renamed { color: #0550ae; }
   html[data-print] .file-added { color: #116329; }
   html[data-print] .file-modified { color: #7d4e00; }
   html[data-print] .file-deleted { color: #a40e26; }
