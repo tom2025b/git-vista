@@ -1200,8 +1200,20 @@ button.detail-file:hover .detail-file-path { color: var(--accent); }
      the #390 defect — the spacers become real pages with nothing on them.
      Hiding it is not a shortcut around that bug; it is the document the user
      asked for, and it means this surface has no windowed content at all. */
+  /* The panel lives INSIDE the shell (.detail-panel < .overlays < .graph <
+     .app), so the shell must be un-trapped, never hidden — hiding .app hides
+     the panel with it and prints a blank sheet. The screen furniture itself
+     (topbar, status, canvas, menus) is already hidden by the shared
+     html[data-print] rule at the top of this block. */
   html[data-print="detail"] .app,
   html[data-print="detail"] .graph,
+  html[data-print="detail"] .overlays {
+    display: block !important;
+    position: static !important;
+    height: auto !important;
+    overflow: visible !important;
+    background: #fff;
+  }
   html[data-print="detail"] .viewer-modal,
   html[data-print="detail"] .print-graph-modal { display: none !important; }
   /* The panel's own chrome: buttons are screen affordances, not paper. */

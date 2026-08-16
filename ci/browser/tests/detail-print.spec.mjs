@@ -85,8 +85,14 @@ test.describe('commit details: full screen and print', () => {
 
     const printed = await page.evaluate(() => {
       const panel = document.querySelector('.detail-panel')
+      const rect = panel.getBoundingClientRect()
       return {
-        panelShown: getComputedStyle(panel).display !== 'none',
+        // NOT `getComputedStyle(panel).display !== 'none'`. That reads the
+        // panel's OWN property and stays "block" while an ancestor is hidden
+        // — a mutation that hid `.app` (the panel's ancestor) once passed
+        // this test while printing a completely blank sheet. A real box is
+        // the only honest answer.
+        panelArea: rect.width * rect.height,
         panelPosition: getComputedStyle(panel).position,
         text: panel.textContent,
       }
@@ -94,7 +100,11 @@ test.describe('commit details: full screen and print', () => {
 
     // 1. THE PANEL SURVIVES. Every other print surface hides it; this one must
     //    not, and that rule was narrowed by hand, so it is worth pinning.
-    expect(printed.panelShown, 'the panel is the print target — it must render').toBe(true)
+    expect(
+      printed.panelArea,
+      'the panel is the print target and must occupy a real box — a zero area ' +
+        'means it (or an ancestor) is hidden and the printout is a blank sheet',
+    ).toBeGreaterThan(10_000)
 
     // 2. IT IS UN-TRAPPED. A panel left `position: fixed` prints its first
     //    page and silently drops the rest.
@@ -110,6 +120,16 @@ test.describe('commit details: full screen and print', () => {
       'the patch must NOT print — it is windowed, and its spacers would come ' +
         'out as blank pages. Print it from the viewer instead.',
     ).toBe(false)
+
+    // ...and the file list right above it MUST still be drawn. Without this
+    // pair, "the patch is hidden" is also satisfied by hiding the whole page,
+    // which is precisely the bug a mutation caught here: the panel's ancestor
+    // was hidden, every rect was zero, and this test passed anyway.
+    expect(
+      await isRendered(page, '.detail-panel .detail-file'),
+      'the per-file list must still be drawn — if this is hidden too, the ' +
+        'surface is not printing the details, it is printing nothing',
+    ).toBe(true)
 
     // 4. THE CHROME IS GONE. Buttons are screen affordances.
     expect(await isRendered(page, '.detail-panel .detail-actions'), 'buttons are not paper').toBe(false)
