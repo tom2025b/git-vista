@@ -55,15 +55,29 @@ fn print_commit_url(repo_url: Option<&str>, on_remote: bool, commit_id: &str) ->
     commit_github_url(repo_url, on_remote, commit_id)
 }
 
-/// Stamp (or clear) `data-print` on `<html>` — shared contract with viewer.rs.
-fn set_print_attr(on: bool) {
+/// Stamp (or clear) `data-print` on `<html>`, naming which surface is being
+/// printed.
+///
+/// The VALUE matters, not just the presence: `styles.css` prints only the named
+/// surface and hides the rest, so "viewer", "graph" and "detail" each get their
+/// own `@media print` block. A surface that stamped a bare attribute would
+/// inherit whichever rules another surface happened to define.
+pub(crate) fn set_print_surface(surface: Option<&str>) {
     if let Some(root) = document().document_element() {
-        if on {
-            let _ = root.set_attribute("data-print", "graph");
-        } else {
-            let _ = root.remove_attribute("data-print");
+        match surface {
+            Some(name) => {
+                let _ = root.set_attribute("data-print", name);
+            }
+            None => {
+                let _ = root.remove_attribute("data-print");
+            }
         }
     }
+}
+
+/// Stamp (or clear) `data-print` on `<html>` — shared contract with viewer.rs.
+fn set_print_attr(on: bool) {
+    set_print_surface(on.then_some("graph"));
 }
 
 /// How big the printed graph is drawn before it goes to paper/PDF. It scales

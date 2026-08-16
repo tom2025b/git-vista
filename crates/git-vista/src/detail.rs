@@ -367,6 +367,37 @@ pub(crate) fn file_change_marker(ic: &GitIcons, kind: ChangeKind) -> (&'static s
 /// Build the detail panel view. `detail` is the lazily-fetched commit keyed on
 /// `detail_id`; `ctx` supplies the repo's GitHub base + pushed-commit set for the
 /// "Open on GitHub" link.
+/// Print the commit-details panel on its own.
+///
+/// Stamps `data-print="detail"` so `styles.css` prints the panel and hides the
+/// shell, then clears it. The patch is excluded by that stylesheet, deliberately
+/// (see the `@media print` block): the panel's diff is windowed, and a windowed
+/// surface prints its spacers as blank pages — the defect fixed in #390 for the
+/// viewer. Rather than repeat the viewer's unwindowing machinery for a document
+/// nobody asked to include the patch in, the patch simply does not print. The
+/// full-screen viewer already prints it, uncapped and unwindowed.
+///
+/// The deferral is the same one `viewer::print_now` documents and needs for the
+/// same reason: `window.print()` blocks while the browser lays out the print
+/// document, and Leptos flushes effects on a microtask, so stamping and printing
+/// in one tick would print the unstamped DOM.
+#[cfg(target_arch = "wasm32")]
+fn print_detail() {
+    crate::print::set_print_surface(Some("detail"));
+    leptos::set_timeout(
+        move || {
+            if let Some(w) = web_sys::window() {
+                let _ = w.print();
+            }
+            crate::print::set_print_surface(None);
+        },
+        std::time::Duration::from_millis(50),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn print_detail() {}
+
 pub fn detail_panel_view(
     features: Features,
     settings: Settings,
@@ -392,6 +423,13 @@ pub fn detail_panel_view(
     // the keyboard was on. Walking to a parent re-renders the patch, and
     // `accessible_rows_window` re-clamps the model to the new hunk count.
     let hunk_focus = create_rw_signal(GraphFocus::new(0));
+    // Full-screen toggle for this panel (Tom's request, 2026-08-15). Deliberately
+    // a restyle of the SAME panel rather than a second surface: the content, the
+    // resources behind it and the scroll position are all already here, and a
+    // full-screen copy would be the copy that starts disagreeing with the
+    // sidebar. Declared beside `hunk_focus` for the same reason its comment
+    // gives — a re-render must not drop the user back out of full screen.
+    let detail_full = create_rw_signal(false);
     // M2.16g (#350): the diff's own scroll position and measured viewport
     // height, the two inputs `render_window` needs. Declared here, beside
     // `hunk_focus` and for the same reason its comment gives — outside the
@@ -795,23 +833,45 @@ pub fn detail_panel_view(
                 }
             };
             view! {
-                <aside class="detail-panel">
+                <aside class="detail-panel" class=("detail-panel--full", move || detail_full.get())>
                     <div class="detail-head">
                         // The commit glyph titles the panel — it's one commit's view.
                         <span class="detail-title">
                             <span class="nf ctx-icon">{ic.commit}</span>
                             "Commit details"
                         </span>
+                        <span class="detail-actions">
                         <button
-                            class="detail-close"
-                            title="Close"
-                            // The visible content is one glyph; VoiceOver would
-                            // otherwise announce this as "multiplication sign" (#65).
-                            aria-label="Close commit details"
-                            on:click=move |_| shell.close_detail()
-                        >
-                            "×"
-                        </button>
+                                class="viewer-btn"
+                                title="Fill the window with this panel — the same \
+                                       details, room to read them"
+                                on:click=move |_| detail_full.update(|f| *f = !*f)
+                            >
+                                {move || if detail_full.get() { "Exit Full Screen" }
+                                         else { "Full Screen" }}
+                            </button>
+                            <button
+                                class="viewer-btn"
+                                title="Opens the print sheet — on iPad choose the \
+                                       share icon (or pinch the preview open) and \
+                                       ‘Save to Files’ to keep it as a PDF. Prints \
+                                       the details and file list; use Expand Full \
+                                       Diff to print the patch"
+                                on:click=move |_| print_detail()
+                            >
+                                "Print / Save PDF"
+                            </button>
+                            <button
+                                class="detail-close"
+                                title="Close"
+                                // The visible content is one glyph; VoiceOver would
+                                // otherwise announce this as "multiplication sign" (#65).
+                                aria-label="Close commit details"
+                                on:click=move |_| shell.close_detail()
+                            >
+                                "×"
+                            </button>
+                        </span>
                     </div>
                     // Same auto-focusable-scroll-container opt-out as
                     // `.detail-diff-scroll` above (`overflow-y: auto` in
