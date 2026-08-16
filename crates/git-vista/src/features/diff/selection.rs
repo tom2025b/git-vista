@@ -319,7 +319,7 @@ impl DiffSelection {
 /// 3, #215): given the flat position (matching
 /// [`crate::features::a11y::focus::GraphFocus`]'s `active` index into the
 /// patch's navigable-hunk ordering — the same index space
-/// [`super::core::hunk_nav`]/[`super::core::selectable_hunks`] enumerate)
+/// [`super::core::selectable_hunks`] enumerates)
 /// where the drag started and where the pointer is now, the inclusive range
 /// of flat indices the drag currently covers. Order-independent — dragging
 /// upward or downward both produce the same range, ascending.

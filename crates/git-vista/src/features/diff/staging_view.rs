@@ -234,10 +234,12 @@ fn hunk_row(
     .into_view()
 }
 
-/// The staging patch, rendered with the selection UI. Structurally mirrors
-/// `detail::accessible_patch_view` (same line-by-line walk, same
-/// `diff_line_class` colouring) but is a separate function, not a refactor
-/// of it — #210's function and its DOM contract are untouched.
+/// The staging patch, rendered with the selection UI. Still a raw-text
+/// line-by-line walk (same `diff_line_class` colouring the surfaces shared
+/// before #361), deliberately separate from `detail::accessible_rows_window`:
+/// selection anchors (`HunkRef`) are keyed on `selectable_hunks`' line-index
+/// coordinate space (#215), and that walk is this view's own contract. Only
+/// the spoken labels come from the structured path now.
 fn staging_patch_view(
     patch: &str,
     focus: RwSignal<GraphFocus>,
@@ -261,13 +263,15 @@ fn staging_patch_view(
             .collect::<Vec<_>>(),
     );
     let drag_anchor: StoredValue<Option<usize>> = store_value(None);
-    // Reuse `hunk_nav`'s labels (the spoken VoiceOver text): both walks
-    // visit the same headers in the same order (pinned by
-    // `selectable_hunks_line_indices_match_hunk_nav_exactly`).
-    let labels: Vec<String> = crate::features::diff::core::hunk_nav(patch)
-        .into_iter()
-        .map(|e| e.label)
-        .collect();
+    // The spoken VoiceOver labels, from the structured path (#361): the same
+    // `flatten` the detail panel and viewer speak from, paired with
+    // `selectable_hunks` by position — both enumerate exactly the ordinary
+    // `@@` headers in rendering order (pinned by
+    // `flattened_hunk_labels_pair_with_selectable_hunks` in `rows`).
+    let labels: Vec<String> = crate::features::diff::rows::flatten(
+        &git_vista_protocol::diff::parse_unified_diff(patch),
+    )
+    .hunk_labels();
     let mut nav_at: HashMap<usize, usize> = hunks
         .iter()
         .enumerate()
