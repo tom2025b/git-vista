@@ -2,12 +2,13 @@
 //!
 //! ## Why this exists
 //!
-//! [`super::core::hunk_nav`] re-derives hunk structure by walking raw patch
-//! text with a marker/countdown scan — structure the parser
+//! `hunk_nav` (deleted with #361's completion) re-derived hunk structure by
+//! walking raw patch text with a marker/countdown scan — structure the parser
 //! ([`git_vista_protocol::diff::parse_unified_diff`], #69a) has *already*
 //! produced. Two independent derivations of the same fact is how they drift:
-//! a body line beginning `+++` or `@@` is a genuine hazard for the text walk
-//! and a non-event for the parser.
+//! a body line beginning `+++` or `@@` is a genuine hazard for a text walk
+//! and a non-event for the parser. This module is the structured derivation
+//! that replaced it, for rendering, spoken labels, and heights alike.
 //!
 //! ## The two coordinates, kept deliberately separate
 //!
@@ -813,7 +814,11 @@ diff --git a/bar.txt b/bar.txt
             sel.len(),
             "both walks must find the same hunks: {labels:?} vs {sel:?}"
         );
-        assert_eq!(sel.len(), 3, "fixture should carry exactly 3 ordinary hunks");
+        assert_eq!(
+            sel.len(),
+            3,
+            "fixture should carry exactly 3 ordinary hunks"
+        );
         for (label, hunk) in labels.iter().zip(&sel) {
             // Labels lead with the file (pinned elsewhere), so positional
             // pairing is verifiable file-by-file.

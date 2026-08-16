@@ -268,10 +268,9 @@ fn staging_patch_view(
     // `selectable_hunks` by position — both enumerate exactly the ordinary
     // `@@` headers in rendering order (pinned by
     // `flattened_hunk_labels_pair_with_selectable_hunks` in `rows`).
-    let labels: Vec<String> = crate::features::diff::rows::flatten(
-        &git_vista_protocol::diff::parse_unified_diff(patch),
-    )
-    .hunk_labels();
+    let labels: Vec<String> =
+        crate::features::diff::rows::flatten(&git_vista_protocol::diff::parse_unified_diff(patch))
+            .hunk_labels();
     let mut nav_at: HashMap<usize, usize> = hunks
         .iter()
         .enumerate()
