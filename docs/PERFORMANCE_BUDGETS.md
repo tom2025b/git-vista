@@ -100,40 +100,38 @@ still catching an actual regression (e.g. the generation derivation's ref
 walk becoming accidentally quadratic, which would show up as a
 multi-second stall at a mere 1,000 files, nowhere close to this budget).
 
-## `hunk_nav` — diff view hunk-navigation walk (one component of #211, M2.16f)
+## Diff per-render walks — `selectable_hunks` and `parse_unified_diff`+`flatten` (one component of #211, M2.16f)
 
 **Status: this is one component of the diff view's total cost, not a
-substitute for the windowed-render measurement.** `hunk_nav` runs on every
-diff render, windowed or not — it walks the raw patch text to build
-hunk-selection labels and navigation targets, upstream of and independent
-from `CumulativeHeights`/`render_window`. The "Windowed diff render" section
-below covers the part of #211 this section always disclaimed: measuring the
-actual virtualized render path now that it exists. This section's own budget stands
-on its own merits and needed no rework once that path landed — it is kept
-here unchanged, reframed only as one piece of the picture rather than a
-placeholder for the whole of it.
+substitute for the windowed-render measurement.** This section used to
+budget `hunk_nav`, the raw-text walk every diff render paid for labels and
+navigation targets. #361 deleted it — rendering and labels are now driven
+by the structured parser (`git_vista_protocol::diff::parse_unified_diff`
+flattened into `rows::DiffRows`) — but the cost center did not vanish with
+the function, it split in two, and BOTH successors are budgeted here:
 
-**What was measured, and why it's a real, independent cost center.**
-`hunk_nav` (`crates/git-vista/src/features/diff/core.rs`) is real,
-host-tested (`features/diff/core.rs` is not wasm-gated — only
-`staging_view.rs` inside that module is), and runs on **every** diff render
-today regardless of virtualization: a full walk of the raw patch text that
-both `accessible_patch_view` (panel + full-screen viewer) and
-`staging_view.rs`'s hunk-selection labels call directly. The function's own
-doc comment already names the failure mode this budget pins down: "a 5 MB
-refactor diff can carry tens of thousands of hunks, and a rescan-per-hunk
-would stall the iPad's main thread before first paint." That shape doesn't
-exist today (both of `hunk_nav`'s passes are already O(n)) — this budget
-exists so it's caught immediately if a future edit reintroduces it.
+- **the structured walk** (`parse_unified_diff` + `rows::flatten`), run once
+  per patch by the detail panel, the full-screen viewer, and the staging
+  view's spoken labels;
+- **`selectable_hunks`** (`features/diff/core.rs`), the one surviving
+  raw-text walk, run per staging render for selection anchors — kept on
+  purpose because the staging view addresses hunks by line index into the
+  raw text it renders (#215).
+
+The failure mode is unchanged from the old section: "a 5 MB refactor diff
+can carry tens of thousands of hunks, and a rescan-per-hunk would stall the
+iPad's main thread before first paint." Neither walk has that shape today
+(all passes are O(n)); this budget exists so it's caught immediately if a
+future edit reintroduces it in either one.
 
 **What this does NOT cover — stated explicitly, not left implicit:**
 
-- The actual DOM/`<pre>` construction in `detail.rs`/`viewer.rs`. Both are
-  `#[cfg(target_arch = "wasm32")]`-gated; `cargo test --workspace` never
-  compiles them and this repo has no wasm test harness. Unmeasured, and no
-  test here claims otherwise.
-- The windowing math itself (`line_heights`, `CumulativeHeights`,
-  `render_window`, `scroll_to_reveal`) — that is now measured separately,
+- The actual DOM/`<pre>` construction in `detail.rs`/`viewer.rs`/
+  `staging_view.rs`. All are `#[cfg(target_arch = "wasm32")]`-gated;
+  `cargo test --workspace` never compiles them and this repo has no wasm
+  test harness. Unmeasured, and no test here claims otherwise.
+- The windowing math itself (`row_heights`, `CumulativeHeights`,
+  `render_window`, `scroll_to_reveal`) — that is measured separately,
   see the section below.
 - Real-world patch shapes (renames, binary markers, combined merge headers,
   uneven hunk sizes). The generator produces one synthetic file with
@@ -144,7 +142,7 @@ exists so it's caught immediately if a future edit reintroduces it.
 Reproduce with:
 
 ```
-cargo test -p git-vista -- --ignored --nocapture hunk_nav_ladder
+cargo test -p git-vista -- --ignored --nocapture diff_walk_ladder
 ```
 
 (`#[ignore]`d — generates up to a ~7 MB synthetic patch, no place in every
@@ -153,48 +151,52 @@ cargo test -p git-vista -- --ignored --nocapture hunk_nav_ladder
 ### The ladder — hunk count vs. wall-clock time
 
 Synthetic uniform hunks (`generate_patch`, 3 add/remove line pairs each),
-debug build, one run each, this host:
+debug build, one run each, this host (2026-08-16, the run recorded when the
+ladder was retargeted from `hunk_nav`):
 
-| hunks  | elapsed     | patch bytes |
-| -----: | ----------: | ----------: |
-|    100 |    0.482 ms |      14,004 |
-|  1,000 |    4.083 ms |     141,804 |
-|  2,000 |    8.294 ms |     285,804 |
-| 10,000 |   41.164 ms |   1,437,804 |
-| 20,000 |   85.035 ms |   2,897,804 |
-| 50,000 |  207.600 ms |   7,277,804 |
+| hunks  | `selectable_hunks` | `parse`+`flatten` | patch bytes |
+| -----: | -----------------: | ----------------: | ----------: |
+|    100 |           0.398 ms |          0.578 ms |      14,037 |
+|  1,000 |           3.128 ms |          5.671 ms |     141,837 |
+|  2,000 |           6.487 ms |         11.359 ms |     285,837 |
+| 10,000 |          31.635 ms |         56.753 ms |   1,437,837 |
+| 20,000 |          64.686 ms |        112.721 ms |   2,897,837 |
+| 50,000 |         162.808 ms |        291.857 ms |   7,277,837 |
 
-Roughly linear (2,000 → 20,000 hunks, a 10x increase, cost 10.25x more time)
-— no evidence of a superlinear cost center at these sizes. The 2,000-hunk row
-sits just past `DIFF_PATCH_CAP` (200,000 bytes, the panel's patch cap in
+Both roughly linear (2,000 → 20,000 hunks, a 10x increase, cost ~10x more
+time in each column) — no evidence of a superlinear cost center at these
+sizes. The structured walk costs about 1.7x the raw walk — the price of
+building owned `String`s per line instead of scanning borrowed text — and
+stays comfortably inside the budget. The 2,000-hunk row sits just past
+`DIFF_PATCH_CAP` (200,000 bytes, the panel's patch cap in
 `handlers/read.rs`) — a realistic "hit the panel's cap" size, not an
 arbitrary round number. 50,000 hunks (~7 MB) sits past `DIFF_PATCH_CAP_FULL`
 (5,000,000 bytes, the full-screen viewer's cap) — the server would already
-have truncated a real patch this large before `hunk_nav` ever saw it; it's
+have truncated a real patch this large before either walk ever saw it; it's
 included to see the shape holds past both caps, not because a real request
 reaches it.
 
 ### Stated budget
 
-**`hunk_nav` over a patch with up to 20,000 hunks (comparable to
-`DIFF_PATCH_CAP_FULL`) must complete in well under 1 second** on hardware
-comparable to this host. The measured 85.0 ms at 20,000 hunks leaves roughly
-11x headroom before that budget.
+**Each walk, over a patch with up to 20,000 hunks (comparable to
+`DIFF_PATCH_CAP_FULL`), must complete in well under 1 second** on hardware
+comparable to this host. The measured 112.7 ms for the slower (structured)
+walk at 20,000 hunks leaves roughly 8x headroom before that budget.
 
 **Regression tests**, both in `features/diff/core.rs` (not `#[ignore]`d —
-run in every `cargo test`):
+run in every `cargo test`), each asserting over BOTH walks:
 
-- `hunk_nav_budget_holds_at_2k_hunks` asserts 2,000 hunks (the
-  panel-cap-realistic size above) complete inside **500 ms** — roughly 60x
-  the measured 8.3 ms at that size.
-- `hunk_nav_scales_roughly_linearly_not_quadratically` asserts the 20,000-hunk
-  run costs less than **25x** the 2,000-hunk run's time. This is the test
-  that actually catches the regression named above: an accidental
+- `diff_walk_budgets_hold_at_2k_hunks` asserts 2,000 hunks (the
+  panel-cap-realistic size above) complete inside **500 ms** per walk —
+  roughly 44x the measured 11.4 ms of the slower one at that size.
+- `diff_walks_scale_roughly_linearly_not_quadratically` asserts the
+  20,000-hunk run costs less than **25x** the 2,000-hunk run's time. This is
+  the test that actually catches the regression named above: an accidental
   reintroduction of a rescan-per-hunk shape would show up as roughly a
   further 10x slowdown on top of the expected 10x (i.e. close to 100x for
   this 10x size increase) — the wall-clock budget alone would not reliably
   catch that until it got much worse, since 500 ms has a lot of headroom.
-  Both tests also assert `hunk_nav` found exactly as many hunks as the
+  Both tests also assert each walk found exactly as many hunks as the
   generator produced, so a fast-but-wrong answer (an early return, or a
   desynced countdown eating the rest of the patch) fails the test instead of
   passing it by accident.
@@ -209,8 +211,9 @@ imports `line_heights`, `render_window`, `scroll_to_reveal`,
 `LineWrap` and `CumulativeHeights`, and builds a real window in its render
 closure (~line 635). Before that PR, "the virtualized diff view" named in
 #211 did not exist anywhere in the tree — this repo's prior session recorded
-that gap honestly in the `hunk_nav` section above rather than measuring a
-substitute and calling it done. That gap is now closed.
+that gap honestly in the per-render walk section above (then budgeting
+`hunk_nav`) rather than measuring a substitute and calling it done. That
+gap is now closed.
 
 **What the windowed path actually is** (read from source, not assumed):
 
@@ -254,9 +257,9 @@ substitute and calling it done. That gap is now closed.
 - **NOT covered — the full-screen viewer.** `viewer.rs`'s `LineWrap::Wrapped`
   path is not windowed at all yet (confirmed by reading `viewer.rs`, not
   assumed); this budget is panel-path (`LineWrap::Never`) only.
-- **Still separately covered — `hunk_nav`.** The hunk-navigation walk (see
-  above) is upstream of and independent from this windowing math; it is not
-  re-measured here.
+- **Still separately covered — the per-render walks.** `selectable_hunks`
+  and `parse_unified_diff`+`flatten` (see above) are upstream of and
+  independent from this windowing math; they are not re-measured here.
 
 Reproduce with:
 

@@ -1,184 +1,26 @@
-//! Pure decisions for the diff view's accessible hunk navigation (M2.16e, #210).
+//! Pure decisions for the diff surfaces: virtualized windowing (M2.16g,
+//! #350) and the staging selection's hunk addressing (M2.17d, #215).
 //!
-//! Today's diff view renders `CommitDiff.patch` as one flat `<pre>` of
-//! per-line spans (`detail.rs`, mirrored full-screen in `viewer.rs`). The
-//! roving-focus wiring there needs to know, for the raw patch text, **which
-//! rendered lines are hunk headers** and **what a screen reader should say
-//! about each** — and that mapping is a pure function of the text, so it
-//! lives here where `cargo test` can reach it.
+//! ## Where the hunk-navigation walk went (#210 → #361)
 //!
-//! ## Deliberately a raw-text walk, and deliberately temporary
+//! This module used to open with `hunk_nav`, a raw-text walk that re-derived
+//! hunk structure — header positions, spoken labels — from `patch.lines()`,
+//! because the flat `<pre>` rendering of the day had no other coordinate.
+//! Its own doc comment called it "deliberately temporary"; #361 was the
+//! change it was waiting for. Rendering is now driven by
+//! `git_vista_protocol::diff::parse_unified_diff` flattened into
+//! [`super::rows::DiffRows`], the spoken labels come from the same
+//! flattening (`DiffRows::hunk_labels`), and `hunk_nav` is deleted rather
+//! than kept alive by nothing but its own tests. The focus model it fed
+//! (`features::a11y::focus::GraphFocus`) is index-based and survived
+//! unchanged, exactly as that doc predicted.
 //!
-//! `git_vista_protocol::diff::parse_unified_diff` (#69a) already parses this
-//! text into structured [`Hunk`]s — but its output carries no mapping back to
-//! *line indices in the raw text*, which is the coordinate the flat rendering
-//! actually uses. Rather than bolt indices onto the protocol type, this walk
-//! re-derives the little it needs (header positions, per-hunk add/remove
-//! counts) directly. When #69e replaces the flat `<pre>` with rendering driven
-//! by `ParsedPatch` itself, this function is the piece that dies with it; the
-//! focus model it feeds (`features::a11y::focus::GraphFocus`) is index-based
-//! and survives unchanged. Scope note argued on #210 (2026-08-01).
-//!
-//! Combined (merge) hunk headers (`@@@`) are *not* navigation stops: the
-//! protocol parser leaves combined diffs deliberately opaque, and a label
-//! this walk can't back up would be worse than the plain colored line the
-//! view already shows. Only ordinary `@@ -a,b +c,d @@` headers qualify.
-//!
-//! ## Truncated patches
-//!
-//! The server caps patches at a **line boundary** (`read.rs`,
-//! `truncate_at_line`), so a cap that lands mid-hunk simply runs the
-//! `old_len`/`new_len` countdown out at end of input: no phantom stops, every
-//! header before the cut keeps its stop, and headers after the cut don't
-//! exist in the text at all. What the cut *can* do is leave the final hunk's
-//! counted added/removed lines short of what its header declared — so when
-//! the walk ends with the countdown unexhausted, the final label says
-//! `, truncated` rather than stating an undercount as fact. The rendering's
-//! separate truncation note discloses that the patch as a whole is cut.
+//! [`selectable_hunks`] below is the one raw-text walk that remains, on
+//! purpose: the staging selection UI (#215) renders the raw
+//! `patch.lines()` text and addresses hunks by line index, so its walk *is*
+//! its coordinate system, not a re-derivation of someone else's.
 
 use std::collections::HashMap;
-
-/// One keyboard-navigable hunk header in the rendered patch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HunkNavEntry {
-    /// Index into `patch.lines()` of the `@@` header this entry describes —
-    /// the same enumeration the rendering walks, so the wiring can attach
-    /// focus attributes while it maps lines to spans.
-    pub line_index: usize,
-    /// The VoiceOver label: file, per-file hunk ordinal, the new-side line
-    /// range, and add/remove counts. Spoken once on focus, so it leads with
-    /// the file and position rather than the raw `-12,5 +12,8` shorthand.
-    pub label: String,
-}
-
-/// Every navigable hunk header in `patch`, in rendering order.
-///
-/// The walk tracks hunk bodies by the exact `old_len`/`new_len` countdown the
-/// unified format defines, so a body line that *begins* with `+++`/`---`/`@@`
-/// (legal — markers are stripped per line, not per prefix-match) can never be
-/// mistaken for a file header or a new hunk.
-pub fn hunk_nav(patch: &str) -> Vec<HunkNavEntry> {
-    struct PendingHunk {
-        line_index: usize,
-        file: String,
-        new_start: u32,
-        new_len: u32,
-        heading: String,
-        added: u32,
-        removed: u32,
-    }
-    let mut pending: Vec<PendingHunk> = Vec::new();
-    // Remaining old-side / new-side lines of the hunk body being consumed;
-    // while either is nonzero, the current line belongs to a body.
-    let (mut old_left, mut new_left) = (0u32, 0u32);
-    // The `+++` side names the file a hunk edits; a deleted file has
-    // `+++ /dev/null`, so the `---` side is kept as the fallback name.
-    let (mut minus_file, mut plus_file) = (None::<String>, None::<String>);
-
-    for (i, line) in patch.lines().enumerate() {
-        if old_left > 0 || new_left > 0 {
-            // Inside a hunk body: classify by marker and count down.
-            match line.as_bytes().first() {
-                Some(b'+') => {
-                    new_left = new_left.saturating_sub(1);
-                    if let Some(h) = pending.last_mut() {
-                        h.added += 1;
-                    }
-                }
-                Some(b'-') => {
-                    old_left = old_left.saturating_sub(1);
-                    if let Some(h) = pending.last_mut() {
-                        h.removed += 1;
-                    }
-                }
-                // `\ No newline at end of file` counts on neither side.
-                Some(b'\\') => {}
-                // Context (or a blank context line git printed as "").
-                _ => {
-                    old_left = old_left.saturating_sub(1);
-                    new_left = new_left.saturating_sub(1);
-                }
-            }
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("--- ") {
-            minus_file = parse_file_side(rest);
-        } else if let Some(rest) = line.strip_prefix("+++ ") {
-            plus_file = parse_file_side(rest);
-        } else if let Some((old_len, new_start, new_len, heading)) = parse_hunk_header(line) {
-            let file = plus_file
-                .clone()
-                .or_else(|| minus_file.clone())
-                .unwrap_or_else(|| "unknown file".to_string());
-            pending.push(PendingHunk {
-                line_index: i,
-                file,
-                new_start,
-                new_len,
-                heading,
-                added: 0,
-                removed: 0,
-            });
-            old_left = old_len;
-            new_left = new_len;
-        }
-    }
-
-    // A countdown still owed lines at end of input means the cap cut the
-    // final hunk's body short — its counted added/removed understate what
-    // the header declared, so its label must say so (module doc).
-    let cut_mid_hunk = old_left > 0 || new_left > 0;
-
-    // Per-file ordinals need the per-file totals first; both passes are O(n)
-    // — a 5 MB refactor diff can carry tens of thousands of hunks, and a
-    // rescan-per-hunk would stall the iPad's main thread before first paint.
-    let mut totals: HashMap<&str, u32> = HashMap::new();
-    for h in &pending {
-        *totals.entry(h.file.as_str()).or_insert(0) += 1;
-    }
-    let mut seen: HashMap<&str, u32> = HashMap::new();
-    let last_idx = pending.len().checked_sub(1);
-    let mut entries = Vec::with_capacity(pending.len());
-    for (idx, h) in pending.iter().enumerate() {
-        let ordinal = {
-            let c = seen.entry(h.file.as_str()).or_insert(0);
-            *c += 1;
-            *c
-        };
-        let total = totals[h.file.as_str()];
-        let range = match h.new_len {
-            // A pure deletion has no new-side lines; "at line N" places it
-            // without claiming a range that doesn't exist.
-            0 => format!("at line {}", h.new_start),
-            1 => format!("line {}", h.new_start),
-            // Saturating: a crafted `+4294967295,2` header must not panic a
-            // debug build; real git output never gets near the edge.
-            n => format!(
-                "lines {}\u{2013}{}",
-                h.new_start,
-                h.new_start.saturating_add(n - 1)
-            ),
-        };
-        let heading = if h.heading.is_empty() {
-            String::new()
-        } else {
-            format!(", in {}", h.heading)
-        };
-        let truncated = if cut_mid_hunk && Some(idx) == last_idx {
-            ", truncated"
-        } else {
-            ""
-        };
-        entries.push(HunkNavEntry {
-            line_index: h.line_index,
-            label: format!(
-                "{}, hunk {} of {}: {}, {} added, {} removed{}{}",
-                h.file, ordinal, total, range, h.added, h.removed, heading, truncated
-            ),
-        });
-    }
-    entries
-}
 
 // ---------------------------------------------------------------------------
 // Virtualized rendering (M2.16g, #350) — the consumer #69c's primitive lacked
@@ -329,28 +171,27 @@ pub fn scroll_to_reveal(
 /// `HunkRef`/`FileSelection` need it (M2.17d, #215): canonical file path,
 /// 0-based per-file ordinal, and the header's own declared anchors.
 ///
-/// A second raw-text walk alongside [`hunk_nav`], deliberately — the staging
-/// selection UI renders the exact same flat `patch.lines()` text `hunk_nav`
-/// already maps for keyboard navigation, so it needs the same line-index
-/// coordinate space `hunk_nav` uses, not the structured parser's. `hunk_nav`
-/// itself is #210's tested contract and is not touched here; this is an
-/// independent function that happens to share its two small parsing helpers
-/// ([`parse_hunk_header`], [`parse_file_side`]). See `hunk_nav`'s module doc
-/// for why a raw-text walk is the right (and deliberately temporary) choice.
+/// A raw-text walk, deliberately (see the module doc): the staging selection
+/// UI renders the flat `patch.lines()` text, so line indices into that text
+/// are its own coordinate system. The countdown tracks hunk bodies by the
+/// exact `old_len`/`new_len` the unified format declares, so a body line
+/// that *begins* with `+++`/`---`/`@@` can never be mistaken for a file
+/// header or a new hunk. Its spoken labels come from the structured path
+/// (`super::rows::DiffRows::hunk_labels`), paired by position — both walks
+/// enumerate exactly the ordinary (non-combined) headers in rendering order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectableHunk {
     /// Index into `patch.lines()` of this hunk's `@@` header — the same
-    /// enumeration [`hunk_nav`]'s entries use, so a caller can pair the two
-    /// walks up by `line_index` (both visit ordinary headers in the same
-    /// order, skipping combined `@@@` headers identically).
+    /// enumeration the staging view walks while rendering, so it can attach
+    /// the selection row at exactly this line.
     pub line_index: usize,
     /// The file this hunk belongs to, addressed the canonical way
     /// (`git_vista_protocol::patch_build::canonical_path`'s rule: new-side
     /// name when the header pair has one).
     pub file: String,
     /// 0-based index into *this file's own* hunk list — the ordinal
-    /// `HunkRef::index` needs. Distinct from `hunk_nav`'s 1-based
-    /// "hunk N of M" spoken ordinal.
+    /// `HunkRef::index` needs. Distinct from the 1-based "hunk N" spoken
+    /// ordinal in the labels.
     pub ordinal: u32,
     /// The hunk header's declared old-side start — `HunkRef::old_start`.
     pub old_start: u32,
@@ -446,9 +287,7 @@ pub fn selectable_hunks(patch: &str) -> Vec<SelectableHunk> {
 /// and a file with a space or non-ASCII byte in its name would silently
 /// fail to stage (`SelectionMismatch::UnknownPath` on the server, since its
 /// canonical path never matched this walk's quoted-looking one). Sharing
-/// the one correct implementation is what keeps that from recurring, and
-/// costs `hunk_nav`'s labels nothing — a correctly unescaped name is a
-/// strictly better spoken label, not a worse one.
+/// the one correct implementation is what keeps that from recurring.
 fn parse_file_side(rest: &str) -> Option<String> {
     git_vista_protocol::path_or_dev_null(rest)
 }
@@ -503,36 +342,17 @@ diff --git a/bar.txt b/bar.txt
 +new
 ";
 
-    #[test]
-    fn headers_are_found_at_their_raw_line_indices() {
-        let nav = hunk_nav(PATCH);
-        // Literal indices counted by hand in PATCH above — not re-derived.
-        assert_eq!(
-            nav.iter().map(|e| e.line_index).collect::<Vec<_>>(),
-            vec![4, 10, 17]
-        );
-    }
+    // ---- selectable_hunks (M2.17d, #215) ------------------------------
+    //
+    // The hunk_nav tests that used to open this module retired with the
+    // function (#361). The behaviours that outlive it are re-pinned against
+    // their survivors: labels and truncation flags against `rows`'s
+    // structured flattening (its own test module), the countdown/no-phantom
+    // properties against `selectable_hunks` below — which shares the exact
+    // walk shape and is now the only raw-text consumer of it.
 
     #[test]
-    fn labels_carry_file_ordinal_range_and_counts() {
-        let nav = hunk_nav(PATCH);
-        assert_eq!(
-            nav[0].label,
-            "src/foo.rs, hunk 1 of 2: lines 10\u{2013}13, 2 added, 1 removed"
-        );
-        assert_eq!(
-            nav[1].label,
-            "src/foo.rs, hunk 2 of 2: lines 31\u{2013}32, 1 added, 1 removed, \
-             in fn frobnicate()"
-        );
-        assert_eq!(
-            nav[2].label,
-            "bar.txt, hunk 1 of 1: line 1, 1 added, 1 removed"
-        );
-    }
-
-    #[test]
-    fn a_body_line_starting_with_at_signs_is_not_a_navigation_stop() {
+    fn a_body_line_starting_with_at_signs_is_not_a_selectable_stop() {
         // Legal: a context line whose *text* is "@@ -1 +1 @@" — the countdown
         // must swallow it. A naive prefix scan would mint a phantom hunk.
         let patch = "\
@@ -543,45 +363,18 @@ diff --git a/bar.txt b/bar.txt
  @@ -9,9 +9,9 @@
  after
 ";
-        let nav = hunk_nav(patch);
-        assert_eq!(nav.len(), 1);
-        assert_eq!(nav[0].line_index, 2);
+        let hunks = selectable_hunks(patch);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].line_index, 2);
     }
 
     #[test]
-    fn combined_merge_headers_are_skipped() {
-        let patch = "\
---- a/x
-+++ b/x
-@@@ -1,2 -1,2 +1,2 @@@
- whatever
-";
-        assert_eq!(hunk_nav(patch), Vec::new());
-    }
-
-    #[test]
-    fn a_deleted_file_is_named_by_its_old_side() {
-        let patch = "\
---- a/gone.rs
-+++ /dev/null
-@@ -1,2 +0,0 @@
--line one
--line two
-";
-        let nav = hunk_nav(patch);
-        assert_eq!(nav.len(), 1);
-        assert_eq!(
-            nav[0].label,
-            "gone.rs, hunk 1 of 1: at line 0, 0 added, 2 removed"
-        );
-    }
-
-    #[test]
-    fn a_patch_cut_mid_hunk_keeps_prior_stops_and_flags_the_last_label() {
+    fn a_patch_cut_mid_hunk_keeps_prior_stops_without_phantoms() {
         // The second header declares a 20/22-line body but the cap cut it
-        // after two body lines — the countdown runs out at EOF (no phantom
-        // stops), and the final label admits the undercount instead of
-        // stating "1 added, 0 removed" as fact.
+        // after two body lines — the countdown runs out at EOF: every header
+        // before the cut keeps its stop, and nothing after the cut is
+        // invented. (The cut hunk's spoken label separately says
+        // ", truncated" — pinned in `rows`, where labels now live.)
         let patch = "\
 --- a/x
 +++ b/x
@@ -593,25 +386,22 @@ diff --git a/bar.txt b/bar.txt
  context
 +added one
 ";
-        let nav = hunk_nav(patch);
-        assert_eq!(nav.len(), 2);
+        let hunks = selectable_hunks(patch);
+        assert_eq!(hunks.len(), 2);
         assert_eq!(
-            nav[0].label,
-            "x, hunk 1 of 2: lines 1\u{2013}2, 1 added, 1 removed"
-        );
-        assert_eq!(
-            nav[1].label,
-            "x, hunk 2 of 2: lines 10\u{2013}31, 1 added, 0 removed, truncated"
+            hunks.iter().map(|h| h.line_index).collect::<Vec<_>>(),
+            vec![2, 6]
         );
     }
 
     #[test]
     fn an_empty_or_headerless_patch_yields_no_stops() {
-        assert_eq!(hunk_nav(""), Vec::new());
-        assert_eq!(hunk_nav("Binary files a/x and b/x differ\n"), Vec::new());
+        assert_eq!(selectable_hunks(""), Vec::new());
+        assert_eq!(
+            selectable_hunks("Binary files a/x and b/x differ\n"),
+            Vec::new()
+        );
     }
-
-    // ---- selectable_hunks (M2.17d, #215) ------------------------------
 
     #[test]
     fn selectable_hunks_carry_per_file_ordinals_and_anchors() {
@@ -645,18 +435,6 @@ diff --git a/bar.txt b/bar.txt
     }
 
     #[test]
-    fn selectable_hunks_line_indices_match_hunk_nav_exactly() {
-        // Both walks must agree on which lines are navigation stops, and in
-        // what order — the staging UI pairs them up by `line_index`.
-        let nav_lines: Vec<usize> = hunk_nav(PATCH).iter().map(|e| e.line_index).collect();
-        let sel_lines: Vec<usize> = selectable_hunks(PATCH)
-            .iter()
-            .map(|h| h.line_index)
-            .collect();
-        assert_eq!(nav_lines, sel_lines);
-    }
-
-    #[test]
     fn selectable_hunks_skip_combined_merge_headers() {
         let patch = "\
 --- a/x
@@ -683,39 +461,29 @@ diff --git a/bar.txt b/bar.txt
         assert_eq!(hunks[0].new_start, 0);
     }
 
-    // ---- Diff hunk-navigation performance budget (#211, M2.16f) ---------------
+    // ---- Diff per-render walk performance budget (#211, M2.16f) ---------------
     //
-    // #211's text calls its target "the virtualized diff view (69c)". As of
-    // this writing that is a stale premise, not a live shape to benchmark:
-    // the diff view renders `CommitDiff.patch` as one flat `<pre>` (this
-    // module's own doc comment, `detail.rs`, `viewer.rs`) — no virtualization
-    // is wired into it. #69c's `CumulativeHeights`/`visible_range`
-    // (`git_vista_core::virtualize`) is a real, already-tested primitive, but
-    // it has zero consumers in the tree (verified: no reference to either
-    // name outside its own module and its own tests). There is nothing
-    // "virtualized diff view" shaped to measure yet.
+    // This block used to budget `hunk_nav`, the raw-text walk every diff
+    // render paid. #361 deleted it; what runs per render now is one of two
+    // walks, and BOTH are budgeted here because the failure mode the old
+    // budget pinned down — "a 5 MB refactor diff can carry tens of thousands
+    // of hunks, and a rescan-per-hunk would stall the iPad's main thread
+    // before first paint" — did not die with the function:
     //
-    // What *is* real, host-tested, and runs on every diff render today
-    // regardless of virtualization is `hunk_nav` itself: a full O(n) walk of
-    // the raw patch text, called from `detail.rs::accessible_patch_view`
-    // (panel and full-screen viewer) and from `staging_view.rs` for
-    // hunk-selection labels. Its own doc comment above already names the
-    // failure mode this budget pins down: "a 5 MB refactor diff can carry
-    // tens of thousands of hunks, and a rescan-per-hunk would stall the
-    // iPad's main thread before first paint." That per-hunk-rescan shape
-    // does not exist today (both passes here are already O(n)), but nothing
-    // stops a future edit from accidentally reintroducing it — that is
-    // exactly the regression a budget test exists to catch.
+    // - the STRUCTURED walk, `parse_unified_diff` + `rows::flatten`, run
+    //   once per patch by the detail panel, the full-screen viewer, and the
+    //   staging view's labels;
+    // - `selectable_hunks`, the surviving raw-text walk, run per staging
+    //   render for selection anchors.
     //
     // **What this budget does NOT cover** (stated plainly, per house rule —
     // a budget that quietly claims more than it measures is worse than none):
-    // - The actual DOM/`<pre>` construction in `detail.rs`/`viewer.rs` is
-    //   `#[cfg(target_arch = "wasm32")]`-gated; `cargo test --workspace`
-    //   never compiles it and this repo has no wasm test harness. Unmeasured.
-    // - Whether virtualization is "engaged" — it isn't wired into the diff
-    //   view at all, so there is nothing to prove engaged or broken. A
-    //   future task that wires `CumulativeHeights` into the render path
-    //   should add its own budget alongside that wiring.
+    // - The actual DOM/`<pre>` construction in `detail.rs`/`viewer.rs`/
+    //   `staging_view.rs` — `#[cfg(target_arch = "wasm32")]`-gated;
+    //   `cargo test --workspace` never compiles it and this repo has no wasm
+    //   test harness. Unmeasured.
+    // - The windowing math (`CumulativeHeights`, `render_window`) — measured
+    //   separately, see the virtualization ladder below.
     // - Real-world patch text (renamed files, binary markers, combined merge
     //   headers, mixed hunk sizes). The generator below produces one
     //   synthetic file with uniformly-sized hunks — deliberately the
@@ -724,14 +492,17 @@ diff --git a/bar.txt b/bar.txt
 
     /// One synthetic hunk: 2 context lines, `pairs` removed lines, `pairs`
     /// added lines — `old_len == new_len == 2 + pairs`, so the header counts
-    /// match the body exactly (a mismatched header would make `hunk_nav`'s
-    /// countdown desync, corrupting every later hunk's line-index mapping —
-    /// this generator must not itself be the thing that breaks the
+    /// match the body exactly (a mismatched header would desync
+    /// `selectable_hunks`' countdown and make every label read ", truncated"
+    /// — this generator must not itself be the thing that breaks the
     /// measurement). Hunks are numbered into `bench.rs` under one file
-    /// header, since `hunk_nav`'s cost is dominated by total line count, not
-    /// by how many file headers that count is spread across.
+    /// header, since both walks' costs are dominated by total line count,
+    /// not by how many file headers that count is spread across. The
+    /// `diff --git` line is what makes the section visible to
+    /// `parse_unified_diff` (it splits on it); `selectable_hunks` skips it.
     fn generate_patch(num_hunks: usize, pairs: usize) -> String {
-        let mut s = String::from("--- a/bench.rs\n+++ b/bench.rs\n");
+        let mut s =
+            String::from("diff --git a/bench.rs b/bench.rs\n--- a/bench.rs\n+++ b/bench.rs\n");
         for i in 0..num_hunks {
             let start = 1 + i * 1000; // spaced out so ranges never overlap
             let len = 2 + pairs;
@@ -747,79 +518,101 @@ diff --git a/bar.txt b/bar.txt
         s
     }
 
-    /// One measurement: wall-clock time for `hunk_nav` over a synthetic
-    /// `num_hunks`-hunk patch, plus the patch's own byte length (so the
-    /// ladder can be read against `DIFF_PATCH_CAP`/`DIFF_PATCH_CAP_FULL` in
-    /// `handlers/read.rs`, 200,000 / 5,000,000 bytes) and a structural check
-    /// that every hunk was actually found — a fast wrong answer (e.g. an
-    /// early return, or a countdown desync eating the rest of the patch)
-    /// must not be mistaken for a fast correct one.
-    fn time_hunk_nav(num_hunks: usize) -> (std::time::Duration, usize, usize) {
+    /// One measurement of both per-render walks over the same synthetic
+    /// `num_hunks`-hunk patch: elapsed time for `selectable_hunks`, elapsed
+    /// time for `parse_unified_diff` + `rows::flatten`, and the patch's byte
+    /// length (so the ladder can be read against
+    /// `DIFF_PATCH_CAP`/`DIFF_PATCH_CAP_FULL` in `handlers/read.rs`,
+    /// 200,000 / 5,000,000 bytes). Both walks are structurally checked to
+    /// have found every hunk — a fast wrong answer (an early return, or a
+    /// countdown desync eating the rest of the patch) must not be mistaken
+    /// for a fast correct one.
+    fn time_diff_walks(num_hunks: usize) -> (std::time::Duration, std::time::Duration, usize) {
         let patch = generate_patch(num_hunks, 3);
         let bytes = patch.len();
+
         let start = std::time::Instant::now();
-        let nav = hunk_nav(&patch);
-        let elapsed = start.elapsed();
+        let sel = selectable_hunks(&patch);
+        let sel_elapsed = start.elapsed();
         assert_eq!(
-            nav.len(),
+            sel.len(),
             num_hunks,
-            "hunk_nav found {} of {num_hunks} synthetic hunks — a fast wrong \
-             answer, not a fast correct one; the measurement below is not \
-             trustworthy if this fails",
-            nav.len()
+            "selectable_hunks found {} of {num_hunks} synthetic hunks — a \
+             fast wrong answer, not a fast correct one; the measurement is \
+             not trustworthy if this fails",
+            sel.len()
         );
-        (elapsed, bytes, nav.len())
+
+        let start = std::time::Instant::now();
+        let flat = crate::features::diff::rows::flatten(
+            &git_vista_protocol::diff::parse_unified_diff(&patch),
+        );
+        let flat_elapsed = start.elapsed();
+        assert_eq!(
+            flat.hunk_count, num_hunks,
+            "flatten found {} of {num_hunks} synthetic hunks — same \
+             fast-wrong-answer guard as above",
+            flat.hunk_count
+        );
+
+        (sel_elapsed, flat_elapsed, bytes)
     }
 
-    /// The real measurement behind `docs/PERFORMANCE_BUDGETS.md`'s `hunk_nav`
-    /// section — **not** part of the normal test run. `#[ignore]`d because a
-    /// 50,000-hunk synthetic patch (~7 MB of generated text) has no place in
-    /// every `cargo test`/CI run; `hunk_nav_budget_holds_at_2k_hunks` below
-    /// is the fast, always-on regression check derived from what this finds.
+    /// The real measurement behind `docs/PERFORMANCE_BUDGETS.md`'s
+    /// per-render-walk section — **not** part of the normal test run.
+    /// `#[ignore]`d because a 50,000-hunk synthetic patch (~7 MB of generated
+    /// text) has no place in every `cargo test`/CI run;
+    /// `diff_walk_budgets_hold_at_2k_hunks` below is the fast, always-on
+    /// regression check derived from what this finds.
     ///
     /// Run explicitly to reproduce or update the recorded numbers:
-    /// `cargo test -p git-vista -- --ignored --nocapture hunk_nav_ladder`
+    /// `cargo test -p git-vista -- --ignored --nocapture diff_walk_ladder`
     ///
     /// One host, one run each — not a statistically controlled benchmark
     /// suite, same caveat `docs/PERFORMANCE_BUDGETS.md` states up front.
     #[test]
     #[ignore = "generates up to a ~7 MB synthetic patch; run explicitly, see doc comment"]
-    fn hunk_nav_ladder() {
-        println!("\n#211 hunk_nav ladder (one host, one run each):");
-        println!("{:>10}  {:>12}  {:>10}", "n_hunks", "elapsed", "bytes");
+    fn diff_walk_ladder() {
+        println!("\n#211 diff per-render walk ladder (one host, one run each):");
+        println!(
+            "{:>10}  {:>14}  {:>14}  {:>10}",
+            "n_hunks", "selectable", "parse+flatten", "bytes"
+        );
         for n in [100usize, 1_000, 2_000, 10_000, 20_000, 50_000] {
-            let (elapsed, bytes, _found) = time_hunk_nav(n);
-            println!("{n:>10}  {elapsed:>12?}  {bytes:>10}");
+            let (sel, flat, bytes) = time_diff_walks(n);
+            println!("{n:>10}  {sel:>14?}  {flat:>14?}  {bytes:>10}");
         }
     }
 
     /// A scaling check, not just a wall-clock one: 10x the hunk count must
-    /// not cost anywhere near 10x-squared the time. `hunk_nav` is O(n) by
-    /// construction (two linear passes — see the module doc and the doc
-    /// comment on the per-file-ordinal pass above), so time should scale
-    /// roughly linearly; this asserts a generous *upper* bound on the ratio
-    /// (25x for a 10x size increase) loose enough to absorb real per-call
-    /// overhead and a loaded CI runner, but tight enough that an accidental
-    /// quadratic reintroduction — which would show roughly a 10x *further*
-    /// slowdown on top of the expected 10x, i.e. close to 100x — still fails
-    /// it. This is the check that would actually catch the "rescan-per-hunk"
-    /// regression the module doc above warns about; the wall-clock budget
-    /// test below would not reliably catch it until it got much worse.
+    /// not cost anywhere near 10x-squared the time. Both walks are O(n) by
+    /// construction (linear passes over lines), so time should scale roughly
+    /// linearly; this asserts a generous *upper* bound on the ratio (25x for
+    /// a 10x size increase) loose enough to absorb real per-call overhead
+    /// and a loaded CI runner, but tight enough that an accidental quadratic
+    /// reintroduction — which would show roughly a 10x *further* slowdown on
+    /// top of the expected 10x, i.e. close to 100x — still fails it. This is
+    /// the check that would actually catch a "rescan-per-hunk" regression;
+    /// the wall-clock budget test below would not reliably catch it until it
+    /// got much worse.
     #[test]
-    fn hunk_nav_scales_roughly_linearly_not_quadratically() {
-        let (small_elapsed, _, _) = time_hunk_nav(2_000);
-        let (large_elapsed, _, _) = time_hunk_nav(20_000);
-        let small_nanos = small_elapsed.as_nanos().max(1);
-        let large_nanos = large_elapsed.as_nanos();
-        let ratio = large_nanos as f64 / small_nanos as f64;
-        assert!(
-            ratio < 25.0,
-            "hunk_nav took {large_elapsed:?} at 20,000 hunks vs {small_elapsed:?} \
-             at 2,000 hunks — a {ratio:.1}x slowdown for a 10x size increase. \
-             hunk_nav is meant to be O(n); this ratio is only consistent with \
-             an accidental quadratic (or worse) regression, not measurement \
-             noise."
-        );
+    fn diff_walks_scale_roughly_linearly_not_quadratically() {
+        let (sel_small, flat_small, _) = time_diff_walks(2_000);
+        let (sel_large, flat_large, _) = time_diff_walks(20_000);
+        for (name, small, large) in [
+            ("selectable_hunks", sel_small, sel_large),
+            ("parse_unified_diff+flatten", flat_small, flat_large),
+        ] {
+            let ratio = large.as_nanos() as f64 / small.as_nanos().max(1) as f64;
+            assert!(
+                ratio < 25.0,
+                "{name} took {large:?} at 20,000 hunks vs {small:?} at 2,000 \
+                 hunks — a {ratio:.1}x slowdown for a 10x size increase. Both \
+                 walks are meant to be O(n); this ratio is only consistent \
+                 with an accidental quadratic (or worse) regression, not \
+                 measurement noise."
+            );
+        }
     }
 
     /// The always-on regression check: 2,000 hunks (~280 KB of patch text,
@@ -827,15 +620,20 @@ diff --git a/bar.txt b/bar.txt
     /// — a realistic "hit the panel's cap" size) must complete well inside a
     /// generous multiple of the budget `docs/PERFORMANCE_BUDGETS.md` states.
     #[test]
-    fn hunk_nav_budget_holds_at_2k_hunks() {
-        let (elapsed, _bytes, _found) = time_hunk_nav(2_000);
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "hunk_nav over a 2,000-hunk patch took {elapsed:?}, budget is \
-             500ms (see docs/PERFORMANCE_BUDGETS.md) — this is a real \
-             regression, not flakiness, unless the CI runner is unusually \
-             loaded"
-        );
+    fn diff_walk_budgets_hold_at_2k_hunks() {
+        let (sel, flat, _) = time_diff_walks(2_000);
+        for (name, elapsed) in [
+            ("selectable_hunks", sel),
+            ("parse_unified_diff+flatten", flat),
+        ] {
+            assert!(
+                elapsed < std::time::Duration::from_millis(500),
+                "{name} over a 2,000-hunk patch took {elapsed:?}, budget is \
+                 500ms (see docs/PERFORMANCE_BUDGETS.md) — this is a real \
+                 regression, not flakiness, unless the CI runner is unusually \
+                 loaded"
+            );
+        }
     }
 
     // -------------------------------------------------------------------
@@ -983,9 +781,9 @@ diff --git a/bar.txt b/bar.txt
     // #211 asks to measure "the virtualized diff view (69c)." Until PR #351
     // (M2.16g, #350, merged this session) that view did not exist: #69c's
     // `CumulativeHeights`/`visible_range` had zero consumers, and the panel
-    // rendered every patch line as one flat `<pre>` — see the `hunk_nav`
-    // budget section above and its `docs/PERFORMANCE_BUDGETS.md` entry for
-    // the full history of that gap. `detail.rs` now builds `CumulativeHeights`
+    // rendered every patch line as one flat `<pre>` — see the per-render
+    // walk budget section above and its `docs/PERFORMANCE_BUDGETS.md` entry
+    // for the full history of that gap. `detail.rs` now builds `CumulativeHeights`
     // and calls `render_window`/`scroll_to_reveal` in its real render
     // closure — this ladder measures exactly those calls, with the exact
     // constants `detail.rs` uses.
@@ -1108,7 +906,7 @@ diff --git a/bar.txt b/bar.txt
 
     /// The real measurement behind #211's `docs/PERFORMANCE_BUDGETS.md`
     /// section — **not** part of the normal test run, for the same reason
-    /// `hunk_nav_ladder` above isn't: a 50,000-line synthetic patch (~2.4 MB
+    /// `diff_walk_ladder` above isn't: a 50,000-line synthetic patch (~2.4 MB
     /// generated twice, once per wrap mode) has no place in every `cargo
     /// test`/CI run. `virtualize_query_budget_holds_at_50k_lines` below is
     /// the fast, always-on regression check derived from what this finds.

@@ -2,12 +2,13 @@
 //!
 //! ## Why this exists
 //!
-//! [`super::core::hunk_nav`] re-derives hunk structure by walking raw patch
-//! text with a marker/countdown scan — structure the parser
+//! `hunk_nav` (deleted with #361's completion) re-derived hunk structure by
+//! walking raw patch text with a marker/countdown scan — structure the parser
 //! ([`git_vista_protocol::diff::parse_unified_diff`], #69a) has *already*
 //! produced. Two independent derivations of the same fact is how they drift:
-//! a body line beginning `+++` or `@@` is a genuine hazard for the text walk
-//! and a non-event for the parser.
+//! a body line beginning `+++` or `@@` is a genuine hazard for a text walk
+//! and a non-event for the parser. This module is the structured derivation
+//! that replaced it, for rendering, spoken labels, and heights alike.
 //!
 //! ## The two coordinates, kept deliberately separate
 //!
@@ -290,7 +291,7 @@ pub fn flatten(patch: &ParsedPatch) -> DiffRows {
                     rows.push(DiffRow::HunkHeader {
                         file_index,
                         hunk_ordinal,
-                        label: hunk_label(&name, within_file, hunk),
+                        label: hunk_label(&name, within_file, hunks.len(), hunk),
                         text: hunk_header_text(hunk),
                     });
                     for line in &hunk.lines {
@@ -348,6 +349,75 @@ pub fn flatten(patch: &ParsedPatch) -> DiffRows {
     }
 }
 
+/// One spoken label per [`super::core::SelectableHunk`], paired by
+/// **(file, per-file ordinal)** — never by position.
+///
+/// The staging view pairs `selectable_hunks` (a raw-text walk that reacts to
+/// any `---`/`+++`/`@@` lines) with labels from the structured parser
+/// ([`git_vista_protocol::diff::parse_unified_diff`], which only recognises
+/// hunks inside a `diff --git`/`--combined`/`--cc` section, and whose
+/// `parse_file_section` has a documented "nothing recognisable — skip"
+/// path). The two are asymmetric by construction, so positional pairing had
+/// two silent failure modes (review findings): a whole file dropped by the
+/// structured parser would shift **every subsequent** hunk's spoken label
+/// onto the wrong checkbox, and any count mismatch fell back to an **empty**
+/// `aria-label`. Keying on `(file, ordinal)` — the same identity
+/// `SelectableHunk` itself carries, built from the same shared
+/// [`git_vista_protocol::diff::path_or_dev_null`] path rule — makes
+/// misalignment structurally impossible: a hunk the parser dropped merely
+/// gets the honest fallback below, and every hunk both walks agree on keeps
+/// its own label.
+///
+/// The fallback label is built from the raw walk's own facts (file, per-file
+/// number, new-side line) — less rich than a parsed label (no counts, no
+/// heading), but never empty and never someone else's.
+///
+/// The output is index-aligned with `hunks`: exactly one label per
+/// selectable hunk, in the same order.
+pub fn labels_for_selectable_hunks(
+    patch: &ParsedPatch,
+    hunks: &[super::core::SelectableHunk],
+) -> Vec<String> {
+    use std::collections::HashMap;
+    // Mirror `selectable_hunks`' per-file ordinal rule exactly: a running
+    // count per file NAME (not per section), so a file split across two
+    // `diff --git` sections still lines up with the raw walk's numbering.
+    let mut labels_by_key: HashMap<(String, u32), String> = HashMap::new();
+    let mut seen: HashMap<String, u32> = HashMap::new();
+    for file in &patch.files {
+        if let FileDiff::Hunks {
+            hunks: parsed_hunks,
+            ..
+        } = file
+        {
+            let name = display_path(file);
+            for (within_file, hunk) in parsed_hunks.iter().enumerate() {
+                let ordinal = {
+                    let c = seen.entry(name.clone()).or_insert(0);
+                    let ord = *c;
+                    *c += 1;
+                    ord
+                };
+                labels_by_key.insert(
+                    (name.clone(), ordinal),
+                    hunk_label(&name, within_file, parsed_hunks.len(), hunk),
+                );
+            }
+        }
+    }
+    hunks
+        .iter()
+        .map(|h| {
+            labels_by_key
+                .get(&(h.file.clone(), h.ordinal))
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!("{} hunk {} at line {}", h.file, h.ordinal + 1, h.new_start)
+                })
+        })
+        .collect()
+}
+
 /// The `@@ … @@` text as git printed it. Reconstructed rather than carried
 /// through, because the parser keeps the numbers and drops the formatting —
 /// and the numbers are what a reader checks against their own file.
@@ -363,25 +433,49 @@ fn hunk_header_text(hunk: &Hunk) -> String {
     }
 }
 
-/// The spoken label, matching [`super::core::hunk_nav`]'s shape: file, the
-/// per-file ordinal, the new-side range, then the counts. Leads with file and
-/// position because that is what orients a listener — the raw `-12,5 +12,8`
-/// shorthand does not.
-fn hunk_label(file: &str, within_file: usize, hunk: &Hunk) -> String {
-    let (added, removed) = hunk
-        .lines
-        .iter()
-        .fold((0u32, 0u32), |(a, r), line| match line.kind {
-            LineKind::Added => (a + 1, r),
-            LineKind::Removed => (a, r + 1),
-            LineKind::Context => (a, r),
-        });
+/// The spoken label: file, the per-file ordinal **and total**, the new-side
+/// position, the counts, then the section heading when the header carried
+/// one. Leads with file and position because that is what orients a
+/// listener — the raw `-12,5 +12,8` shorthand does not. The "of {total}"
+/// and ", in {heading}" cues are #210 content `hunk_nav` spoke and PR #386's
+/// migration silently dropped (review finding): "how many hunks remain in
+/// this file" and "which function is this" are orientation a screen-reader
+/// user cannot get any other way.
+///
+/// **`, truncated` when the body is short of its header's declaration.** The
+/// server caps patches at a line boundary (`read.rs`, `truncate_at_line`), so
+/// a cap landing mid-hunk leaves the final hunk's parsed lines short of the
+/// `old_len`/`new_len` its `@@` header declared. Stating the resulting
+/// undercount as fact would be a lie a screen-reader user cannot see past;
+/// the raw-text walk this replaced flagged exactly this case, and the flag
+/// must survive the migration. Checked per hunk rather than only on the
+/// patch's last one — for well-formed input only the cut hunk can fall
+/// short, and a malformed mid-patch hunk deserves the same honesty.
+fn hunk_label(file: &str, within_file: usize, total_in_file: usize, hunk: &Hunk) -> String {
+    let (added, removed, context) =
+        hunk.lines
+            .iter()
+            .fold((0u32, 0u32, 0u32), |(a, r, c), line| match line.kind {
+                LineKind::Added => (a + 1, r, c),
+                LineKind::Removed => (a, r + 1, c),
+                LineKind::Context => (a, r, c + 1),
+            });
+    // Old side draws context + removed lines, new side context + added; a
+    // body that ran out early is short on at least one of them.
+    let cut = context + removed < hunk.old_len || context + added < hunk.new_len;
     format!(
-        "{file} hunk {} at line {}, {} added, {} removed",
+        "{file} hunk {} of {} at line {}, {} added, {} removed{}{}",
         within_file + 1,
+        total_in_file,
         hunk.new_start,
         added,
-        removed
+        removed,
+        if cut { ", truncated" } else { "" },
+        if hunk.section_heading.is_empty() {
+            String::new()
+        } else {
+            format!(", in {}", hunk.section_heading)
+        }
     )
 }
 
@@ -738,6 +832,240 @@ mod tests {
         assert!(label.contains("42"), "{label}");
         assert!(label.contains("1 added"), "{label}");
         assert!(label.contains("1 removed"), "{label}");
+    }
+
+    /// Every navigable hunk's label in ordinal order — a test lens over the
+    /// flattened rows. Production code never consumes labels positionally
+    /// (the staging view goes through `labels_for_selectable_hunks`' keyed
+    /// pairing), so this lives here rather than as API.
+    fn hunk_labels(flat: &DiffRows) -> Vec<String> {
+        flat.rows
+            .iter()
+            .filter_map(|row| match row {
+                DiffRow::HunkHeader { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flattened_hunk_labels_pair_with_selectable_hunks() {
+        // Both walks must enumerate the same ordinary hunks in the same
+        // order — the property that makes `labels_for_selectable_hunks`'
+        // keyed pairing coincide with rendering order on well-formed
+        // patches. The fixture deliberately mixes the shapes the two
+        // walks must agree on skipping: an ordinary two-hunk file, a combined
+        // merge section (`@@@`, navigable to neither), and a trailing
+        // ordinary file.
+        let patch = "\
+diff --git a/src/foo.rs b/src/foo.rs
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -10,3 +10,4 @@
+ context
++added one
++added two
+ context
+-removed one
+@@ -30,2 +31,2 @@ fn frobnicate()
+ context
+-old line
++new line
+diff --cc merged.rs
+--- a/merged.rs
++++ b/merged.rs
+@@@ -1,2 -1,2 +1,2 @@@
+  ctx
+++both
+diff --git a/bar.txt b/bar.txt
+--- a/bar.txt
++++ b/bar.txt
+@@ -1 +1 @@
+-old
++new
+";
+        let sel = crate::features::diff::core::selectable_hunks(patch);
+        let labels = hunk_labels(&flatten(&parse_unified_diff(patch)));
+        assert_eq!(
+            labels.len(),
+            sel.len(),
+            "both walks must find the same hunks: {labels:?} vs {sel:?}"
+        );
+        assert_eq!(
+            sel.len(),
+            3,
+            "fixture should carry exactly 3 ordinary hunks"
+        );
+        for (label, hunk) in labels.iter().zip(&sel) {
+            // Labels lead with the file (pinned elsewhere), so positional
+            // pairing is verifiable file-by-file.
+            assert!(
+                label.starts_with(&hunk.file),
+                "label {label:?} does not open with its paired hunk's file {:?}",
+                hunk.file
+            );
+        }
+    }
+
+    #[test]
+    fn selectable_labels_pair_by_file_and_ordinal_even_when_the_parsers_disagree() {
+        // The two walks staging pairs are asymmetric by construction:
+        // `selectable_hunks` reacts to bare `---`/`+++`/`@@` lines, while
+        // `parse_unified_diff` only recognises hunks inside a
+        // `diff --git`/`--combined`/`--cc` section. A hunk block with no
+        // `diff --git` line is therefore visible to the raw walk and
+        // invisible to the structured one. Positional pairing would shift
+        // bar.txt's real label onto orphan.rs's checkbox and leave bar.txt's
+        // own hunk with an empty aria-label (the exact silent failure the
+        // review flagged); keyed pairing must instead give orphan.rs an
+        // honest fallback and bar.txt its own label.
+        let patch = "\
+--- a/orphan.rs
++++ b/orphan.rs
+@@ -1,2 +1,2 @@
+ context
+-old
++new
+diff --git a/bar.txt b/bar.txt
+--- a/bar.txt
++++ b/bar.txt
+@@ -5 +5 @@
+-old
++new
+";
+        let sel = crate::features::diff::core::selectable_hunks(patch);
+        assert_eq!(sel.len(), 2, "the raw walk must see both hunks: {sel:?}");
+        let parsed = parse_unified_diff(patch);
+        assert_eq!(
+            parsed.files.len(),
+            1,
+            "the structured parse must see only bar.txt — if this fails the \
+             fixture no longer exercises the asymmetry"
+        );
+        let labels = labels_for_selectable_hunks(&parsed, &sel);
+        assert_eq!(labels.len(), sel.len(), "one label per selectable hunk");
+        assert_eq!(
+            labels[0], "orphan.rs hunk 1 at line 1",
+            "the unparsed hunk gets the honest raw-walk fallback, never an \
+             empty label and never another file's label"
+        );
+        assert!(
+            labels[1].starts_with("bar.txt hunk 1 of 1"),
+            "the parsed hunk keeps its own full label: {:?}",
+            labels[1]
+        );
+        assert!(
+            labels[1].contains("1 added, 1 removed"),
+            "the parsed hunk's label carries real counts: {:?}",
+            labels[1]
+        );
+    }
+
+    #[test]
+    fn selectable_labels_match_the_flattened_labels_when_the_parsers_agree() {
+        // On a well-formed patch (every hunk inside a `diff --git` section —
+        // the only shape the server's git invocations produce) the keyed
+        // pairing must be indistinguishable from the flattened ordinal-order
+        // list: same labels, same order, no fallbacks.
+        let patch = "\
+diff --git a/src/foo.rs b/src/foo.rs
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -10,3 +10,4 @@
+ context
++added one
++added two
+ context
+-removed one
+@@ -30,2 +31,2 @@ fn frobnicate()
+ context
+-old line
++new line
+diff --git a/bar.txt b/bar.txt
+--- a/bar.txt
++++ b/bar.txt
+@@ -1 +1 @@
+-old
++new
+";
+        let sel = crate::features::diff::core::selectable_hunks(patch);
+        let parsed = parse_unified_diff(patch);
+        assert_eq!(
+            labels_for_selectable_hunks(&parsed, &sel),
+            hunk_labels(&flatten(&parsed)),
+            "keyed pairing and ordinal order must coincide when both walks \
+             see the same hunks"
+        );
+    }
+
+    #[test]
+    fn labels_carry_the_per_file_total_and_the_section_heading() {
+        // #210's spoken labels carried "hunk N of M" and the enclosing
+        // section heading (", in fn frobnicate()"). `hunk_nav` was the last
+        // carrier of both; deleting it (#361) must not delete the cues — a
+        // screen-reader user staging hunks needs "how many remain in this
+        // file" and "which function am I in" (review finding).
+        let patch = "\
+diff --git a/src/foo.rs b/src/foo.rs
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -10,3 +10,3 @@
+ context
++added
+ context
+-removed
+@@ -30,2 +31,2 @@ fn frobnicate()
+ context
+-old
++new
+";
+        let labels = hunk_labels(&flatten(&parse_unified_diff(patch)));
+        assert_eq!(labels.len(), 2);
+        assert!(labels[0].contains("hunk 1 of 2"), "{:?}", labels[0]);
+        assert!(labels[1].contains("hunk 2 of 2"), "{:?}", labels[1]);
+        assert!(
+            labels[1].ends_with(", in fn frobnicate()"),
+            "the section heading must be spoken: {:?}",
+            labels[1]
+        );
+        assert!(
+            !labels[0].contains(", in "),
+            "no heading on the header means no heading in the label: {:?}",
+            labels[0]
+        );
+    }
+
+    #[test]
+    fn a_patch_cut_mid_hunk_flags_the_short_hunks_label_as_truncated() {
+        // The server caps patches at a line boundary (`read.rs`,
+        // `truncate_at_line`), so a cap landing mid-hunk leaves the final
+        // hunk's body short of what its header declared. The label must say
+        // so rather than state the undercount as fact — the behaviour
+        // `hunk_nav` had (#210) and the migration to rows must not lose.
+        let patch = "\
+diff --git a/x b/x
+--- a/x
++++ b/x
+@@ -1,2 +1,2 @@
+ context
+-old
++new
+@@ -10,20 +10,22 @@
+ context
++added one
+";
+        let labels = hunk_labels(&flatten(&parse_unified_diff(patch)));
+        assert_eq!(labels.len(), 2);
+        assert!(
+            !labels[0].contains("truncated"),
+            "a complete hunk must not be flagged: {:?}",
+            labels[0]
+        );
+        assert!(
+            labels[1].ends_with(", truncated"),
+            "the cut hunk's label must admit the undercount: {:?}",
+            labels[1]
+        );
     }
 
     #[test]
