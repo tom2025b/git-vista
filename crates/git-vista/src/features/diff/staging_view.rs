@@ -264,13 +264,20 @@ fn staging_patch_view(
     );
     let drag_anchor: StoredValue<Option<usize>> = store_value(None);
     // The spoken VoiceOver labels, from the structured path (#361): the same
-    // `flatten` the detail panel and viewer speak from, paired with
-    // `selectable_hunks` by position — both enumerate exactly the ordinary
-    // `@@` headers in rendering order (pinned by
-    // `flattened_hunk_labels_pair_with_selectable_hunks` in `rows`).
-    let labels: Vec<String> =
-        crate::features::diff::rows::flatten(&git_vista_protocol::diff::parse_unified_diff(patch))
-            .hunk_labels();
+    // `hunk_label` text the detail panel and viewer speak, paired with
+    // `selectable_hunks` by (file, per-file ordinal) — NOT by position,
+    // because the two walks are asymmetric by construction (the structured
+    // parser needs a `diff --git` section, the raw walk does not) and a
+    // positional zip would let one dropped file shift every later label onto
+    // the wrong checkbox, or fall back to an empty aria-label (review
+    // findings). `labels_for_selectable_hunks` returns exactly one label per
+    // entry of `hunks`, in the same order; a hunk the parser cannot see gets
+    // an honest raw-walk fallback, never silence. Pinned host-side by
+    // `selectable_labels_pair_by_file_and_ordinal_even_when_the_parsers_disagree`.
+    let labels: Vec<String> = crate::features::diff::rows::labels_for_selectable_hunks(
+        &git_vista_protocol::diff::parse_unified_diff(patch),
+        &hunks,
+    );
     let mut nav_at: HashMap<usize, usize> = hunks
         .iter()
         .enumerate()
@@ -290,7 +297,9 @@ fn staging_patch_view(
                         old_start: h.old_start,
                         new_start: h.new_start,
                     };
-                    let label = labels.get(idx).cloned().unwrap_or_default();
+                    // Index-aligned by construction: `labels_for_selectable_hunks`
+                    // maps over `hunks`, so `labels.len() == hunks.len()` always.
+                    let label = labels[idx].clone();
                     hunk_row(
                         text,
                         idx,
