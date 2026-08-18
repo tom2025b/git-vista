@@ -88,11 +88,26 @@ pub(crate) async fn lock(repo: Option<RepositoryId>) -> OwnedMutexGuard<()> {
 /// outside it and always will be. This turns the resulting collision from a
 /// confusing raw git error into one sentence a browser-only user can act on.
 ///
-/// This is a **courtesy check, not a guarantee** — the external process can
+/// This is a **courtesy check, not a guarantee** — a live external process can
 /// take the lock in the moment after this returns. When that happens git
 /// refuses on its own and its stderr is forwarded verbatim, exactly as before
 /// this existed. The real mutual exclusion against outside git has always been,
 /// and remains, git's own lock file.
+///
+/// **A present lock is verified live, not just present** (#72 defect fix): a
+/// `git` process (including one of ours, killed mid-hook) that dies without
+/// releasing `index.lock` leaves it on disk, and existence alone cannot tell
+/// that apart from a real in-progress write — see
+/// [`index_lock_is_open_by_a_live_process`]. Confusing the two used to make
+/// this function assert "another git process is working" as a fact it could
+/// not know, and once true, that assertion could never become false again:
+/// every following request against the repository was refused, forever,
+/// recoverable only by a human with shell access
+/// (docs/superpowers/evidence/m1.13-design-trail/m1.13-findings.md, I9/I11).
+/// A lock confirmed to have no live holder is therefore removed here before
+/// answering "not busy" — necessary, not just tidy: git's own lockfile
+/// creation is `O_CREAT|O_EXCL`, so leaving the orphan on disk would still
+/// make the very next git command fail with its own permanent "File exists".
 ///
 /// The path is resolved with `git rev-parse --absolute-git-dir` rather than
 /// assumed to be `<repo>/.git`: a linked worktree's git dir lives under the
@@ -122,15 +137,91 @@ pub(crate) async fn refuse_if_git_busy(repo: &Path) -> Option<(StatusCode, Strin
         // git ran and this is not a repository. Left alone exactly as before —
         // the planner's own stages surface git's error for it.
         Ok(None) => None,
-        Ok(Some(git_dir)) => git_dir.join("index.lock").exists().then(|| {
-            (
-                StatusCode::CONFLICT,
-                "Another git process is working in this repository — wait for it to \
-                 finish and try again."
-                    .to_string(),
-            )
-        }),
+        Ok(Some(git_dir)) => {
+            let lock_path = git_dir.join("index.lock");
+            if !lock_path.exists() {
+                return None;
+            }
+            if index_lock_is_open_by_a_live_process(&lock_path) {
+                return Some((
+                    StatusCode::CONFLICT,
+                    "Another git process is working in this repository — wait for it to \
+                     finish and try again."
+                        .to_string(),
+                ));
+            }
+            // Verified stale: nothing has this file open. Whatever wrote it
+            // died before renaming it onto `index` (success) or unlinking it
+            // (abort) — either way there is no in-progress write for this to
+            // interrupt, and discarding it is exactly what an aborted write
+            // should have done itself. `remove_file` failing here (already
+            // gone, e.g. a genuine race with the dying process's own cleanup)
+            // is not an error worth surfacing — the outcome is "not busy"
+            // either way.
+            let _ = std::fs::remove_file(&lock_path);
+            None
+        }
     }
+}
+
+/// Whether any process on this host currently holds `path` open — the
+/// liveness check [`refuse_if_git_busy`] needs to tell a live `index.lock`
+/// from an orphaned one.
+///
+/// Linux-only (this server has no non-Linux target; see the sandbox shim's
+/// own landlock/seccomp dependencies): walks `/proc/<pid>/fd`, comparing each
+/// open fd's `(device, inode)` against `path`'s — not the fd's path string,
+/// because a held lock's directory entry is exactly the thing that can be
+/// removed and recreated by an unrelated process while the original file (and
+/// the original holder's fd) still exists under a different name. Matching by
+/// identity rather than name is what makes that unambiguous.
+///
+/// A single process's `/proc/<pid>/fd` failing to read (it exited between the
+/// listing and the read, or belongs to a different user) is not evidence
+/// either way for that one process — skipped, not counted as "not holding
+/// it". Only two things are genuinely fail-safe: unable to `stat` `path`
+/// itself, or unable to enumerate `/proc` at all — both mean this check
+/// cannot be trusted, so both answer `true` (assume live) rather than risk
+/// declaring a real in-progress write stale.
+#[cfg(unix)]
+fn index_lock_is_open_by_a_live_process(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let target = match std::fs::metadata(path) {
+        Ok(m) => (m.dev(), m.ino()),
+        Err(_) => return true,
+    };
+
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return true,
+    };
+
+    for pid_entry in proc_dir.flatten() {
+        let pid_name = pid_entry.file_name();
+        let is_pid_dir = pid_name
+            .to_str()
+            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+        if !is_pid_dir {
+            continue; // /proc has non-pid entries too (self, meminfo, ...)
+        }
+
+        let fd_dir = match std::fs::read_dir(pid_entry.path().join("fd")) {
+            Ok(d) => d,
+            // The process exited since the listing, or its fd directory is
+            // not ours to read — neither tells us anything about `target`.
+            Err(_) => continue,
+        };
+        for fd_entry in fd_dir.flatten() {
+            if let Ok(meta) = std::fs::metadata(fd_entry.path()) {
+                if (meta.dev(), meta.ino()) == target {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// This worktree's own git directory, absolute.
@@ -251,10 +342,17 @@ mod tests {
         }
     }
 
-    /// A repository with no git process working in it is not refused; one with
-    /// a live `index.lock` is, in words a browser-only user can act on.
+    /// A repository with no git process working in it is not refused; one
+    /// where a real process still holds `index.lock` open is, in words a
+    /// browser-only user can act on.
+    ///
+    /// The holder is a real `sh` process that opens the lock file and keeps
+    /// the fd open for the span of the check — not just a file dropped on
+    /// disk — because that liveness is exactly what distinguishes this case
+    /// from the stale-lock defect covered by
+    /// `a_stale_index_lock_does_not_refuse_the_repository_forever` below.
     #[tokio::test]
-    async fn an_index_lock_marks_the_repository_busy() {
+    async fn an_index_lock_held_by_a_live_process_marks_the_repository_busy() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -270,18 +368,119 @@ mod tests {
             "an idle repository is not busy"
         );
 
-        std::fs::write(repo.join(".git").join("index.lock"), "").unwrap();
+        let lock_path = repo.join(".git").join("index.lock");
+        let mut holder = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exec 9>'{}'; sleep 5", lock_path.display()))
+            .spawn()
+            .expect("spawn a real process to hold the lock open");
+        // Give the shell a moment to actually reach `exec` and open the fd
+        // before the assertions below race it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Mutation tried: skip the liveness probe and go back to
+        // existence-only — this assertion still passes (a held lock exists
+        // too), but the paired stale-lock test below then fails, which is
+        // the whole point of splitting these two cases apart.
         let (status, why) = refuse_if_git_busy(&repo).await.expect("busy");
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(
             why.contains("Another git process is working in this repository"),
             "{why}"
         );
+        assert!(
+            lock_path.exists(),
+            "a lock a live process still holds must never be removed out from \
+             under it"
+        );
 
-        std::fs::remove_file(repo.join(".git").join("index.lock")).unwrap();
+        holder.kill().expect("kill the holder");
+        holder.wait().expect("reap the holder");
+        std::fs::remove_file(&lock_path).unwrap();
         assert!(
             refuse_if_git_busy(&repo).await.is_none(),
             "once the external process finishes, writes are allowed again"
+        );
+    }
+
+    /// The confirmed #72 defect: `index.lock` orphaned by a process that has
+    /// already died (a SIGKILLed hook, an OOM-kill, a server crash mid-write)
+    /// must not refuse the repository forever. Before this fix,
+    /// `refuse_if_git_busy` tested only the file's existence and could never
+    /// tell this case apart from a live external git — so once one process
+    /// died holding the lock, every commit/stage/checkout/merge/rebase/push
+    /// against that repository returned 409 "wait for it to finish and try
+    /// again" permanently, recoverable only by a human with shell access
+    /// (docs/superpowers/evidence/m1.13-design-trail/m1.13-findings.md,
+    /// lines 21-24).
+    ///
+    /// Answering "not busy" alone does not fix this: git's own lockfile
+    /// creation is `O_CREAT|O_EXCL`, so a stale `index.lock` left on disk
+    /// still makes the *next* git command fail with its own permanent
+    /// `fatal: Unable to create '.../index.lock': File exists.` — verified
+    /// empirically against real git 2.43 before writing this test. The fix
+    /// has to remove a lock it has verified nothing holds open, not merely
+    /// stop reporting it.
+    #[tokio::test]
+    async fn a_stale_index_lock_does_not_refuse_the_repository_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo.join("f"), "x").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "f"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+
+        // Orphaned lock: written directly, never opened by any live process
+        // — exactly what a killed hook or a crashed server leaves behind.
+        // Nothing in this test process, or any other, has this fd open.
+        let lock_path = repo.join(".git").join("index.lock");
+        std::fs::write(&lock_path, "").unwrap();
+
+        // Mutation tried: revert refuse_if_git_busy to the pre-fix
+        // existence-only check — this assertion fails, since the old code
+        // reports 409 unconditionally whenever the file exists.
+        assert!(
+            refuse_if_git_busy(&repo).await.is_none(),
+            "a lock nobody holds open must not be reported busy"
+        );
+
+        // Mutation tried: make the fix answer `None` without removing the
+        // stale file — this assertion then fails, because git's own O_EXCL
+        // lockfile creation still refuses to run with the orphan on disk.
+        std::fs::write(repo.join("f2"), "y").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["add", "f2"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(
+            add.success(),
+            "the repository must be usable again, not refused forever"
         );
     }
 
