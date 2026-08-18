@@ -1390,6 +1390,15 @@ async fn delete_untracked_paths_text_never_sounds_recoverable() {
 /// [`RecoveryStrategy::Irrecoverable`] actually offers: this text is allowed
 /// to say a qualified "recoverable", but only the narrow, true claim (staged
 /// content survives until `git gc`) — never a blanket "this can be undone".
+///
+/// #71 audit item 4a adds the forbidden-word half, mirroring
+/// [`delete_untracked_paths_text_never_sounds_recoverable`]'s grep but with
+/// its own word list: that test greps for words implying recoverability at
+/// ALL (wrong for delete, which has none); this greps for words that would
+/// overclaim BEYOND the narrow, qualified claim discard is actually allowed
+/// to make (wrong here even though "recoverable" itself is fine) — a future
+/// edit that dropped the "only … staged … only until … gc" qualifiers in
+/// favour of something unconditional-sounding fails loudly here.
 #[tokio::test]
 async fn discard_tracked_paths_text_states_the_qualified_recovery_story() {
     let (_dir, repo) = seeded_repo();
@@ -1412,6 +1421,30 @@ async fn discard_tracked_paths_text_states_the_qualified_recovery_story() {
         .expect("the discard must have journaled an event");
     assert!(entry.summary.contains("staged"), "{}", entry.summary);
     assert!(entry.summary.contains("gc"), "{}", entry.summary);
+
+    // No-overclaim grep (item 4a): none of these words may appear anywhere
+    // in the response or the journal — each one would turn the narrow,
+    // qualified claim above into an unconditional one that isn't true.
+    let body_lower = body.to_lowercase();
+    let summary_lower = entry.summary.to_lowercase();
+    for forbidden in [
+        "guaranteed",
+        "always recoverable",
+        "fully recoverable",
+        "completely recoverable",
+        "automatically recover",
+        "safely undo",
+    ] {
+        assert!(
+            !body_lower.contains(forbidden),
+            "response text must not overclaim recovery (found {forbidden:?}): {body}"
+        );
+        assert!(
+            !summary_lower.contains(forbidden),
+            "journal text must not overclaim recovery (found {forbidden:?}): {}",
+            entry.summary
+        );
+    }
 }
 
 /// Review finding (blocker): a bare `git checkout -- <path>` is a no-op for
@@ -1458,6 +1491,69 @@ async fn discard_tracked_paths_reverts_both_staged_and_unstaged_layers() {
 
     assert_eq!(out(&repo, &["status", "--porcelain"]), "");
     assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+}
+
+/// THE BUG (2026-08-17 audit, #71 close-out): on a non-zero exit from `git
+/// checkout HEAD -- <paths>` the activity feed used to get ZERO entry —
+/// silence, not an honest record. Reproduced here exactly as found: a
+/// multi-path discard where `git checkout` reverts an EARLIER path
+/// (`a.txt`, which sorts first) before hitting a real permission error on a
+/// LATER one (`sub/b.txt`, whose parent directory is unwritable) and exits
+/// non-zero. The fix this pins: the journal must name the TRUE partial
+/// state — what actually reverted and what did not — never nothing at all.
+#[tokio::test]
+async fn discard_tracked_paths_journals_honestly_on_a_partial_multi_path_failure() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+    std::fs::write(repo.join("sub/b.txt"), "b\n").unwrap();
+    run(&repo, &["add", "sub/b.txt"]);
+    run(&repo, &["commit", "-q", "-m", "add sub/b.txt"]);
+
+    std::fs::write(repo.join("a.txt"), "edited-a\n").unwrap();
+    std::fs::write(repo.join("sub/b.txt"), "edited-b\n").unwrap();
+
+    // Make `sub/` read-only (r-x, no write) so it can still be resolved —
+    // the symlink-containment guard's `canonicalize` only needs traversal —
+    // but `git checkout` cannot unlink/replace the file inside it. Reverts
+    // `a.txt` (sorts first in the index) but hits a real permission error
+    // on `sub/b.txt`, not a mocked failure — the same shape as the
+    // empirically found bug.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(repo.join("sub"), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let result = exec_discard_tracked_paths(
+        &repo,
+        NetworkNeed::Local,
+        &[wpath("a.txt"), wpath("sub/b.txt")],
+    )
+    .await;
+
+    // Restore permissions immediately, before any assertion can panic and
+    // leave a mode-000 directory behind for the tempdir cleanup to choke on.
+    std::fs::set_permissions(repo.join("sub"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (status, body) = result;
+    assert_ne!(status, StatusCode::OK, "{body}");
+
+    // The reproduced bug, stated plainly: `a.txt` really did revert...
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+    // ...but `sub/b.txt` did not.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("sub/b.txt")).unwrap(),
+        "edited-b\n"
+    );
+
+    // The fix under test: a journal entry must exist, and must name the
+    // true partial state rather than staying silent.
+    let journaled = crate::journal::read_all(&repo);
+    let entry = journaled
+        .last()
+        .expect("a partial discard failure must still journal what happened");
+    assert!(entry.summary.contains("a.txt"), "{}", entry.summary);
+    assert!(entry.summary.contains("sub/b.txt"), "{}", entry.summary);
+    // The response body must be equally honest, not just the journal.
+    assert!(body.contains("a.txt"), "{body}");
+    assert!(body.contains("sub/b.txt"), "{body}");
 }
 
 /// Review finding (blocker): a `WorktreePath` naming a wholly-untracked
@@ -1928,9 +2024,11 @@ async fn a_duplicated_discard_request_reports_the_count_that_really_happened() {
     assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
     assert_eq!(out(&repo, &["status", "--porcelain"]), "");
     // The pre-#284 shape said "2 tracked paths" here for the one file it
-    // discarded.
+    // discarded. #71 audit item 3 additionally names the path, so the
+    // wording gained a colon and the filename — the substance this test
+    // pins (the count reflects reality, not the raw request) is unchanged.
     assert!(
-        body.contains("1 tracked path.") && !body.contains('2'),
+        body.contains("1 tracked path: a.txt.") && !body.contains('2'),
         "one path was discarded, so the response must say 1: {body}"
     );
     assert_eq!(paths.len(), 1, "the repeat must not survive validation");

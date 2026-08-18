@@ -1138,6 +1138,34 @@ mod tests {
         }
     }
 
+    /// #71 close-out (M2.18): pins `DiscardTracked`'s confirmation copy to
+    /// its exact literal wording — not a `.contains` spot-check but the
+    /// whole `title`/`body`/`confirm_label` triple — mirroring the
+    /// delete-side honesty tests above (`the_delete_copy_never_sounds_
+    /// recoverable_but_the_grep_still_works`) with the stricter version:
+    /// where those guard *what the words must never say*, this guards *what
+    /// the words currently ARE*, so a silent rewording of the discard
+    /// ceremony — the one confirmation in this pair with no second arm step
+    /// to catch a slip — fails loudly here instead of drifting unnoticed.
+    #[test]
+    fn discard_tracked_confirmation_copy_is_pinned() {
+        let p = vec!["a.txt".to_string(), "sub/b.txt".to_string()];
+        let c = worktree_confirm(WorktreeAction::DiscardTracked, &p, false);
+        assert_eq!(c.title, "Discard changes to tracked files");
+        assert_eq!(
+            c.body,
+            "Discard uncommitted changes to 2 tracked files?\n\n\
+             • a.txt\n\
+             • sub/b.txt\n\n\
+             Each one goes back to its checked-out version. Content you staged \
+             before this runs is recoverable from git's object database, and only \
+             until the next git gc — a change you never staged has no other copy."
+        );
+        assert_eq!(c.confirm_label, "Discard");
+        assert!(c.danger);
+        assert_eq!(c.arm, None);
+    }
+
     /// A list longer than the cap is summarised, never silently shortened:
     /// the count in the first line still covers every path, and the overflow
     /// is stated. The paired assertion pins that something really was cut —
