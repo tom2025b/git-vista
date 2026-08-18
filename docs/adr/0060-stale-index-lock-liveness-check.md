@@ -16,8 +16,9 @@ An independent adversarial refutation of the #72 work (2026-08-18) confirmed
 a real defect: `refuse_if_git_busy` tested only whether `<git-dir>/index.lock`
 *exists*, then told the browser-only user "Another git process is working in
 this repository — wait for it to finish and try again" — a fact the check
-could not actually know. A lock orphaned by a process that already died (a
-killed hook, an OOM-kill, a crash mid-write) is indistinguishable from a live
+could not actually know. A lock orphaned by a process that already died — an
+OOM-kill, a crash or power loss during the index write, or a `git add`
+interrupted while a slow clean filter runs — is indistinguishable from a live
 write under an existence-only test, and once wrong the message can never
 become right again: every following request against that repository is
 refused, forever, recoverable only by a human with shell access.
@@ -78,6 +79,26 @@ permanent refusal for another with worse wording.
    caught by this preflight at all — a different, already-documented defect
    (same evidence file, lines 39-41) that this decision does not touch. See
    "Consequences" below.
+
+## What does *not* cause this, and why that matters
+
+An earlier draft of this ADR listed "a killed hook" as a cause of an orphaned
+`index.lock`. That is wrong, and ADR 0058 — written the same night, in this
+same branch stack — is what proves it. Measured directly there, both through
+the sandboxed spawn path and with a plain `git commit` watched from a second
+shell, for `git commit` and `git commit --amend` alike: `index.lock` **does
+not exist** while `pre-commit` or `post-commit` is running, sleeping, or being
+killed. Git takes the index write-lock *after* the hooks return.
+
+The stale locks this decision guards against therefore come from a process
+dying **during the index write itself** — an OOM-kill, a crash, power loss, or
+a `git add` interrupted while a slow clean filter runs. That last one is not
+hypothetical: it is the exact mechanism this ADR's own replacement tests use to
+hold a lock legitimately.
+
+Worth stating plainly because the wrong version is the intuitive one, and
+because two ADRs in one stack disagreeing about the same file would have
+quietly taught the wrong lesson to whoever read them next.
 
 ## Alternatives considered
 

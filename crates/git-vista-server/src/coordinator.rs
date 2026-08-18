@@ -95,15 +95,23 @@ pub(crate) async fn lock(repo: Option<RepositoryId>) -> OwnedMutexGuard<()> {
 /// and remains, git's own lock file.
 ///
 /// **A present lock is verified live, not just present** (#72 defect fix): a
-/// `git` process (including one of ours, killed mid-hook) that dies without
-/// releasing `index.lock` leaves it on disk, and existence alone cannot tell
-/// that apart from a real in-progress write — see
+/// `git` process killed while it holds the index write-lock — an OOM-kill, a
+/// crash, power loss, or a `git add` interrupted while a slow clean filter
+/// runs — leaves `index.lock` on disk, and existence alone cannot tell that
+/// apart from a real in-progress write — see
 /// [`index_lock_is_open_by_a_live_process`]. Confusing the two used to make
 /// this function assert "another git process is working" as a fact it could
 /// not know, and once true, that assertion could never become false again:
 /// every following request against the repository was refused, forever,
 /// recoverable only by a human with shell access
 /// (docs/superpowers/evidence/m1.13-design-trail/m1.13-findings.md, I9/I11).
+///
+/// A *killed hook* is deliberately not in that list. ADR 0058 measured it
+/// directly, sandboxed and unsandboxed, for both `git commit` and
+/// `git commit --amend`: git runs `pre-commit`/`post-commit` outside the
+/// index write-lock, so no `index.lock` exists to orphan when the hook is
+/// killed. The stale locks this guards against come from a process dying
+/// *during the index write itself*, which is a different moment entirely.
 /// A lock confirmed to have no live holder is therefore removed here before
 /// answering "not busy" — necessary, not just tidy: git's own lockfile
 /// creation is `O_CREAT|O_EXCL`, so leaving the orphan on disk would still
@@ -473,7 +481,9 @@ mod tests {
             .success());
 
         // Orphaned lock: written directly, never opened by any live process
-        // — exactly what a killed hook or a crashed server leaves behind.
+        // — exactly what an OOM-kill or a crash during an index write leaves
+        // behind. (Not a killed hook: ADR 0058 measured that hooks run
+        // outside the index write-lock, so none is held to orphan.)
         // Nothing in this test process, or any other, has this fd open.
         let lock_path = repo.join(".git").join("index.lock");
         std::fs::write(&lock_path, "").unwrap();
