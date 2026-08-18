@@ -216,17 +216,17 @@ pub fn on_pointer_up(g: GestureState, ev: web_sys::PointerEvent) {
     }
 }
 
-/// Wheel: zoom toward the cursor on desktop (trackpad/mouse). Up/away zooms
-/// in, down/toward zooms out. Touch pinch is handled above, not here.
+/// Wheel: vertical pan, like scrolling an ordinary page — down moves the
+/// view down the graph, up moves it back up. Zoom lives on `-`/`+` instead
+/// (see the keyboard handling below), so the wheel is free for the motion
+/// people already reach for it with everywhere else. Touch pinch is handled
+/// above, not here; horizontal wheel input (`delta_x`) is deliberately
+/// ignored, since nothing asked for sideways scroll and the graph doesn't
+/// grow sideways.
 pub fn on_wheel(camera: RwSignal<Camera>, ev: web_sys::WheelEvent) {
-    ev.prevent_default(); // don't let the page scroll
-    let factor = if ev.delta_y() < 0.0 {
-        ZOOM_STEP
-    } else {
-        1.0 / ZOOM_STEP
-    };
-    let (sx, sy) = (ev.offset_x() as f64, ev.offset_y() as f64);
-    camera.update(|c| *c = c.zoomed_at(factor, sx, sy));
+    ev.prevent_default(); // don't let the page itself scroll underneath
+    let dy = -ev.delta_y();
+    camera.update(|c| *c = c.panned(0.0, dy));
 }
 
 /// Screen-px clearance kept between a keyboard-focused row and the viewport
