@@ -286,9 +286,29 @@ pub fn amend_body(message: &str, expected_tip: &str) -> AmendCommitRequest {
 /// iOS suspension mid-amend loses the edit, where a plain commit draft
 /// survives it — accepted because the alternative revives text against the
 /// wrong commit.
+///
+/// # Two decisions on the draft's own storage, both kept here honestly
+///
+/// **#226 chose `sessionStorage`.** The failure being survived was iOS Safari
+/// suspending and rebuilding the tab's WASM module — a same-tab recovery, so
+/// tab-scoped storage was the right size for the problem: closing the tab
+/// discarding the draft was the expected outcome, not a bug.
+///
+/// **Tom ruled `localStorage` instead, 2026-08-17**, after two hard power
+/// losses on this box in one day. A power cut kills the tab *and* the
+/// browser process `sessionStorage` lives in; only `localStorage` survives
+/// that. The cost of widening the survival window is that a draft can now
+/// resurface an hour, or a day, later — which is exactly why this milestone
+/// pairs the wider storage with a banner instead of shipping it silent: the
+/// dialog never fills the textarea from a stored draft on its own. It offers
+/// the draft back — age shown, a short preview, Restore or Discard — and the
+/// user decides. Silence was the failure mode Tom explicitly vetoed; the
+/// banner is what converts "wider storage" from a stale-draft hazard into a
+/// visible choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageBuffer {
-    /// The #226 draft: persisted per repository, restored on suspension.
+    /// The draft: persisted per repository (#226; `localStorage` since
+    /// 2026-08-17), offered back through a banner rather than auto-filled.
     Draft,
     /// Amend's own buffer: in memory, never persisted.
     Amend,
@@ -302,17 +322,141 @@ pub fn message_buffer(intent: &CommitIntent) -> MessageBuffer {
     }
 }
 
-/// The `sessionStorage` key a buffer persists under, or `None` for a buffer
+/// The storage key a buffer persists under (`localStorage` since the
+/// 2026-08-17 ruling; `sessionStorage` under #226), or `None` for a buffer
 /// that must not persist.
 ///
-/// The single decision point for #226's storage writes: the signal layer
-/// persists **iff** this returns `Some`, so "amend never writes the draft
-/// key" is a property of this tested function rather than of a branch each
-/// call site has to remember.
+/// The single decision point for the draft's storage writes: the signal
+/// layer persists **iff** this returns `Some`, so "amend never writes the
+/// draft key" is a property of this tested function rather than of a branch
+/// each call site has to remember.
 pub fn persist_key(buffer: MessageBuffer, worktree_id: &str) -> Option<String> {
     match buffer {
         MessageBuffer::Draft => Some(commit_draft_key(worktree_id)),
         MessageBuffer::Amend => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The stored draft: what it holds, and the aged restore banner (2026-08-17
+// ruling)
+// ---------------------------------------------------------------------------
+
+/// One persisted draft: the message plus when it was saved.
+///
+/// `saved_at_ms` is `Date.now()`'s own unit (milliseconds since the Unix
+/// epoch, as a float) — the wasm signal layer is the only caller with a
+/// clock, so it is the only caller that ever constructs one directly; this
+/// module only encodes, decodes and reads one back.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DraftRecord {
+    pub message: String,
+    pub saved_at_ms: f64,
+}
+
+/// Encode a draft for storage.
+///
+/// JSON, not the bare message #226 wrote directly — the banner needs an age
+/// to show, and an age needs a timestamp stored alongside the text.
+pub fn encode_draft(message: &str, saved_at_ms: f64) -> String {
+    serde_json::to_string(&DraftRecord {
+        message: message.to_string(),
+        saved_at_ms,
+    })
+    // A `{String, f64}` pair cannot fail to serialize; a stored empty string
+    // decodes to "no draft" via `decode_draft` below, which is a safe
+    // default for a value nothing will ever actually produce.
+    .unwrap_or_default()
+}
+
+/// Decode a stored draft. `None` for anything that isn't a well-formed,
+/// offerable record:
+///
+/// - Malformed JSON, including #226's own bare-message format — a value
+///   written before this milestone (or a future rollback) reads as "nothing
+///   to offer" rather than panicking the banner on unparseable storage.
+/// - A message that is empty or whitespace-only. `set_message` persists on
+///   every keystroke, including the one that empties the box back out, so
+///   storage can legitimately hold `{"message":"","saved_at_ms":…}` for a
+///   draft the user cleared themselves. Offering that back would show a
+///   banner with a blank preview and a Restore button that restores
+///   nothing — worse than no banner, because it looks like a bug rather
+///   than the honest "no draft" it actually is.
+///
+/// An absent draft is a no-op; a draft offered wrong would not be.
+pub fn decode_draft(raw: &str) -> Option<DraftRecord> {
+    let record: DraftRecord = serde_json::from_str(raw).ok()?;
+    if record.message.trim().is_empty() {
+        return None;
+    }
+    Some(record)
+}
+
+/// The banner's preview text stops here — the first line of a draft, cut to
+/// this many `char`s with an ellipsis if anything was cut.
+pub const DRAFT_PREVIEW_CHARS: usize = 40;
+
+/// The banner's preview of a stored draft: its first line, cut to
+/// [`DRAFT_PREVIEW_CHARS`] characters. Counted in `char`s, not bytes, so the
+/// cut always lands on a codepoint boundary.
+pub fn draft_preview(message: &str) -> String {
+    let first_line = message.lines().next().unwrap_or("");
+    let mut chars = first_line.chars();
+    let truncated: String = chars.by_ref().take(DRAFT_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+/// Human copy for how long ago a draft was saved, rounded to the coarsest
+/// unit that stays honest: "just now" for under a minute, then minutes under
+/// an hour, then hours under a day, then days.
+///
+/// Clamped at zero elapsed time: a stored `saved_at_ms` from the future (a
+/// system clock adjustment, or ordinary `Date.now()` jitter across two
+/// reads) must read "just now", never a negative duration.
+pub fn format_age(now_ms: f64, saved_at_ms: f64) -> String {
+    let elapsed_secs = ((now_ms - saved_at_ms).max(0.0) / 1000.0) as i64;
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    if elapsed_secs < MINUTE {
+        "just now".to_string()
+    } else if elapsed_secs < HOUR {
+        pluralize(elapsed_secs / MINUTE, "minute")
+    } else if elapsed_secs < DAY {
+        pluralize(elapsed_secs / HOUR, "hour")
+    } else {
+        pluralize(elapsed_secs / DAY, "day")
+    }
+}
+
+fn pluralize(count: i64, unit: &str) -> String {
+    if count == 1 {
+        format!("1 {unit} ago")
+    } else {
+        format!("{count} {unit}s ago")
+    }
+}
+
+/// What the draft-restore banner shows: the age line and the preview line.
+/// Nothing here decides *whether* to show a banner — that is "is there a
+/// stored draft for this scope", answered by the presence of a
+/// [`DraftRecord`] at the call site — this is only the two facts it renders
+/// once there is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftBanner {
+    pub age: String,
+    pub preview: String,
+}
+
+/// Combine a stored record and the current time into what the banner shows.
+pub fn draft_banner(record: &DraftRecord, now_ms: f64) -> DraftBanner {
+    DraftBanner {
+        age: format_age(now_ms, record.saved_at_ms),
+        preview: draft_preview(&record.message),
     }
 }
 
@@ -1585,6 +1729,106 @@ mod tests {
             Some(commit_draft_key("wt-1"))
         );
         assert_eq!(persist_key(MessageBuffer::Amend, "wt-1"), None);
+    }
+
+    // -----------------------------------------------------------------
+    // localStorage + aged restore banner (Tom's 2026-08-17 ruling): the
+    // draft survives a crash/power cut, but is never auto-filled — it is
+    // offered back through a banner that shows its age, and the user
+    // decides.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_draft_round_trips_through_storage_encoding_with_its_timestamp() {
+        let encoded = encode_draft("fix: the thing", 12_345.0);
+        let decoded = decode_draft(&encoded).expect("a freshly encoded draft always decodes");
+        assert_eq!(decoded.message, "fix: the thing");
+        assert_eq!(decoded.saved_at_ms, 12_345.0);
+
+        // Mutation tried: hard-coding `decode_draft` to always return the raw
+        // string as the message with `saved_at_ms: 0.0` would pass a decode
+        // that never inspected `encoded`. Asserting the timestamp round-trips
+        // a non-zero, distinctive value catches that.
+    }
+
+    #[test]
+    fn a_malformed_or_pre_ruling_stored_value_decodes_to_no_draft() {
+        // #226's own format: the bare message string, no JSON envelope. A
+        // value written before this milestone (or by a future rollback) must
+        // read as "nothing to offer", not panic the banner on malformed JSON.
+        assert_eq!(decode_draft("just a plain string"), None);
+        assert_eq!(decode_draft(""), None);
+        assert_eq!(decode_draft("{\"message\":\"no timestamp field\"}"), None);
+    }
+
+    #[test]
+    fn an_emptied_draft_is_never_offered() {
+        // `set_message` persists on every keystroke, including the one that
+        // clears the box back out — storage can legitimately hold this
+        // shape, and it must decode to "nothing to offer", not a banner with
+        // a blank preview and a Restore button that restores nothing.
+        //
+        // Mutation tried: dropping the `record.message.trim().is_empty()`
+        // check in `decode_draft` would pass every other test in this file
+        // (every other fixture uses a non-empty message) and only this one
+        // would catch it.
+        assert_eq!(decode_draft(&encode_draft("", 1.0)), None);
+        assert_eq!(decode_draft(&encode_draft("   \n\t", 1.0)), None);
+        assert_eq!(decode_draft("{\"message\":\"\",\"saved_at_ms\":1.0}"), None);
+    }
+
+    #[test]
+    fn draft_age_is_rounded_to_the_coarsest_honest_unit() {
+        // Mutation tried: a version that always returned "just now" would
+        // pass only the first of these; each boundary below is chosen to be
+        // wrong under an off-by-one on the threshold it names.
+        assert_eq!(format_age(0.0, 0.0), "just now");
+        assert_eq!(format_age(59_000.0, 0.0), "just now");
+        assert_eq!(format_age(60_000.0, 0.0), "1 minute ago");
+        assert_eq!(format_age(61_000.0, 0.0), "1 minute ago");
+        assert_eq!(format_age(2.0 * 60_000.0, 0.0), "2 minutes ago");
+        assert_eq!(format_age(25.0 * 60_000.0, 0.0), "25 minutes ago");
+        assert_eq!(format_age(3_600_000.0, 0.0), "1 hour ago");
+        assert_eq!(format_age(3.0 * 3_600_000.0, 0.0), "3 hours ago");
+        assert_eq!(format_age(86_400_000.0, 0.0), "1 day ago");
+        assert_eq!(format_age(2.0 * 86_400_000.0, 0.0), "2 days ago");
+
+        // A clock that reads before the save (a system clock adjustment, or
+        // `Date.now()` jitter) must not go negative and read "-1 minutes ago".
+        assert_eq!(format_age(0.0, 5_000.0), "just now");
+    }
+
+    #[test]
+    fn draft_preview_is_the_first_line_cut_to_forty_chars() {
+        assert_eq!(draft_preview("short message"), "short message");
+
+        // Only the first line — a multi-line draft's body doesn't leak into
+        // the one-line preview.
+        assert_eq!(draft_preview("first line\nsecond line"), "first line");
+
+        // Exactly at the cap: no ellipsis, nothing lost.
+        let exact = "a".repeat(DRAFT_PREVIEW_CHARS);
+        assert_eq!(draft_preview(&exact), exact);
+
+        // Past the cap: cut with an ellipsis, and the cut lands on a char
+        // boundary even for multi-byte characters (an emoji-heavy message
+        // must not panic mid-codepoint).
+        let long = "é".repeat(DRAFT_PREVIEW_CHARS + 5);
+        let preview = draft_preview(&long);
+        assert_eq!(preview.chars().count(), DRAFT_PREVIEW_CHARS + 1); // +1 for "…"
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn the_banner_combines_age_and_preview_from_one_record() {
+        let record = DraftRecord {
+            message: "a draft worth restoring, long past forty characters wide".into(),
+            saved_at_ms: 0.0,
+        };
+        let banner = draft_banner(&record, 25.0 * 60_000.0);
+        assert_eq!(banner.age, "25 minutes ago");
+        assert_eq!(banner.preview, draft_preview(&record.message));
+        assert!(banner.preview.ends_with('…'));
     }
 
     #[test]
