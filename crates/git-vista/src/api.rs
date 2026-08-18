@@ -16,7 +16,7 @@ use gloo_net::http::{Request, RequestBuilder};
 use git_vista_core::activity::{ActivityEvent, UndoAction, Undoable};
 use git_vista_core::diff::{CommitDiff, FileContent};
 use git_vista_core::model::CommitDetail;
-use git_vista_core::net::{network_error_text, offline_refusal_text};
+use git_vista_core::net::{network_error_text, offline_refusal_text, timeout_error_text};
 use git_vista_core::status::RepoStatus;
 use git_vista_protocol::diff::{DiffSpec, SpecDiff};
 use git_vista_protocol::dto::TagDetail;
@@ -141,16 +141,13 @@ async fn with_deadline<T>(fut: impl std::future::Future<Output = T>, ms: u64) ->
     }
 }
 
-/// The message a caller sees when a request was abandoned rather than answered.
-///
-/// Deliberately names the tunnel: on this deployment a hung request is nearly
-/// always a dropped SSH forward, and "reconnect the tunnel" is the action that
-/// actually fixes it. A generic "network error" sends the user looking at the
-/// wrong thing.
+/// The message a caller sees when a request was abandoned client-side rather
+/// than answered. Wording lives in `git-vista-core::net::timeout_error_text`
+/// (M2.19, #72) so it is pinned by a host test even though every call site
+/// here is wasm-only; see that function's doc comment for why it no longer
+/// names the SSH tunnel.
 fn timeout_error() -> String {
-    "The server did not answer within 60 seconds. The SSH tunnel has most likely \
-     dropped — restart the port forward and try again."
-        .to_string()
+    timeout_error_text()
 }
 
 /// The ADR 0005 client-side counterpart of the LAN listener's structural
