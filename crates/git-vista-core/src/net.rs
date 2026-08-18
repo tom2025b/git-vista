@@ -27,6 +27,40 @@ pub fn network_error_text(raw: &str) -> String {
     )
 }
 
+/// The message `git-vista`'s `with_deadline`-bounded requests show when the
+/// client gives up waiting for an answer before one arrives (#216/#218, M2.19
+/// #72).
+///
+/// `with_deadline` only drops the client's own `.await` — it has no
+/// `AbortController`, so it cannot cancel the request in flight, and the
+/// server keeps working regardless of whether anyone is still waiting. So
+/// this message states only what the client actually knows (its own wait ran
+/// out) and never claims the request failed, since on this deployment it very
+/// often has not: a slow git hook or a large operation can legitimately run
+/// past the wait. It deliberately does not guess at *why* the wait ran out —
+/// earlier wording named "the SSH tunnel" as the likely cause, which was true
+/// only for the since-paused iPad/SSH-tunnel deployment (see
+/// `docs/SECURITY_MODEL.md` and the M1-05 ADR) and actively misleading for
+/// the localhost-only setup this app actually runs under: there is no tunnel
+/// to drop, so telling the user to "restart the port forward" sent them
+/// looking for a cause that could not be there. The actionable step that
+/// works regardless of deployment is checking the activity feed — the
+/// server's own record of what actually happened — before retrying, because a
+/// commit's write can have landed even though this client never saw the
+/// answer, and retrying it blind creates a second commit. Kept as a pure
+/// function, like [`offline_refusal_text`] above, so the wording is pinned by
+/// a host test even though every caller (`git-vista/src/api.rs`) is
+/// wasm-only.
+pub fn timeout_error_text() -> String {
+    "The request exceeded the time this client waits for an answer, so it \
+     gave up on this attempt — that does not mean it failed. The server may \
+     still be working (a slow git hook or a large operation can run past \
+     that time budget). Check the activity feed for what actually happened \
+     before retrying: retrying a commit that already landed creates a \
+     second commit."
+        .to_string()
+}
+
 /// The message `git-vista`'s `api.rs::refuse_if_offline()` guard shows when
 /// `navigator.onLine` reports the device is offline (M2.22a, #241).
 ///
@@ -66,6 +100,51 @@ pub fn offline_banner_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_names_what_happened_not_a_cause_it_cannot_see() {
+        // Mutation tried: put "SSH tunnel" back in the message — this
+        // assertion catches it, since a single-user localhost deployment has
+        // no tunnel and the client cannot see one either way.
+        let msg = timeout_error_text();
+        assert!(
+            !msg.to_lowercase().contains("tunnel"),
+            "must not guess at a cause the client has no way to observe — {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("time"),
+            "must say what actually happened: the wait ran out — {msg}"
+        );
+    }
+
+    #[test]
+    fn timeout_says_the_server_may_still_be_working() {
+        let msg = timeout_error_text();
+        assert!(
+            msg.contains("may still be working"),
+            "must not claim the request failed — with_deadline drops the \
+             client-side wait, not the server-side work — {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("git hook") || msg.to_lowercase().contains("large"),
+            "must name a real reason a request can outlast the wait — {msg}"
+        );
+    }
+
+    #[test]
+    fn timeout_tells_the_user_to_check_before_retrying() {
+        let msg = timeout_error_text();
+        assert!(
+            msg.to_lowercase().contains("activity"),
+            "must point at the activity feed as the way to find out what \
+             really happened — {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("second commit")
+                || msg.to_lowercase().contains("duplicate"),
+            "must name the concrete cost of retrying blind — {msg}"
+        );
+    }
 
     #[test]
     fn offline_refusal_names_the_devices_own_report_not_the_server() {
