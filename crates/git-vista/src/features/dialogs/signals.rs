@@ -51,6 +51,29 @@ fn local_storage() -> Option<web_sys::Storage> {
     web_sys::window().and_then(|w| w.local_storage().ok().flatten())
 }
 
+// What this file decides untested, stated plainly (this whole file is
+// wasm-only and never compiles under `cargo test --workspace`, so nothing
+// below is a gap that could have been covered here):
+//
+// - The `localStorage` calls themselves — `get_item`/`set_item`/
+//   `remove_item` on the real `web_sys::Storage`, including the
+//   private-browsing/quota refusal path `warn_persist_failed_once` exists
+//   for. Everything that decides *what* to store (`encode_draft`) and how to
+//   read it back (`decode_draft`) is pure and tested in
+//   `features::dialogs::commit`; only the browser API call that carries the
+//   bytes across is not.
+// - The Restore/Discard click handlers in `dialogs/commit.rs` — that a tap
+//   on either button actually reaches `Dialogs::restore_draft` /
+//   `Dialogs::discard_draft` is wiring, not logic, and this repo has no
+//   harness that drives a click through Leptos outside a real browser.
+// - The `<textarea prop:value=move || dialogs.message(&message_intent)>`
+//   re-render after `Dialogs::restore_draft` calls `self.commit_msg.set(…)`.
+//   This is the one behavior the whole banner exists for — that pressing
+//   Restore visibly fills the box — and nothing in this repository can
+//   check that a `prop:value` binding actually re-renders on a signal write.
+// The manual iPad testbed pass this milestone's siblings (#224, #225) went
+// through is the only verification any of these three get.
+
 /// One console breadcrumb, first time a draft persist is refused (quota,
 /// private-mode revocation). The draft then lives in-memory-only — visible
 /// and submittable, but gone on reload — and without this line a later
@@ -298,21 +321,36 @@ impl Dialogs {
                 return;
             };
             if let Some(storage) = local_storage() {
-                let encoded = encode_draft(&msg, js_sys::Date::now());
-                if storage.set_item(&key, &encoded).is_err() {
+                // An emptied box removes the key rather than writing
+                // `{"message":"",…}` — `decode_draft` already refuses to
+                // offer an empty message back, so writing it would only
+                // leave a phantom key sitting in storage under this scope
+                // forever, decoding to nothing on every future read.
+                let result = if msg.trim().is_empty() {
+                    storage.remove_item(&key)
+                } else {
+                    storage.set_item(&key, &encode_draft(&msg, js_sys::Date::now()))
+                };
+                if result.is_err() {
                     warn_persist_failed_once();
                 }
             }
         });
-        // The first keystroke into the (deliberately empty) box dismisses a
-        // still-open draft-restore banner: typing has already started
-        // overwriting the persisted draft above (last write wins), so a
-        // banner still describing the old stored text would be describing
-        // something storage no longer holds. Only the draft buffer can ever
-        // have an offer up — amend's box has no persisted copy and no
-        // banner of its own — but the check is unconditional here rather
-        // than trusting every future `MessageBuffer` variant to remember it.
-        if self.draft_offer.get_untracked().is_some() {
+        // The first keystroke into the (deliberately empty) draft box
+        // dismisses a still-open draft-restore banner: typing has already
+        // started overwriting the persisted draft above (last write wins),
+        // so a banner still describing the old stored text would be
+        // describing something storage no longer holds.
+        //
+        // Gated to `MessageBuffer::Draft` on purpose, not unconditional: a
+        // keystroke into the *amend* box must never touch the plain-commit
+        // draft's offer. Amend mode is reached from the context menu while a
+        // draft offer can still be pending — typing an amend message must
+        // leave that offer exactly as it was, so it is still there, correct
+        // and un-dismissed, if the user cancels the amend and returns to a
+        // plain commit. This is the same buffer-isolation rule `MessageBuffer`
+        // itself exists to state.
+        if buffer == MessageBuffer::Draft && self.draft_offer.get_untracked().is_some() {
             self.draft_offer.set(None);
         }
         match buffer {

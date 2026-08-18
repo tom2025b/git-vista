@@ -369,13 +369,27 @@ pub fn encode_draft(message: &str, saved_at_ms: f64) -> String {
     .unwrap_or_default()
 }
 
-/// Decode a stored draft. `None` for anything that isn't a well-formed
-/// record — including #226's own bare-message format, so a value written
-/// before this milestone (or a future rollback) reads as "nothing to offer"
-/// rather than panicking the banner on malformed JSON. An absent draft is a
-/// no-op; a draft offered wrong would not be.
+/// Decode a stored draft. `None` for anything that isn't a well-formed,
+/// offerable record:
+///
+/// - Malformed JSON, including #226's own bare-message format — a value
+///   written before this milestone (or a future rollback) reads as "nothing
+///   to offer" rather than panicking the banner on unparseable storage.
+/// - A message that is empty or whitespace-only. `set_message` persists on
+///   every keystroke, including the one that empties the box back out, so
+///   storage can legitimately hold `{"message":"","saved_at_ms":…}` for a
+///   draft the user cleared themselves. Offering that back would show a
+///   banner with a blank preview and a Restore button that restores
+///   nothing — worse than no banner, because it looks like a bug rather
+///   than the honest "no draft" it actually is.
+///
+/// An absent draft is a no-op; a draft offered wrong would not be.
 pub fn decode_draft(raw: &str) -> Option<DraftRecord> {
-    serde_json::from_str(raw).ok()
+    let record: DraftRecord = serde_json::from_str(raw).ok()?;
+    if record.message.trim().is_empty() {
+        return None;
+    }
+    Some(record)
 }
 
 /// The banner's preview text stops here — the first line of a draft, cut to
@@ -1745,6 +1759,22 @@ mod tests {
         assert_eq!(decode_draft("just a plain string"), None);
         assert_eq!(decode_draft(""), None);
         assert_eq!(decode_draft("{\"message\":\"no timestamp field\"}"), None);
+    }
+
+    #[test]
+    fn an_emptied_draft_is_never_offered() {
+        // `set_message` persists on every keystroke, including the one that
+        // clears the box back out — storage can legitimately hold this
+        // shape, and it must decode to "nothing to offer", not a banner with
+        // a blank preview and a Restore button that restores nothing.
+        //
+        // Mutation tried: dropping the `record.message.trim().is_empty()`
+        // check in `decode_draft` would pass every other test in this file
+        // (every other fixture uses a non-empty message) and only this one
+        // would catch it.
+        assert_eq!(decode_draft(&encode_draft("", 1.0)), None);
+        assert_eq!(decode_draft(&encode_draft("   \n\t", 1.0)), None);
+        assert_eq!(decode_draft("{\"message\":\"\",\"saved_at_ms\":1.0}"), None);
     }
 
     #[test]
