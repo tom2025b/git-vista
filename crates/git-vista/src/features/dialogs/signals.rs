@@ -17,31 +17,43 @@ use leptos::{
 };
 
 use crate::features::dialogs::commit::{
-    adopt_seed, detail_read_use, is_reading_publication_for, message_buffer, persist_key,
-    seed_outcome, AmendPhase, CommitIntent, DetailUse, MessageBuffer, PreflightKnowledge,
-    SeedOutcome,
+    adopt_seed, decode_draft, detail_read_use, encode_draft, is_reading_publication_for,
+    message_buffer, persist_key, seed_outcome, AmendPhase, CommitIntent, DetailUse, DraftRecord,
+    MessageBuffer, PreflightKnowledge, SeedOutcome,
 };
 use crate::features::dialogs::core::{
     draft_scope_action, pull_confirm_enabled, Dialog, DialogsCore, DraftScopeAction, PullTarget,
 };
 use git_vista_protocol::plan::MergeStrategy;
 
-/// Best-effort handle on the tab's `sessionStorage`, the `prefs.rs`
-/// convention: private browsing can refuse storage, in which case drafts
-/// simply stay in-memory-only — degraded, never broken.
+/// Best-effort handle on the tab's `localStorage`, the `prefs.rs` convention:
+/// private browsing can refuse storage, in which case drafts simply stay
+/// in-memory-only — degraded, never broken.
 ///
-/// `sessionStorage`, not `localStorage`, on purpose (#226): the failure being
-/// survived is iOS Safari suspending and rebuilding THIS tab's WASM module.
-/// A draft is tab-scoped work in progress, not a durable preference — closing
-/// the tab discarding it is the expected outcome, a draft resurfacing days
-/// later in a fresh tab is not.
-fn session_storage() -> Option<web_sys::Storage> {
-    web_sys::window().and_then(|w| w.session_storage().ok().flatten())
+/// `localStorage`, not `sessionStorage` (Tom's 2026-08-17 ruling, superseding
+/// #226's choice below). Two decisions on record, both kept honest:
+///
+/// **#226 chose `sessionStorage`.** The failure being survived was iOS
+/// Safari suspending and rebuilding THIS tab's WASM module — a same-tab
+/// recovery, so tab-scoped storage fit: closing the tab discarding the draft
+/// was the expected outcome, a draft resurfacing days later in a fresh tab
+/// was not.
+///
+/// **Tom ruled `localStorage` instead, 2026-08-17**, after two hard power
+/// losses on this box in one day. `sessionStorage` dies with the browser
+/// process; a power cut takes it out along with the tab. `localStorage`
+/// survives that, at the cost of a draft that can resurface hours or days
+/// later — which is why this milestone pairs the wider storage with a
+/// banner (`Dialogs::draft_offer`) instead of shipping it silent: the draft
+/// is never auto-filled into the textarea, only offered back with its age
+/// shown, so a stale draft is a visible choice and never an ambush.
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
 }
 
 /// One console breadcrumb, first time a draft persist is refused (quota,
 /// private-mode revocation). The draft then lives in-memory-only — visible
-/// and submittable, but gone on suspension — and without this line a later
+/// and submittable, but gone on reload — and without this line a later
 /// stale restore is indistinguishable from broken restore logic during the
 /// iPad testbed pass. Once, not per keystroke: a refusing storage refuses
 /// every write, and the console shouldn't scroll for it.
@@ -53,8 +65,8 @@ fn warn_persist_failed_once() {
     WARNED.with(|w| {
         if !w.replace(true) {
             web_sys::console::warn_1(
-                &"git-vista: sessionStorage refused the commit draft; \
-                  drafts are in-memory-only this session (#226)"
+                &"git-vista: localStorage refused the commit draft; \
+                  drafts are in-memory-only this session (#226, localStorage 2026-08-17)"
                     .into(),
             );
         }
@@ -83,6 +95,18 @@ pub struct Dialogs {
     /// clobber rule maps that to `KeepSignal` and the early return below
     /// leaves this value at the last-known repository.
     draft_scope: StoredValue<Option<String>>,
+    /// A stored draft offered back for restore, or `None` (localStorage
+    /// ruling, 2026-08-17). `Some` for exactly as long as the banner should
+    /// show: set when [`Dialogs::set_draft_scope`] reads a genuinely new
+    /// repository's storage and finds a draft there, cleared by
+    /// [`Dialogs::restore_draft`], [`Dialogs::discard_draft`], or the first
+    /// keystroke into the box (`Dialogs::set_message` — typing starts
+    /// overwriting the persisted draft, "last write wins", and the banner
+    /// must not go on describing text a live keystroke has already replaced).
+    ///
+    /// A tracked `RwSignal`: the banner renders straight from this, the same
+    /// role `pull_target` plays for the pull-strategy picker below.
+    draft_offer: RwSignal<Option<DraftRecord>>,
     /// Whether the confirm modal's second-step arm control has been pressed
     /// (M2.18b, #220).
     ///
@@ -157,6 +181,7 @@ impl Dialogs {
             // lands, and seeding happens in `set_draft_scope` when it does.
             commit_msg: create_rw_signal(String::new()),
             draft_scope: store_value(None),
+            draft_offer: create_rw_signal(None),
             confirm_armed: create_rw_signal(false),
             amend_msg: create_rw_signal(String::new()),
             amend_seed: store_value(String::new()),
@@ -171,10 +196,13 @@ impl Dialogs {
     /// every accepted Frame's `worktree_id` — which re-fires on every epoch
     /// reload, so the same-repo case MUST leave the live signal alone (the
     /// clobber rule is [`draft_scope_action`], host-tested). A genuinely new
-    /// repository swaps the signal for that repository's persisted draft:
-    /// this is both the suspension-recovery path (fresh WASM module, first
-    /// Frame lands, draft comes back) and the repo-switch path (each repo's
-    /// draft stays its own).
+    /// repository reads that repository's persisted draft, but — Tom's
+    /// 2026-08-17 ruling — **never fills the textarea with it**: the box is
+    /// left blank and, if storage held a well-formed draft, `draft_offer` is
+    /// set so the banner can offer it back. This is both the reload-recovery
+    /// path (fresh WASM module, first Frame lands, a stored draft is there
+    /// to offer) and the repo-switch path (each repository's draft stays its
+    /// own, offered only under its own scope).
     pub fn set_draft_scope(&self, worktree_id: Option<String>) {
         let action = self
             .draft_scope
@@ -182,15 +210,53 @@ impl Dialogs {
         if action == DraftScopeAction::KeepSignal {
             return;
         }
-        let restored = worktree_id
-            .as_deref()
-            .and_then(|id| {
-                let key = persist_key(MessageBuffer::Draft, id)?;
-                session_storage()?.get_item(&key).ok()?
-            })
-            .unwrap_or_default();
+        let offer = worktree_id.as_deref().and_then(|id| {
+            let key = persist_key(MessageBuffer::Draft, id)?;
+            let raw = local_storage()?.get_item(&key).ok()??;
+            decode_draft(&raw)
+        });
         self.draft_scope.set_value(worktree_id);
-        self.commit_msg.set(restored);
+        // Blank, always — a stored draft is offered, never auto-filled.
+        // Silence here is exactly the failure mode Tom vetoed: the banner
+        // below is what makes a stale draft a visible choice instead of an
+        // ambush.
+        self.commit_msg.set(String::new());
+        self.draft_offer.set(offer);
+    }
+
+    /// The stored draft currently offered for restore, if any — a tracked
+    /// read; the banner renders straight from it and disappears the instant
+    /// it goes `None`.
+    pub fn draft_offer(&self) -> Option<DraftRecord> {
+        self.draft_offer.get()
+    }
+
+    /// Fill the box with the offered draft and dismiss the banner (the
+    /// Restore button).
+    ///
+    /// Does not touch storage: the persisted copy already holds this exact
+    /// text under this scope's key, so there is nothing to write until the
+    /// user's next keystroke does it the normal way through
+    /// [`Dialogs::set_message`].
+    pub fn restore_draft(&self) {
+        let Some(record) = self.draft_offer.get_untracked() else {
+            return;
+        };
+        self.commit_msg.set(record.message);
+        self.draft_offer.set(None);
+    }
+
+    /// Delete the offered draft from storage and dismiss the banner (the
+    /// Discard button). Leaves the box exactly as it was — empty, since the
+    /// box is never auto-filled — there is nothing in it to clear.
+    pub fn discard_draft(&self) {
+        let scope = self.draft_scope.with_value(|s| s.clone());
+        if let (Some(id), Some(storage)) = (scope.as_deref(), local_storage()) {
+            if let Some(key) = persist_key(MessageBuffer::Draft, id) {
+                let _ = storage.remove_item(&key);
+            }
+        }
+        self.draft_offer.set(None);
     }
 
     /// A tracked read of the message `intent` is editing — the modal's
@@ -216,11 +282,11 @@ impl Dialogs {
     }
 
     /// Update the message `intent` is editing, persisting it **iff** its
-    /// buffer has a storage key (#226 for the draft; nothing for amend).
+    /// buffer has a storage key (the draft; nothing for amend).
     ///
-    /// Unbounced on purpose — a commit message is small, `sessionStorage`
+    /// Unbounced on purpose — a commit message is small, `localStorage`
     /// writes are synchronous and cheap, and a debounce window is exactly the
-    /// keystrokes an iOS suspension would eat.
+    /// keystrokes a reload or power cut would eat.
     pub fn set_message(&self, intent: &CommitIntent, msg: String) {
         let buffer = message_buffer(intent);
         self.draft_scope.with_value(|scope| {
@@ -231,12 +297,24 @@ impl Dialogs {
             let Some(key) = persist_key(buffer, id) else {
                 return;
             };
-            if let Some(storage) = session_storage() {
-                if storage.set_item(&key, &msg).is_err() {
+            if let Some(storage) = local_storage() {
+                let encoded = encode_draft(&msg, js_sys::Date::now());
+                if storage.set_item(&key, &encoded).is_err() {
                     warn_persist_failed_once();
                 }
             }
         });
+        // The first keystroke into the (deliberately empty) box dismisses a
+        // still-open draft-restore banner: typing has already started
+        // overwriting the persisted draft above (last write wins), so a
+        // banner still describing the old stored text would be describing
+        // something storage no longer holds. Only the draft buffer can ever
+        // have an offer up — amend's box has no persisted copy and no
+        // banner of its own — but the check is unconditional here rather
+        // than trusting every future `MessageBuffer` variant to remember it.
+        if self.draft_offer.get_untracked().is_some() {
+            self.draft_offer.set(None);
+        }
         match buffer {
             MessageBuffer::Draft => self.commit_msg.set(msg),
             MessageBuffer::Amend => self.amend_msg.set(msg),
@@ -394,8 +472,8 @@ impl Dialogs {
     /// served repository changed while the POST was in flight, clearing
     /// "the current draft" would delete the *new* repository's draft and
     /// leave the submitted one to resurrect from storage later. The dialog
-    /// *opener* deliberately calls no clear at all, because opening is how a
-    /// suspension-recovered draft comes back.
+    /// *opener* deliberately calls no clear at all — reopening shows the
+    /// offer banner if a draft is still on record, but never auto-fills.
     /// M2.19c (#224) took the `intent` argument: an amend consumes the amend
     /// buffer, which has no persisted copy and no repository scope, so the
     /// storage half of this must not run for it — clearing a draft key on an
@@ -404,7 +482,7 @@ impl Dialogs {
     pub fn clear_message_for(&self, intent: &CommitIntent, submitted_scope: Option<&str>) {
         match message_buffer(intent) {
             MessageBuffer::Draft => {
-                if let (Some(id), Some(storage)) = (submitted_scope, session_storage()) {
+                if let (Some(id), Some(storage)) = (submitted_scope, local_storage()) {
                     if let Some(key) = persist_key(MessageBuffer::Draft, id) {
                         let _ = storage.remove_item(&key);
                     }
@@ -414,6 +492,13 @@ impl Dialogs {
                     .with_value(|s| s.as_deref() == submitted_scope);
                 if still_current {
                     self.commit_msg.set(String::new());
+                    // A submitted draft leaves nothing to offer for this
+                    // scope. In the ordinary path the banner is already gone
+                    // — typing dismissed it via `set_message` long before the
+                    // confirm button could be non-empty — this is the
+                    // defensive close for any path that reaches a submit
+                    // without going through that dismissal.
+                    self.draft_offer.set(None);
                 }
             }
             MessageBuffer::Amend => self.reset_amend(),

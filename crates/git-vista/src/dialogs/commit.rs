@@ -12,9 +12,10 @@ use leptos::*;
 
 use crate::api::{amend_commit_request, create_commit_request, fetch_commit_detail, fetch_frame};
 use crate::features::dialogs::commit::{
-    amend_preflight, dialog_copy, head_tip, phase_view, published_advisory, scope_review,
-    submit_path, AmendOutcome, AmendPhase, AmendTarget, CommitIntent, DialogCopy, PlainCommit,
-    Preflight, Recheck, ScopeLine, ScopeReview, SubmitPath,
+    amend_preflight, dialog_copy, draft_banner, head_tip, message_buffer, phase_view,
+    published_advisory, scope_review, submit_path, AmendOutcome, AmendPhase, AmendTarget,
+    CommitIntent, DialogCopy, MessageBuffer, PlainCommit, Preflight, Recheck, ScopeLine,
+    ScopeReview, SubmitPath,
 };
 use crate::features::dialogs::core::{Dialog, ErrorNotice, PATH_LIST_LIMIT, TOUCH_TARGET_STYLE};
 use crate::features::status::signals as status_state;
@@ -314,6 +315,58 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
             let busy = is_amend && phase_state.busy;
             let notice = if is_amend { phase_state.notice } else { None };
 
+            // The draft-restore banner (localStorage ruling, 2026-08-17):
+            // relevant only for the draft buffer — amend has no persisted
+            // draft of its own, per `MessageBuffer`'s own doc comment — and
+            // only while `Dialogs::draft_offer` still holds one. Restore,
+            // Discard, and the first keystroke into the (deliberately empty)
+            // box all clear it; see `Dialogs::set_message`.
+            let draft_offer_view = (message_buffer(&intent) == MessageBuffer::Draft)
+                .then(|| dialogs.draft_offer())
+                .flatten()
+                .map(|record| {
+                    let banner = draft_banner(&record, js_sys::Date::now());
+                    view! {
+                        // `role="status"`: the dialog opening is what surfaces
+                        // this, not a tap the user just made, so a
+                        // screen-reader user needs it announced the same way
+                        // the amend notice below does.
+                        <div
+                            role="status"
+                            style="margin-bottom:12px; padding:10px; \
+                                   border:1px solid #388bfd; border-radius:6px; \
+                                   background:#0d1b2e; line-height:1.4;"
+                        >
+                            <div style="font-weight:600;">
+                                {format!("Draft from {}", banner.age)}
+                            </div>
+                            <div style="color:var(--muted);">{banner.preview}</div>
+                            <div style="display:flex; gap:8px; margin-top:10px;">
+                                <button
+                                    aria-label="Restore the saved draft into the message box"
+                                    style=format!(
+                                        "{BUTTON_BASE}{TOUCH_TARGET_STYLE}color:#fff; \
+                                         background:#238636; border:1px solid #2ea043;"
+                                    )
+                                    on:click=move |_| dialogs.restore_draft()
+                                >
+                                    "Restore"
+                                </button>
+                                <button
+                                    aria-label="Discard the saved draft"
+                                    style=format!(
+                                        "{BUTTON_BASE}{TOUCH_TARGET_STYLE}color:var(--fg); \
+                                         background:#21262d; border:1px solid #30363d;"
+                                    )
+                                    on:click=move |_| dialogs.discard_draft()
+                                >
+                                    "Discard"
+                                </button>
+                            </div>
+                        </div>
+                    }
+                });
+
             // The banner's own button, when the phase offers one: the re-check
             // step after a stale tip, and the published-history ceremony's
             // second step (#225). Both are deliberately *not* the green confirm
@@ -427,6 +480,7 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
                                 {notice_action}
                             </div>
                         })}
+                        {draft_offer_view}
                         {staged_scope_view(review)}
                         <textarea
                             style="width:100%; box-sizing:border-box; padding:10px; \
