@@ -1,106 +1,64 @@
 # M3.25 — Operation History and Recovery Center: Decision Spec
 
-<style>
-/* Page-1 plain-language card. NOTE: this deliberately does NOT touch @page.
-   The renderer's Legal page is `margin: 16mm 14mm`; the banner escapes it with
-   matched negative margins so exactly one element bleeds, and every following
-   page keeps its margins. Setting `@page { margin: 0 }` here would strip the
-   margins from all 20-odd pages of the spec — learned the hard way 2026-08-18.
 
-   Colours are FIXED, not chosen per document: M3's identity hue is #FF6B00 and
-   its mnemonic is SAVE ("Save points and second chances"). Both are the same on
-   every M3 artifact, forever. The green/amber/red status triad is a separate
-   axis and never borrows the identity hue. */
-h1:first-of-type { display: none !important; }
-.card-bleed { background: #FF6B00; color: #fff;
-  margin: -16mm -14mm 0 -14mm; padding: 12mm 14mm 10mm 14mm; }
-.card-bleed .mn { display: inline-block; border: 1mm solid #fff; padding: 2.5mm 5mm;
-  font-size: 21pt; font-weight: bold; letter-spacing: 3.5pt; margin: 0 0 4mm 0; }
-.card-bleed .kick { font-size: 11pt; letter-spacing: 3.2pt; text-transform: uppercase;
-  font-weight: bold; margin: 0 0 1.5mm 0; opacity: .93; }
-.card-bleed .nm { font-size: 34pt; font-weight: bold; letter-spacing: -1pt;
-  line-height: 1.02; margin: 0 0 3mm 0; }
-.card-bleed .hook { font-size: 18pt; font-weight: bold; line-height: 1.2; margin: 0; }
-.card-body { padding: 6mm 0 0 0; }
-.card-body .plain { font-size: 14.5pt; line-height: 1.4; margin: 0 0 5mm 0; color: #141414; }
-.card-body .sec { font-size: 11pt; text-transform: uppercase; letter-spacing: 1.5pt;
-  font-weight: bold; color: #7A2E00; margin: 0 0 2.5mm 0; }
-.card-body .blk { border-left: 4mm solid; padding: 2.5mm 0 2.5mm 4mm; margin: 0 0 3.2mm 0; }
-.card-body .blk .t { font-size: 15.5pt; font-weight: bold; margin: 0 0 1mm 0; line-height: 1.2; }
-.card-body .blk .d { font-size: 12.8pt; line-height: 1.34; margin: 0; color: #232323; }
-.blk.done { border-color: #1d7a34; background: #eef7f0; }
-.blk.done .t { color: #0f4a1f; }
-.blk.watch { border-color: #a86b12; background: #fdf6ea; }
-.blk.watch .t { color: #5c3a05; }
-.blk.open { border-color: #a11d1d; background: #fbeeee; }
-.blk.open .t { color: #6d1111; }
-.card-strip { background: #7A2E00; color: #fff; padding: 4.5mm 14mm 5mm 14mm;
-  margin: 6mm -14mm 0 -14mm; }
-.card-strip span { display: inline-block; background: #FF6B00; color: #fff; font-size: 9.5pt;
-  font-weight: bold; padding: 1mm 2.6mm; margin-right: 2.6mm; letter-spacing: .7pt; }
-.card-strip p { font-size: 12.5pt; margin: 0 0 2mm 0; line-height: 1.3; }
-.card-strip p:last-child { margin: 0; }
-.card-end { page-break-after: always; }
-</style>
-
-<div class="card-bleed">
-<p class="mn">SAVE</p>
-<p class="kick">Git-Vista &middot; milestone 3 &middot; issue #78</p>
-<p class="nm">An undo button for Git</p>
-<p class="hook">Save points, and second chances.</p>
+<div style="background:#FF6B00;color:#fff;margin:3mm -14mm 0 -14mm;padding:9mm 14mm 8mm 14mm">
+<p style="display:inline-block;border:1mm solid #fff;padding:2.5mm 5mm;font-size:18pt;font-weight:bold;letter-spacing:3pt;margin:0 0 4mm 0">SAVE</p>
+<p style="font-size:11pt;letter-spacing:3.2pt;text-transform:uppercase;font-weight:bold;margin:0 0 1.5mm 0;opacity:.93">Git-Vista &middot; milestone 3 &middot; issue #78</p>
+<p style="font-size:29pt;font-weight:bold;letter-spacing:-1pt;line-height:1.02;margin:0 0 3mm 0">An undo button for Git</p>
+<p style="font-size:16pt;font-weight:bold;line-height:1.2;margin:0">Save points, and second chances.</p>
 </div>
 
-<div class="card-body">
+<div style="padding:5mm 0 0 0">
 
-<p class="plain">Git already writes down everything it does. The problem is that
+<p style="font-size:13pt;line-height:1.34;margin:0 0 4.5mm 0;color:#141414">Git already writes down everything it does. The problem is that
 reading that record needs magic words you have to know in advance, and some of
 it disappears after 30 days. This is about turning that hidden record into a
 list you can actually look at &mdash; and, where it is still safe, a button that
 puts things back.</p>
 
-<p class="sec">What this document decides</p>
+<p style="font-size:11pt;text-transform:uppercase;letter-spacing:1.5pt;font-weight:bold;color:#7A2E00;margin:0 0 2.5mm 0">What this document decides</p>
 
-<div class="blk done">
-<p class="t">The hard part is already built</p>
-<p class="d">Two designs were written for this. The one that won is the boring
+<div style="border-left:4mm solid #1d7a34;background:#eef7f0;padding:2.2mm 0 2.2mm 3.6mm;margin:0 0 2.5mm 0">
+<p style="font-size:13.8pt;font-weight:bold;margin:0 0 1mm 0;line-height:1.2;color:#0f4a1f">The hard part is already built</p>
+<p style="font-size:11.6pt;line-height:1.3;margin:0;color:#232323">Two designs were written for this. The one that won is the boring
 one: the app <em>already</em> writes down every action in its own notebook,
 including the ones it refused to do. So this job is mostly about
 <strong>reading</strong> that notebook, not building a new one. That makes it
 far smaller than it looked.</p>
 </div>
 
-<div class="blk done">
-<p class="t">Refusals count as history too</p>
-<p class="d">"I would not do that, your copy is out of date" is an answer, and
+<div style="border-left:4mm solid #1d7a34;background:#eef7f0;padding:2.2mm 0 2.2mm 3.6mm;margin:0 0 2.5mm 0">
+<p style="font-size:13.8pt;font-weight:bold;margin:0 0 1mm 0;line-height:1.2;color:#0f4a1f">Refusals count as history too</p>
+<p style="font-size:11.6pt;line-height:1.3;margin:0;color:#232323">"I would not do that, your copy is out of date" is an answer, and
 it gets written down like any other. A history that only showed successes would
 quietly hide the most interesting days.</p>
 </div>
 
-<div class="blk watch">
-<p class="t">Never offer an undo you cannot stand behind</p>
-<p class="d">Before showing an <em>Undo</em> button, the app checks &mdash; right
+<div style="border-left:4mm solid #a86b12;background:#fdf6ea;padding:2.2mm 0 2.2mm 3.6mm;margin:0 0 2.5mm 0">
+<p style="font-size:13.8pt;font-weight:bold;margin:0 0 1mm 0;line-height:1.2;color:#5c3a05">Never offer an undo you cannot stand behind</p>
+<p style="font-size:11.6pt;line-height:1.3;margin:0;color:#232323">Before showing an <em>Undo</em> button, the app checks &mdash; right
 then, not from memory &mdash; that the old version is still reachable. If the
 check itself cannot run, that is <strong>not</strong> the same as "safe", and
 the button stays hidden. "Could not tell" must never read as "yes".</p>
 </div>
 
-<div class="blk open">
-<p class="t">One piece has no design at all</p>
-<p class="d">Setting work aside half-finished (#77) still has nothing written
+<div style="border-left:4mm solid #a11d1d;background:#fbeeee;padding:2.2mm 0 2.2mm 3.6mm;margin:0 0 2.5mm 0">
+<p style="font-size:13.8pt;font-weight:bold;margin:0 0 1mm 0;line-height:1.2;color:#6d1111">One piece has no design at all</p>
+<p style="font-size:11.6pt;line-height:1.3;margin:0;color:#232323">Setting work aside half-finished (#77) still has nothing written
 for it. The agent that was supposed to design it failed five times and returned
 nothing, so this document says so plainly instead of pretending otherwise.</p>
 </div>
 
 </div>
 
-<div class="card-strip">
-<p><span>MILESTONE</span> M3 &mdash; Parallel Work &amp; Recovery</p>
-<p><span>THIS DOC</span> the decision behind issue #78, before any code</p>
-<p><span>STATUS</span> designed, nothing built yet</p>
-<p><span>STILL OPEN</span> #77 stash has no design</p>
+<div style="background:#7A2E00;color:#fff;padding:4.5mm 14mm 5mm 14mm;margin:5.5mm -14mm 0 -14mm">
+<p style="font-size:11.6pt;margin:0 0 1.6mm 0;line-height:1.3"><span style="display:inline-block;background:#FF6B00;color:#fff;font-size:9.5pt;font-weight:bold;padding:1mm 2.6mm;margin-right:2.6mm;letter-spacing:.7pt">MILESTONE</span> M3 &mdash; Parallel Work &amp; Recovery</p>
+<p style="font-size:11.6pt;margin:0 0 1.6mm 0;line-height:1.3"><span style="display:inline-block;background:#FF6B00;color:#fff;font-size:9.5pt;font-weight:bold;padding:1mm 2.6mm;margin-right:2.6mm;letter-spacing:.7pt">THIS DOC</span> the decision behind issue #78, before any code</p>
+<p style="font-size:11.6pt;margin:0 0 1.6mm 0;line-height:1.3"><span style="display:inline-block;background:#FF6B00;color:#fff;font-size:9.5pt;font-weight:bold;padding:1mm 2.6mm;margin-right:2.6mm;letter-spacing:.7pt">STATUS</span> designed, nothing built yet</p>
+<p style="font-size:11.6pt;margin:0 0 1.6mm 0;line-height:1.3"><span style="display:inline-block;background:#FF6B00;color:#fff;font-size:9.5pt;font-weight:bold;padding:1mm 2.6mm;margin-right:2.6mm;letter-spacing:.7pt">STILL OPEN</span> #77 stash has no design</p>
 </div>
 
-<div class="card-end"></div>
+<div style="page-break-after:always"></div>
 
 
 **Status:** Design spec, pre-ADR — for Codex adversarial review before an ADR is filed under `docs/adr/`.

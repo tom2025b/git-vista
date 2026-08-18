@@ -1,93 +1,51 @@
 # M3.24 — Complete Stash Workflows: Decision Spec
 
-<style>
-/* Page-1 plain-language card. Deliberately does NOT touch @page: the
-   renderer's Legal page is `margin: 16mm 14mm`, and the banner escapes it with
-   matched negative margins so exactly one element bleeds while every following
-   page keeps its margins.
 
-   Colours are FIXED, not chosen per document. M3's identity hue is #FF6B00 and
-   its mnemonic is SAVE ("Save points and second chances") — the same on every
-   M3 artifact, forever. The green/amber/red status triad is a separate axis
-   and never borrows the identity hue. */
-h1:first-of-type { display: none !important; }
-.card-bleed { background: #FF6B00; color: #fff;
-  margin: -16mm -14mm 0 -14mm; padding: 12mm 14mm 10mm 14mm; }
-.card-bleed .mn { display: inline-block; border: 1mm solid #fff; padding: 2.5mm 5mm;
-  font-size: 21pt; font-weight: bold; letter-spacing: 3.5pt; margin: 0 0 4mm 0; }
-.card-bleed .kick { font-size: 11pt; letter-spacing: 3.2pt; text-transform: uppercase;
-  font-weight: bold; margin: 0 0 1.5mm 0; opacity: .93; }
-.card-bleed .nm { font-size: 34pt; font-weight: bold; letter-spacing: -1pt;
-  line-height: 1.02; margin: 0 0 3mm 0; }
-.card-bleed .hook { font-size: 18pt; font-weight: bold; line-height: 1.2; margin: 0; }
-.card-body { padding: 6mm 0 0 0; }
-.card-body .plain { font-size: 14.5pt; line-height: 1.4; margin: 0 0 5mm 0; color: #141414; }
-.card-body .sec { font-size: 11pt; text-transform: uppercase; letter-spacing: 1.5pt;
-  font-weight: bold; color: #7A2E00; margin: 0 0 2.5mm 0; }
-.card-body .blk { border-left: 4mm solid; padding: 2.5mm 0 2.5mm 4mm; margin: 0 0 3.2mm 0; }
-.card-body .blk .t { font-size: 15.5pt; font-weight: bold; margin: 0 0 1mm 0; line-height: 1.2; }
-.card-body .blk .d { font-size: 12.8pt; line-height: 1.34; margin: 0; color: #232323; }
-.blk.done { border-color: #1d7a34; background: #eef7f0; }
-.blk.done .t { color: #0f4a1f; }
-.blk.watch { border-color: #a86b12; background: #fdf6ea; }
-.blk.watch .t { color: #5c3a05; }
-.blk.open { border-color: #a11d1d; background: #fbeeee; }
-.blk.open .t { color: #6d1111; }
-.card-strip { background: #7A2E00; color: #fff; padding: 4.5mm 14mm 5mm 14mm;
-  margin: 6mm -14mm 0 -14mm; }
-.card-strip span { display: inline-block; background: #FF6B00; color: #fff; font-size: 9.5pt;
-  font-weight: bold; padding: 1mm 2.6mm; margin-right: 2.6mm; letter-spacing: .7pt; }
-.card-strip p { font-size: 12.5pt; margin: 0 0 2mm 0; line-height: 1.3; }
-.card-strip p:last-child { margin: 0; }
-.card-end { page-break-after: always; }
-</style>
-
-<div class="card-bleed">
-<p class="mn">SAVE</p>
-<p class="kick">Git-Vista &middot; milestone 3 &middot; issue #77</p>
-<p class="nm">A proper drawer</p>
-<p class="hook">Put work aside half-finished. Get it back exactly as you left it.</p>
+<div style="background:#FF6B00;color:#fff;margin:3mm -14mm 0 -14mm;padding:9mm 14mm 8mm 14mm">
+<p style="display:inline-block;border:1mm solid #fff;padding:2.5mm 5mm;font-size:18pt;font-weight:bold;letter-spacing:3pt;margin:0 0 4mm 0">SAVE</p>
+<p style="font-size:11pt;letter-spacing:3.2pt;text-transform:uppercase;font-weight:bold;margin:0 0 1.5mm 0;opacity:.93">Git-Vista &middot; milestone 3 &middot; issue #77</p>
+<p style="font-size:29pt;font-weight:bold;letter-spacing:-1pt;line-height:1.02;margin:0 0 3mm 0">A proper drawer</p>
+<p style="font-size:16pt;font-weight:bold;line-height:1.2;margin:0">Put work aside half-finished. Get it back exactly as you left it.</p>
 </div>
 
-<div class="card-body">
+<div style="padding:5mm 0 0 0">
 
-<p class="plain">Sometimes you are halfway through something and have to stop.
-Git has a drawer for that &mdash; it sweeps unfinished work aside and remembers
-it. But the drawer is famously easy to lose things in, and one of its commands
-can leave you stuck in a mess that normally needs a terminal to escape. This app
-has no terminal. So the question is not "how do we call these commands" but
+<p style="font-size:13pt;line-height:1.34;margin:0 0 4.5mm 0;color:#141414">Git has a drawer for work you have to stop halfway
+through. It is famously easy to lose things in, and one of its commands can
+leave you stuck in a mess that normally needs a terminal to escape. This app has
+no terminal &mdash; so the question is not "how do we call these commands" but
 "which can we offer at all, safely." Nothing is built yet: five places in the
 code say "stash", and reading every one shows none of them runs it.</p>
 
-<p class="sec">What this document decides</p>
+<p style="font-size:11pt;text-transform:uppercase;letter-spacing:1.5pt;font-weight:bold;color:#7A2E00;margin:0 0 2.5mm 0">What this document decides</p>
 
-<div class="blk watch">
-<p class="t">One command has no undo, and that shapes everything</p>
-<p class="d">Every other risky thing the app does can be called off halfway.
-Interrupted merge? Call it off. Interrupted rebase? Call it off. But the drawer's
-"take it back out" command has no such escape hatch &mdash; if it goes wrong it
-just leaves the mess in place. Since you have no terminal to fix it from, the app
-must not create that situation in the first place.</p>
+<div style="border-left:4mm solid #a86b12;background:#fdf6ea;padding:2.2mm 0 2.2mm 3.6mm;margin:0 0 2.5mm 0">
+<p style="font-size:13.8pt;font-weight:bold;margin:0 0 1mm 0;line-height:1.2;color:#5c3a05">One command has no undo, and that shapes everything</p>
+<p style="font-size:11.6pt;line-height:1.3;margin:0;color:#232323">Every other risky thing the app does can be called off halfway
+&mdash; interrupted merge, interrupted rebase, both fine. The drawer's "take it
+back out" command has no such escape hatch: if it goes wrong it just leaves the
+mess in place. With no terminal to fix it from, the app must not create that
+situation at all.</p>
 </div>
 
-<div class="blk done">
-<p class="t">The fix is to only open the drawer over a tidy desk</p>
-<p class="d">If the desk is already clear when you take work back out, then
-"call it off" simply means clearing it again. That is something the app can
-always do. So taking work out requires a clean start &mdash; which is a real
-restriction, and this document argues it is the right one.</p>
+<div style="border-left:4mm solid #1d7a34;background:#eef7f0;padding:2.2mm 0 2.2mm 3.6mm;margin:0 0 2.5mm 0">
+<p style="font-size:13.8pt;font-weight:bold;margin:0 0 1mm 0;line-height:1.2;color:#0f4a1f">The fix is to only open the drawer over a tidy desk</p>
+<p style="font-size:11.6pt;line-height:1.3;margin:0;color:#232323">If the desk is clear when you take work back out, "call it
+off" just means clearing it again &mdash; something the app can always do. So
+taking work out requires a clean start. That is a real restriction, and this
+document argues it is the right one.</p>
 </div>
 
-<div class="blk done">
-<p class="t">Throwing a drawer away is survivable too</p>
-<p class="d">Deleting a stashed item does not really delete it for about a
+<div style="border-left:4mm solid #1d7a34;background:#eef7f0;padding:2.2mm 0 2.2mm 3.6mm;margin:0 0 2.5mm 0">
+<p style="font-size:13.8pt;font-weight:bold;margin:0 0 1mm 0;line-height:1.2;color:#0f4a1f">Throwing a drawer away is survivable too</p>
+<p style="font-size:11.6pt;line-height:1.3;margin:0;color:#232323">Deleting a stashed item does not really delete it for about a
 month. The app already has a trick for holding on to things git is about to
 forget, built for a different feature &mdash; it works here unchanged.</p>
 </div>
 
-<div class="blk open">
-<p class="t">Two questions are yours, not mine</p>
-<p class="d">Whether "take it back out" should be offered at all before conflict
+<div style="border-left:4mm solid #a11d1d;background:#fbeeee;padding:2.2mm 0 2.2mm 3.6mm;margin:0 0 2.5mm 0">
+<p style="font-size:13.8pt;font-weight:bold;margin:0 0 1mm 0;line-height:1.2;color:#6d1111">Two questions are yours, not mine</p>
+<p style="font-size:11.6pt;line-height:1.3;margin:0;color:#232323">Whether "take it back out" should be offered at all before conflict
 resolution exists, and whether the clean-desk rule is too strict. Both are
 judgement calls about how you want to work, so they are written down as
 questions rather than quietly decided.</p>
@@ -95,14 +53,14 @@ questions rather than quietly decided.</p>
 
 </div>
 
-<div class="card-strip">
-<p><span>MILESTONE</span> M3 &mdash; Parallel Work &amp; Recovery</p>
-<p><span>THIS DOC</span> the design for issue #77, which had none</p>
-<p><span>STATUS</span> design only &mdash; no code written</p>
-<p><span>WAIT</span> two open questions for Tom before an ADR</p>
+<div style="background:#7A2E00;color:#fff;padding:4.5mm 14mm 5mm 14mm;margin:5.5mm -14mm 0 -14mm">
+<p style="font-size:11.6pt;margin:0 0 1.6mm 0;line-height:1.3"><span style="display:inline-block;background:#FF6B00;color:#fff;font-size:9.5pt;font-weight:bold;padding:1mm 2.6mm;margin-right:2.6mm;letter-spacing:.7pt">MILESTONE</span> M3 &mdash; Parallel Work &amp; Recovery</p>
+<p style="font-size:11.6pt;margin:0 0 1.6mm 0;line-height:1.3"><span style="display:inline-block;background:#FF6B00;color:#fff;font-size:9.5pt;font-weight:bold;padding:1mm 2.6mm;margin-right:2.6mm;letter-spacing:.7pt">THIS DOC</span> the design for issue #77, which had none</p>
+<p style="font-size:11.6pt;margin:0 0 1.6mm 0;line-height:1.3"><span style="display:inline-block;background:#FF6B00;color:#fff;font-size:9.5pt;font-weight:bold;padding:1mm 2.6mm;margin-right:2.6mm;letter-spacing:.7pt">STATUS</span> design only &mdash; no code written</p>
+<p style="font-size:11.6pt;margin:0 0 1.6mm 0;line-height:1.3"><span style="display:inline-block;background:#FF6B00;color:#fff;font-size:9.5pt;font-weight:bold;padding:1mm 2.6mm;margin-right:2.6mm;letter-spacing:.7pt">WAIT</span> two open questions for Tom before an ADR</p>
 </div>
 
-<div class="card-end"></div>
+<div style="page-break-after:always"></div>
 
 **Status:** Design spec, pre-ADR — the design #77 has been missing.
 **Fills the gap named in:** `docs/superpowers/specs/2026-08-18-m3-recovery-center.md`, which recorded that no stash design was ever produced (the agent assigned it hit the structured-output retry cap five times and returned nothing) and declined to invent one.
