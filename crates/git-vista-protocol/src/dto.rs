@@ -124,6 +124,95 @@ pub struct AmendCommitError {
     pub message: String,
 }
 
+/// Typed classification of a failed `POST /api/commit` on HEAD (M2.19,
+/// #72), covering [`crate::GitOperation::CommitOnHead`]'s own execution
+/// failures — never the handler-level request-shape refusals (empty
+/// message) or the branch-stub path's compare-and-swap 400s, which stay
+/// server-wide prose. Same posture [`AmendFailureKind`] set: the server
+/// owns the classification, the wire carries a closed tag plus `message`
+/// fit to show as-is, and the client never regex-sniffs git's own —
+/// gettext-translated, version-dependent — stderr.
+///
+/// **Finer on signing than [`AmendFailureKind`], deliberately.** Amend
+/// collapses every signer failure into one `SigningFailed`; this type keeps
+/// the two-way split [`SignTagFailureKind`] already proved out for signed
+/// tags — `SigningKeyMissing` vs `SigningAgentUnavailable` — because
+/// `git commit`'s gpg-format signer emits the identical GnuPG status-fd
+/// protocol `classify_sign_failure` already reads (verified empirically
+/// against a real git 2.43 `git commit` with `commit.gpgsign=true`: the
+/// same `[GNUPG:] FAILURE sign 17` / `INV_SGNR` lines land in stderr as for
+/// `git tag -s`), so the same precision is available here for free — using
+/// it is more actionable than throwing it away to match amend's coarser
+/// set. The ssh-format signer (`gpg.format=ssh`) carries no status-fd
+/// protocol on *either* path, so its one marker
+/// (`"failed to write commit object"`, verified the same way) maps to
+/// `SigningAgentUnavailable` on this server specifically because ssh-agent
+/// access is denied by the same sandbox boundary gpg-agent's is (#188).
+///
+/// **`Other` always keeps git's own words**, never a canned substitute —
+/// unlike [`SignTagFailureKind::Other`], whose message says only "detail is
+/// in the server log". A misclassification here must still be actionable
+/// from what the client can show, since nothing else names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitFailureKind {
+    /// gpg (or, on this server, always — see the sandbox note on
+    /// [`SignTagFailureKind::NoSecretKey`]) found no secret key to sign
+    /// with. Read from the GnuPG status-fd protocol
+    /// (`[GNUPG:] FAILURE sign 17` / `INV_SGNR`), not prose.
+    SigningKeyMissing,
+    /// gpg could not reach `gpg-agent`, gpg is not installed, or — the
+    /// ssh-format signer — the signing key could not be loaded. Every one
+    /// of these is "signing structurally cannot happen here" from the
+    /// user's vantage point, and the sandbox denies gpg-agent/ssh-agent
+    /// access identically (#188), so they share one actionable answer.
+    SigningAgentUnavailable,
+    /// A repository hook (`pre-commit`, `prepare-commit-msg`,
+    /// `commit-msg`) exited non-zero. Actionable: the hook's own output (if
+    /// any) is in `message`, and the user fixes whatever the hook checks.
+    /// Same documented heuristic and residuals as
+    /// [`AmendFailureKind::HookRejected`] (git prints nothing of its own on
+    /// a silent hook rejection, so this is inferred from the *absence* of
+    /// any other explanation, not a positive marker).
+    HookRejected,
+    /// The spawn — which may run repository hooks, arbitrary user code —
+    /// did not finish inside the server's bound and was killed (#72,
+    /// M2.19). `message` states what was verified afterward: whether HEAD
+    /// moved, stayed put, or could not be confirmed either way — never a
+    /// guess. Mirrors [`AmendFailureKind::HookTimedOut`]; built directly at
+    /// the timeout call site, never returned by a stderr classifier (there
+    /// is no stderr to classify — the spawn was killed, not answered).
+    HookTimedOut,
+    /// Nothing was staged (`git commit` exited non-zero with git's own
+    /// "nothing to commit" family of messages on stdout). Not a failure of
+    /// anything — the user's own working tree state — so the remedy is
+    /// simply to stage something first, or use "allow empty" for a marker
+    /// commit.
+    NothingStaged,
+    /// Everything else, reported with git's own words in `message` —
+    /// **never swallowed**, even though the classified kinds above prefer
+    /// canned guidance: an unclassified failure has no canned text to fall
+    /// back on, so git's own explanation is all there is to act on.
+    Other,
+}
+
+/// Body of a **failed** `POST /api/commit` whose 400 originates in
+/// [`crate::GitOperation::CommitOnHead`]'s own execution (M2.19, #72; ADR
+/// TODO): the typed [`CommitFailureKind`] plus git's own explanation in
+/// `message`. Handler-level request-shape refusals (empty message) and the
+/// branch-stub path's own 400s are **not** guaranteed to carry this shape —
+/// see [`CommitFailureKind`]'s own doc for the exact boundary — so a client
+/// must fall back to plain prose when this fails to parse, the same posture
+/// [`AmendCommitError`]'s own callers already take for their route's
+/// non-JSON 403/409/5xx cases.
+///
+/// A response DTO, so no `deny_unknown_fields` (M1.02 additive rule).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitError {
+    pub kind: CommitFailureKind,
+    pub message: String,
+}
+
 /// Body of a **successful** `POST /api/amend-commit` (status 200).
 ///
 /// `old_tip` is the amended-away commit (the request's own `expected_tip`,

@@ -12,10 +12,10 @@ use leptos::*;
 
 use crate::api::{amend_commit_request, create_commit_request, fetch_commit_detail, fetch_frame};
 use crate::features::dialogs::commit::{
-    amend_preflight, dialog_copy, draft_banner, head_tip, message_buffer, phase_view,
-    published_advisory, scope_review, submit_path, AmendOutcome, AmendPhase, AmendTarget,
-    CommitIntent, DialogCopy, MessageBuffer, PlainCommit, Preflight, Recheck, ScopeLine,
-    ScopeReview, SubmitPath,
+    amend_preflight, commit_refusal_guidance, dialog_copy, draft_banner, head_tip, message_buffer,
+    phase_view, published_advisory, scope_review, submit_path, AmendOutcome, AmendPhase,
+    AmendTarget, CommitIntent, CreateCommitOutcome, DialogCopy, MessageBuffer, PlainCommit,
+    Preflight, Recheck, ScopeLine, ScopeReview, SubmitPath,
 };
 use crate::features::dialogs::core::{Dialog, ErrorNotice, PATH_LIST_LIMIT, TOUCH_TARGET_STYLE};
 use crate::features::status::signals as status_state;
@@ -91,7 +91,7 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
         shell.close_commit_dialog();
         spawn_local(async move {
             match create_commit_request(&message, allow_empty, branch.as_deref()).await {
-                Ok(()) => {
+                CreateCommitOutcome::Created => {
                     // The message is consumed — discard the draft, signal and
                     // persisted copy both (#226). This is the clear the opener
                     // used to do; moved here so a suspension-recovered draft
@@ -101,13 +101,25 @@ pub fn commit_dialog_view(features: Features) -> impl IntoView {
                         g.force_bump();
                     });
                 }
+                // #72 (M2.19): the typed refusal's own actionable guidance
+                // (`commit_refusal_guidance`) appended after git's own words
+                // — never just the raw envelope message (#316's own rule,
+                // sharpened: actionable, not merely readable).
+                CreateCommitOutcome::Refused { refusal, message } => {
+                    let (title, next) = commit_refusal_guidance(refusal);
+                    dialogs.open(Dialog::Error);
+                    shell.open_error(ErrorNotice {
+                        title,
+                        body: format!("{message} {next}"),
+                    });
+                }
                 // #316: the envelope's message in the app's own modal —
                 // never the raw JSON body in a native alert().
-                Err(e) => {
+                CreateCommitOutcome::Unavailable(why) => {
                     dialogs.open(Dialog::Error);
                     shell.open_error(ErrorNotice {
                         title: "Couldn't create commit",
-                        body: e,
+                        body: why,
                     });
                 }
             }

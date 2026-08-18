@@ -39,11 +39,12 @@ use git_vista_core::activity::ActivityKind;
 use git_vista_core::identity::{GenerationInputs, RepositoryId};
 use git_vista_core::seed::{parse_seed, reset_plan, Seed};
 use git_vista_protocol::{
-    AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitMessage, CommitOid,
-    ForcePublish, GenerationToken, GitOperation, IdempotencyKey, MergeStrategy, OperationHash,
-    OperationStage, Plan, Precondition, RecoveryStrategy, RefChange, RefName, RefState, RemoteName,
-    RepositoryToken, RiskLevel, SignTagError, SignTagFailureKind, TagAnnotation, TagName,
-    UnixSeconds, WorktreePath, WorktreeToken, IDEMPOTENCY_HEADER,
+    AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitError,
+    CommitFailureKind, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
+    IdempotencyKey, MergeStrategy, OperationHash, OperationStage, Plan, Precondition,
+    RecoveryStrategy, RefChange, RefName, RefState, RemoteName, RepositoryToken, RiskLevel,
+    SignTagError, SignTagFailureKind, TagAnnotation, TagName, UnixSeconds, WorktreePath,
+    WorktreeToken, IDEMPOTENCY_HEADER,
 };
 
 use crate::git_cmd::{git_ok, rev_parse, ExecUnavailable};
@@ -2493,7 +2494,10 @@ async fn exec_commit_on_head(
                 hooked_git_timeout()
             );
             let check = check_head_after_hook_timeout(repo, need, &old).await;
-            return (StatusCode::BAD_REQUEST, hook_timeout_message(&check));
+            return commit_refusal_body(
+                CommitFailureKind::HookTimedOut,
+                &hook_timeout_message(&check),
+            );
         }
         Err(e) => return couldnt_run("/api/commit", &e),
     };
@@ -2513,11 +2517,19 @@ async fn exec_commit_on_head(
         journal_app_event(repo, ActivityKind::Commit, Some(branch), old, new, summary).await;
         (StatusCode::OK, "Created commit.".to_string())
     } else {
-        // "nothing to commit, working tree clean" goes to *stdout* with a
-        // non-zero exit — prefer stderr, fall back to stdout.
+        // #72 (M2.19): typed classification ([`classify_commit_failure`]),
+        // same posture [`exec_amend_commit`] already takes — `kind` for the
+        // client to branch on, `message` always git's own words (prefer
+        // stderr, fall back to stdout: "nothing to commit, working tree
+        // clean" goes to *stdout* with a non-zero exit).
+        let kind = classify_commit_failure(
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+            signing_requested(repo, need).await,
+            rejectable_hook_present(repo, need).await,
+        );
         let msg = stderr_stdout_or(&output, "git commit failed.");
-        eprintln!("git-vista: /api/commit failed: {msg}");
-        (StatusCode::BAD_REQUEST, msg)
+        commit_refusal_body(kind, &msg)
     }
 }
 
@@ -2981,6 +2993,140 @@ fn classify_amend_failure(
         return AmendFailureKind::HookRejected;
     }
     AmendFailureKind::Other
+}
+
+/// Classify a failed `git commit` (on HEAD) into the typed
+/// [`CommitFailureKind`] the wire carries (#72, M2.19), so the frontend
+/// never regex-sniffs stderr itself. Pure over its inputs — the async
+/// probes ([`signing_requested`], [`rejectable_hook_present`]) live in
+/// [`exec_commit_on_head`] — so every branch is unit-testable without a
+/// spawn.
+///
+/// **Order is load-bearing**, and exists to resolve one genuine ambiguity:
+/// a silently-rejecting hook (empty stderr, non-zero exit — see
+/// [`classify_amend_failure`]'s doc for the same fact on the amend path)
+/// and a signing agent the sandbox stopped before it could write anything
+/// (also empty stderr — see [`classify_sign_failure`]'s doc) are
+/// indistinguishable from stderr alone when both preconditions hold at
+/// once. This function resolves it structurally rather than guessing:
+///
+///  1. **Positive GnuPG status-fd evidence first, unconditionally.** A
+///     `[GNUPG:]` line is proof a signing attempt actually ran — and in
+///     git's own commit sequence, hooks run *before* the object is written
+///     and signed, so a positive status line can never be a hook's doing.
+///     Reads the same protocol [`classify_sign_failure`] does (verified
+///     empirically against a real git 2.43 `git commit` with
+///     `commit.gpgsign=true`: the identical `[GNUPG:] FAILURE sign 17` /
+///     `INV_SGNR` lines land in stderr as for `git tag -s` — this function
+///     duplicates that parse rather than calling `classify_sign_failure`
+///     directly, since that function's own empty-stderr fallback assumes
+///     no hook-shaped alternative explanation exists, which is false here;
+///     see its doc comment).
+///  2. **The ssh-format signing marker next**, guarded on
+///     `signing_requested` exactly like [`classify_amend_failure`]'s own
+///     ssh-format leg: `failed to write commit object` with no status-fd
+///     protocol at all (ssh signing doesn't speak it) — verified against a
+///     real bogus-signing-key ssh commit.
+///  3. **The hook-rejection heuristic third** — a rejectable hook exists
+///     and stderr carries no `fatal:` — so an ambiguous *empty* stderr with
+///     both a hook present and signing requested is attributed to the
+///     hook, not the signer: it is the earlier stage in git's own sequence,
+///     and blaming a signer that structurally can't be reached yet would
+///     send the user to fix a configuration that was never consulted.
+///  4. **Only then** the sandboxed-signing-agent fallback: signing was
+///     requested, stderr is empty, and no hook explains it either. This is
+///     the shape [`classify_sign_failure`]'s own doc names as the
+///     production case under this server's sandbox (gpg stopped before it
+///     could run its protocol engine at all).
+///  5. Nothing staged: `git commit`'s own "nothing to commit" family of
+///     messages, which git prints to **stdout** (not stderr) with a
+///     non-zero exit — checked ahead of everything above, since an empty
+///     working tree can never be a signing or hook problem no matter what
+///     else is configured. Three shapes measured against a real git 2.43:
+///     `"nothing to commit, working tree clean"` (nothing changed at all),
+///     `"no changes added to commit"` (tracked changes exist, unstaged),
+///     and `"nothing added to commit but untracked files present"` (only
+///     untracked files) — gettext-translated under a non-English locale, so
+///     a translated repository falls through to `Other`, the safe
+///     direction, same residual style as every other heuristic here.
+///  6. Everything else: [`CommitFailureKind::Other`], with git's words
+///     forwarded untouched — never swallowed, unlike
+///     [`SignTagFailureKind::Other`]'s canned "see the server log" (#72
+///     asked explicitly that the unknown arm lose no information).
+fn classify_commit_failure(
+    stdout: &str,
+    stderr: &str,
+    signing_requested: bool,
+    rejectable_hook_present: bool,
+) -> CommitFailureKind {
+    if stdout.contains("nothing to commit")
+        || stdout.contains("no changes added to commit")
+        || stdout.contains("nothing added to commit")
+    {
+        return CommitFailureKind::NothingStaged;
+    }
+
+    // Positive GnuPG status-fd evidence is checked unconditionally — like
+    // `classify_amend_failure`'s exact-string gpg marker, a `[GNUPG:]` line
+    // can only be produced by a real signing attempt, so it is decisive
+    // even if the `signing_requested` probe itself somehow disagreed.
+    for line in stderr.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("[GNUPG:] FAILURE ") {
+            return match rest
+                .split_whitespace()
+                .last()
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(|code| (code as u64) & 0xFFFF)
+            {
+                Some(17) => CommitFailureKind::SigningKeyMissing,
+                Some(77) | Some(78) => CommitFailureKind::SigningAgentUnavailable,
+                Some(257..=281) => CommitFailureKind::SigningAgentUnavailable,
+                _ => CommitFailureKind::Other,
+            };
+        }
+        if line.starts_with("[GNUPG:] INV_SGNR") {
+            return CommitFailureKind::SigningKeyMissing;
+        }
+    }
+    // The ssh-format marker, unlike the GnuPG protocol above, is generic
+    // enough ("failed to write commit object") to also be a plain
+    // object-write/disk failure — so it needs the `signing_requested` guard
+    // `classify_amend_failure`'s own ssh-format leg already relies on.
+    if signing_requested && stderr.contains("failed to write commit object") {
+        return CommitFailureKind::SigningAgentUnavailable;
+    }
+
+    if rejectable_hook_present && !stderr.contains("fatal:") {
+        return CommitFailureKind::HookRejected;
+    }
+
+    if signing_requested && stderr.trim().is_empty() {
+        return CommitFailureKind::SigningAgentUnavailable;
+    }
+
+    CommitFailureKind::Other
+}
+
+/// Build a failed `POST /api/commit` refusal's `(StatusCode, String)` — the
+/// typed [`CommitError`] JSON, serialized into the same shared prose
+/// channel [`plan_and_execute`] and its executors return everywhere else.
+/// Needs no `Response`-returning sibling the way
+/// [`amend_refusal`]/[`amend_refusal_body`] split into two:
+/// `middleware::rewrap_error`'s #323 fix already recognises a JSON *object*
+/// body on any route and passes it through with `application/json` set
+/// rather than re-wrapping it as escaped text — the same posture
+/// [`sign_refusal_body`] already relies on, added after that fix landed.
+fn commit_refusal_body(kind: CommitFailureKind, message: &str) -> (StatusCode, String) {
+    eprintln!("git-vista: /api/commit refused ({kind:?}): {message}");
+    (
+        StatusCode::BAD_REQUEST,
+        serde_json::to_string(&CommitError {
+            kind,
+            message: message.to_string(),
+        })
+        .expect("CommitError serialization cannot fail"),
+    )
 }
 
 // --- M2.21d (#238, ADR 0048): local tag execution ---------------------------
@@ -7106,6 +7252,247 @@ mod tests {
                 "{why} (stderr={stderr:?}, signing={signing}, hook={hook})"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #72 (M2.19): `classify_commit_failure` — the pure classification the
+    // wire's `CommitFailureKind` rests on. Every stderr/stdout fixture below
+    // was captured verbatim from a real git 2.43 (scratch repos, 2026-08-18),
+    // not invented — see `classify_commit_failure`'s own doc comment for the
+    // exact commands. Driven branch by branch with paired negatives, mirroring
+    // `classify_amend_failure_covers_every_branch_with_paired_negatives`
+    // above; the end-to-end version (a real hook, a real signing config,
+    // through the full pipeline) lives in `hook_timeout_suite` /
+    // `contract_suite`.
+    // -----------------------------------------------------------------------
+
+    /// Every classification branch, with its paired negative on the same
+    /// row: the input that must NOT take that branch differs from the
+    /// matching one by exactly the load-bearing fact.
+    #[test]
+    fn classify_commit_failure_covers_every_branch_with_paired_negatives() {
+        use CommitFailureKind::*;
+        // Captured verbatim (scratch repos, 2026-08-18, git 2.43):
+        //   git -c commit.gpgsign=true -c user.signingkey=DOESNOTEXIST \
+        //       -c gpg.format=openpgp commit -m x
+        let gpg_no_key = "error: gpg failed to sign the data:\ngpg: skipped \"DOESNOTEXIST\": \
+                           No secret key\n[GNUPG:] INV_SGNR 9 DOESNOTEXIST\n\
+                           [GNUPG:] FAILURE sign 17\ngpg: signing failed: No secret key\n\n\
+                           fatal: failed to write commit object";
+        // A synthetic FAILURE code carrying GPG_ERR_NO_AGENT (77) in the low
+        // 16 bits, the same masking `classify_sign_failure`'s own fixture
+        // documents — this server's sandbox denies the AF_UNIX socket
+        // gpg-agent needs, which surfaces this way when gpg gets far enough
+        // to try.
+        let gpg_agent_unreachable = "[GNUPG:] FAILURE sign 67108941";
+        // git -c commit.gpgsign=true -c gpg.format=ssh \
+        //     -c user.signingkey=/nonexistent/key commit -m x
+        let ssh_bad_key = "error: Couldn't load public key /nonexistent/key: No such file or \
+                            directory?\n\nfatal: failed to write commit object";
+        // git commit -m x   (unstaged tracked change only)
+        let no_changes_added = "On branch main\nChanges not staged for commit:\n\t\
+                                 modified:   a.txt\n\nno changes added to commit (use \"git \
+                                 add\" and/or \"git commit -a\")";
+        // git commit -m x   (clean working tree)
+        let nothing_to_commit = "On branch main\nnothing to commit, working tree clean";
+        // git commit -m x   (only an untracked file present)
+        let untracked_only = "On branch main\n\nUntracked files:\n\tuntracked.txt\n\n\
+                               nothing added to commit but untracked files present (use \
+                               \"git add\" to track)";
+        let merge_fatal = "fatal: You are in the middle of a merge -- cannot amend.";
+
+        // (stdout, stderr, signing_requested, hook_present) → expected kind, and why.
+        let cases: &[(&str, &str, bool, bool, CommitFailureKind, &str)] = &[
+            // -- nothing staged, checked ahead of everything else --
+            (
+                nothing_to_commit,
+                "",
+                true,
+                true,
+                NothingStaged,
+                "an empty working tree is never a signing or hook problem, no matter \
+                 what else is configured",
+            ),
+            (
+                no_changes_added,
+                "",
+                false,
+                false,
+                NothingStaged,
+                "unstaged-but-tracked changes are the same 'nothing staged' answer, \
+                 different git wording",
+            ),
+            (
+                untracked_only,
+                "",
+                false,
+                false,
+                NothingStaged,
+                "untracked-only is the third 'nothing staged' shape git prints",
+            ),
+            // -- signing, gpg format: positive status-fd evidence outranks \
+            //    a present hook, because a hook rejection can never produce \
+            //    it (hooks run before signing in git's own sequence) --
+            (
+                "",
+                gpg_no_key,
+                true,
+                true,
+                SigningKeyMissing,
+                "INV_SGNR / FAILURE sign 17 is positive proof of a signing attempt, \
+                 decisive even with a hook present",
+            ),
+            (
+                "",
+                gpg_agent_unreachable,
+                true,
+                false,
+                SigningAgentUnavailable,
+                "FAILURE sign carrying GPG_ERR_NO_AGENT (77) in the low 16 bits",
+            ),
+            (
+                "",
+                gpg_no_key,
+                false,
+                false,
+                SigningKeyMissing,
+                "paired negative: the GNUPG status line is decisive even unprobed — \
+                 it cannot be produced by anything but a real signing attempt",
+            ),
+            // -- signing, ssh format: needs the config probe, same as amend --
+            (
+                "",
+                ssh_bad_key,
+                true,
+                false,
+                SigningAgentUnavailable,
+                "ssh-format signer failure with signing configured",
+            ),
+            (
+                "",
+                ssh_bad_key,
+                false,
+                false,
+                Other,
+                "paired negative: the identical stderr WITHOUT signing configured is a \
+                 plain object-write failure — blaming the signer would hide disk trouble",
+            ),
+            // -- hook rejection: silence plus a hook, and nothing fatal --
+            (
+                "",
+                "",
+                false,
+                true,
+                HookRejected,
+                "the real shape: silent hook, empty stderr",
+            ),
+            (
+                "",
+                "nope: bad message",
+                false,
+                true,
+                HookRejected,
+                "a chatty hook is still a hook",
+            ),
+            (
+                "",
+                "",
+                true,
+                true,
+                HookRejected,
+                "the genuine ambiguity this function exists to resolve: signing \
+                 requested AND a hook present, empty stderr either way — the hook, as \
+                 the earlier stage in git's own sequence, wins over the signing-agent \
+                 fallback below",
+            ),
+            (
+                "",
+                "",
+                false,
+                false,
+                Other,
+                "paired negative: the identical silence with NO hook present and no \
+                 signing requested must not invent a hook to blame",
+            ),
+            (
+                "",
+                merge_fatal,
+                false,
+                true,
+                Other,
+                "paired negative: git's own fatal refusals never classify as a hook, \
+                 hook present or not — the fatal: prefix is die()'s, unlocalized",
+            ),
+            // -- the sandboxed signing-agent fallback: only once nothing else --
+            // -- explains the empty stderr --
+            (
+                "",
+                "",
+                true,
+                false,
+                SigningAgentUnavailable,
+                "signing requested, empty stderr, no hook to blame instead — the \
+                 production shape under this server's sandbox",
+            ),
+            (
+                "",
+                "   \n  ",
+                true,
+                false,
+                SigningAgentUnavailable,
+                "whitespace-only stderr is still empty for this purpose",
+            ),
+            // -- everything else --
+            (
+                "",
+                merge_fatal,
+                false,
+                false,
+                Other,
+                "an ordinary fatal with nothing else configured is Other",
+            ),
+        ];
+        for (stdout, stderr, signing, hook, expected, why) in cases {
+            assert_eq!(
+                classify_commit_failure(stdout, stderr, *signing, *hook),
+                *expected,
+                "{why} (stdout={stdout:?}, stderr={stderr:?}, signing={signing}, hook={hook})"
+            );
+        }
+    }
+
+    /// Mutation-shaped guard, mirroring
+    /// `classify_sign_failure_distinguishes_no_secret_key_from_agent_unreachable`:
+    /// swapping the `17` arm's target kind must be distinguishable from the
+    /// real thing rather than collapsing the two closed-set reasons together.
+    #[test]
+    fn classify_commit_failure_distinguishes_no_secret_key_from_agent_unreachable() {
+        let no_key = classify_commit_failure("", "[GNUPG:] FAILURE sign 17", true, false);
+        let no_agent = classify_commit_failure("", "[GNUPG:] FAILURE sign 67108941", true, false);
+        assert_ne!(no_key, no_agent);
+        assert_eq!(no_key, CommitFailureKind::SigningKeyMissing);
+        assert_eq!(no_agent, CommitFailureKind::SigningAgentUnavailable);
+    }
+
+    /// #72's own explicit requirement: the unknown/passthrough arm must
+    /// forward git's real words, never a canned substitute — proven at the
+    /// wire-body level, not just the classification, since it is
+    /// `commit_refusal_body` that decides what `message` actually carries.
+    #[test]
+    fn commit_refusal_body_never_swallows_the_unknown_arms_stderr() {
+        let (status, body) = commit_refusal_body(
+            CommitFailureKind::Other,
+            "fatal: some completely unrecognised git failure text (2026-08-18)",
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: CommitError = serde_json::from_str(&body).unwrap_or_else(|e| {
+            panic!("commit_refusal_body must emit parseable CommitError ({e}): {body}")
+        });
+        assert_eq!(parsed.kind, CommitFailureKind::Other);
+        assert_eq!(
+            parsed.message, "fatal: some completely unrecognised git failure text (2026-08-18)",
+            "the Other arm must carry git's own words byte-for-byte"
+        );
     }
 
     // -----------------------------------------------------------------------

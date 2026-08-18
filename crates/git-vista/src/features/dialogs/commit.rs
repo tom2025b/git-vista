@@ -51,7 +51,8 @@
 use git_vista_core::model::{GitRef, RefKind};
 use git_vista_core::status::{ChangeKind, RepoStatus};
 use git_vista_protocol::{
-    AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind,
+    AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind, CommitError,
+    CommitFailureKind,
 };
 
 use crate::features::dialogs::core::commit_draft_key;
@@ -936,6 +937,147 @@ fn non_empty_or(body: &str, fallback: &str) -> String {
         fallback.to_string()
     } else {
         body.trim().to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reading `POST /api/commit` back (M2.19, #72)
+// ---------------------------------------------------------------------------
+
+/// A refusal the plain-commit dialog can show as an error and let the user
+/// retry from — the client-side vocabulary [`CommitFailureKind`] maps onto,
+/// the same split [`AmendRefusal`] is for the amend path above. No stale-tip
+/// analogue is needed here (unlike `AmendRefusal`): `POST /api/commit` on
+/// HEAD has no compare-and-swap to go stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitRefusal {
+    /// gpg found no secret key to sign with.
+    SigningKeyMissing,
+    /// gpg couldn't reach the signing agent, isn't installed, or (ssh
+    /// format) couldn't load the signing key.
+    SigningAgentUnavailable,
+    /// A repository hook exited non-zero.
+    HookRejected,
+    /// The spawn — which may run repository hooks — did not finish inside
+    /// the server's bound and was stopped (#72, M2.19).
+    HookTimedOut,
+    /// Nothing was staged.
+    NothingStaged,
+    /// Anything else git said no to.
+    Other,
+}
+
+/// What one `POST /api/commit` (on HEAD) answer means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateCommitOutcome {
+    /// 2xx: the commit landed.
+    Created,
+    /// 400 with a typed [`CommitFailureKind`].
+    Refused {
+        refusal: CommitRefusal,
+        message: String,
+    },
+    /// Anything this endpoint's typed contract does not cover — a
+    /// handler-level request-shape refusal (never JSON, by design — see
+    /// [`CommitFailureKind`]'s own doc for the exact boundary), a transport
+    /// failure, or a body that would not parse. Carries text fit to show.
+    Unavailable(String),
+}
+
+/// Read one `POST /api/commit` response into an outcome.
+///
+/// Unlike [`classify_amend_response`], **not every 400 from this route is
+/// guaranteed to be [`CommitError`] JSON** — only the ones
+/// `exec_commit_on_head`'s own execution produces. A handler-level refusal
+/// (empty message) or the branch-stub path's compare-and-swap failure stay
+/// plain prose, so a 400 that fails to parse falls to [`Unavailable`],
+/// exactly like a non-400 status — never silently filed under [`Other`],
+/// which is a *classified* git failure and claiming a classification
+/// nobody made is the same lie [`classify_amend_response`]'s own doc warns
+/// against.
+///
+/// [`Unavailable`]: CreateCommitOutcome::Unavailable
+/// [`Other`]: CommitRefusal::Other
+pub fn classify_create_commit_response(status: u16, body: &str) -> CreateCommitOutcome {
+    if (200..300).contains(&status) {
+        return CreateCommitOutcome::Created;
+    }
+    if status == 400 {
+        return match serde_json::from_str::<CommitError>(body) {
+            Ok(err) => CreateCommitOutcome::Refused {
+                refusal: match err.kind {
+                    CommitFailureKind::SigningKeyMissing => CommitRefusal::SigningKeyMissing,
+                    CommitFailureKind::SigningAgentUnavailable => {
+                        CommitRefusal::SigningAgentUnavailable
+                    }
+                    CommitFailureKind::HookRejected => CommitRefusal::HookRejected,
+                    CommitFailureKind::HookTimedOut => CommitRefusal::HookTimedOut,
+                    CommitFailureKind::NothingStaged => CommitRefusal::NothingStaged,
+                    CommitFailureKind::Other => CommitRefusal::Other,
+                },
+                message: err.message,
+            },
+            Err(_) => CreateCommitOutcome::Unavailable(non_empty_or(
+                body,
+                "The server refused the commit but gave no reason it could state.",
+            )),
+        };
+    }
+    CreateCommitOutcome::Unavailable(non_empty_or(body, &format!("HTTP {status}")))
+}
+
+/// The actionable notice for one [`CommitRefusal`]: a title and the "what to
+/// do about it" text to show *after* the server's own `message` — the same
+/// split [`phase_view`]'s `AmendPhase::Refused` match uses, pulled out as
+/// its own named function per #72's explicit requirement for "a pure,
+/// host-testable mapping function" from kind to actionable copy.
+///
+/// **The `Other` case adds no claim of its own** — "read git's own words
+/// above" — because inventing a remedy for a failure nobody classified is
+/// how a user ends up editing signing config over what might be a full
+/// disk (the exact caution [`phase_view`]'s own `AmendRefusal::Other` copy
+/// states).
+pub fn commit_refusal_guidance(refusal: CommitRefusal) -> (&'static str, &'static str) {
+    match refusal {
+        CommitRefusal::SigningKeyMissing => (
+            "gpg has no secret key to sign with",
+            "Nothing was committed. Check that `git config user.signingkey` names a key you \
+             still have, and that `git config commit.gpgsign` is set the way you meant — then \
+             try again.",
+        ),
+        CommitRefusal::SigningAgentUnavailable => (
+            "Signing the commit failed",
+            "Nothing was committed, and this is a signing-setup problem rather than anything \
+             about your message: gpg (or ssh) could not reach the agent, isn't installed, or \
+             couldn't load the signing key. Fix the signer, or turn off `commit.gpgsign` and \
+             commit unsigned — then try again.",
+        ),
+        CommitRefusal::HookRejected => (
+            "A repository hook refused the commit",
+            "Nothing was committed. What the hook printed is above — fix what it reports and \
+             try again; your message is still here. This dialog has no bypass, so a hook you \
+             believe is wrong has to be fixed or disabled in the repository's hooks directory \
+             (.git/hooks).",
+        ),
+        CommitRefusal::HookTimedOut => (
+            "The commit didn't finish in time",
+            "The server stopped waiting on git — likely a repository hook — so this repository \
+             wouldn't stay locked. What was found afterward is above: whether anything actually \
+             landed. Refresh and inspect before trying again if a commit landed; otherwise, \
+             understand what made it slow and try again.",
+        ),
+        CommitRefusal::NothingStaged => (
+            "Nothing is staged to commit",
+            "Stage the changes you want to include, or use \"Create empty commit\" if you meant \
+             to record a marker commit with no changes.",
+        ),
+        CommitRefusal::Other => (
+            "Git refused the commit",
+            "Nothing was committed. This isn't a hook rejection, a signing failure, or an empty \
+             index, and nothing classified it further, so git's own words above are all there \
+             is to go on — read them, fix what they name, and try again. Your message is still \
+             here.",
+        ),
     }
 }
 
@@ -2268,6 +2410,147 @@ mod tests {
         let unknown = published_advisory(&success).expect("an unknown answer is not an all-clear");
         assert!(unknown.contains("couldn't be checked"), "{unknown}");
         assert_ne!(unknown, warned);
+    }
+
+    // -----------------------------------------------------------------
+    // Reading `POST /api/commit`'s typed refusal back (M2.19, #72)
+    // -----------------------------------------------------------------
+
+    fn commit_error_body(kind: CommitFailureKind, message: &str) -> String {
+        // Built from the server's own DTO and serialized the way the server
+        // serializes it — same discipline `error_body` above uses for amend.
+        serde_json::to_string(&CommitError {
+            kind,
+            message: message.to_string(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_2xx_create_commit_response_reads_as_created() {
+        assert_eq!(
+            classify_create_commit_response(200, ""),
+            CreateCommitOutcome::Created
+        );
+        assert_eq!(
+            classify_create_commit_response(201, "ignored body"),
+            CreateCommitOutcome::Created
+        );
+    }
+
+    #[test]
+    fn each_typed_commit_kind_keeps_its_own_classification_and_gits_own_words() {
+        for (kind, expected) in [
+            (
+                CommitFailureKind::SigningKeyMissing,
+                CommitRefusal::SigningKeyMissing,
+            ),
+            (
+                CommitFailureKind::SigningAgentUnavailable,
+                CommitRefusal::SigningAgentUnavailable,
+            ),
+            (CommitFailureKind::HookRejected, CommitRefusal::HookRejected),
+            (CommitFailureKind::HookTimedOut, CommitRefusal::HookTimedOut),
+            (
+                CommitFailureKind::NothingStaged,
+                CommitRefusal::NothingStaged,
+            ),
+            (CommitFailureKind::Other, CommitRefusal::Other),
+        ] {
+            let outcome =
+                classify_create_commit_response(400, &commit_error_body(kind, "git said this"));
+            match outcome {
+                CreateCommitOutcome::Refused { refusal, message } => {
+                    assert_eq!(refusal, expected, "{kind:?} was misclassified");
+                    assert_eq!(
+                        message, "git said this",
+                        "the server's own text must survive verbatim"
+                    );
+                }
+                other => panic!("expected a refusal for {kind:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// #72's explicit requirement, proven at the client's own read of the
+    /// wire, not just the server's construction of it: `Other`'s `message`
+    /// must be exactly git's words, never edited or replaced.
+    #[test]
+    fn the_unknown_arm_never_loses_gits_own_stderr() {
+        let raw = "fatal: some completely unrecognised git failure text, verbatim";
+        let outcome =
+            classify_create_commit_response(400, &commit_error_body(CommitFailureKind::Other, raw));
+        match outcome {
+            CreateCommitOutcome::Refused { refusal, message } => {
+                assert_eq!(refusal, CommitRefusal::Other);
+                assert_eq!(message, raw);
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_400_off_this_endpoints_typed_shape_is_not_dressed_up_as_a_classification() {
+        // Not JSON at all — a handler-level refusal (empty message) or the
+        // branch-stub path's own prose 400, per `CommitFailureKind`'s own
+        // documented boundary.
+        match classify_create_commit_response(400, "Commit message can't be empty.") {
+            CreateCommitOutcome::Unavailable(text) => {
+                assert!(text.contains("can't be empty"), "{text}");
+            }
+            other => panic!(
+                "an unparseable 400 must not be filed under CommitRefusal::Other — that is a \
+                 classification nobody made: got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn off_contract_commit_answers_are_not_dressed_up_as_classifications() {
+        match classify_create_commit_response(409, "The repository moved under this request.") {
+            CreateCommitOutcome::Unavailable(text) => {
+                assert!(text.contains("moved under this request"));
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        match classify_create_commit_response(503, "") {
+            CreateCommitOutcome::Unavailable(text) => assert!(text.contains("503")),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// Every [`CommitRefusal`] has distinct, non-empty guidance, and the
+    /// `Other` arm makes no claim beyond "read git's own words above" — the
+    /// same caution `AmendRefusal::Other`'s copy states, checked here so a
+    /// later edit can't quietly start inventing a remedy for an
+    /// unclassified failure.
+    #[test]
+    fn every_commit_refusal_has_its_own_actionable_guidance() {
+        let all = [
+            CommitRefusal::SigningKeyMissing,
+            CommitRefusal::SigningAgentUnavailable,
+            CommitRefusal::HookRejected,
+            CommitRefusal::HookTimedOut,
+            CommitRefusal::NothingStaged,
+            CommitRefusal::Other,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for refusal in all {
+            let (title, next) = commit_refusal_guidance(refusal);
+            assert!(!title.is_empty());
+            assert!(!next.is_empty());
+            assert!(
+                seen.insert((title, next)),
+                "{refusal:?} reuses another kind's guidance verbatim"
+            );
+        }
+        let (_, other_next) = commit_refusal_guidance(CommitRefusal::Other);
+        assert!(
+            other_next.contains("read git's own words above")
+                || other_next.contains("git's own words above"),
+            "Other must defer to the server's message rather than inventing a remedy: \
+             {other_next}"
+        );
     }
 
     // -----------------------------------------------------------------
