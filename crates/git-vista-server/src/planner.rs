@@ -7285,6 +7285,15 @@ mod tests {
         // gpg-agent needs, which surfaces this way when gpg gets far enough
         // to try.
         let gpg_agent_unreachable = "[GNUPG:] FAILURE sign 67108941";
+        // The bare `FAILURE sign 17` line with no preceding `INV_SGNR` —
+        // `gpg_no_key` above always carries both (that's what a real gpg
+        // invocation prints), so relying on it alone would let the
+        // `Some(17)` arm's mapping drift without any row noticing: the
+        // `INV_SGNR` branch, checked separately in the same loop, would
+        // already have returned `SigningKeyMissing` before the loop ever
+        // reached the `FAILURE` line. This fixture isolates the arm the
+        // `INV_SGNR` line would otherwise shadow.
+        let gpg_no_key_failure_line_only = "[GNUPG:] FAILURE sign 17";
         // git -c commit.gpgsign=true -c gpg.format=ssh \
         //     -c user.signingkey=/nonexistent/key commit -m x
         let ssh_bad_key = "error: Couldn't load public key /nonexistent/key: No such file or \
@@ -7349,6 +7358,15 @@ mod tests {
                 false,
                 SigningAgentUnavailable,
                 "FAILURE sign carrying GPG_ERR_NO_AGENT (77) in the low 16 bits",
+            ),
+            (
+                "",
+                gpg_no_key_failure_line_only,
+                true,
+                false,
+                SigningKeyMissing,
+                "the bare FAILURE sign 17 line, isolated from INV_SGNR, so the code-17 \
+                 arm itself is exercised rather than shadowed by the earlier branch",
             ),
             (
                 "",
