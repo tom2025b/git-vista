@@ -846,6 +846,10 @@ pub enum AmendRefusal {
     Hook,
     /// Commit signing was configured and the signer failed.
     Signing,
+    /// The spawn — which may run repository hooks — did not finish inside
+    /// the server's bound and was stopped (#72, M2.19). Distinct from
+    /// `Hook`: nothing said no, nothing answered at all.
+    Timeout,
     /// Anything else git said no to.
     Other,
 }
@@ -903,6 +907,10 @@ pub fn classify_amend_response(status: u16, body: &str) -> AmendOutcome {
                 },
                 AmendFailureKind::SigningFailed => AmendOutcome::Refused {
                     refusal: AmendRefusal::Signing,
+                    message: err.message,
+                },
+                AmendFailureKind::HookTimedOut => AmendOutcome::Refused {
+                    refusal: AmendRefusal::Timeout,
                     message: err.message,
                 },
                 AmendFailureKind::Other => AmendOutcome::Refused {
@@ -1354,6 +1362,16 @@ pub fn phase_view(phase: &AmendPhase) -> PhaseView {
                      user.signingkey` names a key you still have, that `git config \
                      commit.gpgsign` is set the way you meant, and that the key is \
                      unlocked — then press Amend again.",
+                ),
+                AmendRefusal::Timeout => (
+                    "The amend didn't finish in time",
+                    "The server stopped waiting on git — likely a repository hook — so this \
+                     repository wouldn't stay locked. What was found afterward is above: \
+                     whether anything actually landed. If nothing did, press Amend again \
+                     once you understand what made it slow. If a commit did land before the \
+                     stop, refresh and inspect it before doing anything else — this dialog's \
+                     `expected_tip` no longer matches, so a retry will be refused as stale \
+                     rather than compounding it.",
                 ),
                 AmendRefusal::Other => (
                     "Git refused the amend",
@@ -2177,6 +2195,7 @@ mod tests {
         for (kind, expected) in [
             (AmendFailureKind::HookRejected, AmendRefusal::Hook),
             (AmendFailureKind::SigningFailed, AmendRefusal::Signing),
+            (AmendFailureKind::HookTimedOut, AmendRefusal::Timeout),
             (AmendFailureKind::Other, AmendRefusal::Other),
         ] {
             let outcome = classify_amend_response(400, &error_body(kind, "git said this"));
@@ -2656,6 +2675,38 @@ mod tests {
         assert_ne!(titles[0], titles[1]);
         assert_ne!(titles[1], titles[2]);
         assert_ne!(titles[0], titles[2]);
+    }
+
+    /// `Timeout` (#72, M2.19) is kept out of the shared loop above
+    /// deliberately: unlike `Hook`/`Signing`/`Other`, its server message is
+    /// not always "nothing was rewritten" — a `post-commit` hang means the
+    /// amend actually landed before the timeout. The dialog must show
+    /// exactly what the server found, verbatim, and stay retryable — the
+    /// stale-tip route (not this one) is what stops a retry from compounding
+    /// a landed-but-hung amend.
+    ///
+    /// Mutation tried: drop the `format!("{message} {next}")` interpolation
+    /// for `AmendRefusal::Timeout` (hardcode `next` alone) — the assertion
+    /// that the server's own finding appears verbatim in the body fails.
+    #[test]
+    fn a_timeout_refusal_shows_the_servers_own_finding_and_stays_retryable() {
+        let message = "git didn't finish within 30s and was stopped so this repository \
+                        wouldn't stay locked. No commit was created — HEAD is unchanged.";
+        let view = phase_view(&AmendPhase::Refused {
+            refusal: AmendRefusal::Timeout,
+            message: message.to_string(),
+        });
+        assert!(
+            view.confirm_enabled,
+            "a timeout is retryable — the stale-tip route is what catches a landed-but-hung \
+             amend, not disabling this button"
+        );
+        let notice = view.notice.expect("a refusal is explained");
+        assert!(
+            notice.body.contains(message),
+            "the server's own finding must reach the user verbatim: {}",
+            notice.body
+        );
     }
 
     /// Each classified refusal names something the user can go and do — and
