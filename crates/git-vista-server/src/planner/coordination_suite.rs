@@ -9,7 +9,7 @@
 //! by `state`'s own test — see the invariant note there).
 
 use super::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,6 +44,43 @@ fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
     run(&repo, &["add", "a.txt"]);
     run(&repo, &["commit", "-q", "-m", "seed"]);
     (dir, repo)
+}
+
+/// Spawn a real `git` process that holds `<repo>/.git/index.lock` open until
+/// killed — an actual live external git, not just a file dropped on disk.
+/// Needed since #72's stale-lock fix (coordinator.rs) verifies liveness
+/// rather than mere existence: a lock written directly by the test process
+/// itself, with nothing holding it open, is now correctly recognized as
+/// orphaned and no longer represents "an external git process is working
+/// here" — see `a_stale_index_lock_does_not_refuse_the_repository_forever`
+/// in coordinator.rs for that other, now-distinct case.
+///
+/// Reproduces the mechanism the m1.13 evidence trail measured directly
+/// (docs/superpowers/evidence/m1.13-design-trail/m1.13-findings.md, I9/I11):
+/// a repo-local slow `clean` filter, applied via `.gitattributes`, makes
+/// `git add` hold `index.lock` for the filter's whole duration. This spawns
+/// real `git` (the only program `argv_boundary`'s tripwire allows this file
+/// to spawn) rather than a shell, so it cannot regress that boundary.
+fn hold_lock_open(repo: &Path, lock_path: &Path) -> std::process::Child {
+    run(repo, &["config", "filter.holdlock.clean", "sleep 5; cat"]);
+    std::fs::write(repo.join(".gitattributes"), "held.txt filter=holdlock\n").unwrap();
+    std::fs::write(repo.join("held.txt"), "held\n").unwrap();
+    let holder = std::process::Command::new("git")
+        .args(["add", "held.txt"])
+        .current_dir(repo)
+        .spawn()
+        .expect("spawn git add to hold index.lock via a slow clean filter");
+    // Give the filter time to actually start and git time to take the lock
+    // before the caller's assertions race it.
+    let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+    while !lock_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        lock_path.exists(),
+        "the slow-filter fixture did not take index.lock in time"
+    );
+    holder
 }
 
 fn tokens() -> (RepositoryToken, WorktreeToken) {
@@ -320,7 +357,8 @@ async fn a_repository_busy_with_an_external_git_is_refused() {
     let id = repo_id(&repo);
     let before = commit_count(&repo, "HEAD");
 
-    std::fs::write(repo.join(".git").join("index.lock"), "").unwrap();
+    let lock_path = repo.join(".git").join("index.lock");
+    let mut holder = hold_lock_open(&repo, &lock_path);
 
     let (status, body) = plan_and_execute_in(&repo, Some(id), tokens(), commit("blocked")).await;
     assert_eq!(status, StatusCode::CONFLICT);
@@ -335,7 +373,9 @@ async fn a_repository_busy_with_an_external_git_is_refused() {
     );
 
     // Once the external process finishes, writes work again.
-    std::fs::remove_file(repo.join(".git").join("index.lock")).unwrap();
+    holder.kill().expect("kill the holder");
+    holder.wait().expect("reap the holder");
+    std::fs::remove_file(&lock_path).unwrap();
     let (status, body) = plan_and_execute_in(&repo, Some(id), tokens(), commit("unblocked")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(commit_count(&repo, "HEAD"), before + 1);
@@ -376,7 +416,8 @@ async fn the_busy_check_finds_a_linked_worktrees_own_index_lock() {
         "the linked worktree's .git is a file, the main one's is a directory"
     );
 
-    std::fs::write(PathBuf::from(&git_dir).join("index.lock"), "").unwrap();
+    let lock_path = PathBuf::from(&git_dir).join("index.lock");
+    let mut holder = hold_lock_open(&linked, &lock_path);
     assert!(
         crate::coordinator::refuse_if_git_busy(&linked)
             .await
@@ -390,6 +431,8 @@ async fn the_busy_check_finds_a_linked_worktrees_own_index_lock() {
             .is_none(),
         "one worktree's lock must not report a sibling as busy"
     );
+    holder.kill().expect("kill the holder");
+    holder.wait().expect("reap the holder");
 }
 
 // ---------------------------------------------------------------------------

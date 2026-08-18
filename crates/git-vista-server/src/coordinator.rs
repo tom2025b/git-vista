@@ -346,11 +346,13 @@ mod tests {
     /// where a real process still holds `index.lock` open is, in words a
     /// browser-only user can act on.
     ///
-    /// The holder is a real `sh` process that opens the lock file and keeps
-    /// the fd open for the span of the check — not just a file dropped on
-    /// disk — because that liveness is exactly what distinguishes this case
-    /// from the stale-lock defect covered by
-    /// `a_stale_index_lock_does_not_refuse_the_repository_forever` below.
+    /// The holder is a real `git add` process, blocked mid-operation inside a
+    /// slow repo-local `clean` filter, that keeps `index.lock` open for the
+    /// span of the check — not just a file dropped on disk — because that
+    /// liveness is exactly what distinguishes this case from the stale-lock
+    /// defect covered by `a_stale_index_lock_does_not_refuse_the_repository_forever`
+    /// below. It spawns `git`, not a shell, so it cannot regress
+    /// `argv_boundary`'s tripwire (this file spawns only `git` literally).
     #[tokio::test]
     async fn an_index_lock_held_by_a_live_process_marks_the_repository_busy() {
         let dir = tempfile::tempdir().unwrap();
@@ -369,14 +371,29 @@ mod tests {
         );
 
         let lock_path = repo.join(".git").join("index.lock");
-        let mut holder = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("exec 9>'{}'; sleep 5", lock_path.display()))
+        assert!(std::process::Command::new("git")
+            .args(["config", "filter.holdlock.clean", "sleep 5; cat"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo.join(".gitattributes"), "held.txt filter=holdlock\n").unwrap();
+        std::fs::write(repo.join("held.txt"), "held\n").unwrap();
+        let mut holder = std::process::Command::new("git")
+            .args(["add", "held.txt"])
+            .current_dir(&repo)
             .spawn()
-            .expect("spawn a real process to hold the lock open");
-        // Give the shell a moment to actually reach `exec` and open the fd
-        // before the assertions below race it.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+            .expect("spawn git add to hold index.lock via a slow clean filter");
+        // Give the filter time to actually start and git time to take the
+        // lock before the assertions below race it.
+        let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+        while !lock_path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            lock_path.exists(),
+            "the slow-filter fixture did not take index.lock in time"
+        );
 
         // Mutation tried: skip the liveness probe and go back to
         // existence-only — this assertion still passes (a held lock exists
