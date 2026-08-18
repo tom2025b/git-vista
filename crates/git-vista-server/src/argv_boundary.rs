@@ -150,6 +150,12 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // 0047): a repository, an in-tree bare target the server must refuse to
     // fetch from, and `git remote add` for the paired positive control.
     "src/planner/remote_boundary_suite.rs",
+    // #[cfg(test)] git fixtures for the #72 (M2.19) hook-timeout suite: plain
+    // `git init`/`commit`/`rev-list --count` to build and inspect fixture
+    // repositories, deliberately outside the sandboxed harness under test —
+    // the same "referee is not the code being checked" posture `pull_suite`
+    // and `push_suite` document above.
+    "src/planner/hook_timeout_suite.rs",
     "src/state.rs",         // #[cfg(test)] fixture setup
     "src/argv_boundary.rs", // this file (the scan reads its own source)
     // The M1.13b spawn chokepoint (#66, Task 5). It builds a git Command from

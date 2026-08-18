@@ -69,3 +69,4 @@ it, and note the link in both.
 | [0055](0055-status-readings-carry-a-server-stamped-age.md) | Working-tree status readings carry a server-stamped `scanned_at`, additive to the v1 wire contract | Accepted — implemented |
 | [0056](0056-gv-repo-uses-the-boot-time-catalog-not-live-clone.md) | `gv --repo` registers a catalog entry via the boot-time `GIT_VISTA_REPOS` unit var, not the live `/api/clone` endpoint | Accepted — implemented |
 | [0057](0057-commit-draft-localstorage-and-restore-banner.md) | The commit draft moves to `localStorage`, offered back through an aged restore banner, never auto-filled | Accepted — implemented |
+| [0058](0058-hooked-git-spawns-are-time-bounded.md) | Commit-path git spawns that run hooks are time-bounded, killed, and verified | Accepted — implemented |

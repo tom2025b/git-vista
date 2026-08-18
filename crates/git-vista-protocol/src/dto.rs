@@ -96,6 +96,14 @@ pub enum AmendFailureKind {
     /// sign the data`, an unloadable ssh signing key, …). Actionable: a
     /// signing-setup problem, not a content problem.
     SigningFailed,
+    /// The spawn — which may run `pre-commit`/`prepare-commit-msg`/
+    /// `commit-msg`/`post-commit`, arbitrary user code — did not finish
+    /// inside the server's bound and was killed (#72, M2.19). Distinct from
+    /// [`HookRejected`](Self::HookRejected): that is a hook that ran to
+    /// completion and said no; this is a hook that never said anything.
+    /// `message` states what was verified afterwards — whether HEAD moved,
+    /// stayed put, or could not be confirmed either way — never a guess.
+    HookTimedOut,
     /// Everything else, reported with git's own words in `message`.
     Other,
 }

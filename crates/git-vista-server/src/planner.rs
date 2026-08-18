@@ -2173,6 +2173,78 @@ async fn run_git(repo: &Path, need: NetworkNeed, args: &[&str]) -> std::io::Resu
     crate::git_cmd::git_output_for(repo, args, need).await
 }
 
+/// The wall-clock ceiling on a git spawn that may run repository hooks —
+/// `pre-commit`, `prepare-commit-msg`, `commit-msg`, `post-commit` — arbitrary
+/// user code whose own waiting is not under this server's control, the same
+/// arity [`SIGN_TIMEOUT`] gives `git tag -s`'s call out to `gpg` (#72,
+/// M2.19: "hooks cannot freeze the UI").
+///
+/// Sized against the client, not against any hook Tom actually has:
+/// `REQUEST_TIMEOUT_MS = 60_000` (`crates/git-vista/src/api.rs`) is when the
+/// browser gives up on the request, so the server's honest, typed answer is
+/// only worth building if it arrives first — with room for the coordinator
+/// `Waiting` stage and the bounded post-kill HEAD read below, both charged
+/// against the same 60s. Larger than `SIGN_TIMEOUT` on purpose: a keyless
+/// signing failure resolves in under a second (measured, `SIGN_TIMEOUT`'s own
+/// doc), but a real `pre-commit` running a formatter or a lint pass
+/// legitimately takes seconds, and 30s covers any hook that belongs on a
+/// commit button. Not configurable in v1 — no per-repo tunable surface exists
+/// for it to slot into, and the refusal text below names the number, so the
+/// first hook that actually needs longer is self-diagnosing rather than
+/// silently wrong.
+const HOOKED_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`HOOKED_GIT_TIMEOUT`], read by
+    /// [`hooked_git_timeout`] so the sleeping-hook tests in
+    /// `hook_timeout_suite` can shrink the bound to a couple of seconds
+    /// instead of waiting out the real 30.
+    ///
+    /// A `thread_local`, not a process-wide `OnceLock`: `#[tokio::test]`
+    /// defaults to a **current-thread** runtime, so every `.await` inside
+    /// one test's future — and everything it transitively calls, including
+    /// this function — runs on that one test's own OS thread. Scoping the
+    /// override to the thread means one test's shrunk bound can never leak
+    /// into, or race against, another test's real-bound assertions running
+    /// concurrently on other threads under `cargo test`'s default
+    /// parallel-threads-one-process model — the same hazard
+    /// `sandbox::argv::SSH_AUTH_SOCK_LOCK` documents for a process-wide env
+    /// var, avoided here instead of guarded against. This requires every
+    /// test that sets the override to stay on the default current-thread
+    /// `#[tokio::test]` flavor; none in this suite use
+    /// `flavor = "multi_thread"`.
+    static HOOKED_GIT_TIMEOUT_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`HOOKED_GIT_TIMEOUT`], or the current test thread's override — see
+/// [`HOOKED_GIT_TIMEOUT_OVERRIDE`]'s doc.
+fn hooked_git_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        if let Some(d) = HOOKED_GIT_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
+            return d;
+        }
+    }
+    HOOKED_GIT_TIMEOUT
+}
+
+/// [`run_git`] for the argv shapes that run repository hooks. Same sealed
+/// launcher every other spawn in this file goes through
+/// ([`crate::git_cmd::git_output_bounded`]) — see that function's doc for
+/// what the `SIGKILL` on elapse actually reaches (bwrap, and through the
+/// Strict tier's PID namespace, git and the hook beneath it). #72 (M2.19);
+/// generalizes [`run_signed_tag`]'s [`SIGN_TIMEOUT`] contract to the commit
+/// path, per the M2.19 design doc.
+async fn run_git_hooked(
+    repo: &Path,
+    need: NetworkNeed,
+    args: &[&str],
+) -> std::io::Result<crate::git_cmd::BoundedOutput> {
+    crate::git_cmd::git_output_bounded(repo, args, need, hooked_git_timeout()).await
+}
+
 /// The uniform 500 for a git binary that couldn't be spawned, with the same
 /// per-endpoint log line the handlers printed.
 ///
@@ -2288,6 +2360,111 @@ async fn exec_create_branch(
     }
 }
 
+/// What the bounded post-kill `rev-parse HEAD` read — performed by both
+/// `/api/commit` and `/api/amend-commit`'s timeout arms — found, verified
+/// rather than assumed. #72 (M2.19); mirrors [`run_signed_tag`]'s own
+/// post-kill check on a killed `git tag -s`.
+///
+/// The kill races git's own ref write: a `pre-commit`/`prepare-commit-msg`/
+/// `commit-msg` hang means no commit exists, but a `post-commit` hang means
+/// one landed *before* the hook that hung. Three outcomes, not two — the
+/// verification read can itself fail to answer in time, and that is a
+/// distinct fact from "nothing changed", not a fallback to it.
+enum HookTimeoutHeadCheck {
+    /// HEAD reads back exactly where it was before the spawn — no commit
+    /// landed.
+    Unchanged,
+    /// HEAD moved to this oid — a commit exists despite the kill.
+    Moved(String),
+    /// The verification read itself timed out, or could not be run.
+    Unknown,
+}
+
+/// Read HEAD back through [`crate::git_cmd::git_output_bounded`] — **never**
+/// a plain, unbounded [`run_git`] — and compare it against `old`, the tip
+/// observed before the killed spawn.
+///
+/// Bounded, on purpose, and not merely for symmetry: this runs on a
+/// repository that just proved a git child can block past
+/// [`HOOKED_GIT_TIMEOUT`], still inside the coordinator guard
+/// [`plan_and_execute_in`] holds across `execute()` — an unbounded recovery
+/// read here would hold that guard forever, undoing the entire point of the
+/// bound above. Same reasoning [`run_signed_tag`]'s inline comment spells out
+/// for the signing path; the same bound is reused rather than a second
+/// constant, because the property is "the whole function returns within
+/// [`HOOKED_GIT_TIMEOUT`]", not "each half does".
+async fn check_head_after_hook_timeout(
+    repo: &Path,
+    need: NetworkNeed,
+    old: &Obs<String>,
+) -> HookTimeoutHeadCheck {
+    match crate::git_cmd::git_output_bounded(
+        repo,
+        &["rev-parse", "--verify", "--quiet", "HEAD"],
+        need,
+        hooked_git_timeout(),
+    )
+    .await
+    {
+        Ok(crate::git_cmd::BoundedOutput::Completed(out)) => {
+            let new = if out.status.success() {
+                Obs::Known(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                // Still no commit — unborn HEAD, the same shape a fresh
+                // repository's first-commit read maps to elsewhere.
+                Obs::Absent
+            };
+            if old.same_observation(&new) {
+                HookTimeoutHeadCheck::Unchanged
+            } else {
+                match new {
+                    Obs::Known(head) => HookTimeoutHeadCheck::Moved(head),
+                    Obs::Absent | Obs::Unknown => HookTimeoutHeadCheck::Unknown,
+                }
+            }
+        }
+        Ok(crate::git_cmd::BoundedOutput::TimedOut) | Err(_) => HookTimeoutHeadCheck::Unknown,
+    }
+}
+
+/// The prose for a hooked spawn's timeout arm — what actually happened
+/// (`HOOKED_GIT_TIMEOUT`'s value, named so the first hook that legitimately
+/// needs longer is self-diagnosing), then exactly what [`HookTimeoutHeadCheck`]
+/// found, never a guess. #72 (M2.19), §6 of the design doc.
+///
+/// **Deliberately does not name a hook as the cause.** The design's §6b
+/// wants that sentence conditioned on `rejectable_hook_present`, but that
+/// probe runs an unbounded [`run_git`] (`rev-parse --git-path hooks`, then a
+/// filesystem stat) — calling it from this arm, still inside the coordinator
+/// guard, on a repository that just proved a git child can block, would
+/// reintroduce the exact bug this timeout exists to close. The message says
+/// only what was actually observed: that git did not finish and was stopped,
+/// and — from the bounded HEAD check — whether anything landed.
+fn hook_timeout_message(check: &HookTimeoutHeadCheck) -> String {
+    // The *actual* bound this timeout ran under, which is `HOOKED_GIT_TIMEOUT`
+    // in production and a test's shrunk override under `hook_timeout_suite` —
+    // never the bare constant, or a test run under a sub-second override
+    // would print a message describing a bound nothing actually used.
+    // `{:?}` (not `.as_secs()`) so a sub-second test bound reads as "400ms"
+    // rather than truncating to "0 seconds".
+    let bound = hooked_git_timeout();
+    let tail = match check {
+        HookTimeoutHeadCheck::Unchanged => "No commit was created — HEAD is unchanged.".to_string(),
+        HookTimeoutHeadCheck::Moved(head) => format!(
+            "A commit was created before the stop landed (now at {}) — inspect `git log -1` \
+             before trusting it; its hooks did not finish.",
+            short(head)
+        ),
+        HookTimeoutHeadCheck::Unknown => "Couldn't confirm whether a commit was created — the \
+             check itself didn't finish in time. Run `git log -1` on the server to be sure."
+            .to_string(),
+    };
+    format!(
+        "git didn't finish within {bound:?} and was stopped so this repository wouldn't stay \
+         locked. {tail}"
+    )
+}
+
 /// `git commit [--allow-empty] -m <message>` on HEAD (`/api/commit`).
 async fn exec_commit_on_head(
     repo: &Path,
@@ -2308,8 +2485,16 @@ async fn exec_commit_on_head(
     args.push("-m");
     args.push(message.as_str());
 
-    let output = match run_git(repo, need, &args).await {
-        Ok(o) => o,
+    let output = match run_git_hooked(repo, need, &args).await {
+        Ok(crate::git_cmd::BoundedOutput::Completed(o)) => o,
+        Ok(crate::git_cmd::BoundedOutput::TimedOut) => {
+            eprintln!(
+                "git-vista: /api/commit did not finish within {:?} and was killed",
+                hooked_git_timeout()
+            );
+            let check = check_head_after_hook_timeout(repo, need, &old).await;
+            return (StatusCode::BAD_REQUEST, hook_timeout_message(&check));
+        }
         Err(e) => return couldnt_run("/api/commit", &e),
     };
     if output.status.success() {
@@ -2525,8 +2710,22 @@ async fn exec_amend_commit(
     }
     args.push("-m");
     args.push(message.as_str());
-    let output = match run_git(repo, need, &args).await {
-        Ok(o) => o,
+    let output = match run_git_hooked(repo, need, &args).await {
+        Ok(crate::git_cmd::BoundedOutput::Completed(o)) => o,
+        Ok(crate::git_cmd::BoundedOutput::TimedOut) => {
+            eprintln!(
+                "git-vista: /api/amend-commit did not finish within {:?} and was killed",
+                hooked_git_timeout()
+            );
+            // The CAS check above already proved `observed.head_tip` equals
+            // `expected_tip`, so that's the pre-spawn tip to verify against.
+            let old = Obs::Known(expected_tip.as_str().to_string());
+            let check = check_head_after_hook_timeout(repo, need, &old).await;
+            return amend_refusal_body(
+                AmendFailureKind::HookTimedOut,
+                &hook_timeout_message(&check),
+            );
+        }
         Err(e) => return couldnt_run("/api/amend-commit", &e),
     };
     if !output.status.success() {
@@ -5094,6 +5293,11 @@ mod push_suite;
 // machinery verbatim.
 #[cfg(test)]
 mod remote_boundary_suite;
+
+// #72 (M2.19): a hook that never returns cannot hang a commit/amend request
+// forever, and cannot hold the coordinator guard forever either.
+#[cfg(test)]
+mod hook_timeout_suite;
 
 #[cfg(test)]
 mod tests {
