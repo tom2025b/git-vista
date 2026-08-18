@@ -881,8 +881,8 @@ mod tests {
             Router,
         };
         use git_vista_protocol::{
-            AmendCommitError, AmendCommitSuccess, AmendFailureKind, ApiError, IDEMPOTENCY_HEADER,
-            PROTOCOL_HEADER, PROTOCOL_VERSION,
+            AmendCommitError, AmendCommitSuccess, AmendFailureKind, ApiError, CommitError,
+            CommitFailureKind, IDEMPOTENCY_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
         };
         use tower::ServiceExt;
 
@@ -986,6 +986,57 @@ mod tests {
             panic!("200 body did not parse as AmendCommitSuccess ({e}): {body}")
         });
         assert_eq!(success.message, "Amended commit.");
+
+        // --- #72 (M2.19): the real HTTP path for `POST /api/commit` ---------
+        //
+        // The same #323 proof `amend_router` gave `/api/amend-commit` above,
+        // now for `/api/commit`'s own typed `CommitError`: through the real
+        // `Router` + `idempotency` + `api_contract` middleware stack, not a
+        // direct handler or planner call — so this proves what a client
+        // actually receives on the wire, not just what the executor returns.
+        // Reuses `success_repo`, still `set_current` from the amend success
+        // case above and left with a clean working tree (nothing staged) —
+        // exactly `classify_commit_failure`'s `NothingStaged` case, with no
+        // extra fixture needed.
+        fn commit_router() -> Router {
+            Router::new()
+                .route("/api/commit", post(crate::handlers::commit::create_commit))
+                .layer(from_fn(crate::middleware::idempotency))
+                .layer(from_fn(crate::middleware::api_contract))
+        }
+
+        fn commit_req(body: String, key: &str) -> HttpRequest<Body> {
+            HttpRequest::post("/api/commit")
+                .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+                .header(IDEMPOTENCY_HEADER, key)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let nothing_staged_body =
+            r#"{"message":"nothing here to commit","allow_empty":false}"#.to_string();
+        let resp = commit_router()
+            .oneshot(commit_req(nothing_staged_body, "commit-nothing-staged-72"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("application/json")),
+            "the typed commit refusal must be labeled JSON so `middleware::rewrap_error` \
+             passes it through untouched instead of re-enveloping it (#72, mirroring #323)"
+        );
+        let body = resp_body(resp).await;
+        let refusal: CommitError = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("400 body did not parse as CommitError ({e}): {body}"));
+        assert_eq!(refusal.kind, CommitFailureKind::NothingStaged);
+        assert!(
+            serde_json::from_str::<ApiError>(&body).is_err(),
+            "the refusal was rewrapped into an ApiError envelope — double-encoded: {body}"
+        );
 
         // A third case, proving the *other* direction of the fix:
         // `amend_route_response` must NOT label every `plan_and_execute`

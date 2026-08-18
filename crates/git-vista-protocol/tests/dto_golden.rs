@@ -27,11 +27,11 @@
 
 use git_vista_protocol::{
     AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind, BranchRequest,
-    CloneRequest, CommitOid, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
-    FetchError, FetchFailureKind, FetchRequest, FetchSuccess, ForcePublish, HookPolicy,
-    MergeStrategy, PullError, PullFailureKind, PullRequest, PullSuccess, PushRequest, RebaseStatus,
-    RemoteRefUpdate, RepoMode, RepositoryDescriptor, RepositoryKind, SelectRequest, SessionInfo,
-    SessionRequest,
+    CloneRequest, CommitError, CommitFailureKind, CommitOid, CreateBranchRequest,
+    CreateCommitRequest, DeleteCloneRequest, FetchError, FetchFailureKind, FetchRequest,
+    FetchSuccess, ForcePublish, HookPolicy, MergeStrategy, PullError, PullFailureKind, PullRequest,
+    PullSuccess, PushRequest, RebaseStatus, RemoteRefUpdate, RepoMode, RepositoryDescriptor,
+    RepositoryKind, SelectRequest, SessionInfo, SessionRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +49,14 @@ struct DtoGoldenSet {
     amend_commit_success_published: AmendCommitSuccess,
     amend_commit_success_unknown_reach: AmendCommitSuccess,
     amend_commit_error_hook_rejected: AmendCommitError,
+    // M2.19 (#72): `POST /api/commit`'s own typed failure body. Two
+    // instances pinned, not one — `signing_key_missing` because it's the
+    // split `AmendFailureKind` does NOT have (see `CommitFailureKind`'s own
+    // doc), and `other` because that's the arm whose whole contract is
+    // "git's raw words survive verbatim", the one property this fixture
+    // must prove byte-for-byte rather than take on faith.
+    commit_error_signing_key_missing: CommitError,
+    commit_error_other: CommitError,
     branch_request: BranchRequest,
     fetch_request: FetchRequest,
     fetch_success_with_updates: FetchSuccess,
@@ -127,6 +135,25 @@ fn golden_set() -> DtoGoldenSet {
         amend_commit_error_hook_rejected: AmendCommitError {
             kind: AmendFailureKind::HookRejected,
             message: "pre-commit: trailing whitespace on line 3".to_string(),
+        },
+        // M2.19 (#72): read from the real GnuPG status-fd protocol
+        // (`classify_commit_failure`'s doc names the git 2.43 measurement
+        // this message is drawn from) — the split `AmendFailureKind`
+        // collapses into one `SigningFailed`.
+        commit_error_signing_key_missing: CommitError {
+            kind: CommitFailureKind::SigningKeyMissing,
+            message: "gpg: skipped \"DOESNOTEXIST\": No secret key\ngpg: signing failed: No \
+                      secret key"
+                .to_string(),
+        },
+        // The passthrough arm: git's own words, unedited — the one
+        // property this fixture exists to prove byte-for-byte rather than
+        // take on faith.
+        commit_error_other: CommitError {
+            kind: CommitFailureKind::Other,
+            message:
+                "fatal: unable to auto-detect email address (got 'root@localhost.localdomain')"
+                    .to_string(),
         },
         branch_request: BranchRequest {
             branch: "main".to_string(),
@@ -517,6 +544,26 @@ fn dto_v1_golden() {
         Some("hook_rejected"),
         "AmendFailureKind must reach the wire as snake_case strings — \
          M2.19d branches on these exact spellings"
+    );
+    assert_eq!(
+        obj["commit_error_signing_key_missing"]
+            .as_object()
+            .unwrap()
+            .get("kind")
+            .and_then(|v| v.as_str()),
+        Some("signing_key_missing"),
+        "CommitFailureKind must reach the wire as snake_case strings — the client hard-codes \
+         these exact spellings (#72, M2.19)"
+    );
+    assert_eq!(
+        obj["commit_error_other"]
+            .as_object()
+            .unwrap()
+            .get("message")
+            .and_then(|v| v.as_str()),
+        Some("fatal: unable to auto-detect email address (got 'root@localhost.localdomain')"),
+        "CommitFailureKind::Other must forward git's own words byte-for-byte — never a canned \
+         substitute (#72)"
     );
 }
 

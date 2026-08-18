@@ -34,6 +34,14 @@
     "kind": "hook_rejected",
     "message": "pre-commit: trailing whitespace on line 3"
   },
+  "commit_error_signing_key_missing": {
+    "kind": "signing_key_missing",
+    "message": "gpg: skipped \"DOESNOTEXIST\": No secret key\ngpg: signing failed: No secret key"
+  },
+  "commit_error_other": {
+    "kind": "other",
+    "message": "fatal: unable to auto-detect email address (got 'root@localhost.localdomain')"
+  },
   "branch_request": {
     "branch": "main"
   },

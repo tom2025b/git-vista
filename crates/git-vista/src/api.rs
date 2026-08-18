@@ -31,7 +31,10 @@ use git_vista_protocol::{
     OPERATION_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
-use crate::features::dialogs::commit::{amend_body, classify_amend_response, AmendOutcome};
+use crate::features::dialogs::commit::{
+    amend_body, classify_amend_response, classify_create_commit_response, AmendOutcome,
+    CreateCommitOutcome,
+};
 use crate::features::dialogs::core::{
     clone_poll_step, clone_response_should_poll, ClonePollOutcome, ClonePollStep,
 };
@@ -1124,26 +1127,40 @@ pub async fn create_tag_request(
 /// `allow_empty` picks `git commit --allow-empty` (empty commit) vs a plain
 /// `git commit` (staged changes). `branch` targets a branch other than the
 /// checked-out one — the branch-stub path, empty commits only; `None` commits
-/// on HEAD as before. As with the branch request, a non-2xx body is
-/// unwrapped to the envelope's `error.message` (#316), returned as `Err`.
+/// on HEAD as before.
+///
+/// Reads the response through [`classify_create_commit_response`] (#72,
+/// M2.19) rather than the generic envelope-unwrap [`user_facing_error`] every
+/// other write here uses: `POST /api/commit`'s own execution failures
+/// (signing, a rejected hook, nothing staged) carry a typed
+/// [`git_vista_protocol::CommitFailureKind`] the caller can show actionable
+/// guidance for, the same posture [`amend_commit_request`] already takes for
+/// its own typed contract.
 pub async fn create_commit_request(
     message: &str,
     allow_empty: bool,
     branch: Option<&str>,
-) -> Result<(), String> {
-    refuse_if_offline()?;
-    refuse_if_visualize()?;
+) -> CreateCommitOutcome {
+    if let Err(refusal) = refuse_if_offline().and_then(|()| refuse_if_visualize()) {
+        return CreateCommitOutcome::Unavailable(refusal);
+    }
     let body = CreateCommitRequest {
         message: message.to_string(),
         allow_empty,
         branch: branch.map(str::to_string),
     };
-    let (resp, _key) = write_json("/api/commit", &body).await?;
-    if resp.ok() {
-        Ok(())
-    } else {
-        Err(user_facing_error("/api/commit", resp).await)
-    }
+    let resp = match write_json("/api/commit", &body).await {
+        Ok((resp, _key)) => resp,
+        // A transport failure: the request may or may not have reached the
+        // server, which is precisely what `Unavailable`'s copy says.
+        Err(e) => return CreateCommitOutcome::Unavailable(e),
+    };
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .unwrap_or_else(|_| format!("HTTP {status}"));
+    classify_create_commit_response(status, &text)
 }
 
 /// Rewrite the checked-out branch's tip commit (`POST /api/amend-commit`,
