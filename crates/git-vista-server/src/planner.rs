@@ -4382,6 +4382,118 @@ async fn symlink_containment_guard(
     }
 }
 
+/// What the worktree says happened to each requested tracked path,
+/// determined by re-classifying every one of them against a **fresh** `git
+/// status` taken immediately after `git checkout HEAD --` returns —
+/// regardless of its exit code.
+///
+/// **Why this exists at all (#71 audit, the reproduced bug).** `git
+/// checkout HEAD -- p1 p2 p3` is NOT atomic across a multi-path pathspec:
+/// verified empirically, a permission error on a *later* path in the
+/// batch still lets an *earlier* one revert before the process exits
+/// non-zero. Before this fix, a non-zero exit short-circuited straight to a
+/// `BAD_REQUEST` with git's own stderr and **no journal entry at all** — so
+/// the one path that really did revert went completely unrecorded. This is
+/// the discard-side twin of [`DeleteOutcome`]/[`observe_deletion`]: same
+/// reasoning (trust the worktree, not one exit code; report exactly what
+/// was proven), different question (tracked-and-dirty-or-not here,
+/// present-on-disk-or-not there) because that is what each command's
+/// pathspec atomicity failure actually leaves behind.
+#[derive(Debug, PartialEq, Eq)]
+struct DiscardOutcome<'a> {
+    /// No longer classified [`PathKind::TrackedDirty`] after the attempt:
+    /// this operation actually reverted it.
+    reverted: Vec<&'a str>,
+    /// Still [`PathKind::TrackedDirty`] after the attempt: `git checkout`
+    /// did not reach it — an aborted multi-path batch, most likely.
+    still_dirty: Vec<&'a str>,
+}
+
+/// Partition `requested` by the live classification `live` reports right
+/// now — pure and synchronous so it is unit-testable without a real git
+/// process, same split as [`observe_deletion`]/[`present_paths`] on the
+/// delete side.
+fn observe_discard<'a>(
+    live: &HashMap<String, PathKind>,
+    requested: &[&'a str],
+) -> DiscardOutcome<'a> {
+    let mut outcome = DiscardOutcome {
+        reverted: Vec::new(),
+        still_dirty: Vec::new(),
+    };
+    for p in requested.iter().copied() {
+        match live.get(p).copied().unwrap_or(PathKind::Other) {
+            PathKind::TrackedDirty => outcome.still_dirty.push(p),
+            _ => outcome.reverted.push(p),
+        }
+    }
+    outcome
+}
+
+impl DiscardOutcome<'_> {
+    /// The whole client-facing outcome — status, response body, journal
+    /// line — derived from what the worktree proved, not from git's exit
+    /// code alone. `git_err`, when `git checkout` itself failed, is folded
+    /// into the message so the user still sees git's own explanation.
+    ///
+    /// Names the exact paths in both the success and partial cases (#71
+    /// audit item 3) — the durable journal already carries the full
+    /// `requested` list via [`observe_discard`]'s caller, so this is
+    /// exposing data already in scope, not new storage.
+    fn report(&self, git_err: Option<&str>) -> (StatusCode, String, String) {
+        if self.still_dirty.is_empty() {
+            let count = self.reverted.len();
+            let s = if count == 1 { "" } else { "s" };
+            let names = self.reverted.join(", ");
+            let journal = format!(
+                "discarded uncommitted changes to {count} tracked path{s} ({names}) — \
+                 recoverable only for content staged before this ran, and only until \
+                 git gc; a worktree-only edit is gone"
+            );
+            let body = format!(
+                "Discarded uncommitted changes to {count} tracked path{s}: {names}. \
+                 Recoverable only for content that was staged before this ran, and \
+                 only until the next git gc — a worktree-only edit is gone."
+            );
+            return (StatusCode::OK, body, journal);
+        }
+        // Partial (or total) failure: refusing now cannot re-revert what
+        // already failed, so what this can still do is name exactly what
+        // happened to every requested path instead of a count — or worse,
+        // silence — that does not match reality.
+        let still_dirty_list = self.still_dirty.join(", ");
+        let still_dirty_verb = if self.still_dirty.len() == 1 {
+            "was"
+        } else {
+            "were"
+        };
+        let reverted_note = if self.reverted.is_empty() {
+            "nothing was reverted".to_string()
+        } else {
+            format!(
+                "{} {} reverted — recoverable only for content staged before this ran, \
+                 and only until git gc",
+                self.reverted.join(", "),
+                if self.reverted.len() == 1 {
+                    "was"
+                } else {
+                    "were"
+                },
+            )
+        };
+        let reason = git_err
+            .map(|e| format!(" git said: {e}"))
+            .unwrap_or_default();
+        let msg = format!(
+            "Partial result: {reverted_note}, but {still_dirty_list} {still_dirty_verb} \
+             not — nothing further was applied to {still_dirty_list}; re-check its \
+             status before retrying.{reason}"
+        );
+        let journal = format!("discard-tracked-paths partial result — {msg}");
+        (StatusCode::CONFLICT, msg, journal)
+    }
+}
+
 /// `git checkout -- <paths>` (`/api/discard-tracked-paths`, #219): discard
 /// uncommitted changes to already-tracked paths, restoring each to its
 /// checked-out (index, else HEAD) version. See
@@ -4426,19 +4538,51 @@ async fn exec_discard_tracked_paths(
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/discard-tracked-paths", &e),
     };
-    if !output.status.success() {
-        let msg = stderr_or(&output, "git checkout failed.");
-        eprintln!("git-vista: /api/discard-tracked-paths failed: {msg}");
-        return (StatusCode::BAD_REQUEST, msg);
+    let git_err = if output.status.success() {
+        None
+    } else {
+        Some(stderr_or(&output, "git checkout failed."))
+    };
+
+    // #71 audit items 1/2: never trust the exit code alone. `git checkout
+    // HEAD -- <paths>` is not atomic across a multi-path pathspec (this
+    // module's doc comment above has the empirical proof), so re-classify
+    // every requested path against a fresh `git status` and report exactly
+    // what the worktree proves — whether the process exited 0 or not.
+    let requested: Vec<&str> = paths.iter().map(WorktreePath::as_str).collect();
+    let live_status = run_git(repo, need, &["status", "--porcelain=v2", "-z"]).await;
+    let (status, body, summary) = match live_status {
+        Ok(o) if o.status.success() => {
+            let live = classify_path_states(&git_vista_protocol::parse_porcelain_v2_z(&o.stdout));
+            let outcome = observe_discard(&live, &requested);
+            outcome.report(git_err.as_deref())
+        }
+        _ => {
+            // Could not re-verify what actually happened — fail safe by
+            // saying so plainly rather than trusting the checkout's exit
+            // code alone (exactly what item 2 exists to stop) or guessing.
+            let requested_list = requested.join(", ");
+            let msg = match &git_err {
+                Some(e) => format!(
+                    "git checkout failed ({e}) and the worktree could not be \
+                     re-verified afterwards, so which of {requested_list} actually \
+                     reverted is unknown — check status manually before retrying."
+                ),
+                None => format!(
+                    "git checkout exited successfully but the worktree could not be \
+                     re-verified afterwards, so whether {requested_list} actually \
+                     reverted is unconfirmed."
+                ),
+            };
+            let journal = format!("discard-tracked-paths could not be verified — {msg}");
+            (StatusCode::INTERNAL_SERVER_ERROR, msg, journal)
+        }
+    };
+    if status == StatusCode::OK {
+        println!("[/api/discard-tracked-paths] {summary}");
+    } else {
+        eprintln!("git-vista: /api/discard-tracked-paths partial/failed: {summary}");
     }
-    let count = paths.len();
-    let s = if count == 1 { "" } else { "s" };
-    let summary = format!(
-        "discarded uncommitted changes to {count} tracked path{s} — recoverable only \
-         for content staged before this ran, and only until git gc; a worktree-only \
-         edit is gone"
-    );
-    println!("[/api/discard-tracked-paths] {summary}");
     journal_app_event(
         repo,
         ActivityKind::Other,
@@ -4448,14 +4592,7 @@ async fn exec_discard_tracked_paths(
         summary,
     )
     .await;
-    (
-        StatusCode::OK,
-        format!(
-            "Discarded uncommitted changes to {count} tracked path{s}. Recoverable only \
-             for content that was staged before this ran, and only until the next git \
-             gc — a worktree-only edit is gone."
-        ),
-    )
+    (status, body)
 }
 
 /// After `git clean -f -- <paths>` has run, ask the **filesystem** which of
