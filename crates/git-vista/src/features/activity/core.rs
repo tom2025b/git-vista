@@ -130,6 +130,7 @@ mod tests {
             new_oid: new.map(str::to_owned),
             source: ActivitySource::External,
             undo: None,
+            refs: None,
         }
     }
 

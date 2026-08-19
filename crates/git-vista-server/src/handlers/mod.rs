@@ -90,6 +90,9 @@ pub(crate) fn journal_app_event(
             new_oid,
             source: ActivitySource::App,
             undo: None,
+            // Left None deliberately: journal::append captures the branch-tip
+            // map itself (#131), so no write endpoint can forget to.
+            refs: None,
         },
     );
 }
