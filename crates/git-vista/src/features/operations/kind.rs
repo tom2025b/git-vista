@@ -194,7 +194,7 @@ impl HeadBranch {
         match fetched {
             Ok(Some(branch)) => Self::Known(branch),
             Ok(None) => Self::Detached,
-            Err(_err) => Self::Detached,
+            Err(err) => Self::Unknown(err),
         }
     }
 }
