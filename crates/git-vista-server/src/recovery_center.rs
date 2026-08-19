@@ -1152,6 +1152,54 @@ mod tests {
         );
     }
 
+    /// `/api/operations/history` is a **static** path registered alongside the
+    /// **parameterised** `/api/operations/{id}`, and it is registered *after*
+    /// it. The router must still send `history` to the list handler rather than
+    /// treating it as an operation id — otherwise the whole read surface is
+    /// silently dead, answering "No operation with that id." to every request,
+    /// with no error anywhere to notice.
+    ///
+    /// Asserted rather than assumed. The precedence is a property of axum's
+    /// router, not of this crate, so it could change under a dependency bump
+    /// with nothing else in the suite noticing. Two stand-in handlers so the
+    /// check is about routing alone and needs no session, CSRF or repository
+    /// selection.
+    ///
+    /// Goes red if the precedence ever inverts, and would also have gone red
+    /// had the two routes been registered in a way the router rejects
+    /// outright.
+    #[tokio::test]
+    async fn the_history_path_wins_over_the_operation_id_parameter() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/api/operations/{id}", get(|| async { "by-id" }))
+            .route("/api/operations/history", get(|| async { "history" }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/operations/history")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "history",
+            "the static segment must win over the {{id}} parameter, or the \
+             Recovery Center's list is unreachable"
+        );
+    }
+
     /// A row with no recorded strategy is "we could not check", never "no".
     ///
     /// Goes red if the `None` arm is changed to any `Expired` variant — which
