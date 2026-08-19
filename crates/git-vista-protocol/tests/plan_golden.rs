@@ -17,8 +17,8 @@ use git_vista_protocol::{
     BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
     MergeStrategy, OperationHash, Plan, Precondition, RecoveryStrategy, RefChange, RefName,
     RefState, RemoteName, RepositoryToken, RiskLevel, SignatureStatus, StageDirection,
-    TagAnnotation, TagDetail, TagKind, TagMessage, TagName, UnixSeconds, WorktreePath,
-    WorktreeToken,
+    StashMessage, StashSelector, TagAnnotation, TagDetail, TagKind, TagMessage, TagName,
+    UnixSeconds, WorktreePath, WorktreeToken,
 };
 
 const FIXTURE: &str = include_str!("fixtures/plan_v1.json");
@@ -575,6 +575,63 @@ fn golden_plans() -> Vec<Plan> {
             ],
             Vec::new(),
             RecoveryStrategy::Irrecoverable,
+        ),
+        // The three stash operations (M3.24, #77). `PopStash` is absent from
+        // the enum on purpose, so it is absent here too — see GitOperation's
+        // comment for why a single row cannot tell the truth about a half-done
+        // pop.
+        //
+        // The pinned shape under test is the SELECTOR/OID SPLIT: `entry` is a
+        // positional `stash@{n}` and is what reaches git's argv; `expected_oid`
+        // is the single oid authority and rides in the precondition. A codex
+        // pre-write review proved `git stash drop <oid>` is not a command and
+        // that one oid can occupy two slots at once, so a fixture that let the
+        // oid become the entry would be pinning a design that cannot run.
+        plan(
+            'a',
+            GitOperation::PushStash {
+                message: Some(StashMessage::new("wip: half-done refactor").unwrap()),
+                keep_index: false,
+                include_untracked: true,
+            },
+            RiskLevel::Reversible,
+            Vec::new(),
+            Vec::new(),
+            RecoveryStrategy::NotNeeded,
+        ),
+        // `apply_stash` keeps the entry, so its recovery is NotNeeded — the
+        // stash is still in the drawer to apply again. `CleanWorktree` is the
+        // load-bearing precondition: it is what makes `reset --hard` + `clean`
+        // a provably safe abort, because a clean tree has nothing of the
+        // user's to destroy.
+        plan(
+            'b',
+            GitOperation::ApplyStash {
+                entry: StashSelector::new("stash@{0}").unwrap(),
+                expected_oid: oid('3'),
+            },
+            RiskLevel::Reversible,
+            vec![Precondition::CleanWorktree],
+            Vec::new(),
+            RecoveryStrategy::NotNeeded,
+        ),
+        // `drop_stash` is Destructive on the same reasoning ForceDeleteBranch
+        // is: commits become unreachable. RiskLevel is about what can be lost,
+        // not about whether an undo exists — and the undo here restores the
+        // CONTENT at a new stash@{0}, never the original position.
+        plan(
+            'c',
+            GitOperation::DropStash {
+                entry: StashSelector::new("stash@{2}").unwrap(),
+                expected_oid: oid('4'),
+            },
+            RiskLevel::Destructive,
+            Vec::new(),
+            Vec::new(),
+            RecoveryStrategy::RecreateStashEntry {
+                at: oid('4'),
+                message: Some(StashMessage::new("wip: half-done refactor").unwrap()),
+            },
         ),
     ]
 }

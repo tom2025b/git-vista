@@ -83,7 +83,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::newtype::{
     require_git_safe, require_hex, require_non_empty, require_non_empty_bounded,
-    require_remote_name, require_worktree_relative_path,
+    require_remote_name, require_stash_selector, require_worktree_relative_path,
 };
 
 /// Why a plan field failed validation — see
@@ -247,6 +247,61 @@ validated_string!(
 /// release notes (the kernel's longest tag messages are ~2 KiB) while keeping
 /// a hostile 100 MB "message" a wire-boundary 400 instead of a stored blob.
 pub const MAX_TAG_MESSAGE_LEN: usize = 16 * 1024;
+
+/// The most bytes a [`StashMessage`] may carry (16 KiB).
+///
+/// Bounded for the reason [`MAX_TAG_MESSAGE_LEN`] is: the value is
+/// client-chosen and rides inside a [`GitOperation`] that is hashed,
+/// journaled, and written verbatim into the repository (a stash commit's
+/// message). Same generous-but-finite cap.
+pub const MAX_STASH_MESSAGE_LEN: usize = 16 * 1024;
+
+validated_string!(
+    /// A stash entry's human label — `git stash push -m <message>` (M3.24,
+    /// #77). Non-empty after trimming and at most [`MAX_STASH_MESSAGE_LEN`]
+    /// bytes, exactly like [`TagMessage`].
+    StashMessage,
+    |v| require_non_empty_bounded(v, "stash message", MAX_STASH_MESSAGE_LEN)
+);
+
+validated_string!(
+    /// A stash entry's **positional selector** — `stash@{0}`, `stash@{12}`
+    /// (M3.24, #77). This is the only thing that names an entry to git, and
+    /// the shape is pinned to exactly `stash@{<digits>}`.
+    ///
+    /// # Why a selector and not an oid — the correction that made this ship
+    ///
+    /// The design originally carried the entry's resolved commit oid and said
+    /// *"the oid is what actually executes"*. A codex pre-write review
+    /// (2026-08-19) falsified both halves against git 2.43.0:
+    ///
+    /// 1. **`git stash drop <oid>` is not a command.** It answers
+    ///    `error: '<oid>' is not a stash reference`. `git stash drop` and
+    ///    `git stash apply` take a *reflog selector*.
+    /// 2. **An oid is not a unique entry identity.** A commit identifies
+    ///    recoverable content, not one reflog entry, and `git stash store`
+    ///    can put the same commit in two slots at once — `stash@{0}` and
+    ///    `stash@{2}` holding one oid was reproduced on this box. So "is this
+    ///    oid still present?" can never answer "does the entry I meant still
+    ///    exist?", which is the only question that matters here.
+    ///
+    /// The position alone is not safe either: selectors **renumber on every
+    /// drop**, so `stash@{1}` names a different commit before and after
+    /// `stash@{0}` goes. That is a genuine time-of-check/time-of-use bug, and
+    /// the fix is not to replace the position but to **guard** it — see
+    /// [`GitOperation::DropStash`]'s `expected_oid`, which is the single oid
+    /// authority and is compare-and-swapped against a fresh resolve
+    /// immediately before the selector reaches git.
+    ///
+    /// # This is an argv boundary
+    ///
+    /// The value reaches `git stash <verb> <selector>`. The validator admits
+    /// only `stash@{<digits>}` — no option shape, no path, no separator, no
+    /// room for anything else — so a hostile selector is a wire-boundary 400
+    /// rather than an argument git tries to interpret.
+    StashSelector,
+    |v| require_stash_selector(v, "stash selector")
+);
 
 validated_string!(
     /// An annotated tag's message body — non-empty after trimming (the same
@@ -889,6 +944,58 @@ pub enum GitOperation {
     /// [`GitOperation::PushBranch`]'s reason: the effect leaves the machine,
     /// and whoever fetches the tag keeps it.
     PushTag { name: TagName, remote: RemoteName },
+    /// `git stash push [--keep-index] [--include-untracked] [-m <message>]`
+    /// (`/api/stash/push`, M3.24 #77). Both flags are REQUIRED fields with no
+    /// default: "staged and untracked options are explicit" is a vocabulary
+    /// requirement, not a UI one, and a bool with a default is how a UI
+    /// quietly stops asking.
+    PushStash {
+        message: Option<StashMessage>,
+        /// `--keep-index`: leave staged changes staged in the tree as well as
+        /// stashing them.
+        keep_index: bool,
+        /// `--include-untracked`: sweep untracked files in too. Without it,
+        /// stashing then switching branches leaves them behind — the single
+        /// most common way a user believes the drawer lost their work.
+        include_untracked: bool,
+    },
+    /// `git stash apply <entry>` — restore a stash's changes, KEEPING the
+    /// entry (`/api/stash/apply`, M3.24 #77).
+    ///
+    /// `entry` is the positional selector and is what reaches git;
+    /// `expected_oid` is the single oid authority and is compare-and-swapped
+    /// against a fresh resolve immediately before execution. See
+    /// [`StashSelector`] for why the two are split this way and why an oid
+    /// alone cannot identify an entry.
+    ApplyStash {
+        entry: StashSelector,
+        expected_oid: CommitOid,
+    },
+    /// `git stash drop <entry>` — discard an entry (`/api/stash/drop`,
+    /// M3.24 #77). Recoverable via
+    /// [`RecoveryStrategy::RecreateStashEntry`] until gc, and the durable
+    /// recovery pin extends that.
+    ///
+    /// Same selector/oid split as [`Self::ApplyStash`], and it matters more
+    /// here: selectors renumber on every drop, so the compare-and-swap is the
+    /// only thing standing between this and dropping the wrong stash.
+    DropStash {
+        entry: StashSelector,
+        expected_oid: CommitOid,
+    },
+    //
+    // `PopStash` is deliberately ABSENT (M3.24, decided 2026-08-18).
+    //
+    // Pop is apply-then-drop, and a single operation row cannot tell the truth
+    // about the half-done state: apply succeeds, drop fails, and the record
+    // says only `Failed` — indistinguishable from "nothing happened" while the
+    // user's changes are actually in the tree. Two independent operations
+    // produce two rows, and two rows CAN say "apply succeeded, drop failed".
+    //
+    // Adding the variant before its outcome is durably representable would put
+    // a wire promise in this enum that no executor can keep. See
+    // docs/superpowers/specs/m3.24-stash.md section 5 for the two ways it
+    // could become representable.
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,6 +1141,30 @@ pub enum RecoveryStrategy {
     /// strategy's oid durable is also what protects it from gc. A
     /// message-carrying shape would have had nothing to pin.
     RecreateTag { name: TagName, at: CommitOid },
+    /// Re-create a dropped stash entry with `git stash store <at>` (M3.24,
+    /// #77) — the undo for a [`GitOperation::DropStash`].
+    ///
+    /// # What this restores, and what it does not
+    ///
+    /// `git stash store` appends a **new entry at `stash@{0}`** referencing
+    /// `at`. The *content* comes back exactly — the commit is bit-identical,
+    /// nothing is re-minted, and unlike [`Self::RecreateTag`] there is no
+    /// signature to lose. The entry's **position** does not: a stash dropped
+    /// from `stash@{3}` returns at `stash@{0}`, and every other entry
+    /// renumbers under it.
+    ///
+    /// User-facing text must reflect that. "Restored your stash" is honest;
+    /// "restored it exactly as it was" is not.
+    ///
+    /// Like [`Self::RecreateTag`], taking this strategy's oid durable is also
+    /// what protects it from gc: the recovery pin
+    /// (`refs/git-vista/recovery/<id>`) points a real ref at `at`, keeping the
+    /// stash commit reachable. A message-carrying shape would have had nothing
+    /// to pin.
+    RecreateStashEntry {
+        at: CommitOid,
+        message: Option<StashMessage>,
+    },
     /// Delete the tag the operation created (undo of a
     /// [`GitOperation::CreateTag`], which added `refs/tags/<name>` and —
     /// annotated — one now-unreferenced tag object, and nothing else). The
