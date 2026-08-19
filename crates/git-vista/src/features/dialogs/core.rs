@@ -17,6 +17,8 @@
 //! ever the guarded one. The three separate clocks were never deliberate isolation — they
 //! were three copies of the same idea that happened never to overlap.
 
+use crate::features::operations::kind::HeadBranch;
+
 /// A modal that dismisses by backdrop tap, and therefore needs the guard.
 ///
 /// The full-screen viewer (`viewer.rs`) is deliberately **not** here: it has no backdrop
@@ -668,6 +670,112 @@ pub fn worktree_confirm(action: WorktreeAction, paths: &[String], armed: bool) -
                 None
             },
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The branch merge/delete confirmations
+// ---------------------------------------------------------------------------
+
+/// The branch-delete confirmation (`PendingOp::Delete`), decided here — pure
+/// and host-tested — instead of inline in `dialogs/confirm.rs`'s wasm-only
+/// match, the same extraction `push_confirm_copy` and [`worktree_confirm`]
+/// already had.
+///
+/// The [`HeadBranch::Unknown`] arm is why it moved. When the live HEAD read
+/// failed, the dialog used to receive a plain `None`, read it as detached
+/// HEAD, and offer the delete under its usual confident caption. git's safe
+/// `branch -d` still refused the worst case server-side, but the UI was
+/// authorising an action it had no grounds to offer. The failed read now
+/// arrives as its own state, and this function turns it into a disabled
+/// button whose body says what actually happened — the frontend's half of
+/// `activity.rs`'s rule that "couldn't tell" must never read as "safe to
+/// offer".
+pub fn delete_confirm_prompt(branch: &str, current: &HeadBranch) -> ConfirmPrompt {
+    match current {
+        HeadBranch::Known(current) if current == branch => ConfirmPrompt::plain(
+            "Delete branch",
+            format!(
+                "‘{branch}’ is the branch you're on — check out another branch \
+                 before deleting it."
+            ),
+            "Delete",
+            true,
+            false,
+        ),
+        // A different branch, or a *confirmed* detached HEAD: safe to offer.
+        HeadBranch::Known(_) | HeadBranch::Detached => ConfirmPrompt::plain(
+            "Delete branch",
+            format!("Delete branch ‘{branch}’? Only a fully-merged branch can be deleted here."),
+            "Delete",
+            true,
+            true,
+        ),
+        // The read itself failed. ‘{branch}’ might be the branch you're on,
+        // so the delete is not offered — and the body says the read failed
+        // rather than borrowing the detached-HEAD story. Reason in the body,
+        // `blocked_reason: None`, matching every other branch arm (see
+        // `ConfirmPrompt::plain`'s doc comment).
+        HeadBranch::Unknown(err) => ConfirmPrompt::plain(
+            "Delete branch",
+            format!(
+                "Couldn't read which branch is checked out — {err}\n\n\
+                 Deleting ‘{branch}’ isn't offered without that answer, because it \
+                 might be the branch you're on. Close this and try again."
+            ),
+            "Delete",
+            true,
+            false,
+        ),
+    }
+}
+
+/// The branch-merge confirmation (`PendingOp::Merge`) — the same extraction,
+/// for the same reason, as [`delete_confirm_prompt`] above.
+///
+/// Merge's stakes were lower than delete's: its `None` arm already *disabled*
+/// the button. But it disabled it with "HEAD is detached … check out a branch
+/// first", which on a failed read was a diagnosis the app never made — advice
+/// that can't help, built on a state it didn't observe. [`HeadBranch`] keeps
+/// the two apart, so the detached copy is only ever shown for a confirmed
+/// detached HEAD.
+pub fn merge_confirm_prompt(branch: &str, into: &HeadBranch) -> ConfirmPrompt {
+    match into {
+        HeadBranch::Known(into) if into != branch => ConfirmPrompt::plain(
+            "Merge branch",
+            format!("Merge ‘{branch}’ into ‘{into}’? This updates ‘{into}’ in the working tree."),
+            "Merge",
+            false,
+            true,
+        ),
+        HeadBranch::Known(into) => ConfirmPrompt::plain(
+            "Merge branch",
+            format!("‘{into}’ is the branch you're on — there's nothing to merge into itself."),
+            "Merge",
+            false,
+            false,
+        ),
+        HeadBranch::Detached => ConfirmPrompt::plain(
+            "Merge branch",
+            format!(
+                "HEAD is detached, so there's no branch to merge ‘{branch}’ into. \
+                 Check out a branch first."
+            ),
+            "Merge",
+            false,
+            false,
+        ),
+        HeadBranch::Unknown(err) => ConfirmPrompt::plain(
+            "Merge branch",
+            format!(
+                "Couldn't read which branch is checked out — {err}\n\n\
+                 There's no way to name what ‘{branch}’ would merge into, so merging \
+                 isn't offered. Close this and try again."
+            ),
+            "Merge",
+            false,
+            false,
+        ),
     }
 }
 
@@ -1448,4 +1556,131 @@ mod tests {
     //     .dependencies]`-only crate dependency (Cargo.toml line 81).
     //   - the new `Overlay::Error`/`Dialog::Error`/`error_modal_view` render
     //     path — Leptos view code, wasm-only by construction.
+}
+
+#[cfg(test)]
+mod branch_prompt_tests {
+    use super::*;
+
+    fn known(b: &str) -> HeadBranch {
+        HeadBranch::Known(b.into())
+    }
+
+    fn unknown() -> HeadBranch {
+        HeadBranch::Unknown("network error: connection refused".into())
+    }
+
+    // ---- delete ----
+
+    #[test]
+    fn deleting_another_branch_is_offered_as_a_danger() {
+        let p = delete_confirm_prompt("feature", &known("main"));
+        assert!(p.enabled);
+        assert!(p.danger);
+        assert!(p.body.contains("feature"), "{}", p.body);
+    }
+
+    #[test]
+    fn deleting_the_checked_out_branch_is_refused() {
+        let p = delete_confirm_prompt("main", &known("main"));
+        assert!(!p.enabled);
+        assert!(p.body.contains("branch you're on"), "{}", p.body);
+    }
+
+    #[test]
+    fn deleting_under_a_confirmed_detached_head_is_offered() {
+        // A real detached HEAD means `branch` cannot be the one checked out,
+        // so the delete stays available — this is the legitimate half of the
+        // old `None` arm, kept on purpose.
+        let p = delete_confirm_prompt("feature", &HeadBranch::Detached);
+        assert!(p.enabled);
+    }
+
+    /// The invariant this module was extracted for: a failed HEAD read must
+    /// never enable the delete. The old producer folded `Err` into `None`
+    /// with `unwrap_or(None)` and this dialog then read `None` as detached —
+    /// the enabling answer — so a dead server produced a confident
+    /// "Delete branch ‘x’?" it had no grounds to show. Mutations this must
+    /// catch: the `Unknown` arm's `enabled` flipping to `true`, or `Unknown`
+    /// being folded into the `Known(_) | Detached` arm.
+    #[test]
+    fn deleting_when_head_could_not_be_read_is_never_offered() {
+        let p = delete_confirm_prompt("feature", &unknown());
+        assert!(!p.enabled, "an unreadable HEAD must not enable a delete");
+        assert!(p.danger, "still the danger tier — the subject is a delete");
+    }
+
+    /// The refusal must tell the truth about *why*: the read failed. It must
+    /// carry the underlying error, invite a retry, and not borrow the
+    /// detached-HEAD story (which is a different, observed state).
+    #[test]
+    fn the_unreadable_head_delete_body_says_the_read_failed_not_detached() {
+        let p = delete_confirm_prompt("feature", &unknown());
+        assert!(p.body.contains("Couldn't read"), "{}", p.body);
+        assert!(p.body.contains("connection refused"), "{}", p.body);
+        assert!(p.body.contains("try again"), "{}", p.body);
+        assert!(!p.body.contains("detached"), "{}", p.body);
+        let detached = delete_confirm_prompt("feature", &HeadBranch::Detached);
+        assert_ne!(
+            p.body, detached.body,
+            "a failed read and a detached HEAD must not share copy"
+        );
+    }
+
+    // ---- merge ----
+
+    #[test]
+    fn merging_into_a_different_branch_is_offered() {
+        let p = merge_confirm_prompt("feature", &known("main"));
+        assert!(p.enabled);
+        assert!(p.body.contains("‘feature’ into ‘main’"), "{}", p.body);
+    }
+
+    #[test]
+    fn merging_a_branch_into_itself_is_refused() {
+        let p = merge_confirm_prompt("main", &known("main"));
+        assert!(!p.enabled);
+        assert!(p.body.contains("merge into itself"), "{}", p.body);
+    }
+
+    #[test]
+    fn merging_under_a_confirmed_detached_head_is_refused_with_detached_copy() {
+        let p = merge_confirm_prompt("feature", &HeadBranch::Detached);
+        assert!(!p.enabled);
+        assert!(p.body.contains("HEAD is detached"), "{}", p.body);
+    }
+
+    /// Merge's button was already disabled on the old folded `None` — the
+    /// defect here was the caption: "HEAD is detached … check out a branch
+    /// first" is a diagnosis the app never made and advice that can't help.
+    /// On a failed read the copy must say the read failed, and must not be
+    /// the detached copy.
+    #[test]
+    fn merging_when_head_could_not_be_read_is_refused_with_honest_copy() {
+        let p = merge_confirm_prompt("feature", &unknown());
+        assert!(!p.enabled);
+        assert!(p.body.contains("Couldn't read"), "{}", p.body);
+        assert!(p.body.contains("connection refused"), "{}", p.body);
+        assert!(!p.body.contains("detached"), "{}", p.body);
+        let detached = merge_confirm_prompt("feature", &HeadBranch::Detached);
+        assert_ne!(p.body, detached.body);
+    }
+
+    /// Every refusal in both prompts keeps its reason in the body with
+    /// `blocked_reason: None` — the branch-arm convention `ConfirmPrompt::
+    /// plain` documents, which `dialogs/confirm.rs` relies on for its
+    /// `prop:disabled` behaviour.
+    #[test]
+    fn branch_prompts_keep_reasons_in_the_body_not_blocked_reason() {
+        for p in [
+            delete_confirm_prompt("main", &known("main")),
+            delete_confirm_prompt("feature", &unknown()),
+            merge_confirm_prompt("main", &known("main")),
+            merge_confirm_prompt("feature", &HeadBranch::Detached),
+            merge_confirm_prompt("feature", &unknown()),
+        ] {
+            assert_eq!(p.blocked_reason, None, "{}", p.body);
+            assert!(p.arm.is_none(), "branch ops are single-tap ceremonies");
+        }
+    }
 }
