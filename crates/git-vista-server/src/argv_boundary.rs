@@ -93,6 +93,21 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // is a boundary change needing its own decision, and this comment is the
     // record that it was not one when the entry was added.
     "src/activity.rs",
+    // M3.25 (#78): `#[cfg(test)]` fixture setup only — `git init`/`commit`/
+    // `rev-parse`, building throwaway repositories for the live
+    // recovery-classification tests. The module's production reads all go
+    // through `crate::git_cmd::git_output`, the sealed sandbox launcher
+    // (`resolve_ref_exact`), and its one *mutating* path builds no argv at all:
+    // `recover_operation` hands a typed `GitOperation` to the planner like
+    // every other write (ADR 0016), so the recovery's git argv is constructed
+    // in `planner.rs` with all the others.
+    //
+    // Do not widen this entry to cover a production spawn. If classification
+    // ever stops going through `git_output`, that is a boundary change needing
+    // its own decision — this comment is the record that it was not one when
+    // the entry was added, and the tripwire refusing the build is what forced
+    // the review.
+    "src/recovery_center.rs",
     // `#[cfg(test)]` fixture setup only — `git init -q`, to build repositories
     // `read_repo_facts` can classify. This entry used to read "static-arg read
     // at registration", which stopped being true when registration moved to the

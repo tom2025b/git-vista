@@ -763,6 +763,7 @@ async fn a_dropped_connection_replays_instead_of_fetching_twice() {
             None,
             tokens(),
             PlanSource::Build(fetch_op()),
+            None,
         ),
     )
     .await;
@@ -781,6 +782,7 @@ async fn a_dropped_connection_replays_instead_of_fetching_twice() {
             None,
             tokens(),
             PlanSource::Build(fetch_op()),
+            None,
         ),
     )
     .await
@@ -804,6 +806,7 @@ async fn a_dropped_connection_replays_instead_of_fetching_twice() {
         None,
         tokens(),
         PlanSource::Build(fetch_op()),
+        None,
     )
     .await;
     assert_eq!(again_status, status);

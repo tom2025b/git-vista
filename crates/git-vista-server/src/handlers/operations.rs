@@ -330,6 +330,7 @@ mod tests {
             &hash,
             RepositoryToken::new("test-repo").unwrap(),
             WorktreeToken::new("test-worktree").unwrap(),
+            None,
         ) {
             Admission::Fresh(handle, record) => (record.id(), handle),
             _ => panic!("a fresh key must be admitted"),
@@ -355,6 +356,7 @@ mod tests {
             &hash,
             RepositoryToken::new("test-repo").unwrap(),
             WorktreeToken::new("test-worktree").unwrap(),
+            None,
         ) else {
             panic!("a fresh key must be admitted");
         };

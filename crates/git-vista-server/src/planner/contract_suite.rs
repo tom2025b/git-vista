@@ -2209,6 +2209,17 @@ fn every_git_write_route_reaches_the_planner() {
         // `submit_execute` block right after the `build_only` one below
         // checks this route's own chain.
         ("/api/execute-plan", "execute_plan"),
+        // M3.25 (#78): executing one past operation's recovery. A git write —
+        // it reaches the planner — but not a funnel row below, because it
+        // enters through `plan_and_execute_recovery` rather than
+        // `plan_and_execute` (it carries the `recovers` link the plain entry
+        // point has no parameter for). The `recovery_chain` block after the
+        // funnel loop checks its own chain, the same way `/api/execute-plan`
+        // gets `submit_execute`.
+        (
+            "/api/operations/{id}/recover",
+            "recovery_center::recover_operation",
+        ),
     ];
     assert_eq!(
         posts.len(),
@@ -2326,6 +2337,53 @@ fn every_git_write_route_reaches_the_planner() {
              every git write must flow through the shared planner (ADR 0016)"
         );
     }
+
+    // The recovery chain (M3.25, #78): `recover_operation` is the third way
+    // into the funnel, alongside `plan_and_execute` and `execute_plan`.
+    //
+    // It must reach `plan_and_execute_recovery`, which delegates into the one
+    // gated block (pinned by
+    // `the_global_entry_point_delegates_through_the_lifecycle_to_the_pipeline`
+    // above), so a recovery gets the same read-only gate, idempotency-key
+    // requirement, admission, repository guard, staleness gate and durable
+    // terminal record as every other write. It must NOT call
+    // `plan_and_execute(` directly: that admits a row with no `recovers` link,
+    // silently losing the one fact that ties a recovery to what it recovered.
+    //
+    // And it must still contain the equality gate. That comparison is what the
+    // design names as this feature's single highest-risk point — the moment a
+    // refactor treats the request body as authoritative ("the UI already
+    // validated it"), a stale or hand-crafted `UndoAction` executes against a
+    // world that has moved past `Offered`, and the type-level guarantee this
+    // whole module exists to provide becomes decorative. The exact spelling is
+    // pinned on purpose; if the variables are renamed, update this line
+    // deliberately rather than dropping the assertion.
+    let recovery_src = crate::argv_boundary::code_only(&source("src/recovery_center.rs"));
+    let recover_body = fn_body(&recovery_src, "recover_operation");
+    assert!(
+        recover_body.contains("plan_and_execute_recovery("),
+        "src/recovery_center.rs::recover_operation no longer reaches \
+         plan_and_execute_recovery — every git write must flow through the \
+         shared planner (ADR 0016)"
+    );
+    assert!(
+        !recover_body.contains("plan_and_execute("),
+        "src/recovery_center.rs::recover_operation calls plan_and_execute \
+         directly — the recovery entry point exists so the admitted row records \
+         which operation it recovers"
+    );
+    assert!(
+        recover_body.contains("classify_recovery("),
+        "src/recovery_center.rs::recover_operation must re-derive the \
+         classification live, on this request — never trust a class the client \
+         cached from an earlier page load"
+    );
+    assert!(
+        recover_body.contains("undo != claimed"),
+        "src/recovery_center.rs::recover_operation lost its equality gate — the \
+         server's own re-derived UndoAction must equal the client's claim, or \
+         the request is refused (409)"
+    );
 
     // The build-only rows (M2.23d, #248): the inverse of the funnel above.
     // `/api/plan` exists to hand a reviewable plan back *unexecuted*, so its

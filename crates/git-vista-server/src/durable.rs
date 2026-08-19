@@ -1152,24 +1152,34 @@ mod tests {
         assert_eq!(loaded[0].1.state, OperationState::Succeeded);
     }
 
-    /// **The pagination test that a distinct-timestamp fixture cannot be.**
-    /// Two rows share one `accepted_at`, and the page boundary falls between
-    /// them — so the keyset predicate has to break the tie on `id`, which
-    /// `mint_id` deliberately makes unordered.
+    /// **The pagination test a distinct-timestamp fixture cannot be.** Three
+    /// rows share one `accepted_at` and the page boundary falls *inside* that
+    /// tie — so resuming correctly requires the `id` tie-break, which `mint_id`
+    /// deliberately makes unordered.
     ///
-    /// Goes red if the `(accepted_at = ?2 AND id < ?3)` tie-break is dropped
-    /// from `select_operations_blocking`'s predicate: with `accepted_at < ?2`
-    /// alone the second page skips the tied row entirely (one row lost); with
-    /// `accepted_at <= ?2` alone it returns the tied row again (duplicated).
-    /// A fixture with distinct timestamps passes identically either way.
+    /// The fixture shape is load-bearing and was earned: an earlier version
+    /// put two tied rows on page 1 and the odd one out on page 2, so the
+    /// boundary never landed inside the tie and the whole thing passed
+    /// unchanged with the tie-break deleted. It was a test that could not fail
+    /// on the defect it named. Mutation-checked in both directions now:
+    ///
+    ///  * `accepted_at < ?2` alone (tie-break dropped) — the third tied row is
+    ///    skipped, the walk yields 3 rows, and the multiset assertion fires;
+    ///  * `accepted_at <= ?2` alone — page 2 repeats page 1's rows forever, so
+    ///    the walk hits the page cap and the "terminated" assertion fires.
     #[test]
     fn pagination_breaks_a_shared_timestamp_tie_on_the_id() {
         let (_dir, path) = scratch_db();
         let conn = open_at(&path).unwrap();
 
-        // Three rows: two sharing `accepted_at = 500`, one older, so the page
-        // boundary at limit=2 lands in the middle of the tie.
-        for (id, at) in [("op-b", 500), ("op-a", 500), ("op-older", 400)] {
+        // Three rows share `accepted_at = 500`; at limit 2 the boundary falls
+        // between the second and third of them.
+        for (id, at) in [
+            ("op-c", 500),
+            ("op-b", 500),
+            ("op-a", 500),
+            ("op-older", 400),
+        ] {
             let mut status = sample(id);
             status.accepted_at = UnixSeconds(at);
             status.ended_at = Some(UnixSeconds(at + 1));
@@ -1179,43 +1189,61 @@ mod tests {
         let repo = RepositoryToken::new("r").unwrap();
         let terminal = &[OperationState::Succeeded, OperationState::Failed][..];
 
-        let first = select_operations_blocking(&conn, &repo, terminal, None, 2).unwrap();
-        assert_eq!(
-            first.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
-            vec!["op-b", "op-a"],
-            "newest first, with the id descending inside a shared timestamp"
+        // Walk every page the way a client does: follow the cursor until a
+        // page comes back short. Capped, so a predicate that never advances
+        // fails loudly instead of hanging the suite.
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<(UnixSeconds, OperationId)> = None;
+        let mut terminated = false;
+        for _ in 0..10 {
+            let page =
+                select_operations_blocking(&conn, &repo, terminal, cursor.as_ref(), 2).unwrap();
+            if page.is_empty() {
+                terminated = true;
+                break;
+            }
+            let last = page.last().unwrap();
+            cursor = Some((last.accepted_at, last.id.clone()));
+            seen.extend(page.iter().map(|s| s.id.as_str().to_string()));
+        }
+        assert!(
+            terminated,
+            "the walk never reached an empty page — a keyset predicate that \
+             does not advance past a tie repeats the same page forever, which \
+             in a browser is an infinite scroll with no way out: {seen:?}"
         );
 
-        let last = first.last().unwrap();
-        let cursor = (last.accepted_at, last.id.clone());
-        let second = select_operations_blocking(&conn, &repo, terminal, Some(&cursor), 2).unwrap();
+        // Every row exactly once — duplicates and omissions both fail here,
+        // because this compares the multiset, not a set.
+        let mut sorted = seen.clone();
+        sorted.sort();
         assert_eq!(
-            second.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
-            vec!["op-older"],
-            "the page after a tie must resume *inside* the tie, not skip past \
-             it and not repeat it"
+            sorted,
+            vec!["op-a", "op-b", "op-c", "op-older"],
+            "every row must appear exactly once across the pages: {seen:?}"
         );
 
-        // The union of every page is exactly the inserted set — no row lost,
-        // no row seen twice.
-        let mut seen: Vec<&str> = first
-            .iter()
-            .chain(second.iter())
-            .map(|s| s.id.as_str())
-            .collect();
-        seen.sort_unstable();
-        assert_eq!(seen, vec!["op-a", "op-b", "op-older"]);
+        // And the order the pages hand them back in is the total order the
+        // index describes: newest first, id descending inside a shared second.
+        assert_eq!(seen, vec!["op-c", "op-b", "op-a", "op-older"]);
     }
 
-    /// The history query is scoped to one repository and to terminal states —
-    /// a still-running row (no `ended_at`) and another repository's row are
-    /// both invisible to it.
+    /// The history query is scoped to one repository and to rows that really
+    /// have settled: another repository's row, a still-running row, and a row
+    /// that is inconsistent in each of the two possible directions are all
+    /// invisible to it.
     ///
-    /// Goes red if the `repository = ?1` predicate is dropped (the other
-    /// repository's row appears) or if the `state IN (...)` / `ended_at IS
-    /// NOT NULL` filters are dropped (the running row appears, and
-    /// `HistoryEntry`'s non-optional `ended_at` would then have nothing to
-    /// decode).
+    /// The three excluded rows are chosen so that **each** predicate is the
+    /// only thing keeping one of them out — mutation-checked, after an earlier
+    /// version was found vacuous: with one ordinary `Running`-and-unfinished
+    /// row, `state IN (...)` and `ended_at IS NOT NULL` each covered for the
+    /// other, so deleting either one alone left the test green.
+    ///
+    ///  * drop `repository = ?1` → `other-repo` appears;
+    ///  * drop `state IN (...)` → `running-but-ended` appears;
+    ///  * drop `ended_at IS NOT NULL` → `ended-at-missing` appears, and
+    ///    `HistoryEntry`'s non-optional `ended_at` would have nothing to
+    ///    decode from it.
     #[test]
     fn the_history_query_shows_only_this_repositorys_terminal_rows() {
         let (_dir, path) = scratch_db();
@@ -1223,11 +1251,18 @@ mod tests {
 
         insert_or_update(&conn, &key("mine"), &sample("mine")).unwrap();
 
-        let mut running = sample("still-running");
+        // Non-terminal, but carrying an end time — only the state filter
+        // excludes it.
+        let mut running = sample("running-but-ended");
         running.state = OperationState::Running;
         running.stage = OperationStage::Executing;
-        running.ended_at = None;
-        insert_or_update(&conn, &key("still-running"), &running).unwrap();
+        insert_or_update(&conn, &key("running-but-ended"), &running).unwrap();
+
+        // Terminal, but with no end time — the shape a hand-edited or
+        // half-written row has, and only the `ended_at` guard excludes it.
+        let mut unfinished = sample("ended-at-missing");
+        unfinished.ended_at = None;
+        insert_or_update(&conn, &key("ended-at-missing"), &unfinished).unwrap();
 
         let mut elsewhere = sample("other-repo");
         elsewhere.repository = RepositoryToken::new("other").unwrap();
