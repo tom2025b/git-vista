@@ -87,6 +87,16 @@ pub(crate) enum Exposure {
 pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
     use Exposure::{Excluded, Tool};
     match op {
+        // M3.24 (#77). Push and Apply get tools; Drop is Excluded — it is
+        // Destructive and its safety rests on a compare-and-swap against a
+        // reflog position that an agent cannot meaningfully re-derive between
+        // planning and submitting. A human reading the drawer can.
+        GitOperation::PushStash { .. } => Tool("plan_push_stash"),
+        GitOperation::ApplyStash { .. } => Tool("plan_apply_stash"),
+        GitOperation::DropStash { .. } => Excluded(
+            "destructive, and its safety rests on a compare-and-swap against a reflog \
+             position an agent cannot re-derive between planning and submitting",
+        ),
         GitOperation::CreateBranch { .. } => Tool("plan_create_branch"),
         GitOperation::CommitOnHead { .. } => Tool("plan_commit_on_head"),
         GitOperation::EmptyCommitOnBranch { .. } => Tool("plan_empty_commit_on_branch"),
@@ -758,6 +768,7 @@ fn recovery_name(recovery: &RecoveryStrategy) -> &'static str {
         RecoveryStrategy::RecreateBranch { .. } => "recreate_branch",
         RecoveryStrategy::DeleteCreatedBranch { .. } => "delete_created_branch",
         RecoveryStrategy::RecreateTag { .. } => "recreate_tag",
+        RecoveryStrategy::RecreateStashEntry { .. } => "recreate_stash_entry",
         RecoveryStrategy::DeleteCreatedTag { .. } => "delete_created_tag",
         RecoveryStrategy::CheckoutPrevious { .. } => "checkout_previous",
         RecoveryStrategy::RevertCommit { .. } => "revert_commit",
@@ -771,6 +782,11 @@ fn recovery_meaning(recovery: &RecoveryStrategy) -> String {
         RecoveryStrategy::NotNeeded => {
             "Nothing is destroyed, so there is nothing to recover.".to_string()
         }
+        RecoveryStrategy::RecreateStashEntry { at, .. } => format!(
+            "Undo by re-creating the stash entry from {}. It comes back at the \
+             top of the list (stash@{{0}}), not at its original position.",
+            at.as_str()
+        ),
         RecoveryStrategy::ResetRef { ref_name, to } => format!(
             "Undo by moving {} back to {}.",
             ref_name.as_str(),

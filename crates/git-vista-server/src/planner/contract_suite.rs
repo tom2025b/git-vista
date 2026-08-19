@@ -205,6 +205,9 @@ fn assert_ok(status: StatusCode, body: &str) {
 /// given a real pipeline test below.
 fn covered_by(op: &GitOperation) -> &'static str {
     match op {
+        GitOperation::PushStash { .. } => "push_stash_executes_through_the_pipeline",
+        GitOperation::ApplyStash { .. } => "apply_stash_executes_through_the_pipeline",
+        GitOperation::DropStash { .. } => "drop_stash_refuses_a_moved_selector",
         GitOperation::CreateBranch { .. } => "create_branch_executes_through_the_pipeline",
         GitOperation::CommitOnHead { .. } => "commit_on_head_executes_through_the_pipeline",
         GitOperation::EmptyCommitOnBranch { .. } => {
@@ -256,7 +259,10 @@ fn covered_by(op: &GitOperation) -> &'static str {
 /// pointing at its own test.
 fn covered_on_split_path(op: &GitOperation) -> &'static str {
     match op {
-        GitOperation::CreateBranch { .. }
+        GitOperation::PushStash { .. }
+        | GitOperation::ApplyStash { .. }
+        | GitOperation::DropStash { .. }
+        | GitOperation::CreateBranch { .. }
         | GitOperation::CommitOnHead { .. }
         | GitOperation::EmptyCommitOnBranch { .. }
         | GitOperation::StageAll
@@ -517,6 +523,119 @@ async fn stage_all_executes_through_the_pipeline() {
     let (status, body) = pipeline(&repo, GitOperation::StageAll).await;
     assert_ok(status, &body);
     assert_eq!(out(&repo, &["diff", "--cached", "--name-only"]), "b.txt");
+}
+
+/// M3.24 (#77): a stash push rides the full pipeline and the drawer gains an
+/// entry.
+///
+/// MUTATION: drop `--include-untracked` from the executor's argv and this goes
+/// red — `new.txt` is untracked, so without the flag it stays in the tree and
+/// the working directory is not clean afterwards.
+#[tokio::test]
+async fn push_stash_executes_through_the_pipeline() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    std::fs::write(repo.join("new.txt"), "untracked\n").unwrap();
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::PushStash {
+            message: Some(git_vista_protocol::StashMessage::new("wip").unwrap()),
+            keep_index: false,
+            include_untracked: true,
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    let listed = out(&repo, &["stash", "list"]);
+    assert!(
+        listed.contains("wip"),
+        "the drawer must hold the entry: {listed}"
+    );
+    assert_eq!(
+        out(&repo, &["status", "--porcelain"]),
+        "",
+        "an --include-untracked push leaves a clean tree"
+    );
+}
+
+/// M3.24 (#77): apply restores the changes and KEEPS the entry — the property
+/// that distinguishes it from pop, and the reason pop is not in this slice.
+///
+/// MUTATION: make the executor run `stash pop` instead of `stash apply` and
+/// this goes red on the still-listed assertion.
+#[tokio::test]
+async fn apply_stash_executes_through_the_pipeline() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "wip"]);
+    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ApplyStash {
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(oid.clone()).unwrap(),
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "a changed\n",
+        "the stash's changes are back in the tree"
+    );
+    assert!(
+        out(&repo, &["stash", "list"]).contains("wip"),
+        "apply KEEPS the entry — that is what makes it not a pop"
+    );
+}
+
+/// M3.24 (#77): **the safety property of the whole write path.** A selector is
+/// an index into a reflog, and every drop renumbers it. This drives the exact
+/// race: plan against `stash@{0}`, let the drawer move underneath, then submit.
+/// The compare-and-swap must refuse rather than drop a stash the user never
+/// chose.
+///
+/// MUTATION: delete the `stash_entry_still_at` call from `exec_drop_stash` and
+/// this goes red — the operation succeeds and destroys the wrong entry.
+#[tokio::test]
+async fn drop_stash_refuses_a_moved_selector() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "first\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "target"]);
+    let target_oid = out(&repo, &["rev-parse", "stash@{0}"]);
+
+    // Someone stashes again: "target" is now stash@{1}, and stash@{0} is a
+    // different entry entirely.
+    std::fs::write(repo.join("a.txt"), "second\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "innocent"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::DropStash {
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(target_oid).unwrap(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "a moved selector must refuse, not drop whatever now sits there: {body}"
+    );
+    let listed = out(&repo, &["stash", "list"]);
+    assert!(
+        listed.contains("innocent"),
+        "the entry that moved into the slot must survive: {listed}"
+    );
+    assert!(
+        listed.contains("target"),
+        "and so must the intended one: {listed}"
+    );
 }
 
 #[tokio::test]

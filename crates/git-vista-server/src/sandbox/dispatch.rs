@@ -286,6 +286,9 @@ fn wpath(s: &str) -> WorktreePath {
 /// variant renamed in `plan.rs` cannot quietly keep matching a stale string.
 fn variant_name(op: &GitOperation) -> &'static str {
     match op {
+        GitOperation::PushStash { .. } => "PushStash",
+        GitOperation::ApplyStash { .. } => "ApplyStash",
+        GitOperation::DropStash { .. } => "DropStash",
         GitOperation::CreateBranch { .. } => "CreateBranch",
         GitOperation::CommitOnHead { .. } => "CommitOnHead",
         GitOperation::EmptyCommitOnBranch { .. } => "EmptyCommitOnBranch",

@@ -913,6 +913,12 @@ fn recovery_oid(recovery: &RecoveryStrategy) -> Option<&CommitOid> {
         // `RecreateTag`'s doc in plan.rs — this pin is half the reason the
         // variant carries an oid instead of a message.
         RecoveryStrategy::RecreateTag { at, .. } => Some(at),
+        // M3.24 (#77): the same pin, for the same reason. A dropped stash's
+        // commit is dangling the moment the entry goes, alive only until
+        // gc.reflogExpireUnreachable. The recovery ref keeps it reachable, so
+        // the undo stays possible past that window — and it is why the variant
+        // carries an oid rather than only a message.
+        RecoveryStrategy::RecreateStashEntry { at, .. } => Some(at),
         RecoveryStrategy::RevertCommit { commit } => Some(commit),
         RecoveryStrategy::NotNeeded
         | RecoveryStrategy::DeleteCreatedBranch { .. }

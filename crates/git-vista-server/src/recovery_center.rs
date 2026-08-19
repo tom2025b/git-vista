@@ -286,6 +286,22 @@ pub(crate) async fn classify_recovery(
             }
         }
 
+        // M3.24 (#77). The pin (`durable::recovery_oid`) keeps the stash
+        // commit reachable, so the object is available — but a stash entry is
+        // a REFLOG LINE, not a ref, and there is no ref to resolve to ask
+        // "is it back?". `git stash store` would append a NEW entry at
+        // stash@{0} rather than restoring the original position, so the
+        // question "has this been recovered already?" has no honest live
+        // answer: two identical entries are indistinguishable from one
+        // recovered one.
+        //
+        // KnownNotWired is therefore the truthful class, not a placeholder —
+        // the strategy is real, recorded and pinned, and the button is
+        // deliberately absent until the wiring can say what it restores.
+        RecoveryStrategy::RecreateStashEntry { .. } => RecoveryClass::KnownNotWired {
+            strategy: strategy.clone(),
+        },
+
         RecoveryStrategy::DeleteCreatedTag { name } => {
             match resolve_ref_exact(repo, &tags(name.as_str())).await {
                 Err(_) => check_failed_spawn(),

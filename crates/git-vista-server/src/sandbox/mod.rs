@@ -770,6 +770,11 @@ pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         // no partial-clone promisor (a promisor fetch would make `CheckoutBranch`
         // and `RevertCommit` reach the network — see the note below), no
         // `git merge` of a remote-tracking ref this server does not create.
+        // M3.24 (#77): the stash drawer is entirely local — refs/stash never
+        // leaves the repository and no stash verb takes a remote.
+        GitOperation::PushStash { .. } => NetworkNeed::Local,
+        GitOperation::ApplyStash { .. } => NetworkNeed::Local,
+        GitOperation::DropStash { .. } => NetworkNeed::Local,
         GitOperation::CreateBranch { .. } => NetworkNeed::Local,
         GitOperation::CommitOnHead { .. } => NetworkNeed::Local,
         GitOperation::EmptyCommitOnBranch { .. } => NetworkNeed::Local,
