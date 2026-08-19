@@ -1277,6 +1277,18 @@ mod tests {
         _dir: tempfile::TempDir,
         repo: std::path::PathBuf,
         first: String,
+        /// Name of an *annotated* tag `fixture()` creates at `HEAD` (the
+        /// `second` commit), and the tag **object's own oid** — what
+        /// `git rev-parse --verify --quiet refs/tags/<name>` returns with no
+        /// `^{commit}` peel, i.e. exactly what [`resolve_ref_exact`] returns
+        /// and exactly what `RecoveryStrategy::RecreateTag::at` carries
+        /// (`durable::recovery_oid`'s own doc). A *peeled* `rev_parse` on
+        /// this same ref would return `HEAD`'s commit oid instead — a
+        /// different value — which is the whole reason a test needs a real
+        /// annotated tag rather than a lightweight one: only an annotated
+        /// tag makes the two reads diverge.
+        annotated_tag: String,
+        annotated_tag_oid: String,
     }
 
     fn fixture() -> Fixture {
@@ -1311,11 +1323,57 @@ mod tests {
         // a recovery pin exists to answer.
         std::fs::write(repo.join("a.txt"), "b\n").unwrap();
         run(&["commit", "-qam", "second"]);
+        let annotated_tag = "annotated-tag".to_string();
+        run(&["tag", "-a", &annotated_tag, "-m", "an annotated tag"]);
+        let annotated_tag_oid = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/tags/{annotated_tag}"),
+                ])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
         Fixture {
             _dir: dir,
             repo,
             first,
+            annotated_tag,
+            annotated_tag_oid,
         }
+    }
+
+    /// `git <args>` in `repo`, asserting success — for the tests below that
+    /// need commit history `fixture()` doesn't already provide (a conflicting
+    /// revert needs a third commit with a real dependency on the one being
+    /// reverted).
+    fn run_git(repo: &Path, args: &[&str]) {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?} failed in {repo:?}"
+        );
+    }
+
+    /// `git rev-parse <rev>` in `repo`, trimmed.
+    fn rev_parse_plain(repo: &Path, rev: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git rev-parse {rev} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     fn reset_ref_to(first: &str) -> RecoveryStrategy {
@@ -1510,6 +1568,142 @@ mod tests {
                 label: format!("Restore branch ‘gone’ at {}", &f.first[..7]),
                 warn_pushed: false,
             }
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // `classify_recreate_tag` — exercised nowhere else in this suite
+    // -------------------------------------------------------------------
+
+    /// The load-bearing reason `classify_recreate_tag` uses
+    /// [`resolve_ref_exact`] (no peel) rather than
+    /// [`crate::git_cmd::rev_parse`] (peels to `^{commit}`): an *annotated*
+    /// tag's ref does not point at the commit at all, it points at the tag
+    /// object, and `RecoveryStrategy::RecreateTag::at` pins that tag object's
+    /// own oid (`durable::recovery_oid`'s doc). With the tag still present
+    /// and unchanged, the live read must equal `at` and classify
+    /// `AlreadyCurrent`.
+    ///
+    /// Goes red if `resolve_ref_exact(repo, &tags(name))` in
+    /// `classify_recreate_tag` is swapped for the peeling
+    /// `crate::git_cmd::rev_parse(repo, &tags(name))`: the peeled read would
+    /// return the *commit* `HEAD` points at, not the tag object's oid, which
+    /// no longer equals `at` — the match falls through to
+    /// `Expired { NameReused }` instead, silently telling the user their own
+    /// still-current tag needs recreating.
+    #[tokio::test]
+    async fn recreating_a_still_present_annotated_tag_uses_the_tag_objects_own_oid() {
+        let f = fixture();
+        let id = OperationId::new("recreate-tag-already-current").unwrap();
+        let strategy = RecoveryStrategy::RecreateTag {
+            name: TagName::new(f.annotated_tag.clone()).unwrap(),
+            at: CommitOid::new(f.annotated_tag_oid.clone()).unwrap(),
+        };
+        crate::durable::write_recovery_ref(&f.repo, &id, &strategy).await;
+
+        // Sanity on the fixture itself: an annotated tag's own oid really is
+        // different from the commit it tags, or this test would pass for the
+        // wrong reason (peeled and unpeeled reads happening to agree).
+        let head = crate::git_cmd::rev_parse(&f.repo, "HEAD")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            f.annotated_tag_oid, head,
+            "fixture bug: an annotated tag object must not share its commit's oid"
+        );
+
+        let class = classify_recovery(&f.repo, &id, &GitOperation::StageAll, Some(&strategy)).await;
+        assert_eq!(class, RecoveryClass::AlreadyCurrent);
+    }
+
+    // -------------------------------------------------------------------
+    // `classify_revert_commit` — exercised nowhere else in this suite
+    // -------------------------------------------------------------------
+
+    /// A revert with nothing built on top of the commit being reverted must
+    /// classify `Offered`, live-established via
+    /// `crate::activity::revert_would_conflict` (`Ok(false)`) — the mirror
+    /// case of the conflicting test below.
+    ///
+    /// Goes red if the `Ok(true)`/`Ok(false)` arms at
+    /// `classify_revert_commit`'s `match … revert_would_conflict(..).await`
+    /// are swapped: a clean revert would then classify
+    /// `Expired { WouldConflict }` and carry no `UndoAction`.
+    #[tokio::test]
+    async fn reverting_the_current_tip_with_no_dependents_is_offered() {
+        let f = fixture();
+        let id = OperationId::new("revert-clean").unwrap();
+        let head = crate::git_cmd::rev_parse(&f.repo, "HEAD")
+            .await
+            .unwrap()
+            .unwrap();
+        let strategy = RecoveryStrategy::RevertCommit {
+            commit: CommitOid::new(head.clone()).unwrap(),
+        };
+        crate::durable::write_recovery_ref(&f.repo, &id, &strategy).await;
+
+        let class = classify_recovery(&f.repo, &id, &GitOperation::StageAll, Some(&strategy)).await;
+        assert_eq!(
+            class,
+            RecoveryClass::Offered {
+                undo: UndoAction::RevertCommit {
+                    commit: head.clone(),
+                },
+                label: format!("Revert {} (adds an inverse commit)", &head[..7]),
+                // This fixture has no remote-tracking refs at all, same
+                // reasoning as the `ResetRef` offer test above.
+                warn_pushed: false,
+            }
+        );
+    }
+
+    /// The conflicting mirror case, same repro shape as
+    /// `crate::activity`'s own
+    /// `a_commit_later_work_depends_on_is_reported_as_conflicting`: a commit
+    /// that adds a line, then a later commit whose own content depends on
+    /// that line staying present. Reverting the first must classify
+    /// `Expired { WouldConflict }`, live-established, and carry no
+    /// `UndoAction` — never `Offered` on the strength of "the pin still
+    /// resolves" alone.
+    ///
+    /// Goes red under the same swapped-arm mutation as the clean-case test
+    /// above, from the opposite direction: a genuinely conflicting revert
+    /// would classify `Offered` and hand the UI a button whose execution
+    /// `git revert` cannot actually complete cleanly.
+    #[tokio::test]
+    async fn reverting_a_commit_later_work_depends_on_is_expired_would_conflict() {
+        let f = fixture();
+        run_git(&f.repo, &["checkout", "-q", "main"]);
+        std::fs::write(f.repo.join("c.txt"), "line1\n").unwrap();
+        run_git(&f.repo, &["add", "c.txt"]);
+        run_git(&f.repo, &["commit", "-q", "-m", "base c"]);
+
+        std::fs::write(f.repo.join("c.txt"), "line1\nline2\n").unwrap();
+        run_git(&f.repo, &["add", "c.txt"]);
+        run_git(&f.repo, &["commit", "-q", "-m", "add line2"]);
+        let to_revert = rev_parse_plain(&f.repo, "HEAD");
+
+        std::fs::write(f.repo.join("c.txt"), "line1\nline2\nline3\n").unwrap();
+        run_git(&f.repo, &["add", "c.txt"]);
+        run_git(&f.repo, &["commit", "-q", "-m", "add line3, needs line2"]);
+
+        let id = OperationId::new("revert-conflict").unwrap();
+        let strategy = RecoveryStrategy::RevertCommit {
+            commit: CommitOid::new(to_revert.clone()).unwrap(),
+        };
+        crate::durable::write_recovery_ref(&f.repo, &id, &strategy).await;
+
+        let class = classify_recovery(&f.repo, &id, &GitOperation::StageAll, Some(&strategy)).await;
+        assert_eq!(
+            class,
+            RecoveryClass::Expired {
+                reason: RecoveryExpiredReason::WouldConflict
+            }
+        );
+        assert!(
+            !matches!(class, RecoveryClass::Offered { .. }),
+            "a commit later work depends on must never be offered as a clean revert"
         );
     }
 
