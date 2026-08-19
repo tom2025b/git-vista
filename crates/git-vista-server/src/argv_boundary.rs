@@ -279,6 +279,14 @@ const ALLOWED_GIT_CRATE_SPAWN_SITES: &[&str] = &[
     // `Command::new` sites build tagged fixture repositories (`git tag`,
     // `git mktag`, `git pack-refs`) for the suite to read back.
     "src/tags.rs",
+    // M3.24 (#77): `#[cfg(test)]` fixture setup only, same posture as the two
+    // above. `read_stashes` spawns nothing — it opens the repository with
+    // `gix::open_opts(.., isolated())` and walks `refs/stash`'s reflog out of
+    // the mapped ref store. The file's only `Command::new` sites build stashed
+    // fixture repositories for the suite to read back, including two that pin
+    // properties of *git itself* (one commit can occupy two stash slots;
+    // dropping renumbers the entries below) rather than of this code.
+    "src/stash.rs",
 ];
 
 /// The one carve-out from "every spawn site names `git` literally": sites that

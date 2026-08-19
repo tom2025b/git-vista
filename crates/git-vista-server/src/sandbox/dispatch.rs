@@ -381,6 +381,20 @@ fn variant_names_the_enum_declares() -> std::collections::BTreeSet<String> {
 fn every_operation() -> Vec<GitOperation> {
     let tip = "1111111111111111111111111111111111111111";
     vec![
+        // M3.24 (#77) — all three are Local: refs/stash never leaves the repo.
+        GitOperation::PushStash {
+            message: None,
+            keep_index: false,
+            include_untracked: true,
+        },
+        GitOperation::ApplyStash {
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").expect("valid selector"),
+            expected_oid: oid(tip),
+        },
+        GitOperation::DropStash {
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").expect("valid selector"),
+            expected_oid: oid(tip),
+        },
         GitOperation::CreateBranch {
             name: branch("feature"),
             at: oid(tip),
@@ -538,6 +552,9 @@ fn every_operation_declares_every_variant() {
         "DeleteLocalTag",
         "DeleteRemoteTag",
         "PushTag",
+        "PushStash",
+        "ApplyStash",
+        "DropStash",
     ]
     .into_iter()
     .collect();
@@ -679,7 +696,7 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     let ops = every_operation();
     assert_eq!(
         ops.len(),
-        25,
+        28,
         "every_operation() must list every GitOperation variant; the enum has 25 \
          (this literal is a tripwire, not the enforcement — \
          every_operation_covers_every_variant_the_enum_declares is what checks \
@@ -708,8 +725,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     );
     assert_eq!(
         local.len(),
-        20,
-        "the other twenty operations must stay Local; declared Local: {local:?}"
+        23,
+        "the other twenty-three operations must stay Local; declared Local: {local:?}"
     );
 }
 

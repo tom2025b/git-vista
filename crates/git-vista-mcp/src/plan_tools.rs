@@ -87,15 +87,26 @@ pub(crate) enum Exposure {
 pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
     use Exposure::{Excluded, Tool};
     match op {
-        // M3.24 (#77). Push and Apply get tools; Drop is Excluded — it is
-        // Destructive and its safety rests on a compare-and-swap against a
-        // reflog position that an agent cannot meaningfully re-derive between
-        // planning and submitting. A human reading the drawer can.
-        GitOperation::PushStash { .. } => Tool("plan_push_stash"),
-        GitOperation::ApplyStash { .. } => Tool("plan_apply_stash"),
+        // M3.24 (#77) — all three excluded for now, and the reason is the same
+        // one for each: an agent cannot choose a stash entry it cannot see.
+        //
+        // Every stash operation is addressed by a POSITIONAL selector
+        // (`stash@{n}`) that renumbers on every drop, and this surface has no
+        // stash-listing tool yet. Exposing a planner without the reader would
+        // be exposing a tool whose only safe use requires information the
+        // agent has no way to obtain — it would have to guess `stash@{0}` and
+        // hope. The tools land with the read tool, in their own slice.
+        GitOperation::PushStash { .. } => Excluded(
+            "the stash tool surface lands with its stash-listing reader; a planner \
+             without one would invite guessing at entries",
+        ),
+        GitOperation::ApplyStash { .. } => Excluded(
+            "addressed by a positional selector this surface cannot yet list, so an \
+             agent could only guess which entry it is applying",
+        ),
         GitOperation::DropStash { .. } => Excluded(
             "destructive, and its safety rests on a compare-and-swap against a reflog \
-             position an agent cannot re-derive between planning and submitting",
+             position an agent cannot see or re-derive between planning and submitting",
         ),
         GitOperation::CreateBranch { .. } => Tool("plan_create_branch"),
         GitOperation::CommitOnHead { .. } => Tool("plan_commit_on_head"),
@@ -1098,7 +1109,19 @@ mod tests {
     /// The two wire tags this crate deliberately does not expose. Written out
     /// as tags (not as `Exposure::Excluded` results) so the census below can
     /// compare two independently-authored lists.
-    const UNEXPOSED_TAGS: &[&str] = &["reset_test_repo", "stage_selection"];
+    // M3.24 (#77): the three stash operations are unexposed for one shared
+    // reason — every stash entry is addressed by a positional selector that
+    // renumbers on every drop, and this surface has no stash-listing tool yet.
+    // A planner without the reader would be a tool whose only safe use needs
+    // information the agent cannot obtain. They land together, in their own
+    // slice. See `exposure_of` for the per-operation wording.
+    const UNEXPOSED_TAGS: &[&str] = &[
+        "reset_test_repo",
+        "stage_selection",
+        "push_stash",
+        "apply_stash",
+        "drop_stash",
+    ];
 
     fn catalog_names() -> Vec<String> {
         plan_tool_catalog()
@@ -1203,6 +1226,23 @@ mod tests {
         let tag = |s: &str| TagName::new(s).unwrap();
         let path = |s: &str| WorktreePath::new(s).unwrap();
         vec![
+            // M3.24 (#77). DropStash is Excluded from the tool surface but
+            // must still appear here: the census proves every protocol variant
+            // has a considered exposure, and "deliberately excluded" is an
+            // answer the census has to see.
+            GitOperation::PushStash {
+                message: None,
+                keep_index: false,
+                include_untracked: true,
+            },
+            GitOperation::ApplyStash {
+                entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+                expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+            },
+            GitOperation::DropStash {
+                entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+                expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+            },
             GitOperation::CreateBranch {
                 name: branch("b"),
                 at: oid(&zeros),
