@@ -24,7 +24,7 @@
 //! endpoint needs, plus a compare-and-swap `expected_tip` so a stale menu
 //! can't reset a branch that has since moved.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -121,7 +121,62 @@ pub struct ActivityEvent {
     pub source: ActivitySource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo: Option<Undoable>,
+    /// The complete local branch -> tip map as it stood when this event was
+    /// journaled (#131). This is what lets a future time scrubber replay
+    /// history *losslessly* — including branches that no longer exist —
+    /// instead of depending on the reflog, which expires at ~90 days, keeps
+    /// only 200 entries per ref, and is deleted outright with its branch.
+    ///
+    /// `None` means no capture is recorded: the event predates this field, or
+    /// it was journaled somewhere without a real `.git` directory. It does
+    /// NOT mean the repo had no branches — see [`RefsAtEvent`], whose whole
+    /// purpose is keeping those three answers apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs: Option<RefsAtEvent>,
 }
+
+/// The branch -> tip capture attached to a journaled event.
+///
+/// **Why this is an enum and not a map.** A replayer asking "which branches
+/// existed at this moment?" must be able to tell three answers apart:
+///
+/// | value | meaning | what a replay may conclude |
+/// |---|---|---|
+/// | field absent (`None`) | no capture was attempted | nothing — this event carries no ref history |
+/// | [`Self::CaptureFailed`] | we tried and could not read the refs | nothing — and it must NOT infer deletions |
+/// | [`Self::Captured`] | a real observation, possibly of zero branches | the map is the truth at that instant |
+///
+/// Collapsing the middle row into an empty map would make a failed read
+/// indistinguishable from "every branch was deleted" — the most destructive
+/// reading available, produced by the least informative event. That is the
+/// exact defect class this codebase spent 2026-08-18 removing, so the storage
+/// format refuses to allow it in the first place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RefsAtEvent {
+    /// The refs were read. `branches` is the full local branch -> tip map at
+    /// that instant, and an empty map is a legitimate observation (a repo
+    /// before its first commit genuinely has no branches).
+    Captured {
+        branches: BTreeMap<String, String>,
+        /// `Some(total)` when the repo had more branches than the journal
+        /// records per event, carrying the true count. The map then holds the
+        /// first [`REFS_PER_EVENT_CAP`] by name order. Never silently capped:
+        /// a replayer that cannot see the truncation would read the missing
+        /// branches as deleted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        truncated_at: Option<usize>,
+    },
+    /// The read failed, and the reason is preserved. A replayer must treat
+    /// this as "no information", never as "no branches".
+    CaptureFailed { reason: String },
+}
+
+/// How many branches one journal line records. #131 budgeted "a few KB per
+/// operation"; at ~50 bytes per entry this holds that line for any repo a
+/// person actually works in, and repos past it record the overflow honestly
+/// via `truncated_at` rather than lying by omission.
+pub const REFS_PER_EVENT_CAP: usize = 500;
 
 /// One raw reflog line, as read natively by `git-vista-git` — ref name plus
 /// the entry's old/new oids, timestamp and message. Defined here (not in the
@@ -298,6 +353,8 @@ pub fn assemble_feed(
                 new_oid: Some(entry.new_oid.clone()),
                 source: ActivitySource::External,
                 undo: None,
+                // Reflog-derived: no branch-tip capture exists for it (#131).
+                refs: None,
             });
             i = span + 1;
             continue;
@@ -311,6 +368,8 @@ pub fn assemble_feed(
             new_oid: Some(entry.new_oid.clone()),
             source: ActivitySource::External,
             undo: None,
+            // Reflog-derived: no branch-tip capture exists for it (#131).
+            refs: None,
         });
         i += 1;
     }
@@ -490,6 +549,8 @@ fn fold_one_kind(out: &mut Vec<ActivityEvent>, mut group: Vec<ActivityEvent>, no
                 ActivitySource::External
             },
             undo: None,
+            // Reflog-derived: no branch-tip capture exists for it (#131).
+            refs: None,
         });
     }
 }
@@ -741,6 +802,7 @@ mod tests {
             new_oid: Some("m".into()),
             source: ActivitySource::App,
             undo: None,
+            refs: None,
         }];
         let reflog = vec![
             entry("main", 100, "a", "m", "merge feature: Merge made by 'ort'"),
@@ -766,6 +828,7 @@ mod tests {
             new_oid: Some("a".into()),
             source: ActivitySource::App,
             undo: None,
+            refs: None,
         }];
         let reflog = vec![entry("feature", 100, "m", "a", "branch: Reset to a")];
         let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 10);
@@ -786,6 +849,7 @@ mod tests {
             new_oid: Some("x".into()),
             source: ActivitySource::App,
             undo: None,
+            refs: None,
         }];
         let reflog = vec![entry("main", 99, "w", "x", "commit: quick fix")];
         let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 10);
@@ -803,6 +867,7 @@ mod tests {
             new_oid: None,
             source: ActivitySource::App,
             undo: None,
+            refs: None,
         };
         // Branch absent → restorable.
         let feed = assemble_feed(
@@ -893,6 +958,7 @@ mod tests {
                 new_oid: Some(format!("new-{r}")),
                 source: ActivitySource::App,
                 undo: None,
+                refs: None,
             })
             .collect();
         let reflog = refs
@@ -985,6 +1051,7 @@ mod tests {
             new_oid: Some("b".into()),
             source: ActivitySource::App,
             undo: None,
+            refs: None,
         });
 
         let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 50);

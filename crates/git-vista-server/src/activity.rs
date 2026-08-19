@@ -26,7 +26,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use git_vista_core::activity::{
-    assemble_feed, ActivityEvent, ActivityKind, ActivitySource, UndoAction, Undoable,
+    assemble_feed, ActivityEvent, ActivityKind, ActivitySource, RefsAtEvent, UndoAction, Undoable,
 };
 use git_vista_core::model::RefKind;
 use git_vista_git::{read_commit, read_reflogs, read_refs, read_remote_commits, RepoError};
@@ -97,6 +97,19 @@ pub async fn activity_feed(
                         new_oid: None,
                         source: ActivitySource::External,
                         undo: None,
+                        // This event is synthesized on NOTICING a deletion
+                        // that already happened, so the live repo no longer
+                        // holds the branch. Attach the map that still does —
+                        // the snapshot we are diffing against — rather than
+                        // letting append() capture a present that has already
+                        // lost the very branch this event is about (#131).
+                        refs: Some(RefsAtEvent::Captured {
+                            branches: snapshot
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                            truncated_at: None,
+                        }),
                     },
                 );
                 println!(
