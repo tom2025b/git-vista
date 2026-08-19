@@ -765,29 +765,46 @@ fn clamp_limit(requested: Option<u32>) -> u32 {
     }
 }
 
-/// Split a `limit + 1` lookahead fetch into the page to return and the cursor
+/// Split a `limit + 1` lookahead scan into the page to return and the cursor
 /// for the next one.
 ///
-/// Pure, and separated from the query for exactly that reason: the two ways to
-/// get this wrong are both silent in production and both trivially testable
-/// here. `next_cursor` is `Some` **only** when a `(limit + 1)`th row actually
-/// came back — the existence of a next page is a fact this function observed,
-/// not an inference from "we asked for a full page" — and it is built from the
-/// **last row actually returned**, after the lookahead row is dropped. Building
-/// it from the request shape instead would hand back a working-looking cursor
-/// on the final page too, turning "no more rows" into an endless scroll.
+/// Pure, and separated from the query for exactly that reason: the ways to get
+/// this wrong are all silent in production and all trivially testable here.
+///
+/// It operates on **scanned keys**, not decoded rows — that distinction is
+/// load-bearing twice:
+///
+/// * `next_cursor` is `Some` **only** when a `(limit + 1)`th row was actually
+///   *scanned* — the existence of a next page is a fact the query observed,
+///   never an inference from "we asked for a full page" (which would hand back
+///   a working-looking cursor on the final page too, turning "no more rows"
+///   into an endless scroll), and never a count of the rows that happened to
+///   decode. Counting decoded survivors ended the list early: one undecodable
+///   row inside the window shrank the lookahead to `limit`, read as "last
+///   page", and permanently hid every older operation — the exact "one bad
+///   row must not make other operations unrecoverable" failure the durable
+///   layer promises against.
+/// * The cursor is built from the **last scanned key inside the page window**,
+///   after the lookahead row is dropped — whether or not that row's payload
+///   decoded. The next page resumes past the full window, so an undecodable
+///   row costs exactly itself, never its neighbours.
+///
+/// The page returns the window's decodable rows; a `status: None` entry is
+/// already logged by the durable layer and appears nowhere else.
 fn split_page(
-    mut rows: Vec<OperationStatus>,
+    mut scanned: Vec<crate::durable::ScannedOperation>,
     limit: u32,
 ) -> (Vec<OperationStatus>, Option<HistoryCursor>) {
-    if rows.len() as u32 <= limit {
-        return (rows, None);
-    }
-    rows.truncate(limit as usize);
-    let cursor = rows.last().map(|r| HistoryCursor {
-        accepted_at: r.accepted_at,
-        id: r.id.clone(),
-    });
+    let cursor = if scanned.len() as u32 > limit {
+        scanned.truncate(limit as usize);
+        scanned.last().map(|s| HistoryCursor {
+            accepted_at: s.accepted_at,
+            id: s.id.clone(),
+        })
+    } else {
+        None
+    };
+    let rows = scanned.into_iter().filter_map(|s| s.status).collect();
     (rows, cursor)
 }
 
@@ -1072,21 +1089,40 @@ mod tests {
         }
     }
 
+    /// A scanned row whose payload decoded — the ordinary shape.
+    fn scanned(id: &str, accepted_at: i64) -> crate::durable::ScannedOperation {
+        crate::durable::ScannedOperation {
+            accepted_at: UnixSeconds(accepted_at),
+            id: OperationId::new(id).unwrap(),
+            status: Some(row(id, accepted_at)),
+        }
+    }
+
+    /// A scanned key whose payload failed to decode — the `status: None` shape
+    /// the durable layer hands back for a corrupt row.
+    fn scanned_undecodable(id: &str, accepted_at: i64) -> crate::durable::ScannedOperation {
+        crate::durable::ScannedOperation {
+            accepted_at: UnixSeconds(accepted_at),
+            id: OperationId::new(id).unwrap(),
+            status: None,
+        }
+    }
+
     /// A full page plus the lookahead row: the lookahead is dropped, and the
-    /// cursor names the last row **actually returned**.
+    /// cursor names the last scanned key **inside the page window**.
     ///
     /// Goes red if `split_page` builds the cursor from the lookahead row
-    /// instead (`rows.last()` before the truncate) — the next page would then
+    /// instead (`.last()` before the truncate) — the next page would then
     /// skip a row, silently, forever.
     #[test]
     fn a_full_page_reports_the_cursor_of_its_last_returned_row() {
-        let rows = vec![row("a", 300), row("b", 200), row("c", 100)];
+        let rows = vec![scanned("a", 300), scanned("b", 200), scanned("c", 100)];
         let (page, cursor) = split_page(rows, 2);
         assert_eq!(
             page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             vec!["a", "b"]
         );
-        let cursor = cursor.expect("a lookahead row came back, so there is a next page");
+        let cursor = cursor.expect("a lookahead row was scanned, so there is a next page");
         assert_eq!(cursor.id.as_str(), "b");
         assert_eq!(cursor.accepted_at, UnixSeconds(200));
     }
@@ -1094,18 +1130,18 @@ mod tests {
     /// The last page reports no cursor even when it is exactly `limit` long —
     /// the only honest signal that there is nothing more.
     ///
-    /// Goes red if `split_page` decides on `rows.len() == limit` (an
+    /// Goes red if `split_page` decides on `scanned.len() == limit` (an
     /// off-by-one that hands back a cursor for a page with nothing after it):
     /// the client would fetch an empty page forever, which in a browser with
     /// no shell is an infinite scroll with no exit.
     #[test]
     fn an_exactly_full_last_page_reports_no_cursor() {
-        let rows = vec![row("a", 300), row("b", 200)];
+        let rows = vec![scanned("a", 300), scanned("b", 200)];
         let (page, cursor) = split_page(rows, 2);
         assert_eq!(page.len(), 2);
         assert!(
             cursor.is_none(),
-            "no lookahead row came back, so this was the last page"
+            "no lookahead row was scanned, so this was the last page"
         );
     }
 
@@ -1114,6 +1150,62 @@ mod tests {
         let (page, cursor) = split_page(Vec::new(), 25);
         assert!(page.is_empty());
         assert!(cursor.is_none());
+    }
+
+    /// **The one-bad-row case from pre-merge review (codex, 2026-08-18).**
+    /// `limit + 1` rows were scanned but one inside the page window failed to
+    /// decode: the page comes back one row short AND `next_cursor` is still
+    /// `Some`, pointing past the full scanned window — the bad row costs
+    /// exactly itself, never the older history behind it.
+    ///
+    /// Goes red two ways:
+    /// * if the next-page decision reverts to counting decoded rows
+    ///   (post-drop `rows.len() <= limit`) — the cursor comes back `None`,
+    ///   and "c" plus every older row is permanently hidden behind one
+    ///   corrupt neighbour;
+    /// * if the cursor is built from the last *decoded* row instead of the
+    ///   last *scanned* key — it would name ("a", 300), and the next page
+    ///   would re-scan from the top of the window instead of resuming past
+    ///   it.
+    #[test]
+    fn an_undecodable_row_inside_the_window_does_not_end_the_list() {
+        let rows = vec![
+            scanned("a", 300),
+            scanned_undecodable("b", 200),
+            scanned("c", 100),
+        ];
+        let (page, cursor) = split_page(rows, 2);
+        assert_eq!(
+            page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["a"],
+            "the bad row is dropped from the page — and only the bad row"
+        );
+        let cursor = cursor.expect(
+            "a (limit + 1)th row was scanned, so there IS a next page — None here \
+             is exactly how one bad row used to hide all older history",
+        );
+        assert_eq!(cursor.id.as_str(), "b");
+        assert_eq!(cursor.accepted_at, UnixSeconds(200));
+    }
+
+    /// The lookahead row's decodability is irrelevant to the next-page
+    /// decision: a scanned `(limit + 1)`th row proves more history exists
+    /// even when that particular row will never render.
+    ///
+    /// Goes red if the lookahead is judged on the rows that decoded rather
+    /// than the rows that were scanned.
+    #[test]
+    fn an_undecodable_lookahead_row_still_proves_a_next_page() {
+        let rows = vec![
+            scanned("a", 300),
+            scanned("b", 200),
+            scanned_undecodable("c", 100),
+        ];
+        let (page, cursor) = split_page(rows, 2);
+        assert_eq!(page.len(), 2);
+        let cursor = cursor.expect("three rows scanned at limit 2 means a next page exists");
+        assert_eq!(cursor.id.as_str(), "b");
+        assert_eq!(cursor.accepted_at, UnixSeconds(200));
     }
 
     #[test]

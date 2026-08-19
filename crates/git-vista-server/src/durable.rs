@@ -650,13 +650,72 @@ fn state_literal(state: OperationState) -> &'static str {
     }
 }
 
+/// One row the history query scanned: the keyset key `(accepted_at, id)` the
+/// row occupies in the walk, plus the decoded record when the row's payload
+/// columns decoded too.
+///
+/// The key and the payload deliberately do not share a fate. The key columns
+/// are plain `INTEGER`/`TEXT` SELECT columns the server itself wrote, and they
+/// decode even when a fragile payload field (`operation_json`, a token, a
+/// state spelling) does not. Handing the caller only the decoded survivors —
+/// as this query once did — let one bad row shrink a `limit + 1` lookahead to
+/// `limit` rows, which the pager then read as "last page": a single
+/// undecodable row silently hid **every older row** behind it. That breaks
+/// this module's own promise that one bad row must not make other operations
+/// unrecoverable. With the key carried separately, the pager counts and
+/// cursors on what was *scanned*, and a bad row costs exactly itself.
+#[derive(Debug)]
+pub(crate) struct ScannedOperation {
+    pub accepted_at: UnixSeconds,
+    pub id: OperationId,
+    /// `None` when the payload didn't decode — logged, dropped from the page,
+    /// but still counted and still able to carry the cursor past itself.
+    pub status: Option<OperationStatus>,
+}
+
+/// [`row_to_status`], with the keyset key read first and kept even when the
+/// payload fails to decode.
+///
+/// `Ok(None)` — the row vanishing from the scan entirely — is reserved for a
+/// key that is itself unreadable: an `id` column that no longer satisfies
+/// [`OperationId`]'s token rule. The server minted and validated every id it
+/// wrote and `id` is the table's PRIMARY KEY, so that takes out-of-band
+/// database tampering, not a bad payload; such a row can be neither returned
+/// nor named in a cursor, and dropping it is the only honest option left.
+/// (A rusqlite type error on the key columns surfaces as `Err` from
+/// `query_map` and is likewise logged and dropped by the caller.)
+fn row_to_scanned(row: &rusqlite::Row) -> rusqlite::Result<Option<ScannedOperation>> {
+    let raw_id: String = row.get(0)?;
+    let accepted_at: i64 = row.get(8)?;
+    let Ok(id) = OperationId::new(raw_id) else {
+        eprintln!("git-vista: a journal row's id column isn't an operation id; skipped");
+        return Ok(None);
+    };
+    let status = match row_to_status(row) {
+        Ok(Some((_key, status))) => Some(status),
+        Ok(None) => None, // a field didn't parse; already logged in row_to_status
+        Err(e) => {
+            // A payload column the SQL driver itself couldn't read (a type
+            // mismatch, say). Same outcome as a parse failure: the record is
+            // gone, the key is not.
+            eprintln!("git-vista: couldn't read a history row's payload: {e}");
+            None
+        }
+    };
+    Ok(Some(ScannedOperation {
+        accepted_at: UnixSeconds(accepted_at),
+        id,
+        status,
+    }))
+}
+
 fn select_operations_blocking(
     conn: &Connection,
     repository: &RepositoryToken,
     states: &[OperationState],
     before: Option<&(UnixSeconds, OperationId)>,
     limit: u32,
-) -> rusqlite::Result<Vec<OperationStatus>> {
+) -> rusqlite::Result<Vec<ScannedOperation>> {
     let state_list = states
         .iter()
         .copied()
@@ -685,13 +744,13 @@ fn select_operations_blocking(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         params![repository.as_str(), before_secs, before_id, limit as i64],
-        row_to_status,
+        row_to_scanned,
     )?;
     let mut out = Vec::new();
     for row in rows {
         match row {
-            Ok(Some((_key, status))) => out.push(status),
-            Ok(None) => {} // a field didn't parse; already logged in row_to_status
+            Ok(Some(entry)) => out.push(entry),
+            Ok(None) => {} // the key itself was unreadable; logged in row_to_scanned
             Err(e) => eprintln!("git-vista: couldn't read a history row: {e}"),
         }
     }
@@ -1283,6 +1342,53 @@ mod tests {
         assert_eq!(
             rows.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
             vec!["mine"]
+        );
+    }
+
+    /// A row whose payload no longer decodes must still be **scanned** — key
+    /// intact, `status: None` — never silently dropped from the walk.
+    ///
+    /// This is the durable half of the pagination fix: `recovery_center`'s
+    /// pager counts and cursors on scanned keys, which only works if a bad row
+    /// reaches it as a keyed entry. Goes red if `row_to_scanned` reverts to
+    /// returning only decoded survivors — the corrupt row vanishes, the scan
+    /// comes back one short, and one bad row can again hide every older
+    /// operation behind it.
+    #[test]
+    fn a_row_with_an_undecodable_payload_is_scanned_with_its_key_intact() {
+        let (_dir, path) = scratch_db();
+        let conn = open_at(&path).unwrap();
+        for (id, at) in [("op-new", 300), ("op-bad", 200), ("op-old", 100)] {
+            let mut status = sample(id);
+            status.accepted_at = UnixSeconds(at);
+            status.ended_at = Some(UnixSeconds(at + 1));
+            insert_or_update(&conn, &key(id), &status).unwrap();
+        }
+        // Corrupt the middle row's payload out-of-band, the way a partial
+        // write or a hand edit would. Its key columns are untouched.
+        conn.execute(
+            "UPDATE operations SET operation_json = 'not json' WHERE id = 'op-bad'",
+            [],
+        )
+        .unwrap();
+
+        let repo = RepositoryToken::new("r").unwrap();
+        let terminal = &[OperationState::Succeeded, OperationState::Failed][..];
+        let rows = select_operations_blocking(&conn, &repo, terminal, None, 50).unwrap();
+
+        assert_eq!(
+            rows.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["op-new", "op-bad", "op-old"],
+            "the corrupt row must still occupy its place in the scan"
+        );
+        assert_eq!(rows[1].accepted_at, UnixSeconds(200));
+        assert!(
+            rows[1].status.is_none(),
+            "the corrupt row's payload must be dropped, not guessed at"
+        );
+        assert!(
+            rows[0].status.is_some() && rows[2].status.is_some(),
+            "the rows around it decode as before"
         );
     }
 
