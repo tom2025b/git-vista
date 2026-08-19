@@ -613,12 +613,16 @@ fn parse_stage(s: &str) -> Option<OperationStage> {
 /// only ever breaks a tie among rows sharing one `accepted_at` — and
 /// `UnixSeconds` has one-second resolution, so ties are ordinary, not an edge
 /// case.
+///
+/// Returns **every row the query scanned**, as [`ScannedOperation`]s, not just
+/// the ones whose payload decoded — see that type for why the caller's
+/// pagination must be able to tell "the scan ended" from "a row was dropped".
 pub(crate) async fn list_operations(
     repository: RepositoryToken,
     states: &'static [OperationState],
     before: Option<(UnixSeconds, OperationId)>,
     limit: u32,
-) -> Result<Vec<OperationStatus>, DurableError> {
+) -> Result<Vec<ScannedOperation>, DurableError> {
     let result = tokio::task::spawn_blocking(move || {
         let conn = db()?;
         let conn = conn.lock().expect("operations db lock");

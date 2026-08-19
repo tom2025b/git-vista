@@ -366,7 +366,7 @@ async fn classify_reset_ref(
         },
         Ok(Some(current)) if current == to.as_str() => RecoveryClass::AlreadyCurrent,
         Ok(Some(current)) => {
-            let warn_pushed = tip_is_pushed(repo, &current);
+            let warn_pushed = tip_is_pushed(repo, &current).await;
             RecoveryClass::Offered {
                 undo: UndoAction::ResetBranch {
                     branch: branch.to_string(),
@@ -500,7 +500,7 @@ async fn classify_revert_commit(
                 commit: commit.as_str().to_string(),
             },
             label: format!("Revert {} (adds an inverse commit)", short(commit.as_str())),
-            warn_pushed: tip_is_pushed(repo, commit.as_str()),
+            warn_pushed: tip_is_pushed(repo, commit.as_str()).await,
         },
         Err(_) => check_failed_spawn(),
     }
@@ -556,7 +556,23 @@ async fn resolve_ref_exact(repo: &Path, ref_name: &str) -> Result<Option<String>
         .await
         .map_err(|e| format!("couldn't run git rev-parse: {e}"))?;
     if !output.status.success() {
-        return Ok(None);
+        // ONLY git's documented missing-ref exit is "the ref does not
+        // resolve". `rev-parse --verify --quiet` exits 1 for an unresolvable
+        // ref and says nothing; a FATAL failure (unreadable ref store, exit
+        // 128) is a check that did not run to completion, and the doc comment
+        // above already promised that distinction — the body then collapsed
+        // it, so a fatal probe read as "name is free" and could turn into an
+        // Offered recovery. Found by codex (a different model) in pre-merge
+        // review, 2026-08-18: "the check never returned a positive absence."
+        let code = output.status.code();
+        if code == Some(1) && output.stderr.is_empty() {
+            return Ok(None);
+        }
+        return Err(format!(
+            "git rev-parse --verify failed (exit {:?}): {}",
+            code,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok((!id.is_empty()).then_some(id))
@@ -566,14 +582,34 @@ async fn resolve_ref_exact(repo: &Path, ref_name: &str) -> Result<Option<String>
 /// version of `undo_hint`'s `remote.contains(new)`, recomputed here because
 /// classification has no caller-supplied remote set to reuse.
 ///
-/// A read failure defaults to `true`: this feeds a confirm-dialog warning
+/// One `git rev-list -n 1 <tip> --not --remotes` answers exactly this
+/// question, uncapped. The previous version reused `read_remote_commits`
+/// with the display cap `HISTORY_LIMIT` — safe for the newest-window history
+/// view it was built for (its doc proves that bound), and WRONG here, where
+/// pages reach arbitrarily old operations: a pushed commit older than the
+/// newest `HISTORY_LIMIT` remote commits fell outside the set and read as
+/// not-pushed, so a reset offer shipped without its "already pushed"
+/// warning. Its inner walk also skipped unreadable refs and still returned
+/// `Ok`, slipping an incomplete set past the over-warn default. Found by
+/// codex in pre-merge review, 2026-08-18.
+///
+/// A failure still defaults to `true`: this feeds a confirm-dialog warning
 /// only, never the offer decision, so the safe default is to over-warn. That
 /// asymmetry with this module's fail-closed rule is deliberate — the rule is
 /// about whether to show a button at all, not about this one piece of copy.
-fn tip_is_pushed(repo: &Path, tip: &str) -> bool {
-    read_remote_commits(repo, crate::state::HISTORY_LIMIT)
-        .map(|remote| remote.contains(tip))
-        .unwrap_or(true)
+/// With `rev-list`, git enumerates the remote refs itself, so an unreadable
+/// ref store is a non-zero exit here rather than a silently smaller set.
+async fn tip_is_pushed(repo: &Path, tip: &str) -> bool {
+    match crate::git_cmd::git_output(repo, &["rev-list", "-n", "1", tip, "--not", "--remotes"])
+        .await
+    {
+        // Empty output: every path from `tip` is cut off by a remote ref —
+        // the tip is on a remote. Non-empty: rev-list emitted the tip, so no
+        // remote ref reaches it.
+        Ok(out) if out.status.success() => out.stdout.iter().all(|b| b.is_ascii_whitespace()),
+        // Fatal or spawn failure: we could not tell. Over-warn.
+        _ => true,
+    }
 }
 
 /// The conventional 7-character short id, for labels.
