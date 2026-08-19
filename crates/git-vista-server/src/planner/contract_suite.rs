@@ -161,10 +161,11 @@ async fn tracked_pipeline(repo: &Path, op: GitOperation, key: &str) -> (StatusCo
     let hash = operation_hash(&op);
     let (repository, worktree) = tokens();
     let k = IdempotencyKey::new(format!("contract-{key}")).unwrap();
-    let (handle, record) = match crate::operations::admit(&k, &op, &hash, repository, worktree) {
-        crate::operations::Admission::Fresh(handle, record) => (handle, record),
-        _ => panic!("‘{key}’ must be a fresh idempotency key in this binary"),
-    };
+    let (handle, record) =
+        match crate::operations::admit(&k, &op, &hash, repository, worktree, None) {
+            crate::operations::Admission::Fresh(handle, record) => (handle, record),
+            _ => panic!("‘{key}’ must be a fresh idempotency key in this binary"),
+        };
     let out = crate::operations::with_progress(
         record,
         plan_and_execute_in(repo, None, tokens(), op.clone()),
@@ -2516,11 +2517,28 @@ fn the_recovery_pin_is_composed_inside_the_guard_before_execution() {
 /// that is what makes them impossible for a new handler to forget — while the
 /// guarded pipeline has to stay reachable underneath, or the tracked path would
 /// silently stop taking the repository guard.
+///
+/// M3.25 (#78) added a second public entry point,
+/// `plan_and_execute_recovery`, so "the outermost entry point" is now the one
+/// block both of them delegate into: `plan_and_execute_maybe_recovery`. The
+/// three gate assertions moved there with the code, and this test additionally
+/// pins **both** public entries to delegating into it — which is strictly more
+/// than it checked before, and is the assertion that would catch the tempting
+/// wrong fix (copying the gate block into the recovery entry point, where it
+/// can then drift).
 #[test]
 fn the_global_entry_point_delegates_through_the_lifecycle_to_the_pipeline() {
     let src = source("src/planner.rs");
 
-    let outer = fn_body(&src, "plan_and_execute");
+    for entry in ["plan_and_execute", "plan_and_execute_recovery"] {
+        assert!(
+            fn_body(&src, entry).contains("plan_and_execute_maybe_recovery("),
+            "‘{entry}’ must delegate into the one gated block, never carry its \
+             own copy of the write gate"
+        );
+    }
+
+    let outer = fn_body(&src, "plan_and_execute_maybe_recovery");
     assert!(
         outer.contains("reject_if_read_only()"),
         "the write gate must stay on the global entry point"

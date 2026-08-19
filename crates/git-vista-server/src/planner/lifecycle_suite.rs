@@ -109,7 +109,7 @@ async fn tracked(
 fn record_for(key: &IdempotencyKey, op: &GitOperation) -> std::sync::Arc<operations::Record> {
     let hash = operation_hash(op);
     let (repository, worktree) = tokens();
-    match operations::admit(key, op, &hash, repository, worktree) {
+    match operations::admit(key, op, &hash, repository, worktree, None) {
         Admission::Existing(record) => record,
         Admission::Fresh(..) => panic!("the key should already have been admitted"),
         Admission::Conflict => panic!("the key should name this very operation"),

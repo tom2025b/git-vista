@@ -159,7 +159,7 @@ fn admit_push(
 ) -> (crate::operations::OperationHandle, std::sync::Arc<Record>) {
     let hash = operation_hash(op);
     let (repository, worktree) = tokens();
-    match crate::operations::admit(&key(name), op, &hash, repository, worktree) {
+    match crate::operations::admit(&key(name), op, &hash, repository, worktree, None) {
         Admission::Fresh(handle, record) => (handle, record),
         _ => panic!("a fresh key must be admitted"),
     }

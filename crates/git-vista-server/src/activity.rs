@@ -312,7 +312,13 @@ pub async fn undoables(
 /// spawn failed, or `merge-tree` exited some other way, e.g. a genuinely bad
 /// revision). The caller's job is to treat that exactly like a conflict —
 /// "couldn't tell" must never read as "safe to offer".
-async fn revert_would_conflict(
+///
+/// `pub(crate)` since M3.25 (#78): [`crate::recovery_center::classify_recovery`]
+/// reuses this directly rather than [`revert_offer_established`] below, which
+/// collapses `Err` and "no conflict" into one caller-facing `bool` — the
+/// Recovery Center has to keep those apart (`RecoveryClass::CheckFailed` vs.
+/// `Expired { WouldConflict }` vs. `Offered`).
+pub(crate) async fn revert_would_conflict(
     repo: &Path,
     commit: &str,
     parent: &str,
@@ -393,23 +399,39 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
         Ok((repo, _entry)) => repo,
         Err(rejected) => return rejected,
     };
-    let op = match action {
+    let op = match undo_action_to_operation(&repo, action).await {
+        Ok(op) => op,
+        Err(refused) => return refused,
+    };
+    crate::planner::plan_and_execute(op).await
+}
+
+/// Validate one [`UndoAction`]'s fields — same checks, same wording, same
+/// order — and build the matching [`GitOperation`]. The part of [`undo`] that
+/// has nothing to do with *executing* it.
+///
+/// Factored out for M3.25 (#78) so the Recovery Center's
+/// `POST /api/operations/{id}/recover` builds the identical operation from an
+/// `UndoAction` it has already re-derived and verified live, without a second
+/// copy of this validation to drift from `/api/undo`'s.
+pub(crate) async fn undo_action_to_operation(
+    repo: &Path,
+    action: UndoAction,
+) -> Result<GitOperation, (StatusCode, String)> {
+    match action {
         UndoAction::RestoreBranch { name, tip } => {
             let name = name.trim();
             if !is_safe_branch_name(name) {
-                return (StatusCode::BAD_REQUEST, "Bad branch name.".to_string());
+                return Err((StatusCode::BAD_REQUEST, "Bad branch name.".to_string()));
             }
             if !is_hex_id(&tip) {
-                return (StatusCode::BAD_REQUEST, "Not a commit id.".to_string());
+                return Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string()));
             }
             let Ok(name) = BranchName::new(name) else {
-                return (StatusCode::BAD_REQUEST, "Bad branch name.".to_string());
+                return Err((StatusCode::BAD_REQUEST, "Bad branch name.".to_string()));
             };
-            let tip = match undo_commit_oid(&repo, &tip).await {
-                Ok(tip) => tip,
-                Err(refused) => return refused,
-            };
-            GitOperation::RestoreBranch { name, tip }
+            let tip = undo_commit_oid(repo, &tip).await?;
+            Ok(GitOperation::RestoreBranch { name, tip })
         }
         UndoAction::ResetBranch {
             branch,
@@ -418,47 +440,40 @@ pub async fn undo(Json(action): Json<UndoAction>) -> (StatusCode, String) {
         } => {
             let branch = branch.trim();
             if !is_safe_branch_name(branch) {
-                return (StatusCode::BAD_REQUEST, "Bad branch name.".to_string());
+                return Err((StatusCode::BAD_REQUEST, "Bad branch name.".to_string()));
             }
             if !is_hex_id(&to) || !is_hex_id(&expected_tip) {
-                return (StatusCode::BAD_REQUEST, "Not a commit id.".to_string());
+                return Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string()));
             }
             let Ok(branch) = BranchName::new(branch) else {
-                return (StatusCode::BAD_REQUEST, "Bad branch name.".to_string());
+                return Err((StatusCode::BAD_REQUEST, "Bad branch name.".to_string()));
             };
             // The hint's compare-and-swap tip must be exact — the feed only
             // ever hands out full ids, so anything else is a hand-crafted
             // request whose CAS could never have matched the live tip anyway.
             let Ok(expected_tip) = CommitOid::new(expected_tip) else {
-                return (
+                return Err((
                     StatusCode::CONFLICT,
                     format!(
                         "‘{branch}’ has moved since this undo was offered — refresh and try again."
                     ),
-                );
+                ));
             };
-            let to = match undo_commit_oid(&repo, &to).await {
-                Ok(to) => to,
-                Err(refused) => return refused,
-            };
-            GitOperation::ResetBranch {
+            let to = undo_commit_oid(repo, &to).await?;
+            Ok(GitOperation::ResetBranch {
                 branch,
                 to,
                 expected_tip,
-            }
+            })
         }
         UndoAction::RevertCommit { commit } => {
             if !is_hex_id(&commit) {
-                return (StatusCode::BAD_REQUEST, "Not a commit id.".to_string());
+                return Err((StatusCode::BAD_REQUEST, "Not a commit id.".to_string()));
             }
-            let commit = match undo_commit_oid(&repo, &commit).await {
-                Ok(commit) => commit,
-                Err(refused) => return refused,
-            };
-            GitOperation::RevertCommit { commit }
+            let commit = undo_commit_oid(repo, &commit).await?;
+            Ok(GitOperation::RevertCommit { commit })
         }
-    };
-    crate::planner::plan_and_execute(op).await
+    }
 }
 
 /// An undo id as an exact [`CommitOid`]: the feed's full 40/64-hex ids are
