@@ -32,6 +32,7 @@ pub mod history;
 pub mod identity;
 pub mod reflog;
 pub mod refs;
+pub mod stash;
 pub mod tags;
 
 pub use github::{github_web_base, remote_web_base};
