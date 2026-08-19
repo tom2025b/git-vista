@@ -4660,6 +4660,40 @@ async fn verify_path_states(
 /// filesystem I/O, so this runs on a blocking thread (the same offload
 /// discipline as every other synchronous read in this module — see the
 /// "blocking-work offload" section above).
+/// What a directory check established — three states, not two.
+///
+/// The two-state version of this was a `bool` from
+/// `symlink_metadata(..).map(|m| m.is_dir()).unwrap_or(false)`, and the
+/// `unwrap_or(false)` collapsed "the check could not run" into the single
+/// answer that ADMITS the path for deletion. Found 2026-08-18 by two
+/// independent audits, one of them on a different model.
+#[derive(Debug, PartialEq, Eq)]
+enum DirCheck {
+    /// Established: this is a directory. Refuse.
+    Directory,
+    /// Established: this is not a directory. May proceed.
+    NotDirectory,
+    /// Nothing was established. NEVER equivalent to `NotDirectory`.
+    CheckFailed(String),
+}
+
+/// Classify a `symlink_metadata` result. Pure and synchronous so it is
+/// unit-testable without a real filesystem race — the same split as
+/// [`observe_deletion`] and [`observe_discard`], and for the same reason:
+/// the interesting failure cannot be timed deterministically in a test, but
+/// the honesty property does not depend on how the failure arose.
+///
+/// `canonicalize` has already succeeded by the time this runs, so the path
+/// existed moments ago. Every error — `NotFound` included — therefore means a
+/// race or an I/O fault, and neither is grounds to delete.
+fn classify_dir_check(meta: std::io::Result<std::fs::Metadata>) -> DirCheck {
+    match meta {
+        Ok(m) if m.is_dir() => DirCheck::Directory,
+        Ok(_) => DirCheck::NotDirectory,
+        Err(e) => DirCheck::CheckFailed(e.to_string()),
+    }
+}
+
 async fn symlink_containment_guard(
     repo: &Path,
     paths: &[WorktreePath],
@@ -4688,9 +4722,35 @@ async fn symlink_containment_guard(
                     // `symlink_metadata` (not `metadata`) on the RESOLVED
                     // path so a symlink-to-a-directory is judged by what it
                     // actually points at, already proven in-bounds above.
-                    let is_dir = std::fs::symlink_metadata(&resolved)
-                        .map(|m| m.is_dir())
-                        .unwrap_or(false);
+                    //
+                    // A FAILED stat is not "not a directory". This read used
+                    // to end `.unwrap_or(false)`, which collapsed "the check
+                    // could not run" into the one answer that ADMITS the path
+                    // — and admitting it hands `git clean -f` a directory to
+                    // recurse into, which is precisely what this function's
+                    // contract says it refuses. The careful part above (resolve
+                    // first, then stat the resolved path) was already right;
+                    // the answer was thrown away one line later.
+                    //
+                    // `canonicalize` succeeded moments ago, so the path existed.
+                    // Any error here — including `NotFound` — therefore means
+                    // either a race or an I/O fault, and neither is grounds to
+                    // delete. Fail closed. (`NotFound` from the *canonicalize*
+                    // above is still deliberately tolerated; see the doc
+                    // comment. This is the later, narrower read.)
+                    let is_dir = match classify_dir_check(std::fs::symlink_metadata(&resolved)) {
+                        DirCheck::Directory => true,
+                        DirCheck::NotDirectory => false,
+                        DirCheck::CheckFailed(why) => {
+                            return Err(couldnt_run(
+                                op_name,
+                                &format!(
+                                    "couldn't tell whether ‘{rel}’ is a directory ({why}) — \
+                                     refusing rather than risk deleting one"
+                                ),
+                            ));
+                        }
+                    };
                     if is_dir {
                         return Err((
                             StatusCode::CONFLICT,

@@ -1589,6 +1589,55 @@ async fn delete_untracked_paths_refuses_a_directory_rather_than_recursing_silent
     assert_eq!(status2, StatusCode::CONFLICT);
 }
 
+/// A failed directory check must NEVER read as "not a directory".
+///
+/// Found 2026-08-18 by two independent audits — one on a different model —
+/// both landing within 21 lines of each other. The guard read
+/// `symlink_metadata(..).map(|m| m.is_dir()).unwrap_or(false)`, so a transient
+/// I/O error on a flaky or FUSE-backed worktree produced `false`, the path was
+/// admitted, and `git clean -f` recursed into a directory this function's own
+/// contract says it refuses.
+///
+/// The real failure is a race that cannot be timed deterministically in a
+/// permanent test, so the classification is a pure function and the error is
+/// synthesised — the same approach `partial_delete_report` takes above, and
+/// for the same stated reason: the honesty property does not depend on how the
+/// failure arose.
+///
+/// **Mutation this must catch:** restoring `.unwrap_or(false)` — i.e. making
+/// `CheckFailed` classify as `NotDirectory`. A test that only goes red when
+/// the whole guard is deleted would repeat the defect this repo keeps
+/// shipping.
+#[test]
+fn a_failed_directory_check_is_not_a_non_directory() {
+    use std::io::{Error, ErrorKind};
+
+    // The established answers still work.
+    let dir = std::fs::symlink_metadata(std::env::temp_dir()).unwrap();
+    assert_eq!(classify_dir_check(Ok(dir)), DirCheck::Directory);
+
+    // Every error is CheckFailed — including NotFound, because canonicalize
+    // has already succeeded by then, so a vanished path is a race, not an
+    // absence.
+    for kind in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::NotFound,
+        ErrorKind::Other,
+    ] {
+        let got = classify_dir_check(Err(Error::new(kind, "synthetic")));
+        assert!(
+            matches!(got, DirCheck::CheckFailed(_)),
+            "a {kind:?} stat failure established nothing, but classified as {got:?} — \
+             collapsing it into NotDirectory is what admits a directory to `git clean -f`"
+        );
+        assert_ne!(
+            got,
+            DirCheck::NotDirectory,
+            "{kind:?} must never read as an established non-directory"
+        );
+    }
+}
+
 /// The same directory refusal, `DiscardTrackedPaths` side — the guard is
 /// shared code (`symlink_containment_guard`), but the review finding named
 /// both operations explicitly, so both get their own regression proof.
