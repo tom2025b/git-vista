@@ -66,7 +66,7 @@ use serde::{Deserialize, Serialize};
 
 use git_vista_core::activity::UndoAction;
 use git_vista_core::identity::WorktreeId;
-use git_vista_git::{read_commit, read_remote_commits, RepoError};
+use git_vista_git::{read_commit, RepoError};
 use git_vista_protocol::{
     BranchName, CommitOid, GitOperation, OperationId, OperationState, OperationStatus,
     RecoveryStrategy, RefName, RepositoryToken, TagName, UnixSeconds, WorktreeToken,
