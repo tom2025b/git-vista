@@ -100,6 +100,7 @@ async fn tracked(
         Some(id),
         tokens(),
         PlanSource::Build(op),
+        None,
     )
     .await
 }
@@ -109,7 +110,7 @@ async fn tracked(
 fn record_for(key: &IdempotencyKey, op: &GitOperation) -> std::sync::Arc<operations::Record> {
     let hash = operation_hash(op);
     let (repository, worktree) = tokens();
-    match operations::admit(key, op, &hash, repository, worktree) {
+    match operations::admit(key, op, &hash, repository, worktree, None) {
         Admission::Existing(record) => record,
         Admission::Fresh(..) => panic!("the key should already have been admitted"),
         Admission::Conflict => panic!("the key should name this very operation"),
@@ -368,6 +369,9 @@ async fn a_row_left_running_recovers_as_failed_and_is_rehydrated_into_the_regist
         message: None,
         generation: None,
         recovery: None,
+        // M3.25 (#78): this row is an ordinary write, not the recovery of
+        // another operation.
+        recovers: None,
         // M2.20c (#229): never persisted, so a rehydrated row always reads
         // `None` here regardless of what the crashed process was reporting.
         progress: None,

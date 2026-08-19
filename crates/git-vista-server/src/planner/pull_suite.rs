@@ -179,7 +179,7 @@ fn admit_pull(
     let op = pull_op(strategy);
     let hash = operation_hash(&op);
     let (repository, worktree) = tokens();
-    match crate::operations::admit(&key, &op, &hash, repository, worktree) {
+    match crate::operations::admit(&key, &op, &hash, repository, worktree, None) {
         Admission::Fresh(handle, record) => (handle, record),
         _ => panic!("a fresh key must be admitted"),
     }

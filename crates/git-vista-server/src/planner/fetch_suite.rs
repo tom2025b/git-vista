@@ -169,7 +169,7 @@ fn admit_fetch(name: &str) -> (crate::operations::OperationHandle, std::sync::Ar
     let op = fetch_op();
     let hash = operation_hash(&op);
     let (repository, worktree) = tokens();
-    match crate::operations::admit(&key, &op, &hash, repository, worktree) {
+    match crate::operations::admit(&key, &op, &hash, repository, worktree, None) {
         Admission::Fresh(handle, record) => (handle, record),
         _ => panic!("a fresh key must be admitted"),
     }
@@ -690,7 +690,7 @@ async fn the_cancel_endpoint_refuses_rather_than_pretending() {
     let hash = operation_hash(&op);
     let (repository, worktree) = tokens();
     let Admission::Fresh(stage_handle, stage_record) =
-        crate::operations::admit(&k, &op, &hash, repository, worktree)
+        crate::operations::admit(&k, &op, &hash, repository, worktree, None)
     else {
         panic!("a fresh key must be admitted");
     };
@@ -763,6 +763,7 @@ async fn a_dropped_connection_replays_instead_of_fetching_twice() {
             None,
             tokens(),
             PlanSource::Build(fetch_op()),
+            None,
         ),
     )
     .await;
@@ -781,6 +782,7 @@ async fn a_dropped_connection_replays_instead_of_fetching_twice() {
             None,
             tokens(),
             PlanSource::Build(fetch_op()),
+            None,
         ),
     )
     .await
@@ -804,6 +806,7 @@ async fn a_dropped_connection_replays_instead_of_fetching_twice() {
         None,
         tokens(),
         PlanSource::Build(fetch_op()),
+        None,
     )
     .await;
     assert_eq!(again_status, status);

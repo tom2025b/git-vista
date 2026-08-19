@@ -243,6 +243,24 @@ pub struct OperationStatus {
     /// How the pre-operation state can be recovered, from the plan that ran.
     /// `None` until a plan exists.
     pub recovery: Option<RecoveryStrategy>,
+    /// This operation's own recovery lineage (M3.25, #78): `Some(earlier)`
+    /// when this operation **is** the executed recovery of `earlier`, `None`
+    /// for the overwhelming majority of operations, which recover nothing.
+    ///
+    /// Set once, at admission, only on the row that is itself the recovery —
+    /// never backfilled onto `earlier`'s own row. "Was `earlier` recovered"
+    /// is answered by a read-time lookup for a row whose `recovers` equals it
+    /// and whose state is `Succeeded`, not by mutating `earlier` after the
+    /// fact, so a terminal row stays functionally immutable. See
+    /// `durable.rs`'s `recovers_operation` column — deliberately absent from
+    /// that upsert's `ON CONFLICT DO UPDATE SET` list, which is what makes
+    /// "never backfilled" structural rather than a convention.
+    ///
+    /// `#[serde(default)]`, per this struct's own additive rule above: an
+    /// older client's `Deserialize` keeps working the moment this field
+    /// exists on the wire.
+    #[serde(default)]
+    pub recovers: Option<OperationId>,
     /// The last object-transfer report this operation produced (M2.20c,
     /// #229). `None` for every operation that transfers nothing, and for a
     /// fetch that has not yet reached its first phase. On a *terminal*
@@ -348,6 +366,7 @@ mod tests {
             recovery: Some(RecoveryStrategy::DeleteCreatedBranch {
                 name: BranchName::new("feature/x").unwrap(),
             }),
+            recovers: None,
             progress: None,
         }
     }

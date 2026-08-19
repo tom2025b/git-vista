@@ -41,7 +41,7 @@ use git_vista_core::seed::{parse_seed, reset_plan, Seed};
 use git_vista_protocol::{
     AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitError,
     CommitFailureKind, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
-    IdempotencyKey, MergeStrategy, OperationHash, OperationStage, Plan, Precondition,
+    IdempotencyKey, MergeStrategy, OperationHash, OperationId, OperationStage, Plan, Precondition,
     RecoveryStrategy, RefChange, RefName, RefState, RemoteName, RepositoryToken, RiskLevel,
     SignTagError, SignTagFailureKind, TagAnnotation, TagName, UnixSeconds, WorktreePath,
     WorktreeToken, IDEMPOTENCY_HEADER,
@@ -66,6 +66,42 @@ const PLAN_TTL_SECS: i64 = 300;
 /// The single entry point every write handler calls; everything below it is
 /// private to the planner.
 pub(crate) async fn plan_and_execute(op: GitOperation) -> (StatusCode, String) {
+    plan_and_execute_maybe_recovery(op, None).await
+}
+
+/// [`plan_and_execute`], for an operation that is itself the executed recovery
+/// of an earlier one (M3.25, #78) — the row this admits records `recovers`,
+/// and nothing else about the path differs.
+///
+/// The sole caller is [`crate::recovery_center::recover_operation`]. The live
+/// re-derive-and-compare gate that decided `op` is the one operation allowed
+/// to run has already happened *there*, before this function is reached — so
+/// by the time `op` arrives it is exactly the operation the server itself
+/// independently computed, the same posture every other write's `op` already
+/// has at [`plan_and_execute`]. From here on a recovery inherits admission,
+/// the staleness gate and the durable terminal record like any other mutation:
+/// nothing below this call knows or cares that it is a recovery.
+pub(crate) async fn plan_and_execute_recovery(
+    op: GitOperation,
+    recovers: OperationId,
+) -> (StatusCode, String) {
+    plan_and_execute_maybe_recovery(op, Some(recovers)).await
+}
+
+/// The shared body of [`plan_and_execute`] and [`plan_and_execute_recovery`]:
+/// the gate-then-delegate block both take, differing only in whether the
+/// admitted row names an earlier operation it recovers.
+///
+/// Deliberately *one* copy. Duplicating the read-only gate and the
+/// idempotency-key requirement into a second entry point is exactly the drift
+/// `contract_suite`'s `the_global_entry_point_delegates_through_the_lifecycle_to_the_pipeline`
+/// exists to prevent — which is why that test now pins these three lines here,
+/// on the path every write takes, and pins both public entry points to
+/// delegating into it.
+async fn plan_and_execute_maybe_recovery(
+    op: GitOperation,
+    recovers: Option<OperationId>,
+) -> (StatusCode, String) {
     // The write gate, kept here as well as in the handlers (defense in depth —
     // no operation executes against a Visualize-mode selection).
     if let Some(rejected) = reject_if_read_only() {
@@ -98,6 +134,7 @@ pub(crate) async fn plan_and_execute(op: GitOperation) -> (StatusCode, String) {
         repo_id,
         selection_tokens(),
         PlanSource::Build(op),
+        recovers,
     )
     .await
 }
@@ -190,27 +227,34 @@ async fn plan_and_execute_tracked(
     repo_id: Option<RepositoryId>,
     tokens: (RepositoryToken, WorktreeToken),
     source: PlanSource,
+    recovers: Option<OperationId>,
 ) -> (StatusCode, String) {
     let hash = source.hash();
     let (repository, worktree) = tokens.clone();
 
-    let (handle, record) =
-        match crate::operations::admit(&key, source.operation(), &hash, repository, worktree) {
-            crate::operations::Admission::Fresh(handle, record) => (handle, record),
-            crate::operations::Admission::Existing(record) => {
-                // The same intent, already in flight or already answered.
-                crate::operations::note_minted(&record.id());
-                return record.wait_terminal().await;
-            }
-            crate::operations::Admission::Conflict => {
-                return (
-                    StatusCode::CONFLICT,
-                    "That idempotency key was already used for a different operation. \
+    let (handle, record) = match crate::operations::admit(
+        &key,
+        source.operation(),
+        &hash,
+        repository,
+        worktree,
+        recovers,
+    ) {
+        crate::operations::Admission::Fresh(handle, record) => (handle, record),
+        crate::operations::Admission::Existing(record) => {
+            // The same intent, already in flight or already answered.
+            crate::operations::note_minted(&record.id());
+            return record.wait_terminal().await;
+        }
+        crate::operations::Admission::Conflict => {
+            return (
+                StatusCode::CONFLICT,
+                "That idempotency key was already used for a different operation. \
                  Reload and try again."
-                        .to_string(),
-                );
-            }
-        };
+                    .to_string(),
+            );
+        }
+    };
 
     crate::operations::note_minted(&record.id());
 
@@ -546,6 +590,9 @@ pub(crate) async fn submit_plan_tracked(plan: Plan) -> (StatusCode, String) {
         repo_id,
         selection_tokens(),
         PlanSource::Submit(Box::new(plan)),
+        // A submitted plan runs through the review-roundtrip seam (#249),
+        // never the Recovery Center — it recovers nothing.
+        None,
     )
     .await
 }

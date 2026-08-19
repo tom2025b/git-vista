@@ -69,6 +69,12 @@ mod operations;
 mod planner;
 // Per-source-IP sign-in rate limiting for the LAN listener (ADR 0005, #122).
 mod ratelimit;
+// M3.25 (#78): the Recovery Center — a browsable history of this app's own
+// operations over `durable`'s journal, each row's recovery classified live
+// against the repository, and the one endpoint that executes such a recovery
+// after re-deriving and matching it server-side. See
+// docs/superpowers/specs/2026-08-18-m3-recovery-center.md.
+mod recovery_center;
 #[cfg(test)]
 mod route_authz;
 // M1.13b (#66): the git-process sandbox — the pure argv chokepoint, the tier
@@ -598,6 +604,18 @@ fn api_router(
             .route(
                 "/api/operations/{id}/cancel",
                 post(handlers::operations::cancel_operation),
+            )
+            // M3.25 (#78): the Recovery Center. The list is a read of write
+            // outcomes — same posture and same ADR 0005 reasoning as
+            // `/api/operations/{id}` above — and the recover endpoint is a
+            // full write: it runs git through the ordinary planner.
+            .route(
+                "/api/operations/history",
+                get(recovery_center::operation_history),
+            )
+            .route(
+                "/api/operations/{id}/recover",
+                post(recovery_center::recover_operation),
             );
     }
 

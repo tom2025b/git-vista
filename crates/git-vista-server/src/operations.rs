@@ -381,12 +381,20 @@ fn registry() -> &'static StdMutex<Registry> {
 /// Admission is a single critical section over the maps, so two concurrent
 /// requests carrying the same key cannot both be admitted: the loser sees the
 /// winner's record and awaits it.
+///
+/// `recovers` (M3.25, #78) names the earlier operation this admission is the
+/// executed recovery of, and is `None` for every ordinary write. This is the
+/// **one and only** place it is ever set: on the freshly-minted record below,
+/// once, at admission. It is never written onto the row it names, and
+/// `durable::insert_or_update` leaves its column out of the upsert's update
+/// list so no later write of this same row can change it either.
 pub(crate) fn admit(
     key: &IdempotencyKey,
     operation: &GitOperation,
     operation_hash: &OperationHash,
     repository: RepositoryToken,
     worktree: WorktreeToken,
+    recovers: Option<OperationId>,
 ) -> Admission {
     let now = crate::activity::now_secs();
     let mut reg = registry().lock().expect("operation registry lock");
@@ -416,6 +424,7 @@ pub(crate) fn admit(
         message: None,
         generation: None,
         recovery: None,
+        recovers,
         progress: None,
     });
     let (cancel, _) = watch::channel(false);
@@ -740,7 +749,7 @@ mod tests {
 
     fn admit_op(k: &IdempotencyKey, o: &GitOperation, h: &OperationHash) -> Admission {
         let (repo, worktree) = tokens();
-        admit(k, o, h, repo, worktree)
+        admit(k, o, h, repo, worktree, None)
     }
 
     #[test]

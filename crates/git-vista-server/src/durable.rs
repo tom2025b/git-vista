@@ -53,15 +53,39 @@ use git_vista_protocol::{
     UnixSeconds, WorktreeToken,
 };
 
-/// The schema's `PRAGMA user_version`. Bump this — and add a migration, not a
-/// silent `CREATE TABLE IF NOT EXISTS` edit — the day a column changes shape.
-const SCHEMA_VERSION: i32 = 1;
+/// The schema's `PRAGMA user_version`. Bump this — and add a migration arm to
+/// [`open_at`]'s match plus a `migrate_v{n}_to_v{n+1}` function, not a silent
+/// edit to [`migrate_fresh`] alone — the day a column changes shape.
+///
+/// The convention this file follows, now that there is more than one version:
+/// a brand-new database (version 0) gets [`migrate_fresh`]'s *current-shape*
+/// schema directly, in one step; an existing database reporting an older
+/// version runs the matching incremental migration in place, against its real
+/// rows. [`open_at`] still refuses (`UnknownSchemaVersion`) any version it has
+/// no arm for, so a downgrade or a corrupted `user_version` fails loud.
+///
+/// "Loud" is relative and worth stating: [`recover`] treats every
+/// [`DurableError`] as best-effort-failed and starts with an empty history, so
+/// a version this build has no arm for costs the user their whole browsable
+/// journal with no error reachable from the browser. That is exactly why
+/// bumping this constant without adding the matching arm is not a style
+/// choice — see [`migrate_v1_to_v2`].
+const SCHEMA_VERSION: i32 = 2;
 
 /// The namespace every recovery ref lives under. Never `refs/heads/` or
 /// `refs/tags/`, so "never overwrites a user ref" holds by construction: no
 /// user-chosen name can ever resolve into this prefix, because git refs are
 /// namespaced by their full path and this path is fixed and app-owned.
 const RECOVERY_REF_PREFIX: &str = "refs/git-vista/recovery";
+
+/// `refs/git-vista/recovery/<operation.as_str()>` — the one place this
+/// namespacing is spelled out, shared by [`write_recovery_ref`] (the writer)
+/// and, since M3.25 (#78), `crate::recovery_center`'s live classification
+/// (the reader), so the two can never drift onto different ref names for the
+/// same operation.
+pub(crate) fn recovery_ref_name(operation: &OperationId) -> String {
+    format!("{RECOVERY_REF_PREFIX}/{}", operation.as_str())
+}
 
 /// Why the durable layer couldn't do what was asked. Every caller treats every
 /// variant the same way: log it and carry on with an in-memory-only operation.
@@ -75,6 +99,18 @@ pub(crate) enum DurableError {
     UnknownSchemaVersion(i32),
     Sqlite(rusqlite::Error),
     Io(std::io::Error),
+    /// The `spawn_blocking` task running a query panicked — it never returned
+    /// a `Result` at all, so this is the one variant built from a
+    /// `tokio::task::JoinError` rather than a rusqlite/io error.
+    ///
+    /// It exists because of [`list_operations`], the one read path here that
+    /// does *not* swallow a failure the way [`persist`]/[`recover`] do: those
+    /// are best-effort because the git operation they describe already ran
+    /// regardless of the journal's health, whereas a history read has nothing
+    /// else to fall back on — silently answering "no rows" would read as
+    /// "nothing happened" to a caller who cannot tell that from "we couldn't
+    /// check".
+    TaskPanicked(String),
 }
 
 impl std::fmt::Display for DurableError {
@@ -86,6 +122,7 @@ impl std::fmt::Display for DurableError {
             ),
             DurableError::Sqlite(e) => write!(f, "{e}"),
             DurableError::Io(e) => write!(f, "{e}"),
+            DurableError::TaskPanicked(e) => write!(f, "the journal task panicked: {e}"),
         }
     }
 }
@@ -116,34 +153,89 @@ fn open_at(path: &Path) -> Result<Connection, DurableError> {
     let conn = Connection::open(path)?;
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match version {
-        0 => migrate(&conn)?,
+        0 => migrate_fresh(&conn)?,
+        // M3.25 (#78): a v1 journal already exists on disk (this server has
+        // shipped since M1.09) and must gain `recovers_operation` and the
+        // Recovery Center's two read indexes without losing a row. An
+        // explicit arm here — not a silent fallthrough to
+        // `UnknownSchemaVersion` — is load-bearing: without it, bumping
+        // `SCHEMA_VERSION` refuses to open every already-installed journal,
+        // permanently, with no shell available to fix it.
+        1 => migrate_v1_to_v2(&conn)?,
         v if v == SCHEMA_VERSION => {}
         v => return Err(DurableError::UnknownSchemaVersion(v)),
     }
     Ok(conn)
 }
 
-fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+/// Create the schema from nothing, at its current (v2) shape, for a database
+/// that has never been opened before (`PRAGMA user_version` reads 0). A fresh
+/// database has no existing rows to preserve and no earlier shape to step
+/// through, so it gets `recovers_operation` and both indexes directly in the
+/// initial `CREATE TABLE` rather than being created at v1 and then migrated —
+/// there is nothing an `ALTER TABLE` would need to add a column to yet.
+fn migrate_fresh(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE operations (
-            id              TEXT PRIMARY KEY,
-            idempotency_key TEXT NOT NULL UNIQUE,
-            state           TEXT NOT NULL,
-            stage           TEXT NOT NULL,
-            operation_json  TEXT NOT NULL,
-            operation_hash  TEXT NOT NULL,
-            repository      TEXT NOT NULL,
-            worktree        TEXT NOT NULL,
-            accepted_at     INTEGER NOT NULL,
-            ended_at        INTEGER,
-            status          INTEGER,
-            message         TEXT,
-            generation      TEXT,
-            recovery_json   TEXT
-        );",
+            id                 TEXT PRIMARY KEY,
+            idempotency_key    TEXT NOT NULL UNIQUE,
+            state              TEXT NOT NULL,
+            stage              TEXT NOT NULL,
+            operation_json     TEXT NOT NULL,
+            operation_hash     TEXT NOT NULL,
+            repository         TEXT NOT NULL,
+            worktree           TEXT NOT NULL,
+            accepted_at        INTEGER NOT NULL,
+            ended_at           INTEGER,
+            status             INTEGER,
+            message            TEXT,
+            generation         TEXT,
+            recovery_json      TEXT,
+            recovers_operation TEXT
+        );
+        CREATE INDEX idx_operations_history ON operations(accepted_at, id);
+        CREATE INDEX idx_operations_recovers ON operations(recovers_operation)
+            WHERE recovers_operation IS NOT NULL;",
     )?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
+}
+
+/// Migrate an existing schema-version-1 database — every `operations.sqlite3`
+/// written before the Recovery Center (M3.25, #78) — up to version 2 in
+/// place, preserving every existing row.
+///
+/// `ALTER TABLE ... ADD COLUMN recovers_operation TEXT` backfills every
+/// existing row's new column with `NULL`, which is the honest value: none of
+/// those operations could have been the executed recovery of another, since
+/// nothing could record it. `idx_operations_history` is the keyset index
+/// `crate::recovery_center`'s paginated read walks; `idx_operations_recovers`
+/// is the partial index behind "was this operation ever recovered", which is
+/// a read-time lookup rather than a mutable flag on the original row.
+///
+/// Run as **one transaction** together with the `user_version` bump, not as
+/// separate autocommitted statements: `execute_batch` alone commits each
+/// statement independently, so a process death between the `ALTER` and the
+/// pragma write would leave the database at version 1 with the column already
+/// present. The next startup would re-enter this same arm, re-run the
+/// `ALTER`, hit SQLite's "duplicate column name", and fail permanently —
+/// `open_at` returning `Err` on every future start, with no shell-accessible
+/// way for the user to intervene. The transaction makes the migration
+/// all-or-nothing so that state cannot arise.
+///
+/// [`migrate_fresh`] above is deliberately *not* given the same wrapping: a
+/// half-created, still-empty database is recreated cleanly on the next start,
+/// where a v1 database holds a user's real operation history.
+fn migrate_v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE operations ADD COLUMN recovers_operation TEXT;
+         CREATE INDEX idx_operations_history ON operations(accepted_at, id);
+         CREATE INDEX idx_operations_recovers ON operations(recovers_operation)
+             WHERE recovers_operation IS NOT NULL;",
+    )?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()
 }
 
 /// The process-wide connection, opened on first use. A `std` mutex, taken only
@@ -333,8 +425,8 @@ fn insert_or_update(
         "INSERT INTO operations
             (id, idempotency_key, state, stage, operation_json, operation_hash,
              repository, worktree, accepted_at, ended_at, status, message,
-             generation, recovery_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             generation, recovery_json, recovers_operation)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(id) DO UPDATE SET
             state = excluded.state,
             stage = excluded.stage,
@@ -343,6 +435,14 @@ fn insert_or_update(
             message = excluded.message,
             generation = excluded.generation,
             recovery_json = excluded.recovery_json",
+        // `recovers_operation` is deliberately absent from the UPDATE SET,
+        // the same way `operation_hash`/`repository`/`worktree` above it are:
+        // a fact established once, at admission, on the row it describes, and
+        // never touched again by that row's own terminal update. M3.25's
+        // "never backfilled onto the original row" is exactly this omission,
+        // made structural rather than a runtime check anyone could get wrong
+        // later — see the test
+        // `a_terminal_upsert_can_never_overwrite_the_recovers_link`.
         params![
             status.id.as_str(),
             key.as_str(),
@@ -361,10 +461,25 @@ fn insert_or_update(
                 .recovery
                 .as_ref()
                 .map(|r| serde_json::to_string(r).unwrap_or_default()),
+            status.recovers.as_ref().map(|id| id.as_str().to_string()),
         ],
     )?;
     Ok(())
 }
+
+/// The `SELECT` column list every [`row_to_status`] caller must use, verbatim
+/// and in this order — [`load_all_blocking`], [`load_operation_blocking`], and
+/// [`select_operations_blocking`].
+///
+/// [`row_to_status`] decodes by **position** (`row.get(0)` … `row.get(14)`),
+/// so a list that is reordered, shortened, or replaced with `SELECT *` in one
+/// caller misaligns every field after the first difference — and misaligns it
+/// *silently*, because most of these columns are `TEXT` and would decode as
+/// some other column's perfectly valid string. One constant, three call sites,
+/// so that cannot drift.
+const STATUS_COLUMNS: &str = "id, idempotency_key, state, stage, operation_json, operation_hash,
+     repository, worktree, accepted_at, ended_at, status, message,
+     generation, recovery_json, recovers_operation";
 
 /// Every row in the journal, decoded back into `(key, status)`. A row that
 /// fails to decode (a shape this build doesn't recognise, or a hand-edited
@@ -373,12 +488,7 @@ fn insert_or_update(
 fn load_all_blocking(
     conn: &Connection,
 ) -> rusqlite::Result<Vec<(IdempotencyKey, OperationStatus)>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, idempotency_key, state, stage, operation_json, operation_hash,
-                repository, worktree, accepted_at, ended_at, status, message,
-                generation, recovery_json
-         FROM operations",
-    )?;
+    let mut stmt = conn.prepare(&format!("SELECT {STATUS_COLUMNS} FROM operations"))?;
     let rows = stmt.query_map([], row_to_status)?;
     let mut out = Vec::new();
     for row in rows {
@@ -408,6 +518,7 @@ fn row_to_status(
     let message: Option<String> = row.get(11)?;
     let generation: Option<String> = row.get(12)?;
     let recovery_json: Option<String> = row.get(13)?;
+    let recovers_operation: Option<String> = row.get(14)?;
 
     let decoded = (|| {
         Some((
@@ -427,6 +538,10 @@ fn row_to_status(
                 generation: generation.and_then(|g| GenerationToken::new(g).ok()),
                 recovery: recovery_json
                     .and_then(|r| serde_json::from_str::<RecoveryStrategy>(&r).ok()),
+                // M3.25 (#78): `None` for every row written before the column
+                // existed, and for every operation that recovers nothing —
+                // which is nearly all of them.
+                recovers: recovers_operation.and_then(|id| OperationId::new(id).ok()),
                 // M2.20c (#229): transfer progress is deliberately **not** a
                 // column and is never rehydrated. It describes a transfer in
                 // flight, and this table only ever hands back records this
@@ -464,6 +579,219 @@ fn parse_stage(s: &str) -> Option<OperationStage> {
         "finished" => Some(OperationStage::Finished),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// The Recovery Center's read path (M3.25, #78)
+// ---------------------------------------------------------------------------
+
+/// One page of this repository's terminal operations, newest first, keyset-
+/// paginated on `(accepted_at, id)` — the query behind
+/// `GET /api/operations/history`.
+///
+/// **Not best-effort**, unlike [`persist`]/[`recover`]. Those swallow a
+/// failure because the git operation they describe already ran regardless of
+/// the journal's health; a history *read* has nothing else to fall back on —
+/// the read is the whole of what was asked. Silently returning an empty page
+/// on a real database error would read as "nothing happened" to a caller who
+/// cannot tell that from "we couldn't check", which is the same confusion
+/// `recovery_center::RecoveryClass::CheckFailed` exists to keep out of the
+/// classification path.
+///
+/// `states` is always a `&'static` slice built from a closed, compile-time
+/// enum (`recovery_center::HistoryStateFilter::terminal_states`), never
+/// request-derived text, and each element is rendered by [`state_literal`]'s
+/// exhaustive match into a fixed literal — so the `state IN (...)` fragment
+/// this composes contains nothing a request could influence. rusqlite has no
+/// placeholder for a variable-length `IN` list; this is why the fragment is
+/// composed rather than bound.
+///
+/// `before`, when present, names the last row of a previous page —
+/// `(accepted_at, id)`, both values this endpoint itself already returned.
+/// **Pagination cannot key on `id` alone**: `crate::operations::mint_id`
+/// mints 128 bits from the OS CSPRNG, so ids carry no ordering. `id` here
+/// only ever breaks a tie among rows sharing one `accepted_at` — and
+/// `UnixSeconds` has one-second resolution, so ties are ordinary, not an edge
+/// case.
+///
+/// Returns **every row the query scanned**, as [`ScannedOperation`]s, not just
+/// the ones whose payload decoded — see that type for why the caller's
+/// pagination must be able to tell "the scan ended" from "a row was dropped".
+pub(crate) async fn list_operations(
+    repository: RepositoryToken,
+    states: &'static [OperationState],
+    before: Option<(UnixSeconds, OperationId)>,
+    limit: u32,
+) -> Result<Vec<ScannedOperation>, DurableError> {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db()?;
+        let conn = conn.lock().expect("operations db lock");
+        select_operations_blocking(&conn, &repository, states, before.as_ref(), limit)
+            .map_err(DurableError::from)
+    })
+    .await;
+    match result {
+        Ok(inner) => inner,
+        Err(e) => Err(DurableError::TaskPanicked(e.to_string())),
+    }
+}
+
+/// The `state` column's stored spelling, as a fixed literal — the exact
+/// inverse of [`parse_state`], and the reason [`select_operations_blocking`]'s
+/// `IN` fragment can be composed without ever embedding request data. An
+/// exhaustive match, so a new [`OperationState`] variant is a compile error
+/// here rather than a silently-unmatched row.
+fn state_literal(state: OperationState) -> &'static str {
+    match state {
+        OperationState::Accepted => "'accepted'",
+        OperationState::Running => "'running'",
+        OperationState::Succeeded => "'succeeded'",
+        OperationState::Failed => "'failed'",
+    }
+}
+
+/// One row the history query scanned: the keyset key `(accepted_at, id)` the
+/// row occupies in the walk, plus the decoded record when the row's payload
+/// columns decoded too.
+///
+/// The key and the payload deliberately do not share a fate. The key columns
+/// are plain `INTEGER`/`TEXT` SELECT columns the server itself wrote, and they
+/// decode even when a fragile payload field (`operation_json`, a token, a
+/// state spelling) does not. Handing the caller only the decoded survivors —
+/// as this query once did — let one bad row shrink a `limit + 1` lookahead to
+/// `limit` rows, which the pager then read as "last page": a single
+/// undecodable row silently hid **every older row** behind it. That breaks
+/// this module's own promise that one bad row must not make other operations
+/// unrecoverable. With the key carried separately, the pager counts and
+/// cursors on what was *scanned*, and a bad row costs exactly itself.
+#[derive(Debug)]
+pub(crate) struct ScannedOperation {
+    pub accepted_at: UnixSeconds,
+    pub id: OperationId,
+    /// `None` when the payload didn't decode — logged, dropped from the page,
+    /// but still counted and still able to carry the cursor past itself.
+    pub status: Option<OperationStatus>,
+}
+
+/// [`row_to_status`], with the keyset key read first and kept even when the
+/// payload fails to decode.
+///
+/// `Ok(None)` — the row vanishing from the scan entirely — is reserved for a
+/// key that is itself unreadable: an `id` column that no longer satisfies
+/// [`OperationId`]'s token rule. The server minted and validated every id it
+/// wrote and `id` is the table's PRIMARY KEY, so that takes out-of-band
+/// database tampering, not a bad payload; such a row can be neither returned
+/// nor named in a cursor, and dropping it is the only honest option left.
+/// (A rusqlite type error on the key columns surfaces as `Err` from
+/// `query_map` and is likewise logged and dropped by the caller.)
+fn row_to_scanned(row: &rusqlite::Row) -> rusqlite::Result<Option<ScannedOperation>> {
+    let raw_id: String = row.get(0)?;
+    let accepted_at: i64 = row.get(8)?;
+    let Ok(id) = OperationId::new(raw_id) else {
+        eprintln!("git-vista: a journal row's id column isn't an operation id; skipped");
+        return Ok(None);
+    };
+    let status = match row_to_status(row) {
+        Ok(Some((_key, status))) => Some(status),
+        Ok(None) => None, // a field didn't parse; already logged in row_to_status
+        Err(e) => {
+            // A payload column the SQL driver itself couldn't read (a type
+            // mismatch, say). Same outcome as a parse failure: the record is
+            // gone, the key is not.
+            eprintln!("git-vista: couldn't read a history row's payload: {e}");
+            None
+        }
+    };
+    Ok(Some(ScannedOperation {
+        accepted_at: UnixSeconds(accepted_at),
+        id,
+        status,
+    }))
+}
+
+fn select_operations_blocking(
+    conn: &Connection,
+    repository: &RepositoryToken,
+    states: &[OperationState],
+    before: Option<&(UnixSeconds, OperationId)>,
+    limit: u32,
+) -> rusqlite::Result<Vec<ScannedOperation>> {
+    let state_list = states
+        .iter()
+        .copied()
+        .map(state_literal)
+        .collect::<Vec<_>>()
+        .join(",");
+    // `ended_at IS NOT NULL` is belt-and-braces beside the terminal-state
+    // filter, and it is what lets `recovery_center::HistoryEntry` carry a
+    // plain `UnixSeconds` rather than an `Option`: a row this query returns
+    // has an end time, enforced by the query rather than assumed from the
+    // state.
+    let sql = format!(
+        "SELECT {STATUS_COLUMNS}
+         FROM operations
+         WHERE repository = ?1
+           AND state IN ({state_list})
+           AND ended_at IS NOT NULL
+           AND (?2 IS NULL OR accepted_at < ?2 OR (accepted_at = ?2 AND id < ?3))
+         ORDER BY accepted_at DESC, id DESC
+         LIMIT ?4"
+    );
+    let (before_secs, before_id): (Option<i64>, Option<&str>) = match before {
+        Some((t, id)) => (Some(t.0), Some(id.as_str())),
+        None => (None, None),
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params![repository.as_str(), before_secs, before_id, limit as i64],
+        row_to_scanned,
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        match row {
+            Ok(Some(entry)) => out.push(entry),
+            Ok(None) => {} // the key itself was unreadable; logged in row_to_scanned
+            Err(e) => eprintln!("git-vista: couldn't read a history row: {e}"),
+        }
+    }
+    Ok(out)
+}
+
+/// Load one operation's row by its server-minted id, straight from the
+/// journal — **not** `crate::operations::lookup`, the in-memory registry,
+/// whose bounded size and TTL are exactly why the Recovery Center reads this
+/// table in the first place: a browsable history must outlive both the
+/// eviction and the process.
+///
+/// `None` covers "no such id ever existed" and "the row didn't decode" alike;
+/// the sole caller (`recovery_center::recover_operation`) answers 404 for
+/// both, the same as any other unknown id.
+pub(crate) async fn load_operation(id: &OperationId) -> Option<OperationStatus> {
+    let id = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db().ok()?;
+        let conn = conn.lock().expect("operations db lock");
+        load_operation_blocking(&conn, &id)
+    })
+    .await;
+    match result {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("git-vista: the journal read task panicked: {e}");
+            None
+        }
+    }
+}
+
+fn load_operation_blocking(conn: &Connection, id: &OperationId) -> Option<OperationStatus> {
+    conn.query_row(
+        &format!("SELECT {STATUS_COLUMNS} FROM operations WHERE id = ?1"),
+        params![id.as_str()],
+        row_to_status,
+    )
+    .ok()
+    .flatten()
+    .map(|(_key, status)| status)
 }
 
 // ---------------------------------------------------------------------------
@@ -560,7 +888,7 @@ pub(crate) async fn write_recovery_ref(
     let Some(oid) = recovery_oid(recovery) else {
         return;
     };
-    let ref_name = format!("{RECOVERY_REF_PREFIX}/{}", operation.as_str());
+    let ref_name = recovery_ref_name(operation);
     let result = crate::git_cmd::git_output(repo, &["update-ref", &ref_name, oid.as_str()]).await;
     match result {
         Ok(output) if output.status.success() => {}
@@ -601,7 +929,7 @@ fn recovery_oid(recovery: &RecoveryStrategy) -> Option<&CommitOid> {
 /// `operation`, for tests and any future recovery-browsing endpoint.
 #[cfg(test)]
 async fn read_recovery_ref(repo: &Path, operation: &OperationId) -> Option<String> {
-    let ref_name = format!("{RECOVERY_REF_PREFIX}/{}", operation.as_str());
+    let ref_name = recovery_ref_name(operation);
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -666,6 +994,7 @@ mod tests {
                 ref_name: RefName::new("refs/heads/main").unwrap(),
                 to: CommitOid::new("b".repeat(40)).unwrap(),
             }),
+            recovers: None,
             progress: None,
         }
     }
@@ -689,6 +1018,378 @@ mod tests {
         }
         let err = open_at(&path).unwrap_err();
         assert!(matches!(err, DurableError::UnknownSchemaVersion(99)));
+    }
+
+    /// A version-1 database — every `operations.sqlite3` written before M3.25
+    /// (#78) — must migrate in place, not be refused. A refusal here is
+    /// silent, total loss of the user's operation history: [`recover`] treats
+    /// any [`DurableError`] as best-effort-failed, logs to stderr, and returns
+    /// an empty vec, so the server still starts but the exact history this
+    /// feature exists to make browsable vanishes, with no error reachable
+    /// from the browser (the user has no shell).
+    ///
+    /// Mutations this goes red on, each hitting a different assertion:
+    ///  * delete `open_at`'s `1 => migrate_v1_to_v2(&conn)?` arm →
+    ///    `open_at(&path).unwrap()` panics on `UnknownSchemaVersion(1)`;
+    ///  * make `migrate_v1_to_v2` a no-op `Ok(())` → the version assertion,
+    ///    and the `recovers_operation` query, both fail;
+    ///  * drop either `CREATE INDEX` from it → the matching
+    ///    `names.contains(...)` assertion fails;
+    ///  * drop the `ALTER TABLE` → the `SELECT recovers_operation` errors out;
+    ///  * remove the transaction wrapping *and* have the pragma bump fail →
+    ///    the re-open at the end hits "duplicate column name". (That last one
+    ///    is why the second `open_at` is here at all.)
+    #[test]
+    fn a_version_1_database_migrates_in_place_without_losing_its_rows() {
+        let (_dir, path) = scratch_db();
+        {
+            // A deliberately frozen, hand-written copy of the pre-M3.25
+            // 14-column schema — NOT a call to `migrate_fresh`, which now
+            // emits the v2 shape directly and so could never exercise the
+            // v1→v2 path at all. If the live schema is edited again, this
+            // fixture stays as it is: it is a snapshot of what is being
+            // migrated *from*, not a second copy of what is created today.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE operations (
+                    id              TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    state           TEXT NOT NULL,
+                    stage           TEXT NOT NULL,
+                    operation_json  TEXT NOT NULL,
+                    operation_hash  TEXT NOT NULL,
+                    repository      TEXT NOT NULL,
+                    worktree        TEXT NOT NULL,
+                    accepted_at     INTEGER NOT NULL,
+                    ended_at        INTEGER,
+                    status          INTEGER,
+                    message         TEXT,
+                    generation      TEXT,
+                    recovery_json   TEXT
+                );",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            // Seeded with the v1 column list, since `insert_or_update` now
+            // writes the 15-column v2 shape this table does not have yet.
+            let status = sample("pre-migration");
+            conn.execute(
+                "INSERT INTO operations
+                    (id, idempotency_key, state, stage, operation_json, operation_hash,
+                     repository, worktree, accepted_at, ended_at, status, message,
+                     generation, recovery_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    status.id.as_str(),
+                    key("pre-migration").as_str(),
+                    "succeeded",
+                    "finished",
+                    serde_json::to_string(&status.operation).unwrap(),
+                    status.operation_hash.as_str(),
+                    status.repository.as_str(),
+                    status.worktree.as_str(),
+                    status.accepted_at.0,
+                    status.ended_at.map(|t| t.0),
+                    status.status,
+                    status.message,
+                    status.generation.as_ref().map(|g| g.as_str().to_string()),
+                    status
+                        .recovery
+                        .as_ref()
+                        .map(|r| serde_json::to_string(r).unwrap()),
+                ],
+            )
+            .unwrap();
+        }
+
+        // Opening a v1 database must migrate it, not refuse it.
+        let conn = open_at(&path).unwrap();
+
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION, "the version bump must land");
+
+        // The new column exists and is queryable — this errors outright if
+        // the ALTER TABLE was dropped.
+        let recovers: Option<String> = conn
+            .query_row(
+                "SELECT recovers_operation FROM operations WHERE id = ?1",
+                params!["pre-migration"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recovers, None,
+            "a pre-existing row's new column must backfill to NULL, not a guess"
+        );
+
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(names.contains(&"idx_operations_history".to_string()));
+        assert!(names.contains(&"idx_operations_recovers".to_string()));
+        drop(stmt);
+
+        // The pre-migration row survived, unchanged and still decodable.
+        let loaded = load_all_blocking(&conn).unwrap();
+        assert_eq!(loaded.len(), 1, "migration must not drop existing rows");
+        assert_eq!(loaded[0].1.id.as_str(), "pre-migration");
+        assert_eq!(loaded[0].1.recovers, None);
+        drop(conn);
+
+        // Re-opening an already-migrated database must not re-run the v1 arm
+        // — that would hit SQLite's "duplicate column name" and refuse the
+        // journal permanently, exactly the state a non-atomic migration could
+        // leave behind if it died between the ALTER and the version bump.
+        let reopened = open_at(&path).unwrap();
+        let version_again: i32 = reopened
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version_again, SCHEMA_VERSION);
+    }
+
+    /// M3.25 (#78): a row that *is* a recovery carries `recovers_operation`,
+    /// and it survives insert-then-reload.
+    ///
+    /// Goes red if `recovers_operation` is dropped from the INSERT column
+    /// list, from `STATUS_COLUMNS` (the shared SELECT list), or from
+    /// `row_to_status`'s decode — any one of which strands the field as
+    /// always-`None`.
+    #[test]
+    fn a_recovery_row_persists_and_reloads_its_recovers_link() {
+        let (_dir, path) = scratch_db();
+        let conn = open_at(&path).unwrap();
+        let k = key("recovery-row");
+        let mut status = sample("recovery-row");
+        status.recovers = Some(OperationId::new("earlier-op-id").unwrap());
+        insert_or_update(&conn, &k, &status).unwrap();
+
+        let loaded = load_all_blocking(&conn).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], (k, status));
+    }
+
+    /// The spec's "never backfilled onto the original row", pinned as
+    /// structure rather than convention: `recovers_operation` is absent from
+    /// `insert_or_update`'s `ON CONFLICT DO UPDATE SET`, so the second
+    /// (terminal) write of the same row cannot change it — in either
+    /// direction.
+    ///
+    /// Goes red the moment `recovers_operation = excluded.recovers_operation`
+    /// is added to that update list: the reload would then see `None`, the
+    /// value the second write carried.
+    #[test]
+    fn a_terminal_upsert_can_never_overwrite_the_recovers_link() {
+        let (_dir, path) = scratch_db();
+        let conn = open_at(&path).unwrap();
+        let k = key("recovery-upsert");
+        let mut admitted = sample("recovery-upsert");
+        admitted.recovers = Some(OperationId::new("earlier-op-id").unwrap());
+        admitted.state = OperationState::Running;
+        admitted.ended_at = None;
+        insert_or_update(&conn, &k, &admitted).unwrap();
+
+        // A later write of the same row that has *lost* the link — the shape a
+        // future refactor could produce by rebuilding the terminal status from
+        // something other than the admitted record.
+        let mut terminal = sample("recovery-upsert");
+        terminal.recovers = None;
+        insert_or_update(&conn, &k, &terminal).unwrap();
+
+        let loaded = load_all_blocking(&conn).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].1.recovers,
+            Some(OperationId::new("earlier-op-id").unwrap()),
+            "the recovery link is written once, at admission, and no later \
+             upsert of the same row may change it"
+        );
+        // The rest of the row still updates, so this is an exclusion of one
+        // column and not a broken upsert.
+        assert_eq!(loaded[0].1.state, OperationState::Succeeded);
+    }
+
+    /// **The pagination test a distinct-timestamp fixture cannot be.** Three
+    /// rows share one `accepted_at` and the page boundary falls *inside* that
+    /// tie — so resuming correctly requires the `id` tie-break, which `mint_id`
+    /// deliberately makes unordered.
+    ///
+    /// The fixture shape is load-bearing and was earned: an earlier version
+    /// put two tied rows on page 1 and the odd one out on page 2, so the
+    /// boundary never landed inside the tie and the whole thing passed
+    /// unchanged with the tie-break deleted. It was a test that could not fail
+    /// on the defect it named. Mutation-checked in both directions now:
+    ///
+    ///  * `accepted_at < ?2` alone (tie-break dropped) — the third tied row is
+    ///    skipped, the walk yields 3 rows, and the multiset assertion fires;
+    ///  * `accepted_at <= ?2` alone — page 2 repeats page 1's rows forever, so
+    ///    the walk hits the page cap and the "terminated" assertion fires.
+    #[test]
+    fn pagination_breaks_a_shared_timestamp_tie_on_the_id() {
+        let (_dir, path) = scratch_db();
+        let conn = open_at(&path).unwrap();
+
+        // Three rows share `accepted_at = 500`; at limit 2 the boundary falls
+        // between the second and third of them.
+        for (id, at) in [
+            ("op-c", 500),
+            ("op-b", 500),
+            ("op-a", 500),
+            ("op-older", 400),
+        ] {
+            let mut status = sample(id);
+            status.accepted_at = UnixSeconds(at);
+            status.ended_at = Some(UnixSeconds(at + 1));
+            insert_or_update(&conn, &key(id), &status).unwrap();
+        }
+
+        let repo = RepositoryToken::new("r").unwrap();
+        let terminal = &[OperationState::Succeeded, OperationState::Failed][..];
+
+        // Walk every page the way a client does: follow the cursor until a
+        // page comes back short. Capped, so a predicate that never advances
+        // fails loudly instead of hanging the suite.
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<(UnixSeconds, OperationId)> = None;
+        let mut terminated = false;
+        for _ in 0..10 {
+            let page =
+                select_operations_blocking(&conn, &repo, terminal, cursor.as_ref(), 2).unwrap();
+            if page.is_empty() {
+                terminated = true;
+                break;
+            }
+            let last = page.last().unwrap();
+            cursor = Some((last.accepted_at, last.id.clone()));
+            seen.extend(page.iter().map(|s| s.id.as_str().to_string()));
+        }
+        assert!(
+            terminated,
+            "the walk never reached an empty page — a keyset predicate that \
+             does not advance past a tie repeats the same page forever, which \
+             in a browser is an infinite scroll with no way out: {seen:?}"
+        );
+
+        // Every row exactly once — duplicates and omissions both fail here,
+        // because this compares the multiset, not a set.
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec!["op-a", "op-b", "op-c", "op-older"],
+            "every row must appear exactly once across the pages: {seen:?}"
+        );
+
+        // And the order the pages hand them back in is the total order the
+        // index describes: newest first, id descending inside a shared second.
+        assert_eq!(seen, vec!["op-c", "op-b", "op-a", "op-older"]);
+    }
+
+    /// The history query is scoped to one repository and to rows that really
+    /// have settled: another repository's row, a still-running row, and a row
+    /// that is inconsistent in each of the two possible directions are all
+    /// invisible to it.
+    ///
+    /// The three excluded rows are chosen so that **each** predicate is the
+    /// only thing keeping one of them out — mutation-checked, after an earlier
+    /// version was found vacuous: with one ordinary `Running`-and-unfinished
+    /// row, `state IN (...)` and `ended_at IS NOT NULL` each covered for the
+    /// other, so deleting either one alone left the test green.
+    ///
+    ///  * drop `repository = ?1` → `other-repo` appears;
+    ///  * drop `state IN (...)` → `running-but-ended` appears;
+    ///  * drop `ended_at IS NOT NULL` → `ended-at-missing` appears, and
+    ///    `HistoryEntry`'s non-optional `ended_at` would have nothing to
+    ///    decode from it.
+    #[test]
+    fn the_history_query_shows_only_this_repositorys_terminal_rows() {
+        let (_dir, path) = scratch_db();
+        let conn = open_at(&path).unwrap();
+
+        insert_or_update(&conn, &key("mine"), &sample("mine")).unwrap();
+
+        // Non-terminal, but carrying an end time — only the state filter
+        // excludes it.
+        let mut running = sample("running-but-ended");
+        running.state = OperationState::Running;
+        running.stage = OperationStage::Executing;
+        insert_or_update(&conn, &key("running-but-ended"), &running).unwrap();
+
+        // Terminal, but with no end time — the shape a hand-edited or
+        // half-written row has, and only the `ended_at` guard excludes it.
+        let mut unfinished = sample("ended-at-missing");
+        unfinished.ended_at = None;
+        insert_or_update(&conn, &key("ended-at-missing"), &unfinished).unwrap();
+
+        let mut elsewhere = sample("other-repo");
+        elsewhere.repository = RepositoryToken::new("other").unwrap();
+        insert_or_update(&conn, &key("other-repo"), &elsewhere).unwrap();
+
+        let rows = select_operations_blocking(
+            &conn,
+            &RepositoryToken::new("r").unwrap(),
+            &[OperationState::Succeeded, OperationState::Failed],
+            None,
+            50,
+        )
+        .unwrap();
+        assert_eq!(
+            rows.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["mine"]
+        );
+    }
+
+    /// A row whose payload no longer decodes must still be **scanned** — key
+    /// intact, `status: None` — never silently dropped from the walk.
+    ///
+    /// This is the durable half of the pagination fix: `recovery_center`'s
+    /// pager counts and cursors on scanned keys, which only works if a bad row
+    /// reaches it as a keyed entry. Goes red if `row_to_scanned` reverts to
+    /// returning only decoded survivors — the corrupt row vanishes, the scan
+    /// comes back one short, and one bad row can again hide every older
+    /// operation behind it.
+    #[test]
+    fn a_row_with_an_undecodable_payload_is_scanned_with_its_key_intact() {
+        let (_dir, path) = scratch_db();
+        let conn = open_at(&path).unwrap();
+        for (id, at) in [("op-new", 300), ("op-bad", 200), ("op-old", 100)] {
+            let mut status = sample(id);
+            status.accepted_at = UnixSeconds(at);
+            status.ended_at = Some(UnixSeconds(at + 1));
+            insert_or_update(&conn, &key(id), &status).unwrap();
+        }
+        // Corrupt the middle row's payload out-of-band, the way a partial
+        // write or a hand edit would. Its key columns are untouched.
+        conn.execute(
+            "UPDATE operations SET operation_json = 'not json' WHERE id = 'op-bad'",
+            [],
+        )
+        .unwrap();
+
+        let repo = RepositoryToken::new("r").unwrap();
+        let terminal = &[OperationState::Succeeded, OperationState::Failed][..];
+        let rows = select_operations_blocking(&conn, &repo, terminal, None, 50).unwrap();
+
+        assert_eq!(
+            rows.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["op-new", "op-bad", "op-old"],
+            "the corrupt row must still occupy its place in the scan"
+        );
+        assert_eq!(rows[1].accepted_at, UnixSeconds(200));
+        assert!(
+            rows[1].status.is_none(),
+            "the corrupt row's payload must be dropped, not guessed at"
+        );
+        assert!(
+            rows[0].status.is_some() && rows[2].status.is_some(),
+            "the rows around it decode as before"
+        );
     }
 
     #[test]

@@ -217,6 +217,23 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
         Method::POST,
         Authz::SessionAndCsrf,
     ),
+    // M3.25 (#78): the Recovery Center's list. A GET (no CSRF surface) that
+    // reads write outcomes, so the same posture as `GET /api/operations/{id}`
+    // above and never on the LAN router (ADR 0005). Registered *after*
+    // `/api/operations/{id}` and matched before it: `history` is a static
+    // segment, which the router prefers over the `{id}` parameter.
+    (
+        "/api/operations/history",
+        Method::GET,
+        Authz::SessionRequired,
+    ),
+    // M3.25 (#78): executing a recovery runs git through the ordinary
+    // planner — a write in every sense, so the full write posture.
+    (
+        "/api/operations/{id}/recover",
+        Method::POST,
+        Authz::SessionAndCsrf,
+    ),
 ];
 
 /// The total number of `(path, method)` pairs `api_router` should register
@@ -224,7 +241,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 53;
+const EXPECTED_ROUTE_COUNT: usize = 55;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in
