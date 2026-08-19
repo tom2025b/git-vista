@@ -51,7 +51,10 @@ trunk_build() {
   fi
 }
 
-cmd_gate() {
+# The gate's actual work. Split out from cmd_gate so the wrapper can capture the
+# whole transcript without changing what runs or in what order. `set -e` still
+# applies inside, so the first failure still aborts the rest.
+gate_body() {
   echo "dev: running the CI gate (fmt → clippy → wasm-clippy → test → trunk build → browser)…"
   echo "── fmt ─────────────────────────────────────────────"
   cargo fmt --all -- --check
@@ -65,6 +68,73 @@ cmd_gate() {
   trunk_build
   cmd_browser
   echo "dev: ✅ gate green"
+}
+
+# Where the gatehouse binary lives, if it is installed at all.
+gatehouse_bin() {
+  command -v gatehouse-mcp 2>/dev/null && return 0
+  [[ -x "$HOME/projects/gatehouse-mcp/target/debug/gatehouse-mcp" ]] \
+    && echo "$HOME/projects/gatehouse-mcp/target/debug/gatehouse-mcp" && return 0
+  return 1
+}
+
+# dev gate — the CI gate, with its result recorded as evidence.
+#
+# # Gatehouse is evidence, never enforcement
+#
+# Recording must NEVER change whether the gate passed. Every gatehouse call is
+# allowed to fail, and every failure path ends with the gate's own exit code
+# propagated unchanged. What a recording failure must not be is SILENT: an
+# unrecorded run prints a conspicuous banner, because "green with no evidence"
+# and "green" look identical afterwards and that is the whole problem this
+# exists to solve.
+#
+# # Two phases, because gatehouse must observe the start itself
+#
+# `begin` runs before the gate and lets gatehouse read HEAD and the working tree
+# for itself; `finish` runs after and lets it read them again. A single call at
+# the end could only take this script's word for the starting state. See
+# gatehouse-mcp/src/evidence.rs.
+cmd_gate() {
+  local gh log rid rc digest
+  log=$(mktemp -t gv-gate-XXXXXX.log)
+  rid=""
+
+  if gh=$(gatehouse_bin); then
+    # A begin that fails leaves rid empty and the gate runs anyway.
+    rid=$("$gh" begin --repo "$REPO" -- ./dev gate 2>/dev/null) || rid=""
+  fi
+
+  # The gate itself. `|| true` on the pipeline keeps `set -e` from aborting
+  # before the finish call; the real code is recovered from PIPESTATUS.
+  set +e
+  ( gate_body ) 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  set -e
+
+  if [[ -n "$rid" ]]; then
+    # The digest covers the COMBINED transcript, in the order it was produced —
+    # which is what `2>&1 | tee` captures. Recorded as `combined` so a later
+    # comparison knows what it is comparing.
+    digest=$(sha256sum "$log" | cut -d" " -f1)
+    if ! "$gh" finish --repo "$REPO" --run-id "$rid" --exit "$rc" \
+         --sha256 "$digest" --streams combined \
+         --check fmt --check clippy-native --check clippy-wasm \
+         --check test --check trunk-build --check browser 2>/dev/null; then
+      echo ""
+      echo "⚠️  UNRECORDED: the gate ran but gatehouse could not record its result."
+      echo "    The gate's own verdict above stands. Nothing downstream may treat"
+      echo "    this commit as verified — there is no evidence for it."
+    fi
+  else
+    echo ""
+    echo "⚠️  UNRECORDED: no gate evidence was written (gatehouse unavailable)."
+    echo "    The gate's own verdict above stands. Nothing downstream may treat"
+    echo "    this commit as verified — there is no evidence for it."
+  fi
+
+  rm -f "$log"
+  return "$rc"
 }
 
 # dev browser — the render-path tests `cargo test` structurally cannot reach.
