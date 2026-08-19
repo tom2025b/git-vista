@@ -5,9 +5,9 @@
 //! so this is a re-home and a rename, not a redesign.
 //!
 //! Framework-free by construction: the payloads are `String`, `Option<String>`, `bool`,
-//! `git_vista_core::activity::Undoable`, and (since #233's `ForceWithLease`)
-//! `git_vista_protocol`'s own validated `CommitOid`/`RiskLevel` — none of them tied to a
-//! UI framework, so the operations core stays host-testable.
+//! `git_vista_core::activity::Undoable`, [`HeadBranch`], and (since #233's
+//! `ForceWithLease`) `git_vista_protocol`'s own validated `CommitOid`/`RiskLevel` — none
+//! of them tied to a UI framework, so the operations core stays host-testable.
 //!
 //! `Debug`/`PartialEq`/`Eq` are new (the old `PendingOp` derived only `Clone`). The core
 //! needs equality to enforce ADR 0020's rule that one idempotency key may not be rebound to
@@ -23,12 +23,12 @@ use git_vista_protocol::{CommitOid, MergeStrategy, RiskLevel};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationKind {
     /// Merge `branch` into the checked-out branch (`git merge <branch>`). `into` is
-    /// the live HEAD branch, fetched when the item is clicked, so the confirmation
-    /// names the true target; `None` => detached HEAD (the confirm button is disabled).
-    Merge {
-        branch: String,
-        into: Option<String>,
-    },
+    /// the live HEAD answer, fetched when the item is clicked, so the confirmation
+    /// names the true target. [`HeadBranch::Detached`] and [`HeadBranch::Unknown`]
+    /// both disable the confirm button, with copy that says which one happened —
+    /// a failed read is not evidence of a detached HEAD, and the dialog must not
+    /// claim it is.
+    Merge { branch: String, into: HeadBranch },
     /// Push `branch` to origin (`git push origin <branch>`), optionally
     /// recording it as the upstream and/or forcing it with a reviewed lease
     /// (M2.20g, #233 — widened from the bare `{ branch }` M1 shape).
@@ -51,13 +51,14 @@ pub enum OperationKind {
         /// `Some` for a force-with-lease publish under review.
         force: Option<ForceWithLease>,
     },
-    /// Delete `branch` (`git branch -d <branch>`). `current` is the live HEAD branch,
-    /// fetched on click; when it equals `branch` the confirm button is disabled (git
-    /// refuses to delete the checked-out branch). `None` => detached HEAD (deletable).
-    Delete {
-        branch: String,
-        current: Option<String>,
-    },
+    /// Delete `branch` (`git branch -d <branch>`). `current` is the live HEAD answer,
+    /// fetched on click: [`HeadBranch::Known`] equal to `branch` disables the confirm
+    /// button (git refuses to delete the checked-out branch), [`HeadBranch::Detached`]
+    /// leaves it deletable — and [`HeadBranch::Unknown`] disables it too, because a
+    /// delete offered on a failed read might be a delete of the branch you're on.
+    /// "Couldn't tell" is never "safe to offer" (the same rule the server states in
+    /// `activity.rs`).
+    Delete { branch: String, current: HeadBranch },
     /// Check out `branch` (`git checkout <branch>`), moving HEAD and the working
     /// tree to it. `current` is the live HEAD branch, fetched on click; when it
     /// equals `branch` the confirm button is disabled (nothing to switch to).
@@ -155,6 +156,47 @@ pub enum OperationKind {
 pub struct ForceWithLease {
     pub expected_remote_tip: CommitOid,
     pub risk: RiskLevel,
+}
+
+/// The live "which branch is checked out?" answer a menu pre-check hands the
+/// confirm dialog — with the read's own failure kept as its own state.
+///
+/// `api::fetch_head_branch` distinguishes three outcomes: `Ok(Some(_))` (HEAD
+/// is on a branch), `Ok(None)` (detached HEAD), and `Err(_)` (the read itself
+/// failed — transport or JSON, per its doc comment). The menu pre-checks used
+/// to fold that `Err` into detached with `unwrap_or(None)`, and for a delete
+/// "detached" is the *enabling* answer — so a dead server made the confirm
+/// dialog offer a branch delete with a confident caption when the honest
+/// answer was "couldn't tell". This enum keeps the third state distinct all
+/// the way into `dialogs/confirm.rs`, bringing the frontend to the standard
+/// the server states in `activity.rs`: "couldn't tell" must never read as
+/// "safe to offer".
+///
+/// Framework-free like everything else in this module, so the classification
+/// and the prompts built from it are host-testable facts, not wasm-only ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadBranch {
+    /// HEAD is checked out on this branch.
+    Known(String),
+    /// The read succeeded and said detached HEAD — a real answer, not a guess.
+    Detached,
+    /// The read failed. Carries the transport/JSON error text so the dialog
+    /// can say *why* it refuses, instead of a bare "no".
+    Unknown(String),
+}
+
+impl HeadBranch {
+    /// Classify `api::fetch_head_branch`'s exact return shape — the one place
+    /// its `Result` is allowed to disappear. `Err` becomes [`Self::Unknown`],
+    /// never [`Self::Detached`]: collapsing the two is the defect this type
+    /// exists to make unrepresentable.
+    pub fn classify(fetched: Result<Option<String>, String>) -> Self {
+        match fetched {
+            Ok(Some(branch)) => Self::Known(branch),
+            Ok(None) => Self::Detached,
+            Err(err) => Self::Unknown(err),
+        }
+    }
 }
 
 impl OperationKind {
@@ -281,7 +323,7 @@ mod tests {
         let kinds = [
             OperationKind::Merge {
                 branch: "feature".into(),
-                into: Some("main".into()),
+                into: HeadBranch::Known("main".into()),
             },
             OperationKind::Push {
                 branch: "feature".into(),
@@ -298,7 +340,7 @@ mod tests {
             },
             OperationKind::Delete {
                 branch: "feature".into(),
-                current: None,
+                current: HeadBranch::Detached,
             },
             OperationKind::ForceDelete {
                 branch: "feature".into(),
@@ -499,7 +541,7 @@ mod fetch_pull_tests {
         let not_cancellable = [
             OperationKind::Merge {
                 branch: "feature".into(),
-                into: Some("main".into()),
+                into: HeadBranch::Known("main".into()),
             },
             // Server-honoured (`honours_cancellation` says `true` for
             // `PushBranch`), client-narrower-by-choice — see the doc
@@ -511,7 +553,7 @@ mod fetch_pull_tests {
             },
             OperationKind::Delete {
                 branch: "feature".into(),
-                current: None,
+                current: HeadBranch::Detached,
             },
             OperationKind::ForceDelete {
                 branch: "feature".into(),
@@ -557,5 +599,47 @@ mod fetch_pull_tests {
         assert!(fetch().describe().contains("origin"));
         assert!(pull(MergeStrategy::Merge).describe().contains("origin"));
         assert!(pull(MergeStrategy::Merge).describe().contains("main"));
+    }
+}
+
+#[cfg(test)]
+mod head_branch_tests {
+    use super::*;
+
+    #[test]
+    fn a_named_branch_classifies_as_known() {
+        assert_eq!(
+            HeadBranch::classify(Ok(Some("main".into()))),
+            HeadBranch::Known("main".into())
+        );
+    }
+
+    #[test]
+    fn a_successful_none_classifies_as_detached() {
+        assert_eq!(HeadBranch::classify(Ok(None)), HeadBranch::Detached);
+    }
+
+    /// The defect this type exists for: the menu used to run
+    /// `fetch_head_branch().await.unwrap_or(None)`, which made a transport
+    /// failure indistinguishable from a real detached HEAD — and for a branch
+    /// delete, "detached" is the answer that *enables* the button. A mutation
+    /// of `classify`'s `Err` arm back to `Detached` must fail here, not
+    /// survive into the dialog.
+    #[test]
+    fn a_failed_read_classifies_as_unknown_never_detached() {
+        let classified = HeadBranch::classify(Err("connection refused".into()));
+        assert_eq!(classified, HeadBranch::Unknown("connection refused".into()));
+        assert_ne!(classified, HeadBranch::Detached);
+    }
+
+    /// The error text rides along verbatim — the dialog shows *why* the read
+    /// failed, so a classify that drops or rewrites it loses the one clue the
+    /// user gets.
+    #[test]
+    fn unknown_carries_the_original_error_text() {
+        let HeadBranch::Unknown(err) = HeadBranch::classify(Err("HTTP 502".into())) else {
+            panic!("an Err must classify as Unknown");
+        };
+        assert_eq!(err, "HTTP 502");
     }
 }

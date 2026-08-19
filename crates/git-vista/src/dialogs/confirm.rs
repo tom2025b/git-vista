@@ -15,7 +15,8 @@ use git_vista_core::activity::UndoAction;
 use git_vista_protocol::MergeStrategy;
 
 use crate::features::dialogs::core::{
-    worktree_confirm, ConfirmPrompt, Dialog, PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
+    delete_confirm_prompt, merge_confirm_prompt, worktree_confirm, ConfirmPrompt, Dialog,
+    PullTarget, WorktreeAction, TOUCH_TARGET_STYLE,
 };
 use crate::features::graph::core::{disabled_menu_item_copy, push_confirm_copy};
 use crate::features::operations::kind::OperationKind;
@@ -78,7 +79,9 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
             // moment step one is taken.
             let armed = dialogs.confirm_armed();
             // `enabled` gates the confirm button: a merge into itself or a detached
-            // HEAD has no valid target, so the dialog is informational (Cancel only).
+            // HEAD has no valid target, so the dialog is informational (Cancel only)
+            // — and a live HEAD read that failed outright disables the destructive
+            // arms too, because "couldn't tell" is never "safe to offer".
             let ConfirmPrompt {
                 title,
                 body,
@@ -88,29 +91,12 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                 arm,
                 blocked_reason,
             } = match &op {
-                PendingOp::Merge { branch, into } => match into {
-                    Some(into) if into != branch => ConfirmPrompt::plain(
-                        "Merge branch",
-                        format!("Merge ‘{branch}’ into ‘{into}’? This updates ‘{into}’ in the working tree."),
-                        "Merge",
-                        false,
-                        true,
-                    ),
-                    Some(into) => ConfirmPrompt::plain(
-                        "Merge branch",
-                        format!("‘{into}’ is the branch you're on — there's nothing to merge into itself."),
-                        "Merge",
-                        false,
-                        false,
-                    ),
-                    None => ConfirmPrompt::plain(
-                        "Merge branch",
-                        format!("HEAD is detached, so there's no branch to merge ‘{branch}’ into. Check out a branch first."),
-                        "Merge",
-                        false,
-                        false,
-                    ),
-                },
+                // All string composition — including the refusal when the live
+                // HEAD read itself failed (`HeadBranch::Unknown`) — lives in
+                // `merge_confirm_prompt` (features::dialogs::core, pure and
+                // host-tested); this arm only plugs its answer in, the same
+                // shape the Push arm below took for `push_confirm_copy`.
+                PendingOp::Merge { branch, into } => merge_confirm_prompt(branch, into),
                 // #233: a plain push keeps the single-tap ceremony this
                 // operation has always had; a force-with-lease push (reached
                 // only through the menu's separate force-push entry point,
@@ -155,23 +141,10 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                         true,
                     ),
                 },
-                PendingOp::Delete { branch, current } => match current {
-                    Some(current) if current == branch => ConfirmPrompt::plain(
-                        "Delete branch",
-                        format!("‘{branch}’ is the branch you're on — check out another branch before deleting it."),
-                        "Delete",
-                        true,
-                        false,
-                    ),
-                    // A different branch, or detached HEAD: safe to offer the delete.
-                    _ => ConfirmPrompt::plain(
-                        "Delete branch",
-                        format!("Delete branch ‘{branch}’? Only a fully-merged branch can be deleted here."),
-                        "Delete",
-                        true,
-                        true,
-                    ),
-                },
+                // Same extraction as the Merge arm above: the decision — most
+                // importantly that a failed HEAD read never enables the delete
+                // — is `delete_confirm_prompt`'s, host-tested in the pure core.
+                PendingOp::Delete { branch, current } => delete_confirm_prompt(branch, current),
                 // Reached only after a safe delete was refused for "not fully merged"
                 // (see `run_confirmed`): offer the override, spelling out the risk.
                 PendingOp::ForceDelete { branch } => ConfirmPrompt::plain(

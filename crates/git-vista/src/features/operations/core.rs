@@ -18,6 +18,8 @@ use git_vista_protocol::operation::{
 use git_vista_protocol::plan::{GenerationToken, MergeStrategy};
 
 use crate::features::core_traits::{Applied, Invalidate, InvalidateScope, RequestKey};
+#[cfg(test)]
+use crate::features::operations::kind::HeadBranch;
 use crate::features::operations::kind::OperationKind;
 
 /// How many settled operations are kept for display.
@@ -596,7 +598,7 @@ mod core_tests {
     fn merge() -> OperationKind {
         OperationKind::Merge {
             branch: "feature".into(),
-            into: Some("main".into()),
+            into: HeadBranch::Known("main".into()),
         }
     }
 
@@ -645,7 +647,7 @@ mod core_tests {
                 key("k1"),
                 OperationKind::Delete {
                     branch: "other".into(),
-                    current: None,
+                    current: HeadBranch::Known("main".into()),
                 },
             )
             .unwrap_err();
@@ -795,7 +797,7 @@ mod core_tests {
     fn an_unmerged_delete_escalates_to_a_force_delete_of_the_same_branch() {
         let refused = OperationKind::Delete {
             branch: "feature".into(),
-            current: Some("main".into()),
+            current: HeadBranch::Known("main".into()),
         };
         assert_eq!(
             escalation(&refused, "error: the branch 'feature' is not fully merged"),
@@ -811,7 +813,7 @@ mod core_tests {
         // for, say, a locked ref would suggest force is the answer when it is not.
         let delete = OperationKind::Delete {
             branch: "feature".into(),
-            current: None,
+            current: HeadBranch::Detached,
         };
         assert_eq!(escalation(&delete, "permission denied"), None);
         assert_eq!(
@@ -996,7 +998,7 @@ mod intent_tests {
             },
             kind: OperationKind::Delete {
                 branch: branch.to_string(),
-                current: None,
+                current: HeadBranch::Detached,
             },
         }
     }
@@ -1134,7 +1136,7 @@ mod fetch_pull_summary_tests {
     fn a_kind_that_is_neither_fetch_nor_pull_passes_the_raw_message_through() {
         let merge = OperationKind::Merge {
             branch: "feature".into(),
-            into: Some("main".into()),
+            into: HeadBranch::Known("main".into()),
         };
         let raw = "{\"anything\":true}";
         assert_eq!(fetch_or_pull_summary(&merge, raw), raw);

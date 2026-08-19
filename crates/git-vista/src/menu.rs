@@ -54,7 +54,7 @@ use crate::features::graph::core::{
     tag_annotation_from_prompt, tag_sign_choice, RemoteTipKnowledge,
 };
 use crate::features::operations::core::PendingIntent;
-use crate::features::operations::kind::{rebase_item_label, ForceWithLease};
+use crate::features::operations::kind::{rebase_item_label, ForceWithLease, HeadBranch};
 use crate::features::shell::signals::{self as shell_state, Shell};
 use crate::features::status::core::{deletable_untracked_paths, discardable_tracked_paths};
 use crate::geometry::menu_placement;
@@ -891,7 +891,9 @@ pub fn menu_view(
                     // on click (not from the possibly-stale graph), so the item stays
                     // generic — "into current branch" — and the confirm dialog names
                     // the real HEAD branch once the fetch returns. Whether it's a
-                    // no-op self-merge or a detached HEAD is decided there too.
+                    // no-op self-merge, a detached HEAD, or a read that failed
+                    // outright (`HeadBranch::Unknown` — carried distinctly, never
+                    // folded into "detached") is decided there too.
                     let merge_item = {
                         let branch = b.clone();
                         let on = move |_| {
@@ -900,7 +902,7 @@ pub fn menu_view(
                             let seq = operations.next_seq();
                             let key = operations.request_key(RequestTarget::Branch(branch.clone()));
                             spawn_local(async move {
-                                let into = fetch_head_branch().await.unwrap_or(None);
+                                let into = HeadBranch::classify(fetch_head_branch().await);
                                 let intent = PendingIntent {
                                     seq,
                                     key,
@@ -1150,7 +1152,10 @@ pub fn menu_view(
                     // Delete: like merge, the "is this the checked-out branch?" test is
                     // resolved live on click, not from the possibly-stale graph. The
                     // confirm dialog blocks deleting the current branch; git's safe
-                    // `-d` still refuses an unmerged one server-side.
+                    // `-d` still refuses an unmerged one server-side. A pre-check that
+                    // *failed* travels as `HeadBranch::Unknown` — never folded into
+                    // "detached", which is the answer that would have enabled the
+                    // button — and the dialog refuses to offer the delete on it.
                     let delete_item = {
                         let branch = b.clone();
                         let on = move |_| {
@@ -1159,7 +1164,7 @@ pub fn menu_view(
                             let seq = operations.next_seq();
                             let key = operations.request_key(RequestTarget::Branch(branch.clone()));
                             spawn_local(async move {
-                                let current = fetch_head_branch().await.unwrap_or(None);
+                                let current = HeadBranch::classify(fetch_head_branch().await);
                                 let intent = PendingIntent {
                                     seq,
                                     key,
@@ -1565,8 +1570,8 @@ pub fn menu_view(
                     let key = operations.request_key(RequestTarget::Repository);
                     spawn_local(async move {
                         let remote = "origin".to_string();
-                        match fetch_head_branch().await.unwrap_or(None) {
-                            Some(branch) => {
+                        match HeadBranch::classify(fetch_head_branch().await) {
+                            HeadBranch::Known(branch) => {
                                 let intent = PendingIntent {
                                     seq,
                                     key,
@@ -1584,12 +1589,25 @@ pub fn menu_view(
                             // No branch to pull into. #316 pattern: the app's
                             // own modal, never a silent no-op and never a
                             // native alert().
-                            None => {
+                            HeadBranch::Detached => {
                                 dialogs.open(Dialog::Error);
                                 shell.open_error(ErrorNotice {
                                     title: "Can't pull",
                                     body: "HEAD is detached — check out a branch first."
                                         .to_string(),
+                                });
+                            }
+                            // The read itself failed. Saying "HEAD is detached"
+                            // here would be a diagnosis the app never made and
+                            // advice that can't help — say what happened.
+                            HeadBranch::Unknown(err) => {
+                                dialogs.open(Dialog::Error);
+                                shell.open_error(ErrorNotice {
+                                    title: "Can't pull",
+                                    body: format!(
+                                        "Couldn't read which branch is checked out — \
+                                         {err}\n\nTry again."
+                                    ),
                                 });
                             }
                         }
