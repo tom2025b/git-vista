@@ -868,6 +868,26 @@ fn resolve_repository(requested: Option<&str>) -> Result<RepositoryToken, (Statu
 // The write path
 // ---------------------------------------------------------------------------
 
+/// Whether a durable row's own `state` permits *attempting* a recovery at all
+/// — step 1 of [`recover_operation`], before live classification (step 2)
+/// runs at all.
+///
+/// Terminal only, via [`OperationState::is_terminal`] — but that means both
+/// `Succeeded` *and* `Failed`, not `Succeeded` alone: [`classify_recovery`]
+/// never consults `state`, a failed `ResetRef` still had its recovery pin
+/// written before `execute` ran (`planner.rs`'s `pin_recovery` call sits
+/// immediately before `execute`), and `OperationState::Failed`'s own doc says
+/// a refusal *is* a settled outcome, not a lost answer. Gating this on
+/// `Succeeded` alone let [`HistoryStateFilter::Any`] (whose
+/// [`HistoryStateFilter::terminal_states`] already admits `Failed`) advertise
+/// an `Offered` recovery this endpoint then refused with 400 — an undo the
+/// list showed with no way to press it. `Accepted`/`Running` are still
+/// refused: a non-terminal row has no settled outcome, and nothing durable
+/// guarantees a pin is in place while it's still running.
+fn state_permits_recovery_attempt(state: OperationState) -> bool {
+    state.is_terminal()
+}
+
 /// `POST /api/operations/{id}/recover` — run the recovery this server itself
 /// establishes for one past operation.
 ///
@@ -913,10 +933,36 @@ pub async fn recover_operation(
             "No operation with that id.".to_string(),
         );
     };
-    if row.state != OperationState::Succeeded {
+    if !state_permits_recovery_attempt(row.state) {
         return (
             StatusCode::BAD_REQUEST,
-            "Only a succeeded operation can be recovered.".to_string(),
+            "This operation hasn't finished yet — its recovery can't be checked.".to_string(),
+        );
+    }
+
+    // 1b. `repo` above is the CURRENT selection, and `classify_recovery`
+    //     below (and the execution after it) both run against exactly that
+    //     path — there is no per-row resolution here, unlike the read path's
+    //     `classify_recovery_for_row`, which resolves each row's own
+    //     `worktree` (`state::resolve_worktree`). `select_operations_blocking`
+    //     filters on `repository` alone, so one history page can legitimately
+    //     mix rows from several worktrees of one clone (identity.rs: a main
+    //     working tree and its linked worktrees share a `RepositoryId` but
+    //     carry distinct `WorktreeId`s/HEADs). Without this check, a row from
+    //     worktree B would be classified and, if `Offered`, executed against
+    //     whatever worktree happens to be selected right now — silently the
+    //     wrong HEAD. Refuse instead of resolving `row.worktree` here, so
+    //     classification (step 2) and execution (step 5, which itself
+    //     re-resolves the current selection via
+    //     `plan_and_execute_recovery`/`resolve_target`) can never disagree
+    //     about which worktree they mean.
+    let (_current_repository, current_worktree) = crate::planner::selection_tokens();
+    if row.worktree != current_worktree {
+        return (
+            StatusCode::CONFLICT,
+            "This operation belongs to a different worktree than the one \
+             currently selected — switch to it and try again."
+                .to_string(),
         );
     }
 
@@ -963,7 +1009,8 @@ pub async fn recover_operation(
 mod tests {
     use super::*;
     use git_vista_protocol::{
-        CommitMessage, GenerationToken, OperationHash, OperationStage, OperationState,
+        CommitMessage, GenerationToken, IdempotencyKey, OperationHash, OperationStage,
+        OperationState, RepoMode,
     };
 
     fn row(id: &str, accepted_at: i64) -> OperationStatus {
@@ -1352,6 +1399,47 @@ mod tests {
         }
     }
 
+    /// The bug this pins: `operation_history`'s `Any` filter (the default
+    /// when `?state=` is absent) already includes `Failed` rows — a failed
+    /// `ResetRef` still had its recovery pin written before `execute` ran, so
+    /// `classify_recovery` genuinely offers one. `recover_operation`'s own
+    /// state gate must not disagree with that, or the list advertises a
+    /// recovery the endpoint categorically refuses with 400 — an undo with no
+    /// way to press it.
+    ///
+    /// Goes red if [`state_permits_recovery_attempt`] reverts to
+    /// `state == OperationState::Succeeded` (the original bug): `Failed` is
+    /// still in `HistoryStateFilter::Any::terminal_states()`, so the loop
+    /// below would find a state the list offers that the gate refuses.
+    #[tokio::test]
+    async fn a_failed_row_the_list_would_offer_is_not_refused_by_the_endpoints_own_gate() {
+        let f = fixture();
+        let id = OperationId::new("failed-with-pin").unwrap();
+        let strategy = reset_ref_to(&f.first);
+        // The pin is written from inside the mutation guard immediately
+        // *before* `execute` (`planner.rs`) — so it exists regardless of
+        // whether the operation went on to succeed or fail. Nothing about
+        // this fixture setup is state-specific; only the row's stored
+        // `state` (asserted below) is.
+        crate::durable::write_recovery_ref(&f.repo, &id, &strategy).await;
+
+        let class = classify_recovery(&f.repo, &id, &GitOperation::StageAll, Some(&strategy)).await;
+        assert!(
+            matches!(class, RecoveryClass::Offered { .. }),
+            "a row with a live pin and a moved branch must classify Offered — \
+             same call the list uses per row — got {class:?}"
+        );
+
+        for state in HistoryStateFilter::Any.terminal_states() {
+            assert!(
+                state_permits_recovery_attempt(*state),
+                "{state:?} is one of the states `operation_history`'s default \
+                 `Any` filter returns, so `recover_operation`'s own gate must \
+                 not refuse it"
+            );
+        }
+    }
+
     /// The branch is already where recovery would put it: nothing to do, and
     /// — critically — no button.
     ///
@@ -1476,5 +1564,236 @@ mod tests {
         )
         .await;
         assert_eq!(class, RecoveryClass::AlreadyCurrent);
+    }
+
+    // -------------------------------------------------------------------
+    // `POST /api/operations/{id}/recover` — the equality gate itself
+    // -------------------------------------------------------------------
+
+    /// **The handler's own highest-risk point, driven end to end.** The design
+    /// doc's Consequences #1 names step 3 (`if undo != claimed`) as the single
+    /// place a stale or hand-crafted request could get treated as authoritative;
+    /// this pins that step by calling [`recover_operation`] itself, not by
+    /// grepping its source text.
+    ///
+    /// The branch moves a second time *after* the offer the client is holding
+    /// was drawn, so the `undo` `recover_operation` re-derives right now (a
+    /// reset to the newest tip) is a different [`UndoAction`] from the stale
+    /// `claimed` one built against the older tip. The gate must refuse this
+    /// with 409 and — the second half of the same fact — must never fall
+    /// through to actually resetting `main`, whether to the stale value or to
+    /// its own freshly-derived one.
+    ///
+    /// Goes red under the described neutering mutation of step 3 (keep the
+    /// `if undo != claimed {` line, empty its block and drop the `return`):
+    /// execution then falls through to step 4, which builds its operation
+    /// from the server's own freshly re-derived `undo` — not from `claimed` —
+    /// and reaches the planner, which really executes it. Manually verified
+    /// (not via `failure-atlas`'s `mutation_check`, whose clone reflects git
+    /// HEAD and so cannot see this test while it is uncommitted): applying
+    /// exactly that mutation flips this test from green to a panic reporting
+    /// `left: 200, right: 409` with the response body `"Reset 'main' to
+    /// a699791."` — the branch actually moved, to the server's own
+    /// re-derived tip, not to the stale value `claimed` carried. Both
+    /// assertions below are live nets against that outcome. The call is
+    /// wrapped in [`crate::operations::with_key`] so the planner is actually
+    /// reachable under the mutation rather than refusing one step earlier at
+    /// its own idempotency-header check, which would still catch the
+    /// mutation but would prove less. A bare `assert!(recover_body.contains(
+    /// ...))` substring check on the source text (`contract_suite.rs`) stays
+    /// green through this exact mutation, since the text `undo != claimed`
+    /// remains in the file — that is the gap this test closes.
+    #[tokio::test]
+    async fn a_stale_claimed_undo_is_refused_and_the_branch_is_left_alone() {
+        let f = fixture();
+        crate::state::set_current(&f.repo, RepoMode::Active);
+
+        let id = OperationId::new("recover-stale-claim").unwrap();
+        let strategy = reset_ref_to(&f.first);
+        crate::durable::write_recovery_ref(&f.repo, &id, &strategy).await;
+
+        let mut durable_row = row(id.as_str(), 1_000);
+        durable_row.operation = GitOperation::StageAll;
+        durable_row.recovery = Some(strategy.clone());
+        // This test's own concern is the equality gate (step 3), not the
+        // worktree-scope check (step 1b) — give it the current selection's
+        // real tokens so it reaches step 3 rather than being refused one
+        // step earlier by an unrelated (also correct) gate. `row()`'s
+        // placeholder "w"/"r" tokens are deliberately foreign; see
+        // `a_row_from_a_foreign_worktree_is_refused_not_executed_against_the_current_selection`
+        // for the test that exercises that gate.
+        let (repository, worktree) = crate::planner::selection_tokens();
+        durable_row.repository = repository;
+        durable_row.worktree = worktree;
+        crate::durable::persist(
+            IdempotencyKey::new("recover-stale-claim-key").unwrap(),
+            durable_row,
+        )
+        .await;
+
+        // What the client's page is holding: the offer as it looked before the
+        // branch moved again.
+        let stale_tip = crate::git_cmd::rev_parse(&f.repo, "HEAD")
+            .await
+            .unwrap()
+            .unwrap();
+        let claimed = UndoAction::ResetBranch {
+            branch: "main".to_string(),
+            to: f.first.clone(),
+            expected_tip: stale_tip,
+        };
+
+        // The branch moves again — a third commit — so `recover_operation`'s
+        // own live re-classification now offers a different `expected_tip`
+        // than the one `claimed` above carries.
+        std::fs::write(f.repo.join("a.txt"), "c\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["commit", "-qam", "third"])
+            .current_dir(&f.repo)
+            .status()
+            .unwrap()
+            .success());
+        let tip_before_call = crate::git_cmd::rev_parse(&f.repo, "HEAD")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Scoped with a real idempotency key, the same task-local the
+        // idempotency middleware sets up for a real request: without it, a
+        // neutered gate would still be caught (the planner's own
+        // `current_key()` check refuses with 400 before touching git), but
+        // that would prove less than the real risk this pins — a genuine
+        // client request always carries this header, so the branch-unmoved
+        // assertion below must be exercised with the planner actually
+        // reachable, not merely blocked one step earlier for an unrelated
+        // reason.
+        let (status, body) = crate::operations::with_key(
+            IdempotencyKey::new("recover-stale-claim-req").unwrap(),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            recover_operation(AxumPath(id.as_str().to_string()), Json(claimed)),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a stale claim must be refused, not executed against a different \
+             target — body was: {body}"
+        );
+        assert!(
+            body.contains("changed"),
+            "the refusal must say the offer changed, not something unrelated: {body}"
+        );
+
+        let tip_after_call = crate::git_cmd::rev_parse(&f.repo, "HEAD")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tip_after_call, tip_before_call,
+            "a refused recovery must never move the branch — not to the stale \
+             value the client claimed, and not to the server's own freshly \
+             re-derived one either"
+        );
+    }
+
+    /// **The bug this pins:** `recover_operation` must classify and execute
+    /// against the row's OWN worktree, never silently against whatever
+    /// happens to be the current selection. `select_operations_blocking`
+    /// filters on `repository` alone (`durable.rs`), so one history page can
+    /// legitimately mix rows from several worktrees of one clone
+    /// (`identity.rs`: a main working tree and every linked worktree share a
+    /// `RepositoryId` but carry distinct `WorktreeId`s/HEADs). A row from a
+    /// foreign worktree must never be classified — let alone executed —
+    /// against the currently selected one.
+    ///
+    /// This row's `strategy`/`recovery` and the live pin are set up exactly
+    /// as the "with a live pin" test, so that if the handler ever falls back
+    /// to classifying against the current selection (`f.repo`), it finds a
+    /// genuine `Offered` whose `undo` matches `claimed` exactly — the gate at
+    /// step 3 would then have nothing to catch, and step 5 would really
+    /// reset `main`. Only a worktree-scope check catches this.
+    ///
+    /// Goes red under the mutation this pins against: delete the `if
+    /// row.worktree != current_worktree` block added at recovery_center.rs
+    /// (the fix for this finding). Without it, this test's status assertion
+    /// flips from 409 to 200 and the branch-unmoved assertion fails — `main`
+    /// is actually reset to `f.first`, proved by `tip_after_call` differing
+    /// from `tip_before_call`.
+    #[tokio::test]
+    async fn a_row_from_a_foreign_worktree_is_refused_not_executed_against_the_current_selection() {
+        let f = fixture();
+        crate::state::set_current(&f.repo, RepoMode::Active);
+
+        // The worktree this request is actually about to run against, per
+        // the same resolution the planner itself uses.
+        let (_repo_token, current_worktree) = crate::planner::selection_tokens();
+
+        let id = OperationId::new("recover-foreign-worktree").unwrap();
+        let strategy = reset_ref_to(&f.first);
+        // The pin lives in `f.repo` — the CURRENT selection — precisely so a
+        // fallback to the current selection would find it and offer it.
+        crate::durable::write_recovery_ref(&f.repo, &id, &strategy).await;
+
+        let mut durable_row = row(id.as_str(), 2_000);
+        durable_row.operation = GitOperation::StageAll;
+        durable_row.recovery = Some(strategy.clone());
+        // The row belongs to a worktree the request never selected. Any
+        // literal that isn't the real UUID `current_worktree` holds proves
+        // the point; spelled out for clarity rather than relying on `row()`'s
+        // own default ("w") happening to differ.
+        durable_row.worktree = WorktreeToken::new("foreign-worktree-id").unwrap();
+        assert_ne!(
+            durable_row.worktree, current_worktree,
+            "the fixture must actually be foreign to the current selection"
+        );
+        crate::durable::persist(
+            IdempotencyKey::new("recover-foreign-worktree-key").unwrap(),
+            durable_row,
+        )
+        .await;
+
+        // What a correct live re-derivation against `f.repo` would offer —
+        // built to match exactly, so the equality gate (step 3) cannot be
+        // what refuses this request; only the worktree-scope check can.
+        let head = crate::git_cmd::rev_parse(&f.repo, "HEAD")
+            .await
+            .unwrap()
+            .unwrap();
+        let claimed = UndoAction::ResetBranch {
+            branch: "main".to_string(),
+            to: f.first.clone(),
+            expected_tip: head.clone(),
+        };
+
+        let (status, body) = crate::operations::with_key(
+            IdempotencyKey::new("recover-foreign-worktree-req").unwrap(),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            recover_operation(AxumPath(id.as_str().to_string()), Json(claimed)),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a row from a foreign worktree must be refused, not classified or \
+             executed against the current selection — body was: {body}"
+        );
+        assert!(
+            body.contains("worktree"),
+            "the refusal must name the actual reason (worktree scope), not \
+             something unrelated: {body}"
+        );
+
+        let tip_after_call = crate::git_cmd::rev_parse(&f.repo, "HEAD")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tip_after_call, head,
+            "a foreign-worktree row must never move the current selection's \
+             branch, even though its own live re-derivation would have been \
+             a genuine, matching offer"
+        );
     }
 }
