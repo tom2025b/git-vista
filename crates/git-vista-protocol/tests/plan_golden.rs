@@ -98,6 +98,27 @@ fn golden_plans() -> Vec<Plan> {
             },
         ),
         plan(
+            '4',
+            GitOperation::CherryPick { commit: oid('a') },
+            RiskLevel::Reversible,
+            vec![Precondition::CleanWorktree],
+            vec![],
+            RecoveryStrategy::NotNeeded,
+        ),
+        plan(
+            '5',
+            // M4.28 (#81): separate from CherryPick so "pick a merge without
+            // choosing a side" is unrepresentable, same as RevertMerge.
+            GitOperation::CherryPickMerge {
+                commit: oid('a'),
+                mainline: std::num::NonZeroU8::new(1).unwrap(),
+            },
+            RiskLevel::Reversible,
+            vec![Precondition::CleanWorktree],
+            vec![],
+            RecoveryStrategy::NotNeeded,
+        ),
+        plan(
             '3',
             // M4.28 (#81): a separate variant so "revert a merge without
             // choosing a side" is unrepresentable rather than merely checked.

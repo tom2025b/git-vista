@@ -604,6 +604,38 @@ pub enum GitOperation {
         to: CommitOid,
         expected_tip: CommitOid,
     },
+    /// `git cherry-pick <commit>` — apply one commit's changes onto the
+    /// checked-out branch as a NEW commit (M4.28, #81).
+    ///
+    /// # One commit per operation
+    ///
+    /// A cherry-pick *sequence* is stateful — git keeps its position in
+    /// `.git/sequencer/`. Modelling the whole sequence as one operation would
+    /// mean a plan that is half-executed after a conflict, and a plan in this
+    /// system either ran or it did not. One operation per commit makes partial
+    /// progress an ordinary fact — some operations ran, others have not been
+    /// submitted — which this vocabulary already models exactly.
+    ///
+    /// **Ordinary commits only**, like [`RevertCommit`]. See
+    /// [`CherryPickMerge`] for why a merge needs one more answer.
+    ///
+    /// [`RevertCommit`]: GitOperation::RevertCommit
+    /// [`CherryPickMerge`]: GitOperation::CherryPickMerge
+    CherryPick { commit: CommitOid },
+    /// `git cherry-pick -m <mainline> <commit>` — cherry-pick a **merge**
+    /// (M4.28, #81).
+    ///
+    /// Same reasoning as [`RevertMerge`], one verb over: a merge has two
+    /// parents, so "apply this merge's changes" is ambiguous until someone
+    /// says which parent the change is measured *against*. Git refuses to
+    /// guess, and a separate variant makes "cherry-pick a merge without
+    /// choosing" unrepresentable rather than merely checked.
+    ///
+    /// [`RevertMerge`]: GitOperation::RevertMerge
+    CherryPickMerge {
+        commit: CommitOid,
+        mainline: std::num::NonZeroU8,
+    },
     /// `git revert --no-edit <commit>` — the history-preserving undo for a
     /// commit that's already shared (`/api/undo`; `--abort`ed on conflict).
     ///

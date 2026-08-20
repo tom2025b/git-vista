@@ -152,6 +152,17 @@ pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
         // adding it knows the exposure argument is already made and does not
         // have to re-litigate it. Caught by the catalog census, which refused
         // to accept a Tool() naming something that does not exist.
+        // Same position as RevertMerge: exposure is defensible (a commit named
+        // by oid, plus a small integer) and simply not built yet. Recorded as
+        // pending rather than refused.
+        GitOperation::CherryPick { .. } => Excluded(
+            "the plan_cherry_pick tool is not built yet; exposure is defensible and \
+             pending, not refused",
+        ),
+        GitOperation::CherryPickMerge { .. } => Excluded(
+            "the plan_cherry_pick_merge tool is not built yet; exposure is defensible \
+             and pending, not refused",
+        ),
         GitOperation::RevertMerge { .. } => Excluded(
             "the plan_revert_merge tool is not built yet; exposure is defensible \
              (oid plus a small integer, nothing an agent cannot see) and is simply \
@@ -1170,6 +1181,8 @@ mod tests {
         "resolve_conflict",
         "stage_selection",
         "branch_from_stash",
+        "cherry_pick",
+        "cherry_pick_merge",
         "revert_merge",
         "pop_stash",
         "push_stash",
@@ -1360,6 +1373,13 @@ mod tests {
                 expected_tip: oid(&zeros),
             },
             GitOperation::RevertMerge {
+                commit: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+                mainline: std::num::NonZeroU8::new(1).unwrap(),
+            },
+            GitOperation::CherryPick {
+                commit: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+            },
+            GitOperation::CherryPickMerge {
                 commit: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
                 mainline: std::num::NonZeroU8::new(1).unwrap(),
             },

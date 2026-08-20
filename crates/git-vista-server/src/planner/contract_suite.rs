@@ -232,6 +232,8 @@ fn covered_by(op: &GitOperation) -> &'static str {
         GitOperation::ResetBranch { .. } => "reset_branch_executes_through_the_pipeline",
         GitOperation::RevertCommit { .. } => "revert_commit_executes_through_the_pipeline",
         GitOperation::RevertMerge { .. } => "reverting_a_merge_needs_a_mainline_and_says_why",
+        GitOperation::CherryPick { .. } => "a_cherry_pick_lands_a_commit_from_another_branch",
+        GitOperation::CherryPickMerge { .. } => "cherry_picking_a_merge_needs_a_mainline",
         GitOperation::ResetTestRepo => "reset_test_repo_executes_through_the_pipeline",
         GitOperation::StageSelection { .. } => "stage_selection_executes_through_the_pipeline",
         GitOperation::DiscardTrackedPaths { .. } => {
@@ -286,6 +288,8 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
         | GitOperation::ResetBranch { .. }
         | GitOperation::RevertCommit { .. }
         | GitOperation::RevertMerge { .. }
+        | GitOperation::CherryPick { .. }
+        | GitOperation::CherryPickMerge { .. }
         | GitOperation::ResetTestRepo
         | GitOperation::StageSelection { .. }
         | GitOperation::DiscardTrackedPaths { .. }
@@ -6029,5 +6033,117 @@ async fn a_parent_that_does_not_exist_is_refused() {
     assert!(
         body.contains("does not exist"),
         "the refusal must say the parent does not exist: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_cherry_pick_lands_a_commit_from_another_branch() {
+    let (_dir, repo) = seeded_repo();
+    run(&repo, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(repo.join("picked.txt"), "from side\n").unwrap();
+    run(&repo, &["add", "picked.txt"]);
+    run(&repo, &["commit", "-q", "-m", "side work"]);
+    let wanted = out(&repo, &["rev-parse", "HEAD"]);
+    run(&repo, &["checkout", "-q", "main"]);
+
+    // Main must have moved on, or the cherry-pick reproduces a BYTE-IDENTICAL
+    // commit — same tree, same parent, same author, same message, same
+    // timestamp, therefore the same oid. Correct git behaviour, and it makes
+    // "a new commit was created" unobservable. Discovered by asserting the
+    // opposite and being wrong.
+    std::fs::write(repo.join("unrelated.txt"), "main moved on\n").unwrap();
+    run(&repo, &["add", "unrelated.txt"]);
+    run(&repo, &["commit", "-q", "-m", "main moves on"]);
+
+    assert!(!repo.join("picked.txt").exists(), "fixture: not here yet");
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::CherryPick {
+            commit: git_vista_protocol::CommitOid::new(wanted.clone()).unwrap(),
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    assert!(
+        repo.join("picked.txt").exists(),
+        "the picked commit's file must be present on main"
+    );
+    assert_ne!(
+        out(&repo, &["rev-parse", "HEAD"]),
+        wanted,
+        "a cherry-pick creates a NEW commit; it does not move the branch to the old one"
+    );
+}
+
+#[tokio::test]
+async fn a_conflicting_cherry_pick_pauses_instead_of_aborting() {
+    // The difference #81 depends on #84 for. The revert path next door
+    // `--abort`s on conflict, which was correct when there was nowhere to send
+    // a conflict. There is now — so the cherry-pick is left IN PROGRESS with
+    // the paths named, because aborting would throw away work the user can
+    // finish.
+    //
+    // MUTATION: `--abort` on failure, as revert does. The sequencer state
+    // disappears and the user is told it failed, with the resolution they
+    // could have completed silently discarded.
+    let (_dir, repo) = seeded_repo();
+    run(&repo, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(repo.join("a.txt"), "from side\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "side changes a"]);
+    let wanted = out(&repo, &["rev-parse", "HEAD"]);
+    run(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("a.txt"), "from main\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "main changes a"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::CherryPick {
+            commit: git_vista_protocol::CommitOid::new(wanted).unwrap(),
+        },
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "body: {body}");
+    assert!(
+        body.contains("NOT complete"),
+        "the response must say plainly it did not finish: {body}"
+    );
+    assert!(
+        body.contains("a.txt"),
+        "the conflicted path must be named: {body}"
+    );
+    // The promise must be true: the cherry-pick is still in progress.
+    assert!(
+        repo.join(".git/CHERRY_PICK_HEAD").exists(),
+        "the sequencer state must survive — this is what makes it a pause"
+    );
+}
+
+#[tokio::test]
+async fn cherry_picking_a_merge_needs_a_mainline() {
+    // Same refusal as revert, one verb over — and it must read naturally for
+    // THIS verb, which is why the shared helper takes the word.
+    let (_dir, repo) = merged_repo();
+    let head = out(&repo, &["rev-parse", "HEAD"]);
+    run(&repo, &["checkout", "-q", "-b", "elsewhere", "HEAD~1"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::CherryPick {
+            commit: git_vista_protocol::CommitOid::new(head.clone()).unwrap(),
+        },
+    )
+    .await;
+
+    assert_ne!(status, axum::http::StatusCode::OK, "body: {body}");
+    assert!(
+        body.contains("cherry-picking it needs one more answer"),
+        "the refusal must use THIS verb, not revert's wording: {body}"
+    );
+    assert!(
+        body.contains("which side of the merge"),
+        "and must name the decision: {body}"
     );
 }

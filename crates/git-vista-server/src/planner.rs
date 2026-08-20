@@ -2036,6 +2036,19 @@ async fn shape(
             };
             (RiskLevel::Destructive, preconditions, changes, recovery)
         }
+        GitOperation::CherryPick { .. } | GitOperation::CherryPickMerge { .. } => {
+            // A cherry-pick ADDS a commit to the current branch, so nothing
+            // existing is lost and the undo is to move the branch back — the
+            // same shape as any other commit-creating operation.
+            //
+            // CleanWorktree matters here for a reason revert does not share:
+            // a cherry-pick that conflicts leaves the sequencer mid-flight,
+            // and `--abort` is what unwinds it. That is only provably safe
+            // with nothing of the user's in the tree to destroy.
+            let (preconditions, changes, recovery) =
+                head_moves(Some(Precondition::CleanWorktree));
+            (RiskLevel::Reversible, preconditions, changes, recovery)
+        }
         GitOperation::RevertMerge { commit, .. } => {
             // Identical shape to RevertCommit: a revert ADDS a commit, so
             // nothing existing is lost and the undo is to revert the revert.
@@ -2406,6 +2419,10 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         } => exec_reset_branch(repo, need, &branch, &to, &expected_tip, &observed).await,
         GitOperation::RevertCommit { commit } => {
             exec_revert(repo, need, &commit, None, &observed).await
+        }
+        GitOperation::CherryPick { commit } => exec_cherry_pick(repo, need, &commit, None).await,
+        GitOperation::CherryPickMerge { commit, mainline } => {
+            exec_cherry_pick(repo, need, &commit, Some(mainline)).await
         }
         GitOperation::RevertMerge { commit, mainline } => {
             exec_revert(repo, need, &commit, Some(mainline), &observed).await
@@ -4659,6 +4676,156 @@ async fn exec_reset_branch(
     }
 }
 
+/// `git cherry-pick [-m <mainline>] <commit>` (M4.28, #81).
+///
+/// # A conflict is a pause, not a failure
+///
+/// The revert path next door `--abort`s on conflict, and that was correct when
+/// it was written: there was nowhere to send a conflict. M4.31 (#84) changed
+/// that. So a conflicting cherry-pick is left IN PLACE, with the sequencer
+/// state intact, and reported with the conflicted paths named — because the
+/// resolution path now exists and aborting would throw away work the user can
+/// finish.
+///
+/// That is the difference #81 depends on #84 for.
+async fn exec_cherry_pick(
+    repo: &Path,
+    need: NetworkNeed,
+    commit: &CommitOid,
+    mainline: Option<std::num::NonZeroU8>,
+) -> (StatusCode, String) {
+    let commit = commit.as_str();
+
+    if let Some(refusal) =
+        refuse_mainline_mismatch(repo, need, commit, mainline, "cherry-picking").await
+    {
+        return refusal;
+    }
+
+    let mainline_flag = mainline.map(|m| m.get().to_string());
+    let mut argv: Vec<&str> = vec!["cherry-pick"];
+    if let Some(m) = mainline_flag.as_deref() {
+        argv.push("-m");
+        argv.push(m);
+    }
+    argv.push(commit);
+
+    let output = match run_git(repo, need, &argv).await {
+        Ok(o) => o,
+        Err(e) => return couldnt_run("/api/cherry-pick", &e),
+    };
+
+    // Asked in both branches for the same reason pop does: a cherry-pick git
+    // called successful while leaving conflicted paths would be the case this
+    // check exists for.
+    let continuation = crate::conflicts::continuation(repo).await;
+
+    match (output.status.success(), continuation) {
+        (true, Ok(c)) if c.may_continue() => {
+            println!("[/api/cherry-pick] picked {}", short(commit));
+            (
+                StatusCode::OK,
+                format!("Cherry-picked {} onto this branch.", short(commit)),
+            )
+        }
+
+        // Same posture as pop and branch-from-stash: never claim completion on
+        // a check that could not be made.
+        (_, Err(why)) => (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "git cherry-pick ran, but the conflict state could not be read \
+                 afterwards — {why}. Check `git status` before continuing."
+            ),
+        ),
+
+        (_, Ok(c)) => {
+            let detail = match &c {
+                git_vista_protocol::conflict::Continuation::Blocked { unresolved, .. } => {
+                    if unresolved.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n\nConflicted:\n  {}", unresolved.join("\n  "))
+                    }
+                }
+                git_vista_protocol::conflict::Continuation::Clear => String::new(),
+            };
+            eprintln!("[/api/cherry-pick] {} left conflicts", short(commit));
+            (
+                StatusCode::CONFLICT,
+                format!(
+                    "Cherry-picking {} left conflicts, so it is NOT complete.{detail}\n\n\
+                     The cherry-pick is still in progress — resolve the paths above and \
+                     it can continue, or abort it to unwind.",
+                    short(commit)
+                ),
+            )
+        }
+    }
+}
+
+/// Refuse when a `mainline` and a commit's actual shape disagree (M4.28, #81).
+///
+/// Shared by revert and cherry-pick because both take `-m`, both refuse in the
+/// same two directions, and a second copy of this reasoning would be a second
+/// place for it to drift. `verb` is the word the message uses so each caller
+/// reads naturally.
+///
+/// # The messages name the DECISION, not the flag
+///
+/// Git's own refusal — "commit <sha> is a merge but no -m option was given" —
+/// is accurate and nearly useless to someone who has not done this before: it
+/// names an option, when what the user is missing is a choice. So these say
+/// which choice, and what the usual answer is.
+///
+/// # An unreadable parent count falls through
+///
+/// `None` from [`parent_count`] means this server does not know whether the
+/// commit is a merge. Refusing there would block a legitimate operation on a
+/// read WE failed to make, so the caller proceeds and lets git decide — worst
+/// case the user gets git's terser wording, which is where they were before.
+async fn refuse_mainline_mismatch(
+    repo: &Path,
+    need: NetworkNeed,
+    commit: &str,
+    mainline: Option<std::num::NonZeroU8>,
+    verb: &str,
+) -> Option<(StatusCode, String)> {
+    match (parent_count(repo, need, commit).await, mainline) {
+        (Some(n), None) if n > 1 => Some((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} is a merge commit, so {verb} it needs one more answer: which side \
+                 of the merge is the history you are keeping?\n\nThat side is kept; \
+                 everything the other side brought in is what changes. Usually the \
+                 answer is the branch you were on when you merged, which is parent 1.",
+                short(commit)
+            ),
+        )),
+        // `n <= 1`, not `n == 1`: a ROOT commit has ZERO parents and is just as
+        // much "not a merge" as an ordinary one. Written as == 1 first, which
+        // sent a root commit down the parent-does-not-exist arm and produced
+        // "has 0 parents, so parent 1 does not exist" — true, and the wrong
+        // explanation. Caught by a test, not by review.
+        (Some(n), Some(_)) if n <= 1 => Some((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} is not a merge commit — it has {n} parent(s), so there is no side \
+                 to choose.",
+                short(commit)
+            ),
+        )),
+        (Some(n), Some(m)) if usize::from(m.get()) > n => Some((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} has {n} parents, so parent {m} does not exist.",
+                short(commit)
+            ),
+        )),
+        _ => None,
+    }
+}
+
 /// How many parents `commit` has, or `None` if the read failed.
 ///
 /// `None` is deliberately NOT "one parent". A failed read means this server
@@ -4735,57 +4902,8 @@ async fn exec_revert(
 ) -> (StatusCode, String) {
     let commit = commit.as_str();
 
-    // M4.28 (#81): the two variants must match the commit's actual shape, and
-    // the mismatch is refused HERE rather than left to git.
-    //
-    // Git's own message for the first case — "commit <sha> is a merge but no
-    // -m option was given" — is accurate and nearly useless to someone who has
-    // never reverted a merge. It names a flag, not a decision. The refusal
-    // below names the decision.
-    let parents = parent_count(repo, need, commit).await;
-    match (parents, mainline) {
-        (Some(n), None) if n > 1 => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "{} is a merge commit, so undoing it needs one more answer: which \
-                     side of the merge is the history you are keeping?\n\n\
-                     Reverting a merge undoes everything the OTHER side brought in. \
-                     Usually the answer is the branch you were on when you merged, \
-                     which is parent 1.",
-                    short(commit)
-                ),
-            );
-        }
-        // `n <= 1`, not `n == 1`: a ROOT commit has ZERO parents and is just
-        // as much "not a merge" as an ordinary one. Written as == 1 first,
-        // which sent a root commit down the parent-does-not-exist arm and
-        // produced "has 0 parents, so parent 1 does not exist" — true, and the
-        // wrong explanation. Caught by a test, not by review.
-        (Some(n), Some(_)) if n <= 1 => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "{} is not a merge commit — it has {n} parent(s), so there is no \
-                     side to choose. Revert it without a mainline.",
-                    short(commit)
-                ),
-            );
-        }
-        (Some(n), Some(m)) if usize::from(m.get()) > n => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "{} has {n} parents, so parent {m} does not exist.",
-                    short(commit)
-                ),
-            );
-        }
-        // Parent count unreadable: fall through and let git decide. This is
-        // deliberate — refusing on a read WE could not make would block a
-        // legitimate revert on our own failure, and git will refuse it anyway
-        // with a message that is at worst terse.
-        _ => {}
+    if let Some(refusal) = refuse_mainline_mismatch(repo, need, commit, mainline, "undoing").await {
+        return refusal;
     }
 
     let mainline_flag = mainline.map(|m| m.get().to_string());
@@ -5974,6 +6092,8 @@ pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
         | GitOperation::ResetBranch { .. }
         | GitOperation::RevertCommit { .. }
         | GitOperation::RevertMerge { .. }
+        | GitOperation::CherryPick { .. }
+        | GitOperation::CherryPickMerge { .. }
         | GitOperation::ResetTestRepo
         | GitOperation::DiscardTrackedPaths { .. }
         | GitOperation::DeleteUntrackedPaths { .. }
