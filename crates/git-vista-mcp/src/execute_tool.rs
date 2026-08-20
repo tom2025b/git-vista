@@ -223,6 +223,7 @@ mod tests {
             preconditions: Vec::new(),
             expected_ref_changes: Vec::new(),
             recovery: RecoveryStrategy::NotNeeded,
+            advisories: Vec::new(),
         }
     }
 

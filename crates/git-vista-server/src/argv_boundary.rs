@@ -171,6 +171,11 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // the same "referee is not the code being checked" posture `pull_suite`
     // and `push_suite` document above.
     "src/planner/hook_timeout_suite.rs",
+    // #[cfg(test)] git fixtures for the M4.32 (#85) advisory suite: plain
+    // `git init`/`commit`/`push`/`symbolic-ref` to build a repository with a
+    // real bare remote, so the presence or absence of refs/remotes/origin/HEAD
+    // — the variable the whole suite turns on — is genuine rather than mocked.
+    "src/planner/advisory_suite.rs",
     "src/state.rs",         // #[cfg(test)] fixture setup
     "src/argv_boundary.rs", // this file (the scan reads its own source)
     // The M1.13b spawn chokepoint (#66, Task 5). It builds a git Command from

@@ -30,6 +30,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "delete_created_branch",
       "name": "feature/idea"
@@ -66,6 +67,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "reset_ref",
       "ref_name": "refs/heads/main",
@@ -109,6 +111,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "reset_ref",
       "ref_name": "refs/heads/feature/stub",
@@ -128,6 +131,7 @@
     "risk": "safe",
     "preconditions": [],
     "expected_ref_changes": [],
+    "advisories": [],
     "recovery": {
       "strategy": "not_needed"
     }
@@ -145,6 +149,7 @@
     "risk": "safe",
     "preconditions": [],
     "expected_ref_changes": [],
+    "advisories": [],
     "recovery": {
       "strategy": "not_needed"
     }
@@ -180,6 +185,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "checkout_previous",
       "branch": "main"
@@ -220,6 +226,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "reset_ref",
       "ref_name": "refs/heads/main",
@@ -266,6 +273,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "irrecoverable"
     }
@@ -301,6 +309,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "recreate_branch",
       "name": "feature/done",
@@ -338,6 +347,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "recreate_branch",
       "name": "feature/abandoned",
@@ -378,6 +388,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "reset_ref",
       "ref_name": "refs/heads/feature/idea",
@@ -415,6 +426,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "delete_created_branch",
       "name": "feature/done"
@@ -457,6 +469,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "reset_ref",
       "ref_name": "refs/heads/main",
@@ -493,6 +506,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "revert_commit",
       "commit": "8888888888888888888888888888888888888888"
@@ -527,6 +541,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "irrecoverable"
     }
@@ -550,6 +565,7 @@
     "risk": "safe",
     "preconditions": [],
     "expected_ref_changes": [],
+    "advisories": [],
     "recovery": {
       "strategy": "not_needed"
     }
@@ -571,6 +587,7 @@
     "risk": "destructive",
     "preconditions": [],
     "expected_ref_changes": [],
+    "advisories": [],
     "recovery": {
       "strategy": "recoverable_if_staged"
     }
@@ -591,6 +608,7 @@
     "risk": "destructive",
     "preconditions": [],
     "expected_ref_changes": [],
+    "advisories": [],
     "recovery": {
       "strategy": "irrecoverable"
     }
@@ -632,6 +650,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "reset_ref",
       "ref_name": "refs/heads/main",
@@ -657,6 +676,7 @@
       }
     ],
     "expected_ref_changes": [],
+    "advisories": [],
     "recovery": {
       "strategy": "not_needed"
     }
@@ -702,6 +722,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "reset_ref",
       "ref_name": "refs/heads/main",
@@ -742,6 +763,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "delete_created_tag",
       "name": "v1.0.0"
@@ -778,6 +800,7 @@
         }
       }
     ],
+    "advisories": [],
     "recovery": {
       "strategy": "recreate_tag",
       "name": "v1.0.0",
@@ -804,6 +827,7 @@
       }
     ],
     "expected_ref_changes": [],
+    "advisories": [],
     "recovery": {
       "strategy": "irrecoverable"
     }
@@ -832,6 +856,7 @@
       }
     ],
     "expected_ref_changes": [],
+    "advisories": [],
     "recovery": {
       "strategy": "irrecoverable"
     }

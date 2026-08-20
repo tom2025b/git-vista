@@ -39,7 +39,7 @@ use git_vista_core::activity::ActivityKind;
 use git_vista_core::identity::{GenerationInputs, RepositoryId};
 use git_vista_core::seed::{parse_seed, reset_plan, Seed};
 use git_vista_protocol::{
-    AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitError,
+    Advisory, AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitError,
     CommitFailureKind, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
     IdempotencyKey, MergeStrategy, OperationHash, OperationId, OperationStage, Plan, Precondition,
     RecoveryStrategy, RefChange, RefName, RefState, RemoteName, RepositoryToken, RiskLevel,
@@ -802,6 +802,10 @@ async fn build_plan(
     let generation = generation_token(repo, &observed).await;
     let now = crate::activity::now_secs();
 
+    // Computed before the struct so the borrow of `operation` ends here; the
+    // struct takes it by value on the next line.
+    let advisories = advisories_for(repo, &operation).await;
+
     let plan = Plan {
         repository,
         worktree,
@@ -814,6 +818,7 @@ async fn build_plan(
         preconditions,
         expected_ref_changes,
         recovery,
+        advisories,
     };
     (plan, observed)
 }
@@ -1408,6 +1413,93 @@ async fn rev_parse_ref_unpeeled(
     }
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok((!id.is_empty()).then_some(id))
+}
+
+/// The remote's default branch, read from `refs/remotes/<remote>/HEAD`.
+///
+/// `Ok(Some(name))` — the symbolic ref resolved and names a branch.
+/// `Ok(None)` — git answered, and there is no such ref: this repository simply
+/// does not record a default branch (a bare `git clone` sets it; a manually
+/// added remote often does not).
+/// `Err(_)` — the read itself failed.
+///
+/// **The two non-answers are kept apart on purpose.** Both become
+/// [`Advisory::DefaultBranchUnknown`] at the call site, but they are different
+/// facts and the reason text says which — collapsing them here would be the
+/// same "could not look reads as nothing there" mistake this file guards
+/// against everywhere else.
+///
+/// Local only: resolving a symbolic ref reads `.git`, never a socket. This is
+/// deliberate and load-bearing — see [`Advisory`]'s docs for why no variant
+/// claims anything about forge branch-protection rules, which are not
+/// knowable without asking the forge.
+async fn default_branch_of(repo: &Path, remote: &RemoteName) -> Result<Option<String>, String> {
+    let ref_name = format!("refs/remotes/{}/HEAD", remote.as_str());
+    let output = crate::git_cmd::git_output(
+        repo,
+        &["symbolic-ref", "--quiet", "--short", ref_name.as_str()],
+    )
+    .await
+    .map_err(|e| format!("couldn't run git symbolic-ref: {e}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    // `--short` yields `<remote>/<branch>`; the branch is what follows the
+    // first slash. Split once from the left rather than taking the last
+    // segment: branch names may themselves contain slashes
+    // (`feature/m4.32-...`), and `rsplit` would return only the tail.
+    let short = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let prefix = format!("{}/", remote.as_str());
+    Ok(short
+        .strip_prefix(prefix.as_str())
+        .map(str::to_string)
+        .filter(|b| !b.is_empty()))
+}
+
+/// The advisories this operation earns (M4.32, #85).
+///
+/// Only a force-with-lease push earns any. An ordinary push cannot replace
+/// remote history, so warning on it would train users to click through the
+/// warnings that matter — the same argument `FetchRemote`'s docs make for
+/// refusing to overstate its risk.
+async fn advisories_for(repo: &Path, operation: &GitOperation) -> Vec<Advisory> {
+    let GitOperation::PushBranch {
+        branch,
+        remote,
+        force: ForcePublish::WithLease { .. },
+        ..
+    } = operation
+    else {
+        return Vec::new();
+    };
+
+    let mut out = vec![Advisory::RemoteHistoryReplaced {
+        branch: branch.clone(),
+        remote: remote.clone(),
+    }];
+
+    out.push(match default_branch_of(repo, remote).await {
+        Ok(Some(default)) if default == branch.as_str() => Advisory::DefaultBranchPush {
+            branch: branch.clone(),
+            remote: remote.clone(),
+        },
+        // Known, and this is not it: no advisory. The absence here is earned —
+        // the check ran and answered.
+        Ok(Some(_)) => return out,
+        Ok(None) => Advisory::DefaultBranchUnknown {
+            reason: format!(
+                "{} does not record a default branch (no refs/remotes/{}/HEAD), \
+                 so this plan cannot tell you whether {} is it",
+                remote.as_str(),
+                remote.as_str(),
+                branch.as_str()
+            ),
+        },
+        Err(why) => Advisory::DefaultBranchUnknown {
+            reason: format!("the default branch could not be read — {why}"),
+        },
+    });
+    out
 }
 
 /// Best-effort `CommitOid` from an observation. `Absent` and `Unknown` both
@@ -5491,6 +5583,11 @@ mod remote_boundary_suite;
 // forever, and cannot hold the coordinator guard forever either.
 #[cfg(test)]
 mod hook_timeout_suite;
+
+// M4.32 (#85): which advisories a force-with-lease push earns, and that
+// "could not determine the default branch" never reads as "not it".
+#[cfg(test)]
+mod advisory_suite;
 
 #[cfg(test)]
 mod tests {

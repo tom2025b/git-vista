@@ -14,7 +14,7 @@
 //! review the diff, and record the protocol implications (M1.02 rules).
 
 use git_vista_protocol::{
-    BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
+    Advisory, BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
     MergeStrategy, OperationHash, Plan, Precondition, RecoveryStrategy, RefChange, RefName,
     RefState, RemoteName, RepositoryToken, RiskLevel, SignatureStatus, StageDirection,
     TagAnnotation, TagDetail, TagKind, TagMessage, TagName, UnixSeconds, WorktreePath,
@@ -68,6 +68,10 @@ fn plan(
         preconditions,
         expected_ref_changes,
         recovery,
+        // Most operations earn none. The force-with-lease case that does is
+        // built explicitly below, so the advisory wire shape is pinned by a
+        // case a reader can see rather than by a defaulted argument.
+        advisories: Vec::new(),
     }
 }
 
@@ -1229,4 +1233,75 @@ fn golden_set_covers_every_operation_variant() {
          variant that no longer exists, or a deliberate wire rename that has \
          not reached the fixture"
     );
+}
+
+/// The [`Advisory`] wire shape (M4.32, #85), pinned per variant.
+///
+/// Not in `plan_v1.json`: the golden set allows one plan per `op` tag, and the
+/// push slot is spoken for. But the shape still has to be pinned somewhere — a
+/// retagged variant would change what a client reads without breaking any
+/// round-trip test, and the advisory a client fails to recognise is exactly
+/// the "you are force-pushing the default branch" one.
+#[test]
+fn every_advisory_variant_pins_its_own_wire_shape() {
+    let cases = [
+        (
+            Advisory::DefaultBranchPush {
+                branch: branch("main"),
+                remote: RemoteName::new("origin").unwrap(),
+            },
+            serde_json::json!({
+                "kind": "default_branch_push",
+                "branch": "main",
+                "remote": "origin",
+            }),
+        ),
+        (
+            Advisory::DefaultBranchUnknown {
+                reason: "no refs/remotes/origin/HEAD".into(),
+            },
+            serde_json::json!({
+                "kind": "default_branch_unknown",
+                "reason": "no refs/remotes/origin/HEAD",
+            }),
+        ),
+        (
+            Advisory::RemoteHistoryReplaced {
+                branch: branch("main"),
+                remote: RemoteName::new("origin").unwrap(),
+            },
+            serde_json::json!({
+                "kind": "remote_history_replaced",
+                "branch": "main",
+                "remote": "origin",
+            }),
+        ),
+    ];
+
+    for (advisory, expected) in cases {
+        assert_eq!(
+            serde_json::to_value(&advisory).unwrap(),
+            expected,
+            "advisory wire shape changed: {advisory:?}"
+        );
+        assert_eq!(
+            serde_json::from_value::<Advisory>(expected).unwrap(),
+            advisory,
+            "advisory did not round-trip: {advisory:?}"
+        );
+    }
+}
+
+/// A stray key inside an advisory is a hard error, matching every other body
+/// in this contract. An advisory that silently absorbed an unknown field would
+/// let a newer server think it had warned a client that never saw the warning.
+#[test]
+fn an_advisory_with_an_unknown_field_is_refused() {
+    let stray = serde_json::json!({
+        "kind": "default_branch_push",
+        "branch": "main",
+        "remote": "origin",
+        "severity": "high",
+    });
+    assert!(serde_json::from_value::<Advisory>(stray).is_err());
 }
