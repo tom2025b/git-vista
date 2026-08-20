@@ -98,6 +98,19 @@ fn golden_plans() -> Vec<Plan> {
             },
         ),
         plan(
+            '3',
+            // M4.28 (#81): a separate variant so "revert a merge without
+            // choosing a side" is unrepresentable rather than merely checked.
+            GitOperation::RevertMerge {
+                commit: oid('a'),
+                mainline: std::num::NonZeroU8::new(1).unwrap(),
+            },
+            RiskLevel::Reversible,
+            vec![Precondition::CleanWorktree],
+            vec![],
+            RecoveryStrategy::RevertCommit { commit: oid('a') },
+        ),
+        plan(
             '2',
             // M3.24 (#77): three effects in one verb — creates a branch, moves
             // HEAD, consumes the entry. The RefAbsent precondition is what

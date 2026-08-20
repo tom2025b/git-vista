@@ -231,6 +231,7 @@ fn covered_by(op: &GitOperation) -> &'static str {
         GitOperation::RestoreBranch { .. } => "restore_branch_executes_through_the_pipeline",
         GitOperation::ResetBranch { .. } => "reset_branch_executes_through_the_pipeline",
         GitOperation::RevertCommit { .. } => "revert_commit_executes_through_the_pipeline",
+        GitOperation::RevertMerge { .. } => "reverting_a_merge_needs_a_mainline_and_says_why",
         GitOperation::ResetTestRepo => "reset_test_repo_executes_through_the_pipeline",
         GitOperation::StageSelection { .. } => "stage_selection_executes_through_the_pipeline",
         GitOperation::DiscardTrackedPaths { .. } => {
@@ -284,6 +285,7 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
         | GitOperation::RestoreBranch { .. }
         | GitOperation::ResetBranch { .. }
         | GitOperation::RevertCommit { .. }
+        | GitOperation::RevertMerge { .. }
         | GitOperation::ResetTestRepo
         | GitOperation::StageSelection { .. }
         | GitOperation::DiscardTrackedPaths { .. }
@@ -5895,5 +5897,137 @@ async fn branch_from_stash_refuses_a_name_that_already_exists() {
         "the plan must carry the RefAbsent precondition, so the name clash is \
          visible before approval rather than only on execution: {:?}",
         plan.preconditions
+    );
+}
+
+/// A repository whose HEAD is a real merge commit with two parents.
+fn merged_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (dir, repo) = seeded_repo();
+    run(&repo, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(repo.join("side.txt"), "side\n").unwrap();
+    run(&repo, &["add", "side.txt"]);
+    run(&repo, &["commit", "-q", "-m", "side work"]);
+    run(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("main.txt"), "main\n").unwrap();
+    run(&repo, &["add", "main.txt"]);
+    run(&repo, &["commit", "-q", "-m", "main work"]);
+    run(&repo, &["merge", "--no-ff", "-m", "merge side", "side"]);
+    (dir, repo)
+}
+
+#[tokio::test]
+async fn reverting_a_merge_needs_a_mainline_and_says_why() {
+    // M4.28 (#81). This is the defect that existed before RevertMerge: git
+    // refuses `git revert <merge>` outright, and RevertCommit had nowhere to
+    // carry the answer, so the attempt surfaced as a raw git error naming a
+    // FLAG rather than the decision behind it.
+    //
+    // MUTATION: drop the parent-count check and let git refuse. The revert
+    // still fails, but the user is told "no -m option was given" — which is
+    // accurate and nearly useless to anyone who has not reverted a merge
+    // before.
+    let (_dir, repo) = merged_repo();
+    let head = out(&repo, &["rev-parse", "HEAD"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::RevertCommit {
+            commit: git_vista_protocol::CommitOid::new(head).unwrap(),
+        },
+    )
+    .await;
+
+    assert_ne!(status, axum::http::StatusCode::OK, "body: {body}");
+    assert!(
+        body.contains("which side of the merge"),
+        "the refusal must name the DECISION, not a flag: {body}"
+    );
+    assert!(
+        body.contains("parent 1"),
+        "and it must say what the usual answer is: {body}"
+    );
+}
+
+#[tokio::test]
+async fn reverting_a_merge_with_a_mainline_succeeds() {
+    // The capability that did not exist at all before this change.
+    let (_dir, repo) = merged_repo();
+    let head = out(&repo, &["rev-parse", "HEAD"]);
+    let before = out(&repo, &["rev-parse", "HEAD"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::RevertMerge {
+            commit: git_vista_protocol::CommitOid::new(head).unwrap(),
+            mainline: std::num::NonZeroU8::new(1).unwrap(),
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    assert_ne!(
+        out(&repo, &["rev-parse", "HEAD"]),
+        before,
+        "a revert adds a commit, so HEAD must have moved"
+    );
+    // Reverting the merge with mainline 1 undoes what the OTHER side brought.
+    assert!(
+        !repo.join("side.txt").exists(),
+        "the side branch's file must be gone — that is what reverting the merge means"
+    );
+    assert!(
+        repo.join("main.txt").exists(),
+        "the mainline's own work must survive"
+    );
+}
+
+#[tokio::test]
+async fn a_mainline_on_an_ordinary_commit_is_refused() {
+    // The other half of making the invalid state unrepresentable: the type
+    // stops "merge without a choice", and this stops "choice without a merge".
+    //
+    // MUTATION: drop this arm and pass -m through. Git errors with "mainline
+    // was specified but commit is not a merge", which is again a fact about
+    // flags rather than about what the user asked for.
+    let (_dir, repo) = seeded_repo();
+    let head = out(&repo, &["rev-parse", "HEAD"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::RevertMerge {
+            commit: git_vista_protocol::CommitOid::new(head).unwrap(),
+            mainline: std::num::NonZeroU8::new(1).unwrap(),
+        },
+    )
+    .await;
+
+    assert_ne!(status, axum::http::StatusCode::OK, "body: {body}");
+    assert!(
+        body.contains("not a merge commit"),
+        "the refusal must say the commit is not a merge: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_parent_that_does_not_exist_is_refused() {
+    // A merge has two parents; asking for the third is a request that cannot
+    // be satisfied, and saying so beats letting git say "commit ... does not
+    // have parent 3".
+    let (_dir, repo) = merged_repo();
+    let head = out(&repo, &["rev-parse", "HEAD"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::RevertMerge {
+            commit: git_vista_protocol::CommitOid::new(head).unwrap(),
+            mainline: std::num::NonZeroU8::new(3).unwrap(),
+        },
+    )
+    .await;
+
+    assert_ne!(status, axum::http::StatusCode::OK, "body: {body}");
+    assert!(
+        body.contains("does not exist"),
+        "the refusal must say the parent does not exist: {body}"
     );
 }

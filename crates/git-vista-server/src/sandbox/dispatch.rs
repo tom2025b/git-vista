@@ -306,6 +306,7 @@ fn variant_name(op: &GitOperation) -> &'static str {
         GitOperation::RestoreBranch { .. } => "RestoreBranch",
         GitOperation::ResetBranch { .. } => "ResetBranch",
         GitOperation::RevertCommit { .. } => "RevertCommit",
+        GitOperation::RevertMerge { .. } => "RevertMerge",
         GitOperation::ResetTestRepo => "ResetTestRepo",
         GitOperation::StageSelection { .. } => "StageSelection",
         GitOperation::DiscardTrackedPaths { .. } => "DiscardTrackedPaths",
@@ -457,6 +458,10 @@ fn every_operation() -> Vec<GitOperation> {
             expected_tip: oid(tip),
         },
         GitOperation::RevertCommit { commit: oid(tip) },
+        GitOperation::RevertMerge {
+            commit: oid(tip),
+            mainline: std::num::NonZeroU8::new(1).unwrap(),
+        },
         GitOperation::ResetTestRepo,
         GitOperation::StageSelection {
             direction: StageDirection::Stage,
@@ -558,6 +563,7 @@ fn every_operation_declares_every_variant() {
         "RestoreBranch",
         "ResetBranch",
         "RevertCommit",
+        "RevertMerge",
         "ResetTestRepo",
         "StageSelection",
         "DiscardTrackedPaths",
@@ -715,8 +721,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     let ops = every_operation();
     assert_eq!(
         ops.len(),
-        31,
-        "every_operation() must list every GitOperation variant; the enum has 31 \
+        32,
+        "every_operation() must list every GitOperation variant; the enum has 32 \
          (this literal is a tripwire, not the enforcement — \
          every_operation_covers_every_variant_the_enum_declares is what checks \
          the census against the enum itself and cannot be left stale with it)"
@@ -744,8 +750,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     );
     assert_eq!(
         local.len(),
-        26,
-        "the other twenty-six operations must stay Local; declared Local: {local:?}"
+        27,
+        "the other twenty-seven operations must stay Local; declared Local: {local:?}"
     );
 }
 

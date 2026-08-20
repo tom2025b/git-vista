@@ -606,7 +606,48 @@ pub enum GitOperation {
     },
     /// `git revert --no-edit <commit>` — the history-preserving undo for a
     /// commit that's already shared (`/api/undo`; `--abort`ed on conflict).
+    ///
+    /// **Ordinary commits only.** A merge has two parents, so "undo this
+    /// merge" is ambiguous until someone says which side is the history being
+    /// kept — see [`RevertMerge`], and the executor refuses this variant on a
+    /// merge rather than passing git's raw error through.
+    ///
+    /// [`RevertMerge`]: GitOperation::RevertMerge
     RevertCommit { commit: CommitOid },
+    /// `git revert --no-edit -m <mainline> <commit>` — undo a **merge**
+    /// (M4.28, #81).
+    ///
+    /// # Why this is a separate variant and not a field on `RevertCommit`
+    ///
+    /// Git refuses `git revert <merge>` outright:
+    ///
+    /// ```text
+    /// error: commit <sha> is a merge but no -m option was given.
+    /// ```
+    ///
+    /// A merge has two parents, so undoing it means keeping one side's history
+    /// and discarding the other's — and git will not guess which. Before this
+    /// variant existed, reverting a merge was **impossible** through this
+    /// server: `RevertCommit` had nowhere to carry the answer, so the attempt
+    /// surfaced as that raw git error.
+    ///
+    /// Modelling it as `RevertCommit { commit, mainline: Option<u8> }` would
+    /// have made `None` mean two different things — "this is an ordinary
+    /// commit, mainline is meaningless" and "this is a merge and nobody has
+    /// chosen yet". The first is normal; the second must be refused. Two
+    /// variants make the second **unrepresentable** instead of merely checked,
+    /// which is the same posture [`ForcePublish`] takes toward a bare force.
+    ///
+    /// # `mainline` is 1-based, because git's is
+    ///
+    /// Git numbers parents from 1, and `-m 1` means "keep the branch you were
+    /// on when you merged" — which is what almost everyone wants. A
+    /// [`NonZeroU8`](std::num::NonZeroU8) rather than a `u8` so `-m 0`, which
+    /// git rejects, cannot be constructed here either.
+    RevertMerge {
+        commit: CommitOid,
+        mainline: std::num::NonZeroU8,
+    },
     /// Restore a seeded test repo to its recorded state
     /// (`/api/reset-test-repo`): unbundle seed objects, move every seeded
     /// branch back, forced checkout of the seeded HEAD, hard reset + clean,

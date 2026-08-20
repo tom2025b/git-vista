@@ -2036,6 +2036,21 @@ async fn shape(
             };
             (RiskLevel::Destructive, preconditions, changes, recovery)
         }
+        GitOperation::RevertMerge { commit, .. } => {
+            // Identical shape to RevertCommit: a revert ADDS a commit, so
+            // nothing existing is lost and the undo is to revert the revert.
+            // The mainline choice changes what the revert commit contains,
+            // never what it risks.
+            let (preconditions, changes, _) = head_moves(None);
+            (
+                RiskLevel::Reversible,
+                preconditions,
+                changes,
+                RecoveryStrategy::RevertCommit {
+                    commit: commit.clone(),
+                },
+            )
+        }
         GitOperation::RevertCommit { commit } => {
             let (preconditions, changes, _) = head_moves(None);
             (
@@ -2389,7 +2404,12 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
             to,
             expected_tip,
         } => exec_reset_branch(repo, need, &branch, &to, &expected_tip, &observed).await,
-        GitOperation::RevertCommit { commit } => exec_revert(repo, need, &commit, &observed).await,
+        GitOperation::RevertCommit { commit } => {
+            exec_revert(repo, need, &commit, None, &observed).await
+        }
+        GitOperation::RevertMerge { commit, mainline } => {
+            exec_revert(repo, need, &commit, Some(mainline), &observed).await
+        }
         GitOperation::ResetTestRepo => exec_reset_test_repo(repo, need).await,
         GitOperation::StageSelection {
             direction,
@@ -4639,6 +4659,28 @@ async fn exec_reset_branch(
     }
 }
 
+/// How many parents `commit` has, or `None` if the read failed.
+///
+/// `None` is deliberately NOT "one parent". A failed read means this server
+/// does not know whether the commit is a merge, and the caller falls through
+/// to let git decide rather than refusing on a check it could not make —
+/// refusing there would block a legitimate revert on our own failure.
+///
+/// Local (D3): reading a commit header walks the object database.
+async fn parent_count(repo: &Path, need: NetworkNeed, commit: &str) -> Option<usize> {
+    let out = run_git(repo, need, &["rev-list", "--parents", "-n", "1", commit])
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // `rev-list --parents -n 1` prints "<commit> <parent>..." on one line, so
+    // the parent count is the field count minus the commit itself.
+    let line = String::from_utf8_lossy(&out.stdout);
+    let fields = line.split_whitespace().count();
+    fields.checked_sub(1)
+}
+
 /// Two-step revert (`/api/undo`) — the history-preserving undo; a failed
 /// revert is auto-aborted (like `/api/rebase`) so a browser-only user is
 /// never left mid-revert.
@@ -4688,12 +4730,74 @@ async fn exec_revert(
     repo: &Path,
     need: NetworkNeed,
     commit: &CommitOid,
+    mainline: Option<std::num::NonZeroU8>,
     observed: &Observed,
 ) -> (StatusCode, String) {
     let commit = commit.as_str();
 
+    // M4.28 (#81): the two variants must match the commit's actual shape, and
+    // the mismatch is refused HERE rather than left to git.
+    //
+    // Git's own message for the first case — "commit <sha> is a merge but no
+    // -m option was given" — is accurate and nearly useless to someone who has
+    // never reverted a merge. It names a flag, not a decision. The refusal
+    // below names the decision.
+    let parents = parent_count(repo, need, commit).await;
+    match (parents, mainline) {
+        (Some(n), None) if n > 1 => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{} is a merge commit, so undoing it needs one more answer: which \
+                     side of the merge is the history you are keeping?\n\n\
+                     Reverting a merge undoes everything the OTHER side brought in. \
+                     Usually the answer is the branch you were on when you merged, \
+                     which is parent 1.",
+                    short(commit)
+                ),
+            );
+        }
+        // `n <= 1`, not `n == 1`: a ROOT commit has ZERO parents and is just
+        // as much "not a merge" as an ordinary one. Written as == 1 first,
+        // which sent a root commit down the parent-does-not-exist arm and
+        // produced "has 0 parents, so parent 1 does not exist" — true, and the
+        // wrong explanation. Caught by a test, not by review.
+        (Some(n), Some(_)) if n <= 1 => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{} is not a merge commit — it has {n} parent(s), so there is no \
+                     side to choose. Revert it without a mainline.",
+                    short(commit)
+                ),
+            );
+        }
+        (Some(n), Some(m)) if usize::from(m.get()) > n => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{} has {n} parents, so parent {m} does not exist.",
+                    short(commit)
+                ),
+            );
+        }
+        // Parent count unreadable: fall through and let git decide. This is
+        // deliberate — refusing on a read WE could not make would block a
+        // legitimate revert on our own failure, and git will refuse it anyway
+        // with a message that is at worst terse.
+        _ => {}
+    }
+
+    let mainline_flag = mainline.map(|m| m.get().to_string());
+    let mut argv: Vec<&str> = vec!["revert", "--no-commit"];
+    if let Some(m) = mainline_flag.as_deref() {
+        argv.push("-m");
+        argv.push(m);
+    }
+    argv.push(commit);
+
     // Step 1: compute the revert into the index without committing.
-    if let Err(msg) = git(repo, need, &["revert", "--no-commit", commit]).await {
+    if let Err(msg) = git(repo, need, &argv).await {
         // A conflicted (or otherwise failed) --no-commit leaves sequencer
         // state (REVERT_HEAD) and possibly conflict markers; --abort is
         // git's own cleanup for exactly that. Harmless when no revert is
@@ -5869,6 +5973,7 @@ pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
         | GitOperation::RestoreBranch { .. }
         | GitOperation::ResetBranch { .. }
         | GitOperation::RevertCommit { .. }
+        | GitOperation::RevertMerge { .. }
         | GitOperation::ResetTestRepo
         | GitOperation::DiscardTrackedPaths { .. }
         | GitOperation::DeleteUntrackedPaths { .. }

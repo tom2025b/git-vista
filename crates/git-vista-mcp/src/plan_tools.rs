@@ -140,6 +140,23 @@ pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
         GitOperation::RestoreBranch { .. } => Tool("plan_restore_branch"),
         GitOperation::ResetBranch { .. } => Tool("plan_reset_branch"),
         GitOperation::RevertCommit { .. } => Tool("plan_revert_commit"),
+        // Unexposed for now, and for a DIFFERENT reason than the stash verbs
+        // and conflict resolution. Those are excluded on principle: the agent
+        // cannot see what it would be choosing — a positional selector that
+        // renumbers, or three versions of a file. A merge revert has neither
+        // problem; the commit is named by oid and the mainline is a small
+        // integer the tool description could explain.
+        //
+        // So this one is excluded only because the tool is not BUILT yet, not
+        // because it should not be. Recorded that way so a later session
+        // adding it knows the exposure argument is already made and does not
+        // have to re-litigate it. Caught by the catalog census, which refused
+        // to accept a Tool() naming something that does not exist.
+        GitOperation::RevertMerge { .. } => Excluded(
+            "the plan_revert_merge tool is not built yet; exposure is defensible \
+             (oid plus a small integer, nothing an agent cannot see) and is simply \
+             pending, not refused",
+        ),
         GitOperation::DiscardTrackedPaths { .. } => Tool("plan_discard_tracked_paths"),
         GitOperation::DeleteUntrackedPaths { .. } => Tool("plan_delete_untracked_paths"),
         GitOperation::AmendCommit { .. } => Tool("plan_amend_commit"),
@@ -1153,6 +1170,7 @@ mod tests {
         "resolve_conflict",
         "stage_selection",
         "branch_from_stash",
+        "revert_merge",
         "pop_stash",
         "push_stash",
         "apply_stash",
@@ -1340,6 +1358,10 @@ mod tests {
                 branch: branch("b"),
                 to: oid(&zeros),
                 expected_tip: oid(&zeros),
+            },
+            GitOperation::RevertMerge {
+                commit: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+                mainline: std::num::NonZeroU8::new(1).unwrap(),
             },
             GitOperation::RevertCommit {
                 commit: oid(&zeros),

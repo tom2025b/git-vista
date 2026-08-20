@@ -113,7 +113,8 @@ async fn a_conflicting_revert_is_reported_as_a_classified_conflict() {
     run(&repo, &["commit", "-q", "-m", "add c, needs b"]);
 
     let observed = observe_live(&repo).await;
-    let (status, message) = exec_revert(&repo, NetworkNeed::Local, &to_revert, &observed).await;
+    let (status, message) =
+        exec_revert(&repo, NetworkNeed::Local, &to_revert, None, &observed).await;
 
     assert_eq!(
         status,
@@ -166,7 +167,8 @@ async fn a_non_conflict_revert_failure_keeps_forwarding_gits_words_verbatim() {
     std::fs::write(repo.join("a.txt"), "a\nb\ndirty, not committed\n").unwrap();
 
     let observed = observe_live(&repo).await;
-    let (status, message) = exec_revert(&repo, NetworkNeed::Local, &to_revert, &observed).await;
+    let (status, message) =
+        exec_revert(&repo, NetworkNeed::Local, &to_revert, None, &observed).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
