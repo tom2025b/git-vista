@@ -986,13 +986,19 @@ fn production_body<'a>(code: &'a str, name: &str) -> &'a str {
         "expected exactly one `{marker}` definition in handlers/read.rs, found {defs}"
     );
     let at = code.find(&marker).expect("counted above");
-    let tests_at = code
-        .find("mod tests")
-        .expect("handlers/read.rs has a test module");
-    assert!(
-        at < tests_at,
-        "`{marker}` was found inside `mod tests`, not in production code"
-    );
+    // The ordering check exists to stop a same-named *test helper* being read
+    // instead of the real definition. Once every test moved out into
+    // `handlers/read/*_suite.rs` child modules there is no inline `mod tests`
+    // left, so there is no helper to confuse it with and the guard is
+    // vacuously satisfied — the `defs == 1` assertion above already pins
+    // uniqueness. Kept conditional rather than deleted so the check comes back
+    // the moment an inline test module reappears.
+    if let Some(tests_at) = code.find("mod tests") {
+        assert!(
+            at < tests_at,
+            "`{marker}` was found inside `mod tests`, not in production code"
+        );
+    }
 
     let open = at
         + code[at..]
