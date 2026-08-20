@@ -36,6 +36,14 @@ use std::path::{Path, PathBuf};
 // the Activity Log / Contextual Undo feature. `journal` owns the on-disk state
 // under `.git/git-vista/`; `activity` owns `GET /api/activity`.
 mod activity;
+// M4.31 (#84): the conflict model and the scan that fills it. Contract and
+// scanner first, endpoint later — the same staging `build_plan_only` uses, and
+// the same reason: the vocabulary and the index reads get reviewed before any
+// route exposes them. `allow(dead_code)` off the test build only, so the day a
+// handler wires this up the attribute stops applying on its own rather than
+// hiding a genuinely dead function.
+#[cfg_attr(not(test), allow(dead_code))]
+mod conflicts;
 // The server-owned repository catalog (M1.03): opaque repository/worktree ids,
 // allowed-root enforcement, and the only path→id resolution in the server.
 #[cfg(test)]
