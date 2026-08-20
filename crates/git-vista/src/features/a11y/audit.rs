@@ -24,7 +24,24 @@ const STYLES: &str = include_str!("../../../styles.css");
 const APP_MOD: &str = include_str!("../../app/mod.rs");
 const RENDER_NODES: &str = include_str!("../../render/nodes.rs");
 const RENDER_STUBS: &str = include_str!("../../render/stubs.rs");
-const MENU: &str = include_str!("../../menu.rs");
+// `menu.rs` was split (refactor/split-menu-rs) into a `menu/` directory of
+// per-concern child modules; the tripwires below scan across the whole menu
+// module's markup and handlers (a disabled item's tag, or the `on_amend`
+// handler's ordering), not any one file, so `MENU` is every file in the
+// module concatenated — order doesn't matter to any of the census helpers
+// below, which either count matches or find the first occurrence of a name
+// that lives in exactly one of these files.
+const MENU: &str = concat!(
+    include_str!("../../menu.rs"),
+    include_str!("../../menu/view_items.rs"),
+    include_str!("../../menu/create_items.rs"),
+    include_str!("../../menu/commit_items.rs"),
+    include_str!("../../menu/worktree_items.rs"),
+    include_str!("../../menu/branch_items.rs"),
+    include_str!("../../menu/tag_items.rs"),
+    include_str!("../../menu/remote_items.rs"),
+    include_str!("../../menu/undo_items.rs"),
+);
 /// The commit modal (M2.19c, #224 widened it to three modes). Inline-styled end
 /// to end, so the stylesheet census below cannot see a single one of its
 /// controls — this file's own bytes are the only place its tap targets can be
