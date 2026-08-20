@@ -208,6 +208,9 @@ fn covered_by(op: &GitOperation) -> &'static str {
         GitOperation::PushStash { .. } => "push_stash_executes_through_the_pipeline",
         GitOperation::ApplyStash { .. } => "apply_stash_executes_through_the_pipeline",
         GitOperation::PopStash { .. } => "pop_stash_refuses_to_report_complete_while_conflicted",
+        GitOperation::BranchFromStash { .. } => {
+            "branch_from_stash_lands_a_stash_that_would_not_pop"
+        }
         GitOperation::DropStash { .. } => "drop_stash_refuses_a_moved_selector",
         GitOperation::ResolveConflict { .. } => "resolve_conflict_executes_through_the_pipeline",
         GitOperation::CreateBranch { .. } => "create_branch_executes_through_the_pipeline",
@@ -264,6 +267,7 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
         GitOperation::PushStash { .. }
         | GitOperation::ApplyStash { .. }
         | GitOperation::PopStash { .. }
+        | GitOperation::BranchFromStash { .. }
         | GitOperation::DropStash { .. }
         | GitOperation::ResolveConflict { .. }
         | GitOperation::CreateBranch { .. }
@@ -2305,6 +2309,7 @@ fn every_git_write_route_reaches_the_planner() {
         ("/api/stash/push", "handlers::stash::push_stash"),
         ("/api/stash/apply", "handlers::stash::apply_stash"),
         ("/api/stash/drop", "handlers::stash::drop_stash"),
+        ("/api/stash/branch", "handlers::stash::branch_from_stash"),
         // M2.21d (#238): the two local tag writes — git writes, funnel rows
         // below. M2.21f (#240) added the two remote ones right after. The
         // tag *listing* is a GET and so never reaches this table.
@@ -5775,5 +5780,120 @@ async fn a_stash_push_is_journaled_as_activity() {
     assert!(
         journal.contains("refs/stash"),
         "the stash write must be journaled against refs/stash; journal was: {journal}"
+    );
+}
+
+#[tokio::test]
+async fn branch_from_stash_lands_a_stash_that_would_not_pop() {
+    // The point of this operation, demonstrated rather than asserted in prose:
+    // the SAME stash that conflicts on pop goes in cleanly here, because git
+    // creates the branch at the stash's original base and applies it there.
+    //
+    // The fixture is deliberately the one from the pop conflict test — stash a
+    // change to a.txt, then commit a different change to a.txt — so the two
+    // tests are the same scenario with different verbs, and the difference in
+    // outcome is the whole justification for the variant existing.
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "from the stash\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "wip"]);
+    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
+    std::fs::write(repo.join("a.txt"), "from a commit\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "diverge"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::BranchFromStash {
+            name: git_vista_protocol::BranchName::new("rescued").unwrap(),
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(oid).unwrap(),
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    // All three effects, checked separately — any one could hold while another
+    // silently did not happen.
+    assert_eq!(
+        out(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "rescued",
+        "the new branch must be checked out"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "from the stash\n",
+        "the stashed content must be present, with no conflict markers — this is \
+         the same stash that conflicts on pop"
+    );
+    assert_eq!(
+        out(&repo, &["stash", "list"]),
+        "",
+        "a successful branch-from-stash consumes the entry"
+    );
+}
+
+#[tokio::test]
+async fn branch_from_stash_refuses_a_name_that_already_exists() {
+    // MUTATION: drop the RefAbsent precondition. Git would refuse anyway, but
+    // AFTER approval — the caller would have committed to a plan that could
+    // never run. Refusing at build time lets them pick another name having
+    // consumed nothing.
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "wip"]);
+    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
+    run(&repo, &["branch", "taken"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::BranchFromStash {
+            name: git_vista_protocol::BranchName::new("taken").unwrap(),
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(oid).unwrap(),
+        },
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        axum::http::StatusCode::OK,
+        "an existing branch name must be refused, not reinterpreted: {body}"
+    );
+    assert!(
+        out(&repo, &["stash", "list"]).contains("wip"),
+        "a refused request must not have consumed the stash"
+    );
+
+    // The assertions above hold even WITHOUT the precondition, because git
+    // refuses a taken branch name itself — at execution. That is precisely the
+    // difference this operation's precondition exists to make, so it is
+    // asserted directly: the refusal must be visible in the PLAN, before a
+    // user approves anything.
+    //
+    // Found by mutation: removing the RefAbsent precondition left the checks
+    // above green, which meant they were testing git's behaviour rather than
+    // ours.
+    let plan = build_plan_only(
+        &repo,
+        GitOperation::BranchFromStash {
+            name: git_vista_protocol::BranchName::new("taken").unwrap(),
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(out(
+                &repo,
+                &["rev-parse", "stash@{0}"],
+            ))
+            .unwrap(),
+        },
+        tokens(),
+    )
+    .await;
+    assert!(
+        plan.preconditions.iter().any(|p| matches!(
+            p,
+            git_vista_protocol::Precondition::RefAbsent { ref_name }
+                if ref_name.as_str() == "refs/heads/taken"
+        )),
+        "the plan must carry the RefAbsent precondition, so the name clash is \
+         visible before approval rather than only on execution: {:?}",
+        plan.preconditions
     );
 }

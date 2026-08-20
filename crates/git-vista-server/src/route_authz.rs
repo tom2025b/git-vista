@@ -123,6 +123,9 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     ("/api/stash/push", Method::POST, Authz::SessionAndCsrf),
     ("/api/stash/apply", Method::POST, Authz::SessionAndCsrf),
     ("/api/stash/drop", Method::POST, Authz::SessionAndCsrf),
+    // Creates a branch, moves HEAD and consumes the entry — three writes in
+    // one verb, so the full posture without argument.
+    ("/api/stash/branch", Method::POST, Authz::SessionAndCsrf),
     // Staging selections (M2.17b, #213). The diff read is GET (no CSRF
     // surface) but still full_routes-only — it feeds the write surface and
     // shows uncommitted worktree contents, so the LAN router never sees it.
@@ -257,7 +260,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 60;
+const EXPECTED_ROUTE_COUNT: usize = 61;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

@@ -104,6 +104,11 @@ pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
             "addressed by a positional selector this surface cannot yet list, so an \
              agent could only guess which entry it is applying",
         ),
+        GitOperation::BranchFromStash { .. } => Excluded(
+            "same positional-selector problem as the rest of the drawer, and this one \
+             also creates a branch and moves HEAD — three effects an agent would be \
+             choosing blind",
+        ),
         GitOperation::PopStash { .. } => Excluded(
             "same positional-selector problem as apply, and pop also REMOVES the entry \
              — an agent guessing at stash@{0} would destroy work it never saw",
@@ -1147,6 +1152,7 @@ mod tests {
         "reset_test_repo",
         "resolve_conflict",
         "stage_selection",
+        "branch_from_stash",
         "pop_stash",
         "push_stash",
         "apply_stash",
@@ -1270,6 +1276,11 @@ mod tests {
                 expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
             },
             GitOperation::PopStash {
+                entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+                expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+            },
+            GitOperation::BranchFromStash {
+                name: git_vista_protocol::BranchName::new("from-stash").unwrap(),
                 entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
                 expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
             },

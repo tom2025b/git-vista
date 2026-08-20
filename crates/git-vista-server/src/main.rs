@@ -549,6 +549,10 @@ fn api_router(
             .route("/api/stash/push", post(handlers::stash::push_stash))
             .route("/api/stash/apply", post(handlers::stash::apply_stash))
             .route("/api/stash/drop", post(handlers::stash::drop_stash))
+            .route(
+                "/api/stash/branch",
+                post(handlers::stash::branch_from_stash),
+            )
             .route("/api/tag", post(handlers::tags::create_tag))
             .route("/api/delete-tag", post(handlers::tags::delete_tag))
             // M2.21f (#240): the two **remote** tag writes — each opens a

@@ -1629,6 +1629,38 @@ async fn shape(
             // to put back.
             RecoveryStrategy::NotNeeded,
         ),
+        GitOperation::BranchFromStash {
+            name, expected_oid, ..
+        } => (
+            // Destructive for the same reason pop is: the entry goes. The new
+            // branch and the checkout are not what makes it destructive —
+            // both are trivially undone by hand, and neither can lose work.
+            RiskLevel::Destructive,
+            // The branch must not already exist. Stated as a precondition
+            // rather than left to git because the refusal is more useful
+            // before approval than after: a caller can pick another name
+            // without having consumed anything.
+            //
+            // `heads(name)`, NOT `RefName::from(name)`: the precondition is
+            // resolved against the ref store, so it needs the full
+            // `refs/heads/<name>` path. A bare short name would be checked
+            // under a spelling that never exists — a precondition that always
+            // passes, which is worse than none, because the plan then displays
+            // a guarantee it is not making. Caught by a mutation, not review.
+            heads(name)
+                .map(|ref_name| Precondition::RefAbsent { ref_name })
+                .into_iter()
+                .collect(),
+            Vec::new(),
+            // The stash is the only irreplaceable thing here, so it is what
+            // the recovery names. The created branch and the moved HEAD are
+            // separately reversible by ordinary means and would only crowd a
+            // field that can hold one strategy.
+            RecoveryStrategy::RecreateStashEntry {
+                at: expected_oid.clone(),
+                message: None,
+            },
+        ),
         GitOperation::PopStash { expected_oid, .. } => (
             // Destructive, not Reversible like its apply sibling. Apply keeps
             // the entry whatever happens; pop removes it, so what can be lost
@@ -2435,6 +2467,11 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         // M3.24 (#77): the stash drawer. Apply, Pop and Drop are separate
         // operations on purpose — see PopStash's own comment for why it is not
         // ApplyStash with a flag.
+        GitOperation::BranchFromStash {
+            name,
+            entry,
+            expected_oid,
+        } => stash::exec_branch_from_stash(repo, need, &name, &entry, &expected_oid).await,
         GitOperation::PopStash {
             entry,
             expected_oid,
@@ -5814,6 +5851,7 @@ pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
         GitOperation::PushStash { .. }
         | GitOperation::ApplyStash { .. }
         | GitOperation::PopStash { .. }
+        | GitOperation::BranchFromStash { .. }
         | GitOperation::DropStash { .. }
         | GitOperation::ResolveConflict { .. }
         | GitOperation::CreateBranch { .. }

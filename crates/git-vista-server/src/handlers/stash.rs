@@ -258,6 +258,50 @@ pub(crate) async fn apply_stash(Json(req): Json<StashEntryRequest>) -> (StatusCo
     .await
 }
 
+/// `POST /api/stash/branch` (M3.24 #77) — the escape hatch for a stash that
+/// will not apply where you are now.
+///
+/// Carries the branch name alongside the usual selector/oid pair. The name is
+/// validated by [`BranchName`]'s newtype before a plan exists, so a malformed
+/// name is refused without anything being consumed.
+pub(crate) async fn branch_from_stash(
+    Json(req): Json<BranchFromStashRequest>,
+) -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    // Reuses the shared selector/oid parse so this path cannot drift from
+    // apply and drop on what a valid entry looks like.
+    let (entry, expected_oid) = match parse_entry(&StashEntryRequest {
+        entry: req.entry,
+        expected_oid: req.expected_oid,
+    }) {
+        Ok(pair) => pair,
+        Err(refusal) => return refusal,
+    };
+    let Ok(name) = git_vista_protocol::BranchName::new(&req.name) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("{} is not a usable branch name.", req.name),
+        );
+    };
+    crate::planner::plan_and_execute(GitOperation::BranchFromStash {
+        name,
+        entry,
+        expected_oid,
+    })
+    .await
+}
+
+/// Body of [`branch_from_stash`].
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BranchFromStashRequest {
+    pub(crate) name: String,
+    pub(crate) entry: String,
+    pub(crate) expected_oid: String,
+}
+
 /// `POST /api/stash/drop` — discard an entry.
 ///
 /// `Destructive`, and the compare-and-swap in the executor is what stands

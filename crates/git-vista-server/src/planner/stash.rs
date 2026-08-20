@@ -330,6 +330,105 @@ pub(super) async fn exec_pop_stash(
     }
 }
 
+/// `git stash branch <name> <selector>` (`/api/stash/branch`, M3.24 #77).
+///
+/// # The escape hatch, and why it usually works when pop does not
+///
+/// Git creates the branch at the stash's **original base commit** and applies
+/// there, so the changes land in the context they were written in. A stash
+/// that conflicts on pop generally goes in cleanly this way, which makes this
+/// the answer to the one stash situation users actually panic about: "it
+/// won't come back".
+///
+/// # It still checks, because "usually" is not "always"
+///
+/// If the base commit is itself gone, or the working tree is not what the
+/// precondition believed, the apply can still conflict. Git then leaves the
+/// entry in place — the branch exists and is checked out, but the stash
+/// survives. Same posture as pop: the conflict state is re-read afterwards and
+/// the response says plainly that the work is not finished, rather than
+/// returning a success whose only clue is git's stderr.
+pub(super) async fn exec_branch_from_stash(
+    repo: &Path,
+    need: NetworkNeed,
+    name: &git_vista_protocol::BranchName,
+    entry: &StashSelector,
+    expected_oid: &CommitOid,
+) -> (StatusCode, String) {
+    if let Err(refusal) =
+        stash_entry_still_at(repo, need, "/api/stash/branch", entry, expected_oid).await
+    {
+        return refusal;
+    }
+
+    let output = match run_git(
+        repo,
+        need,
+        &["stash", "branch", name.as_str(), entry.as_str()],
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => return couldnt_run("/api/stash/branch", &e),
+    };
+
+    let continuation = crate::conflicts::continuation(repo).await;
+
+    match (output.status.success(), continuation) {
+        (true, Ok(c)) if c.may_continue() => {
+            println!("[/api/stash/branch] {entry} became branch {name}");
+            journal_app_event(
+                repo,
+                ActivityKind::Other,
+                Some(format!("refs/heads/{name}")),
+                Obs::Absent,
+                Obs::Absent,
+                format!("created branch {name} from stash {entry}"),
+            )
+            .await;
+            (
+                StatusCode::OK,
+                format!(
+                    "Created {name} from {entry} and checked it out. The stash entry \
+                     has been removed."
+                ),
+            )
+        }
+
+        // Same reasoning as pop: this cannot claim the work finished on a
+        // check it could not make.
+        (_, Err(why)) => (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "git stash branch ran, but the conflict state could not be read \
+                 afterwards — {why}. Check `git status` before continuing."
+            ),
+        ),
+
+        (_, Ok(c)) => {
+            let detail = match &c {
+                git_vista_protocol::conflict::Continuation::Blocked { unresolved, .. } => {
+                    if unresolved.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n\nConflicted:\n  {}", unresolved.join("\n  "))
+                    }
+                }
+                git_vista_protocol::conflict::Continuation::Clear => String::new(),
+            };
+            eprintln!("[/api/stash/branch] {entry} left conflicts on {name}");
+            (
+                StatusCode::CONFLICT,
+                format!(
+                    "Creating {name} from {entry} left conflicts, so it is NOT \
+                     complete.{detail}\n\nThe stash entry was not removed — it is \
+                     still in the list."
+                ),
+            )
+        }
+    }
+}
+
 /// `git stash drop <selector>` (`/api/stash/drop`, M3.24 #77).
 ///
 /// `Destructive` on the same reasoning `ForceDeleteBranch` is: the commit

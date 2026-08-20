@@ -775,6 +775,7 @@ pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         GitOperation::PushStash { .. } => NetworkNeed::Local,
         GitOperation::ApplyStash { .. } => NetworkNeed::Local,
         GitOperation::PopStash { .. } => NetworkNeed::Local,
+        GitOperation::BranchFromStash { .. } => NetworkNeed::Local,
         GitOperation::DropStash { .. } => NetworkNeed::Local,
         // M4.31 (#84): `git checkout --ours|--theirs`, `git rm` and `git add`
         // read and write the local index and worktree only. The three versions

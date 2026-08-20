@@ -1019,6 +1019,35 @@ pub enum GitOperation {
         entry: StashSelector,
         expected_oid: CommitOid,
     },
+    /// `git stash branch <name> <entry>` — create a branch at the commit the
+    /// stash was taken from, check it out, apply the stash there, and drop the
+    /// entry if that succeeded (`/api/stash/branch`, M3.24 #77).
+    ///
+    /// # Why this exists when apply and pop already do
+    ///
+    /// It is the escape hatch for a stash that will not apply cleanly onto
+    /// where you are now. Git creates the branch at the stash's **original
+    /// base commit**, so the apply happens in the context the changes were
+    /// written in — where, by construction, they fit. A stash that conflicts
+    /// on pop will usually go in without complaint this way.
+    ///
+    /// That makes it the recovery path for the one case a user is most likely
+    /// to panic about: "my stash won't come back".
+    ///
+    /// # Three effects, one operation, and that is deliberate
+    ///
+    /// It creates a branch, moves HEAD, and consumes the entry. Splitting them
+    /// would be worse, not better: the branch is only useful *because* it is
+    /// where the stash applies, and a caller that created it and then failed
+    /// to apply would be left holding a branch whose entire purpose had not
+    /// happened. Git treats it as one verb for the same reason.
+    BranchFromStash {
+        /// The branch to create. Must not already exist — git refuses, and so
+        /// does this rather than reinterpreting the request as a checkout.
+        name: BranchName,
+        entry: StashSelector,
+        expected_oid: CommitOid,
+    },
     /// `git stash drop <entry>` — discard an entry (`/api/stash/drop`,
     /// M3.24 #77). Recoverable via
     /// [`RecoveryStrategy::RecreateStashEntry`] until gc, and the durable

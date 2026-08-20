@@ -98,6 +98,26 @@ fn golden_plans() -> Vec<Plan> {
             },
         ),
         plan(
+            '2',
+            // M3.24 (#77): three effects in one verb — creates a branch, moves
+            // HEAD, consumes the entry. The RefAbsent precondition is what
+            // refuses a taken name before approval rather than after.
+            GitOperation::BranchFromStash {
+                name: branch("from-stash"),
+                entry: StashSelector::new("stash@{0}").unwrap(),
+                expected_oid: oid('a'),
+            },
+            RiskLevel::Destructive,
+            vec![Precondition::RefAbsent {
+                ref_name: rname("refs/heads/from-stash"),
+            }],
+            vec![],
+            RecoveryStrategy::RecreateStashEntry {
+                at: oid('a'),
+                message: None,
+            },
+        ),
+        plan(
             '1',
             // M3.24 (#77): pop is its own variant, not apply with a flag —
             // Destructive where apply is Reversible, and it earns a recovery
