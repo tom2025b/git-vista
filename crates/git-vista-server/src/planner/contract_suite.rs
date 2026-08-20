@@ -5442,3 +5442,55 @@ async fn resolving_a_path_that_is_not_conflicted_is_refused_by_the_executor() {
         "the refusal must say why, got: {body}"
     );
 }
+
+#[tokio::test]
+async fn taking_a_side_that_was_deleted_is_refused_rather_than_deleting_the_file() {
+    // The gap a surviving mutation exposed: `ConflictedFile::refuses` was
+    // tested at the protocol layer, but nothing checked the EXECUTOR acts on
+    // it. Deleting the `refuses` call left every test green.
+    //
+    // MUTATION: drop the `refuses` check in `exec_resolve_conflict`. This test
+    // goes red, because `git checkout --ours` on a path we deleted resolves to
+    // *nothing* — the user asked to keep our side and would get the file
+    // removed, having been told it succeeded.
+    let (_dir, repo) = seeded_repo();
+
+    run(&repo, &["checkout", "-q", "-b", "theirs"]);
+    std::fs::write(repo.join("a.txt"), "theirs changed it\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "theirs modifies"]);
+    run(&repo, &["checkout", "-q", "main"]);
+    run(&repo, &["rm", "-q", "a.txt"]);
+    run(&repo, &["commit", "-q", "-m", "ours deletes"]);
+    let _ = std::process::Command::new("git")
+        .args(["merge", "theirs"])
+        .current_dir(&repo)
+        .status();
+
+    // Sanity: this really is a delete/modify conflict with no "ours" stage.
+    let unmerged = out(&repo, &["ls-files", "-u", "--", "a.txt"]);
+    assert!(
+        !unmerged.is_empty() && !unmerged.contains(" 2\t"),
+        "fixture must be conflicted with no stage 2 (ours), got: {unmerged}"
+    );
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ResolveConflict {
+            path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+            resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
+        },
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "body: {body}");
+    assert!(
+        body.contains("no ours side"),
+        "the refusal must name the missing side and point at an explicit \
+         deletion instead, got: {body}"
+    );
+    // And nothing may have been written on the way to refusing.
+    assert!(
+        !out(&repo, &["ls-files", "-u", "--", "a.txt"]).is_empty(),
+        "a refused resolution must leave the conflict exactly as it was"
+    );
+}

@@ -3800,6 +3800,20 @@ async fn exec_resolve_conflict(
         // A scan that failed must never fall through to the write. Refusing
         // here is the whole reason `scan` returns a Result rather than an
         // empty Vec.
+        //
+        // SURVIVED MUTATION, documented rather than hidden (M4.31, #84):
+        // replacing this arm with `Err(_) => Vec::new()` leaves every test
+        // green. The fall-through still refuses — the path is simply not found
+        // in an empty list — so nothing is written and no data is lost. What
+        // breaks is the *answer*: the caller is told "not conflicted" when the
+        // truth is "the conflicts could not be read", which is the
+        // I-did-not-look-reported-as-a-fact failure this crate is organised
+        // against.
+        //
+        // Not covered by a test because forcing `git ls-files` to fail inside a
+        // repository still healthy enough for the pipeline to build a plan is
+        // fragile in every form tried. Stated here so the next reader knows the
+        // gap is known rather than missed.
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
