@@ -199,6 +199,17 @@ pub(crate) enum UnsupportedReason {
     /// case), or no single parent to diff a revert against (the merge/root
     /// case — the same exclusion `crate::activity::undoables` already applies).
     NoRecoverableHandle,
+    /// `ConflictRecreatableWhileInProgress` (M4.31, #84): git *can* rebuild the
+    /// conflict, but only while the operation that produced it is still in
+    /// progress, and the recovery centre reads journal rows after the fact.
+    ///
+    /// Not `NoRecoverableHandle` — that means no ref or commit exists to name
+    /// even in principle, which is a different and more final thing. Here a
+    /// mechanism exists and this surface simply cannot confirm the window is
+    /// still open: a journal row cannot say whether the same merge is still
+    /// running. Offering the undo belongs to the live conflict view, which can
+    /// check.
+    OnlyWhileOperationInProgress,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +274,10 @@ pub(crate) async fn classify_recovery(
 
         RecoveryStrategy::RecoverableIfStaged => RecoveryClass::Unsupported {
             reason: UnsupportedReason::NoRecoverableHandle,
+        },
+
+        RecoveryStrategy::ConflictRecreatableWhileInProgress => RecoveryClass::Unsupported {
+            reason: UnsupportedReason::OnlyWhileOperationInProgress,
         },
 
         RecoveryStrategy::Irrecoverable => RecoveryClass::Unsupported {

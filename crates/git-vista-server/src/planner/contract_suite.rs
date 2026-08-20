@@ -208,6 +208,7 @@ fn covered_by(op: &GitOperation) -> &'static str {
         GitOperation::PushStash { .. } => "push_stash_executes_through_the_pipeline",
         GitOperation::ApplyStash { .. } => "apply_stash_executes_through_the_pipeline",
         GitOperation::DropStash { .. } => "drop_stash_refuses_a_moved_selector",
+        GitOperation::ResolveConflict { .. } => "resolve_conflict_executes_through_the_pipeline",
         GitOperation::CreateBranch { .. } => "create_branch_executes_through_the_pipeline",
         GitOperation::CommitOnHead { .. } => "commit_on_head_executes_through_the_pipeline",
         GitOperation::EmptyCommitOnBranch { .. } => {
@@ -262,6 +263,7 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
         GitOperation::PushStash { .. }
         | GitOperation::ApplyStash { .. }
         | GitOperation::DropStash { .. }
+        | GitOperation::ResolveConflict { .. }
         | GitOperation::CreateBranch { .. }
         | GitOperation::CommitOnHead { .. }
         | GitOperation::EmptyCommitOnBranch { .. }
@@ -300,6 +302,10 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
 fn samples() -> Vec<GitOperation> {
     let zeros = "0".repeat(40);
     vec![
+        GitOperation::ResolveConflict {
+            path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+            resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
+        },
         GitOperation::CreateBranch {
             name: branch("b"),
             at: oid(&zeros),
@@ -2289,6 +2295,14 @@ fn every_git_write_route_reaches_the_planner() {
         // M2.20d (#230): pull — a git write, funnel row below.
         ("/api/pull", "pull_branch"),
         ("/api/delete-branch", "delete_branch"),
+        // The stash drawer (M3.24, #77). All three are git writes and all
+        // three go through the planner — push moves worktree state into
+        // refs/stash, apply moves it back, and drop destroys an entry. Listed
+        // here so the census sees three considered rows rather than three
+        // routes nothing checked.
+        ("/api/stash/push", "handlers::stash::push_stash"),
+        ("/api/stash/apply", "handlers::stash::apply_stash"),
+        ("/api/stash/drop", "handlers::stash::drop_stash"),
         // M2.21d (#238): the two local tag writes — git writes, funnel rows
         // below. M2.21f (#240) added the two remote ones right after. The
         // tag *listing* is a GET and so never reaches this table.
@@ -5471,5 +5485,139 @@ async fn review_window_seed_drift_fails_closed_with_the_never_recorded_refusal()
         out(&repo_b, &["branch", "--list", "stray"]),
         "",
         "the refused reset must not have deleted the stray branch"
+    );
+}
+
+#[tokio::test]
+async fn resolve_conflict_executes_through_the_pipeline() {
+    // M4.31 (#84). A REAL merge conflict, resolved through the full production
+    // path — plan build, mutation guard, staleness gate, executor — not a
+    // direct call to the exec function. That is the whole point of this suite:
+    // a variant that works when called directly and breaks somewhere in the
+    // funnel is exactly what the census exists to catch.
+    let (_dir, repo) = seeded_repo();
+
+    run(&repo, &["checkout", "-q", "-b", "theirs"]);
+    std::fs::write(repo.join("a.txt"), "theirs\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "theirs"]);
+    run(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("a.txt"), "ours\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "ours"]);
+    // Expected to fail — that is what produces the conflict under test.
+    let _ = std::process::Command::new("git")
+        .args(["merge", "theirs"])
+        .current_dir(&repo)
+        .status();
+    assert!(
+        out(&repo, &["ls-files", "-u", "--", "a.txt"]).contains("a.txt"),
+        "the fixture must actually be conflicted before the pipeline runs"
+    );
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ResolveConflict {
+            path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+            resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    // Three separate facts, because any one of them alone could hold while the
+    // resolution was still wrong.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "ours\n",
+        "the working tree must hold our side, with no conflict markers"
+    );
+    assert_eq!(
+        out(&repo, &["ls-files", "-u", "--", "a.txt"]),
+        "",
+        "the stage entries must be cleared — a checkout alone leaves them"
+    );
+    // Stage 0 is git's "normal, resolved" slot. Deliberately NOT
+    // `git diff --cached`: taking OUR side produces content identical to HEAD,
+    // so a cached diff is legitimately empty and asserting on it would fail on
+    // a correct resolution. The index stage is the fact that actually means
+    // resolved.
+    let staged = out(&repo, &["ls-files", "-s", "--", "a.txt"]);
+    assert!(
+        staged.starts_with("100644") && staged.contains(" 0\t"),
+        "the resolved file must sit at stage 0, got: {staged}"
+    );
+}
+
+#[tokio::test]
+async fn resolving_a_path_that_is_not_conflicted_is_refused_by_the_executor() {
+    // `shape` records no Precondition for this operation, so the executor's
+    // own re-read is the ONLY guard. MUTATION: drop that re-read and let the
+    // checkout run — `git checkout --ours` on an unconflicted path fails with
+    // a bare git error, and a caller would get an unexplained failure instead
+    // of a refusal that says what happened.
+    let (_dir, repo) = seeded_repo();
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ResolveConflict {
+            path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+            resolution: git_vista_protocol::conflict::Resolution::TakeTheirs,
+        },
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "body: {body}");
+    assert!(
+        body.contains("not conflicted"),
+        "the refusal must say why, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn taking_a_side_that_was_deleted_is_refused_rather_than_deleting_the_file() {
+    // The gap a surviving mutation exposed: `ConflictedFile::refuses` was
+    // tested at the protocol layer, but nothing checked the EXECUTOR acts on
+    // it. Deleting the `refuses` call left every test green.
+    //
+    // MUTATION: drop the `refuses` check in `exec_resolve_conflict`. This test
+    // goes red, because `git checkout --ours` on a path we deleted resolves to
+    // *nothing* — the user asked to keep our side and would get the file
+    // removed, having been told it succeeded.
+    let (_dir, repo) = seeded_repo();
+
+    run(&repo, &["checkout", "-q", "-b", "theirs"]);
+    std::fs::write(repo.join("a.txt"), "theirs changed it\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "theirs modifies"]);
+    run(&repo, &["checkout", "-q", "main"]);
+    run(&repo, &["rm", "-q", "a.txt"]);
+    run(&repo, &["commit", "-q", "-m", "ours deletes"]);
+    let _ = std::process::Command::new("git")
+        .args(["merge", "theirs"])
+        .current_dir(&repo)
+        .status();
+
+    // Sanity: this really is a delete/modify conflict with no "ours" stage.
+    let unmerged = out(&repo, &["ls-files", "-u", "--", "a.txt"]);
+    assert!(
+        !unmerged.is_empty() && !unmerged.contains(" 2\t"),
+        "fixture must be conflicted with no stage 2 (ours), got: {unmerged}"
+    );
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ResolveConflict {
+            path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+            resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
+        },
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "body: {body}");
+    assert!(
+        body.contains("no ours side"),
+        "the refusal must name the missing side and point at an explicit \
+         deletion instead, got: {body}"
+    );
+    // And nothing may have been written on the way to refusing.
+    assert!(
+        !out(&repo, &["ls-files", "-u", "--", "a.txt"]).is_empty(),
+        "a refused resolution must leave the conflict exactly as it was"
     );
 }

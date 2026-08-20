@@ -39,7 +39,7 @@ use git_vista_core::activity::ActivityKind;
 use git_vista_core::identity::{GenerationInputs, RepositoryId};
 use git_vista_core::seed::{parse_seed, reset_plan, Seed};
 use git_vista_protocol::{
-    AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitError,
+    Advisory, AmendCommitError, AmendCommitSuccess, AmendFailureKind, BranchName, CommitError,
     CommitFailureKind, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
     IdempotencyKey, MergeStrategy, OperationHash, OperationId, OperationStage, Plan, Precondition,
     RecoveryStrategy, RefChange, RefName, RefState, RemoteName, RepositoryToken, RiskLevel,
@@ -802,6 +802,10 @@ async fn build_plan(
     let generation = generation_token(repo, &observed).await;
     let now = crate::activity::now_secs();
 
+    // Computed before the struct so the borrow of `operation` ends here; the
+    // struct takes it by value on the next line.
+    let advisories = advisories_for(repo, &operation).await;
+
     let plan = Plan {
         repository,
         worktree,
@@ -814,6 +818,7 @@ async fn build_plan(
         preconditions,
         expected_ref_changes,
         recovery,
+        advisories,
     };
     (plan, observed)
 }
@@ -1410,6 +1415,93 @@ async fn rev_parse_ref_unpeeled(
     Ok((!id.is_empty()).then_some(id))
 }
 
+/// The remote's default branch, read from `refs/remotes/<remote>/HEAD`.
+///
+/// `Ok(Some(name))` — the symbolic ref resolved and names a branch.
+/// `Ok(None)` — git answered, and there is no such ref: this repository simply
+/// does not record a default branch (a bare `git clone` sets it; a manually
+/// added remote often does not).
+/// `Err(_)` — the read itself failed.
+///
+/// **The two non-answers are kept apart on purpose.** Both become
+/// [`Advisory::DefaultBranchUnknown`] at the call site, but they are different
+/// facts and the reason text says which — collapsing them here would be the
+/// same "could not look reads as nothing there" mistake this file guards
+/// against everywhere else.
+///
+/// Local only: resolving a symbolic ref reads `.git`, never a socket. This is
+/// deliberate and load-bearing — see [`Advisory`]'s docs for why no variant
+/// claims anything about forge branch-protection rules, which are not
+/// knowable without asking the forge.
+async fn default_branch_of(repo: &Path, remote: &RemoteName) -> Result<Option<String>, String> {
+    let ref_name = format!("refs/remotes/{}/HEAD", remote.as_str());
+    let output = crate::git_cmd::git_output(
+        repo,
+        &["symbolic-ref", "--quiet", "--short", ref_name.as_str()],
+    )
+    .await
+    .map_err(|e| format!("couldn't run git symbolic-ref: {e}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    // `--short` yields `<remote>/<branch>`; the branch is what follows the
+    // first slash. Split once from the left rather than taking the last
+    // segment: branch names may themselves contain slashes
+    // (`feature/m4.32-...`), and `rsplit` would return only the tail.
+    let short = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let prefix = format!("{}/", remote.as_str());
+    Ok(short
+        .strip_prefix(prefix.as_str())
+        .map(str::to_string)
+        .filter(|b| !b.is_empty()))
+}
+
+/// The advisories this operation earns (M4.32, #85).
+///
+/// Only a force-with-lease push earns any. An ordinary push cannot replace
+/// remote history, so warning on it would train users to click through the
+/// warnings that matter — the same argument `FetchRemote`'s docs make for
+/// refusing to overstate its risk.
+async fn advisories_for(repo: &Path, operation: &GitOperation) -> Vec<Advisory> {
+    let GitOperation::PushBranch {
+        branch,
+        remote,
+        force: ForcePublish::WithLease { .. },
+        ..
+    } = operation
+    else {
+        return Vec::new();
+    };
+
+    let mut out = vec![Advisory::RemoteHistoryReplaced {
+        branch: branch.clone(),
+        remote: remote.clone(),
+    }];
+
+    out.push(match default_branch_of(repo, remote).await {
+        Ok(Some(default)) if default == branch.as_str() => Advisory::DefaultBranchPush {
+            branch: branch.clone(),
+            remote: remote.clone(),
+        },
+        // Known, and this is not it: no advisory. The absence here is earned —
+        // the check ran and answered.
+        Ok(Some(_)) => return out,
+        Ok(None) => Advisory::DefaultBranchUnknown {
+            reason: format!(
+                "{} does not record a default branch (no refs/remotes/{}/HEAD), \
+                 so this plan cannot tell you whether {} is it",
+                remote.as_str(),
+                remote.as_str(),
+                branch.as_str()
+            ),
+        },
+        Err(why) => Advisory::DefaultBranchUnknown {
+            reason: format!("the default branch could not be read — {why}"),
+        },
+    });
+    out
+}
+
 /// Best-effort `CommitOid` from an observation. `Absent` and `Unknown` both
 /// yield `None` — correct here only because every caller uses it to *omit* a
 /// descriptive field rather than to assert one; see the `PushBranch` arm in
@@ -1580,6 +1672,25 @@ async fn shape(
             };
             (RiskLevel::Reversible, preconditions, changes, recovery)
         }
+        // M4.31 (#84). Reversible, not Safe: taking one side discards the
+        // other from the index, which is a real loss even though git can
+        // rebuild it. And not Destructive: the discarded side is still named
+        // by MERGE_HEAD, so `git checkout --merge` reconstructs the conflict
+        // exactly — a definite mechanism, not a maybe.
+        //
+        // No `Precondition`. The obvious one — "this path is still
+        // conflicted" — cannot be expressed in this vocabulary, which
+        // compares refs and worktree cleanliness, not index stage entries.
+        // Rather than approximate it with a precondition that checks
+        // something else and reads as if it checked this, the executor
+        // re-reads the conflict immediately before acting and refuses there.
+        // See `exec_resolve_conflict`.
+        GitOperation::ResolveConflict { .. } => (
+            RiskLevel::Reversible,
+            Vec::new(),
+            Vec::new(),
+            RecoveryStrategy::ConflictRecreatableWhileInProgress,
+        ),
         GitOperation::StageAll
         | GitOperation::UnstageAll
         // A staging selection is index-only like its -All siblings: the
@@ -2138,6 +2249,9 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
             message,
             expected_tip,
         } => exec_empty_commit_on_branch(repo, need, &branch, &message, &expected_tip).await,
+        GitOperation::ResolveConflict { path, resolution } => {
+            exec_resolve_conflict(repo, need, &path, resolution).await
+        }
         GitOperation::StageAll => exec_stage_all(repo, need).await,
         GitOperation::UnstageAll => exec_unstage_all(repo, need).await,
         GitOperation::CheckoutBranch { branch } => {
@@ -3726,6 +3840,133 @@ async fn exec_delete_local_tag(
     )
     .await;
     (StatusCode::OK, format!("Deleted tag '{name}'."))
+}
+
+/// Resolve one conflicted path by taking a whole side, or by deleting it
+/// (M4.31, #84).
+///
+/// # Re-reads the conflict before acting, and refuses on what it finds
+///
+/// `shape` records no `Precondition` for this operation, because "this path is
+/// still conflicted with a readable chosen side" is not expressible in a
+/// vocabulary built to compare refs and worktree cleanliness. Approximating it
+/// with a precondition that checks something *else* would be worse than none:
+/// the plan would display a guarantee it had not made.
+///
+/// So the check lives here, immediately before the write, and it is stricter
+/// than a precondition could be — it re-runs the scan and asks the same
+/// `refuses` the caller asked, so a side that became unreadable between plan
+/// and execution stops the write rather than resolving to content nobody saw.
+async fn exec_resolve_conflict(
+    repo: &Path,
+    need: NetworkNeed,
+    path: &WorktreePath,
+    resolution: git_vista_protocol::conflict::Resolution,
+) -> (StatusCode, String) {
+    use git_vista_protocol::conflict::Resolution;
+
+    let files = match crate::conflicts::scan(repo).await {
+        Ok(f) => f,
+        // A scan that failed must never fall through to the write. Refusing
+        // here is the whole reason `scan` returns a Result rather than an
+        // empty Vec.
+        //
+        // SURVIVED MUTATION, documented rather than hidden (M4.31, #84):
+        // replacing this arm with `Err(_) => Vec::new()` leaves every test
+        // green. The fall-through still refuses — the path is simply not found
+        // in an empty list — so nothing is written and no data is lost. What
+        // breaks is the *answer*: the caller is told "not conflicted" when the
+        // truth is "the conflicts could not be read", which is the
+        // I-did-not-look-reported-as-a-fact failure this crate is organised
+        // against.
+        //
+        // Not covered by a test because forcing `git ls-files` to fail inside a
+        // repository still healthy enough for the pipeline to build a plan is
+        // fragile in every form tried. Stated here so the next reader knows the
+        // gap is known rather than missed.
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("the conflicts could not be read, so nothing was resolved — {e}"),
+            )
+        }
+    };
+
+    let Some(file) = files.iter().find(|f| f.path == path.as_str()) else {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "{} is not conflicted — it may have been resolved already, or the \
+                 operation that produced the conflict may have ended",
+                path.as_str()
+            ),
+        );
+    };
+
+    if let Some(refused) = file.refuses(resolution) {
+        return (
+            StatusCode::CONFLICT,
+            match refused {
+                git_vista_protocol::conflict::ResolutionRefused::SideAbsent { side } => format!(
+                    "{} has no {side} side — to remove the file, ask for a deletion \
+                     explicitly rather than taking a side that is not there",
+                    path.as_str()
+                ),
+                git_vista_protocol::conflict::ResolutionRefused::SideUnreadable {
+                    side,
+                    reason,
+                } => format!(
+                    "{}'s {side} side could not be read, so it cannot be chosen — {reason}",
+                    path.as_str()
+                ),
+            },
+        );
+    }
+
+    // `--` before the path, always: it stops a path that begins with a dash
+    // being read as an option. The newtype already rejects the worst shapes,
+    // but the separator is what makes that irrelevant rather than load-bearing.
+    let argv: Vec<&str> = match resolution {
+        Resolution::TakeOurs => vec!["checkout", "--ours", "--", path.as_str()],
+        Resolution::TakeTheirs => vec!["checkout", "--theirs", "--", path.as_str()],
+        // `rm` clears the index entries and removes the file in one step;
+        // `-f` because a conflicted path is by definition not "clean" and git
+        // refuses without it.
+        Resolution::TakeDeletion => vec!["rm", "-f", "--", path.as_str()],
+    };
+
+    let output = match run_git(repo, need, &argv).await {
+        Ok(o) => o,
+        Err(e) => return couldnt_run("/api/resolve-conflict", &e),
+    };
+    if !output.status.success() {
+        let msg = stderr_or(&output, "git could not apply that resolution.");
+        eprintln!("git-vista: /api/resolve-conflict failed: {msg}");
+        return (StatusCode::BAD_REQUEST, msg);
+    }
+
+    // A checkout writes the working tree but leaves the stage entries in
+    // place; the path stays conflicted until it is staged. `rm` has already
+    // done both, so it needs no second step — and running `add` on a path it
+    // just deleted would fail.
+    if !matches!(resolution, Resolution::TakeDeletion) {
+        let add = match run_git(repo, need, &["add", "--", path.as_str()]).await {
+            Ok(o) => o,
+            Err(e) => return couldnt_run("/api/resolve-conflict", &e),
+        };
+        if !add.status.success() {
+            let msg = stderr_or(&add, "git could not stage the resolved file.");
+            eprintln!("git-vista: /api/resolve-conflict failed to stage: {msg}");
+            return (StatusCode::BAD_REQUEST, msg);
+        }
+    }
+
+    println!(
+        "[/api/resolve-conflict] resolved {} by {:?}",
+        path.as_str(),
+        resolution
+    );
+    (StatusCode::OK, format!("Resolved {}.", path.as_str()))
 }
 
 /// `git add -A` (`/api/stage`).
@@ -5503,10 +5744,12 @@ pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
         | GitOperation::PushBranch { .. } => true,
         // M3.24 (#77): stash verbs are local and finish in milliseconds —
         // there is no transfer to interrupt, so cancellation has nothing to
-        // honour.
+        // honour. M4.31 (#84)'s resolve is two short local git calls, with no
+        // window in which a cancel could arrive and mean anything.
         GitOperation::PushStash { .. }
         | GitOperation::ApplyStash { .. }
         | GitOperation::DropStash { .. }
+        | GitOperation::ResolveConflict { .. }
         | GitOperation::CreateBranch { .. }
         | GitOperation::CommitOnHead { .. }
         | GitOperation::EmptyCommitOnBranch { .. }
@@ -5568,6 +5811,11 @@ mod remote_boundary_suite;
 // forever, and cannot hold the coordinator guard forever either.
 #[cfg(test)]
 mod hook_timeout_suite;
+
+// M4.32 (#85): which advisories a force-with-lease push earns, and that
+// "could not determine the default branch" never reads as "not it".
+#[cfg(test)]
+mod advisory_suite;
 
 // #327 defect B: `git revert`'s failure classification.
 #[cfg(test)]

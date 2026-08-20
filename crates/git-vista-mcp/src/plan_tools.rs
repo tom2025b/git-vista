@@ -108,6 +108,15 @@ pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
             "destructive, and its safety rests on a compare-and-swap against a reflog \
              position an agent cannot see or re-derive between planning and submitting",
         ),
+        // M4.31 (#84): not exposed as an MCP tool. Resolving a conflict is a
+        // judgement about file content made one path at a time by someone
+        // looking at three versions of it; an agent picking a side from a tool
+        // description has not seen any of them.
+        GitOperation::ResolveConflict { .. } => Excluded(
+            "resolving a conflict is a judgement about file content, made one path \
+             at a time by someone looking at all three versions of it; an agent \
+             picking a side from a tool description has seen none of them",
+        ),
         GitOperation::CreateBranch { .. } => Tool("plan_create_branch"),
         GitOperation::CommitOnHead { .. } => Tool("plan_commit_on_head"),
         GitOperation::EmptyCommitOnBranch { .. } => Tool("plan_empty_commit_on_branch"),
@@ -784,12 +793,22 @@ fn recovery_name(recovery: &RecoveryStrategy) -> &'static str {
         RecoveryStrategy::CheckoutPrevious { .. } => "checkout_previous",
         RecoveryStrategy::RevertCommit { .. } => "revert_commit",
         RecoveryStrategy::RecoverableIfStaged => "recoverable_if_staged",
+        RecoveryStrategy::ConflictRecreatableWhileInProgress => {
+            "conflict_recreatable_while_in_progress"
+        }
         RecoveryStrategy::Irrecoverable => "irrecoverable",
     }
 }
 
 fn recovery_meaning(recovery: &RecoveryStrategy) -> String {
     match recovery {
+        RecoveryStrategy::ConflictRecreatableWhileInProgress => {
+            "Undo by asking git to rebuild the conflict (git checkout --merge on the \
+             path) — but only while the merge, rebase or cherry-pick that produced it \
+             is still in progress. Once it is concluded or aborted, this stops being \
+             possible."
+                .to_string()
+        }
         RecoveryStrategy::NotNeeded => {
             "Nothing is destroyed, so there is nothing to recover.".to_string()
         }
@@ -1115,8 +1134,14 @@ mod tests {
     // A planner without the reader would be a tool whose only safe use needs
     // information the agent cannot obtain. They land together, in their own
     // slice. See `exposure_of` for the per-operation wording.
+    // M4.31 (#84): resolve_conflict is unexposed for a different reason than
+    // the stash three — picking a side is a judgement about file content made
+    // by someone looking at all three versions of it, and an agent choosing
+    // from a tool description has seen none of them. Listed here so the census
+    // sees a considered exclusion rather than an omission.
     const UNEXPOSED_TAGS: &[&str] = &[
         "reset_test_repo",
+        "resolve_conflict",
         "stage_selection",
         "push_stash",
         "apply_stash",
@@ -1242,6 +1267,14 @@ mod tests {
             GitOperation::DropStash {
                 entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
                 expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+            },
+            // M4.31 (#84). Present in the census even though `exposure_of`
+            // excludes it from the tool surface — the census is about the
+            // *vocabulary*, and a variant missing here would mean nothing
+            // checked that its exclusion was deliberate rather than forgotten.
+            GitOperation::ResolveConflict {
+                path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+                resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
             },
             GitOperation::CreateBranch {
                 name: branch("b"),
@@ -1376,6 +1409,7 @@ mod tests {
             preconditions: vec![],
             expected_ref_changes: vec![],
             recovery: RecoveryStrategy::NotNeeded,
+            advisories: Vec::new(),
         };
         serde_json::to_vec(&plan).unwrap()
     }

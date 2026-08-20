@@ -57,6 +57,7 @@
 #[macro_use]
 pub mod newtype;
 
+pub mod conflict;
 pub mod diff;
 pub mod dto;
 pub mod error;
@@ -68,9 +69,10 @@ pub mod plan;
 pub mod status;
 pub mod version;
 
+pub use conflict::{ConflictedFile, Continuation, NotTextResolvable, Stage};
 pub use diff::{
-    diff_spec_argv, parse_unified_diff, path_or_dev_null, DiffLine, DiffSpec, FileDiff, Hunk,
-    LineKind, ParsedPatch,
+    diff_spec_argv, parse_unified_diff, path_or_dev_null, ComparisonBasis, DiffLine, DiffSpec,
+    FileDiff, Hunk, LineKind, ParsedPatch,
 };
 pub use dto::{
     validate_clone_url, AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind,
@@ -95,7 +97,7 @@ pub use patch_plan::{
     StageDirection, StagingDiff,
 };
 pub use plan::{
-    BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
+    Advisory, BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
     MergeStrategy, OperationHash, Plan, PlanFieldError, Precondition, RecoveryStrategy, RefChange,
     RefName, RefState, RemoteName, RepositoryToken, RiskLevel, StashMessage, StashSelector,
     TagAnnotation, TagMessage, TagName, UnixSeconds, WorktreePath, WorktreeToken,

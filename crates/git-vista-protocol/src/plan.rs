@@ -559,6 +559,29 @@ pub enum GitOperation {
         /// [`ForcePublish`] for why no third, unguarded option exists.
         force: ForcePublish,
     },
+    /// Resolve one conflicted path by taking a whole side, or by deleting it
+    /// (M4.31, #84) — `git checkout --ours|--theirs -- <path>` then
+    /// `git add <path>`, or `git rm <path>`.
+    ///
+    /// # One path per operation, deliberately
+    ///
+    /// Resolving is a sequence of decisions a human makes one file at a time,
+    /// and each decision is separately reviewable, separately journaled and
+    /// separately undoable. A batch variant would collapse ten judgements into
+    /// one approval and make partial failure ("three applied, then the fourth
+    /// refused") a state this vocabulary has no way to describe.
+    ///
+    /// # Carries no content
+    ///
+    /// Every variant of [`crate::conflict::Resolution`] names a side rather
+    /// than supplying bytes, so a plan stays small and hashable. Line-level
+    /// resolution — #84's "block and line choices" — needs the `patch_plan`
+    /// machinery and its own decision; it is not smuggled in here.
+    ResolveConflict {
+        /// Repository-relative path, exactly as the conflict scan reported it.
+        path: WorktreePath,
+        resolution: crate::conflict::Resolution,
+    },
     /// `git branch -d <branch>` — the safe delete; git refuses an unmerged
     /// branch (`/api/delete-branch`).
     DeleteBranch { branch: BranchName },
@@ -1191,6 +1214,27 @@ pub enum RecoveryStrategy {
     /// the point of a typed field a future reader is expected to switch on
     /// rather than re-derive by also matching on [`GitOperation`]).
     RecoverableIfStaged,
+    /// The conflict this resolved can be put back exactly as it was, by
+    /// git itself, for as long as the operation that produced it is still in
+    /// progress (M4.31, #84).
+    ///
+    /// Resolving a conflicted path clears its stage 1/2/3 index entries, so the
+    /// discarded side is no longer in the index — but `MERGE_HEAD` (or the
+    /// rebase/cherry-pick equivalent) still names both sides, and
+    /// `git checkout --merge -- <path>` reconstructs the conflict from them.
+    ///
+    /// **Distinct from [`RecoverableIfStaged`](Self::RecoverableIfStaged), and
+    /// the distinction is the same one that variant was created to make.**
+    /// `RecoverableIfStaged` means "no git-vista-driven undo, but the bytes may
+    /// linger as a dangling blob until `gc`" — a maybe, about the object store.
+    /// This is a definite, about a mechanism: git will do it, exactly, on
+    /// request. Tagging a resolution `RecoverableIfStaged` would understate it
+    /// and tell a UI to warn where it could offer an undo.
+    ///
+    /// The qualifier is load-bearing: **once the operation is concluded or
+    /// aborted, this stops being true.** A caller offering the undo must check
+    /// the operation is still in progress rather than assuming the tag alone.
+    ConflictRecreatableWhileInProgress,
     /// No recovery exists inside git-vista, and none is possible regardless:
     /// the effect left the machine (push — the remote is ahead and we never
     /// force-push), the discarded state was never journaled (test-repo reset
@@ -1199,6 +1243,75 @@ pub enum RecoveryStrategy {
     /// where "irrecoverable" is a fact about the repository, not just about
     /// what git-vista offers).
     Irrecoverable,
+}
+
+/// Something true about this plan that a reviewer should see, which is not a
+/// reason to refuse it (M4.32, #85).
+///
+/// # Why this is not a [`Precondition`], and not a [`RiskLevel`]
+///
+/// A precondition *blocks*: unmet, the plan does not run. A risk level
+/// classifies the operation *kind* — every `PushBranch` carries the same one.
+/// An advisory is the third thing: legitimate, allowed, and worth a second
+/// look at *this* target. Force-pushing your own topic branch and
+/// force-pushing the default branch are the same operation at the same risk
+/// level, and only one of them deserves a pause.
+///
+/// # It rides on the plan, not on the success response
+///
+/// The existing advisory precedent — `amended_published_commit` on
+/// `AmendCommitSuccess` — is *post-hoc*, and correctly so: whether an
+/// amended-away commit was published cannot be known until the amend runs.
+/// A default-branch warning is the opposite. It is knowable at build time, and
+/// a warning that arrives after the push has already reached the remote is not
+/// a warning, it is a receipt. So it belongs on the thing the user approves.
+///
+/// # "Could not look" is its own variant, deliberately
+///
+/// [`Advisory::DefaultBranchUnknown`] exists because the alternative is the
+/// failure this codebase keeps paying for: an absent `refs/remotes/<remote>/HEAD`
+/// silently reading as "not the default branch", so a force-push onto `main`
+/// goes out with no advisory and nothing ever says the check did not happen.
+/// A reviewer must be able to tell "I checked, it is not the default branch"
+/// from "I could not check". Same reasoning as `Obs`/`Observed` throughout this
+/// crate, and as `drift`'s `NotCheckable` next door in heraldry.
+///
+/// # This says nothing about forge branch protection
+///
+/// The variants speak only about the **default branch**, which is derivable
+/// locally from `refs/remotes/<remote>/HEAD` with no network call. Whether a
+/// forge has branch-protection *rules* configured is not knowable without
+/// asking that forge, and git-vista is deliberately forge-agnostic. Claiming
+/// "this branch is protected" on the strength of a local ref would be
+/// asserting knowledge never obtained — so no variant makes that claim, and
+/// none should be added without a real API call standing behind it.
+///
+/// Wire form: internally tagged on `"kind"`, matching [`Precondition`],
+/// [`RecoveryStrategy`] and [`ForcePublish`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum Advisory {
+    /// This push targets the remote's default branch — the branch that
+    /// `refs/remotes/<remote>/HEAD` points at. Legal and often intended; worth
+    /// showing, because the blast radius of getting it wrong is everyone's.
+    DefaultBranchPush {
+        branch: BranchName,
+        remote: RemoteName,
+    },
+    /// The default branch could not be determined, so this plan does **not**
+    /// know whether it targets it. Not an error and not a refusal — a stated
+    /// gap in what the preview can tell you. `reason` is for a human reading
+    /// the plan, never for a caller to match on.
+    DefaultBranchUnknown { reason: String },
+    /// A force-with-lease push that, if it succeeds, cannot be undone on the
+    /// remote by anything this application offers. Carried separately from
+    /// [`RecoveryStrategy`] because recovery describes what git-vista can
+    /// restore *locally*; this states the part it cannot reach.
+    RemoteHistoryReplaced {
+        branch: BranchName,
+        remote: RemoteName,
+    },
 }
 
 /// The reviewable preview of one [`GitOperation`] (M1.06a, #142): everything a
@@ -1237,6 +1350,16 @@ pub struct Plan {
     pub preconditions: Vec<Precondition>,
     /// The refs the operation is expected to move, with before/after states.
     pub expected_ref_changes: Vec<RefChange>,
+    /// Things a reviewer should see that are not reasons to refuse (M4.32,
+    /// #85). Empty for most operations. **Never a substitute for a
+    /// [`Precondition`]** — anything that should stop the plan belongs there,
+    /// where it is enforced, not here, where it is merely displayed.
+    ///
+    /// No `#[serde(default)]`, matching `PushBranch`'s added fields: a plan
+    /// from a build that predates this field is a version mismatch and must
+    /// fail loudly at the version gate, not arrive with an empty list that
+    /// reads as "checked, nothing to report".
+    pub advisories: Vec<Advisory>,
     /// How the pre-operation state can be recovered afterwards.
     pub recovery: RecoveryStrategy,
 }
@@ -1523,6 +1646,7 @@ mod tests {
                 ref_name: RefName::new("refs/heads/main").unwrap(),
                 to: oid('b'),
             },
+            advisories: Vec::new(),
         };
         let json = serde_json::to_string(&plan).unwrap();
         assert_eq!(serde_json::from_str::<Plan>(&json).unwrap(), plan);

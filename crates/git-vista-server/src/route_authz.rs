@@ -107,6 +107,18 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // so the full write posture like every other mutation here.
     ("/api/amend-commit", Method::POST, Authz::SessionAndCsrf),
     ("/api/stage", Method::POST, Authz::SessionAndCsrf),
+    // The stash drawer (M3.24, #77). The list is a read, so SessionRequired:
+    // it exposes stash messages and the branch each entry was taken from,
+    // which is worktree content and not for an unauthenticated caller.
+    ("/api/stashes", Method::GET, Authz::SessionRequired),
+    // All three writes carry the full posture. Push and apply move worktree
+    // state; drop destroys a stash entry outright, and its compare-and-swap
+    // guard protects against a *stale selector*, not against an unauthorised
+    // caller — those are different concerns and only this table addresses the
+    // second.
+    ("/api/stash/push", Method::POST, Authz::SessionAndCsrf),
+    ("/api/stash/apply", Method::POST, Authz::SessionAndCsrf),
+    ("/api/stash/drop", Method::POST, Authz::SessionAndCsrf),
     // Staging selections (M2.17b, #213). The diff read is GET (no CSRF
     // surface) but still full_routes-only — it feeds the write surface and
     // shows uncommitted worktree contents, so the LAN router never sees it.
@@ -241,7 +253,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 55;
+const EXPECTED_ROUTE_COUNT: usize = 59;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

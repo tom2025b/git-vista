@@ -32,19 +32,29 @@ use serde::{Deserialize, Serialize};
 /// replace the old whole-history payload shape. A v3 client expects the whole
 /// graph in one response and cannot page, so this is a hard window move, not a
 /// tolerated omission — the same reasoning as the v3 bump above.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// **v5 (M4.32, #85)** — [`crate::Plan`] carries `advisories`. A v4 client
+/// would drop the "you are force-pushing the default branch" notice while
+/// still being allowed to submit the push; a warning that vanishes is worse
+/// than one never designed, so the window moves whole.
+/// **v6 (M4.27, #80)** — a two-endpoint [`crate::DiffSpec`] carries an
+/// explicit `basis`. `git diff A B` and `git diff A...B` answer different
+/// questions and produce indistinguishable output, so a v5 client — which has
+/// no field for the answer — could show a three-dot comparison labelled as a
+/// two-dot one, or reverse a comparison whose reversal is not an inverse.
+/// Neither is detectable from the patch, hence a hard window move.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// The oldest client protocol version this server build still accepts. Together
 /// with [`MAX_CLIENT_PROTOCOL`] it is the compatibility window a client's version
 /// must fall inside. Equal to [`PROTOCOL_VERSION`] until a compatible-but-older
 /// contract must be supported.
-pub const MIN_CLIENT_PROTOCOL: u32 = 4;
+pub const MIN_CLIENT_PROTOCOL: u32 = 6;
 
 /// The newest client protocol version this server build can accept. A client
 /// reporting a version above this is *ahead* of the server (the server was
 /// downgraded, or the client cache is from a newer deploy) and is refused the
 /// same way as one that is too old.
-pub const MAX_CLIENT_PROTOCOL: u32 = 4;
+pub const MAX_CLIENT_PROTOCOL: u32 = 6;
 
 /// Request header a client must send on every `/api/*` call **except**
 /// `GET /api/protocol`, carrying the [`PROTOCOL_VERSION`] it was built against.
@@ -222,16 +232,32 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v4_is_hard_compatibility_window() {
+    fn protocol_v6_is_hard_compatibility_window() {
         // M1.10 (#63) bumped the wire protocol to 4 and moved the whole window,
         // not just the ceiling: a v3 client cannot page history, so v3 must be
         // refused exactly like any other out-of-window version, not tolerated.
-        assert_eq!(PROTOCOL_VERSION, 4);
-        assert_eq!(MIN_CLIENT_PROTOCOL, 4);
-        assert_eq!(MAX_CLIENT_PROTOCOL, 4);
-        assert_eq!(check_compatibility(3, 4, 4), Compatibility::ClientTooOld);
-        assert_eq!(check_compatibility(4, 4, 4), Compatibility::Compatible);
-        assert_eq!(check_compatibility(5, 4, 4), Compatibility::ClientTooNew);
+        //
+        // M4.32 (#85) bumped it to 5 for the same reason, one field later.
+        // `Plan` gained `advisories`, and `Plan` is `deny_unknown_fields` with
+        // no `#[serde(default)]` on the new field — so a v4 client neither
+        // accepts a v5 plan nor produces one this server will take. The window
+        // moves whole again: v4 is refused, not tolerated. Tolerating it would
+        // mean a client that silently drops the "you are force-pushing the
+        // default branch" advisory while still being allowed to submit the
+        // push — a warning that vanishes is worse than one that was never
+        // designed.
+        // M4.27 (#80) bumped it again, one field later. A two-endpoint
+        // DiffSpec now carries `basis`, and the two bases produce patches that
+        // are indistinguishable from each other — so a v5 client cannot tell
+        // which question was answered, and its "swap" control cannot know
+        // whether reversal is an inverse. Both failures are silent, which is
+        // exactly what a hard window move is for.
+        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(MIN_CLIENT_PROTOCOL, 6);
+        assert_eq!(MAX_CLIENT_PROTOCOL, 6);
+        assert_eq!(check_compatibility(5, 6, 6), Compatibility::ClientTooOld);
+        assert_eq!(check_compatibility(6, 6, 6), Compatibility::Compatible);
+        assert_eq!(check_compatibility(7, 6, 6), Compatibility::ClientTooNew);
     }
 
     #[test]

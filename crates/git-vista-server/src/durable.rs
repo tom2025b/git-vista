@@ -903,6 +903,13 @@ pub(crate) async fn write_recovery_ref(
 /// The object a recovery strategy would restore, if it names one directly.
 fn recovery_oid(recovery: &RecoveryStrategy) -> Option<&CommitOid> {
     match recovery {
+        // M4.31 (#84): names no object to pin. The discarded side is kept
+        // reachable by MERGE_HEAD for as long as the operation runs, and once
+        // that ends there is nothing a recovery ref could have held open —
+        // pinning a blob would not make the conflict rebuildable, only the
+        // bytes retrievable, which is a different and weaker promise than the
+        // strategy makes.
+        RecoveryStrategy::ConflictRecreatableWhileInProgress => None,
         RecoveryStrategy::ResetRef { to, .. } => Some(to),
         RecoveryStrategy::RecreateBranch { at, .. } => Some(at),
         // M2.21a (#235): for a deleted *annotated* tag `at` is the tag

@@ -775,6 +775,11 @@ pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         GitOperation::PushStash { .. } => NetworkNeed::Local,
         GitOperation::ApplyStash { .. } => NetworkNeed::Local,
         GitOperation::DropStash { .. } => NetworkNeed::Local,
+        // M4.31 (#84): `git checkout --ours|--theirs`, `git rm` and `git add`
+        // read and write the local index and worktree only. The three versions
+        // it chooses between are already in the object database — resolving a
+        // conflict never needs to ask a remote anything.
+        GitOperation::ResolveConflict { .. } => NetworkNeed::Local,
         GitOperation::CreateBranch { .. } => NetworkNeed::Local,
         GitOperation::CommitOnHead { .. } => NetworkNeed::Local,
         GitOperation::EmptyCommitOnBranch { .. } => NetworkNeed::Local,

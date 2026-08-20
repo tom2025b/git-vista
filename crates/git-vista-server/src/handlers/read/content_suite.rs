@@ -8,7 +8,7 @@
 use super::*;
 use axum::routing::get;
 use axum::Router;
-use git_vista_protocol::diff::DiffSpec;
+use git_vista_protocol::diff::{ComparisonBasis, DiffSpec};
 use git_vista_protocol::RepositoryDescriptor;
 use tower::ServiceExt;
 
@@ -510,6 +510,7 @@ async fn spec_diff_commit_vs_commit_sees_only_what_is_committed() {
     let spec = DiffSpec::CommitVsCommit {
         base: git_vista_protocol::plan::CommitOid::new(&c1).unwrap(),
         target: git_vista_protocol::plan::CommitOid::new(&c2).unwrap(),
+        basis: ComparisonBasis::Direct,
     };
     let out = spec_diff_for_repo(&repo, spec.clone())
         .await
@@ -526,6 +527,7 @@ async fn spec_diff_ref_vs_ref_resolves_names_to_the_same_answer() {
     let spec = DiffSpec::RefVsRef {
         base: git_vista_protocol::plan::RefName::new("base").unwrap(),
         target: git_vista_protocol::plan::RefName::new("main").unwrap(),
+        basis: ComparisonBasis::Direct,
     };
     let out = spec_diff_for_repo(&repo, spec.clone())
         .await
@@ -559,6 +561,7 @@ async fn the_worktree_index_and_commit_modes_return_genuinely_different_patches(
         DiffSpec::CommitVsCommit {
             base: git_vista_protocol::plan::CommitOid::new(&c1).unwrap(),
             target: git_vista_protocol::plan::CommitOid::new(&c2).unwrap(),
+            basis: ComparisonBasis::Direct,
         },
     )
     .await
