@@ -74,3 +74,4 @@ it, and note the link in both.
 | [0060](0060-stale-index-lock-liveness-check.md) | `refuse_if_git_busy` verifies liveness via `/proc` before trusting `index.lock`, and removes a lock confirmed stale | Accepted — implemented |
 | [0061](0061-plans-carry-advisories.md) | `Plan` carries `advisories`; a force-with-lease names the default branch, says when it could not tell, and states that the remote cannot be undone | Accepted — implemented |
 | [0062](0062-a-comparison-states-which-question-it-asks.md) | A two-endpoint `DiffSpec` carries an explicit `basis` (two-dot vs three-dot); reversal preserves it, and only a `Direct` reversal is an inverse | Accepted — implemented |
+| [0063](0063-one-conflict-model-for-six-operations.md) | One conflict vocabulary for all six operations; each side is Present, Absent or Unreadable, and none may collapse | Accepted — implemented |
