@@ -941,6 +941,21 @@ async fn generation_token(repo: &Path, observed: &Observed) -> GenerationToken {
     for (name, target) in refs_digest_input(repo).await {
         inputs.field(name, target);
     }
+    // refs/stash, explicitly (M3.24, #77).
+    //
+    // `refs_digest_input` above cannot supply it: it is built on
+    // `git_vista_git::read_refs`, which says in its own comment that it keeps
+    // "only branches and tags". That filter is CORRECT for what read_refs is
+    // for — the badges drawn on commits, where a stash entry has no business
+    // appearing — and wrong for a staleness digest, which needs everything
+    // that can make an approved plan untrue.
+    //
+    // Without this, no stash write moves the generation. A plan approved
+    // before a drop would still pass `enforce_fresh`, while every stash
+    // selector in it addressed a different entry, because dropping renumbers
+    // the list. Caught by a test written for #77's "generation updates are
+    // correct" criterion, not by inspection.
+    inputs.field("stash", stash_digest_input(repo).await);
     inputs.field("status", observed.status.digest_field());
     GenerationToken::new(inputs.generation().to_string())
         .expect("a RepositoryGeneration displays as non-empty decimal")
@@ -965,6 +980,26 @@ async fn read_head_branch_blocking(repo: &Path) -> Option<String> {
         .await
         .ok()
         .flatten()
+}
+
+/// `refs/stash`'s target, or a tagged absence, for the generation digest.
+///
+/// Deliberately its own read rather than a widening of
+/// [`git_vista_git::read_refs`]: that function's branches-and-tags filter is
+/// right for the badge list it exists to build, and loosening it would put
+/// stash entries on commits in the UI.
+///
+/// The three outcomes stay apart, same discipline as `Obs` everywhere else:
+/// a resolved oid, "there is no stash", and "the read failed". The last is
+/// deliberately UNIQUE per call, so a repository whose stash cannot be read
+/// invalidates every plan rather than silently digesting as "no stash" — the
+/// failure mode being a stale plan surviving a change nobody could see.
+async fn stash_digest_input(repo: &Path) -> String {
+    match rev_parse_ref_unpeeled(repo, "refs/stash").await {
+        Ok(Some(oid)) => format!("at\u{0}{oid}"),
+        Ok(None) => "absent".to_string(),
+        Err(_) => format!("unreadable\u{0}{}", crate::activity::now_secs()),
+    }
 }
 
 /// Every ref as `(digest field name, target oid)`, read off the async workers.

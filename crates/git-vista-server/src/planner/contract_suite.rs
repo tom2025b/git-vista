@@ -5708,3 +5708,72 @@ async fn pop_stash_refuses_to_report_complete_while_conflicted() {
         "git leaves the entry on a conflicting pop; the message says so, so it must hold"
     );
 }
+
+#[tokio::test]
+async fn a_stash_write_moves_the_generation_so_an_older_plan_goes_stale() {
+    // M3.24 (#77) criterion 5: "activity and generation updates are correct".
+    //
+    // The generation token is what `enforce_fresh` compares to refuse a plan
+    // approved against a repository that has since moved. If a stash write did
+    // NOT move it, a plan built before a drop would still look fresh
+    // afterwards — and every stash selector in it would point at a different
+    // entry, because dropping renumbers the list. That is the exact failure
+    // `stash_entry_still_at` exists to catch at execution time; this asserts
+    // the staleness gate catches it one stage earlier.
+    //
+    // Asserted rather than assumed: the ref read behind the generation digest
+    // is gix's `all()`, and the test that pins it is named for "head, branches
+    // and tags". Whether refs/stash rides along was worth checking, not
+    // inferring.
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "first"]);
+    std::fs::write(repo.join("a.txt"), "a changed again\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "second"]);
+
+    let before = build_plan_only(&repo, GitOperation::StageAll, tokens())
+        .await
+        .generation;
+
+    // Drop the top entry. refs/stash now points somewhere else and every
+    // selector below it has renumbered.
+    run(&repo, &["stash", "drop", "-q", "stash@{0}"]);
+
+    let after = build_plan_only(&repo, GitOperation::StageAll, tokens())
+        .await
+        .generation;
+
+    assert_ne!(
+        before, after,
+        "dropping a stash must move the generation — otherwise a plan approved \
+         before the drop still passes the staleness gate, while every selector \
+         in it now addresses a different entry"
+    );
+}
+
+#[tokio::test]
+async fn a_stash_push_is_journaled_as_activity() {
+    // The other half of criterion 5. A stash write that never reaches the
+    // journal is invisible to the activity feed and to the recovery centre —
+    // the user's own record of what happened to their work.
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::PushStash {
+            message: Some(git_vista_protocol::StashMessage::new("wip").unwrap()),
+            keep_index: false,
+            include_untracked: false,
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    let journal =
+        std::fs::read_to_string(repo.join(".git/git-vista/journal.jsonl")).unwrap_or_default();
+    assert!(
+        journal.contains("refs/stash"),
+        "the stash write must be journaled against refs/stash; journal was: {journal}"
+    );
+}
