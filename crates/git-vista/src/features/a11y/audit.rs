@@ -24,7 +24,76 @@ const STYLES: &str = include_str!("../../../styles.css");
 const APP_MOD: &str = include_str!("../../app/mod.rs");
 const RENDER_NODES: &str = include_str!("../../render/nodes.rs");
 const RENDER_STUBS: &str = include_str!("../../render/stubs.rs");
-const MENU: &str = include_str!("../../menu.rs");
+// `menu.rs` was split (refactor/split-menu-rs) into a `menu/` directory of
+// per-concern child modules; the tripwires below scan across the whole menu
+// module's markup and handlers (a disabled item's tag, or the `on_amend`
+// handler's ordering), not any one file, so `MENU` is every file in the
+// module concatenated — order doesn't matter to any of the census helpers
+// below, which either count matches or find the first occurrence of a name
+// that lives in exactly one of these files.
+const MENU: &str = concat!(
+    include_str!("../../menu.rs"),
+    include_str!("../../menu/view_items.rs"),
+    include_str!("../../menu/create_items.rs"),
+    include_str!("../../menu/commit_items.rs"),
+    include_str!("../../menu/worktree_items.rs"),
+    include_str!("../../menu/branch_items.rs"),
+    include_str!("../../menu/tag_items.rs"),
+    include_str!("../../menu/remote_items.rs"),
+    include_str!("../../menu/undo_items.rs"),
+);
+/// The exact set of `include_str!` paths folded into [`MENU`] above, minus
+/// `menu.rs` itself — kept as a plain list (not derived from the `concat!`)
+/// so this test can compare it against what's actually on disk.
+const MENU_MODULE_FILES: &[&str] = &[
+    "view_items.rs",
+    "create_items.rs",
+    "commit_items.rs",
+    "worktree_items.rs",
+    "branch_items.rs",
+    "tag_items.rs",
+    "remote_items.rs",
+    "undo_items.rs",
+];
+
+/// Before the menu.rs split (refactor/split-menu-rs), one `include_str!`
+/// covered the whole subject by construction — there was only one file. Now
+/// [`MENU`] is a hand-maintained `concat!` list, and a future `menu/foo.rs`
+/// carrying its own disabled item, or its own copy of a scanned handler,
+/// would be silently invisible to every tripwire below that reads `MENU`:
+/// the `>= 8` floor in [`every_disabled_context_menu_item_is_focusable`]
+/// would keep passing on the same eight items it already found, unaware a
+/// ninth exists in a file nobody added to the list. This test is what
+/// notices the list itself has gone stale, rather than trusting the
+/// tripwires that read it to notice on its behalf — the same "a census
+/// that can't see its own blind spot is worse than no census" reasoning
+/// [`reachability_census`](crate::reachability_census) is built on.
+#[test]
+fn the_menu_census_covers_every_file_in_the_menu_module() {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let menu_dir = manifest.join("src/menu");
+    let on_disk: BTreeSet<String> = std::fs::read_dir(&menu_dir)
+        .unwrap_or_else(|e| panic!("couldn't read {}: {e}", menu_dir.display()))
+        .map(|entry| {
+            let entry = entry.unwrap_or_else(|e| panic!("dir entry error: {e}"));
+            entry
+                .file_name()
+                .to_str()
+                .unwrap_or_else(|| panic!("non-UTF8 file name under {}", menu_dir.display()))
+                .to_string()
+        })
+        .filter(|name| name.ends_with(".rs"))
+        .collect();
+    let listed: BTreeSet<String> = MENU_MODULE_FILES.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        on_disk, listed,
+        "src/menu/ on disk and MENU_MODULE_FILES (which MENU's concat! list above must \
+         match) have diverged. A file was added to or removed from src/menu/ without \
+         updating both — until they match, disabled-item and on_amend-ordering tripwires \
+         in this file may be silently blind to the file that's missing from the list."
+    );
+}
+
 /// The commit modal (M2.19c, #224 widened it to three modes). Inline-styled end
 /// to end, so the stylesheet census below cannot see a single one of its
 /// controls — this file's own bytes are the only place its tap targets can be
