@@ -99,8 +99,9 @@ pub use patch_plan::{
 pub use plan::{
     Advisory, BranchName, CommitMessage, CommitOid, ForcePublish, GenerationToken, GitOperation,
     MergeStrategy, OperationHash, Plan, PlanFieldError, Precondition, RecoveryStrategy, RefChange,
-    RefName, RefState, RemoteName, RepositoryToken, RiskLevel, TagAnnotation, TagMessage, TagName,
-    UnixSeconds, WorktreePath, WorktreeToken, MAX_REMOTE_NAME_LEN, MAX_TAG_MESSAGE_LEN,
+    RefName, RefState, RemoteName, RepositoryToken, RiskLevel, StashMessage, StashSelector,
+    TagAnnotation, TagMessage, TagName, UnixSeconds, WorktreePath, WorktreeToken,
+    MAX_REMOTE_NAME_LEN, MAX_TAG_MESSAGE_LEN,
 };
 pub use status::{
     parse_porcelain_v2_z, ChangeKind, ChangeSides, ConflictKind, ParsedStatus, StatusEntry,

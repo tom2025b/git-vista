@@ -38,6 +38,9 @@ pub enum PlanFieldError {
     /// The value is not a path relative to the worktree root: it is absolute,
     /// carries a `..` component, or embeds a NUL byte (#219).
     NotWorktreeRelative(&'static str),
+    /// The value is not the `stash@{<digits>}` shape a stash entry selector
+    /// must have (M3.24, #77).
+    NotStashSelector(&'static str),
     /// The value is not a plain remote *name*: it carries a character no
     /// remote nickname may (`:`, `/`, `@`, `~`, whitespace, …), starts with
     /// `.`, or embeds `..` — i.e. it is URL-shaped or path-shaped, and git
@@ -59,6 +62,12 @@ impl fmt::Display for PlanFieldError {
             }
             PlanFieldError::NotToken(field) => {
                 write!(f, "{field} may only contain letters, digits, '-' and '_'")
+            }
+            PlanFieldError::NotStashSelector(field) => {
+                write!(
+                    f,
+                    "{field} must be a stash entry selector of the form                      'stash@{{N}}' where N is a number"
+                )
             }
             PlanFieldError::NotWorktreeRelative(field) => {
                 write!(
@@ -236,6 +245,54 @@ pub(crate) fn require_non_empty_bounded(
     require_non_empty(value, field)?;
     if value.len() > max {
         return Err(PlanFieldError::TooLong { field, max });
+    }
+    Ok(())
+}
+
+/// A stash entry's positional selector: exactly `stash@{<digits>}` (M3.24,
+/// #77).
+///
+/// # Why the shape is pinned this hard
+///
+/// The value reaches `git stash apply <selector>` / `git stash drop
+/// <selector>` as an argv element chosen by the client. Every other name in
+/// this file gets [`require_git_safe`], which refuses option shapes and
+/// empties — necessary, but it would still admit `stash@{0}; rm -rf /` or a
+/// path or a ref name, and `git stash drop` accepts any reflog-ish argument it
+/// can resolve. An allowlist is available here in a way it is not for branch
+/// names, because the grammar is finite: the literal `stash@{`, one or more
+/// ASCII digits, `}`. Nothing else is a stash selector, so nothing else is
+/// admitted.
+///
+/// The digits are **not** parsed into a number and not bounded by the stash
+/// list's length: `stash@{9999}` on a two-entry list is a well-formed selector
+/// that git will refuse at execution, and refusing it here would mean this
+/// validator needed to read the repository — a wire-shape check that depends
+/// on live state is a check that can be wrong by the time it is used. Length
+/// is capped only to keep a hostile megabyte of digits out of a hashed,
+/// journaled [`Plan`](crate::plan::Plan).
+///
+/// A leading zero (`stash@{007}`) is admitted deliberately: git resolves it,
+/// and refusing a value the tool accepts would make this validator's rule
+/// differ from git's for no safety gain.
+pub(crate) fn require_stash_selector(
+    value: &str,
+    field: &'static str,
+) -> Result<(), PlanFieldError> {
+    require_non_empty(value, field)?;
+    // A cap far past any real stash list, so a hostile digit run cannot grow
+    // the plan. 32 admits stash@{ + 25 digits + }.
+    if value.len() > 32 {
+        return Err(PlanFieldError::TooLong { field, max: 32 });
+    }
+    let Some(rest) = value.strip_prefix("stash@{") else {
+        return Err(PlanFieldError::NotStashSelector(field));
+    };
+    let Some(digits) = rest.strip_suffix('}') else {
+        return Err(PlanFieldError::NotStashSelector(field));
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(PlanFieldError::NotStashSelector(field));
     }
     Ok(())
 }

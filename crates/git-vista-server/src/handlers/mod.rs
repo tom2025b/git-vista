@@ -62,6 +62,7 @@ pub(crate) mod rebase;
 pub(crate) mod reset;
 pub(crate) mod select;
 pub(crate) mod staging;
+pub(crate) mod stash;
 // M2.21b (#236): `GET /api/tags`, the tag listing with type/target/tagger/message.
 pub(crate) mod tags;
 // M1.04 (#57): establish / check / revoke a loopback session.

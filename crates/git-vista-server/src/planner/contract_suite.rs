@@ -205,6 +205,13 @@ fn assert_ok(status: StatusCode, body: &str) {
 /// given a real pipeline test below.
 fn covered_by(op: &GitOperation) -> &'static str {
     match op {
+        GitOperation::PushStash { .. } => "push_stash_executes_through_the_pipeline",
+        GitOperation::ApplyStash { .. } => "apply_stash_executes_through_the_pipeline",
+        GitOperation::PopStash { .. } => "pop_stash_refuses_to_report_complete_while_conflicted",
+        GitOperation::BranchFromStash { .. } => {
+            "branch_from_stash_lands_a_stash_that_would_not_pop"
+        }
+        GitOperation::DropStash { .. } => "drop_stash_refuses_a_moved_selector",
         GitOperation::ResolveConflict { .. } => "resolve_conflict_executes_through_the_pipeline",
         GitOperation::CreateBranch { .. } => "create_branch_executes_through_the_pipeline",
         GitOperation::CommitOnHead { .. } => "commit_on_head_executes_through_the_pipeline",
@@ -257,7 +264,12 @@ fn covered_by(op: &GitOperation) -> &'static str {
 /// pointing at its own test.
 fn covered_on_split_path(op: &GitOperation) -> &'static str {
     match op {
-        GitOperation::ResolveConflict { .. }
+        GitOperation::PushStash { .. }
+        | GitOperation::ApplyStash { .. }
+        | GitOperation::PopStash { .. }
+        | GitOperation::BranchFromStash { .. }
+        | GitOperation::DropStash { .. }
+        | GitOperation::ResolveConflict { .. }
         | GitOperation::CreateBranch { .. }
         | GitOperation::CommitOnHead { .. }
         | GitOperation::EmptyCommitOnBranch { .. }
@@ -523,6 +535,119 @@ async fn stage_all_executes_through_the_pipeline() {
     let (status, body) = pipeline(&repo, GitOperation::StageAll).await;
     assert_ok(status, &body);
     assert_eq!(out(&repo, &["diff", "--cached", "--name-only"]), "b.txt");
+}
+
+/// M3.24 (#77): a stash push rides the full pipeline and the drawer gains an
+/// entry.
+///
+/// MUTATION: drop `--include-untracked` from the executor's argv and this goes
+/// red — `new.txt` is untracked, so without the flag it stays in the tree and
+/// the working directory is not clean afterwards.
+#[tokio::test]
+async fn push_stash_executes_through_the_pipeline() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    std::fs::write(repo.join("new.txt"), "untracked\n").unwrap();
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::PushStash {
+            message: Some(git_vista_protocol::StashMessage::new("wip").unwrap()),
+            keep_index: false,
+            include_untracked: true,
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    let listed = out(&repo, &["stash", "list"]);
+    assert!(
+        listed.contains("wip"),
+        "the drawer must hold the entry: {listed}"
+    );
+    assert_eq!(
+        out(&repo, &["status", "--porcelain"]),
+        "",
+        "an --include-untracked push leaves a clean tree"
+    );
+}
+
+/// M3.24 (#77): apply restores the changes and KEEPS the entry — the property
+/// that distinguishes it from pop, and the reason pop is not in this slice.
+///
+/// MUTATION: make the executor run `stash pop` instead of `stash apply` and
+/// this goes red on the still-listed assertion.
+#[tokio::test]
+async fn apply_stash_executes_through_the_pipeline() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "wip"]);
+    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ApplyStash {
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(oid.clone()).unwrap(),
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "a changed\n",
+        "the stash's changes are back in the tree"
+    );
+    assert!(
+        out(&repo, &["stash", "list"]).contains("wip"),
+        "apply KEEPS the entry — that is what makes it not a pop"
+    );
+}
+
+/// M3.24 (#77): **the safety property of the whole write path.** A selector is
+/// an index into a reflog, and every drop renumbers it. This drives the exact
+/// race: plan against `stash@{0}`, let the drawer move underneath, then submit.
+/// The compare-and-swap must refuse rather than drop a stash the user never
+/// chose.
+///
+/// MUTATION: delete the `stash_entry_still_at` call from `exec_drop_stash` and
+/// this goes red — the operation succeeds and destroys the wrong entry.
+#[tokio::test]
+async fn drop_stash_refuses_a_moved_selector() {
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "first\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "target"]);
+    let target_oid = out(&repo, &["rev-parse", "stash@{0}"]);
+
+    // Someone stashes again: "target" is now stash@{1}, and stash@{0} is a
+    // different entry entirely.
+    std::fs::write(repo.join("a.txt"), "second\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "innocent"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::DropStash {
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(target_oid).unwrap(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "a moved selector must refuse, not drop whatever now sits there: {body}"
+    );
+    let listed = out(&repo, &["stash", "list"]);
+    assert!(
+        listed.contains("innocent"),
+        "the entry that moved into the slot must survive: {listed}"
+    );
+    assert!(
+        listed.contains("target"),
+        "and so must the intended one: {listed}"
+    );
 }
 
 #[tokio::test]
@@ -2176,6 +2301,15 @@ fn every_git_write_route_reaches_the_planner() {
         // M2.20d (#230): pull — a git write, funnel row below.
         ("/api/pull", "pull_branch"),
         ("/api/delete-branch", "delete_branch"),
+        // The stash drawer (M3.24, #77). All three are git writes and all
+        // three go through the planner — push moves worktree state into
+        // refs/stash, apply moves it back, and drop destroys an entry. Listed
+        // here so the census sees three considered rows rather than three
+        // routes nothing checked.
+        ("/api/stash/push", "handlers::stash::push_stash"),
+        ("/api/stash/apply", "handlers::stash::apply_stash"),
+        ("/api/stash/drop", "handlers::stash::drop_stash"),
+        ("/api/stash/branch", "handlers::stash::branch_from_stash"),
         // M2.21d (#238): the two local tag writes — git writes, funnel rows
         // below. M2.21f (#240) added the two remote ones right after. The
         // tag *listing* is a GET and so never reaches this table.
@@ -5492,5 +5626,274 @@ async fn taking_a_side_that_was_deleted_is_refused_rather_than_deleting_the_file
     assert!(
         !out(&repo, &["ls-files", "-u", "--", "a.txt"]).is_empty(),
         "a refused resolution must leave the conflict exactly as it was"
+    );
+}
+
+#[tokio::test]
+async fn pop_stash_removes_the_entry_on_a_clean_pop() {
+    // The ordinary path, and the half `apply` cannot do: the entry is gone.
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "wip"]);
+    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::PopStash {
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(oid).unwrap(),
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "a changed\n",
+        "the stashed change must be back in the worktree"
+    );
+    assert_eq!(
+        out(&repo, &["stash", "list"]),
+        "",
+        "a clean pop removes the entry — that is the whole difference from apply"
+    );
+}
+
+#[tokio::test]
+async fn pop_stash_refuses_to_report_complete_while_conflicted() {
+    // THE acceptance criterion: "pop is not reported complete while conflicts
+    // remain". Git already leaves the entry in place on a conflicting pop —
+    // what this pins is that the RESPONSE says so, by name, rather than
+    // returning a success whose only clue is a line of git stderr.
+    //
+    // MUTATION: report OK whenever `git stash pop` exits non-zero but the
+    // scan is unavailable, or skip the conflict re-read entirely. Either way
+    // a user is told their stash was popped while their worktree is full of
+    // conflict markers and the entry is still in the drawer.
+    let (_dir, repo) = seeded_repo();
+
+    // Stash a change to a.txt, then commit a DIFFERENT change to the same
+    // file so the stash cannot apply cleanly.
+    std::fs::write(repo.join("a.txt"), "from the stash\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "wip"]);
+    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
+    std::fs::write(repo.join("a.txt"), "from a commit\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "diverge"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::PopStash {
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(oid).unwrap(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "a conflicted pop must not return OK — body: {body}"
+    );
+    assert!(
+        body.contains("NOT complete"),
+        "the response must say plainly that it did not finish: {body}"
+    );
+    assert!(
+        body.contains("a.txt"),
+        "the conflicted path must be named, not left for the user to hunt: {body}"
+    );
+    assert!(
+        body.contains("not removed"),
+        "the user must be told their stash survived: {body}"
+    );
+
+    // And the promise must be true, not just printed.
+    assert!(
+        out(&repo, &["stash", "list"]).contains("wip"),
+        "git leaves the entry on a conflicting pop; the message says so, so it must hold"
+    );
+}
+
+#[tokio::test]
+async fn a_stash_write_moves_the_generation_so_an_older_plan_goes_stale() {
+    // M3.24 (#77) criterion 5: "activity and generation updates are correct".
+    //
+    // The generation token is what `enforce_fresh` compares to refuse a plan
+    // approved against a repository that has since moved. If a stash write did
+    // NOT move it, a plan built before a drop would still look fresh
+    // afterwards — and every stash selector in it would point at a different
+    // entry, because dropping renumbers the list. That is the exact failure
+    // `stash_entry_still_at` exists to catch at execution time; this asserts
+    // the staleness gate catches it one stage earlier.
+    //
+    // Asserted rather than assumed: the ref read behind the generation digest
+    // is gix's `all()`, and the test that pins it is named for "head, branches
+    // and tags". Whether refs/stash rides along was worth checking, not
+    // inferring.
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "first"]);
+    std::fs::write(repo.join("a.txt"), "a changed again\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "second"]);
+
+    let before = build_plan_only(&repo, GitOperation::StageAll, tokens())
+        .await
+        .generation;
+
+    // Drop the top entry. refs/stash now points somewhere else and every
+    // selector below it has renumbered.
+    run(&repo, &["stash", "drop", "-q", "stash@{0}"]);
+
+    let after = build_plan_only(&repo, GitOperation::StageAll, tokens())
+        .await
+        .generation;
+
+    assert_ne!(
+        before, after,
+        "dropping a stash must move the generation — otherwise a plan approved \
+         before the drop still passes the staleness gate, while every selector \
+         in it now addresses a different entry"
+    );
+}
+
+#[tokio::test]
+async fn a_stash_push_is_journaled_as_activity() {
+    // The other half of criterion 5. A stash write that never reaches the
+    // journal is invisible to the activity feed and to the recovery centre —
+    // the user's own record of what happened to their work.
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::PushStash {
+            message: Some(git_vista_protocol::StashMessage::new("wip").unwrap()),
+            keep_index: false,
+            include_untracked: false,
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    let journal =
+        std::fs::read_to_string(repo.join(".git/git-vista/journal.jsonl")).unwrap_or_default();
+    assert!(
+        journal.contains("refs/stash"),
+        "the stash write must be journaled against refs/stash; journal was: {journal}"
+    );
+}
+
+#[tokio::test]
+async fn branch_from_stash_lands_a_stash_that_would_not_pop() {
+    // The point of this operation, demonstrated rather than asserted in prose:
+    // the SAME stash that conflicts on pop goes in cleanly here, because git
+    // creates the branch at the stash's original base and applies it there.
+    //
+    // The fixture is deliberately the one from the pop conflict test — stash a
+    // change to a.txt, then commit a different change to a.txt — so the two
+    // tests are the same scenario with different verbs, and the difference in
+    // outcome is the whole justification for the variant existing.
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "from the stash\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "wip"]);
+    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
+    std::fs::write(repo.join("a.txt"), "from a commit\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "diverge"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::BranchFromStash {
+            name: git_vista_protocol::BranchName::new("rescued").unwrap(),
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(oid).unwrap(),
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    // All three effects, checked separately — any one could hold while another
+    // silently did not happen.
+    assert_eq!(
+        out(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "rescued",
+        "the new branch must be checked out"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "from the stash\n",
+        "the stashed content must be present, with no conflict markers — this is \
+         the same stash that conflicts on pop"
+    );
+    assert_eq!(
+        out(&repo, &["stash", "list"]),
+        "",
+        "a successful branch-from-stash consumes the entry"
+    );
+}
+
+#[tokio::test]
+async fn branch_from_stash_refuses_a_name_that_already_exists() {
+    // MUTATION: drop the RefAbsent precondition. Git would refuse anyway, but
+    // AFTER approval — the caller would have committed to a plan that could
+    // never run. Refusing at build time lets them pick another name having
+    // consumed nothing.
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "wip"]);
+    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
+    run(&repo, &["branch", "taken"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::BranchFromStash {
+            name: git_vista_protocol::BranchName::new("taken").unwrap(),
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(oid).unwrap(),
+        },
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        axum::http::StatusCode::OK,
+        "an existing branch name must be refused, not reinterpreted: {body}"
+    );
+    assert!(
+        out(&repo, &["stash", "list"]).contains("wip"),
+        "a refused request must not have consumed the stash"
+    );
+
+    // The assertions above hold even WITHOUT the precondition, because git
+    // refuses a taken branch name itself — at execution. That is precisely the
+    // difference this operation's precondition exists to make, so it is
+    // asserted directly: the refusal must be visible in the PLAN, before a
+    // user approves anything.
+    //
+    // Found by mutation: removing the RefAbsent precondition left the checks
+    // above green, which meant they were testing git's behaviour rather than
+    // ours.
+    let plan = build_plan_only(
+        &repo,
+        GitOperation::BranchFromStash {
+            name: git_vista_protocol::BranchName::new("taken").unwrap(),
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(out(
+                &repo,
+                &["rev-parse", "stash@{0}"],
+            ))
+            .unwrap(),
+        },
+        tokens(),
+    )
+    .await;
+    assert!(
+        plan.preconditions.iter().any(|p| matches!(
+            p,
+            git_vista_protocol::Precondition::RefAbsent { ref_name }
+                if ref_name.as_str() == "refs/heads/taken"
+        )),
+        "the plan must carry the RefAbsent precondition, so the name clash is \
+         visible before approval rather than only on execution: {:?}",
+        plan.preconditions
     );
 }

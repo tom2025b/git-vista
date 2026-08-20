@@ -59,8 +59,16 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // `git update-ref` for recovery refs (#62) — see the module doc above.
     // The production call (`write_recovery_ref`) now goes through
     // `crate::git_cmd::git_output` (#66 Task 6); this entry now covers only
-    // its `#[cfg(test)]` fixture setup.
+    // its `#[cfg(test)]` fixture setup — specifically `read_recovery_ref`,
+    // which stayed in this file rather than moving with its two callers (see
+    // `durable/recovery_ref_suite.rs`'s doc comment for why).
     "src/durable.rs",
+    // The recovery-ref write/read tests extracted verbatim from durable.rs's
+    // inline `mod tests` (M-current test-extraction). `#[cfg(test)]` fixture
+    // setup only, same posture as `src/durable.rs` above: throwaway
+    // repositories built to prove `write_recovery_ref` writes the right ref
+    // and never the working branch of the same name.
+    "src/durable/recovery_ref_suite.rs",
     // The shared read-only git helpers, including the sealed `git_output`
     // launcher (#66 Task 6). Note what this entry does *not* cover any more:
     // `git_output` builds no `Command` of its own — it goes through
@@ -80,8 +88,26 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // fetches attacker-chosen content.
     // `git status --porcelain=v2` (static args). The production call
     // (`worktree_status`) now goes through `crate::git_cmd::git_output`
-    // (#66 Task 6); this entry now covers only its `#[cfg(test)]` fixtures.
-    "src/handlers/read.rs",
+    // (#66 Task 6). Its `#[cfg(test)]` fixtures used to be this entry's only
+    // remaining reason to exist; a mechanical test-extraction moved every
+    // inline `#[cfg(test)]` module out to `src/handlers/read/<topic>_suite.rs`
+    // child files (this crate's own `planner/*_suite.rs` convention), so
+    // `read.rs` itself now constructs no `Command` at all — see the three
+    // entries below for where those fixtures actually live now.
+    //
+    // #63's paged-history suites, split out of the single `read.rs` test
+    // module above: `content_suite.rs` (diff/file-read fixtures: `run`/`out`/
+    // `stdout_len`), `graph_suite.rs` (history/paging fixtures: `run`/`out`/
+    // `run_env`, plus the `git fast-import`/`git daemon` fixtures for the
+    // deep/adversarial repos), and `status_suite.rs` (worktree-status
+    // fixtures: a duplicated `run`, matching the planner-suite convention of
+    // each suite carrying its own private copy rather than sharing one).
+    // `routing_suite.rs` — the fourth split-out file, covering route
+    // registration and the `?repo=` selector — constructs no `Command` and is
+    // deliberately not listed here.
+    "src/handlers/read/content_suite.rs",
+    "src/handlers/read/graph_suite.rs",
+    "src/handlers/read/status_suite.rs",
     // M2.21b (#236): `#[cfg(test)]` fixture setup only. No handler in this
     // file runs a subprocess in production. `GET /api/tags` runs none at all —
     // `git_vista_git::read_tags` opens the repository with `gix` and decodes
@@ -190,6 +216,33 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // the same "referee is not the code being checked" posture `pull_suite`
     // and `push_suite` document above.
     "src/planner/hook_timeout_suite.rs",
+    // #[cfg(test)] git fixtures for the #327 defect B revert-conflict suite:
+    // plain `git init`/`commit`/`rev-parse` to build fixture repositories,
+    // outside the sandboxed harness under test.
+    "src/planner/revert_suite.rs",
+    // #[cfg(test)] git fixtures for the M2.21d/e (#238/#239) tag-argv-shape
+    // and signed-tag-execution suite: plain `git init`/`commit`/`rev-parse`,
+    // plus the failed-signing attempt's own `git rev-parse --verify` check
+    // that no tag was left behind.
+    "src/planner/tag_signing_suite.rs",
+    // #[cfg(test)] git fixtures for the #145 staleness-contract suite:
+    // plain `git init`/`commit`/`add`/`branch`/`remote` to build and drift
+    // fixture repositories, outside the sandboxed harness under test.
+    "src/planner/staleness_suite.rs",
+    // #[cfg(test)] git fixtures for the #214 (M2.17c) hunk/line-staging
+    // suite: plain `git init`/`commit`/`add`/`diff` to build fixture
+    // repositories and read back their state, outside the sandboxed harness
+    // under test.
+    "src/planner/hunk_staging_suite.rs",
+    // #[cfg(test)] git fixtures for the M2.19a/b (#222/#223) amend/commit
+    // failure-classification suite: plain `git init`/`commit`/`add` to build
+    // fixture repositories, outside the sandboxed harness under test.
+    "src/planner/commit_classification_suite.rs",
+    // #[cfg(test)] git fixtures for the M2.20a/M2.21a/f (#227/#235/#240)
+    // remote-operation-shape suite: plain `git init`/`commit`, plus a real
+    // in-tree bare remote (`git init --bare`) so `RemoteConfigured`
+    // preconditions genuinely hold.
+    "src/planner/remote_operation_shape_suite.rs",
     // #[cfg(test)] git fixtures for the M4.32 (#85) advisory suite: plain
     // `git init`/`commit`/`push`/`symbolic-ref` to build a repository with a
     // real bare remote, so the presence or absence of refs/remotes/origin/HEAD
@@ -308,6 +361,14 @@ const ALLOWED_GIT_CRATE_SPAWN_SITES: &[&str] = &[
     // `Command::new` sites build tagged fixture repositories (`git tag`,
     // `git mktag`, `git pack-refs`) for the suite to read back.
     "src/tags.rs",
+    // M3.24 (#77): `#[cfg(test)]` fixture setup only, same posture as the two
+    // above. `read_stashes` spawns nothing — it opens the repository with
+    // `gix::open_opts(.., isolated())` and walks `refs/stash`'s reflog out of
+    // the mapped ref store. The file's only `Command::new` sites build stashed
+    // fixture repositories for the suite to read back, including two that pin
+    // properties of *git itself* (one commit can occupy two stash slots;
+    // dropping renumbers the entries below) rather than of this code.
+    "src/stash.rs",
 ];
 
 /// The one carve-out from "every spawn site names `git` literally": sites that

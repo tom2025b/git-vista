@@ -87,6 +87,36 @@ pub(crate) enum Exposure {
 pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
     use Exposure::{Excluded, Tool};
     match op {
+        // M3.24 (#77) — all three excluded for now, and the reason is the same
+        // one for each: an agent cannot choose a stash entry it cannot see.
+        //
+        // Every stash operation is addressed by a POSITIONAL selector
+        // (`stash@{n}`) that renumbers on every drop, and this surface has no
+        // stash-listing tool yet. Exposing a planner without the reader would
+        // be exposing a tool whose only safe use requires information the
+        // agent has no way to obtain — it would have to guess `stash@{0}` and
+        // hope. The tools land with the read tool, in their own slice.
+        GitOperation::PushStash { .. } => Excluded(
+            "the stash tool surface lands with its stash-listing reader; a planner \
+             without one would invite guessing at entries",
+        ),
+        GitOperation::ApplyStash { .. } => Excluded(
+            "addressed by a positional selector this surface cannot yet list, so an \
+             agent could only guess which entry it is applying",
+        ),
+        GitOperation::BranchFromStash { .. } => Excluded(
+            "same positional-selector problem as the rest of the drawer, and this one \
+             also creates a branch and moves HEAD — three effects an agent would be \
+             choosing blind",
+        ),
+        GitOperation::PopStash { .. } => Excluded(
+            "same positional-selector problem as apply, and pop also REMOVES the entry \
+             — an agent guessing at stash@{0} would destroy work it never saw",
+        ),
+        GitOperation::DropStash { .. } => Excluded(
+            "destructive, and its safety rests on a compare-and-swap against a reflog \
+             position an agent cannot see or re-derive between planning and submitting",
+        ),
         // M4.31 (#84): not exposed as an MCP tool. Resolving a conflict is a
         // judgement about file content made one path at a time by someone
         // looking at three versions of it; an agent picking a side from a tool
@@ -767,6 +797,7 @@ fn recovery_name(recovery: &RecoveryStrategy) -> &'static str {
         RecoveryStrategy::RecreateBranch { .. } => "recreate_branch",
         RecoveryStrategy::DeleteCreatedBranch { .. } => "delete_created_branch",
         RecoveryStrategy::RecreateTag { .. } => "recreate_tag",
+        RecoveryStrategy::RecreateStashEntry { .. } => "recreate_stash_entry",
         RecoveryStrategy::DeleteCreatedTag { .. } => "delete_created_tag",
         RecoveryStrategy::CheckoutPrevious { .. } => "checkout_previous",
         RecoveryStrategy::RevertCommit { .. } => "revert_commit",
@@ -790,6 +821,11 @@ fn recovery_meaning(recovery: &RecoveryStrategy) -> String {
         RecoveryStrategy::NotNeeded => {
             "Nothing is destroyed, so there is nothing to recover.".to_string()
         }
+        RecoveryStrategy::RecreateStashEntry { at, .. } => format!(
+            "Undo by re-creating the stash entry from {}. It comes back at the \
+             top of the list (stash@{{0}}), not at its original position.",
+            at.as_str()
+        ),
         RecoveryStrategy::ResetRef { ref_name, to } => format!(
             "Undo by moving {} back to {}.",
             ref_name.as_str(),
@@ -1101,7 +1137,27 @@ mod tests {
     /// The two wire tags this crate deliberately does not expose. Written out
     /// as tags (not as `Exposure::Excluded` results) so the census below can
     /// compare two independently-authored lists.
-    const UNEXPOSED_TAGS: &[&str] = &["reset_test_repo", "resolve_conflict", "stage_selection"];
+    // M3.24 (#77): the three stash operations are unexposed for one shared
+    // reason — every stash entry is addressed by a positional selector that
+    // renumbers on every drop, and this surface has no stash-listing tool yet.
+    // A planner without the reader would be a tool whose only safe use needs
+    // information the agent cannot obtain. They land together, in their own
+    // slice. See `exposure_of` for the per-operation wording.
+    // M4.31 (#84): resolve_conflict is unexposed for a different reason than
+    // the stash three — picking a side is a judgement about file content made
+    // by someone looking at all three versions of it, and an agent choosing
+    // from a tool description has seen none of them. Listed here so the census
+    // sees a considered exclusion rather than an omission.
+    const UNEXPOSED_TAGS: &[&str] = &[
+        "reset_test_repo",
+        "resolve_conflict",
+        "stage_selection",
+        "branch_from_stash",
+        "pop_stash",
+        "push_stash",
+        "apply_stash",
+        "drop_stash",
+    ];
 
     fn catalog_names() -> Vec<String> {
         plan_tool_catalog()
@@ -1206,6 +1262,32 @@ mod tests {
         let tag = |s: &str| TagName::new(s).unwrap();
         let path = |s: &str| WorktreePath::new(s).unwrap();
         vec![
+            // M3.24 (#77). DropStash is Excluded from the tool surface but
+            // must still appear here: the census proves every protocol variant
+            // has a considered exposure, and "deliberately excluded" is an
+            // answer the census has to see.
+            GitOperation::PushStash {
+                message: None,
+                keep_index: false,
+                include_untracked: true,
+            },
+            GitOperation::ApplyStash {
+                entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+                expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+            },
+            GitOperation::PopStash {
+                entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+                expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+            },
+            GitOperation::BranchFromStash {
+                name: git_vista_protocol::BranchName::new("from-stash").unwrap(),
+                entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+                expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+            },
+            GitOperation::DropStash {
+                entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+                expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+            },
             // M4.31 (#84). Present in the census even though `exposure_of`
             // excludes it from the tool surface — the census is about the
             // *vocabulary*, and a variant missing here would mean nothing

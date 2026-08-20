@@ -24,21 +24,26 @@ use super::code_only;
 /// Deliberately strict: exactly one definition must exist, and it must sit
 /// ahead of `mod tests`, so a same-named test helper can neither be picked up
 /// instead of the real thing nor make the scan ambiguous.
-fn production_body<'a>(code: &'a str, name: &str) -> &'a str {
+fn production_body<'a>(code: &'a str, name: &str, source_path: &str) -> &'a str {
     let marker = format!("fn {name}");
     let defs = code.matches(&marker).count();
     assert_eq!(
         defs, 1,
-        "expected exactly one `{marker}` definition in handlers/read.rs, found {defs}"
+        "expected exactly one `{marker}` definition in {source_path}, found {defs}"
     );
     let at = code.find(&marker).expect("counted above");
-    let tests_at = code
-        .find("mod tests")
-        .expect("handlers/read.rs has a test module");
-    assert!(
-        at < tests_at,
-        "`{marker}` was found inside `mod tests`, not in production code"
-    );
+    // The ordering check exists to stop a same-named *test helper* being read
+    // instead of the real definition. Once a file's tests move into child
+    // modules there is no inline `mod tests` left, so there is no helper to
+    // confuse it with and the guard is vacuously satisfied — the `defs == 1`
+    // assertion above already pins uniqueness. Kept conditional rather than
+    // deleted so the check returns the moment an inline test module reappears.
+    if let Some(tests_at) = code.find("mod tests") {
+        assert!(
+            at < tests_at,
+            "`{marker}` was found inside `mod tests`, not in production code"
+        );
+    }
 
     let open = at
         + code[at..]
@@ -128,8 +133,12 @@ fn bounded_read_source_boundary_is_streaming_and_exactly_four() {
         ),
     ];
 
-    let diff_body = production_body(&code, "commit_diff_for_repo");
-    let file_body = production_body(&code, "file_at_commit_for_repo");
+    // The path is passed rather than baked into the assertions: the moment
+    // this is pointed at a second file, a failure naming the wrong one sends
+    // whoever is debugging it to the wrong place.
+    const SOURCE: &str = "handlers/read.rs";
+    let diff_body = production_body(&code, "commit_diff_for_repo", SOURCE);
+    let file_body = production_body(&code, "file_at_commit_for_repo", SOURCE);
 
     // The two bodies are distinct regions of the same file.
     assert_ne!(
