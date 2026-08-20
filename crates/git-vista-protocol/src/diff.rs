@@ -195,6 +195,49 @@ pub struct ParsedPatch {
 /// criterion rules out.
 ///
 /// [`IndexVsCommit`]: DiffSpec::IndexVsCommit
+/// Which of the two questions a two-endpoint comparison is asking (M4.27, #80).
+///
+/// # These are different questions, and the output does not say which it answered
+///
+/// `git diff A B` and `git diff A...B` produce patches in the same format, from
+/// the same command, with no marker distinguishing them. Given only the patch
+/// there is no way to tell which was asked. Conflating them is one of the most
+/// common misreadings in git — GitHub's pull-request view shows the three-dot
+/// form, a bare `git diff` shows the two-dot form, and the two disagree
+/// whenever `base` has moved since the branches diverged.
+///
+/// So the question lives in the type. Because [`SpecDiff`] echoes its
+/// [`DiffSpec`] back verbatim, a view can always state which comparison it is
+/// showing rather than inferring it from a patch that cannot say.
+///
+/// # Reversal is not symmetric across the two, and that is the trap
+///
+/// See [`DiffSpec::reversed`]. Briefly: reversing a [`Direct`] comparison
+/// yields the *inverse patch* — every addition becomes a deletion. Reversing a
+/// [`SinceMergeBase`] comparison yields **a different set of commits
+/// entirely**, not an inverse. A "swap" control that assumes the first
+/// behaviour will silently mislead under the second, which is why the basis is
+/// a field rather than a caller-side convention.
+///
+/// [`Direct`]: ComparisonBasis::Direct
+/// [`SinceMergeBase`]: ComparisonBasis::SinceMergeBase
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonBasis {
+    /// `git diff <base> <target>` — what differs between the two states **as
+    /// they are now**, regardless of history. The two-dot form.
+    Direct,
+    /// `git diff <base>...<target>` — what `target` gained **since the two
+    /// diverged**: the diff from their merge base to `target`, ignoring
+    /// anything `base` gained in the meantime. The three-dot form, and what a
+    /// forge shows for a pull request.
+    ///
+    /// Undefined when the two endpoints share no merge base (unrelated
+    /// histories). Git itself errors in that case rather than inventing one,
+    /// and this crate does not paper over it.
+    SinceMergeBase,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum DiffSpec {
@@ -211,6 +254,11 @@ pub enum DiffSpec {
     CommitVsCommit {
         base: crate::plan::CommitOid,
         target: crate::plan::CommitOid,
+        /// Which question this asks. No `#[serde(default)]`: a body that
+        /// omits it is a hard 400, not a silent two-dot. Defaulting here would
+        /// reintroduce exactly the ambiguity this field exists to remove, and
+        /// it would do so invisibly.
+        basis: ComparisonBasis,
     },
     /// Two refs (branches or tags) — `git diff <base> <target>`, resolved
     /// live by git at spawn time. Distinct from `CommitVsCommit` even though
@@ -218,7 +266,86 @@ pub enum DiffSpec {
     RefVsRef {
         base: crate::plan::RefName,
         target: crate::plan::RefName,
+        /// Which question this asks — see [`CommitVsCommit`]'s field.
+        ///
+        /// [`CommitVsCommit`]: DiffSpec::CommitVsCommit
+        basis: ComparisonBasis,
     },
+}
+
+impl DiffSpec {
+    /// The same comparison with its endpoints swapped, when that means
+    /// anything (M4.27, #80).
+    ///
+    /// `None` for the one-sided modes: [`WorktreeVsIndex`] and
+    /// [`IndexVsCommit`] have no second endpoint to swap with. Git can express
+    /// neither reversal (`git diff --cached` has no inverse flag), so
+    /// returning a spec that could not be executed — or worse, silently
+    /// returning the same spec unchanged so a "swap" button appeared to work —
+    /// would be inventing a capability.
+    ///
+    /// # What "reversed" means differs by basis, and callers must not assume
+    ///
+    /// - [`ComparisonBasis::Direct`]: a true inverse. `diff A B` and `diff B A`
+    ///   describe the same pair of states from opposite sides, so every
+    ///   addition in one is a deletion in the other. Reversing twice returns
+    ///   the original.
+    /// - [`ComparisonBasis::SinceMergeBase`]: **not** an inverse. `A...B` is
+    ///   "what B gained since the split"; `B...A` is "what A gained since the
+    ///   split". Both are legitimate and both are about the same divergence,
+    ///   but the second is not the first with its signs flipped — it is a
+    ///   different set of commits. A UI that labels the result "reversed diff"
+    ///   is accurate for `Direct` and misleading for `SinceMergeBase`; it
+    ///   should say "the other side of the divergence" instead.
+    ///
+    /// The basis is carried through unchanged either way: reversing a
+    /// comparison must never quietly change *which question* is being asked.
+    ///
+    /// [`WorktreeVsIndex`]: DiffSpec::WorktreeVsIndex
+    /// [`IndexVsCommit`]: DiffSpec::IndexVsCommit
+    pub fn reversed(&self) -> Option<Self> {
+        match self {
+            DiffSpec::WorktreeVsIndex | DiffSpec::IndexVsCommit { .. } => None,
+            DiffSpec::CommitVsCommit {
+                base,
+                target,
+                basis,
+            } => Some(DiffSpec::CommitVsCommit {
+                base: target.clone(),
+                target: base.clone(),
+                basis: *basis,
+            }),
+            DiffSpec::RefVsRef {
+                base,
+                target,
+                basis,
+            } => Some(DiffSpec::RefVsRef {
+                base: target.clone(),
+                target: base.clone(),
+                basis: *basis,
+            }),
+        }
+    }
+
+    /// Whether reversing this comparison produces the *inverse patch* (every
+    /// addition becoming a deletion), as opposed to a different comparison
+    /// that is merely the other side of the same divergence.
+    ///
+    /// Exists so a view can label its swap control honestly without
+    /// re-deriving the rule — and so the rule lives in one place rather than
+    /// in every client that grows a swap button.
+    pub fn reversal_is_inverse(&self) -> bool {
+        matches!(
+            self,
+            DiffSpec::CommitVsCommit {
+                basis: ComparisonBasis::Direct,
+                ..
+            } | DiffSpec::RefVsRef {
+                basis: ComparisonBasis::Direct,
+                ..
+            }
+        )
+    }
 }
 
 /// The diff of an explicit source/target pair — the response body of
@@ -314,6 +441,33 @@ pub fn diff_spec_argv(spec: &DiffSpec) -> Vec<String> {
 /// This function does not force those flags in, because what to read (`--patch`
 /// vs `--name-status -z` vs `--numstat -z`) genuinely differs per call. It
 /// names them here so the omission has to be deliberate.
+/// Append a two-endpoint comparison's revision arguments in the form the
+/// requested [`ComparisonBasis`] needs.
+///
+/// The shapes differ in *arity*, not just in text: `Direct` is two arguments,
+/// `SinceMergeBase` is **one** argument containing the literal `...`. Writing
+/// the three-dot form as two arguments would silently produce the two-dot
+/// comparison, which is the exact confusion `ComparisonBasis` exists to end —
+/// and it would be invisible, since both spellings run and both return a
+/// plausible patch.
+///
+/// Neither endpoint can begin with `-` (both are validated newtypes — a
+/// [`CommitOid`] is hex, a [`RefName`] is checked at construction), and the
+/// caller places every option before this call, so no revision can be read as
+/// an option's value.
+///
+/// [`CommitOid`]: crate::plan::CommitOid
+/// [`RefName`]: crate::plan::RefName
+fn push_endpoints(argv: &mut Vec<String>, base: &str, target: &str, basis: ComparisonBasis) {
+    match basis {
+        ComparisonBasis::Direct => {
+            argv.push(base.to_string());
+            argv.push(target.to_string());
+        }
+        ComparisonBasis::SinceMergeBase => argv.push(format!("{base}...{target}")),
+    }
+}
+
 pub fn diff_spec_argv_with(spec: &DiffSpec, extra: &[&str]) -> Vec<String> {
     let mut argv = vec!["diff".to_string()];
     let extras = |argv: &mut Vec<String>| argv.extend(extra.iter().map(|s| s.to_string()));
@@ -325,15 +479,21 @@ pub fn diff_spec_argv_with(spec: &DiffSpec, extra: &[&str]) -> Vec<String> {
             extras(&mut argv);
             argv.push(commit.as_str().to_string());
         }
-        DiffSpec::CommitVsCommit { base, target } => {
+        DiffSpec::CommitVsCommit {
+            base,
+            target,
+            basis,
+        } => {
             extras(&mut argv);
-            argv.push(base.as_str().to_string());
-            argv.push(target.as_str().to_string());
+            push_endpoints(&mut argv, base.as_str(), target.as_str(), *basis);
         }
-        DiffSpec::RefVsRef { base, target } => {
+        DiffSpec::RefVsRef {
+            base,
+            target,
+            basis,
+        } => {
             extras(&mut argv);
-            argv.push(base.as_str().to_string());
-            argv.push(target.as_str().to_string());
+            push_endpoints(&mut argv, base.as_str(), target.as_str(), *basis);
         }
     }
     argv
@@ -1172,6 +1332,7 @@ index 333,444..555
         let argv = diff_spec_argv(&DiffSpec::CommitVsCommit {
             base: base.clone(),
             target: target.clone(),
+            basis: ComparisonBasis::Direct,
         });
         assert_eq!(argv, vec!["diff", base.as_str(), target.as_str()]);
     }
@@ -1183,6 +1344,7 @@ index 333,444..555
         let argv = diff_spec_argv(&DiffSpec::RefVsRef {
             base: base.clone(),
             target: target.clone(),
+            basis: ComparisonBasis::Direct,
         });
         assert_eq!(argv, vec!["diff", base.as_str(), target.as_str()]);
     }
@@ -1197,6 +1359,7 @@ index 333,444..555
         let commit_argv = diff_spec_argv(&DiffSpec::CommitVsCommit {
             base: a.clone(),
             target: b.clone(),
+            basis: ComparisonBasis::Direct,
         });
 
         let base_ref = refname("main");
@@ -1204,6 +1367,7 @@ index 333,444..555
         let ref_argv = diff_spec_argv(&DiffSpec::RefVsRef {
             base: base_ref,
             target: target_ref,
+            basis: ComparisonBasis::Direct,
         });
 
         assert_eq!(commit_argv[0], ref_argv[0]);
@@ -1223,6 +1387,7 @@ index 333,444..555
             &DiffSpec::CommitVsCommit {
                 base: base.clone(),
                 target: target.clone(),
+                basis: ComparisonBasis::Direct,
             },
             &["--patch", "--no-color", "--no-textconv"],
         );
@@ -1286,10 +1451,12 @@ index 333,444..555
             DiffSpec::CommitVsCommit {
                 base: base.clone(),
                 target: target.clone(),
+                basis: ComparisonBasis::Direct,
             },
             DiffSpec::RefVsRef {
                 base: refname("main"),
                 target: refname("feature/x"),
+                basis: ComparisonBasis::Direct,
             },
         ] {
             assert_eq!(
@@ -1311,5 +1478,153 @@ index 333,444..555
         .unwrap();
         assert_eq!(value["mode"], "index_vs_commit");
         assert_eq!(value["commit"], "a".repeat(40));
+    }
+
+    // -----------------------------------------------------------------------
+    // M4.27 (#80): the two comparison bases, and the reversal trap
+    // -----------------------------------------------------------------------
+
+    /// The two bases must produce genuinely different argv — and the three-dot
+    /// form must be ONE argument, not two.
+    ///
+    /// MUTATION: push `base`, `"..."`, `target` as three arguments. Git then
+    /// reads `...` as a revision, fails, and the difference is loud. The
+    /// subtler mutation is pushing two arguments and ignoring the basis
+    /// entirely: that runs, returns a plausible patch, and silently answers
+    /// the wrong question. This asserts the exact shape for that reason.
+    #[test]
+    fn the_two_bases_produce_different_argv_and_three_dot_is_one_argument() {
+        let direct = diff_spec_argv(&DiffSpec::CommitVsCommit {
+            base: crate::plan::CommitOid::new("a".repeat(40)).unwrap(),
+            target: crate::plan::CommitOid::new("b".repeat(40)).unwrap(),
+            basis: ComparisonBasis::Direct,
+        });
+        let since = diff_spec_argv(&DiffSpec::CommitVsCommit {
+            base: crate::plan::CommitOid::new("a".repeat(40)).unwrap(),
+            target: crate::plan::CommitOid::new("b".repeat(40)).unwrap(),
+            basis: ComparisonBasis::SinceMergeBase,
+        });
+
+        assert_ne!(
+            direct, since,
+            "the two bases must not spawn the same command"
+        );
+
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        assert_eq!(direct[direct.len() - 2..], [a.clone(), b.clone()]);
+        assert_eq!(
+            since[since.len() - 1],
+            format!("{a}...{b}"),
+            "the merge-base form is a single three-dot revision argument"
+        );
+        assert_eq!(
+            since
+                .iter()
+                .filter(|s| s.as_str() == a || s.as_str() == b)
+                .count(),
+            0,
+            "no bare endpoint may appear beside the three-dot argument"
+        );
+    }
+
+    /// Reversal swaps endpoints and **preserves the basis**.
+    ///
+    /// MUTATION: reset the basis to Direct while reversing. A user who asked
+    /// "what did this branch add since we diverged?" and pressed swap would
+    /// silently get a different question answered, with nothing saying so.
+    #[test]
+    fn reversing_swaps_endpoints_and_never_changes_the_question() {
+        for basis in [ComparisonBasis::Direct, ComparisonBasis::SinceMergeBase] {
+            let spec = DiffSpec::RefVsRef {
+                base: crate::plan::RefName::new("refs/heads/main").unwrap(),
+                target: crate::plan::RefName::new("refs/heads/topic").unwrap(),
+                basis,
+            };
+            let back = spec.reversed().expect("a two-endpoint spec reverses");
+            assert_eq!(
+                back,
+                DiffSpec::RefVsRef {
+                    base: crate::plan::RefName::new("refs/heads/topic").unwrap(),
+                    target: crate::plan::RefName::new("refs/heads/main").unwrap(),
+                    basis,
+                },
+                "endpoints swap, basis is carried through unchanged"
+            );
+            assert_eq!(
+                back.reversed().as_ref(),
+                Some(&spec),
+                "reversing twice returns the original spec"
+            );
+        }
+    }
+
+    /// The one-sided modes have no second endpoint, so they do not reverse.
+    ///
+    /// MUTATION: return `Some(self.clone())`. A swap control would then appear
+    /// to work and do nothing — the worst of the three options, because the
+    /// user believes they are looking at the other direction.
+    #[test]
+    fn one_sided_comparisons_refuse_to_reverse() {
+        assert_eq!(DiffSpec::WorktreeVsIndex.reversed(), None);
+        assert_eq!(
+            DiffSpec::IndexVsCommit {
+                commit: crate::plan::CommitOid::new("a".repeat(40)).unwrap(),
+            }
+            .reversed(),
+            None
+        );
+    }
+
+    /// Only a Direct reversal yields the inverse patch. This is the fact a UI
+    /// needs to label its swap control honestly, so it is pinned here rather
+    /// than re-derived per client.
+    #[test]
+    fn only_a_direct_reversal_is_an_inverse() {
+        let direct = DiffSpec::CommitVsCommit {
+            base: crate::plan::CommitOid::new("a".repeat(40)).unwrap(),
+            target: crate::plan::CommitOid::new("b".repeat(40)).unwrap(),
+            basis: ComparisonBasis::Direct,
+        };
+        let since = DiffSpec::CommitVsCommit {
+            base: crate::plan::CommitOid::new("a".repeat(40)).unwrap(),
+            target: crate::plan::CommitOid::new("b".repeat(40)).unwrap(),
+            basis: ComparisonBasis::SinceMergeBase,
+        };
+        assert!(direct.reversal_is_inverse());
+        assert!(
+            !since.reversal_is_inverse(),
+            "B...A is the other side of the divergence, not the inverse of A...B"
+        );
+        assert!(!DiffSpec::WorktreeVsIndex.reversal_is_inverse());
+    }
+
+    /// The basis is required on the wire. A body that omits it is an error,
+    /// never a silent two-dot.
+    #[test]
+    fn a_comparison_without_a_basis_is_a_deserialize_error() {
+        let without = serde_json::json!({
+            "mode": "commit_vs_commit",
+            "base": "a".repeat(40),
+            "target": "b".repeat(40),
+        });
+        assert!(
+            serde_json::from_value::<DiffSpec>(without).is_err(),
+            "an omitted basis must be an error, never a default"
+        );
+
+        let with = serde_json::json!({
+            "mode": "commit_vs_commit",
+            "base": "a".repeat(40),
+            "target": "b".repeat(40),
+            "basis": "since_merge_base",
+        });
+        assert!(matches!(
+            serde_json::from_value::<DiffSpec>(with).unwrap(),
+            DiffSpec::CommitVsCommit {
+                basis: ComparisonBasis::SinceMergeBase,
+                ..
+            }
+        ));
     }
 }

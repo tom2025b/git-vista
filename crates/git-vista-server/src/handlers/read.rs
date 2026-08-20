@@ -1160,7 +1160,7 @@ mod tests {
     use git_vista_core::identity::RepositoryId;
     use git_vista_core::layout::stream::canonicalize_edges;
     use git_vista_core::model::CommitSummary;
-    use git_vista_protocol::diff::DiffSpec;
+    use git_vista_protocol::diff::{ComparisonBasis, DiffSpec};
     use git_vista_protocol::{
         ApiError, ChangeKind, ChangeSides, ErrorCode, RepositoryDescriptor, StatusEntry,
         PROTOCOL_HEADER, PROTOCOL_VERSION,
@@ -1690,6 +1690,7 @@ mod tests {
         let spec = DiffSpec::CommitVsCommit {
             base: git_vista_protocol::plan::CommitOid::new(&c1).unwrap(),
             target: git_vista_protocol::plan::CommitOid::new(&c2).unwrap(),
+            basis: ComparisonBasis::Direct,
         };
         let out = spec_diff_for_repo(&repo, spec.clone())
             .await
@@ -1706,6 +1707,7 @@ mod tests {
         let spec = DiffSpec::RefVsRef {
             base: git_vista_protocol::plan::RefName::new("base").unwrap(),
             target: git_vista_protocol::plan::RefName::new("main").unwrap(),
+            basis: ComparisonBasis::Direct,
         };
         let out = spec_diff_for_repo(&repo, spec.clone())
             .await
@@ -1739,6 +1741,7 @@ mod tests {
             DiffSpec::CommitVsCommit {
                 base: git_vista_protocol::plan::CommitOid::new(&c1).unwrap(),
                 target: git_vista_protocol::plan::CommitOid::new(&c2).unwrap(),
+                basis: ComparisonBasis::Direct,
             },
         )
         .await

@@ -14,7 +14,7 @@
 //! mapping; this file only pins the wire shape.
 
 use git_vista_protocol::plan::{CommitOid, RefName};
-use git_vista_protocol::DiffSpec;
+use git_vista_protocol::{ComparisonBasis, DiffSpec};
 
 const FIXTURE: &str = include_str!("fixtures/diff_spec_v1.json");
 const FIXTURE_PATH: &str = concat!(
@@ -36,10 +36,26 @@ fn golden_specs() -> Vec<DiffSpec> {
         DiffSpec::CommitVsCommit {
             base: commit('a'),
             target: commit('b'),
+            basis: ComparisonBasis::Direct,
         },
         DiffSpec::RefVsRef {
             base: RefName::new("main").unwrap(),
             target: RefName::new("feature/x").unwrap(),
+            basis: ComparisonBasis::Direct,
+        },
+        // M4.27 (#80): the merge-base basis on both two-endpoint modes. Pinned
+        // separately from their Direct twins because the difference between
+        // them is invisible in the resulting patch — the wire form is the only
+        // place a client can learn which question it asked.
+        DiffSpec::CommitVsCommit {
+            base: commit('c'),
+            target: commit('d'),
+            basis: ComparisonBasis::SinceMergeBase,
+        },
+        DiffSpec::RefVsRef {
+            base: RefName::new("main").unwrap(),
+            target: RefName::new("feature/y").unwrap(),
+            basis: ComparisonBasis::SinceMergeBase,
         },
     ]
 }

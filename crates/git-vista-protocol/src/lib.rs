@@ -69,8 +69,8 @@ pub mod status;
 pub mod version;
 
 pub use diff::{
-    diff_spec_argv, parse_unified_diff, path_or_dev_null, DiffLine, DiffSpec, FileDiff, Hunk,
-    LineKind, ParsedPatch,
+    diff_spec_argv, parse_unified_diff, path_or_dev_null, ComparisonBasis, DiffLine, DiffSpec,
+    FileDiff, Hunk, LineKind, ParsedPatch,
 };
 pub use dto::{
     validate_clone_url, AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind,
