@@ -1320,6 +1320,7 @@ mod tests {
             preconditions: vec![],
             expected_ref_changes: vec![],
             recovery: RecoveryStrategy::NotNeeded,
+            advisories: Vec::new(),
         };
         serde_json::to_vec(&plan).unwrap()
     }
