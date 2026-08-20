@@ -5,14 +5,20 @@ use leptos::*;
 
 use crate::api::{create_branch_request, create_tag_request};
 use crate::features::dialogs::core::{branch_name_space_fix, Dialog, ErrorNotice};
-use crate::features::graph::core::{create_tag_item_label, tag_annotation_from_prompt, tag_sign_choice};
+use crate::features::graph::core::{
+    create_tag_item_label, tag_annotation_from_prompt, tag_sign_choice,
+};
 use crate::icons::GitIcons;
 use crate::state::{Features, MenuData};
 
 /// Builds the full "Create branch…" and "Create tag…" buttons — icon,
 /// label and click handler together, so `menu.rs`'s final template just
 /// embeds the result rather than wiring a bare handler onto inline markup.
-pub(super) fn build_create_items(features: Features, ic: &'static GitIcons, m: &MenuData) -> (View, View) {
+pub(super) fn build_create_items(
+    features: Features,
+    ic: &'static GitIcons,
+    m: &MenuData,
+) -> (View, View) {
     let Features {
         graph,
         dialogs,
@@ -121,9 +127,7 @@ pub(super) fn build_create_items(features: Features, ic: &'static GitIcons, m: &
             None => name,
         };
         let raw_message = win
-            .prompt_with_message(
-                "Optional annotation message (leave blank for a lightweight tag):",
-            )
+            .prompt_with_message("Optional annotation message (leave blank for a lightweight tag):")
             .ok()
             .flatten();
         let message = tag_annotation_from_prompt(raw_message);

@@ -38,8 +38,7 @@ pub(super) fn build_view_items(
         // No GitHub page for this target (no github remote, or unpushed):
         // show the option but disabled, with a reason on hover.
         None => {
-            const REASON: &str =
-                "No GitHub page (no github.com remote, or it isn't pushed)";
+            const REASON: &str = "No GitHub page (no github.com remote, or it isn't pushed)";
             let (aria_label, visible_reason) = disabled_menu_item_copy(label, REASON);
             view! {
                 <button

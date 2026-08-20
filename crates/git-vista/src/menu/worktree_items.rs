@@ -12,15 +12,25 @@ use crate::icons::GitIcons;
 use crate::state::{Features, PendingOp};
 use git_vista_protocol::WorktreeStatus;
 
-/// Builds `(stage_changes, unstage_changes, select_stage, select_unstage,
-/// discard_changes, delete_untracked)`.
+/// `(stage_changes, unstage_changes, select_stage, select_unstage,
+/// discard_changes, delete_untracked)` — named so [`build_worktree_items`]'s
+/// return type isn't a bare six-tuple (clippy's `type_complexity`).
+type WorktreeItems = (
+    View,
+    Option<View>,
+    Option<View>,
+    Option<View>,
+    Option<View>,
+    Option<View>,
+);
+
+/// Builds a [`WorktreeItems`].
 ///
 /// `is_head`/`is_stub` are `MenuData::is_head`/`MenuData::is_branch`,
 /// computed once by the caller since `commit_items` needs the same pair.
 /// `staged_count`/`worktree` are the live resources `menu_view` opens the
 /// menu with — read here exactly where the original inline code read them,
 /// so the reactive tracking is unchanged.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn build_worktree_items(
     features: Features,
     ic: &'static GitIcons,
@@ -28,15 +38,13 @@ pub(super) fn build_worktree_items(
     is_stub: bool,
     staged_count: Resource<(bool, u64), usize>,
     worktree: Resource<(bool, u64), Option<WorktreeStatus>>,
-) -> (
-    View,
-    Option<View>,
-    Option<View>,
-    Option<View>,
-    Option<View>,
-    Option<View>,
-) {
-    let Features { dialogs, status, shell, .. } = features;
+) -> WorktreeItems {
+    let Features {
+        dialogs,
+        status,
+        shell,
+        ..
+    } = features;
     // "Stage Changes" (git add -A): move the working-tree changes into the
     // index so they can be committed. Like committing, it acts on the
     // checked-out branch, so it's offered on the HEAD commit and disabled
@@ -199,8 +207,7 @@ pub(super) fn build_worktree_items(
             } else {
                 "No tracked file has uncommitted changes"
             };
-            let (aria_label, visible_reason) =
-                disabled_menu_item_copy("Discard Changes…", reason);
+            let (aria_label, visible_reason) = disabled_menu_item_copy("Discard Changes…", reason);
             view! {
                 <button
                     class="ctx-item disabled"

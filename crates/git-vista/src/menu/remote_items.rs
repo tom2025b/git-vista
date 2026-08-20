@@ -284,8 +284,7 @@ pub(super) fn build_remote_items(
                         dialogs.open(Dialog::Error);
                         shell.open_error(ErrorNotice {
                             title: "Can't pull",
-                            body: "HEAD is detached — check out a branch first."
-                                .to_string(),
+                            body: "HEAD is detached — check out a branch first.".to_string(),
                         });
                     }
                     // The read itself failed. Saying "HEAD is detached"

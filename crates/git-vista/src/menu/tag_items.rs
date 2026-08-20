@@ -53,7 +53,7 @@ pub(super) fn build_tag_items(features: Features, ic: &'static GitIcons, m: &Men
             view! {
                 <button class="ctx-item danger" on:click=on>
                     // The diff-removed glyph, inheriting the item's
-                    // red — same choice `delete_item` makes above.
+                    // red — same choice `branch_items`'s `delete_item` makes.
                     <span class="nf ctx-icon">{ic.deleted}</span>
                     {format!("Delete tag ‘{t}’")}
                 </button>

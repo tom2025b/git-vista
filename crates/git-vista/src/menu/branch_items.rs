@@ -241,8 +241,7 @@ pub(super) fn build_branch_items(
                         if !still_current() {
                             return;
                         }
-                        let oid = match plain
-                            .map(|p| remote_tip_from_plan(&p.expected_ref_changes))
+                        let oid = match plain.map(|p| remote_tip_from_plan(&p.expected_ref_changes))
                         {
                             Ok(RemoteTipKnowledge::Known(oid)) => oid,
                             Ok(RemoteTipKnowledge::NotYetPushed) => {
@@ -413,8 +412,7 @@ pub(super) fn build_branch_items(
                             // guessing.
                             return;
                         };
-                        let (Ok(base), Ok(target)) =
-                            (RefName::new(&branch), RefName::new(&head))
+                        let (Ok(base), Ok(target)) = (RefName::new(&branch), RefName::new(&head))
                         else {
                             return;
                         };

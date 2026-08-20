@@ -13,7 +13,7 @@ use crate::state::{CommitIntent, Features, MenuData};
 /// Builds `(commit_changes, commit_empty, amend_item)`.
 ///
 /// The two "Commit …" items (Issue #33). Clicking one closes the menu
-/// and opens the commit-message modal; the actual POST + refresh
+/// and opens the commit-message modal (below); the actual POST + refresh
 /// happens when the user confirms there.
 ///
 /// On a commit dot they're enabled only on the HEAD tip — the one place
@@ -40,7 +40,7 @@ pub(super) fn build_commit_items(
     // A stub carries exactly its own branch name (see `MenuData::branches`).
     let stub_branch = is_stub.then(|| m.branches.first().cloned()).flatten();
     // `icon` is the glyph beside the item — the commit glyph for both
-    // commit variants ("Stage Changes" below uses the diff-added glyph).
+    // commit variants ("Stage Changes", in `worktree_items`, uses the diff-added glyph).
     let make_commit_item = move |icon: &'static str, label: &'static str, allow_empty: bool| {
         let stub_branch = stub_branch.clone();
         let enabled = is_head || (allow_empty && stub_branch.is_some());
@@ -192,8 +192,7 @@ pub(super) fn build_commit_items(
             .into_view()
         }
         AmendOffer::Blocked(reason) => {
-            let (aria_label, visible_reason) =
-                disabled_menu_item_copy("Amend last commit", reason);
+            let (aria_label, visible_reason) = disabled_menu_item_copy("Amend last commit", reason);
             view! {
                 <button
                     class="ctx-item disabled"
