@@ -440,6 +440,9 @@ fn api_router(
         // committed, published history like `/api/frame`, so it is registered
         // on the LAN router too; it never discloses working-tree state.
         .route("/api/tags", get(handlers::tags::tag_list))
+        // M3.24 (#77): a read, so the LAN router sees it like every other
+        // listing. Showing the drawer is useful before any write path exists.
+        .route("/api/stashes", get(handlers::stash::stash_list))
         // Activity/Undo feature, step 3: the chronological event feed —
         // journal + reflogs + snapshot diffs, folded and attributed.
         .route("/api/activity", get(activity::activity_feed))
@@ -530,6 +533,13 @@ fn api_router(
             // match the `/api/branch` + `/api/delete-branch` pair beside them,
             // and full_routes-gated like every other write — unlike the
             // `GET /api/tags` listing above, which the LAN router does see.
+            // M3.24 (#77): the stash drawer's three writes. No
+            // `/api/stash/pop` — pop is apply-then-drop and one operation row
+            // cannot tell the truth about the half-done state; see
+            // handlers/stash.rs.
+            .route("/api/stash/push", post(handlers::stash::push_stash))
+            .route("/api/stash/apply", post(handlers::stash::apply_stash))
+            .route("/api/stash/drop", post(handlers::stash::drop_stash))
             .route("/api/tag", post(handlers::tags::create_tag))
             .route("/api/delete-tag", post(handlers::tags::delete_tag))
             // M2.21f (#240): the two **remote** tag writes — each opens a
