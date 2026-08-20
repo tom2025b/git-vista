@@ -61,8 +61,26 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // fetches attacker-chosen content.
     // `git status --porcelain=v2` (static args). The production call
     // (`worktree_status`) now goes through `crate::git_cmd::git_output`
-    // (#66 Task 6); this entry now covers only its `#[cfg(test)]` fixtures.
-    "src/handlers/read.rs",
+    // (#66 Task 6). Its `#[cfg(test)]` fixtures used to be this entry's only
+    // remaining reason to exist; a mechanical test-extraction moved every
+    // inline `#[cfg(test)]` module out to `src/handlers/read/<topic>_suite.rs`
+    // child files (this crate's own `planner/*_suite.rs` convention), so
+    // `read.rs` itself now constructs no `Command` at all — see the three
+    // entries below for where those fixtures actually live now.
+    //
+    // #63's paged-history suites, split out of the single `read.rs` test
+    // module above: `content_suite.rs` (diff/file-read fixtures: `run`/`out`/
+    // `stdout_len`), `graph_suite.rs` (history/paging fixtures: `run`/`out`/
+    // `run_env`, plus the `git fast-import`/`git daemon` fixtures for the
+    // deep/adversarial repos), and `status_suite.rs` (worktree-status
+    // fixtures: a duplicated `run`, matching the planner-suite convention of
+    // each suite carrying its own private copy rather than sharing one).
+    // `routing_suite.rs` — the fourth split-out file, covering route
+    // registration and the `?repo=` selector — constructs no `Command` and is
+    // deliberately not listed here.
+    "src/handlers/read/content_suite.rs",
+    "src/handlers/read/graph_suite.rs",
+    "src/handlers/read/status_suite.rs",
     // M2.21b (#236): `#[cfg(test)]` fixture setup only. No handler in this
     // file runs a subprocess in production. `GET /api/tags` runs none at all —
     // `git_vista_git::read_tags` opens the repository with `gix` and decodes
