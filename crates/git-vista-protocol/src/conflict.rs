@@ -1,0 +1,446 @@
+//! Conflicts, modelled independently of whatever caused them (M4.31, #84).
+//!
+//! # Why this is its own module and not part of `status`
+//!
+//! [`crate::status::ConflictKind`] already classifies *that* a path is
+//! conflicted, from porcelain-v2's `<XY>` codes. That is the right amount for a
+//! status listing: seven variants, one line each, no file contents.
+//!
+//! Resolving a conflict needs something else entirely — the three versions git
+//! is holding, whether each of them exists, and whether any of them is a thing
+//! a text editor can even open. Putting that on `StatusEntry::Conflicted` would
+//! make every status response carry blob reads nobody asked for.
+//!
+//! # One model, six operations
+//!
+//! A merge, a rebase, a cherry-pick, a revert, a stash pop and a pull all
+//! produce *the same thing*: index entries at stages 1, 2 and 3, and a working
+//! tree with markers in it. Git does not record which operation put them there,
+//! and the resolution is identical in every case. So this vocabulary names none
+//! of them. An operation-specific conflict type would be six near-copies that
+//! drift, and it would push the "which resolver do I use" decision onto every
+//! caller for a question that has one answer.
+//!
+//! # Stages, and why absence is a variant rather than an empty blob
+//!
+//! Git's index holds up to three versions of a conflicted path:
+//!
+//! | stage | meaning        | absent when |
+//! |-------|----------------|-------------|
+//! | 1     | base (common ancestor) | the file was added on both sides — there is no ancestor |
+//! | 2     | ours           | we deleted it |
+//! | 3     | theirs         | they deleted it |
+//!
+//! **A missing stage is not an empty file, and the difference decides what the
+//! user is looking at.** "The base is empty" means both sides added content to
+//! a file that existed and was blank. "There is no base" means the file did not
+//! exist before — an add/add conflict, where showing a blank base pane would
+//! invent a common ancestor that never existed. [`Stage`] keeps those apart, and
+//! keeps a third case apart from both: a stage that could not be read.
+
+use serde::{Deserialize, Serialize};
+
+/// One of the three versions git holds for a conflicted path.
+///
+/// The three states are deliberate and none of them may collapse into another:
+///
+/// - [`Present`] — git returned this version's content.
+/// - [`Absent`] — git says this stage does not exist, and that is *information*
+///   about the conflict's shape, not a failure. An add/add conflict genuinely
+///   has no base; a delete/modify genuinely has no ours or theirs.
+/// - [`Unreadable`] — the read itself failed. **Never** rendered as an empty
+///   pane, because a pane that looks empty tells the user the version was blank
+///   when in fact nobody looked.
+///
+/// The last distinction is the one this codebase keeps paying for elsewhere —
+/// see `Advisory::DefaultBranchUnknown` and `drift`'s `NotCheckable`. A
+/// resolution UI that cannot tell "there is nothing here" from "I could not
+/// look" will invite someone to resolve a conflict against a version they never
+/// actually saw.
+///
+/// [`Present`]: Stage::Present
+/// [`Absent`]: Stage::Absent
+/// [`Unreadable`]: Stage::Unreadable
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum Stage {
+    /// This version exists and was read.
+    Present {
+        /// The blob's object id, so a caller can fetch or cache it
+        /// independently of this response.
+        oid: crate::plan::CommitOid,
+        /// Whether the content is binary. Carried per stage rather than per
+        /// file because the sides can genuinely differ — replacing a text file
+        /// with a binary one, or the reverse, is a real conflict shape, and a
+        /// single per-file flag would have to pick a side and be wrong about
+        /// the other.
+        binary: bool,
+        /// Size in bytes as git reports it. Present even for binary content, so
+        /// a caller can decide whether to offer a download without fetching it
+        /// first.
+        size_bytes: u64,
+    },
+    /// Git reports no entry at this stage. A fact about the conflict, not an
+    /// error — see the module docs' stage table for when each stage is
+    /// legitimately absent.
+    ///
+    /// # Why this carries an empty brace rather than being a unit variant
+    ///
+    /// `#[serde(deny_unknown_fields)]` is **not enforced for unit variants of
+    /// an internally-tagged enum** — serde only applies it to struct variants.
+    /// As a bare `Absent`, `{"state":"absent","content":"..."}` would
+    /// deserialize happily and silently discard the stray key. `ForcePublish`
+    /// documents the same serde behaviour next door.
+    ///
+    /// That matters more here than almost anywhere: this is the variant that
+    /// says *there is nothing on this side*. A body that also carried content
+    /// would be self-contradictory, and accepting it quietly is how a resolver
+    /// ends up showing a side that the type says does not exist. An empty
+    /// struct variant costs nothing on the wire — it still serialises as
+    /// `{"state":"absent"}` — and makes the stray key a hard error.
+    Absent {},
+    /// The read failed. `reason` is for a human; callers must not match on it.
+    ///
+    /// A caller must render this as an explicit "could not read" state and must
+    /// **not** offer it as a resolution choice — choosing a side you were never
+    /// shown is the failure this variant exists to prevent.
+    Unreadable { reason: String },
+}
+
+impl Stage {
+    /// Whether this stage can be offered to a user as a resolution choice.
+    ///
+    /// `Absent` is deliberately *choosable*: "take theirs" when theirs is a
+    /// deletion is a legitimate, common resolution, and refusing it would make
+    /// delete/modify conflicts unresolvable through the normal path. Only
+    /// `Unreadable` is barred, because nobody has seen it.
+    pub fn is_choosable(&self) -> bool {
+        !matches!(self, Stage::Unreadable { .. })
+    }
+
+    /// Whether this stage holds content a text resolver can work with.
+    /// `Absent` is not text — it is nothing — and binary content is not text
+    /// either.
+    pub fn is_text(&self) -> bool {
+        matches!(self, Stage::Present { binary: false, .. })
+    }
+}
+
+/// Why a conflicted path cannot be resolved by picking lines out of a text
+/// buffer (M4.31, #84).
+///
+/// Existing as a *typed reason* rather than a bare "not text" boolean matters:
+/// the three cases need visibly different treatment, and a UI that lumps them
+/// together will offer a diff view for a rename and a "keep both" button for a
+/// binary file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum NotTextResolvable {
+    /// At least one side is binary. The only honest resolution is choosing a
+    /// whole side; there is no meaningful line-level merge.
+    Binary {
+        /// Which sides were binary, so the UI can say "theirs is an image"
+        /// rather than "this file is binary".
+        ours: bool,
+        theirs: bool,
+    },
+    /// One or both sides deleted the file. The choice is keep-or-delete, not a
+    /// text merge — and the surviving side's content still needs showing so the
+    /// decision is informed.
+    Deletion {
+        /// True when *we* deleted it (`DeletedByUs`/`BothDeleted`).
+        ours_deleted: bool,
+        /// True when *they* deleted it (`DeletedByThem`/`BothDeleted`).
+        theirs_deleted: bool,
+    },
+    /// The file was renamed on one side and modified on the other, so the two
+    /// sides do not even agree on the path.
+    ///
+    /// **Detection is a caller's job and is not attempted here.** Git's index
+    /// does not record rename information for conflicts — rename detection is a
+    /// diff-time heuristic, not stored state. This variant exists so a caller
+    /// that *has* done that work has somewhere honest to put it, rather than
+    /// this type quietly implying a capability it does not have.
+    Rename {
+        /// The path on our side.
+        ours_path: String,
+        /// The path on their side.
+        theirs_path: String,
+    },
+}
+
+/// One conflicted path, with everything a resolver needs and nothing about the
+/// operation that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConflictedFile {
+    /// Repository-relative path, as git reports it.
+    pub path: String,
+    /// The porcelain-v2 classification, reused rather than re-derived so a
+    /// status listing and a resolver can never disagree about what kind of
+    /// conflict a path has.
+    pub kind: crate::status::ConflictKind,
+    /// Stage 1 — the common ancestor.
+    pub base: Stage,
+    /// Stage 2 — our side.
+    pub ours: Stage,
+    /// Stage 3 — their side.
+    pub theirs: Stage,
+    /// Set when this path cannot be resolved by picking text. `None` means a
+    /// normal text conflict; it does **not** mean "resolvable", since an
+    /// `Unreadable` stage can still block resolution.
+    pub not_text_resolvable: Option<NotTextResolvable>,
+}
+
+impl ConflictedFile {
+    /// Whether every side a user might choose was actually readable.
+    ///
+    /// False when any stage is [`Stage::Unreadable`]. A caller must not present
+    /// a resolution UI for such a file — one of its panes would be a hole, and
+    /// the user would be choosing between versions they have not all seen.
+    pub fn all_sides_readable(&self) -> bool {
+        self.base.is_choosable() && self.ours.is_choosable() && self.theirs.is_choosable()
+    }
+}
+
+/// The answer to "may this operation continue?" (M4.31, #84).
+///
+/// A dedicated type rather than a `bool` because the two blocking cases are
+/// **different** and a caller must treat them differently: paths a human still
+/// has to decide, versus paths this application could not even read. Collapsing
+/// them into "not clear yet" would let a UI tell someone to resolve a file it
+/// cannot show them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum Continuation {
+    /// No conflicted paths remain. The operation may continue.
+    Clear,
+    /// Conflicts remain and must be resolved first.
+    Blocked {
+        /// Paths still awaiting a human decision.
+        unresolved: Vec<String>,
+        /// Paths where at least one side could not be read. Separate from
+        /// `unresolved` because the user cannot fix these by choosing — they
+        /// are a fault to report, not work to do.
+        unreadable: Vec<String>,
+    },
+}
+
+impl Continuation {
+    /// Build the verdict from the conflicted files a scan found.
+    ///
+    /// **An empty input means `Clear`, and that is only safe because the caller
+    /// is required to have actually looked.** A scan that failed must never
+    /// reach here with an empty vector — it must surface its own failure — or
+    /// this returns a green light meaning "I did not check". The one caller in
+    /// `git-vista-server` propagates read failures rather than defaulting to an
+    /// empty list, and any future caller must do the same.
+    pub fn from_files(files: &[ConflictedFile]) -> Self {
+        if files.is_empty() {
+            return Continuation::Clear;
+        }
+        let mut unresolved = Vec::new();
+        let mut unreadable = Vec::new();
+        for f in files {
+            if f.all_sides_readable() {
+                unresolved.push(f.path.clone());
+            } else {
+                unreadable.push(f.path.clone());
+            }
+        }
+        Continuation::Blocked {
+            unresolved,
+            unreadable,
+        }
+    }
+
+    /// Whether the operation may proceed. Exactly one state permits it, and
+    /// this exists so no caller writes `!matches!(.., Blocked { .. })` and gets
+    /// the polarity wrong.
+    pub fn may_continue(&self) -> bool {
+        matches!(self, Continuation::Clear)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::status::ConflictKind;
+
+    fn oid(c: char) -> crate::plan::CommitOid {
+        crate::plan::CommitOid::new(c.to_string().repeat(40)).unwrap()
+    }
+
+    fn present() -> Stage {
+        Stage::Present {
+            oid: oid('a'),
+            binary: false,
+            size_bytes: 12,
+        }
+    }
+
+    fn file(path: &str, base: Stage, ours: Stage, theirs: Stage) -> ConflictedFile {
+        ConflictedFile {
+            path: path.into(),
+            kind: ConflictKind::BothModified,
+            base,
+            ours,
+            theirs,
+            not_text_resolvable: None,
+        }
+    }
+
+    #[test]
+    fn an_absent_stage_is_still_a_choice_but_an_unreadable_one_is_not() {
+        // MUTATION: make Absent unchoosable. Every delete/modify conflict
+        // becomes unresolvable through the normal path, because "take theirs"
+        // where theirs is a deletion is the correct and common resolution.
+        assert!(Stage::Absent {}.is_choosable());
+        assert!(present().is_choosable());
+        assert!(!Stage::Unreadable {
+            reason: "permission denied".into()
+        }
+        .is_choosable());
+    }
+
+    #[test]
+    fn absent_is_not_text_and_neither_is_binary() {
+        // MUTATION: treat Absent as text. A resolver would then open a text
+        // editor on a side that does not exist and present it as empty.
+        assert!(present().is_text());
+        assert!(!Stage::Absent {}.is_text());
+        assert!(!Stage::Unreadable { reason: "x".into() }.is_text());
+        assert!(!Stage::Present {
+            oid: oid('b'),
+            binary: true,
+            size_bytes: 900,
+        }
+        .is_text());
+    }
+
+    #[test]
+    fn a_file_with_an_unreadable_side_is_not_fully_readable() {
+        let f = file(
+            "a.txt",
+            present(),
+            Stage::Unreadable {
+                reason: "blob missing".into(),
+            },
+            present(),
+        );
+        assert!(!f.all_sides_readable());
+
+        // Absent must NOT make a file unreadable — an add/add conflict has no
+        // base and is perfectly resolvable.
+        let add_add = file("b.txt", Stage::Absent {}, present(), present());
+        assert!(add_add.all_sides_readable());
+    }
+
+    #[test]
+    fn no_conflicts_means_clear() {
+        let c = Continuation::from_files(&[]);
+        assert_eq!(c, Continuation::Clear);
+        assert!(c.may_continue());
+    }
+
+    #[test]
+    fn unresolved_and_unreadable_paths_are_reported_separately() {
+        // THE test in this file. MUTATION: put every conflicted path into
+        // `unresolved`. A UI would then tell the user to go and resolve a file
+        // one of whose sides it cannot show them — asking for a decision it
+        // has made impossible.
+        let files = vec![
+            file("needs-a-human.txt", present(), present(), present()),
+            file(
+                "cannot-read.bin",
+                present(),
+                Stage::Unreadable {
+                    reason: "blob missing".into(),
+                },
+                present(),
+            ),
+        ];
+        match Continuation::from_files(&files) {
+            Continuation::Blocked {
+                unresolved,
+                unreadable,
+            } => {
+                assert_eq!(unresolved, vec!["needs-a-human.txt".to_string()]);
+                assert_eq!(unreadable, vec!["cannot-read.bin".to_string()]);
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn any_conflict_at_all_blocks_continuation() {
+        // MUTATION: return Clear when only `unreadable` is non-empty. An
+        // operation would continue over files nothing could even look at.
+        let only_unreadable = vec![file(
+            "x.bin",
+            Stage::Unreadable { reason: "y".into() },
+            present(),
+            present(),
+        )];
+        assert!(!Continuation::from_files(&only_unreadable).may_continue());
+    }
+
+    #[test]
+    fn every_shape_survives_a_json_round_trip() {
+        // The whole vocabulary crosses the wire; a variant that serialises but
+        // does not come back is a resolver that silently loses a side.
+        let f = ConflictedFile {
+            path: "src/a.rs".into(),
+            kind: ConflictKind::BothAdded,
+            base: Stage::Absent {},
+            ours: present(),
+            theirs: Stage::Unreadable {
+                reason: "gone".into(),
+            },
+            not_text_resolvable: Some(NotTextResolvable::Binary {
+                ours: false,
+                theirs: true,
+            }),
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(serde_json::from_str::<ConflictedFile>(&json).unwrap(), f);
+
+        let c = Continuation::Blocked {
+            unresolved: vec!["a".into()],
+            unreadable: vec!["b".into()],
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<Continuation>(&json).unwrap(), c);
+    }
+
+    #[test]
+    fn a_stray_key_in_a_stage_is_refused() {
+        // Same posture as every other body in this contract: a stray key is a
+        // hard error, never a silently-ignored value.
+        let stray = serde_json::json!({
+            "state": "absent",
+            "why": "deleted",
+        });
+        assert!(
+            serde_json::from_value::<Stage>(stray).is_err(),
+            "a stray key beside `absent` must be refused — this is why Absent is \
+             an empty STRUCT variant and not a unit variant; serde does not \
+             enforce deny_unknown_fields on unit variants of an internally \
+             tagged enum"
+        );
+
+        // The plain form still works, and still costs nothing extra on the wire.
+        assert_eq!(
+            serde_json::from_value::<Stage>(serde_json::json!({"state": "absent"})).unwrap(),
+            Stage::Absent {}
+        );
+        assert_eq!(
+            serde_json::to_value(Stage::Absent {}).unwrap(),
+            serde_json::json!({"state": "absent"}),
+            "the empty struct variant must not add a field to the wire form"
+        );
+    }
+}

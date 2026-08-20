@@ -176,6 +176,11 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // real bare remote, so the presence or absence of refs/remotes/origin/HEAD
     // — the variable the whole suite turns on — is genuine rather than mocked.
     "src/planner/advisory_suite.rs",
+    // #[cfg(test)] git fixtures for the M4.31 (#84) conflict scanner: plain
+    // `git init`/`commit`/`checkout`/`merge` to build repositories with REAL
+    // unresolved conflicts, because the whole point of the module is reading
+    // git's actual index staging and a mocked index would prove nothing.
+    "src/conflicts.rs",
     "src/state.rs",         // #[cfg(test)] fixture setup
     "src/argv_boundary.rs", // this file (the scan reads its own source)
     // The M1.13b spawn chokepoint (#66, Task 5). It builds a git Command from
