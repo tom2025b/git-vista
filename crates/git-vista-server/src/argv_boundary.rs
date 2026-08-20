@@ -40,8 +40,16 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // `git update-ref` for recovery refs (#62) — see the module doc above.
     // The production call (`write_recovery_ref`) now goes through
     // `crate::git_cmd::git_output` (#66 Task 6); this entry now covers only
-    // its `#[cfg(test)]` fixture setup.
+    // its `#[cfg(test)]` fixture setup — specifically `read_recovery_ref`,
+    // which stayed in this file rather than moving with its two callers (see
+    // `durable/recovery_ref_suite.rs`'s doc comment for why).
     "src/durable.rs",
+    // The recovery-ref write/read tests extracted verbatim from durable.rs's
+    // inline `mod tests` (M-current test-extraction). `#[cfg(test)]` fixture
+    // setup only, same posture as `src/durable.rs` above: throwaway
+    // repositories built to prove `write_recovery_ref` writes the right ref
+    // and never the working branch of the same name.
+    "src/durable/recovery_ref_suite.rs",
     // The shared read-only git helpers, including the sealed `git_output`
     // launcher (#66 Task 6). Note what this entry does *not* cover any more:
     // `git_output` builds no `Command` of its own — it goes through

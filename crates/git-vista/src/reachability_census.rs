@@ -556,7 +556,17 @@ fn extract_pub_fn_decls(code: &str, rel_path: &str) -> Vec<Declaration> {
 /// Whether `path` (relative to `crates/`) is dedicated test scaffolding that
 /// should never count as a real caller, mirroring the source census's own
 /// exclusions: a `tests/` path component, or a filename stem of `tests`,
-/// `*_test`, or `*_tests`.
+/// `*_test`, or `*_tests`. Also `*_suite` (added when `features/graph/core.rs`
+/// and `durable.rs` split their inline `#[cfg(test)] mod tests` into child
+/// modules, M-current): this repo's other, older test-extraction convention
+/// — `git-vista-server/src/planner/*_suite.rs` — names the exact same
+/// category of file, just with the suffix this census didn't yet recognize.
+/// A `#[cfg(test)] mod foo_suite;` declaration in the parent already gates
+/// the whole file's compilation on the test profile; nothing inside
+/// `foo_suite.rs` itself carries a per-item `#[cfg(test)]` for
+/// [`strip_cfg_test_blocks`] to find, so without this the file's test-only
+/// calls (e.g. `graph_core_suite.rs`'s use of `GraphCore::at_generation`)
+/// were misread as real, non-test call sites.
 fn is_dedicated_test_path(rel_path: &str) -> bool {
     if rel_path.split('/').any(|seg| seg == "tests") {
         return true;
@@ -566,7 +576,10 @@ fn is_dedicated_test_path(rel_path: &str) -> bool {
         .next()
         .unwrap_or(rel_path)
         .trim_end_matches(".rs");
-    stem == "tests" || stem.ends_with("_test") || stem.ends_with("_tests")
+    stem == "tests"
+        || stem.ends_with("_test")
+        || stem.ends_with("_tests")
+        || stem.ends_with("_suite")
 }
 
 /// Whether `code` (already [`neutralize`]d + [`strip_cfg_test_blocks`]ed)
@@ -1117,6 +1130,9 @@ fn fixture_dedicated_test_file_is_excluded_from_consumer_search() {
     ));
     assert!(is_dedicated_test_path("git-vista/src/foo_test.rs"));
     assert!(is_dedicated_test_path("git-vista/src/foo_tests.rs"));
+    assert!(is_dedicated_test_path(
+        "git-vista/src/features/graph/core/graph_core_suite.rs"
+    ));
     assert!(!is_dedicated_test_path(
         "git-vista/src/features/diff/core.rs"
     ));
