@@ -171,6 +171,33 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // the same "referee is not the code being checked" posture `pull_suite`
     // and `push_suite` document above.
     "src/planner/hook_timeout_suite.rs",
+    // #[cfg(test)] git fixtures for the #327 defect B revert-conflict suite:
+    // plain `git init`/`commit`/`rev-parse` to build fixture repositories,
+    // outside the sandboxed harness under test.
+    "src/planner/revert_suite.rs",
+    // #[cfg(test)] git fixtures for the M2.21d/e (#238/#239) tag-argv-shape
+    // and signed-tag-execution suite: plain `git init`/`commit`/`rev-parse`,
+    // plus the failed-signing attempt's own `git rev-parse --verify` check
+    // that no tag was left behind.
+    "src/planner/tag_signing_suite.rs",
+    // #[cfg(test)] git fixtures for the #145 staleness-contract suite:
+    // plain `git init`/`commit`/`add`/`branch`/`remote` to build and drift
+    // fixture repositories, outside the sandboxed harness under test.
+    "src/planner/staleness_suite.rs",
+    // #[cfg(test)] git fixtures for the #214 (M2.17c) hunk/line-staging
+    // suite: plain `git init`/`commit`/`add`/`diff` to build fixture
+    // repositories and read back their state, outside the sandboxed harness
+    // under test.
+    "src/planner/hunk_staging_suite.rs",
+    // #[cfg(test)] git fixtures for the M2.19a/b (#222/#223) amend/commit
+    // failure-classification suite: plain `git init`/`commit`/`add` to build
+    // fixture repositories, outside the sandboxed harness under test.
+    "src/planner/commit_classification_suite.rs",
+    // #[cfg(test)] git fixtures for the M2.20a/M2.21a/f (#227/#235/#240)
+    // remote-operation-shape suite: plain `git init`/`commit`, plus a real
+    // in-tree bare remote (`git init --bare`) so `RemoteConfigured`
+    // preconditions genuinely hold.
+    "src/planner/remote_operation_shape_suite.rs",
     "src/state.rs",         // #[cfg(test)] fixture setup
     "src/argv_boundary.rs", // this file (the scan reads its own source)
     // The M1.13b spawn chokepoint (#66, Task 5). It builds a git Command from
