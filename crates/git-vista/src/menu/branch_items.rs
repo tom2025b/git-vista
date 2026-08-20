@@ -13,7 +13,7 @@ use crate::features::operations::core::PendingIntent;
 use crate::features::operations::kind::{ForceWithLease, HeadBranch};
 use crate::icons::GitIcons;
 use crate::state::{Features, MenuData, PendingOp, ViewerDoc};
-use git_vista_protocol::diff::DiffSpec;
+use git_vista_protocol::diff::{ComparisonBasis, DiffSpec};
 use git_vista_protocol::plan::RefName;
 use git_vista_protocol::RebaseStatus;
 
@@ -417,7 +417,16 @@ pub(super) fn build_branch_items(
                             return;
                         };
                         shell.open_viewer(ViewerDoc::Spec {
-                            spec: DiffSpec::RefVsRef { base, target },
+                            spec: DiffSpec::RefVsRef {
+                                base,
+                                target,
+                                // The comparison this menu has always offered:
+                                // the two states as they are now. M4.27 (#80)
+                                // made the question explicit rather than
+                                // implied; it did not change which one is
+                                // asked here.
+                                basis: ComparisonBasis::Direct,
+                            },
                         });
                     });
                 };

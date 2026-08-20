@@ -1,25 +1,35 @@
 //! #340: a structural gate over the offline write-guard, `refuse_if_offline()`
-//! (`api.rs:197`).
+//! (`api.rs`).
 //!
 //! `mod api` is `#[cfg(target_arch = "wasm32")]`-gated in `main.rs`, and
 //! `gloo-net`/`leptos`/`wasm-bindgen` (everything the module imports) live
 //! under Cargo.toml's `[target.'cfg(target_arch = "wasm32")'.dependencies]`
 //! block. `cargo test --workspace` therefore never compiles a line of
-//! `api.rs`, on host or in CI. Twenty write functions in there call
-//! `refuse_if_offline()` as (or effectively as) their first action today. If
-//! someone deleted that call from one of them tomorrow, nothing in this repo
-//! would notice: not one test exercises the guard, because none can link
-//! against the module it lives in. `offline_refusal_text()`
-//! (`git-vista-core/src/net.rs:43`) is tested, but it only pins the
-//! *wording* of the refusal message — it proves nothing about whether
-//! anything ever calls the function that would return it.
+//! `api.rs` or its `api/` submodules, on host or in CI. Twenty write
+//! functions in there call `refuse_if_offline()` as (or effectively as)
+//! their first action today. If someone deleted that call from one of them
+//! tomorrow, nothing in this repo would notice: not one test exercises the
+//! guard, because none can link against the module it lives in.
+//! `offline_refusal_text()` (`git-vista-core/src/net.rs:43`) is tested, but
+//! it only pins the *wording* of the refusal message — it proves nothing
+//! about whether anything ever calls the function that would return it.
 //!
 //! This module is a ratchet in the same shape as
 //! [`crate::features::a11y::audit`] (styles.css / render / dialogs source
 //! censused as bytes, M1.12 #65) and `git-vista-server`'s `route_authz`
 //! (main.rs's route table censused as bytes, M1.14 #67): it reads `api.rs`'s
-//! own source text with `include_str!` and checks structural facts about the
-//! bytes that ship, because it cannot execute the code that ships them. Two
+//! **and every `api/*.rs` submodule's** own source text with `include_str!`
+//! and checks structural facts about the bytes that ship, because it cannot
+//! execute the code that ships them.
+//!
+//! **api.rs was split into `api/` (a per-endpoint-area module tree) after
+//! this census was written.** [`API_SRC`] concatenates `api.rs` with every
+//! file under `api/` rather than reading `api.rs` alone, so the discovery
+//! and classification below still see every write-reaching function
+//! regardless of which file it now lives in — the classification tables
+//! ([`OFFLINE_GUARDED`]/[`TRANSPORT_HELPERS`]/[`EXEMPT_UNGUARDED`]) are
+//! function-name keyed, not file-keyed, so the split needed no changes to
+//! them at all, only to what source bytes get fed into [`fn_bodies`]. Two
 //! layers:
 //!
 //!  1. **Discovery** ([`every_write_reaching_function_is_classified`]): find
@@ -77,11 +87,43 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// `api.rs`'s own source, read at test-compile time. Cargo tracks
-/// `include_str!` as a build dependency, so an edit to `api.rs` recompiles
-/// this test — there is no way for the two files to silently drift apart the
-/// way a hand-copied fixture could.
-const API_SRC: &str = include_str!("api.rs");
+/// `api.rs`'s own source, concatenated with every `api/*.rs` submodule's
+/// (api.rs was split into a per-endpoint-area `api/` tree; see the module
+/// doc above), all read at test-compile time. Cargo tracks each
+/// `include_str!` as its own build dependency, so an edit to ANY of these
+/// files recompiles this test — there is no way for any of them to silently
+/// drift out of this census's view the way a hand-copied fixture could.
+/// [`fn_bodies`] keys everything by function name, not by file, so the
+/// concatenation order below is arbitrary — it need only include every file.
+const API_SRC: &str = concat!(
+    include_str!("api.rs"),
+    "\n",
+    include_str!("api/activity.rs"),
+    "\n",
+    include_str!("api/branches.rs"),
+    "\n",
+    include_str!("api/clone.rs"),
+    "\n",
+    include_str!("api/commits.rs"),
+    "\n",
+    include_str!("api/diff.rs"),
+    "\n",
+    include_str!("api/graph.rs"),
+    "\n",
+    include_str!("api/operations.rs"),
+    "\n",
+    include_str!("api/remotes.rs"),
+    "\n",
+    include_str!("api/repositories.rs"),
+    "\n",
+    include_str!("api/session.rs"),
+    "\n",
+    include_str!("api/staging.rs"),
+    "\n",
+    include_str!("api/status.rs"),
+    "\n",
+    include_str!("api/tags.rs"),
+);
 
 /// The low-level functions that actually put bytes on the wire for a write.
 /// Everything above this layer reaches the server only by calling one of
@@ -195,10 +237,14 @@ const OFFLINE_GUARDED: &[&str] = &[
 const EXEMPT_UNGUARDED: &[&str] = &["post_session"];
 
 /// The floor `fn_bodies` must clear before any "for every write-reaching
-/// function…" assertion below is trusted. `api.rs` has ~70 functions today;
-/// if the extractor silently stopped finding most of them (a Rust shape it
-/// doesn't handle, a moved file), every downstream census would go green
-/// while checking almost nothing.
+/// function…" assertion below is trusted. `api.rs` plus its `api/`
+/// submodules have ~70 functions today; if the extractor silently stopped
+/// finding most of them (a Rust shape it doesn't handle, a moved or
+/// forgotten file), every downstream census would go green while checking
+/// almost nothing. This is exactly the failure mode the api.rs split risked
+/// — trimming [`API_SRC`] down to `api.rs` alone after the split would have
+/// dropped straight to 23 and tripped this floor, which is how the split
+/// was caught needing this file's attention at all.
 const MIN_EXPECTED_FUNCTIONS: usize = 40;
 
 /// The literal, zero-argument call text every guarded function is expected

@@ -17,7 +17,7 @@ use leptos::*;
 
 use git_vista_core::diff::{CommitDiff, FileContent};
 use git_vista_core::virtualize::CumulativeHeights;
-use git_vista_protocol::diff::{DiffSpec, SpecDiff};
+use git_vista_protocol::diff::{ComparisonBasis, DiffSpec, SpecDiff};
 use git_vista_protocol::{PatchPlan, PatchPreview, StageDirection, StagingDiff};
 
 use crate::api::{fetch_diff_full, fetch_file, fetch_spec_diff, staging_diff_request};
@@ -361,12 +361,35 @@ fn spec_title(spec: &DiffSpec) -> String {
         DiffSpec::IndexVsCommit { commit } => {
             format!("Index vs {}", short(commit.as_str()))
         }
-        DiffSpec::CommitVsCommit { base, target } => {
-            format!("{} → {}", short(base.as_str()), short(target.as_str()))
-        }
-        DiffSpec::RefVsRef { base, target } => {
-            format!("{} → {}", base.as_str(), target.as_str())
-        }
+        // The basis is IN the label, not ignored with `..` (M4.27, #80). Two
+        // comparisons of the same pair answer different questions and produce
+        // patches that look identical, so a label that omitted it would leave
+        // the viewer unable to say which one is on screen — the precise
+        // confusion the field was added to end. `...` is git's own notation
+        // for the merge-base form, so it reads correctly to anyone who has
+        // typed it.
+        DiffSpec::CommitVsCommit {
+            base,
+            target,
+            basis,
+        } => match basis {
+            ComparisonBasis::Direct => {
+                format!("{} → {}", short(base.as_str()), short(target.as_str()))
+            }
+            ComparisonBasis::SinceMergeBase => {
+                format!("{}...{}", short(base.as_str()), short(target.as_str()))
+            }
+        },
+        DiffSpec::RefVsRef {
+            base,
+            target,
+            basis,
+        } => match basis {
+            ComparisonBasis::Direct => format!("{} → {}", base.as_str(), target.as_str()),
+            ComparisonBasis::SinceMergeBase => {
+                format!("{}...{}", base.as_str(), target.as_str())
+            }
+        },
     }
 }
 
