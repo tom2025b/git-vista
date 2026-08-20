@@ -504,6 +504,29 @@ pub enum GitOperation {
         /// [`ForcePublish`] for why no third, unguarded option exists.
         force: ForcePublish,
     },
+    /// Resolve one conflicted path by taking a whole side, or by deleting it
+    /// (M4.31, #84) — `git checkout --ours|--theirs -- <path>` then
+    /// `git add <path>`, or `git rm <path>`.
+    ///
+    /// # One path per operation, deliberately
+    ///
+    /// Resolving is a sequence of decisions a human makes one file at a time,
+    /// and each decision is separately reviewable, separately journaled and
+    /// separately undoable. A batch variant would collapse ten judgements into
+    /// one approval and make partial failure ("three applied, then the fourth
+    /// refused") a state this vocabulary has no way to describe.
+    ///
+    /// # Carries no content
+    ///
+    /// Every variant of [`crate::conflict::Resolution`] names a side rather
+    /// than supplying bytes, so a plan stays small and hashable. Line-level
+    /// resolution — #84's "block and line choices" — needs the `patch_plan`
+    /// machinery and its own decision; it is not smuggled in here.
+    ResolveConflict {
+        /// Repository-relative path, exactly as the conflict scan reported it.
+        path: WorktreePath,
+        resolution: crate::conflict::Resolution,
+    },
     /// `git branch -d <branch>` — the safe delete; git refuses an unmerged
     /// branch (`/api/delete-branch`).
     DeleteBranch { branch: BranchName },
@@ -1060,6 +1083,27 @@ pub enum RecoveryStrategy {
     /// the point of a typed field a future reader is expected to switch on
     /// rather than re-derive by also matching on [`GitOperation`]).
     RecoverableIfStaged,
+    /// The conflict this resolved can be put back exactly as it was, by
+    /// git itself, for as long as the operation that produced it is still in
+    /// progress (M4.31, #84).
+    ///
+    /// Resolving a conflicted path clears its stage 1/2/3 index entries, so the
+    /// discarded side is no longer in the index — but `MERGE_HEAD` (or the
+    /// rebase/cherry-pick equivalent) still names both sides, and
+    /// `git checkout --merge -- <path>` reconstructs the conflict from them.
+    ///
+    /// **Distinct from [`RecoverableIfStaged`](Self::RecoverableIfStaged), and
+    /// the distinction is the same one that variant was created to make.**
+    /// `RecoverableIfStaged` means "no git-vista-driven undo, but the bytes may
+    /// linger as a dangling blob until `gc`" — a maybe, about the object store.
+    /// This is a definite, about a mechanism: git will do it, exactly, on
+    /// request. Tagging a resolution `RecoverableIfStaged` would understate it
+    /// and tell a UI to warn where it could offer an undo.
+    ///
+    /// The qualifier is load-bearing: **once the operation is concluded or
+    /// aborted, this stops being true.** A caller offering the undo must check
+    /// the operation is still in progress rather than assuming the tag alone.
+    ConflictRecreatableWhileInProgress,
     /// No recovery exists inside git-vista, and none is possible regardless:
     /// the effect left the machine (push — the remote is ahead and we never
     /// force-push), the discarded state was never journaled (test-repo reset

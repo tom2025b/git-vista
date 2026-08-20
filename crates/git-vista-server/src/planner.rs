@@ -1621,6 +1621,25 @@ async fn shape(
             };
             (RiskLevel::Reversible, preconditions, changes, recovery)
         }
+        // M4.31 (#84). Reversible, not Safe: taking one side discards the
+        // other from the index, which is a real loss even though git can
+        // rebuild it. And not Destructive: the discarded side is still named
+        // by MERGE_HEAD, so `git checkout --merge` reconstructs the conflict
+        // exactly — a definite mechanism, not a maybe.
+        //
+        // No `Precondition`. The obvious one — "this path is still
+        // conflicted" — cannot be expressed in this vocabulary, which
+        // compares refs and worktree cleanliness, not index stage entries.
+        // Rather than approximate it with a precondition that checks
+        // something else and reads as if it checked this, the executor
+        // re-reads the conflict immediately before acting and refuses there.
+        // See `exec_resolve_conflict`.
+        GitOperation::ResolveConflict { .. } => (
+            RiskLevel::Reversible,
+            Vec::new(),
+            Vec::new(),
+            RecoveryStrategy::ConflictRecreatableWhileInProgress,
+        ),
         GitOperation::StageAll
         | GitOperation::UnstageAll
         // A staging selection is index-only like its -All siblings: the
@@ -2179,6 +2198,9 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
             message,
             expected_tip,
         } => exec_empty_commit_on_branch(repo, need, &branch, &message, &expected_tip).await,
+        GitOperation::ResolveConflict { path, resolution } => {
+            exec_resolve_conflict(repo, need, &path, resolution).await
+        }
         GitOperation::StageAll => exec_stage_all(repo, need).await,
         GitOperation::UnstageAll => exec_unstage_all(repo, need).await,
         GitOperation::CheckoutBranch { branch } => {
@@ -3748,6 +3770,133 @@ async fn exec_delete_local_tag(
     )
     .await;
     (StatusCode::OK, format!("Deleted tag '{name}'."))
+}
+
+/// Resolve one conflicted path by taking a whole side, or by deleting it
+/// (M4.31, #84).
+///
+/// # Re-reads the conflict before acting, and refuses on what it finds
+///
+/// `shape` records no `Precondition` for this operation, because "this path is
+/// still conflicted with a readable chosen side" is not expressible in a
+/// vocabulary built to compare refs and worktree cleanliness. Approximating it
+/// with a precondition that checks something *else* would be worse than none:
+/// the plan would display a guarantee it had not made.
+///
+/// So the check lives here, immediately before the write, and it is stricter
+/// than a precondition could be — it re-runs the scan and asks the same
+/// `refuses` the caller asked, so a side that became unreadable between plan
+/// and execution stops the write rather than resolving to content nobody saw.
+async fn exec_resolve_conflict(
+    repo: &Path,
+    need: NetworkNeed,
+    path: &WorktreePath,
+    resolution: git_vista_protocol::conflict::Resolution,
+) -> (StatusCode, String) {
+    use git_vista_protocol::conflict::Resolution;
+
+    let files = match crate::conflicts::scan(repo).await {
+        Ok(f) => f,
+        // A scan that failed must never fall through to the write. Refusing
+        // here is the whole reason `scan` returns a Result rather than an
+        // empty Vec.
+        //
+        // SURVIVED MUTATION, documented rather than hidden (M4.31, #84):
+        // replacing this arm with `Err(_) => Vec::new()` leaves every test
+        // green. The fall-through still refuses — the path is simply not found
+        // in an empty list — so nothing is written and no data is lost. What
+        // breaks is the *answer*: the caller is told "not conflicted" when the
+        // truth is "the conflicts could not be read", which is the
+        // I-did-not-look-reported-as-a-fact failure this crate is organised
+        // against.
+        //
+        // Not covered by a test because forcing `git ls-files` to fail inside a
+        // repository still healthy enough for the pipeline to build a plan is
+        // fragile in every form tried. Stated here so the next reader knows the
+        // gap is known rather than missed.
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("the conflicts could not be read, so nothing was resolved — {e}"),
+            )
+        }
+    };
+
+    let Some(file) = files.iter().find(|f| f.path == path.as_str()) else {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "{} is not conflicted — it may have been resolved already, or the \
+                 operation that produced the conflict may have ended",
+                path.as_str()
+            ),
+        );
+    };
+
+    if let Some(refused) = file.refuses(resolution) {
+        return (
+            StatusCode::CONFLICT,
+            match refused {
+                git_vista_protocol::conflict::ResolutionRefused::SideAbsent { side } => format!(
+                    "{} has no {side} side — to remove the file, ask for a deletion \
+                     explicitly rather than taking a side that is not there",
+                    path.as_str()
+                ),
+                git_vista_protocol::conflict::ResolutionRefused::SideUnreadable {
+                    side,
+                    reason,
+                } => format!(
+                    "{}'s {side} side could not be read, so it cannot be chosen — {reason}",
+                    path.as_str()
+                ),
+            },
+        );
+    }
+
+    // `--` before the path, always: it stops a path that begins with a dash
+    // being read as an option. The newtype already rejects the worst shapes,
+    // but the separator is what makes that irrelevant rather than load-bearing.
+    let argv: Vec<&str> = match resolution {
+        Resolution::TakeOurs => vec!["checkout", "--ours", "--", path.as_str()],
+        Resolution::TakeTheirs => vec!["checkout", "--theirs", "--", path.as_str()],
+        // `rm` clears the index entries and removes the file in one step;
+        // `-f` because a conflicted path is by definition not "clean" and git
+        // refuses without it.
+        Resolution::TakeDeletion => vec!["rm", "-f", "--", path.as_str()],
+    };
+
+    let output = match run_git(repo, need, &argv).await {
+        Ok(o) => o,
+        Err(e) => return couldnt_run("/api/resolve-conflict", &e),
+    };
+    if !output.status.success() {
+        let msg = stderr_or(&output, "git could not apply that resolution.");
+        eprintln!("git-vista: /api/resolve-conflict failed: {msg}");
+        return (StatusCode::BAD_REQUEST, msg);
+    }
+
+    // A checkout writes the working tree but leaves the stage entries in
+    // place; the path stays conflicted until it is staged. `rm` has already
+    // done both, so it needs no second step — and running `add` on a path it
+    // just deleted would fail.
+    if !matches!(resolution, Resolution::TakeDeletion) {
+        let add = match run_git(repo, need, &["add", "--", path.as_str()]).await {
+            Ok(o) => o,
+            Err(e) => return couldnt_run("/api/resolve-conflict", &e),
+        };
+        if !add.status.success() {
+            let msg = stderr_or(&add, "git could not stage the resolved file.");
+            eprintln!("git-vista: /api/resolve-conflict failed to stage: {msg}");
+            return (StatusCode::BAD_REQUEST, msg);
+        }
+    }
+
+    println!(
+        "[/api/resolve-conflict] resolved {} by {:?}",
+        path.as_str(),
+        resolution
+    );
+    (StatusCode::OK, format!("Resolved {}.", path.as_str()))
 }
 
 /// `git add -A` (`/api/stage`).
@@ -5522,7 +5671,10 @@ pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
         GitOperation::FetchRemote { .. }
         | GitOperation::PullBranch { .. }
         | GitOperation::PushBranch { .. } => true,
-        GitOperation::CreateBranch { .. }
+        // Two short local git calls; there is no window in which a cancel
+        // could arrive and mean anything.
+        GitOperation::ResolveConflict { .. }
+        | GitOperation::CreateBranch { .. }
         | GitOperation::CommitOnHead { .. }
         | GitOperation::EmptyCommitOnBranch { .. }
         | GitOperation::AmendCommit { .. }

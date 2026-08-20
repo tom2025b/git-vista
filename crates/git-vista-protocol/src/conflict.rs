@@ -265,6 +265,90 @@ impl Continuation {
     }
 }
 
+/// How one conflicted path is to be resolved (M4.31, #84).
+///
+/// # Whole sides only, in this slice
+///
+/// Every variant here takes one side *entirely*. Line- and hunk-level
+/// resolution — #84's "block and line choices" — is deliberately absent,
+/// because it means carrying file content through a [`crate::Plan`], and a
+/// plan is hashed, reviewed and replayed. That is the `patch_plan` machinery's
+/// problem (it already solved it for staging selections) and it deserves its
+/// own decision rather than being smuggled in beside three simple choices.
+///
+/// # `TakeDeletion` is separate from "take the side that deleted it"
+///
+/// In a delete/modify conflict, taking the deleting side and deleting the file
+/// are the same outcome — but they are *different requests*, and only one of
+/// them stays correct if the caller is wrong about which side deleted what.
+/// `TakeOurs` on a path where ours is absent means "I want what ours has,
+/// which is nothing"; `TakeDeletion` means "I want this file gone" regardless.
+/// Keeping them apart means a caller that has misread the conflict gets a
+/// refusal rather than a silent deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "choice", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum Resolution {
+    /// Keep our side's content exactly, discarding theirs.
+    TakeOurs,
+    /// Keep their side's content exactly, discarding ours.
+    TakeTheirs,
+    /// Resolve by removing the file, whatever either side held.
+    TakeDeletion,
+}
+
+/// Why a [`Resolution`] cannot be applied to a given [`ConflictedFile`].
+///
+/// A value rather than an error string: refusing is a normal outcome here, and
+/// a caller is expected to render each case differently.
+/// The tag is `"refusal"`, not `"reason"`: a variant already carries a
+/// `reason` field, and serde refuses an internal tag that collides with a
+/// field name rather than silently shadowing it — caught at compile time,
+/// which is the right place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "refusal", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum ResolutionRefused {
+    /// The chosen side could not be read, so choosing it would mean accepting
+    /// content nobody has seen. The one refusal that is about *this
+    /// application's* failure rather than the user's request.
+    SideUnreadable {
+        /// `"ours"` or `"theirs"`. An owned `String` rather than a
+        /// `&'static str` because this crosses the wire and must deserialize
+        /// as well as serialize.
+        side: String,
+        reason: String,
+    },
+    /// The chosen side does not exist. Taking a side that is not there is not
+    /// the same as deleting the file — see [`Resolution::TakeDeletion`] — so
+    /// this is refused rather than quietly reinterpreted.
+    SideAbsent { side: String },
+}
+
+impl ConflictedFile {
+    /// Whether `resolution` may be applied to this file, and why not if not.
+    ///
+    /// Pure, so the same answer is available before a plan is built and again
+    /// before it executes, without a second look at the repository.
+    pub fn refuses(&self, resolution: Resolution) -> Option<ResolutionRefused> {
+        let (side, stage) = match resolution {
+            // Deleting needs neither side to be readable: the request does not
+            // depend on what either side holds.
+            Resolution::TakeDeletion => return None,
+            Resolution::TakeOurs => ("ours", &self.ours),
+            Resolution::TakeTheirs => ("theirs", &self.theirs),
+        };
+        match stage {
+            Stage::Present { .. } => None,
+            Stage::Absent {} => Some(ResolutionRefused::SideAbsent { side: side.into() }),
+            Stage::Unreadable { reason } => Some(ResolutionRefused::SideUnreadable {
+                side: side.into(),
+                reason: reason.clone(),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +525,100 @@ mod tests {
             serde_json::to_value(Stage::Absent {}).unwrap(),
             serde_json::json!({"state": "absent"}),
             "the empty struct variant must not add a field to the wire form"
+        );
+    }
+
+    #[test]
+    fn taking_a_side_that_is_absent_is_refused_not_reinterpreted_as_a_deletion() {
+        // THE test for this vocabulary. MUTATION: return None for Absent, so
+        // "take ours" on a path we deleted silently becomes a deletion. A
+        // caller that misread which side deleted what would then destroy the
+        // surviving side while believing it kept one.
+        let f = ConflictedFile {
+            path: "a.txt".into(),
+            kind: ConflictKind::DeletedByUs,
+            base: present(),
+            ours: Stage::Absent {},
+            theirs: present(),
+            not_text_resolvable: None,
+        };
+        assert_eq!(
+            f.refuses(Resolution::TakeOurs),
+            Some(ResolutionRefused::SideAbsent {
+                side: "ours".into()
+            })
+        );
+        // Theirs is present, so taking theirs is fine...
+        assert_eq!(f.refuses(Resolution::TakeTheirs), None);
+        // ...and deleting is always expressible, whatever the sides hold.
+        assert_eq!(f.refuses(Resolution::TakeDeletion), None);
+    }
+
+    #[test]
+    fn taking_an_unreadable_side_is_refused_and_names_which() {
+        // MUTATION: allow Unreadable. The user would accept content this
+        // application never managed to read, having been shown nothing.
+        let f = ConflictedFile {
+            path: "a.bin".into(),
+            kind: ConflictKind::BothModified,
+            base: present(),
+            ours: present(),
+            theirs: Stage::Unreadable {
+                reason: "blob missing".into(),
+            },
+            not_text_resolvable: None,
+        };
+        match f.refuses(Resolution::TakeTheirs) {
+            Some(ResolutionRefused::SideUnreadable { side, reason }) => {
+                assert_eq!(side, "theirs");
+                assert!(
+                    reason.contains("blob missing"),
+                    "reason must survive: {reason}"
+                );
+            }
+            other => panic!("expected SideUnreadable, got {other:?}"),
+        }
+        assert_eq!(f.refuses(Resolution::TakeOurs), None);
+    }
+
+    #[test]
+    fn a_deletion_is_expressible_even_when_neither_side_can_be_read() {
+        // Deleting does not depend on what either side holds, so it must stay
+        // available as the escape hatch when everything else is refused.
+        let f = ConflictedFile {
+            path: "x".into(),
+            kind: ConflictKind::BothModified,
+            base: Stage::Unreadable { reason: "a".into() },
+            ours: Stage::Unreadable { reason: "b".into() },
+            theirs: Stage::Unreadable { reason: "c".into() },
+            not_text_resolvable: None,
+        };
+        assert_eq!(f.refuses(Resolution::TakeDeletion), None);
+        assert!(f.refuses(Resolution::TakeOurs).is_some());
+        assert!(f.refuses(Resolution::TakeTheirs).is_some());
+    }
+
+    #[test]
+    fn the_resolution_vocabulary_round_trips() {
+        for r in [
+            Resolution::TakeOurs,
+            Resolution::TakeTheirs,
+            Resolution::TakeDeletion,
+        ] {
+            let json = serde_json::to_string(&r).unwrap();
+            assert_eq!(serde_json::from_str::<Resolution>(&json).unwrap(), r);
+        }
+        assert_eq!(
+            serde_json::to_value(Resolution::TakeTheirs).unwrap(),
+            serde_json::json!({"choice": "take_theirs"})
+        );
+        // The tag is `refusal`, not `reason` — a field already uses that name.
+        assert_eq!(
+            serde_json::to_value(ResolutionRefused::SideAbsent {
+                side: "ours".into()
+            })
+            .unwrap(),
+            serde_json::json!({"refusal": "side_absent", "side": "ours"})
         );
     }
 }

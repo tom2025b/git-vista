@@ -98,6 +98,18 @@ fn golden_plans() -> Vec<Plan> {
             },
         ),
         plan(
+            '0',
+            // M4.31 (#84): one path, one whole-side choice, no content.
+            GitOperation::ResolveConflict {
+                path: WorktreePath::new("src/a.rs").unwrap(),
+                resolution: git_vista_protocol::conflict::Resolution::TakeTheirs,
+            },
+            RiskLevel::Reversible,
+            vec![],
+            vec![],
+            RecoveryStrategy::ConflictRecreatableWhileInProgress,
+        ),
+        plan(
             'b',
             GitOperation::CommitOnHead {
                 message: CommitMessage::new("feat: land the thing").unwrap(),

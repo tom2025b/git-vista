@@ -87,6 +87,15 @@ pub(crate) enum Exposure {
 pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
     use Exposure::{Excluded, Tool};
     match op {
+        // M4.31 (#84): not exposed as an MCP tool. Resolving a conflict is a
+        // judgement about file content made one path at a time by someone
+        // looking at three versions of it; an agent picking a side from a tool
+        // description has not seen any of them.
+        GitOperation::ResolveConflict { .. } => Excluded(
+            "resolving a conflict is a judgement about file content, made one path \
+             at a time by someone looking at all three versions of it; an agent \
+             picking a side from a tool description has seen none of them",
+        ),
         GitOperation::CreateBranch { .. } => Tool("plan_create_branch"),
         GitOperation::CommitOnHead { .. } => Tool("plan_commit_on_head"),
         GitOperation::EmptyCommitOnBranch { .. } => Tool("plan_empty_commit_on_branch"),
@@ -762,12 +771,22 @@ fn recovery_name(recovery: &RecoveryStrategy) -> &'static str {
         RecoveryStrategy::CheckoutPrevious { .. } => "checkout_previous",
         RecoveryStrategy::RevertCommit { .. } => "revert_commit",
         RecoveryStrategy::RecoverableIfStaged => "recoverable_if_staged",
+        RecoveryStrategy::ConflictRecreatableWhileInProgress => {
+            "conflict_recreatable_while_in_progress"
+        }
         RecoveryStrategy::Irrecoverable => "irrecoverable",
     }
 }
 
 fn recovery_meaning(recovery: &RecoveryStrategy) -> String {
     match recovery {
+        RecoveryStrategy::ConflictRecreatableWhileInProgress => {
+            "Undo by asking git to rebuild the conflict (git checkout --merge on the \
+             path) — but only while the merge, rebase or cherry-pick that produced it \
+             is still in progress. Once it is concluded or aborted, this stops being \
+             possible."
+                .to_string()
+        }
         RecoveryStrategy::NotNeeded => {
             "Nothing is destroyed, so there is nothing to recover.".to_string()
         }
@@ -1082,7 +1101,7 @@ mod tests {
     /// The two wire tags this crate deliberately does not expose. Written out
     /// as tags (not as `Exposure::Excluded` results) so the census below can
     /// compare two independently-authored lists.
-    const UNEXPOSED_TAGS: &[&str] = &["reset_test_repo", "stage_selection"];
+    const UNEXPOSED_TAGS: &[&str] = &["reset_test_repo", "resolve_conflict", "stage_selection"];
 
     fn catalog_names() -> Vec<String> {
         plan_tool_catalog()
@@ -1187,6 +1206,14 @@ mod tests {
         let tag = |s: &str| TagName::new(s).unwrap();
         let path = |s: &str| WorktreePath::new(s).unwrap();
         vec![
+            // M4.31 (#84). Present in the census even though `exposure_of`
+            // excludes it from the tool surface — the census is about the
+            // *vocabulary*, and a variant missing here would mean nothing
+            // checked that its exclusion was deliberate rather than forgotten.
+            GitOperation::ResolveConflict {
+                path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+                resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
+            },
             GitOperation::CreateBranch {
                 name: branch("b"),
                 at: oid(&zeros),
