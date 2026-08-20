@@ -9,11 +9,25 @@
   {
     "mode": "commit_vs_commit",
     "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "target": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    "target": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "basis": "direct"
   },
   {
     "mode": "ref_vs_ref",
     "base": "main",
-    "target": "feature/x"
+    "target": "feature/x",
+    "basis": "direct"
+  },
+  {
+    "mode": "commit_vs_commit",
+    "base": "cccccccccccccccccccccccccccccccccccccccc",
+    "target": "dddddddddddddddddddddddddddddddddddddddd",
+    "basis": "since_merge_base"
+  },
+  {
+    "mode": "ref_vs_ref",
+    "base": "main",
+    "target": "feature/y",
+    "basis": "since_merge_base"
   }
 ]
