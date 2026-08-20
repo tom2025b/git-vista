@@ -205,6 +205,7 @@ fn assert_ok(status: StatusCode, body: &str) {
 /// given a real pipeline test below.
 fn covered_by(op: &GitOperation) -> &'static str {
     match op {
+        GitOperation::ResolveConflict { .. } => "resolve_conflict_executes_through_the_pipeline",
         GitOperation::CreateBranch { .. } => "create_branch_executes_through_the_pipeline",
         GitOperation::CommitOnHead { .. } => "commit_on_head_executes_through_the_pipeline",
         GitOperation::EmptyCommitOnBranch { .. } => {
@@ -256,7 +257,8 @@ fn covered_by(op: &GitOperation) -> &'static str {
 /// pointing at its own test.
 fn covered_on_split_path(op: &GitOperation) -> &'static str {
     match op {
-        GitOperation::CreateBranch { .. }
+        GitOperation::ResolveConflict { .. }
+        | GitOperation::CreateBranch { .. }
         | GitOperation::CommitOnHead { .. }
         | GitOperation::EmptyCommitOnBranch { .. }
         | GitOperation::StageAll
@@ -294,6 +296,10 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
 fn samples() -> Vec<GitOperation> {
     let zeros = "0".repeat(40);
     vec![
+        GitOperation::ResolveConflict {
+            path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+            resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
+        },
         GitOperation::CreateBranch {
             name: branch("b"),
             at: oid(&zeros),
@@ -5352,5 +5358,87 @@ async fn review_window_seed_drift_fails_closed_with_the_never_recorded_refusal()
         out(&repo_b, &["branch", "--list", "stray"]),
         "",
         "the refused reset must not have deleted the stray branch"
+    );
+}
+
+#[tokio::test]
+async fn resolve_conflict_executes_through_the_pipeline() {
+    // M4.31 (#84). A REAL merge conflict, resolved through the full production
+    // path — plan build, mutation guard, staleness gate, executor — not a
+    // direct call to the exec function. That is the whole point of this suite:
+    // a variant that works when called directly and breaks somewhere in the
+    // funnel is exactly what the census exists to catch.
+    let (_dir, repo) = seeded_repo();
+
+    run(&repo, &["checkout", "-q", "-b", "theirs"]);
+    std::fs::write(repo.join("a.txt"), "theirs\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "theirs"]);
+    run(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("a.txt"), "ours\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "ours"]);
+    // Expected to fail — that is what produces the conflict under test.
+    let _ = std::process::Command::new("git")
+        .args(["merge", "theirs"])
+        .current_dir(&repo)
+        .status();
+    assert!(
+        out(&repo, &["ls-files", "-u", "--", "a.txt"]).contains("a.txt"),
+        "the fixture must actually be conflicted before the pipeline runs"
+    );
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ResolveConflict {
+            path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+            resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    // Three separate facts, because any one of them alone could hold while the
+    // resolution was still wrong.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "ours\n",
+        "the working tree must hold our side, with no conflict markers"
+    );
+    assert_eq!(
+        out(&repo, &["ls-files", "-u", "--", "a.txt"]),
+        "",
+        "the stage entries must be cleared — a checkout alone leaves them"
+    );
+    // Stage 0 is git's "normal, resolved" slot. Deliberately NOT
+    // `git diff --cached`: taking OUR side produces content identical to HEAD,
+    // so a cached diff is legitimately empty and asserting on it would fail on
+    // a correct resolution. The index stage is the fact that actually means
+    // resolved.
+    let staged = out(&repo, &["ls-files", "-s", "--", "a.txt"]);
+    assert!(
+        staged.starts_with("100644") && staged.contains(" 0\t"),
+        "the resolved file must sit at stage 0, got: {staged}"
+    );
+}
+
+#[tokio::test]
+async fn resolving_a_path_that_is_not_conflicted_is_refused_by_the_executor() {
+    // `shape` records no Precondition for this operation, so the executor's
+    // own re-read is the ONLY guard. MUTATION: drop that re-read and let the
+    // checkout run — `git checkout --ours` on an unconflicted path fails with
+    // a bare git error, and a caller would get an unexplained failure instead
+    // of a refusal that says what happened.
+    let (_dir, repo) = seeded_repo();
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ResolveConflict {
+            path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+            resolution: git_vista_protocol::conflict::Resolution::TakeTheirs,
+        },
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "body: {body}");
+    assert!(
+        body.contains("not conflicted"),
+        "the refusal must say why, got: {body}"
     );
 }

@@ -286,6 +286,7 @@ fn wpath(s: &str) -> WorktreePath {
 /// variant renamed in `plan.rs` cannot quietly keep matching a stale string.
 fn variant_name(op: &GitOperation) -> &'static str {
     match op {
+        GitOperation::ResolveConflict { .. } => "ResolveConflict",
         GitOperation::CreateBranch { .. } => "CreateBranch",
         GitOperation::CommitOnHead { .. } => "CommitOnHead",
         GitOperation::EmptyCommitOnBranch { .. } => "EmptyCommitOnBranch",
@@ -378,6 +379,10 @@ fn variant_names_the_enum_declares() -> std::collections::BTreeSet<String> {
 fn every_operation() -> Vec<GitOperation> {
     let tip = "1111111111111111111111111111111111111111";
     vec![
+        GitOperation::ResolveConflict {
+            path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+            resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
+        },
         GitOperation::CreateBranch {
             name: branch("feature"),
             at: oid(tip),
@@ -510,6 +515,7 @@ fn every_operation_declares_every_variant() {
         "every_operation() lists the same GitOperation variant more than once"
     );
     let expected: std::collections::BTreeSet<&str> = [
+        "ResolveConflict",
         "CreateBranch",
         "CommitOnHead",
         "EmptyCommitOnBranch",
@@ -628,7 +634,7 @@ fn the_completeness_guard_catches_a_variant_dropped_from_the_census() {
 fn the_serde_variant_census_is_actually_harvesting_names() {
     let harvested = variant_names_the_enum_declares();
     assert!(
-        harvested.len() >= 25,
+        harvested.len() >= 26,
         "serde's variant census came back implausibly short ({}): the \
          unknown-variant message parse has probably broken — {harvested:?}",
         harvested.len()
@@ -676,8 +682,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     let ops = every_operation();
     assert_eq!(
         ops.len(),
-        25,
-        "every_operation() must list every GitOperation variant; the enum has 25 \
+        26,
+        "every_operation() must list every GitOperation variant; the enum has 26 \
          (this literal is a tripwire, not the enforcement — \
          every_operation_covers_every_variant_the_enum_declares is what checks \
          the census against the enum itself and cannot be left stale with it)"
@@ -705,8 +711,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     );
     assert_eq!(
         local.len(),
-        20,
-        "the other twenty operations must stay Local; declared Local: {local:?}"
+        21,
+        "the other twenty-one operations must stay Local; declared Local: {local:?}"
     );
 }
 
