@@ -219,6 +219,117 @@ The stash entry was not removed — it is still in the list."
     )
 }
 
+/// `git stash pop <selector>` (`/api/stash/pop`, M3.24 #77).
+///
+/// # The criterion this exists to satisfy
+///
+/// *"Pop is not reported complete while conflicts remain."* Git already gets
+/// the **behaviour** right — `stash pop` leaves the entry in place when the
+/// apply conflicts, so nothing is lost. What git cannot do is shape our
+/// response. A caller seeing only a non-zero exit and a line of stderr would
+/// have to parse prose to learn whether their stash survived.
+///
+/// So after the pop this re-reads the conflict state through M4.31 (#84)'s
+/// scanner and names the unresolved paths. The entry either went or it did
+/// not, and the response says which.
+///
+/// # Why a failed scan is a refusal, not a shrug
+///
+/// If the conflict scan cannot run, this cannot know whether the pop left
+/// conflicts behind. Reporting success there would be the exact
+/// green-that-means-I-did-not-look failure the conflict model was built
+/// against, so it reports the gap instead.
+pub(super) async fn exec_pop_stash(
+    repo: &Path,
+    need: NetworkNeed,
+    entry: &StashSelector,
+    expected_oid: &CommitOid,
+) -> (StatusCode, String) {
+    if let Err(refusal) =
+        stash_entry_still_at(repo, need, "/api/stash/pop", entry, expected_oid).await
+    {
+        return refusal;
+    }
+
+    let output = match run_git(repo, need, &["stash", "pop", entry.as_str()]).await {
+        Ok(o) => o,
+        Err(e) => return couldnt_run("/api/stash/pop", &e),
+    };
+
+    // Asked in BOTH branches, not only on failure: a pop git called successful
+    // while leaving conflicted paths behind is precisely the case this
+    // criterion is about.
+    let continuation = crate::conflicts::continuation(repo).await;
+
+    match (output.status.success(), continuation) {
+        (true, Ok(c)) if c.may_continue() => {
+            println!("[/api/stash/pop] popped {entry}");
+            journal_app_event(
+                repo,
+                ActivityKind::Other,
+                Some("refs/stash".to_string()),
+                Obs::Absent,
+                Obs::Absent,
+                format!("popped stash {entry}"),
+            )
+            .await;
+            (
+                StatusCode::OK,
+                format!("Popped {entry}. It has been removed from your stash list."),
+            )
+        }
+
+        // SURVIVED MUTATION, recorded rather than hidden: changing this to
+        // StatusCode::OK leaves every test green. The Err branch only fires
+        // when the conflict scan itself fails, which needs a repository broken
+        // enough that `git ls-files` errors while still being healthy enough
+        // for the pipeline to build and execute a plan — a combination that
+        // proved fragile to construct in every form tried. Identical gap to
+        // the one recorded at `exec_resolve_conflict` (M4.31, #84), and the
+        // same reasoning applies: a test that does not really test it is worth
+        // less than a note that says so.
+        (_, Err(why)) => (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "git stash pop ran, but the conflict state could not be read afterwards \
+                 — {why}. Check `git status` before continuing; this server will not \
+                 report the pop as complete on a check it could not make."
+            ),
+        ),
+
+        (_, Ok(c)) => {
+            let detail = match &c {
+                git_vista_protocol::conflict::Continuation::Blocked {
+                    unresolved,
+                    unreadable,
+                } => {
+                    let mut lines = String::new();
+                    if !unresolved.is_empty() {
+                        lines.push_str(&format!("\n\nConflicted:\n  {}", unresolved.join("\n  ")));
+                    }
+                    if !unreadable.is_empty() {
+                        lines.push_str(&format!(
+                            "\n\nCould not be read (resolve these by hand):\n  {}",
+                            unreadable.join("\n  ")
+                        ));
+                    }
+                    lines
+                }
+                git_vista_protocol::conflict::Continuation::Clear => String::new(),
+            };
+            eprintln!("[/api/stash/pop] {entry} left conflicts");
+            (
+                StatusCode::CONFLICT,
+                format!(
+                    "Popping {entry} left conflicts, so it is NOT complete.{detail}\n\n\
+                     The stash entry was not removed — it is still in the list. Resolve \
+                     the paths above, then the pop can finish."
+                ),
+            )
+        }
+    }
+}
+
 /// `git stash drop <selector>` (`/api/stash/drop`, M3.24 #77).
 ///
 /// `Destructive` on the same reasoning `ForceDeleteBranch` is: the commit

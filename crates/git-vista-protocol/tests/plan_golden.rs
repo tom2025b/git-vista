@@ -98,6 +98,23 @@ fn golden_plans() -> Vec<Plan> {
             },
         ),
         plan(
+            '1',
+            // M3.24 (#77): pop is its own variant, not apply with a flag —
+            // Destructive where apply is Reversible, and it earns a recovery
+            // because it removes the entry.
+            GitOperation::PopStash {
+                entry: StashSelector::new("stash@{0}").unwrap(),
+                expected_oid: oid('a'),
+            },
+            RiskLevel::Destructive,
+            vec![Precondition::CleanWorktree],
+            vec![],
+            RecoveryStrategy::RecreateStashEntry {
+                at: oid('a'),
+                message: None,
+            },
+        ),
+        plan(
             '0',
             // M4.31 (#84): one path, one whole-side choice, no content.
             GitOperation::ResolveConflict {

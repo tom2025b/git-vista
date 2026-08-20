@@ -36,6 +36,99 @@ use git_vista_protocol::{CommitOid, GitOperation, StashMessage, StashSelector};
 use crate::planner;
 use crate::state::reject_if_read_only;
 
+/// `GET /api/stash/show?entry=stash@{N}` — the patch a stash entry holds
+/// (M3.24 #77).
+///
+/// # The criterion: "stash content is inspectable before apply or drop"
+///
+/// Before this, the only way to learn what an entry contained was to apply it
+/// and look — which is exactly the thing a user wants to avoid deciding
+/// blindly, and it is irreversible in the drop case. A stash you cannot read
+/// is a stash you cannot safely discard.
+///
+/// # A read, and only a read
+///
+/// `git stash show -p` resolves the entry and prints a diff. It writes
+/// nothing, touches no index and no worktree, so this needs no plan and no
+/// `GitOperation` — the same posture every other diff read in this server
+/// takes.
+///
+/// The flag set matters and is the same one every diff read here uses:
+/// `--no-color` so a `color.ui = always` config cannot inject escapes into
+/// text rendered as-is, and `--no-textconv` because a repository's own
+/// `.gitattributes` can bind a textconv filter that git would then *execute*
+/// to render content.
+pub(crate) async fn show_stash(
+    axum::extract::Query(q): axum::extract::Query<ShowStashQuery>,
+) -> (StatusCode, String) {
+    let (repo, _read_only) = crate::state::current();
+
+    let Ok(entry) = git_vista_protocol::StashSelector::new(&q.entry) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} is not a stash selector — expected the stash@{{N}} form the \
+                 stash list returns.",
+                q.entry
+            ),
+        );
+    };
+
+    // `--` is not applicable here (the argument is a revision, not a path),
+    // but the selector newtype has already refused anything that is not
+    // `stash@{N}`, so no argument can be read as an option.
+    let out = match crate::git_cmd::git_output(
+        &repo,
+        &[
+            "stash",
+            "show",
+            "--patch",
+            "--no-color",
+            "--no-textconv",
+            entry.as_str(),
+        ],
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("couldn't run git stash show: {e}"),
+            )
+        }
+    };
+
+    if !out.status.success() {
+        // Most often a selector that no longer resolves, because every drop
+        // renumbers the list. Say that, rather than passing git's wording
+        // through and leaving the user to infer it.
+        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return (
+            StatusCode::NOT_FOUND,
+            format!(
+                "{} could not be read — {msg}\n\nStash entries renumber on every \
+                 drop, so a selector held from an earlier listing may now point \
+                 somewhere else or nowhere. Re-read the list and try again.",
+                entry
+            ),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// Query for [`show_stash`].
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ShowStashQuery {
+    /// The `stash@{N}` selector, exactly as the list returned it.
+    pub(crate) entry: String,
+}
+
 /// `GET /api/stashes` — the drawer, newest first.
 ///
 /// A read, so it is not `full_routes`-gated and the LAN router sees it. An app

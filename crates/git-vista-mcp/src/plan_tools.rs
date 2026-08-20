@@ -104,6 +104,10 @@ pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
             "addressed by a positional selector this surface cannot yet list, so an \
              agent could only guess which entry it is applying",
         ),
+        GitOperation::PopStash { .. } => Excluded(
+            "same positional-selector problem as apply, and pop also REMOVES the entry \
+             — an agent guessing at stash@{0} would destroy work it never saw",
+        ),
         GitOperation::DropStash { .. } => Excluded(
             "destructive, and its safety rests on a compare-and-swap against a reflog \
              position an agent cannot see or re-derive between planning and submitting",
@@ -1143,6 +1147,7 @@ mod tests {
         "reset_test_repo",
         "resolve_conflict",
         "stage_selection",
+        "pop_stash",
         "push_stash",
         "apply_stash",
         "drop_stash",
@@ -1261,6 +1266,10 @@ mod tests {
                 include_untracked: true,
             },
             GitOperation::ApplyStash {
+                entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+                expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+            },
+            GitOperation::PopStash {
                 entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
                 expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
             },

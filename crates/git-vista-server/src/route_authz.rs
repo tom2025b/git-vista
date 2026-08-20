@@ -111,6 +111,10 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // it exposes stash messages and the branch each entry was taken from,
     // which is worktree content and not for an unauthenticated caller.
     ("/api/stashes", Method::GET, Authz::SessionRequired),
+    // The entry's patch (M3.24, #77). A read, but SessionRequired for the same
+    // reason the listing is: it returns worktree content — the actual lines a
+    // user stashed — which is exactly what a session gates.
+    ("/api/stash/show", Method::GET, Authz::SessionRequired),
     // All three writes carry the full posture. Push and apply move worktree
     // state; drop destroys a stash entry outright, and its compare-and-swap
     // guard protects against a *stale selector*, not against an unauthorised
@@ -253,7 +257,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 59;
+const EXPECTED_ROUTE_COUNT: usize = 60;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in

@@ -288,6 +288,7 @@ fn variant_name(op: &GitOperation) -> &'static str {
     match op {
         GitOperation::PushStash { .. } => "PushStash",
         GitOperation::ApplyStash { .. } => "ApplyStash",
+        GitOperation::PopStash { .. } => "PopStash",
         GitOperation::DropStash { .. } => "DropStash",
         GitOperation::ResolveConflict { .. } => "ResolveConflict",
         GitOperation::CreateBranch { .. } => "CreateBranch",
@@ -389,6 +390,10 @@ fn every_operation() -> Vec<GitOperation> {
             include_untracked: true,
         },
         GitOperation::ApplyStash {
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").expect("valid selector"),
+            expected_oid: oid(tip),
+        },
+        GitOperation::PopStash {
             entry: git_vista_protocol::StashSelector::new("stash@{0}").expect("valid selector"),
             expected_oid: oid(tip),
         },
@@ -560,6 +565,7 @@ fn every_operation_declares_every_variant() {
         "PushTag",
         "PushStash",
         "ApplyStash",
+        "PopStash",
         "DropStash",
     ]
     .into_iter()
@@ -702,8 +708,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     let ops = every_operation();
     assert_eq!(
         ops.len(),
-        29,
-        "every_operation() must list every GitOperation variant; the enum has 29 \
+        30,
+        "every_operation() must list every GitOperation variant; the enum has 30 \
          (this literal is a tripwire, not the enforcement — \
          every_operation_covers_every_variant_the_enum_declares is what checks \
          the census against the enum itself and cannot be left stale with it)"
@@ -731,8 +737,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     );
     assert_eq!(
         local.len(),
-        24,
-        "the other twenty-four operations must stay Local; declared Local: {local:?}"
+        25,
+        "the other twenty-five operations must stay Local; declared Local: {local:?}"
     );
 }
 

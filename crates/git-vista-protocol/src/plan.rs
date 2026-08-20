@@ -994,6 +994,31 @@ pub enum GitOperation {
         entry: StashSelector,
         expected_oid: CommitOid,
     },
+    /// `git stash pop <entry>` — restore a stash's changes and remove the
+    /// entry, but **only if the restore was clean** (`/api/stash/pop`,
+    /// M3.24 #77).
+    ///
+    /// # A separate variant, not `ApplyStash` with a flag
+    ///
+    /// The two differ in what can be *lost*. Apply keeps the entry whatever
+    /// happens, so its worst outcome is a messy worktree with the stash still
+    /// safe in the drawer. Pop removes the entry, so a bug in it destroys work
+    /// that only existed there. A `bool` on one variant would give both the
+    /// same [`RiskLevel`] and the same [`RecoveryStrategy`], and they are not
+    /// the same on either axis.
+    ///
+    /// # Conflicts leave the entry, and the response must say so
+    ///
+    /// `git stash pop` does not drop the entry when the apply conflicts —
+    /// that is git's own behaviour and it is correct. But the acceptance
+    /// criterion is stronger than the behaviour: the *response* must not read
+    /// as complete while conflicted paths remain. So the executor re-reads the
+    /// conflict state after the pop and reports what is unresolved, rather
+    /// than returning a success whose only clue is a line of git stderr.
+    PopStash {
+        entry: StashSelector,
+        expected_oid: CommitOid,
+    },
     /// `git stash drop <entry>` — discard an entry (`/api/stash/drop`,
     /// M3.24 #77). Recoverable via
     /// [`RecoveryStrategy::RecreateStashEntry`] until gc, and the durable

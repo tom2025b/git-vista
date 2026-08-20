@@ -207,6 +207,7 @@ fn covered_by(op: &GitOperation) -> &'static str {
     match op {
         GitOperation::PushStash { .. } => "push_stash_executes_through_the_pipeline",
         GitOperation::ApplyStash { .. } => "apply_stash_executes_through_the_pipeline",
+        GitOperation::PopStash { .. } => "pop_stash_refuses_to_report_complete_while_conflicted",
         GitOperation::DropStash { .. } => "drop_stash_refuses_a_moved_selector",
         GitOperation::ResolveConflict { .. } => "resolve_conflict_executes_through_the_pipeline",
         GitOperation::CreateBranch { .. } => "create_branch_executes_through_the_pipeline",
@@ -262,6 +263,7 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
     match op {
         GitOperation::PushStash { .. }
         | GitOperation::ApplyStash { .. }
+        | GitOperation::PopStash { .. }
         | GitOperation::DropStash { .. }
         | GitOperation::ResolveConflict { .. }
         | GitOperation::CreateBranch { .. }
@@ -5619,5 +5621,90 @@ async fn taking_a_side_that_was_deleted_is_refused_rather_than_deleting_the_file
     assert!(
         !out(&repo, &["ls-files", "-u", "--", "a.txt"]).is_empty(),
         "a refused resolution must leave the conflict exactly as it was"
+    );
+}
+
+#[tokio::test]
+async fn pop_stash_removes_the_entry_on_a_clean_pop() {
+    // The ordinary path, and the half `apply` cannot do: the entry is gone.
+    let (_dir, repo) = seeded_repo();
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "wip"]);
+    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::PopStash {
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(oid).unwrap(),
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "a changed\n",
+        "the stashed change must be back in the worktree"
+    );
+    assert_eq!(
+        out(&repo, &["stash", "list"]),
+        "",
+        "a clean pop removes the entry — that is the whole difference from apply"
+    );
+}
+
+#[tokio::test]
+async fn pop_stash_refuses_to_report_complete_while_conflicted() {
+    // THE acceptance criterion: "pop is not reported complete while conflicts
+    // remain". Git already leaves the entry in place on a conflicting pop —
+    // what this pins is that the RESPONSE says so, by name, rather than
+    // returning a success whose only clue is a line of git stderr.
+    //
+    // MUTATION: report OK whenever `git stash pop` exits non-zero but the
+    // scan is unavailable, or skip the conflict re-read entirely. Either way
+    // a user is told their stash was popped while their worktree is full of
+    // conflict markers and the entry is still in the drawer.
+    let (_dir, repo) = seeded_repo();
+
+    // Stash a change to a.txt, then commit a DIFFERENT change to the same
+    // file so the stash cannot apply cleanly.
+    std::fs::write(repo.join("a.txt"), "from the stash\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "wip"]);
+    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
+    std::fs::write(repo.join("a.txt"), "from a commit\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "diverge"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::PopStash {
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(oid).unwrap(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "a conflicted pop must not return OK — body: {body}"
+    );
+    assert!(
+        body.contains("NOT complete"),
+        "the response must say plainly that it did not finish: {body}"
+    );
+    assert!(
+        body.contains("a.txt"),
+        "the conflicted path must be named, not left for the user to hunt: {body}"
+    );
+    assert!(
+        body.contains("not removed"),
+        "the user must be told their stash survived: {body}"
+    );
+
+    // And the promise must be true, not just printed.
+    assert!(
+        out(&repo, &["stash", "list"]).contains("wip"),
+        "git leaves the entry on a conflicting pop; the message says so, so it must hold"
     );
 }

@@ -451,6 +451,7 @@ fn api_router(
         // M3.24 (#77): a read, so the LAN router sees it like every other
         // listing. Showing the drawer is useful before any write path exists.
         .route("/api/stashes", get(handlers::stash::stash_list))
+        .route("/api/stash/show", get(handlers::stash::show_stash))
         // Activity/Undo feature, step 3: the chronological event feed —
         // journal + reflogs + snapshot diffs, folded and attributed.
         .route("/api/activity", get(activity::activity_feed))
