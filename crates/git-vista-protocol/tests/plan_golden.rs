@@ -98,6 +98,33 @@ fn golden_plans() -> Vec<Plan> {
             },
         ),
         plan(
+            '6',
+            GitOperation::SequenceContinue,
+            RiskLevel::Reversible,
+            vec![Precondition::CleanWorktree],
+            vec![],
+            RecoveryStrategy::NotNeeded,
+        ),
+        plan(
+            '7',
+            GitOperation::SequenceSkip,
+            RiskLevel::Reversible,
+            vec![Precondition::CleanWorktree],
+            vec![],
+            RecoveryStrategy::NotNeeded,
+        ),
+        plan(
+            '8',
+            // Destructive, and Irrecoverable — not because objects are lost
+            // (they are not) but because the conflict RESOLUTIONS made during
+            // the sequence exist nowhere else and no ref can name them.
+            GitOperation::SequenceAbort,
+            RiskLevel::Destructive,
+            vec![],
+            vec![],
+            RecoveryStrategy::Irrecoverable,
+        ),
+        plan(
             '4',
             GitOperation::CherryPick { commit: oid('a') },
             RiskLevel::Reversible,

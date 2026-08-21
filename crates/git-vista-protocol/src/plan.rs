@@ -604,6 +604,44 @@ pub enum GitOperation {
         to: CommitOid,
         expected_tip: CommitOid,
     },
+    /// `git cherry-pick --continue` or `git revert --continue` — resume an
+    /// in-progress sequence after its conflicts have been resolved (M4.28,
+    /// #81).
+    ///
+    /// # Which sequence is not a field
+    ///
+    /// Git keeps one sequencer per repository, and the caller does not need to
+    /// say whether a cherry-pick or a revert is in flight — the repository
+    /// already knows, via `CHERRY_PICK_HEAD` or `REVERT_HEAD`. Asking the
+    /// caller would invite them to be wrong about it, and a wrong answer here
+    /// would run the wrong verb's continue.
+    ///
+    /// The executor reads which one is in progress and refuses when neither
+    /// is, rather than passing git's error through.
+    SequenceContinue,
+    /// `git cherry-pick --skip` or `git revert --skip` — abandon the commit
+    /// currently being applied and move to the next one (M4.28, #81).
+    ///
+    /// Skipping loses only the *current* commit's changes, and only from this
+    /// sequence — the original commit is untouched and still in history. That
+    /// is why this is [`RiskLevel::Reversible`] where
+    /// [`SequenceAbort`](GitOperation::SequenceAbort) is not.
+    SequenceSkip,
+    /// `git cherry-pick --abort` or `git revert --abort` — unwind the whole
+    /// sequence and return to where it started (M4.28, #81).
+    ///
+    /// # Destructive, and the reason is the resolutions
+    ///
+    /// Abort does not merely stop — it discards every conflict resolution the
+    /// user has already made in this sequence, including ones already
+    /// committed by an earlier `--continue`. Those resolutions exist nowhere
+    /// else: they were hand-made decisions about file content, and git's
+    /// unwinding takes them with it.
+    ///
+    /// That is a different loss from skip, which drops one commit's changes
+    /// while leaving the original commit intact in history. So they are
+    /// separate variants with separate risk, rather than one verb with a mode.
+    SequenceAbort,
     /// `git cherry-pick <commit>` — apply one commit's changes onto the
     /// checked-out branch as a NEW commit (M4.28, #81).
     ///

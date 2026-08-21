@@ -2036,6 +2036,29 @@ async fn shape(
             };
             (RiskLevel::Destructive, preconditions, changes, recovery)
         }
+        // Continue and skip both move the sequence forward and may create a
+        // commit; the undo is to move HEAD back, which head_moves supplies.
+        GitOperation::SequenceContinue | GitOperation::SequenceSkip => {
+            let (preconditions, changes, recovery) = head_moves(None);
+            (RiskLevel::Reversible, preconditions, changes, recovery)
+        }
+        // Destructive, and NOT for the reason the others in that class are.
+        // Nothing in git's object database is lost — the commits being applied
+        // still exist. What abort discards is every conflict RESOLUTION made
+        // during this sequence, including ones an earlier --continue already
+        // committed. Those were hand-made decisions about file content and
+        // exist nowhere else.
+        //
+        // No recovery strategy names them, because none can: there is no ref
+        // to move back to and no object holding the resolutions. Irrecoverable
+        // is the honest tag, and it is a fact about the operation rather than
+        // about what this application chose to offer.
+        GitOperation::SequenceAbort => (
+            RiskLevel::Destructive,
+            Vec::new(),
+            Vec::new(),
+            RecoveryStrategy::Irrecoverable,
+        ),
         GitOperation::CherryPick { .. } | GitOperation::CherryPickMerge { .. } => {
             // A cherry-pick ADDS a commit to the current branch, so nothing
             // existing is lost and the undo is to move the branch back — the
@@ -2420,6 +2443,9 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         GitOperation::RevertCommit { commit } => {
             exec_revert(repo, need, &commit, None, &observed).await
         }
+        GitOperation::SequenceContinue => exec_sequence(repo, need, SequenceVerb::Continue).await,
+        GitOperation::SequenceSkip => exec_sequence(repo, need, SequenceVerb::Skip).await,
+        GitOperation::SequenceAbort => exec_sequence(repo, need, SequenceVerb::Abort).await,
         GitOperation::CherryPick { commit } => exec_cherry_pick(repo, need, &commit, None).await,
         GitOperation::CherryPickMerge { commit, mainline } => {
             exec_cherry_pick(repo, need, &commit, Some(mainline)).await
@@ -4676,6 +4702,150 @@ async fn exec_reset_branch(
     }
 }
 
+/// Which way a sequence is being driven (M4.28, #81).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceVerb {
+    Continue,
+    Skip,
+    Abort,
+}
+
+impl SequenceVerb {
+    fn flag(self) -> &'static str {
+        match self {
+            SequenceVerb::Continue => "--continue",
+            SequenceVerb::Skip => "--skip",
+            SequenceVerb::Abort => "--abort",
+        }
+    }
+}
+
+/// Which sequence, if any, the repository is in the middle of.
+///
+/// Read from git's own markers rather than taken from the caller. A caller
+/// that guessed wrong would run the wrong verb's continue, and there is no
+/// reason to invite that when the repository already knows.
+///
+/// `None` means neither is in progress — a refusal, not a fallback.
+async fn sequence_in_progress(repo: &Path) -> Option<&'static str> {
+    let git_dir = repo.join(".git");
+    // Order matters only for the impossible case of both existing at once,
+    // which git does not produce; cherry-pick first is arbitrary and harmless.
+    for (marker, verb) in [
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+    ] {
+        if tokio::fs::try_exists(git_dir.join(marker))
+            .await
+            .unwrap_or(false)
+        {
+            return Some(verb);
+        }
+    }
+    None
+}
+
+/// Drive an in-progress cherry-pick or revert forward, past, or backward
+/// (M4.28, #81).
+///
+/// # Refuses when nothing is in progress
+///
+/// Git's own message for that case is terse and, worse, `--abort` on a clean
+/// repository can succeed while doing nothing — so a caller could be told an
+/// abort "worked" when there was never anything to abort. The refusal here is
+/// what makes the answer mean something.
+///
+/// # Continue and skip re-read the conflict state; abort does not
+///
+/// A `--continue` that leaves conflicts behind has not finished, for the same
+/// reason a stash pop that leaves conflicts has not. Abort is different: it is
+/// *supposed* to end with a clean tree, so the honest check after it is simply
+/// whether it succeeded.
+async fn exec_sequence(repo: &Path, need: NetworkNeed, verb: SequenceVerb) -> (StatusCode, String) {
+    let Some(kind) = sequence_in_progress(repo).await else {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "There is no cherry-pick or revert in progress, so there is nothing to \
+                 {}. If you expected one, it may have already finished or been \
+                 aborted.",
+                match verb {
+                    SequenceVerb::Continue => "continue",
+                    SequenceVerb::Skip => "skip",
+                    SequenceVerb::Abort => "abort",
+                }
+            ),
+        );
+    };
+
+    let output = match run_git(repo, need, &[kind, verb.flag()]).await {
+        Ok(o) => o,
+        Err(e) => return couldnt_run("/api/sequence", &e),
+    };
+
+    if verb == SequenceVerb::Abort {
+        return if output.status.success() {
+            println!("[/api/sequence] aborted the {kind}");
+            (
+                StatusCode::OK,
+                format!(
+                    "Aborted the {kind}. The repository is back where the sequence \
+                     started, and any conflict resolutions made during it are gone."
+                ),
+            )
+        } else {
+            let msg = stderr_or(&output, "git could not abort the sequence.");
+            eprintln!("git-vista: /api/sequence abort failed: {msg}");
+            (StatusCode::BAD_REQUEST, msg)
+        };
+    }
+
+    let continuation = crate::conflicts::continuation(repo).await;
+    match (output.status.success(), continuation) {
+        (true, Ok(c)) if c.may_continue() => {
+            println!("[/api/sequence] {kind} {}", verb.flag());
+            let done = sequence_in_progress(repo).await.is_none();
+            (
+                StatusCode::OK,
+                if done {
+                    format!("The {kind} is complete.")
+                } else {
+                    format!("Moved the {kind} on. More commits remain in the sequence.")
+                },
+            )
+        }
+
+        (_, Err(why)) => (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "git {kind} {} ran, but the conflict state could not be read afterwards \
+                 — {why}. Check `git status` before continuing.",
+                verb.flag()
+            ),
+        ),
+
+        (_, Ok(c)) => {
+            let detail = match &c {
+                git_vista_protocol::conflict::Continuation::Blocked { unresolved, .. } => {
+                    if unresolved.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n\nStill conflicted:\n  {}", unresolved.join("\n  "))
+                    }
+                }
+                git_vista_protocol::conflict::Continuation::Clear => String::new(),
+            };
+            (
+                StatusCode::CONFLICT,
+                format!(
+                    "The {kind} still has conflicts, so it did not move on.{detail}\n\n\
+                     Resolve them and try again, or abort to unwind the whole sequence."
+                ),
+            )
+        }
+    }
+}
+
 /// `git cherry-pick [-m <mainline>] <commit>` (M4.28, #81).
 ///
 /// # A conflict is a pause, not a failure
@@ -6094,6 +6264,9 @@ pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
         | GitOperation::RevertMerge { .. }
         | GitOperation::CherryPick { .. }
         | GitOperation::CherryPickMerge { .. }
+        | GitOperation::SequenceContinue
+        | GitOperation::SequenceSkip
+        | GitOperation::SequenceAbort
         | GitOperation::ResetTestRepo
         | GitOperation::DiscardTrackedPaths { .. }
         | GitOperation::DeleteUntrackedPaths { .. }
