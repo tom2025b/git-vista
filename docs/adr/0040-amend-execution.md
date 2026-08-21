@@ -43,8 +43,8 @@ flowchart LR
     B --> C["execute: 501 stub<br/>pinned inert by test"]
     C --> D["#223 M2.19b — this ADR<br/>the dangerous half"]
     D --> E["POST /api/amend-commit<br/>exec_amend_commit"]
-    style C fill:#ffe6e6
-    style E fill:#e6f3e6
+    style C fill:#ffe6e6,color:#4c4545
+    style E fill:#e6f3e6,color:#454845
 ```
 
 Four questions were left open, on purpose, for this slice to answer with the git
@@ -75,9 +75,9 @@ flowchart TD
     B -->|"#223 or later,<br/>own route"| C["exec_amend_commit runs"]
     B -->|"pre-#223,<br/>own route"| D["404 — loud, safe"]
     B -->|"pre-#223, hypothetical<br/>widened /api/commit body"| E["plain commit runs:<br/>second commit on top,<br/>silent wrong outcome"]
-    style C fill:#e6f3e6
-    style D fill:#e6f3e6
-    style E fill:#ffe6e6
+    style C fill:#e6f3e6,color:#454845
+    style D fill:#e6f3e6,color:#454845
+    style E fill:#ffe6e6,color:#4c4545
 ```
 
 The new route ripples through every census that exists to make route additions loud, and
@@ -157,8 +157,8 @@ flowchart TD
     B -->|"walk ran, absent"| D["flag Some false"]
     B -->|"walk failed"| E["flag None — unknown,<br/>never collapsed to false"]
     C --> F["client warns:<br/>plain push will refuse,<br/>lease-force is the followup"]
-    style C fill:#fff4e6
-    style E fill:#fff4e6
+    style C fill:#fff4e6,color:#4c4945
+    style E fill:#fff4e6,color:#4c4945
 ```
 
 One knowing substitution against the issue's letter, recorded here rather than hidden:
@@ -203,8 +203,8 @@ flowchart LR
         O["401 403 409 5xx —<br/>server-wide prose, unchanged"]
     end
     F --> K["stale_tip<br/>hook_rejected<br/>signing_failed<br/>other"]
-    style S fill:#e6f3e6
-    style F fill:#ffe6e6
+    style S fill:#e6f3e6,color:#454845
+    style F fill:#ffe6e6,color:#4c4545
 ```
 
 ### 5. Classification: probes first, prose second, and every heuristic written down
@@ -241,8 +241,8 @@ flowchart TD
     C -->|"no"| D{"rejectable hook exists — probe —<br/>AND no fatal: prefix<br/>AND not the empty-amend advice"}
     D -->|"yes"| H["hook_rejected"]
     D -->|"no"| O["other — git's words forwarded"]
-    style S1 fill:#fff4e6
-    style H fill:#fff4e6
+    style S1 fill:#fff4e6,color:#4c4945
+    style H fill:#fff4e6,color:#4c4945
 ```
 
 This is a deliberate, narrow relaxation of [0037](0037-observe-state-not-git-prose.md)'s

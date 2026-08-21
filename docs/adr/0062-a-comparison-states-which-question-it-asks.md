@@ -94,38 +94,18 @@ config:
     wrappingWidth: 430
 ---
 flowchart TD
-    S["`**A two-endpoint
-    comparison**
-    base + target + basis`"]
+    S["<b>A two-endpoint<br/>comparison</b><br/>base + target + basis"]
 
-    D["`**Direct**
-    git diff A B
-    two arguments`"]
-    M["`**SinceMergeBase**
-    git diff A...B
-    ONE argument`"]
+    D["<b>Direct</b><br/>git diff A B<br/>two arguments"]
+    M["<b>SinceMergeBase</b><br/>git diff A...B<br/>ONE argument"]
 
-    DQ["`**Question:**
-    how do these two states
-    differ right now?`"]
-    MQ["`**Question:**
-    what did B gain since
-    the two diverged?`"]
+    DQ["<b>Question:</b><br/>how do these two states<br/>differ right now?"]
+    MQ["<b>Question:</b><br/>what did B gain since<br/>the two diverged?"]
 
-    DR["`**Reversed: B A**
-    a true inverse —
-    additions become
-    deletions`"]
-    MR["`**Reversed: B...A**
-    NOT an inverse —
-    a different set
-    of commits`"]
+    DR["<b>Reversed: B A</b><br/>a true inverse —<br/>additions become<br/>deletions"]
+    MR["<b>Reversed: B...A</b><br/>NOT an inverse —<br/>a different set<br/>of commits"]
 
-    L["`**reversal_is_inverse()**
-    so a swap control can
-    label itself honestly:
-    'the reverse' vs
-    'the other side'`"]
+    L["<b>reversal_is_inverse()</b><br/>so a swap control can<br/>label itself honestly:<br/>'the reverse' vs<br/>'the other side'"]
 
     S --> D
     S --> M
@@ -136,10 +116,10 @@ flowchart TD
     DR --> L
     MR --> L
 
-    classDef root fill:#eaf2fa,stroke:#14406f,stroke-width:2px,rx:6,ry:6
-    classDef direct fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,rx:6,ry:6
-    classDef merge fill:#fff8e1,stroke:#bc6c25,stroke-width:3px,rx:6,ry:6
-    classDef rule fill:#f3e8fd,stroke:#6a1b9a,stroke-width:3px,rx:6,ry:6
+    classDef root fill:#eaf2fa,stroke:#14406f,stroke-width:2px,rx:6,ry:6,color:#14406f
+    classDef direct fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,rx:6,ry:6,color:#225d25
+    classDef merge fill:#fff8e1,stroke:#bc6c25,stroke-width:3px,rx:6,ry:6,color:#704016
+    classDef rule fill:#f3e8fd,stroke:#6a1b9a,stroke-width:3px,rx:6,ry:6,color:#6a1b9a
 
     class S root
     class D,DQ,DR direct

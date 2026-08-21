@@ -38,8 +38,8 @@ flowchart TD
     O["fetch fails on iPad"] --> Q{"service worker<br/>installed?"}
     Q -->|"no (today)"| L["Safari's own error page:<br/>connection failure, named"] --> D["operator checks tunnel /<br/>server.log — diagnosable"]
     Q -->|"yes, any caching kind"| C["cached shell renders,<br/>API calls fail oddly"] --> M["looks like an app bug —<br/>the failure mode that already<br/>cost real debugging time"]
-    style D fill:#e6f3e6
-    style M fill:#ffe6e6
+    style D fill:#e6f3e6,color:#454845
+    style M fill:#ffe6e6,color:#4c4545
 ```
 
 ## Decision

@@ -62,16 +62,16 @@ flowchart LR
         E["exec_push<br/>git push remote branch"]
         S["3 of 4 combinations<br/>501 'tracked by #231'"]
         T -. "value discarded" .-> E
-        style S fill:#ffe6e6
-        style E fill:#ffe6e6
+        style S fill:#ffe6e6,color:#4c4545
+        style E fill:#ffe6e6,color:#4c4545
     end
     subgraph AFTER["after this ADR"]
         T2["ForcePublish<br/>unchanged"]
         A2["push_argv<br/>one builder, no wildcard"]
         E2["planner::push<br/>streamed, cancellable, observed"]
         T2 --> A2 --> E2
-        style E2 fill:#e6f3e6
-        style A2 fill:#e6f3e6
+        style E2 fill:#e6f3e6,color:#454845
+        style A2 fill:#e6f3e6,color:#454845
     end
 ```
 
@@ -98,8 +98,8 @@ flowchart TD
     NA --> ARGV["push, --progress, [--set-upstream], [lease], remote, branch"]
     LA --> ARGV
     X["a third variant"] -.->|"compile error, not a fallthrough"| F
-    style X fill:#ffe6e6
-    style LA fill:#fff4e0
+    style X fill:#ffe6e6,color:#4c4545
+    style LA fill:#fff4e0,color:#4c4943
 ```
 
 Why a function rather than three `if`s inline: the failure mode of the inline version is
@@ -271,8 +271,8 @@ flowchart LR
     subgraph PUSH["push"]
         LE["Enumerating"] --> LC["Counting"] --> LCo["Compressing"] --> LW["Writing"] --> RRd["remote: Resolving"]
     end
-    style LW fill:#fff4e0
-    style LR fill:#e6f3e6
+    style LW fill:#fff4e0,color:#4c4943
+    style LR fill:#e6f3e6,color:#454845
 ```
 
 So `parse_progress` moved out of `planner::fetch` into `planner::transfer` and both
@@ -307,7 +307,7 @@ flowchart TD
     C -->|"non-fast-forward, fetch first"| NF["NonFastForward — 409<br/>pull, or approve a force-publish"]
     C -->|"hook declined, not found"| RR["RemoteRejected — 400"]
     C -->|"anything else"| OT["Other — 400, no hint invented"]
-    style LS fill:#fff4e0
+    style LS fill:#fff4e0,color:#4c4943
 ```
 
 Ordering is deliberate: `stale info` is checked **first**, because a rejected lease also

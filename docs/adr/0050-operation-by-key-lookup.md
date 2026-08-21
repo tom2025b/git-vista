@@ -126,8 +126,8 @@ flowchart TD
     C -->|not found| E{"why not found?"}
     E -->|"not admitted yet"| N
     E -->|"never will be / aged out"| N
-    style N fill:#fff3e0
-    style D fill:#e6f3e6
+    style N fill:#fff3e0,color:#4c4843
+    style D fill:#e6f3e6,color:#454845
 ```
 
 A caller cannot act differently on the two cases anyway — both mean "keep polling, or give

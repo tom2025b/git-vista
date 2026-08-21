@@ -100,31 +100,15 @@ config:
     wrappingWidth: 440
 ---
 flowchart TD
-    P["`**An approved plan**
-    path + whole-side choice`"]
-    SCAN{"`**Re-read the conflicts**
-    right before writing`"}
-    ERR["`**REFUSED**
-    the conflicts could not
-    be read — never fall
-    through to a write`"]
-    FIND{"`**Is this path
-    still conflicted?**`"}
-    GONE["`**REFUSED**
-    already resolved, or the
-    operation that produced
-    it has ended`"]
-    REF{"`**Does the file refuse
-    this choice?**`"}
-    ABS["`**REFUSED: side absent**
-    ask for a deletion
-    explicitly instead`"]
-    UNR["`**REFUSED: side unreadable**
-    choosing it would accept
-    content nobody saw`"]
-    GO["`**checkout --ours/--theirs
-    then add**
-    or **rm** for a deletion`"]
+    P["<b>An approved plan</b><br/>path + whole-side choice"]
+    SCAN{"<b>Re-read the conflicts</b><br/>right before writing"}
+    ERR["<b>REFUSED</b><br/>the conflicts could not<br/>be read — never fall<br/>through to a write"]
+    FIND{"<b>Is this path<br/>still conflicted?</b>"}
+    GONE["<b>REFUSED</b><br/>already resolved, or the<br/>operation that produced<br/>it has ended"]
+    REF{"<b>Does the file refuse<br/>this choice?</b>"}
+    ABS["<b>REFUSED: side absent</b><br/>ask for a deletion<br/>explicitly instead"]
+    UNR["<b>REFUSED: side unreadable</b><br/>choosing it would accept<br/>content nobody saw"]
+    GO["<b>checkout --ours/--theirs<br/>then add</b><br/>or <b>rm</b> for a deletion"]
 
     P --> SCAN
     SCAN -->|"scan failed"| ERR
@@ -135,9 +119,9 @@ flowchart TD
     REF -->|"Unreadable"| UNR
     REF -->|"no"| GO
 
-    classDef ask fill:#eaf2fa,stroke:#14406f,stroke-width:2px,rx:6,ry:6
-    classDef refuse fill:#fdecea,stroke:#c62828,stroke-width:3px,rx:6,ry:6
-    classDef allow fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,rx:6,ry:6
+    classDef ask fill:#eaf2fa,stroke:#14406f,stroke-width:2px,rx:6,ry:6,color:#14406f
+    classDef refuse fill:#fdecea,stroke:#c62828,stroke-width:3px,rx:6,ry:6,color:#941e1e
+    classDef allow fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,rx:6,ry:6,color:#225d25
 
     class P,SCAN,FIND,REF ask
     class ERR,GONE,ABS,UNR refuse

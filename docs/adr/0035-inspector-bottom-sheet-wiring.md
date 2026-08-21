@@ -30,8 +30,8 @@ flowchart LR
     B --> D["Drag gesture<br/>-> SheetState"]
     C --> E["app/mod.rs<br/>renders it"]
     D --> E
-    style A fill:#fff4e6
-    style E fill:#e6f3e6
+    style A fill:#fff4e6,color:#4c4945
+    style E fill:#e6f3e6,color:#454845
 ```
 
 ## Decision
