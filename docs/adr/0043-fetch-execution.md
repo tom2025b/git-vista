@@ -42,6 +42,7 @@ kill git — which is right for a commit and exactly wrong for a fetch the user 
 their mind about. Before this slice, the only way to stop a fetch was to stop the server.
 
 ```mermaid
+%%{init: {'themeVariables': {'noteBkgColor':'#fff5ad','noteTextColor':'#1a1a1a','noteBorderColor':'#aaaa33'}}}%%
 stateDiagram-v2
     [*] --> Queued
     Queued --> Planning

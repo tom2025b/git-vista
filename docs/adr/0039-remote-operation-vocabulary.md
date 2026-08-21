@@ -121,6 +121,7 @@ push into a compare-and-swap — this is the typed form of `git push
 --force-with-lease=<branch>:<expected-tip>`.
 
 ```mermaid
+%%{init: {'themeVariables': {'noteBkgColor':'#fff5ad','noteTextColor':'#1a1a1a','noteBorderColor':'#aaaa33'}}}%%
 stateDiagram-v2
     [*] --> None : default posture,<br/>fast-forward only
     None --> None : git itself refuses<br/>a non-fast-forward
