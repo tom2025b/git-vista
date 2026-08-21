@@ -132,8 +132,8 @@ flowchart TD
     E --> F{still current?}
     F -->|no| X
     F -->|yes| G[open_confirm]
-    style X fill:#f0f0f0,stroke:#888
-    style G fill:#eafaea,stroke:#1e8449
+    style X fill:#f0f0f0,stroke:#888,color:#3d3d3d
+    style G fill:#eafaea,stroke:#1e8449,color:#124f2b
 ```
 
 Re-offering is safe precisely because `latest_wins` uses `>=`: an intent compared against

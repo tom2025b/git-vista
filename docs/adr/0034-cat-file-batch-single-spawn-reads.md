@@ -43,8 +43,8 @@ flowchart LR
         B4 -->|"no"| B5["reject —<br/>no content read"]
         B4 -->|"yes"| B6["read exactly size bytes"]
     end
-    style A3 fill:#ffe6e6
-    style B5 fill:#ffe6e6
+    style A3 fill:#ffe6e6,color:#4c4545
+    style B5 fill:#ffe6e6,color:#4c4545
 ```
 
 ## Decision

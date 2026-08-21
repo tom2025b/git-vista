@@ -65,8 +65,8 @@ flowchart TD
     CHECK -- no --> BACKUP["back up unit file"]
     BACKUP --> EDIT["append path to GIT_VISTA_REPOS"]
     EDIT --> RESTART["daemon-reload + restart<br/>git-vista.service"]
-    classDef done fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    classDef noop fill:#fff3cd,stroke:#b8860b,stroke-width:2px
+    classDef done fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#225d25
+    classDef noop fill:#fff3cd,stroke:#b8860b,stroke-width:2px,color:#523c04
     class NOOP noop
     class URL,RESOLVE,CHECK,BACKUP,EDIT,RESTART done
 ```

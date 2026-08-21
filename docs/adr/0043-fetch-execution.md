@@ -284,10 +284,10 @@ flowchart TD
     G -->|"killed by us"| H["409 FetchError cancelled<br/>+ updated_refs"]
     G -->|"non-zero exit"| I["400 FetchError classified<br/>+ updated_refs"]
     G -->|"exit 0"| J["200 FetchSuccess<br/>+ updated_refs"]
-    style B fill:#ffe6e6
-    style H fill:#fff3e0
-    style I fill:#fff3e0
-    style J fill:#e6f3e6
+    style B fill:#ffe6e6,color:#4c4545
+    style H fill:#fff3e0,color:#4c4843
+    style I fill:#fff3e0,color:#4c4843
+    style J fill:#e6f3e6,color:#454845
 ```
 
 A cancelled fetch answers **409**, not a success code. The registry derives

@@ -108,33 +108,18 @@ config:
     wrappingWidth: 450
 ---
 flowchart TD
-    F["`**A force-with-lease push**
-    branch + remote`"]
-    R["`**Read
-    refs/remotes/&lt;remote&gt;/HEAD**
-    local only — no socket`"]
+    F["<b>A force-with-lease push</b><br/>branch + remote"]
+    R["<b>Read<br/>refs/remotes/&lt;remote&gt;/HEAD</b><br/>local only — no socket"]
 
-    Y["`**It resolved,
-    and names this branch**`"]
-    N["`**It resolved,
-    and names another**`"]
-    U["`**It did not resolve**
-    no such ref, or the
-    read itself failed`"]
+    Y["<b>It resolved,<br/>and names this branch</b>"]
+    N["<b>It resolved,<br/>and names another</b>"]
+    U["<b>It did not resolve</b><br/>no such ref, or the<br/>read itself failed"]
 
-    A1["`**DefaultBranchPush**
-    the reviewer sees it`"]
-    A2["`**no advisory**
-    earned silence — the
-    check ran and answered`"]
-    A3["`**DefaultBranchUnknown**
-    states the gap in words`"]
+    A1["<b>DefaultBranchPush</b><br/>the reviewer sees it"]
+    A2["<b>no advisory</b><br/>earned silence — the<br/>check ran and answered"]
+    A3["<b>DefaultBranchUnknown</b><br/>states the gap in words"]
 
-    ALL["`**RemoteHistoryReplaced**
-    on every force-with-lease,
-    whatever the branch:
-    no local reflog un-sends
-    what the remote accepted`"]
+    ALL["<b>RemoteHistoryReplaced</b><br/>on every force-with-lease,<br/>whatever the branch:<br/>no local reflog un-sends<br/>what the remote accepted"]
 
     F --> R
     R --> Y
@@ -145,10 +130,10 @@ flowchart TD
     U --> A3
     F --> ALL
 
-    classDef ask fill:#eaf2fa,stroke:#14406f,stroke-width:2px,rx:6,ry:6
-    classDef warn fill:#fff8e1,stroke:#bc6c25,stroke-width:3px,rx:6,ry:6
-    classDef quiet fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,rx:6,ry:6
-    classDef gap fill:#fdecea,stroke:#c62828,stroke-width:3px,rx:6,ry:6
+    classDef ask fill:#eaf2fa,stroke:#14406f,stroke-width:2px,rx:6,ry:6,color:#14406f
+    classDef warn fill:#fff8e1,stroke:#bc6c25,stroke-width:3px,rx:6,ry:6,color:#704016
+    classDef quiet fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,rx:6,ry:6,color:#225d25
+    classDef gap fill:#fdecea,stroke:#c62828,stroke-width:3px,rx:6,ry:6,color:#941e1e
 
     class F,R,Y,N,U ask
     class A1,ALL warn

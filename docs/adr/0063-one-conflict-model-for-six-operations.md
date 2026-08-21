@@ -112,34 +112,17 @@ config:
     wrappingWidth: 430
 ---
 flowchart TD
-    IDX["`**git's index**
-    stages 1, 2, 3
-    for one path`"]
+    IDX["<b>git's index</b><br/>stages 1, 2, 3<br/>for one path"]
 
-    P["`**Present**
-    oid, binary, size`"]
-    A["`**Absent {}**
-    git says this stage
-    does not exist`"]
-    U["`**Unreadable**
-    the read failed`"]
+    P["<b>Present</b><br/>oid, binary, size"]
+    A["<b>Absent {}</b><br/>git says this stage<br/>does not exist"]
+    U["<b>Unreadable</b><br/>the read failed"]
 
-    PC["`**Choosable**
-    and text-resolvable
-    when not binary`"]
-    AC["`**Choosable**
-    'take theirs' where
-    theirs is a deletion
-    is a real resolution`"]
-    UC["`**NOT choosable**
-    nobody has seen it —
-    offering it would ask
-    for a blind decision`"]
+    PC["<b>Choosable</b><br/>and text-resolvable<br/>when not binary"]
+    AC["<b>Choosable</b><br/>'take theirs' where<br/>theirs is a deletion<br/>is a real resolution"]
+    UC["<b>NOT choosable</b><br/>nobody has seen it —<br/>offering it would ask<br/>for a blind decision"]
 
-    GATE["`**Continuation::Blocked**
-    unresolved: a human decides
-    unreadable: a fault to report
-    — never the same list`"]
+    GATE["<b>Continuation::Blocked</b><br/>unresolved: a human decides<br/>unreadable: a fault to report<br/>— never the same list"]
 
     IDX --> P
     IDX --> A
@@ -151,10 +134,10 @@ flowchart TD
     AC --> GATE
     UC --> GATE
 
-    classDef idx fill:#eaf2fa,stroke:#14406f,stroke-width:2px,rx:6,ry:6
-    classDef good fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,rx:6,ry:6
-    classDef mid fill:#fff8e1,stroke:#bc6c25,stroke-width:3px,rx:6,ry:6
-    classDef bad fill:#fdecea,stroke:#c62828,stroke-width:3px,rx:6,ry:6
+    classDef idx fill:#eaf2fa,stroke:#14406f,stroke-width:2px,rx:6,ry:6,color:#14406f
+    classDef good fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,rx:6,ry:6,color:#225d25
+    classDef mid fill:#fff8e1,stroke:#bc6c25,stroke-width:3px,rx:6,ry:6,color:#704016
+    classDef bad fill:#fdecea,stroke:#c62828,stroke-width:3px,rx:6,ry:6,color:#941e1e
 
     class IDX idx
     class P,PC good

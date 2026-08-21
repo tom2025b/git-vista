@@ -61,8 +61,8 @@ flowchart TD
     A["GitOperation before #227:<br/>19 variants, one remote-reaching"] --> B["PushBranch branch remote<br/>always a plain fast-forward"]
     C["SECURITY_MODEL.md line 524:<br/>lease slash CAS control, described"] -.->|"documented but<br/>not representable"| D["no way to even ask<br/>for a guarded force push"]
     E["git pull with no flag:<br/>silent merge-vs-rebase from config"] -.->|"reviewer never<br/>sees the choice"| F["#230's named hazard"]
-    style D fill:#ffe6e6
-    style F fill:#ffe6e6
+    style D fill:#ffe6e6,color:#4c4545
+    style F fill:#ffe6e6,color:#4c4545
 ```
 
 This ADR is the decision to close both gaps in the *type*, ahead of any code that executes
@@ -191,9 +191,9 @@ flowchart TD
     F -->|"no"| G["400 at the wire boundary —<br/>missing-field deserialize error"]
     F -->|"yes, valid"| H["deserializes to Merge or Rebase"]
     F -->|"yes, invented value"| I["400 — unknown variant"]
-    style C fill:#ffe6e6
-    style G fill:#ffe6e6
-    style I fill:#ffe6e6
+    style C fill:#ffe6e6,color:#4c4545
+    style G fill:#ffe6e6,color:#4c4545
+    style I fill:#ffe6e6,color:#4c4545
 ```
 
 `a_pull_without_a_strategy_is_a_deserialize_error` (`plan_golden.rs`) pins all three arms:
@@ -266,10 +266,10 @@ flowchart TD
     Which -->|"PushBranch,<br/>any other combination"| R1["501 — tracked by #231"]
     Which -->|"FetchRemote"| R2["501 — tracked by #229"]
     Which -->|"PullBranch"| R3["501 — tracked by #230"]
-    style Exec fill:#e6f3e6
-    style R1 fill:#ffe6e6
-    style R2 fill:#ffe6e6
-    style R3 fill:#ffe6e6
+    style Exec fill:#e6f3e6,color:#454845
+    style R1 fill:#ffe6e6,color:#4c4545
+    style R2 fill:#ffe6e6,color:#4c4545
+    style R3 fill:#ffe6e6,color:#4c4545
 ```
 
 Why a `501` rather than an arm that ignores the new fields and runs a plain push: that
@@ -326,8 +326,8 @@ flowchart TD
     A["mode with_lease,<br/>plus a stray key"] --> B["deny_unknown_fields fires —<br/>hard deserialize error"]
     C["mode none,<br/>plus a stray key"] --> D["ignored — serde has no fields<br/>to enforce on a unit variant"]
     D --> E["result is still ForcePublish None —<br/>the safe, unleased mode"]
-    style B fill:#e6f3e6
-    style E fill:#e6f3e6
+    style B fill:#e6f3e6,color:#454845
+    style E fill:#e6f3e6,color:#454845
 ```
 
 The mitigation this branch takes is honest rather than structural: the asymmetry lands on the
