@@ -13,9 +13,15 @@
 //!
 //! No new git reader here. `/api/conflicts` is `conflicts::scan()` (ADR
 //! 0063) unchanged; `/api/blob/{oid}` and the worktree read share the same
-//! cap and the same `truncate_at_line` tidy-up `handlers::read::file_at_commit_for_repo`
-//! uses, so a truncated blob and a truncated worktree file report the
-//! identical fact the same way a truncated commit file already does.
+//! cap and the same `truncate_at_line` tidy-up
+//! `handlers::read::file_at_commit_for_repo` uses, so a truncated blob and a
+//! truncated worktree file report the identical fact the same way a
+//! truncated commit file already does.
+//!
+//! Every handler is a thin wrapper over a `..._for_repo` function, same shape
+//! as `handlers::read`: the handler resolves `?repo=` from the process-wide
+//! `CURRENT` selection (no test-time setter), so the seam a test actually
+//! drives is the `_for_repo` function with an explicit repository.
 
 use std::path::{Path, PathBuf};
 
@@ -26,6 +32,7 @@ use axum::Json;
 use tokio::io::AsyncReadExt;
 
 use git_vista_core::diff::{BlobContent, WorktreeFileContent};
+use git_vista_protocol::conflict::ConflictedFile;
 use git_vista_protocol::plan::CommitOid;
 use git_vista_protocol::WorktreePath;
 
@@ -33,20 +40,24 @@ use crate::git_cmd::{git_cat_file_batch_oid, BatchFileRead};
 use crate::handlers::read::{resolve_repo, truncate_at_line, RepoQuery, FILE_CONTENT_CAP};
 
 /// `GET /api/conflicts`: every conflicted path's stage metadata
-/// ([`git_vista_protocol::conflict::ConflictedFile`]), nothing else. The
-/// type's own doc comment says a caller fetches content independently
-/// (`/api/blob/{oid}`) — this is metadata only, so a client that just wants
-/// the count for a status chip never pays for a blob read.
+/// ([`ConflictedFile`]), nothing else. The type's own doc comment says a
+/// caller fetches content independently (`/api/blob/{oid}`) — this is
+/// metadata only, so a client that just wants the count for a status chip
+/// never pays for a blob read.
 pub(crate) async fn list_conflicts(
     Query(q): Query<RepoQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let repo = resolve_repo(q.repo.as_deref())?.0;
-    let files = crate::conflicts::scan(&repo).await.map_err(|e| {
-        eprintln!("git-vista: /api/conflicts failed: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, e)
-    })?;
+    let files = list_conflicts_for_repo(&repo).await?;
     let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
     Ok((no_store, Json(files)))
+}
+
+async fn list_conflicts_for_repo(repo: &Path) -> Result<Vec<ConflictedFile>, (StatusCode, String)> {
+    crate::conflicts::scan(repo).await.map_err(|e| {
+        eprintln!("git-vista: /api/conflicts failed: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })
 }
 
 /// Sniff-then-decode one already-bounded byte buffer the same way
@@ -79,6 +90,16 @@ pub(crate) async fn blob_content(
     AxumPath(oid): AxumPath<String>,
     Query(q): Query<RepoQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = resolve_repo(q.repo.as_deref())?.0;
+    let content = blob_content_for_repo(&repo, oid).await?;
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(content)))
+}
+
+async fn blob_content_for_repo(
+    repo: &Path,
+    oid: String,
+) -> Result<BlobContent, (StatusCode, String)> {
     // The discriminating check (#428): `cat-file --batch` accepts full
     // revision syntax, not just object ids. Without this gate first,
     // `/api/blob/HEAD:secrets.txt` or `/api/blob/:0:path` would be working
@@ -86,8 +107,7 @@ pub(crate) async fn blob_content(
     if CommitOid::new(&oid).is_err() {
         return Err((StatusCode::BAD_REQUEST, "Not an object id.".to_string()));
     }
-    let repo = resolve_repo(q.repo.as_deref())?.0;
-    let found = git_cat_file_batch_oid(&repo, &oid, FILE_CONTENT_CAP, "/api/blob").await?;
+    let found = git_cat_file_batch_oid(repo, &oid, FILE_CONTENT_CAP, "/api/blob").await?;
     let (bytes, read_truncated) = match found {
         BatchFileRead::NotABlob { kind } => {
             return Err((
@@ -98,16 +118,12 @@ pub(crate) async fn blob_content(
         BatchFileRead::Blob { bytes, truncated } => (bytes, truncated),
     };
     let (content, truncated, binary) = decode_bounded(&bytes, read_truncated, FILE_CONTENT_CAP);
-    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
-    Ok((
-        no_store,
-        Json(BlobContent {
-            oid,
-            content,
-            truncated,
-            binary,
-        }),
-    ))
+    Ok(BlobContent {
+        oid,
+        content,
+        truncated,
+        binary,
+    })
 }
 
 /// Resolve `path` to a real, in-worktree, non-directory file, refusing a
@@ -208,10 +224,18 @@ pub(crate) async fn worktree_file(
     AxumPath(raw_path): AxumPath<String>,
     Query(q): Query<RepoQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let path =
-        WorktreePath::new(raw_path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let repo = resolve_repo(q.repo.as_deref())?.0;
-    let resolved = resolve_worktree_read_path(&repo, &path).await?;
+    let content = worktree_file_for_repo(&repo, raw_path).await?;
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(content)))
+}
+
+async fn worktree_file_for_repo(
+    repo: &Path,
+    raw_path: String,
+) -> Result<WorktreeFileContent, (StatusCode, String)> {
+    let path = WorktreePath::new(raw_path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let resolved = resolve_worktree_read_path(repo, &path).await?;
     let (bytes, read_truncated) = read_bounded_worktree_file(&resolved, FILE_CONTENT_CAP)
         .await
         .map_err(|e| {
@@ -225,17 +249,310 @@ pub(crate) async fn worktree_file(
             )
         })?;
     let (content, truncated, binary) = decode_bounded(&bytes, read_truncated, FILE_CONTENT_CAP);
-    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
-    Ok((
-        no_store,
-        Json(WorktreeFileContent {
-            path: path.as_str().to_string(),
-            content,
-            truncated,
-            binary,
-        }),
-    ))
+    Ok(WorktreeFileContent {
+        path: path.as_str().to_string(),
+        content,
+        truncated,
+        binary,
+    })
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+
+    fn run(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {repo:?}");
+    }
+
+    fn out(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed in {repo:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A fresh repository on branch `main` with one committed file.
+    fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@example.invalid"]);
+        run(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        run(&repo, &["add", "a.txt"]);
+        run(&repo, &["commit", "-q", "-m", "seed"]);
+        (dir, repo)
+    }
+
+    /// A repository with a real, unresolved modify/modify conflict on
+    /// `a.txt`, mirroring `conflicts.rs`'s own fixture so both files' tests
+    /// exercise the identical shape of git state.
+    fn conflicted_repo() -> (tempfile::TempDir, PathBuf) {
+        let (dir, repo) = seeded_repo();
+        run(&repo, &["checkout", "-q", "-b", "theirs"]);
+        std::fs::write(repo.join("a.txt"), "theirs\n").unwrap();
+        run(&repo, &["commit", "-q", "-am", "theirs"]);
+        run(&repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("a.txt"), "ours\n").unwrap();
+        run(&repo, &["commit", "-q", "-am", "ours"]);
+        let _ = std::process::Command::new("git")
+            .args(["merge", "theirs"])
+            .current_dir(&repo)
+            .status();
+        (dir, repo)
+    }
+
+    // ---- list_conflicts_for_repo -------------------------------------
+
+    #[tokio::test]
+    async fn a_clean_repo_lists_no_conflicts() {
+        let (_d, repo) = seeded_repo();
+        let files = list_conflicts_for_repo(&repo).await.unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_conflicted_repo_lists_the_conflicted_path_with_all_stages() {
+        let (_d, repo) = conflicted_repo();
+        let files = list_conflicts_for_repo(&repo).await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "a.txt");
+        assert!(files[0].base.is_text());
+        assert!(files[0].ours.is_text());
+        assert!(files[0].theirs.is_text());
+    }
+
+    #[tokio::test]
+    async fn a_scan_failure_is_a_500_not_a_silent_empty_list() {
+        // MUTATION: map the scan error to Ok(vec![]). The endpoint would then
+        // report "no conflicts" for a repository it could not even read —
+        // the exact failure `conflicts::scan`'s own contract exists to
+        // prevent, now one HTTP hop further out.
+        let dir = tempfile::tempdir().unwrap();
+        let (status, msg) = list_conflicts_for_repo(dir.path()).await.unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(msg.contains("ls-files"), "{msg}");
+    }
+
+    // ---- blob_content_for_repo -----------------------------------------
+
+    #[tokio::test]
+    async fn a_present_stage_oid_reads_back_its_content() {
+        let (_d, repo) = conflicted_repo();
+        let oid = out(&repo, &["rev-parse", ":2:a.txt"]); // stage 2 = ours
+        let content = blob_content_for_repo(&repo, oid.clone()).await.unwrap();
+        assert_eq!(content.oid, oid);
+        assert_eq!(content.content, "ours\n");
+        assert!(!content.truncated);
+        assert!(!content.binary);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_oid_is_refused_before_anything_spawns() {
+        // THE test in this file. MUTATION: drop the CommitOid gate.
+        // `cat-file --batch` accepts full revision syntax, so
+        // `HEAD:some/path` would be a working object read through a route
+        // that claims to take a bare object id.
+        let (_d, repo) = seeded_repo();
+        let (status, msg) = blob_content_for_repo(&repo, "HEAD:a.txt".to_string())
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("object id"), "{msg}");
+
+        let (status, _) = blob_content_for_repo(&repo, "not-hex".to_string())
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_but_well_formed_oid_is_a_404() {
+        let (_d, repo) = seeded_repo();
+        let (status, _) = blob_content_for_repo(&repo, "a".repeat(40))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_tree_oid_is_refused_as_not_a_blob() {
+        let (_d, repo) = seeded_repo();
+        let tree_oid = out(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let (status, msg) = blob_content_for_repo(&repo, tree_oid).await.unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(msg.contains("tree"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_binary_blob_reports_binary_with_empty_content() {
+        let (dir, repo) = seeded_repo();
+        std::fs::write(repo.join("bin.dat"), [0u8, 1, 2, 3, b'x']).unwrap();
+        run(&repo, &["add", "bin.dat"]);
+        let oid = out(&repo, &["hash-object", "bin.dat"]);
+        let content = blob_content_for_repo(&repo, oid).await.unwrap();
+        assert!(content.binary);
+        assert_eq!(content.content, "");
+        drop(dir);
+    }
+
+    #[tokio::test]
+    async fn a_blob_past_the_cap_is_truncated_at_a_line_boundary() {
+        let (_d, repo) = seeded_repo();
+        let big = "line\n".repeat(10);
+        std::fs::write(repo.join("big.txt"), &big).unwrap();
+        run(&repo, &["add", "big.txt"]);
+        let oid = out(&repo, &["hash-object", "big.txt"]);
+
+        // Drive the cap logic directly at a tiny cap, same shape as
+        // read/content_suite.rs's cap tests: cap mid-line so the tidy-up has
+        // something to do.
+        let found = git_cat_file_batch_oid(&repo, &oid, 12, "/api/blob")
+            .await
+            .unwrap();
+        let BatchFileRead::Blob { bytes, truncated } = found else {
+            panic!("expected a blob");
+        };
+        assert!(truncated);
+        let (content, reported_truncated, binary) = decode_bounded(&bytes, truncated, 12);
+        assert!(reported_truncated);
+        assert!(!binary);
+        assert!(
+            content.ends_with('\n') || content.is_empty(),
+            "must cut at a line boundary, got {content:?}"
+        );
+        assert!(content.len() <= 12);
+    }
+
+    // ---- worktree_file_for_repo -----------------------------------------
+
+    #[tokio::test]
+    async fn the_result_pane_reads_the_marker_file_git_actually_wrote() {
+        let (_d, repo) = conflicted_repo();
+        let content = worktree_file_for_repo(&repo, "a.txt".to_string())
+            .await
+            .unwrap();
+        assert_eq!(content.path, "a.txt");
+        assert!(
+            content.content.contains("<<<<<<<"),
+            "must be the real marker file: {:?}",
+            content.content
+        );
+        assert!(!content.binary);
+    }
+
+    #[tokio::test]
+    async fn a_path_traversal_attempt_is_refused_at_the_wire_boundary() {
+        // WorktreePath's own `..`-rejection, exercised through this seam.
+        let (_d, repo) = seeded_repo();
+        let (status, _) = worktree_file_for_repo(&repo, "../escape.txt".to_string())
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_symlink_escaping_the_worktree_is_refused() {
+        // THE test for resolve_worktree_read_path. MUTATION: compare the
+        // joined (unresolved) path against the repo root instead of the
+        // canonicalized one. `WorktreePath` has no `..` in it anywhere, so a
+        // lexical-only check would wave this straight through.
+        #[cfg(unix)]
+        {
+            let (dir, repo) = seeded_repo();
+            let outside = dir.path().join("outside.txt");
+            std::fs::write(&outside, "secret\n").unwrap();
+            std::os::unix::fs::symlink(&outside, repo.join("escape.txt")).unwrap();
+
+            let (status, _) = worktree_file_for_repo(&repo, "escape.txt".to_string())
+                .await
+                .unwrap_err();
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_worktree_path_is_a_404() {
+        let (_d, repo) = seeded_repo();
+        let (status, _) = worktree_file_for_repo(&repo, "does-not-exist.txt".to_string())
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_directory_is_refused_not_read() {
+        let (_d, repo) = seeded_repo();
+        std::fs::create_dir_all(repo.join("a-dir")).unwrap();
+        let (status, msg) = worktree_file_for_repo(&repo, "a-dir".to_string())
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(msg.contains("directory"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_worktree_file_past_the_cap_is_truncated_and_never_reads_past_it() {
+        // THE test for read_bounded_worktree_file. MUTATION: read the whole
+        // file then truncate the buffer — still passes every assertion here
+        // on a small fixture, but defeats the cap's whole purpose on a
+        // pathological file. Caught only by the length still exceeding the
+        // read: a file many times the cap must never be read in full.
+        let (_d, repo) = seeded_repo();
+        let big = "line\n".repeat(10);
+        std::fs::write(repo.join("big.txt"), &big).unwrap();
+
+        let (bytes, truncated) = read_bounded_worktree_file(&repo.join("big.txt"), 12)
+            .await
+            .unwrap();
+        assert!(truncated);
+        assert_eq!(bytes.len(), 12, "must read at most cap bytes, never more");
+
+        let content = worktree_file_for_repo(&repo, "big.txt".to_string())
+            .await
+            .unwrap();
+        assert!(content.truncated);
+        assert!(content.content.len() <= 12);
+    }
+
+    // ---- decode_bounded ---------------------------------------------------
+
+    #[test]
+    fn binary_sniff_matches_gits_own_heuristic() {
+        // MUTATION: treat any content as text. A conflict stage's binary
+        // side would then decode as (likely mangled) lossy UTF-8 text
+        // instead of being flagged for the caller to handle separately.
+        let (content, truncated, binary) = decode_bounded(&[0, 1, 2], false, 100);
+        assert!(binary);
+        assert!(content.is_empty());
+        assert!(!truncated);
+
+        let (content, truncated, binary) = decode_bounded(b"hello\n", false, 100);
+        assert!(!binary);
+        assert_eq!(content, "hello\n");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn a_read_truncation_is_reported_even_when_the_decoded_string_would_not_show_it() {
+        let (_content, truncated, _binary) = decode_bounded(b"short", true, 100);
+        assert!(
+            truncated,
+            "read_truncated must be authoritative, never re-derived from decoded length"
+        );
+    }
+}

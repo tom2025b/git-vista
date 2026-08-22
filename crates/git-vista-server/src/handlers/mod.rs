@@ -46,6 +46,9 @@ pub(crate) mod branch;
 pub(crate) mod catalog;
 pub(crate) mod clone;
 pub(crate) mod commit;
+// M4.31a (#428): inspect a conflict — the metadata listing, a stage blob by
+// oid, and the read-only result-pane worktree read.
+pub(crate) mod conflicts;
 // #219 (M2.18a): discard tracked-path changes / delete untracked paths.
 pub(crate) mod discard;
 // M2.20c (#229): fetch from a configured remote.
