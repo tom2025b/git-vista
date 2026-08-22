@@ -553,3 +553,240 @@ fn two_unknown_tips_are_not_the_same_observation() {
     assert!(!Obs::Known("a".to_string()).same_observation(&Obs::Known("b".to_string())));
     assert!(Obs::<String>::Absent.same_observation(&Obs::Absent));
 }
+
+/// A stage entry moving, with the working tree untouched, moves the
+/// generation (M4.31c groundwork, #432).
+///
+/// # Why this test exists
+///
+/// #432 wants to carry a user-composed conflict resolution in the plan, and the
+/// staleness argument for doing that safely rests on a claim nobody had
+/// checked: that git's `status --porcelain=v2` `u` lines carry the three stage
+/// OIDs, so any stage moving between build and execute is visible to
+/// `enforce_fresh` for free.
+///
+/// That claim was asserted from git's documented format, not from this
+/// repository. The precedent for why that is not good enough is a few hundred
+/// lines up in `generation_token` itself: refs/stash had to be added as its own
+/// digest field because `read_refs` keeps "only branches and tags", and until
+/// #77 did so, **no stash write moved the generation at all**. Its comment
+/// records how that was found — "Caught by a test written for #77's
+/// 'generation updates are correct' criterion, not by inspection."
+///
+/// Same shape, same crate, so it gets the same treatment before a design leans
+/// on it.
+///
+/// # What makes it a real test
+///
+/// The working tree file is written ONCE and never touched again. Only the
+/// index changes, via `update-index --cacheinfo` at an explicit stage. If the
+/// generation moved because the worktree moved, this would prove nothing.
+#[tokio::test]
+async fn a_stage_entry_moving_with_the_worktree_untouched_moves_the_generation() {
+    let (_dir, repo) = seeded_repo();
+
+    // Two blobs to point a stage entry at. Written through git so the objects
+    // exist without any working-tree file ever holding them.
+    let blob_one = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(&repo)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"stage content one\n")?;
+                c.wait_with_output()
+            })
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let blob_two = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(&repo)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"stage content two\n")?;
+                c.wait_with_output()
+            })
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_ne!(blob_one, blob_two, "fixture: two distinct blobs");
+
+    // The working tree gets its bytes now, and never again.
+    std::fs::write(repo.join("staged.txt"), "worktree bytes\n").unwrap();
+    let worktree_before = std::fs::read(repo.join("staged.txt")).unwrap();
+
+    run(
+        &repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob_one},staged.txt"),
+        ],
+    );
+    let before = generation_token(&repo, &observe_live(&repo).await)
+        .await
+        .as_str()
+        .to_string();
+
+    // Only the index moves: the same path, a different blob, no file write.
+    run(
+        &repo,
+        &[
+            "update-index",
+            "--cacheinfo",
+            &format!("100644,{blob_two},staged.txt"),
+        ],
+    );
+    let after = generation_token(&repo, &observe_live(&repo).await)
+        .await
+        .as_str()
+        .to_string();
+
+    assert_eq!(
+        std::fs::read(repo.join("staged.txt")).unwrap(),
+        worktree_before,
+        "fixture: the working tree must not have changed, or this proves nothing"
+    );
+    assert_ne!(
+        before, after,
+        "a stage entry moving must move the generation — otherwise a plan \
+         approved against one staging state executes against another, and \
+         enforce_fresh cannot see the difference"
+    );
+}
+
+/// The same guarantee for an UNMERGED path: rewriting one of the three
+/// conflict stages, with the working tree untouched, moves the generation
+/// (M4.31c groundwork, #432).
+///
+/// # Why this is a separate test from the one above
+///
+/// The stage-0 test above passes through a different porcelain shape. A
+/// non-conflicted staged path renders as a `1`/`2` line; only an unmerged path
+/// renders as a `u` line, and it is the `u` line that carries the three stage
+/// OIDs:
+///
+/// ```text
+/// u UU N... 100644 100644 100644 100644 <stage1> <stage2> <stage3> a.txt
+/// ```
+///
+/// #432's design leans on exactly that: "any stage moving between build and
+/// execute is visible to `enforce_fresh` for free." Proving it for stage 0
+/// would have looked like proving it and would not have been — the same
+/// almost-right shape that let three M4 tests pass for months while pinning
+/// nothing.
+#[tokio::test]
+async fn rewriting_one_conflict_stage_moves_the_generation() {
+    let (_dir, repo) = seeded_repo();
+
+    // A real conflict, so the path renders as a porcelain `u` line.
+    run(&repo, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(repo.join("a.txt"), "from side\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "side changes a"]);
+    run(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("a.txt"), "from main\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "main changes a"]);
+    let _ = std::process::Command::new("git")
+        .args(["merge", "side"])
+        .current_dir(&repo)
+        .output();
+
+    let unmerged = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["ls-files", "-u", "--", "a.txt"])
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        unmerged.lines().count(),
+        3,
+        "fixture: a.txt must be unmerged with all three stages, got:\n{unmerged}"
+    );
+
+    // The conflict markers git wrote. Captured so the assertion at the end can
+    // prove the working tree never moved.
+    let worktree_before = std::fs::read(repo.join("a.txt")).unwrap();
+    let before = generation_token(&repo, &observe_live(&repo).await)
+        .await
+        .as_str()
+        .to_string();
+
+    // Rewrite ONLY stage 3 (theirs), to a blob no file on disk holds.
+    let replacement = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(&repo)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"a third side, never on disk\n")?;
+                c.wait_with_output()
+            })
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let mut child = std::process::Command::new("git")
+        .args(["update-index", "--index-info"])
+        .current_dir(&repo)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        write!(
+            child.stdin.as_mut().unwrap(),
+            "100644 {replacement} 3\ta.txt\n"
+        )
+        .unwrap();
+    }
+    assert!(child.wait().unwrap().success(), "update-index must succeed");
+
+    let after = generation_token(&repo, &observe_live(&repo).await)
+        .await
+        .as_str()
+        .to_string();
+
+    assert_eq!(
+        std::fs::read(repo.join("a.txt")).unwrap(),
+        worktree_before,
+        "fixture: the working tree must not have changed, or this proves nothing"
+    );
+    assert_ne!(
+        before, after,
+        "rewriting a conflict stage must move the generation — #432's staleness \
+         story depends on a stage move being visible to enforce_fresh"
+    );
+}
