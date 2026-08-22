@@ -766,9 +766,9 @@ async fn rewriting_one_conflict_stage_moves_the_generation() {
         .unwrap();
     {
         use std::io::Write;
-        write!(
+        writeln!(
             child.stdin.as_mut().unwrap(),
-            "100644 {replacement} 3\ta.txt\n"
+            "100644 {replacement} 3\ta.txt"
         )
         .unwrap();
     }
