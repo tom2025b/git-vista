@@ -431,10 +431,10 @@ mod tests {
         let (content, reported_truncated, binary) = decode_bounded(&bytes, truncated, 12);
         assert!(reported_truncated);
         assert!(!binary);
-        assert!(
-            content.ends_with('\n') || content.is_empty(),
-            "must cut at a line boundary, got {content:?}"
-        );
+        // Cut at the last full line *before* the cap — the cut point itself
+        // (not a trailing newline) is what `truncate_at_line` guarantees, so
+        // the tidied text never ends mid-line.
+        assert_eq!(content, "line\nline");
         assert!(content.len() <= 12);
     }
 
