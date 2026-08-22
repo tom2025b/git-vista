@@ -5,38 +5,44 @@ using an iPad to work with real repositories on Linux. The browser is the
 portable UI platform; Rust, Axum, `gix`, System Git, Leptos, and WebAssembly
 provide the native repository service and adaptive client.
 
-Its **V1 foundation is complete**: every write reaches the repository through
-one typed, reviewable planner, mutations against a repository serialize, Git
-process execution is policy-bounded, and an operation journal makes recovery
-provable rather than assumed. V1's daily-driver line — full working-tree
-status, diffs, staging, commit/amend/hook/signing UX, remotes, tags, and an
-installable PWA — is **in progress** on top of that foundation. The proposed
-V2 direction beyond it adds worktrees, stash, history editing, conflict
-resolution, forge integration, and teaching built on the same professional
-semantics. See [Status](#status) below for exactly what has shipped.
+**V1 is complete.** Its foundation — one typed, reviewable planner every write
+passes through, serialized per-repository mutations, policy-bounded Git process
+execution, and an operation journal that makes recovery provable rather than
+assumed — landed first. The daily-driver line on top of it (working-tree status,
+diffs, staging, commit/amend/hook/signing, remotes, tags, an installable PWA)
+followed and is now closed out.
 
-> **Current security boundary:** the server is hard-limited to
-> `127.0.0.1:8080` and requires a single-use bootstrap, HttpOnly session, CSRF,
-> and strict Host/Origin checks. Non-loopback bind overrides are refused; an SSH
-> local-port forward is the only supported iPad access path. Every mutation —
-> from the browser or from an MCP agent — is planned, serialized per repository,
-> and journaled before it runs; see [the security model](docs/SECURITY_MODEL.md)
-> and the ADR index below for how.
+**V2 is under way rather than proposed.** The stash drawer, the shared conflict
+model, and the first history-editing operations have shipped; worktrees, forge
+integration and the teaching layer have not. See [Status](#status) for what is
+actually in the code, and treat the ADR index as the tiebreaker over any prose
+in this file.
+
+> **Current security boundary:** the server binds `127.0.0.1:8080` and requires
+> a single-use bootstrap, HttpOnly session, CSRF, and strict Host/Origin checks.
+> An **opt-in** LAN listener exists behind `--lan` / `GIT_VISTA_LAN_IP` — off
+> unless explicitly asked for, and an arbitrary bind override is still refused.
+> Remote access is expected to arrive over a private network the operator
+> already trusts (an SSH forward, or a tailnet), not by widening the listener.
+> Every mutation — from the browser or from an MCP agent — is planned,
+> serialized per repository, and journaled before it runs; see
+> [the security model](docs/SECURITY_MODEL.md) and the ADR index below for how.
 
 ## Product Direction
 
 - Professional Git client first; teaching is a major layer, not the base product.
 - iPad, finger, and Apple Pencil as primary design inputs.
 - Local-first and single-user, with no required Git-Vista cloud account.
-- Git-Vista runs beside repositories on Linux; an SSH tunnel is the target remote
-  access path.
+- Git-Vista runs beside repositories on Linux. Remote access arrives over a
+  network the operator already trusts — an SSH forward, or a private tailnet —
+  never by exposing the listener.
 - One frontend for iPad, Linux, macOS, Windows, touchscreens, and large displays.
 - Standard Git remains authoritative and interoperable with terminal workflows.
 
 ## Documentation
 
 - [Architecture Decision Records](docs/adr/) — the numbered, dated record of
-  every decision expensive to reverse (49 so far, 0001–0049). This is where
+  every decision expensive to reverse (64 so far, 0001–0064). This is where
   implemented behavior is authoritative; start here before trusting a claim in
   a prose doc below against the running code.
 - [Future vision](docs/FUTURE_VISION.md) — proposed, not current.
@@ -329,25 +335,38 @@ typed operation vocabulary and shared planner, serialized per-repository
 mutations, a bounded and sandboxed Git process policy, and a durable
 operation journal with recovery refs have all landed and shipped.
 
-**M2 — Daily Driver: Status to Push [V1]** is the active milestone, roughly
-**62% done** (34 shipped / 21 open, per `./dev roadmap`). Fetch, pull, and
-push execution, tag listing and local tag create/delete, amend UX, published-
-history warnings, the build/submit planner split, and the MCP `plan_<operation>`
-tool surface all landed most recently. Remaining M2 work is full working-tree
-status and diff UI, file/hunk/partial staging, guarded discard, complete
-commit/hook/signing UX, full remote and upstream management, and an
-installable PWA with offline read-only mode — see `./dev roadmap` for the
-open issue list.
+**M2 — Daily Driver: Status to Push [V1]** is **complete** (0 open). Working-tree
+status and diff UI, file/hunk/partial staging, guarded discard, the full
+commit/hook/signing path, remote and upstream management, tags, and the
+installable PWA all landed. With M1 and M2 both closed, the V1 line is done.
 
-M3 (parallel work & recovery), M4 (history editing), M5 (investigation &
-forges), and M6 (teaching semantics, reduced to a single issue) are the
-proposed V2 milestones beyond the V1 line; M7 was retired and M8 deleted as
-never-started. [ADR 0049](docs/adr/0049-v1-scope-freeze.md) records that scope
-freeze — eighteen never-started issues closed as won't-do, each with an
-explicit return condition — and is the place to check before assuming
-anything described only in `FUTURE_VISION.md`, `V2_ARCHITECTURE.md`, or
-`GIT_CLIENT_ROADMAP.md` is still intended as written.
+**M3 — Parallel Work & Recovery** is in progress (1 shipped, 5 open). The stash
+drawer is complete: list, inspect, push, apply, pop, drop and branch-from-stash,
+each planned and journaled, with conflicts entering the shared resolution model
+rather than being discarded. Linked worktrees are the substantial piece still
+outstanding.
 
-49 ADRs (`docs/adr/`, numbered 0001–0049) now record the project's
-architectural decisions in order; treat that index, not this README's prose,
-as the living record of what has actually shipped.
+**M4 — History Editing** is in progress (2 shipped, 4 open). Force-with-lease
+carries advisories a reviewer sees before approving; a two-endpoint comparison
+now states *which* comparison it is (two-dot or three-dot) rather than leaving
+two different questions indistinguishable; and conflicts have a single model
+across merge, rebase, cherry-pick, revert, stash and pull, because git leaves an
+identical index state for all six. Cherry-pick and merge-revert are on a branch
+at the time of writing — reverting a merge commit was previously impossible, as
+git refuses without being told which parent is the mainline and there was
+nowhere to carry that answer.
+
+**M5 — Investigation & Forges** is part-shipped (3 shipped, 3 open). **M6**
+(teaching semantics) remains a single issue. M7 was retired and M8 deleted as
+never-started.
+
+[ADR 0049](docs/adr/0049-v1-scope-freeze.md) records the V1 scope freeze —
+eighteen never-started issues closed as won't-do, each with an explicit return
+condition — and is the place to check before assuming anything described only in
+`FUTURE_VISION.md`, `V2_ARCHITECTURE.md`, or `GIT_CLIENT_ROADMAP.md` is still
+intended as written.
+
+64 ADRs (`docs/adr/`, numbered 0001–0064) now record the project's architectural
+decisions in order. Treat that index, not this README's prose, as the living
+record of what has actually shipped — this file is periodically true, the ADRs
+are continuously true.

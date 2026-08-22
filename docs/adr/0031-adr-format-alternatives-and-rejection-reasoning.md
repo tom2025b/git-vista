@@ -33,8 +33,8 @@ flowchart LR
     B -->|"yes"| C["a later proposal<br/>that repeats it<br/>is caught"]
     B -->|"no"| D["it is re-litigated,<br/>or silently reversed"]
     D --> E["audit finds it<br/>days later"]
-    style C fill:#e6f3e6
-    style E fill:#ffe6e6
+    style C fill:#e6f3e6,color:#454845
+    style E fill:#ffe6e6,color:#4c4545
 ```
 
 ## Decision

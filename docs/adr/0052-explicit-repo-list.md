@@ -39,7 +39,7 @@ flowchart TD
     end
     C --> E["opaque WorktreeId only<br/>(ADR 0003, unchanged)"]
     E --> F[browser picks by id]
-    style E fill:#eafaea,stroke:#1e8449
+    style E fill:#eafaea,stroke:#1e8449,color:#124f2b
 ```
 
 Four decisions inside that, each of which could reasonably have gone another way:

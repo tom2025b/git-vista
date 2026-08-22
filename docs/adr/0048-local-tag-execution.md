@@ -127,6 +127,7 @@ flowchart TD
 ```
 
 ```mermaid
+%%{init: {'themeVariables': {'noteBkgColor':'#fff5ad','noteTextColor':'#1a1a1a','noteBorderColor':'#aaaa33'}}}%%
 stateDiagram-v2
     [*] --> Requested
     Requested --> Refused400: message present, blank
@@ -245,6 +246,7 @@ plan leaves no stray ref — and immediately before `execute`. The window is now
 construction rather than by being narrow.
 
 ```mermaid
+%%{init: {'themeVariables': {'noteBkgColor':'#fff5ad','noteTextColor':'#1a1a1a','noteBorderColor':'#aaaa33'}}}%%
 stateDiagram-v2
     [*] --> Building
     Building --> Waiting: plan built, generation observed

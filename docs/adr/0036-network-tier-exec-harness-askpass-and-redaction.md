@@ -137,8 +137,8 @@ flowchart LR
         A2 --> A3["exec_push, and every future<br/>Remote-declared caller,<br/>hardened by construction"]
     end
     before -.->|"adversarial review found the gap"| after
-    style B3 fill:#ffe6e6
-    style A3 fill:#e6f3e6
+    style B3 fill:#ffe6e6,color:#4c4545
+    style A3 fill:#e6f3e6,color:#454845
 ```
 
 Adversarial review of the same branch, before merge, found this gap plus two independent

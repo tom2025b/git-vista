@@ -46,14 +46,14 @@ flowchart LR
         M["exec_merge<br/>(real)"]
         R["exec_rebase<br/>(real)"]
         P["PullBranch arm<br/>501 'tracked by #230'"]
-        style P fill:#ffe6e6
+        style P fill:#ffe6e6,color:#4c4545
     end
     subgraph AFTER["after this ADR"]
         F2["planner::fetch::run_fetch"]
         M2["exec_merge"]
         R2["exec_rebase"]
         P2["planner::pull<br/>composes, spawns nothing"]
-        style P2 fill:#e6f3e6
+        style P2 fill:#e6f3e6,color:#454845
     end
     F2 --> P2
     M2 --> P2
@@ -134,8 +134,8 @@ flowchart TD
     E --> F["git_cmd::git_streamed_for<br/>(sandboxed, ADR 0036)"]
     B --> G["FetchSuccess / FetchError"]
     D --> H["PullSuccess / PullError"]
-    style E fill:#e6f3e6
-    style F fill:#e6f3e6
+    style E fill:#e6f3e6,color:#454845
+    style F fill:#e6f3e6,color:#454845
 ```
 
 The reuse is proved two ways rather than asserted. `contract_suite` pins at source level
@@ -170,8 +170,8 @@ flowchart TD
     D -->|"anything else"| F["400 PullError<br/>kind = other<br/>git-vista quotes serde verbatim"]
     C -->|ok| G["reject_if_read_only, then the planner"]
     C -->|error| F
-    style E fill:#fff3e0
-    style B fill:#e6f3e6
+    style E fill:#fff3e0,color:#4c4843
+    style B fill:#e6f3e6,color:#454845
 ```
 
 **"Did the client omit the strategy?" is answered structurally, not by matching serde's
@@ -332,9 +332,9 @@ flowchart TD
     H -->|yes| I["409 kind = conflict"]
     H -->|no| J["409 kind = other"]
     G --> K["409 kind = conflict_left_in_progress"]
-    style I fill:#fff3e0
-    style J fill:#fff3e0
-    style K fill:#ffe6e6
+    style I fill:#fff3e0,color:#4c4843
+    style J fill:#fff3e0,color:#4c4843
+    style K fill:#ffe6e6,color:#4c4545
 ```
 
 Four decisions are stacked here and each is separable.
@@ -402,11 +402,11 @@ has to *carry* the strategy, which a flag could not.
 flowchart LR
     subgraph WRONG["what a naive reuse records"]
         A1["Fetch: origin/main"] --> A2["Merge: origin/main into main"]
-        style A2 fill:#ffe6e6
+        style A2 fill:#ffe6e6,color:#4c4545
     end
     subgraph RIGHT["what this records"]
         B1["Fetch: origin/main"] --> B2["Pull: origin/main into main (merge strategy)"]
-        style B2 fill:#e6f3e6
+        style B2 fill:#e6f3e6,color:#454845
     end
 ```
 
