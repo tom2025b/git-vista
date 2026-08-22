@@ -272,7 +272,7 @@ DENIED-CONTROL  ~/.claude/CLAUDE.md       DENIED
 GRANTED-CONTROL ~/.gitconfig (symlink)    OK
 no local identity (correct)
 commit_exit=0
-author=tomb <thomaslane2025@gmail.com>
+author=tomb <<personal-email-redacted>>
 secret via git: denied (correct)
 ~~~
 
