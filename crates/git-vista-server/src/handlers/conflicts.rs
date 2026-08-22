@@ -522,11 +522,15 @@ mod tests {
         assert!(truncated);
         assert_eq!(bytes.len(), 12, "must read at most cap bytes, never more");
 
+        // Well under the real (2 MiB) production cap, so the full-stack seam
+        // reports it untruncated — this asserts `worktree_file_for_repo`
+        // actually reaches `read_bounded_worktree_file` rather than some
+        // other reader, not that this particular fixture crosses the cap.
         let content = worktree_file_for_repo(&repo, "big.txt".to_string())
             .await
             .unwrap();
-        assert!(content.truncated);
-        assert!(content.content.len() <= 12);
+        assert!(!content.truncated);
+        assert_eq!(content.content, big);
     }
 
     // ---- decode_bounded ---------------------------------------------------
