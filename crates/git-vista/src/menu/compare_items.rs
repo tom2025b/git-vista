@@ -34,7 +34,6 @@ fn short(oid: &str) -> &str {
 /// two compare items render empty when no anchor is set, or when the anchor IS
 /// this commit — comparing a commit with itself is an empty diff and offering
 /// it would be a dead end dressed as an action.
-
 pub(super) fn build_compare_items(
     features: Features,
     ic: &'static GitIcons,
@@ -79,6 +78,10 @@ pub(super) fn build_compare_items(
     // Items 2 and 3: only once a DIFFERENT commit is anchored.
     let (direct, since) = match offer {
         CompareOffer::Compare { base: a, .. } => {
+            // Read the short form BEFORE `mk` moves `a` into itself. Borrowing
+            // it afterwards does not compile (#436), and the label is a plain
+            // string the closure never needs.
+            let a_short = short(&a).to_string();
             let mk = move |basis: ComparisonBasis, label: String| {
                 let a = a.clone();
                 let this = this.clone();
@@ -108,7 +111,6 @@ pub(super) fn build_compare_items(
                 }
                 .into_view()
             };
-            let a_short = short(&a).to_string();
             (
                 mk(ComparisonBasis::Direct, format!("Compare with ‘{a_short}’")),
                 // The merge-base question, reachable from the UI for the first

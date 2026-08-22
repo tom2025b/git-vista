@@ -76,3 +76,4 @@ it, and note the link in both.
 | [0062](0062-a-comparison-states-which-question-it-asks.md) | A two-endpoint `DiffSpec` carries an explicit `basis` (two-dot vs three-dot); reversal preserves it, and only a `Direct` reversal is an inverse | Accepted — implemented |
 | [0063](0063-one-conflict-model-for-six-operations.md) | One conflict vocabulary for all six operations; each side is Present, Absent or Unreadable, and none may collapse | Accepted — implemented |
 | [0064](0064-resolving-a-conflict-is-a-planned-operation.md) | Resolving a conflict is a `GitOperation`; no precondition can express "still conflicted", so the executor re-reads and refuses | Accepted — implemented |
+| [0065](0065-the-gate-must-be-able-to-say-no.md) | `set +e` for recording left errexit off inside `gate_body`, so the gate could not fail for three days; errexit is re-armed and a test drives the real script to prove it | Accepted — implemented |
