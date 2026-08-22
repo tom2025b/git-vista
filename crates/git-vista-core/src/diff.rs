@@ -83,6 +83,28 @@ pub struct FileContent {
     pub binary: bool,
 }
 
+/// One blob's content, read by object id rather than by `<commit>:<path>` —
+/// the payload of `GET /api/blob/{oid}` (M4.31a, #428). A conflict stage's
+/// `Stage::Present` (`git_vista_protocol::conflict`) carries an `oid` with no
+/// path and no owning commit (it is an index entry, not a tree entry at some
+/// revision), so [`FileContent`]'s `id`/`path` pair — meant for "this file, at
+/// this commit" — does not fit; this is "this exact object, whatever names
+/// it."
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobContent {
+    /// The requested object id, echoed back so the viewer can ignore a stale
+    /// response after the user switches panes.
+    pub oid: String,
+    /// The blob's text. Empty when `binary` is set.
+    pub content: String,
+    /// True when the content was cut at the server's size cap — same meaning
+    /// as [`FileContent::truncated`].
+    pub truncated: bool,
+    /// True when the blob isn't text (NUL bytes near the start) — same
+    /// meaning as [`FileContent::binary`].
+    pub binary: bool,
+}
+
 /// Map a `--name-status` letter to the UI's [`ChangeKind`]. Same folding as
 /// the status parser: `T` (type change) reads as modified, `C` (copy) as a
 /// rename. Unknown letters read as modified rather than dropping the file.
