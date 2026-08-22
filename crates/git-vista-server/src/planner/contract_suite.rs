@@ -6275,7 +6275,7 @@ fn conflicted_revert(repo: &std::path::Path) -> String {
 }
 
 #[tokio::test]
-async fn a_sequence_resumes_after_a_reconnect_and_keeps_its_own_verb() {
+async fn a_sequence_resumes_after_a_reconnect() {
     // #81's acceptance criterion "sequences resume after reconnect", and the
     // only one of the five with no test before this.
     //
@@ -6286,15 +6286,18 @@ async fn a_sequence_resumes_after_a_reconnect_and_keeps_its_own_verb() {
     // sequence below is started by raw git and resumed by a planner run that
     // never saw it begin.
     //
-    // The verb is what makes this worth testing. `SequenceContinue` maps to
-    // `git cherry-pick --continue` OR `git revert --continue`, and the choice
-    // comes from `sequence_in_progress` reading git's own on-disk markers. A
-    // reconnecting client cannot have been told which one it is.
+    // MUTATION-PROVEN, two ways, 2026-08-22 — and the two disagreed:
     //
-    // MUTATION: have the continue path assume "cherry-pick" instead of reading
-    // the marker. Every assertion below still passes EXCEPT the last one —
-    // `git cherry-pick --continue` against a revert opens an editor/commits the
-    // wrong message, so the "Revert" subject is what actually pins the verb.
+    //   1. Report a revert as a cherry-pick
+    //      (`("REVERT_HEAD", "revert")` -> `("REVERT_HEAD", "cherry-pick")`)
+    //      -> SURVIVED. See the note on the subject assertion below.
+    //   2. Drop REVERT_HEAD from the marker table entirely
+    //      -> CAUGHT: 409 "no cherry-pick or revert in progress".
+    //
+    // So what this test actually pins is (2): a sequence started by one
+    // connection must still be FOUND by a later one that shares no state with
+    // it. That is the acceptance criterion. It does not — and provably cannot,
+    // by this route — pin which verb drives the continue.
     let (_dir, repo) = seeded_repo();
     conflicted_revert(&repo);
 
@@ -6324,13 +6327,17 @@ async fn a_sequence_resumes_after_a_reconnect_and_keeps_its_own_verb() {
         "the resolution made after the reconnect is what must be committed"
     );
 
-    // The verb assertion. Only `git revert --continue` writes a "Revert ..."
-    // subject; a cherry-pick would carry the original commit's subject over.
+    // Records the commit shape, but is NOT a test of the verb, and must not be
+    // read as one. Mutation 1 above swapped the verb and this still passed:
+    // git keeps ONE sequencer per repository, `--continue` drives whichever
+    // sequence is open regardless of the verb spelled at the command line, and
+    // the "Revert" subject was already fixed by the original `git revert`.
+    // Left in as a regression guard on the commit message, with its own limits
+    // stated so no later reader mistakes it for verb coverage.
     let subject = out(&repo, &["log", "-1", "--pretty=%s"]);
     assert!(
         subject.starts_with("Revert"),
-        "the resumed sequence must run the REVERT verb it read from the \
-         repository, not a cherry-pick: got subject {subject:?}"
+        "the resumed revert must still produce a Revert commit: got {subject:?}"
     );
 }
 
