@@ -28,11 +28,11 @@ use crate::api::{
 // different numbers is how a window and its scrollbar drift apart.
 use crate::detail::{accessible_rows_window, file_change_marker, DIFF_LINE_PX, DIFF_OVERSCAN};
 use crate::features::a11y::focus::GraphFocus;
+use crate::features::conflicts::core::{ConflictPanes, Pane, PaneState};
 use crate::features::diff::core::{render_window, LineWrap};
 use crate::features::diff::rows::{flatten, row_heights};
 use crate::features::diff::selection::DiffSelection;
 use crate::features::diff::staging_view::staging_body;
-use crate::features::conflicts::core::{ConflictPanes, Pane, PaneState};
 use crate::features::graph::core::RenderCtx;
 use crate::icons::icon_set;
 use crate::state::{Features, Settings, ViewerDoc};
@@ -266,6 +266,17 @@ pub fn viewer_view(
                         return view! { <p class="detail-status">"Loading…"</p> }.into_view();
                     }
                     spec_body(&d, hunk_focus)
+                }
+                Some(DocResult::Conflict(Ok(panes))) => {
+                    // Same staleness echo as every other arm: a response for a
+                    // path that is no longer open is a late answer to a
+                    // superseded request, and is dropped rather than painted.
+                    if !matches!(&which_for_body, ViewerDoc::Conflict { path }
+                                 if *path == panes.path)
+                    {
+                        return view! { <p class="detail-status">"Loading…"</p> }.into_view();
+                    }
+                    conflict_body(&panes)
                 }
                 Some(DocResult::Staging(Ok(d))) => {
                     let ViewerDoc::Staging { direction } = which_for_body else {
@@ -586,6 +597,70 @@ fn file_body(f: &FileContent) -> View {
         </div>
         {truncated_note}
         <pre class="detail-diff viewer-pre">{f.content.clone()}</pre>
+    }
+    .into_view()
+}
+
+/// One conflict pane: its heading, and whatever its [`PaneState`] permits.
+///
+/// **Every non-text state renders as its own explicit note, never as an empty
+/// `<pre>`.** That is #428's second and third acceptance criteria made real —
+/// an empty text box asserts "this version was blank", which is a claim about
+/// the repository, and only [`PaneState::Text`] is entitled to make it.
+/// [`PaneState::describe`] owns the wording, so this function cannot drift
+/// from the host-tested core's account of what each state means.
+fn conflict_pane(pane: Pane, state: &PaneState) -> View {
+    let body = match state {
+        PaneState::Text { content, truncated } => {
+            let truncated_note = truncated.then(|| {
+                view! {
+                    <p class="detail-status">
+                        "Content truncated — this side is larger than the viewer's cap."
+                    </p>
+                }
+            });
+            view! {
+                {truncated_note}
+                <pre class="detail-diff viewer-pre">{content.clone()}</pre>
+            }
+            .into_view()
+        }
+        // Absent, Unreadable, Binary, AwaitingContent and ContentUnavailable
+        // all land here — each one says what it is, in the core's own words.
+        // `detail-error` marks the two that are faults rather than facts.
+        other => {
+            let class = match other {
+                PaneState::Unreadable { .. } | PaneState::ContentUnavailable { .. } => {
+                    "detail-status detail-error"
+                }
+                _ => "detail-status",
+            };
+            let text = other.describe();
+            view! { <p class=class>{text}</p> }.into_view()
+        }
+    };
+    view! {
+        <section class="conflict-pane">
+            <h3 class="conflict-pane-head">{pane.label()}</h3>
+            {body}
+        </section>
+    }
+    .into_view()
+}
+
+/// The four-pane conflict view (M4.31a, #428).
+///
+/// Iterates [`Pane::ALL`] rather than naming four fields, so a pane cannot be
+/// silently omitted — #428's first acceptance criterion is that all four are
+/// reachable, and a hand-written list of three would satisfy every type check.
+fn conflict_body(panes: &ConflictPanes) -> View {
+    let rendered: Vec<View> = Pane::ALL
+        .iter()
+        .map(|p| conflict_pane(*p, panes.pane(*p)))
+        .collect();
+    view! {
+        <div class="viewer-doc-head">{panes.path.clone()}</div>
+        <div class="conflict-panes">{rendered}</div>
     }
     .into_view()
 }
