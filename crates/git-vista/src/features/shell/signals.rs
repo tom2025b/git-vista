@@ -584,7 +584,16 @@ impl Shell {
             Overlay::Confirm => self.confirm_op.set(None),
             Overlay::Error => self.error_notice.set(None),
             Overlay::Detail => self.detail_id.set(None),
-            Overlay::Viewer => self.viewer_doc.set(None),
+            Overlay::Viewer => {
+                // M4.27 (#80): the viewer is gone, so there is nothing to come
+                // back to. Cleared HERE rather than in `close_viewer` because
+                // this is the one funnel every close path reaches — Esc goes
+                // through `dismiss_top`, which never calls `close_viewer` and
+                // would otherwise leave a stored comparison that reopens itself
+                // on the next load.
+                crate::prefs::clear_comparison();
+                self.viewer_doc.set(None)
+            }
             Overlay::Activity => self.activity.close(),
         }
     }
