@@ -6254,6 +6254,86 @@ async fn skipping_drops_one_commit_and_keeps_going() {
     );
 }
 
+/// A repository mid-revert, stopped on a conflict in `a.txt`.
+///
+/// The revert twin of [`conflicted_pick`]. Both markers cannot be produced at
+/// once by git, so this is the only way to get a sequence whose verb is
+/// `revert` rather than `cherry-pick`.
+fn conflicted_revert(repo: &std::path::Path) -> String {
+    std::fs::write(repo.join("a.txt"), "first\n").unwrap();
+    run(repo, &["commit", "-q", "-am", "first change to a"]);
+    let target = out(repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("a.txt"), "second\n").unwrap();
+    run(repo, &["commit", "-q", "-am", "second change to a"]);
+    // Reverting the first change conflicts with the second. Expected to fail —
+    // that is the point.
+    let _ = std::process::Command::new("git")
+        .args(["revert", "--no-edit", &target])
+        .current_dir(repo)
+        .status();
+    target
+}
+
+#[tokio::test]
+async fn a_sequence_resumes_after_a_reconnect_and_keeps_its_own_verb() {
+    // #81's acceptance criterion "sequences resume after reconnect", and the
+    // only one of the five with no test before this.
+    //
+    // A reconnect means the client that continues a sequence shares NOTHING
+    // with the one that started it — no cached plan, no remembered verb, no
+    // in-memory sequencer state. `pipeline` builds a fresh plan against the
+    // live repository on every call, so calling it here is exactly that: the
+    // sequence below is started by raw git and resumed by a planner run that
+    // never saw it begin.
+    //
+    // The verb is what makes this worth testing. `SequenceContinue` maps to
+    // `git cherry-pick --continue` OR `git revert --continue`, and the choice
+    // comes from `sequence_in_progress` reading git's own on-disk markers. A
+    // reconnecting client cannot have been told which one it is.
+    //
+    // MUTATION: have the continue path assume "cherry-pick" instead of reading
+    // the marker. Every assertion below still passes EXCEPT the last one —
+    // `git cherry-pick --continue` against a revert opens an editor/commits the
+    // wrong message, so the "Revert" subject is what actually pins the verb.
+    let (_dir, repo) = seeded_repo();
+    conflicted_revert(&repo);
+
+    assert!(
+        repo.join(".git/REVERT_HEAD").exists(),
+        "fixture: a revert must be in progress"
+    );
+    assert!(
+        !repo.join(".git/CHERRY_PICK_HEAD").exists(),
+        "fixture: and it must not look like a cherry-pick"
+    );
+
+    // Resolve by hand, exactly as a user would after reconnecting.
+    std::fs::write(repo.join("a.txt"), "resolved after reconnect\n").unwrap();
+    run(&repo, &["add", "a.txt"]);
+
+    let (status, body) = pipeline(&repo, GitOperation::SequenceContinue).await;
+    assert_ok(status, &body);
+
+    assert!(
+        !repo.join(".git/REVERT_HEAD").exists(),
+        "a completed sequence must leave no marker behind"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "resolved after reconnect\n",
+        "the resolution made after the reconnect is what must be committed"
+    );
+
+    // The verb assertion. Only `git revert --continue` writes a "Revert ..."
+    // subject; a cherry-pick would carry the original commit's subject over.
+    let subject = out(&repo, &["log", "-1", "--pretty=%s"]);
+    assert!(
+        subject.starts_with("Revert"),
+        "the resumed sequence must run the REVERT verb it read from the \
+         repository, not a cherry-pick: got subject {subject:?}"
+    );
+}
+
 #[tokio::test]
 async fn aborting_with_no_sequence_in_progress_is_refused() {
     // THE reason this refusal exists. `git cherry-pick --abort` on a clean
