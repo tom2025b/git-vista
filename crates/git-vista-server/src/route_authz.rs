@@ -142,6 +142,20 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
     // full_routes-only, with the staging reads: two of its four modes show
     // uncommitted worktree and index content (ADR 0005).
     ("/api/diff/spec", Method::POST, Authz::SessionAndCsrf),
+    // M4.31a (#428): inspect a conflict. Every GET, `SessionRequired` (no
+    // CSRF surface — these are reads), full_routes-only — recorded on the
+    // issue itself before this landed. `/api/conflicts` reports uncommitted
+    // index state; `/api/blob/{oid}` reads conflict stage blobs, which are
+    // index objects with no guarantee of being reachable from any commit
+    // (unlike `/api/file/{id}/{*path}`'s committed content); the worktree
+    // read is uncommitted by definition. See `main.rs`'s matching comment.
+    ("/api/conflicts", Method::GET, Authz::SessionRequired),
+    ("/api/blob/{oid}", Method::GET, Authz::SessionRequired),
+    (
+        "/api/worktree-file/{*path}",
+        Method::GET,
+        Authz::SessionRequired,
+    ),
     ("/api/unstage", Method::POST, Authz::SessionAndCsrf),
     ("/api/undo", Method::POST, Authz::SessionAndCsrf),
     ("/api/merge", Method::POST, Authz::SessionAndCsrf),
@@ -260,7 +274,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 61;
+const EXPECTED_ROUTE_COUNT: usize = 64;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in
