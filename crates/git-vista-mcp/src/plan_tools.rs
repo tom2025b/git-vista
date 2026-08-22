@@ -140,6 +140,52 @@ pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
         GitOperation::RestoreBranch { .. } => Tool("plan_restore_branch"),
         GitOperation::ResetBranch { .. } => Tool("plan_reset_branch"),
         GitOperation::RevertCommit { .. } => Tool("plan_revert_commit"),
+        // Unexposed for now, and for a DIFFERENT reason than the stash verbs
+        // and conflict resolution. Those are excluded on principle: the agent
+        // cannot see what it would be choosing — a positional selector that
+        // renumbers, or three versions of a file. A merge revert has neither
+        // problem; the commit is named by oid and the mainline is a small
+        // integer the tool description could explain.
+        //
+        // So this one is excluded only because the tool is not BUILT yet, not
+        // because it should not be. Recorded that way so a later session
+        // adding it knows the exposure argument is already made and does not
+        // have to re-litigate it. Caught by the catalog census, which refused
+        // to accept a Tool() naming something that does not exist.
+        // Same position as RevertMerge: exposure is defensible (a commit named
+        // by oid, plus a small integer) and simply not built yet. Recorded as
+        // pending rather than refused.
+        // The sequence controls are the one place in this family where an
+        // agent has genuinely LESS information than a human. Continue means
+        // "the conflicts are resolved correctly", which is a judgement about
+        // file content nobody can make from a tool description — the same
+        // reason conflict resolution itself is excluded. Abort discards
+        // hand-made resolutions outright.
+        GitOperation::SequenceContinue => Excluded(
+            "continue asserts the conflicts were resolved correctly, which is a \
+             judgement about file content an agent has not seen",
+        ),
+        GitOperation::SequenceSkip => Excluded(
+            "skip drops a commit from the sequence; deciding that requires knowing why \
+             it conflicted, which is the same unseen judgement",
+        ),
+        GitOperation::SequenceAbort => Excluded(
+            "abort discards every conflict resolution made during the sequence — \
+             hand-made decisions that exist nowhere else",
+        ),
+        GitOperation::CherryPick { .. } => Excluded(
+            "the plan_cherry_pick tool is not built yet; exposure is defensible and \
+             pending, not refused",
+        ),
+        GitOperation::CherryPickMerge { .. } => Excluded(
+            "the plan_cherry_pick_merge tool is not built yet; exposure is defensible \
+             and pending, not refused",
+        ),
+        GitOperation::RevertMerge { .. } => Excluded(
+            "the plan_revert_merge tool is not built yet; exposure is defensible \
+             (oid plus a small integer, nothing an agent cannot see) and is simply \
+             pending, not refused",
+        ),
         GitOperation::DiscardTrackedPaths { .. } => Tool("plan_discard_tracked_paths"),
         GitOperation::DeleteUntrackedPaths { .. } => Tool("plan_delete_untracked_paths"),
         GitOperation::AmendCommit { .. } => Tool("plan_amend_commit"),
@@ -1153,6 +1199,12 @@ mod tests {
         "resolve_conflict",
         "stage_selection",
         "branch_from_stash",
+        "cherry_pick",
+        "sequence_abort",
+        "sequence_continue",
+        "sequence_skip",
+        "cherry_pick_merge",
+        "revert_merge",
         "pop_stash",
         "push_stash",
         "apply_stash",
@@ -1340,6 +1392,20 @@ mod tests {
                 branch: branch("b"),
                 to: oid(&zeros),
                 expected_tip: oid(&zeros),
+            },
+            GitOperation::RevertMerge {
+                commit: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+                mainline: std::num::NonZeroU8::new(1).unwrap(),
+            },
+            GitOperation::CherryPick {
+                commit: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+            },
+            GitOperation::SequenceContinue,
+            GitOperation::SequenceSkip,
+            GitOperation::SequenceAbort,
+            GitOperation::CherryPickMerge {
+                commit: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
+                mainline: std::num::NonZeroU8::new(1).unwrap(),
             },
             GitOperation::RevertCommit {
                 commit: oid(&zeros),

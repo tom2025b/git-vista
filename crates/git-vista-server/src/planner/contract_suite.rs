@@ -231,6 +231,12 @@ fn covered_by(op: &GitOperation) -> &'static str {
         GitOperation::RestoreBranch { .. } => "restore_branch_executes_through_the_pipeline",
         GitOperation::ResetBranch { .. } => "reset_branch_executes_through_the_pipeline",
         GitOperation::RevertCommit { .. } => "revert_commit_executes_through_the_pipeline",
+        GitOperation::RevertMerge { .. } => "reverting_a_merge_needs_a_mainline_and_says_why",
+        GitOperation::CherryPick { .. } => "a_cherry_pick_lands_a_commit_from_another_branch",
+        GitOperation::SequenceContinue => "a_resolved_conflict_lets_the_sequence_continue",
+        GitOperation::SequenceSkip => "skipping_drops_one_commit_and_keeps_going",
+        GitOperation::SequenceAbort => "aborting_with_no_sequence_in_progress_is_refused",
+        GitOperation::CherryPickMerge { .. } => "cherry_picking_a_merge_needs_a_mainline",
         GitOperation::ResetTestRepo => "reset_test_repo_executes_through_the_pipeline",
         GitOperation::StageSelection { .. } => "stage_selection_executes_through_the_pipeline",
         GitOperation::DiscardTrackedPaths { .. } => {
@@ -284,6 +290,12 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
         | GitOperation::RestoreBranch { .. }
         | GitOperation::ResetBranch { .. }
         | GitOperation::RevertCommit { .. }
+        | GitOperation::RevertMerge { .. }
+        | GitOperation::CherryPick { .. }
+        | GitOperation::CherryPickMerge { .. }
+        | GitOperation::SequenceContinue
+        | GitOperation::SequenceSkip
+        | GitOperation::SequenceAbort
         | GitOperation::ResetTestRepo
         | GitOperation::StageSelection { .. }
         | GitOperation::DiscardTrackedPaths { .. }
@@ -5895,5 +5907,484 @@ async fn branch_from_stash_refuses_a_name_that_already_exists() {
         "the plan must carry the RefAbsent precondition, so the name clash is \
          visible before approval rather than only on execution: {:?}",
         plan.preconditions
+    );
+}
+
+/// A repository whose HEAD is a real merge commit with two parents.
+fn merged_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (dir, repo) = seeded_repo();
+    run(&repo, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(repo.join("side.txt"), "side\n").unwrap();
+    run(&repo, &["add", "side.txt"]);
+    run(&repo, &["commit", "-q", "-m", "side work"]);
+    run(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("main.txt"), "main\n").unwrap();
+    run(&repo, &["add", "main.txt"]);
+    run(&repo, &["commit", "-q", "-m", "main work"]);
+    run(&repo, &["merge", "--no-ff", "-m", "merge side", "side"]);
+    (dir, repo)
+}
+
+#[tokio::test]
+async fn reverting_a_merge_needs_a_mainline_and_says_why() {
+    // M4.28 (#81). This is the defect that existed before RevertMerge: git
+    // refuses `git revert <merge>` outright, and RevertCommit had nowhere to
+    // carry the answer, so the attempt surfaced as a raw git error naming a
+    // FLAG rather than the decision behind it.
+    //
+    // MUTATION: drop the parent-count check and let git refuse. The revert
+    // still fails, but the user is told "no -m option was given" — which is
+    // accurate and nearly useless to anyone who has not reverted a merge
+    // before.
+    let (_dir, repo) = merged_repo();
+    let head = out(&repo, &["rev-parse", "HEAD"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::RevertCommit {
+            commit: git_vista_protocol::CommitOid::new(head).unwrap(),
+        },
+    )
+    .await;
+
+    assert_ne!(status, axum::http::StatusCode::OK, "body: {body}");
+    assert!(
+        body.contains("which side of the merge"),
+        "the refusal must name the DECISION, not a flag: {body}"
+    );
+    assert!(
+        body.contains("parent 1"),
+        "and it must say what the usual answer is: {body}"
+    );
+}
+
+#[tokio::test]
+async fn reverting_a_merge_with_a_mainline_succeeds() {
+    // The capability that did not exist at all before this change.
+    let (_dir, repo) = merged_repo();
+    let head = out(&repo, &["rev-parse", "HEAD"]);
+    let before = out(&repo, &["rev-parse", "HEAD"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::RevertMerge {
+            commit: git_vista_protocol::CommitOid::new(head).unwrap(),
+            mainline: std::num::NonZeroU8::new(1).unwrap(),
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    assert_ne!(
+        out(&repo, &["rev-parse", "HEAD"]),
+        before,
+        "a revert adds a commit, so HEAD must have moved"
+    );
+    // Reverting the merge with mainline 1 undoes what the OTHER side brought.
+    assert!(
+        !repo.join("side.txt").exists(),
+        "the side branch's file must be gone — that is what reverting the merge means"
+    );
+    assert!(
+        repo.join("main.txt").exists(),
+        "the mainline's own work must survive"
+    );
+}
+
+#[tokio::test]
+async fn a_mainline_on_an_ordinary_commit_is_refused() {
+    // The other half of making the invalid state unrepresentable: the type
+    // stops "merge without a choice", and this stops "choice without a merge".
+    //
+    // MUTATION: drop this arm and pass -m through. Git errors with "mainline
+    // was specified but commit is not a merge", which is again a fact about
+    // flags rather than about what the user asked for.
+    let (_dir, repo) = seeded_repo();
+    let head = out(&repo, &["rev-parse", "HEAD"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::RevertMerge {
+            commit: git_vista_protocol::CommitOid::new(head).unwrap(),
+            mainline: std::num::NonZeroU8::new(1).unwrap(),
+        },
+    )
+    .await;
+
+    assert_ne!(status, axum::http::StatusCode::OK, "body: {body}");
+    assert!(
+        body.contains("not a merge commit"),
+        "the refusal must say the commit is not a merge: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_parent_that_does_not_exist_is_refused() {
+    // A merge has two parents; asking for the third is a request that cannot
+    // be satisfied, and saying so beats letting git say "commit ... does not
+    // have parent 3".
+    let (_dir, repo) = merged_repo();
+    let head = out(&repo, &["rev-parse", "HEAD"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::RevertMerge {
+            commit: git_vista_protocol::CommitOid::new(head).unwrap(),
+            mainline: std::num::NonZeroU8::new(3).unwrap(),
+        },
+    )
+    .await;
+
+    assert_ne!(status, axum::http::StatusCode::OK, "body: {body}");
+    assert!(
+        body.contains("does not exist"),
+        "the refusal must say the parent does not exist: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_cherry_pick_lands_a_commit_from_another_branch() {
+    let (_dir, repo) = seeded_repo();
+    run(&repo, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(repo.join("picked.txt"), "from side\n").unwrap();
+    run(&repo, &["add", "picked.txt"]);
+    run(&repo, &["commit", "-q", "-m", "side work"]);
+    let wanted = out(&repo, &["rev-parse", "HEAD"]);
+    run(&repo, &["checkout", "-q", "main"]);
+
+    // Main must have moved on, or the cherry-pick reproduces a BYTE-IDENTICAL
+    // commit — same tree, same parent, same author, same message, same
+    // timestamp, therefore the same oid. Correct git behaviour, and it makes
+    // "a new commit was created" unobservable. Discovered by asserting the
+    // opposite and being wrong.
+    std::fs::write(repo.join("unrelated.txt"), "main moved on\n").unwrap();
+    run(&repo, &["add", "unrelated.txt"]);
+    run(&repo, &["commit", "-q", "-m", "main moves on"]);
+
+    assert!(!repo.join("picked.txt").exists(), "fixture: not here yet");
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::CherryPick {
+            commit: git_vista_protocol::CommitOid::new(wanted.clone()).unwrap(),
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    assert!(
+        repo.join("picked.txt").exists(),
+        "the picked commit's file must be present on main"
+    );
+    assert_ne!(
+        out(&repo, &["rev-parse", "HEAD"]),
+        wanted,
+        "a cherry-pick creates a NEW commit; it does not move the branch to the old one"
+    );
+}
+
+#[tokio::test]
+async fn a_conflicting_cherry_pick_pauses_instead_of_aborting() {
+    // The difference #81 depends on #84 for. The revert path next door
+    // `--abort`s on conflict, which was correct when there was nowhere to send
+    // a conflict. There is now — so the cherry-pick is left IN PROGRESS with
+    // the paths named, because aborting would throw away work the user can
+    // finish.
+    //
+    // MUTATION: `--abort` on failure, as revert does. The sequencer state
+    // disappears and the user is told it failed, with the resolution they
+    // could have completed silently discarded.
+    let (_dir, repo) = seeded_repo();
+    run(&repo, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(repo.join("a.txt"), "from side\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "side changes a"]);
+    let wanted = out(&repo, &["rev-parse", "HEAD"]);
+    run(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("a.txt"), "from main\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "main changes a"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::CherryPick {
+            commit: git_vista_protocol::CommitOid::new(wanted).unwrap(),
+        },
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "body: {body}");
+    assert!(
+        body.contains("NOT complete"),
+        "the response must say plainly it did not finish: {body}"
+    );
+    assert!(
+        body.contains("a.txt"),
+        "the conflicted path must be named: {body}"
+    );
+    // The promise must be true: the cherry-pick is still in progress.
+    assert!(
+        repo.join(".git/CHERRY_PICK_HEAD").exists(),
+        "the sequencer state must survive — this is what makes it a pause"
+    );
+}
+
+#[tokio::test]
+async fn cherry_picking_a_merge_needs_a_mainline() {
+    // Same refusal as revert, one verb over — and it must read naturally for
+    // THIS verb, which is why the shared helper takes the word.
+    let (_dir, repo) = merged_repo();
+    let head = out(&repo, &["rev-parse", "HEAD"]);
+    run(&repo, &["checkout", "-q", "-b", "elsewhere", "HEAD~1"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::CherryPick {
+            commit: git_vista_protocol::CommitOid::new(head.clone()).unwrap(),
+        },
+    )
+    .await;
+
+    assert_ne!(status, axum::http::StatusCode::OK, "body: {body}");
+    assert!(
+        body.contains("cherry-picking it needs one more answer"),
+        "the refusal must use THIS verb, not revert's wording: {body}"
+    );
+    assert!(
+        body.contains("which side of the merge"),
+        "and must name the decision: {body}"
+    );
+}
+
+/// A repository mid-cherry-pick, stopped on a conflict in `a.txt`.
+fn conflicted_pick(repo: &std::path::Path) -> String {
+    run(repo, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(repo.join("a.txt"), "from side\n").unwrap();
+    run(repo, &["commit", "-q", "-am", "side changes a"]);
+    let wanted = out(repo, &["rev-parse", "HEAD"]);
+    run(repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("a.txt"), "from main\n").unwrap();
+    run(repo, &["commit", "-q", "-am", "main changes a"]);
+    // Expected to fail — that is the point.
+    let _ = std::process::Command::new("git")
+        .args(["cherry-pick", &wanted])
+        .current_dir(repo)
+        .status();
+    wanted
+}
+
+#[tokio::test]
+async fn a_resolved_conflict_lets_the_sequence_continue() {
+    // The whole loop #81 depends on #84 for: a cherry-pick conflicts, the user
+    // resolves, and the sequence carries on. Before the conflict model existed
+    // there was nowhere to send the conflict, so this path did not exist.
+    let (_dir, repo) = seeded_repo();
+    conflicted_pick(&repo);
+    assert!(
+        repo.join(".git/CHERRY_PICK_HEAD").exists(),
+        "fixture: a cherry-pick must be in progress"
+    );
+
+    // Resolve by hand, exactly as a user would.
+    std::fs::write(repo.join("a.txt"), "resolved by hand\n").unwrap();
+    run(&repo, &["add", "a.txt"]);
+
+    let (status, body) = pipeline(&repo, GitOperation::SequenceContinue).await;
+    assert_ok(status, &body);
+
+    assert!(
+        !repo.join(".git/CHERRY_PICK_HEAD").exists(),
+        "a completed sequence must leave no marker behind"
+    );
+    assert!(
+        body.contains("complete"),
+        "and the response must say the sequence finished: {body}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "resolved by hand\n",
+        "the user's resolution is what must be committed"
+    );
+}
+
+#[tokio::test]
+async fn continuing_while_still_conflicted_is_refused() {
+    // MUTATION: skip the conflict re-read and report whatever git's exit code
+    // said. `git cherry-pick --continue` on an unresolved tree fails, but the
+    // user would be told only that a command failed — not WHICH file is still
+    // in the way, and not that the sequence is still open.
+    let (_dir, repo) = seeded_repo();
+    conflicted_pick(&repo);
+
+    // Deliberately do NOT resolve.
+    let (status, body) = pipeline(&repo, GitOperation::SequenceContinue).await;
+
+    assert_ne!(status, axum::http::StatusCode::OK, "body: {body}");
+    assert!(
+        repo.join(".git/CHERRY_PICK_HEAD").exists(),
+        "a refused continue must leave the sequence exactly as it was"
+    );
+
+    // The two assertions above hold WITHOUT the conflict re-read, because git's
+    // own exit code already refuses. That makes them tests of git, not of us.
+    // What the re-read actually buys is naming the file still in the way, so
+    // that is what is asserted. Found by mutation: removing the re-read left
+    // everything above green.
+    assert!(
+        body.contains("a.txt"),
+        "the response must name the path still blocking the sequence, not just \
+         report that a command failed: {body}"
+    );
+}
+
+#[tokio::test]
+async fn skipping_drops_one_commit_and_keeps_going() {
+    let (_dir, repo) = seeded_repo();
+    conflicted_pick(&repo);
+
+    let (status, body) = pipeline(&repo, GitOperation::SequenceSkip).await;
+    assert_ok(status, &body);
+
+    assert!(
+        !repo.join(".git/CHERRY_PICK_HEAD").exists(),
+        "skipping the only commit ends the sequence"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "from main\n",
+        "skipping keeps what was here; the picked commit's version is dropped"
+    );
+}
+
+/// A repository mid-revert, stopped on a conflict in `a.txt`.
+///
+/// The revert twin of [`conflicted_pick`]. Both markers cannot be produced at
+/// once by git, so this is the only way to get a sequence whose verb is
+/// `revert` rather than `cherry-pick`.
+fn conflicted_revert(repo: &std::path::Path) -> String {
+    std::fs::write(repo.join("a.txt"), "first\n").unwrap();
+    run(repo, &["commit", "-q", "-am", "first change to a"]);
+    let target = out(repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("a.txt"), "second\n").unwrap();
+    run(repo, &["commit", "-q", "-am", "second change to a"]);
+    // Reverting the first change conflicts with the second. Expected to fail —
+    // that is the point.
+    let _ = std::process::Command::new("git")
+        .args(["revert", "--no-edit", &target])
+        .current_dir(repo)
+        .status();
+    target
+}
+
+#[tokio::test]
+async fn a_sequence_resumes_after_a_reconnect() {
+    // #81's acceptance criterion "sequences resume after reconnect", and the
+    // only one of the five with no test before this.
+    //
+    // A reconnect means the client that continues a sequence shares NOTHING
+    // with the one that started it — no cached plan, no remembered verb, no
+    // in-memory sequencer state. `pipeline` builds a fresh plan against the
+    // live repository on every call, so calling it here is exactly that: the
+    // sequence below is started by raw git and resumed by a planner run that
+    // never saw it begin.
+    //
+    // MUTATION-PROVEN, two ways, 2026-08-22 — and the two disagreed:
+    //
+    //   1. Report a revert as a cherry-pick
+    //      (`("REVERT_HEAD", "revert")` -> `("REVERT_HEAD", "cherry-pick")`)
+    //      -> SURVIVED. See the note on the subject assertion below.
+    //   2. Drop REVERT_HEAD from the marker table entirely
+    //      -> CAUGHT: 409 "no cherry-pick or revert in progress".
+    //
+    // So what this test actually pins is (2): a sequence started by one
+    // connection must still be FOUND by a later one that shares no state with
+    // it. That is the acceptance criterion. It does not — and provably cannot,
+    // by this route — pin which verb drives the continue.
+    let (_dir, repo) = seeded_repo();
+    conflicted_revert(&repo);
+
+    assert!(
+        repo.join(".git/REVERT_HEAD").exists(),
+        "fixture: a revert must be in progress"
+    );
+    assert!(
+        !repo.join(".git/CHERRY_PICK_HEAD").exists(),
+        "fixture: and it must not look like a cherry-pick"
+    );
+
+    // Resolve by hand, exactly as a user would after reconnecting.
+    std::fs::write(repo.join("a.txt"), "resolved after reconnect\n").unwrap();
+    run(&repo, &["add", "a.txt"]);
+
+    let (status, body) = pipeline(&repo, GitOperation::SequenceContinue).await;
+    assert_ok(status, &body);
+
+    assert!(
+        !repo.join(".git/REVERT_HEAD").exists(),
+        "a completed sequence must leave no marker behind"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "resolved after reconnect\n",
+        "the resolution made after the reconnect is what must be committed"
+    );
+
+    // Records the commit shape, but is NOT a test of the verb, and must not be
+    // read as one. Mutation 1 above swapped the verb and this still passed:
+    // git keeps ONE sequencer per repository, `--continue` drives whichever
+    // sequence is open regardless of the verb spelled at the command line, and
+    // the "Revert" subject was already fixed by the original `git revert`.
+    // Left in as a regression guard on the commit message, with its own limits
+    // stated so no later reader mistakes it for verb coverage.
+    let subject = out(&repo, &["log", "-1", "--pretty=%s"]);
+    assert!(
+        subject.starts_with("Revert"),
+        "the resumed revert must still produce a Revert commit: got {subject:?}"
+    );
+}
+
+#[tokio::test]
+async fn aborting_with_no_sequence_in_progress_is_refused() {
+    // THE reason this refusal exists. `git cherry-pick --abort` on a clean
+    // repository can SUCCEED while doing nothing — so without this check a
+    // caller would be told an abort worked when there was never anything to
+    // abort. A success that means nothing is the failure this whole codebase
+    // is organised against.
+    //
+    // MUTATION: drop the sequence_in_progress check and pass the call through.
+    let (_dir, repo) = seeded_repo();
+    assert!(
+        !repo.join(".git/CHERRY_PICK_HEAD").exists(),
+        "fixture: nothing in progress"
+    );
+
+    let (status, body) = pipeline(&repo, GitOperation::SequenceAbort).await;
+
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "body: {body}");
+    assert!(
+        body.contains("no cherry-pick or revert in progress"),
+        "the refusal must say plainly there was nothing to abort: {body}"
+    );
+}
+
+#[tokio::test]
+async fn aborting_unwinds_the_sequence() {
+    let (_dir, repo) = seeded_repo();
+    conflicted_pick(&repo);
+    let before = out(&repo, &["rev-parse", "HEAD"]);
+
+    let (status, body) = pipeline(&repo, GitOperation::SequenceAbort).await;
+    assert_ok(status, &body);
+
+    assert!(
+        !repo.join(".git/CHERRY_PICK_HEAD").exists(),
+        "abort must clear the sequencer"
+    );
+    assert_eq!(
+        out(&repo, &["rev-parse", "HEAD"]),
+        before,
+        "abort returns to where the sequence started"
+    );
+    assert!(
+        body.contains("resolutions made during it are gone"),
+        "the response must say what was discarded, not just that it worked: {body}"
     );
 }

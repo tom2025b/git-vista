@@ -98,6 +98,67 @@ fn golden_plans() -> Vec<Plan> {
             },
         ),
         plan(
+            '6',
+            GitOperation::SequenceContinue,
+            RiskLevel::Reversible,
+            vec![Precondition::CleanWorktree],
+            vec![],
+            RecoveryStrategy::NotNeeded,
+        ),
+        plan(
+            '7',
+            GitOperation::SequenceSkip,
+            RiskLevel::Reversible,
+            vec![Precondition::CleanWorktree],
+            vec![],
+            RecoveryStrategy::NotNeeded,
+        ),
+        plan(
+            '8',
+            // Destructive, and Irrecoverable — not because objects are lost
+            // (they are not) but because the conflict RESOLUTIONS made during
+            // the sequence exist nowhere else and no ref can name them.
+            GitOperation::SequenceAbort,
+            RiskLevel::Destructive,
+            vec![],
+            vec![],
+            RecoveryStrategy::Irrecoverable,
+        ),
+        plan(
+            '4',
+            GitOperation::CherryPick { commit: oid('a') },
+            RiskLevel::Reversible,
+            vec![Precondition::CleanWorktree],
+            vec![],
+            RecoveryStrategy::NotNeeded,
+        ),
+        plan(
+            '5',
+            // M4.28 (#81): separate from CherryPick so "pick a merge without
+            // choosing a side" is unrepresentable, same as RevertMerge.
+            GitOperation::CherryPickMerge {
+                commit: oid('a'),
+                mainline: std::num::NonZeroU8::new(1).unwrap(),
+            },
+            RiskLevel::Reversible,
+            vec![Precondition::CleanWorktree],
+            vec![],
+            RecoveryStrategy::NotNeeded,
+        ),
+        plan(
+            '3',
+            // M4.28 (#81): a separate variant so "revert a merge without
+            // choosing a side" is unrepresentable rather than merely checked.
+            GitOperation::RevertMerge {
+                commit: oid('a'),
+                mainline: std::num::NonZeroU8::new(1).unwrap(),
+            },
+            RiskLevel::Reversible,
+            vec![Precondition::CleanWorktree],
+            vec![],
+            RecoveryStrategy::RevertCommit { commit: oid('a') },
+        ),
+        plan(
             '2',
             // M3.24 (#77): three effects in one verb — creates a branch, moves
             // HEAD, consumes the entry. The RefAbsent precondition is what

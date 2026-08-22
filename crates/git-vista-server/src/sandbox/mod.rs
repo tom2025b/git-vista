@@ -795,6 +795,16 @@ pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         GitOperation::RestoreBranch { .. } => NetworkNeed::Local,
         GitOperation::ResetBranch { .. } => NetworkNeed::Local,
         GitOperation::RevertCommit { .. } => NetworkNeed::Local,
+        GitOperation::RevertMerge { .. } => NetworkNeed::Local,
+        // A cherry-pick reads one commit already in the object database and
+        // writes a new one; nothing about it reaches a remote.
+        // The sequencer is entirely local state under .git; driving it forward,
+        // past, or backward never reaches a remote.
+        GitOperation::SequenceContinue => NetworkNeed::Local,
+        GitOperation::SequenceSkip => NetworkNeed::Local,
+        GitOperation::SequenceAbort => NetworkNeed::Local,
+        GitOperation::CherryPick { .. } => NetworkNeed::Local,
+        GitOperation::CherryPickMerge { .. } => NetworkNeed::Local,
         // `git apply --cached` + pathspec add/reset: index-only, local.
         GitOperation::StageSelection { .. } => NetworkNeed::Local,
         GitOperation::ResetTestRepo => NetworkNeed::Local,

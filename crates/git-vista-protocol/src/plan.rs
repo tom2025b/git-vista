@@ -604,9 +604,120 @@ pub enum GitOperation {
         to: CommitOid,
         expected_tip: CommitOid,
     },
+    /// `git cherry-pick --continue` or `git revert --continue` — resume an
+    /// in-progress sequence after its conflicts have been resolved (M4.28,
+    /// #81).
+    ///
+    /// # Which sequence is not a field
+    ///
+    /// Git keeps one sequencer per repository, and the caller does not need to
+    /// say whether a cherry-pick or a revert is in flight — the repository
+    /// already knows, via `CHERRY_PICK_HEAD` or `REVERT_HEAD`. Asking the
+    /// caller would invite them to be wrong about it, and a wrong answer here
+    /// would run the wrong verb's continue.
+    ///
+    /// The executor reads which one is in progress and refuses when neither
+    /// is, rather than passing git's error through.
+    SequenceContinue,
+    /// `git cherry-pick --skip` or `git revert --skip` — abandon the commit
+    /// currently being applied and move to the next one (M4.28, #81).
+    ///
+    /// Skipping loses only the *current* commit's changes, and only from this
+    /// sequence — the original commit is untouched and still in history. That
+    /// is why this is [`RiskLevel::Reversible`] where
+    /// [`SequenceAbort`](GitOperation::SequenceAbort) is not.
+    SequenceSkip,
+    /// `git cherry-pick --abort` or `git revert --abort` — unwind the whole
+    /// sequence and return to where it started (M4.28, #81).
+    ///
+    /// # Destructive, and the reason is the resolutions
+    ///
+    /// Abort does not merely stop — it discards every conflict resolution the
+    /// user has already made in this sequence, including ones already
+    /// committed by an earlier `--continue`. Those resolutions exist nowhere
+    /// else: they were hand-made decisions about file content, and git's
+    /// unwinding takes them with it.
+    ///
+    /// That is a different loss from skip, which drops one commit's changes
+    /// while leaving the original commit intact in history. So they are
+    /// separate variants with separate risk, rather than one verb with a mode.
+    SequenceAbort,
+    /// `git cherry-pick <commit>` — apply one commit's changes onto the
+    /// checked-out branch as a NEW commit (M4.28, #81).
+    ///
+    /// # One commit per operation
+    ///
+    /// A cherry-pick *sequence* is stateful — git keeps its position in
+    /// `.git/sequencer/`. Modelling the whole sequence as one operation would
+    /// mean a plan that is half-executed after a conflict, and a plan in this
+    /// system either ran or it did not. One operation per commit makes partial
+    /// progress an ordinary fact — some operations ran, others have not been
+    /// submitted — which this vocabulary already models exactly.
+    ///
+    /// **Ordinary commits only**, like [`RevertCommit`]. See
+    /// [`CherryPickMerge`] for why a merge needs one more answer.
+    ///
+    /// [`RevertCommit`]: GitOperation::RevertCommit
+    /// [`CherryPickMerge`]: GitOperation::CherryPickMerge
+    CherryPick { commit: CommitOid },
+    /// `git cherry-pick -m <mainline> <commit>` — cherry-pick a **merge**
+    /// (M4.28, #81).
+    ///
+    /// Same reasoning as [`RevertMerge`], one verb over: a merge has two
+    /// parents, so "apply this merge's changes" is ambiguous until someone
+    /// says which parent the change is measured *against*. Git refuses to
+    /// guess, and a separate variant makes "cherry-pick a merge without
+    /// choosing" unrepresentable rather than merely checked.
+    ///
+    /// [`RevertMerge`]: GitOperation::RevertMerge
+    CherryPickMerge {
+        commit: CommitOid,
+        mainline: std::num::NonZeroU8,
+    },
     /// `git revert --no-edit <commit>` — the history-preserving undo for a
     /// commit that's already shared (`/api/undo`; `--abort`ed on conflict).
+    ///
+    /// **Ordinary commits only.** A merge has two parents, so "undo this
+    /// merge" is ambiguous until someone says which side is the history being
+    /// kept — see [`RevertMerge`], and the executor refuses this variant on a
+    /// merge rather than passing git's raw error through.
+    ///
+    /// [`RevertMerge`]: GitOperation::RevertMerge
     RevertCommit { commit: CommitOid },
+    /// `git revert --no-edit -m <mainline> <commit>` — undo a **merge**
+    /// (M4.28, #81).
+    ///
+    /// # Why this is a separate variant and not a field on `RevertCommit`
+    ///
+    /// Git refuses `git revert <merge>` outright:
+    ///
+    /// ```text
+    /// error: commit <sha> is a merge but no -m option was given.
+    /// ```
+    ///
+    /// A merge has two parents, so undoing it means keeping one side's history
+    /// and discarding the other's — and git will not guess which. Before this
+    /// variant existed, reverting a merge was **impossible** through this
+    /// server: `RevertCommit` had nowhere to carry the answer, so the attempt
+    /// surfaced as that raw git error.
+    ///
+    /// Modelling it as `RevertCommit { commit, mainline: Option<u8> }` would
+    /// have made `None` mean two different things — "this is an ordinary
+    /// commit, mainline is meaningless" and "this is a merge and nobody has
+    /// chosen yet". The first is normal; the second must be refused. Two
+    /// variants make the second **unrepresentable** instead of merely checked,
+    /// which is the same posture [`ForcePublish`] takes toward a bare force.
+    ///
+    /// # `mainline` is 1-based, because git's is
+    ///
+    /// Git numbers parents from 1, and `-m 1` means "keep the branch you were
+    /// on when you merged" — which is what almost everyone wants. A
+    /// [`NonZeroU8`](std::num::NonZeroU8) rather than a `u8` so `-m 0`, which
+    /// git rejects, cannot be constructed here either.
+    RevertMerge {
+        commit: CommitOid,
+        mainline: std::num::NonZeroU8,
+    },
     /// Restore a seeded test repo to its recorded state
     /// (`/api/reset-test-repo`): unbundle seed objects, move every seeded
     /// branch back, forced checkout of the seeded HEAD, hard reset + clean,
