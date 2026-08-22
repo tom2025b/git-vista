@@ -34,10 +34,12 @@ use tokio::io::AsyncReadExt;
 use git_vista_core::diff::{BlobContent, WorktreeFileContent};
 use git_vista_protocol::conflict::ConflictedFile;
 use git_vista_protocol::plan::CommitOid;
-use git_vista_protocol::WorktreePath;
+use git_vista_protocol::{GitOperation, ResolveConflictRequest, WorktreePath};
 
 use crate::git_cmd::{git_cat_file_batch_oid, BatchFileRead};
 use crate::handlers::read::{resolve_repo, truncate_at_line, RepoQuery, FILE_CONTENT_CAP};
+use crate::planner;
+use crate::state::reject_if_read_only;
 
 /// `GET /api/conflicts`: every conflicted path's stage metadata
 /// ([`ConflictedFile`]), nothing else. The type's own doc comment says a
@@ -577,4 +579,37 @@ mod tests {
             "read_truncated must be authoritative, never re-derived from decoded length"
         );
     }
+}
+
+/// `POST /api/resolve-conflict` (M4.31b, #429): resolve one conflicted path
+/// by taking a whole side, or by removing the file.
+///
+/// Thin on purpose. Every part of this that could be wrong already exists and
+/// is already tested: [`git_vista_protocol::conflict::Resolution`] is the
+/// closed vocabulary, `GitOperation::ResolveConflict` carries it,
+/// `ConflictedFile::refuses` decides admissibility, and
+/// `planner::exec_resolve_conflict` re-runs that check inside the coordinator
+/// lock immediately before the write (ADR 0064) — because no precondition can
+/// express "still conflicted, and this side is still readable". The issue's
+/// own words: *this is the missing surface, not a missing mechanism.*
+///
+/// So this handler validates the wire shape and hands over. It deliberately
+/// does **not** pre-check `refuses` here: a check at the HTTP boundary would
+/// be a second, racier copy of the one that actually protects the write, and
+/// two answers that can disagree is worse than one answer that cannot.
+pub(crate) async fn resolve_conflict(
+    Json(req): Json<ResolveConflictRequest>,
+) -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    let path = match WorktreePath::new(req.path) {
+        Ok(path) => path,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()),
+    };
+    planner::plan_and_execute(GitOperation::ResolveConflict {
+        path,
+        resolution: req.resolution,
+    })
+    .await
 }

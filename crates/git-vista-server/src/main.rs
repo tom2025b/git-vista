@@ -124,7 +124,7 @@ use handlers::branch::{
 };
 use handlers::clone::{clone_repo, clone_status, delete_clone_repo};
 use handlers::commit::{amend_commit, create_commit, stage_all, unstage_all};
-use handlers::conflicts::{blob_content, list_conflicts, worktree_file};
+use handlers::conflicts::{blob_content, list_conflicts, resolve_conflict, worktree_file};
 use handlers::discard::{delete_untracked_paths, discard_tracked_paths};
 use handlers::fetch::fetch_remote;
 use handlers::plan::{execute_plan, plan_operation};
@@ -533,6 +533,11 @@ fn api_router(
             .route("/api/conflicts", get(list_conflicts))
             .route("/api/blob/{oid}", get(blob_content))
             .route("/api/worktree-file/{*path}", get(worktree_file))
+            // M4.31b (#429): resolve one conflicted path by taking a whole
+            // side, or removing the file. A write, so the full posture — and
+            // it goes through the planner like every other mutation (ADR
+            // 0016), never straight to git.
+            .route("/api/resolve-conflict", post(resolve_conflict))
             // …and unstage it again (`git reset HEAD`) — the exact inverse, offered
             // by the menu while anything is staged.
             .route("/api/unstage", post(unstage_all))

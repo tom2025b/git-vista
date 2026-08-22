@@ -156,6 +156,10 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
         Method::GET,
         Authz::SessionRequired,
     ),
+    // M4.31b (#429): resolving a conflict writes the working tree and the
+    // index, so the full write posture — and full_routes-only like every
+    // other mutation (ADR 0005).
+    ("/api/resolve-conflict", Method::POST, Authz::SessionAndCsrf),
     ("/api/unstage", Method::POST, Authz::SessionAndCsrf),
     ("/api/undo", Method::POST, Authz::SessionAndCsrf),
     ("/api/merge", Method::POST, Authz::SessionAndCsrf),
@@ -274,7 +278,7 @@ const ROUTE_AUTHZ: &[(&str, Method, Authz)] = &[
 /// dropped by a `main.rs` refactor that this scanner's pattern-matching
 /// doesn't recognise is exactly as much a regression as a route silently
 /// added, and a bare membership check alone would miss the former.
-const EXPECTED_ROUTE_COUNT: usize = 64;
+const EXPECTED_ROUTE_COUNT: usize = 65;
 
 /// The `Authz::Unauthenticated` allowlist, pinned to this exact set rather
 /// than merely counted — each entry carries its own reason above in
