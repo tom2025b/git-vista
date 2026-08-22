@@ -720,7 +720,9 @@ fn conflict_body(
                         // two rows — caught by the browser test, invisible to
                         // every unit test, because no unit test has a panel.
                         status.refetch();
-                        graph.update(|g| g.force_bump());
+                        graph.update(|g| {
+                            g.force_bump();
+                        });
                         shell.close_viewer();
                     }
                     // The server's own sentence, kept whole. It names which
