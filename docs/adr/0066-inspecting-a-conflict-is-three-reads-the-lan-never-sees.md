@@ -89,27 +89,26 @@ fully-tested core with zero consumers beside a green gate.
 Six pane states, none collapsing into another:
 
 ```mermaid
----
-config:
-  flowchart:
-    wrappingWidth: 330
----
 flowchart TD
     KEYS["<b>KEYS</b>
-    green — content a pane may render as text
-    amber — a fact about the conflict's shape
-    red — a fault, and it must say so
-    grey — the read that produced the state"]
+    green — may render as text
+    amber — a fact about the
+    conflict's shape
+    red — a fault; must say so
+    grey — a read"]
 
-    SCAN["<b>GET /api/conflicts</b><br/>stage metadata only — no content is fetched for a side the metadata already settles"]
+    SCAN["<b>GET /api/conflicts</b><br/>stage metadata only<br/>no content fetched"]
 
-    ABS["<b>Absent</b><br/>no stage here — an add/add conflict has no ancestor"]
-    UNR["<b>Unreadable</b><br/>the stage read failed; nobody has seen this side"]
-    BIN["<b>Binary</b><br/>not text; the pane stops at size and never fetches"]
-    AWAIT["<b>AwaitingContent</b><br/>text, fetched by oid from GET /api/blob/{oid}"]
+    ABS["<b>Absent</b><br/>no stage here<br/>add/add has<br/>no ancestor"]
+    UNR["<b>Unreadable</b><br/>the stage read<br/>failed — nobody<br/>has seen this side"]
+    BIN["<b>Binary</b><br/>not text; stops<br/>at size, never<br/>fetches"]
+    AWAIT["<b>AwaitingContent</b><br/>text, fetched by<br/>oid from<br/>GET /api/blob"]
 
-    TEXT["<b>Text</b><br/>the only state entitled to render a pre block"]
-    FAIL["<b>ContentUnavailable</b><br/>the stage was fine; the follow-up read was not"]
+    TEXT["<b>Text</b><br/>content in hand"]
+    FAIL["<b>ContentUnavailable</b><br/>stage was fine,<br/>follow-up read<br/>was not"]
+
+    PRE["<b>renders a pre block</b><br/>the only state<br/>entitled to claim<br/>'this side is blank'"]
+    NOTE["<b>renders a NOTE saying<br/>which state it is</b><br/>never an empty pre —<br/>an empty box asserts<br/>something about the repo"]
 
     SCAN --> ABS
     SCAN --> UNR
@@ -117,6 +116,12 @@ flowchart TD
     SCAN --> AWAIT
     AWAIT --> TEXT
     AWAIT --> FAIL
+
+    TEXT --> PRE
+    ABS --> NOTE
+    UNR --> NOTE
+    BIN --> NOTE
+    FAIL --> NOTE
 
     classDef ok fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,rx:6,ry:6,color:#1b5e20
     classDef mid fill:#fff8e1,stroke:#bc6c25,stroke-width:3px,rx:6,ry:6,color:#704016
@@ -126,7 +131,9 @@ flowchart TD
     class SCAN,AWAIT legend
     class ABS,BIN mid
     class UNR,FAIL bad
-    class TEXT ok
+    class TEXT,PRE ok
+    class NOTE mid
+    class KEYS legend
 ```
 
 ### 6. A late or mismatched response can never overwrite a settled pane
