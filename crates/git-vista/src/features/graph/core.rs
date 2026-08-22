@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use git_vista_core::model::{Edge, FrameStub, GitRef, GraphRow, Oid};
+use git_vista_protocol::plan::Advisory;
 use git_vista_protocol::{
     CommitOid, GenerationToken, HistoryFrame, HistoryPage, RefChange, RefState, RepoMode, RiskLevel,
 };
@@ -866,6 +867,7 @@ pub fn push_confirm_copy(
     branch: &str,
     set_upstream: bool,
     force: Option<(&CommitOid, RiskLevel)>,
+    advisories: &[Advisory],
 ) -> PushConfirmCopy {
     let upstream_line = if set_upstream {
         format!(
@@ -888,13 +890,55 @@ pub fn push_confirm_copy(
                 "Force-push ‘{branch}’ to origin? This overwrites origin/{branch} — \
                  currently at {} — with what's here. If anyone else pushed to \
                  ‘{branch}’ since you last looked, their commits become unreachable \
-                 there. This can't be undone.{upstream_line}",
+                 there. This can't be undone.{upstream_line}{}",
                 short_oid(oid.as_str()),
+                advisory_lines(advisories),
             ),
             confirm_label: "Force Push",
             danger: risk == RiskLevel::Destructive,
         },
     }
+}
+
+/// The planner's advisories, as prose appended to the force-push confirmation
+/// (M4.32, #85).
+///
+/// # Why only two of the three are rendered
+///
+/// [`Advisory::RemoteHistoryReplaced`] is deliberately skipped: the force body
+/// above already says the push overwrites `origin/<branch>`, makes other
+/// people's commits unreachable, and cannot be undone. Printing the same fact
+/// twice in one dialog is how a reader learns to skim past the warnings that
+/// are not duplicated — the same argument `advisories_for` makes server-side
+/// for refusing to warn on an ordinary push at all.
+///
+/// # Why `DefaultBranchUnknown` gets its own sentence
+///
+/// It is NOT an all-clear, and must never read as one. The server carries a
+/// separate `Unknown` variant precisely so that "the check could not run" is
+/// distinguishable from "the check ran and this is not the default branch" —
+/// the latter emits no advisory at all. Collapsing the two here would throw
+/// away the distinction the protocol went out of its way to preserve, and
+/// would tell the user a dangerous push is ordinary.
+fn advisory_lines(advisories: &[Advisory]) -> String {
+    let mut out = String::new();
+    for advisory in advisories {
+        match advisory {
+            Advisory::DefaultBranchPush { branch, remote } => out.push_str(&format!(
+                "\n\n‘{}’ is {}’s default branch — the one everyone starts from. \
+                 Replacing its history affects every clone.",
+                branch.as_str(),
+                remote.as_str(),
+            )),
+            Advisory::DefaultBranchUnknown { reason } => out.push_str(&format!(
+                "\n\nThis preview could not tell whether that is the default branch: \
+                 {reason}. Treat it as unknown, not as safe.",
+            )),
+            // Already stated by the body above; see this function's doc.
+            Advisory::RemoteHistoryReplaced { .. } => {}
+        }
+    }
+    out
 }
 
 /// The conventional 7-char short id, for confirmation copy (#233) —
