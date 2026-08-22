@@ -124,3 +124,50 @@ pub fn clear_inflight_remote_op_if_matches(id: &str) {
         let _ = s.remove_item(INFLIGHT_REMOTE_OP_KEY);
     }
 }
+
+/// localStorage key for the comparison the user last had open (M4.27, #80).
+///
+/// The stored value is a [`StoredComparison`]: the [`DiffSpec`] plus the
+/// opaque `repo_id` it belongs to. Nothing here is ever a filesystem path —
+/// `repo_id` is a token the SERVER assigned and only the server can resolve,
+/// which is what satisfies #80's "restored without exposing filesystem paths".
+const COMPARISON_KEY: &str = "git-vista.comparison";
+
+/// The comparison to restore for `repo_id`, if one was stored for THIS
+/// repository and still parses.
+///
+/// Returns `None` for every failure — no stored value, private browsing
+/// refusing localStorage, malformed JSON, a shape written by another version,
+/// or a comparison belonging to a different repository. Same best-effort
+/// posture as every other read here: a comparison that cannot be restored just
+/// is not restored, which is exactly where the user was before the feature
+/// existed.
+pub fn load_comparison(repo_id: &str) -> Option<git_vista_protocol::diff::DiffSpec> {
+    let stored: crate::features::graph::core::StoredComparison = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(COMPARISON_KEY).ok().flatten())
+        .and_then(|v| serde_json::from_str(&v).ok())?;
+    crate::features::graph::core::restorable_for(&stored, repo_id)
+}
+
+/// Remember the comparison now on screen. Best-effort; private browsing may
+/// refuse it, in which case a reload simply reopens nothing.
+pub fn store_comparison(repo_id: &str, spec: &git_vista_protocol::diff::DiffSpec) {
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let entry = crate::features::graph::core::StoredComparison {
+            repo_id: repo_id.to_string(),
+            spec: spec.clone(),
+        };
+        if let Ok(json) = serde_json::to_string(&entry) {
+            let _ = s.set_item(COMPARISON_KEY, &json);
+        }
+    }
+}
+
+/// Forget the stored comparison — the viewer was closed, so there is nothing
+/// to come back to.
+pub fn clear_comparison() {
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = s.remove_item(COMPARISON_KEY);
+    }
+}

@@ -932,6 +932,36 @@ pub fn offer_for(anchor: Option<&str>, this: &str) -> CompareOffer {
     }
 }
 
+/// A comparison, remembered with the repository it means something in.
+///
+/// # Why the repo id is stored with it
+///
+/// A `DiffSpec` is a pair of commit oids or ref names and nothing else. Restore
+/// one into a DIFFERENT repository and it either errors or — worse, and the
+/// reason this field exists — silently resolves against unrelated commits and
+/// renders a diff that looks real. Storing the repo makes that unrepresentable:
+/// a comparison whose repo does not match the one on screen is simply not
+/// restored.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredComparison {
+    /// Opaque server-assigned repository token, from `HistoryFrame::repo_id`.
+    pub repo_id: String,
+    pub spec: git_vista_protocol::diff::DiffSpec,
+}
+
+/// The stored comparison to restore, or `None` when it belongs to a different
+/// repository.
+///
+/// Pure and host-tested. The whole point of the type is this one comparison,
+/// and `prefs` is `#[cfg(target_arch = "wasm32")]` — a test written beside it
+/// would compile out and report `0 passed` forever.
+pub fn restorable_for(
+    stored: &StoredComparison,
+    repo_id: &str,
+) -> Option<git_vista_protocol::diff::DiffSpec> {
+    (stored.repo_id == repo_id).then(|| stored.spec.clone())
+}
+
 /// The planner's advisories, as prose appended to the force-push confirmation
 /// (M4.32, #85).
 ///
@@ -985,6 +1015,9 @@ fn short_oid(oid: &str) -> &str {
 
 #[cfg(test)]
 mod compare_offer_suite;
+
+#[cfg(test)]
+mod restore_comparison_suite;
 
 #[cfg(test)]
 mod push_confirm_suite;
