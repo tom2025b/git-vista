@@ -426,6 +426,32 @@ mod tests {
 
         let binary = PaneState::Binary { size_bytes: 4 }.with_content(Ok(blob));
         assert_eq!(binary, PaneState::Binary { size_bytes: 4 });
+
+        // The **failed** fetch is the half this test originally missed, and
+        // missing it made the whole test inert against the state guard: with
+        // only the `Ok` cases above, removing the guard left every assertion
+        // green, because the oid comparison one line further down happened to
+        // reject the mismatched blob anyway. Verified by `mutation_check`
+        // (#428) — the mutation SURVIVED until these three lines existed.
+        //
+        // The `Err` path has no such second line to hide behind. Without the
+        // guard, a failed fetch rewrites `Absent` to `ContentUnavailable`,
+        // turning "there is nothing on this side" into "the content could not
+        // be loaded" — a fault reported where git is simply, correctly,
+        // holding nothing.
+        for pane in [
+            PaneState::Absent,
+            PaneState::Unreadable {
+                reason: "gone".into(),
+            },
+            PaneState::Binary { size_bytes: 4 },
+        ] {
+            assert_eq!(
+                pane.clone().with_content(Err("timed out".into())),
+                pane,
+                "a failed fetch must not rewrite {pane:?}"
+            );
+        }
     }
 
     #[test]
