@@ -34,7 +34,7 @@ use crate::features::diff::core::{render_window, LineWrap};
 use crate::features::diff::rows::{flatten, row_heights};
 use crate::features::diff::selection::DiffSelection;
 use crate::features::diff::staging_view::staging_body;
-use crate::features::graph::core::RenderCtx;
+use crate::features::graph::core::{GraphCore, RenderCtx};
 use crate::features::shell::signals::Shell;
 use crate::features::status::signals::StatusResource;
 use crate::icons::icon_set;
@@ -140,7 +140,12 @@ pub fn viewer_view(
     settings: Settings,
     ctx: StoredValue<RenderCtx>,
 ) -> impl IntoView {
-    let Features { shell, status, .. } = features;
+    let Features {
+        shell,
+        status,
+        graph,
+        ..
+    } = features;
     let nerd_icons = settings.nerd_icons;
     // The full-screen patch's roving hunk focus (M2.16e, #210) — its own
     // model, distinct from the detail panel's, because both surfaces can be
@@ -290,7 +295,7 @@ pub fn viewer_view(
                     {
                         return view! { <p class="detail-status">"Loading…"</p> }.into_view();
                     }
-                    conflict_body(&panes, resolve_busy, resolve_error, status, shell)
+                    conflict_body(&panes, resolve_busy, resolve_error, status, graph, shell)
                 }
                 Some(DocResult::Staging(Ok(d))) => {
                     let ViewerDoc::Staging { direction } = which_for_body else {
@@ -672,6 +677,7 @@ fn conflict_body(
     busy: RwSignal<bool>,
     error: RwSignal<Option<String>>,
     status: StatusResource,
+    graph: RwSignal<GraphCore>,
     shell: Shell,
 ) -> View {
     let rendered: Vec<View> = Pane::ALL
@@ -705,7 +711,16 @@ fn conflict_body(
             spawn_local(async move {
                 match resolve_conflict_request(&path, resolution).await {
                     Ok(()) => {
+                        // BOTH, and the second one is the load-bearing half.
+                        // `status.refetch()` updates the topbar chip's v1
+                        // read; the Activity panel's conflicted list is a
+                        // SEPARATE v2 resource keyed on the graph epoch
+                        // (M2.15, #68). Refetching status alone left the chip
+                        // saying "1 conflicted" while the panel still listed
+                        // two rows — caught by the browser test, invisible to
+                        // every unit test, because no unit test has a panel.
                         status.refetch();
+                        graph.update(|g| g.force_bump());
                         shell.close_viewer();
                     }
                     // The server's own sentence, kept whole. It names which
