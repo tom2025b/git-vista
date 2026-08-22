@@ -10,11 +10,14 @@
 //! the judgement #428 keeps out of wasm-only code.
 
 use git_vista_core::diff::{BlobContent, WorktreeFileContent};
-use git_vista_protocol::conflict::ConflictedFile;
+use git_vista_protocol::conflict::{ConflictedFile, Resolution};
+use git_vista_protocol::ResolveConflictRequest;
 
 use crate::features::conflicts::core::{result_pane_state, ConflictPanes, PaneState, ResultRead};
 
-use super::{network_error, req_get};
+use super::{
+    network_error, refuse_if_offline, refuse_if_visualize, req_get, user_facing_error, write_json,
+};
 
 /// Every conflicted path with its three stages described — metadata only, no
 /// content (`GET /api/conflicts`).
@@ -131,4 +134,26 @@ pub async fn fetch_conflict_panes(path: &str) -> Result<ConflictPanes, String> {
     });
 
     Ok(panes)
+}
+
+/// Resolve one conflicted path (`POST /api/resolve-conflict`, M4.31b, #429).
+///
+/// The `Err` string is the server's own words, not a generic failure. That is
+/// the whole point of the endpoint's refusal handling: taking a side that is
+/// absent, or one that could not be read, each produce a *different* sentence
+/// naming which side and why, and a caller that collapses them into "it
+/// failed" throws away the only thing that tells the user what to do next.
+pub async fn resolve_conflict_request(path: &str, resolution: Resolution) -> Result<(), String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let body = ResolveConflictRequest {
+        path: path.to_string(),
+        resolution,
+    };
+    let (resp, _key) = write_json("/api/resolve-conflict", &body).await?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(user_facing_error("/api/resolve-conflict", resp).await)
+    }
 }
