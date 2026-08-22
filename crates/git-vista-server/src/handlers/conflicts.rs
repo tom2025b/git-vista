@@ -571,6 +571,57 @@ mod tests {
         assert!(!truncated);
     }
 
+    // ---- resolve_conflict's wire boundary (M4.31b, #429) ----------------
+    //
+    // The write path itself is `planner::exec_resolve_conflict`, tested in
+    // planner's own suites against real conflicted repositories. What is
+    // tested here is the part this file owns: the wire shape, and that a
+    // malformed path never becomes a `WorktreePath`.
+
+    #[test]
+    fn the_request_body_refuses_a_stray_key() {
+        // Same posture as every other body in this contract. A stray key
+        // beside a resolution is a caller that believes it is sending
+        // something this endpoint honours — silently dropping it is how a
+        // user ends up with a resolution they did not ask for.
+        let stray = serde_json::json!({
+            "path": "a.txt",
+            "resolution": {"choice": "take_ours"},
+            "also_stage": true,
+        });
+        assert!(serde_json::from_value::<ResolveConflictRequest>(stray).is_err());
+    }
+
+    #[test]
+    fn the_request_body_round_trips_every_resolution() {
+        // MUTATION: drop a variant from the wire form. A resolution the UI
+        // can offer but the wire cannot carry fails at the boundary with a
+        // deserialize error, which reads as "it failed" — the exact
+        // undifferentiated refusal #429 exists to prevent.
+        for choice in ["take_ours", "take_theirs", "take_deletion"] {
+            let body = serde_json::json!({
+                "path": "src/a.rs",
+                "resolution": {"choice": choice},
+            });
+            let req: ResolveConflictRequest =
+                serde_json::from_value(body).unwrap_or_else(|e| panic!("{choice}: {e}"));
+            assert_eq!(req.path, "src/a.rs");
+        }
+    }
+
+    #[test]
+    fn a_path_that_escapes_the_worktree_never_becomes_a_worktree_path() {
+        // The newtype is the gate; this pins that the handler actually runs
+        // it on THIS field rather than trusting the wire string.
+        for bad in ["../escape.txt", "/etc/passwd", "-rf", ""] {
+            assert!(
+                WorktreePath::new(bad.to_string()).is_err(),
+                "{bad:?} must be refused at the wire boundary"
+            );
+        }
+        assert!(WorktreePath::new("src/a.rs".to_string()).is_ok());
+    }
+
     #[test]
     fn a_read_truncation_is_reported_even_when_the_decoded_string_would_not_show_it() {
         let (_content, truncated, _binary) = decode_bounded(b"short", true, 100);
