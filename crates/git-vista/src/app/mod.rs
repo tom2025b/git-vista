@@ -500,14 +500,11 @@ pub fn App() -> impl IntoView {
         let Some(repo_id) = frame().and_then(|f| f.repo_id.clone()) else {
             return;
         };
-        match shell.viewer_doc() {
-            Some(crate::state::ViewerDoc::Spec { spec }) => {
-                crate::prefs::store_comparison(&repo_id, &spec);
-            }
-            // Every other doc, and a closed viewer, are handled by
-            // `Shell::clear_payload` — which clears on the one funnel that Esc
-            // also reaches. Doing it again here would fight that.
-            _ => {}
+        // Only a `Spec` doc is stored. Every other doc, and a closed viewer,
+        // are handled by `Shell::clear_payload` — which clears on the one
+        // funnel that Esc also reaches. Clearing again here would fight that.
+        if let Some(crate::state::ViewerDoc::Spec { spec }) = shell.viewer_doc() {
+            crate::prefs::store_comparison(&repo_id, &spec);
         }
     });
 

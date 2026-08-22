@@ -34,7 +34,6 @@ fn short(oid: &str) -> &str {
 /// two compare items render empty when no anchor is set, or when the anchor IS
 /// this commit — comparing a commit with itself is an empty diff and offering
 /// it would be a dead end dressed as an action.
-
 pub(super) fn build_compare_items(
     features: Features,
     ic: &'static GitIcons,
