@@ -506,12 +506,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_worktree_file_past_the_cap_is_truncated_and_never_reads_past_it() {
-        // THE test for read_bounded_worktree_file. MUTATION: read the whole
-        // file then truncate the buffer — still passes every assertion here
-        // on a small fixture, but defeats the cap's whole purpose on a
-        // pathological file. Caught only by the length still exceeding the
-        // read: a file many times the cap must never be read in full.
+    async fn a_worktree_file_past_the_cap_is_reported_truncated_and_capped() {
+        // What this proves: crossing the cap sets `truncated`, and the buffer
+        // handed back never exceeds it.
+        //
+        // What it does NOT prove, stated plainly rather than implied by the
+        // name: that the read is *bounded at read time*. Replacing
+        // `file.take(cap + 1)` with an unbounded `read_to_end` followed by the
+        // same `buf.truncate(cap)` leaves every assertion here green — the
+        // returned buffer is identical, and only the bytes pulled off disk
+        // differ. That mutation SURVIVES, verified rather than assumed
+        // (`mutation_check`, #428), and it is documented here for the same
+        // reason `planner.rs`'s `exec_resolve_conflict` documents its own
+        // survivor: a survived mutation hidden is worse than one written down.
+        //
+        // The read-time bound is what stops a pathological worktree file
+        // costing this request its whole size in RAM on an 8 GB box. No test
+        // in this suite can observe it — the only difference is bytes read and
+        // memory held, neither of which a return value carries — so it is
+        // enforced by `read_bounded_worktree_file`'s `.take()` and held by
+        // code review, not by this test.
         let (_d, repo) = seeded_repo();
         let big = "line\n".repeat(10);
         std::fs::write(repo.join("big.txt"), &big).unwrap();
@@ -519,8 +533,12 @@ mod tests {
         let (bytes, truncated) = read_bounded_worktree_file(&repo.join("big.txt"), 12)
             .await
             .unwrap();
-        assert!(truncated);
-        assert_eq!(bytes.len(), 12, "must read at most cap bytes, never more");
+        assert!(truncated, "crossing the cap must be reported, never silent");
+        assert_eq!(
+            bytes.len(),
+            12,
+            "the buffer handed back never exceeds the cap"
+        );
 
         // Well under the real (2 MiB) production cap, so the full-stack seam
         // reports it untruncated — this asserts `worktree_file_for_repo`
