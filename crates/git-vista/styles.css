@@ -1397,3 +1397,53 @@ button.detail-file,
 @media (prefers-reduced-motion: no-preference) {
   .repomap-leaf .repomap-chip { transition: filter 0.12s ease, stroke-width 0.12s ease; }
 }
+
+/* ── Conflict inspection (M4.31a, #428) ─────────────────────────────────── */
+
+/* A conflicted status card is a <button> — it opens the four-pane view. Same
+   flatten-the-chrome treatment `.act-row` gets for the same reason: it must
+   read as the row it replaced, not as a form control, while still being a
+   real button for keyboard and screen-reader users. */
+.act-status-card-open {
+  width: 100%;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.act-status-card-open:hover,
+.act-status-card-open:focus-visible {
+  background: var(--surface-2, rgba(127, 127, 127, 0.12));
+}
+
+/* The four panes stack vertically and each scrolls internally, so the viewer
+   shell itself never scrolls (ADR 0012: the app shell never scrolls; all
+   scrolling is internal). On a wide screen they pair up two-across — four
+   side-by-side columns would leave each one too narrow to read a real line of
+   code in. */
+.conflict-panes {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.75rem;
+}
+@media (min-width: 900px) {
+  .conflict-panes { grid-template-columns: 1fr 1fr; }
+}
+.conflict-pane {
+  min-width: 0;
+  border: 1px solid var(--border, rgba(127, 127, 127, 0.35));
+  border-radius: 8px;
+  padding: 0.5rem 0.6rem;
+}
+.conflict-pane-head {
+  margin: 0 0 0.4rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+/* Bounded so one enormous side cannot push the other three off screen. */
+.conflict-pane .viewer-pre {
+  max-height: 40vh;
+  overflow: auto;
+}
