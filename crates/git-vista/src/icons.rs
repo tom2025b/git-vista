@@ -93,6 +93,13 @@ pub struct GitIcons {
     pub push: &'static str,
     /// A branch switch (checkout) — HEAD moving between branches.
     pub checkout: &'static str,
+
+    // -- Comparing two states (M4.27, #80) ------------------------------------
+    /// Comparing two commits or refs — the compare menu items, which offer a
+    /// `DiffSpec` rather than one commit's own diff. Distinct from
+    /// [`Self::checkout`]'s exchange arrows on purpose: that glyph means HEAD
+    /// *moved*, and a comparison moves nothing.
+    pub diff: &'static str,
 }
 
 /// The Nerd Font set. Codepoints are from the Nerd Fonts cheat sheet; most sit
@@ -123,6 +130,7 @@ pub const ICONS: GitIcons = GitIcons {
     undo: "\u{F0E2}",         // nf-fa-undo
     push: "\u{F0EE}",         // nf-fa-cloud_upload
     checkout: "\u{F0EC}",     // nf-fa-exchange
+    diff: "\u{F440}",         // nf-oct-diff
 };
 
 /// The plain-text fallback set: every value renders in any font (ASCII, or a
@@ -153,6 +161,7 @@ pub const TEXT_ICONS: GitIcons = GitIcons {
     undo: "\u{21A9}",     // ↩ — turn back
     push: "\u{2191}",     // ↑ — up to the remote (matches the chip's arrows)
     checkout: "\u{21C4}", // ⇄ — switching between branches
+    diff: "\u{00B1}",     // ± — the +/- a diff is summarised by
 };
 
 /// The set to render with: Nerd Font glyphs when `nerd` is on (the default),
