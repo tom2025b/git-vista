@@ -20,7 +20,9 @@ use git_vista_core::virtualize::CumulativeHeights;
 use git_vista_protocol::diff::{ComparisonBasis, DiffSpec, SpecDiff};
 use git_vista_protocol::{PatchPlan, PatchPreview, StageDirection, StagingDiff};
 
-use crate::api::{fetch_diff_full, fetch_file, fetch_spec_diff, staging_diff_request};
+use crate::api::{
+    fetch_conflict_panes, fetch_diff_full, fetch_file, fetch_spec_diff, staging_diff_request,
+};
 // The row-height scale and overscan are the panel's constants, shared rather
 // than duplicated: two surfaces measuring the same rendered text with
 // different numbers is how a window and its scrollbar drift apart.
@@ -30,6 +32,7 @@ use crate::features::diff::core::{render_window, LineWrap};
 use crate::features::diff::rows::{flatten, row_heights};
 use crate::features::diff::selection::DiffSelection;
 use crate::features::diff::staging_view::staging_body;
+use crate::features::conflicts::core::{ConflictPanes, Pane, PaneState};
 use crate::features::graph::core::RenderCtx;
 use crate::icons::icon_set;
 use crate::state::{Features, Settings, ViewerDoc};
@@ -196,6 +199,9 @@ pub fn viewer_view(
                 Some(ViewerDoc::Spec { spec }) => {
                     Some(DocResult::Spec(fetch_spec_diff(&spec).await))
                 }
+                Some(ViewerDoc::Conflict { path }) => {
+                    Some(DocResult::Conflict(fetch_conflict_panes(&path).await))
+                }
             }
         },
     );
@@ -216,6 +222,7 @@ pub fn viewer_view(
                     StageDirection::Unstage => "Unstage selected changes".to_string(),
                 },
                 ViewerDoc::Spec { spec } => spec_title(spec),
+                ViewerDoc::Conflict { path } => format!("Conflict — {path}"),
             };
             let which_for_body = which.clone();
             let body = move || match doc.get().flatten() {
@@ -223,6 +230,7 @@ pub fn viewer_view(
                 Some(DocResult::Diff(Err(e)))
                 | Some(DocResult::File(Err(e)))
                 | Some(DocResult::Staging(Err(e)))
+                | Some(DocResult::Conflict(Err(e)))
                 | Some(DocResult::Spec(Err(e))) => view! {
                     <p class="detail-status detail-error">{format!("Couldn't load: {e}")}</p>
                 }
@@ -345,6 +353,8 @@ enum DocResult {
     File(Result<FileContent, String>),
     Staging(Result<StagingDiff, String>),
     Spec(Result<SpecDiff, String>),
+    /// All four panes of one conflicted path (M4.31a, #428).
+    Conflict(Result<ConflictPanes, String>),
 }
 
 /// The viewer title for an explicit source/target diff (M2.16, #69).

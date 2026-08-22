@@ -26,6 +26,8 @@ mod activity;
 mod branches;
 mod clone;
 mod commits;
+// M4.31a (#428): inspect a conflict — the three reads and the pane assembler.
+mod conflicts;
 mod diff;
 mod graph;
 mod operations;
@@ -42,6 +44,7 @@ pub use branches::{
     rebase_request,
 };
 pub use clone::clone_request;
+pub use conflicts::fetch_conflict_panes;
 pub use commits::{amend_commit_request, create_commit_request, fetch_commit_detail};
 pub use diff::{fetch_diff, fetch_diff_full, fetch_file, fetch_spec_diff};
 pub use graph::{fetch_frame, fetch_page};
