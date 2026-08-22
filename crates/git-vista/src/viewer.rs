@@ -21,7 +21,8 @@ use git_vista_protocol::diff::{ComparisonBasis, DiffSpec, SpecDiff};
 use git_vista_protocol::{PatchPlan, PatchPreview, StageDirection, StagingDiff};
 
 use crate::api::{
-    fetch_conflict_panes, fetch_diff_full, fetch_file, fetch_spec_diff, staging_diff_request,
+    fetch_conflict_panes, fetch_diff_full, fetch_file, fetch_spec_diff, resolve_conflict_request,
+    staging_diff_request,
 };
 // The row-height scale and overscan are the panel's constants, shared rather
 // than duplicated: two surfaces measuring the same rendered text with
@@ -33,9 +34,12 @@ use crate::features::diff::core::{render_window, LineWrap};
 use crate::features::diff::rows::{flatten, row_heights};
 use crate::features::diff::selection::DiffSelection;
 use crate::features::diff::staging_view::staging_body;
-use crate::features::graph::core::RenderCtx;
+use crate::features::graph::core::{GraphCore, RenderCtx};
+use crate::features::shell::signals::Shell;
+use crate::features::status::signals::StatusResource;
 use crate::icons::icon_set;
 use crate::state::{Features, Settings, ViewerDoc};
+use git_vista_protocol::conflict::Resolution;
 use git_vista_protocol::diff::parse_unified_diff;
 
 /// Stamp (or clear) the `data-print` attribute on `<html>`. The print styles
@@ -136,7 +140,12 @@ pub fn viewer_view(
     settings: Settings,
     ctx: StoredValue<RenderCtx>,
 ) -> impl IntoView {
-    let Features { shell, status, .. } = features;
+    let Features {
+        shell,
+        status,
+        graph,
+        ..
+    } = features;
     let nerd_icons = settings.nerd_icons;
     // The full-screen patch's roving hunk focus (M2.16e, #210) — its own
     // model, distinct from the detail panel's, because both surfaces can be
@@ -178,6 +187,13 @@ pub fn viewer_view(
     // content — see its own comment at the point of use.
     let staging_previewed_plan = create_rw_signal(None::<PatchPlan>);
     let staging_busy = create_rw_signal(false);
+    // M4.31b (#429): the conflict view's own write state. `resolve_error`
+    // holds the server's OWN sentence about a refusal — which side, and why —
+    // rendered inline rather than thrown at an alert box, because "you cannot
+    // take a side that is not there" is the answer the user needs in front of
+    // the panes they are choosing between.
+    let resolve_busy = create_rw_signal(false);
+    let resolve_error = create_rw_signal(None::<String>);
     // One resource for every document kind: the key carries the enum, the
     // fetch picks the endpoint. A stale response is ignored via the id/path
     // echo, same rule as the detail panel's fetches.
@@ -200,6 +216,9 @@ pub fn viewer_view(
                     Some(DocResult::Spec(fetch_spec_diff(&spec).await))
                 }
                 Some(ViewerDoc::Conflict { path }) => {
+                    // A refusal belongs to the path it was about; carrying it
+                    // onto the next file would explain the wrong conflict.
+                    resolve_error.set(None);
                     Some(DocResult::Conflict(fetch_conflict_panes(&path).await))
                 }
             }
@@ -276,7 +295,7 @@ pub fn viewer_view(
                     {
                         return view! { <p class="detail-status">"Loading…"</p> }.into_view();
                     }
-                    conflict_body(&panes)
+                    conflict_body(&panes, resolve_busy, resolve_error, status, graph, shell)
                 }
                 Some(DocResult::Staging(Ok(d))) => {
                     let ViewerDoc::Staging { direction } = which_for_body else {
@@ -653,13 +672,92 @@ fn conflict_pane(pane: Pane, state: &PaneState) -> View {
 /// Iterates [`Pane::ALL`] rather than naming four fields, so a pane cannot be
 /// silently omitted — #428's first acceptance criterion is that all four are
 /// reachable, and a hand-written list of three would satisfy every type check.
-fn conflict_body(panes: &ConflictPanes) -> View {
+fn conflict_body(
+    panes: &ConflictPanes,
+    busy: RwSignal<bool>,
+    error: RwSignal<Option<String>>,
+    status: StatusResource,
+    graph: RwSignal<GraphCore>,
+    shell: Shell,
+) -> View {
     let rendered: Vec<View> = Pane::ALL
         .iter()
         .map(|p| conflict_pane(*p, panes.pane(*p)))
         .collect();
+
+    // One button per `Resolution` variant — the vocabulary is closed, so the
+    // three here ARE the three that exist. `TakeDeletion` is deliberately its
+    // own control rather than "take the side that deleted it": those are the
+    // same outcome but different requests, and only one of them stays correct
+    // if the user has misread which side deleted what (see `Resolution`'s own
+    // doc comment).
+    let path = panes.path.clone();
+    let controls: Vec<View> = [
+        (Resolution::TakeOurs, "Take ours", "conflict-take-ours"),
+        (
+            Resolution::TakeTheirs,
+            "Take theirs",
+            "conflict-take-theirs",
+        ),
+        (Resolution::TakeDeletion, "Delete file", "conflict-delete"),
+    ]
+    .into_iter()
+    .map(|(resolution, label, class)| {
+        let path = path.clone();
+        let on = move |_| {
+            let path = path.clone();
+            error.set(None);
+            busy.set(true);
+            spawn_local(async move {
+                match resolve_conflict_request(&path, resolution).await {
+                    Ok(()) => {
+                        // BOTH, and the second one is the load-bearing half.
+                        // `status.refetch()` updates the topbar chip's v1
+                        // read; the Activity panel's conflicted list is a
+                        // SEPARATE v2 resource keyed on the graph epoch
+                        // (M2.15, #68). Refetching status alone left the chip
+                        // saying "1 conflicted" while the panel still listed
+                        // two rows — caught by the browser test, invisible to
+                        // every unit test, because no unit test has a panel.
+                        status.refetch();
+                        graph.update(|g| {
+                            g.force_bump();
+                        });
+                        shell.close_viewer();
+                    }
+                    // The server's own sentence, kept whole. It names which
+                    // side and why; shortening it here would produce exactly
+                    // the "it failed" this endpoint was built to avoid.
+                    Err(e) => error.set(Some(e)),
+                }
+                busy.set(false);
+            });
+        };
+        view! {
+            <button
+                class=format!("viewer-btn {class}")
+                prop:disabled=move || busy.get()
+                on:click=on
+            >
+                {label}
+            </button>
+        }
+        .into_view()
+    })
+    .collect();
+
+    let refusal = move || {
+        error.get().map(|e| {
+            view! {
+                <p class="detail-status detail-error conflict-refusal" role="alert">{e}</p>
+            }
+        })
+    };
+
     view! {
         <div class="viewer-doc-head">{panes.path.clone()}</div>
+        <div class="conflict-actions">{controls}</div>
+        {refusal}
         <div class="conflict-panes">{rendered}</div>
     }
     .into_view()

@@ -34,10 +34,12 @@ use tokio::io::AsyncReadExt;
 use git_vista_core::diff::{BlobContent, WorktreeFileContent};
 use git_vista_protocol::conflict::ConflictedFile;
 use git_vista_protocol::plan::CommitOid;
-use git_vista_protocol::WorktreePath;
+use git_vista_protocol::{GitOperation, ResolveConflictRequest, WorktreePath};
 
 use crate::git_cmd::{git_cat_file_batch_oid, BatchFileRead};
 use crate::handlers::read::{resolve_repo, truncate_at_line, RepoQuery, FILE_CONTENT_CAP};
+use crate::planner;
+use crate::state::reject_if_read_only;
 
 /// `GET /api/conflicts`: every conflicted path's stage metadata
 /// ([`ConflictedFile`]), nothing else. The type's own doc comment says a
@@ -255,6 +257,41 @@ async fn worktree_file_for_repo(
         truncated,
         binary,
     })
+}
+
+/// `POST /api/resolve-conflict` (M4.31b, #429): resolve one conflicted path
+/// by taking a whole side, or by removing the file.
+///
+/// Thin on purpose. Every part of this that could be wrong already exists and
+/// is already tested: [`git_vista_protocol::conflict::Resolution`] is the
+/// closed vocabulary, `GitOperation::ResolveConflict` carries it,
+/// `ConflictedFile::refuses` decides admissibility, and
+/// `planner::exec_resolve_conflict` re-runs that check inside the coordinator
+/// lock immediately before the write (ADR 0064) — because no precondition can
+/// express "still conflicted, and this side is still readable". The issue's
+/// own words: *this is the missing surface, not a missing mechanism.*
+///
+/// So this handler only guards read-only mode and hands over. The path is a
+/// `WorktreePath` on the DTO itself, so a traversal body fails to deserialize
+/// and never reaches here — structural rather than remembered (see
+/// `ResolveConflictRequest`'s own doc for why that replaced a check written
+/// out in this function).
+///
+/// It deliberately does **not** pre-check `refuses` here either: a check at
+/// the HTTP boundary would be a second, racier copy of the one that actually
+/// protects the write, and two answers that can disagree is worse than one
+/// answer that cannot.
+pub(crate) async fn resolve_conflict(
+    Json(req): Json<ResolveConflictRequest>,
+) -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    planner::plan_and_execute(GitOperation::ResolveConflict {
+        path: req.path,
+        resolution: req.resolution,
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -567,6 +604,79 @@ mod tests {
         assert!(!binary);
         assert_eq!(content, "hello\n");
         assert!(!truncated);
+    }
+
+    // ---- resolve_conflict's wire boundary (M4.31b, #429) ----------------
+    //
+    // The write path itself is `planner::exec_resolve_conflict`, tested in
+    // planner's own suites against real conflicted repositories. What is
+    // tested here is the part this file owns: the wire shape, and that a
+    // malformed path never becomes a `WorktreePath`.
+
+    #[test]
+    fn the_request_body_refuses_a_stray_key() {
+        // Same posture as every other body in this contract. A stray key
+        // beside a resolution is a caller that believes it is sending
+        // something this endpoint honours — silently dropping it is how a
+        // user ends up with a resolution they did not ask for.
+        let stray = serde_json::json!({
+            "path": "a.txt",
+            "resolution": {"choice": "take_ours"},
+            "also_stage": true,
+        });
+        assert!(serde_json::from_value::<ResolveConflictRequest>(stray).is_err());
+    }
+
+    #[test]
+    fn the_request_body_round_trips_every_resolution() {
+        // MUTATION: drop a variant from the wire form. A resolution the UI
+        // can offer but the wire cannot carry fails at the boundary with a
+        // deserialize error, which reads as "it failed" — the exact
+        // undifferentiated refusal #429 exists to prevent.
+        for choice in ["take_ours", "take_theirs", "take_deletion"] {
+            let body = serde_json::json!({
+                "path": "src/a.rs",
+                "resolution": {"choice": choice},
+            });
+            let req: ResolveConflictRequest =
+                serde_json::from_value(body).unwrap_or_else(|e| panic!("{choice}: {e}"));
+            assert_eq!(req.path.as_str(), "src/a.rs");
+        }
+    }
+
+    #[test]
+    fn the_request_body_itself_refuses_a_path_that_escapes_the_worktree() {
+        // THE test for this endpoint's path handling, and it is deliberately
+        // written against the BODY rather than against `WorktreePath::new`.
+        //
+        // The first version called the newtype directly. `mutation_check`
+        // reported SURVIVED when the handler's validation was gutted — of
+        // course it did: it was testing the protocol crate's newtype, which
+        // has its own tests, and said nothing whatever about this endpoint.
+        // A test that passes while the endpoint it names is defenceless is
+        // worse than no test.
+        //
+        // Deserializing the real request body is what actually pins it,
+        // because `path` IS a `WorktreePath` on the DTO — so the refusal
+        // happens in serde, before any handler code runs, and no handler can
+        // skip it.
+        for bad in ["../escape.txt", "/etc/passwd", "-rf", ""] {
+            let body = serde_json::json!({
+                "path": bad,
+                "resolution": {"choice": "take_ours"},
+            });
+            assert!(
+                serde_json::from_value::<ResolveConflictRequest>(body).is_err(),
+                "{bad:?} must be refused by the body itself"
+            );
+        }
+
+        let ok = serde_json::json!({
+            "path": "src/a.rs",
+            "resolution": {"choice": "take_deletion"},
+        });
+        let req: ResolveConflictRequest = serde_json::from_value(ok).expect("a plain path");
+        assert_eq!(req.path.as_str(), "src/a.rs");
     }
 
     #[test]

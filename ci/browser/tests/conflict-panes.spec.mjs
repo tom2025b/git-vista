@@ -113,3 +113,65 @@ test('a modify/modify conflict shows a real base, and the result pane holds git 
   await expect(resultPane.locator('pre')).toContainText('<<<<<<<')
   await expect(resultPane.locator('pre')).toContainText('>>>>>>>')
 })
+
+// M4.31b (#429) -- the three whole-file resolutions must be REACHABLE and
+// must actually resolve. Same reasoning as the tests above: the buttons and
+// their click handlers are wasm-only, so no Rust test can see them.
+//
+// This spec MUTATES the conflict fixture, so it runs last and each assertion
+// accounts for what the previous one consumed.
+test('taking a side resolves the path, and the conflict count drops', async ({ page }) => {
+  await openConflictRepo(page)
+  await openActivityPanel(page)
+
+  // Two conflicted paths to start with.
+  const before = page.getByRole('button', { name: /inspect this conflict/ })
+  await expect(before).toHaveCount(2)
+
+  await page.getByRole('button', { name: new RegExp(`${ADD_ADD}.*inspect this conflict`) }).click()
+  const viewer = page.locator('.viewer-modal')
+  await expect(viewer).toBeVisible()
+
+  // All three resolutions are offered for this path -- the closed
+  // `Resolution` vocabulary has exactly three variants, so three is the
+  // complete set, not a sample.
+  await expect(viewer.getByRole('button', { name: 'Take ours' })).toBeVisible()
+  await expect(viewer.getByRole('button', { name: 'Take theirs' })).toBeVisible()
+  await expect(viewer.getByRole('button', { name: 'Delete file' })).toBeVisible()
+
+  await viewer.getByRole('button', { name: 'Take ours' }).click()
+
+  // The viewer closes on success and the path stops being conflicted. This is
+  // the real assertion: not "the button existed", but "the index changed".
+  await expect(viewer).toBeHidden()
+  await expect(page.getByRole('button', { name: /inspect this conflict/ })).toHaveCount(1, {
+    timeout: 15_000,
+  })
+
+  // ...and the one still listed is the OTHER path, so the right file resolved.
+  await expect(
+    page.getByRole('button', { name: new RegExp(`${BOTH_MODIFIED}.*inspect this conflict`) }),
+  ).toBeVisible()
+})
+
+test('deleting resolves the last path and the repository stops being conflicted', async ({
+  page,
+}) => {
+  await openConflictRepo(page)
+  await openActivityPanel(page)
+
+  const rows = page.getByRole('button', { name: /inspect this conflict/ })
+  await expect(rows).toHaveCount(1)
+
+  await rows.first().click()
+  const viewer = page.locator('.viewer-modal')
+  await viewer.getByRole('button', { name: 'Delete file' }).click()
+  await expect(viewer).toBeHidden()
+
+  // Nothing conflicted remains. Server-side this is `continuation()` reporting
+  // Clear, which is what lets the interrupted merge proceed -- #429's third
+  // acceptance criterion, observed from the outside.
+  await expect(page.getByRole('button', { name: /inspect this conflict/ })).toHaveCount(0, {
+    timeout: 15_000,
+  })
+})

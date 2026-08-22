@@ -453,6 +453,48 @@ pub struct WorktreePathsRequest {
     pub paths: Vec<String>,
 }
 
+/// Body of `POST /api/resolve-conflict` (M4.31b, #429): resolve **one**
+/// conflicted path by taking a whole side, or by removing the file.
+///
+/// # One path per request, deliberately
+///
+/// `WorktreePathsRequest` above takes a list because discarding twenty paths
+/// is one decision a user makes once. Resolving a conflict is the opposite:
+/// each path is its own judgement about whose version is right, and
+/// [`crate::conflict::ConflictedFile::refuses`] answers **per path** — a
+/// batch would have to report "three of these five were refused, and for
+/// different reasons", which is a shape no caller handles well and every
+/// caller would be tempted to collapse into "it failed".
+///
+/// One path also keeps the operation reviewable: the plan a user confirms
+/// names a single file and a single side, so what was approved and what runs
+/// cannot drift apart.
+///
+/// `resolution` carries no bytes — every [`crate::conflict::Resolution`]
+/// variant names a side. Line-level resolution needs the `patch_plan`
+/// machinery and its own decision (#432); it is not smuggled in here.
+///
+/// # `path` is a `WorktreePath`, not a `String`
+///
+/// The newtype deserializes through its own validator, so a body naming
+/// `../escape.txt` fails at the wire boundary and the handler never sees it.
+/// That is deliberately different from [`WorktreePathsRequest`] above, which
+/// takes `Vec<String>` because it must also deduplicate and therefore needs a
+/// validation pass of its own anyway.
+///
+/// The difference matters: a handler-side `WorktreePath::new(...)` is a step
+/// someone can delete, and a test that calls `WorktreePath::new` directly
+/// will not notice — it is testing the newtype, not the endpoint. Verified
+/// the hard way: that exact mutation SURVIVED (`mutation_check`, #429).
+/// Typing the field makes the check structural instead of remembered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveConflictRequest {
+    /// Repository-relative path, exactly as the conflict scan reported it.
+    pub path: crate::plan::WorktreePath,
+    pub resolution: crate::conflict::Resolution,
+}
+
 /// Body of a `POST /api/fetch` request (M2.20c, #229): fetch from the named
 /// configured remote.
 ///

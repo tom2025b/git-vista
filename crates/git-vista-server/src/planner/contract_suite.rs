@@ -2339,6 +2339,11 @@ fn every_git_write_route_reaches_the_planner() {
         // #219 (M2.18a): discard/delete of working-tree paths.
         ("/api/discard-tracked-paths", "discard_tracked_paths"),
         ("/api/delete-untracked-paths", "delete_untracked_paths"),
+        // M4.31b (#429): resolving one conflicted path by taking a whole
+        // side, or removing the file. A git write — it runs `checkout --ours`
+        // / `--theirs` / `rm -f` — so it goes through the planner like every
+        // other mutation, and appears in the funnel below.
+        ("/api/resolve-conflict", "resolve_conflict"),
         // M2.20c (#229): cancelling a running operation. A POST, and a write
         // in the "changes what the server is doing" sense — it kills a child
         // process — but **not** a git write: it constructs no argv and mints
