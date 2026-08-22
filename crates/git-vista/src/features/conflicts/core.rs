@@ -153,16 +153,6 @@ impl PaneState {
         }
     }
 
-    /// Whether this pane may be rendered as a text buffer at all.
-    ///
-    /// Exists so no caller writes `matches!(.., Text { .. })` in four places
-    /// and gets one of them wrong — the same reason
-    /// [`Continuation::may_continue`](git_vista_protocol::conflict::Continuation::may_continue)
-    /// exists next door.
-    pub fn is_text(&self) -> bool {
-        matches!(self, PaneState::Text { .. })
-    }
-
     /// A short human description, and the one place the
     /// absent/unreadable/failed distinction becomes words a user reads.
     pub fn describe(&self) -> String {
@@ -293,10 +283,6 @@ mod tests {
         let state = PaneState::for_stage(&Stage::Absent {});
         assert_eq!(state, PaneState::Absent);
         assert!(
-            !state.is_text(),
-            "absent must never render as a text buffer"
-        );
-        assert!(
             state.describe().contains("Not present"),
             "{}",
             state.describe()
@@ -317,7 +303,6 @@ mod tests {
                 reason: "blob missing".into()
             }
         );
-        assert!(!state.is_text());
         assert!(
             state.describe().contains("blob missing"),
             "the reason must reach the user: {}",
@@ -335,7 +320,6 @@ mod tests {
             size_bytes: 900,
         });
         assert_eq!(state, PaneState::Binary { size_bytes: 900 });
-        assert!(!state.is_text());
     }
 
     #[test]
@@ -365,7 +349,6 @@ mod tests {
                 truncated: false
             }
         );
-        assert!(filled.is_text());
     }
 
     #[test]
@@ -479,7 +462,6 @@ mod tests {
                 reason: "connection lost".into()
             }
         );
-        assert!(!failed.is_text());
         assert!(failed.describe().contains("connection lost"));
     }
 
@@ -532,7 +514,6 @@ mod tests {
                 reason: "permission denied".into()
             }
         );
-        assert!(!state.is_text());
     }
 
     // ---- all four panes --------------------------------------------------

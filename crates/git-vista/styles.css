@@ -1362,6 +1362,8 @@ button.detail-file:focus-visible .detail-file-path { color: var(--accent); }
 .detail-parent,
 .act-refresh,
 .act-row,
+/* M4.31a (#428): a conflicted status card opens the four-pane view. */
+.act-status-card-open,
 .act-undo,
 button.detail-file,
 .detail-expand,
