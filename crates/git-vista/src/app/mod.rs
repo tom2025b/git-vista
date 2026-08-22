@@ -373,51 +373,6 @@ pub fn App() -> impl IntoView {
             .flatten()
     };
 
-    // M4.27 (#80): remember the comparison on screen, and put it back after a
-    // reload.
-    //
-    // Both live HERE, not in the viewer or the menu, because this is the only
-    // scope holding BOTH halves: the `DiffSpec` (via the shell's viewer doc) and
-    // the opaque `repo_id` (via the Frame). Storing a comparison without the
-    // repository it belongs to would let a reload restore it against unrelated
-    // commits and render a diff that looks entirely real.
-    //
-    // Nothing here writes a filesystem path — `repo_id` is a token the server
-    // assigned and only the server can resolve, which is what #80's
-    // "restored without exposing filesystem paths" asks for.
-    create_effect(move |_| {
-        let Some(repo_id) = frame().and_then(|f| f.repo_id.clone()) else {
-            return;
-        };
-        match shell.viewer_doc() {
-            Some(crate::state::ViewerDoc::Spec { spec }) => {
-                crate::prefs::store_comparison(&repo_id, &spec);
-            }
-            // Every other doc, and a closed viewer, are handled by
-            // `Shell::clear_payload` — which clears on the one funnel that Esc
-            // also reaches. Doing it again here would fight that.
-            _ => {}
-        }
-    });
-
-    // Restore runs at most once per load. `restored` latches, so a subsequent
-    // close (which clears storage) cannot be undone by this effect firing again
-    // on the next Frame — without the latch, closing a restored comparison
-    // would reopen it.
-    let restored = StoredValue::new(false);
-    create_effect(move |_| {
-        if restored.get_value() {
-            return;
-        }
-        let Some(repo_id) = frame().and_then(|f| f.repo_id.clone()) else {
-            return;
-        };
-        restored.set_value(true);
-        if let Some(spec) = crate::prefs::load_comparison(&repo_id) {
-            shell.open_viewer(crate::state::ViewerDoc::Spec { spec });
-        }
-    });
-
     // M1.04 (#57): establish the loopback session before the API is usable. Run
     // once on load (source `|| ()`, not keyed on `reload`, so re-reads don't
     // re-bootstrap): it exchanges a `#s=<token>` fragment for a session cookie, or
@@ -521,6 +476,58 @@ pub fn App() -> impl IntoView {
     // this is where Task 6's deferred "move the overlay signals out of canvas scope" step
     // actually lands, rather than migrating them twice.
     let shell = Shell::new(activity);
+
+    // M4.27 (#80): remember the comparison on screen, and put it back after a
+    // reload.
+    //
+    // Both live HERE, not in the viewer or the menu, because this is the only
+    // scope holding BOTH halves: the `DiffSpec` (via the shell's viewer doc) and
+    // the opaque `repo_id` (via the Frame). Storing a comparison without the
+    // repository it belongs to would let a reload restore it against unrelated
+    // commits and render a diff that looks entirely real.
+    //
+    // Nothing here writes a filesystem path — `repo_id` is a token the server
+    // assigned and only the server can resolve, which is what #80's
+    // "restored without exposing filesystem paths" asks for.
+    //
+    // Placed immediately BELOW `shell` rather than beside `frame` ~130 lines up,
+    // which is where #427 first put them: `shell` is bound here, and a `let`
+    // binding is not in scope above itself. That is not a style point — it did
+    // not compile, and the wasm build was broken on `main` for four hours
+    // because nothing ran a wasm build (#436). `frame` is defined further up and
+    // is still in scope, so both effects read exactly as they did.
+    create_effect(move |_| {
+        let Some(repo_id) = frame().and_then(|f| f.repo_id.clone()) else {
+            return;
+        };
+        match shell.viewer_doc() {
+            Some(crate::state::ViewerDoc::Spec { spec }) => {
+                crate::prefs::store_comparison(&repo_id, &spec);
+            }
+            // Every other doc, and a closed viewer, are handled by
+            // `Shell::clear_payload` — which clears on the one funnel that Esc
+            // also reaches. Doing it again here would fight that.
+            _ => {}
+        }
+    });
+
+    // Restore runs at most once per load. `restored` latches, so a subsequent
+    // close (which clears storage) cannot be undone by this effect firing again
+    // on the next Frame — without the latch, closing a restored comparison
+    // would reopen it.
+    let restored = StoredValue::new(false);
+    create_effect(move |_| {
+        if restored.get_value() {
+            return;
+        }
+        let Some(repo_id) = frame().and_then(|f| f.repo_id.clone()) else {
+            return;
+        };
+        restored.set_value(true);
+        if let Some(spec) = crate::prefs::load_comparison(&repo_id) {
+            shell.open_viewer(crate::state::ViewerDoc::Spec { spec });
+        }
+    });
 
     // #232 follow-up: give `operations` the handles it needs to put its own
     // failures on screen. It is created ~200 lines above this, deliberately —
