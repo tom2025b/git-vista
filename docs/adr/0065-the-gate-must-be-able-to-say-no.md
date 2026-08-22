@@ -42,25 +42,46 @@ Exactly one enforcement path survived: `cmd_browser`'s prerequisite checks call
 `die` (an explicit `exit 1`) when node or the Playwright cache is missing.
 **Missing tools failed; failing tests passed.**
 
+The diagram at the end of this section traces the shell state from the line
+that arms errexit to the false record that came out the other end.
+
 ```mermaid
+---
+config:
+  flowchart:
+    wrappingWidth: 480
+---
 flowchart TD
-    L32["<b>dev:32</b><br/>set -euo pipefail<br/>errexit ON"]
-    OFF["<b>cmd_gate</b><br/>set +e — needed so a red gate<br/>still reaches the finish call<br/>errexit OFF"]
-    SUB["<b>( gate_body )</b><br/>a subshell INHERITS<br/>the caller's shell state"]
-    RUN["<b>every step runs</b><br/>fmt, clippy, wasm-clippy, test,<br/>trunk build, browser —<br/>failures ignored"]
-    ECHO["<b>echo 'gate green'</b><br/>the last command<br/>in the function"]
-    RC["<b>rc = PIPESTATUS[0]</b><br/>= that echo's status<br/>= 0"]
-    REC["<b>gatehouse records</b><br/>outcome: passed<br/>verified: true"]
+    KEYS["<b>KEYS</b>
+    green — errexit armed, as intended
+    amber — deliberate, scoped, defensible
+    red — the consequence nobody chose
+    each arrow is 'this then allowed that'"]
 
-    L32 --> OFF --> SUB --> RUN --> ECHO --> RC --> REC
+    L32["<b>dev:32</b><br/>set -euo pipefail<br/>errexit ON for the whole script"]
+    OFF["<b>cmd_gate does set +e</b><br/>needed so a RED gate still reaches<br/>the finish call and gets recorded"]
+    SUB["<b>( gate_body ) runs</b><br/>a subshell INHERITS the caller's<br/>shell state — so errexit is OFF inside"]
 
-    classDef ok fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,rx:6,ry:6,color:#225d25
+    RUN["<b>every step runs regardless</b><br/>fmt, clippy, wasm-clippy, test,<br/>trunk build, browser — each failure ignored"]
+    ECHO["<b>echo 'dev: gate green'</b><br/>reached unconditionally, because it is<br/>simply the last line of the function"]
+    RC["<b>rc = PIPESTATUS of the subshell</b><br/>which is that echo's own status — zero"]
+
+    REC["<b>gatehouse writes evidence</b><br/>outcome passed, verified true<br/>for a tree that cannot compile"]
+    BROWSER["<b>the one surviving refusal</b><br/>cmd_browser calls die when node is missing<br/>missing tools fail, failing tests pass"]
+
+    L32 --> OFF --> SUB
+    SUB --> RUN --> ECHO --> RC --> REC
+    SUB --> BROWSER
+
+    classDef ok fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,rx:6,ry:6,color:#1b5e20
+    classDef mid fill:#fff8e1,stroke:#bc6c25,stroke-width:3px,rx:6,ry:6,color:#704016
     classDef bad fill:#fdecea,stroke:#c62828,stroke-width:3px,rx:6,ry:6,color:#941e1e
-    classDef mid fill:#fff8e1,stroke:#bc6c25,stroke-width:2px,rx:6,ry:6,color:#704016
+    classDef legend fill:#f2f2f2,stroke:#555555,stroke-width:2px,rx:6,ry:6,color:#333333
 
     class L32 ok
-    class OFF,SUB mid
+    class OFF,SUB,BROWSER mid
     class RUN,ECHO,RC,REC bad
+    class KEYS legend
 ```
 
 ### The irony, recorded rather than smoothed over
