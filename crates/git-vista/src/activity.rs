@@ -186,26 +186,66 @@ pub fn activity_panel_view(
                             if sec != StatusSection::Ignored {
                                 shown += card_count;
                             }
+                            // M4.31a (#428): a conflicted path is the one row
+                            // that opens something — the four-pane view. Every
+                            // other section's card stays inert, because there
+                            // is nothing yet to inspect behind it, and a
+                            // control that looks clickable and does nothing is
+                            // worse than plain text.
+                            let inspectable = sec == StatusSection::Conflicted;
                             let cards = taken
                                 .map(|row| {
-                                    view! {
-                                        <div
-                                            role="listitem"
-                                            class="act-status-card"
-                                            aria-label=row.accessible_label.clone()
-                                        >
-                                            <span class="nf ctx-icon">{glyph}</span>
-                                            <span class="act-file-path">
-                                                {row.path.clone()}
-                                            </span>
-                                            {row.secondary.clone().map(|sec| {
-                                                view! {
-                                                    <span class="detail-muted act-file-secondary">
-                                                        {sec}
-                                                    </span>
-                                                }
-                                            })}
-                                        </div>
+                                    let path = row.path.clone();
+                                    let body = view! {
+                                        <span class="nf ctx-icon">{glyph}</span>
+                                        <span class="act-file-path">{row.path.clone()}</span>
+                                        {row.secondary.clone().map(|sec| {
+                                            view! {
+                                                <span class="detail-muted act-file-secondary">
+                                                    {sec}
+                                                </span>
+                                            }
+                                        })}
+                                    };
+                                    if inspectable {
+                                        let open = move |_| {
+                                            shell.open_viewer(crate::state::ViewerDoc::Conflict {
+                                                path: path.clone(),
+                                            });
+                                        };
+                                        // The listitem role sits on a WRAPPER, not
+                                        // on the button. Putting `role="listitem"`
+                                        // on the <button> itself overrides its
+                                        // implicit button role, so assistive tech is
+                                        // told "list item" and the fact that it
+                                        // opens something disappears — the one
+                                        // affordance this control exists to offer.
+                                        view! {
+                                            <div role="listitem">
+                                                <button
+                                                    class="act-status-card act-status-card-open"
+                                                    aria-label=format!(
+                                                        "{} — inspect this conflict",
+                                                        row.accessible_label,
+                                                    )
+                                                    on:click=open
+                                                >
+                                                    {body}
+                                                </button>
+                                            </div>
+                                        }
+                                        .into_view()
+                                    } else {
+                                        view! {
+                                            <div
+                                                role="listitem"
+                                                class="act-status-card"
+                                                aria-label=row.accessible_label.clone()
+                                            >
+                                                {body}
+                                            </div>
+                                        }
+                                        .into_view()
                                     }
                                 })
                                 .collect_view();

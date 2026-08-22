@@ -83,6 +83,52 @@ pub struct FileContent {
     pub binary: bool,
 }
 
+/// One blob's content, read by object id rather than by `<commit>:<path>` —
+/// the payload of `GET /api/blob/{oid}` (M4.31a, #428). A conflict stage's
+/// `Stage::Present` (`git_vista_protocol::conflict`) carries an `oid` with no
+/// path and no owning commit (it is an index entry, not a tree entry at some
+/// revision), so [`FileContent`]'s `id`/`path` pair — meant for "this file, at
+/// this commit" — does not fit; this is "this exact object, whatever names
+/// it."
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobContent {
+    /// The requested object id, echoed back so the viewer can ignore a stale
+    /// response after the user switches panes.
+    pub oid: String,
+    /// The blob's text. Empty when `binary` is set.
+    pub content: String,
+    /// True when the content was cut at the server's size cap — same meaning
+    /// as [`FileContent::truncated`].
+    pub truncated: bool,
+    /// True when the blob isn't text (NUL bytes near the start) — same
+    /// meaning as [`FileContent::binary`].
+    pub binary: bool,
+}
+
+/// One path's content as it sits in the **working tree right now** — the
+/// result pane's payload (M4.31a, #428): what git actually wrote to disk
+/// after leaving conflict markers in it. Read-only, and the client must label
+/// it as such — see that issue's decision comment. Deliberately its own type
+/// rather than a fourth [`BlobContent`]: this is never addressed by an object
+/// id (a conflicted worktree file is not a git object at all until it is
+/// staged), and it can vanish or reappear between requests in a way a fixed
+/// blob cannot, which callers reading `truncated`/`binary` alongside it
+/// should not have to reason about through an `oid` field that is never
+/// meaningfully populated.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeFileContent {
+    /// Repo-relative path, exactly as requested.
+    pub path: String,
+    /// The file's text. Empty when `binary` is set.
+    pub content: String,
+    /// True when the content was cut at the server's size cap — same meaning
+    /// as [`FileContent::truncated`].
+    pub truncated: bool,
+    /// True when the file isn't text (NUL bytes near the start) — same
+    /// meaning as [`FileContent::binary`].
+    pub binary: bool,
+}
+
 /// Map a `--name-status` letter to the UI's [`ChangeKind`]. Same folding as
 /// the status parser: `T` (type change) reads as modified, `C` (copy) as a
 /// rename. Unknown letters read as modified rather than dropping the file.

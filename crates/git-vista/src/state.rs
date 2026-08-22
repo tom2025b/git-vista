@@ -150,6 +150,18 @@ pub enum ViewerDoc {
     /// and apply on top. Two ways to reach one view is how a surface starts
     /// disagreeing with itself.
     Spec { spec: DiffSpec },
+    /// One conflicted path, in four panes (M4.31a, #428): base, ours, theirs,
+    /// and the working tree's own copy.
+    ///
+    /// Keyed by **path**, not by any object id, because that is what the
+    /// conflict is: a path git could not merge. The three stage blobs are
+    /// found by re-reading `/api/conflicts` — an oid captured here would go
+    /// stale the moment the index moved, and a viewer painting content from a
+    /// superseded index is exactly the failure ADR 0063's `Unreadable` state
+    /// exists to prevent, one layer up.
+    ///
+    /// Read-only in this slice. Editing arrives in #429.
+    Conflict { path: String },
 }
 
 /// The persisted display settings, shared into every icon-drawing view so a

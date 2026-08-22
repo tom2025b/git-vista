@@ -337,6 +337,12 @@ const INTERACTIVE_CENSUS: &[(&str, bool)] = &[
     (".detail-parent", true),
     (".act-refresh", true),
     (".act-row", true),
+    // M4.31a (#428): a conflicted status card, which opens the four-pane
+    // conflict view. Added to the shared #65 tap-target rule at the end of
+    // styles.css rather than recorded as a `false` — it is an ordinary CSS-
+    // sized control with nothing SVG about it, so there is no honest reason
+    // for it to be the exception.
+    (".act-status-card-open", true),
     (".act-undo", true),
     ("button.detail-file", true),
     (".detail-expand", true),

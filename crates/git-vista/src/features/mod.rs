@@ -8,6 +8,8 @@ pub mod core_traits;
 
 pub mod a11y;
 pub mod activity;
+// M4.31a (#428): the four panes of a conflict view, and the state of each.
+pub mod conflicts;
 pub mod dialogs;
 pub mod diff;
 pub mod graph;

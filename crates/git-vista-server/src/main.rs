@@ -124,6 +124,7 @@ use handlers::branch::{
 };
 use handlers::clone::{clone_repo, clone_status, delete_clone_repo};
 use handlers::commit::{amend_commit, create_commit, stage_all, unstage_all};
+use handlers::conflicts::{blob_content, list_conflicts, worktree_file};
 use handlers::discard::{delete_untracked_paths, discard_tracked_paths};
 use handlers::fetch::fetch_remote;
 use handlers::plan::{execute_plan, plan_operation};
@@ -517,6 +518,21 @@ fn api_router(
             // would put a security boundary inside a match arm — where a later
             // variant inherits whichever side someone forgets to consider.
             .route("/api/diff/spec", post(spec_diff))
+            // M4.31a (#428): inspect a conflict. All three GETs, full_routes
+            // only — the decision recorded on the issue itself before this
+            // landed. `/api/conflicts` reports the stage entries of an
+            // in-progress merge (uncommitted index state by definition);
+            // `/api/blob/{oid}` addresses conflict stage blobs, which are
+            // **index** objects with no guarantee of being reachable from
+            // any commit, so "it is just a blob" is not `/api/file`'s
+            // guarantee; the worktree read is uncommitted by definition.
+            // Deliberately NOT gated by "is this OID reachable from a
+            // commit?" to make `/api/blob` LAN-safe — that is exactly the
+            // by-variant gating `/api/diff/spec`'s own comment above rejects,
+            // one call site over: the whole route is withheld instead.
+            .route("/api/conflicts", get(list_conflicts))
+            .route("/api/blob/{oid}", get(blob_content))
+            .route("/api/worktree-file/{*path}", get(worktree_file))
             // …and unstage it again (`git reset HEAD`) — the exact inverse, offered
             // by the menu while anything is staged.
             .route("/api/unstage", post(unstage_all))

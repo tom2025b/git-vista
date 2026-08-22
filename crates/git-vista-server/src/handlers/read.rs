@@ -728,7 +728,12 @@ async fn commit_diff_for_repo(
 /// Cut `text` down to at most `cap` bytes, at the last full line before the
 /// cap. The cap is first walked back to a char boundary so a multi-byte
 /// character straddling it can't panic the slice.
-fn truncate_at_line(text: &mut String, cap: usize) {
+///
+/// `pub(crate)`: `handlers::conflicts` reuses this for `/api/blob/{oid}` and
+/// the result-pane worktree read (#428) — same tidy-already-bounded-bytes
+/// contract, so a truncated blob or worktree file never hands the viewer half
+/// a line either.
+pub(crate) fn truncate_at_line(text: &mut String, cap: usize) {
     let mut end = cap.min(text.len());
     while !text.is_char_boundary(end) {
         end -= 1;
@@ -740,7 +745,12 @@ fn truncate_at_line(text: &mut String, cap: usize) {
 /// Upper bound on the text returned by `/api/file/{id}/{path}` — same iPad
 /// protection as the diff caps; past this the content is cut at a line
 /// boundary and flagged `truncated`.
-const FILE_CONTENT_CAP: usize = 2_000_000;
+///
+/// `pub(crate)`: `handlers::conflicts` reuses this exact cap for
+/// `/api/blob/{oid}` and the result-pane worktree read (#428) — one number
+/// governing every bounded text read in the app, not a second cap that could
+/// silently drift from this one.
+pub(crate) const FILE_CONTENT_CAP: usize = 2_000_000;
 
 /// One file's full content at one commit (`GET /api/file/{id}/{*path}`), for
 /// the full file viewer opened from the diff's file list.

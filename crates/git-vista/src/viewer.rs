@@ -20,12 +20,15 @@ use git_vista_core::virtualize::CumulativeHeights;
 use git_vista_protocol::diff::{ComparisonBasis, DiffSpec, SpecDiff};
 use git_vista_protocol::{PatchPlan, PatchPreview, StageDirection, StagingDiff};
 
-use crate::api::{fetch_diff_full, fetch_file, fetch_spec_diff, staging_diff_request};
+use crate::api::{
+    fetch_conflict_panes, fetch_diff_full, fetch_file, fetch_spec_diff, staging_diff_request,
+};
 // The row-height scale and overscan are the panel's constants, shared rather
 // than duplicated: two surfaces measuring the same rendered text with
 // different numbers is how a window and its scrollbar drift apart.
 use crate::detail::{accessible_rows_window, file_change_marker, DIFF_LINE_PX, DIFF_OVERSCAN};
 use crate::features::a11y::focus::GraphFocus;
+use crate::features::conflicts::core::{ConflictPanes, Pane, PaneState};
 use crate::features::diff::core::{render_window, LineWrap};
 use crate::features::diff::rows::{flatten, row_heights};
 use crate::features::diff::selection::DiffSelection;
@@ -196,6 +199,9 @@ pub fn viewer_view(
                 Some(ViewerDoc::Spec { spec }) => {
                     Some(DocResult::Spec(fetch_spec_diff(&spec).await))
                 }
+                Some(ViewerDoc::Conflict { path }) => {
+                    Some(DocResult::Conflict(fetch_conflict_panes(&path).await))
+                }
             }
         },
     );
@@ -216,6 +222,7 @@ pub fn viewer_view(
                     StageDirection::Unstage => "Unstage selected changes".to_string(),
                 },
                 ViewerDoc::Spec { spec } => spec_title(spec),
+                ViewerDoc::Conflict { path } => format!("Conflict — {path}"),
             };
             let which_for_body = which.clone();
             let body = move || match doc.get().flatten() {
@@ -223,6 +230,7 @@ pub fn viewer_view(
                 Some(DocResult::Diff(Err(e)))
                 | Some(DocResult::File(Err(e)))
                 | Some(DocResult::Staging(Err(e)))
+                | Some(DocResult::Conflict(Err(e)))
                 | Some(DocResult::Spec(Err(e))) => view! {
                     <p class="detail-status detail-error">{format!("Couldn't load: {e}")}</p>
                 }
@@ -258,6 +266,17 @@ pub fn viewer_view(
                         return view! { <p class="detail-status">"Loading…"</p> }.into_view();
                     }
                     spec_body(&d, hunk_focus)
+                }
+                Some(DocResult::Conflict(Ok(panes))) => {
+                    // Same staleness echo as every other arm: a response for a
+                    // path that is no longer open is a late answer to a
+                    // superseded request, and is dropped rather than painted.
+                    if !matches!(&which_for_body, ViewerDoc::Conflict { path }
+                                 if *path == panes.path)
+                    {
+                        return view! { <p class="detail-status">"Loading…"</p> }.into_view();
+                    }
+                    conflict_body(&panes)
                 }
                 Some(DocResult::Staging(Ok(d))) => {
                     let ViewerDoc::Staging { direction } = which_for_body else {
@@ -345,6 +364,8 @@ enum DocResult {
     File(Result<FileContent, String>),
     Staging(Result<StagingDiff, String>),
     Spec(Result<SpecDiff, String>),
+    /// All four panes of one conflicted path (M4.31a, #428).
+    Conflict(Result<ConflictPanes, String>),
 }
 
 /// The viewer title for an explicit source/target diff (M2.16, #69).
@@ -576,6 +597,70 @@ fn file_body(f: &FileContent) -> View {
         </div>
         {truncated_note}
         <pre class="detail-diff viewer-pre">{f.content.clone()}</pre>
+    }
+    .into_view()
+}
+
+/// One conflict pane: its heading, and whatever its [`PaneState`] permits.
+///
+/// **Every non-text state renders as its own explicit note, never as an empty
+/// `<pre>`.** That is #428's second and third acceptance criteria made real —
+/// an empty text box asserts "this version was blank", which is a claim about
+/// the repository, and only [`PaneState::Text`] is entitled to make it.
+/// [`PaneState::describe`] owns the wording, so this function cannot drift
+/// from the host-tested core's account of what each state means.
+fn conflict_pane(pane: Pane, state: &PaneState) -> View {
+    let body = match state {
+        PaneState::Text { content, truncated } => {
+            let truncated_note = truncated.then(|| {
+                view! {
+                    <p class="detail-status">
+                        "Content truncated — this side is larger than the viewer's cap."
+                    </p>
+                }
+            });
+            view! {
+                {truncated_note}
+                <pre class="detail-diff viewer-pre">{content.clone()}</pre>
+            }
+            .into_view()
+        }
+        // Absent, Unreadable, Binary, AwaitingContent and ContentUnavailable
+        // all land here — each one says what it is, in the core's own words.
+        // `detail-error` marks the two that are faults rather than facts.
+        other => {
+            let class = match other {
+                PaneState::Unreadable { .. } | PaneState::ContentUnavailable { .. } => {
+                    "detail-status detail-error"
+                }
+                _ => "detail-status",
+            };
+            let text = other.describe();
+            view! { <p class=class>{text}</p> }.into_view()
+        }
+    };
+    view! {
+        <section class="conflict-pane">
+            <h3 class="conflict-pane-head">{pane.label()}</h3>
+            {body}
+        </section>
+    }
+    .into_view()
+}
+
+/// The four-pane conflict view (M4.31a, #428).
+///
+/// Iterates [`Pane::ALL`] rather than naming four fields, so a pane cannot be
+/// silently omitted — #428's first acceptance criterion is that all four are
+/// reachable, and a hand-written list of three would satisfy every type check.
+fn conflict_body(panes: &ConflictPanes) -> View {
+    let rendered: Vec<View> = Pane::ALL
+        .iter()
+        .map(|p| conflict_pane(*p, panes.pane(*p)))
+        .collect();
+    view! {
+        <div class="viewer-doc-head">{panes.path.clone()}</div>
+        <div class="conflict-panes">{rendered}</div>
     }
     .into_view()
 }
