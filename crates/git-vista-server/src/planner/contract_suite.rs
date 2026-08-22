@@ -6062,6 +6062,7 @@ async fn a_cherry_pick_lands_a_commit_from_another_branch() {
     run(&repo, &["commit", "-q", "-m", "main moves on"]);
 
     assert!(!repo.join("picked.txt").exists(), "fixture: not here yet");
+    let tip_before = out(&repo, &["rev-parse", "HEAD"]);
 
     let (status, body) = pipeline(
         &repo,
@@ -6076,10 +6077,34 @@ async fn a_cherry_pick_lands_a_commit_from_another_branch() {
         repo.join("picked.txt").exists(),
         "the picked commit's file must be present on main"
     );
+
+    // `assert_ne!(HEAD, wanted)` alone was INERT: main had already moved on in
+    // the fixture above, so HEAD differed from `wanted` before the pipeline ran
+    // and a cherry-pick that did nothing at all would still have passed. What
+    // has to be pinned is that a NEW COMMIT WAS CREATED, on top of where main
+    // actually was. (M4 test-integrity audit, 2026-08-22.)
+    //
+    // MUTATION: make exec_cherry_pick apply the change without committing (drop
+    // to `--no-commit`). `picked.txt` still appears and HEAD still differs from
+    // `wanted`; the three assertions below are what notice.
+    let after = out(&repo, &["rev-parse", "HEAD"]);
     assert_ne!(
-        out(&repo, &["rev-parse", "HEAD"]),
-        wanted,
+        after, wanted,
         "a cherry-pick creates a NEW commit; it does not move the branch to the old one"
+    );
+    assert_ne!(
+        after, tip_before,
+        "a commit must actually have been created — HEAD must move"
+    );
+    assert_eq!(
+        out(&repo, &["rev-parse", "HEAD^"]),
+        tip_before,
+        "and it must sit on top of where main was, not replace it"
+    );
+    assert_eq!(
+        out(&repo, &["status", "--porcelain"]),
+        "",
+        "the pick must be committed, not left staged in the worktree"
     );
 }
 
@@ -6171,6 +6196,41 @@ fn conflicted_pick(repo: &std::path::Path) -> String {
     wanted
 }
 
+/// A repository mid-cherry-pick of TWO commits, stopped on a conflict in the
+/// FIRST. Returns `(first, second)`.
+///
+/// # Why two and not one
+///
+/// With a single-commit sequence, `--skip` and `--abort` are externally
+/// IDENTICAL: both clear the sequencer and both leave `a.txt` at main's
+/// version, because skipping the only commit leaves nothing to apply. Every
+/// assertion either test could make would hold under the other verb, so a
+/// mutation that ran the wrong flag stayed green. Found by the M4 test-integrity
+/// audit, 2026-08-22.
+///
+/// With two, the verbs diverge on a fact neither can fake: after `--skip` the
+/// sequence carries on and lands the SECOND commit (`b.txt` appears); after
+/// `--abort` the whole thing unwinds and it does not.
+fn conflicted_pick_of_two(repo: &std::path::Path) -> (String, String) {
+    run(repo, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(repo.join("a.txt"), "from side\n").unwrap();
+    run(repo, &["commit", "-q", "-am", "side changes a"]);
+    let first = out(repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("b.txt"), "second of two\n").unwrap();
+    run(repo, &["add", "b.txt"]);
+    run(repo, &["commit", "-q", "-m", "side adds b"]);
+    let second = out(repo, &["rev-parse", "HEAD"]);
+    run(repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("a.txt"), "from main\n").unwrap();
+    run(repo, &["commit", "-q", "-am", "main changes a"]);
+    // Expected to stop on the FIRST of the two — that is the point.
+    let _ = std::process::Command::new("git")
+        .args(["cherry-pick", &format!("{first}^..{second}")])
+        .current_dir(repo)
+        .status();
+    (first, second)
+}
+
 #[tokio::test]
 async fn a_resolved_conflict_lets_the_sequence_continue() {
     // The whole loop #81 depends on #84 for: a cherry-pick conflicts, the user
@@ -6237,20 +6297,54 @@ async fn continuing_while_still_conflicted_is_refused() {
 
 #[tokio::test]
 async fn skipping_drops_one_commit_and_keeps_going() {
+    // The name promises "and keeps going", and until 2026-08-22 nothing here
+    // tested the second half. On a single-commit fixture `--skip` and `--abort`
+    // are indistinguishable, so this passed under either verb. Two commits make
+    // the difference observable: skip drops the conflicting one and LANDS THE
+    // NEXT.
+    //
+    // MUTATION: make SequenceSkip's flag() return "--abort". `b.txt` then never
+    // arrives, and the commit-count assertion below goes red.
     let (_dir, repo) = seeded_repo();
-    conflicted_pick(&repo);
+    conflicted_pick_of_two(&repo);
+    // Captured AFTER the fixture: it commits "main changes a" itself, and a tip
+    // read before that would count the fixture's own commit as one the sequence
+    // landed. This is where the paused sequence actually left HEAD.
+    let before = out(&repo, &["rev-parse", "HEAD"]);
 
     let (status, body) = pipeline(&repo, GitOperation::SequenceSkip).await;
     assert_ok(status, &body);
 
     assert!(
         !repo.join(".git/CHERRY_PICK_HEAD").exists(),
-        "skipping the only commit ends the sequence"
+        "the sequence must be finished, not left open"
     );
     assert_eq!(
         std::fs::read_to_string(repo.join("a.txt")).unwrap(),
         "from main\n",
-        "skipping keeps what was here; the picked commit's version is dropped"
+        "the skipped commit's version of a.txt must NOT be applied"
+    );
+
+    // The half the old test could not see. An abort would leave neither of
+    // these true.
+    assert!(
+        repo.join("b.txt").exists(),
+        "skip must CONTINUE the sequence and land the second commit; an abort \
+         would have unwound it"
+    );
+    let after = out(&repo, &["rev-parse", "HEAD"]);
+    assert_ne!(
+        after, before,
+        "one commit of the two must have landed, so HEAD must have moved"
+    );
+    let landed = out(
+        &repo,
+        &["rev-list", "--count", &format!("{before}..{after}")],
+    );
+    assert_eq!(
+        landed, "1",
+        "exactly one of the two commits may land — the conflicting one is \
+         dropped, not merged in"
     );
 }
 
@@ -6367,8 +6461,14 @@ async fn aborting_with_no_sequence_in_progress_is_refused() {
 
 #[tokio::test]
 async fn aborting_unwinds_the_sequence() {
+    // Two commits, not one: on a single-commit sequence an abort and a skip
+    // leave byte-identical state, so this test passed under either verb until
+    // 2026-08-22. The `b.txt` assertion below is what actually separates them.
+    //
+    // MUTATION: make SequenceAbort's flag() return "--skip". The sequence then
+    // carries on, `b.txt` lands, and this goes red.
     let (_dir, repo) = seeded_repo();
-    conflicted_pick(&repo);
+    conflicted_pick_of_two(&repo);
     let before = out(&repo, &["rev-parse", "HEAD"]);
 
     let (status, body) = pipeline(&repo, GitOperation::SequenceAbort).await;
@@ -6382,6 +6482,11 @@ async fn aborting_unwinds_the_sequence() {
         out(&repo, &["rev-parse", "HEAD"]),
         before,
         "abort returns to where the sequence started"
+    );
+    assert!(
+        !repo.join("b.txt").exists(),
+        "abort must unwind the WHOLE sequence — the second commit must not have \
+         landed; a skip would have applied it"
     );
     assert!(
         body.contains("resolutions made during it are gone"),
