@@ -1449,3 +1449,18 @@ button.detail-file,
   max-height: 40vh;
   overflow: auto;
 }
+
+/* M4.31b (#429): the three whole-file resolutions, above the panes so the
+   choice is visible without scrolling past four buffers to find it. */
+.conflict-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+}
+/* The refusal names WHICH side and why. It sits between the controls and the
+   panes on purpose — beside the choice it is about, not in a toast that is
+   gone before the user has read it. */
+.conflict-refusal {
+  margin: 0.25rem 0 0.5rem;
+}
