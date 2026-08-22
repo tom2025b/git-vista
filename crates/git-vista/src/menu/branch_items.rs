@@ -308,8 +308,13 @@ pub(super) fn build_branch_items(
                         if !still_current() {
                             return;
                         }
-                        let risk = match leased {
-                            Ok(plan) => plan.risk,
+                        // Both taken off the SAME leased plan. The advisories
+                        // are the planner's answer about the remote's default
+                        // branch, which this client cannot see for itself
+                        // (M4.32, #85) — computed server-side, carried here,
+                        // never re-derived.
+                        let (risk, advisories) = match leased {
+                            Ok(plan) => (plan.risk, plan.advisories),
                             Err(e) => {
                                 dialogs.open(Dialog::Error);
                                 shell.open_error(ErrorNotice {
@@ -326,6 +331,7 @@ pub(super) fn build_branch_items(
                             force: Some(ForceWithLease {
                                 expected_remote_tip: oid,
                                 risk,
+                                advisories,
                             }),
                         });
                     });

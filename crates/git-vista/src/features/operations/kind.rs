@@ -14,6 +14,7 @@
 //! a *different* operation, and needs `Debug` for the assertions that prove it.
 
 use git_vista_core::activity::Undoable;
+use git_vista_protocol::plan::Advisory;
 use git_vista_protocol::{CommitOid, MergeStrategy, RiskLevel};
 
 /// A branch operation awaiting confirmation in the modal (Issue #33 follow-up).
@@ -156,6 +157,13 @@ pub enum OperationKind {
 pub struct ForceWithLease {
     pub expected_remote_tip: CommitOid,
     pub risk: RiskLevel,
+    /// The planner's own advisories for this exact lease plan (M4.32, #85).
+    ///
+    /// Carried rather than recomputed: `advisories_for` reads the remote's
+    /// default branch off the repository, which this client cannot see. The
+    /// server already answered the question; re-deriving it here could only
+    /// disagree.
+    pub advisories: Vec<Advisory>,
 }
 
 /// The live "which branch is checked out?" answer a menu pre-check hands the
@@ -336,6 +344,7 @@ mod tests {
                 force: Some(ForceWithLease {
                     expected_remote_tip: oid('a'),
                     risk: RiskLevel::Destructive,
+                    advisories: Vec::new(),
                 }),
             },
             OperationKind::Delete {
@@ -400,6 +409,7 @@ mod tests {
             force: Some(ForceWithLease {
                 expected_remote_tip: oid('a'),
                 risk: RiskLevel::Destructive,
+                advisories: Vec::new(),
             }),
         }
         .describe();

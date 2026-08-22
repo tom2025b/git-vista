@@ -115,6 +115,7 @@ pub fn confirm_modal_view(features: Features) -> impl IntoView {
                         branch,
                         *set_upstream,
                         force.as_ref().map(|f| (&f.expected_remote_tip, f.risk)),
+                        force.as_ref().map_or(&[][..], |f| &f.advisories),
                     );
                     ConfirmPrompt::plain(
                         copy.title,
