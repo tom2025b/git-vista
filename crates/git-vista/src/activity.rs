@@ -213,18 +213,26 @@ pub fn activity_panel_view(
                                                 path: path.clone(),
                                             });
                                         };
+                                        // The listitem role sits on a WRAPPER, not
+                                        // on the button. Putting `role="listitem"`
+                                        // on the <button> itself overrides its
+                                        // implicit button role, so assistive tech is
+                                        // told "list item" and the fact that it
+                                        // opens something disappears — the one
+                                        // affordance this control exists to offer.
                                         view! {
-                                            <button
-                                                role="listitem"
-                                                class="act-status-card act-status-card-open"
-                                                aria-label=format!(
-                                                    "{} — inspect this conflict",
-                                                    row.accessible_label,
-                                                )
-                                                on:click=open
-                                            >
-                                                {body}
-                                            </button>
+                                            <div role="listitem">
+                                                <button
+                                                    class="act-status-card act-status-card-open"
+                                                    aria-label=format!(
+                                                        "{} — inspect this conflict",
+                                                        row.accessible_label,
+                                                    )
+                                                    on:click=open
+                                                >
+                                                    {body}
+                                                </button>
+                                            </div>
                                         }
                                         .into_view()
                                     } else {
