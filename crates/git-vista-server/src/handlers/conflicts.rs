@@ -271,22 +271,24 @@ async fn worktree_file_for_repo(
 /// express "still conflicted, and this side is still readable". The issue's
 /// own words: *this is the missing surface, not a missing mechanism.*
 ///
-/// So this handler validates the wire shape and hands over. It deliberately
-/// does **not** pre-check `refuses` here: a check at the HTTP boundary would
-/// be a second, racier copy of the one that actually protects the write, and
-/// two answers that can disagree is worse than one answer that cannot.
+/// So this handler only guards read-only mode and hands over. The path is a
+/// `WorktreePath` on the DTO itself, so a traversal body fails to deserialize
+/// and never reaches here — structural rather than remembered (see
+/// `ResolveConflictRequest`'s own doc for why that replaced a check written
+/// out in this function).
+///
+/// It deliberately does **not** pre-check `refuses` here either: a check at
+/// the HTTP boundary would be a second, racier copy of the one that actually
+/// protects the write, and two answers that can disagree is worse than one
+/// answer that cannot.
 pub(crate) async fn resolve_conflict(
     Json(req): Json<ResolveConflictRequest>,
 ) -> (StatusCode, String) {
     if let Some(rejected) = reject_if_read_only() {
         return rejected;
     }
-    let path = match WorktreePath::new(req.path) {
-        Ok(path) => path,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()),
-    };
     planner::plan_and_execute(GitOperation::ResolveConflict {
-        path,
+        path: req.path,
         resolution: req.resolution,
     })
     .await
@@ -638,21 +640,43 @@ mod tests {
             });
             let req: ResolveConflictRequest =
                 serde_json::from_value(body).unwrap_or_else(|e| panic!("{choice}: {e}"));
-            assert_eq!(req.path, "src/a.rs");
+            assert_eq!(req.path.as_str(), "src/a.rs");
         }
     }
 
     #[test]
-    fn a_path_that_escapes_the_worktree_never_becomes_a_worktree_path() {
-        // The newtype is the gate; this pins that the handler actually runs
-        // it on THIS field rather than trusting the wire string.
+    fn the_request_body_itself_refuses_a_path_that_escapes_the_worktree() {
+        // THE test for this endpoint's path handling, and it is deliberately
+        // written against the BODY rather than against `WorktreePath::new`.
+        //
+        // The first version called the newtype directly. `mutation_check`
+        // reported SURVIVED when the handler's validation was gutted — of
+        // course it did: it was testing the protocol crate's newtype, which
+        // has its own tests, and said nothing whatever about this endpoint.
+        // A test that passes while the endpoint it names is defenceless is
+        // worse than no test.
+        //
+        // Deserializing the real request body is what actually pins it,
+        // because `path` IS a `WorktreePath` on the DTO — so the refusal
+        // happens in serde, before any handler code runs, and no handler can
+        // skip it.
         for bad in ["../escape.txt", "/etc/passwd", "-rf", ""] {
+            let body = serde_json::json!({
+                "path": bad,
+                "resolution": {"choice": "take_ours"},
+            });
             assert!(
-                WorktreePath::new(bad.to_string()).is_err(),
-                "{bad:?} must be refused at the wire boundary"
+                serde_json::from_value::<ResolveConflictRequest>(body).is_err(),
+                "{bad:?} must be refused by the body itself"
             );
         }
-        assert!(WorktreePath::new("src/a.rs".to_string()).is_ok());
+
+        let ok = serde_json::json!({
+            "path": "src/a.rs",
+            "resolution": {"choice": "take_deletion"},
+        });
+        let req: ResolveConflictRequest = serde_json::from_value(ok).expect("a plain path");
+        assert_eq!(req.path.as_str(), "src/a.rs");
     }
 
     #[test]
