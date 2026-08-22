@@ -894,6 +894,88 @@ pub(crate) async fn git_cat_file_batch(
     }
 }
 
+/// Resolve one blob **object id directly** — no `<rev>:<path>` spec, no `^`
+/// parent fallback — through a dedicated `git cat-file --batch` spawn (#428).
+///
+/// This is deliberately not a thin wrapper around [`git_cat_file_batch`]: that
+/// function's whole shape exists to build `<id>:<path>` and retry
+/// `<id>^:<path>` when the first is missing, because a *file at a commit* can
+/// legitimately have moved to the parent (a commit that deleted it). A blob
+/// oid names one exact object with no such history to fall back into — a
+/// conflict's stage entries are already-resolved blob ids from the index
+/// (`ConflictedFile`'s `Stage::Present.oid`), not revisions to walk. Retrying
+/// `<oid>^:` would ask git to treat the oid as a commit and silently resolve
+/// to a *different, unrelated* object on a coincidental hit — the one thing
+/// this endpoint must never do with a fixed identity the caller already
+/// picked out of a scan.
+///
+/// `oid` is validated by the caller (`CommitOid::new`, 40 or 64 lowercase hex)
+/// before this is reached — it is not re-checked here — so a bare oid can
+/// never be read as `cat-file --batch` revision syntax
+/// (`HEAD:secrets.txt`, `:0:path`, `@{u}`): the hex gate admits nothing the
+/// batch protocol's `<spec>` grammar treats as anything but a plain object
+/// name.
+pub(crate) async fn git_cat_file_batch_oid(
+    repo: &Path,
+    oid: &str,
+    cap: usize,
+    endpoint: &str,
+) -> Result<BatchFileRead, (StatusCode, String)> {
+    let mut child = sandboxed(
+        repo,
+        &["cat-file", "--batch"],
+        crate::sandbox::NetworkNeed::Local,
+    )
+    .map_err(|e| io_error(endpoint, std::io::Error::other(e)))?
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true)
+    .spawn()
+    .map_err(|e| io_error(endpoint, e))?;
+
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(io_error(
+            endpoint,
+            std::io::Error::other("git stdin was not piped"),
+        ));
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return Err(io_error(
+            endpoint,
+            std::io::Error::other("git stdout was not piped"),
+        ));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return Err(io_error(
+            endpoint,
+            std::io::Error::other("git stderr was not piped"),
+        ));
+    };
+    let stderr_task = tokio::spawn(drain_stderr(stderr));
+    let mut reader = tokio::io::BufReader::new(stdout);
+
+    let outcome = batch_query(&mut stdin, &mut reader, oid, cap).await;
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
+
+    match outcome {
+        Ok(BatchQueryOutcome::Found(found)) => Ok(found),
+        Ok(BatchQueryOutcome::Missing) => {
+            Err((StatusCode::NOT_FOUND, format!("no such object: {oid}")))
+        }
+        Err(BatchLookupError::Io(e)) => Err(io_error(endpoint, e)),
+        Err(BatchLookupError::ProcessEnded) => Err(git_error(endpoint, &stderr_bytes)),
+        Err(BatchLookupError::Protocol(msg)) => Err(io_error(endpoint, std::io::Error::other(msg))),
+        Err(BatchLookupError::BothMissing) => unreachable!(
+            "batch_query never returns BothMissing — only batch_lookup_with_fallback's \
+             two-query retry does"
+        ),
+    }
+}
+
 /// Why [`batch_lookup_with_fallback`] (and the [`batch_query`] it drives)
 /// could not produce a [`BatchFileRead`].
 #[derive(Debug)]
