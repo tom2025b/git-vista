@@ -56,6 +56,7 @@ use crate::api::{fetch_rebase_status, fetch_status, fetch_undoables, fetch_workt
 
 mod branch_items;
 mod commit_items;
+mod compare_items;
 mod create_items;
 mod remote_items;
 mod tag_items;
@@ -210,6 +211,8 @@ pub fn menu_view(
                 create_items::build_create_items(features, ic, &m);
             let (commit_changes, commit_empty, amend_item) =
                 commit_items::build_commit_items(features, ic, &m);
+            let (compare_anchor_item, compare_direct, compare_since) =
+                compare_items::build_compare_items(features, ic, &m);
             let (
                 stage_changes,
                 unstage_changes,
@@ -325,6 +328,12 @@ pub fn menu_view(
                     {fold_wip_item}
                     {details_item}
                     {diff_item}
+                    // M4.27 (#80): reads next to the other two read-only views.
+                    // `diff_item` shows this commit against its parent; these
+                    // show it against another commit the user picked.
+                    {compare_anchor_item}
+                    {compare_direct}
+                    {compare_since}
                     {open_github}
                     {write_items}
                     {offline_notice}

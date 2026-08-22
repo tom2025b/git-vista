@@ -198,6 +198,14 @@ pub struct Features {
     /// came to be governed by two rules on two different ticks. `App` still holds the
     /// `Activity` handle directly, because the shared status read keys on it.
     pub shell: Shell,
+    /// The first endpoint of a two-commit comparison, once one has been picked
+    /// (M4.27, #80). `None` when no comparison is in progress.
+    ///
+    /// A full commit hash, matching [`MenuData::commit`]. Held here rather than
+    /// in `GraphCore` because it survives an epoch bump: the anchor is a thing
+    /// the USER chose, and a background refresh re-reading the repo must not
+    /// silently discard it.
+    pub compare_anchor: RwSignal<Option<String>>,
 }
 
 /// The lazily-fetched commit detail (Phase 10): keyed on the open commit's hash,

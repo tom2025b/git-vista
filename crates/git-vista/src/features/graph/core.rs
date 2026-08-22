@@ -900,6 +900,38 @@ pub fn push_confirm_copy(
     }
 }
 
+/// What this commit's menu should offer, given the current anchor.
+///
+/// Pure, so the decision is testable without a DOM: the rendering below reads
+/// this and nothing else. Extracted because the interesting part is not which
+/// buttons appear but WHICH COMMIT ENDS UP AS `base` — get that backwards and
+/// every diff in the app reads inverted while still looking plausible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompareOffer {
+    /// No anchor set: offer to make this commit the anchor.
+    SetAnchor,
+    /// This commit IS the anchor: offer only to clear it. Comparing a commit
+    /// with itself is an empty diff, so no compare items are offered.
+    ClearAnchor,
+    /// A different commit is anchored: offer both comparisons.
+    ///
+    /// `base` is the ANCHOR and `target` is the commit whose menu this is —
+    /// "compare from here, with that" reads as anchor → here, matching the
+    /// direction `RefVsRef` already uses for "Compare with HEAD".
+    Compare { base: String, target: String },
+}
+
+pub fn offer_for(anchor: Option<&str>, this: &str) -> CompareOffer {
+    match anchor {
+        None => CompareOffer::SetAnchor,
+        Some(a) if a == this => CompareOffer::ClearAnchor,
+        Some(a) => CompareOffer::Compare {
+            base: a.to_string(),
+            target: this.to_string(),
+        },
+    }
+}
+
 /// The planner's advisories, as prose appended to the force-push confirmation
 /// (M4.32, #85).
 ///
@@ -950,6 +982,9 @@ fn advisory_lines(advisories: &[Advisory]) -> String {
 fn short_oid(oid: &str) -> &str {
     &oid[..oid.len().min(7)]
 }
+
+#[cfg(test)]
+mod compare_offer_suite;
 
 #[cfg(test)]
 mod push_confirm_suite;

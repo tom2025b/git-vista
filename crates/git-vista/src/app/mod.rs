@@ -556,12 +556,18 @@ pub fn App() -> impl IntoView {
     // The two bundles `graph_canvas` takes (see `crate::state`). `features` is every
     // handle created here, above the canvas, precisely so an epoch bump's rebuild cannot
     // drop it; `settings` is the display preferences every icon-drawing view reads.
+    // M4.27 (#80): created here, above the canvas, for the same reason as every
+    // other handle in this bundle — an epoch bump rebuilds the canvas, and a
+    // signal owned below it would lose the user's chosen anchor on every
+    // background refresh.
+    let compare_anchor = create_rw_signal(None::<String>);
     let features = Features {
         graph,
         dialogs: dialogs_guard,
         operations,
         status,
         shell,
+        compare_anchor,
     };
     let settings = Settings {
         nerd_icons,
