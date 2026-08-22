@@ -11,7 +11,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { buildFixture } from './fixture.mjs'
+import { buildConflictFixture, buildFixture } from './fixture.mjs'
 import { startServer } from './server.mjs'
 
 export const RUNTIME_FILE = join(import.meta.dirname, '.runtime.json')
@@ -61,8 +61,13 @@ export default async function globalSetup() {
 
   const work = mkdtempSync(join(tmpdir(), 'gv-browser-'))
   const fixture = buildFixture(join(work, 'fixture-repo'))
+  // #428: a second, separately-built repository left mid-merge. Served
+  // alongside the main fixture so the conflict specs have real stage entries
+  // to inspect without putting the shared fixture into MERGING state.
+  const conflictFixture = buildConflictFixture(join(work, 'conflict-repo'))
   const { child, base, signInUrl } = await startServer({
     repoPath: fixture.root,
+    extraRepos: [conflictFixture.root],
     stateHome: join(work, 'state'),
   })
 
@@ -73,7 +78,7 @@ export default async function globalSetup() {
   // breaking the next one.
   writeFileSync(
     RUNTIME_FILE,
-    JSON.stringify({ base, pid: child.pid, work, fixture }, null, 2),
+    JSON.stringify({ base, pid: child.pid, work, fixture, conflictFixture }, null, 2),
   )
 
   try {

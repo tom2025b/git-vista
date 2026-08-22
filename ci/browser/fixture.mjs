@@ -128,3 +128,61 @@ export function buildFixture(root) {
     multiHunkCount: MULTI_HUNK_COUNT,
   }
 }
+
+/**
+ * A SECOND repository, left mid-merge with real unresolved conflicts (M4.31a,
+ * #428).
+ *
+ * Deliberately its own repository rather than a conflict added to
+ * `buildFixture`. A conflicted index puts a repo in MERGING state and changes
+ * the status headline, the section counts and the rebase-status surface — all
+ * of which existing specs assert exact values for (#348's staged/unstaged/
+ * untracked shape especially). Conflicting the shared fixture would make those
+ * specs fail for a reason that has nothing to do with what they test.
+ *
+ * Two conflicted paths, chosen so the panes differ:
+ *
+ *   `both-modified.txt` — modify/modify. All three stages PRESENT, so every
+ *   pane has content and the base pane is real.
+ *
+ *   `added-by-both.txt` — add/add. **No stage 1**, so the base pane is
+ *   `Absent` — the exact case ADR 0063 spends its longest section on, and the
+ *   one a renderer is most likely to paint as an empty box.
+ */
+export function buildConflictFixture(root) {
+  rmSync(root, { recursive: true, force: true })
+  mkdirSync(root, { recursive: true })
+
+  const git = (...args) =>
+    execFileSync('git', [...IDENT, '-C', root, ...args], {
+      encoding: 'utf8',
+      env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+    })
+
+  git('init', '-q', '-b', 'main')
+  writeFileSync(join(root, 'both-modified.txt'), 'the common ancestor\n')
+  git('add', 'both-modified.txt')
+  git('commit', '-q', '-m', 'seed: the common ancestor')
+
+  git('checkout', '-q', '-b', 'theirs')
+  writeFileSync(join(root, 'both-modified.txt'), 'their version\n')
+  writeFileSync(join(root, 'added-by-both.txt'), 'theirs created this\n')
+  git('add', '-A')
+  git('commit', '-q', '-m', 'theirs: edit and add')
+
+  git('checkout', '-q', 'main')
+  writeFileSync(join(root, 'both-modified.txt'), 'our version\n')
+  writeFileSync(join(root, 'added-by-both.txt'), 'ours created this\n')
+  git('add', '-A')
+  git('commit', '-q', '-m', 'ours: edit and add')
+
+  // This merge is SUPPOSED to fail — that is the whole fixture. Not asserted,
+  // for the same reason `conflicts.rs`'s own test fixture does not assert it.
+  try {
+    git('merge', 'theirs')
+  } catch {
+    /* expected: leaves the index at stages 1/2/3 */
+  }
+
+  return { root, conflicted: ['added-by-both.txt', 'both-modified.txt'] }
+}

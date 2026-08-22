@@ -30,7 +30,7 @@ export const SERVER_BIN = join(
  * stdout because the file is the contract `gv` itself uses, and stdout parsing
  * breaks silently whenever the startup banner is reworded.
  */
-export async function startServer({ repoPath, stateHome, port = TEST_PORT }) {
+export async function startServer({ repoPath, stateHome, extraRepos = [], port = TEST_PORT }) {
   if (!existsSync(SERVER_BIN)) {
     throw new Error(
       `server binary missing at ${SERVER_BIN}\n` +
@@ -47,7 +47,8 @@ export async function startServer({ repoPath, stateHome, port = TEST_PORT }) {
     env: {
       ...process.env,
       XDG_STATE_HOME: stateHome,
-      GIT_VISTA_REPOS: repoPath,
+      // `:`-separated, matching PATH — see state.rs's `repo_list`.
+      GIT_VISTA_REPOS: [repoPath, ...extraRepos].join(':'),
       // Keep the fixture's own hooks out of it; the tests assert on git state,
       // not on hook behaviour.
       GIT_CONFIG_GLOBAL: '/dev/null',
