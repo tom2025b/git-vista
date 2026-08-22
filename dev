@@ -52,8 +52,16 @@ trunk_build() {
 }
 
 # The gate's actual work. Split out from cmd_gate so the wrapper can capture the
-# whole transcript without changing what runs or in what order. `set -e` still
-# applies inside, so the first failure still aborts the rest.
+# whole transcript without changing what runs or in what order.
+#
+# This function DEPENDS on errexit being on, and cannot enforce that itself —
+# a function inherits whatever the caller's shell state is. `cmd_gate` has to
+# turn errexit off around the recording pipeline (see the comment there), so it
+# re-arms it explicitly for this subshell: `( set -e; gate_body )`. Between
+# 2026-08-19 and #434 it did not, and the consequence was total — every step ran
+# regardless of the last one's failure, and the gate could not fail at all.
+# If you change how this function is invoked, `a_failing_step_fails_the_gate` in
+# ci/gate_errexit_test.sh is the thing that will notice.
 gate_body() {
   echo "dev: running the CI gate (fmt → clippy → wasm-clippy → test → trunk build → browser)…"
   echo "── fmt ─────────────────────────────────────────────"
@@ -105,10 +113,23 @@ cmd_gate() {
     rid=$("$gh" begin --repo "$REPO" -- ./dev gate 2>/dev/null) || rid=""
   fi
 
-  # The gate itself. `|| true` on the pipeline keeps `set -e` from aborting
-  # before the finish call; the real code is recovered from PIPESTATUS.
+  # The gate itself. `set +e` here keeps a failing gate from aborting THIS
+  # function before the finish call below records the result; the real code is
+  # recovered from PIPESTATUS.
+  #
+  # `set -e` INSIDE the subshell is not redundant with line 32's
+  # `set -euo pipefail` — it undoes the `set +e` immediately above, which the
+  # subshell would otherwise inherit. Without it (#434, 2026-08-19 to
+  # 2026-08-22) every step of `gate_body` ran regardless of the previous one's
+  # failure, the function reached its own `echo "dev: ✅ gate green"`, and
+  # PIPESTATUS[0] was that echo's 0 — so the gate could not fail, and gatehouse
+  # recorded a `verified: true` for a commit that could not compile.
+  #
+  # This is the line the header comment above means by "Recording must NEVER
+  # change whether the gate passed". Recording is why `set +e` is here at all;
+  # `set -e` is what keeps that from costing the verdict.
   set +e
-  ( gate_body ) 2>&1 | tee "$log"
+  ( set -e; gate_body ) 2>&1 | tee "$log"
   rc=${PIPESTATUS[0]}
   set -e
 
