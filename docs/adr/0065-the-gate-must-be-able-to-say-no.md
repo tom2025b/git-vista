@@ -49,28 +49,27 @@ that arms errexit to the false record that came out the other end.
 ---
 config:
   flowchart:
-    wrappingWidth: 480
+    wrappingWidth: 900
 ---
 flowchart TD
     KEYS["<b>KEYS</b>
     green — errexit armed, as intended
     amber — deliberate, scoped, defensible
     red — the consequence nobody chose
-    each arrow is 'this then allowed that'"]
+    each arrow reads 'this then allowed that'"]
 
-    L32["<b>dev:32</b><br/>set -euo pipefail<br/>errexit ON for the whole script"]
-    OFF["<b>cmd_gate does set +e</b><br/>needed so a RED gate still reaches<br/>the finish call and gets recorded"]
-    SUB["<b>( gate_body ) runs</b><br/>a subshell INHERITS the caller's<br/>shell state — so errexit is OFF inside"]
+    L32["<b>dev:32 — set -euo pipefail</b><br/>errexit ON for the whole script"]
+    OFF["<b>cmd_gate does set +e</b><br/>deliberate: a RED gate must still reach the finish call and get recorded"]
+    SUB["<b>( gate_body ) runs in a subshell</b><br/>a subshell INHERITS the caller's shell state — so errexit is OFF inside it"]
 
-    RUN["<b>every step runs regardless</b><br/>fmt, clippy, wasm-clippy, test,<br/>trunk build, browser — each failure ignored"]
-    ECHO["<b>echo 'dev: gate green'</b><br/>reached unconditionally, because it is<br/>simply the last line of the function"]
-    RC["<b>rc = PIPESTATUS of the subshell</b><br/>which is that echo's own status — zero"]
+    RUN["<b>every step runs regardless of the last one</b><br/>fmt, clippy, wasm-clippy, test, trunk build, browser — each failure ignored"]
+    ECHO["<b>the function's last line is echo 'dev: gate green'</b><br/>reached unconditionally, so PIPESTATUS of the subshell is that echo's own status — zero"]
+    REC["<b>gatehouse writes outcome passed, verified true</b><br/>certifying clippy-wasm and trunk-build for a tree that cannot compile"]
 
-    REC["<b>gatehouse writes evidence</b><br/>outcome passed, verified true<br/>for a tree that cannot compile"]
     BROWSER["<b>the one surviving refusal</b><br/>cmd_browser calls die when node is missing<br/>missing tools fail, failing tests pass"]
 
     L32 --> OFF --> SUB
-    SUB --> RUN --> ECHO --> RC --> REC
+    SUB --> RUN --> ECHO --> REC
     SUB --> BROWSER
 
     classDef ok fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,rx:6,ry:6,color:#1b5e20
@@ -80,7 +79,7 @@ flowchart TD
 
     class L32 ok
     class OFF,SUB,BROWSER mid
-    class RUN,ECHO,RC,REC bad
+    class RUN,ECHO,REC bad
     class KEYS legend
 ```
 
