@@ -121,11 +121,12 @@ pub struct ActivityEvent {
     pub source: ActivitySource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo: Option<Undoable>,
-    /// The complete local branch -> tip map as it stood when this event was
-    /// journaled (#131). This is what lets a future time scrubber replay
-    /// history *losslessly* — including branches that no longer exist —
-    /// instead of depending on the reflog, which expires at ~90 days, keeps
-    /// only 200 entries per ref, and is deleted outright with its branch.
+    /// The repository's refs as they stood when this event was journaled —
+    /// HEAD, local branches, tags and remote-tracking branches (#131, #449).
+    /// This is what lets a future time scrubber replay history *losslessly*
+    /// — including refs that no longer exist — instead of depending on the
+    /// reflog, which expires at ~90 days, keeps only 200 entries per ref, and
+    /// is deleted outright with its branch.
     ///
     /// `None` means no capture is recorded: the event predates this field, or
     /// it was journaled somewhere without a real `.git` directory. It does
@@ -135,29 +136,58 @@ pub struct ActivityEvent {
     pub refs: Option<RefsAtEvent>,
 }
 
-/// The branch -> tip capture attached to a journaled event.
+/// The ref capture attached to a journaled event: HEAD, local branches, tags
+/// and remote-tracking refs as they stood at that instant.
 ///
-/// **Why this is an enum and not a map.** A replayer asking "which branches
+/// **Why this is an enum and not a map.** A replayer asking "which refs
 /// existed at this moment?" must be able to tell three answers apart:
 ///
 /// | value | meaning | what a replay may conclude |
 /// |---|---|---|
 /// | field absent (`None`) | no capture was attempted | nothing — this event carries no ref history |
 /// | [`Self::CaptureFailed`] | we tried and could not read the refs | nothing — and it must NOT infer deletions |
-/// | [`Self::Captured`] | a real observation, possibly of zero branches | the map is the truth at that instant |
+/// | [`Self::Captured`] | a real observation, possibly of zero refs | the maps are the truth at that instant |
 ///
 /// Collapsing the middle row into an empty map would make a failed read
 /// indistinguishable from "every branch was deleted" — the most destructive
 /// reading available, produced by the least informative event. That is the
 /// exact defect class this codebase spent 2026-08-18 removing, so the storage
 /// format refuses to allow it in the first place.
+///
+/// **The same rule, one level down (#449).** The three-state honesty is a
+/// property of *every* field, not just of this enum. A new field must
+/// distinguish **not recorded** from **recorded as empty**, or it reintroduces
+/// at the field level the defect this type exists to prevent at the record
+/// level:
+///
+/// | `tags` | meaning | what a replay may conclude |
+/// |---|---|---|
+/// | absent (`None`) | this line predates #449 | nothing about tags |
+/// | `Some` with an empty map | observed | the repo genuinely had no tags |
+/// | `Some` with entries | observed | these tags, at these tips |
+///
+/// Declaring `tags` a bare `BTreeMap` with `#[serde(default)]` would make
+/// every journal line written before #449 deserialize as a confident
+/// observation that the repository had zero tags — a claim never made,
+/// produced by the least informative line available.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RefsAtEvent {
-    /// The refs were read. `branches` is the full local branch -> tip map at
-    /// that instant, and an empty map is a legitimate observation (a repo
-    /// before its first commit genuinely has no branches).
+    /// The refs were read. Each map is a short-name -> tip map at that
+    /// instant, and an empty map is a legitimate observation (a repo before
+    /// its first commit genuinely has no branches).
+    ///
+    /// `branches` and `truncated_at` keep the names, positions and meanings
+    /// they had under #131 exactly: the journal is append-only, and a line
+    /// written last month must keep meaning what it meant when it was
+    /// written. Everything #449 adds is an additional optional field. The
+    /// resulting shape is asymmetric — `branches` is a bare map with a
+    /// sibling `truncated_at` while `tags` and `remotes` are
+    /// [`CapturedRefs`] — and that asymmetry is the price of not rewriting
+    /// the meaning of lines already on disk. Uniformity was available only by
+    /// breaking them.
     Captured {
+        /// Local branches, under their short names (`main`, `feature/ui`).
         branches: BTreeMap<String, String>,
         /// `Some(total)` when the repo had more branches than the journal
         /// records per event, carrying the true count. The map then holds the
@@ -166,17 +196,109 @@ pub enum RefsAtEvent {
         /// branches as deleted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         truncated_at: Option<usize>,
+        /// Where HEAD pointed (#449). `None` means this line predates the
+        /// field — which is not "HEAD was unreadable", a state
+        /// [`HeadAtEvent::Unreadable`] records explicitly and with a reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head: Option<HeadAtEvent>,
+        /// Tags, under their short names (`v1.0`), each **peeled** to the
+        /// commit it ultimately points at — see [`CapturedRefs`] for what
+        /// peeling costs. `None` = not recorded; `Some` = observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<CapturedRefs>,
+        /// Remote-tracking refs, under their short names (`origin/main`).
+        /// `None` = not recorded; `Some` = observed. Kept in their own map
+        /// rather than merged with `branches`: a fork of a busy upstream can
+        /// hold hundreds, and under one shared cap they would evict the local
+        /// branches — the data of record — to make room for refs that change
+        /// rarely. See ADR 0070 for why they are recorded at all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remotes: Option<CapturedRefs>,
     },
     /// The read failed, and the reason is preserved. A replayer must treat
     /// this as "no information", never as "no branches".
     CaptureFailed { reason: String },
 }
 
-/// How many branches one journal line records. #131 budgeted "a few KB per
-/// operation"; at ~50 bytes per entry this holds that line for any repo a
-/// person actually works in, and repos past it record the overflow honestly
-/// via `truncated_at` rather than lying by omission.
+/// A captured ref map plus its own truncation count, so one kind overflowing
+/// can never be mistaken for another kind's completeness.
+///
+/// **What peeling costs, recorded so nobody rediscovers it as a bug.** Every
+/// entry is peeled to a commit, because that is what the graph badges and
+/// what a replay draws. In the capture a lightweight tag and an annotated tag
+/// on the same commit are therefore indistinguishable, and the tag object's
+/// own id is not recoverable: a replay can show *that* `v1.0` pointed at
+/// commit X, never the tag's message or tagger. If a viewer ever needs that,
+/// it is a follow-up that adds a field — not a reason to store unpeeled ids
+/// now and make every consumer peel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedRefs {
+    pub entries: BTreeMap<String, String>,
+    /// `Some(total)` when there were more than [`REFS_PER_EVENT_CAP`] of this
+    /// kind, carrying the true count. As with `branches`' `truncated_at`,
+    /// never silently capped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_at: Option<usize>,
+}
+
+/// How many refs of **each** map — branches, tags, remotes — one journal line
+/// records. #131 budgeted "a few KB per operation"; at ~60 bytes per entry
+/// this holds that line for any repo a person actually works in, and repos
+/// past it record the overflow honestly via the matching `truncated_at`
+/// rather than lying by omission.
+///
+/// The cap is applied per map rather than as one shared budget. A shared one
+/// has to decide *which* kind loses its tail — truncation would become
+/// order-dependent, whether tags were cut would depend on how many branches
+/// happened to exist, and a single count could not say which kind lost
+/// entries. Three independent caps make each map's honesty self-contained,
+/// and branches keep exactly the guarantee they had under #131.
+///
+/// The price: the pathological worst case for one line is ~1500 entries,
+/// roughly 90 KB, against ~25 KB before #449. A typical repository (10
+/// branches, 30 tags, 20 remotes) lands near 3.5 KB. See ADR 0070.
 pub const REFS_PER_EVENT_CAP: usize = 500;
+
+/// Where HEAD pointed when an event was journaled (#449).
+///
+/// **Why an enum rather than a symbolic-name/oid pair.** Two independent
+/// `Option`s would be the flag-pair shape ADR 0068 was written against: four
+/// combinations, a reader who must remember which are possible, and a
+/// renderer free to assert a fact the data never carried. An enum makes the
+/// states total and named.
+///
+/// Every variant below was reproduced against `gix` 0.84 before it was
+/// written; none is defensive padding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "at", rename_all = "snake_case")]
+pub enum HeadAtEvent {
+    /// HEAD is symbolic and resolves: the ref it names, plus the commit.
+    ///
+    /// `symbolic` is the **full** ref name (`refs/heads/main`), never
+    /// shortened — a symbolic ref names a full ref path, and a short name
+    /// would collide with a same-named tag. The join back to `branches` is a
+    /// lossless `strip_prefix("refs/heads/")`.
+    OnBranch { symbolic: String, oid: String },
+    /// Detached and resolving: a commit, and deliberately no name.
+    Detached { oid: String },
+    /// Symbolic, pointing at a ref that has no commit yet (a fresh repo, a
+    /// new orphan branch). A name with nothing behind it — not a branch at
+    /// zero.
+    Unborn { symbolic: String },
+    /// Neither a name nor a commit: HEAD read, and held an object id nothing
+    /// resolves. Recorded rather than smoothed into one of the three above.
+    Unresolvable,
+    /// HEAD itself could not be read, and the reason is preserved.
+    ///
+    /// Distinct from [`Self::Unresolvable`], which is a HEAD that *was* read
+    /// and pointed nowhere. This is reachable while the surrounding capture
+    /// succeeds: a repository whose ref store opens and lists normally can
+    /// still have a corrupt `.git/HEAD`, or a branch ref that will not
+    /// instantiate. Recording that as "no HEAD" — or letting it fail the
+    /// whole capture, discarding branches that read perfectly well — is the
+    /// collapse this type exists to forbid.
+    Unreadable { reason: String },
+}
 
 /// One raw reflog line, as read natively by `git-vista-git` — ref name plus
 /// the entry's old/new oids, timestamp and message. Defined here (not in the

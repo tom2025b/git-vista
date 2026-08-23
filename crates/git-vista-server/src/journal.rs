@@ -24,9 +24,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use git_vista_core::activity::{ActivityEvent, RefsAtEvent, REFS_PER_EVENT_CAP};
-use git_vista_core::model::RefKind;
-use git_vista_git::read_refs;
+use git_vista_core::activity::{ActivityEvent, CapturedRefs, RefsAtEvent, REFS_PER_EVENT_CAP};
+use git_vista_core::model::{GitRef, RefKind};
+use git_vista_git::read_refs_at;
 
 /// Only this many of the newest journal lines are read back. The journal is
 /// append-only and unbounded; the feed shows nothing like this many events.
@@ -50,40 +50,65 @@ fn snapshot_path(repo: &Path) -> Option<PathBuf> {
     state_dir(repo).map(|d| d.join("refs.json"))
 }
 
-/// Read the repo's local branch -> tip map for journaling with an event
-/// (#131).
+/// Collect one ref kind into a [`CapturedRefs`], capped at
+/// [`REFS_PER_EVENT_CAP`] entries by name order.
+///
+/// `truncated_at` carries the true count whenever the repo held more than the
+/// cap — never a silently short map, which a replayer would read as "the rest
+/// were deleted". The cap is applied here, per kind, so one kind overflowing
+/// can never evict another's entries.
+fn collect(refs: &[GitRef], kind: RefKind) -> CapturedRefs {
+    let mut entries: BTreeMap<String, String> = refs
+        .iter()
+        .filter(|r| r.kind == kind)
+        .map(|r| (r.name.clone(), r.target.0.clone()))
+        .collect();
+    let total = entries.len();
+    let truncated_at = (total > REFS_PER_EVENT_CAP).then_some(total);
+    if truncated_at.is_some() {
+        let keep: Vec<String> = entries.keys().take(REFS_PER_EVENT_CAP).cloned().collect();
+        entries.retain(|name, _| keep.binary_search(name).is_ok());
+    }
+    CapturedRefs {
+        entries,
+        truncated_at,
+    }
+}
+
+/// Read the repo's refs for journaling with an event: HEAD, local branches,
+/// tags and remote-tracking refs (#131, extended by #449).
 ///
 /// The return type is the point. A failed read yields
 /// [`RefsAtEvent::CaptureFailed`] carrying the reason — never an empty map,
 /// which a replayer would read as "every branch was deleted at this instant".
 /// An empty map is reserved for the genuine observation of a repo with no
 /// branches, which is a real state a fresh repo is in.
+///
+/// Everything comes from **one** [`read_refs_at`] call, so HEAD and the three
+/// maps describe the same instant rather than three successive ones.
+///
+/// Why HEAD and tags at all: #131's snapshot exists so "a future time
+/// scrubber can replay history losslessly", and a snapshot of local branches
+/// alone cannot show the HEAD moving — the one thing such a scrubber is for.
+/// Why remote-tracking refs: the story a scrubber mostly tells is divergence,
+/// "your branch moved, origin did not", and local branches alone cannot tell
+/// it. See ADR 0070.
 pub fn capture_refs(repo: &Path) -> RefsAtEvent {
-    let refs = match read_refs(repo) {
-        Ok(refs) => refs,
+    let read = match read_refs_at(repo) {
+        Ok(read) => read,
         Err(e) => {
             return RefsAtEvent::CaptureFailed {
                 reason: e.to_string(),
             }
         }
     };
-    let mut branches: BTreeMap<String, String> = refs
-        .iter()
-        .filter(|r| r.kind == RefKind::Branch)
-        .map(|r| (r.name.clone(), r.target.0.clone()))
-        .collect();
-    // Cap loudly, never silently: `truncated_at` carries the true count so a
-    // replayer can tell "these are all the branches" from "these are the
-    // first 500 of N".
-    let total = branches.len();
-    let truncated_at = (total > REFS_PER_EVENT_CAP).then_some(total);
-    if truncated_at.is_some() {
-        let keep: Vec<String> = branches.keys().take(REFS_PER_EVENT_CAP).cloned().collect();
-        branches.retain(|name, _| keep.binary_search(name).is_ok());
-    }
+    let branches = collect(&read.refs, RefKind::Branch);
     RefsAtEvent::Captured {
-        branches,
-        truncated_at,
+        branches: branches.entries,
+        truncated_at: branches.truncated_at,
+        head: Some(read.head),
+        tags: Some(collect(&read.refs, RefKind::Tag)),
+        remotes: Some(collect(&read.refs, RefKind::RemoteBranch)),
     }
 }
 
@@ -219,6 +244,7 @@ pub fn clear(repo: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git_vista_core::activity::HeadAtEvent;
     use git_vista_core::activity::{ActivityKind, ActivitySource};
     use std::process::Command;
 
@@ -284,6 +310,7 @@ mod tests {
         let RefsAtEvent::Captured {
             branches,
             truncated_at,
+            ..
         } = read[0].refs.clone().expect("a capture is attached")
         else {
             panic!("a readable repo must capture, not fail");
@@ -370,6 +397,7 @@ mod tests {
             RefsAtEvent::Captured {
                 branches,
                 truncated_at,
+                ..
             } => {
                 assert!(branches.is_empty());
                 assert_eq!(truncated_at, None);
@@ -378,6 +406,435 @@ mod tests {
                 panic!("a readable empty repo is an observation, not a failure: {reason}")
             }
         }
+    }
+
+    /// Run a git command in `dir`, with a fixed identity, asserting success.
+    fn git_ok(dir: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .current_dir(dir)
+                .status()
+                .expect("git runs")
+                .success(),
+            "git {args:?} failed"
+        );
+    }
+
+    /// Ask **git** what a revision resolves to.
+    ///
+    /// Every assertion about a captured oid compares against this, never
+    /// against a second call into the capture code: a capture that agrees with
+    /// itself proves only that it is consistent, which is the "assert a
+    /// mapping by calling the function that defines it" trap.
+    fn git_says(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// One capture, unwrapped into its parts — or a panic naming the failure.
+    /// Named rather than a tuple so a test that reads `tags` cannot quietly be
+    /// reading `remotes`.
+    struct Capture {
+        branches: BTreeMap<String, String>,
+        truncated_at: Option<usize>,
+        head: HeadAtEvent,
+        tags: CapturedRefs,
+        remotes: CapturedRefs,
+    }
+
+    fn captured(repo: &Path) -> Capture {
+        match capture_refs(repo) {
+            RefsAtEvent::Captured {
+                branches,
+                truncated_at,
+                head,
+                tags,
+                remotes,
+            } => Capture {
+                branches,
+                truncated_at,
+                head: head.expect("#449: a fresh capture always records HEAD"),
+                tags: tags.expect("#449: a fresh capture always records tags"),
+                remotes: remotes.expect("#449: a fresh capture always records remotes"),
+            },
+            RefsAtEvent::CaptureFailed { reason } => panic!("expected a capture: {reason}"),
+        }
+    }
+
+    /// #449's headline: the snapshot exists so a scrubber can replay the HEAD
+    /// moving, and until now it recorded local branches only — so it could not
+    /// say which branch HEAD was on at any event in its own history.
+    ///
+    /// MUTATION-a: drop the `head` fill-in from `capture_refs` (`head: None`)
+    /// and this goes red — the replay loses the one fact it is for.
+    /// MUTATION-b: record the *short* branch name instead of the full ref name
+    /// and this goes red on the exact-string assertion. That is why the
+    /// assertion compares the whole string rather than `contains("feature")`.
+    #[test]
+    fn a_capture_records_which_branch_head_was_on_and_where_that_branch_was() {
+        let dir = repo();
+        commit(dir.path(), "main");
+        commit(dir.path(), "feature");
+        let tip = git_says(dir.path(), &["rev-parse", "HEAD"]);
+
+        let c = captured(dir.path());
+        assert_eq!(
+            c.head,
+            HeadAtEvent::OnBranch {
+                symbolic: "refs/heads/feature".to_string(),
+                oid: tip.clone(),
+            },
+            "the full ref name, so a replay can tell a branch from any other ref"
+        );
+        assert_eq!(c.branches.get("feature"), Some(&tip));
+        assert!(
+            c.branches.contains_key("main"),
+            "sibling branches still captured"
+        );
+    }
+
+    /// A detached HEAD is a different state from being on a branch, and the
+    /// record has to keep them apart: a replay that reads a detached HEAD as
+    /// "on the branch that happens to share the commit" draws a checkout that
+    /// never happened.
+    ///
+    /// MUTATION-a: map a `None` symbolic name to `OnBranch { symbolic: "HEAD" }`
+    /// and this goes red.
+    /// MUTATION-b: fall through to `Unresolvable` when the oid is present and
+    /// this goes red, differently — the commit is known, and dropping it throws
+    /// away a fact the repo gave us.
+    #[test]
+    fn a_detached_head_is_recorded_as_detached_not_as_the_branch_it_sits_on() {
+        let dir = repo();
+        commit(dir.path(), "main");
+        git_ok(dir.path(), &["checkout", "-q", "--detach"]);
+        let at = git_says(dir.path(), &["rev-parse", "HEAD"]);
+
+        let c = captured(dir.path());
+        assert_eq!(c.head, HeadAtEvent::Detached { oid: at.clone() });
+        assert_eq!(
+            c.branches.get("main"),
+            Some(&at),
+            "detached at main's commit — the same commit, recorded as a different state"
+        );
+    }
+
+    /// A repo before its first commit has a HEAD that names a branch which does
+    /// not exist yet. That is an observation, not a failure and not a detached
+    /// HEAD: the branch name is real and worth recording, the commit genuinely
+    /// is not there.
+    ///
+    /// MUTATION-a: treat an unresolved HEAD as `CaptureFailed` and this goes
+    /// red — a fresh repo is readable, and saying otherwise also loses the
+    /// empty observation `a_repo_with_no_branches_captures_an_empty_map_not_a_failure`
+    /// pins.
+    /// MUTATION-b: record it as `Unresolvable`, discarding the symbolic name,
+    /// and this goes red — the name is the whole content of this state.
+    #[test]
+    fn an_unborn_head_records_the_branch_it_names_with_no_commit() {
+        let dir = repo(); // git init, no commits
+                          // Don't assume the host's `init.defaultBranch`; ask git what it chose.
+        let expected = git_says(dir.path(), &["symbolic-ref", "HEAD"]);
+
+        let c = captured(dir.path());
+        assert_eq!(
+            c.head,
+            HeadAtEvent::Unborn { symbolic: expected },
+            "the branch HEAD would create, with no commit — not a failure"
+        );
+        assert!(c.branches.is_empty() && c.tags.entries.is_empty() && c.remotes.entries.is_empty());
+    }
+
+    /// HEAD read fine and held an object id nothing resolves. Neither a name
+    /// nor a commit — and forcing it into `Detached` would mean inventing an
+    /// oid to put there.
+    ///
+    /// MUTATION-a: `CaptureFailed` on the both-absent case and this goes red —
+    /// the branches read perfectly well and must survive.
+    /// MUTATION-b: collapse it into `Detached { oid: String::new() }` and this
+    /// goes red on the variant, having manufactured a commit that never was.
+    #[test]
+    fn a_head_pointing_at_nothing_is_unresolvable_and_the_branches_survive() {
+        let dir = repo();
+        commit(dir.path(), "main");
+        let tip = git_says(dir.path(), &["rev-parse", "main"]);
+        // A well-formed object id with no object behind it.
+        std::fs::write(dir.path().join(".git/HEAD"), "0".repeat(40) + "\n").unwrap();
+
+        let c = captured(dir.path());
+        assert_eq!(c.head, HeadAtEvent::Unresolvable);
+        assert_eq!(
+            c.branches.get("main"),
+            Some(&tip),
+            "the readable half of the repo is still an observation worth keeping"
+        );
+    }
+
+    /// The state the design's probe did not reach, and the reason this enum has
+    /// a fifth variant: the ref store opens and lists normally while HEAD
+    /// *itself* will not read. Recording that as "no HEAD" would be the same
+    /// lie the record-level enum forbids — and failing the whole capture would
+    /// throw away branches that read perfectly well.
+    ///
+    /// MUTATION-a: let the HEAD read error propagate as a `RepoError` (what
+    /// `read_history_materials` does) and this goes red — `main` disappears
+    /// with it.
+    /// MUTATION-b: record the failure as `Unresolvable`, dropping the reason,
+    /// and this goes red — "we could not read it" and "it pointed nowhere" are
+    /// different answers.
+    #[test]
+    fn an_unreadable_head_records_the_reason_while_the_branches_still_capture() {
+        let dir = repo();
+        commit(dir.path(), "main");
+        let tip = git_says(dir.path(), &["rev-parse", "main"]);
+        // Corrupt HEAD only — `.git/refs` stays intact, so the ref store opens
+        // and lists as usual and the failure is HEAD's alone.
+        std::fs::write(dir.path().join(".git/HEAD"), "garbage\n").unwrap();
+
+        let c = captured(dir.path());
+        let HeadAtEvent::Unreadable { reason } = &c.head else {
+            panic!(
+                "a HEAD that will not read must say so, not go quiet: {:?}",
+                c.head
+            );
+        };
+        assert!(!reason.is_empty(), "the failure must say what happened");
+        assert_eq!(c.branches.get("main"), Some(&tip));
+    }
+
+    /// Tags, the other half of #449's gap. Both spellings are captured, and an
+    /// annotated tag records the *commit* it peels to — not the tag object,
+    /// which is on no commit graph a replay can draw.
+    ///
+    /// MUTATION-a: drop `RefKind::Tag` from the partition and this goes red.
+    /// MUTATION-b: record the unpeeled id and this goes red on the annotated
+    /// tag alone — which is why the fixture carries both flavours and asserts
+    /// the tag object's own id is *not* what was stored.
+    #[test]
+    fn tags_are_captured_and_an_annotated_tag_records_the_commit_it_peels_to() {
+        let dir = repo();
+        commit(dir.path(), "main");
+        git_ok(dir.path(), &["tag", "light"]);
+        git_ok(dir.path(), &["tag", "-a", "annot", "-m", "annotated"]);
+
+        let commit_oid = git_says(dir.path(), &["rev-parse", "annot^{commit}"]);
+        let tag_object = git_says(dir.path(), &["rev-parse", "annot"]);
+        assert_ne!(
+            commit_oid, tag_object,
+            "fixture check: an annotated tag must really be a separate object"
+        );
+
+        let c = captured(dir.path());
+        assert_eq!(c.tags.entries.get("light"), Some(&commit_oid));
+        assert_eq!(
+            c.tags.entries.get("annot"),
+            Some(&commit_oid),
+            "an annotated tag records the commit it peels to"
+        );
+        assert_ne!(
+            c.tags.entries.get("annot"),
+            Some(&tag_object),
+            "never the tag object's own id"
+        );
+        assert_eq!(c.tags.entries.len(), 2);
+    }
+
+    /// The distinction that makes these fields `Option` rather than bare maps,
+    /// pinned from both sides: a line that predates #449 claims nothing, and a
+    /// repo genuinely observed to have no tags records an empty map.
+    ///
+    /// Making them bare `BTreeMap`s does not compile — every construction site
+    /// would have to claim an observation it does not have, so the type refuses
+    /// the collapse before a test can. What a test still has to catch is the
+    /// same lie told through serde, and its mirror image.
+    ///
+    /// MUTATION-a: give `tags` `#[serde(default = "..")]` returning
+    /// `Some(CapturedRefs::default())` — "absent means there were none", the
+    /// natural reading and the wrong one — and the first half goes red.
+    /// MUTATION-b: emit `None` for a genuinely tagless repo (the "don't write
+    /// empty objects" optimisation) and the second half goes red.
+    #[test]
+    fn absent_and_observed_empty_are_different_answers_about_tags() {
+        // Half one: a pre-#449 line claims nothing.
+        let old = repo();
+        let path = old.path().join(".git/git-vista/journal.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "{\"time\":1,\"kind\":\"Commit\",\"ref_name\":\"main\",\"summary\":\"old\",\
+             \"old_oid\":\"a\",\"new_oid\":\"b\",\"source\":\"App\",\
+             \"refs\":{\"status\":\"captured\",\"branches\":{\"main\":\"aaa\"}}}\n",
+        )
+        .unwrap();
+        let read = read_all(old.path());
+        assert_eq!(
+            read.len(),
+            1,
+            "a #131-era line must not be dropped as corrupt"
+        );
+        let RefsAtEvent::Captured {
+            branches,
+            head,
+            tags,
+            remotes,
+            ..
+        } = read[0]
+            .refs
+            .clone()
+            .expect("the branch capture still parses")
+        else {
+            panic!("expected a capture");
+        };
+        assert_eq!(branches.get("main").map(String::as_str), Some("aaa"));
+        assert_eq!(head, None, "absent HEAD means nobody recorded one");
+        assert_eq!(tags, None, "absent tags is not the observation 'no tags'");
+        assert_eq!(remotes, None);
+
+        // Half two: a real repo with no tags records an observation.
+        let live = repo();
+        commit(live.path(), "main");
+        let c = captured(live.path());
+        assert_eq!(
+            c.tags,
+            CapturedRefs {
+                entries: BTreeMap::new(),
+                truncated_at: None
+            },
+            "observed-and-empty, never absent — absent means nobody looked"
+        );
+        assert_eq!(c.remotes.entries, BTreeMap::new());
+    }
+
+    /// Remote-tracking refs are recorded (ADR 0070): the story a scrubber
+    /// mostly tells is divergence, and local branches alone cannot tell it. The
+    /// remote's symbolic default-branch pointer is not a tip and stays out.
+    ///
+    /// MUTATION-a: drop `RefKind::RemoteBranch` from the partition and this
+    /// goes red.
+    /// MUTATION-b: remove the `/HEAD` skip in the ref classification and this
+    /// goes red on the exclusion assertion instead.
+    #[test]
+    fn remote_tracking_refs_are_captured_and_origin_head_is_not() {
+        let origin = repo();
+        commit(origin.path(), "main");
+        let clone = tempfile::tempdir().unwrap();
+        let dest = clone.path().join("work");
+        git_ok(
+            clone.path(),
+            &[
+                "clone",
+                "-q",
+                origin.path().to_str().unwrap(),
+                dest.to_str().unwrap(),
+            ],
+        );
+        // Fixture check: the pointer this test excludes must really exist.
+        assert!(
+            git_says(&dest, &["symbolic-ref", "refs/remotes/origin/HEAD"]).starts_with("refs/"),
+            "fixture check: the clone must have created refs/remotes/origin/HEAD"
+        );
+        let tip = git_says(&dest, &["rev-parse", "refs/remotes/origin/main"]);
+
+        let c = captured(&dest);
+        assert_eq!(c.remotes.entries.get("origin/main"), Some(&tip));
+        assert!(
+            !c.remotes.entries.keys().any(|k| k.ends_with("/HEAD")),
+            "the remote's symbolic default pointer is not a tip worth recording"
+        );
+    }
+
+    /// Caps are per map, so one kind overflowing cannot evict another's
+    /// entries, and each map reports its own overflow.
+    ///
+    /// MUTATION-a: share one budget across the maps (cap tags at what is left
+    /// after branches) and this goes red — with 501 tags the branches are
+    /// evicted.
+    /// MUTATION-b: cap without setting `truncated_at` and this goes red — the
+    /// silent-truncation defect the cap's own doc comment names.
+    #[test]
+    fn caps_are_per_map_and_each_reports_its_own_overflow() {
+        let dir = repo();
+        commit(dir.path(), "main");
+        commit(dir.path(), "second");
+        let tip = git_says(dir.path(), &["rev-parse", "HEAD"]);
+
+        // 501 real tags, created in one git process — a genuine fixture.
+        let over = REFS_PER_EVENT_CAP + 1;
+        let mut stdin = String::new();
+        for i in 0..over {
+            stdin.push_str(&format!("create refs/tags/v{i:04} {tip}\n"));
+        }
+        let mut child = Command::new("git")
+            .args(["update-ref", "--stdin"])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("git runs");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success(), "git update-ref failed");
+
+        let c = captured(dir.path());
+        assert_eq!(c.tags.entries.len(), REFS_PER_EVENT_CAP);
+        assert_eq!(
+            c.tags.truncated_at,
+            Some(over),
+            "the true count travels with the capped map"
+        );
+        assert_eq!(
+            c.branches.len(),
+            2,
+            "one map's overflow must not evict another's entries"
+        );
+        assert_eq!(c.truncated_at, None, "branches did not overflow");
+    }
+
+    /// The lossless promise extends to the new kinds. Mirrors
+    /// `a_deleted_branch_survives_in_the_event_that_predates_its_deletion`: git
+    /// deletes a tag outright, so the journal is the only place its tip
+    /// survives.
+    ///
+    /// MUTATION-a: have the read consult live refs instead of the stored map
+    /// and this goes red.
+    /// MUTATION-b: capture at read time rather than at append time and this
+    /// goes red — the deletion would already have happened.
+    #[test]
+    fn a_deleted_tag_survives_in_the_event_that_predates_its_deletion() {
+        let dir = repo();
+        commit(dir.path(), "main");
+        git_ok(dir.path(), &["tag", "doomed"]);
+        let tip = git_says(dir.path(), &["rev-parse", "doomed^{commit}"]);
+        append(dir.path(), &event("before the deletion"));
+        git_ok(dir.path(), &["tag", "-d", "doomed"]);
+        assert!(
+            !git_says(dir.path(), &["tag", "--list"]).contains("doomed"),
+            "fixture check: the tag must really be gone from the repo"
+        );
+
+        let read = read_all(dir.path());
+        let RefsAtEvent::Captured { tags, .. } = read[0].refs.clone().expect("capture attached")
+        else {
+            panic!("expected a capture");
+        };
+        assert_eq!(
+            tags.expect("tags recorded").entries.get("doomed"),
+            Some(&tip),
+            "the journal must still know the tag existed, and at which commit"
+        );
     }
 
     /// An event that already carries a capture keeps it. The feed's
@@ -396,6 +853,9 @@ mod tests {
         e.refs = Some(RefsAtEvent::Captured {
             branches: BTreeMap::from([("long-gone".to_string(), "deadbeef".to_string())]),
             truncated_at: None,
+            head: None,
+            tags: None,
+            remotes: None,
         });
         append(dir.path(), &e);
 

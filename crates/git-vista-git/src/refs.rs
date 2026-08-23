@@ -5,6 +5,7 @@ use std::path::Path;
 
 use gix::refs::Category;
 
+use git_vista_core::activity::HeadAtEvent;
 use git_vista_core::model::{GitRef, Oid, RefKind};
 
 use crate::RepoError;
@@ -19,6 +20,47 @@ use crate::RepoError;
 /// commit (an unborn HEAD, a broken ref) are skipped. Notes and worktree-private
 /// refs are ignored.
 pub fn read_refs(path: &Path) -> Result<Vec<GitRef>, RepoError> {
+    read_refs_at(path).map(|read| read.refs)
+}
+
+/// [`read_refs`]'s output plus the *state* of HEAD — which ref it named, and
+/// whether that resolved — from the **same** open, so the two describe one
+/// instant (#449).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefsAt {
+    /// Display refs exactly as [`read_refs`] produces them.
+    pub refs: Vec<GitRef>,
+    /// Where HEAD pointed. This is strictly more than the `RefKind::Head`
+    /// entry in `refs`: that entry exists only when HEAD resolves and carries
+    /// the commit alone, so it cannot say *which branch* HEAD was on — the
+    /// one fact a "watch the HEAD move" replay is made of.
+    pub head: HeadAtEvent,
+}
+
+/// Read [`RefsAt`]: the badge refs and HEAD's state together, from one open.
+///
+/// This is the whole of [`read_refs`]'s work — that function is this one with
+/// the HEAD state dropped — so the two can never drift apart, and no third
+/// copy of the ref-classification loop enters the crate.
+///
+/// Deliberately **not** built on [`read_history_materials`], which would
+/// otherwise supply the same HEAD facts:
+///
+/// 1. It also reads `$GIT_DIR/shallow` and treats malformed shallow metadata
+///    as a hard error. A corrupt `shallow` file would then turn every
+///    journaled event's capture into a failure, for a reason that has nothing
+///    to do with refs.
+/// 2. It reads HEAD through `head_name()`, whose failure is a hard error
+///    there. Here a HEAD that will not read is [`HeadAtEvent::Unreadable`]
+///    and the branches that *did* read are still returned.
+///
+/// The `RefKind::Head` badge keeps coming from `repo.head()`, exactly as it
+/// always has, rather than from the resolved-HEAD path used for
+/// classification. The two disagree for a HEAD holding an object id nothing
+/// resolves — `head()` hands back the raw id, `head_id()` refuses it — and
+/// that disagreement predates #449. Preserving it keeps this refactor free of
+/// behaviour change; resolving it is its own question, and its own issue.
+pub fn read_refs_at(path: &Path) -> Result<RefsAt, RepoError> {
     let repo =
         gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
             path: path.to_path_buf(),
@@ -37,6 +79,30 @@ pub fn read_refs(path: &Path) -> Result<Vec<GitRef>, RepoError> {
             });
         }
     }
+
+    // Classify HEAD from its symbolic name and what it resolves to. All five
+    // states below were reproduced against gix 0.84 on real repositories; the
+    // `Unreadable` arm is the one a repo with a corrupt `.git/HEAD` and an
+    // intact `.git/refs` lands in, where the ref store still lists normally.
+    let head = match repo.head_name() {
+        Err(e) => HeadAtEvent::Unreadable {
+            reason: e.to_string(),
+        },
+        Ok(name) => {
+            let oid = repo.head_id().ok().map(|id| id.detach().to_string());
+            match (name, oid) {
+                (Some(name), Some(oid)) => HeadAtEvent::OnBranch {
+                    symbolic: name.as_bstr().to_string(),
+                    oid,
+                },
+                (Some(name), None) => HeadAtEvent::Unborn {
+                    symbolic: name.as_bstr().to_string(),
+                },
+                (None, Some(oid)) => HeadAtEvent::Detached { oid },
+                (None, None) => HeadAtEvent::Unresolvable,
+            }
+        }
+    };
 
     // As in `walk_history`, treat a ref-store open/list failure as a real error
     // rather than silently returning only the HEAD badge (issue #16).
@@ -85,7 +151,7 @@ pub fn read_refs(path: &Path) -> Result<Vec<GitRef>, RepoError> {
         }
     }
 
-    Ok(refs)
+    Ok(RefsAt { refs, head })
 }
 
 /// Everything a paged-history snapshot needs, read from **one** opened
