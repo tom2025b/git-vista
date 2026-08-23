@@ -6,11 +6,18 @@
 
 The task pointed at `design-docs/handoffs/CLOUD-3-verify-readme-audit.md`, which does
 not exist here — and not because it was lost. `design-docs/` is gitignored
-(`.gitignore:71`), and `README.md:103-105` says why: "Agent prompts, session handoffs,
-and running project memory are local working material and are intentionally excluded
-from the repository's public-facing docs." The handoff lives on the author's machine
-and never travels to a cloud session. Confirmed absent from the working tree, all of
-git history, all ~250 remote branches, and the issue tracker.
+(`.gitignore:71`, "Local design documents — session artifacts, not product docs"), and
+`README.md:103-105` says the same of handoffs: "Agent prompts, session handoffs, and
+running project memory are local working material and are intentionally excluded from
+the repository's public-facing docs." So the handoff was never committed, and a cloud
+session — which gets only what the repo carries — cannot see it. It lives on the
+author's machine. Confirmed absent from the working tree, all of git history, all ~250
+remote branches, and the issue tracker.
+
+(One file *is* tracked under `design-docs/` — `2026-08-18-wf-78-map-results.md`,
+force-added past the rule in `ed9a18d`, "bank the map phase's drafts before the network
+drops". The ignore rule still matches any new path there, which is why this report is
+filed elsewhere. Force-adding is the escape hatch if a handoff ever needs to travel.)
 
 The branch name (`claude/readme-audit-verify-...`) was therefore the only surviving
 statement of intent, and this audit reads it the one way that has an object: **audit
