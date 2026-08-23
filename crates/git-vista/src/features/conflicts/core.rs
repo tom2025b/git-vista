@@ -33,6 +33,7 @@
 
 use git_vista_core::diff::{BlobContent, WorktreeFileContent};
 use git_vista_protocol::conflict::{ConflictedFile, NotTextResolvable, Stage};
+use git_vista_protocol::status::ConflictKind;
 
 /// Which of the four views a pane is.
 ///
@@ -364,25 +365,51 @@ impl ResolutionSurface {
                 };
                 format!("{which}. There is no line-by-line merge for binary content — choose a whole side, or delete the file.")
             }
-            Some(NotTextResolvable::Deletion {
-                ours_deleted,
-                theirs_deleted,
-            }) => match (ours_deleted, theirs_deleted) {
-                (true, true) => {
+            // BRANCHES ON `kind`, NOT ON THE TWO BOOLEANS — and that is the
+            // whole point of this arm.
+            //
+            // The server sets `ours_deleted` for `DeletedByUs`, `BothDeleted`
+            // AND `AddedByThem` (server conflicts.rs:164-167); `theirs_deleted`
+            // likewise covers `AddedByUs`. So the booleans conflate two
+            // genuinely different facts: "this side deleted an existing file"
+            // and "this side never had the file at all". An add/add-shaped
+            // conflict (`UA`/`AU`) would otherwise be described as a deletion
+            // that never happened, and the other side as a change nobody made
+            // — a UI asserting two facts it was never told, which is exactly
+            // what ADR 0063 exists to prevent.
+            //
+            // `kind` is git's own porcelain classification and cannot be
+            // conflated, so it is what gets read here. Note also that no arm
+            // claims the surviving side "changed" anything: the wire carries
+            // deletion flags, not modification flags, and "still has it" is
+            // supported by that side's stage being Present.
+            Some(NotTextResolvable::Deletion { .. }) => match file.kind {
+                ConflictKind::BothDeleted => {
                     "Both sides deleted this file. Deleting it is the only resolution.".to_string()
                 }
-                (true, false) => {
-                    "We deleted this file; they changed it. Keep their version, or delete it."
+                ConflictKind::DeletedByUs => {
+                    "We deleted this file; their side still has it. Keep their version, or delete it."
                         .to_string()
                 }
-                (false, true) => {
-                    "They deleted this file; we changed it. Keep our version, or delete it."
+                ConflictKind::DeletedByThem => {
+                    "They deleted this file; our side still has it. Keep our version, or delete it."
                         .to_string()
                 }
-                // Neither side deleted, yet the server called this a deletion.
-                // Say what is known instead of inventing a side.
-                (false, false) => {
-                    "This file was deleted on one side. Keep a version, or delete it.".to_string()
+                ConflictKind::AddedByUs => {
+                    "We added this file; their side does not have it. Keep our version, or delete it."
+                        .to_string()
+                }
+                ConflictKind::AddedByThem => {
+                    "They added this file; our side does not have it. Keep their version, or delete it."
+                        .to_string()
+                }
+                // The server only reports Deletion for the five kinds above, so
+                // these are unreachable today. They describe the shape without
+                // naming a side, rather than asserting a deletion this type was
+                // never actually told about.
+                ConflictKind::BothAdded | ConflictKind::BothModified => {
+                    "Only one side has a version of this file. Keep a version, or delete it."
+                        .to_string()
                 }
             },
             // Unreachable from the server today (nothing constructs Rename),
@@ -783,6 +810,33 @@ mod tests {
         }
     }
 
+    /// A conflict of an explicit `kind`, for the deletion sentences — which
+    /// read `kind` rather than the two booleans, and so cannot be exercised
+    /// through [`with_reason`]'s fixed `BothModified`.
+    fn of_kind(kind: ConflictKind, ours: Stage, theirs: Stage) -> ConflictedFile {
+        // Mirrors the server's own mapping (conflicts.rs:164-171) so these
+        // fixtures carry the same flags a real response would.
+        let ours_deleted = matches!(
+            kind,
+            ConflictKind::DeletedByUs | ConflictKind::BothDeleted | ConflictKind::AddedByThem
+        );
+        let theirs_deleted = matches!(
+            kind,
+            ConflictKind::DeletedByThem | ConflictKind::BothDeleted | ConflictKind::AddedByUs
+        );
+        ConflictedFile {
+            path: "a.txt".into(),
+            kind,
+            base: Stage::Absent {},
+            ours,
+            theirs,
+            not_text_resolvable: Some(NotTextResolvable::Deletion {
+                ours_deleted,
+                theirs_deleted,
+            }),
+        }
+    }
+
     #[test]
     fn a_binary_conflict_says_no_line_merge_is_possible_and_still_offers_both_sides() {
         // #430's FIRST acceptance criterion.
@@ -852,42 +906,127 @@ mod tests {
     }
 
     #[test]
-    fn a_delete_modify_conflict_names_which_side_deleted_and_which_changed() {
-        // #430's SECOND acceptance criterion, stated as literally as the issue
-        // states it.
+    fn a_delete_modify_conflict_names_which_side_deleted() {
+        // #430's SECOND acceptance criterion.
         //
-        // MUTATION: collapse the (ours_deleted, theirs_deleted) match to one
-        // generic sentence. The user is then told a deletion happened but not
-        // by whom — and the whole decision is *which* side to keep.
-        let they_deleted = with_reason(
-            present('1'),
-            present('2'),
-            Stage::Absent {},
-            Some(NotTextResolvable::Deletion {
-                ours_deleted: false,
-                theirs_deleted: true,
-            }),
-        );
+        // RENAMED, and the assertion narrowed, on purpose. The first version of
+        // this test was called `..._and_which_changed` and required the
+        // sentence to say "we changed it" / "they changed it". That shipped in
+        // 7ca1ac8c and was wrong: the wire carries DELETION flags only, so the
+        // surviving side's modification was never a fact this type held. The
+        // test was pinning a claim the data did not support — a green test
+        // guarding a false sentence, which is worse than no test.
+        //
+        // What is legitimately pinned is the half the issue actually asks for:
+        // WHICH SIDE deleted. The surviving side is described by what is known
+        // — its stage is Present, so it "still has it".
+        //
+        // MUTATION: collapse the `kind` match to one generic sentence. The user
+        // is told a deletion happened but not by whom, and choosing which side
+        // to keep is the entire decision.
+        let they_deleted = of_kind(ConflictKind::DeletedByThem, present('2'), Stage::Absent {});
         let note = ResolutionSurface::of(&they_deleted).note.unwrap();
+        assert!(note.contains("They deleted"), "must name the side: {note}");
         assert!(
-            note.contains("They deleted") && note.contains("we changed"),
-            "must name both roles: {note}"
+            note.contains("our side still has it"),
+            "the surviving side is described by its stage, not by a guess: {note}"
         );
 
-        let we_deleted = with_reason(
-            present('1'),
+        let we_deleted = of_kind(ConflictKind::DeletedByUs, Stage::Absent {}, present('3'));
+        let note = ResolutionSurface::of(&we_deleted).note.unwrap();
+        assert!(note.contains("We deleted"), "{note}");
+        assert!(note.contains("their side still has it"), "{note}");
+    }
+
+    #[test]
+    fn an_added_by_one_side_conflict_is_never_described_as_a_deletion() {
+        // Found by the #430 honesty review, and it had already shipped in
+        // 7ca1ac8c.
+        //
+        // The server sets `ours_deleted` for AddedByThem (UA) and
+        // `theirs_deleted` for AddedByUs (AU) — see server conflicts.rs:164-171
+        // — because from the index's point of view "we have no stage 2" looks
+        // the same either way. But UA means "they added it, we haven't touched
+        // it": NOBODY deleted anything, and the other side changed nothing,
+        // because there was nothing there to change.
+        //
+        // Reading the two booleans produced "We deleted this file; they changed
+        // it." Both halves false — two facts asserted that the wire never
+        // carried, which is the ADR 0063 collapse one layer up.
+        //
+        // MUTATION A: branch on (ours_deleted, theirs_deleted) again instead of
+        // on `kind`. UA immediately claims a deletion that never happened.
+        // MUTATION B: keep `kind` but merge the AddedBy* arms into the
+        // DeletedBy* ones. Same false sentence, arrived at differently.
+        let they_added = of_kind(ConflictKind::AddedByThem, Stage::Absent {}, present('3'));
+        let note = ResolutionSurface::of(&they_added).note.unwrap();
+        assert!(
+            !note.contains("deleted"),
+            "UA means they ADDED it — nobody deleted anything: {note}"
+        );
+        assert!(
+            note.contains("They added"),
+            "the sentence must say what actually happened: {note}"
+        );
+
+        let we_added = of_kind(ConflictKind::AddedByUs, present('2'), Stage::Absent {});
+        let note = ResolutionSurface::of(&we_added).note.unwrap();
+        assert!(
+            !note.contains("deleted"),
+            "AU is an add, not a delete: {note}"
+        );
+        assert!(note.contains("We added"), "{note}");
+    }
+
+    #[test]
+    fn no_deletion_sentence_claims_the_surviving_side_changed_anything() {
+        // The wire carries DELETION flags. It carries nothing about whether the
+        // surviving side was modified, so no sentence may say it was. "still
+        // has it" is supported by that side's stage being Present; "changed it"
+        // is an inference, and this codebase does not print inferences as
+        // facts.
+        //
+        // MUTATION: restore "they changed it" / "we changed it". The claim is
+        // unsupported for every kind, and flatly contradicts DeletedByUs's own
+        // doc ("we deleted it, they haven't touched it").
+        for kind in [
+            ConflictKind::DeletedByUs,
+            ConflictKind::DeletedByThem,
+            ConflictKind::AddedByUs,
+            ConflictKind::AddedByThem,
+            ConflictKind::BothDeleted,
+        ] {
+            let note = ResolutionSurface::of(&of_kind(kind, present('2'), present('3')))
+                .note
+                .unwrap();
+            assert!(
+                !note.contains("changed it"),
+                "{kind:?} must not assert the other side changed anything: {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_deletion_directions_do_not_produce_the_same_sentence() {
+        // Cheap, and it is the assertion that would survive someone
+        // "simplifying" the match into a single generic string later.
+        let we = ResolutionSurface::of(&of_kind(
+            ConflictKind::DeletedByUs,
             Stage::Absent {},
             present('3'),
-            Some(NotTextResolvable::Deletion {
-                ours_deleted: true,
-                theirs_deleted: false,
-            }),
-        );
-        let note = ResolutionSurface::of(&we_deleted).note.unwrap();
-        assert!(
-            note.contains("We deleted") && note.contains("they changed"),
-            "the two directions must not produce the same sentence: {note}"
-        );
+        ))
+        .note
+        .unwrap();
+        let they = ResolutionSurface::of(&of_kind(
+            ConflictKind::DeletedByThem,
+            present('2'),
+            Stage::Absent {},
+        ))
+        .note
+        .unwrap();
+        assert_ne!(we, they);
+        assert!(we.starts_with("We deleted"), "{we}");
+        assert!(they.starts_with("They deleted"), "{they}");
     }
 
     #[test]
