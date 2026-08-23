@@ -86,3 +86,8 @@ crates/**/README.pdf
 /README.pdf
 target-testbed-*/
 /ci/browser/*.pdf
+
+# Cold-build measurement report (ci/cold_build_measure.sh) — a machine-local
+# observation, not repository history. The numbers that matter are transcribed
+# into docs/PERFORMANCE_BUDGETS.md.
+/cold-build-report.txt

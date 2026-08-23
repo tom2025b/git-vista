@@ -344,3 +344,63 @@ applying both mutations (always-empty, always-full-range) to
 `render_window`'s body and confirming red, then restoring and reconfirming
 30/30 green. A window that renders nothing is as broken as one that renders
 everything, and only the floor catches it.
+
+## Cold build of the workspace (CLOUD-2)
+
+**Why this section is here.** `dev` line 614 tells an operator to "Expect
+10-25 minutes" before a cold testbed build. That range was never measured, and
+it is wide enough that no outcome contradicts it — the unfalsifiable prose this
+file exists to replace, sitting in front of the one build a human is asked to
+wait through. The design, the one-shot constraints, and what the numbers do and
+do not license are in
+`design-docs/handoffs/CLOUD-2-cold-build-measurement.md`; this is the number.
+
+Reproduce with:
+
+```
+ci/cold_build_measure.sh [report-path]
+```
+
+The harness refuses to run with a `target/` present — a warm host cannot
+measure a cold build, and refusing is more useful than producing a number.
+
+**Measured 2026-08-23, one cloud container** (4 × Intel Xeon @ 2.10 GHz,
+15.7 GiB RAM, rustc/cargo 1.98.0, trunk 0.21.7), from tier **C0** — no
+`~/.cargo/registry` and no `target/`, i.e. paying the crate download as well as
+the compile:
+
+| phase | wall-clock | crates compiled | `target/` after |
+| --- | ---: | ---: | ---: |
+| `cargo fetch --locked` (405 packages) | 6 s | 0 | 0 |
+| `cargo build -p git-vista-server` (debug) | 39 s | 178 | 771 MiB |
+| `cargo build -p git-vista --target wasm32-unknown-unknown` | 49 s | 176 | 1.88 GiB |
+| `trunk build` (wasm-bindgen, hashing, `dist/`) | 6 s | 0 | 1.90 GiB |
+| **total** | **100 s (1.7 min)** | **354** | **1.90 GiB** |
+
+`~/.cargo/registry` ends at 478 MiB.
+
+**The wasm32 half costs more than the native half** — 49 s against 39 s, 56% of
+compile time. `dev`'s testbed build runs both into one `CARGO_TARGET_DIR`
+(lines 621-624), and 51 packages appear in *both* phases' `Compiling` lines
+(≈29% of each graph), so a shared target dir does not collapse them. An
+estimate formed by watching `cargo build -p git-vista-server` alone understates
+the real cold build by more than 2×.
+
+**This number does NOT replace the 10-25 minutes in `dev`, and that line is
+deliberately left alone.** It describes a different machine: #331's comment in
+`dev` records that box writing testbed builds onto a spinning
+`/dev/mapper/vgmint-root`, and a build that writes 1.9 GiB can be disk-bound
+there while being CPU-bound here. What is established is that the range is
+untethered from any observation — not that it is too high. Replacing it needs
+one C1 run of the same harness on that host (registry warm, `target/` moved
+aside), which is the open item in the handoff doc.
+
+**No regression test derives from this budget**, unlike every other section
+here, and that is a property of the measurement rather than an omission: a
+cold cache is destroyed by measuring it, so an assertion over cold-build
+wall-clock could only run once per machine and would be measuring the CI
+runner's hardware, not this repository's code. The anti-vacuity guards live in
+the harness instead — the pre-run state of `target/` and the registry is
+recorded as observed fact, and each compile phase fails if it compiled fewer
+than 50 crates, because a warm rebuild prints zero `Compiling` lines and so
+cannot produce a passing record.
