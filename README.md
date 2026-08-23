@@ -28,6 +28,48 @@ in this file.
 > serialized per repository, and journaled before it runs; see
 > [the security model](docs/SECURITY_MODEL.md) and the ADR index below for how.
 
+## Screenshots
+
+Captured from Git-Vista browsing its own repository.
+
+![The commit graph](docs/screenshots/01-graph.png)
+
+*History reads top-to-bottom, one colour per lane, with branch and remote-ref
+labels attached to the commits they actually point at. Runs of automated
+checkpoint commits collapse into a single "13 WIP commits" marker so hand-written
+history stays legible — the fold is a display choice, nothing is rewritten. The
+graph is virtualised: this repository is ~3,400 commits and the DOM holds only
+what is on screen.*
+
+![A commit's diff, full screen](docs/screenshots/02-diff.png)
+
+*Opening a commit shows its message, a per-file summary, and the unified diff.
+Files Git-Vista cannot render as text are labelled `binary` and left alone rather
+than printed as noise. Any view can be sent straight to a PDF.*
+
+![The commit action menu](docs/screenshots/03-commit-actions.png)
+
+*Every write available on a commit, in one menu — branch, tag, revert, undo,
+compare, checkout. Operations that cannot succeed on this commit are shown
+greyed out **with the reason** ("Only available on the current HEAD commit")
+instead of being hidden or failing after the click.*
+
+![The activity panel](docs/screenshots/04-activity.png)
+
+*The operation journal. Every mutation is recorded before it runs — including
+the ones made in a terminal, tagged `terminal`, because standard Git stays
+authoritative and Git-Vista observes it rather than owning it. Entries that can
+be safely undone offer an Undo button; the rest do not.*
+
+![The four-pane conflict view](docs/screenshots/05-conflict-panes.png)
+
+*A conflicted file, showing all three index stages beside the working-tree
+result. This one is an add/add conflict: both sides created the file, so there
+is no common ancestor, and the Base pane says **"Not present on this side"** — an
+empty box there would claim an ancestor existed and was blank, which is a false
+statement about the repository. `Take ours`, `Take theirs` and `Delete file`
+resolve the whole file; the result pane is deliberately read-only.*
+
 ## Product Direction
 
 - Professional Git client first; teaching is a major layer, not the base product.
