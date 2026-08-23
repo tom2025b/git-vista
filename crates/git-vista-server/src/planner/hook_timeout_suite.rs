@@ -115,6 +115,16 @@ fn set_test_hooked_timeout(d: Duration) {
     HOOKED_GIT_TIMEOUT_OVERRIDE.with(|c| c.set(Some(d)));
 }
 
+/// Install this test's [`super::LOCK_ACQUIRED_SIGNAL`] and hand back the
+/// `Notify` to await on — mirrors [`set_test_hooked_timeout`] above; see the
+/// thread-local's own doc for why a thread-scoped `Notify` and not some
+/// process-wide mechanism.
+fn set_test_lock_acquired_signal() -> std::rc::Rc<tokio::sync::Notify> {
+    let notify = std::rc::Rc::new(tokio::sync::Notify::new());
+    LOCK_ACQUIRED_SIGNAL.with(|c| c.set(Some(std::rc::Rc::clone(&notify))));
+    notify
+}
+
 // ---------------------------------------------------------------------------
 // The timeout fires
 // ---------------------------------------------------------------------------
@@ -185,11 +195,28 @@ async fn a_commit_with_a_hook_that_sleeps_forever_times_out_and_answers() {
 /// fired.
 ///
 /// `tokio::join!` (not `tokio::spawn` on a `multi_thread` runtime) drives the
-/// two operations: both futures are polled on this test's one OS thread, so
-/// the create-branch future can only make progress on `coordinator::lock`
-/// once the commit future actually yields at it — a deterministic queue, not
-/// a race, and one that keeps [`set_test_hooked_timeout`]'s thread-local
-/// override valid for both.
+/// two operations: both futures are polled on this test's one OS thread —
+/// true, and load-bearing, since it is what keeps
+/// [`set_test_hooked_timeout`]'s thread-local override valid for both. **It
+/// does not, on its own, make guard arrival a deterministic queue.**
+/// `build_plan` runs before `coordinator::lock` is taken (deliberately — see
+/// [`plan_and_execute_in`]'s own doc) and does genuine OS-scheduled work
+/// before either future ever reaches the guard: a `rev_parse` subprocess
+/// spawn and a `refs_digest_input` `spawn_blocking`. Both futures sharing one
+/// OS thread says nothing about which one's subprocess or blocking thread the
+/// OS returns control to first — that part really is a race, and it used to
+/// decide this test's outcome: when `CreateBranch` won it, it created its ref
+/// before the commit's plan was re-checked, moved the generation the
+/// commit's plan was built against, and made the commit's `enforce_fresh`
+/// correctly refuse with 409 ("the repository changed") instead of the 400
+/// this test means to observe — an intermittent CI failure (#444), not a
+/// production bug.
+///
+/// So this test does not lean on scheduling order at all: it installs
+/// [`set_test_lock_acquired_signal`] and gates the create-branch leg on it,
+/// so `CreateBranch` cannot even begin building its plan until the commit leg
+/// is provably holding `coordinator::lock` — see that signal's own doc
+/// ([`super::LOCK_ACQUIRED_SIGNAL`]) for the full argument.
 ///
 /// Mutation tried: have the timeout arm `return` before the coordinator
 /// guard's scope ends without actually letting `execute()`'s stack frame
@@ -205,19 +232,28 @@ async fn the_coordinator_lock_is_released_after_a_hook_timeout() {
         .await
         .expect("git runs in a fixture repo")
         .expect("HEAD resolves");
+    let lock_acquired = set_test_lock_acquired_signal();
 
     let (commit_result, branch_result) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(
             plan_and_execute_in(&repo, Some(id), tokens(), commit("hangs")),
-            plan_and_execute_in(
-                &repo,
-                Some(id),
-                tokens(),
-                GitOperation::CreateBranch {
-                    name: BranchName::new("after-hook-timeout").unwrap(),
-                    at: CommitOid::new(head).unwrap(),
-                },
-            ),
+            async {
+                // Do not even begin building a plan for `CreateBranch` until
+                // the commit leg is provably holding `coordinator::lock` —
+                // see `LOCK_ACQUIRED_SIGNAL`'s doc for why anything looser
+                // races `build_plan`'s genuinely concurrent pre-lock work.
+                lock_acquired.notified().await;
+                plan_and_execute_in(
+                    &repo,
+                    Some(id),
+                    tokens(),
+                    GitOperation::CreateBranch {
+                        name: BranchName::new("after-hook-timeout").unwrap(),
+                        at: CommitOid::new(head).unwrap(),
+                    },
+                )
+                .await
+            },
         )
     })
     .await

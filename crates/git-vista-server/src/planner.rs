@@ -370,6 +370,8 @@ pub(crate) async fn plan_and_execute_in(
 
     crate::operations::stage(OperationStage::Waiting);
     let _guard = crate::coordinator::lock(repo_id).await;
+    #[cfg(test)]
+    notify_lock_acquired();
 
     // Outside git holds the index: refuse now, in words the browser can show,
     // rather than letting git fail opaquely part-way through (#60).
@@ -2695,6 +2697,60 @@ fn hooked_git_timeout() -> std::time::Duration {
         }
     }
     HOOKED_GIT_TIMEOUT
+}
+
+// ---------------------------------------------------------------------------
+// Test-only: a real signal for "the guard is held", not an assumed one (#444)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only signal that fires the instant [`plan_and_execute_in`]
+    /// acquires [`crate::coordinator::lock`]. Read by
+    /// `hook_timeout_suite::the_coordinator_lock_is_released_after_a_hook_timeout`,
+    /// which races a hooked commit against a `CreateBranch` on the same
+    /// repository and needs the create-branch leg to start only once the
+    /// commit leg genuinely holds the guard.
+    ///
+    /// Needed because `build_plan` runs before the guard, deliberately (see
+    /// [`plan_and_execute_in`]'s own doc), and does real, OS-scheduled work —
+    /// a `rev_parse` subprocess spawn and a `refs_digest_input`
+    /// `spawn_blocking`. `tokio::join!`'s poll order says nothing about which
+    /// of two joined futures reaches those points first: both are polled on
+    /// the same OS thread, but the OS — not `tokio::join!` — decides which
+    /// one's subprocess or blocking thread returns first. Without this
+    /// signal, `CreateBranch` can win that race, land its ref before the
+    /// commit's plan is re-checked, and move the generation the commit's plan
+    /// was built against — its `enforce_fresh` then correctly refuses with
+    /// 409 ("the repository changed") before the request ever reaches the
+    /// 400ms hook bound this test exists to observe.
+    ///
+    /// A `thread_local`, for the same reason as
+    /// [`HOOKED_GIT_TIMEOUT_OVERRIDE`]: `#[tokio::test]`'s default
+    /// current-thread runtime keeps one test's whole future tree — every
+    /// `tokio::join!`ed branch included — on that one OS thread, so scoping
+    /// the signal to the thread means one test's wiring can never fire into,
+    /// or silently miss, another test running concurrently on a different
+    /// thread under `cargo test`'s default parallel-threads-one-process
+    /// model. Every test that sets it must stay on that default
+    /// current-thread `#[tokio::test]` flavor.
+    static LOCK_ACQUIRED_SIGNAL: std::cell::Cell<Option<std::rc::Rc<tokio::sync::Notify>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Fire this thread's [`LOCK_ACQUIRED_SIGNAL`] if a test installed one, then
+/// clear it — a no-op, and compiled out entirely in non-test builds,
+/// everywhere `plan_and_execute_in` runs without a listener. Consuming the
+/// signal (`Cell::take`) rather than merely reading it means it fires for
+/// exactly the one acquisition a test is synchronizing against, not for
+/// every later `plan_and_execute_in` call this thread happens to make —
+/// including the very `CreateBranch` call this signal unblocks, which itself
+/// acquires the guard once it runs.
+#[cfg(test)]
+fn notify_lock_acquired() {
+    if let Some(notify) = LOCK_ACQUIRED_SIGNAL.with(|c| c.take()) {
+        notify.notify_one();
+    }
 }
 
 /// [`run_git`] for the argv shapes that run repository hooks. Same sealed
