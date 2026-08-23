@@ -425,9 +425,25 @@ pub enum ContentResolutionRefused {
     /// resolved against — the picture the choice was made against has
     /// changed, whatever the surviving bytes now say.
     StagesMoved,
-    /// The served marker-file document itself no longer matches what was
-    /// served — an edit landed (in the app or outside it) between serve and
-    /// submit. The one case no repository-level check alone can catch.
+    /// The `conflict-v1:` token no longer matches the one the document was
+    /// served under.
+    ///
+    /// **Deliberately does not name a cause, and the first version of this
+    /// did.** It said the file "was edited elsewhere" — which the code cannot
+    /// know. `conflict_source_token` folds the marker-file bytes *and* the
+    /// whole repository generation (HEAD, every ref, the index checksum) into
+    /// one opaque digest, and `GenerationInputs::generation()` hashes those
+    /// fields together so no per-field attribution survives. A mismatch can
+    /// therefore mean an unrelated branch moved, a fetch landed, or a
+    /// different file was staged — none of which touched this path.
+    ///
+    /// Worse, by the time this can fire, [`StagesMoved`] has already proven
+    /// this path's own stage OIDs unchanged, so the "someone edited your file"
+    /// reading is the *least* likely of the remaining causes. Asserting it
+    /// would be the exact ADR 0063 failure this vocabulary exists to prevent:
+    /// stating as fact something never observed.
+    ///
+    /// [`StagesMoved`]: ContentResolutionRefused::StagesMoved
     SourceMoved,
 }
 
@@ -446,8 +462,11 @@ impl ContentResolutionRefused {
                 "{path} changed since you opened it — the version you resolved against is no \
                  longer current. Reopen it and try again."
             ),
+            // Says WHAT was observed (the document is no longer the one served)
+            // and what to do, never WHY — see the variant's own doc comment for
+            // why naming a cause here would be a false statement.
             ContentResolutionRefused::SourceMoved => format!(
-                "{path} was edited elsewhere while you were resolving it, so your changes were \
+                "The repository changed while you were resolving {path}, so your changes were \
                  not applied — reopen it to see the current version."
             ),
         }

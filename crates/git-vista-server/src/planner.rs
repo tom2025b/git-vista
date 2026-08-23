@@ -4305,10 +4305,60 @@ async fn exec_resolve_conflict_content(
         return refused;
     }
 
+    // A SYMLINK AT THE CONFLICTED PATH IS REFUSED OUTRIGHT, and this is not
+    // belt-and-braces over the guard above — the guard refuses symlinks that
+    // ESCAPE the worktree and directories, never an in-worktree symlink (see
+    // its own doc comment). One that stays inside is the dangerous case here,
+    // because the two legs below resolve it differently:
+    //
+    //   * `tokio::fs::write` follows the link and writes the TARGET file
+    //   * `git add -- <path>` stages the link OBJECT (its target string)
+    //
+    // so the content would land in an unrelated tracked file while the
+    // conflicted path staged something else entirely, and both half-state
+    // messages below ("now holds your resolved content") would be false.
+    // `conflicts::scan` cannot catch this: it reads the index, never the
+    // worktree's file type.
+    //
+    // `symlink_metadata` on the JOINED path, deliberately not the
+    // canonicalised `resolved` — canonicalising is what erases the distinction
+    // this check exists to see.
+    let joined = repo.join(path.as_str());
+    match tokio::fs::symlink_metadata(&joined).await {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return (
+                StatusCode::CONFLICT,
+                format!(
+                    "'{}' is a symbolic link, not a regular file — refusing to resolve it, \
+                     because writing would follow the link and stage something else",
+                    path.as_str()
+                ),
+            );
+        }
+        Ok(_) => {}
+        // Vanished between gate 4 and here. Report it rather than creating a
+        // file at a path the conflict scan no longer describes.
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                format!(
+                    "'{}' could not be inspected before writing ({e}) — nothing was changed",
+                    path.as_str()
+                ),
+            );
+        }
+    }
+
     // The write. No atomicity equivalent to `git apply` exists for
     // write-then-add (ADR 0069) — a failure on either leg is reported exactly
     // as what happened, never papered over.
-    if let Err(e) = tokio::fs::write(&resolved, content.as_bytes()).await {
+    //
+    // Writes `joined`, NOT the canonicalised `resolved`, so the bytes land at
+    // exactly the path `git add` stages one call below. They can only differ
+    // through a symlink, which the check above has just refused — writing the
+    // same path both legs name makes that agreement structural rather than
+    // something a future edit could quietly break.
+    if let Err(e) = tokio::fs::write(&joined, content.as_bytes()).await {
         eprintln!("git-vista: {OP} couldn't write '{}': {e}", path.as_str());
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
