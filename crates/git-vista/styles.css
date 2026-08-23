@@ -1464,3 +1464,23 @@ button.detail-file,
 .conflict-refusal {
   margin: 0.25rem 0 0.5rem;
 }
+
+/* M4.31d (#430): the conflict's shape, in a sentence, ABOVE the controls.
+   Above rather than below because it is the thing that decides which control
+   to press — a binary file has no line merge, and a deleted side has nothing
+   to take. Only present when there is something to say; an ordinary text
+   conflict gets no note, so the eye never learns to skip this line. */
+.conflict-note {
+  margin: 0.25rem 0 0.5rem;
+  font-weight: 600;
+}
+
+/* A withheld control is REPLACED by its reason, never rendered as a disabled
+   button. A greyed button with no explanation is a dead end the user keeps
+   pressing; the sentence says which side and why. Sized to sit in the same
+   flex row as the buttons it stands in for. */
+.conflict-withheld {
+  margin: 0;
+  align-self: center;
+  font-style: italic;
+}

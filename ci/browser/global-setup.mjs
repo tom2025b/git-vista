@@ -11,7 +11,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { buildConflictFixture, buildFixture } from './fixture.mjs'
+import { buildConflictFixture, buildFixture, buildNonTextConflictFixture } from './fixture.mjs'
 import { startServer } from './server.mjs'
 
 export const RUNTIME_FILE = join(import.meta.dirname, '.runtime.json')
@@ -65,9 +65,13 @@ export default async function globalSetup() {
   // alongside the main fixture so the conflict specs have real stage entries
   // to inspect without putting the shared fixture into MERGING state.
   const conflictFixture = buildConflictFixture(join(work, 'conflict-repo'))
+  // #430: a third repository holding the conflicts that cannot be resolved
+  // as text (binary/binary and delete/modify). Separate again, because the
+  // #428/#429 specs assert an exact conflicted count on conflict-repo.
+  const nonTextFixture = buildNonTextConflictFixture(join(work, 'nontext-repo'))
   const { child, base, signInUrl } = await startServer({
     repoPath: fixture.root,
-    extraRepos: [conflictFixture.root],
+    extraRepos: [conflictFixture.root, nonTextFixture.root],
     stateHome: join(work, 'state'),
   })
 
@@ -78,7 +82,7 @@ export default async function globalSetup() {
   // breaking the next one.
   writeFileSync(
     RUNTIME_FILE,
-    JSON.stringify({ base, pid: child.pid, work, fixture, conflictFixture }, null, 2),
+    JSON.stringify({ base, pid: child.pid, work, fixture, conflictFixture, nonTextFixture }, null, 2),
   )
 
   try {

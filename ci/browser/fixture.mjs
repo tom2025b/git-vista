@@ -186,3 +186,70 @@ export function buildConflictFixture(root) {
 
   return { root, conflicted: ['added-by-both.txt', 'both-modified.txt'] }
 }
+
+/**
+ * A THIRD repository, for the conflicts that cannot be resolved by picking
+ * lines (M4.31d, #430).
+ *
+ * Its own repository for exactly the reason `buildConflictFixture` is separate
+ * from `buildFixture`: the #428/#429 specs assert an exact conflicted count
+ * (`toHaveCount(2)`) and one of them mutates the fixture as it resolves. Adding
+ * paths to that repo would fail those specs for a reason that has nothing to do
+ * with what they test.
+ *
+ * Two shapes, chosen because they are the two #430 can actually build:
+ *
+ *   `logo.png` — binary/binary. Real NUL bytes in the first 8000, so git's own
+ *   sniff calls it binary on both sides. Neither pane may render it as text,
+ *   and the note must say why rather than only printing a byte count.
+ *
+ *   `doomed.txt` — delete/modify. `theirs` deletes it, `ours` edits it, so git
+ *   reports `UD` (DeletedByThem). This is the case that exposed the defect the
+ *   honesty review found: the index shows "no stage 3", which looks identical
+ *   to an add-by-us, and only `kind` tells them apart.
+ *
+ * Deliberately NOT built here: a rename conflict. Git records no rename
+ * information for conflicted paths, so there is nothing for a fixture to
+ * produce and nothing for the UI to read — see #430's ADR.
+ */
+export function buildNonTextConflictFixture(root) {
+  rmSync(root, { recursive: true, force: true })
+  mkdirSync(root, { recursive: true })
+
+  const git = (...args) =>
+    execFileSync('git', [...IDENT, '-C', root, ...args], {
+      encoding: 'utf8',
+      env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+    })
+
+  // A NUL in the first bytes is what git's own binary sniff looks for; a .png
+  // extension alone would not make it binary.
+  const png = (marker) => Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x00]), Buffer.from(marker)])
+
+  git('init', '-q', '-b', 'main')
+  writeFileSync(join(root, 'logo.png'), png('ancestor'))
+  writeFileSync(join(root, 'doomed.txt'), 'the original line\n')
+  git('add', '-A')
+  git('commit', '-q', '-m', 'seed: a binary file and a file one side will delete')
+
+  git('checkout', '-q', '-b', 'theirs')
+  writeFileSync(join(root, 'logo.png'), png('theirs-version'))
+  git('rm', '-q', 'doomed.txt')
+  git('add', '-A')
+  git('commit', '-q', '-m', 'theirs: change the binary, delete the text file')
+
+  git('checkout', '-q', 'main')
+  writeFileSync(join(root, 'logo.png'), png('ours-version'))
+  writeFileSync(join(root, 'doomed.txt'), 'our edit to the doomed file\n')
+  git('add', '-A')
+  git('commit', '-q', '-m', 'ours: change the binary, edit the text file')
+
+  // Expected to fail — that is the fixture.
+  try {
+    git('merge', 'theirs')
+  } catch {
+    /* expected: leaves logo.png at stages 1/2/3 and doomed.txt as UD */
+  }
+
+  return { root, conflicted: ['doomed.txt', 'logo.png'] }
+}
