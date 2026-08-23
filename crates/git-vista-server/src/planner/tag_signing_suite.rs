@@ -4,6 +4,7 @@
 //! read using the bounded primitive, and the real sandboxed spawn with no
 //! usable key.
 
+use super::tag_exec::{classify_sign_failure, create_tag_argv, exec_create_tag, SIGN_TIMEOUT};
 use super::*;
 use std::path::PathBuf;
 
@@ -271,10 +272,10 @@ fn classify_sign_failure_distinguishes_no_secret_key_from_agent_unreachable() {
 /// `rev_parse_ref_unpeeled` a future edit could revert to.
 #[test]
 fn the_timed_out_arms_recovery_read_uses_the_bounded_primitive() {
-    const PLANNER_SRC: &str = include_str!("../planner.rs");
+    const PLANNER_SRC: &str = include_str!("tag_exec.rs");
     let start = PLANNER_SRC
         .find("async fn run_signed_tag(")
-        .expect("run_signed_tag must exist in planner.rs — this test's own anchor moved");
+        .expect("run_signed_tag must exist in tag_exec.rs — this test's own anchor moved");
     let end = start
         + PLANNER_SRC[start..]
             .find("\n/// Map a failed signing spawn's stderr")

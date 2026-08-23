@@ -61,6 +61,9 @@
 //! (see the invariant note there). The handler→planner funnel that
 //! `plan_and_execute` adds on top is exactly what layer 2 proves.
 
+use super::worktree_exec::{
+    exec_delete_untracked_paths, exec_discard_tracked_paths, observe_deletion, DeleteOutcome,
+};
 use super::*;
 use std::path::PathBuf;
 
