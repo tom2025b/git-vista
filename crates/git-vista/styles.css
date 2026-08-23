@@ -1484,3 +1484,73 @@ button.detail-file,
   align-self: center;
   font-style: italic;
 }
+
+/* M4.31c (#432): the line/block resolver. Sits between the whole-file controls
+   and the four panes — after the cheap answer, before the reference material,
+   because it is the middle option in effort as well as in the layout. */
+.conflict-editor {
+  margin: 0.5rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.conflict-blocks {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.conflict-blk {
+  margin: 0;
+}
+/* Context is shown but not chosen, and reads quieter than the sides so the eye
+   lands on the decisions rather than the agreement. */
+.conflict-blk-context {
+  opacity: 0.7;
+  padding: 0.2rem 0.4rem;
+}
+.conflict-blk-conflict {
+  border-left: 3px solid currentColor;
+  padding: 0.3rem 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.conflict-blk-head {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+/* Ours and theirs are labelled by position and border, never by colour alone —
+   the same reason the pane headings spell their names out. */
+.conflict-blk-ours,
+.conflict-blk-theirs {
+  margin: 0;
+  padding: 0.2rem 0.4rem;
+  max-height: 20vh;
+  overflow: auto;
+}
+.conflict-blk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+}
+.conflict-blk-state {
+  font-size: 0.85rem;
+  align-self: center;
+}
+.conflict-compose-head {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+/* The composed result, editable. Monospace and generously tall: this is the
+   file, and judging a merge through a three-line window is how a mistake gets
+   through. */
+.conflict-compose {
+  width: 100%;
+  min-height: 12rem;
+  font-family: inherit;
+  font-size: 0.9rem;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}

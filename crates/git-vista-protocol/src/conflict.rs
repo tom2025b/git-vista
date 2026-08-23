@@ -398,6 +398,15 @@ pub struct ConflictSource {
     /// it back unchanged in a resolution submission; the executor refuses if
     /// it no longer matches the live file.
     pub source: crate::plan::GenerationToken,
+    /// The stage OID triple (base, ours, theirs) as the scan reported them at
+    /// the moment this document was served. `None` for a stage that is
+    /// [`Stage::Absent`] or [`Stage::Unreadable`].
+    ///
+    /// **Served rather than derived client-side, deliberately.** The executor
+    /// re-scans and compares against exactly this triple, so a client that
+    /// computed its own could only ever agree with itself — the check would
+    /// pass by construction and prove nothing. Echo it back unchanged.
+    pub stages: [Option<crate::plan::CommitOid>; 3],
 }
 
 /// Why a submitted content resolution was refused, in words a user reads
@@ -846,6 +855,11 @@ mod tests {
             truncated: false,
             binary: false,
             source: crate::plan::GenerationToken::new("conflict-v1:deadbeef").unwrap(),
+            // An add/add shape: no common ancestor, both sides present. Carried
+            // so the round trip exercises a `None` slot as well as `Some` ones
+            // — the two serialize differently and a test using three `Some`s
+            // would not notice a null being dropped.
+            stages: [None, Some(oid('a')), Some(oid('b'))],
         };
         let json = serde_json::to_value(&src).unwrap();
         let back: ConflictSource = serde_json::from_value(json.clone()).unwrap();

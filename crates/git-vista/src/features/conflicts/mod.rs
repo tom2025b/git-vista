@@ -20,3 +20,9 @@
 //! No `signals.rs` yet: this slice adds no live resource of its own.
 
 pub mod core;
+/// M4.31c (#432): reading git's marker file into choosable blocks, and
+/// composing the resolved file back out of them. Framework-free and
+/// host-tested for the same reason [`core`] is — #432's criteria are facts
+/// about what content a choice produces, and `cargo test` never compiles the
+/// wasm viewer.
+pub mod markers;

@@ -21,8 +21,8 @@ use git_vista_protocol::diff::{ComparisonBasis, DiffSpec, SpecDiff};
 use git_vista_protocol::{PatchPlan, PatchPreview, StageDirection, StagingDiff};
 
 use crate::api::{
-    fetch_conflict_panes, fetch_diff_full, fetch_file, fetch_spec_diff, resolve_conflict_request,
-    staging_diff_request,
+    fetch_conflict_panes, fetch_conflict_source, fetch_diff_full, fetch_file, fetch_spec_diff,
+    resolve_conflict_content_request, resolve_conflict_request, staging_diff_request,
 };
 // The row-height scale and overscan are the panel's constants, shared rather
 // than duplicated: two surfaces measuring the same rendered text with
@@ -785,12 +785,269 @@ fn conflict_body(
         })
     };
 
+    // M4.31c (#432): the line/block resolver, gated on the SAME predicate the
+    // server asks before executing one.
+    let editor = conflict_editor(
+        panes.path.clone(),
+        panes.surface.text_resolution_allowed,
+        busy,
+        error,
+        status,
+        graph,
+        shell,
+    );
+
     view! {
         <div class="viewer-doc-head">{panes.path.clone()}</div>
         {note}
         <div class="conflict-actions">{controls}</div>
         {refusal}
+        {editor}
         <div class="conflict-panes">{rendered}</div>
+    }
+    .into_view()
+}
+
+/// The line/block resolver and free-text editor (M4.31c, #432, ADR 0069).
+///
+/// # Why this is gated, and on what
+///
+/// Only rendered when `surface.text_resolution_allowed` says so — the flag
+/// #430 computed and nothing consumed until now. That flag is
+/// `ConflictedFile::text_resolvable`, the SAME predicate the server asks
+/// before executing a content resolution, so the button cannot appear for a
+/// file the executor would refuse. Two copies of that rule is how #430 shipped
+/// a wrong sentence; there is one.
+///
+/// # What lives here versus in `markers`
+///
+/// Nothing here decides what content a choice produces. Parsing the marker
+/// file and composing the result are
+/// [`markers::parse`](crate::features::conflicts::markers::parse) and
+/// [`markers::compose`](crate::features::conflicts::markers::compose), both
+/// framework-free and host-tested, for the reason ADR 0066 gives: `cargo test`
+/// never compiles this file, so a decision made here would be pinned by
+/// nothing. This function fetches, renders, and submits.
+fn conflict_editor(
+    path: String,
+    allowed: bool,
+    busy: RwSignal<bool>,
+    error: RwSignal<Option<String>>,
+    status: StatusResource,
+    graph: RwSignal<GraphCore>,
+    shell: Shell,
+) -> View {
+    use crate::features::conflicts::markers::{compose, conflict_count, parse, unchosen, Choice};
+
+    if !allowed {
+        return ().into_view();
+    }
+
+    // `None` until the user asks for it. The marker file is a second read, and
+    // a conflict the user resolves with a whole-side button should not pay for
+    // it — the same reasoning `fetch_conflict_panes` uses to skip binary blobs.
+    let source = create_rw_signal::<Option<git_vista_protocol::ConflictSource>>(None);
+    let choices = create_rw_signal::<Vec<Choice>>(Vec::new());
+    // Set once the user edits the composed text by hand. From then on it is
+    // authoritative and the per-block buttons stop rewriting it — silently
+    // discarding someone's typing to re-apply a button is the one thing an
+    // editor must never do.
+    let edited = create_rw_signal::<Option<String>>(None);
+
+    let open_path = path.clone();
+    let open = move |_| {
+        let p = open_path.clone();
+        error.set(None);
+        busy.set(true);
+        spawn_local(async move {
+            match fetch_conflict_source(&p).await {
+                Ok(src) => {
+                    let n = conflict_count(&parse(&src.content));
+                    choices.set(vec![Choice::Unchosen; n]);
+                    edited.set(None);
+                    source.set(Some(src));
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    };
+
+    let submit_path = path.clone();
+    let submit = move |_| {
+        let Some(src) = source.get() else { return };
+        let blocks = parse(&src.content);
+        // Hand-edited text wins outright; otherwise compose from the choices.
+        // `compose` returning None means a block is still unchosen, and the
+        // button is disabled in that case — this is belt and braces, and it
+        // refuses rather than submitting a guess.
+        let Some(content) = edited.get().or_else(|| compose(&blocks, &choices.get())) else {
+            error.set(Some(
+                "Every conflict needs a choice before this can be applied.".to_string(),
+            ));
+            return;
+        };
+        let p = submit_path.clone();
+        // Echoed back unchanged — never recomputed here. A client that
+        // recomputed the stages it was given could only ever agree with itself.
+        let stages = src.stages.clone();
+        let token = src.source.clone();
+        error.set(None);
+        busy.set(true);
+        spawn_local(async move {
+            match resolve_conflict_content_request(&p, stages, token, content).await {
+                Ok(()) => {
+                    // BOTH refreshes, for the reason #429 documents: the topbar
+                    // chip and the Activity panel's conflicted list are
+                    // separate resources, and refetching one leaves the other
+                    // claiming a conflict that is resolved.
+                    status.refetch();
+                    graph.update(|g| {
+                        g.force_bump();
+                    });
+                    shell.close_viewer();
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    };
+
+    view! {
+        <div class="conflict-editor">
+            {move || match source.get() {
+                None => view! {
+                    <button
+                        class="viewer-btn conflict-edit-open"
+                        prop:disabled=move || busy.get()
+                        on:click=open.clone()
+                    >
+                        "Resolve line by line…"
+                    </button>
+                }.into_view(),
+                Some(src) => {
+                    let blocks = parse(&src.content);
+                    let total = conflict_count(&blocks);
+                    let mut nth = 0usize;
+                    let rows: Vec<View> = blocks
+                        .iter()
+                        .map(|b| match b {
+                            crate::features::conflicts::markers::Block::Context { text } => {
+                                view! { <pre class="conflict-blk conflict-blk-context">{text.clone()}</pre> }
+                                    .into_view()
+                            }
+                            crate::features::conflicts::markers::Block::Conflict {
+                                ours, theirs, ..
+                            } => {
+                                let i = nth;
+                                nth += 1;
+                                let (o, t) = (ours.clone(), theirs.clone());
+                                let pick = move |c: Choice| {
+                                    move |_| {
+                                        // A hand-edit is never silently thrown
+                                        // away by a later button press.
+                                        if edited.get().is_none() {
+                                            choices.update(|v| {
+                                                if let Some(slot) = v.get_mut(i) {
+                                                    *slot = c;
+                                                }
+                                            });
+                                        }
+                                    }
+                                };
+                                let chosen = move || choices.get().get(i).copied()
+                                    .unwrap_or(Choice::Unchosen);
+                                view! {
+                                    <div class="conflict-blk conflict-blk-conflict">
+                                        <div class="conflict-blk-head">
+                                            {format!("Conflict {} of {}", i + 1, total)}
+                                        </div>
+                                        <pre class="conflict-blk-ours">{o}</pre>
+                                        <pre class="conflict-blk-theirs">{t}</pre>
+                                        <div class="conflict-blk-actions">
+                                            <button
+                                                class="viewer-btn"
+                                                prop:disabled=move || busy.get() || edited.get().is_some()
+                                                on:click=pick(Choice::Ours)
+                                            >"Ours"</button>
+                                            <button
+                                                class="viewer-btn"
+                                                prop:disabled=move || busy.get() || edited.get().is_some()
+                                                on:click=pick(Choice::Theirs)
+                                            >"Theirs"</button>
+                                            <button
+                                                class="viewer-btn"
+                                                prop:disabled=move || busy.get() || edited.get().is_some()
+                                                on:click=pick(Choice::Both)
+                                            >"Both"</button>
+                                            <span class="conflict-blk-state">
+                                                {move || match chosen() {
+                                                    Choice::Unchosen => "not chosen yet",
+                                                    Choice::Ours => "keeping ours",
+                                                    Choice::Theirs => "keeping theirs",
+                                                    Choice::Both => "keeping both",
+                                                }}
+                                            </span>
+                                        </div>
+                                    </div>
+                                }
+                                .into_view()
+                            }
+                        })
+                        .collect();
+
+                    let blocks_for_area = blocks.clone();
+                    let area = move || {
+                        edited
+                            .get()
+                            .or_else(|| compose(&blocks_for_area, &choices.get()))
+                            .unwrap_or_default()
+                    };
+                    // Stored, not a bare closure: it is read by two separate
+                    // reactive scopes (the button's disabled state and the
+                    // status line), and a plain closure moves into the first.
+                    let blocks_for_open = StoredValue::new(blocks.clone());
+                    let open_count =
+                        move || unchosen(&blocks_for_open.get_value(), &choices.get()).len();
+
+                    view! {
+                        <div class="conflict-blocks">{rows}</div>
+                        <div class="conflict-compose-head">
+                            "Result — edit freely; typing here takes over from the buttons above."
+                        </div>
+                        <textarea
+                            class="conflict-compose"
+                            prop:value=area
+                            on:input=move |ev| edited.set(Some(event_target_value(&ev)))
+                        ></textarea>
+                        <div class="conflict-actions">
+                            <button
+                                class="viewer-btn conflict-apply"
+                                prop:disabled=move || {
+                                    busy.get() || (edited.get().is_none() && open_count() > 0)
+                                }
+                                on:click=submit.clone()
+                            >
+                                "Apply this resolution"
+                            </button>
+                            <span class="conflict-blk-state">
+                                {move || {
+                                    let n = open_count();
+                                    if edited.get().is_some() {
+                                        "edited by hand".to_string()
+                                    } else if n == 0 {
+                                        "every conflict chosen".to_string()
+                                    } else {
+                                        format!("{n} conflict(s) still need a choice")
+                                    }
+                                }}
+                            </span>
+                        </div>
+                    }
+                    .into_view()
+                }
+            }}
+        </div>
     }
     .into_view()
 }
