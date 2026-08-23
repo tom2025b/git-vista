@@ -4,6 +4,7 @@
 //! every branch, paired negatives, and the guarantee that the unknown arm
 //! never swallows git's own stderr.
 
+use super::commit_exec::{classify_amend_failure, classify_commit_failure, commit_refusal_body};
 use super::*;
 use std::path::PathBuf;
 

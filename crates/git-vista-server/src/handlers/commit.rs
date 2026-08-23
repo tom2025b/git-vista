@@ -93,7 +93,7 @@ pub(crate) async fn create_commit(Json(req): Json<CreateCommitRequest>) -> (Stat
 /// classified failures use — this route's own checks go straight through
 /// [`planner::amend_refusal`], which builds the `Response` itself (#323);
 /// `exec_amend_commit`'s callers build the same JSON through the
-/// `(StatusCode, String)`-shaped [`planner::amend_refusal_body`] instead,
+/// `(StatusCode, String)`-shaped `planner::commit_exec::amend_refusal_body` instead,
 /// re-labeled `application/json` at the final hop by
 /// [`amend_route_response`] — so the endpoint's contract stays simple for
 /// M2.19d: **every** 400 body from this route parses as `AmendCommitError`.

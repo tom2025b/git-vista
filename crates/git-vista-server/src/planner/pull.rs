@@ -59,6 +59,7 @@ use git_vista_protocol::{
     FetchFailureKind, MergeStrategy, PullError, PullFailureKind, PullSuccess, RemoteRefUpdate,
 };
 
+use super::branch_exec::{exec_merge, exec_rebase, IntegrationCaller};
 use super::fetch::FetchStep;
 use super::*;
 

@@ -3,6 +3,7 @@
 //! case where a dirty-tree refusal must stay unclassified, forwarding
 //! git's own words as-is.
 
+use super::sequence_exec::{exec_revert, looks_like_revert_conflict};
 use super::*;
 use std::path::PathBuf;
 

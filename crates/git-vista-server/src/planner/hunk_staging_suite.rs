@@ -5,6 +5,7 @@
 //! and unstaging a content hunk of a renamed file without disturbing the
 //! rename itself.
 
+use super::staging_exec::exec_stage_selection;
 use super::*;
 use std::path::PathBuf;
 
