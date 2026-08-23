@@ -333,12 +333,12 @@ impl ResolutionSurface {
                 .not_text_resolvable
                 .as_ref()
                 .map(|_| Self::note_for(file)),
-            // Text resolution needs real text on both sides a resolver would
-            // merge between. `Stage::is_text` is false for Absent and for
-            // binary, which is exactly the set #430 is about.
-            text_resolution_allowed: file.not_text_resolvable.is_none()
-                && file.ours.is_text()
-                && file.theirs.is_text(),
+            // Delegated to `ConflictedFile::text_resolvable` (protocol
+            // conflict.rs, added for #432/ADR 0069) rather than computed here
+            // a second time: the server asks the identical question before
+            // executing a content resolution, and two independent copies of
+            // this exact rule is how #430 shipped a wrong sentence.
+            text_resolution_allowed: file.text_resolvable(),
             take_ours: side(&file.ours),
             take_theirs: side(&file.theirs),
             take_deletion: Ok(()),

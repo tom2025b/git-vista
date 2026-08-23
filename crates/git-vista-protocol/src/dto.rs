@@ -495,6 +495,31 @@ pub struct ResolveConflictRequest {
     pub resolution: crate::conflict::Resolution,
 }
 
+/// Body of a `POST /api/resolve-conflict-content` request (M4.31c, #432, ADR
+/// 0069): a block/line/manual-edit resolution.
+///
+/// `path` is a [`crate::plan::WorktreePath`] on the DTO itself for the same
+/// structural reason [`ResolveConflictRequest`]'s is — a traversal attempt
+/// fails to deserialize and never reaches handler code. `expected_stages` and
+/// `expected_source` are opaque to this DTO; the executor is the only thing
+/// that interprets them, inside the coordinator lock, immediately before
+/// writing anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveConflictContentRequest {
+    /// Repository-relative path, exactly as the conflict scan reported it.
+    pub path: crate::plan::WorktreePath,
+    /// The stage OID triple the user resolved against, echoed back from
+    /// `GET /api/conflicts`. `None` means that stage was
+    /// [`crate::conflict::Stage::Absent`].
+    pub expected_stages: [Option<crate::plan::CommitOid>; 3],
+    /// The `conflict-v1:` token from the [`crate::conflict::ConflictSource`]
+    /// this content was composed against, echoed back unchanged.
+    pub expected_source: crate::plan::GenerationToken,
+    /// The user's chosen result, in full.
+    pub content: String,
+}
+
 /// Body of a `POST /api/fetch` request (M2.20c, #229): fetch from the named
 /// configured remote.
 ///

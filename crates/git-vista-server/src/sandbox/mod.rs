@@ -782,6 +782,10 @@ pub(crate) fn network_need_for_operation(op: &GitOperation) -> NetworkNeed {
         // it chooses between are already in the object database — resolving a
         // conflict never needs to ask a remote anything.
         GitOperation::ResolveConflict { .. } => NetworkNeed::Local,
+        // M4.31c (#432): a worktree write plus `git add` — the content itself
+        // was composed client-side against sides already in the object
+        // database, so this asks a remote nothing either.
+        GitOperation::ResolveConflictContent { .. } => NetworkNeed::Local,
         GitOperation::CreateBranch { .. } => NetworkNeed::Local,
         GitOperation::CommitOnHead { .. } => NetworkNeed::Local,
         GitOperation::EmptyCommitOnBranch { .. } => NetworkNeed::Local,

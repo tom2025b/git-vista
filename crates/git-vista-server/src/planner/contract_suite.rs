@@ -213,6 +213,9 @@ fn covered_by(op: &GitOperation) -> &'static str {
         }
         GitOperation::DropStash { .. } => "drop_stash_refuses_a_moved_selector",
         GitOperation::ResolveConflict { .. } => "resolve_conflict_executes_through_the_pipeline",
+        GitOperation::ResolveConflictContent { .. } => {
+            "resolve_conflict_content_executes_through_the_pipeline"
+        }
         GitOperation::CreateBranch { .. } => "create_branch_executes_through_the_pipeline",
         GitOperation::CommitOnHead { .. } => "commit_on_head_executes_through_the_pipeline",
         GitOperation::EmptyCommitOnBranch { .. } => {
@@ -276,6 +279,7 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
         | GitOperation::BranchFromStash { .. }
         | GitOperation::DropStash { .. }
         | GitOperation::ResolveConflict { .. }
+        | GitOperation::ResolveConflictContent { .. }
         | GitOperation::CreateBranch { .. }
         | GitOperation::CommitOnHead { .. }
         | GitOperation::EmptyCommitOnBranch { .. }
@@ -323,6 +327,12 @@ fn samples() -> Vec<GitOperation> {
         GitOperation::ResolveConflict {
             path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
             resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
+        },
+        GitOperation::ResolveConflictContent {
+            path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+            expected_stages: [Some(oid(&zeros)), Some(oid(&zeros)), Some(oid(&zeros))],
+            expected_source: GenerationToken::new("conflict-v1:census").unwrap(),
+            content: "resolved\n".to_string(),
         },
         GitOperation::CreateBranch {
             name: branch("b"),
@@ -5569,6 +5579,241 @@ async fn resolve_conflict_executes_through_the_pipeline() {
         staged.starts_with("100644") && staged.contains(" 0\t"),
         "the resolved file must sit at stage 0, got: {staged}"
     );
+}
+
+/// A modify/modify conflict with real base/ours/theirs stages, plus the
+/// [`ConflictSource`](git_vista_protocol::ConflictSource) a content resolution
+/// needs to build a valid request against — the OID triple and the
+/// `conflict-v1:` token, both read the way a real client would: from the live
+/// repository, not invented.
+async fn content_conflict_fixture() -> (
+    tempfile::TempDir,
+    PathBuf,
+    [Option<CommitOid>; 3],
+    GenerationToken,
+) {
+    let (dir, repo) = seeded_repo();
+    run(&repo, &["checkout", "-q", "-b", "theirs"]);
+    std::fs::write(repo.join("a.txt"), "theirs\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "theirs"]);
+    run(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("a.txt"), "ours\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "ours"]);
+    let _ = std::process::Command::new("git")
+        .args(["merge", "theirs"])
+        .current_dir(&repo)
+        .status();
+    assert!(
+        out(&repo, &["ls-files", "-u", "--", "a.txt"]).contains("a.txt"),
+        "the fixture must actually be conflicted"
+    );
+
+    let stages = [
+        oid(&out(&repo, &["rev-parse", ":1:a.txt"])),
+        oid(&out(&repo, &["rev-parse", ":2:a.txt"])),
+        oid(&out(&repo, &["rev-parse", ":3:a.txt"])),
+    ]
+    .map(Some);
+
+    let marker = std::fs::read(repo.join("a.txt")).unwrap();
+    let source = crate::conflicts::conflict_source_token(&repo, "a.txt", &marker)
+        .await
+        .unwrap();
+
+    (dir, repo, stages, source)
+}
+
+#[tokio::test]
+async fn resolve_conflict_content_executes_through_the_pipeline() {
+    // M4.31c (#432), ADR 0069. Same discipline as
+    // `resolve_conflict_executes_through_the_pipeline`: the full production
+    // path, not a direct call to the exec function.
+    let (_dir, repo, expected_stages, expected_source) = content_conflict_fixture().await;
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ResolveConflictContent {
+            path: WorktreePath::new("a.txt").unwrap(),
+            expected_stages,
+            expected_source,
+            content: "resolved by hand\n".to_string(),
+        },
+    )
+    .await;
+    assert_ok(status, &body);
+
+    // Three separate facts, same reasoning as the whole-side test: any one
+    // alone could hold while the resolution was still wrong.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "resolved by hand\n",
+        "the working tree must hold exactly the submitted content, no markers"
+    );
+    assert_eq!(
+        out(&repo, &["ls-files", "-u", "--", "a.txt"]),
+        "",
+        "the stage entries must be cleared"
+    );
+    let staged = out(&repo, &["ls-files", "-s", "--", "a.txt"]);
+    assert!(
+        staged.starts_with("100644") && staged.contains(" 0\t"),
+        "the resolved file must sit at stage 0, got: {staged}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_conflict_content_refuses_when_a_stage_moved_since_it_was_built() {
+    // ADR 0069's gate 3. MUTATION: drop the `live_stages != expected_stages`
+    // comparison. A resolution composed against one picture would then apply
+    // silently over a repository that has since moved — "the picture you
+    // decided against has changed" is the invariant, not just the surviving
+    // bytes.
+    let (_dir, repo, expected_stages, expected_source) = content_conflict_fixture().await;
+
+    // Rewrite ONLY the stage-2 (ours) index entry to a different blob, via the
+    // plumbing command that changes a single stage without touching the
+    // marker file or any other stage — isolating gate 3 from gate 4. A whole-
+    // side resolve (`git checkout --ours`, then a fresh `add`) does exactly
+    // this in production; a fabricated blob proves the same shape without
+    // needing a resolution to already have happened.
+    let scratch = repo.join(".moved-blob-scratch");
+    std::fs::write(&scratch, "ours, moved\n").unwrap();
+    let new_blob = out(&repo, &["hash-object", "-w", scratch.to_str().unwrap()]);
+    std::fs::remove_file(&scratch).unwrap();
+    // `--index-info` (not `--cacheinfo`, which cannot target a specific
+    // stage): "<mode> SP <sha1> SP <stage> TAB <path>" replaces exactly the
+    // stage-2 entry, leaving stage 1, stage 3, and the worktree file untouched.
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .args(["update-index", "--index-info"])
+        .current_dir(&repo)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("100644 {new_blob} 2\ta.txt\n").as_bytes())
+        .unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "update-index --index-info failed"
+    );
+    assert!(
+        out(&repo, &["ls-files", "-u", "--", "a.txt"]).contains("a.txt"),
+        "the path must still be conflicted after moving one stage"
+    );
+    let marker_unchanged = std::fs::read_to_string(repo.join("a.txt")).unwrap();
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ResolveConflictContent {
+            path: WorktreePath::new("a.txt").unwrap(),
+            expected_stages, // stale — names the old stage-2 blob
+            expected_source,
+            content: "resolved by hand\n".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "body: {body}");
+    assert!(
+        body.contains("changed since you opened it"),
+        "must be gate 3's sentence, not gate 4's: {body}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        marker_unchanged,
+        "a refused resolution must never touch the working tree"
+    );
+}
+
+#[tokio::test]
+async fn resolve_conflict_content_refuses_when_the_served_document_moved() {
+    // ADR 0069's gate 4 — the one no repository-level generation alone can
+    // catch. The stage OIDs here are UNCHANGED; only the marker file's own
+    // bytes moved, exactly the gap `conflict-v1:` exists to close.
+    //
+    // MUTATION: skip re-minting the token and only check `expected_stages`.
+    // An edit landing between serve and submit — in the app or outside it —
+    // would then be silently overwritten rather than refused.
+    let (_dir, repo, expected_stages, stale_source) = content_conflict_fixture().await;
+
+    // An edit to the marker file itself, stage entries untouched. Simulates
+    // another tool (or another tab) writing the same file mid-resolution.
+    std::fs::write(
+        repo.join("a.txt"),
+        "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> theirs\nan edit landed here\n",
+    )
+    .unwrap();
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ResolveConflictContent {
+            path: WorktreePath::new("a.txt").unwrap(),
+            expected_stages,
+            expected_source: stale_source,
+            content: "resolved by hand\n".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "body: {body}");
+    assert!(body.contains("edited elsewhere"), "{body}");
+    assert!(
+        std::fs::read_to_string(repo.join("a.txt"))
+            .unwrap()
+            .contains("an edit landed here"),
+        "a refused resolution must never overwrite the edit it just detected"
+    );
+}
+
+#[tokio::test]
+async fn resolve_conflict_content_refuses_a_binary_conflict() {
+    // ADR 0069's gate 2, and #430's ResolutionSurface asks the identical
+    // question client-side — this is the SAME rule
+    // (`ConflictedFile::text_resolvable`), checked here at the layer that
+    // actually writes.
+    let (dir, repo) = seeded_repo();
+    run(&repo, &["checkout", "-q", "-b", "theirs"]);
+    std::fs::write(repo.join("bin.dat"), [0x89u8, b'P', b'N', b'G', 0, 1]).unwrap();
+    run(&repo, &["add", "bin.dat"]);
+    run(&repo, &["commit", "-q", "-m", "theirs adds a binary"]);
+    run(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("bin.dat"), [0x89u8, b'P', b'N', b'G', 0, 2]).unwrap();
+    run(&repo, &["add", "bin.dat"]);
+    run(
+        &repo,
+        &["commit", "-q", "-m", "ours adds a different binary"],
+    );
+    let _ = std::process::Command::new("git")
+        .args(["merge", "theirs"])
+        .current_dir(&repo)
+        .status();
+    assert!(
+        out(&repo, &["ls-files", "-u", "--", "bin.dat"]).contains("bin.dat"),
+        "the fixture must be conflicted"
+    );
+
+    let stages = [
+        None,
+        Some(oid(&out(&repo, &["rev-parse", ":2:bin.dat"]))),
+        Some(oid(&out(&repo, &["rev-parse", ":3:bin.dat"]))),
+    ];
+    let source = GenerationToken::new("conflict-v1:irrelevant").unwrap();
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ResolveConflictContent {
+            path: WorktreePath::new("bin.dat").unwrap(),
+            expected_stages: stages,
+            expected_source: source,
+            content: "cannot merge bytes as text".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "body: {body}");
+    assert!(body.contains("binary"), "{body}");
+    drop(dir);
 }
 
 #[tokio::test]

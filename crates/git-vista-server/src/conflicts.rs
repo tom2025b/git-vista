@@ -187,6 +187,48 @@ fn not_text_resolvable(
     None
 }
 
+/// The `conflict-v1:` token for one served [`ConflictSource`](git_vista_protocol::ConflictSource)
+/// document (M4.31c, #432, ADR 0069).
+///
+/// Repository generation (HEAD, every ref, the index checksum — via
+/// [`git_vista_git::read_generation_inputs`], the same reader `/api/status`
+/// and `/api/history` already use) plus a digest of the marker-file bytes
+/// served, folded together exactly the way `handlers/read.rs`'s `diff-v1:`
+/// recipe folds direction and patch bytes.
+///
+/// Still read-only, despite this module's header claiming nothing here
+/// writes: minting a token reads the repository and hashes bytes already in
+/// hand. Two-phase, like `diff-v1:` — the handler mints this when serving the
+/// document; [`crate::planner`]'s executor re-mints it from the LIVE file,
+/// inside the coordinator lock, immediately before writing anything, and
+/// refuses on any mismatch. That is the mechanism ADR 0069 exists to
+/// establish: this is the one input no repository-level generation can see on
+/// its own, because porcelain v2 carries stage OIDs but no worktree hash.
+pub(crate) async fn conflict_source_token(
+    repo: &Path,
+    path: &str,
+    marker_bytes: &[u8],
+) -> Result<git_vista_protocol::GenerationToken, String> {
+    let mut inputs = git_vista_git::read_generation_inputs(repo)
+        .map_err(|e| format!("couldn't read generation inputs: {e}"))?;
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        // Namespaced and path-folded the same way `diff-v1:` folds its
+        // direction: two different paths' marker files must never hash to the
+        // same digest merely because their bytes happened to collide.
+        hasher.update(b"conflict-source:marker-file\0");
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(marker_bytes);
+        format!("{:x}", hasher.finalize())
+    };
+    inputs.worktree(&digest);
+    let generation = inputs.generation();
+    git_vista_protocol::GenerationToken::new(format!("conflict-v1:{generation}"))
+        .map_err(|e| format!("couldn't build the conflict-v1 token: {e}"))
+}
+
 /// Every conflicted path in the repository, with all three stages described.
 ///
 /// An `Err` means the *scan* failed and the caller must surface that — it must

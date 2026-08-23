@@ -126,6 +126,18 @@ pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
              at a time by someone looking at all three versions of it; an agent \
              picking a side from a tool description has seen none of them",
         ),
+        // M4.31c (#432), ADR 0069 decision 7: excluded a fortiori. Whole-side
+        // resolution is already excluded because choosing requires having
+        // SEEN the sides; this variant carries arbitrary authored bytes, so
+        // an agent exposing it has not only seen none of the sides, it would
+        // be authoring file content from a tool description — strictly less
+        // information than the case already excluded above.
+        GitOperation::ResolveConflictContent { .. } => Excluded(
+            "carries arbitrary authored file content chosen by looking at three \
+             versions of a conflict; an agent has seen none of them and would be \
+             authoring bytes from a tool description — excluded more strongly than \
+             whole-side resolution above, which this inherits from and extends",
+        ),
         GitOperation::CreateBranch { .. } => Tool("plan_create_branch"),
         GitOperation::CommitOnHead { .. } => Tool("plan_commit_on_head"),
         GitOperation::EmptyCommitOnBranch { .. } => Tool("plan_empty_commit_on_branch"),
@@ -1197,6 +1209,7 @@ mod tests {
     const UNEXPOSED_TAGS: &[&str] = &[
         "reset_test_repo",
         "resolve_conflict",
+        "resolve_conflict_content",
         "stage_selection",
         "branch_from_stash",
         "cherry_pick",
@@ -1347,6 +1360,20 @@ mod tests {
             GitOperation::ResolveConflict {
                 path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
                 resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
+            },
+            // M4.31c (#432), ADR 0069 decision 7. Same reasoning as
+            // ResolveConflict above: present so the exclusion is checked as
+            // deliberate, not absent by omission.
+            GitOperation::ResolveConflictContent {
+                path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+                expected_stages: [
+                    Some(git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap()),
+                    Some(git_vista_protocol::CommitOid::new("2".repeat(40)).unwrap()),
+                    Some(git_vista_protocol::CommitOid::new("3".repeat(40)).unwrap()),
+                ],
+                expected_source: git_vista_protocol::GenerationToken::new("conflict-v1:census")
+                    .unwrap(),
+                content: "resolved\n".to_string(),
             },
             GitOperation::CreateBranch {
                 name: branch("b"),
