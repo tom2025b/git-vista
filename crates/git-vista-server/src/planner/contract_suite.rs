@@ -2354,6 +2354,7 @@ fn every_git_write_route_reaches_the_planner() {
         // / `--theirs` / `rm -f` — so it goes through the planner like every
         // other mutation, and appears in the funnel below.
         ("/api/resolve-conflict", "resolve_conflict"),
+        ("/api/resolve-conflict-content", "resolve_conflict_content"),
         // M2.20c (#229): cancelling a running operation. A POST, and a write
         // in the "changes what the server is doing" sense — it kills a child
         // process — but **not** a git write: it constructs no argv and mints
