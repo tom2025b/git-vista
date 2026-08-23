@@ -32,7 +32,7 @@
 //! carries that flag per side precisely because the sides can differ.
 
 use git_vista_core::diff::{BlobContent, WorktreeFileContent};
-use git_vista_protocol::conflict::{ConflictedFile, Stage};
+use git_vista_protocol::conflict::{ConflictedFile, NotTextResolvable, Stage};
 
 /// Which of the four views a pane is.
 ///
@@ -204,6 +204,205 @@ pub fn result_pane_state(read: ResultRead) -> PaneState {
     }
 }
 
+/// Why a resolution control is not offered, in words a user reads (M4.31d,
+/// #430).
+///
+/// A *reason*, not a bool, for the same argument
+/// [`NotTextResolvable`](git_vista_protocol::conflict::NotTextResolvable)
+/// makes one layer down: "disabled" with no sentence is a dead control the
+/// user cannot act on, and the three causes here call for three different
+/// next moves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Withheld {
+    /// The side this control takes holds nothing. Refused by
+    /// `ConflictedFile::refuses` as `SideAbsent`, so offering it would produce
+    /// a server error the user could have been spared.
+    SideAbsent,
+    /// The side this control takes could not be read, so choosing it would be
+    /// choosing a version nobody has seen.
+    SideUnreadable { reason: String },
+    /// Some *other* stage of this file is unreadable. Nothing may be resolved
+    /// until it can be read — `ConflictedFile::all_sides_readable`'s own doc
+    /// says a caller "must not present a resolution UI for such a file".
+    FileNotFullyReadable,
+}
+
+impl Withheld {
+    /// The sentence shown in place of the control.
+    pub fn describe(&self) -> String {
+        match self {
+            Withheld::SideAbsent => {
+                "Not offered — that side holds no version of this file".to_string()
+            }
+            Withheld::SideUnreadable { reason } => {
+                format!("Not offered — that side could not be read: {reason}")
+            }
+            Withheld::FileNotFullyReadable => {
+                "Not offered — one side of this file could not be read".to_string()
+            }
+        }
+    }
+}
+
+/// What kind of conflict this is, as a sentence and a set of offered controls
+/// (M4.31d, #430).
+///
+/// # Why this is a type and not three `if`s in the viewer
+///
+/// Issue #430's whole premise is that binary, delete/modify and rename
+/// conflicts "are the cases a text-first resolver gets wrong by default".
+/// Getting them right is a *classification*, and classification tested in a
+/// `#[cfg(target_arch = "wasm32")]` viewer is classification `cargo test`
+/// never compiles — the failure mode this module's parent documents at
+/// length. So the decision lives here, host-tested, and the viewer only draws
+/// what it is handed.
+///
+/// # Rename is deliberately absent
+///
+/// [`NotTextResolvable::Rename`](git_vista_protocol::conflict::NotTextResolvable::Rename)
+/// exists on the wire and **nothing ever constructs it**. Git does not record
+/// rename information for conflicted paths: `git status --porcelain=v2` gives
+/// a rename's original path only on a `2` record, and a conflicted path is a
+/// `u` record, whose grammar has exactly one path field. Producing two paths
+/// would mean re-running git's own similarity heuristic and inventing a
+/// confidence this type could not honestly state — precisely what
+/// [`Stage::Unreadable`] exists to refuse. #430's third acceptance criterion
+/// is therefore **not implemented, and is recorded as unbuildable** rather
+/// than satisfied by a guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionSurface {
+    /// The plain-language fact about this conflict's shape, or `None` for an
+    /// ordinary text conflict that needs no explanation.
+    pub note: Option<String>,
+    /// Whether a line-level text resolver may open on this path at all.
+    ///
+    /// #430's fourth acceptance criterion. **There is no line-level resolver
+    /// yet** — that is #432 — so today this flag is a promise nothing consumes.
+    /// It is computed and tested here so that when the resolver arrives it has
+    /// a tested answer to ask, rather than re-deriving the rule at the call
+    /// site.
+    pub text_resolution_allowed: bool,
+    /// `Take ours`, or why it is withheld.
+    pub take_ours: Result<(), Withheld>,
+    /// `Take theirs`, or why it is withheld.
+    pub take_theirs: Result<(), Withheld>,
+    /// `Delete file`, or why it is withheld.
+    ///
+    /// Deleting depends on neither side's content — `ConflictedFile::refuses`
+    /// returns `None` for it unconditionally — so this is withheld only when
+    /// the file as a whole cannot be resolved.
+    pub take_deletion: Result<(), Withheld>,
+}
+
+impl ResolutionSurface {
+    /// Classify one conflicted file.
+    pub fn of(file: &ConflictedFile) -> Self {
+        let fully_readable = file.all_sides_readable();
+
+        // The gate that outranks everything below it. `all_sides_readable`
+        // means "no stage is Unreadable"; when one is, the user would be
+        // choosing between versions they have not all seen, so nothing is
+        // offered — including deletion, because the decision to delete is
+        // still made against a file the user cannot fully inspect.
+        if !fully_readable {
+            return ResolutionSurface {
+                note: Some(Self::note_for(file)),
+                text_resolution_allowed: false,
+                take_ours: Err(Withheld::FileNotFullyReadable),
+                take_theirs: Err(Withheld::FileNotFullyReadable),
+                take_deletion: Err(Withheld::FileNotFullyReadable),
+            };
+        }
+
+        // Mirrors `ConflictedFile::refuses` rather than re-deciding: a control
+        // offered here and refused by the server is a 409 the user was walked
+        // into. Absent is the delete/modify case — the side that deleted the
+        // file holds nothing to take, and `TakeDeletion` is the control that
+        // expresses that intent.
+        let side = |stage: &Stage| match stage {
+            Stage::Present { .. } => Ok(()),
+            Stage::Absent {} => Err(Withheld::SideAbsent),
+            Stage::Unreadable { reason } => Err(Withheld::SideUnreadable {
+                reason: reason.clone(),
+            }),
+        };
+
+        ResolutionSurface {
+            note: file
+                .not_text_resolvable
+                .as_ref()
+                .map(|_| Self::note_for(file)),
+            // Text resolution needs real text on both sides a resolver would
+            // merge between. `Stage::is_text` is false for Absent and for
+            // binary, which is exactly the set #430 is about.
+            text_resolution_allowed: file.not_text_resolvable.is_none()
+                && file.ours.is_text()
+                && file.theirs.is_text(),
+            take_ours: side(&file.ours),
+            take_theirs: side(&file.theirs),
+            take_deletion: Ok(()),
+        }
+    }
+
+    /// The plain-language sentence for this conflict's shape.
+    ///
+    /// Named sides ("theirs deleted it, ours changed it") rather than a
+    /// generic "this file cannot be text-merged": #430's second acceptance
+    /// criterion is specifically that a delete/modify conflict **names which
+    /// side deleted and which modified**.
+    fn note_for(file: &ConflictedFile) -> String {
+        match &file.not_text_resolvable {
+            Some(NotTextResolvable::Binary { ours, theirs }) => {
+                let which = match (ours, theirs) {
+                    (true, true) => "Both sides are binary",
+                    (true, false) => "Our side is binary",
+                    (false, true) => "Their side is binary",
+                    // The server sets at least one flag when it reports
+                    // Binary; this arm keeps the sentence honest rather than
+                    // asserting a side we were not told about.
+                    (false, false) => "This file is binary",
+                };
+                format!("{which}. There is no line-by-line merge for binary content — choose a whole side, or delete the file.")
+            }
+            Some(NotTextResolvable::Deletion {
+                ours_deleted,
+                theirs_deleted,
+            }) => match (ours_deleted, theirs_deleted) {
+                (true, true) => {
+                    "Both sides deleted this file. Deleting it is the only resolution.".to_string()
+                }
+                (true, false) => {
+                    "We deleted this file; they changed it. Keep their version, or delete it."
+                        .to_string()
+                }
+                (false, true) => {
+                    "They deleted this file; we changed it. Keep our version, or delete it."
+                        .to_string()
+                }
+                // Neither side deleted, yet the server called this a deletion.
+                // Say what is known instead of inventing a side.
+                (false, false) => {
+                    "This file was deleted on one side. Keep a version, or delete it.".to_string()
+                }
+            },
+            // Unreachable from the server today (nothing constructs Rename),
+            // but the wire type permits it, so it gets an honest sentence
+            // rather than a panic or a silent blank.
+            Some(NotTextResolvable::Rename {
+                ours_path,
+                theirs_path,
+            }) => format!(
+                "This file was renamed: ours is {ours_path}, theirs is {theirs_path}. \
+                 The two sides do not agree on the path, so there is no line-by-line merge."
+            ),
+            None if !file.all_sides_readable() => {
+                "One side of this file could not be read, so it cannot be resolved yet.".to_string()
+            }
+            None => String::new(),
+        }
+    }
+}
+
 /// All four panes for one conflicted path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictPanes {
@@ -212,6 +411,15 @@ pub struct ConflictPanes {
     pub ours: PaneState,
     pub theirs: PaneState,
     pub result: PaneState,
+    /// What kind of conflict this is and what may be done about it (M4.31d,
+    /// #430).
+    ///
+    /// Carried here because `ConflictPanes` is the whole of what the viewer
+    /// receives: before this field, `open()` took a `ConflictedFile` holding
+    /// `not_text_resolvable` and returned a struct without it, so the typed
+    /// reason died at the display boundary and no renderer could distinguish
+    /// a binary conflict from a text one.
+    pub surface: ResolutionSurface,
 }
 
 impl ConflictPanes {
@@ -230,6 +438,7 @@ impl ConflictPanes {
             result: PaneState::AwaitingContent {
                 oid: file.path.clone(),
             },
+            surface: ResolutionSurface::of(file),
         }
     }
 
@@ -546,6 +755,274 @@ mod tests {
             panes.pane(Pane::Theirs),
             PaneState::AwaitingContent { .. }
         ));
+    }
+
+    // ---- M4.31d (#430): binary, delete/modify and unreadable surfaces ------
+
+    fn binary_stage(c: char) -> Stage {
+        Stage::Present {
+            oid: oid(c),
+            binary: true,
+            size_bytes: 4096,
+        }
+    }
+
+    fn with_reason(
+        base: Stage,
+        ours: Stage,
+        theirs: Stage,
+        reason: Option<NotTextResolvable>,
+    ) -> ConflictedFile {
+        ConflictedFile {
+            path: "a.bin".into(),
+            kind: ConflictKind::BothModified,
+            base,
+            ours,
+            theirs,
+            not_text_resolvable: reason,
+        }
+    }
+
+    #[test]
+    fn a_binary_conflict_says_no_line_merge_is_possible_and_still_offers_both_sides() {
+        // #430's FIRST acceptance criterion.
+        //
+        // MUTATION A: return `note: None` for Binary. The pane would show only
+        // "Binary file (4096 bytes)" — a size, not an explanation — which is
+        // exactly today's behaviour and exactly what this issue exists to fix.
+        // MUTATION B: set `text_resolution_allowed: true`. A line resolver
+        // would be allowed to open on bytes it cannot merge.
+        let file = with_reason(
+            Stage::Absent {},
+            binary_stage('2'),
+            binary_stage('3'),
+            Some(NotTextResolvable::Binary {
+                ours: true,
+                theirs: true,
+            }),
+        );
+        let s = ResolutionSurface::of(&file);
+
+        let note = s.note.expect("a binary conflict must explain itself");
+        assert!(note.contains("binary"), "{note}");
+        assert!(
+            note.contains("no line-by-line merge"),
+            "the user must be told WHY, not just that it is binary: {note}"
+        );
+        assert!(
+            !s.text_resolution_allowed,
+            "a line resolver must never open on binary content"
+        );
+        // Choosing a whole side IS the honest resolution for binary, and the
+        // server accepts it: `refuses()` returns None for a Present stage
+        // whatever its `binary` flag. Withholding these would leave a binary
+        // conflict unresolvable.
+        assert_eq!(s.take_ours, Ok(()));
+        assert_eq!(s.take_theirs, Ok(()));
+        assert_eq!(s.take_deletion, Ok(()));
+    }
+
+    #[test]
+    fn a_binary_note_names_which_side_rather_than_generalising() {
+        // "Their side is binary" is actionable; "this file is binary" is not.
+        // The protocol carries the two flags separately for this reason.
+        let theirs_only = with_reason(
+            present('1'),
+            present('2'),
+            binary_stage('3'),
+            Some(NotTextResolvable::Binary {
+                ours: false,
+                theirs: true,
+            }),
+        );
+        let note = ResolutionSurface::of(&theirs_only).note.unwrap();
+        assert!(note.starts_with("Their side is binary"), "{note}");
+
+        let ours_only = with_reason(
+            present('1'),
+            binary_stage('2'),
+            present('3'),
+            Some(NotTextResolvable::Binary {
+                ours: true,
+                theirs: false,
+            }),
+        );
+        let note = ResolutionSurface::of(&ours_only).note.unwrap();
+        assert!(note.starts_with("Our side is binary"), "{note}");
+    }
+
+    #[test]
+    fn a_delete_modify_conflict_names_which_side_deleted_and_which_changed() {
+        // #430's SECOND acceptance criterion, stated as literally as the issue
+        // states it.
+        //
+        // MUTATION: collapse the (ours_deleted, theirs_deleted) match to one
+        // generic sentence. The user is then told a deletion happened but not
+        // by whom — and the whole decision is *which* side to keep.
+        let they_deleted = with_reason(
+            present('1'),
+            present('2'),
+            Stage::Absent {},
+            Some(NotTextResolvable::Deletion {
+                ours_deleted: false,
+                theirs_deleted: true,
+            }),
+        );
+        let note = ResolutionSurface::of(&they_deleted).note.unwrap();
+        assert!(
+            note.contains("They deleted") && note.contains("we changed"),
+            "must name both roles: {note}"
+        );
+
+        let we_deleted = with_reason(
+            present('1'),
+            Stage::Absent {},
+            present('3'),
+            Some(NotTextResolvable::Deletion {
+                ours_deleted: true,
+                theirs_deleted: false,
+            }),
+        );
+        let note = ResolutionSurface::of(&we_deleted).note.unwrap();
+        assert!(
+            note.contains("We deleted") && note.contains("they changed"),
+            "the two directions must not produce the same sentence: {note}"
+        );
+    }
+
+    #[test]
+    fn taking_a_side_that_deleted_the_file_is_withheld_before_the_server_refuses_it() {
+        // The defect this slice actually fixes, and it is not in the issue text.
+        //
+        // `ConflictedFile::refuses` (protocol conflict.rs:343) returns
+        // `SideAbsent` for TakeOurs/TakeTheirs against an Absent stage. The
+        // viewer offers all three buttons unconditionally, so today a user
+        // clicking "Take theirs" on the side that deleted the file receives a
+        // 409 from the server. Withholding it here is the difference between
+        // an explained control and a walked-into error.
+        //
+        // MUTATION: return Ok(()) for Stage::Absent. The button comes back and
+        // so does the 409.
+        let they_deleted = with_reason(
+            present('1'),
+            present('2'),
+            Stage::Absent {},
+            Some(NotTextResolvable::Deletion {
+                ours_deleted: false,
+                theirs_deleted: true,
+            }),
+        );
+        let s = ResolutionSurface::of(&they_deleted);
+
+        assert_eq!(
+            s.take_theirs,
+            Err(Withheld::SideAbsent),
+            "their side holds nothing to take"
+        );
+        assert_eq!(s.take_ours, Ok(()), "our side still has content to keep");
+        assert_eq!(
+            s.take_deletion,
+            Ok(()),
+            "deletion needs neither side readable — refuses() returns None for it"
+        );
+        assert!(
+            s.take_theirs.unwrap_err().describe().contains("no version"),
+            "the withheld control must say why"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_stage_withholds_every_control_including_deletion() {
+        // `ConflictedFile::all_sides_readable`'s own doc says a caller "must
+        // not present a resolution UI for such a file". Nothing in the client
+        // enforced that before this slice — confirmed by reading viewer.rs's
+        // control list, which is built unconditionally.
+        //
+        // MUTATION A: drop the `!fully_readable` early return. Every control
+        // returns, and the user chooses between versions one of which nobody
+        // has seen.
+        // MUTATION B: leave `take_deletion: Ok(())` in the early return. That
+        // is the subtle one — deleting does not need the stages readable, so
+        // it looks safe, but the user is deciding to destroy a file they were
+        // never able to inspect.
+        let unreadable = with_reason(
+            present('1'),
+            present('2'),
+            Stage::Unreadable {
+                reason: "blob missing".into(),
+            },
+            None,
+        );
+        let s = ResolutionSurface::of(&unreadable);
+
+        assert_eq!(s.take_ours, Err(Withheld::FileNotFullyReadable));
+        assert_eq!(s.take_theirs, Err(Withheld::FileNotFullyReadable));
+        assert_eq!(
+            s.take_deletion,
+            Err(Withheld::FileNotFullyReadable),
+            "deletion is withheld too: the file cannot be inspected before destroying it"
+        );
+        assert!(!s.text_resolution_allowed);
+        assert!(
+            s.note.unwrap().contains("could not be read"),
+            "an unreadable file must say so even with no NotTextResolvable reason"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_text_conflict_gets_no_note_and_allows_text_resolution() {
+        // The negative control. Without it, every assertion above could pass
+        // on an implementation that slapped a note on everything and withheld
+        // every button — maximally "safe" and completely useless.
+        let s = ResolutionSurface::of(&file(present('1'), present('2'), present('3')));
+        assert_eq!(s.note, None, "a normal text conflict needs no explanation");
+        assert!(s.text_resolution_allowed);
+        assert_eq!(s.take_ours, Ok(()));
+        assert_eq!(s.take_theirs, Ok(()));
+        assert_eq!(s.take_deletion, Ok(()));
+    }
+
+    #[test]
+    fn a_binary_side_blocks_text_resolution_even_with_no_typed_reason() {
+        // Defence in depth, and a real case: the server sets
+        // `not_text_resolvable` from its own scan, but `Stage::is_text` is the
+        // per-side truth. If the two ever disagree, the side that refuses to
+        // decode must win — the same direction `with_content` already takes
+        // when a fetched blob turns out binary.
+        let sneaky = with_reason(present('1'), present('2'), binary_stage('3'), None);
+        let s = ResolutionSurface::of(&sneaky);
+        assert!(
+            !s.text_resolution_allowed,
+            "a binary side must block a line resolver whatever the typed reason says"
+        );
+    }
+
+    #[test]
+    fn opening_a_conflict_carries_the_reason_through_to_the_viewer() {
+        // THE regression test for this slice. Before #430, `ConflictPanes`
+        // had no `surface` field at all: `open()` accepted a ConflictedFile
+        // carrying `not_text_resolvable` and returned a struct without it, so
+        // the typed reason died at the display boundary and no renderer could
+        // tell a binary conflict from a text one.
+        //
+        // MUTATION: build `surface` from a default/empty ConflictedFile rather
+        // than from `file`. The panes still render, every existing test still
+        // passes, and the explanation silently disappears — which is precisely
+        // the bug this issue was filed about.
+        let panes = ConflictPanes::open(&with_reason(
+            Stage::Absent {},
+            binary_stage('2'),
+            binary_stage('3'),
+            Some(NotTextResolvable::Binary {
+                ours: true,
+                theirs: true,
+            }),
+        ));
+        assert!(
+            panes.surface.note.is_some(),
+            "the reason must survive the trip into ConflictPanes"
+        );
+        assert!(!panes.surface.text_resolution_allowed);
     }
 
     #[test]

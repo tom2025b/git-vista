@@ -692,17 +692,48 @@ fn conflict_body(
     // if the user has misread which side deleted what (see `Resolution`'s own
     // doc comment).
     let path = panes.path.clone();
+
+    // M4.31d (#430): the conflict's shape, in a sentence, above the controls.
+    // `None` for an ordinary text conflict — a note on every conflict would
+    // train the eye to skip it, and then the binary and delete/modify cases
+    // would be skipped too.
+    let note = panes.surface.note.clone().map(|text| {
+        view! { <p class="detail-status conflict-note">{text}</p> }
+    });
+
     let controls: Vec<View> = [
-        (Resolution::TakeOurs, "Take ours", "conflict-take-ours"),
+        (
+            Resolution::TakeOurs,
+            "Take ours",
+            "conflict-take-ours",
+            panes.surface.take_ours.clone(),
+        ),
         (
             Resolution::TakeTheirs,
             "Take theirs",
             "conflict-take-theirs",
+            panes.surface.take_theirs.clone(),
         ),
-        (Resolution::TakeDeletion, "Delete file", "conflict-delete"),
+        (
+            Resolution::TakeDeletion,
+            "Delete file",
+            "conflict-delete",
+            panes.surface.take_deletion.clone(),
+        ),
     ]
     .into_iter()
-    .map(|(resolution, label, class)| {
+    .map(|(resolution, label, class, offered)| {
+        // A withheld control is replaced by its reason, never rendered as a
+        // dead button. `ConflictedFile::refuses` would answer these with a 409
+        // anyway (protocol conflict.rs:343) — saying so here is the difference
+        // between an explained absence and a walked-into server error.
+        if let Err(withheld) = offered {
+            let text = withheld.describe();
+            return view! {
+                <p class="detail-status conflict-withheld">{text}</p>
+            }
+            .into_view();
+        }
         let path = path.clone();
         let on = move |_| {
             let path = path.clone();
@@ -756,6 +787,7 @@ fn conflict_body(
 
     view! {
         <div class="viewer-doc-head">{panes.path.clone()}</div>
+        {note}
         <div class="conflict-actions">{controls}</div>
         {refusal}
         <div class="conflict-panes">{rendered}</div>
