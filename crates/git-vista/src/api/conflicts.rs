@@ -11,7 +11,10 @@
 
 use git_vista_core::diff::{BlobContent, WorktreeFileContent};
 use git_vista_protocol::conflict::{ConflictedFile, Resolution};
-use git_vista_protocol::{ResolveConflictRequest, WorktreePath};
+use git_vista_protocol::{
+    CommitOid, ConflictSource, GenerationToken, ResolveConflictContentRequest,
+    ResolveConflictRequest, WorktreePath,
+};
 
 use crate::features::conflicts::core::{result_pane_state, ConflictPanes, PaneState, ResultRead};
 
@@ -159,5 +162,74 @@ pub async fn resolve_conflict_request(path: &str, resolution: Resolution) -> Res
         Ok(())
     } else {
         Err(user_facing_error("/api/resolve-conflict", resp).await)
+    }
+}
+
+/// The marker file a content resolution's editor seeds from, plus the
+/// `conflict-v1:` token pinning it (M4.31c, #432; `GET
+/// /api/conflict-source/{*path}`).
+///
+/// A separate call from [`fetch_worktree_file`] even though both read the same
+/// bytes, and deliberately so: that one serves #428's read-only *result pane*
+/// and promises nothing about resubmission. This one hands back a token whose
+/// entire purpose is being echoed into a write. Sharing an endpoint would give
+/// every reader a token implying "this can be resubmitted", which the result
+/// pane does not mean.
+pub async fn fetch_conflict_source(path: &str) -> Result<ConflictSource, String> {
+    let encoded: Vec<String> = path
+        .split('/')
+        .map(|seg| {
+            js_sys::encode_uri_component(seg)
+                .as_string()
+                .unwrap_or_default()
+        })
+        .collect();
+    let url = format!(
+        "/api/conflict-source/{}?t={}",
+        encoded.join("/"),
+        js_sys::Date::now()
+    );
+    let resp = req_get(&url).send().await.map_err(network_error)?;
+    if resp.ok() {
+        resp.json::<ConflictSource>()
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        Err(user_facing_error("/api/conflict-source", resp).await)
+    }
+}
+
+/// Submit a block/line/manual-edit resolution (M4.31c, #432, ADR 0069;
+/// `POST /api/resolve-conflict-content`).
+///
+/// `expected_stages` and `expected_source` are echoed back **unchanged** from
+/// what the reads handed over — this client never computes them. They are the
+/// server's own record of the picture the user decided against, and a client
+/// that recomputed them could only ever agree with itself.
+///
+/// The `Err` string is the server's own sentence, for the same reason
+/// [`resolve_conflict_request`]'s is: the four refusals name four different
+/// things that moved, and collapsing them into "it failed" throws away the
+/// only part that tells the user what to do next.
+pub async fn resolve_conflict_content_request(
+    path: &str,
+    expected_stages: [Option<CommitOid>; 3],
+    expected_source: GenerationToken,
+    content: String,
+) -> Result<(), String> {
+    refuse_if_offline()?;
+    refuse_if_visualize()?;
+    let path = WorktreePath::new(path.to_string()).map_err(|e| e.to_string())?;
+    let body = ResolveConflictContentRequest {
+        path,
+        expected_stages,
+        expected_source,
+        content,
+    };
+    let (resp, _key) = write_json("/api/resolve-conflict-content", &body).await?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(user_facing_error("/api/resolve-conflict-content", resp).await)
     }
 }

@@ -253,3 +253,54 @@ export function buildNonTextConflictFixture(root) {
 
   return { root, conflicted: ['doomed.txt', 'logo.png'] }
 }
+
+/**
+ * A FOURTH repository, for the line-by-line editor (M4.31c, #432).
+ *
+ * Its own repository for the reason the two above already are, and this time
+ * it was learned the hard way: the editor spec RESOLVES what it opens, and
+ * running before `conflict-panes.spec.mjs` alphabetically it emptied that
+ * spec's fixture and failed all four of its tests. `conflict-panes` says in
+ * its own comment that it mutates the shared fixture and must run last — two
+ * specs cannot both be last.
+ *
+ * Two text conflicts, because each test resolves one and a test that had to
+ * share would be racing its sibling. Both sides text on both paths, so
+ * `text_resolvable` is true and the editor is actually offered — a binary or
+ * delete/modify path would be correctly refused it.
+ */
+export function buildEditorFixture(root) {
+  rmSync(root, { recursive: true, force: true })
+  mkdirSync(root, { recursive: true })
+
+  const git = (...args) =>
+    execFileSync('git', [...IDENT, '-C', root, ...args], {
+      encoding: 'utf8',
+      env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+    })
+
+  git('init', '-q', '-b', 'main')
+  writeFileSync(join(root, 'first.txt'), 'the common ancestor\n')
+  writeFileSync(join(root, 'second.txt'), 'the common ancestor\n')
+  git('add', '-A')
+  git('commit', '-q', '-m', 'seed both files')
+
+  git('checkout', '-q', '-b', 'theirs')
+  writeFileSync(join(root, 'first.txt'), 'their version\n')
+  writeFileSync(join(root, 'second.txt'), 'their version\n')
+  git('commit', '-q', '-am', 'theirs edits both')
+
+  git('checkout', '-q', 'main')
+  writeFileSync(join(root, 'first.txt'), 'our version\n')
+  writeFileSync(join(root, 'second.txt'), 'our version\n')
+  git('commit', '-q', '-am', 'ours edits both')
+
+  // Expected to fail — that is the fixture.
+  try {
+    git('merge', 'theirs')
+  } catch {
+    /* expected: both paths left at stages 1/2/3 */
+  }
+
+  return { root, conflicted: ['first.txt', 'second.txt'] }
+}

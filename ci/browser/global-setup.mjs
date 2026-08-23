@@ -11,7 +11,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { buildConflictFixture, buildFixture, buildNonTextConflictFixture } from './fixture.mjs'
+import {
+  buildConflictFixture,
+  buildEditorFixture,
+  buildFixture,
+  buildNonTextConflictFixture,
+} from './fixture.mjs'
 import { startServer } from './server.mjs'
 
 export const RUNTIME_FILE = join(import.meta.dirname, '.runtime.json')
@@ -69,9 +74,13 @@ export default async function globalSetup() {
   // as text (binary/binary and delete/modify). Separate again, because the
   // #428/#429 specs assert an exact conflicted count on conflict-repo.
   const nonTextFixture = buildNonTextConflictFixture(join(work, 'nontext-repo'))
+  // #432: a fourth repo for the line-by-line editor, which RESOLVES what it
+  // opens — sharing conflict-repo emptied conflict-panes' fixture and failed
+  // all four of its tests.
+  const editorFixture = buildEditorFixture(join(work, 'editor-repo'))
   const { child, base, signInUrl } = await startServer({
     repoPath: fixture.root,
-    extraRepos: [conflictFixture.root, nonTextFixture.root],
+    extraRepos: [conflictFixture.root, nonTextFixture.root, editorFixture.root],
     stateHome: join(work, 'state'),
   })
 
@@ -82,7 +91,11 @@ export default async function globalSetup() {
   // breaking the next one.
   writeFileSync(
     RUNTIME_FILE,
-    JSON.stringify({ base, pid: child.pid, work, fixture, conflictFixture, nonTextFixture }, null, 2),
+    JSON.stringify(
+      { base, pid: child.pid, work, fixture, conflictFixture, nonTextFixture, editorFixture },
+      null,
+      2,
+    ),
   )
 
   try {

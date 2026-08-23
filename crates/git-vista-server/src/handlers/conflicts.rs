@@ -344,12 +344,40 @@ async fn conflict_source_for_repo(
             eprintln!("git-vista: /api/conflict-source couldn't mint conflict-v1: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, e)
         })?;
+
+    // The stage triple as it stands right now, from the same scan the executor
+    // will re-run. Served rather than left to the client to derive: the gate
+    // compares the submitted triple against a fresh scan, and a client-computed
+    // triple would agree with itself by construction.
+    let files = crate::conflicts::scan(repo).await.map_err(|e| {
+        eprintln!("git-vista: /api/conflict-source couldn't scan: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
+    let file = files
+        .iter()
+        .find(|f| f.path == path.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                format!(
+                    "{} is not conflicted — nothing to resolve line by line",
+                    path.as_str()
+                ),
+            )
+        })?;
+    let oid_of = |stage: &git_vista_protocol::conflict::Stage| match stage {
+        git_vista_protocol::conflict::Stage::Present { oid, .. } => Some(oid.clone()),
+        _ => None,
+    };
+    let stages = [oid_of(&file.base), oid_of(&file.ours), oid_of(&file.theirs)];
+
     Ok(git_vista_protocol::ConflictSource {
         path: path.as_str().to_string(),
         content,
         truncated,
         binary,
         source,
+        stages,
     })
 }
 
