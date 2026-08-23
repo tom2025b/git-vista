@@ -292,6 +292,7 @@ fn variant_name(op: &GitOperation) -> &'static str {
         GitOperation::BranchFromStash { .. } => "BranchFromStash",
         GitOperation::DropStash { .. } => "DropStash",
         GitOperation::ResolveConflict { .. } => "ResolveConflict",
+        GitOperation::ResolveConflictContent { .. } => "ResolveConflictContent",
         GitOperation::CreateBranch { .. } => "CreateBranch",
         GitOperation::CommitOnHead { .. } => "CommitOnHead",
         GitOperation::EmptyCommitOnBranch { .. } => "EmptyCommitOnBranch",
@@ -416,6 +417,13 @@ fn every_operation() -> Vec<GitOperation> {
         GitOperation::ResolveConflict {
             path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
             resolution: git_vista_protocol::conflict::Resolution::TakeOurs,
+        },
+        GitOperation::ResolveConflictContent {
+            path: git_vista_protocol::WorktreePath::new("a.txt").unwrap(),
+            expected_stages: [Some(oid(tip)), Some(oid(tip)), Some(oid(tip))],
+            expected_source: git_vista_protocol::GenerationToken::new("conflict-v1:census")
+                .unwrap(),
+            content: "resolved\n".to_string(),
         },
         GitOperation::CreateBranch {
             name: branch("feature"),
@@ -562,6 +570,7 @@ fn every_operation_declares_every_variant() {
     );
     let expected: std::collections::BTreeSet<&str> = [
         "ResolveConflict",
+        "ResolveConflictContent",
         "CreateBranch",
         "CommitOnHead",
         "EmptyCommitOnBranch",
@@ -739,8 +748,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     let ops = every_operation();
     assert_eq!(
         ops.len(),
-        37,
-        "every_operation() must list every GitOperation variant; the enum has 37 \
+        38,
+        "every_operation() must list every GitOperation variant; the enum has 38 \
          (this literal is a tripwire, not the enforcement — \
          every_operation_covers_every_variant_the_enum_declares is what checks \
          the census against the enum itself and cannot be left stale with it)"
@@ -768,8 +777,8 @@ fn exactly_the_five_remote_operations_declare_a_network_need() {
     );
     assert_eq!(
         local.len(),
-        32,
-        "the other thirty-two operations must stay Local; declared Local: {local:?}"
+        33,
+        "the other thirty-three operations must stay Local; declared Local: {local:?}"
     );
 }
 

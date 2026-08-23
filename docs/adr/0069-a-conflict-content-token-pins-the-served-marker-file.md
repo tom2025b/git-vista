@@ -119,12 +119,58 @@ the resolver; executor re-mints inside the lock before writing. Two-phase,
 exactly `StageSelection`'s pattern.
 
 **3. The executor re-scans and refuses on any mismatch, inside the guard,
-before writing anything.** In order: the path is still conflicted; the three
-live stage OIDs equal `expected_stages` exactly; `conflicts::scan`'s
-eligibility holds (text-resolvable, all sides readable — reusing #430's
-`ResolutionSurface` classification rather than re-deriving it); the re-minted
-`conflict-v1:` token equals `expected_source`. Any failure refuses the whole
-operation before the file is touched.
+before writing anything.** In order:
+
+1. the path is still conflicted (and the scan itself succeeded);
+2. eligibility holds — `all_sides_readable()` first, then `text_resolvable()`,
+   the same predicate #430's `ResolutionSurface` asks client-side rather than a
+   second copy of the rule;
+3. the three live stage OIDs equal `expected_stages` exactly;
+4. the re-minted `conflict-v1:` token equals `expected_source`.
+
+Any failure refuses the whole operation before the file is touched.
+
+*Amended 2026-08-23, after implementation.* This ADR originally listed
+eligibility **after** the stage-OID check. The executor ships with eligibility
+second, and that order is the better one: an ineligible path (binary, a
+deletion, an unreadable side) should be told *why it cannot be resolved as
+text* rather than *that its stages moved* — the eligibility answer is the more
+informative refusal, and it is true regardless of whether the stages moved
+too. Recorded as an amendment rather than silently reordered, because a
+decision record that quietly matches the code teaches nothing about which was
+wrong. Both orders refuse before any write; nothing about the safety argument
+changes.
+
+**3a. Two further gates the implementation added, neither in this ADR's first
+draft.** Both came out of the post-implementation adversarial review:
+
+- **A symlink at the conflicted path is refused outright.**
+  `symlink_containment_guard` refuses symlinks that *escape* the worktree and
+  refuses directories — never an in-worktree symlink. That is the dangerous
+  one here: `tokio::fs::write` follows the link and writes its **target**,
+  while `git add -- <path>` stages the link **object**, so the resolution
+  would land in an unrelated tracked file while the conflicted path staged
+  something else, and the half-state message would be false.
+  `conflicts::scan` cannot see this — it reads the index, never the worktree's
+  file type.
+- **The write targets the joined path, not the canonicalised one**, so both
+  legs name the same file by construction rather than by the symlink check
+  alone holding.
+
+**3b. The `conflict-v1:` token pins only the first `FILE_CONTENT_CAP` bytes,
+and this is a stated limit rather than a solved problem.** Both the serving
+handler and the executor's re-mint read the marker file through the same
+bounded reader (2,000,000 bytes). Two states of a marker file larger than that,
+identical up to the cap and differing only past it, therefore mint the **same**
+token, and gate 4 cannot tell them apart. Nothing currently consults the
+`truncated` flag `ConflictSource` already carries.
+
+Low severity — it needs a >2 MB conflicted text file whose change is confined
+entirely past the cap — but it is real, and it narrows gate 4's guarantee from
+"the served document" to "the served document's first 2 MB". Written down
+because a guarantee overstated in a decision record is how a later reader
+builds on something that was never true. The fix, if it is ever wanted, is to
+refuse a content resolution whose source was served truncated.
 
 **4. All three stages are checked, not only the ones the outcome nominally
 depends on.** `TakeOurs` only reads stage 2 at execution time and is
@@ -217,6 +263,18 @@ ADR needs to pre-answer.
 - A resolution applied against drifted stages, a drifted served document, or an
   ineligible path is refused before any write, by construction of the guard
   order in decision 3.
+- **Gate 4's refusal names no cause, deliberately.** The first implementation
+  said the file "was edited elsewhere while you were resolving it". That is a
+  claim the code cannot make: `conflict_source_token` folds the marker bytes
+  *and* the whole repository generation (HEAD, every ref, the index checksum)
+  into one digest, and `GenerationInputs::generation()` hashes those fields
+  together, so no per-field attribution survives a mismatch. Worse, gate 3 has
+  by then already proven this path's own stage OIDs unchanged — making "someone
+  edited your file" the *least* likely remaining cause, behind an unrelated
+  branch moving, a fetch landing, or a different file being staged. The
+  sentence now states only what was observed: the repository changed. Caught by
+  the post-implementation honesty review, and it is the same defect class ADR
+  0063 exists to prevent.
 - The operation is `Reversible`, never `Safe`, and the journal says why —
   matching this codebase's standing rule that a green result must show real
   evidence, not an optimistic label.

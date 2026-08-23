@@ -124,7 +124,10 @@ use handlers::branch::{
 };
 use handlers::clone::{clone_repo, clone_status, delete_clone_repo};
 use handlers::commit::{amend_commit, create_commit, stage_all, unstage_all};
-use handlers::conflicts::{blob_content, list_conflicts, resolve_conflict, worktree_file};
+use handlers::conflicts::{
+    blob_content, conflict_source, list_conflicts, resolve_conflict, resolve_conflict_content,
+    worktree_file,
+};
 use handlers::discard::{delete_untracked_paths, discard_tracked_paths};
 use handlers::fetch::fetch_remote;
 use handlers::plan::{execute_plan, plan_operation};
@@ -533,11 +536,21 @@ fn api_router(
             .route("/api/conflicts", get(list_conflicts))
             .route("/api/blob/{oid}", get(blob_content))
             .route("/api/worktree-file/{*path}", get(worktree_file))
+            // M4.31c (#432), ADR 0069: the marker file plus the `conflict-v1:`
+            // token pinning it — what a content resolution's editor seeds
+            // from. Same uncommitted-content disclosure as the two routes
+            // above; full_routes-only for the same reason.
+            .route("/api/conflict-source/{*path}", get(conflict_source))
             // M4.31b (#429): resolve one conflicted path by taking a whole
             // side, or removing the file. A write, so the full posture — and
             // it goes through the planner like every other mutation (ADR
             // 0016), never straight to git.
             .route("/api/resolve-conflict", post(resolve_conflict))
+            // M4.31c (#432), ADR 0069: a block/line/manual-edit resolution.
+            .route(
+                "/api/resolve-conflict-content",
+                post(resolve_conflict_content),
+            )
             // …and unstage it again (`git reset HEAD`) — the exact inverse, offered
             // by the menu while anything is staged.
             .route("/api/unstage", post(unstage_all))

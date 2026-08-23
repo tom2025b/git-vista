@@ -69,7 +69,10 @@ pub mod plan;
 pub mod status;
 pub mod version;
 
-pub use conflict::{ConflictedFile, Continuation, NotTextResolvable, Stage};
+pub use conflict::{
+    ConflictSource, ConflictedFile, ContentResolutionRefused, Continuation, NotTextResolvable,
+    Stage,
+};
 pub use diff::{
     diff_spec_argv, parse_unified_diff, path_or_dev_null, ComparisonBasis, DiffLine, DiffSpec,
     FileDiff, Hunk, LineKind, ParsedPatch,
@@ -81,9 +84,9 @@ pub use dto::{
     DeleteTagRequest, FetchError, FetchFailureKind, FetchRequest, FetchSuccess, HookPolicy,
     PullError, PullFailureKind, PullRequest, PullSuccess, PushRequest, PushTagRequest,
     RebaseStatus, RemoteRefUpdate, RepoMode, RepositoryDescriptor, RepositoryKind,
-    ResolveConflictRequest, SelectRequest, SessionInfo, SessionRequest, SignTagError,
-    SignTagFailureKind, SignatureStatus, TagDetail, TagKind, WorktreePathsRequest,
-    CLONE_IN_PROGRESS_SENTINEL,
+    ResolveConflictContentRequest, ResolveConflictRequest, SelectRequest, SessionInfo,
+    SessionRequest, SignTagError, SignTagFailureKind, SignatureStatus, TagDetail, TagKind,
+    WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use history::{HistoryFrame, HistoryPage};

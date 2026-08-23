@@ -143,7 +143,7 @@ async fn blob_content_for_repo(
 ///
 /// Blocking filesystem I/O, so this runs on a blocking thread — the same
 /// offload discipline `symlink_containment_guard` documents for itself.
-async fn resolve_worktree_read_path(
+pub(crate) async fn resolve_worktree_read_path(
     repo: &Path,
     path: &WorktreePath,
 ) -> Result<PathBuf, (StatusCode, String)> {
@@ -205,7 +205,10 @@ async fn resolve_worktree_read_path(
 /// a TOCTOU race between statting the file and reading it, and matches the
 /// reader-fact-is-authoritative rule [`decode_bounded`] already applies to
 /// git's own capped reads.
-async fn read_bounded_worktree_file(path: &Path, cap: usize) -> std::io::Result<(Vec<u8>, bool)> {
+pub(crate) async fn read_bounded_worktree_file(
+    path: &Path,
+    cap: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
     let file = tokio::fs::File::open(path).await?;
     let mut limited = file.take(cap as u64 + 1);
     let mut buf = Vec::new();
@@ -290,6 +293,85 @@ pub(crate) async fn resolve_conflict(
     planner::plan_and_execute(GitOperation::ResolveConflict {
         path: req.path,
         resolution: req.resolution,
+    })
+    .await
+}
+
+/// `GET /api/conflict-source/{*path}` (M4.31c, #432, ADR 0069): the marker
+/// file a content resolution's editor seeds from, plus the `conflict-v1:`
+/// token that pins it.
+///
+/// Same read as `/api/worktree-file`, plus one thing: the token. Kept as a
+/// SEPARATE route rather than adding the token to `worktree_file`'s response
+/// — that endpoint already ships and is tested as the read-only #428/#429
+/// result pane, and giving every caller of it a token implying "this can be
+/// resubmitted" would be a promise the result pane never makes.
+pub(crate) async fn conflict_source(
+    AxumPath(raw_path): AxumPath<String>,
+    Query(q): Query<RepoQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repo = resolve_repo(q.repo.as_deref())?.0;
+    let source = conflict_source_for_repo(&repo, raw_path).await?;
+    let no_store = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(source)))
+}
+
+async fn conflict_source_for_repo(
+    repo: &Path,
+    raw_path: String,
+) -> Result<git_vista_protocol::ConflictSource, (StatusCode, String)> {
+    let path = WorktreePath::new(raw_path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let resolved = resolve_worktree_read_path(repo, &path).await?;
+    let (bytes, read_truncated) = read_bounded_worktree_file(&resolved, FILE_CONTENT_CAP)
+        .await
+        .map_err(|e| {
+            eprintln!(
+                "git-vista: /api/conflict-source couldn't read '{}': {e}",
+                path.as_str()
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("couldn't read '{}': {e}", path.as_str()),
+            )
+        })?;
+    let (content, truncated, binary) = decode_bounded(&bytes, read_truncated, FILE_CONTENT_CAP);
+    // Token minted from the SAME bytes just decoded, before any further await
+    // — narrowest possible window between "these are the bytes served" and
+    // "this is the token that says so".
+    let source = crate::conflicts::conflict_source_token(repo, path.as_str(), &bytes)
+        .await
+        .map_err(|e| {
+            eprintln!("git-vista: /api/conflict-source couldn't mint conflict-v1: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
+    Ok(git_vista_protocol::ConflictSource {
+        path: path.as_str().to_string(),
+        content,
+        truncated,
+        binary,
+        source,
+    })
+}
+
+/// `POST /api/resolve-conflict-content` (M4.31c, #432, ADR 0069): a
+/// block/line/manual-edit resolution.
+///
+/// Thin, same posture as `resolve_conflict` above: every check that decides
+/// whether this succeeds lives in `planner::exec_resolve_conflict_content`,
+/// inside the coordinator lock, immediately before any write — a check
+/// repeated here would be a second, racier copy of the one that actually
+/// protects the write.
+pub(crate) async fn resolve_conflict_content(
+    Json(req): Json<git_vista_protocol::ResolveConflictContentRequest>,
+) -> (StatusCode, String) {
+    if let Some(rejected) = reject_if_read_only() {
+        return rejected;
+    }
+    planner::plan_and_execute(GitOperation::ResolveConflictContent {
+        path: req.path,
+        expected_stages: req.expected_stages,
+        expected_source: req.expected_source,
+        content: req.content,
     })
     .await
 }

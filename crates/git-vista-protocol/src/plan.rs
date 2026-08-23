@@ -582,6 +582,52 @@ pub enum GitOperation {
         path: WorktreePath,
         resolution: crate::conflict::Resolution,
     },
+    /// A block/line/manual-edit resolution — the "line-level resolution" the
+    /// doc comment above defers (M4.31c, #432, ADR 0069).
+    ///
+    /// Kept as its OWN operation rather than a `content` field added to
+    /// [`ResolveConflict`]: that field is the thing ADR 0069 (and #432's own
+    /// issue text) name as "the thing not to do without argument" — a plan is
+    /// hashed, reviewed and replayed, and a bytes field folded into an
+    /// existing whole-side operation would blur two decisions that deserve
+    /// separate vocabulary members. Same precedent
+    /// [`crate::conflict::Resolution::TakeDeletion`]'s own doc comment states:
+    /// two requests that can reach the same outcome are still different
+    /// requests.
+    ///
+    /// `content` IS hashed by [`OperationHash`] like every other field —
+    /// nothing here bypasses review. What makes this operation different from
+    /// every other write in this enum is that `content` is not itself
+    /// verifiable against repository state the way a branch name or a commit
+    /// oid is; it is arbitrary bytes the user composed. Two extra fields carry
+    /// the verification that content alone cannot provide:
+    ///
+    /// - `expected_stages` pins the three-way picture the user actually saw.
+    ///   The executor re-scans inside the coordinator lock and refuses on any
+    ///   mismatch — this is the conflict-side equivalent of `enforce_fresh`,
+    ///   done here rather than as a `Precondition` because no precondition in
+    ///   this vocabulary can express "these three specific blobs are still the
+    ///   live stage entries" (see `ResolveConflict`'s own note on this, one
+    ///   variant up).
+    /// - `expected_source` pins the served document itself — see
+    ///   [`crate::conflict::ConflictSource`]'s doc comment for why this is not
+    ///   redundant with `expected_stages`: the working-tree marker file this
+    ///   operation's editor was seeded from is invisible to every
+    ///   repository-level generation, stage OIDs included.
+    ResolveConflictContent {
+        /// Repository-relative path, exactly as the conflict scan reported it.
+        path: WorktreePath,
+        /// The stage OID triple (base, ours, theirs) the user resolved
+        /// against. `None` means that stage was
+        /// [`Stage::Absent`](crate::conflict::Stage::Absent).
+        expected_stages: [Option<CommitOid>; 3],
+        /// `conflict-v1:` token of the [`crate::conflict::ConflictSource`]
+        /// document actually served.
+        expected_source: GenerationToken,
+        /// The user's chosen result — the marker file's replacement content,
+        /// in full.
+        content: String,
+    },
     /// `git branch -d <branch>` — the safe delete; git refuses an unmerged
     /// branch (`/api/delete-branch`).
     DeleteBranch { branch: BranchName },

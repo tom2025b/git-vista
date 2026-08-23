@@ -203,6 +203,26 @@ impl ConflictedFile {
     pub fn all_sides_readable(&self) -> bool {
         self.base.is_choosable() && self.ours.is_choosable() && self.theirs.is_choosable()
     }
+
+    /// Whether a line-level text resolver may open on this path at all
+    /// (M4.31c/d, #430/#432, ADR 0069).
+    ///
+    /// Lives here rather than being computed separately by the client
+    /// (rendering) and the server (executing the resolution) so both ask the
+    /// SAME question. Two independent copies of this exact three-clause rule
+    /// is how #430 shipped a wrong sentence for an hour: the client and the
+    /// scanner each held their own idea of "resolvable" and one of them was
+    /// subtly wrong. There is exactly one definition now.
+    ///
+    /// A typed reason (any `NotTextResolvable`) rules it out outright; failing
+    /// that, both live sides must actually be text — `not_text_resolvable`
+    /// is the server's own classification and should already agree, but a
+    /// stage's `is_text()` is the per-side ground truth and wins if they ever
+    /// disagree, the same direction `PaneState::with_content`'s binary-wins
+    /// rule already takes.
+    pub fn text_resolvable(&self) -> bool {
+        self.not_text_resolvable.is_none() && self.ours.is_text() && self.theirs.is_text()
+    }
 }
 
 /// The answer to "may this operation continue?" (M4.31, #84).
@@ -345,6 +365,110 @@ impl ConflictedFile {
                 side: side.into(),
                 reason: reason.clone(),
             }),
+        }
+    }
+}
+
+/// The document served to seed a content resolution's editor (M4.31c, #432,
+/// ADR 0069): the working-tree marker file exactly as `GET
+/// /api/worktree-file/{*path}` already serves it, plus the `conflict-v1:`
+/// token that pins it.
+///
+/// ADR 0069's decision: the editor seeds from THIS file — the same bytes
+/// every terminal merge tool works from — rather than composing text from the
+/// three stage panes. The cost of that choice is that this is the one
+/// document no existing staleness mechanism can see: porcelain v2's unmerged
+/// lines carry the three stage OIDs but no worktree hash, and the index
+/// checksum does not cover worktree bytes either. `source` is what closes
+/// that gap — the executor re-mints it from the live file before writing
+/// anything, and refuses on any mismatch, the same two-phase shape
+/// `diff-v1:` already uses for staging selections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConflictSource {
+    /// Repository-relative path, exactly as requested.
+    pub path: String,
+    /// The marker file's text. Empty when `binary` is set.
+    pub content: String,
+    /// True when the content was cut at the server's size cap.
+    pub truncated: bool,
+    /// True when the file isn't text (NUL bytes near the start).
+    pub binary: bool,
+    /// The `conflict-v1:` token this exact document was served under. Echo
+    /// it back unchanged in a resolution submission; the executor refuses if
+    /// it no longer matches the live file.
+    pub source: crate::plan::GenerationToken,
+}
+
+/// Why a submitted content resolution was refused, in words a user reads
+/// (M4.31c, #432, ADR 0069).
+///
+/// Three distinct facts, not one generic "stale" message, for the same reason
+/// [`ResolutionRefused`] is not a bool: each names a different thing that
+/// moved, and only one of them is "someone else got there first" — the other
+/// two are "the picture changed under you" in different ways.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "refusal", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum ContentResolutionRefused {
+    /// The path is no longer conflicted — resolved already, or the operation
+    /// that produced the conflict ended.
+    NoLongerConflicted,
+    /// Not eligible for a line-level resolution — binary, deletion-shaped, or
+    /// a side that could not be read. Mirrors
+    /// [`ConflictedFile::text_resolvable`] and
+    /// [`ConflictedFile::all_sides_readable`]; carried as a sentence rather
+    /// than re-deriving which rule fired, since the caller only needs to know
+    /// why, not which internal check tripped.
+    NotTextResolvable { reason: String },
+    /// One or more of base/ours/theirs no longer matches the stage the user
+    /// resolved against — the picture the choice was made against has
+    /// changed, whatever the surviving bytes now say.
+    StagesMoved,
+    /// The `conflict-v1:` token no longer matches the one the document was
+    /// served under.
+    ///
+    /// **Deliberately does not name a cause, and the first version of this
+    /// did.** It said the file "was edited elsewhere" — which the code cannot
+    /// know. `conflict_source_token` folds the marker-file bytes *and* the
+    /// whole repository generation (HEAD, every ref, the index checksum) into
+    /// one opaque digest, and `GenerationInputs::generation()` hashes those
+    /// fields together so no per-field attribution survives. A mismatch can
+    /// therefore mean an unrelated branch moved, a fetch landed, or a
+    /// different file was staged — none of which touched this path.
+    ///
+    /// Worse, by the time this can fire, [`StagesMoved`] has already proven
+    /// this path's own stage OIDs unchanged, so the "someone edited your file"
+    /// reading is the *least* likely of the remaining causes. Asserting it
+    /// would be the exact ADR 0063 failure this vocabulary exists to prevent:
+    /// stating as fact something never observed.
+    ///
+    /// [`StagesMoved`]: ContentResolutionRefused::StagesMoved
+    SourceMoved,
+}
+
+impl ContentResolutionRefused {
+    /// The sentence a user reads.
+    pub fn describe(&self, path: &str) -> String {
+        match self {
+            ContentResolutionRefused::NoLongerConflicted => format!(
+                "{path} is not conflicted — it may have been resolved already, or the \
+                 operation that produced the conflict may have ended"
+            ),
+            ContentResolutionRefused::NotTextResolvable { reason } => {
+                format!("{path} cannot be resolved as text — {reason}")
+            }
+            ContentResolutionRefused::StagesMoved => format!(
+                "{path} changed since you opened it — the version you resolved against is no \
+                 longer current. Reopen it and try again."
+            ),
+            // Says WHAT was observed (the document is no longer the one served)
+            // and what to do, never WHY — see the variant's own doc comment for
+            // why naming a cause here would be a false statement.
+            ContentResolutionRefused::SourceMoved => format!(
+                "The repository changed while you were resolving {path}, so your changes were \
+                 not applied — reopen it to see the current version."
+            ),
         }
     }
 }
@@ -619,6 +743,119 @@ mod tests {
             })
             .unwrap(),
             serde_json::json!({"refusal": "side_absent", "side": "ours"})
+        );
+    }
+
+    // ---- text_resolvable (M4.31c/d, #430/#432) ----------------------------
+
+    #[test]
+    fn an_ordinary_text_conflict_is_text_resolvable() {
+        // The negative control. Without it, every assertion below could pass
+        // on an implementation that returned false unconditionally.
+        let f = file(
+            "a.txt",
+            present(),
+            present(),
+            Stage::Present {
+                oid: oid('c'),
+                binary: false,
+                size_bytes: 12,
+            },
+        );
+        assert!(f.text_resolvable());
+    }
+
+    #[test]
+    fn a_typed_not_text_resolvable_reason_blocks_text_resolution() {
+        // MUTATION: ignore `not_text_resolvable` and check only the stages.
+        // A server that classified a conflict as Binary or Deletion, but whose
+        // stages happen to both still read as text (a deletion's surviving
+        // side, say), would then be offered a line-level resolver anyway.
+        let mut f = file(
+            "a.txt",
+            present(),
+            present(),
+            Stage::Present {
+                oid: oid('c'),
+                binary: false,
+                size_bytes: 12,
+            },
+        );
+        f.not_text_resolvable = Some(NotTextResolvable::Deletion {
+            ours_deleted: false,
+            theirs_deleted: true,
+        });
+        assert!(!f.text_resolvable());
+    }
+
+    #[test]
+    fn a_binary_side_blocks_text_resolution_even_with_no_typed_reason() {
+        // Defence in depth: the per-side stage truth wins even if the typed
+        // reason and the stages ever disagree — same direction
+        // `PaneState::with_content`'s binary-wins rule already takes.
+        let f = file(
+            "a.txt",
+            present(),
+            present(),
+            Stage::Present {
+                oid: oid('c'),
+                binary: true,
+                size_bytes: 900,
+            },
+        );
+        assert!(!f.text_resolvable());
+    }
+
+    #[test]
+    fn an_absent_side_blocks_text_resolution() {
+        // An add/add or delete/modify conflict's Absent side is not text —
+        // there is nothing there to merge lines against.
+        let f = file("a.txt", Stage::Absent {}, present(), Stage::Absent {});
+        assert!(!f.text_resolvable());
+    }
+
+    // ---- ContentResolutionRefused::describe --------------------------------
+
+    #[test]
+    fn every_content_refusal_names_the_path_and_says_something_distinct() {
+        // MUTATION: collapse all four arms to one generic "cannot be resolved"
+        // string. Four different facts would then read identically, which is
+        // exactly the undifferentiated-refusal failure #429's own handler doc
+        // exists to prevent one layer up.
+        let refusals = [
+            ContentResolutionRefused::NoLongerConflicted,
+            ContentResolutionRefused::NotTextResolvable {
+                reason: "binary content".into(),
+            },
+            ContentResolutionRefused::StagesMoved,
+            ContentResolutionRefused::SourceMoved,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for r in &refusals {
+            let text = r.describe("src/a.rs");
+            assert!(text.contains("src/a.rs"), "{text}");
+            assert!(seen.insert(text), "two refusals produced the same sentence");
+        }
+    }
+
+    #[test]
+    fn conflict_source_round_trips_and_refuses_a_stray_key() {
+        let src = ConflictSource {
+            path: "a.txt".into(),
+            content: "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> theirs\n".into(),
+            truncated: false,
+            binary: false,
+            source: crate::plan::GenerationToken::new("conflict-v1:deadbeef").unwrap(),
+        };
+        let json = serde_json::to_value(&src).unwrap();
+        let back: ConflictSource = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(src, back);
+
+        let mut stray = json;
+        stray["extra"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<ConflictSource>(stray).is_err(),
+            "a stray key must be refused, not silently dropped"
         );
     }
 }

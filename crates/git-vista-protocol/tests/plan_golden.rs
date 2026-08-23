@@ -208,6 +208,23 @@ fn golden_plans() -> Vec<Plan> {
             RecoveryStrategy::ConflictRecreatableWhileInProgress,
         ),
         plan(
+            '9',
+            // M4.31c (#432), ADR 0069: content DOES cross the wire here, and
+            // that is exactly what the golden fixture must pin — a future
+            // change to this variant's shape must fail this test, the same
+            // way it would for any other operation.
+            GitOperation::ResolveConflictContent {
+                path: WorktreePath::new("src/a.rs").unwrap(),
+                expected_stages: [Some(oid('1')), Some(oid('2')), Some(oid('3'))],
+                expected_source: GenerationToken::new("conflict-v1:abc123").unwrap(),
+                content: "resolved by hand\n".to_string(),
+            },
+            RiskLevel::Reversible,
+            vec![],
+            vec![],
+            RecoveryStrategy::ConflictRecreatableWhileInProgress,
+        ),
+        plan(
             'b',
             GitOperation::CommitOnHead {
                 message: CommitMessage::new("feat: land the thing").unwrap(),
