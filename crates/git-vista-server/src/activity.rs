@@ -103,12 +103,23 @@ pub async fn activity_feed(
                         // the snapshot we are diffing against — rather than
                         // letting append() capture a present that has already
                         // lost the very branch this event is about (#131).
+                        //
+                        // The snapshot records branches and nothing else, so
+                        // HEAD, tags and remotes stay `None`
+                        // — *not recorded* (#449). Filling them from the live
+                        // repo would date them to the moment of noticing, not
+                        // the moment of the deletion, and pass that off as one
+                        // observation; a replayer would then draw a HEAD that
+                        // was never where this event claims.
                         refs: Some(RefsAtEvent::Captured {
                             branches: snapshot
                                 .iter()
                                 .map(|(k, v)| (k.clone(), v.clone()))
                                 .collect(),
                             truncated_at: None,
+                            head: None,
+                            tags: None,
+                            remotes: None,
                         }),
                     },
                 );
