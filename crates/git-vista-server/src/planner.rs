@@ -3287,6 +3287,9 @@ mod hook_timeout_suite;
 #[cfg(test)]
 mod advisory_suite;
 
+// M4.31e (#431): conflict resolution survives a reconnect and a crash.
+#[cfg(test)]
+mod reconnect_suite;
 // #327 defect B: `git revert`'s failure classification.
 #[cfg(test)]
 mod revert_suite;
