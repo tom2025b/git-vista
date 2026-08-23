@@ -477,6 +477,47 @@ cmd_serve()  { ./gv "$@"; }
 # reach it. That is why this is a worktree and not a container — the code is our
 # own at our own commit, so the only boundaries needed are filesystem and port,
 # both of which git and a const already give us.
+# testbed_target_for <repo-root> <port> — where this port's testbed build goes.
+#
+# The isolation itself (one target dir per port, never shared with the main
+# tree) is argued at length inside cmd_testbed. This decides only the LOCATION,
+# and it is a separate function so `ci/testbed_target_test.sh` can drive the
+# real code instead of a copy of it.
+#
+# $REPO/target is a symlink onto the scratch SSD, but a sibling
+# `target-testbed-$port` in the repo root is NOT — so every testbed cold-built
+# 3+ GB onto the spinning system disk while looking correctly configured
+# (measured 2026-08-23: 5.8 GB across two ports on /dev/mapper/vgmint-root).
+# Follow the main tree by reading where its symlink points, rather than
+# hardcoding a mount path that a later disk swap would silently invalidate.
+#
+# THE `== /*` TEST IS THE SAFETY MECHANISM, not decoration. A dangling symlink
+# (the SSD unplugged) makes `readlink -f` print nothing, so `dirname ""` is "."
+# — and "." IS a directory, so a bare `-n && -d` guard passes and the build
+# lands in whatever directory the operator happened to be standing in. The
+# unmounted disk is the entire reason this fallback exists, so it is the one
+# case it must not get wrong. Requiring an absolute path is what rules "." out,
+# and it rules out a relative link for the same reason: relative to the repo
+# root is not relative to the CWD, and only the CWD is what would be used.
+#
+# Reading the LINK TEXT rather than `readlink -f` is a deliberate but SECONDARY
+# choice — it does not depend on the disk being attached to produce an answer at
+# all. Mutation-proven 2026-08-23 and worth recording honestly: swapping in
+# `readlink -f` alone SURVIVED, because the `== /*` test catches its empty
+# output anyway. Removing `== /*` was caught, three assertions red. Do not read
+# the link-text choice as the thing keeping the build out of your CWD.
+#
+# A missing cache disk is a slower build, never a failure.
+testbed_target_for() {
+  local repo="$1" port="$2" cargo_root=""
+  [[ -L $repo/target ]] && cargo_root="$(dirname "$(readlink "$repo/target")")"
+  if [[ $cargo_root == /* && -d $cargo_root ]]; then
+    echo "$cargo_root/git-vista-testbed-$port"
+  else
+    echo "$repo/target-testbed-$port"
+  fi
+}
+
 cmd_testbed() {
   local ref="${1:-main}" port="${2:-8081}"
   local dir="$REPO-testbed-$port"
@@ -562,12 +603,20 @@ cmd_testbed() {
   #
   # Debug, not --release: this build exists to be driven by a human for a few
   # minutes, not to be fast at runtime. Optimizing it is the tail wagging the dog.
-  local testbed_target="$REPO/target-testbed-$port"
+  #
+  # WHERE it lives is testbed_target_for's job — see that function.
+  local testbed_target
+  testbed_target="$(testbed_target_for "$REPO" "$port")"
   if [[ -d $testbed_target ]]; then
     echo "dev: reusing this port's own cache at $testbed_target (debug)"
   else
     echo "dev: cold build in $testbed_target (debug) — first testbed on this port,"
     echo "dev: so every dependency compiles from scratch. Expect 10-25 minutes."
+    # An older build for this same port on the system disk is not reused: the
+    # move is deliberate. Say so, rather than letting the cold build look like a
+    # regression.
+    [[ -d $REPO/target-testbed-$port ]] \
+      && echo "dev: (an older cache for this port sits at $REPO/target-testbed-$port on the system disk — safe to delete)"
   fi
   ( cd "$dir" && env CARGO_TARGET_DIR="$testbed_target" \
       trunk build --config crates/git-vista/Trunk.toml )
