@@ -220,6 +220,15 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // plain `git init`/`commit`/`rev-parse` to build fixture repositories,
     // outside the sandboxed harness under test.
     "src/planner/revert_suite.rs",
+    // #[cfg(test)] git fixtures for M4.31e (#431)'s reconnect/crash suite:
+    // `git init`/`commit`/`merge` to build a two-path conflict, then
+    // `checkout --ours|--theirs` + `add` to resolve one path BY HAND — the
+    // point of that suite being that a reconnected client shares no state with
+    // whatever produced the conflict, including this fixture. The mutating
+    // argv under test still goes through the planner's executor
+    // (`plan_and_execute_in`); these are the fixture and the hand-resolution
+    // standing in for a user at a terminal, never the path being proven.
+    "src/planner/reconnect_suite.rs",
     // #[cfg(test)] git fixtures for the M2.21d/e (#238/#239) tag-argv-shape
     // and signed-tag-execution suite: plain `git init`/`commit`/`rev-parse`,
     // plus the failed-signing attempt's own `git rev-parse --verify` check
