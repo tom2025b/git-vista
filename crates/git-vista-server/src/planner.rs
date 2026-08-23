@@ -3289,6 +3289,7 @@ mod advisory_suite;
 
 // #327 defect B: `git revert`'s failure classification.
 #[cfg(test)]
+mod reconnect_suite;
 mod revert_suite;
 
 // M2.21d (#238) / M2.21e (#239, ADR 0048): the tag argv shape and the
