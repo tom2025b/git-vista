@@ -178,6 +178,47 @@ pub enum RefsAtEvent {
 /// via `truncated_at` rather than lying by omission.
 pub const REFS_PER_EVENT_CAP: usize = 500;
 
+/// Where HEAD pointed when an event was journaled (#449).
+///
+/// **Why an enum rather than a symbolic-name/oid pair.** Two independent
+/// `Option`s would be the flag-pair shape ADR 0068 was written against: four
+/// combinations, a reader who must remember which are possible, and a
+/// renderer free to assert a fact the data never carried. An enum makes the
+/// states total and named.
+///
+/// Every variant below was reproduced against `gix` 0.84 before it was
+/// written; none is defensive padding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "at", rename_all = "snake_case")]
+pub enum HeadAtEvent {
+    /// HEAD is symbolic and resolves: the ref it names, plus the commit.
+    ///
+    /// `symbolic` is the **full** ref name (`refs/heads/main`), never
+    /// shortened — a symbolic ref names a full ref path, and a short name
+    /// would collide with a same-named tag. The join back to `branches` is a
+    /// lossless `strip_prefix("refs/heads/")`.
+    OnBranch { symbolic: String, oid: String },
+    /// Detached and resolving: a commit, and deliberately no name.
+    Detached { oid: String },
+    /// Symbolic, pointing at a ref that has no commit yet (a fresh repo, a
+    /// new orphan branch). A name with nothing behind it — not a branch at
+    /// zero.
+    Unborn { symbolic: String },
+    /// Neither a name nor a commit: HEAD read, and held an object id nothing
+    /// resolves. Recorded rather than smoothed into one of the three above.
+    Unresolvable,
+    /// HEAD itself could not be read, and the reason is preserved.
+    ///
+    /// Distinct from [`Self::Unresolvable`], which is a HEAD that *was* read
+    /// and pointed nowhere. This is reachable while the surrounding capture
+    /// succeeds: a repository whose ref store opens and lists normally can
+    /// still have a corrupt `.git/HEAD`, or a branch ref that will not
+    /// instantiate. Recording that as "no HEAD" — or letting it fail the
+    /// whole capture, discarding branches that read perfectly well — is the
+    /// collapse this type exists to forbid.
+    Unreadable { reason: String },
+}
+
 /// One raw reflog line, as read natively by `git-vista-git` — ref name plus
 /// the entry's old/new oids, timestamp and message. Defined here (not in the
 /// git crate) so [`assemble_feed`] can take them without core depending on
