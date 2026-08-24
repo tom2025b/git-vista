@@ -1107,7 +1107,7 @@ mod tests {
             source.bytes_read
         );
         assert!(
-            source.bytes_read <= 4 * TAIL_CHUNK,
+            source.bytes_read <= TAIL_CHUNK.saturating_mul(4),
             "the window is ~14 KiB; reading {} bytes for it means the backward \
              scan is not stopping where it should",
             source.bytes_read
