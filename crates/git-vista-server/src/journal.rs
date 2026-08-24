@@ -1251,6 +1251,11 @@ mod tests {
         }
     }
 
+    /// A crate may have exactly one of these, so this is the test build's
+    /// only `#[global_allocator]` and a second one anywhere in
+    /// `git-vista-server`'s tests is a compile error, not a runtime surprise.
+    /// If another test needs allocation numbers, extend
+    /// [`alloc_probe::bytes_allocated_by`] rather than adding a second.
     #[global_allocator]
     static COUNTING_ALLOCATOR: alloc_probe::Counting = alloc_probe::Counting;
 
