@@ -113,6 +113,69 @@ run_with_node "v22.14.0"
 [[ -e "$work/reached-cargo" ]] \
   || fail "the guard refused node v22.14.0, which satisfies Playwright's >= 20 — the fix rejects good versions (#469)"
 
+# ── 5. THIS BOX. A too-old node on PATH, a new-enough one only under nvm ──
+#
+# The case the whole issue is about, and the one that pins the PATH export:
+# finding a good node is not enough, because run.sh reaches `npx`, not `node`.
+# A fix that inspects the nvm node and then lets PATH's v18 `npx` run would
+# satisfy every assertion above and still leave the gate exactly as broken.
+nvm_bin="$work/home/.local/share/nvm/v24.18.0/bin"
+run_with_node_and_nvm() {
+  local path_version="$1"
+  local bin="$work/bin" home="$work/home"
+  rm -rf "$bin" "$home"
+  mkdir -p "$bin" "$home/.cache/ms-playwright" "$nvm_bin"
+
+  cat > "$bin/node" <<EOF
+#!/usr/bin/env bash
+case "\${1:-}" in
+  -v|--version) echo "$path_version" ;;
+  *)            echo "FAKE path node \$*" ;;
+esac
+EOF
+  cat > "$nvm_bin/node" <<EOF
+#!/usr/bin/env bash
+case "\${1:-}" in
+  -v|--version) echo "v24.18.0" ;;
+  *)            echo "FAKE nvm node \$*" ;;
+esac
+EOF
+  cat > "$bin/cargo" <<EOF
+#!/usr/bin/env bash
+touch "$work/reached-cargo"
+EOF
+  for who in path nvm; do
+    local dir="$bin"; [[ $who == nvm ]] && dir="$nvm_bin"
+    cat > "$dir/npx" <<EOF
+#!/usr/bin/env bash
+touch "$work/reached-$who-npx"
+EOF
+    cat > "$dir/npm" <<EOF
+#!/usr/bin/env bash
+touch "$work/reached-$who-npm"
+EOF
+  done
+  chmod +x "$bin"/* "$nvm_bin"/*
+
+  rm -f "$work"/reached-*
+  out="$work/out-nvm.txt"
+  set +e
+  ( cd "$repo_root" && HOME="$home" PATH="$bin:/usr/bin:/bin" bash ./dev browser ) > "$out" 2>&1
+  rc=$?
+  set -e
+}
+
+run_with_node_and_nvm "v18.19.1"
+
+[[ -e "$work/reached-cargo" ]] \
+  || fail "a v24 under nvm was not found, so the guard refused a box that can actually run these tests (#469)"
+
+[[ -e "$work/reached-nvm-npx" ]] \
+  || fail "the guard accepted the nvm node but never put it on PATH — run.sh reaches npx, not node (#469)"
+
+[[ ! -e "$work/reached-path-npx" ]] \
+  || fail "Playwright ran under PATH's too-old npx even though a newer node was found (#469)"
+
 # ── 4. No node at all: the original not-found path must survive ──
 run_with_node ""
 
