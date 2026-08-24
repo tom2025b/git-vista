@@ -1271,12 +1271,18 @@ mod tests {
     /// quadratic one near 29x. The 10x bar sits in that gap, and the gap
     /// widens with every extra chunk rather than narrowing.
     ///
-    /// MUTATION 1: restore `chunk.append(&mut window); window = chunk;` and
-    ///   drop the concat — red, the join is quadratic again.
-    /// MUTATION 2: `Vec::new()` in place of `Vec::with_capacity(total)` — red,
-    ///   the result reallocates its way up instead of being sized once.
-    ///   The two fail differently: the first moves bytes it never needed to
-    ///   move, the second allocates a staircase of buffers it never needed.
+    /// MUTATION 1: join by prepending each chunk to what is already held —
+    ///   the quadratic shape this fixes, restored. Red on the byte budget.
+    /// MUTATION 2: drop the `.rev()` and join the chunks in scan order. Red on
+    ///   the last line, which is no longer the last line of the file.
+    ///
+    /// The two fail through different assertions on purpose: the first breaks
+    /// what the join *costs*, the second breaks what it *returns*, and either
+    /// alone would leave half of this test unproven. A pre-size mutation
+    /// (`Vec::new()` for `Vec::with_capacity(total)`) is deliberately **not**
+    /// claimed here — doubling growth is amortized linear, so it survives, and
+    /// naming a mutation this test cannot catch is the failure mode the
+    /// mutation rule exists to prevent.
     #[test]
     fn the_tail_window_joins_its_chunks_in_one_pass() {
         let pad = "p".repeat(4 * 1024);
