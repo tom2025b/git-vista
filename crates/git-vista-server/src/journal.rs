@@ -183,10 +183,20 @@ const TAIL_CHUNK: usize = 64 * 1024;
 /// Decoding is lossy on purpose: bytes older than the window are already
 /// outside the answer, and refusing the whole file over one of them is what
 /// `read_to_string` used to do.
+///
+/// The chunks are kept apart until the scan ends and joined once, into a
+/// buffer sized from the total (#467). Growing the window in place instead —
+/// prepending each new chunk to what is already held — recopies the whole
+/// accumulated window on every backward step, which is quadratic in the size
+/// of the window rather than linear. That is invisible in both the answer and
+/// the bytes read, and it lands on the two hot paths #464 exists to protect:
+/// at the ~90 KB-a-line worst case of ADR 0070 the window reaches ~86 MB, and
+/// the difference measured 41 s against 0.5 s.
 fn tail_window<R: Read + Seek>(source: &mut R, cap: usize) -> std::io::Result<String> {
     let mut pos = source.seek(SeekFrom::End(0))?;
-    let mut window: Vec<u8> = Vec::new();
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
     let mut newlines = 0usize;
+    let mut total = 0usize;
     while pos > 0 && newlines <= cap {
         let step = TAIL_CHUNK.min(pos as usize);
         pos -= step as u64;
@@ -194,8 +204,14 @@ fn tail_window<R: Read + Seek>(source: &mut R, cap: usize) -> std::io::Result<St
         let mut chunk = vec![0u8; step];
         source.read_exact(&mut chunk)?;
         newlines += chunk.iter().filter(|b| **b == b'\n').count();
-        chunk.append(&mut window);
-        window = chunk;
+        total += step;
+        chunks.push(chunk);
+    }
+    // The scan collected the chunks newest-first; the window is file order,
+    // so they go back together in reverse (#467).
+    let mut window = Vec::with_capacity(total);
+    for chunk in chunks.iter().rev() {
+        window.extend_from_slice(chunk);
     }
     Ok(String::from_utf8_lossy(&window).into_owned())
 }
@@ -1185,5 +1201,128 @@ mod tests {
         assert!(read_snapshot(dir.path()).is_none());
         write_snapshot(dir.path(), &HashMap::new()); // must not create anything
         assert!(!dir.path().join(".git").exists());
+    }
+
+    /// A counting allocator, test-only, used by
+    /// `the_tail_window_joins_its_chunks_in_one_pass` (#467).
+    ///
+    /// The tally is **thread-local and opt-in**: the rest of the suite runs in
+    /// parallel on other threads, and those threads never enter the `Some`
+    /// arm, so their allocations can never land in a measurement. The cell is
+    /// `const`-initialized and holds no `Drop` type, so touching it from
+    /// inside `alloc` cannot allocate and cannot recurse.
+    ///
+    /// Only `alloc`/`dealloc` are implemented on purpose: `GlobalAlloc`'s
+    /// default `realloc` and `alloc_zeroed` are written in terms of
+    /// `self.alloc`, so a `Vec` growing or a `vec![0u8; n]` is counted through
+    /// the same path rather than needing its own arm.
+    mod alloc_probe {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static COUNTED: Cell<Option<usize>> = const { Cell::new(None) };
+        }
+
+        pub struct Counting;
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let _ = COUNTED.try_with(|c| {
+                    if let Some(n) = c.get() {
+                        c.set(Some(n + layout.size()));
+                    }
+                });
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        /// Runs `f`, returning its value and the bytes allocated on this
+        /// thread while it ran.
+        pub fn bytes_allocated_by<T>(f: impl FnOnce() -> T) -> (T, usize) {
+            COUNTED.with(|c| c.set(Some(0)));
+            let out = f();
+            let n = COUNTED.with(|c| c.replace(None)).unwrap_or(0);
+            (out, n)
+        }
+    }
+
+    /// A crate may have exactly one of these, so this is the test build's
+    /// only `#[global_allocator]` and a second one anywhere in
+    /// `git-vista-server`'s tests is a compile error, not a runtime surprise.
+    /// If another test needs allocation numbers, extend
+    /// [`alloc_probe::bytes_allocated_by`] rather than adding a second.
+    #[global_allocator]
+    static COUNTING_ALLOCATOR: alloc_probe::Counting = alloc_probe::Counting;
+
+    /// #467: `tail_window`'s *read* is bounded by the cap — that is #464, and
+    /// it holds. What is not bounded is the *join*. Growing the window with
+    /// `chunk.append(&mut window)` copies everything accumulated so far on
+    /// every backward step, so the bytes moved are quadratic in the size of
+    /// the window.
+    ///
+    /// Neither the answer nor `bytes_read` changes, which is exactly why
+    /// #466's own tests could not see it. The only axis that separates a
+    /// one-pass join from a quadratic one is how much gets **allocated**, so
+    /// that is what this measures.
+    ///
+    /// The window below is ~4 MB — a size a post-#449 repository reaches
+    /// today (ADR 0070: ~3.5 KB a line, ~90 KB worst case, against a
+    /// 1,000-line cap). A one-pass join lands near 3.5x the window; the
+    /// quadratic one near 29x. The 10x bar sits in that gap, and the gap
+    /// widens with every extra chunk rather than narrowing.
+    ///
+    /// MUTATION 1: join by prepending each chunk to what is already held —
+    ///   the quadratic shape this fixes, restored. Red on the byte budget.
+    /// MUTATION 2: drop the `.rev()` and join the chunks in scan order. Red on
+    ///   the last line, which is no longer the last line of the file.
+    ///
+    /// The two fail through different assertions on purpose: the first breaks
+    /// what the join *costs*, the second breaks what it *returns*, and either
+    /// alone would leave half of this test unproven. A pre-size mutation
+    /// (`Vec::new()` for `Vec::with_capacity(total)`) is deliberately **not**
+    /// claimed here — doubling growth is amortized linear, so it survives, and
+    /// naming a mutation this test cannot catch is the failure mode the
+    /// mutation rule exists to prevent.
+    #[test]
+    fn the_tail_window_joins_its_chunks_in_one_pass() {
+        let pad = "p".repeat(4 * 1024);
+        let mut bytes: Vec<u8> = Vec::new();
+        for i in 0..(JOURNAL_READ_CAP + 20) {
+            writeln!(bytes, "{{\"n\":{i},\"pad\":\"{pad}\"}}").unwrap();
+        }
+        let mut source = std::io::Cursor::new(bytes);
+
+        let (window, allocated) = alloc_probe::bytes_allocated_by(|| {
+            tail_window(&mut source, JOURNAL_READ_CAP).expect("the tail reads")
+        });
+
+        // The window must be the real thing before its cost means anything:
+        // an empty answer is cheap and wrong.
+        assert!(
+            window.lines().count() > JOURNAL_READ_CAP,
+            "the window must overshoot the cap, else there is nothing to join"
+        );
+        assert_eq!(
+            window.lines().last().unwrap(),
+            format!("{{\"n\":{},\"pad\":\"{pad}\"}}", JOURNAL_READ_CAP + 19),
+            "the window must still end at the end of the file"
+        );
+
+        let budget = window.len().saturating_mul(10);
+        assert!(
+            allocated <= budget,
+            "joining a {:.1} MB window allocated {:.1} MB ({:.1}x the window, \
+             budget {:.1} MB) — the chunks are being copied on every backward \
+             step instead of concatenated once",
+            window.len() as f64 / 1_048_576.0,
+            allocated as f64 / 1_048_576.0,
+            allocated as f64 / window.len() as f64,
+            budget as f64 / 1_048_576.0,
+        );
     }
 }
