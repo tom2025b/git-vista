@@ -174,11 +174,50 @@ cmd_gate() {
 # FAILURE with instructions, never a silent skip. A skipped browser check reads
 # identically to a passing one in a gate log, which is how the defects it exists
 # to catch survived in the first place.
+# Playwright refuses to start on anything older than this (#469).
+BROWSER_NODE_MIN_MAJOR=20
+
+# The bin directory of a node new enough for Playwright, or nothing.
+#
+# "a node exists" and "a node that will work exists" are different questions,
+# and only the second one matters here. On this box a bare `node` is v18.19.1
+# while a v24 sits under nvm — so this prefers whatever `node` already resolves
+# to and falls back to the newest nvm install, rather than making a too-old
+# system node something the operator has to replace before testing anything.
+browser_node_bin() {
+  local candidate major
+  while IFS= read -r candidate; do
+    [[ -n $candidate && -x $candidate ]] || continue
+    major="$("$candidate" -v 2>/dev/null)" || continue
+    major="${major#v}"
+    major="${major%%.*}"
+    [[ $major =~ ^[0-9]+$ ]] || continue
+    if (( major >= BROWSER_NODE_MIN_MAJOR )); then
+      dirname "$candidate"
+      return 0
+    fi
+  done < <(
+    command -v node 2>/dev/null || true
+    ls -d "$HOME"/.local/share/nvm/*/bin/node \
+          "$HOME"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V -r
+  )
+  return 1
+}
+
 cmd_browser() {
   echo "── browser (render path) ───────────────────────────"
-  if ! command -v node >/dev/null 2>&1; then
-    die "browser tests need node (not found). Install it, or run the rest with 'dev gate' on a host that has it."
+  local on_path node_bin
+  on_path="$(command -v node 2>/dev/null || true)"
+  if ! node_bin="$(browser_node_bin)"; then
+    if [[ -z $on_path ]]; then
+      die "browser tests need node >= $BROWSER_NODE_MIN_MAJOR (none found). Install it, or run the rest with 'dev gate' on a host that has it."
+    fi
+    die "browser tests need node >= $BROWSER_NODE_MIN_MAJOR — Playwright refuses anything older, and '$on_path' is $("$on_path" -v 2>/dev/null || echo 'an unreadable version'). Install a newer node, or put one on PATH ahead of it; an nvm install under ~/.local/share/nvm or ~/.nvm is found automatically."
   fi
+  # run.sh reaches `npx` and `npm`, not only `node`, so the whole toolchain has
+  # to come from the install this guard actually inspected — checking one
+  # binary and then running a different one is the shape of the bug above.
+  local -x PATH="$node_bin:$PATH"
   if [[ ! -d ~/.cache/ms-playwright ]]; then
     die "browser tests need a Playwright browser: npx playwright install chromium"
   fi
