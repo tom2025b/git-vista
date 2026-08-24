@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use git_vista_core::activity::{ActivityEvent, CapturedRefs, RefsAtEvent, REFS_PER_EVENT_CAP};
@@ -157,14 +157,71 @@ pub fn append(repo: &Path, event: &ActivityEvent) {
     }
 }
 
+/// How much of the journal is pulled back per backward step. One step
+/// already covers the whole window in any realistic journal; the loop exists
+/// for the pathological case of very long lines.
+const TAIL_CHUNK: usize = 64 * 1024;
+
+/// The tail of `source` guaranteed to contain the last `cap` lines — read
+/// backwards from the end and stopping the moment it has seen `cap + 1`
+/// newlines (#464).
+///
+/// **The overshoot is the whole design.** Stopping one newline late means the
+/// returned text holds at least `cap + 1` lines, so the caller's existing
+/// `len().saturating_sub(cap)` window always discards the first of them. That
+/// single invariant pays for three things at once: the leading line is
+/// allowed to be a fragment (it is dropped), a multi-byte character split by
+/// the chunk boundary can only land in that fragment, and a file with no
+/// trailing newline needs no special case.
+///
+/// The `+ 1` is defensive rather than load-bearing at the current
+/// [`TAIL_CHUNK`]: a 64 KiB step already spans far more than one line of any
+/// realistic journal, so the scan overshoots the cap by many lines anyway.
+/// It is what makes the invariant hold for a journal of very long lines, and
+/// it costs one comparison.
+///
+/// Decoding is lossy on purpose: bytes older than the window are already
+/// outside the answer, and refusing the whole file over one of them is what
+/// `read_to_string` used to do.
+fn tail_window<R: Read + Seek>(source: &mut R, cap: usize) -> std::io::Result<String> {
+    let mut pos = source.seek(SeekFrom::End(0))?;
+    let mut window: Vec<u8> = Vec::new();
+    let mut newlines = 0usize;
+    while pos > 0 && newlines <= cap {
+        let step = TAIL_CHUNK.min(pos as usize);
+        pos -= step as u64;
+        source.seek(SeekFrom::Start(pos))?;
+        let mut chunk = vec![0u8; step];
+        source.read_exact(&mut chunk)?;
+        newlines += chunk.iter().filter(|b| **b == b'\n').count();
+        chunk.append(&mut window);
+        window = chunk;
+    }
+    Ok(String::from_utf8_lossy(&window).into_owned())
+}
+
 /// Read the newest [`JOURNAL_READ_CAP`] journaled events (file order — oldest
 /// first — is preserved within the returned slice). Unparsable lines are
 /// skipped loudly: one corrupt line must not hide the rest of the history.
+///
+/// The cap bounds the *read*, not just the parse (#464): the journal is
+/// append-only and unbounded, and both production callers are on hot paths —
+/// the activity feed and `/api/undoables`, which the graph menu hits on every
+/// open. [`tail_window`] seeks from the end rather than loading the file, so
+/// the cost of a feed request stops growing with the age of the repository.
+///
+/// One deliberate behaviour change comes with it: bytes older than the window
+/// can no longer blank the feed. `read_to_string` refused the entire file over
+/// a single invalid byte anywhere in it, which contradicted this function's
+/// own rule about corrupt lines.
 pub fn read_all(repo: &Path) -> Vec<ActivityEvent> {
     let Some(path) = journal_path(repo) else {
         return Vec::new();
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return Vec::new();
+    };
+    let Ok(text) = tail_window(&mut file, JOURNAL_READ_CAP) else {
         return Vec::new();
     };
     let lines: Vec<&str> = text.lines().collect();
@@ -923,6 +980,184 @@ mod tests {
         append(dir.path(), &event("after"));
         let read = read_all(dir.path());
         assert_eq!(read.len(), 2, "good lines on both sides of the corruption");
+    }
+
+    /// A journal file holding `count` events, summaries `{prefix}0` upward,
+    /// written directly rather than through `append` — 1,000+ real captures
+    /// would spend the whole test in git.
+    fn seed_journal(dir: &Path, prefix: &str, count: usize, trailing_newline: bool) -> PathBuf {
+        let path = dir.join(".git/git-vista/journal.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut text = String::new();
+        for i in 0..count {
+            if i > 0 {
+                text.push('\n');
+            }
+            text.push_str(&serde_json::to_string(&event(&format!("{prefix}{i}"))).unwrap());
+        }
+        if trailing_newline {
+            text.push('\n');
+        }
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// A `Read + Seek` source that tallies every byte handed out, so a test
+    /// can assert on I/O volume rather than on the answer alone.
+    struct CountingCursor {
+        inner: std::io::Cursor<Vec<u8>>,
+        bytes_read: usize,
+    }
+
+    impl CountingCursor {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                inner: std::io::Cursor::new(bytes),
+                bytes_read: 0,
+            }
+        }
+    }
+
+    impl Read for CountingCursor {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.bytes_read += n;
+            Ok(n)
+        }
+    }
+
+    impl Seek for CountingCursor {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// #464, half one: the window is the NEWEST `JOURNAL_READ_CAP` events and
+    /// its boundary is exact — including the case a naive backward newline
+    /// count gets wrong, a file of exactly the cap with no trailing newline.
+    ///
+    /// This is the off-by-one net. It says nothing about how much was read;
+    /// `the_tail_window_reads_only_the_tail_of_the_journal` owns that.
+    ///
+    /// MUTATION: `.max(1)` on the window start — "always drop the first line,
+    /// it might be a fragment", the natural wrong fix — and both halves go
+    /// red. The fragment must be discarded by the cap arithmetic, never by a
+    /// rule of its own, or a journal at or under the cap loses its oldest
+    /// event.
+    #[test]
+    fn the_read_window_is_the_newest_events_and_its_boundary_is_exact() {
+        let dir = repo();
+        seed_journal(dir.path(), "e", JOURNAL_READ_CAP + 50, true);
+        let read = read_all(dir.path());
+        assert_eq!(read.len(), JOURNAL_READ_CAP, "the cap bounds the answer");
+        assert_eq!(
+            read[0].summary, "e50",
+            "the oldest kept event is the 51st, not the 52nd"
+        );
+        assert_eq!(
+            read[JOURNAL_READ_CAP - 1].summary,
+            format!("e{}", JOURNAL_READ_CAP + 49),
+            "the newest event is the last line of the file"
+        );
+
+        // Exactly the cap, and no trailing newline: the shape that costs a
+        // naive implementation its oldest line.
+        let dir = repo();
+        seed_journal(dir.path(), "x", JOURNAL_READ_CAP, false);
+        let read = read_all(dir.path());
+        assert_eq!(
+            read.len(),
+            JOURNAL_READ_CAP,
+            "a missing trailing newline must not cost an event"
+        );
+        assert_eq!(read[0].summary, "x0");
+    }
+
+    /// #464's actual defect: the cap bounded *parsing*, not I/O — the whole
+    /// journal was read into memory first, so disk cost grew without limit.
+    ///
+    /// The only test here that can tell the two implementations apart: a
+    /// whole-file read returns exactly the same events, so it can only be
+    /// caught by counting bytes.
+    ///
+    /// MUTATION: restore the old `read_to_string` body and this goes red on
+    /// the byte count while every other journal test stays green.
+    #[test]
+    fn the_tail_window_reads_only_the_tail_of_the_journal() {
+        // A pre-window prefix that dwarfs the window: 200 padded events the
+        // cap must push out of view.
+        let pad = "p".repeat(8 * 1024);
+        let mut bytes: Vec<u8> = Vec::new();
+        for i in 0..200 {
+            writeln!(bytes, "{{\"old\":{i},\"pad\":\"{pad}\"}}").unwrap();
+        }
+        let prefix_len = bytes.len();
+        for i in 0..(JOURNAL_READ_CAP + 5) {
+            writeln!(bytes, "{{\"new\":{i}}}").unwrap();
+        }
+        let total = bytes.len();
+
+        let mut source = CountingCursor::new(bytes);
+        let window = tail_window(&mut source, JOURNAL_READ_CAP).unwrap();
+
+        assert!(
+            source.bytes_read < prefix_len,
+            "read {} bytes of a {total}-byte journal whose pre-window prefix \
+             alone is {prefix_len} — the read is not bounded by the cap",
+            source.bytes_read
+        );
+        assert!(
+            source.bytes_read <= TAIL_CHUNK.saturating_mul(4),
+            "the window is ~14 KiB; reading {} bytes for it means the backward \
+             scan is not stopping where it should",
+            source.bytes_read
+        );
+
+        // The tail may overshoot into the prefix by up to a chunk — that is
+        // the design. What must hold is that the capped window inside it is
+        // entirely post-prefix, and that it ends at the end of the file.
+        let lines: Vec<&str> = window.lines().collect();
+        assert!(
+            lines.len() > JOURNAL_READ_CAP,
+            "the window must overshoot the cap by at least one line so the \
+             leading partial line is always trimmed away"
+        );
+        let capped = &lines[lines.len() - JOURNAL_READ_CAP..];
+        assert!(
+            capped.iter().all(|l| l.starts_with("{\"new\":")),
+            "the capped window must hold only events newer than the prefix"
+        );
+        assert_eq!(
+            *capped.last().unwrap(),
+            format!("{{\"new\":{}}}", JOURNAL_READ_CAP + 4),
+            "the tail must end at the end of the file"
+        );
+    }
+
+    /// A consequence of the tail read, and an intended one: corruption older
+    /// than the window can no longer blank the feed. `read_to_string` refused
+    /// the whole file over one invalid byte anywhere in it, which contradicted
+    /// this module's own rule that one bad line must not hide the history.
+    ///
+    /// MUTATION: decode the window with `String::from_utf8` (strict) instead
+    /// of `from_utf8_lossy` and this goes red whenever the chunk boundary
+    /// lands inside the corrupt prefix.
+    #[test]
+    fn corruption_older_than_the_window_no_longer_blanks_the_feed() {
+        let dir = repo();
+        let path = seed_journal(dir.path(), "c", JOURNAL_READ_CAP + 2, true);
+        let good = std::fs::read(&path).unwrap();
+        let mut bytes: Vec<u8> = vec![0xff, 0xfe, 0xff, b'\n'];
+        bytes.extend_from_slice(&good);
+        std::fs::write(&path, bytes).unwrap();
+
+        let read = read_all(dir.path());
+        assert_eq!(
+            read.len(),
+            JOURNAL_READ_CAP,
+            "invalid bytes older than the window must not cost the feed"
+        );
+        assert_eq!(read[0].summary, "c2");
     }
 
     #[test]
