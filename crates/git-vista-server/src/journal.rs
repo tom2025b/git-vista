@@ -182,7 +182,13 @@ const TAIL_CHUNK: usize = 64 * 1024;
 ///
 /// Decoding is lossy on purpose: bytes older than the window are already
 /// outside the answer, and refusing the whole file over one of them is what
-/// `read_to_string` used to do.
+/// `read_to_string` used to do. It is lossy by *fallback* rather than by
+/// default (#468) — `String::from_utf8` takes the window's allocation over
+/// unchanged when it is valid, which is every normal journal, and hands the
+/// bytes back untouched when it is not. `from_utf8_lossy(&window)` instead
+/// borrows and then copies the whole window a second time on the normal path,
+/// which at ADR 0070's worst case is ~86 MB of copying to produce bytes that
+/// were already owned, contiguous and valid.
 ///
 /// The chunks are kept apart until the scan ends and joined once, into a
 /// buffer sized from the total (#467). Growing the window in place instead —
@@ -213,7 +219,12 @@ fn tail_window<R: Read + Seek>(source: &mut R, cap: usize) -> std::io::Result<St
     for chunk in chunks.iter().rev() {
         window.extend_from_slice(chunk);
     }
-    Ok(String::from_utf8_lossy(&window).into_owned())
+    Ok(match String::from_utf8(window) {
+        Ok(text) => text,
+        // The rare path, and the only one that pays a copy: `from_utf8` hands
+        // the bytes back untouched so the lossy decode can still have them.
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
 }
 
 /// Read the newest [`JOURNAL_READ_CAP`] journaled events (file order — oldest
@@ -1174,6 +1185,105 @@ mod tests {
             "invalid bytes older than the window must not cost the feed"
         );
         assert_eq!(read[0].summary, "c2");
+    }
+
+    /// The lossy decode's `Err` branch, which nothing reached before (#468).
+    ///
+    /// `corruption_older_than_the_window_no_longer_blanks_the_feed` puts its
+    /// invalid bytes BEFORE the window, so the window itself is clean and a
+    /// strict decode of it would succeed — that test passes whether the decode
+    /// is lossy or not. The bytes have to land INSIDE the window for the
+    /// fallback to be exercised at all, which is what this does.
+    ///
+    /// Why the fallback must exist: `tail_window` starts at an arbitrary byte
+    /// offset, so a multi-byte character can be cut in half at the window's
+    /// leading edge. Refusing the whole window over that would blank the feed —
+    /// the exact behaviour #466 removed.
+    ///
+    /// MUTATION: decode with `String::from_utf8(window).expect(...)` — red,
+    /// the read panics instead of skipping one line.
+    #[test]
+    fn invalid_bytes_inside_the_window_cost_their_line_and_nothing_else() {
+        let dir = repo();
+        let path = seed_journal(dir.path(), "w", 12, true);
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        // Corrupt one byte of the 6th line's payload — inside the window, so
+        // the decode itself has to cope, not just the JSON parse.
+        let sixth = bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b == b'\n')
+            .nth(4)
+            .map(|(i, _)| i + 1)
+            .expect("the fixture has at least six lines");
+        bytes[sixth + 10] = 0xff;
+        std::fs::write(&path, bytes).unwrap();
+
+        let read = read_all(dir.path());
+        assert_eq!(
+            read.len(),
+            11,
+            "one corrupt line must cost exactly itself — the other 11 events \
+             must survive the decode"
+        );
+        assert!(
+            !read.iter().any(|e| e.summary == "w5"),
+            "the corrupted event is the one that should be missing"
+        );
+    }
+
+    /// #468: the window is decoded by taking ownership of the bytes, not by
+    /// borrowing them and copying.
+    ///
+    /// `String::from_utf8_lossy(&window)` hands back a `Cow::Borrowed` whenever
+    /// the window is valid UTF-8 — which is every normal journal — and
+    /// `into_owned()` then allocates a second buffer and copies the whole thing
+    /// into it. The bytes were already owned, contiguous and valid; the copy is
+    /// paid only because they were passed as a slice.
+    ///
+    /// The budget is measured, not guessed: 3.00x the window before, 2.00x
+    /// after (the chunks, the joined buffer, and — before the fix — the decode).
+    /// The bar sits in the middle of that gap.
+    ///
+    /// This is deliberately a separate test from
+    /// `the_tail_window_joins_its_chunks_in_one_pass`, whose 10x bar is the net
+    /// for the quadratic join (#467). One assertion, one reason to fail: a
+    /// 3.00x regression and a 34x one are different defects and should not
+    /// report as the same failure.
+    ///
+    /// MUTATION: restore `String::from_utf8_lossy(&window).into_owned()` — red
+    /// here at 3.0x, while the #467 test stays green at its 10x bar.
+    #[test]
+    fn the_window_is_decoded_by_taking_ownership_not_by_copying_it_again() {
+        let pad = "p".repeat(4 * 1024);
+        let mut bytes: Vec<u8> = Vec::new();
+        for i in 0..(JOURNAL_READ_CAP + 20) {
+            writeln!(bytes, "{{\"n\":{i},\"pad\":\"{pad}\"}}").unwrap();
+        }
+        let mut source = std::io::Cursor::new(bytes);
+
+        let (window, allocated) = alloc_probe::bytes_allocated_by(|| {
+            tail_window(&mut source, JOURNAL_READ_CAP).expect("the tail reads")
+        });
+
+        assert!(
+            window.lines().count() > JOURNAL_READ_CAP,
+            "an empty window is cheap and wrong"
+        );
+
+        // 2.5x: measured 2.00x with the fix, 3.00x without it.
+        let budget = window.len().saturating_mul(5) / 2;
+        assert!(
+            allocated <= budget,
+            "decoding a {:.1} MB window allocated {:.1} MB ({:.2}x the window, \
+             budget {:.2}x) — the window is being copied again on the way out \
+             instead of being handed over",
+            window.len() as f64 / 1_048_576.0,
+            allocated as f64 / 1_048_576.0,
+            allocated as f64 / window.len() as f64,
+            budget as f64 / window.len() as f64,
+        );
     }
 
     #[test]
