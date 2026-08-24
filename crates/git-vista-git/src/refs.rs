@@ -376,8 +376,11 @@ mod tests {
             v
         };
 
-        // (label, how to put HEAD into the state, does HEAD resolve)
-        let cases: Vec<(&str, Box<dyn Fn(&Path)>, bool)> = vec![
+        /// One row: a label, how to put HEAD into that state, and whether
+        /// HEAD resolves to a commit there.
+        type HeadCase = (&'static str, Box<dyn Fn(&Path)>, bool);
+
+        let cases: Vec<HeadCase> = vec![
             ("on a branch", Box::new(|_: &Path| {}), true),
             (
                 "detached at a real commit",
