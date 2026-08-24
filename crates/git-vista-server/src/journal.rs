@@ -174,6 +174,12 @@ const TAIL_CHUNK: usize = 64 * 1024;
 /// the chunk boundary can only land in that fragment, and a file with no
 /// trailing newline needs no special case.
 ///
+/// The `+ 1` is defensive rather than load-bearing at the current
+/// [`TAIL_CHUNK`]: a 64 KiB step already spans far more than one line of any
+/// realistic journal, so the scan overshoots the cap by many lines anyway.
+/// It is what makes the invariant hold for a journal of very long lines, and
+/// it costs one comparison.
+///
 /// Decoding is lossy on purpose: bytes older than the window are already
 /// outside the answer, and refusing the whole file over one of them is what
 /// `read_to_string` used to do.
@@ -1033,9 +1039,11 @@ mod tests {
     /// This is the off-by-one net. It says nothing about how much was read;
     /// `the_tail_window_reads_only_the_tail_of_the_journal` owns that.
     ///
-    /// MUTATION: scan back for `cap` newlines instead of `cap + 1` and the
-    /// oldest-kept assertion goes red — the window silently loses its first
-    /// line to the partial-line fragment.
+    /// MUTATION: `.max(1)` on the window start — "always drop the first line,
+    /// it might be a fragment", the natural wrong fix — and both halves go
+    /// red. The fragment must be discarded by the cap arithmetic, never by a
+    /// rule of its own, or a journal at or under the cap loses its oldest
+    /// event.
     #[test]
     fn the_read_window_is_the_newest_events_and_its_boundary_is_exact() {
         let dir = repo();
