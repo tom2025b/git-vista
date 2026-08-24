@@ -217,7 +217,7 @@ cmd_browser() {
   # run.sh reaches `npx` and `npm`, not only `node`, so the whole toolchain has
   # to come from the install this guard actually inspected — checking one
   # binary and then running a different one is the shape of the bug above.
-  export PATH="$node_bin:$PATH"
+  local -x PATH="$node_bin:$PATH"
   if [[ ! -d ~/.cache/ms-playwright ]]; then
     die "browser tests need a Playwright browser: npx playwright install chromium"
   fi
