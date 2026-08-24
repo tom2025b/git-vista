@@ -14,11 +14,12 @@ use crate::RepoError;
 /// peeled to the commit it ultimately points at, for badging and per-branch
 /// colouring in the UI.
 ///
-/// HEAD is always emitted (as [`RefKind::Head`], named `"HEAD"`) when it resolves
-/// to a commit, whether it's on a branch or detached; when it's on a branch the
-/// branch is emitted too, so a tip shows both. Refs that don't resolve to a
-/// commit (an unborn HEAD, a broken ref) are skipped. Notes and worktree-private
-/// refs are ignored.
+/// HEAD is emitted (as [`RefKind::Head`], named `"HEAD"`) exactly when it
+/// **resolves to a commit**, whether it's on a branch or detached; when it's on
+/// a branch the branch is emitted too, so a tip shows both. Refs that don't
+/// resolve to a commit — an unborn HEAD, a HEAD holding an oid nothing resolves,
+/// a broken ref — are skipped: every entry here is a claim about a commit, and
+/// there is no commit to claim. Notes and worktree-private refs are ignored.
 pub fn read_refs(path: &Path) -> Result<Vec<GitRef>, RepoError> {
     read_refs_at(path).map(|read| read.refs)
 }
@@ -54,12 +55,18 @@ pub struct RefsAt {
 ///    there. Here a HEAD that will not read is [`HeadAtEvent::Unreadable`]
 ///    and the branches that *did* read are still returned.
 ///
-/// The `RefKind::Head` badge keeps coming from `repo.head()`, exactly as it
-/// always has, rather than from the resolved-HEAD path used for
-/// classification. The two disagree for a HEAD holding an object id nothing
-/// resolves — `head()` hands back the raw id, `head_id()` refuses it — and
-/// that disagreement predates #449. Preserving it keeps this refactor free of
-/// behaviour change; resolving it is its own question, and its own issue.
+/// The `RefKind::Head` badge comes from `head_id()`, the same resolved id
+/// [`read_history_materials`] badges from — **not** from `repo.head()`, which
+/// hands back a HEAD's raw object id without checking anything resolves to it.
+/// Those two disagree for exactly one state, a HEAD holding an oid with no
+/// object behind it, and this reader used to be the one that badged it. That
+/// made two readers of one repository give opposite answers about whether HEAD
+/// existed (#465, ADR 0071).
+///
+/// The fact is not discarded with the badge: a HEAD that points at nothing is
+/// [`HeadAtEvent::Unresolvable`] in [`RefsAt::head`], which is the field that
+/// can say so. `refs` is display refs peeled to commits; `head` is HEAD's
+/// state. Only the second can describe a HEAD with no commit.
 pub fn read_refs_at(path: &Path) -> Result<RefsAt, RepoError> {
     let repo =
         gix::open_opts(path, gix::open::Options::isolated()).map_err(|e| RepoError::Open {
@@ -69,39 +76,37 @@ pub fn read_refs_at(path: &Path) -> Result<RefsAt, RepoError> {
 
     let mut refs = Vec::new();
 
-    // HEAD first, so it's the leading badge on its commit.
-    if let Ok(head) = repo.head() {
-        if let Some(id) = head.id() {
-            refs.push(GitRef {
-                name: "HEAD".to_string(),
-                kind: RefKind::Head,
-                target: Oid(id.detach().to_string()),
-            });
-        }
+    // The two questions gix answers separately: the symbolic name HEAD holds,
+    // and the commit it resolves to.
+    let head_name = repo.head_name();
+    let resolved = repo.head_id().ok().map(|id| id.detach().to_string());
+
+    // HEAD first, so it's the leading badge on its commit — and badged from the
+    // id that RESOLVED, never the raw one `repo.head()` hands back unvalidated
+    // (#465). `read_history_materials` has always badged it this way; this is
+    // the reader that disagreed.
+    if let Some(oid) = &resolved {
+        refs.push(GitRef {
+            name: "HEAD".to_string(),
+            kind: RefKind::Head,
+            target: Oid(oid.clone()),
+        });
     }
 
-    // Classify HEAD from its symbolic name and what it resolves to. All five
-    // states below were reproduced against gix 0.84 on real repositories; the
-    // `Unreadable` arm is the one a repo with a corrupt `.git/HEAD` and an
-    // intact `.git/refs` lands in, where the ref store still lists normally.
-    let head = match repo.head_name() {
+    // Classify HEAD from those same two answers. All five states below were
+    // reproduced against gix 0.84 on real repositories; the `Unreadable` arm is
+    // the one a repo with a corrupt `.git/HEAD` and an intact `.git/refs` lands
+    // in, where the ref store still lists normally.
+    let head = match head_name {
         Err(e) => HeadAtEvent::Unreadable {
             reason: e.to_string(),
         },
-        Ok(name) => {
-            let oid = repo.head_id().ok().map(|id| id.detach().to_string());
-            match (name, oid) {
-                (Some(name), Some(oid)) => HeadAtEvent::OnBranch {
-                    symbolic: name.as_bstr().to_string(),
-                    oid,
-                },
-                (Some(name), None) => HeadAtEvent::Unborn {
-                    symbolic: name.as_bstr().to_string(),
-                },
-                (None, Some(oid)) => HeadAtEvent::Detached { oid },
-                (None, None) => HeadAtEvent::Unresolvable,
-            }
-        }
+        Ok(name) => match (name.map(|n| n.as_bstr().to_string()), resolved) {
+            (Some(symbolic), Some(oid)) => HeadAtEvent::OnBranch { symbolic, oid },
+            (Some(symbolic), None) => HeadAtEvent::Unborn { symbolic },
+            (None, Some(oid)) => HeadAtEvent::Detached { oid },
+            (None, None) => HeadAtEvent::Unresolvable,
+        },
     };
 
     // As in `walk_history`, treat a ref-store open/list failure as a real error
@@ -308,6 +313,7 @@ pub fn read_head_branch(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::history::tests::{fixture, git};
 
@@ -338,5 +344,117 @@ mod tests {
         let head = refs.iter().find(|r| r.kind == RefKind::Head).unwrap();
         let main = refs.iter().find(|r| r.name == "main").unwrap();
         assert_eq!(head.target, main.target);
+    }
+
+    /// #465: two readers, one repository, opposite answers about whether HEAD
+    /// exists. `read_refs_at` badged HEAD from `repo.head()`, which hands back
+    /// the raw oid unvalidated; `read_history_materials` badges it from
+    /// `repo.head_id()`, which refuses one nothing resolves. So a dangling HEAD
+    /// produced a `Head:HEAD` badge from one and nothing from the other — and
+    /// a dangling HEAD is exactly the state someone opens this app to
+    /// understand.
+    ///
+    /// Asserted across every state the two readers share, not the broken one
+    /// alone: proving the dangling case says the fix works, and proving the
+    /// other three says it did not cost anything. (`Unreadable` — a corrupt
+    /// `.git/HEAD` — is deliberately not here: `read_history_materials` treats
+    /// that as a hard error and `read_refs_at` does not, which is a documented
+    /// difference of error policy, not of what HEAD is.)
+    ///
+    /// MUTATION 1: badge from `repo.head()`/`head.id()` again — red on the
+    ///   dangling row, the readers disagree.
+    /// MUTATION 2: classify `(None, None)` as `Detached` — red on the recorded
+    ///   state, which is where the fact now lives.
+    #[test]
+    fn the_two_readers_badge_head_identically_in_every_state_they_share() {
+        let badges = |refs: &[GitRef]| {
+            let mut v: Vec<String> = refs
+                .iter()
+                .map(|r| format!("{:?}:{}", r.kind, r.name))
+                .collect();
+            v.sort();
+            v
+        };
+
+        /// One row: a label, how to put HEAD into that state, and whether
+        /// HEAD resolves to a commit there.
+        type HeadCase = (&'static str, Box<dyn Fn(&Path)>, bool);
+
+        let cases: Vec<HeadCase> = vec![
+            ("on a branch", Box::new(|_: &Path| {}), true),
+            (
+                "detached at a real commit",
+                Box::new(|p: &Path| {
+                    git(p, &["checkout", "-q", "--detach", "HEAD"]);
+                }),
+                true,
+            ),
+            (
+                "unborn",
+                Box::new(|p: &Path| {
+                    std::fs::write(p.join(".git/HEAD"), "ref: refs/heads/nothing-here\n").unwrap();
+                }),
+                false,
+            ),
+            (
+                "dangling — a well-formed oid with no object behind it",
+                Box::new(|p: &Path| {
+                    std::fs::write(p.join(".git/HEAD"), "0".repeat(40) + "\n").unwrap();
+                }),
+                false,
+            ),
+        ];
+
+        for (label, put_head_into_state, resolves) in cases {
+            let dir = fixture();
+            let p = dir.path();
+            put_head_into_state(p);
+
+            let at = read_refs_at(p).expect("read_refs_at");
+            let materials = read_history_materials(p).expect("read_history_materials");
+
+            assert_eq!(
+                badges(&at.refs),
+                badges(&materials.refs),
+                "{label}: the two readers must not disagree about what refs exist"
+            );
+            assert_eq!(
+                at.refs.iter().any(|r| r.kind == RefKind::Head),
+                resolves,
+                "{label}: HEAD is badged exactly when it resolves to a commit — \
+                 a badge is a claim about a commit, and there is no commit here"
+            );
+        }
+    }
+
+    /// The other half of #465, and the reason dropping the badge is not
+    /// laundering: a HEAD that points at nothing is still *recorded* as a fact,
+    /// in the one place that can say it. The badge list is display refs
+    /// "peeled to the commit it ultimately points at"; `HeadAtEvent` is where a
+    /// HEAD with no commit gets to exist.
+    #[test]
+    fn a_dangling_head_is_still_recorded_even_though_it_is_not_badged() {
+        let dir = fixture();
+        let p = dir.path();
+        let main_tip = read_refs(p)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "main")
+            .expect("main is badged")
+            .target;
+        std::fs::write(p.join(".git/HEAD"), "0".repeat(40) + "\n").unwrap();
+
+        let at = read_refs_at(p).expect("read_refs_at");
+        assert_eq!(
+            at.head,
+            HeadAtEvent::Unresolvable,
+            "the state must survive the badge's removal — otherwise the fix \
+             discards a real fact instead of relocating it"
+        );
+        assert_eq!(
+            at.refs.iter().find(|r| r.name == "main").map(|r| &r.target),
+            Some(&main_tip),
+            "a broken HEAD must not cost the branches that read perfectly well"
+        );
     }
 }
