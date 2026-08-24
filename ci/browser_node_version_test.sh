@@ -140,24 +140,25 @@ case "\${1:-}" in
   *)            echo "FAKE nvm node \$*" ;;
 esac
 EOF
+
+  # cargo is the first thing `cmd_browser` runs after the guard, and it is a
+  # shim — so it is the last hermetic point at which the exported PATH can be
+  # observed. Everything past it (`run.sh`) needs a built server binary and a
+  # built web bundle, which a fresh clone does not have; asserting out there
+  # made this test pass on repo state rather than on the fix.
   cat > "$bin/cargo" <<EOF
 #!/usr/bin/env bash
 touch "$work/reached-cargo"
+printf '%s' "\$PATH" > "$work/cargo-path"
 EOF
-  for who in path nvm; do
-    local dir="$bin"; [[ $who == nvm ]] && dir="$nvm_bin"
-    cat > "$dir/npx" <<EOF
-#!/usr/bin/env bash
-touch "$work/reached-$who-npx"
-EOF
-    cat > "$dir/npm" <<EOF
-#!/usr/bin/env bash
-touch "$work/reached-$who-npm"
-EOF
+  for dir in "$bin" "$nvm_bin"; do
+    for tool in npx npm; do
+      printf '#!/usr/bin/env bash\n' > "$dir/$tool"
+    done
   done
   chmod +x "$bin"/* "$nvm_bin"/*
 
-  rm -f "$work"/reached-*
+  rm -f "$work"/reached-* "$work/cargo-path"
   out="$work/out-nvm.txt"
   set +e
   ( cd "$repo_root" && HOME="$home" PATH="$bin:/usr/bin:/bin" bash ./dev browser ) > "$out" 2>&1
@@ -170,11 +171,17 @@ run_with_node_and_nvm "v18.19.1"
 [[ -e "$work/reached-cargo" ]] \
   || fail "a v24 under nvm was not found, so the guard refused a box that can actually run these tests (#469)"
 
-[[ -e "$work/reached-nvm-npx" ]] \
-  || fail "the guard accepted the nvm node but never put it on PATH — run.sh reaches npx, not node (#469)"
+exported_path="$(cat "$work/cargo-path")"
 
-[[ ! -e "$work/reached-path-npx" ]] \
-  || fail "Playwright ran under PATH's too-old npx even though a newer node was found (#469)"
+[[ "$(cut -d: -f1 <<<"$exported_path")" == "$nvm_bin" ]] \
+  || fail "the guard accepted the nvm node but did not put it first on PATH; PATH began with $(cut -d: -f1 <<<"$exported_path") (#469)"
+
+# The invariant that actually matters: `run.sh` invokes `npx`, never `node`.
+# A fix that inspects one binary and then runs a different one leaves the gate
+# exactly as broken as it found it.
+resolved_npx="$(PATH="$exported_path" command -v npx || true)"
+[[ "$resolved_npx" == "$nvm_bin/npx" ]] \
+  || fail "with the exported PATH, npx resolves to '$resolved_npx', not the accepted toolchain's $nvm_bin/npx (#469)"
 
 # ── 4. No node at all: the original not-found path must survive ──
 run_with_node ""
