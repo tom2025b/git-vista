@@ -670,6 +670,35 @@ fn names_a_local_branch(ref_name: Option<&str>, branches: &HashMap<String, Strin
     branches.contains_key(name)
 }
 
+/// True for the one [`ActivityKind::Fetch`]/[`ActivityKind::Pull`] event that
+/// must never be folded into a count: the admission
+/// `planner::fetch::journal_unobserved` writes when `git fetch` succeeded and
+/// only the re-read of `refs/remotes/<remote>/*` failed.
+///
+/// **The discriminator is the whole shape, not any one field** (ADR 0081). No
+/// ref name *and* no old oid *and* no new oid is what that one writer produces
+/// and nothing else does:
+///
+/// - Reflog-derived events are built in [`assemble_feed`]'s step 1 from a
+///   [`ReflogEntry`], which carries a ref name and both oids by construction —
+///   every one of them fails all three tests.
+/// - Journalled fetches come from `planner::fetch::journal_updates`, one per
+///   ref that moved, each naming its ref. `Obs::Absent` does flatten to `None`
+///   the same way `Obs::Unknown` does, so an oid pair says nothing on its own —
+///   the `ref_name` is what separates those entries from this one.
+/// - Journalled pulls come from `planner::branch_exec`, which names the branch
+///   the pull landed on.
+/// - The two other all-`None` journal writers — `planner::worktree_exec`'s two
+///   admissions and `planner::push`'s — carry `ActivityKind::Other` and
+///   `ActivityKind::Push`, kinds this fold never looks at.
+///
+/// Keying on `ref_name` alone would be wider than that: it would also exclude
+/// any future Fetch/Pull event that names no ref but does know an oid, and such
+/// an event knows what it moved and belongs in the count.
+fn admits_it_could_not_read_the_refs(event: &ActivityEvent) -> bool {
+    event.ref_name.is_none() && event.old_oid.is_none() && event.new_oid.is_none()
+}
+
 /// Collapse each run of remote-tracking ref updates — [`ActivityKind::Fetch`]
 /// and [`ActivityKind::Pull`] — that happened within [`FETCH_BURST_GAP`] of one
 /// another into a single counted row.
@@ -692,40 +721,52 @@ fn names_a_local_branch(ref_name: Option<&str>, branches: &HashMap<String, Strin
 /// useful thing ("fetched ‘origin/main’ from origin") and rewriting it as
 /// "1 ref updated" would lose information to no purpose.
 ///
-/// # Two known defects, measured 2026-08-25
+/// # The "tips unknown — git could not be read" admission never folds
 ///
-/// Both are recorded with their evidence in
-/// `docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`. Neither is
-/// fixed here; do not read the paragraphs above as covering them.
+/// `planner::fetch::journal_unobserved` writes one entry with no `ref_name`
+/// and no oids when `git fetch` *succeeded* and only the re-read of
+/// `refs/remotes/<remote>/*` failed. It used to fold in with the refs it could
+/// not name, and this comment used to argue that it could not: the entry "is
+/// journaled *instead of* per-ref entries, never alongside them, so it is
+/// always a run of one". That accounts for the journal and forgets git's
+/// reflog — the same shape of mistake that got the first #329 attempt
+/// reverted. The fetch succeeded, so git logged every ref it moved; the
+/// admission carries no `new_oid`, so it suppresses none of those lines in
+/// attribution and folded in with them instead. Measured 2026-08-25: four refs
+/// moved rendered as "fetch — 5 refs updated", the admission gone and the
+/// count one too high because the admission was counted as a ref.
 ///
-/// 1. **The "tips unknown — git could not be read" entry is not safe here.**
-///    This comment used to claim the entry "is journaled *instead of* per-ref
-///    entries, never alongside them, so it is always a run of one". That
-///    accounts for the journal and forgets git's reflog — the same shape of
-///    mistake that got the first #329 attempt reverted. `journal_unobserved`
-///    fires when the fetch *succeeded* and only the re-read of the refs
-///    failed, so git wrote a reflog line for every ref it moved; the admission
-///    carries no `new_oid`, so it suppresses none of them and folds in with
-///    them instead. Measured: four refs moved renders as
-///    "fetch — 5 refs updated", with the admission gone and the count one too
-///    high. It is a run of one only when the fetch moved nothing at all.
-/// 2. **The count inflates when the journal's entries drift.** A journal
-///    entry that lands more than [`JOURNAL_MATCH_SLACK`] after git's reflog
-///    line for the same movement stops suppressing it; the unmatched reflog
-///    line survives attribution and the fold counts both copies. Measured
-///    against the app's fetch as it then was — one entry per ref, each
-///    performing a full ref capture and taking its own timestamp afterwards —
-///    250 refs reported as 297 and 500 as 891. The feed stayed at one row, so
-///    #329's symptom held, but the number in it was not true.
+/// It is excluded from the fold outright — see [`admits_it_could_not_read_the_refs`]
+/// for the shape and why that shape is not shared (ADR 0081). The refs that
+/// really moved still fold, from their reflog lines, into a row of their own;
+/// the admission sits beside them saying that the app could not confirm any of
+/// it. Two rows, both true, rather than one confident wrong number.
 ///
-///    **Fixed at the writer (#485), not in the fold.** A fetch now takes one
-///    ref capture and one timestamp for the whole batch
-///    (`handlers::journal_app_events`), so its entries no longer drift apart
-///    at all, and pull journals through the same path. The fold itself still
-///    counts both copies of anything that *does* drift; nothing can currently
-///    produce that — only `Fetch` and `Pull` fold, and both are batched — so
-///    the F1 pin below became a live regression test rather than staying an
-///    expected failure. Its doc comment carries the full argument.
+/// # The count that used to inflate at scale — fixed at the writer (#485)
+///
+/// Both defects this function was found to have were measured on 2026-08-25
+/// while verifying #329's fix, and recorded with their evidence in
+/// `docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`. The
+/// admission above is one. This is the other. **Neither is outstanding** —
+/// they were fixed by #486 and #485 respectively, hours apart, and this
+/// paragraph is kept because the reasoning is worth more than the defect was.
+///
+/// A journal entry that lands more than [`JOURNAL_MATCH_SLACK`] after git's
+/// reflog line for the same movement stops suppressing it; the unmatched
+/// reflog line survives attribution and the fold counts both copies. Measured
+/// against the app's fetch as it then was — one entry per ref, each performing
+/// a full ref capture and taking its own timestamp afterwards — 250 refs
+/// reported as 297 and 500 as 891. The feed stayed at one row, so #329's
+/// symptom held, but the number in it was not true.
+///
+/// **Fixed at the writer (#485), not in the fold.** A fetch now takes one ref
+/// capture and one timestamp for the whole batch
+/// (`handlers::journal_app_events`), so its entries no longer drift apart at
+/// all, and pull journals through the same path. The fold itself still counts
+/// both copies of anything that *does* drift; nothing can currently produce
+/// that — only `Fetch` and `Pull` fold, and both are batched — so the F1 pin
+/// below became a live regression test rather than staying an expected
+/// failure. Its doc comment carries the full argument.
 ///
 /// **Safe for undo by construction, not by luck:** [`undo_hint`] has no arm for
 /// `Fetch` or `Pull`, so neither row has ever carried a hint and dropping the
@@ -738,6 +779,7 @@ fn fold_ref_update_bursts(
     let (candidates, mut out): (Vec<_>, Vec<_>) = events.into_iter().partition(|e| {
         matches!(e.kind, ActivityKind::Fetch | ActivityKind::Pull)
             && !names_a_local_branch(e.ref_name.as_deref(), branches)
+            && !admits_it_could_not_read_the_refs(e)
     });
 
     // Fetch and Pull group separately: they are different actions, and a fetch
@@ -1360,36 +1402,38 @@ mod tests {
 
     // -- The two defects #329's fix was found to still have. ------------------
     //
-    // Both were filed as expected-failure pins: each asserts what the fold
-    // *should* do, marked `#[should_panic]` while it did not. That is the
-    // `test.fail()` convention `ci/browser/tests/hunk-keyboard.spec.mjs` uses,
-    // and for the same reason it was adopted there: #210 survived for months
-    // behind a green gate. A test asserting today's wrong answer would go
-    // quietly green and stay green after a fix; `#[ignore]` says nothing at
-    // all. A pin goes RED the moment its defect is fixed, and demands to be
-    // looked at.
+    // Both were written as `#[should_panic]` pins asserting what the fold
+    // *should* do, on the `test.fail()` convention
+    // `ci/browser/tests/hunk-keyboard.spec.mjs` uses and for the reason it was
+    // adopted there: #210 survived for months behind a green gate. A test
+    // asserting today's wrong answer would go quietly green and stay green
+    // after a fix; `#[ignore]` says nothing at all. A pin goes RED the moment
+    // its defect is fixed, and demands to be looked at.
     //
-    // **F1 is fixed (#485) and is now a live regression test**; its
-    // `#[should_panic]` is gone and its fixture models what the writer
-    // actually produces. F2 is still pinned.
+    // **Both pins have now gone red and been retired, hours apart.** F1 is
+    // fixed at the writer (#485) and its fixture models what that writer
+    // actually produces; F2 is fixed in the fold (#486, ADR 0081) on the
+    // assertions it was written with, unedited. Neither is a pin any more,
+    // and the convention is recorded here because it worked twice.
     //
     // Evidence and the proposed fixes:
     // `docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`.
 
     /// **F2 — the "tips unknown — git could not be read" admission is erased.**
+    /// Fixed by #486; this was a `#[should_panic]` pin until then.
     ///
     /// `planner::fetch::journal_unobserved` fires when `git fetch` *succeeded*
     /// and only the re-read of the refs failed, so git wrote a reflog line for
     /// every ref it moved. The admission carries no `new_oid`, so it suppresses
-    /// none of them in attribution and folds in with them instead — replacing
+    /// none of them in attribution and folded in with them instead — replacing
     /// a deliberate "we could not read this" with a confident count, and a
-    /// count that is one too high, since the admission is itself counted.
+    /// count that was one too high, since the admission was itself counted.
     ///
-    /// **Fixing this:** exclude it from folding. `ref_name: None` with both
-    /// oids `None` is the shape `journal_unobserved` alone produces. Then
-    /// delete the `#[should_panic]` — the assertions below are already right.
+    /// [`admits_it_could_not_read_the_refs`] now keeps it out of the fold. The
+    /// four refs that really moved still fold, from their reflog lines, into a
+    /// row of their own; the assertions below are the ones the pin was written
+    /// with and are unchanged.
     #[test]
-    #[should_panic(expected = "F2: the admission did not survive")]
     fn an_unobserved_fetch_keeps_its_admission_instead_of_being_counted() {
         // Four refs really moved, so git wrote four reflog lines...
         let reflog: Vec<ReflogEntry> = ["main", "dev", "topic", "release"]
@@ -1431,6 +1475,207 @@ mod tests {
             "F2: four refs moved, not five — the admission was counted as a ref. \
              Feed: {feed:#?}"
         );
+    }
+
+    /// The other half of the F2 fixture's answer: what the four refs that
+    /// *did* move render as, now that they no longer carry the admission with
+    /// them.
+    ///
+    /// Two rows, from the feed's two sources, neither speaking for the other.
+    /// git's reflog saw four ref movements and says so; the app says it could
+    /// not confirm any of them. Making the admission swallow the reflog rows
+    /// would need it to suppress lines it has no oid to match — which is
+    /// exactly the move `0a7ba777` reverted — and would hide real ref
+    /// movements behind an admission of ignorance about them. See ADR 0081.
+    #[test]
+    fn an_unobserved_fetch_renders_beside_the_refs_the_reflog_saw() {
+        let (journal, reflog) = unobserved_fetch_of(&["main", "dev", "topic", "release"], 100);
+        let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 50);
+
+        assert_eq!(
+            feed.len(),
+            2,
+            "the admission and the fold, no more: {feed:#?}"
+        );
+        let admission = feed
+            .iter()
+            .find(|e| e.summary.contains("tips unknown"))
+            .expect("the admission survives");
+        assert_eq!(
+            admission.source,
+            ActivitySource::App,
+            "the admission is the app's own statement"
+        );
+        assert!(
+            admission.ref_name.is_none() && admission.new_oid.is_none(),
+            "the admission is passed through untouched, not rebuilt: {admission:#?}"
+        );
+        let counted = feed
+            .iter()
+            .find(|e| e.summary.starts_with("fetch — "))
+            .expect("the refs that moved still fold into one row");
+        assert_eq!(
+            counted.summary, "fetch — 4 refs updated",
+            "four refs moved, and the admission is not one of them"
+        );
+        assert_eq!(
+            counted.source,
+            ActivitySource::External,
+            "those four rows came from git's reflog, which the app never read"
+        );
+    }
+
+    /// A fetch that moved *nothing at all* and could not be re-read: the one
+    /// case the fold's old reasoning was actually right about, since there are
+    /// no reflog lines for the admission to be folded in with.
+    ///
+    /// It is here because it is the case a too-wide exclusion cannot break and
+    /// a too-*narrow* rendering can: the admission must still come out as
+    /// itself, a run of one returned untouched, rather than as "1 ref updated"
+    /// or as nothing at all.
+    #[test]
+    fn a_fetch_that_moved_nothing_still_keeps_its_admission_as_a_run_of_one() {
+        let (journal, _) = unobserved_fetch_of(&[], 100);
+        let feed = assemble_feed(journal, vec![], &HashMap::new(), &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 1, "one admission, one row: {feed:#?}");
+        assert!(
+            feed[0].summary.contains("tips unknown"),
+            "the admission is the row, in its own words: {feed:#?}"
+        );
+        assert_eq!(feed[0].source, ActivitySource::App);
+    }
+
+    /// The exclusion turns on the **whole** shape — no ref name *and* no oids.
+    ///
+    /// A Fetch row that names no ref but does know where the ref landed is not
+    /// an admission of ignorance: it knows what moved, and belongs in the
+    /// count. No production path builds one today
+    /// ([`admits_it_could_not_read_the_refs`] says which paths build what), so
+    /// this fixture is synthetic on purpose — it exists so that narrowing the
+    /// discriminator to `ref_name.is_none()` alone has something to fail.
+    #[test]
+    fn a_fetch_that_names_no_ref_but_knows_an_oid_is_still_counted() {
+        let reflog = vec![
+            entry(
+                "origin/main",
+                100,
+                "old-main",
+                "new-main",
+                "fetch origin: fast-forward",
+            ),
+            entry(
+                "origin/dev",
+                100,
+                "old-dev",
+                "new-dev",
+                "fetch origin: fast-forward",
+            ),
+        ];
+        let journal = vec![ActivityEvent {
+            time: 100,
+            kind: ActivityKind::Fetch,
+            ref_name: None,
+            summary: "fetched a ref whose name we did not record".into(),
+            old_oid: None,
+            // The one field that separates this from the admission: something
+            // *was* observed.
+            new_oid: Some("new-unnamed".into()),
+            source: ActivitySource::App,
+            undo: None,
+            refs: None,
+        }];
+
+        let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 1, "one burst, one row: {feed:#?}");
+        assert_eq!(
+            feed[0].summary, "fetch — 3 refs updated",
+            "all three moved a ref and all three are counted: {feed:#?}"
+        );
+    }
+
+    /// The mirror of the test above: a Fetch row that names a ref but carries
+    /// no oids is still an ordinary ref update, so narrowing the discriminator
+    /// to "both oids `None`" alone must fail here.
+    ///
+    /// Synthetic for the same reason — no production path builds this shape
+    /// either, and `Obs::Absent` flattening to `None` is why the oid pair
+    /// cannot carry the decision on its own.
+    #[test]
+    fn a_fetch_that_names_a_ref_without_oids_is_still_counted() {
+        let reflog = vec![
+            entry(
+                "origin/main",
+                100,
+                "old-main",
+                "new-main",
+                "fetch origin: fast-forward",
+            ),
+            entry(
+                "origin/dev",
+                100,
+                "old-dev",
+                "new-dev",
+                "fetch origin: fast-forward",
+            ),
+        ];
+        let journal = vec![ActivityEvent {
+            time: 100,
+            kind: ActivityKind::Fetch,
+            // The one field that separates this from the admission: a ref was
+            // named, so this row is about that ref.
+            ref_name: Some("refs/remotes/origin/topic".into()),
+            summary: "fetched ‘origin/topic’ from origin".into(),
+            old_oid: None,
+            new_oid: None,
+            source: ActivitySource::App,
+            undo: None,
+            refs: None,
+        }];
+
+        let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 1, "one burst, one row: {feed:#?}");
+        assert_eq!(
+            feed[0].summary, "fetch — 3 refs updated",
+            "all three name a ref and all three are counted: {feed:#?}"
+        );
+    }
+
+    /// The F2 situation as fixtures: `refs` really moved, so git logged each
+    /// one, and the app — unable to re-read `refs/remotes/origin` — journaled
+    /// the single admission `planner::fetch::journal_unobserved` writes.
+    ///
+    /// An empty `refs` is the fetch that moved nothing at all: the admission
+    /// with no reflog lines beside it.
+    fn unobserved_fetch_of(refs: &[&str], time: i64) -> (Vec<ActivityEvent>, Vec<ReflogEntry>) {
+        let reflog = refs
+            .iter()
+            .map(|r| {
+                entry(
+                    &format!("origin/{r}"),
+                    time,
+                    &format!("old-{r}"),
+                    &format!("new-{r}"),
+                    "fetch origin: fast-forward",
+                )
+            })
+            .collect();
+        let journal = vec![ActivityEvent {
+            time,
+            kind: ActivityKind::Fetch,
+            ref_name: None,
+            summary: "fetched from ‘origin’, but refs/remotes/origin could not be re-read \
+                      afterwards (tips unknown — git could not be read)"
+                .into(),
+            old_oid: None,
+            new_oid: None,
+            source: ActivitySource::App,
+            undo: None,
+            refs: None,
+        }];
+        (journal, reflog)
     }
 
     /// **F1, now a regression test: a slow fetch counts only the refs that
