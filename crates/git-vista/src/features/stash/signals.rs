@@ -19,7 +19,8 @@ use git_vista_protocol::operation::IdempotencyKey;
 
 use crate::api;
 use crate::features::stash::core::{
-    self as core, ApplyOutcome, ConflictScan, DropGate, DropOutcome, PopVerdict, TreeState,
+    self as core, ApplyOutcome, ConflictScan, DropGate, DropOutcome, PopVerdict, StashWriteOutcome,
+    TreeState,
 };
 
 /// Run a pop as apply-then-drop, returning what actually happened.
@@ -40,25 +41,25 @@ use crate::features::stash::core::{
 /// mutating, so a list that moved in between is refused there rather than
 /// papered over here.
 pub async fn compose_pop(entry: &str, expected_oid: &str, key: IdempotencyKey) -> PopVerdict {
-    let apply = match api::apply_stash_request(entry, expected_oid).await {
-        Ok(()) => ApplyOutcome::Applied,
-        Err(why) => ApplyOutcome::Refused(why),
-    };
+    // Classification is [`core::ApplyOutcome::from_write`]'s, host-tested:
+    // an answered or record-recovered refusal is Refused, a lost reply whose
+    // record could not settle it is Unknown — never Refused (#515). The old
+    // arm here mapped every `Err` to Refused, which dressed transport loss
+    // as a server decision.
+    let apply = ApplyOutcome::from_write(api::apply_stash_request(entry, expected_oid).await);
 
     let scan = ConflictScan::from_fetch(api::fetch_conflicts().await);
 
     match core::drop_gate(&apply, &scan) {
         DropGate::Halt(verdict) => verdict,
         DropGate::Run => {
-            let outcome = match api::drop_stash_request(entry, expected_oid, key).await {
-                // A receipt is not a success. `send_write_with_key` returns
-                // `Ok` for any answered request, including a 409 — the status
-                // lives in `receipt.ok`, and reading the `Ok` as "it worked"
-                // is how a failed drop would be reported as a finished pop.
-                Ok(receipt) if receipt.ok => DropOutcome::Dropped,
-                Ok(receipt) => DropOutcome::Refused(receipt.message),
-                Err(why) => DropOutcome::Refused(why),
-            };
+            // Same classifier discipline for the destructive half. An
+            // answered 409 is a refusal (the status rides inside the
+            // outcome, so the outer `Ok` still cannot be read as "it
+            // worked"); a lost reply is Unknown, and the verdict says the
+            // entry's fate was not observed rather than asserting it.
+            let outcome =
+                DropOutcome::from_write(api::drop_stash_request(entry, expected_oid, key).await);
             core::verdict_after_drop(&outcome)
         }
     }
@@ -138,8 +139,11 @@ pub struct StashNotice {
     /// "failed" still needs to know their files moved — and after a refused
     /// apply with an unreadable tree, that it could not be established.
     pub tree: Option<TreeState>,
-    /// Whether the stash entry is still in the drawer.
-    pub entry_retained: bool,
+    /// Whether the stash entry this action targeted is still in the drawer —
+    /// `None` when this client has no way to know (a lost reply whose record
+    /// could not settle it, #515), or when the action has no target entry
+    /// (push). A `bool` here forced a guess, and the guess shipped as fact.
+    pub entry_retained: Option<bool>,
     pub conflicted: Vec<String>,
     pub unreadable: Vec<String>,
 }
@@ -159,29 +163,51 @@ impl StashNotice {
         }
     }
 
-    /// A notice for the simple writes, which either worked or did not.
-    pub fn from_result(result: Result<(), String>, done: &str) -> Self {
-        match result {
-            // The simple writes each say their own effect in `done`, and a
-            // second structural line would repeat it — so `tree` is None here
-            // rather than a guess. Only a composed pop has an effect the prose
-            // cannot fully carry.
-            Ok(()) => StashNotice {
-                headline: done.to_string(),
-                complete: true,
-                tree: None,
-                entry_retained: false,
-                conflicted: Vec::new(),
-                unreadable: Vec::new(),
-            },
-            Err(why) => StashNotice {
-                headline: why,
-                complete: false,
-                tree: None,
-                entry_retained: true,
-                conflicted: Vec::new(),
-                unreadable: Vec::new(),
-            },
+    /// A notice for the simple writes, honest about lost replies (#515).
+    ///
+    /// The caller states the entry's fate PER OUTCOME, because the truth
+    /// differs per action: a successful drop removed the entry
+    /// (`Some(false)`), a successful apply kept it (`Some(true)`), a push
+    /// has no target entry at all (`None`) — and an unrecoverable lost reply
+    /// is `None` for every action whose success would have changed the
+    /// drawer, because a value here is a claim the user acts on.
+    ///
+    /// `tree` stays `None` throughout: the simple writes say their effect in
+    /// prose, and only a composed pop has an effect the prose cannot fully
+    /// carry (see [`Self::from_pop`]).
+    pub fn from_write(
+        sent: Result<StashWriteOutcome, String>,
+        done: &str,
+        entry_on_success: Option<bool>,
+        entry_on_failure: Option<bool>,
+        unknown: (&str, Option<bool>),
+    ) -> Self {
+        let (headline, complete, entry_retained) = match sent {
+            // A local refusal never left the device, so nothing changed.
+            Err(local) => (local, false, entry_on_failure),
+            Ok(StashWriteOutcome::Answered { ok: true, .. })
+            | Ok(StashWriteOutcome::Reconciled { ok: true, .. }) => {
+                (done.to_string(), true, entry_on_success)
+            }
+            Ok(StashWriteOutcome::Answered { ok: false, message })
+            | Ok(StashWriteOutcome::Reconciled { ok: false, message }) => {
+                (message, false, entry_on_failure)
+            }
+            // Lost and unrecoverable: the one arm that may not claim an
+            // outcome. `complete` is false NOT because it failed — nobody
+            // knows — but because a view must never style this as done.
+            Ok(StashWriteOutcome::Unknown { why }) => {
+                let (hint, entry) = unknown;
+                (format!("{hint}\n\n{why}"), false, entry)
+            }
+        };
+        StashNotice {
+            headline,
+            complete,
+            tree: None,
+            entry_retained,
+            conflicted: Vec::new(),
+            unreadable: Vec::new(),
         }
     }
 }

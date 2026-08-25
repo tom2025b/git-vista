@@ -579,9 +579,57 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 pub enum ApplyOutcome {
     /// 2xx. The changes are in the working tree and git reported no conflict.
     Applied,
-    /// Any refusal, carrying the server's own sentence. May or may not have
-    /// left changes behind — see this type's doc comment.
+    /// A refusal the server actually SAID — an answered non-2xx, or a reply
+    /// recovered from the operation record after the response was lost. May
+    /// or may not have left changes behind — see this type's doc comment.
     Refused(String),
+    /// The reply was lost AND the operation record could not settle it
+    /// (#515). Not a refusal: the server may have applied cleanly. Encoding
+    /// this as `Refused` is exactly the lie #508 removed on the tree axis —
+    /// asserting an outcome this client never observed.
+    Unknown(String),
+}
+
+/// What one stash write actually established, once a lost reply is accounted
+/// for (#515).
+///
+/// A dropped HTTP response does not abort the request — `api::with_deadline`'s
+/// own doc says the server may still complete the work. Every stash POST
+/// enters the tracked planner, so the truth survives in the operation record,
+/// reachable by the idempotency key (`operations::lookup_by_key` server-side,
+/// `api::resolve_operation_id` here). This type is the honest vocabulary for
+/// that recovery: the api layer produces it, and the pure classifiers below
+/// turn it into apply/drop outcomes where a host test can reach the decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StashWriteOutcome {
+    /// The server answered this request directly. `ok` is `Response::ok()`.
+    Answered { ok: bool, message: String },
+    /// Both attempts were lost, but the operation record was found terminal —
+    /// this is the RECORDED answer, recovered by the key. Same standing as
+    /// [`Self::Answered`]: the server said it, we just heard it late.
+    Reconciled { ok: bool, message: String },
+    /// Lost, and the record could not settle it (never admitted, still
+    /// running past the reconciliation budget, or unreachable). The one case
+    /// with no answer to report — and it must be REPORTED as no answer.
+    Unknown { why: String },
+}
+
+impl ApplyOutcome {
+    /// Classify an apply's wire outcome. The outer `Err` is a LOCAL refusal —
+    /// offline, visualize mode, a malformed selector — where nothing was ever
+    /// sent, so "refused" is certain, not inferred.
+    pub fn from_write(sent: Result<StashWriteOutcome, String>) -> Self {
+        match sent {
+            Err(local) => ApplyOutcome::Refused(local),
+            Ok(StashWriteOutcome::Answered { ok: true, .. })
+            | Ok(StashWriteOutcome::Reconciled { ok: true, .. }) => ApplyOutcome::Applied,
+            Ok(StashWriteOutcome::Answered { ok: false, message })
+            | Ok(StashWriteOutcome::Reconciled { ok: false, message }) => {
+                ApplyOutcome::Refused(message)
+            }
+            Ok(StashWriteOutcome::Unknown { why }) => ApplyOutcome::Unknown(why),
+        }
+    }
 }
 
 /// What the conflict scan after an apply came back with.
@@ -615,7 +663,28 @@ impl ConflictScan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DropOutcome {
     Dropped,
+    /// An answered or record-recovered refusal — the server said no.
     Refused(String),
+    /// The reply was lost and the record could not settle it (#515). The
+    /// entry may or may not still exist; only a fresh list read can say.
+    Unknown(String),
+}
+
+impl DropOutcome {
+    /// Classify a drop's wire outcome; same contract as
+    /// [`ApplyOutcome::from_write`].
+    pub fn from_write(sent: Result<StashWriteOutcome, String>) -> Self {
+        match sent {
+            Err(local) => DropOutcome::Refused(local),
+            Ok(StashWriteOutcome::Answered { ok: true, .. })
+            | Ok(StashWriteOutcome::Reconciled { ok: true, .. }) => DropOutcome::Dropped,
+            Ok(StashWriteOutcome::Answered { ok: false, message })
+            | Ok(StashWriteOutcome::Reconciled { ok: false, message }) => {
+                DropOutcome::Refused(message)
+            }
+            Ok(StashWriteOutcome::Unknown { why }) => DropOutcome::Unknown(why),
+        }
+    }
 }
 
 /// What is true of the working tree, as far as this client can actually tell.
@@ -711,6 +780,16 @@ pub enum PopVerdict {
     /// single operation row could not express, and the reason pop is two
     /// requests here.
     AppliedNotDropped { why: String },
+    /// The apply's reply was lost and the operation record could not settle
+    /// it (#515). One thing IS certain and the headline says it: an apply
+    /// never removes the entry, ran or not, so the stash is still listed.
+    /// What the tree holds is not.
+    ApplyUnknown { why: String },
+    /// Applied and verified clear, then the DROP's reply was lost and the
+    /// record could not settle it (#515). The changes are in the tree — the
+    /// gate proved that before the drop was sent — but whether the entry
+    /// left the drawer is exactly what nobody observed.
+    DropUnknown { why: String },
 }
 
 impl PopVerdict {
@@ -737,13 +816,29 @@ impl PopVerdict {
             // See `TreeState`'s own doc (#508).
             PopVerdict::ApplyRefused { .. } => TreeState::Unknown,
             PopVerdict::RefusedUnverified { .. } => TreeState::Unknown,
+            // A lost apply reply establishes nothing about the tree (#515).
+            PopVerdict::ApplyUnknown { .. } => TreeState::Unknown,
+            // A lost DROP reply is different: the apply half was verified
+            // before the drop was sent, so the changes are in the tree.
+            PopVerdict::DropUnknown { .. } => TreeState::Changed,
         }
     }
 
-    /// Whether the stash entry is still in the drawer. Knowable in every case:
-    /// this client only ever sends the drop after [`drop_gate`] opens.
-    pub fn entry_retained(&self) -> bool {
-        !matches!(self, PopVerdict::Popped)
+    /// Whether the stash entry is still in the drawer — `None` when this
+    /// client has no way to know.
+    ///
+    /// This used to return `bool` under a doc claiming it was "knowable in
+    /// every case". That was true only while every drop reply was assumed to
+    /// arrive: a lost drop response (#515) leaves the entry's fate exactly
+    /// unobserved, and a `bool` would have to guess — the same shape of lie
+    /// `TreeState` removed in #508. `Some(true)` is still provable for every
+    /// pre-drop halt (an apply never consumes the entry, ran or not).
+    pub fn entry_retained(&self) -> Option<bool> {
+        match self {
+            PopVerdict::Popped => Some(false),
+            PopVerdict::DropUnknown { .. } => None,
+            _ => Some(true),
+        }
     }
 
     /// The sentence shown to the user.
@@ -788,6 +883,19 @@ impl PopVerdict {
                 "The changes were applied cleanly, but removing the stash entry failed — so \
                  it is STILL in your list and the changes are also in your working tree. \
                  Applying it again would duplicate them.\n\n{why}"
+            ),
+            PopVerdict::ApplyUnknown { why } => format!(
+                "The reply to the apply was lost, and its outcome could not be recovered — \
+                 so whether anything reached your working tree is unknown. The stash was NOT \
+                 popped and IS still in your list (an apply never removes it). Check \
+                 `git status`, and reload before retrying.\n\n{why}"
+            ),
+            PopVerdict::DropUnknown { why } => format!(
+                "The stash's changes ARE in your working tree — that was verified — but the \
+                 reply to the remove step was lost and its outcome could not be recovered. \
+                 Whether the entry is still in your list is unknown: reload the drawer to \
+                 see, and do NOT apply it again meanwhile, which would duplicate the \
+                 changes.\n\n{why}"
             ),
         }
     }
@@ -841,6 +949,14 @@ pub fn drop_gate(apply: &ApplyOutcome, scan: &ConflictScan) -> DropGate {
             apply_refusal: match apply {
                 ApplyOutcome::Applied => None,
                 ApplyOutcome::Refused(why) => Some(why.clone()),
+                // The conflicts are real either way — the scan read the live
+                // index — so Conflicted is the actionable truth even when the
+                // apply's own reply was lost. The sentence says which kind of
+                // non-success this was rather than dressing it as a refusal.
+                ApplyOutcome::Unknown(why) => Some(format!(
+                    "the apply's own outcome could not be learned ({why}) — \
+                     but the conflicts below are from a live read"
+                )),
             },
             unresolved: unresolved.clone(),
             unreadable: unreadable.clone(),
@@ -870,6 +986,18 @@ pub fn drop_gate(apply: &ApplyOutcome, scan: &ConflictScan) -> DropGate {
                 scan_why: scan_why.clone(),
             })
         }
+
+        // The apply's reply was lost and the record could not settle it
+        // (#515). A clear or failed scan cannot upgrade that to either
+        // "applied" or "refused" — a clear scan proves no CONFLICTS, not
+        // that nothing ran (#508's lesson, same axis) — so the gate stays
+        // shut on an outcome nobody observed. The one certainty worth
+        // stating rides in the verdict: an apply never removes the entry,
+        // ran or not, so the stash is still in the drawer.
+        (ApplyOutcome::Unknown(why), ConflictScan::Read(Continuation::Clear))
+        | (ApplyOutcome::Unknown(why), ConflictScan::Failed(_)) => {
+            DropGate::Halt(PopVerdict::ApplyUnknown { why: why.clone() })
+        }
     }
 }
 
@@ -879,6 +1007,13 @@ pub fn verdict_after_drop(drop: &DropOutcome) -> PopVerdict {
     match drop {
         DropOutcome::Dropped => PopVerdict::Popped,
         DropOutcome::Refused(why) => PopVerdict::AppliedNotDropped { why: why.clone() },
+        // The drop's reply was lost and the record could not settle it
+        // (#515). The apply half is verified — this arm is only reachable
+        // after the gate opened — but whether the entry is still in the
+        // drawer is exactly what a lost drop reply leaves unknown, and
+        // AppliedNotDropped's "it is still in your list" would be an
+        // asserted fact nobody observed.
+        DropOutcome::Unknown(why) => PopVerdict::DropUnknown { why: why.clone() },
     }
 }
 
@@ -972,7 +1107,7 @@ mod tests {
             "the user's files did move; say so"
         );
         assert!(
-            verdict.entry_retained(),
+            verdict.entry_retained() == Some(true),
             "git stash apply leaves the entry, and this path never drops it"
         );
         assert_eq!(verdict.conflicted_paths(), ["src/main.rs", "README.md"]);
@@ -1039,7 +1174,10 @@ mod tests {
             "the conflict markers ARE in the working tree; reporting it untouched is the bug"
         );
         assert_eq!(verdict.conflicted_paths(), ["collision.txt"]);
-        assert!(verdict.entry_retained(), "git stash apply leaves the entry");
+        assert!(
+            verdict.entry_retained() == Some(true),
+            "git stash apply leaves the entry"
+        );
 
         let headline = verdict.headline();
         assert!(headline.contains("NOT popped"), "got: {headline}");
@@ -1093,7 +1231,7 @@ mod tests {
             TreeState::Unknown,
             "neither fact was established; a bool would have had to guess"
         );
-        assert!(verdict.entry_retained());
+        assert!(verdict.entry_retained() == Some(true));
         assert!(
             verdict.headline().contains("unknown"),
             "got: {}",
@@ -1141,7 +1279,7 @@ mod tests {
         assert!(!verdict.is_complete());
         assert_eq!(verdict.tree(), TreeState::Changed);
         assert!(
-            verdict.entry_retained(),
+            verdict.entry_retained() == Some(true),
             "the apply happened and the entry was left alone; both must be reported"
         );
         assert!(
@@ -1185,7 +1323,10 @@ mod tests {
             TreeState::Changed,
             "the changes ARE in the working tree"
         );
-        assert!(verdict.entry_retained(), "the entry is STILL in the drawer");
+        assert!(
+            verdict.entry_retained() == Some(true),
+            "the entry is STILL in the drawer"
+        );
 
         let headline = verdict.headline();
         assert!(
@@ -1236,12 +1377,12 @@ mod tests {
         // drawer, so nothing the user had is gone.
         for verdict in all.iter().filter(|v| !v.is_complete()) {
             assert!(
-                verdict.entry_retained(),
+                verdict.entry_retained() == Some(true),
                 "{verdict:?} did not finish, so the entry must still be there"
             );
         }
         assert!(
-            !PopVerdict::Popped.entry_retained(),
+            PopVerdict::Popped.entry_retained() == Some(false),
             "a finished pop removed the entry"
         );
     }
@@ -1285,7 +1426,7 @@ mod tests {
             TreeState::Unknown,
             "a clear conflict scan proves nothing CONFLICTS, not that nothing LANDED"
         );
-        assert!(verdict.entry_retained());
+        assert!(verdict.entry_retained() == Some(true));
         assert!(verdict.conflicted_paths().is_empty());
         assert!(
             verdict.headline().contains("check `git status`"),
@@ -1809,6 +1950,132 @@ mod tests {
         assert!(
             serde_json::from_str::<Vec<StashEntry>>(bad).is_err(),
             "an abbreviated oid cannot be compare-and-swapped, so it is not an entry"
+        );
+    }
+
+    /// **#515: a lost apply reply is reported as UNKNOWN, never as a
+    /// refusal.** Encoding transport loss as `Refused` was H3's core lie —
+    /// the UI asserting an outcome nobody observed. The gate must hold the
+    /// drop shut AND the verdict must be the unknown-shaped one, because
+    /// `ApplyRefused`'s headline claims the server said no, which here it
+    /// never did.
+    ///
+    /// MUTATION 1 (restore the lie): make `drop_gate` map
+    /// `(Unknown, Clear)` to `ApplyRefused` — red on the variant assert.
+    /// MUTATION 2 (weaken the one certainty): make `ApplyUnknown`'s
+    /// `entry_retained()` return `None` — red on the `Some(true)` assert;
+    /// an apply never consumes the entry, ran or not, and the headline
+    /// leans on exactly that.
+    #[test]
+    fn a_lost_apply_reply_is_reported_unknown_never_refused() {
+        let apply = ApplyOutcome::Unknown("the reply was lost".to_string());
+        let scan = ConflictScan::Read(Continuation::Clear);
+        let DropGate::Halt(verdict) = drop_gate(&apply, &scan) else {
+            panic!("a lost apply reply must never open the drop gate");
+        };
+        assert_eq!(
+            verdict,
+            PopVerdict::ApplyUnknown {
+                why: "the reply was lost".to_string()
+            },
+            "unknown must stay unknown — ApplyRefused claims the server said no"
+        );
+        assert!(!verdict.is_complete());
+        assert_eq!(verdict.tree(), TreeState::Unknown);
+        assert_eq!(
+            verdict.entry_retained(),
+            Some(true),
+            "an apply never removes the entry, ran or not — this is the one certainty"
+        );
+        let line = verdict.headline();
+        assert!(line.contains("lost"), "the headline names the actual event");
+        assert!(
+            !line.to_lowercase().contains("was refused"),
+            "the headline must not dress a lost reply as a refusal"
+        );
+    }
+
+    /// **#515: a lost DROP reply leaves the entry's fate genuinely unknown.**
+    /// `AppliedNotDropped` asserts "it is STILL in your list"; after a lost
+    /// drop reply that is a guess — the server may have removed it. The
+    /// verdict must be `DropUnknown`, whose `entry_retained()` is `None`,
+    /// and whose headline still owns the verified half (the changes ARE in
+    /// the tree) while warning that a re-apply would duplicate them.
+    ///
+    /// MUTATION 1 (restore the lie): make `verdict_after_drop` map
+    /// `Unknown` to `AppliedNotDropped` — red on the variant assert.
+    /// MUTATION 2 (overclaim): make `DropUnknown`'s `entry_retained()`
+    /// return `Some(true)` — red on the `None` assert.
+    #[test]
+    fn a_lost_drop_reply_leaves_entry_fate_unknown() {
+        let verdict = verdict_after_drop(&DropOutcome::Unknown("reply lost".to_string()));
+        assert_eq!(
+            verdict,
+            PopVerdict::DropUnknown {
+                why: "reply lost".to_string()
+            },
+            "unknown must stay unknown — AppliedNotDropped asserts the entry is retained"
+        );
+        assert!(
+            !verdict.is_complete(),
+            "an unobserved drop is not a finished pop"
+        );
+        assert_eq!(
+            verdict.tree(),
+            TreeState::Changed,
+            "the apply half WAS verified before the drop was sent"
+        );
+        assert_eq!(
+            verdict.entry_retained(),
+            None,
+            "nobody observed the drop's outcome; a bool here would be a guess"
+        );
+        assert!(verdict.headline().contains("duplicate"));
+    }
+
+    /// **#515: the classifiers keep the three-way distinction.** A recovered
+    /// record answer has the same standing as a direct answer (the server
+    /// said it — we heard it late); a local refusal is CERTAIN (nothing was
+    /// sent); only a lost-and-unrecoverable reply may say Unknown.
+    #[test]
+    fn wire_outcomes_classify_without_inventing_answers() {
+        use StashWriteOutcome as W;
+        let msg = |m: &str| m.to_string();
+        assert_eq!(
+            ApplyOutcome::from_write(Ok(W::Reconciled {
+                ok: true,
+                message: msg("done")
+            })),
+            ApplyOutcome::Applied,
+            "a recovered success is a success"
+        );
+        assert_eq!(
+            ApplyOutcome::from_write(Ok(W::Reconciled {
+                ok: false,
+                message: msg("no")
+            })),
+            ApplyOutcome::Refused(msg("no")),
+            "a recovered refusal is a refusal — not an unknown"
+        );
+        assert_eq!(
+            ApplyOutcome::from_write(Err(msg("offline"))),
+            ApplyOutcome::Refused(msg("offline")),
+            "a local refusal never left the device; refused is certain"
+        );
+        assert_eq!(
+            ApplyOutcome::from_write(Ok(W::Unknown { why: msg("lost") })),
+            ApplyOutcome::Unknown(msg("lost"))
+        );
+        assert_eq!(
+            DropOutcome::from_write(Ok(W::Answered {
+                ok: false,
+                message: msg("409")
+            })),
+            DropOutcome::Refused(msg("409"))
+        );
+        assert_eq!(
+            DropOutcome::from_write(Ok(W::Unknown { why: msg("lost") })),
+            DropOutcome::Unknown(msg("lost"))
         );
     }
 }
