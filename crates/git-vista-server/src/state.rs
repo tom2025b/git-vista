@@ -288,6 +288,13 @@ struct Current {
 
 static CURRENT: OnceLock<RwLock<Current>> = OnceLock::new();
 
+#[cfg(test)]
+pub(crate) async fn with_isolated_test_current<F: std::future::Future>(future: F) -> F::Output {
+    // RED seam: this deliberately provides no isolation until the concurrent
+    // regression below proves the process-global overwrite.
+    future.await
+}
+
 fn set_current_resolved(path: PathBuf, mode: RepoMode, handle: Option<RepositoryHandle>) {
     let value = Current { path, mode, handle };
     if let Some(lock) = CURRENT.get() {
@@ -697,6 +704,50 @@ pub(crate) fn reject_if_read_only() -> Option<(StatusCode, String)> {
 mod tests {
     use super::*;
     use super::{parse_bind_addr, LOOPBACK_ADDR};
+
+    /// #438: two test tasks that select different repositories must retain
+    /// their own path and mode after both writes have happened.
+    ///
+    /// Mutation caught: bypassing the test-local selection and writing the
+    /// process-global `CURRENT` makes exactly one task observe the other's
+    /// literal selection after the barrier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_test_selections_do_not_overwrite_each_other() {
+        // Avoid making the OnceLock's first-write race the failure under test;
+        // the assertion below pins the later cross-task replacement instead.
+        set_current_resolved(PathBuf::from("/tmp/git-vista-current-seed"), RepoMode::Active, None);
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let observe = |path: &'static str, mode: RepoMode| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(async move {
+                with_isolated_test_current(async move {
+                    let path = PathBuf::from(path);
+                    set_current_resolved(path.clone(), mode, None);
+                    barrier.wait().await;
+                    assert_eq!(
+                        current(),
+                        (path, mode == RepoMode::Visualize),
+                        "a concurrent test replaced this task's repository selection"
+                    );
+                })
+                .await;
+            })
+        };
+
+        let active = observe(
+            "/tmp/git-vista-current-active",
+            RepoMode::Active,
+        );
+        let visualize = observe(
+            "/tmp/git-vista-current-visualize",
+            RepoMode::Visualize,
+        );
+        let (active, visualize) = tokio::join!(active, visualize);
+        active.expect("active selection task completes");
+        visualize.expect("visualize selection task completes");
+    }
 
     /// One test fn drives the CURRENT/CATALOG globals end-to-end — keeping every
     /// global mutation in a single test means parallel test threads never fight
