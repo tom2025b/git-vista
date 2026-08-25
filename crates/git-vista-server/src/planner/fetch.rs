@@ -548,6 +548,22 @@ async fn journal_updates(
 /// `why` is already redacted: it comes back through `run_git` under
 /// [`NetworkNeed::Remote`], which applies the same `redact_if_remote` every
 /// other Network-tier output goes through (#228).
+///
+/// # The all-`None` shape of this entry is load-bearing (#486, ADR 0081)
+///
+/// No `ref_name` *and* no oid — `Obs::Unknown` flattens to `None` — is what
+/// `git_vista_core::activity::admits_it_could_not_read_the_refs` recognises,
+/// and this is the only writer of that shape at `ActivityKind::Fetch`. It is
+/// how the feed keeps this admission out of `fold_ref_update_bursts`: the
+/// fetch succeeded, so git logged every ref it moved, and this entry carries
+/// no `new_oid` with which to suppress those reflog lines. Before #486 it
+/// folded in with them, and four moved refs rendered as "fetch — 5 refs
+/// updated" with the admission gone.
+///
+/// **Giving this entry a `ref_name` or a placeholder oid would silently
+/// restore that defect.** If it ever has to name something, add an explicit
+/// discriminator to `ActivityEvent` and change the core's predicate in the
+/// same commit.
 async fn journal_unobserved(repo: &Path, remote: &RemoteName, why: &str) {
     journal_app_event(
         repo,
