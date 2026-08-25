@@ -41,6 +41,7 @@ use git_vista_protocol::{FetchError, FetchFailureKind, FetchSuccess, RemoteName,
 
 use super::transfer::{diff_refs, parse_progress, remote_tracking_refs};
 use super::*;
+use crate::handlers::AppEntry;
 
 /// The endpoint name in log lines, matching every other executor here.
 const ENDPOINT: &str = "/api/fetch";
@@ -475,51 +476,59 @@ pub(crate) fn error_body(
 /// collapsed, and it covers terminal fetches, which have no journal entry at
 /// all.
 ///
-/// # The per-ref cost is real, and is not what the revert was about
+/// # The per-ref cost was the whole of #485, and it is fixed here
 ///
-/// Every iteration reaches `journal::append`, which calls `capture_refs` —
-/// a full ref read of the repository, embedded into the line. One fetch of N
-/// refs therefore performs N full ref reads and writes N lines whose size
-/// itself grows with N. Measured 2026-08-25: 94 refs costs 527 KiB and 1.1 s,
-/// 500 refs costs 14 MiB and 27.6 s — and this is awaited before the endpoint
-/// responds, so it is the user's fetch latency. The drift it introduces also
-/// inflates the folded count past ~170 refs.
+/// Until #485 every iteration of this loop reached `journal::append`, which
+/// called `capture_refs` — a full ref read of the repository, embedded into
+/// that one line. A fetch of N refs therefore performed N full ref reads and
+/// wrote N lines whose size itself grew with N. Measured 2026-08-25: 94 refs
+/// cost 527 KiB and 1.1 s, 500 refs cost 14 MiB and 27.6 s — and it is awaited
+/// before the endpoint responds, so it was the user's fetch latency.
 ///
-/// Fixing that means capturing the ref map **once per operation** and handing
-/// it to each entry — `journal::append` already keeps an event's own `refs`
-/// when it arrives carrying them. That keeps one entry per ref, so the dedup
-/// key above stays intact. See
-/// `docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`.
+/// The entries stay one per ref, because of the dedup key above. What
+/// collapsed is the *capture*: the whole batch goes to
+/// [`crate::handlers::journal_app_events`] in one call, and
+/// `journal::append_all` reads the refs once, stores them once, and has the
+/// batch's other lines reference that one snapshot (ADR 0080). One
+/// `spawn_blocking` hop and one file open now serve the whole batch too.
+///
+/// See `docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`.
 async fn journal_updates(
     repo: &Path,
     remote: &RemoteName,
     updated: &[RemoteRefUpdate],
     verb: &str,
 ) {
-    for update in updated {
-        let short_name = update
-            .ref_name
-            .strip_prefix("refs/remotes/")
-            .unwrap_or(&update.ref_name);
-        journal_app_event(
-            repo,
-            ActivityKind::Fetch,
-            Some(update.ref_name.clone()),
-            // Observed, not read back through `Obs::from_read`: these come
-            // from the before/after listings this module took itself, so
-            // "absent" genuinely means the ref did not exist.
-            match &update.old_oid {
-                Some(oid) => Obs::Known(oid.clone()),
-                None => Obs::Absent,
-            },
-            match &update.new_oid {
-                Some(oid) => Obs::Known(oid.clone()),
-                None => Obs::Absent,
-            },
-            format!("{verb} ‘{short_name}’ from {}", remote.as_str()),
-        )
-        .await;
+    if updated.is_empty() {
+        return;
     }
+    let entries: Vec<AppEntry> = updated
+        .iter()
+        .map(|update| {
+            let short_name = update
+                .ref_name
+                .strip_prefix("refs/remotes/")
+                .unwrap_or(&update.ref_name);
+            AppEntry {
+                kind: ActivityKind::Fetch,
+                ref_name: Some(update.ref_name.clone()),
+                // Observed, not read back through `Obs::from_read`: these come
+                // from the before/after listings this module took itself, so
+                // `None` genuinely means the ref did not exist. `Obs::Unknown`
+                // — "git could not be read" — cannot arise from a diff of two
+                // listings this module is already holding, which is why these
+                // go straight to `Option` instead of through the `Obs` that
+                // [`journal_unobserved`], whose tips really are unknown, needs.
+                old_oid: update.old_oid.clone(),
+                new_oid: update.new_oid.clone(),
+                summary: format!("{verb} ‘{short_name}’ from {}", remote.as_str()),
+            }
+        })
+        .collect();
+    let repo = repo.to_path_buf();
+    let _ =
+        tokio::task::spawn_blocking(move || crate::handlers::journal_app_events(&repo, entries))
+            .await;
 }
 
 /// Journal the one fetch outcome this module cannot name: `git fetch` ran to
@@ -559,6 +568,7 @@ async fn journal_unobserved(repo: &Path, remote: &RemoteName, why: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git_vista_core::activity::{ActivitySource, RefsAtEvent};
 
     #[test]
     fn classification_names_the_actionable_cause() {
@@ -673,6 +683,125 @@ mod tests {
                 "some future gh: open /home/tom/.config/gh/config.yml: permission denied"
             ),
             FetchFailureKind::CredentialHelperBlocked
+        );
+    }
+    // -----------------------------------------------------------------------
+    // #485 — what one fetch costs the journal (ADR 0080)
+    // -----------------------------------------------------------------------
+
+    /// A tempdir with a real `.git` directory and one commit, so journaling
+    /// engages and `capture_refs` has something to observe.
+    fn journalling_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for args in [
+            vec!["init", "-q"],
+            vec!["commit", "-q", "--allow-empty", "-m", "x"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(&args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .current_dir(dir.path())
+                .status()
+                .expect("git runs")
+                .success());
+        }
+        dir
+    }
+
+    /// **#485 at this module's own boundary.** One fetch that moved N refs
+    /// still journals N entries — the dedup key the `0a7ba777` revert exists
+    /// to protect — but pays for **one** ref read and stamps **one** moment.
+    ///
+    /// The two counts are asserted together because the two costs were the
+    /// same loop. Restoring the per-ref `journal_app_event` call gives 12
+    /// captures, and gives each entry its own `now_secs()` reading — the
+    /// drift that inflated the folded count past ~170 refs.
+    ///
+    /// Read back through `journal::read_all`, i.e. through the parser
+    /// `/api/activity` uses, rather than by inspecting what this function was
+    /// handed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_fetch_journals_every_ref_at_one_moment_under_one_capture() {
+        let dir = journalling_repo();
+        let updated: Vec<RemoteRefUpdate> = (0..12)
+            .map(|i| RemoteRefUpdate {
+                ref_name: format!("refs/remotes/origin/b{i}"),
+                old_oid: None,
+                new_oid: Some(format!("{i:040x}")),
+            })
+            .collect();
+
+        journal_updates(
+            dir.path(),
+            &RemoteName::new("origin").expect("a valid remote name"),
+            &updated,
+            "fetched",
+        )
+        .await;
+
+        let read = crate::journal::read_all(dir.path());
+        assert_eq!(
+            read.len(),
+            12,
+            "one entry per moved ref, still — the entries are the feed's \
+             dedup key against git's own reflog lines: {read:#?}"
+        );
+        let moments: std::collections::BTreeSet<i64> = read.iter().map(|e| e.time).collect();
+        assert_eq!(
+            moments.len(),
+            1,
+            "one fetch is one moment; {} distinct timestamps means the \
+             entries are drifting apart again",
+            moments.len()
+        );
+        let captures = read
+            .iter()
+            .filter(|e| matches!(e.refs, Some(RefsAtEvent::Captured { .. })))
+            .count();
+        assert_eq!(
+            captures, 1,
+            "12 moved refs must cost ONE full ref read, not {captures}"
+        );
+        assert_eq!(
+            read.iter()
+                .filter(|e| matches!(e.refs, Some(RefsAtEvent::InBatch { .. })))
+                .count(),
+            11,
+            "and the other eleven must say where their capture is, rather \
+             than going silent"
+        );
+        // The entries themselves are unchanged: still per-ref, still named.
+        assert!(read
+            .iter()
+            .all(|e| e.kind == ActivityKind::Fetch && e.source == ActivitySource::App));
+        assert!(
+            read.iter()
+                .any(|e| e.ref_name.as_deref() == Some("refs/remotes/origin/b11")),
+            "the last ref of the batch must still have its own entry"
+        );
+    }
+
+    /// The paired negative: nothing moved, nothing journaled — and in
+    /// particular no ref read. An empty batch that still captured would put
+    /// the cost back on every up-to-date fetch, which is the common case.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_that_moved_nothing_writes_no_journal_at_all() {
+        let dir = journalling_repo();
+
+        journal_updates(
+            dir.path(),
+            &RemoteName::new("origin").expect("a valid remote name"),
+            &[],
+            "fetched",
+        )
+        .await;
+
+        assert!(
+            crate::journal::read_all(dir.path()).is_empty(),
+            "an up-to-date fetch leaves no trace"
         );
     }
 }

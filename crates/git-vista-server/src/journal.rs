@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use git_vista_core::activity::{ActivityEvent, CapturedRefs, RefsAtEvent, REFS_PER_EVENT_CAP};
 use git_vista_core::model::{GitRef, RefKind};
@@ -109,6 +110,9 @@ pub fn capture_refs(repo: &Path) -> RefsAtEvent {
         head: Some(read.head),
         tags: Some(collect(&read.refs, RefKind::Tag)),
         remotes: Some(collect(&read.refs, RefKind::RemoteBranch)),
+        // A bare capture anchors nothing; `append_all` stamps the batch id
+        // when it is sharing this one snapshot across several lines.
+        batch: None,
     }
 }
 
@@ -121,23 +125,146 @@ pub fn capture_refs(repo: &Path) -> RefsAtEvent {
 /// without history. An event that arrives already carrying `refs` keeps its
 /// own — the feed's synthesized external-deletion event needs to attach the
 /// map as it stood *before* the deletion it just noticed.
+///
+/// A batch of one, and deliberately spelled as one: the single-event line this
+/// writes is byte-for-byte what it was before [`append_all`] existed, so the
+/// twenty-odd endpoints that record one event apiece are untouched by #485.
 pub fn append(repo: &Path, event: &ActivityEvent) {
+    append_all(repo, std::slice::from_ref(event));
+}
+
+/// A journal write batch id: unique across processes on one box, and ordered
+/// enough to be legible in a file anyone may end up reading by eye.
+///
+/// Wall-clock nanoseconds plus a process-local counter. The counter alone
+/// repeats after a restart; the clock alone repeats if two batches land in the
+/// same nanosecond (and can go backwards). Neither is load-bearing on its own,
+/// and the pair only has to be unique among the lines of one read window.
+fn mint_batch_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}-{:x}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Append a whole operation's events under **one** ref capture (#485,
+/// ADR 0080).
+///
+/// # Why this exists
+///
+/// [`capture_refs`] is a full ref read of the repository, and what it produces
+/// is up to `REFS_PER_EVENT_CAP` branches, tags *and* remote-tracking refs —
+/// tens of kilobytes. Calling [`append`] in a loop therefore pays both costs
+/// once per event, and for the one caller whose event count tracks the
+/// repository's ref count — a fetch — both are quadratic in the refs it moved.
+/// Measured on 2026-08-25 before this function existed: a 500-ref fetch spent
+/// **27.6 s** journalling, on the user's latency, and left a 14 MiB journal
+/// whose lines averaged 28,872 bytes against a single event's 537.
+///
+/// # What one line means afterwards
+///
+/// The capture is read once and stored once. The batch's **last** event that
+/// needs one carries it, stamped with a batch id; the earlier ones carry
+/// [`RefsAtEvent::InBatch`] naming that id. So the maps are still recorded for
+/// every event — a replayer asks [`git_vista_core::activity::refs_at`] instead
+/// of reading the field — and one operation stores one snapshot.
+///
+/// **Last, not first, and the read cap is the reason.** [`read_all`] returns
+/// the newest [`JOURNAL_READ_CAP`] lines, so a window can begin in the middle
+/// of a batch. With the anchor written first, that window holds referrers
+/// whose anchor was trimmed away; with it written last, every referrer the
+/// window keeps is followed by its anchor in the same window. The failure is
+/// survivable either way — [`git_vista_core::activity::refs_at`] answers
+/// `None`, i.e. *no information* — but survivable is not the same as
+/// unnecessary.
+///
+/// A **failed** capture is copied onto every line of the batch instead of
+/// anchored. It is a reason string rather than three maps, so sharing it saves
+/// nothing, and a batch whose anchor is a failure would have referrers
+/// pointing at a line that carries no maps to resolve to.
+///
+/// Events arriving with their own `refs` keep them, exactly as [`append`]
+/// always promised, and take no part in the batch.
+///
+/// Best-effort throughout, and now in one place: the file is opened once and
+/// written once per batch rather than once per event.
+pub fn append_all(repo: &Path, events: &[ActivityEvent]) {
     let Some(path) = journal_path(repo) else {
         return;
     };
-    let captured;
-    let event = if event.refs.is_some() {
-        event
-    } else {
-        captured = ActivityEvent {
-            refs: Some(capture_refs(repo)),
-            ..event.clone()
-        };
-        &captured
-    };
-    let Ok(line) = serde_json::to_string(event) else {
+    if events.is_empty() {
         return;
-    };
+    }
+
+    // The events that arrived without a capture of their own — the only ones
+    // this function fills in, and the only ones the batch is sized by.
+    let needing: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.refs.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    // ONE ref read for the whole batch, and none at all when nothing needs it.
+    let capture = (!needing.is_empty()).then(|| capture_refs(repo));
+    let shareable = matches!(capture, Some(RefsAtEvent::Captured { .. }));
+    let anchor = shareable.then(|| needing.last().copied()).flatten();
+    let batch = (shareable && needing.len() > 1).then(mint_batch_id);
+
+    let mut lines = String::new();
+    for (i, event) in events.iter().enumerate() {
+        let filled;
+        let event = match (&capture, event.refs.is_some()) {
+            // Carrying its own capture: untouched, and outside the batch.
+            (_, true) | (None, _) => event,
+            (Some(capture), false) => {
+                let refs = match (Some(i) == anchor, &batch) {
+                    // The one line that stores the maps. `batch` is None for a
+                    // batch of one, which is the pre-#485 single-event line.
+                    (true, batch) => match capture.clone() {
+                        RefsAtEvent::Captured {
+                            branches,
+                            truncated_at,
+                            head,
+                            tags,
+                            remotes,
+                            ..
+                        } => RefsAtEvent::Captured {
+                            branches,
+                            truncated_at,
+                            head,
+                            tags,
+                            remotes,
+                            batch: batch.clone(),
+                        },
+                        failed => failed,
+                    },
+                    // A shared capture exists and is elsewhere in this batch.
+                    (false, Some(batch)) => RefsAtEvent::InBatch {
+                        batch: batch.clone(),
+                    },
+                    // Not the anchor and no batch id: the capture failed, so
+                    // every line carries the reason itself.
+                    (false, None) => capture.clone(),
+                };
+                filled = ActivityEvent {
+                    refs: Some(refs),
+                    ..event.clone()
+                };
+                &filled
+            }
+        };
+        let Ok(line) = serde_json::to_string(event) else {
+            continue;
+        };
+        lines.push_str(&line);
+        lines.push('\n');
+    }
+    if lines.is_empty() {
+        return;
+    }
+
     let result = path
         .parent()
         .map(std::fs::create_dir_all)
@@ -148,7 +275,7 @@ pub fn append(repo: &Path, event: &ActivityEvent) {
                 .append(true)
                 .open(&path)
         })
-        .and_then(|mut f| writeln!(f, "{line}"));
+        .and_then(|mut f| f.write_all(lines.as_bytes()));
     if let Err(e) = result {
         eprintln!(
             "git-vista: couldn't append to the journal at {}: {e}",
@@ -466,6 +593,10 @@ mod tests {
                 "a failed read must not masquerade as an observation of {} branches",
                 branches.len()
             ),
+            RefsAtEvent::InBatch { batch } => panic!(
+                "`capture_refs` reads refs; only `append_all` hands out batch \
+                 references, and it got {batch}"
+            ),
         }
     }
 
@@ -489,6 +620,10 @@ mod tests {
             RefsAtEvent::CaptureFailed { reason } => {
                 panic!("a readable empty repo is an observation, not a failure: {reason}")
             }
+            RefsAtEvent::InBatch { batch } => panic!(
+                "`capture_refs` reads refs; only `append_all` hands out batch \
+                 references, and it got {batch}"
+            ),
         }
     }
 
@@ -544,6 +679,9 @@ mod tests {
                 head,
                 tags,
                 remotes,
+                // A single capture anchors no batch; `a_lone_append_...`
+                // is where that is asserted rather than assumed.
+                batch: _,
             } => Capture {
                 branches,
                 truncated_at,
@@ -552,6 +690,10 @@ mod tests {
                 remotes: remotes.expect("#449: a fresh capture always records remotes"),
             },
             RefsAtEvent::CaptureFailed { reason } => panic!("expected a capture: {reason}"),
+            RefsAtEvent::InBatch { batch } => panic!(
+                "`capture_refs` reads refs; only `append_all` hands out batch \
+                 references, and it got {batch}"
+            ),
         }
     }
 
@@ -940,6 +1082,7 @@ mod tests {
             head: None,
             tags: None,
             remotes: None,
+            batch: None,
         });
         append(dir.path(), &e);
 
@@ -1434,5 +1577,411 @@ mod tests {
             allocated as f64 / window.len() as f64,
             budget as f64 / 1_048_576.0,
         );
+    }
+    // -----------------------------------------------------------------------
+    // #485 — one capture per operation, not one per ref (ADR 0080)
+    // -----------------------------------------------------------------------
+
+    /// Point `n` remote-tracking refs at HEAD, in one `git update-ref --stdin`
+    /// process. A fetch's ref count without a fetch's network, and cheap
+    /// enough that a test can afford the counts the defect showed up at.
+    fn seed_remote_refs(dir: &Path, n: usize) {
+        let head = git_says(dir, &["rev-parse", "HEAD"]);
+        let mut stdin = String::new();
+        for i in 0..n {
+            stdin.push_str(&format!("create refs/remotes/origin/b{i:04} {head}\n"));
+        }
+        let mut child = Command::new("git")
+            .args(["update-ref", "--stdin"])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("git runs");
+        child
+            .stdin
+            .take()
+            .expect("piped")
+            .write_all(stdin.as_bytes())
+            .expect("write");
+        assert!(child.wait().expect("git runs").success());
+    }
+
+    /// The `refs` of every line in the journal, in file order.
+    fn refs_of(repo: &Path) -> Vec<Option<RefsAtEvent>> {
+        read_all(repo).into_iter().map(|e| e.refs).collect()
+    }
+
+    /// The raw journal lines, for the questions that are about bytes rather
+    /// than about parsed values.
+    fn raw_lines(repo: &Path) -> Vec<String> {
+        std::fs::read_to_string(journal_path(repo).expect("a state dir"))
+            .expect("the journal exists")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// **#485's mechanism, stated as a count.** One operation that journals
+    /// many events reads the refs *once*: exactly one line of the batch
+    /// carries the maps, and every other line carries a reference to it.
+    ///
+    /// The count is the assertion, deliberately. "Some line has a capture"
+    /// would pass unchanged if the batching were removed entirely.
+    ///
+    /// MUTATION (remove the batching): give every needing event its own
+    /// `capture_refs(repo)` in `append_all` — 8 anchors, red.
+    /// MUTATION (weaken it): anchor every second event instead of the last
+    /// one — 4 anchors, red.
+    #[test]
+    fn a_batch_stores_one_capture_and_the_other_lines_reference_it() {
+        let dir = repo();
+        commit(dir.path(), "main");
+        let events: Vec<ActivityEvent> = (0..8).map(|i| event(&format!("ref {i}"))).collect();
+
+        append_all(dir.path(), &events);
+
+        let refs = refs_of(dir.path());
+        assert_eq!(refs.len(), 8, "one line per event, batching or not");
+        let anchors: Vec<&RefsAtEvent> = refs
+            .iter()
+            .flatten()
+            .filter(|r| matches!(r, RefsAtEvent::Captured { .. }))
+            .collect();
+        assert_eq!(
+            anchors.len(),
+            1,
+            "8 events must cost ONE ref read and store ONE snapshot; found \
+             {} lines carrying maps of their own",
+            anchors.len()
+        );
+        let RefsAtEvent::Captured {
+            batch: Some(id),
+            branches,
+            ..
+        } = anchors[0]
+        else {
+            panic!(
+                "the anchor of a batch must carry the batch id: {:?}",
+                anchors[0]
+            );
+        };
+        assert!(
+            branches.contains_key("main"),
+            "the one stored snapshot must be a real observation of the repo"
+        );
+        let referrers: Vec<&String> = refs
+            .iter()
+            .flatten()
+            .filter_map(|r| match r {
+                RefsAtEvent::InBatch { batch } => Some(batch),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            referrers.len(),
+            7,
+            "the other seven lines must say a capture exists and where — not \
+             go silent, which reads as 'no capture attempted'"
+        );
+        assert!(
+            referrers.iter().all(|b| *b == id),
+            "every referrer must name the anchor of its own batch"
+        );
+    }
+
+    /// The anchor is the **last** line of its batch, because [`read_all`]
+    /// returns the newest [`JOURNAL_READ_CAP`] lines and a window may begin
+    /// in the middle of a batch. Anchor-first would leave the window holding
+    /// referrers whose capture was trimmed away.
+    ///
+    /// Asserted on the file rather than on `append_all`'s internals: the
+    /// order that matters is the order on disk.
+    ///
+    /// MUTATION: anchor the first needing event instead of the last — red.
+    #[test]
+    fn the_batchs_capture_is_written_last_so_a_trimmed_window_keeps_it() {
+        let dir = repo();
+        commit(dir.path(), "main");
+        let events: Vec<ActivityEvent> = (0..5).map(|i| event(&format!("ref {i}"))).collect();
+
+        append_all(dir.path(), &events);
+
+        let refs = refs_of(dir.path());
+        assert!(
+            matches!(refs.last(), Some(Some(RefsAtEvent::Captured { .. }))),
+            "the capture must be on the batch's last line: {refs:#?}"
+        );
+        // And the property it buys: every window that ends at the file's end
+        // — which is every window `read_all` can return — holds the anchor.
+        for start in 0..refs.len() {
+            let window = &refs[start..];
+            assert!(
+                window
+                    .iter()
+                    .flatten()
+                    .any(|r| matches!(r, RefsAtEvent::Captured { .. })),
+                "a window starting at line {start} lost the capture its \
+                 referrers point at"
+            );
+        }
+    }
+
+    /// The other twenty-odd endpoints record one event apiece, and #485 must
+    /// not have changed a byte of what they write: a lone append still stores
+    /// its own maps, and anchors no batch.
+    ///
+    /// This is also what keeps the count in
+    /// `a_batch_stores_one_capture_and_the_other_lines_reference_it` honest —
+    /// an implementation that dropped captures altogether would satisfy "one
+    /// anchor per batch" by having none anywhere, and would fail here.
+    #[test]
+    fn a_lone_append_still_stores_its_own_capture_and_names_no_batch() {
+        let dir = repo();
+        commit(dir.path(), "main");
+
+        append(dir.path(), &event("on its own"));
+
+        let refs = refs_of(dir.path());
+        assert_eq!(refs.len(), 1);
+        let Some(RefsAtEvent::Captured {
+            branches, batch, ..
+        }) = &refs[0]
+        else {
+            panic!("a single event still captures its own refs: {refs:#?}");
+        };
+        assert!(branches.contains_key("main"));
+        assert_eq!(
+            *batch, None,
+            "a batch of one anchors nothing — and a `batch` field on this \
+             line would change what every pre-#485 single-event line means"
+        );
+    }
+
+    /// A batch whose ref read **failed** copies the reason onto every line
+    /// rather than anchoring it. The reason is a string, so sharing it saves
+    /// nothing — and a referrer pointing at a line that carries no maps would
+    /// resolve to "no information" when the truth ("we tried and could not
+    /// read the refs") is available and different.
+    ///
+    /// MUTATION: anchor the failure like a capture — the other four lines
+    /// become `InBatch` and this goes red.
+    #[test]
+    fn a_batch_whose_ref_read_failed_records_the_failure_on_every_line() {
+        let dir = repo();
+        // Destroy the ref store, keeping .git a directory so journaling still
+        // engages — the same fixture the single-event failure test uses.
+        std::fs::remove_dir_all(dir.path().join(".git/refs")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "garbage\n").unwrap();
+        let events: Vec<ActivityEvent> = (0..4).map(|i| event(&format!("ref {i}"))).collect();
+
+        append_all(dir.path(), &events);
+
+        let refs = refs_of(dir.path());
+        assert_eq!(refs.len(), 4);
+        for (i, r) in refs.iter().enumerate() {
+            match r {
+                Some(RefsAtEvent::CaptureFailed { reason }) => {
+                    assert!(!reason.is_empty(), "line {i} must say what happened")
+                }
+                other => panic!(
+                    "line {i} must carry the failure itself, not a reference to \
+                     a capture that does not exist: {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// An event that arrives carrying its own `refs` keeps them inside a
+    /// batch, and takes no part in it — the feed's synthesized
+    /// external-deletion event attaches the map as it stood *before* the
+    /// deletion, and a batch must not overwrite that with the live present.
+    #[test]
+    fn an_event_with_its_own_capture_keeps_it_and_stays_out_of_the_batch() {
+        let dir = repo();
+        commit(dir.path(), "main");
+        let mut own = event("brought its own");
+        own.refs = Some(RefsAtEvent::Captured {
+            branches: BTreeMap::from([("long-gone".to_string(), "deadbeef".to_string())]),
+            truncated_at: None,
+            head: None,
+            tags: None,
+            remotes: None,
+            batch: None,
+        });
+        let events = vec![event("a"), own, event("b"), event("c")];
+
+        append_all(dir.path(), &events);
+
+        let refs = refs_of(dir.path());
+        let Some(RefsAtEvent::Captured {
+            branches, batch, ..
+        }) = &refs[1]
+        else {
+            panic!("the caller's own capture must survive the batch: {refs:#?}");
+        };
+        assert!(branches.contains_key("long-gone"));
+        assert!(!branches.contains_key("main"), "no live refs merged in");
+        assert_eq!(*batch, None, "and it anchors nothing");
+        // The other three still form a batch of their own: one anchor, two
+        // referrers.
+        assert_eq!(
+            refs.iter()
+                .flatten()
+                .filter(|r| matches!(r, RefsAtEvent::InBatch { .. }))
+                .count(),
+            2
+        );
+    }
+
+    /// The round trip a replayer actually makes: read the journal back and
+    /// resolve each line's capture through
+    /// [`git_vista_core::activity::refs_at`]. Every event of the batch must
+    /// answer with the same maps, and those maps must be what **git** says —
+    /// not what a second call into `capture_refs` says.
+    #[test]
+    fn every_line_of_a_batch_resolves_to_the_same_maps_and_git_agrees() {
+        let dir = repo();
+        commit(dir.path(), "main");
+        commit(dir.path(), "feature");
+        let events: Vec<ActivityEvent> = (0..6).map(|i| event(&format!("ref {i}"))).collect();
+        append_all(dir.path(), &events);
+
+        let read = read_all(dir.path());
+        let main = git_says(dir.path(), &["rev-parse", "refs/heads/main"]);
+        let feature = git_says(dir.path(), &["rev-parse", "refs/heads/feature"]);
+        assert_eq!(read.len(), 6);
+        for (i, e) in read.iter().enumerate() {
+            let Some(RefsAtEvent::Captured { branches, .. }) =
+                git_vista_core::activity::refs_at(e, &read)
+            else {
+                panic!("line {i} did not resolve to a capture: {:?}", e.refs);
+            };
+            assert_eq!(branches.get("main"), Some(&main), "line {i}");
+            assert_eq!(branches.get("feature"), Some(&feature), "line {i}");
+        }
+    }
+
+    /// **Acceptance #1 for #485, as an assertion.** The bytes one journal
+    /// *line* costs must stop growing with the number of refs the operation
+    /// moved.
+    ///
+    /// Both writers run against the same fixture, which is what makes the
+    /// claim readable: the per-event path (`append` in a loop — what a fetch
+    /// did before #485) writes N lines that each embed the whole ref set, and
+    /// the batched path writes one that does and N-1 that do not.
+    ///
+    /// The contrast leg is not decoration. Without it, a fixture whose refs
+    /// were too few to inflate a line would let the batched leg pass while
+    /// proving nothing at all — so the old path is asserted to be *fat* on
+    /// this very fixture before the new one is asserted to be thin.
+    ///
+    /// 120 refs rather than 500: enough that a captured line is an order of
+    /// magnitude over a referrer line, cheap enough for the gate. The 500-ref
+    /// row is in `measure_the_journalling_cost_of_one_fetch`.
+    #[test]
+    fn a_batched_line_stops_growing_with_the_refs_the_operation_moved() {
+        const REFS: usize = 120;
+        // A referrer line is the event's own fields plus a batch id: a few
+        // hundred bytes, and constant. A captured line at 120 remote refs is
+        // ~60 bytes per entry, so several kilobytes.
+        const THIN: usize = 700;
+        const FAT: usize = 4_000;
+
+        let per_event = repo();
+        commit(per_event.path(), "main");
+        seed_remote_refs(per_event.path(), REFS);
+        let events: Vec<ActivityEvent> = (0..REFS).map(|i| event(&format!("ref {i}"))).collect();
+        for e in &events {
+            append(per_event.path(), e);
+        }
+        let old = raw_lines(per_event.path());
+        assert_eq!(old.len(), REFS);
+        assert!(
+            old.iter().all(|l| l.len() > FAT),
+            "the fixture must actually inflate a per-event line, or the \
+             batched leg below proves nothing: shortest was {} bytes",
+            old.iter().map(String::len).min().unwrap_or(0)
+        );
+
+        let batched = repo();
+        commit(batched.path(), "main");
+        seed_remote_refs(batched.path(), REFS);
+        append_all(batched.path(), &events);
+        let new = raw_lines(batched.path());
+        assert_eq!(new.len(), REFS, "still one line per ref");
+
+        let mut sizes: Vec<usize> = new.iter().map(String::len).collect();
+        sizes.sort_unstable();
+        let (referrers, anchor) = sizes.split_at(REFS - 1);
+        assert!(
+            anchor[0] > FAT,
+            "one line must still store the whole snapshot — the history is \
+             not what #485 economises on"
+        );
+        assert!(
+            referrers.iter().all(|l| *l < THIN),
+            "every other line must be flat in the ref count; largest was {} \
+             bytes against a {THIN}-byte bound",
+            referrers.last().copied().unwrap_or(0)
+        );
+
+        let old_total: usize = old.iter().map(String::len).sum();
+        let new_total: usize = new.iter().map(String::len).sum();
+        assert!(
+            new_total * 8 < old_total,
+            "at {REFS} refs the batch wrote {new_total} bytes against the \
+             per-event path's {old_total} — not the collapse #485 is for"
+        );
+    }
+
+    /// The filed table's method, re-run against both writers, printing the
+    /// row this issue is judged on.
+    ///
+    /// `#[ignore]` because the per-event leg at 500 refs is the 27.6-second
+    /// cost the issue is about, and a gate must not pay it on every run. Run
+    /// with:
+    ///
+    /// ```text
+    /// cargo test -p git-vista-server --bin git-vista-server -- \
+    ///     --ignored --nocapture measure_the_journalling_cost_of_one_fetch
+    /// ```
+    #[test]
+    #[ignore = "takes ~30s at 500 refs — this is the cost being measured"]
+    fn measure_the_journalling_cost_of_one_fetch() {
+        println!("| refs moved | writer | journal bytes | bytes/line | journalling time |");
+        println!("| ---: | --- | ---: | ---: | ---: |");
+        for n in [1usize, 94, 500] {
+            for batched in [false, true] {
+                let dir = repo();
+                commit(dir.path(), "main");
+                seed_remote_refs(dir.path(), n);
+                let events: Vec<ActivityEvent> =
+                    (0..n).map(|i| event(&format!("ref {i}"))).collect();
+
+                let start = std::time::Instant::now();
+                if batched {
+                    append_all(dir.path(), &events);
+                } else {
+                    for e in &events {
+                        append(dir.path(), e);
+                    }
+                }
+                let elapsed = start.elapsed();
+
+                let lines = raw_lines(dir.path());
+                let bytes: usize = lines.iter().map(|l| l.len() + 1).sum();
+                assert_eq!(lines.len(), n, "one line per ref, either way");
+                println!(
+                    "| {n} | {} | {bytes} | {} | {:.1} ms |",
+                    if batched {
+                        "append_all"
+                    } else {
+                        "append (pre-#485)"
+                    },
+                    bytes / n,
+                    elapsed.as_secs_f64() * 1000.0,
+                );
+            }
+        }
     }
 }

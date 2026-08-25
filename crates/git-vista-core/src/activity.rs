@@ -214,10 +214,77 @@ pub enum RefsAtEvent {
         /// rarely. See ADR 0070 for why they are recorded at all.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remotes: Option<CapturedRefs>,
+        /// Names the *batch* this capture was taken for, when it was taken
+        /// for more than one event (#485, ADR 0080). The other events of the
+        /// batch carry [`Self::InBatch`] with the same id and no maps of
+        /// their own, so one operation that moves N refs stores one snapshot
+        /// rather than N copies of it.
+        ///
+        /// `None` is the ordinary single-event capture — one line, its own
+        /// snapshot, anchoring nothing. Every journal line written before
+        /// #485 is that, which is exactly what it meant then.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch: Option<String>,
     },
     /// The read failed, and the reason is preserved. A replayer must treat
     /// this as "no information", never as "no branches".
     CaptureFailed { reason: String },
+    /// The refs *were* read for this event — once, together with the rest of
+    /// the batch it was written in — and the maps live on a different line of
+    /// the same journal: the one whose [`Self::Captured`] carries the same
+    /// `batch` id. Resolve it with [`refs_at`].
+    ///
+    /// **This is a fourth answer, not a spelling of one of the other three.**
+    /// It says "a capture exists and here is where"; the field being absent
+    /// says "none was attempted"; `CaptureFailed` says "one was attempted and
+    /// failed". Writing the referrers as `None` instead would have been the
+    /// cheap change, and it would have told a replayer that N-1 of every N
+    /// journal lines carry no history — a claim that is false and, being
+    /// indistinguishable from the pre-#131 lines, uncorrectable later.
+    ///
+    /// A referrer whose anchor is not in the slice being read — the anchor
+    /// aged out of the window, or its line was corrupt — resolves to `None`:
+    /// *no information*, never an empty map. [`refs_at`] is what enforces
+    /// that, and it is why a replayer must not match on this variant itself.
+    InBatch { batch: String },
+}
+
+/// The refs as they stood at `event`, resolving a [`RefsAtEvent::InBatch`]
+/// referrer against the batch anchor in `journal`.
+///
+/// **Every reader of [`ActivityEvent::refs`] must go through here** (#485,
+/// ADR 0080). Reading the field directly was correct while every line carried
+/// its own maps; it now silently sees "no maps" on the N-1 lines of an N-ref
+/// batch that reference the anchor instead.
+///
+/// `journal` is the slice the event was read from — [`crate::activity`]'s
+/// callers get it from `journal::read_all`, which returns the newest window of
+/// the file in file order. The anchor is written *last* within its batch
+/// precisely so that a window trimmed mid-batch keeps it, but a trim is not
+/// the only way to lose one (a corrupt anchor line is skipped by the parser),
+/// so an unresolvable referrer is `None` — the replayer concludes nothing,
+/// which is the same reading the absent field gets.
+///
+/// Linear in `journal` per call, which is bounded by the read cap and only
+/// paid on the referrer path. A replayer resolving every event of a full
+/// window should build the batch index once instead.
+pub fn refs_at<'a>(
+    event: &'a ActivityEvent,
+    journal: &'a [ActivityEvent],
+) -> Option<&'a RefsAtEvent> {
+    match event.refs.as_ref()? {
+        RefsAtEvent::InBatch { batch } => {
+            journal.iter().find_map(|other| match other.refs.as_ref() {
+                Some(
+                    anchor @ RefsAtEvent::Captured {
+                        batch: Some(id), ..
+                    },
+                ) if id == batch => Some(anchor),
+                _ => None,
+            })
+        }
+        own => Some(own),
+    }
 }
 
 /// A captured ref map plus its own truncation count, so one kind overflowing
@@ -532,7 +599,11 @@ pub fn assemble_feed(
         })
     });
 
-    events.extend(journal);
+    // Cloned rather than moved: the journal window is needed again in step 7,
+    // to resolve the batched captures (#485). Every event copied here is a
+    // small one — the ref maps live on one line per batch, and that one is
+    // cloned once.
+    events.extend(journal.iter().cloned());
 
     // -- 4. Fold a burst of remote-tracking ref updates into one row. --------
     // One `git fetch` is one user action with one outcome they care about
@@ -551,6 +622,27 @@ pub fn assemble_feed(
     // events keep their source order (reflog order within a ref).
     events.sort_by_key(|e| std::cmp::Reverse(e.time));
     events.truncate(limit);
+
+    // -- 7. Resolve batched ref captures, so the feed is self-contained. -----
+    // A journaled event may carry [`RefsAtEvent::InBatch`]: its maps were read
+    // and stored once, on another line of the same journal (#485, ADR 0080).
+    // Whoever receives this feed has no journal to resolve that against, so
+    // **nothing leaves here as a reference** — an event carries its maps, its
+    // failure, or nothing at all, which are the three answers that have always
+    // been on the wire.
+    //
+    // After the truncation on purpose: a batch's one snapshot is copied only
+    // onto rows actually being sent, which is at most `limit` of them.
+    // Resolving before step 4 would copy it onto every line of the batch —
+    // reinstating, in memory and on every feed read, exactly the duplication
+    // #485 took out of the file.
+    for event in &mut events {
+        if matches!(event.refs, Some(RefsAtEvent::InBatch { .. })) {
+            // `None` when the anchor is not in this window: no information,
+            // the same reading an absent field gets. Never an empty map.
+            event.refs = refs_at(event, &journal).cloned();
+        }
+    }
     events
 }
 
@@ -617,13 +709,21 @@ fn names_a_local_branch(ref_name: Option<&str>, branches: &HashMap<String, Strin
 ///    them instead. Measured: four refs moved renders as
 ///    "fetch — 5 refs updated", with the admission gone and the count one too
 ///    high. It is a run of one only when the fetch moved nothing at all.
-/// 2. **The count inflates at scale.** The app stamps one journal entry per
-///    ref, each performing a full ref capture, so entry *i* lands later and
-///    later after git's reflog lines. Past roughly 170 refs that drift exceeds
-///    [`JOURNAL_MATCH_SLACK`], the unmatched reflog lines survive attribution,
-///    and the fold counts both copies. Measured: 250 refs reported as 297,
-///    500 reported as 891. The feed stays at one row, so #329's symptom holds
-///    — but the number in it stops being true.
+/// 2. **The count inflates when the journal's entries drift.** A journal
+///    entry that lands more than [`JOURNAL_MATCH_SLACK`] after git's reflog
+///    line for the same movement stops suppressing it; the unmatched reflog
+///    line survives attribution and the fold counts both copies. Measured
+///    against the app's fetch as it then was — one entry per ref, each
+///    performing a full ref capture and taking its own timestamp afterwards —
+///    250 refs reported as 297 and 500 as 891. The feed stayed at one row, so
+///    #329's symptom held, but the number in it was not true.
+///
+///    **The driver is gone; the defect is not.** #485 gave a fetch one ref
+///    capture and one timestamp for the whole batch
+///    (`handlers::journal_app_events`), so its entries no longer drift apart
+///    at all. The fold still counts both copies of anything that does drift —
+///    from a slow operation, from a clock step, from any writer that has not
+///    adopted the batch — which is why the pin below stays.
 ///
 /// **Safe for undo by construction, not by luck:** [`undo_hint`] has no arm for
 /// `Fetch` or `Pull`, so neither row has ever carried a hint and dropping the
@@ -1326,21 +1426,32 @@ mod tests {
         );
     }
 
-    /// **F1 — the folded count stops being true at scale.**
+    /// **F1 — the folded count stops being true when entries drift.**
     ///
-    /// The app stamps one journal entry per ref, each performing a full ref
-    /// capture, so entry *i* lands later and later after git's reflog lines.
-    /// Measured 2026-08-25: ~29.63 ms per ref at 250 refs, modelled below as a
-    /// flat 30 ms. Past [`JOURNAL_MATCH_SLACK`] the later entries stop matching
-    /// their reflog echo, those reflog lines survive attribution, and the fold
-    /// counts both copies of the same ref movement.
+    /// A journal entry that lands more than [`JOURNAL_MATCH_SLACK`] after
+    /// git's reflog line for the same movement stops matching it; that reflog
+    /// line survives attribution, and the fold counts both copies of one ref
+    /// movement. The fixture below models the drift that produced it when it
+    /// was filed: the app stamped one journal entry per ref, each after its
+    /// own full ref capture — ~29.63 ms per ref at 250 refs, flattened to
+    /// 30 ms here.
     ///
     /// The feed still shows one row, so #329's reported symptom holds — this
     /// pins the *number in it*, which is the part that is not true.
     ///
-    /// **Fixing this:** capture the ref map once per operation rather than per
-    /// ref (`journal::append` already keeps an event's own `refs`), which
-    /// removes the drift. Then delete the `#[should_panic]`.
+    /// **#485 removed that driver and this pin still stands, deliberately.**
+    /// A fetch now takes one capture and one timestamp for the whole batch, so
+    /// its own entries cannot drift (proved at the writer, in
+    /// `planner::fetch::tests::one_fetch_journals_every_ref_at_one_moment_under_one_capture`).
+    /// The defect pinned here is the *fold's*: it double-counts whatever
+    /// drifts, from any cause, and nothing about that changed. Rewriting this
+    /// fixture to the batched writer's zero drift would turn the pin green
+    /// while testing nothing — exactly the green-that-proves-nothing this
+    /// repository keeps finding.
+    ///
+    /// **Fixing this** means changing the fold, in `fold_one_kind`: a run must
+    /// not count a ref movement twice because it arrived from both sources.
+    /// Then delete the `#[should_panic]`.
     #[test]
     #[should_panic(expected = "F1: the fold counted")]
     fn a_slow_fetch_still_counts_only_the_refs_that_moved() {
@@ -1391,6 +1502,227 @@ mod tests {
             "F1: the fold counted {counted} refs but only {REFS} moved — the \
              journal's own write cost drifted its entries past the dedup window, \
              so each movement was counted twice"
+        );
+    }
+    // -----------------------------------------------------------------------
+    // #485 — resolving a batched ref capture (ADR 0080)
+    // -----------------------------------------------------------------------
+
+    /// One journaled event, with whatever `refs` the case under test needs.
+    fn with_refs(summary: &str, refs: Option<RefsAtEvent>) -> ActivityEvent {
+        ActivityEvent {
+            time: 100,
+            kind: ActivityKind::Fetch,
+            ref_name: Some("refs/remotes/origin/main".into()),
+            summary: summary.into(),
+            old_oid: Some("old".into()),
+            new_oid: Some("new".into()),
+            source: ActivitySource::App,
+            undo: None,
+            refs,
+        }
+    }
+
+    /// A journaled commit — a kind the burst fold leaves alone, so the row
+    /// reaches the end of `assemble_feed` as itself.
+    fn commit_event(time: i64, summary: &str, refs: Option<RefsAtEvent>) -> ActivityEvent {
+        ActivityEvent {
+            time,
+            kind: ActivityKind::Commit,
+            ref_name: Some("main".into()),
+            summary: summary.into(),
+            old_oid: Some("old".into()),
+            new_oid: Some(format!("new{time}")),
+            source: ActivitySource::App,
+            undo: None,
+            refs,
+        }
+    }
+
+    fn anchor(batch: Option<&str>, branch: (&str, &str)) -> RefsAtEvent {
+        RefsAtEvent::Captured {
+            branches: BTreeMap::from([(branch.0.to_string(), branch.1.to_string())]),
+            truncated_at: None,
+            head: None,
+            tags: None,
+            remotes: None,
+            batch: batch.map(str::to_string),
+        }
+    }
+
+    /// The point of the whole format: a referrer resolves to the maps its
+    /// batch stored, so an event whose line carries no maps is not an event
+    /// with no history.
+    ///
+    /// MUTATION: have `refs_at` return `event.refs` verbatim — the referrer
+    /// resolves to `InBatch`, which carries no branches, and this goes red.
+    #[test]
+    fn a_batched_referrer_resolves_to_the_capture_its_batch_stored() {
+        let journal = vec![
+            with_refs("first", Some(RefsAtEvent::InBatch { batch: "b1".into() })),
+            with_refs("second", Some(RefsAtEvent::InBatch { batch: "b1".into() })),
+            with_refs("last", Some(anchor(Some("b1"), ("main", "cafe")))),
+        ];
+
+        for (i, event) in journal.iter().enumerate() {
+            let Some(RefsAtEvent::Captured { branches, .. }) = refs_at(event, &journal) else {
+                panic!("line {i} resolved to nothing: {:?}", event.refs);
+            };
+            assert_eq!(branches.get("main").map(String::as_str), Some("cafe"));
+        }
+    }
+
+    /// A referrer whose anchor is not in the slice — trimmed off by the read
+    /// window, or lost with a corrupt line — resolves to `None`: **no
+    /// information**. Never an empty map, which a replayer reads as "every
+    /// branch was deleted at this instant", and never another batch's maps.
+    ///
+    /// MUTATION: resolve to the nearest following `Captured` regardless of
+    /// the id and this goes red on the second leg, with the wrong repository
+    /// asserted for the orphan.
+    #[test]
+    fn an_orphaned_referrer_is_no_information_not_an_empty_map() {
+        let orphan = with_refs(
+            "orphan",
+            Some(RefsAtEvent::InBatch {
+                batch: "gone".into(),
+            }),
+        );
+        assert!(
+            refs_at(&orphan, std::slice::from_ref(&orphan)).is_none(),
+            "an unresolvable referrer must claim nothing"
+        );
+
+        // And it must not latch onto a different batch's anchor.
+        let journal = vec![
+            orphan.clone(),
+            with_refs("other", Some(anchor(Some("b2"), ("main", "beef")))),
+        ];
+        assert!(
+            refs_at(&journal[0], &journal).is_none(),
+            "the orphan resolved to another batch's capture: {:?}",
+            refs_at(&journal[0], &journal)
+        );
+    }
+
+    /// The three pre-#485 answers are returned unchanged, and a lone capture
+    /// (`batch: None`) anchors nothing — so it cannot be found by a referrer
+    /// that names no id either.
+    #[test]
+    fn an_unbatched_capture_a_failure_and_an_absent_field_answer_for_themselves() {
+        let lone = with_refs("lone", Some(anchor(None, ("main", "cafe"))));
+        assert!(matches!(
+            refs_at(&lone, std::slice::from_ref(&lone)),
+            Some(RefsAtEvent::Captured { batch: None, .. })
+        ));
+
+        let failed = with_refs(
+            "failed",
+            Some(RefsAtEvent::CaptureFailed {
+                reason: "ref store gone".into(),
+            }),
+        );
+        assert!(
+            matches!(
+                refs_at(&failed, std::slice::from_ref(&failed)),
+                Some(RefsAtEvent::CaptureFailed { .. })
+            ),
+            "a failure must stay a failure — resolving it to None would lose \
+             the one thing it records"
+        );
+
+        let silent = with_refs("pre-#131", None);
+        assert!(refs_at(&silent, std::slice::from_ref(&silent)).is_none());
+    }
+
+    /// A journal line written before #485 has no `batch` key at all. It must
+    /// still parse, and must still be the self-contained observation it was —
+    /// the format is additive, and the journal is append-only.
+    ///
+    /// No mutation is offered, because the obvious one is not real: dropping
+    /// `#[serde(default)]` from `batch` was tried and this test stayed green.
+    /// `serde`'s derive already reads a missing `Option` field as `None`, so
+    /// the attribute is belt-and-braces on this field and only the `Option`
+    /// itself is load-bearing. Recorded rather than left as a mutation note
+    /// that would quietly never have fired.
+    #[test]
+    fn a_pre_485_capture_line_still_parses_and_anchors_nothing() {
+        let line = r#"{"time":1,"kind":"Fetch","ref_name":"origin/main","summary":"s",
+            "old_oid":null,"new_oid":"n","source":"App",
+            "refs":{"status":"captured","branches":{"main":"cafe"}}}"#;
+        let event: ActivityEvent = serde_json::from_str(line).expect("a pre-#485 line parses");
+        let Some(RefsAtEvent::Captured {
+            branches, batch, ..
+        }) = refs_at(&event, std::slice::from_ref(&event))
+        else {
+            panic!("expected the line's own capture: {:?}", event.refs);
+        };
+        assert_eq!(branches.get("main").map(String::as_str), Some("cafe"));
+        assert_eq!(*batch, None);
+    }
+    /// **Nothing leaves the feed as a reference.** A journaled event may point
+    /// at its batch's capture instead of carrying one (#485); whoever receives
+    /// the feed has no journal to follow that with, so `assemble_feed`
+    /// resolves it.
+    ///
+    /// `Commit`, not `Fetch`, so the rows survive the burst fold and reach the
+    /// end of the pipeline individually — which is where the resolution has to
+    /// hold.
+    ///
+    /// MUTATION: delete step 7 and the first two rows ship `in_batch` — a
+    /// value whose only possible reading, to a client, is "no history".
+    #[test]
+    fn the_feed_resolves_a_batched_capture_rather_than_shipping_the_reference() {
+        let journal = vec![
+            commit_event(
+                1,
+                "first",
+                Some(RefsAtEvent::InBatch { batch: "b1".into() }),
+            ),
+            commit_event(
+                2,
+                "second",
+                Some(RefsAtEvent::InBatch { batch: "b1".into() }),
+            ),
+            commit_event(3, "last", Some(anchor(Some("b1"), ("main", "cafe")))),
+        ];
+
+        let feed = assemble_feed(journal, Vec::new(), &HashMap::new(), &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 3);
+        for event in &feed {
+            let Some(RefsAtEvent::Captured { branches, .. }) = &event.refs else {
+                panic!(
+                    "'{}' left the feed carrying {:?} — a client cannot resolve that",
+                    event.summary, event.refs
+                );
+            };
+            assert_eq!(branches.get("main").map(String::as_str), Some("cafe"));
+        }
+    }
+
+    /// The paired negative, and the one that must not be "fixed" into an
+    /// empty map: when the anchor is outside the window the feed was read
+    /// from, the row ships **nothing** — the same silence a line that never
+    /// captured ships, which a replayer already knows to conclude nothing
+    /// from.
+    #[test]
+    fn a_row_whose_batch_anchor_is_outside_the_window_ships_nothing_at_all() {
+        let journal = vec![commit_event(
+            1,
+            "orphan",
+            Some(RefsAtEvent::InBatch {
+                batch: "trimmed-away".into(),
+            }),
+        )];
+
+        let feed = assemble_feed(journal, Vec::new(), &HashMap::new(), &HashSet::new(), 50);
+
+        assert_eq!(feed.len(), 1);
+        assert!(
+            feed[0].refs.is_none(),
+            "an unresolvable reference must become silence, never a map: {:?}",
+            feed[0].refs
         );
     }
 }
