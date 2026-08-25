@@ -1194,31 +1194,6 @@ pub enum GitOperation {
         entry: StashSelector,
         expected_oid: CommitOid,
     },
-    /// `git stash pop <entry>` — restore a stash's changes and remove the
-    /// entry, but **only if the restore was clean** (`/api/stash/pop`,
-    /// M3.24 #77).
-    ///
-    /// # A separate variant, not `ApplyStash` with a flag
-    ///
-    /// The two differ in what can be *lost*. Apply keeps the entry whatever
-    /// happens, so its worst outcome is a messy worktree with the stash still
-    /// safe in the drawer. Pop removes the entry, so a bug in it destroys work
-    /// that only existed there. A `bool` on one variant would give both the
-    /// same [`RiskLevel`] and the same [`RecoveryStrategy`], and they are not
-    /// the same on either axis.
-    ///
-    /// # Conflicts leave the entry, and the response must say so
-    ///
-    /// `git stash pop` does not drop the entry when the apply conflicts —
-    /// that is git's own behaviour and it is correct. But the acceptance
-    /// criterion is stronger than the behaviour: the *response* must not read
-    /// as complete while conflicted paths remain. So the executor re-reads the
-    /// conflict state after the pop and reports what is unresolved, rather
-    /// than returning a success whose only clue is a line of git stderr.
-    PopStash {
-        entry: StashSelector,
-        expected_oid: CommitOid,
-    },
     /// `git stash branch <name> <entry>` — create a branch at the commit the
     /// stash was taken from, check it out, apply the stash there, and drop the
     /// entry if that succeeded (`/api/stash/branch`, M3.24 #77).
@@ -1261,7 +1236,9 @@ pub enum GitOperation {
         expected_oid: CommitOid,
     },
     //
-    // `PopStash` is deliberately ABSENT (M3.24, decided 2026-08-18).
+    // `PopStash` is deliberately ABSENT (M3.24, decided 2026-08-18; the
+    // variant that contradicted this comment was removed 2026-08-25, #493,
+    // ADR 0078).
     //
     // Pop is apply-then-drop, and a single operation row cannot tell the truth
     // about the half-done state: apply succeeds, drop fails, and the record
@@ -1273,6 +1250,14 @@ pub enum GitOperation {
     // a wire promise in this enum that no executor can keep. See
     // docs/superpowers/specs/m3.24-stash.md section 5 for the two ways it
     // could become representable.
+    //
+    // Between 2026-08-18 and 2026-08-25 this comment was false: a fully wired
+    // `PopStash` sat forty-six lines above it, unreachable because no route
+    // built one, and shelling out to `git stash pop` — which §5 of that same
+    // spec forbids in as many words. Clients compose a pop out of
+    // `ApplyStash` → read the conflict state → `DropStash`, which is the
+    // shape §5 says can tell the truth; see ADR 0077 for what such a client
+    // is allowed to claim about the result.
 }
 
 // ---------------------------------------------------------------------------

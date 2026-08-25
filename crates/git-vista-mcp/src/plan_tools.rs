@@ -109,10 +109,6 @@ pub(crate) fn exposure_of(op: &GitOperation) -> Exposure {
              also creates a branch and moves HEAD — three effects an agent would be \
              choosing blind",
         ),
-        GitOperation::PopStash { .. } => Excluded(
-            "same positional-selector problem as apply, and pop also REMOVES the entry \
-             — an agent guessing at stash@{0} would destroy work it never saw",
-        ),
         GitOperation::DropStash { .. } => Excluded(
             "destructive, and its safety rests on a compare-and-swap against a reflog \
              position an agent cannot see or re-derive between planning and submitting",
@@ -1218,7 +1214,6 @@ mod tests {
         "sequence_skip",
         "cherry_pick_merge",
         "revert_merge",
-        "pop_stash",
         "push_stash",
         "apply_stash",
         "drop_stash",
@@ -1337,10 +1332,6 @@ mod tests {
                 include_untracked: true,
             },
             GitOperation::ApplyStash {
-                entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
-                expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
-            },
-            GitOperation::PopStash {
                 entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
                 expected_oid: git_vista_protocol::CommitOid::new("1".repeat(40)).unwrap(),
             },
