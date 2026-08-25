@@ -28,6 +28,18 @@ if [[ ! -x $bin ]]; then
   exit 1
 fi
 
+# Since #448 the fixtures are built by the Rust catalogue rather than in
+# JavaScript (ADR 0076), so this binary is as much a prerequisite as the server.
+# Checked here rather than left to the first spec: a missing binary otherwise
+# surfaces as a spec failing against an empty directory, which reads as a
+# product defect instead of a missing build step.
+fixture_bin="$repo/target/debug/gv-fixture"
+if [[ ! -x $fixture_bin ]]; then
+  echo "browser tests: no fixture binary at $fixture_bin" >&2
+  echo "               build it first:  cargo build -p git-vista-fixtures" >&2
+  exit 1
+fi
+
 if [[ ! -f $repo/crates/git-vista/dist/index.html ]]; then
   echo "browser tests: no web bundle at crates/git-vista/dist" >&2
   echo "               build it first:  trunk build --config crates/git-vista/Trunk.toml" >&2

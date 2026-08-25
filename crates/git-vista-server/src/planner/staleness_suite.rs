@@ -6,7 +6,7 @@
 //! it could and could not read (D5, #66 Task 19).
 
 use super::*;
-use std::path::PathBuf;
+use git_vista_fixtures::seeded as seeded_repo;
 
 fn tokens() -> (RepositoryToken, WorktreeToken) {
     (
@@ -39,21 +39,6 @@ async fn git_rev_parse_head(repo: &Path) -> String {
         .unwrap();
     assert!(output.status.success(), "git rev-parse HEAD failed");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-/// A fresh repository on branch `main` with one committed file and a
-/// clean working tree.
-fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    run(&repo, &["init", "-q", "-b", "main"]);
-    run(&repo, &["config", "user.email", "t@example.invalid"]);
-    run(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-    run(&repo, &["add", "a.txt"]);
-    run(&repo, &["commit", "-q", "-m", "seed"]);
-    (dir, repo)
 }
 
 /// #249: the admission hash for a **submitted** plan is derived from its
@@ -766,6 +751,7 @@ async fn rewriting_one_conflict_stage_moves_the_generation() {
         .unwrap();
     {
         use std::io::Write;
+
         writeln!(
             child.stdin.as_mut().unwrap(),
             "100644 {replacement} 3\ta.txt"

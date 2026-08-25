@@ -6,6 +6,7 @@
 //! (#68e).
 
 use super::*;
+use git_vista_fixtures::seeded as seeded_repo;
 use git_vista_protocol::{ChangeKind, ChangeSides, StatusEntry};
 
 // --- duplicated cross-suite test helpers, verbatim from read.rs's original inline test module —
@@ -22,20 +23,6 @@ fn run(repo: &Path, args: &[&str]) {
         .status()
         .unwrap();
     assert!(status.success(), "git {args:?} failed in {repo:?}");
-}
-
-/// A fresh repository on branch `main` with one committed file.
-fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    run(&repo, &["init", "-q", "-b", "main"]);
-    run(&repo, &["config", "user.email", "t@example.invalid"]);
-    run(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-    run(&repo, &["add", "a.txt"]);
-    run(&repo, &["commit", "-q", "-m", "seed"]);
-    (dir, repo)
 }
 
 // ---- GET /api/status/v2: the live handler seam (#68c) ---------------------

@@ -407,6 +407,7 @@ pub(crate) async fn resolve_conflict_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git_vista_fixtures::{conflict_modify_modify as conflicted_repo, seeded as seeded_repo};
 
     fn run(repo: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
@@ -429,38 +430,6 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    /// A fresh repository on branch `main` with one committed file.
-    fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        run(&repo, &["init", "-q", "-b", "main"]);
-        run(&repo, &["config", "user.email", "t@example.invalid"]);
-        run(&repo, &["config", "user.name", "t"]);
-        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-        run(&repo, &["add", "a.txt"]);
-        run(&repo, &["commit", "-q", "-m", "seed"]);
-        (dir, repo)
-    }
-
-    /// A repository with a real, unresolved modify/modify conflict on
-    /// `a.txt`, mirroring `conflicts.rs`'s own fixture so both files' tests
-    /// exercise the identical shape of git state.
-    fn conflicted_repo() -> (tempfile::TempDir, PathBuf) {
-        let (dir, repo) = seeded_repo();
-        run(&repo, &["checkout", "-q", "-b", "theirs"]);
-        std::fs::write(repo.join("a.txt"), "theirs\n").unwrap();
-        run(&repo, &["commit", "-q", "-am", "theirs"]);
-        run(&repo, &["checkout", "-q", "main"]);
-        std::fs::write(repo.join("a.txt"), "ours\n").unwrap();
-        run(&repo, &["commit", "-q", "-am", "ours"]);
-        let _ = std::process::Command::new("git")
-            .args(["merge", "theirs"])
-            .current_dir(&repo)
-            .status();
-        (dir, repo)
     }
 
     // ---- list_conflicts_for_repo -------------------------------------

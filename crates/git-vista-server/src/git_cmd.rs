@@ -1356,6 +1356,7 @@ pub(crate) fn unrunnable_repo() -> (tempfile::TempDir, std::path::PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git_vista_fixtures::seeded as seeded_repo;
 
     use std::path::PathBuf;
     use std::time::Duration;
@@ -1479,20 +1480,6 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    /// A fresh repository on branch `main` with one committed file.
-    fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        run(&repo, &["init", "-q", "-b", "main"]);
-        run(&repo, &["config", "user.email", "t@example.invalid"]);
-        run(&repo, &["config", "user.name", "t"]);
-        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-        run(&repo, &["add", "a.txt"]);
-        run(&repo, &["commit", "-q", "-m", "seed"]);
-        (dir, repo)
     }
 
     /// Deterministic filler of exactly `len` bytes, built in fixed rows so the

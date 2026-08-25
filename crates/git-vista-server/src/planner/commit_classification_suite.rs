@@ -6,7 +6,7 @@
 
 use super::commit_exec::{classify_amend_failure, classify_commit_failure, commit_refusal_body};
 use super::*;
-use std::path::PathBuf;
+use git_vista_fixtures::seeded as seeded_repo;
 
 fn tokens() -> (RepositoryToken, WorktreeToken) {
     (
@@ -39,21 +39,6 @@ async fn git_rev_parse_head(repo: &Path) -> String {
         .unwrap();
     assert!(output.status.success(), "git rev-parse HEAD failed");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-/// A fresh repository on branch `main` with one committed file and a
-/// clean working tree.
-fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    run(&repo, &["init", "-q", "-b", "main"]);
-    run(&repo, &["config", "user.email", "t@example.invalid"]);
-    run(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-    run(&repo, &["add", "a.txt"]);
-    run(&repo, &["commit", "-q", "-m", "seed"]);
-    (dir, repo)
 }
 
 // -----------------------------------------------------------------------
@@ -295,6 +280,7 @@ fn classify_amend_failure_covers_every_branch_with_paired_negatives() {
 #[test]
 fn classify_commit_failure_covers_every_branch_with_paired_negatives() {
     use CommitFailureKind::*;
+
     // Captured verbatim (scratch repos, 2026-08-18, git 2.43):
     //   git -c commit.gpgsign=true -c user.signingkey=DOESNOTEXIST \
     //       -c gpg.format=openpgp commit -m x
