@@ -26,12 +26,14 @@
 //! review the diff, and record the protocol implications (M1.02 rules).
 
 use git_vista_protocol::{
-    AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind, BranchRequest,
-    CloneRequest, CommitError, CommitFailureKind, CommitOid, CreateBranchRequest,
-    CreateCommitRequest, DeleteCloneRequest, FetchError, FetchFailureKind, FetchRequest,
-    FetchSuccess, ForcePublish, HookPolicy, MergeStrategy, PullError, PullFailureKind, PullRequest,
-    PullSuccess, PushRequest, RebaseStatus, RemoteRefUpdate, RepoMode, RepositoryDescriptor,
-    RepositoryKind, SelectRequest, SessionInfo, SessionRequest,
+    AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind,
+    BranchFromStashRequest, BranchName, BranchRequest, CloneRequest, CommitError,
+    CommitFailureKind, CommitOid, CreateBranchRequest, CreateCommitRequest, DeleteCloneRequest,
+    FetchError, FetchFailureKind, FetchRequest, FetchSuccess, ForcePublish, HookPolicy,
+    MergeStrategy, PullError, PullFailureKind, PullRequest, PullSuccess, PushRequest,
+    PushStashRequest, RebaseStatus, RemoteRefUpdate, RepoMode, RepositoryDescriptor,
+    RepositoryKind, SelectRequest, SessionInfo, SessionRequest, StashEntry, StashMessage,
+    StashSelector, StashTarget,
 };
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +83,23 @@ struct DtoGoldenSet {
     rebase_status: RebaseStatus,
     repository_descriptor_minimal: RepositoryDescriptor,
     repository_descriptor_with_path_and_remote: RepositoryDescriptor,
+    // M3.24 (#77, ADR 0079) — the stash family, enrolled by #506.
+    //
+    // These four were added to `dto.rs` by PR #500 and NOT added here, while
+    // this file's own module doc claims to cover "every public DTO `dto.rs`
+    // puts on the wire". Both shapes then changed incompatibly and nothing
+    // noticed: `GET /api/stashes` dropped `index`, and the branch body moved
+    // its pair into a nested `target`. `PROTOCOL_VERSION` stayed at 6, so a
+    // cached PWA negotiated successfully and only then found it could not read
+    // the drawer. A claim of total coverage is worth nothing if enrolling a
+    // new type is a step someone has to remember.
+    stash_entry: StashEntry,
+    stash_target: StashTarget,
+    // Twice, because `message` is the optional field and an optional silently
+    // becoming required is precisely what a round-trip cannot catch.
+    push_stash_request_with_message: PushStashRequest,
+    push_stash_request_without_message: PushStashRequest,
+    branch_from_stash_request: BranchFromStashRequest,
 }
 
 fn golden_set() -> DtoGoldenSet {
@@ -394,6 +413,44 @@ fn golden_set() -> DtoGoldenSet {
             // rather than the quiet one. The minimal descriptor above pins the
             // absent case.
             hook_policy: Some(HookPolicy::Unsandboxed),
+        },
+        stash_entry: StashEntry {
+            entry: StashSelector::new("stash@{0}").expect("a valid selector"),
+            oid: CommitOid::new("2d927e40035906ea731e87ce6dcf6618e9fd5778").expect("a valid oid"),
+            // Left exactly as git wrote it, including the `On <branch>:` form
+            // git uses for `git stash push -m` — see `StashEntry`'s own doc for
+            // why this is a plain String and not `StashMessage`.
+            message: "On main: will not apply cleanly".to_string(),
+            time: 1_787_650_449,
+        },
+        stash_target: StashTarget {
+            entry: StashSelector::new("stash@{12}").expect("a valid selector"),
+            expected_oid: CommitOid::new("9d8f02ce4d63e734936efa3a8535ada77b909d3a")
+                .expect("a valid oid"),
+        },
+        push_stash_request_with_message: PushStashRequest {
+            message: Some(StashMessage::new("half-finished refactor").expect("a valid message")),
+            keep_index: true,
+            include_untracked: false,
+        },
+        // Both flags false AND no message: the shape a client sends when the
+        // user typed nothing and ticked nothing. `PushStashRequest`'s doc
+        // explains why neither flag carries `#[serde(default)]`; this instance
+        // is what proves the absent message still serialises distinguishably.
+        push_stash_request_without_message: PushStashRequest {
+            message: None,
+            keep_index: false,
+            include_untracked: false,
+        },
+        branch_from_stash_request: BranchFromStashRequest {
+            name: BranchName::new("rescue/half-finished").expect("a valid branch name"),
+            // NESTED, not flat. This is the shape change that went out
+            // unversioned; pinning it here is what makes the next one visible.
+            target: StashTarget {
+                entry: StashSelector::new("stash@{1}").expect("a valid selector"),
+                expected_oid: CommitOid::new("3e6a573fc9954d8c58b122ba79b46563244dc2ef")
+                    .expect("a valid oid"),
+            },
         },
     }
 }
