@@ -23,7 +23,15 @@
 
 import { expect, test } from '@playwright/test'
 
-import { markPage, openApp, pageSurvived, runtime, setHash, watchSignIns } from './helpers.mjs'
+import {
+  forceOnline,
+  markPage,
+  openApp,
+  pageSurvived,
+  runtime,
+  setHash,
+  watchSignIns,
+} from './helpers.mjs'
 
 /** Shaped like the real thing (64 lowercase hex, per the server's
  *  `SECRET_BYTES`) but not it: the one bootstrap token was spent by global
@@ -46,7 +54,11 @@ test.describe('#392 a token pasted into a live tab', () => {
 
     // ...and it redeemed THIS token, not merely re-checked the cookie. A
     // reload that skipped the exchange would leave the pasted link unspent.
-    await expect.poll(() => posts.some((body) => body.includes(DEAD_TOKEN))).toBe(true)
+    // 20s, not the config's 10s default: this is the one assertion that waits
+    // on a full wasm boot after a reload, and this box serialises heavy builds.
+    await expect
+      .poll(() => posts.some((body) => body.includes(DEAD_TOKEN)), { timeout: 20_000 })
+      .toBe(true)
 
     // A dead token must not cost the tab its session: `establish_session`
     // falls through to `GET /api/session`, the cookie is still live, and the
@@ -95,5 +107,42 @@ test.describe('#392 a token pasted into a live tab', () => {
     // Cheap guard against a green run over a stale `.runtime.json` -- the same
     // failure mode `harness-selfcheck` exists for.
     expect(runtime().base).toMatch(/^http:\/\/(localhost|127\.0\.0\.1):8080/)
+  })
+})
+
+// The scenario #392 was actually REPORTED from, which every test above misses.
+//
+// `openApp` loads with the suite's saved `storageState`, so those tabs are
+// already signed in. But the session store is in-memory: a restart drops every
+// session AND rotates the token, so the tab Tom was looking at is sitting on
+// the blocking sign-in screen when he pastes the new link. That is a different
+// entry point -- no cookie, a blocking overlay mounted, `needs_sign_in` true --
+// and "the listener is installed unconditionally" is a claim about source, not
+// an observation.
+test.describe('#392 a token pasted into a tab that is NOT signed in', () => {
+  test.use({ storageState: { cookies: [], origins: [] } })
+
+  test('reloads and attempts the exchange from the sign-in screen', async ({ page }) => {
+    await forceOnline(page)
+    const { base } = runtime()
+    const posts = watchSignIns(page)
+    await page.goto(base)
+
+    // Proves the starting state is the blocking overlay and not the app -- the
+    // whole point of this second entry point.
+    await expect(page.getByText('Connect to git-vista')).toBeVisible()
+    await markPage(page)
+
+    await setHash(page, `#s=${DEAD_TOKEN}`)
+
+    await expect.poll(() => pageSurvived(page)).toBe(false)
+    await expect
+      .poll(() => posts.some((body) => body.includes(DEAD_TOKEN)), { timeout: 20_000 })
+      .toBe(true)
+
+    // The token is dead, so the screen comes back rather than the app. What
+    // matters is that it came back at all: a reload that broke the sign-in
+    // path would strand the one tab with no other way in.
+    await expect(page.getByText('Connect to git-vista')).toBeVisible()
   })
 })
