@@ -105,3 +105,59 @@ Three things the previous batch proved necessary, in every one of the six:
   container (`landlock_abi=-1`; the server refuses to start without its strict
   sandbox tier and INV-13 gives it no degraded mode), and every one of the three
   defects found in PR #490 was found by that leg and by nothing else.
+
+---
+
+## Never tell a cloud session "`cargo test --workspace` must be green"
+
+**It cannot be.** Every handoff in the 25 August batch said it, and every one
+was wrong.
+
+A cloud container fails **320 of 915** `git-vista-server` tests on unmodified
+`main`, before reaching anything a handoff is about. One cause, printed 535
+times in a single run:
+
+> `this operation runs in the strict sandbox tier and this host cannot provide
+> it (missing: landlock_abi>=6, bwrap). Per ADR 0029 the operation is refused
+> rather than run in a weaker tier`
+
+268 of those tests print that refusal verbatim; the other 52 are downstream of
+it (`CheckFailed { GitSpawnFailed }`, "couldn't run git"). Landlock is absent
+from that kernel — verified by raw `landlock_create_ruleset` syscall,
+independently of the server's own probe — so **installing `bwrap` changes
+nothing**. `seccomp` and user namespaces are present; the strict tier needs all
+four.
+
+**Five sessions worked around this silently and none of them said so.** That is
+the part that matters: an instruction a session cannot follow does not produce
+a complaint, it produces a quiet workaround and a PR whose green claim means
+something different from what the reader assumes.
+
+### What to write instead
+
+> Roughly 320 `git-vista-server` tests fail in your container for environmental
+> reasons — the strict sandbox tier is unavailable there. **Run the suite on
+> unmodified `main` first, keep that failing-test set, and compare yours
+> against it. Only the difference is yours.** State the two counts in your PR
+> body. Do not report a sandbox-refusal failure as a defect, and do not claim
+> the suite is green.
+
+### The trap that makes this worse than a nuisance
+
+Running the six `CURRENT`-writing tests at 8 threads in a container fails
+**20/20**. That looks exactly like a reproduction of #438's race, and it is an
+environment failure — the same set fails at `--test-threads=1`. A session
+reporting that 20/20 as a repro has reported the wrong bug convincingly.
+
+The session that found this refused to report it, and refused to conclude from
+`--test-threads=1` failing that the process-global hypothesis was dead, on the
+grounds that the tests never got far enough to race. Both refusals were right.
+Its write-up is `CLOUD-4-issue-438-result.md`, and it is the most useful
+document the batch produced.
+
+### The general rule
+
+**Before writing an acceptance criterion, ask whether the session you are
+sending it to can physically satisfy it.** A criterion that cannot be met is
+not a high bar. It is an instruction to improvise, issued to someone with no
+way to tell you they had to.
