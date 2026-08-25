@@ -55,11 +55,16 @@ pub mod git;
 
 mod broken;
 mod conflict;
+mod content;
 mod seeded;
 
 pub use broken::{broken_head, unrunnable};
 pub use conflict::{
     conflict_add_add, conflict_binary, conflict_delete_modify, conflict_modify_modify,
     sequence_mid_revert,
+};
+pub use content::{
+    binary_blob, four_mode, on_disk_len, path_battery, pathological_content, write_rows,
+    BIG_TEXT_APPEND, BIG_TEXT_BYTES, BINARY_SENTINEL,
 };
 pub use seeded::{empty, seeded, seeded_dated, seeded_files, Fixture, PINNED_DATE};
