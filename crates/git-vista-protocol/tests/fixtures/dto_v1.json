@@ -202,5 +202,31 @@
     "path": "/home/tom/repos/git-vista/.worktrees/linked",
     "remote_web_url": "https://github.com/owner/repo",
     "hook_policy": "unsandboxed"
+  },
+  "stash_entry": {
+    "entry": "stash@{0}",
+    "oid": "2d927e40035906ea731e87ce6dcf6618e9fd5778",
+    "message": "On main: will not apply cleanly",
+    "time": 1787650449
+  },
+  "stash_target": {
+    "entry": "stash@{12}",
+    "expected_oid": "9d8f02ce4d63e734936efa3a8535ada77b909d3a"
+  },
+  "push_stash_request_with_message": {
+    "message": "half-finished refactor",
+    "keep_index": true,
+    "include_untracked": false
+  },
+  "push_stash_request_without_message": {
+    "keep_index": false,
+    "include_untracked": false
+  },
+  "branch_from_stash_request": {
+    "name": "rescue/half-finished",
+    "target": {
+      "entry": "stash@{1}",
+      "expected_oid": "3e6a573fc9954d8c58b122ba79b46563244dc2ef"
+    }
   }
 }
