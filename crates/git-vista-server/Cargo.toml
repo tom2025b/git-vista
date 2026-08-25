@@ -75,6 +75,10 @@ tower-http = { version = "0.7.0", features = ["fs", "set-header", "catch-panic"]
 tempfile = "3"
 
 [dev-dependencies]
+# The #448 fixture catalogue: every deliberately-broken repository shape these
+# suites drive, built once in one place. Dev-only — no shipped code builds a
+# fixture, and the crate must never reach the release binary.
+git-vista-fixtures = { workspace = true }
 # `ServiceExt::oneshot` drives the router in the contract-layer tests (protocol
 # negotiation, the error envelope, the no-path-based-selection guard) without a
 # live socket. Test-only: the release binary never pulls tower's `util` feature.

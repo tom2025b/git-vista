@@ -65,6 +65,8 @@ use super::worktree_exec::{
     exec_delete_untracked_paths, exec_discard_tracked_paths, observe_deletion, DeleteOutcome,
 };
 use super::*;
+use git_vista_fixtures::seeded as seeded_repo;
+use git_vista_fixtures::seeded_dated as seeded_repo_dated;
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -103,21 +105,6 @@ fn out(repo: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-/// A fresh repository on branch `main` with one committed file (`a.txt`) and
-/// a clean working tree — same shape as `planner::tests::seeded_repo`.
-fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    run(&repo, &["init", "-q", "-b", "main"]);
-    run(&repo, &["config", "user.email", "t@example.invalid"]);
-    run(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-    run(&repo, &["add", "a.txt"]);
-    run(&repo, &["commit", "-q", "-m", "seed"]);
-    (dir, repo)
 }
 
 fn tip(repo: &Path, rev: &str) -> String {
@@ -4903,40 +4890,6 @@ async fn push_tag_executes_through_the_pipeline() {
 // --- paths must be byte-identical for every operation kind. -----------------
 // ---------------------------------------------------------------------------
 
-/// `git <args…>` with author/committer dates pinned, so two identically
-/// seeded repositories get **identical commit oids** — what lets
-/// [`the_split_path_is_byte_identical_to_the_single_shot_path`] compare
-/// response bytes (some refusals embed the seed tip) across twin repos.
-fn run_dated(repo: &Path, args: &[&str]) {
-    assert!(
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .env("GIT_AUTHOR_DATE", "2026-01-02T03:04:05Z")
-            .env("GIT_COMMITTER_DATE", "2026-01-02T03:04:05Z")
-            .status()
-            .unwrap()
-            .success(),
-        "git {args:?} failed in {repo:?}"
-    );
-}
-
-/// [`seeded_repo`] with the seed commit's dates pinned via [`run_dated`]:
-/// every call yields a repository in the byte-identical state — same tree,
-/// same tip oid, same generation inputs — so a pair of them are true twins.
-fn seeded_repo_dated() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    run(&repo, &["init", "-q", "-b", "main"]);
-    run(&repo, &["config", "user.email", "t@example.invalid"]);
-    run(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-    run(&repo, &["add", "a.txt"]);
-    run_dated(&repo, &["commit", "-q", "-m", "seed"]);
-    (dir, repo)
-}
-
 /// The split-path census (M2.23c, #247): every [`GitOperation`] variant maps
 /// through [`covered_on_split_path`] to a **live** `#[tokio::test]`, and the
 /// sweep that table vouches for must itself iterate [`samples`] — the same
@@ -5707,6 +5660,7 @@ async fn resolve_conflict_content_refuses_when_a_stage_moved_since_it_was_built(
     // stage): "<mode> SP <sha1> SP <stage> TAB <path>" replaces exactly the
     // stage-2 entry, leaving stage 1, stage 3, and the worktree file untouched.
     use std::io::Write;
+
     let mut child = std::process::Command::new("git")
         .args(["update-index", "--index-info"])
         .current_dir(&repo)

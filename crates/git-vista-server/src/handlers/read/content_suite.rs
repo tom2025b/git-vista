@@ -8,6 +8,7 @@
 use super::*;
 use axum::routing::get;
 use axum::Router;
+use git_vista_fixtures::seeded as seeded_repo;
 use git_vista_protocol::diff::{ComparisonBasis, DiffSpec};
 use git_vista_protocol::RepositoryDescriptor;
 use tower::ServiceExt;
@@ -61,20 +62,6 @@ fn stdout_len(repo: &Path, args: &[String]) -> usize {
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout.len()
-}
-
-/// A fresh repository on branch `main` with one committed file.
-fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    run(&repo, &["init", "-q", "-b", "main"]);
-    run(&repo, &["config", "user.email", "t@example.invalid"]);
-    run(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-    run(&repo, &["add", "a.txt"]);
-    run(&repo, &["commit", "-q", "-m", "seed"]);
-    (dir, repo)
 }
 
 /// A repository whose HEAD commit modifies several files — enough `-z`
@@ -317,6 +304,7 @@ async fn bounded_diff_numstat_cap_returns_413() {
 /// literally `git`.
 fn write_rows(path: &Path, header: &str, len: usize, tag: &str) {
     use std::io::Write;
+
     let mut w = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
     w.write_all(header.as_bytes()).unwrap();
     let mut written = header.len();

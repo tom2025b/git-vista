@@ -532,6 +532,12 @@ async fn undo_commit_oid(repo: &Path, given: &str) -> Result<CommitOid, (StatusC
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    /// The activity suite's seed: one commit named `base` holding `f.txt`.
+    /// Named differently from the catalogue default because these tests assert
+    /// on the subject line and add further commits to `f.txt`.
+    fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
+        git_vista_fixtures::seeded_files(&[("f.txt", "line1\n")], "base")
+    }
 
     fn run(repo: &Path, args: &[&str]) {
         assert!(
@@ -556,21 +562,6 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "git rev-parse {rev} failed");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    /// A fresh repository on `main` with one committed file and a clean
-    /// working tree — same shape `planner.rs`'s own `seeded_repo` uses.
-    fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        run(&repo, &["init", "-q", "-b", "main"]);
-        run(&repo, &["config", "user.email", "t@example.invalid"]);
-        run(&repo, &["config", "user.name", "t"]);
-        std::fs::write(repo.join("f.txt"), "line1\n").unwrap();
-        run(&repo, &["add", "f.txt"]);
-        run(&repo, &["commit", "-q", "-m", "base"]);
-        (dir, repo)
     }
 
     /// #327 defect A: the exact repro shape from the owner's session log —

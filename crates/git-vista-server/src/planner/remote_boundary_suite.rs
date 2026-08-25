@@ -67,6 +67,12 @@ use git_vista_protocol::{
 
 use crate::handlers::fetch::validate_remote;
 use crate::test_ports::PortClaim;
+/// `a.txt` holds `seed\n` rather than the catalogue default `a\n`: these
+/// tests match on the content to tell the seed commit from what a fetch
+/// brought in.
+fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
+    git_vista_fixtures::seeded_files(&[("a.txt", "seed\n")], "seed")
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -90,21 +96,6 @@ fn tokens() -> (RepositoryToken, WorktreeToken) {
         RepositoryToken::new("remote-boundary-repo").unwrap(),
         WorktreeToken::new("remote-boundary-worktree").unwrap(),
     )
-}
-
-/// A repository with one commit and **no remote configured** — the state in
-/// which every "an unconfigured remote must not be reached" leg runs.
-fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    run(&repo, &["init", "-q", "-b", "main"]);
-    run(&repo, &["config", "user.email", "t@example.invalid"]);
-    run(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.txt"), "seed\n").unwrap();
-    run(&repo, &["add", "a.txt"]);
-    run(&repo, &["commit", "-q", "-m", "seed"]);
-    (dir, repo)
 }
 
 /// Add a bare repository named `name` **inside the served repository's tree**,

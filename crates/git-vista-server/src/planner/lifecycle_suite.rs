@@ -13,13 +13,13 @@
 //! commit, which is the failure this whole milestone exists to remove.
 
 use super::*;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use git_vista_core::identity::RepositoryId;
 use git_vista_protocol::{OperationId, OperationState, OperationStatus};
 
 use crate::operations::{self, Admission};
+use git_vista_fixtures::seeded as seeded_repo;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -35,20 +35,6 @@ fn run(repo: &Path, args: &[&str]) {
             .success(),
         "git {args:?} failed in {repo:?}"
     );
-}
-
-/// A fresh repository on `main` with one commit and a clean working tree.
-fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    run(&repo, &["init", "-q", "-b", "main"]);
-    run(&repo, &["config", "user.email", "t@example.invalid"]);
-    run(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-    run(&repo, &["add", "a.txt"]);
-    run(&repo, &["commit", "-q", "-m", "seed"]);
-    (dir, repo)
 }
 
 fn tokens() -> (RepositoryToken, WorktreeToken) {
