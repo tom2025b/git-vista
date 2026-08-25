@@ -21,29 +21,7 @@
 // under the temp dir it is handed.
 
 import { execFileSync } from 'node:child_process'
-// `buildStashFixture` below is the one builder #448 did not move into the Rust
-// catalogue: it landed in PR #490 while #448 was in flight, so the two merged
-// cleanly as text and not as meaning -- #448 dropped these imports because
-// nothing in this file needed them any more, and #490's builder needs three of
-// them. Filed as a follow-up; until it moves, the imports stay.
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-
-// Commit identity is set per-invocation, never through repo or global config:
-// this box has repositories whose local user.email is a personal gmail address,
-// and a bare `git commit` would silently pick it up.
-//
-// Restored during the #448 merge for the same reason the `node:fs` imports
-// above were: #448 moved every other builder into the Rust catalogue and
-// dropped this with them, while #490's `buildStashFixture` -- which landed
-// while #448 was in flight -- still calls git from JavaScript. The two merged
-// as text and not as meaning. It goes away when that builder moves.
-const IDENT = [
-  '-c', 'user.name=Claude_Max',
-  '-c', 'user.email=262510778+tom2025b@users.noreply.github.com',
-  '-c', 'commit.gpgsign=false',
-  '-c', 'tag.gpgsign=false',
-]
 
 /** Repo root, from this file's location: ci/browser -> ../.. */
 const REPO = join(import.meta.dirname, '..', '..')
@@ -57,15 +35,25 @@ const FIXTURE_BIN = join(REPO, 'target', 'debug', 'gv-fixture')
  * The failure is deliberately loud and says how to fix it: a missing binary
  * here otherwise surfaces much later as a spec failing against an empty
  * directory, which reads as a product defect rather than a missing build step.
+ *
+ * Read off the spawn failure rather than an `existsSync` probe first (#496).
+ * That is not only what lets this file drop `node:fs` entirely -- it also
+ * covers the case the probe missed: a binary that exists but cannot be
+ * executed raises EACCES here, and used to sail past the check and die with
+ * git's own message instead of this one.
  */
 function build(shape, root) {
-  if (!existsSync(FIXTURE_BIN)) {
-    throw new Error(
-      `browser fixtures: no catalogue binary at ${FIXTURE_BIN}\n` +
-        `               build it first:  cargo build -p git-vista-fixtures`,
-    )
+  try {
+    execFileSync(FIXTURE_BIN, [shape, root], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  } catch (err) {
+    if (err?.code === 'ENOENT' || err?.code === 'EACCES') {
+      throw new Error(
+        `browser fixtures: cannot run the catalogue binary at ${FIXTURE_BIN} (${err.code})\n` +
+          `               build it first:  cargo build -p git-vista-fixtures`,
+      )
+    }
+    throw err
   }
-  execFileSync(FIXTURE_BIN, [shape, root], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
   return root
 }
 
@@ -179,6 +167,23 @@ export function buildInterleavedWipFixture(root) {
   }
 }
 
+/** The subject of the entry that cannot be applied cleanly — `stash@{0}`, the
+ *  newest, so a spec reaches it as "the first row". Mirrors
+ *  `browser::STASH_CONFLICTING_SUBJECT`. */
+export const STASH_CONFLICTING_SUBJECT = 'will not apply cleanly'
+
+/** The path that entry collides on. Mirrors `browser::STASH_CONFLICTING_PATH`. */
+export const STASH_CONFLICTING_PATH = 'collision.txt'
+
+/** Left in the working tree and never stashed, so the push preview has
+ *  something real to report as NOT captured (A2). Mirrors
+ *  `browser::STASH_UNTRACKED_FILE`. */
+export const STASH_UNTRACKED_FILE = 'untracked-note.txt'
+
+/** How many entries the fixture leaves on the stash. Asserted directly by the
+ *  drawer spec, so it must stay in sync with `browser::STASH_COUNT`. */
+export const STASH_COUNT = 3
+
 /**
  * A SEVENTH repository, holding real stash entries (M3.24, #77).
  *
@@ -188,73 +193,20 @@ export function buildInterleavedWipFixture(root) {
  * and #348. Stashing in that repo would empty the working tree those specs
  * assert on, and stashing anywhere else would change a count.
  *
- * Three entries, because each one exists for a different assertion:
- *
- *   `stash@{2}` — the OLDEST, made with `git stash push -m`, so its reflog
- *   message is the `On <branch>: <text>` form. Pins that a user's own words are
- *   shown as written and marked as theirs (no "auto" pill).
- *
- *   `stash@{1}` — made with a bare `git stash`, so git writes
- *   `WIP on main: <sha> <subject>`. Pins the other parse: the branch comes out
- *   as a pill, the base commit's sha is dropped from the subject, and the entry
- *   IS marked automatic.
- *
- *   `stash@{0}` — the NEWEST, and the one that CONFLICTS on apply. Built by
- *   stashing an edit to a line and then committing a different edit to the same
- *   line, so `git stash apply` cannot merge it. This is the A4 fixture: a pop
- *   here applies something and drops nothing, and the drawer must not say
- *   "popped".
- *
- * The conflicting entry is deliberately `stash@{0}` so a spec can reach it
- * without depending on row ordering beyond "first".
+ * Shape and rationale: `git_vista_fixtures::browser::stash_fixture` — which is
+ * also where the reason the automatic entry's subject deliberately collides
+ * with the seed commit's is written down, because that collision is what
+ * `helpers.mjs`'s scoped `openDrawer` locators exist to survive.
  */
 export function buildStashFixture(root) {
-  rmSync(root, { recursive: true, force: true })
-  mkdirSync(root, { recursive: true })
-
-  const git = (...args) =>
-    execFileSync('git', [...IDENT, '-C', root, ...args], {
-      encoding: 'utf8',
-      env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
-    })
-
-  git('init', '-q', '-b', 'main')
-  writeFileSync(join(root, 'tracked.txt'), 'the committed line\n')
-  writeFileSync(join(root, 'collision.txt'), 'original\n')
-  git('add', '-A')
-  git('commit', '-q', '-m', 'seed: two tracked files')
-
-  // --- stash@{2} after the two below land: the `-m` message form.
-  writeFileSync(join(root, 'tracked.txt'), 'a named change\n')
-  git('stash', 'push', '-m', 'half-finished refactor')
-
-  // --- stash@{1}: the automatic `WIP on main: <sha> <subject>` form.
-  writeFileSync(join(root, 'tracked.txt'), 'an unnamed change\n')
-  git('stash')
-
-  // --- stash@{0}: the one that conflicts.
-  //
-  // Stash an edit to `collision.txt`, then commit a DIFFERENT edit to the same
-  // line. The stash's base no longer matches the working tree, so applying it
-  // leaves the path conflicted. This is what A4 is about, and it is why this
-  // fixture cannot be shared with any spec that wants a clean tree.
-  writeFileSync(join(root, 'collision.txt'), 'the stashed edit\n')
-  git('stash', 'push', '-m', 'will not apply cleanly')
-  writeFileSync(join(root, 'collision.txt'), 'a conflicting committed edit\n')
-  git('add', 'collision.txt')
-  git('commit', '-q', '-m', 'move the line the stash also touches')
-
-  // An untracked file left in place, so the push preview has something to
-  // report as NOT stashed (A2). It is never stashed by this fixture.
-  writeFileSync(join(root, 'untracked-note.txt'), 'not in the index\n')
-
+  build('stash', root)
   return {
     root,
     // Newest first, exactly as `GET /api/stashes` returns them.
-    entries: ['will not apply cleanly', 'WIP on main', 'half-finished refactor'],
-    stashCount: 3,
+    entries: [STASH_CONFLICTING_SUBJECT, 'WIP on main', 'half-finished refactor'],
+    stashCount: STASH_COUNT,
     conflictingSelector: 'stash@{0}',
-    conflictingPath: 'collision.txt',
-    untracked: 'untracked-note.txt',
+    conflictingPath: STASH_CONFLICTING_PATH,
+    untracked: STASH_UNTRACKED_FILE,
   }
 }

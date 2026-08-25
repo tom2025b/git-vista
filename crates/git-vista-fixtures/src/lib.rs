@@ -40,7 +40,17 @@
 //! building repositories in JavaScript, because two implementations of "a
 //! repository broken in shape X" is the drift problem one layer up — and drift
 //! between a *teaching* fixture and a *test* fixture means the thing being
-//! taught is not the thing the code handles. See `docs/adr/0074`.
+//! taught is not the thing the code handles. See `docs/adr/0076`.
+//!
+//! # A shape can also be evidence about `git` itself
+//!
+//! [`status`] is the newest module and the one that stretches the idea. Its
+//! repositories are not broken at all — they hold one of every working-tree
+//! status record git can emit, so the same shapes can be read by **two git
+//! binaries** and compared (#365, ADR 0082). That is only possible because the
+//! fixtures are real repositories built by real `git`: a hand-written byte
+//! string, however carefully captured, can never tell you what a different git
+//! would have written.
 //!
 //! # Using it
 //!
@@ -52,6 +62,7 @@
 
 pub mod browser;
 pub mod git;
+pub mod status;
 
 mod broken;
 mod conflict;

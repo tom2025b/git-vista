@@ -90,6 +90,33 @@ fn command(repo: &Path, args: &[&str]) -> Command {
     command_as(CATALOGUE, repo, args)
 }
 
+/// [`run`] with extra `-c <key>=<value>` overrides in front of the subcommand.
+///
+/// Needed because some settings are only honoured when they arrive on the
+/// command line. `protocol.file.allow` is the case this exists for: git
+/// deliberately does **not** read it from the repository's own config when
+/// deciding whether a submodule may be cloned over a `file` transport — a
+/// repository could otherwise authorise its own clone — so writing it with
+/// `git config` has no effect and the clone fails with `transport 'file' not
+/// allowed`. Passed as `-c` it reaches the child through
+/// `GIT_CONFIG_PARAMETERS`, which is what the submodule helper consults.
+pub fn run_configured(repo: &Path, config: &[&str], args: &[&str]) {
+    let mut cmd = Command::new("git");
+    cmd.args(ident_args(CATALOGUE));
+    for kv in config {
+        cmd.arg("-c").arg(kv);
+    }
+    let status = cmd
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .status()
+        .unwrap_or_else(|e| panic!("could not spawn git {args:?} in {repo:?}: {e}"));
+    assert!(status.success(), "git {args:?} failed in {repo:?}");
+}
+
 /// Run `git <args>` in `repo` and panic if it fails.
 ///
 /// Fixtures assert rather than return a `Result` on purpose: a builder that

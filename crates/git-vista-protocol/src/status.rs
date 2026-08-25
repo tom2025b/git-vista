@@ -260,20 +260,40 @@ pub struct WorktreeStatus {
 // on the read side; the same discipline applies here), and -z is the only
 // v2 form that survives one losslessly.
 //
-// Verified against a real `git 2.43.0` install on this host (`git --version`),
-// not assumed from `git-status(1)` alone — every record shape below (the
-// rename/copy two-token split, a submodule's `<sub>` field, one conflict
-// XY combination) was captured from an actual `git status --porcelain=v2
-// --branch -z` run against a scratch repository before being encoded here.
-// The CI-enforced git version floor (`docs/SUPPORTED_VERSIONS.md`) is 2.32;
-// porcelain v2 has not changed shape since its introduction in git 2.11, and
-// nothing in `git`'s own release notes between 2.32 and 2.43 documents a
-// porcelain-v2 format change, but this parser has only been *exercised*
-// against 2.43.0 — a single version, not the floor itself. That is a real
-// gap against #68's *"results match supported Git versions on fixtures"*
-// criterion, named here rather than silently claimed satisfied; closing it
-// fully would need a second git binary at 2.32 on the CI runner, which is
-// out of this task's scope to add.
+// Verified against real git, not assumed from `git-status(1)` alone. Every
+// record shape below (the rename/copy two-token split, a submodule's `<sub>`
+// field, every conflict XY combination) was captured from an actual `git
+// status --porcelain=v2 --branch -z` run against a real repository before
+// being encoded here.
+//
+// The unit tests in this file feed the parser hand-written bytes, which is
+// deliberate — they are tests of the parser, and a literal is the clearest way
+// to say which byte sequence is under test. They are not, on their own,
+// evidence about any git version, and until #365 nothing else was: this parser
+// had only ever been *exercised* against the 2.43.0 on one host, a single
+// version rather than the floor itself.
+//
+// That gap is now closed rather than merely admitted (#365, ADR 0082).
+// `crates/git-vista-fixtures/tests/status_floor.rs` builds real repositories
+// covering this whole vocabulary and runs the argv above over them with TWO
+// binaries — the runner's git and a build of the floor named by the `## Git:`
+// heading in `docs/SUPPORTED_VERSIONS.md` — parsing both streams with
+// `parse_porcelain_v2_z` and holding each to a named expected value. CI
+// provisions the floor binary and then asserts, in shell over the test's own
+// report, that the second leg really ran; a missing report or an absent floor
+// fails the build rather than passing quietly.
+//
+// The finding, recorded because "no difference" is a result and not an
+// absence of one: **the floor and the current git parse identically here**, on
+// every shape and under all three read modes. Measured pairs so far — 2.32.0
+// against 2.43.0 on a developer box, and 2.32.0 against **2.55.0** on the CI
+// runner. The second leg is deliberately not pinned to a version: it is
+// whatever git the machine has, so the span widens on its own as runners move,
+// and no comment here has to be edited to keep up.
+//
+// That is the expected outcome — porcelain v2 has not changed shape since its
+// introduction in git 2.11 — and it is now measured on every CI run instead of
+// inferred from the release notes.
 
 /// [`parse_porcelain_v2_z`]'s output — everything a real repository read can
 /// produce **except** the generation tag, which this pure function has no
