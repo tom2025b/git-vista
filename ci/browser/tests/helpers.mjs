@@ -136,3 +136,57 @@ export function watchSignIns(page) {
   })
   return posts
 }
+
+// --- #77: the stash drawer -------------------------------------------------
+//
+// Shared between `stash-drawer.spec.mjs` and `harness-selfcheck.spec.mjs`.
+// They live HERE and not in the spec file because importing a spec file
+// re-executes its top-level `test.describe`, which registers its tests a
+// second time under the importing file — so the stash suite would have run
+// twice, and the self-check's run of it would have popped the fixture the
+// real spec needs.
+
+/** The entry that cannot be applied cleanly. Newest, so it is the first row. */
+export const CONFLICTING_SUBJECT = 'will not apply cleanly'
+/** The path that entry collides on. */
+export const CONFLICTING_PATH = 'collision.txt'
+/** Left in the working tree by the fixture and never stashed by it. */
+export const UNTRACKED = '1 untracked file'
+
+/**
+ * Open the stash repo in FULL mode.
+ *
+ * Not Visualize like `helpers.openApp`: this spec writes. The mode matters for
+ * a second reason worth stating — in Visualize the drawer deliberately still
+ * lists and still inspects, but every write is refused with a reason, so a
+ * spec that landed in the wrong mode would find the Pop button rendered as a
+ * `<span>` and fail with a confusing "not a button".
+ */
+export async function openStashRepo(page) {
+  await forceOnline(page)
+  const { base } = runtime()
+  await page.goto(base)
+  await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
+
+  const entry = page.getByRole('button', { name: /stash-repo/i }).first()
+  await expect(entry).toBeVisible()
+  await entry.click()
+
+  const full = page.getByRole('button', { name: /full git operations/ })
+  if (await full.isVisible().catch(() => false)) {
+    await full.click()
+  }
+  await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
+}
+
+/** Open the Activity panel and wait for the Stashes section to have rendered. */
+export async function openDrawer(page) {
+  await page.getByRole('button', { name: /activity/i }).first().click()
+  await expect(page.getByText('Stashes', { exact: true })).toBeVisible()
+  // Wait on a ROW, not on the heading: the heading renders before the fetch
+  // resolves, so asserting on it would let a spec proceed against a drawer
+  // still showing "Loading stashes…" — and every assertion below would then
+  // fail for the wrong reason.
+  await expect(page.getByText(CONFLICTING_SUBJECT)).toBeVisible({ timeout: 20_000 })
+}
+

@@ -15,7 +15,17 @@
 
 import { expect, test } from '@playwright/test'
 
-import { DIFF_SCROLLER, markPage, openApp, openDiff, pageSurvived, setHash } from './helpers.mjs'
+import {
+  DIFF_SCROLLER,
+  markPage,
+  openApp,
+  openDiff,
+  openDrawer,
+  openStashRepo,
+  pageSurvived,
+  setHash,
+} from './helpers.mjs'
+
 
 /**
  * Run `fn` and return the message it threw, or `null` if it did not throw.
@@ -143,6 +153,48 @@ test.describe('harness self-check — every assertion must be able to go red', (
       expect(name, 'the chip must be announceable').toBeTruthy()
     })
     expectFailedBecause(msg, /the chip must be announceable/, 'the announceability assertion')
+  })
+
+  test('the #77 pop assertion fails when a conflicted pop claims success', async ({ page }) => {
+    // The load-bearing negative of the whole stash slice: a pop that conflicts
+    // has applied something and dropped nothing, so a UI reporting "Popped"
+    // there has lied about the user's data. `stash-drawer.spec.mjs` asserts
+    // that wording is ABSENT, and an absence assertion is the easiest kind to
+    // pass for the wrong reason — it also passes when the notice never renders
+    // at all, or when the selector is wrong.
+    //
+    // So the mutation injects the success wording into the live DOM and
+    // requires the absence assertion to notice.
+    //
+    // It deliberately does NOT drive a real pop. A pop mutates the stash repo,
+    // and this file runs before `stash-drawer.spec.mjs` (workers: 1,
+    // fullyParallel: false, alphabetical) — consuming its fixture here is
+    // exactly what broke conflict-panes when the #432 editor shared
+    // conflict-repo. Reaching the real drawer and injecting the notice tests
+    // the assertion without touching the entries.
+    await openStashRepo(page)
+    await openDrawer(page)
+
+    // The mutation: the exact sentence `PopVerdict::Popped` produces, added to
+    // a drawer whose pop has NOT completed.
+    await page.evaluate(() => {
+      const p = document.createElement('p')
+      p.className = 'detail-status'
+      p.textContent = 'Popped the stash. It has been removed from your stash list.'
+      document.body.appendChild(p)
+    })
+
+    const msg = await failureMessage(async () => {
+      await expect(
+        page.getByText(/^Popped the stash/),
+        'a conflicted pop must never claim it completed',
+      ).toHaveCount(0)
+    })
+    expectFailedBecause(
+      msg,
+      /a conflicted pop must never claim it completed/,
+      'the #77 pop-completion assertion',
+    )
   })
 
   test('the #392 reload assertion fails when the tab does not reload', async ({ page }) => {
