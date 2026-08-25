@@ -129,11 +129,51 @@ The verdict carries paths (`conflicted_paths()`), not markup. The view opens `Vi
 
 ## Findings recorded while implementing
 
-**F1 — `GitOperation::PopStash` is fully wired and completely unreachable.** `plan.rs:1175` defines it with a doc comment citing `/api/stash/pop` as its route; `planner.rs:2610` dispatches it; `planner/stash.rs:242` implements `exec_pop_stash`, which shells out to `git stash pop` and re-reads the conflict state in both branches; `contract_suite.rs:213` names its contract `pop_stash_refuses_to_report_complete_while_conflicted`. No route reaches any of it. Meanwhile `plan.rs:1220-1233` — forty-six lines below the variant's own definition — says `PopStash` "is deliberately ABSENT", and `handlers/stash.rs:12-18` points readers at that comment. Both cannot be true. Additionally, spec §5 says *"Do not shell out to `git stash pop`"*, which is precisely what the executor does. **Not touched on this branch** (the server was to be treated as read-only), and recommended as its own issue: either the route ships with the prerequisites §5 names, or the variant and its executor come out, but the tree should not carry an enum arm whose doc comment advertises a route that does not exist beside a comment saying it never will.
+**F1 — `GitOperation::PopStash` is fully wired and completely unreachable.** *(**Corrected 2026-08-25 — see the note below. It was reachable.** The finding's recommendation was right; its reason was not.)* `plan.rs:1175` defines it with a doc comment citing `/api/stash/pop` as its route; `planner.rs:2610` dispatches it; `planner/stash.rs:242` implements `exec_pop_stash`, which shells out to `git stash pop` and re-reads the conflict state in both branches; `contract_suite.rs:213` names its contract `pop_stash_refuses_to_report_complete_while_conflicted`. No route reaches any of it. Meanwhile `plan.rs:1220-1233` — forty-six lines below the variant's own definition — says `PopStash` "is deliberately ABSENT", and `handlers/stash.rs:12-18` points readers at that comment. Both cannot be true. Additionally, spec §5 says *"Do not shell out to `git stash pop`"*, which is precisely what the executor does. **Not touched on this branch** (the server was to be treated as read-only), and recommended as its own issue: either the route ships with the prerequisites §5 names, or the variant and its executor come out, but the tree should not carry an enum arm whose doc comment advertises a route that does not exist beside a comment saying it never will.
 
 **F2 — `exec_apply_stash` does not re-read the conflict state; `exec_pop_stash` does.** The latter's own comment says why it asks in both branches: *"a pop git called successful while leaving conflicted paths behind is precisely the case this criterion is about."* That case is unguarded on the apply path. It does not bite today, because git exits non-zero for a content conflict (§ Context) — but the guard exists on the sibling path for a reason, and the asymmetry is worth closing. The client compensates by scanning itself (D3), so this is a robustness gap rather than a live defect. Recommended as its own issue.
 
 **F3 — the stash endpoints share no DTOs with the client.** `handlers::stash::stash_list` builds its JSON object by hand and each write handler declares its own `Deserialize` struct, so every field name exists twice in the workspace with nothing forcing them to agree. A rename on either side presents as an empty drawer. Pinned from the client side by `the_listing_shape_the_server_actually_sends`, which asserts against a JSON literal transcribed from that handler — weaker than one type serving both ends, and recorded as weaker in `StashEntry`'s own doc comment.
+
+### Correction to F1 (2026-08-25): "No route reaches any of it" was false
+
+F1 said `PopStash` was unreachable. It was not, and the sentence propagated:
+issue #493 quoted it, ADR 0078 rested on it, the pre-dispatch truth-check
+fan-out repeated it, and the session that merged the removal repeated it again.
+Four passes, all Claude. An outside model (codex) checked the generic seam a
+few hours after the removal landed.
+
+`POST /api/plan` deserializes a **bare, client-supplied** `GitOperation`
+(`handlers/plan.rs`: `Json(op): Json<GitOperation>`). `shape()` and the
+executor dispatch both carried `PopStash` arms. `POST /api/execute-plan` takes
+the returned `Plan` and runs it through `submit_plan_tracked` **without
+rebuilding it** — the plan's own hash is the approval. Both routes are
+`Authz::SessionAndCsrf`, write-mode router only. So any session holder — the
+operator, or the MCP bridge, which drives those two endpoints deliberately —
+could execute it.
+
+**This repository already knew the distinction F1 missed.** ADR 0048, written
+earlier, states it outright about the tag routes:
+
+> The routes are reachable by any HTTP client (and by the MCP bridge), but a
+> user driving the app cannot reach them.
+
+F1 collapsed those two into one. "No UI reaches it" and "no route reaches it"
+are different claims, and only the second justifies calling something dead
+code.
+
+**What F1 got right, and it is the part that mattered:** its recommendation —
+*either the route ships with the prerequisites §5 names, or the variant and its
+executor come out* — was correct, and taking the second option is what actually
+closed the path. `"op":"pop_stash"` now fails deserialization at the wire
+boundary.
+
+**The general rule this leaves behind:** a gate that lives only in a document
+is not a gate. Compare the two variants that got it right — `CreateTag` is
+refused by `execute` itself until #239 lands (ADR 0041), and `ResetTestRepo`
+refuses any repo with no recorded seed (`worktree_exec.rs`). Both enforce their
+gate **in code**. `PopStash`'s gate lived in spec §5 and nowhere else, which is
+why a reachable route could walk straight past it.
 
 **F4 — `offline_guard_audit`'s `API_SRC` was blind to `api/conflicts.rs`.** Fixed on this branch (it is frontend code): the file was never added to the hand-maintained `include_str!` list when the `api/` split created it, so `resolve_conflict_request` and `resolve_conflict_content_request` reached the write transport with nothing in that census watching them. Both were correctly guarded in fact, but a deleted guard would have passed every test in the module. `api_src_concatenates_every_api_submodule` now walks the directory, because a hand-maintained list cannot notice its own gap.
 
