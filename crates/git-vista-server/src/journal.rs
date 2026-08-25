@@ -133,20 +133,37 @@ pub fn append(repo: &Path, event: &ActivityEvent) {
     append_all(repo, std::slice::from_ref(event));
 }
 
-/// A journal write batch id: unique across processes on one box, and ordered
-/// enough to be legible in a file anyone may end up reading by eye.
+/// A journal write batch id: unique among **concurrently-live processes** on
+/// one box, and ordered enough to be legible in a file anyone may end up
+/// reading by eye. Everything else treats it as an opaque string —
+/// [`git_vista_core::activity::refs_at`] compares whole ids, nothing parses
+/// the pieces.
 ///
-/// Wall-clock nanoseconds plus a process-local counter. The counter alone
-/// repeats after a restart; the clock alone repeats if two batches land in the
-/// same nanosecond (and can go backwards). Neither is load-bearing on its own,
-/// and the pair only has to be unique among the lines of one read window.
+/// Wall-clock nanoseconds, the process id, and a process-local counter. The
+/// counter alone repeats after a restart; the clock alone repeats if two
+/// batches land in the same nanosecond (and can go backwards, or collapse to
+/// 0 on a pre-epoch clock — `unwrap_or(0)` below). The pid is what makes two
+/// processes journalling their first batch in the same tick mint *different*
+/// ids (#519): before it was added, both minted `<same nanos>-0` and a
+/// referrer could resolve to the *other* process's ref map, because `refs_at`
+/// takes the first matching anchor.
+///
+/// Still NOT guaranteed: uniqueness across pid reuse (two boots, or a pid
+/// recycled after exit, plus an identical clock reading). Acceptable because
+/// the id only has to be unambiguous within one [`JOURNAL_READ_CAP`] read
+/// window, and a recycled pid colliding inside the same nanosecond within one
+/// window would need the clock itself to have stood still or gone backwards.
 fn mint_batch_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{nanos:x}-{:x}", COUNTER.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "{nanos:x}-{:x}-{:x}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Append a whole operation's events under **one** ref capture (#485,
@@ -458,6 +475,25 @@ mod tests {
     use git_vista_core::activity::HeadAtEvent;
     use git_vista_core::activity::{ActivityKind, ActivitySource};
     use std::process::Command;
+
+    /// #519: two processes journalling their first batch in the same clock
+    /// tick minted identical ids (`<nanos>-0`), and
+    /// [`git_vista_core::activity::refs_at`] resolves a referrer to the
+    /// FIRST matching anchor — potentially the other process's ref map. The
+    /// pid segment is what keeps concurrently-live processes distinct, so
+    /// its presence is pinned here. This is the one deliberate exception to
+    /// "the id is opaque": the test compares against `std::process::id()`
+    /// itself (ground truth), not against a re-run of the minting code.
+    ///
+    /// MUTATION: drop the pid from the format string — this goes red.
+    #[test]
+    fn a_batch_id_embeds_this_process_id_so_concurrent_processes_cannot_collide() {
+        let id = mint_batch_id();
+        assert!(
+            id.contains(&format!("-{:x}-", std::process::id())),
+            "batch id {id:?} must carry the pid between the clock and the counter"
+        );
+    }
 
     /// A tempdir with a real `.git` directory (git init), since the state dir
     /// deliberately requires one.
