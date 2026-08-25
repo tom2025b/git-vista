@@ -16,6 +16,7 @@ import {
   buildConflictFixture,
   buildEditorFixture,
   buildFixture,
+  buildInterleavedWipFixture,
   buildNonTextConflictFixture,
 } from './fixture.mjs'
 import { startServer } from './server.mjs'
@@ -82,6 +83,13 @@ export default async function globalSetup() {
   // #473: a fifth repo whose HEAD resolves to nothing. Separate because it is
   // deliberately broken — no other spec's repo may be left in this state.
   const brokenHeadFixture = buildBrokenHeadFixture(join(work, 'broken-head-repo'))
+  // #478: a sixth repo holding a branch and its DIVERGED remote-tracking twin,
+  // whose two checkpoint chains interleave row for row. Separate because it
+  // needs a remote — `fixture-repo` has none — and because six more commits in
+  // the shared fixture would move the newest-first indices half this suite
+  // asserts against. Its bare origin lives beside it under `work` and is not
+  // offered to the picker.
+  const interleavedFixture = buildInterleavedWipFixture(join(work, 'interleaved-repo'))
   const { child, base, signInUrl } = await startServer({
     repoPath: fixture.root,
     extraRepos: [
@@ -89,6 +97,7 @@ export default async function globalSetup() {
       nonTextFixture.root,
       editorFixture.root,
       brokenHeadFixture.root,
+      interleavedFixture.root,
     ],
     stateHome: join(work, 'state'),
   })
@@ -110,6 +119,7 @@ export default async function globalSetup() {
         nonTextFixture,
         editorFixture,
         brokenHeadFixture,
+        interleavedFixture,
       },
       null,
       2,
