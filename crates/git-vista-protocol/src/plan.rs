@@ -303,6 +303,49 @@ validated_string!(
     |v| require_stash_selector(v, "stash selector")
 );
 
+impl StashSelector {
+    /// The selector for the entry at position `index` — `stash@{0}` is the
+    /// newest (M3.24, #77; #495).
+    ///
+    /// This is the **only** place the `stash@{N}` spelling is produced.
+    /// `handlers::stash::stash_list` builds every listed entry through it, and
+    /// no client rebuilds one: the wire carries the selector and not the
+    /// position precisely so the two cannot disagree (see
+    /// [`StashEntry`](crate::StashEntry)).
+    ///
+    /// Infallible by construction, and that is checkable rather than hoped
+    /// for: a `usize` formats to one or more ASCII digits and nothing else,
+    /// which is exactly what [`require_stash_selector`] admits after the
+    /// literal `stash@{`. `usize::MAX` is 20 digits, twelve short of the
+    /// validator's 32-character cap.
+    ///
+    /// [`require_stash_selector`]: crate::newtype::PlanFieldError
+    pub fn at(index: usize) -> Self {
+        Self::new(format!("stash@{{{index}}}"))
+            .expect("a usize formats to digits, which is what a stash selector's braces hold")
+    }
+
+    /// The position this selector addresses, or `None` if the digits do not
+    /// fit a `usize`.
+    ///
+    /// The inverse of [`Self::at`], here so that dropping `index` from the
+    /// listing wire (#495) moved no work to any client: a consumer that wants
+    /// the number reads it back through this one author instead of parsing
+    /// `stash@{…}` for itself.
+    ///
+    /// `None` is reachable only from a value that came off the wire —
+    /// `stash@{99999999999999999999}` is a well-formed selector that git will
+    /// refuse when it runs, which is the same posture the validator takes
+    /// about `stash@{9999}` on a two-entry drawer: a wire-shape check must not
+    /// need to read live state.
+    pub fn index(&self) -> Option<usize> {
+        self.as_str()
+            .strip_prefix("stash@{")
+            .and_then(|rest| rest.strip_suffix('}'))
+            .and_then(|digits| digits.parse().ok())
+    }
+}
+
 validated_string!(
     /// An annotated tag's message body — non-empty after trimming (the same
     /// rejection [`CommitMessage`] gives) and at most
@@ -1581,6 +1624,42 @@ mod tests {
 
     fn oid(byte: char) -> CommitOid {
         CommitOid::new(byte.to_string().repeat(40)).unwrap()
+    }
+
+    /// [`StashSelector::at`] and [`StashSelector::index`] are the two halves
+    /// of the mapping the listing wire used to carry twice (#495): the server
+    /// sent `entry` *and* the `index` it had just been formatted from.
+    ///
+    /// MUTATION 1: build `at` as `format!("stash@{}", index)` (no braces) —
+    ///   RED, the `expect` fires because the validator refuses it.
+    /// MUTATION 2: have `index` return `Some(0)` for anything — RED on the
+    ///   round trip below, which walks positions the constant never matches.
+    #[test]
+    fn a_stash_selector_carries_its_position_in_both_directions() {
+        assert_eq!(StashSelector::at(0).as_str(), "stash@{0}");
+        assert_eq!(StashSelector::at(12).as_str(), "stash@{12}");
+        // Every position round-trips through the wire form and back.
+        for index in [0, 1, 9, 10, 99, 1_000, usize::MAX] {
+            let selector = StashSelector::at(index);
+            assert_eq!(
+                selector.index(),
+                Some(index),
+                "{selector} lost its position"
+            );
+        }
+
+        // `at` is infallible because a `usize` formats to digits and nothing
+        // else — the property, asserted rather than assumed, at the bound that
+        // would break it first.
+        assert_eq!(usize::MAX.to_string().len(), 20, "the 32-char cap holds");
+
+        // A selector git will refuse at execution is still a well-formed one
+        // here (the validator does not read the repository), and its digits
+        // can overflow a usize — `None`, never a wrong number.
+        let huge = StashSelector::new("stash@{99999999999999999999}").unwrap();
+        assert_eq!(huge.index(), None);
+        // A leading zero is admitted, because git resolves it.
+        assert_eq!(StashSelector::new("stash@{007}").unwrap().index(), Some(7));
     }
 
     #[test]

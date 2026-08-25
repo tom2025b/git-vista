@@ -45,39 +45,29 @@ use crate::features::status::core::{StatusSection, StatusSections};
 // The wire shape
 // ---------------------------------------------------------------------------
 
-/// One entry of `GET /api/stashes`.
+/// One entry of `GET /api/stashes` — the shared DTO, not a transcription of
+/// one (#495, ADR 0079).
 ///
-/// # This shape has two authors, and that is a known risk
+/// # This shape used to have two authors
 ///
-/// The server does not serialise a shared DTO for this listing —
-/// `handlers::stash::stash_list` builds the JSON object by hand, so the field
-/// names exist twice in the workspace with nothing forcing them to agree. A
-/// rename on either side would present as an empty drawer, which is precisely
-/// the failure mode this milestone's own modules keep warning about.
+/// The server built the listing's JSON by hand with `serde_json::json!`, and
+/// this module declared its own struct to read it back. A rename on either
+/// side presented as **an empty drawer** — not an error, not a 400 — because a
+/// field serde cannot find is a field that was not sent. That is exactly the
+/// "no stashes" / "couldn't look" merge `git_vista_git::stash::read_stashes`
+/// goes out of its way to prevent one layer down.
 ///
-/// Until a shared DTO exists, [`tests::the_listing_shape_the_server_actually_sends`]
-/// pins the contract against a JSON literal transcribed from that handler. It
-/// is a weaker guarantee than one type serving both ends — it catches a
-/// server-side rename only when someone re-reads the handler — and it is
-/// recorded as such rather than presented as equivalent.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub struct StashEntry {
-    /// The `stash@{N}` selector, built server-side so the wire form has one
-    /// author. Sent back verbatim to act on the entry; never rebuilt here by
-    /// formatting [`Self::index`], which would give it a second author in the
-    /// client.
-    pub entry: String,
-    /// Position in the drawer; `0` is the newest.
-    pub index: usize,
-    /// The stash commit. Identifies recoverable *content*, never the entry —
-    /// two entries may carry the same oid.
-    pub oid: String,
-    /// The reflog line's message, exactly as git wrote it.
-    pub message: String,
-    /// Unix seconds. Formatting needs a clock, so it stays raw here and the
-    /// view calls `crate::datetime::time_ago` — this module has no `js_sys`.
-    pub time: i64,
-}
+/// Both ends now deserialize [`git_vista_protocol::StashEntry`], so a rename
+/// is a compile error in one crate and a red test in the other rather than a
+/// panel that renders nothing. The wire is pinned in the protocol crate
+/// (`dto::tests::the_stash_listing_pins_its_wire_keys_and_their_types`) and at
+/// the server's own mapping boundary
+/// (`handlers::stash::listing_tests::a_record_becomes_the_wire_bytes_the_frontend_parses`).
+///
+/// Re-exported rather than aliased so every existing `use` here keeps working
+/// and there is still exactly one place the drawer's wire shape is written
+/// down — the protocol crate.
+pub use git_vista_protocol::StashEntry;
 
 // ---------------------------------------------------------------------------
 // A1 — what a row says, and inspection as the default motion
@@ -209,9 +199,12 @@ pub struct StashRow {
 /// not be offered mutations it cannot perform.
 pub fn stash_row(entry: &StashEntry, write_gate: WriteGate) -> StashRow {
     StashRow {
-        selector: entry.entry.clone(),
-        oid: entry.oid.clone(),
-        oid_short: entry.oid.chars().take(7).collect(),
+        // `as_str().to_string()` and not a re-derivation: the selector and the
+        // oid are what the compare-and-swap is sent back, and the newtypes are
+        // unwrapped here only because the view and its signals speak `&str`.
+        selector: entry.entry.as_str().to_string(),
+        oid: entry.oid.as_str().to_string(),
+        oid_short: entry.oid.as_str().chars().take(7).collect(),
         subject: stash_subject(&entry.message),
         when: entry.time,
         actions: action_offers(write_gate),
@@ -1528,11 +1521,14 @@ mod tests {
     // The drawer's four states
     // -----------------------------------------------------------------------
 
-    fn entry(selector: &str, oid: &str) -> StashEntry {
+    /// A listing entry, built through the shared DTO's own newtypes — so a
+    /// fixture cannot spell an oid or a selector the server could never send.
+    /// `hex` is repeated to a full 40-character object id.
+    fn entry(selector: &str, hex: char) -> StashEntry {
         StashEntry {
-            entry: selector.to_string(),
-            index: 0,
-            oid: oid.to_string(),
+            entry: git_vista_protocol::StashSelector::new(selector).expect("a valid selector"),
+            oid: git_vista_protocol::CommitOid::new(hex.to_string().repeat(40))
+                .expect("a valid oid"),
             message: "On main: work".to_string(),
             time: 1_700_000_000,
         }
@@ -1581,7 +1577,7 @@ mod tests {
             drawer_view(None, WriteGate::Allowed),
             drawer_view(Some(Err("x".to_string())), WriteGate::Allowed),
             drawer_view(Some(Ok(vec![])), WriteGate::Allowed),
-            drawer_view(Some(Ok(vec![entry("stash@{0}", "aa")])), WriteGate::Allowed),
+            drawer_view(Some(Ok(vec![entry("stash@{0}", 'a')])), WriteGate::Allowed),
         ];
         for (i, a) in all.iter().enumerate() {
             for b in all.iter().skip(i + 1) {
@@ -1604,10 +1600,7 @@ mod tests {
     ///   Verified: red.
     #[test]
     fn rows_keep_the_servers_order_and_carry_the_write_gate() {
-        let entries = vec![
-            entry("stash@{0}", "aaaaaaaaaaaa"),
-            entry("stash@{1}", "bbbbbbbbbbbb"),
-        ];
+        let entries = vec![entry("stash@{0}", 'a'), entry("stash@{1}", 'b')];
 
         let DrawerView::Rows(rows) = drawer_view(Some(Ok(entries.clone())), WriteGate::Allowed)
         else {
@@ -1682,58 +1675,60 @@ mod tests {
 
     /// A row carries the selector and oid **verbatim from the wire**, because
     /// both are sent back to act on the entry and the server pairs them in a
-    /// compare-and-swap. Rebuilding the selector from `index` in the client
-    /// would give the wire form a second author.
+    /// compare-and-swap. Re-deriving either in the client would give the wire
+    /// form a second author — which is the whole defect #495 closed.
     ///
-    /// MUTATION 1: build `selector` as `format!("stash@{{{}}}", entry.index)`
-    ///   — red against an entry whose selector and index disagree, which is
-    ///   what a renumbered list looks like mid-flight. Verified: red.
+    /// The fixture is deliberately a drawer whose selectors do not match their
+    /// positions in the list. That is not a contrived shape: the git crate
+    /// stops a listing at an unreadable reflog line rather than renumbering
+    /// what is below it, so a gap is a real thing to receive, and a
+    /// concurrent drop renumbers the drawer under any list already read.
+    ///
+    /// MUTATION 1: build `selector` from the row's position in the vector
+    ///   (`format!("stash@{{{i}}}")`) — red, the second row addresses
+    ///   `stash@{5}` and would be sent as `stash@{1}`. Verified: red.
     /// MUTATION 2: truncate `oid` to `oid_short` for the round-trip field —
     ///   red, the compare-and-swap would be sent an abbreviated oid.
     ///   Verified: red.
     #[test]
     fn a_row_round_trips_the_selector_and_oid_untouched() {
-        // Deliberately inconsistent with `index`: a client must never "fix"
-        // this by recomputing, it must send back what it was given.
-        let entry = StashEntry {
-            entry: "stash@{2}".to_string(),
-            index: 0,
-            oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
-            message: "On main: work".to_string(),
-            time: 1_700_000_000,
-        };
+        let entries = vec![entry("stash@{2}", '0'), entry("stash@{5}", 'f')];
 
-        let row = stash_row(&entry, WriteGate::Allowed);
+        let DrawerView::Rows(rows) = drawer_view(Some(Ok(entries)), WriteGate::Allowed) else {
+            panic!("a populated drawer must classify as Rows");
+        };
         assert_eq!(
-            row.selector, "stash@{2}",
-            "the selector came from the server"
+            rows.iter().map(|r| r.selector.as_str()).collect::<Vec<_>>(),
+            ["stash@{2}", "stash@{5}"],
+            "each row addresses the entry the server addressed, not its place in the list"
         );
         assert_eq!(
-            row.oid, "0123456789abcdef0123456789abcdef01234567",
+            rows[1].oid,
+            "f".repeat(40),
             "the full oid is what the compare-and-swap needs"
         );
-        assert_eq!(row.oid_short, "0123456", "display only");
-        assert_eq!(row.when, 1_700_000_000);
+        assert_eq!(rows[1].oid_short, "fffffff", "display only");
+        assert_eq!(rows[1].when, 1_700_000_000);
     }
 
-    /// The listing shape, pinned against a JSON literal transcribed from
-    /// `crates/git-vista-server/src/handlers/stash.rs`'s `stash_list`.
+    /// The listing shape, pinned against the JSON literal the server's own
+    /// mapping test pins the other end of
+    /// (`handlers::stash::listing_tests::a_record_becomes_the_wire_bytes_the_frontend_parses`).
     ///
-    /// This is a weaker guarantee than one shared DTO serving both ends — it
-    /// notices a server-side rename only when someone re-reads that handler —
-    /// and [`StashEntry`]'s doc comment records it as such.
+    /// Since #495 this is no longer a transcription that notices a rename only
+    /// when someone re-reads the handler: the type here *is* the type there.
+    /// The literal stays because the shared type is what agrees with itself —
+    /// only a literal can say what a browser receives.
     ///
-    /// MUTATION 1: rename any field in `StashEntry` — red, serde cannot find
-    ///   it. Verified by hand: red.
-    /// MUTATION 2: make a field `#[serde(default)]` and delete it from the
-    ///   literal — red on the value assertion, because a missing field would
-    ///   otherwise deserialize to a confident zero. Verified: red.
+    /// MUTATION 1 (rename): `entry` → `selector` in
+    ///   `git_vista_protocol::StashEntry` — red, `missing field \`entry\``.
+    /// MUTATION 2 (retype): `oid: CommitOid` → `oid: String` — red, the
+    ///   abbreviated-oid listing below stops being refused.
     #[test]
     fn the_listing_shape_the_server_actually_sends() {
         let wire = r#"[
             {
               "entry": "stash@{0}",
-              "index": 0,
               "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
               "message": "WIP on main: 1a2b3c4 tidy the parser",
               "time": 1700000000
@@ -1742,10 +1737,22 @@ mod tests {
 
         let parsed: Vec<StashEntry> = serde_json::from_str(wire).expect("listing must deserialize");
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].entry, "stash@{0}");
-        assert_eq!(parsed[0].index, 0);
-        assert_eq!(parsed[0].oid.len(), 40);
+        assert_eq!(parsed[0].entry.as_str(), "stash@{0}");
+        assert_eq!(parsed[0].oid.as_str().len(), 40);
         assert_eq!(parsed[0].message, "WIP on main: 1a2b3c4 tidy the parser");
         assert_eq!(parsed[0].time, 1_700_000_000);
+
+        // The position is no longer on the wire, and is not missed: it reads
+        // back out of the selector through the protocol crate's own accessor,
+        // so no client parses `stash@{…}` for itself.
+        assert_eq!(parsed[0].entry.index(), Some(0));
+
+        // And a listing the server could not have produced does not become a
+        // drawer full of unusable rows — it fails to deserialize at all.
+        let bad = r#"[{"entry":"stash@{0}","oid":"aaaaaaa","message":"m","time":1}]"#;
+        assert!(
+            serde_json::from_str::<Vec<StashEntry>>(bad).is_err(),
+            "an abbreviated oid cannot be compare-and-swapped, so it is not an entry"
+        );
     }
 }
