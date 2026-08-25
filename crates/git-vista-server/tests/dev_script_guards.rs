@@ -75,6 +75,15 @@ fn a_failing_step_fails_the_gate_and_stops_it() {
     run_guard("gate_errexit_test.sh");
 }
 
+/// #476: `gv doctor` must MEASURE the managed-clones root from the running
+/// listener's own environment, and say `unknown` when it cannot — never print
+/// a constant. The line it replaces had never been correct on this box, and it
+/// sat directly beneath a measured line whose credibility it borrowed.
+#[test]
+fn the_doctor_measures_the_clones_root_and_refuses_to_guess() {
+    run_guard("doctor_clones_root_test.sh");
+}
+
 /// #331 follow-up: `dev testbed` must build onto the scratch SSD when it is
 /// attached and must never fall back into the caller's current directory when
 /// it is not — the dangling-symlink case, which is the whole reason the
