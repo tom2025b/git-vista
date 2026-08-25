@@ -17,6 +17,7 @@ import {
   buildEditorFixture,
   buildFixture,
   buildNonTextConflictFixture,
+  buildStashFixture,
 } from './fixture.mjs'
 import { startServer } from './server.mjs'
 
@@ -82,6 +83,11 @@ export default async function globalSetup() {
   // #473: a fifth repo whose HEAD resolves to nothing. Separate because it is
   // deliberately broken — no other spec's repo may be left in this state.
   const brokenHeadFixture = buildBrokenHeadFixture(join(work, 'broken-head-repo'))
+  // #77: a sixth repo with three real stash entries, one of which cannot be
+  // applied cleanly. Separate because it is the only repo here whose stash
+  // list has an asserted count, and because applying that entry leaves a
+  // conflict no other spec's repo may inherit.
+  const stashFixture = buildStashFixture(join(work, 'stash-repo'))
   const { child, base, signInUrl } = await startServer({
     repoPath: fixture.root,
     extraRepos: [
@@ -89,6 +95,7 @@ export default async function globalSetup() {
       nonTextFixture.root,
       editorFixture.root,
       brokenHeadFixture.root,
+      stashFixture.root,
     ],
     stateHome: join(work, 'state'),
   })
@@ -110,6 +117,7 @@ export default async function globalSetup() {
         nonTextFixture,
         editorFixture,
         brokenHeadFixture,
+        stashFixture,
       },
       null,
       2,

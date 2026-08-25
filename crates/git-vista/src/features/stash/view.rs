@@ -87,7 +87,8 @@ pub fn stash_section_view(
             let StashNotice {
                 headline,
                 complete,
-                data,
+                tree,
+                entry_retained: _,
                 conflicted,
                 unreadable,
             } = notice;
@@ -142,7 +143,7 @@ pub fn stash_section_view(
             // What happened to the user's data, stated as its own line. For a
             // composed pop this is the part that matters most when the pop did
             // NOT finish.
-            let effect = data.map(|d| view! { <p class="detail-status">{d.line()}</p> });
+            let effect = tree.map(|t| view! { <p class="detail-status">{t.line()}</p> });
             let dismiss = move |_| drawer.clear_notice();
             view! {
                 <p class=class>{headline}</p>

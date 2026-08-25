@@ -19,7 +19,7 @@ use git_vista_protocol::operation::IdempotencyKey;
 
 use crate::api;
 use crate::features::stash::core::{
-    self as core, ApplyOutcome, ConflictScan, DropGate, DropOutcome, PopVerdict,
+    self as core, ApplyOutcome, ConflictScan, DropGate, DropOutcome, PopVerdict, TreeState,
 };
 
 /// Run a pop as apply-then-drop, returning what actually happened.
@@ -116,42 +116,15 @@ pub struct StashNotice {
     /// True only when the operation genuinely finished. A view must scale its
     /// styling on this and never on "the request returned".
     pub complete: bool,
-    /// What is true of the user's data, carried structurally rather than left
-    /// only inside [`Self::headline`]'s prose. A user whose pop "failed" still
-    /// needs to know their working tree changed, and a renderer that only had
-    /// the sentence could not, for instance, decide to re-read the working-tree
-    /// status on the strength of it.
-    pub data: Option<DataEffect>,
+    /// What is true of the user's working tree, carried structurally rather
+    /// than left only inside [`Self::headline`]'s prose. A user whose pop
+    /// "failed" still needs to know their files moved — and after a refused
+    /// apply with an unreadable tree, that it could not be established.
+    pub tree: Option<TreeState>,
+    /// Whether the stash entry is still in the drawer.
+    pub entry_retained: bool,
     pub conflicted: Vec<String>,
     pub unreadable: Vec<String>,
-}
-
-/// What a finished (or halted) stash operation did to the user's data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DataEffect {
-    /// The working tree changed.
-    pub applied: bool,
-    /// The stash entry is still in the drawer.
-    pub entry_retained: bool,
-}
-
-impl DataEffect {
-    /// The one-line summary shown under the headline.
-    ///
-    /// Four combinations, all reachable through a composed pop, and each says
-    /// both halves — because "applied" alone and "still in the list" alone are
-    /// each half of what the user needs to decide what to do next.
-    pub fn line(self) -> &'static str {
-        match (self.applied, self.entry_retained) {
-            (true, true) => "Your working tree changed, and the stash entry is still in the list.",
-            (true, false) => "Your working tree changed, and the stash entry is gone.",
-            (false, true) => "Your working tree is unchanged, and the stash entry is still there.",
-            // Nothing applied and no entry left: not reachable from a composed
-            // pop, which never drops without applying first. Named rather than
-            // unreachable!() — a panic in the client is a blank screen.
-            (false, false) => "The stash entry is gone and nothing was applied to your tree.",
-        }
-    }
 }
 
 impl StashNotice {
@@ -162,10 +135,8 @@ impl StashNotice {
         StashNotice {
             headline: verdict.headline(),
             complete: verdict.is_complete(),
-            data: Some(DataEffect {
-                applied: verdict.applied(),
-                entry_retained: verdict.entry_retained(),
-            }),
+            tree: Some(verdict.tree()),
+            entry_retained: verdict.entry_retained(),
             conflicted: verdict.conflicted_paths().to_vec(),
             unreadable: verdict.unreadable_paths().to_vec(),
         }
@@ -175,20 +146,22 @@ impl StashNotice {
     pub fn from_result(result: Result<(), String>, done: &str) -> Self {
         match result {
             // The simple writes each say their own effect in `done`, and a
-            // second structural line would repeat it — so `data` is None here
+            // second structural line would repeat it — so `tree` is None here
             // rather than a guess. Only a composed pop has an effect the prose
             // cannot fully carry.
             Ok(()) => StashNotice {
                 headline: done.to_string(),
                 complete: true,
-                data: None,
+                tree: None,
+                entry_retained: false,
                 conflicted: Vec::new(),
                 unreadable: Vec::new(),
             },
             Err(why) => StashNotice {
                 headline: why,
                 complete: false,
-                data: None,
+                tree: None,
+                entry_retained: true,
                 conflicted: Vec::new(),
                 unreadable: Vec::new(),
             },
