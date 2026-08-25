@@ -555,6 +555,143 @@ pub fn interleaved_wip_fixture(root: &Path) {
     run(root, &["fetch", "-q", "origin"]);
 }
 
+/// The seed commit's subject — and, because of how `git stash` builds its
+/// automatic message, half of `stash@{1}`'s subject too.
+///
+/// This collision is deliberate. See [`stash_fixture`]'s "Why it matters".
+pub const STASH_SEED_SUBJECT: &str = "seed: two tracked files";
+
+/// `stash@{2}`'s subject: the `git stash push -m <message>` form, written by
+/// the user and stored verbatim.
+pub const STASH_NAMED_SUBJECT: &str = "half-finished refactor";
+
+/// The prefix git itself writes for a bare `git stash` — `stash@{1}` here.
+///
+/// The full message is `WIP on <branch>: <sha> <subject>`; only this much is
+/// git's own vocabulary, and it is what the drawer keys "automatic" off.
+pub const STASH_AUTO_PREFIX: &str = "WIP on main";
+
+/// `stash@{0}`'s subject: the entry that cannot be applied cleanly.
+pub const STASH_CONFLICTING_SUBJECT: &str = "will not apply cleanly";
+
+/// The path `stash@{0}` collides on.
+pub const STASH_CONFLICTING_PATH: &str = "collision.txt";
+
+/// Left in the working tree by [`stash_fixture`] and never stashed by it, so
+/// the push preview has something to report as NOT captured.
+pub const STASH_UNTRACKED_FILE: &str = "untracked-note.txt";
+
+/// How many entries [`stash_fixture`] leaves on the stash. Asserted directly by
+/// the drawer spec, so it is contract rather than incidental.
+pub const STASH_COUNT: usize = 3;
+
+/// A repository with **three real stash entries, one of which cannot be
+/// applied** (M3.24, #77).
+///
+/// ## What is wrong with it
+///
+/// Nothing is corrupt. What is *wrong* is the thing the stash drawer exists to
+/// tell the truth about: **a pop is two operations, and the first can fail.**
+/// `git stash pop` is an apply followed by a drop, and when the apply
+/// conflicts, git applies what it can, writes conflict markers, leaves the
+/// entry on the list and exits non-zero. A drawer that reports "popped" there
+/// has lied about the user's data twice over — the entry was not dropped, and
+/// the working tree *was* changed (ADR 0077).
+///
+/// So `stash@{0}` is built to conflict, on purpose, and it is deliberately the
+/// **newest** entry so a spec can reach it as "the first row" without depending
+/// on row ordering beyond that.
+///
+/// ## What git put on disk
+///
+/// One commit, then three stashes, then a fourth commit that is what makes the
+/// newest stash unappliable. Newest first, `git stash list` reads:
+///
+/// ```text
+///   stash@{0}  On main: will not apply cleanly          <- conflicts on apply
+///   stash@{1}  WIP on main: <sha> seed: two tracked files
+///   stash@{2}  On main: half-finished refactor
+/// ```
+///
+/// The two message forms are both present because git writes them
+/// differently, and the drawer has to tell them apart:
+///
+/// * `git stash push -m <message>` stores the message as given. The drawer
+///   shows it as written, marked as the user's — no "auto" pill.
+/// * a bare `git stash` makes git compose `WIP on <branch>: <sha> <subject>`
+///   from the branch and the base commit. The drawer parses that: the branch
+///   becomes a pill, the sha is dropped, and the entry IS marked automatic.
+///
+/// `stash@{0}` is made unappliable the only way that is honest — by moving the
+/// ground under it. An edit to one line of `collision.txt` is stashed; then a
+/// *different* edit to that same line is committed. The stash's base no longer
+/// matches, so `git stash apply` cannot merge it and leaves the path
+/// conflicted.
+///
+/// `untracked-note.txt` is left untracked and never stashed, so the push
+/// preview has something real to report as NOT captured (A2). A preview that
+/// always warns would satisfy the letter of that criterion and miss its
+/// failure — a user believing they stashed a new file that git left on disk.
+///
+/// ## Why it matters
+///
+/// Beyond the pop: **the automatic entry's subject is also the seed commit's
+/// subject**, because git copies the base commit's subject verbatim into `WIP
+/// on <branch>: <sha> <subject>`. That is not an accident of this fixture that
+/// could be tidied away — it is what git does, so any fixture built this way
+/// has it.
+///
+/// The consequence is that `"seed: two tracked files"` resolves in the graph's
+/// SVG `<title>`, in the activity feed, and in the drawer at once, and a
+/// page-wide `getByText` dies of a strict-mode violation. That is a real
+/// failure this suite hit on its first run against a browser, and it is why
+/// `helpers.mjs`'s `openDrawer` returns the drawer's own region and every
+/// caller queries inside it. Keeping the collision is the point: it is the
+/// cheapest standing proof that the drawer's locators are scoped.
+///
+/// ## Why it is its own repository
+///
+/// Two reasons, both the same shape as the other splits above. It is the only
+/// repository here whose stash list has an asserted count, so anything else
+/// stashing into it would break that count. And applying `stash@{0}` leaves
+/// `collision.txt` conflicted — a state no other spec's repository may
+/// inherit.
+pub fn stash_fixture(root: &Path) {
+    fresh(root);
+
+    git::write(root, "tracked.txt", b"the committed line\n");
+    git::write(root, STASH_CONFLICTING_PATH, b"original\n");
+    run(root, &["add", "-A"]);
+    run(root, &["commit", "-q", "-m", STASH_SEED_SUBJECT]);
+
+    // Ends up as stash@{2} once the two below land: the `-m` message form.
+    git::write(root, "tracked.txt", b"a named change\n");
+    run(root, &["stash", "push", "-m", STASH_NAMED_SUBJECT]);
+
+    // stash@{1}: the automatic `WIP on main: <sha> <subject>` form. No -m, so
+    // git composes the message — and copies the seed commit's subject into it.
+    git::write(root, "tracked.txt", b"an unnamed change\n");
+    run(root, &["stash"]);
+
+    // stash@{0}: the one that conflicts. Stash an edit to collision.txt, then
+    // commit a DIFFERENT edit to the same line.
+    git::write(root, STASH_CONFLICTING_PATH, b"the stashed edit\n");
+    run(root, &["stash", "push", "-m", STASH_CONFLICTING_SUBJECT]);
+    git::write(
+        root,
+        STASH_CONFLICTING_PATH,
+        b"a conflicting committed edit\n",
+    );
+    run(root, &["add", STASH_CONFLICTING_PATH]);
+    run(
+        root,
+        &["commit", "-q", "-m", "move the line the stash also touches"],
+    );
+
+    // Never stashed by this fixture — see the doc comment.
+    git::write(root, STASH_UNTRACKED_FILE, b"not in the index\n");
+}
+
 /// Every browser shape, by the name the `gv-fixture` binary accepts.
 pub const SHAPES: &[(&str, Builder)] = &[
     ("main", main_fixture),
@@ -563,6 +700,7 @@ pub const SHAPES: &[(&str, Builder)] = &[
     ("editor", editor_fixture),
     ("broken-head", broken_head_fixture),
     ("interleaved-wip", interleaved_wip_fixture),
+    ("stash", stash_fixture),
 ];
 
 #[cfg(test)]
@@ -786,5 +924,123 @@ mod tests {
         std::fs::write(root.join("stray.txt"), "left over\n").unwrap();
         main_fixture(&root);
         assert!(!root.join("stray.txt").exists(), "root must be cleared");
+    }
+
+    /// Three entries, in the two message forms git actually writes.
+    ///
+    /// Read off `git stash list`, which is what the server's own stash read
+    /// parses — not off the constants, which are this builder's inputs and
+    /// would agree with themselves.
+    #[test]
+    fn the_stash_fixture_leaves_three_entries_in_both_message_forms() {
+        let (_d, root) = build("stash");
+        let list = git::out_as(BROWSER, &root, &["stash", "list"]);
+        let lines: Vec<&str> = list.lines().collect();
+
+        assert_eq!(lines.len(), STASH_COUNT, "{list}");
+
+        // Newest first, exactly as `GET /api/stashes` returns them.
+        assert!(
+            lines[0].starts_with("stash@{0}: ") && lines[0].ends_with(STASH_CONFLICTING_SUBJECT),
+            "newest entry is not the conflicting one: {list}"
+        );
+        // The bare-`git stash` form. git composes this; the fixture never
+        // writes the string, so an assertion on it is an assertion about git.
+        assert!(
+            lines[1].contains(STASH_AUTO_PREFIX),
+            "the middle entry is not git's automatic form: {list}"
+        );
+        assert!(
+            lines[2].ends_with(STASH_NAMED_SUBJECT),
+            "the oldest entry is not the -m form: {list}"
+        );
+        // The two forms must be distinguishable, which is the whole point of
+        // having both: exactly one of them is git's `WIP on` vocabulary.
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains(STASH_AUTO_PREFIX))
+                .count(),
+            1,
+            "the drawer tells the forms apart by this prefix: {list}"
+        );
+    }
+
+    /// The A4 property: `stash@{0}` really cannot be applied.
+    ///
+    /// Proved by applying it, not by trusting the shape. A pop is an apply plus
+    /// a drop, so a fixture whose apply quietly succeeded would let the drawer
+    /// report "Popped" and still pass every spec built on it.
+    #[test]
+    fn the_newest_stash_entry_conflicts_on_apply_and_survives_it() {
+        let (_d, root) = build("stash");
+
+        let applied = git::try_run_as(BROWSER, &root, &["stash", "apply", "stash@{0}"]);
+        assert!(
+            !applied,
+            "stash@{{0}} applied cleanly; it is supposed to conflict"
+        );
+
+        // Unmerged, not merely modified: `UU` is what routes the path into the
+        // shared conflict view (A3).
+        let status = git::out_exact_as(BROWSER, &root, &["status", "--porcelain"]);
+        assert!(
+            status
+                .lines()
+                .any(|l| l.starts_with("UU ") && l.ends_with(STASH_CONFLICTING_PATH)),
+            "expected an unmerged {STASH_CONFLICTING_PATH}: {status}"
+        );
+
+        // A refused apply drops nothing. This is the half a drawer is most
+        // likely to get wrong, so the fixture pins it.
+        let after = git::out_as(BROWSER, &root, &["stash", "list"]);
+        assert_eq!(after.lines().count(), STASH_COUNT, "{after}");
+    }
+
+    /// The collision `openDrawer`'s scoped locators exist to survive.
+    ///
+    /// git copies the base commit's subject verbatim into `WIP on <branch>:
+    /// <sha> <subject>`, so the automatic entry's subject is also a commit
+    /// subject and the same string resolves in the graph's SVG `<title>`, in
+    /// the activity feed AND in the drawer at once. A page-wide `getByText`
+    /// therefore dies of a strict-mode violation — a real failure this suite
+    /// hit on its first run against a browser, and the reason `helpers.mjs`'s
+    /// `openDrawer` returns the drawer's own region.
+    ///
+    /// Pinned as *the oldest commit's* subject, not merely "some commit's":
+    /// with a bare `git stash` the collision is unavoidable, so a test that
+    /// asked only for a collision could not go red while a fixture still had
+    /// one. Which commit the automatic entry hangs off is a real choice — take
+    /// it later and `stash@{1}` holds a different base — and it is losable, so
+    /// it is what this pins.
+    ///
+    /// Both sides are read back from git: the stash message from `stash list`,
+    /// the subject from `log`. Neither is compared against the constant that
+    /// produced it.
+    #[test]
+    fn the_automatic_stash_entry_repeats_the_oldest_commits_subject() {
+        let (_d, root) = build("stash");
+
+        let auto = git::out_as(BROWSER, &root, &["stash", "list"])
+            .lines()
+            .find(|l| l.contains(STASH_AUTO_PREFIX))
+            .expect("the automatic entry")
+            .to_string();
+
+        let subjects = git::out_as(BROWSER, &root, &["log", "--format=%s"]);
+        let mut subjects = subjects.lines();
+        let newest = subjects.next().expect("a newest commit").to_string();
+        let oldest = subjects.next_back().expect("an oldest commit").to_string();
+
+        assert!(
+            !oldest.is_empty() && oldest != newest,
+            "this fixture needs at least two distinctly-named commits for the \
+             assertion below to be able to fail: {subjects:?}"
+        );
+        assert!(
+            auto.ends_with(&oldest),
+            "the automatic entry should repeat the OLDEST commit's subject \
+             ({oldest:?}), so `stash@{{1}}` hangs off the seed commit: {auto}"
+        );
     }
 }
