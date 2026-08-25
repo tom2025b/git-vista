@@ -1669,32 +1669,6 @@ async fn shape(
                 message: None,
             },
         ),
-        GitOperation::PopStash { expected_oid, .. } => (
-            // Destructive, not Reversible like its apply sibling. Apply keeps
-            // the entry whatever happens; pop removes it, so what can be lost
-            // is the stash itself, not just a tidy worktree. RiskLevel is
-            // about what can be lost.
-            RiskLevel::Destructive,
-            // Same reasoning as ApplyStash: with a clean tree the abort path
-            // is provably safe because there is nothing of the user's to
-            // destroy. It matters more here — a pop that had to be abandoned
-            // in a dirty tree could discard work that was never in the stash
-            // AND the entry holding the rest of it.
-            vec![Precondition::CleanWorktree],
-            Vec::new(),
-            // The same undo a drop gets, for the same reason: if the entry was
-            // removed, the commit is unreachable and only the pin keeps it
-            // alive. When the pop CONFLICTS git leaves the entry in place, so
-            // this recovery is simply unnecessary rather than wrong — an undo
-            // that recreates an entry which still exists is refused by its own
-            // preconditions, not by this tag.
-            RecoveryStrategy::RecreateStashEntry {
-                at: expected_oid.clone(),
-                // Not recoverable from the oid; it lives in the reflog line
-                // that the pop destroys. Left None rather than guessed.
-                message: None,
-            },
-        ),
         GitOperation::DropStash { expected_oid, .. } => (
             // Destructive on the same reasoning ForceDeleteBranch is: the
             // commit becomes unreachable. RiskLevel is about what can be lost,
@@ -2599,18 +2573,16 @@ async fn execute(repo: &Path, plan: Plan, observed: Observed) -> (StatusCode, St
         GitOperation::PushTag { name, remote } => {
             remote_tags::exec_push_tag(repo, need, &name, &remote).await
         }
-        // M3.24 (#77): the stash drawer. Apply, Pop and Drop are separate
-        // operations on purpose — see PopStash's own comment for why it is not
-        // ApplyStash with a flag.
+        // M3.24 (#77): the stash drawer. Apply and Drop are separate
+        // operations on purpose, and there is no pop verb here — a pop is
+        // composed from those two, because two durable rows can say "applied,
+        // then the drop failed" and one row cannot. See `GitOperation`'s
+        // comment on the absent `PopStash` in `plan.rs`, and ADR 0078.
         GitOperation::BranchFromStash {
             name,
             entry,
             expected_oid,
         } => stash::exec_branch_from_stash(repo, need, &name, &entry, &expected_oid).await,
-        GitOperation::PopStash {
-            entry,
-            expected_oid,
-        } => stash::exec_pop_stash(repo, need, &entry, &expected_oid).await,
         GitOperation::PushStash {
             message,
             keep_index,
@@ -3263,7 +3235,6 @@ pub(crate) fn honours_cancellation(op: &GitOperation) -> bool {
         // window in which a cancel could arrive and mean anything.
         GitOperation::PushStash { .. }
         | GitOperation::ApplyStash { .. }
-        | GitOperation::PopStash { .. }
         | GitOperation::BranchFromStash { .. }
         | GitOperation::DropStash { .. }
         | GitOperation::ResolveConflict { .. }

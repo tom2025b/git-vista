@@ -165,6 +165,165 @@ pub(super) async fn exec_push_stash(
     (StatusCode::OK, "Stashed your changes.".to_string())
 }
 
+/// What an apply is allowed to claim, given git's exit status and a conflict
+/// scan that may itself have failed (M3.24 #77, #494, ADR 0078).
+///
+/// # Why this is a separate function
+///
+/// Three of the six (status, scan) combinations below cannot be produced by
+/// driving real git. `(succeeded, Blocked)` needs an apply git calls
+/// successful while leaving unmerged index entries behind, and no invocation
+/// found on git 2.43.0 does that — eight shapes were tried (ADR 0078
+/// § "What was measured"). Both `Err` rows need a repository broken enough
+/// that `git ls-files` errors while still being healthy enough to build and
+/// execute a plan. The executor this replaced recorded that as an untestable
+/// gap and left those arms unproven.
+///
+/// The other three are reachable and are driven end-to-end in
+/// `planner::contract_suite`: a clean apply, a content conflict (exit 1 with
+/// `UU`), and a plain refusal with a clean index (exit 1, an untracked
+/// collision).
+///
+/// Splitting the *decision* out from the *doing* turns the gap into ordinary
+/// unit tests: the combinations are enumerable even where the world that
+/// produces them is not constructible. All six are pinned in the unit tests
+/// below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ApplyVerdict {
+    /// git succeeded and the scan confirmed nothing is unmerged. The **only**
+    /// verdict that claims the apply is complete.
+    Applied,
+    /// git succeeded but the scan found unmerged paths. The acceptance
+    /// criterion is about exactly this: the response must not read as complete
+    /// while conflicted paths remain.
+    AppliedWithConflicts(git_vista_protocol::conflict::Continuation),
+    /// git failed, and the scan named what it left behind. A refused apply is
+    /// **not** proof that nothing was applied — exit 1 with `UU` in the index
+    /// is git's ordinary behaviour for a content conflict, and the markers are
+    /// already in the tree (ADR 0077 § Context).
+    FailedWithConflicts(git_vista_protocol::conflict::Continuation),
+    /// git failed and nothing is unmerged — a plain refusal, such as an
+    /// untracked file in the stash colliding with one already on disk. git's
+    /// own stderr is the best thing to say, so the scan adds nothing here and
+    /// must not be allowed to imply conflicts that do not exist.
+    Failed,
+    /// The scan could not run, so this cannot know whether conflicts remain.
+    /// Reporting success here would be the green-that-means-I-did-not-look
+    /// failure the conflict model was built against.
+    Unverifiable(String),
+}
+
+/// The decision table. Pure, total, and unit-tested in both directions.
+///
+/// The asymmetry between the two `Err` rows is deliberate: on the **failure**
+/// path git has already told us the operation did not succeed, and its stderr
+/// is a better message than "the scan broke", so a broken scan only costs the
+/// conflict detail. On the **success** path the scan is the only thing
+/// standing between a green response and an unread working tree, so a broken
+/// scan withdraws the claim entirely.
+pub(super) fn apply_verdict(
+    succeeded: bool,
+    scan: Result<git_vista_protocol::conflict::Continuation, String>,
+) -> ApplyVerdict {
+    match (succeeded, scan) {
+        (true, Ok(c)) if c.may_continue() => ApplyVerdict::Applied,
+        (true, Ok(c)) => ApplyVerdict::AppliedWithConflicts(c),
+        (true, Err(why)) => ApplyVerdict::Unverifiable(why),
+        (false, Ok(c)) if c.may_continue() => ApplyVerdict::Failed,
+        (false, Ok(c)) => ApplyVerdict::FailedWithConflicts(c),
+        (false, Err(_)) => ApplyVerdict::Failed,
+    }
+}
+
+/// Render the conflicted and unreadable paths a [`Continuation`] carries, as
+/// the trailing block of a response body.
+///
+/// [`Continuation`]: git_vista_protocol::conflict::Continuation
+fn conflict_detail(c: &git_vista_protocol::conflict::Continuation) -> String {
+    match c {
+        git_vista_protocol::conflict::Continuation::Blocked {
+            unresolved,
+            unreadable,
+        } => {
+            let mut lines = String::new();
+            if !unresolved.is_empty() {
+                lines.push_str(&format!("\n\nConflicted:\n  {}", unresolved.join("\n  ")));
+            }
+            if !unreadable.is_empty() {
+                lines.push_str(&format!(
+                    "\n\nCould not be read (resolve these by hand):\n  {}",
+                    unreadable.join("\n  ")
+                ));
+            }
+            lines
+        }
+        git_vista_protocol::conflict::Continuation::Clear => String::new(),
+    }
+}
+
+/// Turn a verdict into the status and body a caller sees. Pure, so the exact
+/// wording of every outcome — including the ones real git will not produce —
+/// is unit-testable without a repository or a sandbox (#494, ADR 0078).
+///
+/// `git_said` is git's own stderr, already defaulted by [`stderr_or`]. It is
+/// used only on the two failure verdicts, where git has the better message.
+pub(super) fn render_apply(
+    verdict: &ApplyVerdict,
+    git_said: &str,
+    entry: &StashSelector,
+) -> (StatusCode, String) {
+    match verdict {
+        ApplyVerdict::Applied => (
+            StatusCode::OK,
+            format!("Applied {entry}. It is still in your stash list."),
+        ),
+
+        ApplyVerdict::AppliedWithConflicts(c) => (
+            StatusCode::CONFLICT,
+            format!(
+                "Applying {entry} left conflicts, so it is NOT complete.{}\n\n\
+                 The stash entry was not removed — it is still in the list. Resolve \
+                 the paths above before treating the apply as done.",
+                conflict_detail(c)
+            ),
+        ),
+
+        // Still a 400, exactly as before this change: git refused, and the
+        // frontend's composed pop (ADR 0077) reads the status to decide
+        // whether its drop may run. What is new is the path list after it.
+        ApplyVerdict::FailedWithConflicts(c) => (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{git_said}{}\n\nThe stash entry was not removed — it is still in the \
+                 list. The paths above are conflicted in your working tree: the apply \
+                 got far enough to write them, so this is not a no-op you can ignore.",
+                conflict_detail(c)
+            ),
+        ),
+
+        // A conflicting apply leaves the entry in place — that is git's own
+        // behaviour and it is the right one, so the message says so rather
+        // than leaving the user wondering whether their stash survived.
+        ApplyVerdict::Failed => (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{git_said}
+
+The stash entry was not removed — it is still in the list."
+            ),
+        ),
+
+        ApplyVerdict::Unverifiable(why) => (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "git stash apply ran, but the conflict state could not be read afterwards \
+                 — {why}. Check `git status` before continuing; this server will not \
+                 report the apply as complete on a check it could not make."
+            ),
+        ),
+    }
+}
+
 /// `git stash apply <selector>` (`/api/stash/apply`, M3.24 #77) — restore a
 /// stash's changes, KEEPING the entry.
 ///
@@ -173,6 +332,31 @@ pub(super) async fn exec_push_stash(
 /// and that is *provably* safe, because a clean tree has nothing of the
 /// user's to destroy. Apply into a dirty tree would mean an abort could
 /// discard work that was never in the stash.
+///
+/// # The conflict state is re-read on BOTH outcomes (#494, ADR 0078)
+///
+/// Not only on failure. Two independent reasons, and the second is the one
+/// that bites today:
+///
+/// 1. A stash apply git called successful while leaving conflicted paths
+///    behind would otherwise be reported as complete. No such invocation was
+///    found on git 2.43.0 — this is a guarantee held against a future git or a
+///    conflict shape not yet tried, not a bug being fixed. It is stated as a
+///    property rather than left to the exit code because a proxy that happens
+///    to agree is a weaker promise than a check that asks.
+/// 2. **A refused apply is not proof that nothing was applied.** Exit 1 with
+///    `UU` in the index is git's ordinary response to a content conflict, and
+///    the markers are already in the working tree. Naming those paths is the
+///    reachable half of this, and it is what lets a client stop scanning for
+///    itself on the apply-only path (ADR 0077 D3).
+///
+/// # Three pieces, so the untestable parts are testable anyway
+///
+/// The decision ([`apply_verdict`]) and the wording ([`render_apply`]) are
+/// pure and unit-tested, including the combinations no `git stash apply`
+/// invocation on 2.43.0 produces. What is left here is spawning git, reading
+/// the conflict state, and journalling — the part that genuinely needs a
+/// repository, covered by the pipeline tests in `planner::contract_suite`.
 pub(super) async fn exec_apply_stash(
     repo: &Path,
     need: NetworkNeed,
@@ -188,146 +372,46 @@ pub(super) async fn exec_apply_stash(
         Ok(o) => o,
         Err(e) => return couldnt_run("/api/stash/apply", &e),
     };
-    if !output.status.success() {
-        // A conflicting apply leaves the entry in place — that is git's own
-        // behaviour and it is the right one, so the message says so rather
-        // than leaving the user wondering whether their stash survived.
-        let msg = stderr_or(&output, "git stash apply failed.");
-        eprintln!("git-vista: /api/stash/apply failed: {msg}");
-        return (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "{msg}
 
-The stash entry was not removed — it is still in the list."
-            ),
-        );
-    }
-    println!("[/api/stash/apply] applied {entry}");
-    journal_app_event(
-        repo,
-        ActivityKind::Other,
-        Some("refs/stash".to_string()),
-        Obs::Absent,
-        Obs::Absent,
-        format!("applied stash {entry}"),
-    )
-    .await;
-    (
-        StatusCode::OK,
-        format!("Applied {entry}. It is still in your stash list."),
-    )
-}
+    // Asked on BOTH outcomes, not only on failure — see the doc comment above
+    // for the two reasons.
+    let verdict = apply_verdict(
+        output.status.success(),
+        crate::conflicts::continuation(repo).await,
+    );
 
-/// `git stash pop <selector>` (`/api/stash/pop`, M3.24 #77).
-///
-/// # The criterion this exists to satisfy
-///
-/// *"Pop is not reported complete while conflicts remain."* Git already gets
-/// the **behaviour** right — `stash pop` leaves the entry in place when the
-/// apply conflicts, so nothing is lost. What git cannot do is shape our
-/// response. A caller seeing only a non-zero exit and a line of stderr would
-/// have to parse prose to learn whether their stash survived.
-///
-/// So after the pop this re-reads the conflict state through M4.31 (#84)'s
-/// scanner and names the unresolved paths. The entry either went or it did
-/// not, and the response says which.
-///
-/// # Why a failed scan is a refusal, not a shrug
-///
-/// If the conflict scan cannot run, this cannot know whether the pop left
-/// conflicts behind. Reporting success there would be the exact
-/// green-that-means-I-did-not-look failure the conflict model was built
-/// against, so it reports the gap instead.
-pub(super) async fn exec_pop_stash(
-    repo: &Path,
-    need: NetworkNeed,
-    entry: &StashSelector,
-    expected_oid: &CommitOid,
-) -> (StatusCode, String) {
-    if let Err(refusal) =
-        stash_entry_still_at(repo, need, "/api/stash/pop", entry, expected_oid).await
-    {
-        return refusal;
-    }
-
-    let output = match run_git(repo, need, &["stash", "pop", entry.as_str()]).await {
-        Ok(o) => o,
-        Err(e) => return couldnt_run("/api/stash/pop", &e),
-    };
-
-    // Asked in BOTH branches, not only on failure: a pop git called successful
-    // while leaving conflicted paths behind is precisely the case this
-    // criterion is about.
-    let continuation = crate::conflicts::continuation(repo).await;
-
-    match (output.status.success(), continuation) {
-        (true, Ok(c)) if c.may_continue() => {
-            println!("[/api/stash/pop] popped {entry}");
+    match &verdict {
+        ApplyVerdict::Applied => {
+            println!("[/api/stash/apply] applied {entry}");
             journal_app_event(
                 repo,
                 ActivityKind::Other,
                 Some("refs/stash".to_string()),
                 Obs::Absent,
                 Obs::Absent,
-                format!("popped stash {entry}"),
+                format!("applied stash {entry}"),
             )
             .await;
-            (
-                StatusCode::OK,
-                format!("Popped {entry}. It has been removed from your stash list."),
-            )
         }
-
-        // SURVIVED MUTATION, recorded rather than hidden: changing this to
-        // StatusCode::OK leaves every test green. The Err branch only fires
-        // when the conflict scan itself fails, which needs a repository broken
-        // enough that `git ls-files` errors while still being healthy enough
-        // for the pipeline to build and execute a plan — a combination that
-        // proved fragile to construct in every form tried. Identical gap to
-        // the one recorded at `exec_resolve_conflict` (M4.31, #84), and the
-        // same reasoning applies: a test that does not really test it is worth
-        // less than a note that says so.
-        (_, Err(why)) => (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "git stash pop ran, but the conflict state could not be read afterwards \
-                 — {why}. Check `git status` before continuing; this server will not \
-                 report the pop as complete on a check it could not make."
-            ),
-        ),
-
-        (_, Ok(c)) => {
-            let detail = match &c {
-                git_vista_protocol::conflict::Continuation::Blocked {
-                    unresolved,
-                    unreadable,
-                } => {
-                    let mut lines = String::new();
-                    if !unresolved.is_empty() {
-                        lines.push_str(&format!("\n\nConflicted:\n  {}", unresolved.join("\n  ")));
-                    }
-                    if !unreadable.is_empty() {
-                        lines.push_str(&format!(
-                            "\n\nCould not be read (resolve these by hand):\n  {}",
-                            unreadable.join("\n  ")
-                        ));
-                    }
-                    lines
-                }
-                git_vista_protocol::conflict::Continuation::Clear => String::new(),
-            };
-            eprintln!("[/api/stash/pop] {entry} left conflicts");
-            (
-                StatusCode::CONFLICT,
-                format!(
-                    "Popping {entry} left conflicts, so it is NOT complete.{detail}\n\n\
-                     The stash entry was not removed — it is still in the list. Resolve \
-                     the paths above, then the pop can finish."
-                ),
-            )
+        ApplyVerdict::AppliedWithConflicts(_) => {
+            eprintln!("[/api/stash/apply] {entry} reported success but left conflicts");
+        }
+        ApplyVerdict::FailedWithConflicts(_) => {
+            eprintln!("[/api/stash/apply] {entry} was refused and left conflicts");
+        }
+        ApplyVerdict::Failed => {
+            eprintln!("git-vista: /api/stash/apply failed for {entry}");
+        }
+        ApplyVerdict::Unverifiable(why) => {
+            eprintln!("[/api/stash/apply] {entry}: conflict state unreadable — {why}");
         }
     }
+
+    render_apply(
+        &verdict,
+        &stderr_or(&output, "git stash apply failed."),
+        entry,
+    )
 }
 
 /// `git stash branch <name> <selector>` (`/api/stash/branch`, M3.24 #77).
@@ -474,4 +558,264 @@ pub(super) async fn exec_drop_stash(
         StatusCode::OK,
         format!("Dropped {entry}. You can undo this from the history."),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_verdict, conflict_detail, ApplyVerdict, StashSelector, StatusCode};
+    use git_vista_protocol::conflict::Continuation;
+
+    fn blocked() -> Continuation {
+        Continuation::Blocked {
+            unresolved: vec!["a.txt".to_string()],
+            unreadable: vec![],
+        }
+    }
+
+    /// All six (exit status, scan) combinations, including the four real git
+    /// will not produce (#494, ADR 0078).
+    ///
+    /// Mutations applied to [`apply_verdict`] and observed red, each alone:
+    ///
+    /// | # | mutation | kind |
+    /// |---|---|---|
+    /// | V1 | collapse to `(true, Ok(_)) => Applied` — success stops asking | removed |
+    /// | V2 | `(true, Err(_)) => Applied` — "the scan is best-effort" | weakened |
+    /// | V3 | collapse to `(false, Ok(c)) => FailedWithConflicts` | weakened |
+    /// | V4 | collapse to `(false, Ok(_)) => Failed` — failure stops asking | removed |
+    /// | V5 | `(false, Err(why)) => Unverifiable` — a broken scan buries git's stderr | weakened |
+    ///
+    /// Five kills, spanning both directions on both paths. V2 and V5 also take
+    /// [`a_broken_scan_withdraws_a_success_but_not_a_failure`] with them, which
+    /// is the point of stating that asymmetry as its own test.
+    #[test]
+    fn every_combination_of_exit_status_and_scan_has_a_pinned_verdict() {
+        // git succeeded and the tree is clean — the only claim of completion.
+        assert_eq!(
+            apply_verdict(true, Ok(Continuation::Clear)),
+            ApplyVerdict::Applied
+        );
+
+        // git succeeded but conflicts remain. THE criterion: not complete.
+        // Unreachable through real git on 2.43.0, which is precisely why it is
+        // pinned here rather than left to a pipeline test that cannot exist.
+        assert_eq!(
+            apply_verdict(true, Ok(blocked())),
+            ApplyVerdict::AppliedWithConflicts(blocked())
+        );
+
+        // git succeeded and the scan did not. The claim is withdrawn, not
+        // softened: an unread tree may not be reported as applied.
+        assert_eq!(
+            apply_verdict(true, Err("ls-files exploded".to_string())),
+            ApplyVerdict::Unverifiable("ls-files exploded".to_string())
+        );
+
+        // git failed and left conflicts — the reachable case. A refused apply
+        // is not proof that nothing was applied.
+        assert_eq!(
+            apply_verdict(false, Ok(blocked())),
+            ApplyVerdict::FailedWithConflicts(blocked())
+        );
+
+        // git failed and left nothing unmerged. Also reachable: an untracked
+        // file in the stash colliding with one on disk exits 1 with a clean
+        // index. This must NOT claim conflicts.
+        assert_eq!(
+            apply_verdict(false, Ok(Continuation::Clear)),
+            ApplyVerdict::Failed
+        );
+
+        // git failed and the scan failed. git's stderr is still the best thing
+        // to say, so a broken scan costs only the conflict detail here — it
+        // does not turn a plain failure into a mystery.
+        assert_eq!(
+            apply_verdict(false, Err("ls-files exploded".to_string())),
+            ApplyVerdict::Failed
+        );
+    }
+
+    /// The two `Err` rows differ on purpose, and the difference is the point:
+    /// a broken scan withdraws a *success* claim but not a *failure* message.
+    /// Asserted separately so that collapsing them into one arm — the obvious
+    /// "simplification" — goes red with a message saying why it is wrong.
+    ///
+    /// Killed two ways, both run: **V2** `(true, Err(_)) => Applied` (the
+    /// success half stops being withdrawn) and **V5**
+    /// `(false, Err(why)) => Unverifiable` (the failure half starts being
+    /// withdrawn). One collapses the arms upward, the other downward.
+    #[test]
+    fn a_broken_scan_withdraws_a_success_but_not_a_failure() {
+        let on_success = apply_verdict(true, Err("boom".to_string()));
+        let on_failure = apply_verdict(false, Err("boom".to_string()));
+        assert!(
+            matches!(on_success, ApplyVerdict::Unverifiable(_)),
+            "a scan that could not run must withdraw a claimed success, got {on_success:?}"
+        );
+        assert_eq!(
+            on_failure,
+            ApplyVerdict::Failed,
+            "git already said this failed; a broken scan must not replace its stderr \
+             with a report about the scan"
+        );
+    }
+
+    fn sel() -> StashSelector {
+        StashSelector::new("stash@{0}").unwrap()
+    }
+
+    fn render(v: ApplyVerdict) -> (StatusCode, String) {
+        super::render_apply(&v, "CONFLICT (content): Merge conflict in a.txt", &sel())
+    }
+
+    /// **Exactly one verdict may claim the apply is complete.**
+    ///
+    /// This is the acceptance criterion of #494 stated as a property over the
+    /// whole outcome space rather than as a check on one path, which is the
+    /// form that survives someone adding a sixth verdict later.
+    ///
+    /// Killed two ways, both run:
+    ///
+    /// - **R1, removed:** return `StatusCode::OK` from `AppliedWithConflicts`.
+    ///   Two verdicts then claim completion.
+    /// - **R2, weakened:** keep the 409 but soften the wording to
+    ///   `"Applied {entry}, with conflicts"`. The status is still correct, so a
+    ///   status-only assertion passes — this one reads the body's opening
+    ///   claim, which is why the filter tests `starts_with("Applied ")` rather
+    ///   than a fixed sentence. R2 survived an earlier, narrower version of
+    ///   this test; the filter was widened because of it.
+    #[test]
+    fn exactly_one_verdict_reports_the_apply_as_complete() {
+        let all = [
+            ApplyVerdict::Applied,
+            ApplyVerdict::AppliedWithConflicts(blocked()),
+            ApplyVerdict::FailedWithConflicts(blocked()),
+            ApplyVerdict::Failed,
+            ApplyVerdict::Unverifiable("boom".to_string()),
+        ];
+        let claiming: Vec<_> = all
+            .iter()
+            .map(|v| render(v.clone()))
+            // "claims complete" means either a 2xx, or a body that OPENS by
+            // asserting the apply happened. The second half is what catches a
+            // 409 whose wording was softened to "Applied …, with conflicts" —
+            // a status-only check reads that as correct.
+            .filter(|(status, body)| status.is_success() || body.starts_with("Applied "))
+            .collect();
+        assert_eq!(
+            claiming.len(),
+            1,
+            "exactly one of five verdicts may read as a completed apply, got {claiming:?}"
+        );
+    }
+
+    /// The two verdicts that carry conflicts must NAME them, and the two that
+    /// do not must not imply them.
+    ///
+    /// Killed two ways, both run:
+    ///
+    /// - **R3, removed:** drop `conflict_detail(c)` from `FailedWithConflicts`;
+    ///   the paths vanish from the body.
+    /// - **C3, weakened:** keep the call but stop rendering the `unresolved`
+    ///   list inside it, so the block survives with only its unreadable half.
+    ///
+    /// The negative half of this test — that `Failed` and `Unverifiable` carry
+    /// no conflict block — is what the deleted `exec_pop_stash` got wrong: its
+    /// `(_, Ok(c))` arm caught every non-clean outcome, so a plain refusal with
+    /// a clear index produced *"left conflicts"* above an empty list. **C1**
+    /// (render a heading even for `Clear`) reproduces that defect and is caught
+    /// by [`a_clear_continuation_renders_no_detail_block`].
+    #[test]
+    fn only_the_conflict_carrying_verdicts_name_paths() {
+        for v in [
+            ApplyVerdict::AppliedWithConflicts(blocked()),
+            ApplyVerdict::FailedWithConflicts(blocked()),
+        ] {
+            let (_, body) = render(v);
+            assert!(
+                body.contains("Conflicted:\n  a.txt"),
+                "a conflict-carrying verdict must name its paths: {body}"
+            );
+        }
+        for v in [
+            ApplyVerdict::Applied,
+            ApplyVerdict::Failed,
+            ApplyVerdict::Unverifiable("boom".to_string()),
+        ] {
+            let (_, body) = render(v);
+            assert!(
+                !body.contains("Conflicted:"),
+                "a verdict with no conflicts must not carry a conflict block: {body}"
+            );
+        }
+    }
+
+    /// A refusal keeps its 400 and keeps git's own stderr — the status the
+    /// frontend's composed pop reads to gate its drop (ADR 0077) must not have
+    /// moved, and git's message is better than any this could write.
+    ///
+    /// Killed two ways, both run:
+    ///
+    /// - **R4, removed:** drop `{git_said}` from the `FailedWithConflicts`
+    ///   body, losing git's own words.
+    /// - **R5, weakened:** return `StatusCode::CONFLICT` from
+    ///   `FailedWithConflicts` — which reads as the *more* correct status and
+    ///   is the tempting change, but silently moves what the frontend's
+    ///   composed pop gates its drop on (ADR 0077).
+    #[test]
+    fn a_refused_apply_keeps_its_status_and_gits_own_words() {
+        for v in [
+            ApplyVerdict::Failed,
+            ApplyVerdict::FailedWithConflicts(blocked()),
+        ] {
+            let (status, body) = render(v);
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "a refusal stays a 400 — the composed pop's gate reads it: {body}"
+            );
+            assert!(
+                body.contains("CONFLICT (content): Merge conflict in a.txt"),
+                "git's own stderr must survive into the body: {body}"
+            );
+            assert!(
+                body.contains("not removed"),
+                "and the user must be told their stash survived: {body}"
+            );
+        }
+    }
+
+    /// `Clear` must render nothing. A detail block that appended an empty
+    /// "Conflicted:" heading would put a conflict-shaped section into a
+    /// response about a tree with no conflicts.
+    ///
+    /// Killed two ways, both run: **C1, removed** — `Clear` returns
+    /// `"\n\nConflicted:\n  (none)"`, reproducing the deleted
+    /// `exec_pop_stash`'s defect exactly; **C4, weakened** — `Clear` returns
+    /// `"\n\n"`, blank padding that looks harmless and still appends a
+    /// section separator to a response that has no section.
+    #[test]
+    fn a_clear_continuation_renders_no_detail_block() {
+        assert_eq!(conflict_detail(&Continuation::Clear), "");
+    }
+
+    /// Unreadable paths are rendered under their own heading, not folded in
+    /// with the resolvable ones — the user cannot fix them by choosing a side.
+    ///
+    /// Killed two ways, both run: **R6, weakened** — label the unreadable
+    /// block `"Conflicted:"` so the two collapse into one heading; **C2,
+    /// removed** — drop the unreadable block entirely, so a path nobody can
+    /// resolve is simply never mentioned.
+    #[test]
+    fn unreadable_paths_are_named_separately_from_conflicted_ones() {
+        let detail = conflict_detail(&Continuation::Blocked {
+            unresolved: vec!["a.txt".to_string()],
+            unreadable: vec!["blob.bin".to_string()],
+        });
+        assert!(detail.contains("Conflicted:\n  a.txt"), "{detail}");
+        assert!(
+            detail.contains("Could not be read (resolve these by hand):\n  blob.bin"),
+            "{detail}"
+        );
+    }
 }

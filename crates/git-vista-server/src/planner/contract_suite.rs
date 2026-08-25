@@ -197,7 +197,6 @@ fn covered_by(op: &GitOperation) -> &'static str {
     match op {
         GitOperation::PushStash { .. } => "push_stash_executes_through_the_pipeline",
         GitOperation::ApplyStash { .. } => "apply_stash_executes_through_the_pipeline",
-        GitOperation::PopStash { .. } => "pop_stash_refuses_to_report_complete_while_conflicted",
         GitOperation::BranchFromStash { .. } => {
             "branch_from_stash_lands_a_stash_that_would_not_pop"
         }
@@ -265,7 +264,6 @@ fn covered_on_split_path(op: &GitOperation) -> &'static str {
     match op {
         GitOperation::PushStash { .. }
         | GitOperation::ApplyStash { .. }
-        | GitOperation::PopStash { .. }
         | GitOperation::BranchFromStash { .. }
         | GitOperation::DropStash { .. }
         | GitOperation::ResolveConflict { .. }
@@ -614,6 +612,156 @@ async fn apply_stash_executes_through_the_pipeline() {
     assert!(
         out(&repo, &["stash", "list"]).contains("wip"),
         "apply KEEPS the entry — that is what makes it not a pop"
+    );
+}
+
+/// M3.24 (#77), #494: a refused apply is **not** proof that nothing was
+/// applied, and the response must name what is now conflicted in the tree.
+///
+/// Measured on git 2.43.0: `git stash apply` on an entry that cannot merge
+/// exits **1** and leaves `UU` in the index — the markers are already written.
+/// Before this, `exec_apply_stash` branched on the exit status alone and
+/// returned git's stderr with no path list, leaving the caller to go and look
+/// (ADR 0077 D3 is the client-side compensation this removes the need for).
+///
+/// # What this test covers that the unit tests cannot
+///
+/// The decision and the wording are pinned by pure tests in `planner::stash`,
+/// each killed at least two ways. What is left for this one is the **wiring**:
+/// that a real `git stash apply` against a real conflicting entry reaches
+/// `apply_verdict` with `succeeded = false` and a scan that really found
+/// `a.txt`. Predicted mutations: delete the `crate::conflicts::continuation`
+/// call from `exec_apply_stash`, or consult it only on the success path — both
+/// leave `FailedWithConflicts` unreachable and the body without its path list.
+///
+/// **Not executed on the branch that wrote it.** This container reports
+/// `landlock_abi=-1`, so the strict sandbox tier refuses every git spawn and
+/// all 321 pipeline tests in this crate fail identically before reaching their
+/// assertions (`ci_preflight_host_meets_the_declared_minimum` says so by name).
+/// The git behaviour this rests on WAS measured here, with git 2.43.0 driven
+/// directly: `git stash apply` on a diverged entry exits 1 and leaves `UU`.
+/// The mutation claims above are reasoned, not run — treat them as untested
+/// until CI executes this on a provisioned runner.
+#[tokio::test]
+async fn apply_stash_names_the_paths_a_refused_apply_left_conflicted() {
+    let (_dir, repo) = seeded_repo();
+
+    // Stash a change to a.txt, then commit a DIFFERENT change to the same file
+    // so the stash cannot apply cleanly. The tree is clean afterwards, which
+    // the `CleanWorktree` precondition requires.
+    std::fs::write(repo.join("a.txt"), "from the stash\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-m", "wip"]);
+    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
+    std::fs::write(repo.join("a.txt"), "from a commit\n").unwrap();
+    run(&repo, &["commit", "-q", "-am", "diverge"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ApplyStash {
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(oid).unwrap(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "a conflicting apply is still a refusal — body: {body}"
+    );
+    assert!(
+        body.contains("Conflicted:"),
+        "the response must carry a conflict block, not just git's stderr: {body}"
+    );
+    assert!(
+        body.contains("a.txt"),
+        "the conflicted path must be named, not left for the user to hunt: {body}"
+    );
+    assert!(
+        body.contains("not removed"),
+        "the user must be told their stash survived: {body}"
+    );
+
+    // The promise must be true, not merely printed: the markers really are in
+    // the tree, which is why saying "nothing was applied" would be a lie.
+    assert!(
+        !out(&repo, &["ls-files", "-u", "--", "a.txt"]).is_empty(),
+        "the apply got far enough to write conflict stages; that is the premise"
+    );
+    assert!(
+        out(&repo, &["stash", "list"]).contains("wip"),
+        "apply never removes the entry, conflicted or not"
+    );
+}
+
+/// M3.24 (#77), #494: the other half of the same guard — a failure with
+/// **nothing** unmerged must not be dressed up as a conflict.
+///
+/// This is the defect the executor being replaced actually had: `exec_pop_stash`
+/// matched `(_, Ok(c))` for anything that was not a clean success, so a plain
+/// refusal with a clear index produced *"left conflicts, so it is NOT
+/// complete"* followed by an empty detail block — a conflict report about a
+/// tree with no conflicts. Reachable, and reached here.
+///
+/// The shape: a stash carrying an *untracked* file, applied when a committed
+/// file of that name already exists. Measured on git 2.43.0 — exit 1, `git
+/// ls-files -u` empty, stderr *"could not restore untracked files from stash"*.
+///
+/// The verdict-level version of this — `(false, Ok(c)) if c.may_continue()`
+/// collapsed into `FailedWithConflicts` — is mutation **V3** in
+/// `planner::stash::tests`, applied and observed red there. What this test adds
+/// is that **real git actually produces the input**: exit 1 with a clean index,
+/// which is why the arm is not dead code guarding a case that cannot happen.
+///
+/// **Not executed on the branch that wrote it**, for the reason given on the
+/// test above. The git behaviour WAS measured here directly on 2.43.0 — exit 1,
+/// `git ls-files -u` empty, stderr *"could not restore untracked files from
+/// stash"*. What is unverified is only this crate's plumbing to it.
+#[tokio::test]
+async fn apply_stash_does_not_report_conflicts_a_plain_failure_did_not_leave() {
+    let (_dir, repo) = seeded_repo();
+
+    std::fs::write(repo.join("newcomer.txt"), "mine\n").unwrap();
+    run(&repo, &["stash", "push", "-q", "-u", "-m", "wip"]);
+    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
+    std::fs::write(repo.join("newcomer.txt"), "theirs\n").unwrap();
+    run(&repo, &["add", "-A"]);
+    run(&repo, &["commit", "-q", "-m", "committed the same name"]);
+
+    let (status, body) = pipeline(
+        &repo,
+        GitOperation::ApplyStash {
+            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
+            expected_oid: git_vista_protocol::CommitOid::new(oid).unwrap(),
+        },
+    )
+    .await;
+
+    // The premise this test rests on, asserted rather than assumed: git really
+    // did refuse without leaving anything unmerged. If a future git starts
+    // producing conflict stages here, this assertion says so instead of the
+    // test quietly becoming a duplicate of its sibling.
+    assert!(
+        out(&repo, &["ls-files", "-u"]).is_empty(),
+        "premise: this refusal leaves a clean index"
+    );
+
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "still a refusal — body: {body}"
+    );
+    assert!(
+        !body.contains("Conflicted:"),
+        "a failure that left nothing unmerged must not carry a conflict block: {body}"
+    );
+    assert!(
+        !body.contains("conflicted in your working tree"),
+        "and must not claim conflicted paths it has none of: {body}"
+    );
+    assert!(
+        body.contains("not removed"),
+        "the user must still be told their stash survived: {body}"
     );
 }
 
@@ -6033,91 +6181,6 @@ async fn taking_a_side_that_was_deleted_is_refused_rather_than_deleting_the_file
     assert!(
         !out(&repo, &["ls-files", "-u", "--", "a.txt"]).is_empty(),
         "a refused resolution must leave the conflict exactly as it was"
-    );
-}
-
-#[tokio::test]
-async fn pop_stash_removes_the_entry_on_a_clean_pop() {
-    // The ordinary path, and the half `apply` cannot do: the entry is gone.
-    let (_dir, repo) = seeded_repo();
-    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
-    run(&repo, &["stash", "push", "-q", "-m", "wip"]);
-    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
-
-    let (status, body) = pipeline(
-        &repo,
-        GitOperation::PopStash {
-            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
-            expected_oid: git_vista_protocol::CommitOid::new(oid).unwrap(),
-        },
-    )
-    .await;
-    assert_ok(status, &body);
-
-    assert_eq!(
-        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
-        "a changed\n",
-        "the stashed change must be back in the worktree"
-    );
-    assert_eq!(
-        out(&repo, &["stash", "list"]),
-        "",
-        "a clean pop removes the entry — that is the whole difference from apply"
-    );
-}
-
-#[tokio::test]
-async fn pop_stash_refuses_to_report_complete_while_conflicted() {
-    // THE acceptance criterion: "pop is not reported complete while conflicts
-    // remain". Git already leaves the entry in place on a conflicting pop —
-    // what this pins is that the RESPONSE says so, by name, rather than
-    // returning a success whose only clue is a line of git stderr.
-    //
-    // MUTATION: report OK whenever `git stash pop` exits non-zero but the
-    // scan is unavailable, or skip the conflict re-read entirely. Either way
-    // a user is told their stash was popped while their worktree is full of
-    // conflict markers and the entry is still in the drawer.
-    let (_dir, repo) = seeded_repo();
-
-    // Stash a change to a.txt, then commit a DIFFERENT change to the same
-    // file so the stash cannot apply cleanly.
-    std::fs::write(repo.join("a.txt"), "from the stash\n").unwrap();
-    run(&repo, &["stash", "push", "-q", "-m", "wip"]);
-    let oid = out(&repo, &["rev-parse", "stash@{0}"]);
-    std::fs::write(repo.join("a.txt"), "from a commit\n").unwrap();
-    run(&repo, &["commit", "-q", "-am", "diverge"]);
-
-    let (status, body) = pipeline(
-        &repo,
-        GitOperation::PopStash {
-            entry: git_vista_protocol::StashSelector::new("stash@{0}").unwrap(),
-            expected_oid: git_vista_protocol::CommitOid::new(oid).unwrap(),
-        },
-    )
-    .await;
-
-    assert_eq!(
-        status,
-        axum::http::StatusCode::CONFLICT,
-        "a conflicted pop must not return OK — body: {body}"
-    );
-    assert!(
-        body.contains("NOT complete"),
-        "the response must say plainly that it did not finish: {body}"
-    );
-    assert!(
-        body.contains("a.txt"),
-        "the conflicted path must be named, not left for the user to hunt: {body}"
-    );
-    assert!(
-        body.contains("not removed"),
-        "the user must be told their stash survived: {body}"
-    );
-
-    // And the promise must be true, not just printed.
-    assert!(
-        out(&repo, &["stash", "list"]).contains("wip"),
-        "git leaves the entry on a conflicting pop; the message says so, so it must hold"
     );
 }
 
