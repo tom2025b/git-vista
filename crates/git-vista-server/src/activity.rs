@@ -120,6 +120,9 @@ pub async fn activity_feed(
                             head: None,
                             tags: None,
                             remotes: None,
+                            // One event, its own capture: this anchors no
+                            // batch (#485).
+                            batch: None,
                         }),
                     },
                 );
