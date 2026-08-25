@@ -21,8 +21,29 @@
 // under the temp dir it is handed.
 
 import { execFileSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+// `buildStashFixture` below is the one builder #448 did not move into the Rust
+// catalogue: it landed in PR #490 while #448 was in flight, so the two merged
+// cleanly as text and not as meaning -- #448 dropped these imports because
+// nothing in this file needed them any more, and #490's builder needs three of
+// them. Filed as a follow-up; until it moves, the imports stay.
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+
+// Commit identity is set per-invocation, never through repo or global config:
+// this box has repositories whose local user.email is a personal gmail address,
+// and a bare `git commit` would silently pick it up.
+//
+// Restored during the #448 merge for the same reason the `node:fs` imports
+// above were: #448 moved every other builder into the Rust catalogue and
+// dropped this with them, while #490's `buildStashFixture` -- which landed
+// while #448 was in flight -- still calls git from JavaScript. The two merged
+// as text and not as meaning. It goes away when that builder moves.
+const IDENT = [
+  '-c', 'user.name=Claude_Max',
+  '-c', 'user.email=262510778+tom2025b@users.noreply.github.com',
+  '-c', 'commit.gpgsign=false',
+  '-c', 'tag.gpgsign=false',
+]
 
 /** Repo root, from this file's location: ci/browser -> ../.. */
 const REPO = join(import.meta.dirname, '..', '..')
