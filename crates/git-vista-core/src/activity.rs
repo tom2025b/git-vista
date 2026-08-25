@@ -718,12 +718,14 @@ fn names_a_local_branch(ref_name: Option<&str>, branches: &HashMap<String, Strin
 ///    250 refs reported as 297 and 500 as 891. The feed stayed at one row, so
 ///    #329's symptom held, but the number in it was not true.
 ///
-///    **The driver is gone; the defect is not.** #485 gave a fetch one ref
-///    capture and one timestamp for the whole batch
+///    **Fixed at the writer (#485), not in the fold.** A fetch now takes one
+///    ref capture and one timestamp for the whole batch
 ///    (`handlers::journal_app_events`), so its entries no longer drift apart
-///    at all. The fold still counts both copies of anything that does drift —
-///    from a slow operation, from a clock step, from any writer that has not
-///    adopted the batch — which is why the pin below stays.
+///    at all, and pull journals through the same path. The fold itself still
+///    counts both copies of anything that *does* drift; nothing can currently
+///    produce that — only `Fetch` and `Pull` fold, and both are batched — so
+///    the F1 pin below became a live regression test rather than staying an
+///    expected failure. Its doc comment carries the full argument.
 ///
 /// **Safe for undo by construction, not by luck:** [`undo_hint`] has no arm for
 /// `Fetch` or `Pull`, so neither row has ever carried a hint and dropping the
@@ -1356,15 +1358,20 @@ mod tests {
         );
     }
 
-    // -- Expected-failure pins for the two defects #329's fix still has. ------
+    // -- The two defects #329's fix was found to still have. ------------------
     //
-    // Both assert what the fold *should* do and are marked `#[should_panic]`
-    // because it does not do it yet. That is the `test.fail()` convention
-    // `ci/browser/tests/hunk-keyboard.spec.mjs` uses, and for the same reason
-    // it was adopted there: #210 survived for months behind a green gate. A
-    // test asserting today's wrong answer would go quietly green and stay
-    // green after a fix; `#[ignore]` says nothing at all. These go RED the
-    // moment the defect is fixed, and demand to be looked at.
+    // Both were filed as expected-failure pins: each asserts what the fold
+    // *should* do, marked `#[should_panic]` while it did not. That is the
+    // `test.fail()` convention `ci/browser/tests/hunk-keyboard.spec.mjs` uses,
+    // and for the same reason it was adopted there: #210 survived for months
+    // behind a green gate. A test asserting today's wrong answer would go
+    // quietly green and stay green after a fix; `#[ignore]` says nothing at
+    // all. A pin goes RED the moment its defect is fixed, and demands to be
+    // looked at.
+    //
+    // **F1 is fixed (#485) and is now a live regression test**; its
+    // `#[should_panic]` is gone and its fixture models what the writer
+    // actually produces. F2 is still pinned.
     //
     // Evidence and the proposed fixes:
     // `docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`.
@@ -1426,37 +1433,42 @@ mod tests {
         );
     }
 
-    /// **F1 — the folded count stops being true when entries drift.**
+    /// **F1, now a regression test: a slow fetch counts only the refs that
+    /// moved.**
     ///
     /// A journal entry that lands more than [`JOURNAL_MATCH_SLACK`] after
     /// git's reflog line for the same movement stops matching it; that reflog
     /// line survives attribution, and the fold counts both copies of one ref
-    /// movement. The fixture below models the drift that produced it when it
-    /// was filed: the app stamped one journal entry per ref, each after its
-    /// own full ref capture — ~29.63 ms per ref at 250 refs, flattened to
-    /// 30 ms here.
+    /// movement. When this was filed the app produced exactly that: one entry
+    /// per ref, each taking its own timestamp *after* its own full ref
+    /// capture, so entry *i* drifted ~29.63 ms further at 250 refs — past the
+    /// window around ref 170, and 500 refs reported as 891.
     ///
-    /// The feed still shows one row, so #329's reported symptom holds — this
-    /// pins the *number in it*, which is the part that is not true.
+    /// **#485 removed the drift at its source**, and the fixture below is now
+    /// the writer's real output: `handlers::journal_app_events` takes **one**
+    /// `now_secs()` reading for the whole batch, so every entry of one fetch
+    /// carries the same moment however long the fetch itself took. Hence the
+    /// name — the fetch is still slow, and the count is now true anyway.
     ///
-    /// **#485 removed that driver and this pin still stands, deliberately.**
-    /// A fetch now takes one capture and one timestamp for the whole batch, so
-    /// its own entries cannot drift (proved at the writer, in
-    /// `planner::fetch::tests::one_fetch_journals_every_ref_at_one_moment_under_one_capture`).
-    /// The defect pinned here is the *fold's*: it double-counts whatever
-    /// drifts, from any cause, and nothing about that changed. Rewriting this
-    /// fixture to the batched writer's zero drift would turn the pin green
-    /// while testing nothing — exactly the green-that-proves-nothing this
-    /// repository keeps finding.
+    /// **Neither half of this proves the chain alone, and both exist.** That
+    /// the writer emits one moment is pinned at the writer, in
+    /// `planner::fetch::tests::one_fetch_journals_every_ref_at_one_moment_under_one_capture`;
+    /// this pins that the fold then counts correctly. Read on its own, this
+    /// test would go green for a writer that had regressed to per-entry
+    /// timestamps, because it builds its own journal — which is why the pair
+    /// is named here rather than left to be discovered.
     ///
-    /// **Fixing this** means changing the fold, in `fold_one_kind`: a run must
-    /// not count a ref movement twice because it arrived from both sources.
-    /// Then delete the `#[should_panic]`.
+    /// **What is no longer pinned, said plainly.** The fold still counts both
+    /// copies of anything that *does* drift; that is not fixed, and after this
+    /// change nothing asserts it. It is left unpinned because no writer can
+    /// currently produce it: fetch and pull journal through the batched
+    /// `fetch::journal_updates` (pull runs `fetch::run_fetch`), and
+    /// `fold_ref_update_bursts` folds only `Fetch` and `Pull` — so the per-ref
+    /// push journalling of #487, the one remaining unbatched writer, cannot
+    /// reach this code path at all.
     #[test]
-    #[should_panic(expected = "F1: the fold counted")]
     fn a_slow_fetch_still_counts_only_the_refs_that_moved() {
         const REFS: i64 = 250;
-        const MS_PER_REF: i64 = 30; // measured 29.63 ms at this ref count
 
         // git wrote every reflog line during the fetch, at one moment.
         let reflog: Vec<ReflogEntry> = (0..REFS)
@@ -1470,10 +1482,11 @@ mod tests {
                 )
             })
             .collect();
-        // The app journaled them one at a time, drifting ~7.4s in total.
+        // And the app journals its whole batch at one moment — the same one,
+        // since #485. Before it, entry `i` landed at `100 + i * 30ms`.
         let journal: Vec<ActivityEvent> = (0..REFS)
             .map(|i| ActivityEvent {
-                time: 100 + (i * MS_PER_REF) / 1000,
+                time: 100,
                 kind: ActivityKind::Fetch,
                 ref_name: Some(format!("refs/remotes/origin/b{i}")),
                 summary: format!("fetched ‘origin/b{i}’ from origin"),
@@ -1500,8 +1513,9 @@ mod tests {
         assert_eq!(
             counted, REFS,
             "F1: the fold counted {counted} refs but only {REFS} moved — the \
-             journal's own write cost drifted its entries past the dedup window, \
-             so each movement was counted twice"
+             app's entries have drifted past the dedup window again, so each \
+             movement is being counted twice (see #485: one `now_secs()` \
+             reading for the whole batch)"
         );
     }
     // -----------------------------------------------------------------------
