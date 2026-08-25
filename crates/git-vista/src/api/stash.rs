@@ -26,27 +26,53 @@
 //! value is ever *computed* here — both are echoed back exactly as
 //! `GET /api/stashes` handed them over.
 //!
-//! # These request bodies have two authors
+//! # These request bodies have one author (#495, ADR 0079)
 //!
-//! The server does not share DTOs for the stash endpoints — its handlers
-//! declare their own `#[derive(Deserialize)]` structs — so the field names
-//! exist twice in the workspace with nothing forcing them to agree. The shapes
-//! below are transcribed from `crates/git-vista-server/src/handlers/stash.rs`.
-//! `BranchFromStashRequest` there carries `#[serde(deny_unknown_fields)]`, so a
-//! drifted field name is at least a 400 rather than a silently ignored value;
-//! `PushStashRequest` and `StashEntryRequest` do not, so on those a renamed
-//! optional field would be dropped in silence.
-
-use serde::Serialize;
+//! Every shape this module sends is a `git-vista-protocol` DTO the server
+//! deserializes — [`PushStashRequest`], [`StashTarget`] for apply and drop,
+//! [`BranchFromStashRequest`] for the escape hatch. Until #495 each was
+//! declared here *and* in `crates/git-vista-server/src/handlers/stash.rs`, so
+//! every field name existed twice with nothing forcing the copies to agree,
+//! and a rename on either side was silent: `PushStashRequest` and
+//! `StashEntryRequest` there tolerated unknown fields, so a drifted name was a
+//! value dropped on the floor rather than a 400.
+//!
+//! # The selectors and oids are typed, and that is where the argument lands
+//!
+//! The functions below still take `&str`, because the drawer's view and its
+//! signals hold selectors as strings. But nothing leaves this module as a
+//! string: each is passed through [`StashSelector`]/[`CommitOid`], which are
+//! the same validators the server's wire boundary runs. So a malformed
+//! selector cannot be *sent*, not merely cannot be served — and the failure
+//! arrives as a sentence in the drawer instead of a round trip.
 
 use git_vista_protocol::operation::IdempotencyKey;
-
-use crate::features::stash::core::StashEntry;
+use git_vista_protocol::{
+    BranchFromStashRequest, BranchName, CommitOid, PlanFieldError, PushStashRequest, StashEntry,
+    StashMessage, StashSelector, StashTarget,
+};
 
 use super::{
     network_error, receipt, refuse_if_offline, refuse_if_visualize, req_get, send_write_with_key,
     user_facing_error, write_json, WriteReceipt, REQUEST_TIMEOUT_MS,
 };
+
+/// The `(selector, expected_oid)` pair every write echoes back, validated
+/// through the shared newtypes before anything is sent.
+///
+/// Neither value is ever *computed* here — both are exactly what
+/// `GET /api/stashes` handed over, and both are already `StashSelector` and
+/// `CommitOid` on that listing. Re-validating them costs nothing and means the
+/// view's `String` round trip cannot be where a bad value enters. In practice
+/// this never fails; it is checked rather than unwrapped because "the server
+/// said so" is an assumption, and a panic in the client is a blank screen —
+/// the same posture `api::conflicts`'s `WorktreePath` build takes.
+fn target(entry: &str, expected_oid: &str) -> Result<StashTarget, String> {
+    Ok(StashTarget {
+        entry: StashSelector::new(entry).map_err(|e| e.to_string())?,
+        expected_oid: CommitOid::new(expected_oid).map_err(|e| e.to_string())?,
+    })
+}
 
 /// Every entry in the drawer, newest first (`GET /api/stashes`).
 ///
@@ -87,7 +113,13 @@ pub async fn fetch_stashes() -> Result<Vec<StashEntry>, String> {
 /// because `{` and `}` are not legal in a query string unescaped, and relying
 /// on every intermediary to tolerate them is a bet with no upside.
 pub async fn fetch_stash_patch(entry: &str) -> Result<String, String> {
-    let encoded = js_sys::encode_uri_component(entry)
+    // The server's `ShowStashQuery` deserializes this field as a
+    // `StashSelector`, so this is the same gate one process earlier — a query
+    // string is the one stash shape that is not a shared DTO (see that type's
+    // doc for why), and running its validator here is what keeps the two ends
+    // from drifting on what `entry` may hold.
+    let entry = StashSelector::new(entry).map_err(|e| e.to_string())?;
+    let encoded = js_sys::encode_uri_component(entry.as_str())
         .as_string()
         .unwrap_or_default();
     let url = format!("/api/stash/show?entry={encoded}&t={}", js_sys::Date::now());
@@ -105,26 +137,22 @@ pub async fn fetch_stash_patch(entry: &str) -> Result<String, String> {
     }
 }
 
-/// Body of `POST /api/stash/push`.
-#[derive(Serialize)]
-struct PushStashBody {
-    /// Omitted entirely when the user typed nothing, which is what makes git
-    /// write its own `WIP on <branch>` message. The server refuses a
-    /// present-but-blank string rather than silently dropping it, so this is
-    /// `None` and never `Some("")`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-    /// Both required, no defaults, mirroring the server's own struct: A2 is
-    /// that staged and untracked handling is *explicit*, and a bool with a
-    /// default is how a UI quietly stops asking.
-    keep_index: bool,
-    include_untracked: bool,
-}
+/// What a caller is told when it asks to stash under a blank message.
+///
+/// A blank message is the caller's bug, and normalising it to `None` would
+/// hide that the user typed something and it went nowhere. Before #495 the
+/// server owned this sentence, because the wire carried `Option<String>` and
+/// only a handler could tell the two apart. The wire now carries
+/// `Option<StashMessage>`, which cannot spell a blank at all — so the refusal
+/// moves to the one place a user could act on it, and this line exists rather
+/// than the newtype's own terser "stash message can't be empty".
+pub const BLANK_STASH_MESSAGE: &str =
+    "Stash message can't be blank — omit it entirely to let git write its own.";
 
 /// Put the working tree in the drawer (`POST /api/stash/push`).
 ///
 /// `keep_index` and `include_untracked` are taken as plain required arguments
-/// for the same reason the server's DTO has no `#[serde(default)]` on them: a
+/// for the same reason the shared DTO has no `#[serde(default)]` on them: a
 /// caller must have decided. The decision is shown to the user first by
 /// [`crate::features::stash::core::push_preview`].
 pub async fn push_stash_request(
@@ -134,11 +162,19 @@ pub async fn push_stash_request(
 ) -> Result<(), String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
-    let body = PushStashBody {
-        // A blank message is the caller's bug, and the server names it as one.
-        // Normalising it to `None` here would hide that the user typed
-        // something and it went nowhere.
-        message: message.map(str::to_string),
+    let message = match message {
+        None => None,
+        // A blank is the one refusal worth its own sentence; the other
+        // (16 KiB of "message") already says exactly what is wrong.
+        Some(m) => Some(
+            StashMessage::new(m).map_err(|e| match e {
+                PlanFieldError::Empty(_) => BLANK_STASH_MESSAGE.to_string(),
+                other => other.to_string(),
+            })?,
+        ),
+    };
+    let body = PushStashRequest {
+        message,
         keep_index,
         include_untracked,
     };
@@ -148,13 +184,6 @@ pub async fn push_stash_request(
     } else {
         Err(user_facing_error("/api/stash/push", resp).await)
     }
-}
-
-/// Body of `POST /api/stash/apply` and `POST /api/stash/drop`.
-#[derive(Serialize)]
-struct StashEntryBody {
-    entry: String,
-    expected_oid: String,
 }
 
 /// Restore a stash's changes, keeping the entry (`POST /api/stash/apply`).
@@ -169,10 +198,7 @@ struct StashEntryBody {
 pub async fn apply_stash_request(entry: &str, expected_oid: &str) -> Result<(), String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
-    let body = StashEntryBody {
-        entry: entry.to_string(),
-        expected_oid: expected_oid.to_string(),
-    };
+    let body = target(entry, expected_oid)?;
     let (resp, _key) = write_json("/api/stash/apply", &body).await?;
     if resp.ok() {
         Ok(())
@@ -196,24 +222,11 @@ pub async fn drop_stash_request(
 ) -> Result<WriteReceipt, String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
-    let body = StashEntryBody {
-        entry: entry.to_string(),
-        expected_oid: expected_oid.to_string(),
-    };
+    let body = target(entry, expected_oid)?;
     let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
     let (resp, _key) =
         send_write_with_key("/api/stash/drop", Some(json), key, REQUEST_TIMEOUT_MS).await?;
     Ok(receipt(resp).await)
-}
-
-/// Body of `POST /api/stash/branch`. The server declares this one
-/// `deny_unknown_fields`, so a drifted name here is a 400 rather than a
-/// silently ignored value.
-#[derive(Serialize)]
-struct BranchFromStashBody {
-    name: String,
-    entry: String,
-    expected_oid: String,
 }
 
 /// Create a branch at the stash's own base commit, check it out, apply the
@@ -231,10 +244,14 @@ pub async fn branch_from_stash_request(
 ) -> Result<(), String> {
     refuse_if_offline()?;
     refuse_if_visualize()?;
-    let body = BranchFromStashBody {
-        name: name.to_string(),
-        entry: entry.to_string(),
-        expected_oid: expected_oid.to_string(),
+    let body = BranchFromStashRequest {
+        // The name is the user's own typing, so unlike the selector/oid pair
+        // this really can be malformed — and refusing it here means the drawer
+        // says so without a round trip. `git stash branch <name> <selector>`
+        // puts it straight after the subcommand, which is why option-shaped is
+        // the shape that matters.
+        name: BranchName::new(name).map_err(|e| e.to_string())?,
+        target: target(entry, expected_oid)?,
     };
     let (resp, _key) = write_json("/api/stash/branch", &body).await?;
     if resp.ok() {

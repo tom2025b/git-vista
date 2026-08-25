@@ -1255,6 +1255,148 @@ pub struct TagDetail {
     pub signature: SignatureStatus,
 }
 
+// ---------------------------------------------------------------------------
+// The stash drawer's wire contract (M3.24, #77; #495, ADR 0079)
+// ---------------------------------------------------------------------------
+//
+// Every shape `GET /api/stashes`, `POST /api/stash/{push,apply,drop,branch}`
+// exchange lives here and nowhere else. Before #495 the listing was built by
+// hand with `serde_json::json!` in the server's handler, each write body was
+// declared once in that handler and again in the frontend's `api/stash.rs`,
+// and the frontend's own `StashEntry` transcribed the listing's field names a
+// third time. Nothing forced the copies to agree, and the failure mode of a
+// disagreement is not an error: a renamed field deserializes as *absent*, so
+// the drawer renders empty — the exact "no stashes" / "couldn't look" merge
+// `git_vista_git::stash::read_stashes` refuses to make one layer down.
+
+/// One entry of `GET /api/stashes`, newest first (M3.24, #77; ADR 0079).
+///
+/// # The wire carries the selector, not the position
+///
+/// The server used to send both `entry` (`stash@{0}`) and `index` (`0`), with
+/// the first *derived* from the second one line earlier. Only `entry` survives
+/// (#495): it is the only form git accepts as an argument, it is what every
+/// write echoes back, and no client ever read `index`. A derivable field on
+/// the wire is a second place for the same fact to be wrong — and the two can
+/// genuinely disagree here, because a concurrent drop renumbers the drawer
+/// between the read that built the list and anything done with it.
+///
+/// The position is not lost, and it is not the client's to re-derive by
+/// parsing: [`StashSelector::index`] answers it, next to
+/// [`StashSelector::at`], which is what the server builds this field with. One
+/// author for the mapping, in both directions.
+///
+/// # No `deny_unknown_fields`, unlike the request bodies below
+///
+/// A *response* DTO, so it follows the crate's additive rule (M1.02): a client
+/// that is older than the server keeps parsing when a field is added. The
+/// request bodies below are strict for the opposite reason — an unknown key in
+/// something that reaches a git argv is a smuggling attempt, not a new field.
+///
+/// # `message` is a `String`, and stays one
+///
+/// [`crate::StashMessage`] validates what a *user* may write into a new stash
+/// (non-empty, bounded). This field is the reflog line git already wrote, and
+/// a stash list is a reflog: any tool may have written it, including one that
+/// left it empty. Typing it as `StashMessage` would make an odd entry fail the
+/// whole listing — a strictly worse answer than showing the row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StashEntry {
+    /// The positional selector, `stash@{0}`. Sent back verbatim to act on this
+    /// entry; never rebuilt by a client.
+    pub entry: crate::plan::StashSelector,
+    /// The stash commit. Identifies recoverable *content*, never the entry —
+    /// two entries may carry the same oid (`git stash store` will do it).
+    pub oid: crate::plan::CommitOid,
+    /// The reflog line's message, exactly as git wrote it.
+    pub message: String,
+    /// Unix seconds from the reflog entry's own signature. Formatting needs a
+    /// clock and a locale, so the wire carries the raw number.
+    pub time: i64,
+}
+
+/// The `(selector, expected_oid)` pair **every** stash write carries, and the
+/// whole body of `POST /api/stash/apply` and `POST /api/stash/drop` (M3.24,
+/// #77; ADR 0079).
+///
+/// # Why both halves, always
+///
+/// The selector is the *address* and is the only thing git accepts:
+/// `git stash drop <oid>` is not a command (it answers `'<oid>' is not a stash
+/// reference`). The oid is the *witness*, compare-and-swapped against a fresh
+/// resolve immediately before the mutation runs. Neither alone can be served:
+/// selectors renumber on every drop, so acting on a stale one would eventually
+/// discard a stash nobody chose, and an oid is not an entry identity because
+/// two entries may hold the same commit. See [`StashSelector`]'s own doc for
+/// the review that established this.
+///
+/// [`StashSelector`]: crate::plan::StashSelector
+///
+/// # One declaration, nested rather than repeated
+///
+/// [`BranchFromStashRequest`] carries this as a field instead of spelling the
+/// pair again. `#[serde(flatten)]` would keep that body's JSON flat but is
+/// mutually exclusive with `deny_unknown_fields`, and giving up strictness on
+/// a body that reaches `git stash branch` to save one level of nesting is the
+/// wrong trade — the same nesting [`crate::TagAnnotation`] already uses for an
+/// operation's inner shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StashTarget {
+    /// The positional selector, exactly as `GET /api/stashes` returned it.
+    pub entry: crate::plan::StashSelector,
+    /// The oid the client believes that selector names.
+    pub expected_oid: crate::plan::CommitOid,
+}
+
+/// Body of `POST /api/stash/push` — put the working tree in the drawer
+/// (M3.24, #77; ADR 0079).
+///
+/// # Both flags are required, with no `#[serde(default)]`
+///
+/// M3.24's acceptance criterion is that staged and untracked handling is
+/// *explicit*. A `bool` with a default is how a UI quietly stops asking: the
+/// field disappears from the client, every request reads `false`, and nothing
+/// anywhere is red. Requiring them makes a client that stopped deciding a 400.
+///
+/// # `message` is `Option<StashMessage>`, and the option means what it says
+///
+/// Absent ⇒ git writes its own `WIP on <branch>` line. Present ⇒ the user
+/// typed something, and [`StashMessage`](crate::StashMessage) refuses a blank
+/// or oversized one at the wire boundary. There is deliberately no third state:
+/// `Some("")` cannot be constructed, so "the user typed something and it went
+/// nowhere" is not a shape this DTO can carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushStashRequest {
+    /// Omitted entirely when the user typed nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<crate::plan::StashMessage>,
+    /// `git stash push --keep-index`: stash the staged changes but leave them
+    /// staged as well.
+    pub keep_index: bool,
+    /// `git stash push --include-untracked`.
+    pub include_untracked: bool,
+}
+
+/// Body of `POST /api/stash/branch` (M3.24, #77; ADR 0079) — create a branch
+/// at the stash's own base commit, check it out, apply the stash there, and
+/// drop the entry if that succeeded.
+///
+/// The recovery path for "my stash won't come back": git creates the branch at
+/// the commit the stash was *taken from*, so the apply happens in the context
+/// the changes were written in, where by construction they fit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchFromStashRequest {
+    /// The branch to create. [`BranchName`](crate::BranchName) refuses an
+    /// empty or option-shaped name before a plan exists.
+    pub name: crate::plan::BranchName,
+    /// Which entry to branch from — the same pair apply and drop take, so
+    /// this path cannot drift from theirs on what a valid entry looks like.
+    pub target: StashTarget,
+}
+
 /// Validate a URL a user pasted to clone, before the server hands it to
 /// `git clone` (Phase 12). This is a *gate*, not a parser: it accepts only the
 /// public, read-oriented transports (`https://`, `http://`, `git://`) and rejects
@@ -1287,6 +1429,248 @@ pub fn validate_clone_url(url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // The stash drawer's wire contract (#495, ADR 0079)
+    // -----------------------------------------------------------------------
+    //
+    // One test per DTO, and each pins the **JSON** rather than only
+    // round-tripping the Rust value. A round trip alone is vacuous for a
+    // shared type: rename a field and `to_string` → `from_str` still agrees
+    // with itself, because both ends moved together. What must not move
+    // silently is the wire, so every one of these asserts against a literal
+    // body — the shape a running server and a running browser exchange.
+
+    /// The listing (`GET /api/stashes`), pinned key by key.
+    ///
+    /// MUTATION 1 (rename): `entry` → `selector` in [`StashEntry`]. RED —
+    ///   `missing field \`entry\``, before any assertion runs.
+    /// MUTATION 2 (retype): `time: i64` → `time: String`. RED —
+    ///   `invalid type: integer \`1700000000\`, expected a string`.
+    #[test]
+    fn the_stash_listing_pins_its_wire_keys_and_their_types() {
+        let wire = r#"[
+            {
+              "entry": "stash@{0}",
+              "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "message": "WIP on main: 1a2b3c4 tidy the parser",
+              "time": 1700000000
+            }
+        ]"#;
+
+        let parsed: Vec<StashEntry> = serde_json::from_str(wire).expect("the listing must parse");
+        assert_eq!(parsed.len(), 1);
+        let entry = &parsed[0];
+        assert_eq!(entry.entry.as_str(), "stash@{0}");
+        assert_eq!(
+            entry.oid.as_str(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(entry.message, "WIP on main: 1a2b3c4 tidy the parser");
+        assert_eq!(entry.time, 1_700_000_000);
+
+        // Serialising it back produces those keys and no others — the half a
+        // deserialization-only test cannot see, and the half that matters to
+        // the browser.
+        assert_eq!(
+            serde_json::to_value(entry).unwrap(),
+            serde_json::json!({
+                "entry": "stash@{0}",
+                "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "message": "WIP on main: 1a2b3c4 tidy the parser",
+                "time": 1_700_000_000,
+            }),
+            "the listing's keys are this DTO's to change, and only deliberately"
+        );
+
+        // `index` is gone from the wire (#495) and is not missed: the position
+        // reads back out of the selector, through the same author that wrote it.
+        assert_eq!(entry.entry.index(), Some(0));
+    }
+
+    /// A listing whose values are not the shapes git produces fails at the
+    /// wire boundary, not in a handler — the newtypes deserialize through
+    /// their own validators.
+    ///
+    /// This is what a `String`-typed listing could not say: `"HEAD"` is a
+    /// perfectly good `String`, and it is not a stash entry.
+    #[test]
+    fn a_listing_entry_refuses_values_git_could_not_have_produced() {
+        for (what, body) in [
+            (
+                "a ref name where a selector belongs",
+                r#"{"entry":"HEAD","oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","message":"m","time":1}"#,
+            ),
+            (
+                "an option-shaped selector",
+                r#"{"entry":"--all","oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","message":"m","time":1}"#,
+            ),
+            (
+                "an abbreviated oid",
+                r#"{"entry":"stash@{0}","oid":"aaaaaaa","message":"m","time":1}"#,
+            ),
+        ] {
+            assert!(
+                serde_json::from_str::<StashEntry>(body).is_err(),
+                "{what}: accepted"
+            );
+        }
+
+        // A response DTO follows the additive rule (M1.02) — an unknown key
+        // from a newer server is ignored, not fatal. Asserted so that
+        // loosening/tightening is a deliberate edit rather than a surprise.
+        let tolerant: StashEntry = serde_json::from_str(
+            r#"{"entry":"stash@{1}","oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","message":"m","time":1,"branch":"main"}"#,
+        )
+        .expect("a read DTO must tolerate a field a newer server added");
+        assert_eq!(tolerant.entry.as_str(), "stash@{1}");
+    }
+
+    /// The pair `POST /api/stash/apply` and `POST /api/stash/drop` take.
+    ///
+    /// MUTATION 1 (rename): `expected_oid` → `oid` in [`StashTarget`]. RED —
+    ///   `missing field \`expected_oid\``.
+    /// MUTATION 2 (retype): `entry: StashSelector` → `entry: String`. RED —
+    ///   the "a bare ref name is refused" assertion below stops holding.
+    #[test]
+    fn the_stash_write_target_pins_both_halves_and_requires_both() {
+        let wire = r#"{"entry":"stash@{2}","expected_oid":"0123456789abcdef0123456789abcdef01234567"}"#;
+        let target: StashTarget = serde_json::from_str(wire).expect("the pair must parse");
+        assert_eq!(target.entry.as_str(), "stash@{2}");
+        assert_eq!(
+            target.expected_oid.as_str(),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(serde_json::to_string(&target).unwrap(), wire);
+
+        // Half a pair is not a request. The selector alone renumbers on every
+        // drop; the oid alone is not something `git stash drop` accepts.
+        assert!(serde_json::from_str::<StashTarget>(r#"{"entry":"stash@{2}"}"#).is_err());
+        assert!(serde_json::from_str::<StashTarget>(
+            r#"{"expected_oid":"0123456789abcdef0123456789abcdef01234567"}"#
+        )
+        .is_err());
+        // A write body, so it is closed: no extra key rides along to the argv.
+        assert!(serde_json::from_str::<StashTarget>(
+            r#"{"entry":"stash@{2}","expected_oid":"0123456789abcdef0123456789abcdef01234567","force":true}"#
+        )
+        .is_err());
+        // And the selector is a selector, not any string that parses.
+        assert!(serde_json::from_str::<StashTarget>(
+            r#"{"entry":"refs/stash","expected_oid":"0123456789abcdef0123456789abcdef01234567"}"#
+        )
+        .is_err());
+    }
+
+    /// `POST /api/stash/push`.
+    ///
+    /// MUTATION 1 (rename): `keep_index` → `keep_staged`. RED — `missing
+    ///   field \`keep_index\``.
+    /// MUTATION 2 (retype): `message: Option<StashMessage>` →
+    ///   `Option<String>`. RED — the blank-message assertion stops holding
+    ///   (`Some("")` becomes representable again).
+    #[test]
+    fn the_push_body_pins_its_flags_and_refuses_a_blank_message() {
+        let with_message = PushStashRequest {
+            message: Some(crate::plan::StashMessage::new("half-finished refactor").unwrap()),
+            keep_index: true,
+            include_untracked: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&with_message).unwrap(),
+            r#"{"message":"half-finished refactor","keep_index":true,"include_untracked":false}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<PushStashRequest>(
+                r#"{"message":"half-finished refactor","keep_index":true,"include_untracked":false}"#
+            )
+            .unwrap(),
+            with_message
+        );
+
+        // No message: the key is absent, which is what makes git write its own
+        // `WIP on <branch>` line. Absent on the way out, absent on the way in.
+        let no_message = PushStashRequest {
+            message: None,
+            keep_index: false,
+            include_untracked: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&no_message).unwrap(),
+            r#"{"keep_index":false,"include_untracked":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<PushStashRequest>(
+                r#"{"keep_index":false,"include_untracked":true}"#
+            )
+            .unwrap(),
+            no_message
+        );
+
+        // A blank message is not a third state — the user typed something and
+        // it must not go nowhere.
+        assert!(serde_json::from_str::<PushStashRequest>(
+            r#"{"message":"","keep_index":false,"include_untracked":false}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<PushStashRequest>(
+            r#"{"message":"   ","keep_index":false,"include_untracked":false}"#
+        )
+        .is_err());
+
+        // Neither flag defaults: a client that stopped deciding is a 400, not
+        // a silent `false` (M3.24 A2).
+        assert!(serde_json::from_str::<PushStashRequest>(r#"{"keep_index":true}"#).is_err());
+        assert!(serde_json::from_str::<PushStashRequest>(r#"{"include_untracked":true}"#).is_err());
+        // Closed, like every other write body.
+        assert!(serde_json::from_str::<PushStashRequest>(
+            r#"{"keep_index":false,"include_untracked":false,"all":true}"#
+        )
+        .is_err());
+    }
+
+    /// `POST /api/stash/branch` — the same target, nested, plus a name.
+    ///
+    /// MUTATION 1 (rename): `target` → `entry` in
+    ///   [`BranchFromStashRequest`]. RED — `missing field \`target\``.
+    /// MUTATION 2 (retype): `name: BranchName` → `name: String`. RED — the
+    ///   option-shaped-name assertion stops holding.
+    #[test]
+    fn the_branch_body_nests_the_write_target_rather_than_respelling_it() {
+        let req = BranchFromStashRequest {
+            name: crate::plan::BranchName::new("rescue").unwrap(),
+            target: StashTarget {
+                entry: crate::plan::StashSelector::new("stash@{0}").unwrap(),
+                expected_oid: crate::plan::CommitOid::new("a".repeat(40)).unwrap(),
+            },
+        };
+        let wire = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"name":"rescue","target":{"entry":"stash@{0}","expected_oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<BranchFromStashRequest>(&wire).unwrap(),
+            req
+        );
+
+        // `git stash branch <name> <selector>` puts the name straight after
+        // the subcommand, so an option-shaped one is the shape that would turn
+        // this into a different command.
+        assert!(serde_json::from_str::<BranchFromStashRequest>(
+            r#"{"name":"--force","target":{"entry":"stash@{0}","expected_oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#
+        )
+        .is_err());
+        // The nested pair is still closed, and still whole.
+        assert!(serde_json::from_str::<BranchFromStashRequest>(
+            r#"{"name":"rescue","target":{"entry":"stash@{0}"}}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<BranchFromStashRequest>(
+            r#"{"name":"rescue","target":{"entry":"stash@{0}","expected_oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","force":true}}"#
+        )
+        .is_err());
+    }
 
     #[test]
     fn create_branch_request_roundtrips() {

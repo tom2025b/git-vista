@@ -1,13 +1,31 @@
 //! The stash drawer's HTTP surface (M3.24, #77).
 //!
-//! Four endpoints: one read and three writes.
+//! Six endpoints: two reads and four writes.
 //!
-//! | endpoint | operation |
-//! |---|---|
-//! | `GET  /api/stashes` | list the drawer — unconditionally safe |
-//! | `POST /api/stash/push` | [`GitOperation::PushStash`] |
-//! | `POST /api/stash/apply` | [`GitOperation::ApplyStash`] |
-//! | `POST /api/stash/drop` | [`GitOperation::DropStash`] |
+//! | endpoint | body | operation |
+//! |---|---|---|
+//! | `GET  /api/stashes` | → `Vec<`[`StashEntry`]`>` | list the drawer — unconditionally safe |
+//! | `GET  /api/stash/show` | → patch text | read one entry, and only read it |
+//! | `POST /api/stash/push` | [`PushStashRequest`] | [`GitOperation::PushStash`] |
+//! | `POST /api/stash/apply` | [`StashTarget`] | [`GitOperation::ApplyStash`] |
+//! | `POST /api/stash/drop` | [`StashTarget`] | [`GitOperation::DropStash`] |
+//! | `POST /api/stash/branch` | [`BranchFromStashRequest`] | [`GitOperation::BranchFromStash`] |
+//!
+//! # Every shape in that table is a `git-vista-protocol` DTO (#495, ADR 0079)
+//!
+//! Not one of them used to be. The listing was built by hand with
+//! `serde_json::json!` right here, each write body was declared here and again
+//! in the frontend's `api/stash.rs`, and every field name existed twice in the
+//! workspace with nothing forcing the copies to agree. A rename on either side
+//! did not fail: the field deserialized as absent and the drawer rendered
+//! empty — "no stashes", which is the one thing `git-vista-git`'s
+//! `read_stashes` refuses to say when it means "couldn't look".
+//!
+//! What follows from sharing them is that **this file has no validation left**.
+//! Every field arrives as the type its operation wants, checked by the
+//! newtype's own `Deserialize`, so there is no `::new` call here for someone to
+//! delete and no test that could pass by testing the newtype instead of the
+//! endpoint.
 //!
 //! **There is no `/api/stash/pop`.** Pop is apply-then-drop, and a single
 //! operation row cannot tell the truth about the half-done state: apply
@@ -19,7 +37,8 @@
 //!
 //! # The selector/oid split, restated here because this is where clients meet it
 //!
-//! Every write takes `entry` (a positional `stash@{n}`) **and** `expected_oid`.
+//! Every write takes [`StashTarget`]'s two fields — `entry` (a positional
+//! `stash@{n}`) **and** `expected_oid`.
 //! The selector is the address and is what reaches git; the oid is the witness
 //! and is compare-and-swapped against a fresh resolve immediately before the
 //! mutation runs. A client that sends only one of them cannot be served: an oid
@@ -29,9 +48,11 @@
 
 use axum::http::StatusCode;
 use axum::Json;
-use serde::Deserialize;
 
-use git_vista_protocol::{CommitOid, GitOperation, StashMessage, StashSelector};
+use git_vista_protocol::{
+    BranchFromStashRequest, CommitOid, GitOperation, PushStashRequest, StashEntry, StashSelector,
+    StashTarget,
+};
 
 use crate::planner;
 use crate::state::reject_if_read_only;
@@ -62,17 +83,7 @@ pub(crate) async fn show_stash(
     axum::extract::Query(q): axum::extract::Query<ShowStashQuery>,
 ) -> (StatusCode, String) {
     let (repo, _read_only) = crate::state::current();
-
-    let Ok(entry) = git_vista_protocol::StashSelector::new(&q.entry) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "{} is not a stash selector — expected the stash@{{N}} form the \
-                 stash list returns.",
-                q.entry
-            ),
-        );
-    };
+    let entry = q.entry;
 
     // `--` is not applicable here (the argument is a revision, not a path),
     // but the selector newtype has already refused anything that is not
@@ -139,12 +150,25 @@ pub(crate) async fn show_stash(
 /// The closed-DTO rule this looked like it was following is about **write
 /// bodies** reaching the argv boundary (`argv_boundary::dto_gates`), where an
 /// unknown key is a smuggling attempt. This is a GET query whose one field is
-/// already refused by `StashSelector` unless it is exactly `stash@{N}`, so an
+/// already refused by [`StashSelector`] unless it is exactly `stash@{N}`, so an
 /// extra key buys an attacker nothing at all.
+///
+/// # The one stash shape that is not in `git-vista-protocol` (#495, ADR 0079)
+///
+/// Every stash *body* is now a shared DTO both ends deserialize. A query
+/// string is not a body: the frontend builds this URL with
+/// `js_sys::encode_uri_component`, and serializing a shared type into a query
+/// instead would need `serde_urlencoded` as a dependency of the wasm crate,
+/// which is a bigger change than the duplication it removes. What *is* shared
+/// is the part that can be wrong in a way nothing catches — the field's
+/// **type**. `entry` is a [`StashSelector`], so it deserializes through the
+/// same validator the write bodies use and the handler has no `::new` call
+/// left to delete. The name is pinned by the three tests below, which send the
+/// query string the browser actually sends.
 #[derive(serde::Deserialize)]
 pub(crate) struct ShowStashQuery {
     /// The `stash@{N}` selector, exactly as the list returned it.
-    pub(crate) entry: String,
+    pub(crate) entry: StashSelector,
 }
 
 #[cfg(test)]
@@ -160,7 +184,8 @@ mod show_stash_query_tests {
         let q: ShowStashQuery = serde_urlencoded::from_str("entry=stash%40%7B0%7D&t=1756112884123")
             .expect("the `?t=` cache-buster every frontend GET appends must not 400");
         assert_eq!(
-            q.entry, "stash@{0}",
+            q.entry.as_str(),
+            "stash@{0}",
             "the selector must survive percent-decoding intact"
         );
     }
@@ -172,7 +197,7 @@ mod show_stash_query_tests {
         let q: ShowStashQuery =
             serde_urlencoded::from_str("t=1756112884123.4&entry=stash%40%7B12%7D")
                 .expect("a cache-buster is opaque to this handler wherever it sits");
-        assert_eq!(q.entry, "stash@{12}");
+        assert_eq!(q.entry.as_str(), "stash@{12}");
     }
 
     /// The one field that IS this DTO's business still has to be there.
@@ -193,23 +218,22 @@ mod show_stash_query_tests {
 pub(crate) async fn stash_list() -> (StatusCode, String) {
     let (repo, _read_only) = crate::state::current();
     match git_vista_git::stash::read_stashes(&repo) {
-        Ok(entries) => {
-            let body: Vec<serde_json::Value> = entries
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        // The selector a client must send back to act on this
-                        // entry — built here rather than in the client, so
-                        // the wire form has exactly one author.
-                        "entry": format!("stash@{{{}}}", s.index),
-                        "index": s.index,
-                        "oid": s.oid.0,
-                        "message": s.message,
-                        "time": s.time,
-                    })
-                })
-                .collect();
-            match serde_json::to_string(&body) {
+        Ok(records) => {
+            let entries: Result<Vec<StashEntry>, _> = records.iter().map(listing_entry).collect();
+            let entries = match entries {
+                Ok(entries) => entries,
+                // A record this server cannot express on the wire is a failure
+                // to read the drawer, not an entry to leave out: a shorter
+                // list renumbers everything below the gap, and the number is
+                // the address the user acts on.
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("could not read the stash list: {e}"),
+                    )
+                }
+            };
+            match serde_json::to_string(&entries) {
                 Ok(json) => (StatusCode::OK, json),
                 Err(e) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -227,70 +251,141 @@ pub(crate) async fn stash_list() -> (StatusCode, String) {
     }
 }
 
-#[derive(Deserialize)]
-pub(crate) struct PushStashRequest {
-    #[serde(default)]
-    pub message: Option<String>,
-    /// REQUIRED, no default. The acceptance criterion is that staged and
-    /// untracked handling is *explicit*; a bool with a default is how a UI
-    /// quietly stops asking.
-    pub keep_index: bool,
-    pub include_untracked: bool,
+/// The mapping boundary `git-vista-git`'s module doc names: git-shaped facts
+/// in, the shared wire DTO out (#495, ADR 0079).
+///
+/// `git-vista-git` deliberately does not depend on `git-vista-protocol`, so
+/// this is where a [`StashRecord`](git_vista_git::stash::StashRecord) becomes
+/// something both ends of the wire deserialize. Two things happen here and
+/// nowhere else:
+///
+/// - the position becomes a selector, through [`StashSelector::at`] — the one
+///   author of the `stash@{N}` spelling. The wire no longer carries the
+///   position beside it; see [`StashEntry`] for why a derivable field was the
+///   worse of the two options.
+/// - the oid is validated. `gix` gives back a hex id and this cannot fail in
+///   practice, but "cannot fail in practice" is not a reason to `unwrap` in a
+///   read that a whole panel depends on — the caller turns an `Err` into a
+///   500, which is the honest answer for a drawer that could not be read.
+fn listing_entry(
+    record: &git_vista_git::stash::StashRecord,
+) -> Result<StashEntry, git_vista_protocol::PlanFieldError> {
+    Ok(StashEntry {
+        entry: StashSelector::at(record.index),
+        oid: CommitOid::new(record.oid.0.clone())?,
+        message: record.message.clone(),
+        time: record.time,
+    })
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::listing_entry;
+    use git_vista_core::model::Oid;
+    use git_vista_git::stash::StashRecord;
+    use git_vista_protocol::StashEntry;
+
+    fn record(index: usize, oid: &str) -> StashRecord {
+        StashRecord {
+            index,
+            oid: Oid(oid.to_string()),
+            message: "WIP on main: 1a2b3c4 tidy the parser".to_string(),
+            time: 1_700_000_000,
+        }
+    }
+
+    /// The round trip the two hand-written copies could never make: a record
+    /// goes through the real mapping, out as JSON, and back in as the type the
+    /// **frontend** parses — with the JSON itself pinned to a literal in
+    /// between, so this cannot pass by agreeing with itself.
+    ///
+    /// The literal is the point. Both ends now share one type, so
+    /// `to_string` → `from_str` would round-trip happily through any rename;
+    /// what a browser sees is the bytes, and those are asserted here.
+    ///
+    /// MUTATION 1 (rename): `entry` → `selector` in [`StashEntry`]. RED — the
+    ///   serialised bytes stop matching the literal.
+    /// MUTATION 2 (retype): `time: i64` → `time: String` in [`StashEntry`].
+    ///   RED — this file stops compiling at `time: record.time`, which is the
+    ///   same failure one process earlier.
+    #[test]
+    fn a_record_becomes_the_wire_bytes_the_frontend_parses() {
+        let mapped =
+            listing_entry(&record(0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")).expect("maps");
+
+        const WIRE: &str = concat!(
+            r#"{"entry":"stash@{0}","#,
+            r#""oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
+            r#""message":"WIP on main: 1a2b3c4 tidy the parser","#,
+            r#""time":1700000000}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&mapped).unwrap(),
+            WIRE,
+            "these are the bytes the drawer reads; changing them is a wire change"
+        );
+
+        let parsed: StashEntry = serde_json::from_str(WIRE).expect("the frontend must parse this");
+        assert_eq!(parsed, mapped, "field for field, both directions");
+    }
+
+    /// The selector is built from the record's own position, and the drawer's
+    /// order is the reflog's order — so entry *k* of the response is
+    /// `stash@{k}`, and nothing downstream re-derives it.
+    ///
+    /// MUTATION: build the selector from the iteration order rather than
+    ///   `record.index` — RED here, because these records deliberately carry
+    ///   positions the enumeration does not match.
+    #[test]
+    fn each_entry_is_addressed_by_its_own_recorded_position() {
+        // A drawer read mid-drop: the git crate stops at an unreadable line
+        // rather than renumbering, so a caller may legitimately see a gap.
+        let records = [
+            record(0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            record(3, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ];
+        let mapped: Vec<_> = records.iter().map(|r| listing_entry(r).unwrap()).collect();
+        assert_eq!(mapped[0].entry.as_str(), "stash@{0}");
+        assert_eq!(
+            mapped[1].entry.as_str(),
+            "stash@{3}",
+            "the address is the record's position, not its place in the array"
+        );
+    }
+
+    /// A record the wire cannot express fails the whole read rather than
+    /// vanishing from it. An entry silently dropped from a listing shifts
+    /// every entry below it, and the position is what the user's next click
+    /// acts on — the same "no stashes" / "couldn't look" merge the git crate
+    /// refuses to make.
+    #[test]
+    fn an_unrepresentable_oid_fails_the_read_instead_of_shortening_the_list() {
+        assert!(
+            listing_entry(&record(0, "not-a-hex-object-id")).is_err(),
+            "a malformed oid must not reach the wire, nor be quietly skipped"
+        );
+    }
 }
 
 /// `POST /api/stash/push` — put the working tree in the drawer.
+///
+/// Every field of [`PushStashRequest`] is already the type the operation
+/// wants, so there is nothing to validate here and nothing to forget to
+/// validate: an absent message is git's own `WIP on <branch>` line, a blank
+/// one is refused by [`StashMessage`](git_vista_protocol::StashMessage) at the
+/// wire boundary, and neither flag has a default a client could stop sending.
+///
+/// [`StashMessage`]: git_vista_protocol::StashMessage
 pub(crate) async fn push_stash(Json(req): Json<PushStashRequest>) -> (StatusCode, String) {
     if let Some(rejected) = reject_if_read_only() {
         return rejected;
     }
-    // An absent message is fine (git writes its own "WIP on <branch>"); a
-    // present-but-blank one is a client bug worth naming rather than silently
-    // dropping, since the user typed something and it went nowhere.
-    let message = match req.message.as_deref().map(str::trim) {
-        None | Some("") if req.message.is_none() => None,
-        Some("") => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Stash message can't be blank — omit it entirely to let git write its own."
-                    .to_string(),
-            );
-        }
-        Some(m) => match StashMessage::new(m) {
-            Ok(msg) => Some(msg),
-            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()),
-        },
-        None => None,
-    };
     planner::plan_and_execute(GitOperation::PushStash {
-        message,
+        message: req.message,
         keep_index: req.keep_index,
         include_untracked: req.include_untracked,
     })
     .await
-}
-
-#[derive(Deserialize)]
-pub(crate) struct StashEntryRequest {
-    /// Positional selector, `stash@{0}`. Validated to exactly that shape.
-    pub entry: String,
-    /// The oid the client believes that selector names. Compare-and-swapped
-    /// server-side before the mutation runs.
-    pub expected_oid: String,
-}
-
-/// Validate the pair both write endpoints share.
-///
-/// Both fields are required. A request carrying only one is refused rather
-/// than half-honoured: the selector alone renumbers on every drop, and the oid
-/// alone is not something `git stash drop` accepts.
-fn parse_entry(
-    req: &StashEntryRequest,
-) -> Result<(StashSelector, CommitOid), (StatusCode, String)> {
-    let entry = StashSelector::new(req.entry.trim())
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let oid = CommitOid::new(req.expected_oid.trim())
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    Ok((entry, oid))
 }
 
 /// `POST /api/stash/apply` — restore a stash's changes, keeping the entry.
@@ -299,17 +394,18 @@ fn parse_entry(
 /// decision of this slice: with a clean tree the abort path is `reset --hard`
 /// plus `clean -fd`, and that is provably safe because there is nothing of the
 /// user's to destroy.
-pub(crate) async fn apply_stash(Json(req): Json<StashEntryRequest>) -> (StatusCode, String) {
+///
+/// The body is [`StashTarget`] — the same one declaration drop and branch take
+/// (#495, ADR 0079). Both halves are required and both arrive validated, so
+/// this path cannot drift from theirs on what a valid entry looks like: there
+/// is no parse step here to drift.
+pub(crate) async fn apply_stash(Json(req): Json<StashTarget>) -> (StatusCode, String) {
     if let Some(rejected) = reject_if_read_only() {
         return rejected;
     }
-    let (entry, expected_oid) = match parse_entry(&req) {
-        Ok(pair) => pair,
-        Err(rejected) => return rejected,
-    };
     planner::plan_and_execute(GitOperation::ApplyStash {
-        entry,
-        expected_oid,
+        entry: req.entry,
+        expected_oid: req.expected_oid,
     })
     .await
 }
@@ -317,45 +413,25 @@ pub(crate) async fn apply_stash(Json(req): Json<StashEntryRequest>) -> (StatusCo
 /// `POST /api/stash/branch` (M3.24 #77) — the escape hatch for a stash that
 /// will not apply where you are now.
 ///
-/// Carries the branch name alongside the usual selector/oid pair. The name is
-/// validated by [`BranchName`]'s newtype before a plan exists, so a malformed
-/// name is refused without anything being consumed.
+/// Carries the branch name alongside the usual selector/oid pair — the latter
+/// nested as [`StashTarget`] rather than respelled, so this endpoint and
+/// apply/drop cannot disagree about what a valid entry is (#495, ADR 0079).
+///
+/// The name is a [`BranchName`](git_vista_protocol::BranchName), validated by
+/// its own newtype at the wire boundary, so a malformed one is refused before
+/// a plan exists and without anything being consumed.
 pub(crate) async fn branch_from_stash(
     Json(req): Json<BranchFromStashRequest>,
 ) -> (StatusCode, String) {
     if let Some(rejected) = reject_if_read_only() {
         return rejected;
     }
-    // Reuses the shared selector/oid parse so this path cannot drift from
-    // apply and drop on what a valid entry looks like.
-    let (entry, expected_oid) = match parse_entry(&StashEntryRequest {
-        entry: req.entry,
-        expected_oid: req.expected_oid,
-    }) {
-        Ok(pair) => pair,
-        Err(refusal) => return refusal,
-    };
-    let Ok(name) = git_vista_protocol::BranchName::new(&req.name) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("{} is not a usable branch name.", req.name),
-        );
-    };
     crate::planner::plan_and_execute(GitOperation::BranchFromStash {
-        name,
-        entry,
-        expected_oid,
+        name: req.name,
+        entry: req.target.entry,
+        expected_oid: req.target.expected_oid,
     })
     .await
-}
-
-/// Body of [`branch_from_stash`].
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct BranchFromStashRequest {
-    pub(crate) name: String,
-    pub(crate) entry: String,
-    pub(crate) expected_oid: String,
 }
 
 /// `POST /api/stash/drop` — discard an entry.
@@ -364,17 +440,13 @@ pub(crate) struct BranchFromStashRequest {
 /// between this and dropping a stash the user never chose: every drop
 /// renumbers the list, so a selector planned seconds ago may now address
 /// someone else's work.
-pub(crate) async fn drop_stash(Json(req): Json<StashEntryRequest>) -> (StatusCode, String) {
+pub(crate) async fn drop_stash(Json(req): Json<StashTarget>) -> (StatusCode, String) {
     if let Some(rejected) = reject_if_read_only() {
         return rejected;
     }
-    let (entry, expected_oid) = match parse_entry(&req) {
-        Ok(pair) => pair,
-        Err(rejected) => return rejected,
-    };
     planner::plan_and_execute(GitOperation::DropStash {
-        entry,
-        expected_oid,
+        entry: req.entry,
+        expected_oid: req.expected_oid,
     })
     .await
 }
