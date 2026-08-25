@@ -10,7 +10,8 @@
 //! - [`error`]   — the [`ApiError`] envelope every endpoint returns on failure,
 //!   its machine-readable [`ErrorCode`], and the [`RequestId`] correlation token.
 //! - [`dto`]     — the shared request/response DTOs (branch/commit/clone bodies,
-//!   rebase-status) the server and frontend exchange.
+//!   rebase-status, the stash drawer's listing and write bodies) the server and
+//!   frontend exchange.
 //! - [`plan`]    — the closed, typed [`GitOperation`] vocabulary (every mutation
 //!   the server can perform) and the reviewable [`Plan`] previewing one before
 //!   execution (M1.06a, #142; enforcement lands with #145).
@@ -79,14 +80,14 @@ pub use diff::{
 };
 pub use dto::{
     validate_clone_url, AmendCommitError, AmendCommitRequest, AmendCommitSuccess, AmendFailureKind,
-    BranchRequest, CloneRequest, CommitError, CommitFailureKind, CreateBranchRequest,
-    CreateCommitRequest, CreateTagRequest, DeleteCloneRequest, DeleteRemoteTagRequest,
-    DeleteTagRequest, FetchError, FetchFailureKind, FetchRequest, FetchSuccess, HookPolicy,
-    PullError, PullFailureKind, PullRequest, PullSuccess, PushRequest, PushTagRequest,
-    RebaseStatus, RemoteRefUpdate, RepoMode, RepositoryDescriptor, RepositoryKind,
-    ResolveConflictContentRequest, ResolveConflictRequest, SelectRequest, SessionInfo,
-    SessionRequest, SignTagError, SignTagFailureKind, SignatureStatus, TagDetail, TagKind,
-    WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
+    BranchFromStashRequest, BranchRequest, CloneRequest, CommitError, CommitFailureKind,
+    CreateBranchRequest, CreateCommitRequest, CreateTagRequest, DeleteCloneRequest,
+    DeleteRemoteTagRequest, DeleteTagRequest, FetchError, FetchFailureKind, FetchRequest,
+    FetchSuccess, HookPolicy, PullError, PullFailureKind, PullRequest, PullSuccess, PushRequest,
+    PushStashRequest, PushTagRequest, RebaseStatus, RemoteRefUpdate, RepoMode,
+    RepositoryDescriptor, RepositoryKind, ResolveConflictContentRequest, ResolveConflictRequest,
+    SelectRequest, SessionInfo, SessionRequest, SignTagError, SignTagFailureKind, SignatureStatus,
+    StashEntry, StashTarget, TagDetail, TagKind, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use history::{HeadState, HistoryFrame, HistoryPage};
