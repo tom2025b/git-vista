@@ -61,7 +61,9 @@ use crate::prefs::{
     load_collapse_wip_pref, load_icon_pref, load_node_icons_pref, store_collapse_wip_pref,
     store_icon_pref, store_node_icons_pref,
 };
-use crate::session::{establish_session, not_connected_view, recheck_session};
+use crate::session::{
+    establish_session, install_token_paste_reload, not_connected_view, recheck_session,
+};
 use crate::state::{Features, Settings};
 use crate::update_required::update_required_view;
 
@@ -385,6 +387,10 @@ pub fn App() -> impl IntoView {
     // `#s=` token); every retry is `recheck_session`, a GET that neither
     // re-spends the single-use token nor consumes the LAN listener's
     // sign-in rate budget — see that function's doc comment.
+    // #392: a token pasted over the URL of this already-open tab edits only the
+    // fragment, so none of the above re-runs. Installed unconditionally —
+    // signed in or stuck on the sign-in screen, the paste must be noticed.
+    install_token_paste_reload();
     let session_attempt = create_rw_signal(0u32);
     let session = create_local_resource(
         move || session_attempt.get(),
