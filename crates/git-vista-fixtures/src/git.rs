@@ -23,28 +23,49 @@
 use std::path::Path;
 use std::process::Command;
 
-/// The identity every fixture commit is authored with.
+/// Who a fixture's commits are authored by.
+#[derive(Clone, Copy, Debug)]
+pub struct Ident {
+    /// `user.name`.
+    pub name: &'static str,
+    /// `user.email`.
+    pub email: &'static str,
+}
+
+/// The identity the Rust suites' fixtures are authored with.
 ///
 /// `t <t@example.invalid>` is not arbitrary — it is what all twenty of the
 /// hand-rolled `seeded_repo()` implementations this catalogue replaces already
 /// used, and `.invalid` is the RFC 2606 TLD guaranteed never to resolve. Two
 /// suites assert on the literal string, so it is part of the contract.
-pub const IDENT_NAME: &str = "t";
+pub const CATALOGUE: Ident = Ident {
+    name: "t",
+    email: "t@example.invalid",
+};
 
-/// The email half of [`IDENT_NAME`].
-pub const IDENT_EMAIL: &str = "t@example.invalid";
+/// The identity the browser harness's fixtures are authored with.
+///
+/// Kept byte-identical to what `ci/browser/fixture.mjs` used before #448 moved
+/// these builders into Rust: no spec asserts on it today, but a fixture whose
+/// commits change author is a fixture whose rendered history changed, and this
+/// migration is supposed to change nothing a spec can see.
+pub const BROWSER: Ident = Ident {
+    name: "Claude_Max",
+    email: "262510778+tom2025b@users.noreply.github.com",
+};
 
 /// Config overrides prepended to every `git` invocation the builders make.
 ///
 /// Signing is forced off in both forms: a developer with `commit.gpgsign` or
 /// `tag.gpgsign` set globally would otherwise be prompted for a passphrase by
 /// a unit test, or simply watch it fail.
-fn ident_args() -> Vec<String> {
+fn ident_args(ident: Ident) -> Vec<String> {
+    let Ident { name, email } = ident;
     vec![
         "-c".into(),
-        format!("user.name={IDENT_NAME}"),
+        format!("user.name={name}"),
         "-c".into(),
-        format!("user.email={IDENT_EMAIL}"),
+        format!("user.email={email}"),
         "-c".into(),
         "commit.gpgsign=false".into(),
         "-c".into(),
@@ -54,15 +75,19 @@ fn ident_args() -> Vec<String> {
 
 /// Build a `git` command rooted at `repo`, with identity supplied and the
 /// developer's global and system config taken out of the picture.
-fn command(repo: &Path, args: &[&str]) -> Command {
+fn command_as(ident: Ident, repo: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
-    cmd.args(ident_args())
+    cmd.args(ident_args(ident))
         .arg("-C")
         .arg(repo)
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null");
     cmd
+}
+
+fn command(repo: &Path, args: &[&str]) -> Command {
+    command_as(CATALOGUE, repo, args)
 }
 
 /// Run `git <args>` in `repo` and panic if it fails.
@@ -120,10 +145,40 @@ pub fn try_run(repo: &Path, args: &[&str]) -> bool {
 /// with its own bare `git commit` after the builder has returned — see the
 /// module doc.
 pub fn init(repo: &Path) {
+    init_as(CATALOGUE, repo);
+}
+
+/// [`init`] under an explicit identity.
+pub fn init_as(ident: Ident, repo: &Path) {
     std::fs::create_dir_all(repo).expect("create fixture repo directory");
-    run(repo, &["init", "-q", "-b", "main"]);
-    run(repo, &["config", "user.email", IDENT_EMAIL]);
-    run(repo, &["config", "user.name", IDENT_NAME]);
+    run_as(ident, repo, &["init", "-q", "-b", "main"]);
+    run_as(ident, repo, &["config", "user.email", ident.email]);
+    run_as(ident, repo, &["config", "user.name", ident.name]);
+}
+
+/// [`run`] under an explicit identity.
+pub fn run_as(ident: Ident, repo: &Path, args: &[&str]) {
+    let status = command_as(ident, repo, args)
+        .status()
+        .unwrap_or_else(|e| panic!("could not spawn git {args:?} in {repo:?}: {e}"));
+    assert!(status.success(), "git {args:?} failed in {repo:?}");
+}
+
+/// [`try_run`] under an explicit identity.
+pub fn try_run_as(ident: Ident, repo: &Path, args: &[&str]) -> bool {
+    command_as(ident, repo, args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// [`out`] under an explicit identity.
+pub fn out_as(ident: Ident, repo: &Path, args: &[&str]) -> String {
+    let output = command_as(ident, repo, args)
+        .output()
+        .unwrap_or_else(|e| panic!("could not spawn git {args:?} in {repo:?}: {e}"));
+    assert!(output.status.success(), "git {args:?} failed in {repo:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 /// Write `content` to `repo/name`, creating parent directories as needed.

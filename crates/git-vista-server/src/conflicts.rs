@@ -341,45 +341,7 @@ pub(crate) async fn continuation(repo: &Path) -> Result<Continuation, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn run(repo: &Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok, "git {args:?} failed in {repo:?}");
-    }
-
-    /// A repository with a real, unresolved merge conflict on `a.txt`.
-    fn conflicted_repo() -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        run(&repo, &["init", "-q", "-b", "main"]);
-        run(&repo, &["config", "user.email", "t@example.invalid"]);
-        run(&repo, &["config", "user.name", "t"]);
-
-        std::fs::write(repo.join("a.txt"), "base\n").unwrap();
-        run(&repo, &["add", "a.txt"]);
-        run(&repo, &["commit", "-q", "-m", "base"]);
-
-        run(&repo, &["checkout", "-q", "-b", "theirs"]);
-        std::fs::write(repo.join("a.txt"), "theirs\n").unwrap();
-        run(&repo, &["commit", "-q", "-am", "theirs"]);
-
-        run(&repo, &["checkout", "-q", "main"]);
-        std::fs::write(repo.join("a.txt"), "ours\n").unwrap();
-        run(&repo, &["commit", "-q", "-am", "ours"]);
-
-        // Deliberately not asserted: this merge is SUPPOSED to fail.
-        let _ = std::process::Command::new("git")
-            .args(["merge", "theirs"])
-            .current_dir(&repo)
-            .status();
-        (dir, repo)
-    }
+    use git_vista_fixtures::{conflict_add_add, conflict_modify_modify as conflicted_repo, seeded};
 
     #[tokio::test]
     async fn a_real_merge_conflict_yields_all_three_stages() {
@@ -411,32 +373,10 @@ mod tests {
         // MUTATION: report a missing stage as Unreadable. Every add/add
         // conflict would then look broken, and `all_sides_readable` would
         // refuse to offer a resolver for a perfectly resolvable file.
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        run(&repo, &["init", "-q", "-b", "main"]);
-        run(&repo, &["config", "user.email", "t@example.invalid"]);
-        run(&repo, &["config", "user.name", "t"]);
-        std::fs::write(repo.join("seed.txt"), "s\n").unwrap();
-        run(&repo, &["add", "seed.txt"]);
-        run(&repo, &["commit", "-q", "-m", "seed"]);
-
-        run(&repo, &["checkout", "-q", "-b", "theirs"]);
-        std::fs::write(repo.join("new.txt"), "theirs\n").unwrap();
-        run(&repo, &["add", "new.txt"]);
-        run(&repo, &["commit", "-q", "-m", "theirs adds"]);
-
-        run(&repo, &["checkout", "-q", "main"]);
-        std::fs::write(repo.join("new.txt"), "ours\n").unwrap();
-        run(&repo, &["add", "new.txt"]);
-        run(&repo, &["commit", "-q", "-m", "ours adds"]);
-        let _ = std::process::Command::new("git")
-            .args(["merge", "theirs"])
-            .current_dir(&repo)
-            .status();
+        let (_d, repo) = conflict_add_add();
 
         let files = scan(&repo).await.expect("scan must succeed");
-        let f = files.iter().find(|f| f.path == "new.txt").expect("new.txt");
+        let f = files.iter().find(|f| f.path == "c.txt").expect("c.txt");
         assert_eq!(f.base, Stage::Absent {}, "add/add has no common ancestor");
         assert!(f.ours.is_text());
         assert!(f.theirs.is_text());
@@ -448,15 +388,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_clean_repository_is_clear_and_a_conflicted_one_is_blocked() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        run(&repo, &["init", "-q", "-b", "main"]);
-        run(&repo, &["config", "user.email", "t@example.invalid"]);
-        run(&repo, &["config", "user.name", "t"]);
-        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-        run(&repo, &["add", "a.txt"]);
-        run(&repo, &["commit", "-q", "-m", "seed"]);
+        let (_d, repo) = seeded();
 
         assert!(continuation(&repo).await.unwrap().may_continue());
 

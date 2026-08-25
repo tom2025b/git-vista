@@ -36,9 +36,15 @@
 use crate::git;
 use crate::seeded::{empty, Fixture};
 
-/// Stand up `main` with `base.txt`, so every shape below shares one ancestor.
-fn base_commit(repo: &std::path::Path) {
-    git::write(repo, "base.txt", b"base\n");
+/// Stand up `main` with one commit holding `files`, the ancestor every shape
+/// below diverges from.
+///
+/// Each shape seeds only the path it is about: a conflict fixture carrying
+/// unrelated extra files is a fixture whose status output nobody predicted.
+fn base_commit(repo: &std::path::Path, files: &[(&str, &[u8])]) {
+    for (name, content) in files {
+        git::write(repo, name, content);
+    }
     git::run(repo, &["add", "-A"]);
     git::run(repo, &["commit", "-q", "-m", "base"]);
 }
@@ -86,11 +92,7 @@ fn stages_of(repo: &std::path::Path, path: &str) -> Vec<u8> {
 /// #448.
 pub fn conflict_modify_modify() -> Fixture {
     let (dir, repo) = empty();
-    base_commit(&repo);
-
-    git::write(&repo, "a.txt", b"base\n");
-    git::run(&repo, &["add", "-A"]);
-    git::run(&repo, &["commit", "-q", "-m", "a.txt base"]);
+    base_commit(&repo, &[("a.txt", b"base\n")]);
 
     git::run(&repo, &["checkout", "-q", "-b", "theirs"]);
     git::write(&repo, "a.txt", b"theirs\n");
@@ -134,7 +136,9 @@ pub fn conflict_modify_modify() -> Fixture {
 /// matters.
 pub fn conflict_add_add() -> Fixture {
     let (dir, repo) = empty();
-    base_commit(&repo);
+    // `c.txt` must be absent from the ancestor — that absence IS the shape —
+    // so the base commit carries an unrelated file to have something to hold.
+    base_commit(&repo, &[("base.txt", b"base\n")]);
 
     git::run(&repo, &["checkout", "-q", "-b", "theirs"]);
     git::write(&repo, "c.txt", b"theirs made this\n");
@@ -182,11 +186,7 @@ pub fn conflict_add_add() -> Fixture {
 /// resolved?" by scanning for `<<<<<<<` gets this shape wrong every time.
 pub fn conflict_delete_modify() -> Fixture {
     let (dir, repo) = empty();
-    base_commit(&repo);
-
-    git::write(&repo, "d.txt", b"line one\nline two\n");
-    git::run(&repo, &["add", "-A"]);
-    git::run(&repo, &["commit", "-q", "-m", "d.txt base"]);
+    base_commit(&repo, &[("d.txt", b"line one\nline two\n")]);
 
     git::run(&repo, &["checkout", "-q", "-b", "theirs"]);
     git::run(&repo, &["rm", "-q", "d.txt"]);
@@ -233,13 +233,9 @@ pub fn conflict_delete_modify() -> Fixture {
 /// (#432) purely because this shape did not exist in the shared catalogue.
 pub fn conflict_binary() -> Fixture {
     let (dir, repo) = empty();
-    base_commit(&repo);
-
     // NUL in the first bytes is what makes git call it binary — the check is a
     // scan of the leading block, not a file extension.
-    git::write(&repo, "b.bin", b"\x00\x01base payload\x00\xff");
-    git::run(&repo, &["add", "-A"]);
-    git::run(&repo, &["commit", "-q", "-m", "b.bin base"]);
+    base_commit(&repo, &[("b.bin", b"\x00\x01base payload\x00\xff")]);
 
     git::run(&repo, &["checkout", "-q", "-b", "theirs"]);
     git::write(&repo, "b.bin", b"\x00\x01theirs payload\x00\xfe");

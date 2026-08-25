@@ -257,16 +257,14 @@ const ALLOWED_SPAWN_SITES: &[&str] = &[
     // real bare remote, so the presence or absence of refs/remotes/origin/HEAD
     // — the variable the whole suite turns on — is genuine rather than mocked.
     "src/planner/advisory_suite.rs",
-    // #[cfg(test)] git fixtures for the M4.31 (#84) conflict scanner: plain
-    // `git init`/`commit`/`checkout`/`merge` to build repositories with REAL
-    // unresolved conflicts, because the whole point of the module is reading
-    // git's actual index staging and a mocked index would prove nothing.
-    "src/conflicts.rs",
+    // #448 removed `src/conflicts.rs` from this list: its `#[cfg(test)]` git
+    // fixtures now come from the `git-vista-fixtures` catalogue, so the file
+    // constructs no `Command` at all and the entry had become a permission
+    // granted to nothing — invisible until someone added a raw spawn back.
+    //
     // #[cfg(test)] git fixtures for the M4.31a (#428) inspect-a-conflict
-    // handlers: same `git init`/`commit`/`checkout`/`merge` shape as
-    // `src/conflicts.rs` above, building real unresolved conflicts so
-    // `blob_content_for_repo` and `worktree_file_for_repo` are proven against
-    // git's actual index and working-tree state, not a mock.
+    // handlers: `blob_content_for_repo` and `worktree_file_for_repo` are
+    // proven against git's actual index and working-tree state, not a mock.
     "src/handlers/conflicts.rs",
     "src/state.rs",         // #[cfg(test)] fixture setup
     "src/argv_boundary.rs", // this file (the scan reads its own source)
