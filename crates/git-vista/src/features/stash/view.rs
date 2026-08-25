@@ -231,7 +231,10 @@ pub fn stash_section_view(
                             result,
                             "Stashed your working tree changes.",
                         ));
-                        drawer.finish();
+                        // The push has no stash entry, so it locks and
+                        // releases under its reserved key — never the whole
+                        // drawer (#518).
+                        drawer.finish(PUSH_KEY);
                         // A5: one bump refreshes the drawer, the feed, the
                         // working-tree read and the graph together — the same
                         // convention every other write in this app follows.
@@ -381,11 +384,13 @@ fn stash_row_view(
     };
 
     let busy_label = {
-        let selector = selector.clone();
+        // Keyed on the OID, not the selector: selectors renumber on every
+        // drop, and this label must follow the entry it describes (#518).
+        let oid = oid.clone();
         move || {
             drawer
                 .busy()
-                .label(&selector)
+                .label(&oid)
                 .map(|what| view! { <span class="detail-muted">{what}"…"</span> })
         }
     };
@@ -418,12 +423,14 @@ fn action_button(
     let oid = oid.to_string();
     let label = action.label();
 
-    // Disabled only while THIS row is mid-write. `locked` is per-selector on
+    // Disabled only while THIS row is mid-write. `locked` is per-entry on
     // purpose: the drawer lists many entries, and greying all of them out
     // because one is being dropped would be a claim about the others that is
-    // not true.
-    let locked_selector = selector.clone();
-    let locked = move || drawer.busy().locked(&locked_selector);
+    // not true. Keyed on the OID, never the selector — a drop elsewhere
+    // renumbers every selector below it, and the lock must stay on the entry
+    // whose write is in flight, not on a list position (#518).
+    let locked_oid = oid.clone();
+    let locked = move || drawer.busy().locked(&locked_oid);
 
     let on_click = move |_| {
         let selector = selector.clone();
@@ -432,21 +439,24 @@ fn action_button(
             // A read — no confirmation, no epoch bump, nothing to undo.
             StashAction::Inspect => drawer.toggle_inspect(&selector),
             StashAction::Apply => {
-                drawer.begin(&selector, "applying");
+                drawer.begin(&oid, "applying");
                 spawn_local(async move {
                     let result = crate::api::apply_stash_request(&selector, &oid).await;
                     drawer.set_notice(StashNotice::from_result(
                         result,
                         "Applied the stash. It is still in your list.",
                     ));
-                    drawer.finish();
+                    // Release THIS row only: busy is per-selector (#518), so
+                    // finishing here must not unlock a write still in flight
+                    // on another entry.
+                    drawer.finish(&oid);
                     graph.update(|g| {
                         g.force_bump();
                     });
                 });
             }
             StashAction::Pop => {
-                drawer.begin(&selector, "popping");
+                drawer.begin(&oid, "popping");
                 spawn_local(async move {
                     let key = crate::api::new_idempotency_key();
                     // Every decision about whether this finished belongs to
@@ -454,16 +464,30 @@ fn action_button(
                     // the HTTP results itself.
                     let verdict = compose_pop(&selector, &oid, key).await;
                     drawer.set_notice(StashNotice::from_pop(&verdict));
-                    drawer.finish();
+                    // Per-selector release (#518) — see the Apply arm.
+                    drawer.finish(&oid);
                     graph.update(|g| {
                         g.force_bump();
                     });
                 });
             }
             StashAction::Branch => {
+                // Destructive (#516): success deletes the stash entry, same as
+                // the server's RiskLevel::Destructive classification. The
+                // removal warning rides in the name prompt itself rather than
+                // a separate confirm-then-prompt pair: the prompt is already a
+                // cancellable modal, so one dialog carries both the disclosure
+                // and the decision — a second dialog would add a step without
+                // adding information. Cancelling the prompt declines the whole
+                // operation.
                 let Some(win) = web_sys::window() else { return };
                 let Some(name) = win
-                    .prompt_with_message("Name for the new branch:")
+                    .prompt_with_message(&format!(
+                        "Branch from {selector}?\n\nThis creates a branch at the \
+                         stash's own base commit and applies the stash there. On \
+                         success the stash entry is REMOVED from your list.\n\n\
+                         Name for the new branch:"
+                    ))
                     .ok()
                     .flatten()
                     .map(|n| n.trim().to_string())
@@ -471,15 +495,21 @@ fn action_button(
                 else {
                     return;
                 };
-                drawer.begin(&selector, "branching");
+                drawer.begin(&oid, "branching");
                 spawn_local(async move {
                     let result =
                         crate::api::branch_from_stash_request(&name, &selector, &oid).await;
                     drawer.set_notice(StashNotice::from_result(
                         result,
-                        "Created the branch and applied the stash there.",
+                        // The removal must be disclosed here too: the API layer
+                        // discards the server's success sentence ("The stash
+                        // entry has been removed."), so this notice is the only
+                        // place the user learns their entry is gone (#516).
+                        "Created the branch and applied the stash there. \
+                         The stash entry has been removed.",
                     ));
-                    drawer.finish();
+                    // Per-selector release (#518) — see the Apply arm.
+                    drawer.finish(&oid);
                     graph.update(|g| {
                         g.force_bump();
                     });
@@ -501,7 +531,7 @@ fn action_button(
                 if !confirmed {
                     return;
                 }
-                drawer.begin(&selector, "dropping");
+                drawer.begin(&oid, "dropping");
                 spawn_local(async move {
                     let key = crate::api::new_idempotency_key();
                     let receipt = crate::api::drop_stash_request(&selector, &oid, key).await;
@@ -514,7 +544,8 @@ fn action_button(
                         Err(why) => Err(why),
                     };
                     drawer.set_notice(StashNotice::from_result(result, "Dropped the stash entry."));
-                    drawer.finish();
+                    // Per-selector release (#518) — see the Apply arm.
+                    drawer.finish(&oid);
                     graph.update(|g| {
                         g.force_bump();
                     });

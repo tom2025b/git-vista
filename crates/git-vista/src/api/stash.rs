@@ -253,6 +253,10 @@ pub async fn branch_from_stash_request(
     };
     let (resp, _key) = write_json("/api/stash/branch", &body).await?;
     if resp.ok() {
+        // The success body's one sentence of substance — "The stash entry has
+        // been removed." — is discarded here, so the caller's own notice must
+        // disclose the removal itself; silently dropping it left the user with
+        // a vanished stash and no explanation (#516).
         Ok(())
     } else {
         Err(user_facing_error("/api/stash/branch", resp).await)

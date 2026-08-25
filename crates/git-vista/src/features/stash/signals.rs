@@ -69,43 +69,51 @@ pub async fn compose_pop(entry: &str, expected_oid: &str, key: IdempotencyKey) -
 /// A reserved sentinel rather than `""`: an empty string silently matches no
 /// row, so a push in flight left every control enabled — including its own
 /// button, where a second tap would stash the already-stashed tree again. The
-/// value cannot collide with a real selector, which `StashSelector` requires to
-/// be `stash@{<digits>}`.
+/// value cannot collide with a real key: rows key on the entry's commit OID,
+/// which is hex, and this is not.
 pub const PUSH_KEY: &str = "\u{0}push";
 
 /// What the drawer is currently doing, so a view can disable controls and say
 /// why without inventing its own notion of "busy".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DrawerBusy {
-    Idle,
-    /// A write is in flight against this selector. Held per-selector rather
-    /// than as one global flag: the drawer lists many entries and locking all
-    /// of them because one is being dropped would be a lie about the others.
-    Working {
-        selector: String,
-        what: &'static str,
-    },
+///
+/// One entry per stash entry with a write in flight, not one overwriteable
+/// slot (#518): the drawer lists many entries and writes overlap — start an
+/// apply on one row and then a drop on another, and a single slot would
+/// re-enable the first row mid-flight, then let whichever write finished
+/// first unlock everything.
+///
+/// # Keys are the entry's commit OID, never its selector
+///
+/// `stash@{N}` is a *position*, and positions renumber on every drop: an
+/// apply in flight on `stash@{1}` while a drop on `stash@{0}` completes
+/// would leave a selector-keyed lock pointing at whichever entry the list
+/// now shows at `{1}` — the wrong row locked, the working row free. The
+/// commit OID names the entry itself, which no renumbering moves. (Found by
+/// the #518 review pass, both reviewers independently.) [`PUSH_KEY`] is the
+/// one non-OID key, for the control with no entry.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DrawerBusy {
+    working: std::collections::HashMap<String, &'static str>,
 }
 
 impl DrawerBusy {
-    /// Whether this selector specifically is mid-write.
-    pub fn locked(&self, selector: &str) -> bool {
-        matches!(self, DrawerBusy::Working { selector: s, .. } if s == selector)
+    /// Whether this entry specifically is mid-write. `key` is the entry's
+    /// commit OID (or [`PUSH_KEY`]) — see the type doc for why never a
+    /// selector.
+    pub fn locked(&self, key: &str) -> bool {
+        self.working.contains_key(key)
     }
 
     /// The label to show on the row that is working.
-    pub fn label(&self, selector: &str) -> Option<&'static str> {
-        match self {
-            DrawerBusy::Working { selector: s, what } if s == selector => Some(what),
-            _ => None,
-        }
+    pub fn label(&self, key: &str) -> Option<&'static str> {
+        self.working.get(key).copied()
     }
 }
 
 /// The drawer's own signals, created once by the Activity panel.
 #[derive(Clone, Copy)]
 pub struct StashDrawer {
-    /// Which selector, if any, is mid-write.
+    /// Which selectors are mid-write, each with its in-flight label.
     busy: RwSignal<DrawerBusy>,
     /// The patch of the entry currently expanded for inspection, keyed by
     /// selector. `None` means nothing is expanded — inspection is opt-in per
@@ -181,7 +189,7 @@ impl StashNotice {
 impl StashDrawer {
     pub fn new() -> Self {
         StashDrawer {
-            busy: create_rw_signal(DrawerBusy::Idle),
+            busy: create_rw_signal(DrawerBusy::default()),
             inspecting: create_rw_signal(None),
             notice: create_rw_signal(None),
         }
@@ -220,15 +228,23 @@ impl StashDrawer {
         });
     }
 
-    pub fn begin(&self, selector: &str, what: &'static str) {
-        self.busy.set(DrawerBusy::Working {
-            selector: selector.to_string(),
-            what,
+    /// Mark this entry mid-write. `key` is the entry's commit OID (or
+    /// [`PUSH_KEY`]); inserts into the per-entry map rather than replacing a
+    /// single slot, so an overlapping write on another row neither relabels
+    /// nor re-enables this one (#518).
+    pub fn begin(&self, key: &str, what: &'static str) {
+        self.busy.update(|busy| {
+            busy.working.insert(key.to_string(), what);
         });
     }
 
-    pub fn finish(&self) {
-        self.busy.set(DrawerBusy::Idle);
+    /// Release this entry only. Takes the key for the same reason `begin`
+    /// does: an unconditional "everything idle" let whichever of two
+    /// overlapping writes finished first unlock the one still in flight.
+    pub fn finish(&self, key: &str) {
+        self.busy.update(|busy| {
+            busy.working.remove(key);
+        });
     }
 }
 

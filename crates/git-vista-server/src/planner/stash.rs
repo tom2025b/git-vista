@@ -530,6 +530,35 @@ pub(super) async fn exec_branch_from_stash(
             ),
         ),
 
+        // git failed and NOTHING is unmerged — the same shape ADR 0078 caught
+        // in the deleted pop executor and #493 fixed in `exec_apply_stash`,
+        // reintroduced here by a wildcard that read every `Ok` scan as
+        // conflicts (#517). Reachable: `git stash branch` creates and checks
+        // out the branch FIRST, then applies; a stashed untracked file
+        // colliding with one on disk makes that apply exit 1 with a clean
+        // index (pinned by the regression test below). Calling this
+        // "left conflicts" with an empty path list would send the user
+        // hunting for conflicts that do not exist, so git's own stderr leads
+        // and the scan is not allowed to imply what it did not find.
+        (false, Ok(c)) if c.may_continue() => {
+            eprintln!("git-vista: /api/stash/branch failed for {entry} with nothing unmerged");
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{}\n\nThe operation failed without leaving conflicts — nothing \
+                     is unmerged. Git may still have created and checked out {name} \
+                     before refusing (it switches branches first), so check \
+                     `git status` before retrying.\n\nThe stash entry was not \
+                     removed — it is still in the list.",
+                    stderr_or(&output, "git stash branch failed.")
+                ),
+            )
+        }
+
+        // Only `Blocked` reaches here now: a `Clear` scan took the OK arm on
+        // success and the honest-failure arm above on failure. The 409 holds
+        // whatever the exit code said — unmerged paths mean the work is not
+        // finished, and that is the fact that outranks git's own verdict.
         (_, Ok(c)) => {
             let detail = match &c {
                 git_vista_protocol::conflict::Continuation::Blocked { unresolved, .. } => {
@@ -1007,6 +1036,90 @@ mod tests {
         assert!(
             !git::out(repo, &["stash", "list"]).trim().is_empty(),
             "and the entry survives, so a pop composed on top of this must not drop it"
+        );
+    }
+
+    /// #517: a failed `git stash branch` with a CLEAN index must not be
+    /// dressed up as conflicts — the executor equivalent of the pop defect
+    /// ADR 0078 documented and #493 fixed in `exec_apply_stash`.
+    ///
+    /// The shape was **observed with real git before these assertions were
+    /// written** (git 2.43+, this box): `git stash branch` switches to the
+    /// new branch first, then applies; a stashed untracked file colliding
+    /// with one on disk makes the apply exit **1** while `git ls-files -u`
+    /// stays empty and the entry survives. `Branch` has no clean-tree
+    /// precondition (only `RefAbsent`), so a user can reach this from the
+    /// UI. Before the fix, the wildcard `(_, Ok(c))` arm returned 409
+    /// "left conflicts" with an EMPTY detail block for this tuple — a
+    /// conflict claim with no conflicts to show.
+    #[tokio::test]
+    async fn a_failed_branch_with_a_clean_index_is_not_reported_as_conflicts() {
+        use git_vista_fixtures::git;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git::init(repo);
+
+        std::fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        git::run(repo, &["add", "tracked.txt"]);
+        git::run(repo, &["commit", "-q", "-m", "seed"]);
+
+        // Stash a tracked edit AND an untracked file, then put a DIFFERENT
+        // file in the untracked one's way — the collision that makes the
+        // apply half of `stash branch` fail without creating unmerged paths.
+        std::fs::write(repo.join("tracked.txt"), "from-stash\n").unwrap();
+        std::fs::write(repo.join("collision.txt"), "from-stash\n").unwrap();
+        git::run(
+            repo,
+            &["stash", "push", "--include-untracked", "-m", "both"],
+        );
+        std::fs::write(repo.join("collision.txt"), "already-here\n").unwrap();
+
+        let oid = git::out(repo, &["rev-parse", "stash@{0}"]);
+        let (status, body) = super::exec_branch_from_stash(
+            repo,
+            crate::sandbox::NetworkNeed::Local,
+            &git_vista_protocol::BranchName::new("rescue").unwrap(),
+            &StashSelector::new("stash@{0}").unwrap(),
+            &git_vista_protocol::CommitOid::new(oid).unwrap(),
+        )
+        .await;
+
+        // The premise, re-checked on the repo the executor actually ran in:
+        // git failed, nothing is unmerged, the entry survived. If a future
+        // git changes any of these, the test says so here instead of letting
+        // the wording assertions below fail mysteriously.
+        assert_eq!(
+            git::out(repo, &["ls-files", "-u"]).trim(),
+            "",
+            "the index must be clean — that is what makes 'left conflicts' a lie"
+        );
+        assert!(
+            git::out(repo, &["stash", "list"]).contains("both"),
+            "git keeps the entry when the apply half fails"
+        );
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a clean-index failure is a refusal, not a 409 conflict — body: {body}"
+        );
+        assert!(
+            !body.contains("left conflicts"),
+            "the conflicts sentence must not appear when nothing is unmerged: {body}"
+        );
+        assert!(
+            body.contains("failed without leaving conflicts"),
+            "the honest failure sentence must appear: {body}"
+        );
+        assert!(
+            body.contains("not removed"),
+            "the user must be told their stash survived: {body}"
+        );
+        assert!(
+            body.contains("git status"),
+            "and pointed at `git status`, because the branch may already be \
+             checked out: {body}"
         );
     }
 }
