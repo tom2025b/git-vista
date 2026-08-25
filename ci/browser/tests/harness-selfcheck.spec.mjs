@@ -15,7 +15,25 @@
 
 import { expect, test } from '@playwright/test'
 
-import { DIFF_SCROLLER, markPage, openApp, openDiff, pageSurvived, setHash } from './helpers.mjs'
+import { DIFF_SCROLLER, forceOnline, markPage, openApp, openDiff, pageSurvived, runtime, setHash } from './helpers.mjs'
+
+/** Open the #478 interleaved-twin repository. Duplicated from
+ *  `wip-collapse.spec.mjs` rather than imported, for the same reason every
+ *  other mutation here is written out: this file must be able to fail on its
+ *  own terms, and a shared opener that broke would silently turn these
+ *  self-checks into "the page never loaded" passes. */
+async function openTwinRepo(page) {
+  await forceOnline(page)
+  await page.goto(runtime().base)
+  await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
+  const entry = page.getByRole('button', { name: /interleaved-repo/i }).first()
+  await expect(entry).toBeVisible()
+  await entry.click()
+  const visualize = page.getByRole('button', { name: /look only/ })
+  if (await visualize.isVisible().catch(() => false)) await visualize.click()
+  await expect(page.locator('p.status.repo')).toContainText(/interleaved-repo/i)
+  await expect(page.locator('.wip-group')).toHaveCount(2)
+}
 
 /**
  * Run `fn` and return the message it threw, or `null` if it did not throw.
@@ -143,6 +161,57 @@ test.describe('harness self-check — every assertion must be able to go red', (
       expect(name, 'the chip must be announceable').toBeTruthy()
     })
     expectFailedBecause(msg, /the chip must be announceable/, 'the announceability assertion')
+  })
+
+  test('the #478 two-markers assertion fails when the two are folded into one', async ({
+    page,
+  }) => {
+    await openTwinRepo(page)
+
+    // The mutation is the WRONG FIX the issue names, expressed in the DOM:
+    // one marker standing for both chains, carrying their combined count.
+    // Relaxing the lane check would produce exactly this — a group claiming a
+    // chain that does not exist.
+    await page.evaluate(() => {
+      const markers = [...document.querySelectorAll('.wip-group')]
+      markers[0].querySelector('.wip-group-label').textContent = '\u22ef 8 WIP commits \u22ef'
+      markers[1].remove()
+    })
+
+    const msg = await failureMessage(async () => {
+      const labels = await page.locator('.wip-group-label').allInnerTexts()
+      expect(labels, 'each chain must fold into its own marker').toHaveLength(2)
+    })
+    expectFailedBecause(msg, /each chain must fold into its own marker/, 'the #478 grouping assertion')
+  })
+
+  test('the #478 upward-edge assertion fails when that edge is not drawn', async ({ page }) => {
+    await openTwinRepo(page)
+
+    // The mutation is the defect itself: `visible_edges` culling an edge whose
+    // endpoints arrive out of order, so the line into the folded fork point is
+    // never drawn. Removing the upward path from the DOM is what that looks
+    // like from outside the app.
+    await page.evaluate(() => {
+      for (const p of document.querySelectorAll('section.graph svg path')) {
+        const n = (p.getAttribute('d') ?? '').match(/-?\d+(\.\d+)?/g)
+        if (n && n.length >= 4 && Number(n[n.length - 1]) < Number(n[1])) p.remove()
+      }
+    })
+
+    const msg = await failureMessage(async () => {
+      const spans = await page.evaluate(() =>
+        [...document.querySelectorAll('section.graph svg path')]
+          .map((p) => (p.getAttribute('d') ?? '').match(/-?\d+(\.\d+)?/g))
+          .filter((n) => n && n.length >= 4)
+          .map((n) => [Number(n[1]), Number(n[n.length - 1])]),
+      )
+      expect(
+        spans.filter(([from, to]) => to < from),
+        'exactly one edge must run upward',
+      ).toHaveLength(1)
+    })
+    expectFailedBecause(msg, /exactly one edge must run upward/, 'the #478 upward-edge assertion')
   })
 
   test('the #392 reload assertion fails when the tab does not reload', async ({ page }) => {

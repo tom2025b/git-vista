@@ -259,20 +259,22 @@ pub(super) fn graph_canvas(
             row_count.set(count);
         });
     });
-    let on_expand = Callback::new(move |start_row_index: usize| {
+    let on_expand = Callback::new(move |row_index: usize| {
         expanded_groups.update(|s| {
-            s.insert(start_row_index);
+            s.insert(row_index);
         });
     });
     // Fold one open run again, leaving every other run as it is (#374
     // follow-up) — the topbar toggle is all-or-nothing, and a reader who
     // opened one section should not have to re-fold the whole graph to close
-    // it. Clears the run's WHOLE index range rather than just the index the
-    // tap arrived on: `project` treats a run as open when ANY member is in
-    // this set, so removing one member would leave the run open.
+    // it. Clears EVERY member rather than just the index the tap arrived on:
+    // `project` treats a run as open when ANY member is in this set, so
+    // removing one member would leave the run open. The run carries its own
+    // member list because those rows need not be contiguous (#478) — a row
+    // range would both miss members and clear a diverged twin's rows.
     let on_fold_wip = Callback::new(move |run: collapse::WipRun| {
         expanded_groups.update(|s| {
-            for row_index in run.start_row_index..run.start_row_index + run.count {
+            for row_index in run.rows {
                 s.remove(&row_index);
             }
         });
