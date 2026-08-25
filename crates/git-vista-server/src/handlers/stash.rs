@@ -157,9 +157,8 @@ mod show_stash_query_tests {
     /// deserialized perfectly well while the feature was broken in the app.
     #[test]
     fn the_frontend_cache_buster_does_not_make_the_read_a_400() {
-        let q: ShowStashQuery =
-            serde_urlencoded::from_str("entry=stash%40%7B0%7D&t=1756112884123")
-                .expect("the `?t=` cache-buster every frontend GET appends must not 400");
+        let q: ShowStashQuery = serde_urlencoded::from_str("entry=stash%40%7B0%7D&t=1756112884123")
+            .expect("the `?t=` cache-buster every frontend GET appends must not 400");
         assert_eq!(
             q.entry, "stash@{0}",
             "the selector must survive percent-decoding intact"

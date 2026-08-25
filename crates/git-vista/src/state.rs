@@ -113,10 +113,10 @@ pub use crate::features::dialogs::commit::CommitIntent;
 pub use crate::features::operations::kind::OperationKind as PendingOp;
 
 use crate::features::dialogs::signals::Dialogs;
-use crate::features::stash::signals::StashDrawer;
 use crate::features::graph::core::GraphCore;
 use crate::features::operations::signals::Operations;
 use crate::features::shell::signals::Shell;
+use crate::features::stash::signals::StashDrawer;
 use crate::features::status::signals::StatusResource;
 
 // `DIALOG_GUARD_MS` used to live here. It moved to `features/dialogs/core.rs` in M1.11
