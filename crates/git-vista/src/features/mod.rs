@@ -17,4 +17,7 @@ pub mod operations;
 pub mod session;
 pub mod shell;
 pub mod status;
+// M3.24 (#77): the stash drawer — rows, action offers, push preview,
+// and the client-composed pop.
+pub mod stash;
 pub mod tags;
