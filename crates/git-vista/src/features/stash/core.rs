@@ -345,14 +345,24 @@ impl StashAction {
     }
 
     /// Whether performing this can lose the user's work if it goes wrong.
-    /// A view scales its confirmation ceremony on this; it is not cosmetic.
+    ///
+    /// What actually keys on it: the view's danger styling, and the core
+    /// test pinning that Inspect is offered ahead of every destructive
+    /// action. The confirmation dialogs themselves are hand-written per
+    /// action arm rather than gated on this flag — Pop currently has none
+    /// at all — which is #525's business, and this comment claims only
+    /// what the code delivers.
     pub fn destructive(self) -> bool {
         match self {
-            StashAction::Inspect | StashAction::Apply | StashAction::Branch => false,
-            // Both remove the entry. `Branch` consumes it too, but only after
-            // a successful apply onto the commit the stash was taken from,
-            // where by construction it fits — git treats that as one verb.
-            StashAction::Pop | StashAction::Drop => true,
+            StashAction::Inspect | StashAction::Apply => false,
+            // All three remove the entry. `Branch` only consumes it after a
+            // successful apply onto the commit the stash was taken from, where
+            // by construction it fits — but that sequencing does not change
+            // what success costs: the stash entry, the user's recovery object,
+            // is deleted. The server classifies the same operation
+            // `RiskLevel::Destructive` for exactly that reason; classing it
+            // safe here let the view skip the warning entirely (#516).
+            StashAction::Pop | StashAction::Drop | StashAction::Branch => true,
         }
     }
 }
@@ -1291,7 +1301,7 @@ mod tests {
     /// **A1: "stash content is inspectable before apply or drop."**
     ///
     /// Order is the criterion. Inspect must be offered, and offered *ahead of*
-    /// both destructive actions — an inspect control that exists but sits below
+    /// every destructive action — an inspect control that exists but sits below
     /// Drop is the defect the criterion names.
     ///
     /// MUTATION 1 (removes the mechanism): drop `StashAction::Inspect` from
@@ -1315,7 +1325,9 @@ mod tests {
         assert_eq!(inspect, 0, "inspection must be the first thing on offer");
         assert_eq!(offers[inspect].availability, Availability::Offered);
 
-        for destructive in [StashAction::Drop, StashAction::Pop] {
+        // Branch is destructive since #516: success removes the stash entry,
+        // matching the server's RiskLevel::Destructive classification.
+        for destructive in [StashAction::Drop, StashAction::Pop, StashAction::Branch] {
             assert!(
                 inspect < position(destructive),
                 "{destructive:?} is offered before the user can look at the stash"
@@ -1328,11 +1340,7 @@ mod tests {
 
         // The non-destructive ones must NOT be classed destructive, or the
         // classification would be satisfied by marking everything dangerous.
-        for safe in [
-            StashAction::Inspect,
-            StashAction::Apply,
-            StashAction::Branch,
-        ] {
+        for safe in [StashAction::Inspect, StashAction::Apply] {
             assert!(!safe.destructive(), "{safe:?} cannot lose the user's work");
         }
     }
