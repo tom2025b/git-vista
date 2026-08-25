@@ -34,7 +34,7 @@ use crate::api::{fetch_stash_patch, fetch_stashes, push_stash_request};
 use crate::datetime::time_ago;
 use crate::features::stash::core::{
     drawer_view, push_preview, Availability, DrawerView, PushPreview, StashAction, StashRow,
-    LOADING_STASHES, NOTHING_TO_STASH, NO_STASHES,
+    LOADING_STASHES, NO_STASHES,
 };
 use crate::features::stash::signals::{compose_pop, StashDrawer, StashNotice, PUSH_KEY};
 use crate::features::status::core::StatusSections;

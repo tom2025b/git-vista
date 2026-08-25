@@ -16,6 +16,7 @@ import {
   buildConflictFixture,
   buildEditorFixture,
   buildFixture,
+  buildInterleavedWipFixture,
   buildNonTextConflictFixture,
   buildStashFixture,
 } from './fixture.mjs'
@@ -83,10 +84,17 @@ export default async function globalSetup() {
   // #473: a fifth repo whose HEAD resolves to nothing. Separate because it is
   // deliberately broken — no other spec's repo may be left in this state.
   const brokenHeadFixture = buildBrokenHeadFixture(join(work, 'broken-head-repo'))
-  // #77: a sixth repo with three real stash entries, one of which cannot be
-  // applied cleanly. Separate because it is the only repo here whose stash
-  // list has an asserted count, and because applying that entry leaves a
-  // conflict no other spec's repo may inherit.
+  // #478: a sixth repo holding a branch and its DIVERGED remote-tracking twin,
+  // whose two checkpoint chains interleave row for row. Separate because it
+  // needs a remote — `fixture-repo` has none — and because six more commits in
+  // the shared fixture would move the newest-first indices half this suite
+  // asserts against. Its bare origin lives beside it under `work` and is not
+  // offered to the picker.
+  const interleavedFixture = buildInterleavedWipFixture(join(work, 'interleaved-repo'))
+  // #77: a seventh repo with three real stash entries, one of which cannot be
+  // applied cleanly. Separate because it is the only repo here whose stash list
+  // has an asserted count, and because applying that entry leaves collision.txt
+  // conflicted — a state no other spec's repo may inherit.
   const stashFixture = buildStashFixture(join(work, 'stash-repo'))
   const { child, base, signInUrl } = await startServer({
     repoPath: fixture.root,
@@ -95,6 +103,7 @@ export default async function globalSetup() {
       nonTextFixture.root,
       editorFixture.root,
       brokenHeadFixture.root,
+      interleavedFixture.root,
       stashFixture.root,
     ],
     stateHome: join(work, 'state'),
@@ -118,6 +127,7 @@ export default async function globalSetup() {
         editorFixture,
         brokenHeadFixture,
         stashFixture,
+        interleavedFixture,
       },
       null,
       2,

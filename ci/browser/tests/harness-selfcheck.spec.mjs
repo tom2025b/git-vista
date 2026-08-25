@@ -15,17 +15,51 @@
 
 import { expect, test } from '@playwright/test'
 
-import {
-  DIFF_SCROLLER,
-  markPage,
-  openApp,
-  openDiff,
-  openDrawer,
-  openStashRepo,
-  pageSurvived,
-  setHash,
-} from './helpers.mjs'
+import { DIFF_SCROLLER, forceOnline, markPage, openApp, openDiff, pageSurvived, runtime, setHash } from './helpers.mjs'
 
+/** Open the #478 interleaved-twin repository. Duplicated from
+ *  `wip-collapse.spec.mjs` rather than imported, for the same reason every
+ *  other mutation here is written out: this file must be able to fail on its
+ *  own terms, and a shared opener that broke would silently turn these
+ *  self-checks into "the page never loaded" passes. */
+async function openTwinRepo(page) {
+  await forceOnline(page)
+  await page.goto(runtime().base)
+  await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
+  const entry = page.getByRole('button', { name: /interleaved-repo/i }).first()
+  await expect(entry).toBeVisible()
+  await entry.click()
+  const visualize = page.getByRole('button', { name: /look only/ })
+  if (await visualize.isVisible().catch(() => false)) await visualize.click()
+  await expect(page.locator('p.status.repo')).toContainText(/interleaved-repo/i)
+  await expect(page.locator('.wip-group')).toHaveCount(2)
+}
+
+/** Open the #77 stash repository and its drawer. Duplicated rather than
+ *  imported from `helpers.mjs`, for the same reason `openTwinRepo` above is:
+ *  this file must be able to fail on its own terms, and a shared opener that
+ *  broke would silently turn these self-checks into "the page never loaded"
+ *  passes.
+ *
+ *  Opened in VISUALIZE, not full mode. The self-check only reads the drawer,
+ *  and a read-only session cannot mutate the fixture that
+ *  `stash-drawer.spec.mjs` — which runs after this file — depends on. */
+async function openStashDrawer(page) {
+  await forceOnline(page)
+  await page.goto(runtime().base)
+  await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
+  const entry = page.getByRole('button', { name: /stash-repo/i }).first()
+  await expect(entry).toBeVisible()
+  await entry.click()
+  const visualize = page.getByRole('button', { name: /look only/ })
+  if (await visualize.isVisible().catch(() => false)) await visualize.click()
+  await expect(page.locator('p.status.repo')).toContainText(/stash-repo/i)
+  await page.getByRole('button', { name: /activity/i }).first().click()
+  // Wait on a ROW, not the heading: the heading renders before the fetch
+  // resolves, so this would otherwise proceed against "Loading stashes…" and
+  // the mutation below would be applied to an empty drawer.
+  await expect(page.getByText('will not apply cleanly')).toBeVisible({ timeout: 20_000 })
+}
 
 /**
  * Run `fn` and return the message it threw, or `null` if it did not throw.
@@ -155,28 +189,75 @@ test.describe('harness self-check — every assertion must be able to go red', (
     expectFailedBecause(msg, /the chip must be announceable/, 'the announceability assertion')
   })
 
+  test('the #478 two-markers assertion fails when the two are folded into one', async ({
+    page,
+  }) => {
+    await openTwinRepo(page)
+
+    // The mutation is the WRONG FIX the issue names, expressed in the DOM:
+    // one marker standing for both chains, carrying their combined count.
+    // Relaxing the lane check would produce exactly this — a group claiming a
+    // chain that does not exist.
+    await page.evaluate(() => {
+      const markers = [...document.querySelectorAll('.wip-group')]
+      markers[0].querySelector('.wip-group-label').textContent = '\u22ef 8 WIP commits \u22ef'
+      markers[1].remove()
+    })
+
+    const msg = await failureMessage(async () => {
+      const labels = await page.locator('.wip-group-label').allInnerTexts()
+      expect(labels, 'each chain must fold into its own marker').toHaveLength(2)
+    })
+    expectFailedBecause(msg, /each chain must fold into its own marker/, 'the #478 grouping assertion')
+  })
+
+  test('the #478 upward-edge assertion fails when that edge is not drawn', async ({ page }) => {
+    await openTwinRepo(page)
+
+    // The mutation is the defect itself: `visible_edges` culling an edge whose
+    // endpoints arrive out of order, so the line into the folded fork point is
+    // never drawn. Removing the upward path from the DOM is what that looks
+    // like from outside the app.
+    await page.evaluate(() => {
+      for (const p of document.querySelectorAll('section.graph svg path')) {
+        const n = (p.getAttribute('d') ?? '').match(/-?\d+(\.\d+)?/g)
+        if (n && n.length >= 4 && Number(n[n.length - 1]) < Number(n[1])) p.remove()
+      }
+    })
+
+    const msg = await failureMessage(async () => {
+      const spans = await page.evaluate(() =>
+        [...document.querySelectorAll('section.graph svg path')]
+          .map((p) => (p.getAttribute('d') ?? '').match(/-?\d+(\.\d+)?/g))
+          .filter((n) => n && n.length >= 4)
+          .map((n) => [Number(n[1]), Number(n[n.length - 1])]),
+      )
+      expect(
+        spans.filter(([from, to]) => to < from),
+        'exactly one edge must run upward',
+      ).toHaveLength(1)
+    })
+    expectFailedBecause(msg, /exactly one edge must run upward/, 'the #478 upward-edge assertion')
+  })
+
   test('the #77 pop assertion fails when a conflicted pop claims success', async ({ page }) => {
     // The load-bearing negative of the whole stash slice: a pop that conflicts
     // has applied something and dropped nothing, so a UI reporting "Popped"
     // there has lied about the user's data. `stash-drawer.spec.mjs` asserts
     // that wording is ABSENT, and an absence assertion is the easiest kind to
-    // pass for the wrong reason — it also passes when the notice never renders
+    // pass for the wrong reason -- it also passes when the notice never renders
     // at all, or when the selector is wrong.
     //
-    // So the mutation injects the success wording into the live DOM and
-    // requires the absence assertion to notice.
-    //
-    // It deliberately does NOT drive a real pop. A pop mutates the stash repo,
-    // and this file runs before `stash-drawer.spec.mjs` (workers: 1,
-    // fullyParallel: false, alphabetical) — consuming its fixture here is
-    // exactly what broke conflict-panes when the #432 editor shared
-    // conflict-repo. Reaching the real drawer and injecting the notice tests
-    // the assertion without touching the entries.
-    await openStashRepo(page)
-    await openDrawer(page)
+    // The mutation injects the success wording into the live DOM and requires
+    // the absence assertion to notice. It deliberately does NOT drive a real
+    // pop: a pop mutates the stash repo, this file runs before
+    // stash-drawer.spec.mjs (workers: 1, fullyParallel: false, alphabetical),
+    // and consuming that fixture here is exactly what broke conflict-panes when
+    // the #432 editor shared conflict-repo.
+    await openStashDrawer(page)
 
-    // The mutation: the exact sentence `PopVerdict::Popped` produces, added to
-    // a drawer whose pop has NOT completed.
+    // The exact sentence `PopVerdict::Popped` produces, added to a drawer whose
+    // pop has NOT completed.
     await page.evaluate(() => {
       const p = document.createElement('p')
       p.className = 'detail-status'
