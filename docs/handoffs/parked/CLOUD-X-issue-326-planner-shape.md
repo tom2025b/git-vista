@@ -32,33 +32,37 @@ forbidden_paths:
   - crates/git-vista/src/**
   - crates/git-vista-protocol/src/**   # the vocabulary does not change
   - handoff.md
-merge_order: independent, but see "Merge order" -- it collides with CLOUD-11.
+merge_order: independent, but see "Merge order" -- it collides with CLOUD-2.
 ```
 
 ---
 
 ## The measured state (from the issue, 2026-08-05)
 
-`planner.rs` is 6,244 lines, but that number is misleading:
+`planner.rs` was 6,244 lines when the issue was filed (2026-08-05); it is now
+**3,376 lines** after commit `50350e5b` (2026-08-23, "extract the 23 local
+executors into seven domain modules", 6,618 -> 3,317). That refactor did NOT
+touch `shape()` — it moved execution functions, not the risk/precondition/
+recovery match.
 
-| | Lines |
-|---|---|
-| Inline `#[cfg(test)]` blocks | 2,343 |
-| Comments (31% of the file) | ~1,200 |
-| **Actual production code** | **~2,700** across ~50 functions |
-
-Every production function is under 200 lines **except one**: `shape()`, at 614
-lines, holding **22 `GitOperation::` match arms** of roughly 20 lines each.
+**`shape()` itself has also grown since 2026-08-05**: it is currently ~798
+lines holding **31** `GitOperation::` match arms (verified on
+`docs/cloud-batch-2` @ `095f7cf6`), not the 614 lines / 22 arms the issue
+measured — new variants (e.g. `PopStash`, `DropStash`, M3.24) landed since.
+Re-measure `shape()` before estimating: expect roughly 31 one-arm-per-commit
+moves, not 22.
 
 So this is not "split a god file". It is: the per-operation modules already
 exist, most of the extraction is already done, and `shape()` is where the last
-22 arms still live centrally.
+~31 arms still live centrally.
 
 ---
 
 ## How to do it without breaking anything
 
-**One arm per commit, or one small group per commit.** A 22-arm move in a single
+**Read issue #326's own scope guidance before starting — it conflicts with this handoff's shape.** The issue says explicitly: *"Do NOT do this as a single large refactor... planner.rs is the most contended file in the repo — every write-path milestone touches it, so a big-bang move maximises conflict against in-flight branches... moving 22 arms plus their suites at once is a large, hard-to-review diff for zero behavioural change."* Its recommended approach is to move one operation's arm only when a milestone already touches that operation, with **no deadline** — closing only "when the milestones that touch these operations have passed through." This handoff instead assigns one session to move ALL remaining arms (now 31, not 22) in one branch/PR that closes the issue outright. Splitting into many commits does not resolve the issue's stated objection — the objection is against a single dedicated sweep landing at once, not against large commits. **This is a scope call for Tom, not something already settled**: either get his explicit go-ahead to override the issue's incremental guidance for this cloud batch, or descope this session to a subset of arms (e.g. ones with no CLOUD-2 collision) and leave #326 open for the rest.
+
+**One arm per commit, or one small group per commit.** A 22-arm move (now ~31) in a single
 commit is unreviewable and un-bisectable, and this repo's history is teaching
 material — Tom re-reads it. Small commits are the deliverable, not an overhead.
 
@@ -105,7 +109,7 @@ believing either is yours.
 
 ## Merge order
 
-This touches `planner.rs` and `planner/stash.rs`, and so does CLOUD-11
+This touches `planner.rs` and `planner/stash.rs`, and so does CLOUD-2
 (#493/#494). **Whichever of you is ready second rebases** — but say in the PR
 which you are, and do not merge on top of the other without re-running
 `cargo test --workspace` against the actual merge result. Landing against a head
