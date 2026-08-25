@@ -304,3 +304,45 @@ export function buildEditorFixture(root) {
 
   return { root, conflicted: ['first.txt', 'second.txt'] }
 }
+
+/**
+ * A FIFTH repository, whose HEAD holds an object id nothing resolves (#473).
+ *
+ * Its own repository for the same reason every other fixture here is separate:
+ * this one is deliberately BROKEN, and every other spec's repo must stay
+ * usable. Nothing resolves HEAD here, so the graph has no current commit — do
+ * not add assertions about rows to specs that open it.
+ *
+ * Why a browser fixture at all, when `head_notice` is host-tested: that test
+ * proves the decision, and cannot prove it is REACHED. The consumer is
+ * `app/mod.rs`, which is `#[cfg(target_arch = "wasm32")]` and which
+ * `cargo test` never compiles — the exact shape this suite's README table
+ * catalogues, and the shape #473 itself was.
+ *
+ * The HEAD is written by hand rather than produced by a git command, because
+ * no porcelain command will put a repository into this state: it is what a
+ * repository looks like after a bad manual ref write, or after the object a
+ * detached HEAD pointed at is garbage-collected.
+ */
+export function buildBrokenHeadFixture(root) {
+  rmSync(root, { recursive: true, force: true })
+  mkdirSync(root, { recursive: true })
+
+  const git = (...args) =>
+    execFileSync('git', [...IDENT, '-C', root, ...args], {
+      encoding: 'utf8',
+      env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+    })
+
+  git('init', '-q', '-b', 'main')
+  writeFileSync(join(root, 'a.txt'), 'a\n')
+  git('add', '-A')
+  git('commit', '-q', '-m', 'seed: one real commit, so the branch still reads')
+
+  // A well-formed object id with no object behind it. `main` still points at a
+  // real commit, so the readable half of the repository survives — which is
+  // the state the notice has to be legible against.
+  writeFileSync(join(root, '.git/HEAD'), '0'.repeat(40) + '\n')
+
+  return { root }
+}
