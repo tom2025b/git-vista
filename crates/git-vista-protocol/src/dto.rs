@@ -1486,6 +1486,19 @@ mod tests {
         // `index` is gone from the wire (#495) and is not missed: the position
         // reads back out of the selector, through the same author that wrote it.
         assert_eq!(entry.entry.index(), Some(0));
+
+        // Both string-shaped fields are typed, and that is load-bearing rather
+        // than decorative: a listing carrying an oid no compare-and-swap could
+        // use does not deserialize at all. Added because retyping `oid` to a
+        // bare `String` left every other assertion here passing (mutation M3,
+        // #495) — the test agreed with itself while the guarantee was gone.
+        assert!(
+            serde_json::from_str::<StashEntry>(
+                r#"{"entry":"stash@{0}","oid":"aaaaaaa","message":"m","time":1}"#
+            )
+            .is_err(),
+            "an abbreviated oid is not an object id, and `oid` must be typed to know it"
+        );
     }
 
     /// A listing whose values are not the shapes git produces fails at the
