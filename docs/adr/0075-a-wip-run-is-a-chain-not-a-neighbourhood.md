@@ -1,4 +1,4 @@
-# 0074 — A WIP run is a chain, not a neighbourhood
+# 0075 — A WIP run is a chain, not a neighbourhood
 
 **Status:** Accepted — implemented and tested
 **Date:** 2026-08-25
