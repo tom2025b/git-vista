@@ -42,19 +42,42 @@ use serde::{Deserialize, Serialize};
 /// no field for the answer — could show a three-dot comparison labelled as a
 /// two-dot one, or reverse a comparison whose reversal is not an inverse.
 /// Neither is detectable from the patch, hence a hard window move.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// **v7 (M3.24, #495/#506)** — the stash contract changed shape on both ends.
+/// `GET /api/stashes` no longer sends `index`: it was derived from `entry` one
+/// line earlier, no client read it, and a derivable field on the wire is a
+/// second place for it to be wrong (ADR 0079). And
+/// [`crate::BranchFromStashRequest`] moved its entry/oid pair into a nested
+/// [`crate::StashTarget`] instead of spelling both flat, because
+/// `#[serde(flatten)]` is mutually exclusive with `deny_unknown_fields` and
+/// giving up strictness on a body that reaches `git stash branch` is the wrong
+/// trade.
+///
+/// A v6 client misreads **both**, and the second is a hard failure rather than
+/// a tolerated omission: `BranchFromStashRequest` carries
+/// `deny_unknown_fields`, so a flat body arrives with `entry` and
+/// `expected_oid` unknown at the top level and `target` missing, and is
+/// refused outright. A cached PWA speaking v6 would have negotiated
+/// successfully against a `[6, 6]` window and only then discovered it could
+/// not read the drawer or branch from an entry — which is the exact situation
+/// this negotiation exists to prevent, so the window moves whole.
+///
+/// Both shape changes shipped in PR #500 without this bump. #506 records how
+/// four review passes missed it; the short version is that nothing fails when
+/// this number stays still, which is why the golden fixture below now pins it.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The oldest client protocol version this server build still accepts. Together
 /// with [`MAX_CLIENT_PROTOCOL`] it is the compatibility window a client's version
 /// must fall inside. Equal to [`PROTOCOL_VERSION`] until a compatible-but-older
 /// contract must be supported.
-pub const MIN_CLIENT_PROTOCOL: u32 = 6;
+pub const MIN_CLIENT_PROTOCOL: u32 = 7;
 
 /// The newest client protocol version this server build can accept. A client
 /// reporting a version above this is *ahead* of the server (the server was
 /// downgraded, or the client cache is from a newer deploy) and is refused the
 /// same way as one that is too old.
-pub const MAX_CLIENT_PROTOCOL: u32 = 6;
+pub const MAX_CLIENT_PROTOCOL: u32 = 7;
 
 /// Request header a client must send on every `/api/*` call **except**
 /// `GET /api/protocol`, carrying the [`PROTOCOL_VERSION`] it was built against.
@@ -232,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v6_is_hard_compatibility_window() {
+    fn protocol_v7_is_hard_compatibility_window() {
         // M1.10 (#63) bumped the wire protocol to 4 and moved the whole window,
         // not just the ceiling: a v3 client cannot page history, so v3 must be
         // refused exactly like any other out-of-window version, not tolerated.
@@ -252,12 +275,21 @@ mod tests {
         // which question was answered, and its "swap" control cannot know
         // whether reversal is an inverse. Both failures are silent, which is
         // exactly what a hard window move is for.
-        assert_eq!(PROTOCOL_VERSION, 6);
-        assert_eq!(MIN_CLIENT_PROTOCOL, 6);
-        assert_eq!(MAX_CLIENT_PROTOCOL, 6);
-        assert_eq!(check_compatibility(5, 6, 6), Compatibility::ClientTooOld);
-        assert_eq!(check_compatibility(6, 6, 6), Compatibility::Compatible);
-        assert_eq!(check_compatibility(7, 6, 6), Compatibility::ClientTooNew);
+        //
+        // M3.24 (#495/#506) bumped it to 7, and this test is the reason the
+        // bump was not silently skipped a second time: the stash contract
+        // changed on both ends — `GET /api/stashes` dropped `index`, and
+        // `BranchFromStashRequest` moved its pair into a nested `target` — and
+        // the branch body is `deny_unknown_fields`, so a v6 client's flat body
+        // is REFUSED rather than tolerated. Those shapes shipped without a
+        // bump; a cached PWA negotiated against a [6, 6] window and only then
+        // found it could not read the drawer. Whole window again.
+        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(MIN_CLIENT_PROTOCOL, 7);
+        assert_eq!(MAX_CLIENT_PROTOCOL, 7);
+        assert_eq!(check_compatibility(6, 7, 7), Compatibility::ClientTooOld);
+        assert_eq!(check_compatibility(7, 7, 7), Compatibility::Compatible);
+        assert_eq!(check_compatibility(8, 7, 7), Compatibility::ClientTooNew);
     }
 
     #[test]
