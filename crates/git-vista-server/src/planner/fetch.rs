@@ -689,26 +689,13 @@ mod tests {
     // #485 — what one fetch costs the journal (ADR 0080)
     // -----------------------------------------------------------------------
 
-    /// A tempdir with a real `.git` directory and one commit, so journaling
-    /// engages and `capture_refs` has something to observe.
-    fn journalling_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        for args in [
-            vec!["init", "-q"],
-            vec!["commit", "-q", "--allow-empty", "-m", "x"],
-        ] {
-            assert!(std::process::Command::new("git")
-                .args(&args)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@t")
-                .current_dir(dir.path())
-                .status()
-                .expect("git runs")
-                .success());
-        }
-        dir
+    /// The canonical seeded repository (ADR 0076): a real `.git` directory
+    /// and one commit, so journaling engages and `capture_refs` has something
+    /// to observe. From the fixture catalogue rather than a `git init` spawned
+    /// here — this module's process spawns are the planner's git argv, and
+    /// `argv_boundary` is right to hold that line.
+    fn journalling_repo() -> git_vista_fixtures::Fixture {
+        git_vista_fixtures::seeded()
     }
 
     /// **#485 at this module's own boundary.** One fetch that moved N refs
@@ -725,7 +712,7 @@ mod tests {
     /// handed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_fetch_journals_every_ref_at_one_moment_under_one_capture() {
-        let dir = journalling_repo();
+        let (_dir, repo) = journalling_repo();
         let updated: Vec<RemoteRefUpdate> = (0..12)
             .map(|i| RemoteRefUpdate {
                 ref_name: format!("refs/remotes/origin/b{i}"),
@@ -735,14 +722,14 @@ mod tests {
             .collect();
 
         journal_updates(
-            dir.path(),
+            &repo,
             &RemoteName::new("origin").expect("a valid remote name"),
             &updated,
             "fetched",
         )
         .await;
 
-        let read = crate::journal::read_all(dir.path());
+        let read = crate::journal::read_all(&repo);
         assert_eq!(
             read.len(),
             12,
@@ -789,10 +776,10 @@ mod tests {
     /// the cost back on every up-to-date fetch, which is the common case.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fetch_that_moved_nothing_writes_no_journal_at_all() {
-        let dir = journalling_repo();
+        let (_dir, repo) = journalling_repo();
 
         journal_updates(
-            dir.path(),
+            &repo,
             &RemoteName::new("origin").expect("a valid remote name"),
             &[],
             "fetched",
@@ -800,7 +787,7 @@ mod tests {
         .await;
 
         assert!(
-            crate::journal::read_all(dir.path()).is_empty(),
+            crate::journal::read_all(&repo).is_empty(),
             "an up-to-date fetch leaves no trace"
         );
     }
