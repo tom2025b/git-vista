@@ -779,6 +779,13 @@ pub(crate) mod tests {
     /// handler's own fact, and where breaking it goes red.
     #[tokio::test]
     async fn the_handler_itself_marks_the_listing_no_store() {
+        crate::state::with_isolated_test_current(
+            the_handler_itself_marks_the_listing_no_store_in_scope(),
+        )
+        .await;
+    }
+
+    async fn the_handler_itself_marks_the_listing_no_store_in_scope() {
         let dir = tempfile::tempdir().unwrap();
         let fixture = build_tagged_fixture(dir.path());
         let response = tag_list(axum::extract::Query(RepoQuery {
@@ -798,6 +805,13 @@ pub(crate) mod tests {
     /// `read_tags` → `tag_detail` — not only that the router reaches it.
     #[tokio::test]
     async fn the_handler_composes_the_reader_and_the_mapping() {
+        crate::state::with_isolated_test_current(
+            the_handler_composes_the_reader_and_the_mapping_in_scope(),
+        )
+        .await;
+    }
+
+    async fn the_handler_composes_the_reader_and_the_mapping_in_scope() {
         let dir = tempfile::tempdir().unwrap();
         let fixture = build_tagged_fixture(dir.path());
         let response = tag_list(axum::extract::Query(RepoQuery {

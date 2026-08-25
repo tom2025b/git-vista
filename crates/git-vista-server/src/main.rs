@@ -937,6 +937,11 @@ mod tests {
     /// satisfied by a mapping that is merely self-consistent.
     #[tokio::test]
     async fn api_tags_reports_both_tag_kinds_end_to_end() {
+        state::with_isolated_test_current(api_tags_reports_both_tag_kinds_end_to_end_in_scope())
+            .await;
+    }
+
+    async fn api_tags_reports_both_tag_kinds_end_to_end_in_scope() {
         let dir = tempfile::tempdir().unwrap();
         let fixture = handlers::tags::tests::build_tagged_fixture(dir.path());
         let repo_id = &fixture.repo_id;
