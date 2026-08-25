@@ -928,6 +928,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-vista-fixtures"
+version = "0.2.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "git-vista-git"
 version = "0.2.0"
 dependencies = [

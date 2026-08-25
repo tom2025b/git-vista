@@ -1,0 +1,18 @@
+# The fixture catalogue (#448): every deliberately-broken repository shape
+# git-vista's tests exercise, built once, in one place, by real `git`.
+#
+# It is a normal library rather than a `#[cfg(test)]` module because two
+# different consumers need the same shapes: the server's Rust suites depend on
+# it under `[dev-dependencies]`, and the browser harness shells out to the
+# `gv-fixture` binary. One implementation, two callers — see docs/adr/0074.
+[package]
+name = "git-vista-fixtures"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deliberately-broken git repositories, as named and documented shapes."
+
+[dependencies]
+tempfile = "3"

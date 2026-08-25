@@ -1,0 +1,136 @@
+//! The argv boundary every fixture is built through.
+//!
+//! Every child process this crate spawns is literally `git` — never a shell,
+//! never a helper binary. A fixture that needed `sh -c` to build itself would
+//! be a fixture whose shape depended on the machine's shell, and the whole
+//! point of the catalogue is that the same bytes land on disk everywhere.
+//!
+//! ## Why identity is passed per invocation
+//!
+//! Every commit here is made with `-c user.name=… -c user.email=…` on the
+//! command line, and with `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` pointed
+//! at `/dev/null`. A bare `git commit` reads identity, `commit.gpgsign`, hook
+//! paths and template directories from the developer's own global config — so
+//! a fixture built that way is a different repository on every machine, and on
+//! a box with `commit.gpgsign = true` it does not build at all.
+//!
+//! The builders *also* write `user.name` and `user.email` into the fixture's
+//! local config. That is not redundancy for its own sake: the suites that use
+//! these fixtures go on to run their own `git commit` against the repository
+//! afterwards, through their own helpers, which pass no identity. Removing the
+//! local config would leave those follow-up commits with no author.
+
+use std::path::Path;
+use std::process::Command;
+
+/// The identity every fixture commit is authored with.
+///
+/// `t <t@example.invalid>` is not arbitrary — it is what all twenty of the
+/// hand-rolled `seeded_repo()` implementations this catalogue replaces already
+/// used, and `.invalid` is the RFC 2606 TLD guaranteed never to resolve. Two
+/// suites assert on the literal string, so it is part of the contract.
+pub const IDENT_NAME: &str = "t";
+
+/// The email half of [`IDENT_NAME`].
+pub const IDENT_EMAIL: &str = "t@example.invalid";
+
+/// Config overrides prepended to every `git` invocation the builders make.
+///
+/// Signing is forced off in both forms: a developer with `commit.gpgsign` or
+/// `tag.gpgsign` set globally would otherwise be prompted for a passphrase by
+/// a unit test, or simply watch it fail.
+fn ident_args() -> Vec<String> {
+    vec![
+        "-c".into(),
+        format!("user.name={IDENT_NAME}"),
+        "-c".into(),
+        format!("user.email={IDENT_EMAIL}"),
+        "-c".into(),
+        "commit.gpgsign=false".into(),
+        "-c".into(),
+        "tag.gpgsign=false".into(),
+    ]
+}
+
+/// Build a `git` command rooted at `repo`, with identity supplied and the
+/// developer's global and system config taken out of the picture.
+fn command(repo: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(ident_args())
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null");
+    cmd
+}
+
+/// Run `git <args>` in `repo` and panic if it fails.
+///
+/// Fixtures assert rather than return a `Result` on purpose: a builder that
+/// half-succeeded would hand a test a repository in a shape nobody wrote down,
+/// and the test would then fail somewhere far away from the real cause.
+pub fn run(repo: &Path, args: &[&str]) {
+    let status = command(repo, args)
+        .status()
+        .unwrap_or_else(|e| panic!("could not spawn git {args:?} in {repo:?}: {e}"));
+    assert!(status.success(), "git {args:?} failed in {repo:?}");
+}
+
+/// Run `git <args>` in `repo` with author and committer dates pinned.
+///
+/// Used by the shapes whose whole purpose is to be byte-identical across two
+/// independent builds: commit oids hash the timestamps, so without this two
+/// repositories built from the same instructions one second apart are different
+/// repositories.
+pub fn run_dated(repo: &Path, args: &[&str], date: &str) {
+    let status = command(repo, args)
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .status()
+        .unwrap_or_else(|e| panic!("could not spawn git {args:?} in {repo:?}: {e}"));
+    assert!(status.success(), "git {args:?} failed in {repo:?}");
+}
+
+/// Run `git <args>` in `repo` and return trimmed stdout, panicking on failure.
+pub fn out(repo: &Path, args: &[&str]) -> String {
+    let output = command(repo, args)
+        .output()
+        .unwrap_or_else(|e| panic!("could not spawn git {args:?} in {repo:?}: {e}"));
+    assert!(output.status.success(), "git {args:?} failed in {repo:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Run `git <args>` in `repo` and report only whether it succeeded.
+///
+/// The conflict shapes need this: `git merge` on a conflicted merge is
+/// *supposed* to exit non-zero, and a builder that asserted on its status
+/// would refuse to build the very shape it exists to build.
+pub fn try_run(repo: &Path, args: &[&str]) -> bool {
+    command(repo, args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `git init -b main` plus the local identity config, in a directory that is
+/// created if it does not exist.
+///
+/// The local config is what lets a *caller* keep committing to the fixture
+/// with its own bare `git commit` after the builder has returned — see the
+/// module doc.
+pub fn init(repo: &Path) {
+    std::fs::create_dir_all(repo).expect("create fixture repo directory");
+    run(repo, &["init", "-q", "-b", "main"]);
+    run(repo, &["config", "user.email", IDENT_EMAIL]);
+    run(repo, &["config", "user.name", IDENT_NAME]);
+}
+
+/// Write `content` to `repo/name`, creating parent directories as needed.
+pub fn write(repo: &Path, name: &str, content: &[u8]) {
+    let path = repo.join(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create fixture file parent");
+    }
+    std::fs::write(&path, content).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+}
