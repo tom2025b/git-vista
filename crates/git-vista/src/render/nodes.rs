@@ -54,13 +54,13 @@ pub fn build_node(
     // commit: it has no single identity, so none of the per-commit menu
     // data below applies to it (#374).
     if let DisplayItem::WipGroup {
-        start_row_index,
+        anchor_row_index,
         count,
         lane,
         color,
     } = item
     {
-        return build_wip_group(moved, on_expand, i, start_row_index, count, lane, color);
+        return build_wip_group(moved, on_expand, i, anchor_row_index, count, lane, color);
     }
     let DisplayItem::Single { row_index } = item else {
         return ().into_view();
@@ -315,7 +315,7 @@ fn build_wip_group(
     moved: StoredValue<bool>,
     on_expand: Callback<usize>,
     i: usize,
-    start_row_index: usize,
+    anchor_row_index: usize,
     count: usize,
     lane: usize,
     color: usize,
@@ -324,16 +324,20 @@ fn build_wip_group(
     let cy = node_cy(i);
     let stroke = branch_color(color);
     let label = format!("⋯ {count} WIP commits ⋯");
+    // The anchor is one member's raw row index, which is all `project` needs
+    // to identify the run — it opens a run when ANY member is in the expanded
+    // set. It is deliberately not treated as the head of a `count`-long
+    // range: since #478 a run's members need not be adjacent.
     let expand = move |_: web_sys::PointerEvent| {
         if moved.get_value() {
             return;
         }
-        on_expand.call(start_row_index);
+        on_expand.call(anchor_row_index);
     };
     let expand_kb = move |ev: web_sys::KeyboardEvent| {
         if ev.key() == "Enter" || ev.key() == " " {
             ev.prevent_default();
-            on_expand.call(start_row_index);
+            on_expand.call(anchor_row_index);
         }
     };
     view! {

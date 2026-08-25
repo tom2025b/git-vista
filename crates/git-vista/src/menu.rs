@@ -297,16 +297,20 @@ pub fn menu_view(
             // commit inside a run the user opened, and deliberately FIRST: it is
             // the reason a reader taps a checkpoint dot at all, and the topbar
             // toggle is the only alternative, which folds the entire graph.
-            let fold_wip_item = match m.wip_run {
+            let fold_wip_item = match m.wip_run.clone() {
                 Some(run) => {
+                    // The run's own member list, not a row span: since #478 a
+                    // run's rows need not be contiguous, so the count comes
+                    // from the members themselves.
+                    let label = format!("Fold these {} checkpoints", run.rows.len());
                     let on_fold = move |_| {
                         shell.close_menu();
-                        on_fold_wip.call(run);
+                        on_fold_wip.call(run.clone());
                     };
                     view! {
                         <button class="ctx-item" on:click=on_fold>
                             <span class="nf ctx-icon">{ic.commit}</span>
-                            {format!("Fold these {} checkpoints", run.count)}
+                            {label.clone()}
                         </button>
                     }
                     .into_view()
