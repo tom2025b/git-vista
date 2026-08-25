@@ -52,10 +52,15 @@ pub fn stash_section_view(
     settings: Settings,
     read_only: bool,
     sections: Signal<Option<StatusSections>>,
+    // The drawer's own signals, owned by the Activity panel rather than by this
+    // function. See `activity.rs` for why: this call sits inside a reactive
+    // child that re-runs on every `graph` epoch bump, and a `StashDrawer` built
+    // here is destroyed by the very refresh each write fires -- taking the
+    // outcome notice with it.
+    drawer: StashDrawer,
 ) -> impl IntoView {
     let Features { graph, shell, .. } = features;
     let nerd_icons = settings.nerd_icons;
-    let drawer = StashDrawer::new();
     let write_gate = crate::features::stash::core::write_gate(read_only);
 
     let stashes = create_local_resource(

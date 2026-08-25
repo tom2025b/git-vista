@@ -50,7 +50,12 @@ pub fn activity_panel_view(
     settings: Settings,
     read_only: bool,
 ) -> impl IntoView {
-    let Features { graph, shell, .. } = features;
+    let Features {
+        graph,
+        shell,
+        stash: stash_drawer,
+        ..
+    } = features;
     let nerd_icons = settings.nerd_icons;
 
     // The feed keys on (open, reload): opening the panel fetches fresh, and any
@@ -371,7 +376,7 @@ pub fn activity_panel_view(
                             "Tags"
                         </div>
                         {tags_section}
-                        {stash_section_view(features, settings, read_only, status_sections)}
+                        {stash_section_view(features, settings, read_only, status_sections, stash_drawer)}
                         <div class="detail-section-title act-feed-title">
                             "History"
                         </div>

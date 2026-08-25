@@ -72,14 +72,26 @@ test.describe.serial('the stash drawer', () => {
     await expect(show).toBeVisible()
     await show.click()
 
-    // The patch itself, from `GET /api/stash/show`. Asserting on a real diff
-    // line rather than on the <pre> existing: the element appears before the
-    // fetch resolves.
-    await expect(drawer.getByText(/^\+.*the stashed edit/m)).toBeVisible({ timeout: 20_000 })
+    // The patch itself, from `GET /api/stash/show`, rendered as
+    // `<pre class="act-file-path">` (`features/stash/view.rs:374`). The <pre>
+    // appears before the fetch resolves, so its mere presence proves nothing;
+    // the assertion below is on a real added line.
+    const patch = drawer.locator('pre.act-file-path')
+    await expect(patch).toBeVisible({ timeout: 20_000 })
+
+    // Read the raw `textContent` rather than matching with `getByText`.
+    // Playwright's text engine NORMALISES whitespace before matching -- line
+    // breaks become spaces -- so `^` under the `m` flag can never match a diff
+    // line inside a <pre>: the whole patch arrives as one long line and only
+    // its first character sits at a line start. `getByText(/^\+.../m)` there
+    // fails with "element(s) not found" and reads like a missing patch.
+    await expect
+      .poll(async () => (await patch.textContent()) ?? '', { timeout: 20_000 })
+      .toMatch(/^\+.*the stashed edit/m)
 
     // Tapping the open one closes it, so the control is its own undo.
     await show.click()
-    await expect(drawer.getByText(/^\+.*the stashed edit/m)).toHaveCount(0)
+    await expect(patch).toHaveCount(0)
   })
 
   test('A2: an untracked file the push would leave behind is named first', async ({ page }) => {
@@ -94,7 +106,13 @@ test.describe.serial('the stash drawer', () => {
 
     // Ticking the box moves it to the captured list. Without this half the
     // assertion above would pass against a preview that always warns.
-    await drawer.getByText('Include untracked files').click()
+    //
+    // By ROLE, not by text. The preview's own sentence names the control it is
+    // telling the user to tick — “Nothing here would be stashed … tick
+    // “Include untracked files”” — so `getByText` resolves to two elements
+    // and dies of a strict-mode violation. The checkbox is the only thing here
+    // that IS a checkbox.
+    await drawer.getByRole('checkbox', { name: 'Include untracked files' }).click()
     await expect(drawer.getByText(`${UNTRACKED} — NOT stashed`)).toHaveCount(0)
     await expect(drawer.getByText(UNTRACKED, { exact: true })).toBeVisible()
   })
@@ -141,6 +159,22 @@ test.describe.serial('the stash drawer', () => {
 
     // The entry is still listed, which is the drawer agreeing with the notice.
     await expect(drawer.getByText(CONFLICTING_SUBJECT)).toBeVisible()
+
+    // And the notice SURVIVES the panel's own refresh.
+    //
+    // This is the defect this test found, and it is worth pinning separately
+    // from the assertions above because it is invisible to all of them on a
+    // fast machine. The drawer's signals were created inside a reactive child
+    // that tracks the graph epoch, so the `force_bump()` every write fires
+    // after `set_notice(...)` rebuilt them and threw the notice away roughly
+    // one frame after it was written. A conflicted pop then left the user with
+    // conflict markers in their tree and no sentence at all.
+    //
+    // Asserted through the Refresh button rather than by reaching for where
+    // the state happens to live: what must be true is that a refresh does not
+    // erase the report of what just happened, whatever owns it.
+    await page.getByRole('complementary').getByRole('button', { name: 'Refresh' }).first().click()
+    await expect(notice).toBeVisible()
 
     // Following the route opens the four-pane conflict view (#428) — not a
     // second, stash-shaped conflict UI.

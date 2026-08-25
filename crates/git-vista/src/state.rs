@@ -113,6 +113,7 @@ pub use crate::features::dialogs::commit::CommitIntent;
 pub use crate::features::operations::kind::OperationKind as PendingOp;
 
 use crate::features::dialogs::signals::Dialogs;
+use crate::features::stash::signals::StashDrawer;
 use crate::features::graph::core::GraphCore;
 use crate::features::operations::signals::Operations;
 use crate::features::shell::signals::Shell;
@@ -210,6 +211,18 @@ pub struct Features {
     /// came to be governed by two rules on two different ticks. `App` still holds the
     /// `Activity` handle directly, because the shared status read keys on it.
     pub shell: Shell,
+    /// The stash drawer's own state: which row is mid-write, which entry is
+    /// expanded, and the last outcome notice (M3.24, #77).
+    ///
+    /// Here for the reason this whole bundle exists. It was created inside
+    /// `stash_section_view`, which the Activity panel calls from inside a
+    /// reactive child -- so an epoch bump rebuilt it. Every drawer write ends
+    /// `set_notice(...)` then `graph.force_bump()`, and the bump destroyed the
+    /// signal it had just written: the notice appeared for about a frame and
+    /// then vanished, on every path. A conflicted pop is where it hurt most
+    /// (#77 A4) -- the verdict was correct, and the user was told nothing while
+    /// conflict markers sat in their tree.
+    pub stash: StashDrawer,
     /// The first endpoint of a two-commit comparison, once one has been picked
     /// (M4.27, #80). `None` when no comparison is in progress.
     ///

@@ -122,11 +122,68 @@ pub(crate) async fn show_stash(
 }
 
 /// Query for [`show_stash`].
+///
+/// Deliberately **not** `deny_unknown_fields`, for the same reason
+/// `read.rs`'s `PageQuery` is not: the frontend appends its own
+/// `?t=<millis>` cache-buster to every GET it makes (`api/stash.rs`, and
+/// nine other call sites in `crates/git-vista/src/api/`), and a read must
+/// never answer that with a 400.
+///
+/// It shipped closed, and the drawer's whole "Show changes" control was dead
+/// on arrival — every click answered
+/// `Failed to deserialize query string: t: unknown field \`t\`, expected
+/// \`entry\``, rendered into the panel where the patch belonged. Nothing in
+/// the Rust suite could see it: the handler was only ever called with the
+/// query a test composed by hand, never the one the browser sends.
+///
+/// The closed-DTO rule this looked like it was following is about **write
+/// bodies** reaching the argv boundary (`argv_boundary::dto_gates`), where an
+/// unknown key is a smuggling attempt. This is a GET query whose one field is
+/// already refused by `StashSelector` unless it is exactly `stash@{N}`, so an
+/// extra key buys an attacker nothing at all.
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct ShowStashQuery {
     /// The `stash@{N}` selector, exactly as the list returned it.
     pub(crate) entry: String,
+}
+
+#[cfg(test)]
+mod show_stash_query_tests {
+    use super::ShowStashQuery;
+
+    /// The exact query string the browser sends, cache-buster and all.
+    ///
+    /// Pinned against the live shape rather than a tidy one: `entry` alone
+    /// deserialized perfectly well while the feature was broken in the app.
+    #[test]
+    fn the_frontend_cache_buster_does_not_make_the_read_a_400() {
+        let q: ShowStashQuery =
+            serde_urlencoded::from_str("entry=stash%40%7B0%7D&t=1756112884123")
+                .expect("the `?t=` cache-buster every frontend GET appends must not 400");
+        assert_eq!(
+            q.entry, "stash@{0}",
+            "the selector must survive percent-decoding intact"
+        );
+    }
+
+    /// Order is the client's to choose, and `js_sys::Date::now()` yields a
+    /// float — `1756112884123.4` is a legal thing for it to send.
+    #[test]
+    fn neither_the_parameter_order_nor_a_fractional_millisecond_matters() {
+        let q: ShowStashQuery =
+            serde_urlencoded::from_str("t=1756112884123.4&entry=stash%40%7B12%7D")
+                .expect("a cache-buster is opaque to this handler wherever it sits");
+        assert_eq!(q.entry, "stash@{12}");
+    }
+
+    /// The one field that IS this DTO's business still has to be there.
+    #[test]
+    fn a_query_with_no_entry_is_still_refused() {
+        assert!(
+            serde_urlencoded::from_str::<ShowStashQuery>("t=1756112884123").is_err(),
+            "`entry` is required — tolerating unknown keys is not tolerating a missing one"
+        );
+    }
 }
 
 /// `GET /api/stashes` — the drawer, newest first.

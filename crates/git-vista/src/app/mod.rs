@@ -617,12 +617,18 @@ pub fn App() -> impl IntoView {
     // signal owned below it would lose the user's chosen anchor on every
     // background refresh.
     let compare_anchor = create_rw_signal(None::<String>);
+    // M3.24 (#77): the stash drawer's signals, created here for the same reason
+    // as `compare_anchor` above it — the Activity panel is rebuilt by an epoch
+    // bump, and every drawer write ends with a bump. Owned below it, the
+    // outcome notice was destroyed one frame after being written.
+    let stash = crate::features::stash::signals::StashDrawer::new();
     let features = Features {
         graph,
         dialogs: dialogs_guard,
         operations,
         status,
         shell,
+        stash,
         compare_anchor,
     };
     let settings = Settings {
