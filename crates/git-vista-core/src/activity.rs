@@ -598,10 +598,32 @@ fn names_a_local_branch(ref_name: Option<&str>, branches: &HashMap<String, Strin
 ///
 /// A run of one is returned untouched — a single-ref fetch already says the
 /// useful thing ("fetched ‘origin/main’ from origin") and rewriting it as
-/// "1 ref updated" would lose information to no purpose. That is also what
-/// keeps the "tips unknown — git could not be read" entry intact: it is
-/// journaled *instead of* per-ref entries, never alongside them, so it is
-/// always a run of one.
+/// "1 ref updated" would lose information to no purpose.
+///
+/// # Two known defects, measured 2026-08-25
+///
+/// Both are recorded with their evidence in
+/// `docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`. Neither is
+/// fixed here; do not read the paragraphs above as covering them.
+///
+/// 1. **The "tips unknown — git could not be read" entry is not safe here.**
+///    This comment used to claim the entry "is journaled *instead of* per-ref
+///    entries, never alongside them, so it is always a run of one". That
+///    accounts for the journal and forgets git's reflog — the same shape of
+///    mistake that got the first #329 attempt reverted. `journal_unobserved`
+///    fires when the fetch *succeeded* and only the re-read of the refs
+///    failed, so git wrote a reflog line for every ref it moved; the admission
+///    carries no `new_oid`, so it suppresses none of them and folds in with
+///    them instead. Measured: four refs moved renders as
+///    "fetch — 5 refs updated", with the admission gone and the count one too
+///    high. It is a run of one only when the fetch moved nothing at all.
+/// 2. **The count inflates at scale.** The app stamps one journal entry per
+///    ref, each performing a full ref capture, so entry *i* lands later and
+///    later after git's reflog lines. Past roughly 170 refs that drift exceeds
+///    [`JOURNAL_MATCH_SLACK`], the unmatched reflog lines survive attribution,
+///    and the fold counts both copies. Measured: 250 refs reported as 297,
+///    500 reported as 891. The feed stays at one row, so #329's symptom holds
+///    — but the number in it stops being true.
 ///
 /// **Safe for undo by construction, not by luck:** [`undo_hint`] has no arm for
 /// `Fetch` or `Pull`, so neither row has ever carried a hint and dropping the
@@ -1231,6 +1253,144 @@ mod tests {
             feed[0].source,
             ActivitySource::External,
             "nothing claimed the app did it"
+        );
+    }
+
+    // -- Expected-failure pins for the two defects #329's fix still has. ------
+    //
+    // Both assert what the fold *should* do and are marked `#[should_panic]`
+    // because it does not do it yet. That is the `test.fail()` convention
+    // `ci/browser/tests/hunk-keyboard.spec.mjs` uses, and for the same reason
+    // it was adopted there: #210 survived for months behind a green gate. A
+    // test asserting today's wrong answer would go quietly green and stay
+    // green after a fix; `#[ignore]` says nothing at all. These go RED the
+    // moment the defect is fixed, and demand to be looked at.
+    //
+    // Evidence and the proposed fixes:
+    // `docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`.
+
+    /// **F2 — the "tips unknown — git could not be read" admission is erased.**
+    ///
+    /// `planner::fetch::journal_unobserved` fires when `git fetch` *succeeded*
+    /// and only the re-read of the refs failed, so git wrote a reflog line for
+    /// every ref it moved. The admission carries no `new_oid`, so it suppresses
+    /// none of them in attribution and folds in with them instead — replacing
+    /// a deliberate "we could not read this" with a confident count, and a
+    /// count that is one too high, since the admission is itself counted.
+    ///
+    /// **Fixing this:** exclude it from folding. `ref_name: None` with both
+    /// oids `None` is the shape `journal_unobserved` alone produces. Then
+    /// delete the `#[should_panic]` — the assertions below are already right.
+    #[test]
+    #[should_panic(expected = "F2: the admission did not survive")]
+    fn an_unobserved_fetch_keeps_its_admission_instead_of_being_counted() {
+        // Four refs really moved, so git wrote four reflog lines...
+        let reflog: Vec<ReflogEntry> = ["main", "dev", "topic", "release"]
+            .iter()
+            .map(|r| {
+                entry(
+                    &format!("origin/{r}"),
+                    100,
+                    &format!("old-{r}"),
+                    &format!("new-{r}"),
+                    "fetch origin: fast-forward",
+                )
+            })
+            .collect();
+        // ...and the app, unable to re-read them, journaled one admission.
+        let journal = vec![ActivityEvent {
+            time: 100,
+            kind: ActivityKind::Fetch,
+            ref_name: None,
+            summary: "fetched from ‘origin’, but refs/remotes/origin could not be re-read \
+                      afterwards (tips unknown — git could not be read)"
+                .into(),
+            old_oid: None,
+            new_oid: None,
+            source: ActivitySource::App,
+            undo: None,
+            refs: None,
+        }];
+
+        let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 50);
+
+        assert!(
+            feed.iter().any(|e| e.summary.contains("tips unknown")),
+            "F2: the admission did not survive the fold — an honest \"we could not \
+             read this\" became a confident count. Feed: {feed:#?}"
+        );
+        assert!(
+            !feed.iter().any(|e| e.summary == "fetch — 5 refs updated"),
+            "F2: four refs moved, not five — the admission was counted as a ref. \
+             Feed: {feed:#?}"
+        );
+    }
+
+    /// **F1 — the folded count stops being true at scale.**
+    ///
+    /// The app stamps one journal entry per ref, each performing a full ref
+    /// capture, so entry *i* lands later and later after git's reflog lines.
+    /// Measured 2026-08-25: ~29.63 ms per ref at 250 refs, modelled below as a
+    /// flat 30 ms. Past [`JOURNAL_MATCH_SLACK`] the later entries stop matching
+    /// their reflog echo, those reflog lines survive attribution, and the fold
+    /// counts both copies of the same ref movement.
+    ///
+    /// The feed still shows one row, so #329's reported symptom holds — this
+    /// pins the *number in it*, which is the part that is not true.
+    ///
+    /// **Fixing this:** capture the ref map once per operation rather than per
+    /// ref (`journal::append` already keeps an event's own `refs`), which
+    /// removes the drift. Then delete the `#[should_panic]`.
+    #[test]
+    #[should_panic(expected = "F1: the fold counted")]
+    fn a_slow_fetch_still_counts_only_the_refs_that_moved() {
+        const REFS: i64 = 250;
+        const MS_PER_REF: i64 = 30; // measured 29.63 ms at this ref count
+
+        // git wrote every reflog line during the fetch, at one moment.
+        let reflog: Vec<ReflogEntry> = (0..REFS)
+            .map(|i| {
+                entry(
+                    &format!("origin/b{i}"),
+                    100,
+                    &format!("o{i}"),
+                    &format!("n{i}"),
+                    "fetch origin: fast-forward",
+                )
+            })
+            .collect();
+        // The app journaled them one at a time, drifting ~7.4s in total.
+        let journal: Vec<ActivityEvent> = (0..REFS)
+            .map(|i| ActivityEvent {
+                time: 100 + (i * MS_PER_REF) / 1000,
+                kind: ActivityKind::Fetch,
+                ref_name: Some(format!("refs/remotes/origin/b{i}")),
+                summary: format!("fetched ‘origin/b{i}’ from origin"),
+                old_oid: Some(format!("o{i}")),
+                new_oid: Some(format!("n{i}")),
+                source: ActivitySource::App,
+                undo: None,
+                refs: None,
+            })
+            .collect();
+
+        let feed = assemble_feed(journal, reflog, &HashMap::new(), &HashSet::new(), 500);
+        let counted: i64 = feed
+            .iter()
+            .find_map(|e| {
+                e.summary
+                    .strip_prefix("fetch — ")?
+                    .strip_suffix(" refs updated")?
+                    .parse()
+                    .ok()
+            })
+            .expect("F1: expected one counted fetch row");
+
+        assert_eq!(
+            counted, REFS,
+            "F1: the fold counted {counted} refs but only {REFS} moved — the \
+             journal's own write cost drifted its entries past the dedup window, \
+             so each movement was counted twice"
         );
     }
 }
