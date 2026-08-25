@@ -18,6 +18,7 @@ import {
   buildFixture,
   buildInterleavedWipFixture,
   buildNonTextConflictFixture,
+  buildStashFixture,
 } from './fixture.mjs'
 import { startServer } from './server.mjs'
 
@@ -90,6 +91,11 @@ export default async function globalSetup() {
   // asserts against. Its bare origin lives beside it under `work` and is not
   // offered to the picker.
   const interleavedFixture = buildInterleavedWipFixture(join(work, 'interleaved-repo'))
+  // #77: a seventh repo with three real stash entries, one of which cannot be
+  // applied cleanly. Separate because it is the only repo here whose stash list
+  // has an asserted count, and because applying that entry leaves collision.txt
+  // conflicted — a state no other spec's repo may inherit.
+  const stashFixture = buildStashFixture(join(work, 'stash-repo'))
   const { child, base, signInUrl } = await startServer({
     repoPath: fixture.root,
     extraRepos: [
@@ -98,6 +104,7 @@ export default async function globalSetup() {
       editorFixture.root,
       brokenHeadFixture.root,
       interleavedFixture.root,
+      stashFixture.root,
     ],
     stateHome: join(work, 'state'),
   })
@@ -119,6 +126,7 @@ export default async function globalSetup() {
         nonTextFixture,
         editorFixture,
         brokenHeadFixture,
+        stashFixture,
         interleavedFixture,
       },
       null,

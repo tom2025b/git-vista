@@ -28,6 +28,7 @@ use crate::datetime::time_ago;
 use crate::features::activity::core::{event_commit, kind_glyph, kind_label};
 use crate::features::dialogs::core::Dialog;
 use crate::features::shell::signals as shell_state;
+use crate::features::stash::view::stash_section_view;
 use crate::features::status::core::{chip_label, StatusHeadline, StatusSection, StatusSections};
 use crate::features::tags::core::{
     tag_list_view, tag_row_lines, TagListView, TagRow, LOADING_TAGS, NO_TAGS,
@@ -83,6 +84,17 @@ pub fn activity_panel_view(
             }
         },
     );
+
+    // The push preview (M3.24 #77, A2) needs the staged/unstaged/untracked
+    // counts, and it must read the SAME working-tree observation the status
+    // section above renders — a second `/api/status/v2` resource would be a
+    // second "is the panel open" to drift, which is the defect M1.11 removed.
+    let status_sections = Signal::derive(move || {
+        worktree_status
+            .get()
+            .flatten()
+            .map(|s| StatusSections::from_worktree_status(&s))
+    });
 
     // The tag list (M2.21b, #236), keyed exactly like the feed above: open the
     // panel and it is read fresh, and any operation that bumps the graph epoch
@@ -359,6 +371,7 @@ pub fn activity_panel_view(
                             "Tags"
                         </div>
                         {tags_section}
+                        {stash_section_view(features, settings, read_only, status_sections)}
                         <div class="detail-section-title act-feed-title">
                             "History"
                         </div>

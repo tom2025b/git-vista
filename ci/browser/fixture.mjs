@@ -477,3 +477,83 @@ export function buildInterleavedWipFixture(root) {
     rewritten: TWIN_REWRITTEN,
   }
 }
+
+/**
+ * A SEVENTH repository, holding real stash entries (M3.24, #77).
+ *
+ * Its own repository for the reason every fixture here is its own: the drawer
+ * spec asserts an exact stash count, and `buildFixture`'s repo is left
+ * deliberately dirty (staged + unstaged + untracked, simultaneously) for #68d
+ * and #348. Stashing in that repo would empty the working tree those specs
+ * assert on, and stashing anywhere else would change a count.
+ *
+ * Three entries, because each one exists for a different assertion:
+ *
+ *   `stash@{2}` — the OLDEST, made with `git stash push -m`, so its reflog
+ *   message is the `On <branch>: <text>` form. Pins that a user's own words are
+ *   shown as written and marked as theirs (no "auto" pill).
+ *
+ *   `stash@{1}` — made with a bare `git stash`, so git writes
+ *   `WIP on main: <sha> <subject>`. Pins the other parse: the branch comes out
+ *   as a pill, the base commit's sha is dropped from the subject, and the entry
+ *   IS marked automatic.
+ *
+ *   `stash@{0}` — the NEWEST, and the one that CONFLICTS on apply. Built by
+ *   stashing an edit to a line and then committing a different edit to the same
+ *   line, so `git stash apply` cannot merge it. This is the A4 fixture: a pop
+ *   here applies something and drops nothing, and the drawer must not say
+ *   "popped".
+ *
+ * The conflicting entry is deliberately `stash@{0}` so a spec can reach it
+ * without depending on row ordering beyond "first".
+ */
+export function buildStashFixture(root) {
+  rmSync(root, { recursive: true, force: true })
+  mkdirSync(root, { recursive: true })
+
+  const git = (...args) =>
+    execFileSync('git', [...IDENT, '-C', root, ...args], {
+      encoding: 'utf8',
+      env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+    })
+
+  git('init', '-q', '-b', 'main')
+  writeFileSync(join(root, 'tracked.txt'), 'the committed line\n')
+  writeFileSync(join(root, 'collision.txt'), 'original\n')
+  git('add', '-A')
+  git('commit', '-q', '-m', 'seed: two tracked files')
+
+  // --- stash@{2} after the two below land: the `-m` message form.
+  writeFileSync(join(root, 'tracked.txt'), 'a named change\n')
+  git('stash', 'push', '-m', 'half-finished refactor')
+
+  // --- stash@{1}: the automatic `WIP on main: <sha> <subject>` form.
+  writeFileSync(join(root, 'tracked.txt'), 'an unnamed change\n')
+  git('stash')
+
+  // --- stash@{0}: the one that conflicts.
+  //
+  // Stash an edit to `collision.txt`, then commit a DIFFERENT edit to the same
+  // line. The stash's base no longer matches the working tree, so applying it
+  // leaves the path conflicted. This is what A4 is about, and it is why this
+  // fixture cannot be shared with any spec that wants a clean tree.
+  writeFileSync(join(root, 'collision.txt'), 'the stashed edit\n')
+  git('stash', 'push', '-m', 'will not apply cleanly')
+  writeFileSync(join(root, 'collision.txt'), 'a conflicting committed edit\n')
+  git('add', 'collision.txt')
+  git('commit', '-q', '-m', 'move the line the stash also touches')
+
+  // An untracked file left in place, so the push preview has something to
+  // report as NOT stashed (A2). It is never stashed by this fixture.
+  writeFileSync(join(root, 'untracked-note.txt'), 'not in the index\n')
+
+  return {
+    root,
+    // Newest first, exactly as `GET /api/stashes` returns them.
+    entries: ['will not apply cleanly', 'WIP on main', 'half-finished refactor'],
+    stashCount: 3,
+    conflictingSelector: 'stash@{0}',
+    conflictingPath: 'collision.txt',
+    untracked: 'untracked-note.txt',
+  }
+}

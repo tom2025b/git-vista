@@ -35,6 +35,7 @@ mod remotes;
 mod repositories;
 mod session;
 mod staging;
+mod stash;
 mod status;
 mod tags;
 
@@ -46,7 +47,7 @@ pub use branches::{
 pub use clone::clone_request;
 pub use commits::{amend_commit_request, create_commit_request, fetch_commit_detail};
 pub use conflicts::{
-    fetch_conflict_panes, fetch_conflict_source, resolve_conflict_content_request,
+    fetch_conflict_panes, fetch_conflict_source, fetch_conflicts, resolve_conflict_content_request,
     resolve_conflict_request,
 };
 pub use diff::{fetch_diff, fetch_diff_full, fetch_file, fetch_spec_diff};
@@ -62,6 +63,10 @@ pub use session::{fetch_protocol, get_session, post_session};
 pub use staging::{
     stage_request, staging_apply_request, staging_diff_request, staging_preview_request,
     unstage_request,
+};
+pub use stash::{
+    apply_stash_request, branch_from_stash_request, drop_stash_request, fetch_stash_patch,
+    fetch_stashes, push_stash_request,
 };
 pub use status::{
     delete_untracked_paths_request, discard_tracked_paths_request, fetch_status,

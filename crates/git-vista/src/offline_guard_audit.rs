@@ -95,6 +95,16 @@ use std::collections::{BTreeMap, BTreeSet};
 /// drift out of this census's view the way a hand-copied fixture could.
 /// [`fn_bodies`] keys everything by function name, not by file, so the
 /// concatenation order below is arbitrary — it need only include every file.
+///
+/// **"Every file" is load-bearing, and it was wrong.** `api/conflicts.rs` was
+/// absent from this list from the moment the `api/` split created it until #77,
+/// so `resolve_conflict_request` and `resolve_conflict_content_request` reached
+/// the write transport with nothing in this module watching them. Both were
+/// correctly guarded in fact — but that was luck, not ratchet, and a deleted
+/// guard would have passed every test in here. A hand-maintained
+/// `include_str!` list has no way to notice its own gap, so
+/// [`api_src_concatenates_every_api_submodule`] now compares it against the
+/// directory on disk.
 const API_SRC: &str = concat!(
     include_str!("api.rs"),
     "\n",
@@ -105,6 +115,8 @@ const API_SRC: &str = concat!(
     include_str!("api/clone.rs"),
     "\n",
     include_str!("api/commits.rs"),
+    "\n",
+    include_str!("api/conflicts.rs"),
     "\n",
     include_str!("api/diff.rs"),
     "\n",
@@ -119,6 +131,8 @@ const API_SRC: &str = concat!(
     include_str!("api/session.rs"),
     "\n",
     include_str!("api/staging.rs"),
+    "\n",
+    include_str!("api/stash.rs"),
     "\n",
     include_str!("api/status.rs"),
     "\n",
@@ -206,6 +220,28 @@ const OFFLINE_GUARDED: &[&str] = &[
     // The most consequential write in this table: an irreversible remote
     // publish. Guarded first thing.
     "push_request",
+    // M4.31b/M4.31c (#429, #432). Both resolve a conflicted path — a
+    // working-tree write through the shared planner — and both call the guard
+    // as their first action. They were **not** in this table until #77 added
+    // `api/conflicts.rs` to `API_SRC`: the file was missing from that
+    // concatenation, so the census never saw either function and the ratchet
+    // this module exists to be did not cover them. See
+    // `api_src_concatenates_every_api_submodule`, added at the same time so a
+    // forgotten `include_str!` cannot hide a write path again.
+    "resolve_conflict_request",
+    "resolve_conflict_content_request",
+    // M3.24 (#77). The stash drawer's four writes. All four are ref or
+    // working-tree mutations through the shared planner and all four call the
+    // guard first. `drop_stash_request` is the destructive one — the entry's
+    // commit becomes unreachable and only the recovery pin keeps it alive — and
+    // it is also the second half of a composed pop, sent only after
+    // features::stash::core::drop_gate returns Run. There is no
+    // `pop_stash_request` to classify: the server has no /api/stash/pop route,
+    // deliberately, so no client function can bypass that gate.
+    "push_stash_request",
+    "apply_stash_request",
+    "drop_stash_request",
+    "branch_from_stash_request",
     // M2.16 (#69). `POST /api/diff/spec` — the four explicit DiffSpec modes.
     // A pure read that mutates nothing, so it appears in this table for the
     // same reason `preview_push` does: it reaches the *write transport*
@@ -1047,4 +1083,78 @@ fn the_amend_and_then_shape_is_accepted() {
         }
     "#;
     assert_eq!(check_guard(&only_fn_body(src)), GuardVerdict::Ok);
+}
+
+#[cfg(test)]
+mod api_src_completeness {
+    use super::API_SRC;
+
+    /// Every `.rs` file under `src/api/` must have its bytes inside
+    /// [`API_SRC`].
+    ///
+    /// # Why this test exists
+    ///
+    /// [`API_SRC`] is a hand-written `concat!` of `include_str!`s. Every
+    /// assertion in this module is quantified over "every write-reaching
+    /// function in `API_SRC`", so a file missing from that list is not a
+    /// smaller census — it is a **silent** one: the functions in it are never
+    /// discovered, never required to be classified, and never checked for
+    /// guard ordering. The module reports success either way.
+    ///
+    /// That is not hypothetical. `api/conflicts.rs` was missing from the list
+    /// from the `api/` split until #77, hiding two write-reaching functions.
+    /// Adding it to `API_SRC` made
+    /// `every_write_reaching_function_is_classified` fail immediately, which is
+    /// exactly what the ratchet is supposed to do — it simply never got the
+    /// chance.
+    ///
+    /// Compares against the real directory rather than a second hand-written
+    /// list of names, because a second list would rot the same way the first
+    /// one did.
+    ///
+    /// MUTATION 1 (removes the mechanism): delete any `include_str!` line from
+    ///   `API_SRC` — red, naming the file that is no longer covered. Verified
+    ///   by hand: red.
+    /// MUTATION 2 (keeps the walk, weakens the check): compare only the file
+    ///   *names* against a hardcoded list instead of the bytes against
+    ///   `API_SRC` — a file could then be listed by name while its
+    ///   `include_str!` was absent. Simulated by asserting on a name list
+    ///   built from the same directory walk, which passes while `API_SRC` is
+    ///   short. Verified by hand: green, i.e. the weaker check is the one this
+    ///   test deliberately does not make.
+    #[test]
+    fn api_src_concatenates_every_api_submodule() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/api");
+        let mut checked = 0usize;
+
+        for entry in std::fs::read_dir(dir).expect("src/api must be readable") {
+            let entry = entry.expect("a readable directory entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".rs") {
+                continue;
+            }
+            let content =
+                std::fs::read_to_string(entry.path()).unwrap_or_else(|e| panic!("{name}: {e}"));
+
+            assert!(
+                API_SRC.contains(&content),
+                "src/api/{name} is not concatenated into API_SRC, so every census in \
+                 offline_guard_audit.rs is blind to the write-reaching functions it \
+                 contains. Add `include_str!(\"api/{name}\"),` to API_SRC — and expect \
+                 `every_write_reaching_function_is_classified` to then demand a decision \
+                 for each of them, which is the point."
+            );
+            checked += 1;
+        }
+
+        // A floor, so a `read_dir` that silently yielded nothing (a moved
+        // directory, a changed manifest dir) could not pass this test by
+        // examining no files at all — the same "a scan that did not look is
+        // not a clean scan" discipline the guarded code itself follows.
+        assert!(
+            checked >= 14,
+            "only {checked} api submodules were examined; the directory walk found \
+             fewer files than exist, so this test proved nothing"
+        );
+    }
 }
