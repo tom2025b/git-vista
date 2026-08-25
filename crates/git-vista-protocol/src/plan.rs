@@ -1252,9 +1252,27 @@ pub enum GitOperation {
     // could become representable.
     //
     // Between 2026-08-18 and 2026-08-25 this comment was false: a fully wired
-    // `PopStash` sat forty-six lines above it, unreachable because no route
-    // built one, and shelling out to `git stash pop` — which §5 of that same
-    // spec forbids in as many words. Clients compose a pop out of
+    // `PopStash` sat forty-six lines above it, shelling out to `git stash pop`
+    // — which §5 of that same spec forbids in as many words.
+    //
+    // **And it was REACHABLE, which #493, ADR 0078 and this comment's first
+    // correction all got wrong.** They said no route built one. `POST
+    // /api/plan` deserializes a bare, client-supplied `GitOperation`
+    // (`handlers/plan.rs`: `Json(op): Json<GitOperation>`), `shape()` and the
+    // executor dispatch both had `PopStash` arms, and `POST /api/execute-plan`
+    // takes the returned `Plan` and runs it through `submit_plan_tracked`
+    // WITHOUT rebuilding it — the plan's own hash is the approval. So any
+    // holder of a session and CSRF token, the MCP server included, could
+    // execute a `Destructive` operation §5 had gated. The gate it was missing
+    // is the one that renders an applied-but-not-dropped pop in the Recovery
+    // Centre, so the exposure was data-shaped rather than access-shaped.
+    //
+    // Removing the variant is what actually closed it: `"op":"pop_stash"`
+    // now fails deserialization at the boundary. Found by an outside model
+    // (codex) reviewing the batch that removed it — four Claude passes wrote
+    // or repeated the "unreachable" claim without checking the generic seam.
+    //
+    // Clients compose a pop out of
     // `ApplyStash` → read the conflict state → `DropStash`, which is the
     // shape §5 says can tell the truth; see ADR 0077 for what such a client
     // is allowed to claim about the result.

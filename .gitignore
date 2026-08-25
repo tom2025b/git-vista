@@ -86,3 +86,11 @@ crates/**/README.pdf
 /README.pdf
 target-testbed-*/
 /ci/browser/*.pdf
+
+# Tool logs dropped in the repo root by agent CLIs. codex cloud's TUI writes
+# `error.log` here on every run; it carries diagnostics and a ChatGPT account
+# id, and this repository is PUBLIC. No credentials were in the one observed on
+# 2026-08-25 (`"secrets": {}`), but an untracked file in a public repo's root is
+# one `git add -A` away from being published, and that is not a bet worth
+# taking on a file whose contents are decided by someone else's tool.
+/error.log

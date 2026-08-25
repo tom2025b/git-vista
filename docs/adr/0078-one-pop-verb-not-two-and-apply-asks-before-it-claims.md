@@ -108,3 +108,55 @@ The frontend is untouched and keeps working: a refused apply is still 400 and a 
 **F5 — A 4xx on a succeeded apply was shipped, and cross-session review caught it.** The first version of this branch returned 409 from `AppliedWithConflicts` and 400 from `Unverifiable`, copying `exec_pop_stash`'s status codes without checking what reads them. Both are wrong for the reasons in § "The status mirrors git's exit status", and both were invisible to every test on this branch because the frontend and `operations.rs` are in crates the stash executor's tests never touch. The unreachability of `AppliedWithConflicts` on git 2.43.0 made it worse, not better: the arm exists *only* to hold a guarantee against a future git, and in that future it would have rendered the wrong sentence. `the_status_mirrors_gits_exit_status_not_the_scan` now pins the coupling in the crate that can break it, with the reason in the assertion message rather than left to a reviewer.
 
 **F6 — The status is spent, so the body carries the obligation.** Once 2xx means "git succeeded", a 2xx no longer distinguishes finished from unfinished, and a mutation that dropped `"NOT complete"` from `Unverifiable`'s body **survived** the completion test — that test reads bodies opening with `"Applied "`, and `Unverifiable`'s opens with `"Applying "`. The fix was not to widen the prefix but to assert the obligation where it belongs: every 2xx that is not a finished apply must disclaim in its body. That assertion also kills the equivalent mutation on `AppliedWithConflicts`.
+
+## Correction (2026-08-25, same day): it was not unreachable
+
+**This ADR, the issue that prompted it (#493), and the merge review that
+accepted it all said `PopStash` was unreachable because no route built one.
+That is false, and it was found the same afternoon by an outside model (codex)
+reviewing this batch.**
+
+The generic plan seam reached it end to end:
+
+| step | code |
+|---|---|
+| `POST /api/plan` | `plan_operation(Json(op): Json<GitOperation>)` — a **bare, client-supplied** operation |
+| plan construction | `shape()` and the executor dispatch both carried `PopStash` arms (`planner.rs:1672`, `:2610`) |
+| `POST /api/execute-plan` | `execute_plan(Json(plan): Json<Plan>)` → `submit_plan_tracked(plan)` — takes the client's plan and **does not rebuild it**; the plan's own hash is the approval |
+
+Both routes are `Authz::SessionAndCsrf` and live only in the write-mode router,
+so this needed an authenticated session — the operator, or the MCP server,
+which drives these exact two endpoints on purpose.
+
+### Why the correction matters more than the wording
+
+The spec §5 gate on `PopStash` is not stylistic. It exists because a pop that
+applies and then fails to drop has no durable representation: the operation row
+says `Failed`, which is indistinguishable from "nothing happened" while the
+user's changes are in the tree. **So the exposure was data-shaped, not
+access-shaped** — an operation could reach a state the Recovery Centre had no
+way to render, which is precisely the situation §5 was written to prevent.
+
+Between 2026-08-18 and 2026-08-25 that was reachable by any session holder.
+
+### What this does NOT change
+
+**The decision stands, and it was worth more than this ADR claimed.** Deleting
+the variant is what actually closed the path: `"op":"pop_stash"` now fails
+deserialization at the wire boundary, before any planner code runs. Option A
+was right. The argument given for it — "it is dead code contradicting a
+comment" — understated it. It was live code contradicting a spec.
+
+### The process lesson
+
+Four passes asserted "unreachable" without checking the generic seam: the issue
+author, the implementing session, the pre-dispatch truth-check fan-out, and the
+merging session. All four were Claude. The seam is documented in
+`handlers/plan.rs`'s own header — *"`GitOperation` is already the closed,
+internally-tagged wire … and answers a `Plan`; the execute endpoint takes that
+same"* — so it was not hidden. It was simply not the question any of them
+thought to ask.
+
+**A "no route points at it" claim is a claim about EVERY route, including the
+generic ones.** Grep for the type, not for the variant name.
+

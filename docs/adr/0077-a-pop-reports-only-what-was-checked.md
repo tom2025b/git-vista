@@ -1,6 +1,8 @@
 # 0077 — A pop is two operations, and its report never outruns what was checked
 
-**Status:** Accepted — implemented and tested (frontend); the browser leg is written but has not been executed
+**Status:** Accepted — implemented and tested (frontend); **the browser leg has
+since been executed, and it found three defects this ADR's own slice shipped
+with.** See "What running it actually found", below.
 **Date:** 2026-08-25
 **Issue:** [#77](https://github.com/tom2025b/Git-Vista/issues/77)
 
@@ -134,3 +136,42 @@ The verdict carries paths (`conflicted_paths()`), not markup. The view opens `Vi
 **F3 — the stash endpoints share no DTOs with the client.** `handlers::stash::stash_list` builds its JSON object by hand and each write handler declares its own `Deserialize` struct, so every field name exists twice in the workspace with nothing forcing them to agree. A rename on either side presents as an empty drawer. Pinned from the client side by `the_listing_shape_the_server_actually_sends`, which asserts against a JSON literal transcribed from that handler — weaker than one type serving both ends, and recorded as weaker in `StashEntry`'s own doc comment.
 
 **F4 — `offline_guard_audit`'s `API_SRC` was blind to `api/conflicts.rs`.** Fixed on this branch (it is frontend code): the file was never added to the hand-maintained `include_str!` list when the `api/` split created it, so `resolve_conflict_request` and `resolve_conflict_content_request` reached the write transport with nothing in that census watching them. Both were correctly guarded in fact, but a deleted guard would have passed every test in the module. `api_src_concatenates_every_api_submodule` now walks the directory, because a hand-maintained list cannot notice its own gap.
+
+## What running it actually found (added 2026-08-25)
+
+This ADR shipped with its browser leg written but unexecuted — a cloud session
+cannot run it, because the server refuses to start without the strict sandbox
+tier and that container's kernel has no Landlock. The leg was run on the
+operator's box a few hours later, against the exact head being merged. **It
+failed, three times, for three unrelated reasons**, and every one of them was
+invisible to the seven CI checks that had already passed.
+
+**1. The drawer's "Show changes" control was dead on arrival.** The server's
+`ShowStashQuery` shipped `#[serde(deny_unknown_fields)]`, while the frontend
+appends a `?t=<millis>` cache-buster to every GET it makes. Every click
+answered `unknown field \`t\`, expected \`entry\``, and the drawer rendered that
+JSON where the patch belonged. `read.rs`'s `PageQuery` documents the rule this
+broke, in a comment, and had done for months.
+
+**2. Every outcome notice was destroyed one frame after it appeared** — this
+ADR's D6 sentence included. `StashDrawer` was created inside a reactive child
+that tracks the graph epoch; every drawer write ends `set_notice(...)` then
+`force_bump()`, so the bump rebuilt the child and threw away the message it had
+just written. A conflicted pop left conflict markers in the user's tree and
+said **nothing at all**. The verdict logic this ADR specifies was correct
+throughout; it simply never reached the screen.
+
+**3. Two spec locators could never have matched** — `getByText(/^\+.../m)`
+inside a `<pre>` (Playwright normalises newlines to spaces before matching),
+and a text match that also hit the preview sentence naming its own checkbox.
+
+**The lesson this ADR should carry forward, because it is more general than the
+stash drawer:** a verdict that is computed correctly and never rendered is
+indistinguishable, to the user, from a verdict that was never computed. D6 says
+a report must not outrun what was checked. It should also say that a report
+which does not survive the refresh its own operation triggers has not been made
+at all.
+
+Both defects 1 and 2 are fixed on `main` (commit `e270350c`), each
+mutation-proved two different ways, and A4 now additionally asserts that the
+notice survives the panel's own Refresh.
