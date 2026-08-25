@@ -275,14 +275,35 @@ lines, and removing them takes the feed from 94 rows to 95.
   orders of magnitude as the finding; the absolute milliseconds will differ on
   Tom's box. The quadratic *shape* — bytes/line rising 537 → 28,872 as refs rise
   1 → 500 — is not a timing artefact.
-- **No test was added.** The tests that would pin F1 and F2 are red against
-  current `main`, and a red test does not belong in a green gate. The fixtures
-  are reproduced below so whoever fixes them starts from the reproduction rather
-  than rebuilding it.
+- **F1 and F2 are pinned as expected failures**, in
+  `crates/git-vista-core/src/activity.rs`. Each asserts what the fold *should*
+  do and is marked `#[should_panic]` because it does not do it yet — the same
+  shape as `test.fail()` in `ci/browser/tests/hunk-keyboard.spec.mjs`, adopted
+  there because #210 survived for months behind a green gate. A test asserting
+  today's wrong answer would go quietly green and stay green after a fix;
+  `#[ignore]` says nothing at all. These go **red the moment the defect is
+  fixed**, so the fix cannot land unnoticed. Fixing either one means deleting
+  its `#[should_panic]`; the assertions are already correct.
+- **Both pins were mutation-proven by hand**, two ways each — `failure-atlas`
+  is a local MCP server and was not available in this session:
+
+  | Pin | Mutation | Result |
+  | --- | --- | --- |
+  | F2 | Apply the real fix (exclude `ref_name`/oids all-`None` from folding) | red ✅ |
+  | F2 | Weaken the fixture: drop the reflog lines, making it a true run of one | red ✅ |
+  | F1 | Remove the mechanism: widen `JOURNAL_MATCH_SLACK` to 100,000 | red ✅ |
+  | F1 | Weaken the trigger: journalling costs 0 ms/ref, so nothing drifts | red ✅ |
+
+  The F2 fix mutation is worth noting on its own: it is a **one-line** change to
+  the `partition` predicate in `fold_ref_update_bursts`, and the pin caught it.
 
 ## Reproduction
 
-Drop into `crates/git-vista-core/tests/` and run with `--nocapture`.
+F1 and F2 now live as expected-failure pins in `activity.rs`'s test module
+(`a_slow_fetch_still_counts_only_the_refs_that_moved`,
+`an_unobserved_fetch_keeps_its_admission_instead_of_being_counted`). The
+standalone fixtures below reproduce the same two findings outside the gate —
+drop into `crates/git-vista-core/tests/` and run with `--nocapture`.
 
 ```rust
 use git_vista_core::activity::{
