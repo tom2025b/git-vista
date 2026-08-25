@@ -71,6 +71,20 @@ pub(crate) mod tags;
 // M1.04 (#57): establish / check / revoke a loopback session.
 pub(crate) mod session;
 
+/// One entry of a batched app journal write: exactly the five fields
+/// [`journal_app_event`] takes, minus the repository they are written to.
+///
+/// A named struct rather than a tuple because two of the three `Option`
+/// fields hold object ids and the third holds a ref name; a five-tuple at the
+/// call site would let the two oids swap silently.
+pub(crate) struct AppEntry {
+    pub kind: ActivityKind,
+    pub ref_name: Option<String>,
+    pub old_oid: Option<String>,
+    pub new_oid: Option<String>,
+    pub summary: String,
+}
+
 /// Record one successful app operation in the journal (source: App). The
 /// activity feed matches the operation's own reflog echo against this entry
 /// and shows a single event labelled "via git-vista". Best-effort by design:
@@ -83,20 +97,63 @@ pub(crate) fn journal_app_event(
     new_oid: Option<String>,
     summary: String,
 ) {
-    journal::append(
+    journal_app_events(
         repo,
-        &ActivityEvent {
-            time: activity::now_secs(),
+        vec![AppEntry {
             kind,
             ref_name,
-            summary,
             old_oid,
             new_oid,
+            summary,
+        }],
+    );
+}
+
+/// Record one operation that moved several refs — every entry written
+/// together, under one ref capture and at one moment (#485, ADR 0080).
+///
+/// # One moment, not one per entry
+///
+/// Every entry is stamped with the same [`activity::now_secs`] reading,
+/// because they describe one action. That is not a convenience: the feed
+/// attributes a journal entry to git's own reflog line for the same movement
+/// only when the two are within `JOURNAL_MATCH_SLACK` of each other, and while
+/// each entry took its own reading *after* its own full ref read, entry *i*
+/// drifted further and further from the reflog line git wrote for it. Past
+/// roughly 170 refs the later entries stopped matching, their reflog lines
+/// survived attribution, and the fold counted both copies — 500 refs reported
+/// as 891 (`docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`,
+/// F1). Removing the per-entry ref read removes most of that drift; taking one
+/// reading for the batch removes the rest of it at this level.
+///
+/// It does **not** repair the fold, which over-counts whenever entries drift
+/// past the window for any reason — that defect is still pinned in
+/// `git_vista_core::activity`.
+///
+/// # Still one entry per ref
+///
+/// The batching is in the *capture*, never in the entries. `0a7ba777` reverted
+/// an attempt to replace them with a single summary entry: the per-ref
+/// entries, each carrying a `new_oid`, are what suppresses git's own per-ref
+/// reflog lines, and a summary entry suppresses none of them.
+pub(crate) fn journal_app_events(repo: &Path, entries: Vec<AppEntry>) {
+    let time = activity::now_secs();
+    let events: Vec<ActivityEvent> = entries
+        .into_iter()
+        .map(|entry| ActivityEvent {
+            time,
+            kind: entry.kind,
+            ref_name: entry.ref_name,
+            summary: entry.summary,
+            old_oid: entry.old_oid,
+            new_oid: entry.new_oid,
             source: ActivitySource::App,
             undo: None,
-            // Left None deliberately: journal::append captures the branch-tip
-            // map itself (#131), so no write endpoint can forget to.
+            // Left None deliberately: journal::append_all captures the
+            // branch-tip map itself (#131), so no write endpoint can forget
+            // to — once for the whole batch since #485.
             refs: None,
-        },
-    );
+        })
+        .collect();
+    journal::append_all(repo, &events);
 }
