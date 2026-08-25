@@ -267,6 +267,36 @@ fn conflict_detail(c: &git_vista_protocol::conflict::Continuation) -> String {
 ///
 /// `git_said` is git's own stderr, already defaulted by [`stderr_or`]. It is
 /// used only on the two failure verdicts, where git has the better message.
+///
+/// # The status mirrors git's exit status. The verdict rides in the body.
+///
+/// **2xx exactly when `git stash apply` succeeded**, whatever the conflict
+/// scan then found. This is not a stylistic choice; two things downstream read
+/// the status and neither can read the body.
+///
+/// 1. **`ApplyOutcome`, and ADR 0077 D6.** The frontend's
+///    `api::stash::apply_stash_request` derives its whole outcome from
+///    `resp.ok()` — any non-2xx becomes `ApplyOutcome::Refused`. `drop_gate`
+///    then sets `PopVerdict::Conflicted { apply_refusal }` from it, and D6
+///    turns that into one of two different sentences: `None` →
+///    *"The changes were applied but left conflicts"*, `Some(_)` →
+///    *"Applying the stash hit conflicts"*. A 409 on
+///    [`ApplyVerdict::AppliedWithConflicts`] would make the *only* case D6's
+///    `None` branch exists for unreachable, and the UI would tell a user their
+///    apply was refused while their changes sat in the tree.
+/// 2. **The durable operation row.** `operations::apply_terminal` maps
+///    `status.is_success()` to `Succeeded` or `Failed` with nothing in
+///    between. A 409 here would record `Failed` for an apply git performed —
+///    "the record says only `Failed`, indistinguishable from nothing
+///    happened", which is the exact single-row limit that kept `PopStash` out
+///    of the enum. `Succeeded` is honest for an apply in a way it never was
+///    for a pop: apply's contract is *restore the changes and keep the entry*,
+///    and a conflicted apply did both. Nothing is lost either way.
+///
+/// So no verdict is demoted to 4xx for what the *scan* found. The
+/// "not complete" claim lives in the body, which is the only channel that can
+/// carry a three-way distinction, and it is asserted by
+/// [`tests::exactly_one_verdict_reports_the_apply_as_complete`].
 pub(super) fn render_apply(
     verdict: &ApplyVerdict,
     git_said: &str,
@@ -278,8 +308,11 @@ pub(super) fn render_apply(
             format!("Applied {entry}. It is still in your stash list."),
         ),
 
+        // 2xx: git succeeded. See this function's doc comment — a 4xx here
+        // makes ADR 0077 D6's "applied but left conflicts" sentence
+        // unreachable and records `Failed` for an apply that happened.
         ApplyVerdict::AppliedWithConflicts(c) => (
-            StatusCode::CONFLICT,
+            StatusCode::OK,
             format!(
                 "Applying {entry} left conflicts, so it is NOT complete.{}\n\n\
                  The stash entry was not removed — it is still in the list. Resolve \
@@ -313,12 +346,20 @@ The stash entry was not removed — it is still in the list."
             ),
         ),
 
+        // 2xx for the same reason: git succeeded, so `ApplyOutcome::Applied` is
+        // the true reading, and the frontend's `AppliedUnverified` verdict —
+        // "applied, scan unavailable, drop withheld" — is only reachable from
+        // it. A 4xx would produce `RefusedUnverified`, whose sentence is
+        // "whether anything reached the tree is genuinely unknown", and it is
+        // not unknown: git said it applied. The drop is gated client-side on
+        // the client's own successful scan, so a 2xx here authorises nothing.
         ApplyVerdict::Unverifiable(why) => (
-            StatusCode::BAD_REQUEST,
+            StatusCode::OK,
             format!(
-                "git stash apply ran, but the conflict state could not be read afterwards \
-                 — {why}. Check `git status` before continuing; this server will not \
-                 report the apply as complete on a check it could not make."
+                "Applying {entry} ran and git reported success, but the conflict state \
+                 could not be read afterwards — {why}. This is NOT complete: run \
+                 `git status` before treating it as done, because this server could not \
+                 make the check that would say so."
             ),
         ),
     }
@@ -674,18 +715,31 @@ mod tests {
     /// whole outcome space rather than as a check on one path, which is the
     /// form that survives someone adding a sixth verdict later.
     ///
+    /// The claim is read from the **body alone**, deliberately. Three of the
+    /// five verdicts are 2xx (see [`render_apply`]'s doc comment on why the
+    /// status mirrors git's exit status), so a status-shaped test of this
+    /// property would now pass three verdicts and prove nothing.
+    ///
     /// Killed two ways, both run:
     ///
-    /// - **R1, removed:** return `StatusCode::OK` from `AppliedWithConflicts`.
+    /// - **R1, removed:** give `AppliedWithConflicts` the `Applied` body.
     ///   Two verdicts then claim completion.
-    /// - **R2, weakened:** keep the 409 but soften the wording to
-    ///   `"Applied {entry}, with conflicts"`. The status is still correct, so a
-    ///   status-only assertion passes — this one reads the body's opening
-    ///   claim, which is why the filter tests `starts_with("Applied ")` rather
-    ///   than a fixed sentence. R2 survived an earlier, narrower version of
-    ///   this test; the filter was widened because of it.
+    /// - **R2, weakened:** soften its wording to
+    ///   `"Applied {entry}, with conflicts"`, dropping the disclaimer while
+    ///   keeping everything else. R2 survived an earlier, narrower version of
+    ///   this test that matched a fixed prefix; the comma defeated it. It is
+    ///   why the check is now "opens by asserting the apply happened **and**
+    ///   takes it back nowhere".
     #[test]
     fn exactly_one_verdict_reports_the_apply_as_complete() {
+        /// A body claims completion when it opens by saying the apply happened
+        /// and disclaims it nowhere.
+        fn claims_complete(body: &str) -> bool {
+            body.starts_with("Applied ")
+                && !body.contains("NOT complete")
+                && !body.contains("could not be read afterwards")
+        }
+
         let all = [
             ApplyVerdict::Applied,
             ApplyVerdict::AppliedWithConflicts(blocked()),
@@ -696,17 +750,87 @@ mod tests {
         let claiming: Vec<_> = all
             .iter()
             .map(|v| render(v.clone()))
-            // "claims complete" means either a 2xx, or a body that OPENS by
-            // asserting the apply happened. The second half is what catches a
-            // 409 whose wording was softened to "Applied …, with conflicts" —
-            // a status-only check reads that as correct.
-            .filter(|(status, body)| status.is_success() || body.starts_with("Applied "))
+            .filter(|(_, body)| claims_complete(body))
             .collect();
         assert_eq!(
             claiming.len(),
             1,
             "exactly one of five verdicts may read as a completed apply, got {claiming:?}"
         );
+        assert!(
+            claims_complete(&render(ApplyVerdict::Applied).1),
+            "and it must be `Applied`"
+        );
+    }
+
+    /// **The status mirrors git's exit status — never what the scan found.**
+    ///
+    /// Two things downstream read the status and cannot read the body, and
+    /// both break if a scan result is allowed to demote a successful apply.
+    /// `api::stash::apply_stash_request` derives `ApplyOutcome` from
+    /// `resp.ok()`, so a 4xx on a succeeded apply makes ADR 0077 D6's
+    /// *"The changes were applied but left conflicts"* sentence unreachable;
+    /// and `operations::apply_terminal` maps `is_success()` to
+    /// `Succeeded`/`Failed`, so it would record `Failed` for an apply that
+    /// happened — the single-row ambiguity that kept `PopStash` out of the
+    /// enum in the first place.
+    ///
+    /// Both of those live in crates this one cannot see, which is exactly why
+    /// the coupling is pinned here instead of being left to a reviewer.
+    ///
+    /// Killed two ways, both run:
+    ///
+    /// - **S1, removed:** `AppliedWithConflicts` returns
+    ///   `StatusCode::CONFLICT` — the shape this branch shipped before review
+    ///   caught it, and the more "correct-looking" status.
+    /// - **S2, weakened:** `Unverifiable` returns `StatusCode::BAD_REQUEST`,
+    ///   the conservative-seeming choice, which produces the frontend's
+    ///   `RefusedUnverified` — *"whether anything reached the tree is
+    ///   genuinely unknown"* — when git plainly said it applied.
+    #[test]
+    fn the_status_mirrors_gits_exit_status_not_the_scan() {
+        for v in [
+            ApplyVerdict::Applied,
+            ApplyVerdict::AppliedWithConflicts(blocked()),
+            ApplyVerdict::Unverifiable("boom".to_string()),
+        ] {
+            let (status, body) = render(v.clone());
+            assert!(
+                status.is_success(),
+                "git succeeded, so this must stay 2xx or ADR 0077 D6's \
+                 'applied but left conflicts' sentence becomes unreachable and the \
+                 operation row records Failed for an apply that happened — {v:?} gave \
+                 {status}: {body}"
+            );
+        }
+        for v in [
+            ApplyVerdict::Failed,
+            ApplyVerdict::FailedWithConflicts(blocked()),
+        ] {
+            let (status, body) = render(v.clone());
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "git failed, so this must stay 4xx — {v:?}: {body}"
+            );
+        }
+
+        // The obligation that BUYS the 2xx above. A successful status on an
+        // apply that is not finished is only defensible while the body says
+        // so, because the body is the sole channel carrying that distinction
+        // once the status has been spent on git's exit code.
+        for v in [
+            ApplyVerdict::AppliedWithConflicts(blocked()),
+            ApplyVerdict::Unverifiable("boom".to_string()),
+        ] {
+            let (status, body) = render(v.clone());
+            assert!(status.is_success(), "{v:?}");
+            assert!(
+                body.contains("NOT complete"),
+                "a 2xx that is not a finished apply must disclaim in the body — \
+                 it is the only place left to say it — {v:?}: {body}"
+            );
+        }
     }
 
     /// The two verdicts that carry conflicts must NAME them, and the two that

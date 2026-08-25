@@ -45,10 +45,20 @@ The verdicts:
 | verdict | when | says |
 |---|---|---|
 | `Applied` | git succeeded, scan clear | 200 — **the only verdict claiming completion** |
-| `AppliedWithConflicts` | git succeeded, scan blocked | 409, names the paths |
+| `AppliedWithConflicts` | git succeeded, scan blocked | **200**, says NOT complete, names the paths |
 | `FailedWithConflicts` | git failed, scan blocked | 400, git's stderr **plus** the paths |
 | `Failed` | git failed, scan clear | 400, git's stderr alone |
-| `Unverifiable` | git succeeded, scan failed | 400, the claim withdrawn |
+| `Unverifiable` | git succeeded, scan failed | **200**, says NOT complete, names the gap |
+
+### The status mirrors git's exit status; the verdict rides in the body
+
+**2xx exactly when `git stash apply` succeeded**, whatever the scan then found. `AppliedWithConflicts` and `Unverifiable` are 200, not 4xx, and that is load-bearing in two places neither of which can read a response body.
+
+**`ApplyOutcome`, and ADR 0077 D6.** `api::stash::apply_stash_request` derives its entire outcome from `resp.ok()` — any non-2xx becomes `ApplyOutcome::Refused`. `drop_gate` sets `PopVerdict::Conflicted { apply_refusal }` from that, and D6 turns it into one of two sentences: `None` → *"The changes were applied but left conflicts"*, `Some(_)` → *"Applying the stash hit conflicts"*. A 409 on `AppliedWithConflicts` makes D6's `None` branch — which exists for precisely this case and no other — unreachable, and tells a user their apply was refused while their changes sit in the working tree. The same argument demotes `Unverifiable`: a 4xx there produces `RefusedUnverified`, whose sentence is *"whether anything reached the tree is genuinely unknown"*, and it is not unknown — git said it applied.
+
+**The durable operation row.** `operations::apply_terminal` maps `status.is_success()` to `Succeeded` or `Failed` with nothing between them. A 4xx on a succeeded apply records `Failed` for an operation git performed — *"the record says only `Failed`, indistinguishable from nothing happened"*, which is verbatim the single-row limit that keeps `PopStash` out of the enum. `Succeeded` is honest here in a way it never was for a pop: apply's contract is *restore the changes and keep the entry*, and a conflicted apply did both. Nothing is lost either way, which is exactly what is not true of a pop.
+
+So no verdict is demoted for what the *scan* found. The "not complete" claim lives in the body — and because the status has been spent on git's exit code, the body is the only channel left that can carry it. A test asserts that obligation directly: a 2xx that is not a finished apply must disclaim in its body.
 
 **The two `Err` rows differ on purpose.** On the failure path git has already said the operation did not succeed and its stderr is the better message, so a broken scan costs only the conflict detail. On the success path the scan is the only thing between a green response and an unread working tree, so a broken scan withdraws the claim entirely. Collapsing those two arms is the obvious simplification and it is wrong in one direction; a test asserts the asymmetry with a message saying so.
 
@@ -78,9 +88,9 @@ So `AppliedWithConflicts` is **not a bug being fixed**. It is a guarantee held a
 
 **`pop_stash` leaves the v1 wire vocabulary.** No route ever built such a plan and plans are server-issued and operation-hashed, so nothing in the wild carries one. `tests/fixtures/plan_v1.json` loses its `pop_stash` plan and `plan_golden.rs` its fixture, which makes the comment already sitting there true.
 
-Two contract tests are deleted (`pop_stash_removes_the_entry_on_a_clean_pop`, `pop_stash_refuses_to_report_complete_while_conflicted`) and two added for apply. Seven unit tests are new.
+Two contract tests are deleted (`pop_stash_removes_the_entry_on_a_clean_pop`, `pop_stash_refuses_to_report_complete_while_conflicted`) and two added for apply. Eight unit tests are new.
 
-The frontend is untouched and keeps working: a refused apply is still 400, which is what `drop_gate` reads. ADR 0077 D3's client-side scan on the apply-only path is now redundant rather than wrong — the server names the paths itself — and can be dropped whenever that crate is next opened. It was left alone here deliberately; the frontend was out of scope for this change.
+The frontend is untouched and keeps working: a refused apply is still 400 and a succeeded one still 2xx, which is what `ApplyOutcome` and `drop_gate` read. ADR 0077 D3's client-side scan on the apply-only path is now redundant rather than wrong — the server names the paths itself — and can be dropped whenever that crate is next opened. It was left alone here deliberately; the frontend was out of scope for this change.
 
 **The two new pipeline tests were not executed on the branch that wrote them.** This container reports `landlock_abi=-1`, so the strict sandbox tier refuses every git spawn (INV-13 gives no degraded mode, per ADR 0029) and all 321 pipeline tests in `git-vista-server` fail identically before reaching their assertions — `ci_preflight_host_meets_the_declared_minimum` names the reason. Installing `bwrap` removed one of the two missing prerequisites and not the kernel one. Measured against `main` in the same container, the branch's failure set is unchanged: the two new tests fail where the two deleted pop tests used to, 320 either way. **The unit tests and the git measurements above did run here.**
 
@@ -90,7 +100,11 @@ The frontend is untouched and keeps working: a refused apply is still 400, which
 
 **F2 — A mutation harness reported false negatives.** The first battery flagged four mutations as "did not compile" because it grepped for `^error`, which matches cargo's own `error: test failed, to rerun pass…` line printed on every red run. Four real kills read as invalid mutations. A mutation harness that cannot distinguish a compile failure from a caught mutation gives the wrong answer in the safe-looking direction, and the two survivors it did report were the only reason it was checked.
 
-**F3 — Every test here is killed at least two ways, and it was run.** Fifteen mutations across `apply_verdict`, `render_apply` and `conflict_detail`, each applied alone and reverted: five kill the decision table, two kill the asymmetry test, two the completion test, two the path-naming test, two the status/stderr test, two the `Clear`-renders-nothing test, three the unreadable-paths test. The per-test tallies are in the doc comments beside them.
+**F3 — Every test here is killed at least two ways, and it was run.** Twenty-three mutations across `apply_verdict`, `render_apply` and `conflict_detail`, each applied alone and reverted: five kill the decision table, two the asymmetry test, two the completion test, two the path-naming test, four the status/stderr test, two the `Clear`-renders-nothing test, three the unreadable-paths test, and six the status-mirrors-git test. The per-test tallies are in the doc comments beside them.
 
 
 **F4 — The guarantee is bounded by the index, and that bound is worth naming.** A ninth shape was tried: a custom merge driver (`.gitattributes` + `merge.<name>.driver`) that writes conflict markers into the file and exits 0. `git stash apply` then exits **0**, `git ls-files -u` is **empty**, and the working tree contains `<<<<<<<` markers. Neither the exit code nor `crate::conflicts::continuation` catches it, because both are index-shaped and the index is clean. This is not a regression — the whole conflict model is built on unmerged index stages (ADR 0063) — and a user who configures a merge driver that lies has broken a contract git itself relies on. It is recorded because "apply now asks whether conflicts remain" should not be read as "apply now detects conflict markers"; it asks the index, and the index is what it reports.
+
+**F5 — A 4xx on a succeeded apply was shipped, and cross-session review caught it.** The first version of this branch returned 409 from `AppliedWithConflicts` and 400 from `Unverifiable`, copying `exec_pop_stash`'s status codes without checking what reads them. Both are wrong for the reasons in § "The status mirrors git's exit status", and both were invisible to every test on this branch because the frontend and `operations.rs` are in crates the stash executor's tests never touch. The unreachability of `AppliedWithConflicts` on git 2.43.0 made it worse, not better: the arm exists *only* to hold a guarantee against a future git, and in that future it would have rendered the wrong sentence. `the_status_mirrors_gits_exit_status_not_the_scan` now pins the coupling in the crate that can break it, with the reason in the assertion message rather than left to a reviewer.
+
+**F6 — The status is spent, so the body carries the obligation.** Once 2xx means "git succeeded", a 2xx no longer distinguishes finished from unfinished, and a mutation that dropped `"NOT complete"` from `Unverifiable`'s body **survived** the completion test — that test reads bodies opening with `"Applied "`, and `Unverifiable`'s opens with `"Applying "`. The fix was not to widen the prefix but to assert the obligation where it belongs: every 2xx that is not a finished apply must disclaim in its body. That assertion also kills the equivalent mutation on `AppliedWithConflicts`.
