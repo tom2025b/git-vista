@@ -89,7 +89,7 @@ pub use dto::{
     WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
-pub use history::{HistoryFrame, HistoryPage};
+pub use history::{HeadState, HistoryFrame, HistoryPage};
 pub use operation::{
     IdempotencyKey, OperationByKeyResponse, OperationId, OperationStage, OperationState,
     OperationStatus, ProgressEvent, TransferPhase, TransferProgress, MAX_IDEMPOTENCY_KEY_LEN,

@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  buildBrokenHeadFixture,
   buildConflictFixture,
   buildEditorFixture,
   buildFixture,
@@ -78,9 +79,17 @@ export default async function globalSetup() {
   // opens — sharing conflict-repo emptied conflict-panes' fixture and failed
   // all four of its tests.
   const editorFixture = buildEditorFixture(join(work, 'editor-repo'))
+  // #473: a fifth repo whose HEAD resolves to nothing. Separate because it is
+  // deliberately broken — no other spec's repo may be left in this state.
+  const brokenHeadFixture = buildBrokenHeadFixture(join(work, 'broken-head-repo'))
   const { child, base, signInUrl } = await startServer({
     repoPath: fixture.root,
-    extraRepos: [conflictFixture.root, nonTextFixture.root, editorFixture.root],
+    extraRepos: [
+      conflictFixture.root,
+      nonTextFixture.root,
+      editorFixture.root,
+      brokenHeadFixture.root,
+    ],
     stateHome: join(work, 'state'),
   })
 
@@ -92,7 +101,16 @@ export default async function globalSetup() {
   writeFileSync(
     RUNTIME_FILE,
     JSON.stringify(
-      { base, pid: child.pid, work, fixture, conflictFixture, nonTextFixture, editorFixture },
+      {
+        base,
+        pid: child.pid,
+        work,
+        fixture,
+        conflictFixture,
+        nonTextFixture,
+        editorFixture,
+        brokenHeadFixture,
+      },
       null,
       2,
     ),

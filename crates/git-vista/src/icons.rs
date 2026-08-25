@@ -75,6 +75,12 @@ pub struct GitIcons {
     pub ignored: &'static str,
     /// Merge conflict / something needs attention — also the error status line.
     pub conflict: &'static str,
+    /// The repository itself is in a broken state — currently a HEAD that
+    /// resolves to no object (#473). Distinct from [`Self::conflict`] on
+    /// purpose: a conflict is an ordinary step in a merge and the user is
+    /// expected to resolve it, whereas this says the repository is not in a
+    /// state git can reason about at all.
+    pub broken: &'static str,
 
     // -- Worktree summary ----------------------------------------------------
     /// Working tree clean / operation succeeded.
@@ -123,6 +129,7 @@ pub const ICONS: GitIcons = GitIcons {
     untracked: "\u{F128}",    // nf-fa-question
     ignored: "\u{F070}",      // nf-fa-eye_slash — deliberately not looking
     conflict: "\u{F071}",     // nf-fa-warning
+    broken: "\u{F06A}",       // nf-fa-exclamation_circle — louder than a warning
     clean: "\u{F058}",        // nf-fa-check_circle
     dirty: "\u{25CF}",        // ● black circle (not PUA, but themed with the set)
     stash: "\u{F187}",        // nf-fa-archive
@@ -154,6 +161,7 @@ pub const TEXT_ICONS: GitIcons = GitIcons {
     untracked: "?",      // `git status --short` shows untracked as ??
     ignored: "\u{2205}", // ∅ — the empty set: present, deliberately disregarded
     conflict: "!",
+    broken: "\u{26A0}",   // ⚠ — universal system-font coverage
     clean: "\u{2713}",    // ✓
     dirty: "*",           // `__git_ps1` marks a dirty tree with *
     stash: "$",           // `__git_ps1` marks a stash with $

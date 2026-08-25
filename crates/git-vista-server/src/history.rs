@@ -13,6 +13,7 @@
 //! excluded, while the `$GIT_DIR/shallow` boundary set — which changes which
 //! parents a traversal may see without moving a single ref — is included.
 
+use git_vista_protocol::HeadState;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -56,6 +57,11 @@ pub(crate) struct HistorySnapshot {
     pub refs: Vec<GitRef>,
     /// The checked-out branch's short name; `None` when detached.
     pub head_branch: Option<String>,
+    /// What state HEAD is in, which `head_branch` cannot express: its `None`
+    /// covers a healthy detached HEAD and a HEAD that resolves to nothing
+    /// alike, and those are opposite situations for the person looking at the
+    /// screen (#473).
+    pub head_state: HeadState,
     /// The commit HEAD resolves to; `None` for an unborn HEAD.
     ///
     /// Carried because the plan's snapshot pins *both* HEAD halves, but read
@@ -156,9 +162,20 @@ pub(crate) async fn read_history_snapshot(
             )
         })?;
 
+    // The same four-way reading `read_refs_at` applies to HEAD (ADR 0071):
+    // a branch name and a commit, a branch name and none, a commit and no
+    // branch, or neither.
+    let head_state = match (&materials.head_branch, &materials.resolved_head) {
+        (Some(_), Some(_)) => HeadState::OnBranch,
+        (Some(_), None) => HeadState::Unborn,
+        (None, Some(_)) => HeadState::Detached,
+        (None, None) => HeadState::Unresolvable,
+    };
+
     Ok(HistorySnapshot {
         refs: materials.refs,
         head_branch: materials.head_branch,
+        head_state,
         resolved_head: materials.resolved_head,
         shallow_boundaries,
         tips,
@@ -574,6 +591,18 @@ mod tests {
         (dir, repo)
     }
 
+    /// An initialised repository with no commit yet — HEAD names `main` and
+    /// nothing is under it.
+    fn empty_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@example.invalid"]);
+        run(&repo, &["config", "user.name", "t"]);
+        (dir, repo)
+    }
+
     /// Write `content` into `file`, stage everything, commit.
     fn commit_file(repo: &Path, file: &str, content: &str, msg: &str) {
         std::fs::write(repo.join(file), content).unwrap();
@@ -680,6 +709,57 @@ mod tests {
         assert_eq!(before.head_branch, after.head_branch);
         assert_eq!(before.resolved_head, after.resolved_head);
         assert_ne!(before.generation, after.generation);
+    }
+
+    /// #473: `head_branch` is `None` for a healthy detached HEAD **and** for a
+    /// HEAD that resolves to nothing. The frame must tell those apart, because
+    /// one is normal and the other means the repository is broken.
+    ///
+    /// The assertion that matters is the `assert_ne!` — a test that only
+    /// checked "a dangling HEAD reports Unresolvable" would pass against a
+    /// server that reported `Unresolvable` for a healthy detached HEAD too,
+    /// which is the same silence in a different costume.
+    ///
+    /// MUTATION 1: map `(None, None)` to `Detached` — red, the two states
+    ///   collapse again.
+    /// MUTATION 2: map `(Some(_), None)` to `OnBranch` — red on the unborn
+    ///   row, which claims a commit that does not exist.
+    #[tokio::test]
+    async fn a_broken_head_and_a_healthy_detached_head_are_not_the_same_state() {
+        let (_dir, repo) = seeded_repo();
+
+        let on_branch = snapshot(&repo).await;
+        assert_eq!(on_branch.head_state, HeadState::OnBranch);
+
+        run(&repo, &["checkout", "-q", "--detach"]);
+        let detached = snapshot(&repo).await;
+        assert_eq!(detached.head_branch, None);
+        assert_eq!(
+            detached.head_state,
+            HeadState::Detached,
+            "a detached HEAD at a real commit is a normal state, not a fault"
+        );
+
+        // A well-formed object id with no object behind it.
+        std::fs::write(repo.join(".git/HEAD"), "0".repeat(40) + "\n").unwrap();
+        let broken = snapshot(&repo).await;
+        assert_eq!(broken.head_branch, None, "still no branch name to show");
+        assert_eq!(broken.head_state, HeadState::Unresolvable);
+
+        assert_ne!(
+            detached.head_state, broken.head_state,
+            "both arrive as head_branch: None — if the state does not separate \
+             them, the payload still cannot say the repository is broken"
+        );
+
+        // An unborn HEAD: a branch name, and no commit under it.
+        let (_dir2, fresh) = empty_repo();
+        let unborn = snapshot(&fresh).await;
+        assert_eq!(unborn.head_state, HeadState::Unborn);
+        assert_ne!(
+            unborn.head_state, broken.head_state,
+            "a fresh repository is not a broken one"
+        );
     }
 
     #[tokio::test]

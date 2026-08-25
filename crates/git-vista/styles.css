@@ -318,6 +318,9 @@ html, body {
    gap — the checked-out branch with the branch glyph in branch green. */
 .ic-repo { color: var(--accent); }
 .repo-branch { margin-left: 1.1em; }
+/* A HEAD that resolves to nothing (#473): read as a fault, not as decoration. */
+.head-broken { color: #b3261e; font-weight: 600; }
+@media (prefers-color-scheme: dark) { .head-broken { color: #ff8a80; } }
 .ic-branch { color: #3fb950; }
 
 /* Icons inside menu items / panel headers: a fixed-width slot so the labels
