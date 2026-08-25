@@ -32,7 +32,11 @@ mod features;
 // on the host. `picker.rs` renders what this returns.
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod hook_policy_disclosure;
-/// The topbar's HEAD notice — a pure decision, host-tested (#473).
+// #473: what the topbar says about a HEAD that resolves to nothing. NOT
+// wasm-gated, for the same reason as the disclosure above — `mod app` is
+// wasm-only, so a decision left inside the view could never be host-tested,
+// and "renders nothing" is exactly the failure being fixed.
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod head_notice;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod icons;

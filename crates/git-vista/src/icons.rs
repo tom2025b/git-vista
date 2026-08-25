@@ -161,7 +161,7 @@ pub const TEXT_ICONS: GitIcons = GitIcons {
     untracked: "?",      // `git status --short` shows untracked as ??
     ignored: "\u{2205}", // ∅ — the empty set: present, deliberately disregarded
     conflict: "!",
-    broken: "\u{26A0}", // ⚠ — universal system-font coverage
+    broken: "\u{26A0}",   // ⚠ — universal system-font coverage
     clean: "\u{2713}",    // ✓
     dirty: "*",           // `__git_ps1` marks a dirty tree with *
     stash: "$",           // `__git_ps1` marks a stash with $

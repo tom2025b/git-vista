@@ -31,7 +31,6 @@ use leptos::*;
 
 use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
-use crate::head_notice::head_notice;
 use crate::api::{fetch_frame, fetch_page, fetch_protocol, HistoryFetchError};
 use crate::datetime;
 use crate::dialogs;
@@ -55,6 +54,7 @@ use crate::features::shell::signals::{
 };
 use crate::features::status::core as status_core;
 use crate::features::status::signals as status_seam;
+use crate::head_notice::head_notice;
 use crate::hook_policy_banner::hook_policy_banner_view;
 use crate::icons::icon_set;
 use crate::prefs::{
@@ -1160,4 +1160,3 @@ pub fn App() -> impl IntoView {
         </main>
     }
 }
-
