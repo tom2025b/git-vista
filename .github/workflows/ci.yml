@@ -151,6 +151,7 @@ jobs:
       # runner below the floor fails loudly here, before any test that
       # depends on git behaviour this old a binary might not have.
       - name: Git version meets the documented floor
+        id: git_floor
         run: |
           floor=$(grep -oP '^## Git: \K[0-9]+\.[0-9]+' docs/SUPPORTED_VERSIONS.md)
           if [ -z "$floor" ]; then
@@ -164,6 +165,65 @@ jobs:
             echo "::error::runner git ($actual) is older than the documented floor ($floor, docs/SUPPORTED_VERSIONS.md)"
             exit 1
           fi
+          # Published for the #365 steps below, so the floor number is read out
+          # of the document exactly once per job and every consumer — the cache
+          # key included — moves with it.
+          echo "version=$floor" >> "$GITHUB_OUTPUT"
+
+      # -- #365: the floor is EXERCISED, not merely enforced as a lower bound --
+      #
+      # The step above rejects a runner older than 2.32. It does not run
+      # anything AT 2.32, so until now every status fixture had only ever met
+      # the runner's own git — which `crates/git-vista-protocol/src/status.rs`
+      # said in as many words. These three steps close that: build the floor,
+      # run the battery against both binaries, and then assert in SHELL that
+      # the floor leg actually happened.
+      #
+      # Why the assertion is not left to the test: a test that skips when its
+      # binary is missing reports the same green as one that passed. So the
+      # test writes a report and this job checks it, the same anti-vacuity
+      # shape the sandbox job uses against GV_ESCAPE_REPORT. See ADR 0082.
+      - name: Cache the git floor build
+        id: git_floor_cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/gv-git-floor
+          key: gv-git-floor-${{ runner.os }}-${{ steps.git_floor.outputs.version }}
+
+      # A cache hit needs no network at all, which is most of the answer to
+      # "what happens when the source is briefly unreachable". A miss retries
+      # with backoff, and a total failure fails the job with a message that
+      # says PROVISIONING rather than letting it read as a parser regression.
+      - name: Provision the documented git floor
+        if: steps.git_floor_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          floor='${{ steps.git_floor.outputs.version }}'
+          src=$(mktemp -d)
+          ok=false
+          for attempt in 1 2 3; do
+            if git clone --depth 1 -b "v${floor}.0" https://github.com/git/git "$src/git"; then
+              ok=true
+              break
+            fi
+            echo "clone attempt $attempt failed; retrying in $((attempt * 5))s"
+            sleep $((attempt * 5))
+          done
+          if [ "$ok" != true ]; then
+            echo "::error::PROVISIONING FAILED: could not fetch git v${floor}.0 after 3 attempts. This is not a parser regression — the floor leg could not be built. Re-run the job; a successful run populates the cache keyed on the floor number."
+            exit 1
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends zlib1g-dev
+          # NO_GETTEXT/NO_TCLTK: msgfmt and tclsh are not needed to run
+          # `git status`, and requiring them would make provisioning fail for a
+          # reason having nothing to do with what is being tested. NO_CURL and
+          # NO_EXPAT drop the HTTP transport, which the battery never uses.
+          make -C "$src/git" -j"$(nproc)" \
+            prefix="$HOME/.cache/gv-git-floor" \
+            NO_GETTEXT=1 NO_TCLTK=1 NO_CURL=1 NO_EXPAT=1 NO_PERL=1 NO_PYTHON=1 \
+            install
+          "$HOME/.cache/gv-git-floor/bin/git" --version
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -187,6 +247,60 @@ jobs:
       # and isn't the gap being closed here.
       - name: Test core + git + protocol + server + frontend crates
         run: cargo test --workspace
+
+      # Re-run the one #365 test with the floor binary in scope. It is already
+      # covered by `--workspace` above against the runner's git; this run is
+      # what adds the second version, and GV_STATUS_FLOOR_REPORT is what lets
+      # the next step prove it happened.
+      - name: Status vocabulary against the documented git floor (#365)
+        run: |
+          set -euo pipefail
+          export GV_GIT_FLOOR="$HOME/.cache/gv-git-floor/bin/git"
+          export GV_STATUS_FLOOR_REPORT="${GITHUB_WORKSPACE}/gv-status-floor-report.txt"
+          cargo test -p git-vista-fixtures --test status_floor
+
+      - name: Report assertions (the floor leg ran, at the documented floor)
+        run: |
+          set -euo pipefail
+          report="${GITHUB_WORKSPACE}/gv-status-floor-report.txt"
+          floor='${{ steps.git_floor.outputs.version }}'
+
+          if [ ! -f "$report" ]; then
+            echo "::error::GV_STATUS_FLOOR_REPORT ($report) was not written — either the test did not run, or the env var did not reach the test process. An unset variable must fail closed."
+            exit 1
+          fi
+          cat "$report"
+
+          # `|| true` on every grep in this step, deliberately: under
+          # `set -euo pipefail` a grep that matches nothing exits 1 and would
+          # kill the step BEFORE the `::error::` below explains why — turning
+          # the most interesting failure (the floor leg did not run) into a
+          # silent non-zero exit. The checks below decide; grep only reports.
+          got_floor=$(grep -oP '^floor=\K.*' "$report" | head -1 || true)
+          if [ "$got_floor" = "unrun" ] || [ -z "$got_floor" ]; then
+            echo "::error::the report says the floor leg did not run (floor=$got_floor). #365's acceptance is that this leg is mandatory, never a silent fallback to the ambient git."
+            exit 1
+          fi
+          case "$got_floor" in
+            "$floor"|"$floor".*) ;;
+            *)
+              echo "::error::the floor leg ran git $got_floor, which is not the documented floor $floor (docs/SUPPORTED_VERSIONS.md)."
+              exit 1
+              ;;
+          esac
+
+          # Every shape/mode the test walked must be recorded for BOTH gits.
+          # Counting rather than eyeballing: a report naming the floor once and
+          # then quietly reading only the current git would pass the check
+          # above and prove nothing.
+          current_version=$(git --version | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          current_rows=$(grep -c "^shape=.* git=$current_version " "$report" || true)
+          floor_rows=$(grep -c "^shape=.* git=$got_floor " "$report" || true)
+          echo "rows: current=$current_rows floor=$floor_rows"
+          if [ "$current_rows" -lt 1 ] || [ "$current_rows" -ne "$floor_rows" ]; then
+            echo "::error::the two gits did not read the same set of shapes (current=$current_rows, floor=$floor_rows). Both legs must cover the whole battery."
+            exit 1
+          fi
 
   # ---------------------------------------------------------------------------
   # 3. The M1.06 write contract (#146, parent #59) plus the #67 M1.14 route-
