@@ -25,10 +25,17 @@ render of the latest snapshot.
   every single brief, no exceptions:**
 
   ```bash
-  milestone-bars --html     # paste the block verbatim into the brief
-  milestone-bars            # the same numbers as a text table, for prose
+  milestone-bars            # regenerate, then rebuild as a MARKDOWN table
   ./dev report              # line counts by crate + repo health
   ```
+
+  **NEVER paste `milestone-bars --html` (or any raw HTML) into a brief.**
+  brief-mcp escapes markup when exporting the archive `.md` — `<div` becomes
+  `&lt;div` — so the PDF ships pages of literal tag soup. This happened
+  2026-08-25 and the owner caught it from the iPad. Render bars as a markdown
+  table with unicode blocks instead (`` `███░░░░░░░` `` **29%**), which
+  survives every layer. The `--html` form is for artifacts and standalone
+  pages only, never this pipeline.
 
   This is not a style preference. The bars were carried forward by hand across
   four briefs on 2026-08-05 and the owner asked, reasonably, "why is this
@@ -56,4 +63,18 @@ render of the latest snapshot.
    the `Git-Vista-current.pdf` slot update. Both the history file and the
    stable slot carry the repo in the FILENAME, not only the directory — a
    brief that leaves the folder still has to say which repo it is about.
-5. Send the PDF to the owner when the update is one they asked about.
+5. **VERIFY BEFORE SENDING — every render, no exceptions.** Four checks,
+   all cheap, in this order:
+
+   ```bash
+   pdftotext "<brief>.pdf" - | grep -cE '&lt;|<div|</?style'   # 0 or do not send
+   pdftotext "<brief>.pdf" - | grep -icE 'syntax error|unsupported markdown'
+   pdfinfo "<brief>.pdf" | grep Pages                          # sane count
+   pdftoppm -png -r 60 -f 1 -l 1 "<brief>.pdf" /tmp/p          # then LOOK at it
+   ```
+
+   Rasterize at least page 1 and one mid-document page and actually look at
+   the images. Two escapes have now shipped from skipping this: line-initial
+   `#` becoming giant headings, and the 2026-08-25 escaped-HTML bars. The
+   grep catches the known failures; the eyes catch the next one.
+6. Send the PDF to the owner when the update is one they asked about.
