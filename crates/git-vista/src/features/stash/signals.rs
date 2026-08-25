@@ -64,6 +64,15 @@ pub async fn compose_pop(entry: &str, expected_oid: &str, key: IdempotencyKey) -
     }
 }
 
+/// The busy key for the push control, which has no stash entry of its own.
+///
+/// A reserved sentinel rather than `""`: an empty string silently matches no
+/// row, so a push in flight left every control enabled — including its own
+/// button, where a second tap would stash the already-stashed tree again. The
+/// value cannot collide with a real selector, which `StashSelector` requires to
+/// be `stash@{<digits>}`.
+pub const PUSH_KEY: &str = "\u{0}push";
+
 /// What the drawer is currently doing, so a view can disable controls and say
 /// why without inventing its own notion of "busy".
 #[derive(Debug, Clone, PartialEq, Eq)]

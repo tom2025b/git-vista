@@ -36,7 +36,7 @@ use crate::features::stash::core::{
     drawer_view, push_preview, Availability, DrawerView, PushPreview, StashAction, StashRow,
     LOADING_STASHES, NOTHING_TO_STASH, NO_STASHES,
 };
-use crate::features::stash::signals::{compose_pop, StashDrawer, StashNotice};
+use crate::features::stash::signals::{compose_pop, StashDrawer, StashNotice, PUSH_KEY};
 use crate::features::status::core::StatusSections;
 use crate::icons::icon_set;
 use crate::state::{Features, Settings, ViewerDoc};
@@ -202,15 +202,24 @@ pub fn stash_section_view(
             .collect_view();
 
         let button = if !offerable {
-            // The refusal text is the core's, not this file's.
-            let why = refusal.unwrap_or(NOTHING_TO_STASH);
+            // The refusal text is the core's, not this file's — including WHICH
+            // refusal, since an excluded untracked file and an already-clean
+            // tree authorise different next actions.
+            let Some(why) = refusal else {
+                // `may_push` said no, so the core owes a reason. Rendering
+                // nothing here would leave a silent gap where the button was.
+                return view! {
+                    <p class="detail-status">"This push cannot be offered right now."</p>
+                }
+                .into_view();
+            };
             view! { <p class="detail-status">{why}</p> }.into_view()
         } else {
             {
                 let on_push = move |_| {
                     let keep = keep_index.get_untracked();
                     let untracked = include_untracked.get_untracked();
-                    drawer.begin("", "stashing");
+                    drawer.begin(PUSH_KEY, "stashing");
                     spawn_local(async move {
                         let result = push_stash_request(None, keep, untracked).await;
                         drawer.set_notice(StashNotice::from_result(
@@ -226,8 +235,12 @@ pub fn stash_section_view(
                         });
                     });
                 };
+                // Disabled while the push is in flight. Without this the
+                // button stayed live and a second tap would stash the
+                // already-stashed tree a second time.
+                let pushing = move || drawer.busy().locked(PUSH_KEY);
                 view! {
-                    <button class="act-undo" on:click=on_push>
+                    <button class="act-undo" prop:disabled=pushing on:click=on_push>
                         "Stash these changes"
                     </button>
                 }

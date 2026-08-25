@@ -428,6 +428,18 @@ pub struct PushPreview {
 pub const NOTHING_TO_STASH: &str =
     "There are no local changes to stash. The working tree is already clean.";
 
+/// The refusal for a tree whose *only* changes are untracked files that this
+/// push would exclude.
+///
+/// A separate sentence from [`NOTHING_TO_STASH`] because the two authorise
+/// different next actions, and the generic one contradicts what is on screen
+/// beside it: the preview is simultaneously listing an untracked file as left
+/// behind and claiming the tree is "already clean". It is not — there is
+/// something there, and one tick would capture it.
+pub const ONLY_EXCLUDED_UNTRACKED: &str =
+    "Nothing here would be stashed. The only changes are untracked files — tick \
+     \u{201c}Include untracked files\u{201d} to put them in the drawer.";
+
 impl PushPreview {
     /// Whether a push may be offered at all.
     pub fn may_push(&self) -> bool {
@@ -491,11 +503,12 @@ pub fn push_preview(
     // untracked warning that matters.
 
     // `git stash push` with no tracked changes and no `--include-untracked`
-    // has nothing to save even when untracked files exist.
-    let refusal = if captures.is_empty() {
-        Some(NOTHING_TO_STASH)
-    } else {
-        None
+    // has nothing to save even when untracked files exist — but which refusal
+    // to show depends on whether there is something a tick would capture.
+    let refusal = match (captures.is_empty(), untracked > 0 && !include_untracked) {
+        (false, _) => None,
+        (true, true) => Some(ONLY_EXCLUDED_UNTRACKED),
+        (true, false) => Some(NOTHING_TO_STASH),
     };
 
     PushPreview {
@@ -1431,6 +1444,9 @@ mod tests {
     ///
     /// MUTATION 1: always return `refusal: None` — red, a push would be offered
     ///   on a clean tree. Verified: red.
+    /// MUTATION 3: collapse the two refusals into `NOTHING_TO_STASH` — red on
+    ///   the untracked-only case, where "the working tree is already clean"
+    ///   contradicts the line printed beside it. Verified by hand: red.
     /// MUTATION 2: refuse whenever `leaves_behind` is non-empty — red, the
     ///   untracked-excluded case is a perfectly valid push. **This mutation
     ///   SURVIVED the first version of this test**, which never exercised a
@@ -1443,11 +1459,22 @@ mod tests {
         assert_eq!(clean.refusal, Some(NOTHING_TO_STASH));
         assert!(!clean.may_push());
 
-        // Untracked only, excluded: still nothing to save.
+        // Untracked only, excluded: still nothing to save — but a DIFFERENT
+        // refusal, because one tick would capture it and the generic wording
+        // ("the working tree is already clean") contradicts the untracked line
+        // rendered beside it.
         let untracked_only = status_with(vec![untracked("scratch.log")]);
+        let excluded_only = push_preview(&untracked_only, false, false);
+        assert_eq!(excluded_only.refusal, Some(ONLY_EXCLUDED_UNTRACKED));
+        assert_ne!(
+            excluded_only.refusal,
+            Some(NOTHING_TO_STASH),
+            "an excluded untracked file is not an already-clean tree"
+        );
         assert_eq!(
-            push_preview(&untracked_only, false, false).refusal,
-            Some(NOTHING_TO_STASH)
+            excluded_only.leaves_behind,
+            ["1 untracked file — NOT stashed"],
+            "and it is still named, so the tick has something to refer to"
         );
 
         // Untracked only, included: now there is.
