@@ -31,6 +31,7 @@ use leptos::*;
 
 use git_vista_protocol::{check_compatibility, PROTOCOL_VERSION};
 
+use crate::head_notice::head_notice;
 use crate::api::{fetch_frame, fetch_page, fetch_protocol, HistoryFetchError};
 use crate::datetime;
 use crate::dialogs;
@@ -1084,6 +1085,7 @@ pub fn App() -> impl IntoView {
                                     // pointed at a stale server/tab — now visible.
                                     let repo = seed.frame.repo_label.clone();
                                     let branch = seed.frame.head_branch.clone();
+                                    let head_notice = head_notice(seed.frame.head_state);
                                     let remote_web_url = seed.frame.remote_web_url.clone();
                                     view! {
                                         // Repo glyph + name, then branch glyph + checked-out
@@ -1097,6 +1099,22 @@ pub fn App() -> impl IntoView {
                                                     <span class="repo-branch">
                                                         <span class="nf ic-branch">{ic.branch}</span>
                                                         {format!(" {b}")}
+                                                    </span>
+                                                })}
+                                                // A HEAD that resolves to nothing looked
+                                                // exactly like a healthy detached HEAD here:
+                                                // both have no branch name, so both rendered
+                                                // nothing at all (#473).
+                                                {head_notice.map(|notice| view! {
+                                                    <span
+                                                        class="repo-branch head-broken"
+                                                        title="HEAD holds an object id that no \
+                                                               commit matches. The repository is \
+                                                               in a broken state — git cannot \
+                                                               say where you are."
+                                                    >
+                                                        <span class="nf ic-broken">{ic.broken}</span>
+                                                        {format!(" {notice}")}
                                                     </span>
                                                 })}
                                                 // Forge repo link (ADR 0010): out to wherever
@@ -1142,3 +1160,4 @@ pub fn App() -> impl IntoView {
         </main>
     }
 }
+

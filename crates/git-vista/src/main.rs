@@ -32,6 +32,8 @@ mod features;
 // on the host. `picker.rs` renders what this returns.
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod hook_policy_disclosure;
+/// The topbar's HEAD notice — a pure decision, host-tested (#473).
+mod head_notice;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod icons;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
