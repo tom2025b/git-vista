@@ -246,7 +246,12 @@ test.describe('#478 two diverged chains whose checkpoints interleave', () => {
     // chains' real lengths. Asserting "two markers" alone would pass against a
     // grouping that split the same chain in half, or that mixed the chains and
     // happened to land on two groups.
-    const labels = await page.locator('.wip-group-label').allInnerTexts()
+    // `allInnerTexts()` reads `element.innerText`, an HTML property SVG nodes
+    // do not have: it yields an array of `undefined`, so the length check
+    // above passes and the content check below dies on the first entry.
+    // `.wip-group-label` is an SVG `<text>` (render/nodes.rs:356), so read
+    // `textContent`, which SVG does have.
+    const labels = await page.locator('.wip-group-label').allTextContents()
     expect(labels).toHaveLength(2)
     expect(labels[0]).toContain(String(LOCAL_RUN))
     expect(labels[1]).toContain(String(REMOTE_RUN))
