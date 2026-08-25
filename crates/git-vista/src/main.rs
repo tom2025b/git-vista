@@ -38,6 +38,12 @@ mod hook_policy_disclosure;
 // and "renders nothing" is exactly the failure being fixed.
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod head_notice;
+// M1.04 (#57) / #392: the `#s=<token>` fragment parse, lifted out of the
+// wasm-only `mod session` so it can be host-tested at all — and so startup and
+// #392's `hashchange` listener share one parser rather than two that can
+// silently disagree.
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+mod bootstrap_fragment;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
 mod icons;
 #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]

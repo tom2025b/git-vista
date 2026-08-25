@@ -15,7 +15,7 @@
 
 import { expect, test } from '@playwright/test'
 
-import { DIFF_SCROLLER, openApp, openDiff } from './helpers.mjs'
+import { DIFF_SCROLLER, markPage, openApp, openDiff, pageSurvived, setHash } from './helpers.mjs'
 
 /**
  * Run `fn` and return the message it threw, or `null` if it did not throw.
@@ -143,5 +143,27 @@ test.describe('harness self-check — every assertion must be able to go red', (
       expect(name, 'the chip must be announceable').toBeTruthy()
     })
     expectFailedBecause(msg, /the chip must be announceable/, 'the announceability assertion')
+  })
+
+  test('the #392 reload assertion fails when the tab does not reload', async ({ page }) => {
+    await openApp(page)
+    await markPage(page)
+
+    // The mutation is the defect itself, and needs no DOM surgery: a fragment
+    // carrying no token is a hash change the app is *supposed* to ignore, so
+    // the document survives -- which is precisely what #392 looked like for
+    // every fragment, token or not. If the reload assertion could not tell
+    // that apart, `token-paste.spec.mjs` would pass against the unfixed app.
+    await setHash(page, '#tab=diff')
+
+    const msg = await failureMessage(async () => {
+      await expect
+        .poll(() => pageSurvived(page), {
+          timeout: 3_000,
+          message: 'the tab must have reloaded',
+        })
+        .toBe(false)
+    })
+    expectFailedBecause(msg, /the tab must have reloaded/, 'the #392 reload assertion')
   })
 })

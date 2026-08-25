@@ -84,3 +84,55 @@ export async function openDiff(page, nth = 0) {
 
 /** The vertical scroller that wraps the windowed patch. */
 export const DIFF_SCROLLER = '.detail-diff-scroll'
+
+// --- #392: pasting a sign-in link over the URL of an already-open tab -------
+//
+// Shared with `harness-selfcheck.spec.mjs`, which requires the reload
+// assertion below to go red when nothing reloads -- the exact shape of the
+// defect (a same-document hash change the app never noticed).
+
+/** Marks a particular loaded document, so a reload can be told from a
+ *  same-document hash change: a hash change preserves `window`, a reload
+ *  builds a fresh one. Playwright's navigation events do not distinguish the
+ *  two, so an assertion built on them would pass against the unfixed app. */
+export const RELOAD_SENTINEL = '__gv392_survived_the_hash_change'
+
+/** Stamp the sentinel on the current document. */
+export async function markPage(page) {
+  await page.evaluate((key) => {
+    window[key] = true
+  }, RELOAD_SENTINEL)
+}
+
+/** Whether this is still the document `markPage` stamped. Resolves `false`
+ *  rather than throwing while the context is being torn down by the reload
+ *  the caller is waiting for. */
+export function pageSurvived(page) {
+  return page.evaluate((key) => window[key] === true, RELOAD_SENTINEL).catch(() => false)
+}
+
+/**
+ * Set `location.hash`, tolerating the context teardown a reload causes.
+ *
+ * The assignment returns before the handler runs, so this normally resolves
+ * cleanly -- but "Execution context was destroyed" here is the fix working,
+ * not a failure, and must never fail the test asserting for it.
+ */
+export async function setHash(page, hash) {
+  await page
+    .evaluate((h) => {
+      window.location.hash = h
+    }, hash)
+    .catch(() => {})
+}
+
+/** Collect the body of every `POST /api/session` the page makes from now on. */
+export function watchSignIns(page) {
+  const posts = []
+  page.on('request', (r) => {
+    if (r.method() === 'POST' && r.url().includes('/api/session')) {
+      posts.push(r.postData() ?? '')
+    }
+  })
+  return posts
+}

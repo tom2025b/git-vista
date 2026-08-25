@@ -17,6 +17,7 @@
 use leptos::*;
 
 use crate::api::{get_session, post_session};
+use crate::bootstrap_fragment::token_in_fragment;
 use crate::features::session::core::SessionEvent;
 use crate::features::session::signals as session_state;
 
@@ -82,11 +83,7 @@ fn take_bootstrap_token() -> Option<String> {
     let win = web_sys::window()?;
     let loc = win.location();
     let hash = loc.hash().ok()?;
-    let fragment = hash.strip_prefix('#').unwrap_or(&hash);
-    let token = fragment.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
-        (key == "s" && !value.is_empty()).then(|| value.to_string())
-    })?;
+    let token = token_in_fragment(&hash)?.to_string();
     // Remove the fragment from the address bar (keep path + query) without adding a
     // history entry. Best-effort: on failure the token is still exchanged; it just
     // lingers in the URL until the next navigation.
@@ -97,6 +94,71 @@ fn take_bootstrap_token() -> Option<String> {
         let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&clean));
     }
     Some(token)
+}
+
+/// Re-run sign-in when a bootstrap token arrives in the address bar of a tab
+/// that is **already open** (#392, ADR 0073).
+///
+/// Pasting a fresh `gv` link over the URL of a live tab edits only the
+/// fragment, which is a same-document navigation: nothing reloads, and
+/// [`establish_session`] has already run and will not run again. The token sits
+/// visibly in the URL and the app never signs in. Opening the same link in a
+/// new tab works, and a manual refresh appears to "fix" it — which is what
+/// makes the defect confusing rather than merely annoying. It is also the exact
+/// motion a server restart forces, because a restart rotates the token.
+///
+/// # Why this reloads rather than re-bootstrapping in place
+///
+/// A reload re-runs the *whole* of startup, which is the only path that has
+/// ever been reasoned about on this security boundary. Doing it in place would
+/// mean re-resolving a session while the app is mounted, and this module's
+/// documented posture (see [`recheck_session`], and
+/// `SessionCore`'s per-tab facts) is that `via_lan`, the CSRF token and the
+/// hook policy are **fixed once `establish_session` resolves**. Consumers rely
+/// on that: `api`'s CSRF token is a `thread_local`, and the hook-policy banner
+/// reads session state non-reactively precisely because it cannot change. A
+/// second, in-flight `Established` event would leave every one of them holding
+/// values from a session that no longer exists — a half-swapped identity, which
+/// is a worse thing to have on a sign-in path than a page reload.
+///
+/// Redeeming a token does not disturb the old session: `SessionManager::
+/// exchange` rotates the bootstrap token and *inserts* a new session, so
+/// nothing that was already signed in is signed out by this.
+///
+/// # Why this cannot loop
+///
+/// `take_bootstrap_token` strips the fragment with `history.replaceState`,
+/// which does **not** fire `hashchange` — so the reload's own cleanup is
+/// silent. Nothing else in the crate writes `location.hash`, so the only source
+/// of an event here is a human pasting a URL. A fragment carrying no usable
+/// token returns early and the live tab is left alone; that negative is the
+/// load-bearing half, since a reload is destructive to a signed-in tab's state.
+///
+/// One stated dependency: repeated pastes of the *same* link only work because
+/// that `replaceState` succeeds. If it fails (it is best-effort, by that
+/// function's own comment) the fragment lingers, and re-pasting an identical
+/// URL is a no-op navigation the browser never reports.
+pub fn install_token_paste_reload() {
+    use wasm_bindgen::{closure::Closure, JsCast};
+
+    let Some(win) = web_sys::window() else { return };
+
+    let target = win.clone();
+    let cb = Closure::<dyn FnMut()>::new(move || {
+        let Ok(hash) = target.location().hash() else {
+            return;
+        };
+        if token_in_fragment(&hash).is_none() {
+            return;
+        }
+        let _ = target.location().reload();
+    });
+    let _ = win.add_event_listener_with_callback("hashchange", cb.as_ref().unchecked_ref());
+
+    let win2 = win.clone();
+    on_cleanup(move || {
+        let _ = win2.remove_event_listener_with_callback("hashchange", cb.as_ref().unchecked_ref());
+    });
 }
 
 /// The blocking "not connected" screen, shown when the app has no session and no
