@@ -239,8 +239,53 @@ record_runtime_state() {
   fi
 }
 
+# One variable's value from a NUL-delimited environ blob, or empty when the
+# blob has no such variable (#476). `name` is a literal constant at every call
+# site below; nothing user-supplied reaches the `sed` expression.
+#
+# Deliberately not `… | head -n 1`: `head` closes the pipe on its first line,
+# and under `set -o pipefail` a SIGPIPE'd `sed` fails the whole expansion. The
+# first line is taken with parameter expansion instead, which cannot race.
+environ_value() {
+  local file="$1" name="$2" all
+  [[ -r "$file" ]] || return 1
+  all="$(tr '\0' '\n' <"$file" 2>/dev/null | sed -n "s/^${name}=//p")" || true
+  printf '%s' "${all%%$'\n'*}"
+}
+
+# The managed-clones root the process owning `file`'s environ actually resolved
+# (#476). A faithful mirror of `resolve_clones_root` in
+# `crates/git-vista-server/src/state.rs`: the override wins, then
+# `XDG_DATA_HOME`, then `$HOME/.local/share`, then the server's own temp-dir
+# last resort — and an *empty* value counts as unset at every step, exactly as
+# the Rust `.filter(|p| !p.as_os_str().is_empty())` does.
+#
+# Returns non-zero and prints nothing when the environ cannot be read, so the
+# caller can say "unknown". That refusal is the whole point of this function:
+# the line it replaces printed a constant, and a diagnostic that fabricates a
+# value is worse than one that omits it — an omitted line sends you to read the
+# code, a fabricated one sends you to the wrong directory believing you checked.
+clones_root_from_environ() {
+  local file="$1" override xdg home tmp
+  [[ -r "$file" ]] || return 1
+  override="$(environ_value "$file" GIT_VISTA_CLONES_ROOT)"
+  xdg="$(environ_value "$file" XDG_DATA_HOME)"
+  home="$(environ_value "$file" HOME)"
+  tmp="$(environ_value "$file" TMPDIR)"
+  if [[ -n "$override" ]]; then
+    printf '%s\n' "$override"
+  elif [[ -n "$xdg" ]]; then
+    printf '%s/git-vista/clones\n' "$xdg"
+  elif [[ -n "$home" ]]; then
+    printf '%s/.local/share/git-vista/clones\n' "$home"
+  else
+    printf '%s/git-vista-data/git-vista/clones\n' "${tmp:-/tmp}"
+  fi
+}
+
 doctor() {
   local result=0 addresses mode recorded_mode protocol pid target token_mode modified now age
+  local clones_root
   echo "Git-Vista doctor (no secrets printed)"
   echo "  checkout: $REPO"
   echo "  Git: $(git --version 2>&1 || echo unavailable)"
@@ -287,7 +332,24 @@ doctor() {
     target="$(tr '\0' '\n' 2>/dev/null <"/proc/$pid/cmdline" | sed -n '2p')" || target=""
   fi
   echo "  catalog root (launch repository): ${target:-unknown}"
-  echo "  catalog root (managed clones): ${TMPDIR:-/tmp}/git-vista-clones"
+  # #476: measured from the RUNNING listener's own environment, never from
+  # this shell's. The server is normally started by git-vista.service, whose
+  # `Environment=` lines are absent from an interactive shell — so even a
+  # faithful reimplementation reading `gv`'s env could disagree with the
+  # server it is describing. `/proc/$pid/environ` is the same source of truth
+  # the launch-repository line above already uses for `cmdline`.
+  clones_root=""
+  [[ -n "$pid" ]] && clones_root="$(clones_root_from_environ "/proc/$pid/environ")" || clones_root=""
+  if [[ -z "$clones_root" ]]; then
+    # `unknown`, in the same shape as the line above — never a guess.
+    echo "  catalog root (managed clones): unknown — the listener's environment could not be read"
+  elif [[ -d "$clones_root" ]]; then
+    echo "  catalog root (managed clones): $clones_root (exists)"
+  else
+    # Created on demand, so "configured but not yet created" and "configured
+    # and populated" are different answers to the question being asked.
+    echo "  catalog root (managed clones): $clones_root (configured, not yet created)"
+  fi
 
   if [[ -r "$TOKEN_FILE" ]]; then
     token_mode="$(stat -c '%a' "$TOKEN_FILE" 2>/dev/null || echo unknown)"
@@ -408,6 +470,15 @@ usage() {
   sed -n '2,/^set -euo pipefail$/p' "${BASH_SOURCE[0]}" \
     | sed '$d; s/^# \{0,1\}//'
 }
+
+# Sourcing this file defines its functions and runs nothing else, so a guard
+# test can drive one function directly instead of modelling it (#476). Every
+# line above is a definition or a plain assignment; everything below is the
+# command-line flow. Executing `gv` is unchanged — `$0` is the script itself,
+# so the guard is false and the flow runs exactly as before.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
 
 if [[ ${1:-} == help ]]; then
   usage
