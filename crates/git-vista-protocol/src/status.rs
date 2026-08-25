@@ -284,12 +284,16 @@ pub struct WorktreeStatus {
 // fails the build rather than passing quietly.
 //
 // The finding, recorded because "no difference" is a result and not an
-// absence of one: **git 2.32.0 and git 2.43.0 parse identically here**, on
-// every shape and under all three read modes. That is the expected outcome —
-// porcelain v2 has not changed shape since its introduction in git 2.11, and
-// nothing in git's release notes between 2.32 and 2.43 documents a
-// porcelain-v2 format change — and it is now measured on every CI run instead
-// of inferred from the release notes.
+// absence of one: **the floor and the current git parse identically here**, on
+// every shape and under all three read modes. Measured pairs so far — 2.32.0
+// against 2.43.0 on a developer box, and 2.32.0 against **2.55.0** on the CI
+// runner. The second leg is deliberately not pinned to a version: it is
+// whatever git the machine has, so the span widens on its own as runners move,
+// and no comment here has to be edited to keep up.
+//
+// That is the expected outcome — porcelain v2 has not changed shape since its
+// introduction in git 2.11 — and it is now measured on every CI run instead of
+// inferred from the release notes.
 
 /// [`parse_porcelain_v2_z`]'s output — everything a real repository read can
 /// produce **except** the generation tag, which this pure function has no

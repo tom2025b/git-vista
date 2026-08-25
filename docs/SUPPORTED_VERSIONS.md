@@ -45,8 +45,11 @@ undocumented once #66 lands.
   See ADR 0082 for why the leg is mandatory and how that survives a transient
   fetch failure.
 
-  **The finding: git 2.32.0 and git 2.43.0 parse identically**, on every shape
-  and under all three read modes. That is the expected result, and it is now
+  **The finding: the floor and the current git parse identically**, on every
+  shape and under all three read modes — measured at 2.32.0 against 2.43.0 on a
+  developer box, and 2.32.0 against **2.55.0** on the CI runner. The upper end
+  is deliberately not pinned: it is whatever git the machine has, so the span
+  widens on its own as runners move. That is the expected result, and it is now
   measured on every run rather than inferred from git's release notes.
 
 ### Reproducing the floor leg locally

@@ -17,7 +17,7 @@ The parser said so itself. `crates/git-vista-protocol/src/status.rs` recorded, i
 Two further facts shape the decision, and both were measured rather than assumed:
 
 - The parser's twelve porcelain tests all feed it **hand-written byte strings**, with literal oids like `6666…`. Excellent tests of the parser; no evidence at all about `git`.
-- Building git 2.32.0 from source takes **about a minute** on four cores, and the result parses this repository's whole status vocabulary **byte-identically** to 2.43.0. The expected answer to #365 is "no difference".
+- Building git 2.32.0 from source takes **about a minute** on four cores, and the result parses this repository's whole status vocabulary **byte-identically** to the current git. Measured at 2.43.0 on a developer box and at **2.55.0** on the CI runner — a twenty-three-minor-version span. The expected answer to #365 is "no difference".
 
 That last point is the trap. When the expected result is agreement, a harness that never invoked the second binary passes exactly as loudly as one that did.
 
@@ -74,7 +74,9 @@ A binary that is not the documented floor is refused *before* it is compared aga
 
 **The admission in `status.rs` is retired, because it is no longer true.** Leaving an honest confession in place after closing the gap it confesses would be its own small lie. The comment now says what is measured, and records the finding.
 
-**"No difference" is a result, and it is recorded as one.** git 2.32.0 and 2.43.0 parse this workspace's whole status vocabulary identically — every shape, and under all three read modes. Every CI run now measures that instead of inferring it.
+**"No difference" is a result, and it is recorded as one.** The floor parses this workspace's whole status vocabulary identically to the current git — every shape, under all three read modes, at both 2.43.0 and 2.55.0. Every CI run now measures that instead of inferring it.
+
+**The upper end of the comparison is deliberately unpinned.** The second leg is whatever git the machine has, so the span widens by itself as runners move — CI's first run of this gate already spanned 2.32.0 to 2.55.0 — and nothing has to be edited to keep that true. Pinning both ends would have frozen the test at the day it was written.
 
 **Two records exist that production can never see, and that is now written down.** `!` (ignored) requires `--ignored`, and `C` (copy) requires `status.renames=copies` *and* a copy source that is itself part of the change set. `/api/status/v2` passes neither flag. The battery is read three ways so both record shapes are exercised against every supported git, but a reader looking for `StatusEntry::Ignored` in a live response will not find one, and now learns why from the fixture rather than from a debugging session.
 
