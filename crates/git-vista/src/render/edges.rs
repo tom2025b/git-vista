@@ -16,15 +16,23 @@ use crate::features::graph::core::RenderCtx;
 /// Indices of display edges whose row span intersects the visible display-row
 /// window `[start, end)`. Same rule as before collapsing (#374): an edge is
 /// kept whenever any part of it could cross the viewport, so a long line
-/// passing through never blinks out at the window's edge. Rows still always
-/// run downward, so the span is `[from_display, to_display]`.
+/// passing through never blinks out at the window's edge.
+///
+/// The span comes from [`DisplayEdge::span`] rather than being read off the
+/// endpoints in order. Raw edges always run downward, but a display edge no
+/// longer must: with two interleaved chains folded (#478), an edge into a
+/// fork point that folded into the *upper* chain's marker points back up the
+/// screen. Comparing `from`/`to` positionally culled those wherever they were.
 pub fn visible_edges(display: StoredValue<DisplayProjection>, range: (usize, usize)) -> Vec<usize> {
     let (start, end) = range;
     display.with_value(|d| {
         d.edges
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.from_display < end && e.to_display >= start)
+            .filter(|(_, e)| {
+                let (top, bottom) = e.span();
+                top < end && bottom >= start
+            })
             .map(|(i, _)| i)
             .collect()
     })
@@ -47,7 +55,7 @@ pub fn visible_edges(display: StoredValue<DisplayProjection>, range: (usize, usi
 /// on that would take the whole canvas down, so an edge whose endpoints aren't
 /// both loaded simply draws nothing until the page owning them lands.
 ///
-/// A group takes its first member's identity for this colour lookup (#374) —
+/// A group takes its anchor member's identity for this colour lookup (#374) —
 /// arbitrary but consistent, matching `build_wip_group`'s own choice.
 pub fn build_edge(
     ctx: StoredValue<RenderCtx>,
@@ -70,8 +78,8 @@ pub fn build_edge(
         let row_of = |item: DisplayItem| match item {
             DisplayItem::Single { row_index } => rows.get(row_index),
             DisplayItem::WipGroup {
-                start_row_index, ..
-            } => rows.get(start_row_index),
+                anchor_row_index, ..
+            } => rows.get(anchor_row_index),
         };
         let (Some(from), Some(to)) = (row_of(from_item), row_of(to_item)) else {
             return ().into_view();

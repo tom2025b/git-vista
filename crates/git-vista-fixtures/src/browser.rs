@@ -423,6 +423,138 @@ pub fn broken_head_fixture(root: &Path) {
 /// A builder: empties the directory it is given and writes one shape into it.
 pub type Builder = fn(&Path);
 
+/// How many checkpoints [`interleaved_wip_fixture`]'s branch carries in total,
+/// and how many are rewritten so the pushed twin diverges (#478).
+///
+/// Five and three, so **both** chains clear MIN_RUN on their own — the local
+/// chain keeps the two shared checkpoints, the remote chain has three of its
+/// own — and the two runs come out different lengths. A fixture where both
+/// markers said the same number could not tell a correct grouping from a
+/// swapped one. Asserted directly by the collapse spec.
+pub const TWIN_CHECKPOINTS: usize = 5;
+
+/// How many of [`TWIN_CHECKPOINTS`] are rewritten after the push.
+pub const TWIN_REWRITTEN: usize = 3;
+
+/// A branch and its **diverged remote-tracking twin**, whose checkpoint chains
+/// interleave in display order (#478).
+///
+/// ## What is wrong
+///
+/// Every checkpoint number appears **twice, on different commits** — which is
+/// exactly what the issue reporter saw scrolling real history. The branch was
+/// pushed, then rewritten, so `origin/feature/wip-twin` still points at commits
+/// the branch no longer contains.
+///
+/// ## What git put on disk
+///
+/// A real bare repository beside this one (`twin-origin.git`), pushed to before
+/// the rewrite, then fetched. Nothing here fakes a ref: the remote-tracking ref
+/// is genuinely what a push whose branch then moved leaves behind. Newest
+/// first, the history reads:
+///
+/// ```text
+///   checkpoint 5   (local)     <- feature/wip-twin
+///   checkpoint 5   (remote)    <- origin/feature/wip-twin
+///   checkpoint 4   (local)
+///   checkpoint 4   (remote)
+///   checkpoint 3   (local)
+///   checkpoint 3   (remote)
+///   checkpoint 2               <- shared: the fork point both chains descend from
+///   checkpoint 1               <- shared
+///   seed                       <- main
+/// ```
+///
+/// Commit times are pinned rather than taken from the clock, and the rewritten
+/// half is offset thirty seconds later than the pushed half. The walk is
+/// `DateOrder`, so a fixture whose two chains shared a timestamp would order
+/// them arbitrarily and the spec would flake.
+///
+/// ## Why it matters
+///
+/// The two chains **alternate**, so every display-adjacent pair is a
+/// cross-chain pair — the condition under which the pre-#478 scan found no run
+/// longer than one and folded nothing. A fixture with two separated chains
+/// would not reproduce it.
+///
+/// The bare repository is deliberately *not* named after this one: the picker
+/// matches entries by name, and an origin whose name contained the repo's would
+/// make the match ambiguous the day someone hands the bare repo to the server
+/// too.
+pub fn interleaved_wip_fixture(root: &Path) {
+    fresh(root);
+
+    let origin = root
+        .parent()
+        .expect("fixture root must have a parent")
+        .join("twin-origin.git");
+    if origin.exists() {
+        std::fs::remove_dir_all(&origin).expect("clear twin origin");
+    }
+    std::fs::create_dir_all(&origin).expect("create twin origin");
+    git::run_as(BROWSER, &origin, &["init", "-q", "--bare"]);
+
+    // A fixed base time, so the row order is a property of the fixture rather
+    // than of the minute it was built in. 2026-01-02T10:<n>:<offset>Z.
+    let at = |n: usize, offset: usize| -> String {
+        let base = 1_767_349_200_i64; // 2026-01-02T10:00:00Z
+        format!("{} +0000", base + (n as i64) * 60 + offset as i64)
+    };
+    let checkpoint = |n: usize, body: &str, offset: usize| {
+        git::write(
+            root,
+            "wip-marker.txt",
+            format!(
+                "{body}
+"
+            )
+            .as_bytes(),
+        );
+        run(root, &["add", "wip-marker.txt"]);
+        git::run_dated_as(
+            BROWSER,
+            root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                &format!("wip(#478): auto-checkpoint {n}"),
+            ],
+            &at(n, offset),
+        );
+    };
+
+    run(
+        root,
+        &["remote", "add", "origin", &origin.display().to_string()],
+    );
+    git::write(root, "seed.txt", b"a commit that is not a checkpoint\n");
+    run(root, &["add", "seed.txt"]);
+    run(root, &["commit", "-q", "-m", "seed: the branch point"]);
+
+    run(root, &["checkout", "-q", "-b", "feature/wip-twin"]);
+    for n in 1..=TWIN_CHECKPOINTS {
+        checkpoint(n, &format!("checkpoint {n}"), 0);
+    }
+
+    // Push BEFORE rewriting: this is what leaves a remote-tracking ref pointing
+    // at commits the branch no longer contains.
+    run(root, &["push", "-q", "origin", "feature/wip-twin"]);
+
+    // The rewrite. Same messages, different commits, thirty seconds later each,
+    // so every rewritten checkpoint sorts immediately above the one it replaced.
+    run(
+        root,
+        &["reset", "-q", "--hard", &format!("HEAD~{TWIN_REWRITTEN}")],
+    );
+    for n in (TWIN_CHECKPOINTS - TWIN_REWRITTEN + 1)..=TWIN_CHECKPOINTS {
+        checkpoint(n, &format!("checkpoint {n} (rewritten)"), 30);
+    }
+
+    // Make the twin visible as a remote-tracking ref in this repository.
+    run(root, &["fetch", "-q", "origin"]);
+}
+
 /// Every browser shape, by the name the `gv-fixture` binary accepts.
 pub const SHAPES: &[(&str, Builder)] = &[
     ("main", main_fixture),
@@ -430,6 +562,7 @@ pub const SHAPES: &[(&str, Builder)] = &[
     ("non-text-conflict", non_text_conflict_fixture),
     ("editor", editor_fixture),
     ("broken-head", broken_head_fixture),
+    ("interleaved-wip", interleaved_wip_fixture),
 ];
 
 #[cfg(test)]
@@ -571,6 +704,56 @@ mod tests {
             let text = std::fs::read_to_string(root.join(path)).unwrap();
             assert!(text.contains("<<<<<<<"), "{path} should carry markers");
         }
+    }
+
+    /// The interleave is the whole shape: every display-adjacent pair must be
+    /// a cross-chain pair, or the condition #478 fixed is not reproduced.
+    #[test]
+    fn the_two_checkpoint_chains_alternate_in_display_order() {
+        let (_d, root) = build("interleaved-wip");
+        let log = git::out_as(
+            BROWSER,
+            &root,
+            &[
+                "log",
+                "--date-order",
+                "--format=%s|%d",
+                "feature/wip-twin",
+                "origin/feature/wip-twin",
+            ],
+        );
+        let subjects: Vec<&str> = log
+            .lines()
+            .map(|l| l.split('|').next().unwrap())
+            .filter(|s| s.starts_with("wip(#478)"))
+            .collect();
+        // Every checkpoint number in the rewritten range appears twice.
+        for n in (TWIN_CHECKPOINTS - TWIN_REWRITTEN + 1)..=TWIN_CHECKPOINTS {
+            let needle = format!("wip(#478): auto-checkpoint {n}");
+            assert_eq!(
+                subjects.iter().filter(|s| **s == needle).count(),
+                2,
+                "checkpoint {n} must appear on two different commits: {subjects:?}"
+            );
+        }
+    }
+
+    /// The remote-tracking ref must be real, and must point at commits the
+    /// branch no longer contains — a faked ref would prove nothing.
+    #[test]
+    fn the_twin_is_a_real_remote_tracking_ref_the_branch_has_left_behind() {
+        let (_d, root) = build("interleaved-wip");
+        let local = git::out_as(BROWSER, &root, &["rev-parse", "feature/wip-twin"]);
+        let remote = git::out_as(BROWSER, &root, &["rev-parse", "origin/feature/wip-twin"]);
+        assert_ne!(local, remote, "the twin must have diverged");
+        assert!(
+            !git::try_run_as(
+                BROWSER,
+                &root,
+                &["merge-base", "--is-ancestor", &remote, &local]
+            ),
+            "the remote tip must NOT still be on the branch"
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@
 
 import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 /** Repo root, from this file's location: ci/browser -> ../.. */
 const REPO = join(import.meta.dirname, '..', '..')
@@ -53,6 +53,17 @@ function build(shape, root) {
  *  "run" rather than the MIN_RUN boundary case. Asserted directly by the
  *  collapse spec, so it must stay in sync with `browser::WIP_RUN_COUNT`. */
 export const WIP_RUN_COUNT = 3
+
+/** #478: how many checkpoints the interleaved-twin fixture's branch carries in
+ *  total, and how many of them are rewritten so the pushed twin diverges. Five
+ *  and three, so BOTH chains clear MIN_RUN on their own (the local chain keeps
+ *  the two shared checkpoints, the remote chain has three of its own) and the
+ *  two runs come out different lengths — a fixture where both markers said the
+ *  same number could not tell a correct grouping from a swapped one.
+ *  Asserted directly by the collapse spec. Mirrors `browser::TWIN_CHECKPOINTS`
+ *  and `browser::TWIN_REWRITTEN`. */
+export const TWIN_CHECKPOINTS = 5
+export const TWIN_REWRITTEN = 3
 
 /** Line count of the big file. Large enough that rendering every line would be
  *  obviously different from rendering a window, small enough to stay fast.
@@ -125,4 +136,24 @@ export function buildEditorFixture(root) {
 export function buildBrokenHeadFixture(root) {
   build('broken-head', root)
   return { root }
+}
+
+/**
+ * A SIXTH repository: a branch and its DIVERGED remote-tracking twin, both
+ * carrying checkpoint chains that interleave in display order (#478). The two
+ * chains alternate, so EVERY display-adjacent pair is a cross-chain pair — the
+ * condition under which the pre-#478 scan found no run longer than one and
+ * folded nothing.
+ *
+ * Shape and rationale:
+ * `git_vista_fixtures::browser::interleaved_wip_fixture`.
+ */
+export function buildInterleavedWipFixture(root) {
+  build('interleaved-wip', root)
+  return {
+    root,
+    originPath: join(dirname(root), 'twin-origin.git'),
+    checkpoints: TWIN_CHECKPOINTS,
+    rewritten: TWIN_REWRITTEN,
+  }
 }

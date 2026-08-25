@@ -172,6 +172,16 @@ pub fn try_run_as(ident: Ident, repo: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// [`run_dated`] under an explicit identity.
+pub fn run_dated_as(ident: Ident, repo: &Path, args: &[&str], date: &str) {
+    let status = command_as(ident, repo, args)
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .status()
+        .unwrap_or_else(|e| panic!("could not spawn git {args:?} in {repo:?}: {e}"));
+    assert!(status.success(), "git {args:?} failed in {repo:?}");
+}
+
 /// [`out`] without trimming, under an explicit identity.
 ///
 /// For output whose leading whitespace is *data*. `git status --porcelain` is

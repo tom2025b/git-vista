@@ -9,8 +9,8 @@
 
 import { expect, test } from '@playwright/test'
 
-import { WIP_RUN_COUNT } from '../fixture.mjs'
-import { openApp } from './helpers.mjs'
+import { TWIN_CHECKPOINTS, TWIN_REWRITTEN, WIP_RUN_COUNT } from '../fixture.mjs'
+import { forceOnline, openApp, runtime } from './helpers.mjs'
 
 // The fixture seeds 4 real commits plus one run of WIP_RUN_COUNT checkpoint
 // commits between commit 1 and commit 2 (fixture.mjs). Folded, the graph
@@ -142,5 +142,205 @@ test.describe('#374 WIP-checkpoint collapsing', () => {
     // with collapsing off nothing is being hidden, so a count of hidden runs
     // would be a claim about nothing
     await expect(toggle).not.toContainText('run')
+  })
+})
+
+// ── #478: two diverged chains, interleaved in display order ──────────────
+//
+// Everything above drives `fixture-repo`, whose checkpoint run is CONTIGUOUS.
+// Those specs are the regression half: they prove the rewrite of `project` did
+// not break the #374 behaviour. They cannot prove the #478 path is reached,
+// because a contiguous run folds under the old scan and the new one alike.
+//
+// This block drives `interleaved-repo`, where a branch and its diverged
+// remote-tracking twin put two checkpoint chains in the graph at once. Every
+// display-adjacent pair is a cross-chain pair, so the pre-#478 scan found no
+// run longer than one and folded nothing.
+//
+// The numbers below are DERIVED, not guessed: the fixture repository was built
+// and run through the real layout engine (`layout_with_refs`) and `project`,
+// and these are what came out. Rows as the layout engine places them:
+//
+//   row 0 lane 1  checkpoint 5 (local)     row 5 lane 2  checkpoint 3 (remote)
+//   row 1 lane 2  checkpoint 5 (remote)    row 6 lane 1  checkpoint 2 (shared)
+//   row 2 lane 1  checkpoint 4 (local)     row 7 lane 1  checkpoint 1 (shared)
+//   row 3 lane 2  checkpoint 4 (remote)    row 8 lane 0  seed
+//   row 4 lane 1  checkpoint 3 (local)
+//
+// The shared tail sits in the local chain's lane, so it folds into the local
+// group: members [0, 2, 4, 6, 7] and [1, 3, 5] — five and three, scattered
+// through display order, with the other chain's rows between them.
+
+/** The local chain: the rewritten checkpoints, plus the shared ones below the
+ *  divergence, which sit in its lane and so chain onto it. */
+const LOCAL_RUN = TWIN_REWRITTEN + (TWIN_CHECKPOINTS - TWIN_REWRITTEN)
+/** The remote-tracking twin has only its own rewritten-away half: the shared
+ *  tail is in the other lane, so its chain stops at the fork point. */
+const REMOTE_RUN = TWIN_REWRITTEN
+
+/** Folded: two markers plus the one ordinary commit (`seed`). */
+const TWIN_FOLDED_ROWS = 3
+/** Toggle off: every commit, nine of them. */
+const TWIN_ALL_ROWS = TWIN_CHECKPOINTS + TWIN_REWRITTEN + 1
+/** The local marker opened: its five members, the twin's marker, and seed. */
+const TWIN_LOCAL_OPEN_ROWS = LOCAL_RUN + 1 + 1
+
+/**
+ * Open the interleaved repository.
+ *
+ * Its own opener rather than `openApp`, which hardcodes `fixture-repo` — the
+ * same shape `broken-head.spec.mjs` needed for the same reason.
+ */
+async function openTwinRepo(page) {
+  await forceOnline(page)
+  const { base } = runtime()
+  await page.goto(base)
+  await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
+
+  const entry = page.getByRole('button', { name: /interleaved-repo/i }).first()
+  await expect(entry).toBeVisible()
+  await entry.click()
+
+  // The mode dialog only appears when the repository is not already open.
+  const visualize = page.getByRole('button', { name: /look only/ })
+  if (await visualize.isVisible().catch(() => false)) {
+    await visualize.click()
+  }
+
+  // Prove we are looking at the right repository before asserting on its rows.
+  await expect(page.locator('p.status.repo')).toContainText(/interleaved-repo/i)
+  await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
+  await expect(page.locator('circle.node-hit').first()).toBeAttached()
+}
+
+/**
+ * The vertical span of every edge path drawn in the graph, as `[startY, endY]`.
+ *
+ * Read out of the rendered `d` rather than from any app state: the question is
+ * whether the path was DRAWN, which is what `visible_edges` decides. `section
+ * .graph` holds edge paths and stub paths; this fixture has no branch stubs
+ * (verified against the layout engine), so every path here is an edge.
+ */
+function edgeSpans(page) {
+  return page.evaluate(() =>
+    [...document.querySelectorAll('section.graph svg path')]
+      .map((p) => (p.getAttribute('d') ?? '').match(/-?\d+(\.\d+)?/g))
+      .filter((n) => n && n.length >= 4)
+      // `d` is "M x1 y1 L x2 y2" or "M x1 y1 C ...  x2 y2": the second number
+      // is always the start y and the last is always the end y.
+      .map((n) => [Number(n[1]), Number(n[n.length - 1])]),
+  )
+}
+
+test.describe('#478 two diverged chains whose checkpoints interleave', () => {
+  test('each chain folds into its own marker', async ({ page }) => {
+    await openTwinRepo(page)
+
+    // Two markers, not one and not none. None is the defect (#478); one is the
+    // wrong fix the issue names — folding two branches' checkpoints together
+    // and claiming a chain that does not exist.
+    await expect(page.locator('.wip-group')).toHaveCount(2)
+    await expect(page.locator('.graph-row')).toHaveCount(TWIN_FOLDED_ROWS)
+
+    // The two markers carry DIFFERENT counts, and those counts are the two
+    // chains' real lengths. Asserting "two markers" alone would pass against a
+    // grouping that split the same chain in half, or that mixed the chains and
+    // happened to land on two groups.
+    // `allInnerTexts()` reads `element.innerText`, an HTML property SVG nodes
+    // do not have: it yields an array of `undefined`, so the length check
+    // above passes and the content check below dies on the first entry.
+    // `.wip-group-label` is an SVG `<text>` (render/nodes.rs:356), so read
+    // `textContent`, which SVG does have.
+    const labels = await page.locator('.wip-group-label').allTextContents()
+    expect(labels).toHaveLength(2)
+    expect(labels[0]).toContain(String(LOCAL_RUN))
+    expect(labels[1]).toContain(String(REMOTE_RUN))
+    expect(LOCAL_RUN).not.toBe(REMOTE_RUN)
+  })
+
+  test('the topbar counts both runs', async ({ page }) => {
+    await openTwinRepo(page)
+    await expect(page.getByRole('button', { name: /^WIP:/ })).toContainText('2 runs')
+  })
+
+  test('the toggle shows every checkpoint on both chains', async ({ page }) => {
+    // The paired positive for the count above: the marker really is standing in
+    // for eight commits, so "3 rows" is folding and not a graph that only ever
+    // had three commits in it.
+    await openTwinRepo(page)
+    await page.getByRole('button', { name: /WIP: folded/ }).click()
+
+    await expect(page.locator('.wip-group')).toHaveCount(0)
+    await expect(page.locator('.graph-row')).toHaveCount(TWIN_ALL_ROWS)
+  })
+
+  test('opening one chain leaves the other folded', async ({ page }) => {
+    await openTwinRepo(page)
+    // The first marker in DOM order is the first display slot: the local chain.
+    await page.locator('.wip-group .node-hit').first().click()
+
+    // Its five members are back, scattered through display order with the
+    // twin's marker still among them — this is the case a contiguous span
+    // cannot express, and the reason the group had to stop being a range.
+    await expect(page.locator('.graph-row')).toHaveCount(TWIN_LOCAL_OPEN_ROWS)
+    await expect(page.locator('.wip-group')).toHaveCount(1)
+    await expect(page.locator('.wip-group-label')).toContainText(String(REMOTE_RUN))
+  })
+
+  test('a member of the opened chain offers to fold that chain, not the other', async ({
+    page,
+  }) => {
+    await openTwinRepo(page)
+    await page.locator('.wip-group .node-hit').first().click()
+    await expect(page.locator('.graph-row')).toHaveCount(TWIN_LOCAL_OPEN_ROWS)
+
+    // Display row 3 is the opened chain's third member (checkpoint 3), which is
+    // NOT its head — the offer has to come from membership. Focus + Enter, not
+    // a click, for the reason the contiguous case documents above.
+    await page.locator('.node-hit[data-row-index="3"]').focus()
+    await page.keyboard.press('Enter')
+
+    // The menu names this chain's length, not the twin's and not the sum.
+    const fold = page.getByRole('button', {
+      name: new RegExp(`Fold these ${LOCAL_RUN} checkpoints`),
+    })
+    await expect(fold).toBeVisible()
+    await fold.click()
+
+    await expect(page.locator('.wip-group')).toHaveCount(2)
+    await expect(page.locator('.graph-row')).toHaveCount(TWIN_FOLDED_ROWS)
+  })
+
+  test('the edge into the folded fork point is still drawn, running upward', async ({ page }) => {
+    // The culler's half of #478, and the only assertion in this suite that
+    // reaches it. `visible_edges` used to compare `from_display < end &&
+    // to_display >= start`, which assumes a display edge runs downward. Folding
+    // non-adjacent rows breaks that: the twin's oldest commit descends from a
+    // fork point that folded into the OTHER chain's marker, and that marker is
+    // above — so the edge points back up the screen and the old filter dropped
+    // it wherever the viewport sat. `edge_path` always drew it correctly; only
+    // the culling was wrong, which is why the visible symptom is a missing line
+    // rather than a misdrawn one.
+    await openTwinRepo(page)
+    await expect(page.locator('.wip-group')).toHaveCount(2)
+
+    const spans = await edgeSpans(page)
+    expect(spans.length, 'the folded graph must still draw its edges').toBeGreaterThan(0)
+    const upward = spans.filter(([from, to]) => to < from)
+    expect(upward, `exactly one edge must run upward, got ${JSON.stringify(spans)}`).toHaveLength(1)
+  })
+
+  test('with the toggle off no edge runs upward', async ({ page }) => {
+    // The paired positive. Without it the assertion above passes just as
+    // happily against a graph that draws every edge upward, or against a
+    // parser that mixed up the coordinates — and an upward edge is only
+    // meaningful because the unfolded graph has none.
+    await openTwinRepo(page)
+    await page.getByRole('button', { name: /WIP: folded/ }).click()
+    await expect(page.locator('.wip-group')).toHaveCount(0)
+
+    const spans = await edgeSpans(page)
+    expect(spans.length, 'the unfolded graph must draw its edges').toBeGreaterThan(0)
+    expect(spans.filter(([from, to]) => to < from)).toHaveLength(0)
   })
 })

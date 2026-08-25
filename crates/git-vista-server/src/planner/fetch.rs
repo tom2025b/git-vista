@@ -459,6 +459,37 @@ pub(crate) fn error_body(
 /// "origin/main moved from X to Y" instead of "a fetch happened". Nothing is
 /// journaled when nothing moved, so an up-to-date fetch leaves no trace —
 /// the same posture `exec_checkout` takes towards a no-op checkout.
+///
+/// # These entries are a deduplication key. Do not collapse them.
+///
+/// #329 read as "one action should be one journal line" and an attempt was
+/// made to replace this loop with a single summary entry carrying the count.
+/// It was reverted in `0a7ba777`, because these entries are quietly doing a
+/// *second* job nobody had written down: `assemble_feed`'s attribution step
+/// drops a reflog line when a journal entry matches it on kind, resulting oid
+/// and moment. One fetch of 94 refs writes 94 reflog lines, and it is these 94
+/// per-ref entries — each carrying a `new_oid` — that suppress them. A summary
+/// entry has no `new_oid`, matches nothing, and lets all 94 reflog lines back
+/// in: the "fix" took the feed from 94 rows to 95. The feed-level fold
+/// (`git_vista_core::activity::fold_ref_update_bursts`) is where that noise is
+/// collapsed, and it covers terminal fetches, which have no journal entry at
+/// all.
+///
+/// # The per-ref cost is real, and is not what the revert was about
+///
+/// Every iteration reaches `journal::append`, which calls `capture_refs` —
+/// a full ref read of the repository, embedded into the line. One fetch of N
+/// refs therefore performs N full ref reads and writes N lines whose size
+/// itself grows with N. Measured 2026-08-25: 94 refs costs 527 KiB and 1.1 s,
+/// 500 refs costs 14 MiB and 27.6 s — and this is awaited before the endpoint
+/// responds, so it is the user's fetch latency. The drift it introduces also
+/// inflates the folded count past ~170 refs.
+///
+/// Fixing that means capturing the ref map **once per operation** and handing
+/// it to each entry — `journal::append` already keeps an event's own `refs`
+/// when it arrives carrying them. That keeps one entry per ref, so the dedup
+/// key above stays intact. See
+/// `docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`.
 async fn journal_updates(
     repo: &Path,
     remote: &RemoteName,
