@@ -32,7 +32,7 @@ forbidden_paths:
   - ci/browser/**
   - crates/git-vista/src/**
   - handoff.md
-merge_order: independent — touches no file the stash follow-ups touch.
+merge_order: shares two files with CLOUD-6 (#486) — both this handoff and CLOUD-6-issue-486-tips-unknown-fold.md list `crates/git-vista-core/src/activity.rs` and `crates/git-vista-server/src/planner/fetch.rs` in allowed_paths. CLOUD-6's own merge_order line ("nothing else in this batch touches activity.rs") is wrong on that point, and the batch README marks both #3 and #6 "independent" with no cross-reference between them. Coordinate with whichever CLOUD-6 session runs — do not assume the two land conflict-free unreviewed. Otherwise touches no file the stash follow-ups touch.
 ```
 
 ---
@@ -111,7 +111,7 @@ believing either is your doing.
    not 11,000×.
 3. A test that fails if the per-ref full ref read comes back — and proved able
    to go red **two different ways** (remove the batching, and weaken it to
-   every-other-ref). One `caught` verdict is not proof.
+   every-other-ref). One `caught` verdict is not proof. **Start from the test already in the tree**: `a_slow_fetch_still_counts_only_the_refs_that_moved` (`crates/git-vista-core/src/activity.rs:1346`, `#[should_panic(expected = "F1: the fold counted")]`) is #485's own pinned regression test, whose doc comment already says "Fixing this: capture the ref map once per operation... Then delete the `#[should_panic]`." It is synthetic — it builds its own `Vec<ActivityEvent>` with a hardcoded `MS_PER_REF` constant and never calls `journal_updates`/`capture_refs` — so the `fetch.rs` fix will not turn it green by itself; update `MS_PER_REF` to reflect the corrected (near-zero) drift as well as removing the `#[should_panic]`.
 4. **ADR 0080** records what a journal line carries after this change, and what
    reads it. `docs/adr/README.md` index updated.
 5. `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`,

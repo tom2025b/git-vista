@@ -123,9 +123,13 @@ recording as **ADR 0082** is *how the floor stays honest as it moves*:
   that source disappears — a version-floor job that silently stops running is
   worse than none, because the comment in `status.rs` would then be wrong in the
   reassuring direction.
-- **Is the floor job required or advisory?** If required, a transient failure
-  fetching an eleven-year-old git blocks every merge. If advisory, it will be
-  ignored. Pick one and defend it.
+- **The floor job is mandatory, not a choice for the ADR.** #365's own
+  acceptance criteria already settle this: "Make the 2.32 leg mandatory rather
+  than silently falling back to the runner's ambient Git." What the ADR
+  actually decides is how mandatory survives a *transient* failure fetching an
+  eleven-year-old git — retry, a cached/pinned artifact, or a pinned container
+  image — so a flaky fetch neither blocks every merge on infrastructure noise
+  nor becomes the excuse to quietly downgrade to advisory.
 - **What happens when `SUPPORTED_VERSIONS.md` changes the floor?** The existing
   CI step already parses the document rather than hardcoding — keep that
   property. The new job must read the same source, so the doc and the test can
@@ -147,6 +151,10 @@ recording as **ADR 0082** is *how the floor stays honest as it moves*:
 - **The comment at `status.rs:258-276` is updated to say what is now true.**
   Leaving an honest admission in place after closing the gap it admits is its
   own small lie.
+- **`docs/SUPPORTED_VERSIONS.md` documents the local reproduction command** —
+  #365's acceptance criteria require this explicitly ("Document the local
+  reproduction command") and it is currently missing from this list even
+  though the file is already in `allowed_paths`.
 
 ---
 

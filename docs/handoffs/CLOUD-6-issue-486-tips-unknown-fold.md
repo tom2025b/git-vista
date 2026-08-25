@@ -30,7 +30,7 @@ forbidden_paths:
   - ci/browser/**
   - crates/git-vista/src/**
   - handoff.md
-merge_order: independent — nothing else in this batch touches activity.rs.
+merge_order: NOT independent — shares crates/git-vista-core/src/activity.rs and crates/git-vista-server/src/planner/fetch.rs with CLOUD-3 (#485, ADR 0080). The collision is textual: both fixes edit the "Two known defects, measured 2026-08-25" doc-comment block (activity.rs ~601-624, one item each) and the shared #[should_panic] preamble above the F1/F2 tests (~1259-1270). Land after CLOUD-3 and rebase onto its result; do not treat this as touching a clean copy of either file.
 ```
 
 ---
@@ -138,7 +138,13 @@ believing either is your doing.
 4. Every test pinning this is proved able to go red **two different ways** —
    remove the exclusion, and weaken it (exclude on `ref_name: None` alone, say).
    One `caught` verdict is not proof; a Git-Vista test survived one mutation and
-   caught another on 2026-08-22, and either alone gives the wrong verdict.
+   caught another on 2026-08-22, and either alone gives the wrong verdict. Note: no
+   production path currently constructs a Fetch/Pull event with `ref_name: None`
+   and a `Some` oid, or `ref_name: Some` with both oids `None` — so on the F2
+   test's existing fixture, "exclude on `ref_name: None` alone" and the full fix
+   are behaviorally identical, and that mutation will not go red on its own. Add
+   a synthetic fixture event exercising that combination (it need not come
+   through a real code path) so the second mutation has something to catch.
 5. **ADR 0081** records the discriminator chosen and why — especially if the
    grep above found the shape is shared. `docs/adr/README.md` index updated.
 6. `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`,

@@ -130,9 +130,7 @@ believing either.
 
 ## Acceptance
 
-1. Every stash field name has **one** author in the workspace. `grep` for
-   `"entry"`, `"expected_oid"`, `"keep_index"`, `"include_untracked"` finds the
-   DTO definition and no hand-written duplicate.
+1. Every stash field name has **one** author at the wire boundary. `grep -n 'expected_oid\|keep_index\|include_untracked' crates/git-vista-server/src/handlers/stash.rs crates/git-vista/src/api/stash.rs` finds only the shared DTO's uses, no second struct definition. **Do not grep these names workspace-wide**: `GitOperation`'s `PushStash`/`PopStash`/`DropStash`/`BranchFromStash` variants already use identical field names for the internal execution plan in `crates/git-vista-protocol/src/plan.rs` (a separate, already-correct layer), and that name is threaded through `planner.rs`, `planner/stash.rs`, `sandbox/dispatch.rs`, and `git-vista-mcp/plan_tools.rs` — none of which are in `allowed_paths`. Those are legitimate consumers, not the duplicates this task removes. `"entry"` alone is too generic a token to grep meaningfully at all.
 2. `stash_list` no longer builds JSON with `serde_json::json!`.
 3. A round-trip test per DTO, and each proved able to go red **two different
    ways** — rename a field, and change a type. One `caught` verdict is not

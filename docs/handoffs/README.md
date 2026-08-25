@@ -48,17 +48,36 @@ its place in the queue.
 
 | # | Handoff | Issue(s) | ADR | Merge order |
 |---|---|---|---|---|
-| **1** | `CLOUD-1-issue-495-stash-dtos.md` | #495 | 0079 | **FIRST** — rewrites stash field names everywhere; everything else would pay for its rebase |
+| **1** | `CLOUD-1-issue-495-stash-dtos.md` | #495 | 0079 | **FIRST of all six** — rewrites stash field names everywhere; everything else would pay for its rebase |
 | **2** | `CLOUD-2-issues-493-494-stash-executor.md` | #493 + #494 | 0078 | after #1 |
-| **3** | `CLOUD-3-issue-485-journal-quadratic.md` | #485 | 0080 | independent |
-| **4** | `CLOUD-4-issue-326-planner-shape.md` | #326 | none | collides with #2 — whichever is ready second rebases |
+| **3** | `CLOUD-3-issue-485-journal-quadratic.md` | #485 | 0080 | **before #6** — shares `activity.rs` and `planner/fetch.rs` with it |
+| **4** | `CLOUD-4-issue-438-parallel-test-race.md` | #438 | 0083 | independent |
 | **5** | `CLOUD-5-issues-496-365-fixtures-finished.md` | #496 + #365 | 0082 | independent |
-| **6** | `CLOUD-6-issue-486-tips-unknown-fold.md` | #486 | 0081 | independent |
+| **6** | `CLOUD-6-issue-486-tips-unknown-fold.md` | #486 | 0081 | **after #3** — same two files, and the collision is textual |
+
+**Only two of the six are truly independent (#4 and #5).** The batch's own
+truth-check found that #3 and #6 both edit `crates/git-vista-core/src/activity.rs`
+and `crates/git-vista-server/src/planner/fetch.rs` — and not incidentally: they
+edit *the same doc-comment block*, `activity.rs` ~601-624, which lists two known
+defects, one each. Each fix deletes its own numbered item and whichever lands
+second must reword the block header. Both handoffs originally claimed to be
+independent. Both were wrong.
 
 **ADR numbers are assigned here, up front, on purpose.** When four sessions run
 at once and each picks "the next free number", they all pick the same one and
 the index conflicts. That happened on 25 August. 0074–0077 are taken; this batch
-claims 0078–0082.
+claims 0078–0083.
+
+### One handoff was written and withdrawn
+
+`CLOUD-4` was originally about **#326** (moving `shape()`'s match arms into
+their per-operation modules). The truth-check refuted three of its claims —
+its measurements were eighteen days stale, and issue #326 *explicitly forbids*
+the single-sweep approach the handoff instructed, for a reason that was live
+inside this very batch. It is parked at
+`docs/handoffs/parked/CLOUD-X-issue-326-planner-shape.md`, kept rather than
+deleted, with the full account in `docs/handoffs/parked/README.md`. #438 took
+its slot.
 
 ### A name collision worth knowing about
 
