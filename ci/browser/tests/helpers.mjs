@@ -136,3 +136,45 @@ export function watchSignIns(page) {
   })
   return posts
 }
+
+// --- #478: the interleaved-chains grouping assertion ------------------------
+//
+// Shared with `harness-selfcheck.spec.mjs`, the same way `RELOAD_SENTINEL`
+// above is, and for a stronger reason. That file's contract is that each
+// assertion is run against a DOM broken in the exact way the real test claims
+// to detect — which only holds if it runs the SAME assertion. When the two
+// were separate copies they agreed only because someone had just made them
+// agree; the next person to tighten the spec's version had no reason to know
+// a self-check mirrored it.
+//
+// It landed as two copies once already, and the copy that mattered covered
+// less: the self-check asserted only the length, so it stayed green over a
+// reader (`allInnerTexts()` on SVG) under which the content checks it was
+// guarding could never have passed at all.
+
+/**
+ * The interleaved graph folds into exactly TWO markers, and each carries its
+ * OWN chain's length.
+ *
+ * `local`/`remote` are passed in rather than read from `fixture.mjs`: every
+ * spec imports this module, and it has no business depending on one fixture's
+ * shape. The caller owns the numbers.
+ *
+ * Reads `textContent`, not `innerText`. `.wip-group-label` is an SVG `<text>`
+ * (`render/nodes.rs:356`) and SVG elements have no `innerText`, so
+ * `allInnerTexts()` yields an array of `undefined` — silently, without
+ * throwing. Both are real Playwright methods; only one of them works here.
+ */
+export async function expectEachChainHasItsOwnMarker(page, { local, remote }) {
+  // A precondition, not a formality: if both chains were the same length the
+  // per-chain checks below would pass against a projection that put each
+  // chain in the OTHER one's marker, and this assertion would discriminate
+  // nothing.
+  expect(local, 'the two chains must differ in length, or the counts prove nothing').not.toBe(
+    remote,
+  )
+  const labels = await page.locator('.wip-group-label').allTextContents()
+  expect(labels, 'each chain must fold into its own marker').toHaveLength(2)
+  expect(labels[0], 'each marker must carry its own chain length').toContain(String(local))
+  expect(labels[1], 'each marker must carry its own chain length').toContain(String(remote))
+}

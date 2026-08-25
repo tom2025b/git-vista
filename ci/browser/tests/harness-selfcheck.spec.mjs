@@ -16,7 +16,17 @@
 import { expect, test } from '@playwright/test'
 
 import { TWIN_CHECKPOINTS, TWIN_REWRITTEN } from '../fixture.mjs'
-import { DIFF_SCROLLER, forceOnline, markPage, openApp, openDiff, pageSurvived, runtime, setHash } from './helpers.mjs'
+import {
+  DIFF_SCROLLER,
+  expectEachChainHasItsOwnMarker,
+  forceOnline,
+  markPage,
+  openApp,
+  openDiff,
+  pageSurvived,
+  runtime,
+  setHash,
+} from './helpers.mjs'
 
 /** The two chains' lengths, derived from the fixture exactly as
  *  `wip-collapse.spec.mjs` derives them. */
@@ -24,31 +34,18 @@ const LOCAL_RUN = TWIN_REWRITTEN + (TWIN_CHECKPOINTS - TWIN_REWRITTEN)
 const REMOTE_RUN = TWIN_REWRITTEN
 
 /**
- * The #478 grouping assertion, in full, so the two self-checks below run the
- * SAME assertion `wip-collapse.spec.mjs` runs rather than a paraphrase of it.
+ * The #478 grouping assertion, run through `helpers.mjs` — the SAME function
+ * `wip-collapse.spec.mjs` calls, not a copy of it.
  *
- * Reading `textContent`, not `innerText`. `allInnerTexts()` reads an **HTML**
- * property; `.wip-group-label` is an SVG `<text>` (`render/nodes.rs:356`) and
- * SVG has no `innerText`, so it silently yields an array of `undefined`. That
- * shipped: the length check passed (two undefineds are still two) and the
- * content check below died on the first entry, reading like a product bug.
- * That is also why this file asserts all three parts and not just the length —
- * a self-check that only exercised the length check would have watched the
- * broken reader go red for the right reason and reported nothing wrong.
- *
- * Hand-mirrored rather than imported. Lifting the reader into `helpers.mjs`
- * — the precedent `RELOAD_SENTINEL` sets a few lines down — is what would make
- * drift between the two impossible, and it is the better end state. It is not
- * done here on purpose: this file's defect is a one-word reader bug, and
- * widening the fix into a three-file refactor of specs that still cannot be
- * executed in the session writing them is how the reader bug got here.
+ * That is the whole point of a self-check, and it took two goes to get right.
+ * The first version was written out here instead, and covered less than the
+ * spec did: it asserted only the length, so it stayed green over a reader
+ * (`allInnerTexts()` on an SVG `<text>`) under which the two content checks it
+ * was supposed to be guarding could never have passed at all. Two copies agree
+ * only until someone edits one.
  */
-async function assertEachChainHasItsOwnMarker(page) {
-  const labels = await page.locator('.wip-group-label').allTextContents()
-  expect(labels, 'each chain must fold into its own marker').toHaveLength(2)
-  expect(labels[0], 'each marker must carry its own chain length').toContain(String(LOCAL_RUN))
-  expect(labels[1], 'each marker must carry its own chain length').toContain(String(REMOTE_RUN))
-}
+const grouping = (page) =>
+  expectEachChainHasItsOwnMarker(page, { local: LOCAL_RUN, remote: REMOTE_RUN })
 
 /** Open the #478 interleaved-twin repository. Duplicated from
  *  `wip-collapse.spec.mjs` rather than imported, for the same reason every
@@ -211,7 +208,7 @@ test.describe('harness self-check — every assertion must be able to go red', (
       markers[1].remove()
     }, LOCAL_RUN + REMOTE_RUN)
 
-    const msg = await failureMessage(() => assertEachChainHasItsOwnMarker(page))
+    const msg = await failureMessage(() => grouping(page))
     expectFailedBecause(
       msg,
       /each chain must fold into its own marker/,
@@ -236,7 +233,7 @@ test.describe('harness self-check — every assertion must be able to go red', (
       labels[1].textContent = first
     })
 
-    const msg = await failureMessage(() => assertEachChainHasItsOwnMarker(page))
+    const msg = await failureMessage(() => grouping(page))
     expectFailedBecause(
       msg,
       /each marker must carry its own chain length/,

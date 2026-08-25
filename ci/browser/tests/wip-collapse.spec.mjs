@@ -10,7 +10,7 @@
 import { expect, test } from '@playwright/test'
 
 import { TWIN_CHECKPOINTS, TWIN_REWRITTEN, WIP_RUN_COUNT } from '../fixture.mjs'
-import { forceOnline, openApp, runtime } from './helpers.mjs'
+import { expectEachChainHasItsOwnMarker, forceOnline, openApp, runtime } from './helpers.mjs'
 
 // The fixture seeds 4 real commits plus one run of WIP_RUN_COUNT checkpoint
 // commits between commit 1 and commit 2 (fixture.mjs). Folded, the graph
@@ -246,16 +246,11 @@ test.describe('#478 two diverged chains whose checkpoints interleave', () => {
     // chains' real lengths. Asserting "two markers" alone would pass against a
     // grouping that split the same chain in half, or that mixed the chains and
     // happened to land on two groups.
-    // `allInnerTexts()` reads `element.innerText`, an HTML property SVG nodes
-    // do not have: it yields an array of `undefined`, so the length check
-    // above passes and the content check below dies on the first entry.
-    // `.wip-group-label` is an SVG `<text>` (render/nodes.rs:356), so read
-    // `textContent`, which SVG does have.
-    const labels = await page.locator('.wip-group-label').allTextContents()
-    expect(labels).toHaveLength(2)
-    expect(labels[0]).toContain(String(LOCAL_RUN))
-    expect(labels[1]).toContain(String(REMOTE_RUN))
-    expect(LOCAL_RUN).not.toBe(REMOTE_RUN)
+    //
+    // Shared with `harness-selfcheck.spec.mjs` rather than written out here,
+    // so the self-check that proves this can go red runs THIS assertion and
+    // not a copy of it. See `helpers.mjs` for what the two copies cost.
+    await expectEachChainHasItsOwnMarker(page, { local: LOCAL_RUN, remote: REMOTE_RUN })
   })
 
   test('the topbar counts both runs', async ({ page }) => {
