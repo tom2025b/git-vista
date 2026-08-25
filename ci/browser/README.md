@@ -25,9 +25,11 @@ ci/browser/run.sh hunk-keyboard   # one file
 First run installs `@playwright/test` and needs a Chromium build present
 (`npx playwright install chromium`). Everything after that is offline.
 
-Prerequisites, both checked with a clear message rather than a stack trace:
+Prerequisites, each checked with a clear message rather than a stack trace:
 
 - `target/debug/git-vista-server` — `cargo build -p git-vista-server`
+- `target/debug/gv-fixture` — `cargo build -p git-vista-fixtures` (since #448 the
+  fixtures are built by the Rust catalogue, not in JavaScript — see ADR 0076)
 - `crates/git-vista/dist/` — `trunk build --config crates/git-vista/Trunk.toml`
 
 ## Why it runs in a network namespace
@@ -72,7 +74,7 @@ fails — so the mount is load-bearing, not decorative.
 
 | file | role |
 |---|---|
-| `fixture.mjs` | builds the throwaway repo — every shape in it exists for a specific defect |
+| `fixture.mjs` | invokes the Rust catalogue (`gv-fixture`) for each shape, and holds the constants the specs assert against — the shapes themselves, and the documentation of what is wrong with each, live in `crates/git-vista-fixtures` |
 | `server.mjs` | spawns a server with its own state dir and repository list |
 | `global-setup.mjs` | fixture + server + spends the one-time token, saves `storageState` |
 | `tests/reachability.spec.mjs` | is the shipped code actually reached? |

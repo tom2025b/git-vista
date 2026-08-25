@@ -50,6 +50,7 @@
 //! // must stay in scope, because dropping it deletes the repository.
 //! ```
 
+pub mod browser;
 pub mod git;
 
 mod broken;

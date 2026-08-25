@@ -172,6 +172,21 @@ pub fn try_run_as(ident: Ident, repo: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// [`out`] without trimming, under an explicit identity.
+///
+/// For output whose leading whitespace is *data*. `git status --porcelain` is
+/// the case that matters: its first column is a space when a path is changed
+/// but not staged, so trimming the output shifts every column of the first
+/// line one to the left and silently turns " M file" into "M file" — an
+/// unstaged edit read as a staged rename.
+pub fn out_exact_as(ident: Ident, repo: &Path, args: &[&str]) -> String {
+    let output = command_as(ident, repo, args)
+        .output()
+        .unwrap_or_else(|e| panic!("could not spawn git {args:?} in {repo:?}: {e}"));
+    assert!(output.status.success(), "git {args:?} failed in {repo:?}");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 /// [`out`] under an explicit identity.
 pub fn out_as(ident: Ident, repo: &Path, args: &[&str]) -> String {
     let output = command_as(ident, repo, args)
