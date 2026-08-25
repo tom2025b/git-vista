@@ -26,7 +26,7 @@ feed:     1 × "fetch — 5 refs updated"
 
 Two harms in one line of output. A deliberate admission of ignorance was replaced by a confident count — the exact distinction `Obs::Unknown` exists to preserve, destroyed in the direction of false confidence. And the count was wrong anyway: four refs moved, and the admission was counted as the fifth.
 
-Evidence: `docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`, finding F2, pinned in `activity.rs` as a `#[should_panic]` expected-failure test.
+Evidence: `docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`, finding F2, which was pinned in `activity.rs` as a `#[should_panic]` expected-failure test until this change.
 
 ## Decision
 
@@ -112,10 +112,16 @@ assert_eq!(entry.new_oid, None, …);
 
 So the shape this ADR keys on cannot drift silently at the producer: a change to `journal_unobserved` that named a ref or invented an oid fails that test, in the crate where the change would be made. `journal_unobserved`'s doc comment now says so beside the code.
 
-`cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings` are clean, and `cargo doc -p git-vista-core --no-deps` adds no warning. `cargo test --workspace` is green in every crate except `git-vista-server`, which cannot run here: this container reports `landlock_abi=-1` — the capability probe's own words are *"this host is known to support Landlock; got abi=-1"* — and INV-13 gives the server no degraded tier, so every test that runs real git through the sandbox launcher fails. That is 320 tests, and it is environmental, not this change: the failing set on a stashed clean tree is **byte-identical** to the failing set with this change applied (320 = 320, `diff` empty), and `a_fetch_whose_outcome_cannot_be_observed_is_journaled_as_unknown` is one of the 320 on both. It must be run on a host with Landlock before this is believed.
+`cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings` are clean, and `cargo doc -p git-vista-core --no-deps` adds no warning. `cargo test --workspace` is green in every crate except `git-vista-server`, which cannot run here: this container reports `landlock_abi=-1` — the capability probe's own words are *"this host is known to support Landlock; got abi=-1"* — and INV-13 gives the server no degraded tier, so every test that runs real git through the sandbox launcher fails. That is 320 tests, and it is environmental, not this change: the failing set on a stashed clean tree is **byte-identical** to the failing set with this change applied (320 = 320, `diff` empty), and `a_fetch_whose_outcome_cannot_be_observed_is_journaled_as_unknown` is one of the 320 on both.
+
+**Confirmed on a Landlock host.** CI's `Core (check + test)` job runs `cargo test --workspace` (`.github/workflows/ci.yml`, "Test core + git + protocol + server + frontend crates"), and it passed on this branch — so the whole server suite, that write-path pin included, is green where the sandbox can actually be built.
 
 The browser leg was not run either, for the same reason. This change is confined to the pure core and one doc comment; it reaches no frontend code.
 
 ## What this does not fix
 
-F1 — the folded count inflating at scale, because per-ref `capture_refs` drifts the journal entries past `JOURNAL_MATCH_SLACK` — is untouched and remains a `#[should_panic]` pin (`a_slow_fetch_still_counts_only_the_refs_that_moved`). #329 should not be closed on this ADR alone.
+F1 — the folded count inflating at scale — is untouched **here**, and was never this ADR's to fix. It was still a `#[should_panic]` pin when this change was written; #485 (ADR 0080) landed hours later and fixed it at the writer, so `a_slow_fetch_still_counts_only_the_refs_that_moved` is now a live regression test rather than a pin. Both statements are recorded because the ordering matters to a later reader: this ADR was authored against a tree where F1 was still pinned, and `main` was merged down afterwards.
+
+The fold itself still counts both copies of any Fetch/Pull entry that drifts past `JOURNAL_MATCH_SLACK`; #485 removed every writer that can produce such drift rather than making the fold robust to it. That is ADR 0080's argument, not this one's.
+
+With F1 and F2 both fixed, #329's two known successor defects are closed — but this ADR closes only #486.
