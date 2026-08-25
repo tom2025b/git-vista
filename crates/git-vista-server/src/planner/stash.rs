@@ -942,4 +942,71 @@ mod tests {
             "{detail}"
         );
     }
+
+    /// The premise the `(false, Clear)` arm rests on, **executed** rather than
+    /// asserted in a comment (#508).
+    ///
+    /// [`apply_verdict`]'s own table has claimed since #494 that this shape is
+    /// reachable — *"an untracked file in the stash colliding with one on disk
+    /// exits 1 with a clean index"*. It was right, and nothing ran it. So the
+    /// claim sat in a comment in THIS crate while the frontend, in another
+    /// crate, read the same `(false, Clear)` pair and rendered *"Your working
+    /// tree was left untouched"* over a file git had just rewritten.
+    ///
+    /// What this pins is **git's** behaviour, not ours: git can write a tracked
+    /// file and then fail, leaving nothing unmerged. Every verdict that
+    /// declines to describe the working tree after a refused apply depends on
+    /// that being true. If some future git stops doing it, this says so loudly
+    /// instead of letting the caution look superstitious.
+    #[test]
+    fn a_failed_apply_can_change_a_tracked_file_and_leave_the_index_clean() {
+        use git_vista_fixtures::git;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git::init(repo);
+
+        std::fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        git::run(repo, &["add", "tracked.txt"]);
+        git::run(repo, &["commit", "-q", "-m", "seed"]);
+
+        // The stash carries BOTH a tracked edit and an untracked file.
+        std::fs::write(repo.join("tracked.txt"), "from-stash\n").unwrap();
+        std::fs::write(repo.join("collision.txt"), "from-stash\n").unwrap();
+        git::run(
+            repo,
+            &["stash", "push", "--include-untracked", "-m", "both"],
+        );
+
+        // Now put a DIFFERENT file in the untracked one's way.
+        std::fs::write(repo.join("collision.txt"), "already-here\n").unwrap();
+
+        let applied = git::try_run(repo, &["stash", "apply", "stash@{0}"]);
+
+        assert!(
+            !applied,
+            "git must refuse: the stash's untracked file collides with one on disk"
+        );
+        assert_eq!(
+            git::out(repo, &["ls-files", "-u"]).trim(),
+            "",
+            "and it leaves NOTHING unmerged — which is why a clear conflict scan \
+             cannot be read as 'nothing happened'"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+            "from-stash\n",
+            "yet the tracked file WAS rewritten by the failed apply. A verdict \
+             calling this 'untouched' would be lying about the user's data"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("collision.txt")).unwrap(),
+            "already-here\n",
+            "the colliding file is the one git refused to overwrite"
+        );
+        assert!(
+            !git::out(repo, &["stash", "list"]).trim().is_empty(),
+            "and the entry survives, so a pop composed on top of this must not drop it"
+        );
+    }
 }

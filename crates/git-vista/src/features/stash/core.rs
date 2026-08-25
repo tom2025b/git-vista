@@ -610,17 +610,39 @@ pub enum DropOutcome {
 
 /// What is true of the working tree, as far as this client can actually tell.
 ///
-/// Three states, not a `bool`, because after a refused apply whose conflict
-/// scan also failed the honest answer is *"unknown"* — and a `bool` has nowhere
-/// to put it, so it would have to guess.
+/// Two states, not a `bool`, because the honest answer is often *"unknown"* —
+/// and a `bool` has nowhere to put it, so it would have to guess.
+///
+/// # There is deliberately no `Untouched`
+///
+/// There used to be, produced only by what is now
+/// [`PopVerdict::ApplyRefused`] and justified as *"the apply was refused **and**
+/// a scan that really ran found nothing conflicted"*. **That inference is
+/// false, and it shipped** (#508).
+///
+/// A conflict scan establishes that nothing **conflicts**. It cannot establish
+/// that nothing **landed**. `git stash apply --include-untracked`, run where
+/// the untracked file already exists on disk, writes the tracked change, *then*
+/// fails restoring the untracked one, exits non-zero, and leaves no unmerged
+/// index entries. The scan comes back clear, and the app told the user *"Your
+/// working tree was left untouched"* over a file it had just rewritten.
+///
+/// There **is** a genuinely untouched case — a compare-and-swap refusal, where
+/// git never ran at all — and the test that pinned this arm used exactly that
+/// input, then let the arm generalise to every input. [`ApplyOutcome::Refused`]
+/// carries no fact about whether git ran, so [`PopVerdict::tree`] cannot tell
+/// the two apart.
+///
+/// The variant is removed rather than made conditional: **a state this client
+/// has no way to establish should not be sayable.** Restoring the precision
+/// honestly requires the server to report structurally whether git ran before
+/// it failed, which is a wire change and is filed separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TreeState {
     /// There is work in the working tree from this operation.
     Changed,
-    /// Verified untouched: the apply was refused *and* a scan that really ran
-    /// found nothing conflicted.
-    Untouched,
-    /// Neither could be established. Says so rather than picking a side.
+    /// It could not be established either way. Says so rather than picking a
+    /// side — see this type's own doc for why that is the common case.
     Unknown,
 }
 
@@ -629,7 +651,6 @@ impl TreeState {
     pub fn line(self) -> &'static str {
         match self {
             TreeState::Changed => "Your working tree has changes from this stash.",
-            TreeState::Untouched => "Your working tree was left untouched.",
             TreeState::Unknown => {
                 "Whether anything reached your working tree could not be established — \
                  check `git status` before retrying."
@@ -654,7 +675,7 @@ pub enum PopVerdict {
     Popped,
     /// The apply was refused **and** a scan that really ran found nothing
     /// conflicted, so nothing landed. The entry is intact.
-    NotApplied { why: String },
+    ApplyRefused { why: String },
     /// Conflicted paths remain. **A4's case.**
     ///
     /// Reached two ways, kept distinguishable by `apply_refusal`:
@@ -674,7 +695,7 @@ pub enum PopVerdict {
     AppliedUnverified { why: String },
     /// The apply was refused *and* the conflict scan failed, so whether
     /// anything reached the tree is genuinely unknown. Distinct from
-    /// [`Self::NotApplied`], which is a verified claim.
+    /// [`Self::ApplyRefused`], which is a verified claim.
     RefusedUnverified { why: String, scan_why: String },
     /// Applied, verified clear, and then the drop failed. The composite state a
     /// single operation row could not express, and the reason pop is two
@@ -700,9 +721,11 @@ impl PopVerdict {
             | PopVerdict::AppliedNotDropped { .. } => TreeState::Changed,
             // Conflicted paths are in the tree whichever step put them there.
             PopVerdict::Conflicted { .. } => TreeState::Changed,
-            // The only verified-untouched case: refused, and a real scan found
-            // nothing.
-            PopVerdict::NotApplied { .. } => TreeState::Untouched,
+            // Refused, with a scan that came back clear. That establishes no
+            // CONFLICTS; it does not establish that nothing landed, because git
+            // can write a file and then fail without leaving an unmerged entry.
+            // See `TreeState`'s own doc (#508).
+            PopVerdict::ApplyRefused { .. } => TreeState::Unknown,
             PopVerdict::RefusedUnverified { .. } => TreeState::Unknown,
         }
     }
@@ -723,9 +746,10 @@ impl PopVerdict {
             PopVerdict::Popped => {
                 "Popped the stash. It has been removed from your stash list.".to_string()
             }
-            PopVerdict::NotApplied { why } => format!(
-                "Nothing was applied, so the stash was not popped. It is still in your \
-                 list.\n\n{why}"
+            PopVerdict::ApplyRefused { why } => format!(
+                "The apply was refused, so the stash was not popped. It is still in \
+                 your list — but check `git status` before retrying: a refused apply \
+                 is not proof that nothing reached your files.\n\n{why}"
             ),
             PopVerdict::Conflicted { apply_refusal, .. } => {
                 let opening = match apply_refusal {
@@ -820,9 +844,13 @@ pub fn drop_gate(apply: &ApplyOutcome, scan: &ConflictScan) -> DropGate {
             DropGate::Halt(PopVerdict::AppliedUnverified { why: why.clone() })
         }
 
-        // Refused, and a real scan found nothing conflicted: nothing landed.
+        // Refused, and a real scan found nothing conflicted. That is ALL it
+        // found: the scan reads unmerged index entries, and git can write a
+        // tracked file and then fail on an untracked one without creating any
+        // (#508). The gate stays shut, and the verdict declines to describe a
+        // working tree it did not look at.
         (ApplyOutcome::Refused(why), ConflictScan::Read(Continuation::Clear)) => {
-            DropGate::Halt(PopVerdict::NotApplied { why: why.clone() })
+            DropGate::Halt(PopVerdict::ApplyRefused { why: why.clone() })
         }
 
         // Refused AND unscannable: genuinely unknown, and said so.
@@ -867,7 +895,7 @@ mod tests {
     fn every_verdict() -> Vec<PopVerdict> {
         vec![
             PopVerdict::Popped,
-            PopVerdict::NotApplied {
+            PopVerdict::ApplyRefused {
                 why: "the entry no longer exists".to_string(),
             },
             PopVerdict::Conflicted {
@@ -1036,7 +1064,7 @@ mod tests {
     /// A refused apply whose conflict scan ALSO failed knows nothing, and says
     /// so rather than picking a side.
     ///
-    /// MUTATION 1: return `NotApplied` for this pair — red, it would claim a
+    /// MUTATION 1: return `ApplyRefused` for this pair — red, it would claim a
     ///   verified-untouched tree on two failed observations. Verified: red.
     /// MUTATION 2: return `AppliedUnverified` instead — red, it would claim the
     ///   changes were applied when the apply was refused. Verified: red.
@@ -1062,15 +1090,17 @@ mod tests {
             verdict.headline()
         );
 
-        // The three TreeStates are distinct, so the assertion above cannot be
+        // The two TreeStates are distinct, so the assertion above cannot be
         // satisfied by a `tree()` that returns one value for everything.
         assert_eq!(PopVerdict::Popped.tree(), TreeState::Changed);
         assert_eq!(
-            PopVerdict::NotApplied {
+            PopVerdict::ApplyRefused {
                 why: "gone".to_string()
             }
             .tree(),
-            TreeState::Untouched
+            // Was `Untouched` until #508. A refused apply says nothing about
+            // the tree — see `TreeState`'s doc.
+            TreeState::Unknown
         );
     }
 
@@ -1128,8 +1158,11 @@ mod tests {
     ///   `verdict_after_drop`'s `Refused` arm — red, a failed drop reported as
     ///   a finished pop. Verified by hand: red.
     /// MUTATION 2 (keeps the variant, weakens the report): make
-    ///   `AppliedNotDropped`'s `tree()` return `TreeState::Untouched` — red,
-    ///   the tree changed and the report denies it. Verified by hand: red.
+    ///   `AppliedNotDropped`'s `tree()` return `TreeState::Unknown` — red, the
+    ///   tree demonstrably changed and the report retreats to "could not
+    ///   establish". Verified by hand: red. (This mutation named
+    ///   `TreeState::Untouched` until #508 removed that variant; `Unknown` is
+    ///   the same weakening now that it is the only other arm.)
     #[test]
     fn an_applied_stash_whose_drop_failed_says_both_things() {
         let verdict = verdict_after_drop(&DropOutcome::Refused(
@@ -1209,13 +1242,28 @@ mod tests {
     ///
     /// MUTATION 1: return `DropGate::Run` for a refused apply — red, a drop
     ///   would be sent for a stash that was never applied. Verified: red.
-    /// MUTATION 2: make `NotApplied`'s `tree()` return `TreeState::Changed` —
+    /// MUTATION 2: make `ApplyRefused`'s `tree()` return `TreeState::Changed` —
     ///   red, it would tell the user their files moved when nothing ran.
     ///   Verified: red.
+    /// A refused apply over a clear scan says the stash is still yours — and
+    /// **declines to describe the working tree**.
+    ///
+    /// This test asserted `TreeState::Untouched` until #508, on the strength of
+    /// its own input: a compare-and-swap refusal, where git genuinely never
+    /// ran. That input is real. The inference from it was not — the arm under
+    /// test receives every refusal, and `ApplyOutcome::Refused` carries no fact
+    /// about whether git ran. `git stash apply --include-untracked` can write a
+    /// tracked file, fail on the untracked one, exit non-zero and leave no
+    /// unmerged entry, and this same arm would have called that "untouched".
+    ///
+    /// The assertion changed because it was wrong, not to accommodate a fix.
+    /// What it pins now is the honest floor: the gate stays shut, the entry is
+    /// retained, and the tree is `Unknown`.
     #[test]
-    fn a_refused_apply_over_a_clear_tree_is_the_one_nothing_moved_case() {
+    fn a_refused_apply_over_a_clear_scan_declines_to_describe_the_tree() {
         let DropGate::Halt(verdict) = drop_gate(
             // A compare-and-swap refusal: the entry moved, so git never ran.
+            // The verdict cannot know that, which is the whole point.
             &ApplyOutcome::Refused("stash@{3} no longer exists".to_string()),
             &ConflictScan::Read(Continuation::Clear),
         ) else {
@@ -1224,13 +1272,13 @@ mod tests {
         assert!(!verdict.is_complete());
         assert_eq!(
             verdict.tree(),
-            TreeState::Untouched,
-            "nothing ran, and a real scan confirmed it"
+            TreeState::Unknown,
+            "a clear conflict scan proves nothing CONFLICTS, not that nothing LANDED"
         );
         assert!(verdict.entry_retained());
         assert!(verdict.conflicted_paths().is_empty());
         assert!(
-            verdict.headline().contains("Nothing was applied"),
+            verdict.headline().contains("check `git status`"),
             "got: {}",
             verdict.headline()
         );
