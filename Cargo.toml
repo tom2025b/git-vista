@@ -24,6 +24,7 @@ members = [
     "crates/git-vista",
     "crates/git-vista-mcp",
     "crates/gv-scrollcast",
+    "crates/git-vista-fixtures",
 ]
 
 [workspace.package]
@@ -39,6 +40,9 @@ repository = "https://github.com/tom2025b/git-vista"
 git-vista-core = { path = "crates/git-vista-core" }
 git-vista-protocol = { path = "crates/git-vista-protocol" }
 git-vista-git = { path = "crates/git-vista-git" }
+# The #448 fixture catalogue — deliberately-broken repositories as named,
+# documented shapes. A dev-dependency only: no shipped code builds fixtures.
+git-vista-fixtures = { path = "crates/git-vista-fixtures" }
 # Landlock/prctl raw syscalls (444/445/446, PR_SET_NO_NEW_PRIVS) for the M1.13b
 # (#66) sandbox shim — no stable std wrapper exists. See
 # docs/NATIVE_DEPENDENCIES.md (F10) for why this is a reviewed dependency.

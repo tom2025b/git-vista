@@ -29,6 +29,11 @@
 
 use super::*;
 use std::path::PathBuf;
+/// Two files at the seed, because the partial-resolution tests need two
+/// independently conflictable paths.
+fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
+    git_vista_fixtures::seeded_files(&[("a.txt", "a\n"), ("b.txt", "b\n")], "seed")
+}
 
 fn run(repo: &Path, args: &[&str]) {
     assert!(
@@ -50,21 +55,6 @@ fn out(repo: &Path, args: &[&str]) -> String {
         .unwrap();
     assert!(output.status.success(), "git {args:?} failed in {repo:?}");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-/// A fresh repository on `main` with two committed files.
-fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    run(&repo, &["init", "-q", "-b", "main"]);
-    run(&repo, &["config", "user.email", "t@example.invalid"]);
-    run(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-    std::fs::write(repo.join("b.txt"), "b\n").unwrap();
-    run(&repo, &["add", "-A"]);
-    run(&repo, &["commit", "-q", "-m", "seed"]);
-    (dir, repo)
 }
 
 /// A merge left conflicted on **two** paths.

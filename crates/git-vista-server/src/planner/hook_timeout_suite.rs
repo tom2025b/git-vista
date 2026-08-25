@@ -13,40 +13,14 @@
 //! a process-wide value.
 
 use super::*;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use git_vista_core::identity::RepositoryId;
+use git_vista_fixtures::seeded as seeded_repo;
 
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
-
-fn run(repo: &Path, args: &[&str]) {
-    assert!(
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .status()
-            .unwrap()
-            .success(),
-        "git {args:?} failed in {repo:?}"
-    );
-}
-
-/// A fresh repository on `main` with one commit and a clean working tree.
-fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    run(&repo, &["init", "-q", "-b", "main"]);
-    run(&repo, &["config", "user.email", "t@example.invalid"]);
-    run(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-    run(&repo, &["add", "a.txt"]);
-    run(&repo, &["commit", "-q", "-m", "seed"]);
-    (dir, repo)
-}
 
 fn tokens() -> (RepositoryToken, WorktreeToken) {
     (
@@ -97,6 +71,7 @@ fn write_sleep_forever_hook(repo: &Path, name: &str) {
     // does not sit on the test-runner box indefinitely.
     std::fs::write(&path, "#!/bin/sh\nsleep 10000\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
+
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).unwrap();

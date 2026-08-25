@@ -6,19 +6,7 @@
 
 use super::tag_exec::{classify_sign_failure, create_tag_argv, exec_create_tag, SIGN_TIMEOUT};
 use super::*;
-use std::path::PathBuf;
-
-fn run(repo: &Path, args: &[&str]) {
-    assert!(
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .status()
-            .unwrap()
-            .success(),
-        "git {args:?} failed in {repo:?}"
-    );
-}
+use git_vista_fixtures::seeded as seeded_repo;
 
 /// `git rev-parse HEAD` in `repo`, trimmed — for tests that need a real
 /// oid to build a compare-and-swap `GitOperation` against (#222).
@@ -32,21 +20,6 @@ async fn git_rev_parse_head(repo: &Path) -> String {
         .unwrap();
     assert!(output.status.success(), "git rev-parse HEAD failed");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-/// A fresh repository on branch `main` with one committed file and a
-/// clean working tree.
-fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    run(&repo, &["init", "-q", "-b", "main"]);
-    run(&repo, &["config", "user.email", "t@example.invalid"]);
-    run(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-    run(&repo, &["add", "a.txt"]);
-    run(&repo, &["commit", "-q", "-m", "seed"]);
-    (dir, repo)
 }
 
 /// M2.21d (#238) / M2.21e (#239, ADR 0048): the argv `git tag` is

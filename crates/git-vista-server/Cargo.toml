@@ -75,6 +75,10 @@ tower-http = { version = "0.7.0", features = ["fs", "set-header", "catch-panic"]
 tempfile = "3"
 
 [dev-dependencies]
+# The #448 fixture catalogue: every deliberately-broken repository shape these
+# suites drive, built once in one place. Dev-only — no shipped code builds a
+# fixture, and the crate must never reach the release binary.
+git-vista-fixtures = { workspace = true }
 # The exact crate axum's `Query` extractor parses with, so a test that says
 # "this is the query string the browser sends" is parsed by the same code the
 # handler will meet it with. Already in the lock as an axum dependency.

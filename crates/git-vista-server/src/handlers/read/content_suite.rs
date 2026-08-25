@@ -8,6 +8,10 @@
 use super::*;
 use axum::routing::get;
 use axum::Router;
+use git_vista_fixtures::{
+    four_mode as four_mode_repo, path_battery as path_battery_repo,
+    pathological_content as pathological_repo, seeded as seeded_repo, write_rows, BINARY_SENTINEL,
+};
 use git_vista_protocol::diff::{ComparisonBasis, DiffSpec};
 use git_vista_protocol::RepositoryDescriptor;
 use tower::ServiceExt;
@@ -61,20 +65,6 @@ fn stdout_len(repo: &Path, args: &[String]) -> usize {
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout.len()
-}
-
-/// A fresh repository on branch `main` with one committed file.
-fn seeded_repo() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    run(&repo, &["init", "-q", "-b", "main"]);
-    run(&repo, &["config", "user.email", "t@example.invalid"]);
-    run(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
-    run(&repo, &["add", "a.txt"]);
-    run(&repo, &["commit", "-q", "-m", "seed"]);
-    (dir, repo)
 }
 
 /// A repository whose HEAD commit modifies several files — enough `-z`
@@ -307,28 +297,6 @@ async fn bounded_diff_numstat_cap_returns_413() {
     assert!(diff.files.iter().all(|f| f.additions == Some(1)));
 }
 
-/// Write a file of about `len` bytes: `header` first, then deterministic
-/// fixed-size rows. Streamed through a `BufWriter` rather than built in
-/// memory so a 50 MiB fixture costs the test almost nothing, and generated
-/// from the running offset so a longer file is a byte-identical *prefix*
-/// extension of a shorter one (which is what makes an "append" diff cheap
-/// for git to compute). No shell helper is involved — `yes`/`dd`/`head` are
-/// banned by the argv boundary, and every child these tests spawn is
-/// literally `git`.
-fn write_rows(path: &Path, header: &str, len: usize, tag: &str) {
-    use std::io::Write;
-    let mut w = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
-    w.write_all(header.as_bytes()).unwrap();
-    let mut written = header.len();
-    while written < len {
-        let row = format!("{written:012} {tag} bounded-read fixture row\n");
-        let take = row.len().min(len - written);
-        w.write_all(&row.as_bytes()[..take]).unwrap();
-        written += take;
-    }
-    w.flush().unwrap();
-}
-
 /// A file read that hits the content cap is a *successful truncated file*,
 /// not a missing object. It must therefore never fall through to the
 /// `<id>^:<path>` fallback — that fallback exists for a file this commit
@@ -385,75 +353,7 @@ async fn bounded_file_read_caps_without_parent_fallback() {
     assert!(deleted.truncated);
 }
 
-/// Roughly the size of the text fixture's first version.
-const BIG_TEXT_BYTES: usize = 50 * 1024 * 1024;
-/// How much the second version appends — comfortably past both patch caps.
-const BIG_TEXT_APPEND: usize = 8 * 1024 * 1024;
-/// A string that appears only inside the binary blob. If it ever shows up in
-/// a patch, binary bytes reached the wire.
-const BINARY_SENTINEL: &str = "GV-BINARY-SENTINEL-PAYLOAD";
-
-fn on_disk_len(path: &Path) -> usize {
-    std::fs::metadata(path).unwrap().len() as usize
-}
-
-/// `len` bytes of binary content: NUL-delimited sentinel runs. The leading
-/// NUL is inside the first 8000 bytes, which is what makes both git and our
-/// own sniff call this binary.
-fn binary_blob(tag: &str, len: usize) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(len);
-    bytes.push(0u8);
-    bytes.extend_from_slice(tag.as_bytes());
-    while bytes.len() < len {
-        bytes.push(0u8);
-        bytes.extend_from_slice(BINARY_SENTINEL.as_bytes());
-    }
-    bytes.truncate(len);
-    bytes
-}
-
 // ---- POST /api/diff/spec: the four explicit modes (M2.16, #69) -------
-
-/// A repository where **each of the four `DiffSpec` modes sees a different
-/// change**, so a test can prove a mode diffed what it claims rather than
-/// merely returning some non-empty patch.
-///
-/// `v.txt` moves through four values, each parked in a different place:
-///
-/// ```text
-///   one    commit 1 (branch `base`)
-///   two    commit 2 (branch `main`, HEAD)
-///   three  staged in the index, not committed
-///   four   in the working tree, not staged
-/// ```
-///
-/// So `WorktreeVsIndex` must see three→four, `IndexVsCommit(HEAD)` two→three,
-/// and `CommitVsCommit`/`RefVsRef` one→two. Four modes, four distinguishable
-/// answers — a mode that silently ran the wrong argv shows up as the wrong
-/// pair, not as a pass.
-fn four_mode_repo() -> (tempfile::TempDir, PathBuf, String, String) {
-    let (dir, repo) = seeded_repo();
-
-    std::fs::write(repo.join("v.txt"), "one\n").unwrap();
-    run(&repo, &["add", "-A"]);
-    run(&repo, &["commit", "-q", "-m", "v = one"]);
-    let c1 = out(&repo, &["rev-parse", "HEAD"]);
-    run(&repo, &["branch", "base"]);
-
-    std::fs::write(repo.join("v.txt"), "two\n").unwrap();
-    run(&repo, &["add", "-A"]);
-    run(&repo, &["commit", "-q", "-m", "v = two"]);
-    let c2 = out(&repo, &["rev-parse", "HEAD"]);
-
-    // Staged but uncommitted.
-    std::fs::write(repo.join("v.txt"), "three\n").unwrap();
-    run(&repo, &["add", "-A"]);
-
-    // Working tree, on top of the staged value and not added.
-    std::fs::write(repo.join("v.txt"), "four\n").unwrap();
-
-    (dir, repo, c1, c2)
-}
 
 /// Assert a patch changes exactly `from` → `to`, and **not** any of the
 /// other values in play. The negative half is the point: without it, a
@@ -644,45 +544,6 @@ async fn spec_diff_never_runs_a_repository_configured_textconv_filter() {
     }
 }
 
-/// A repository whose HEAD commit modifies both a ~50 MiB text file and a
-/// NUL-bearing binary blob.
-///
-/// Two deliberate choices. `bin.dat` sorts before `zbig.txt`, so git's patch
-/// leads with the binary section — otherwise the 200 KB panel cap would cut
-/// away the very "Binary files … differ" line the test is about. And the
-/// text change is an *append*: git trims the identical 50 MiB prefix in one
-/// pass, so the fixture stays a fixture instead of a minutes-long diff,
-/// while still producing a patch far past both patch caps.
-fn pathological_repo() -> (tempfile::TempDir, PathBuf, String) {
-    let (dir, repo) = seeded_repo();
-    write_rows(&repo.join("zbig.txt"), "ZBIG\n", BIG_TEXT_BYTES, "alpha");
-    std::fs::write(repo.join("bin.dat"), binary_blob("one", 64 * 1024)).unwrap();
-    assert_eq!(on_disk_len(&repo.join("zbig.txt")), BIG_TEXT_BYTES);
-    run(&repo, &["add", "-A"]);
-    run(&repo, &["commit", "-q", "-m", "add pathological content"]);
-
-    write_rows(
-        &repo.join("zbig.txt"),
-        "ZBIG\n",
-        BIG_TEXT_BYTES + BIG_TEXT_APPEND,
-        "alpha",
-    );
-    assert_eq!(
-        on_disk_len(&repo.join("zbig.txt")),
-        BIG_TEXT_BYTES + BIG_TEXT_APPEND,
-        "the fixture must really be ~50 MiB, not a silently short write"
-    );
-    std::fs::write(repo.join("bin.dat"), binary_blob("two", 96 * 1024)).unwrap();
-    run(&repo, &["add", "-A"]);
-    run(
-        &repo,
-        &["commit", "-q", "-m", "modify pathological content"],
-    );
-
-    let id = out(&repo, &["rev-parse", "HEAD"]);
-    (dir, repo, id)
-}
-
 /// The whole point of the milestone, driven through the real handler helper:
 /// a commit no iPad could ever render still comes back bounded, honestly
 /// flagged, and with the binary blob's bytes nowhere near the wire.
@@ -799,20 +660,6 @@ async fn bounded_file_handler_caps_large_existing_file() {
 // `../` that would walk above that cwd ("outside repository"), independent
 // of anything this server does. That is the fact this whole battery exists
 // to pin down instead of assume.
-
-/// A repository shaped to exercise the malicious-path battery: a root file,
-/// a subdirectory (so a tree-vs-blob path exists), and a **committed
-/// symlink** whose target must come back as blob content, never followed.
-fn path_battery_repo() -> (tempfile::TempDir, PathBuf) {
-    let (dir, repo) = seeded_repo();
-    std::fs::write(repo.join("secret.txt"), "root-secret\n").unwrap();
-    std::fs::create_dir_all(repo.join("sub")).unwrap();
-    std::fs::write(repo.join("sub/file.txt"), "sub-file\n").unwrap();
-    std::os::unix::fs::symlink("file.txt", repo.join("sub/link.txt")).unwrap();
-    run(&repo, &["add", "-A"]);
-    run(&repo, &["commit", "-q", "-m", "path battery fixture"]);
-    (dir, repo)
-}
 
 /// `../../../etc/passwd`, and a same-depth `../` from the tree root: git's
 /// own boundary check refuses to resolve a `<rev>:../path` that would walk
