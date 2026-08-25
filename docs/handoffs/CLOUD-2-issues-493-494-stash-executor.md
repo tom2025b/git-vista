@@ -34,7 +34,7 @@ forbidden_paths:
   - crates/git-vista/src/**     # the frontend is not yours this round
   - ci/browser/**               # see "What you cannot run" below
   - handoff.md
-merge_order: after CLOUD-12 (#495). See "Merge order" below.
+merge_order: after CLOUD-1 (#495). See "Merge order" below.
 ```
 
 ---
@@ -142,7 +142,7 @@ yours are green and only those flake, say so in the PR rather than chasing it.
 
 ## Merge order
 
-Land **after** CLOUD-12 (#495, shared stash DTOs). #495 rewrites field names
+Land **after** CLOUD-1 (#495, shared stash DTOs). #495 rewrites field names
 across `handlers/stash.rs` and the protocol crate; if this PR lands first, #495
 pays for the rebase, and #495 is the one whose diff is mechanical enough that a
 rebase is genuinely risky to review. If you are ready first, say so in the PR and

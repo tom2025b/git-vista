@@ -32,7 +32,7 @@ forbidden_paths:
   - crates/git-vista/src/**
   - crates/git-vista-protocol/src/**   # the vocabulary does not change
   - handoff.md
-merge_order: independent, but see "Merge order" -- it collides with CLOUD-11.
+merge_order: independent, but see "Merge order" -- it collides with CLOUD-2.
 ```
 
 ---
@@ -105,7 +105,7 @@ believing either is yours.
 
 ## Merge order
 
-This touches `planner.rs` and `planner/stash.rs`, and so does CLOUD-11
+This touches `planner.rs` and `planner/stash.rs`, and so does CLOUD-2
 (#493/#494). **Whichever of you is ready second rebases** — but say in the PR
 which you are, and do not merge on top of the other without re-running
 `cargo test --workspace` against the actual merge result. Landing against a head

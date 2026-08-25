@@ -33,7 +33,7 @@ forbidden_paths:
   - crates/git-vista/src/features/stash/view.rs
   - crates/git-vista/src/features/stash/signals.rs
   - handoff.md
-merge_order: FIRST of the stash follow-ups. See "Merge order".
+merge_order: FIRST of all six. See "Merge order". See "Merge order".
 ```
 
 ---
@@ -151,7 +151,7 @@ believing either.
 Land this **first** of the stash follow-ups. It rewrites field names across the
 server handler and the protocol crate; every other stash PR would pay for its
 rebase, and a mechanical rename is the worst diff to review through a conflict
-resolution. CLOUD-11 (#493/#494) has been told to wait for you.
+resolution. CLOUD-2 (#493/#494) has been told to wait for you.
 
 ---
 
