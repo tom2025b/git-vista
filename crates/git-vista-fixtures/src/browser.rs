@@ -58,11 +58,96 @@ pub const MULTI_HUNK_COUNT: usize = 4;
 /// The repository is rebuilt from scratch on every run, which is what lets the
 /// specs assert exact counts instead of matching loosely.
 fn fresh(root: &Path) {
-    if root.exists() {
-        std::fs::remove_dir_all(root).expect("clear fixture root");
-    }
+    clear_or_refuse(root, "fixture root");
     git::init_as(BROWSER, root);
+    mark(root);
 }
+
+/// The marker every directory this module creates carries, so it can tell a
+/// directory it built from one it is about to destroy.
+pub const FIXTURE_MARKER: &str = ".gv-fixture";
+
+/// Recursively clear `path` — but **only** if this module plausibly created it.
+///
+/// # Why this guard exists (#510)
+///
+/// `fresh` used to `remove_dir_all` whatever it was handed, and `gv-fixture`
+/// takes that path straight from `argv` with no validation. So
+/// `gv-fixture main ~/projects/Git-Vista` deleted the checkout, and
+/// `gv-fixture interleaved-wip /tmp/work/repo` deleted an unrelated
+/// `/tmp/work/twin-origin.git` the caller had never named.
+///
+/// # Why a marker rather than a list of forbidden paths
+///
+/// A blocklist of "dangerous" directories is unwinnable — it has to anticipate
+/// every path worth protecting, and it is wrong the first time someone keeps a
+/// repository somewhere it did not think of. A marker inverts the question
+/// from *"is this one of the paths we must not delete"* to *"is this one of
+/// the paths we made"*, which is knowable.
+///
+/// An **empty** directory is cleared without a marker: creating the target
+/// yourself and handing it over is an ordinary thing to do, and deleting
+/// nothing destroys nothing.
+///
+/// # Why the marker lives inside `.git/`
+///
+/// It started at the fixture root and immediately broke
+/// `the_main_fixture_has_one_staged_one_unstaged_and_two_untracked`: a file at
+/// the root is an **untracked file**, and these fixtures exist precisely so
+/// specs can assert exact untracked counts. Inside `.git/` it is invisible to
+/// `git status` and still an ordinary file this function can look for.
+///
+/// A bare repository has no `.git/` subdirectory — its root *is* the git
+/// directory — so [`marker_path`] resolves to the root there, and the same
+/// property holds: nothing lists it, because a bare repo has no working tree.
+fn clear_or_refuse(path: &Path, what: &str) {
+    if !path.exists() {
+        return;
+    }
+    let empty = std::fs::read_dir(path)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false);
+    if !empty && !marker_path(path).exists() {
+        panic!(
+            "gv-fixture: refusing to delete {what} {} — it is not empty and carries no \
+             {FIXTURE_MARKER} marker, so this crate did not create it.\n\
+             If you really mean to destroy it, remove it by hand first.",
+            path.display()
+        );
+    }
+    std::fs::remove_dir_all(path)
+        .unwrap_or_else(|e| panic!("clear {what} {}: {e}", path.display()));
+}
+
+/// Where the marker lives for `path`: inside `.git/` when there is one, and at
+/// the root otherwise (a bare repository, whose root already IS the git dir).
+///
+/// Either way it is somewhere `git status` will never list, which is the
+/// property that matters — see [`clear_or_refuse`].
+fn marker_path(path: &Path) -> std::path::PathBuf {
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        dot_git.join(FIXTURE_MARKER)
+    } else {
+        path.join(FIXTURE_MARKER)
+    }
+}
+
+/// Write the marker that lets a later [`clear_or_refuse`] recognise our work.
+fn mark(path: &Path) {
+    std::fs::write(marker_path(path), MARKER_BODY).expect("write fixture marker");
+}
+
+/// What the marker file says, so a human who finds one knows what it is.
+const MARKER_BODY: &str = "\
+Built by `gv-fixture` (crates/git-vista-fixtures). This directory is rebuilt
+from scratch on every run and its contents are disposable.
+
+This file is the marker that permits that deletion: without it, gv-fixture
+refuses to clear a non-empty directory rather than destroying work it did not
+create (#510). Deleting this file does not protect the directory — it makes
+gv-fixture refuse to touch it at all.
+";
 
 fn run(root: &Path, args: &[&str]) {
     git::run_as(BROWSER, root, args);
@@ -488,11 +573,12 @@ pub fn interleaved_wip_fixture(root: &Path) {
         .parent()
         .expect("fixture root must have a parent")
         .join("twin-origin.git");
-    if origin.exists() {
-        std::fs::remove_dir_all(&origin).expect("clear twin origin");
-    }
+    // The one place this module writes OUTSIDE the root it was given, which is
+    // why it goes through the same guard (#510). The CLI's doc discloses it.
+    clear_or_refuse(&origin, "twin origin");
     std::fs::create_dir_all(&origin).expect("create twin origin");
     git::run_as(BROWSER, &origin, &["init", "-q", "--bare"]);
+    mark(&origin);
 
     // A fixed base time, so the row order is a property of the fixture rather
     // than of the minute it was built in. 2026-01-02T10:<n>:<offset>Z.
@@ -1041,6 +1127,89 @@ mod tests {
             auto.ends_with(&oldest),
             "the automatic entry should repeat the OLDEST commit's subject \
              ({oldest:?}), so `stash@{{1}}` hangs off the seed commit: {auto}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod deletion_guard_tests {
+    use super::{clear_or_refuse, mark};
+
+    /// The case that cost this guard its issue: a real directory holding real
+    /// work, named on the command line by mistake.
+    #[test]
+    fn a_non_empty_unmarked_directory_is_refused() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let victim = tmp.path().join("someones-checkout");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("important.txt"), "work").unwrap();
+
+        let refused = std::panic::catch_unwind(|| clear_or_refuse(&victim, "fixture root"));
+
+        assert!(
+            refused.is_err(),
+            "a non-empty unmarked directory must be refused"
+        );
+        assert!(
+            victim.join("important.txt").exists(),
+            "the refusal must leave the contents alone — a guard that panics AFTER \
+             deleting is not a guard"
+        );
+    }
+
+    /// The permission is the marker, and nothing else.
+    #[test]
+    fn a_marked_directory_is_cleared() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let ours = tmp.path().join("prior-fixture");
+        std::fs::create_dir_all(&ours).unwrap();
+        std::fs::write(ours.join("leftover.txt"), "from the last run").unwrap();
+        mark(&ours);
+
+        clear_or_refuse(&ours, "fixture root");
+
+        assert!(!ours.exists(), "a marked directory is ours to rebuild");
+    }
+
+    /// Handing over a directory you created yourself is ordinary, and deleting
+    /// nothing destroys nothing.
+    #[test]
+    fn an_empty_directory_needs_no_marker() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let empty = tmp.path().join("staging");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        clear_or_refuse(&empty, "fixture root");
+
+        assert!(!empty.exists());
+    }
+
+    /// A path that does not exist is not an error — most runs take this arm.
+    #[test]
+    fn a_missing_path_is_not_an_error() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        clear_or_refuse(&tmp.path().join("never-existed"), "fixture root");
+    }
+
+    /// The marker must SAY what it is. Someone will find one of these in a
+    /// stray directory months from now with no idea why it is there.
+    #[test]
+    fn the_marker_explains_itself_and_says_deleting_it_does_not_protect_you() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        mark(tmp.path());
+        let body = std::fs::read_to_string(super::marker_path(tmp.path())).unwrap();
+        assert!(
+            body.contains("gv-fixture"),
+            "the marker must name the tool that wrote it"
+        );
+        assert!(
+            body.contains("disposable"),
+            "it must say the contents are disposable, which is the whole claim"
+        );
+        assert!(
+            body.contains("refuse to touch it at all"),
+            "and it must correct the natural wrong guess — that deleting the marker \
+             protects the directory, when it does the opposite"
         );
     }
 }
