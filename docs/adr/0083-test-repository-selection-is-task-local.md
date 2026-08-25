@@ -129,7 +129,7 @@ The original stale-offer recovery test, the state selection-flow test, the
 foreign-worktree recovery test, and all three tag tests that install a current
 repository pass individually. The post-fix reproduction campaign passed 12 of
 12 full server runs at 16 threads — 0 failures over 851 seconds. Each run
-executed all 934 non-ignored tests.
+executed all 935 non-ignored tests.
 
 `buildlock cargo fmt --all` and
 `buildlock cargo clippy --all-targets -- -D warnings` are green. The first raw
