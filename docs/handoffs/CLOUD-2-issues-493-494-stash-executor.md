@@ -23,8 +23,11 @@ sign_artifacts_as: max
 adr_number: 0078          # ASSIGNED. Do not pick "the next free" one.
 allowed_paths:
   - crates/git-vista-protocol/src/plan.rs
+  - crates/git-vista-protocol/tests/plan_golden.rs        # constructs GitOperation::PopStash directly (lines 186, 710); Option A will not compile without editing it
   - crates/git-vista-server/src/planner.rs
   - crates/git-vista-server/src/planner/stash.rs
+  - crates/git-vista-server/src/planner/contract_suite.rs # exhaustively matches GitOperation on PopStash (lines 200, 268, 6049, 6092); not covered by the two planner paths above
+  - crates/git-vista-mcp/src/plan_tools.rs                # a separate workspace crate; exhaustively matches GitOperation on PopStash (lines 112, 1343) — `cargo test --workspace` will not build under Option A without it
   - crates/git-vista-server/src/sandbox/**
   - crates/git-vista-server/src/main.rs        # only if you wire the route
   - crates/git-vista-server/src/route_authz.rs # ditto
@@ -34,7 +37,7 @@ forbidden_paths:
   - crates/git-vista/src/**     # the frontend is not yours this round
   - ci/browser/**               # see "What you cannot run" below
   - handoff.md
-merge_order: after CLOUD-12 (#495). See "Merge order" below.
+merge_order: after CLOUD-1 (#495). See "Merge order" below.
 ```
 
 ---
@@ -68,6 +71,19 @@ cost: `main.rs` carries a written argument for why that route deliberately does
 not exist ("pop is apply-then-drop and one operation row…"). **Read that comment
 in full before choosing B.** Overturning a written decision is allowed; doing it
 without addressing its argument is not.
+
+**That argument is stronger than the one-line comment shows.**
+`docs/superpowers/specs/m3.24-stash.md` §5 — and issue #493's own body, which
+quotes it — say `PopStash` must not ship until one of two prerequisites lands:
+composite outcomes persisted on the operation row (`apply_failed` /
+`applied_drop_failed` / `completed`, with a Recovery Centre rendering for
+each), or `PopStash` rebuilt as durable orchestration over linked child
+`ApplyStash`/`DropStash` records. ADR 0077's own "Alternatives considered"
+section, written today, reaches the same conclusion and adds: "Neither
+exists." Both live in `durable.rs`, `operations.rs`, and/or
+`recovery_center.rs` — none of which are in `allowed_paths`. Treat B as
+needing an `allowed_paths` amendment and a separate design conversation
+before it is real work, not as a same-branch alternative to A.
 
 **Recommend one, in the ADR, with the argument.** Tom's standing preference is
 the thorough path over the quick one, and a decision that leaves the tree
@@ -127,7 +143,18 @@ yours are green and only those flake, say so in the PR rather than chasing it.
    Whichever option you take, the comment and the code agree afterwards.
 2. Whatever the executor for "apply a stash" is called at the end, it reads the
    conflict state on the success path as well as the failure path — the
-   guarantee `exec_pop_stash` currently documents alone.
+   guarantee `exec_pop_stash` currently documents alone. **Do not copy
+   `exec_pop_stash`'s status code for the new success-but-conflicted case.**
+   That path returns `409 CONFLICT`, but the frontend's `apply_stash_request`
+   (`crates/git-vista/src/api/stash.rs`, forbidden to you) derives
+   `ApplyOutcome::Applied` from `resp.ok()` alone — any non-2xx becomes
+   `ApplyOutcome::Refused`. ADR 0077 D6 depends on telling those apart:
+   `Conflicted { apply_refusal: None }` ("applied but left conflicts") versus
+   `Some(..)` ("applying hit conflicts") are deliberately different
+   sentences, and D6 calls the wrong one on the wrong case a false claim. A
+   409 on git-succeeded-but-left-conflicts would collapse that distinction
+   through a file you cannot fix. Keep the success path's status in the 2xx
+   range and name the conflicted paths in the response body instead.
 3. **ADR 0078** records the choice, its alternative, and why the 2026-08-18
    decision was kept or overturned. `docs/adr/README.md` index updated.
 4. Every mutation-sensitive test you add is proved able to go red **two
@@ -142,7 +169,7 @@ yours are green and only those flake, say so in the PR rather than chasing it.
 
 ## Merge order
 
-Land **after** CLOUD-12 (#495, shared stash DTOs). #495 rewrites field names
+Land **after** CLOUD-1 (#495, shared stash DTOs). #495 rewrites field names
 across `handlers/stash.rs` and the protocol crate; if this PR lands first, #495
 pays for the rebase, and #495 is the one whose diff is mechanical enough that a
 rebase is genuinely risky to review. If you are ready first, say so in the PR and
