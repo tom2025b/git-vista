@@ -49,7 +49,7 @@ use crate::features::status::core::{StatusSection, StatusSections};
 ///
 /// # This shape has two authors, and that is a known risk
 ///
-/// The server does not serialise a shared DTO for this listing — 
+/// The server does not serialise a shared DTO for this listing —
 /// `handlers::stash::stash_list` builds the JSON object by hand, so the field
 /// names exist twice in the workspace with nothing forcing them to agree. A
 /// rename on either side would present as an empty drawer, which is precisely
@@ -218,6 +218,62 @@ pub fn stash_row(entry: &StashEntry, write_gate: WriteGate) -> StashRow {
     }
 }
 
+/// The empty-state line, so "no stashes" is testable wording rather than an
+/// empty panel that looks like a failed fetch.
+pub const NO_STASHES: &str = "Nothing stashed. Your working tree changes are all still here.";
+
+/// The in-flight line. Distinct from [`NO_STASHES`] on purpose: "we have not
+/// asked yet" and "we asked and the drawer is empty" are different facts, and
+/// collapsing them would tell a user with stashes that they have none.
+pub const LOADING_STASHES: &str = "Loading stashes…";
+
+/// Everything the drawer can be showing, with the decision already made.
+///
+/// Same posture as [`crate::features::tags::core::TagListView`], and the same
+/// reason: the view lives in `activity.rs`, which is
+/// `#[cfg(target_arch = "wasm32")]` and therefore compiled by `trunk build` and
+/// by nothing that asserts anything. A `match` on
+/// `Option<Result<Vec<StashEntry>, String>>` written there could swap two arms
+/// — rendering every populated drawer as the empty state — and still build,
+/// lint, and pass the whole suite.
+///
+/// **[`Self::Failed`] and [`Self::Empty`] are the pair that must not merge.**
+/// `git_vista_git::stash::read_stashes` goes out of its way to keep "read and
+/// empty" apart from "could not read", and the server's handler refuses to
+/// serialise a failure as `[]` for exactly that reason. A client that rendered
+/// an error as the empty state would undo both, and tell a user their stashes
+/// are gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrawerView {
+    /// The fetch has not answered yet — show [`LOADING_STASHES`].
+    Loading,
+    /// The fetch failed. The payload is the finished user-facing line.
+    Failed(String),
+    /// The drawer was read and holds nothing — show [`NO_STASHES`].
+    Empty,
+    /// One row per entry, in the server's order (newest first).
+    Rows(Vec<StashRow>),
+}
+
+/// Classify what the stash resource currently holds.
+///
+/// `state` is the Activity panel's resource after `.flatten()`: `None` while
+/// the fetch is unresolved (or the panel is shut), `Some(Err)` for a failed
+/// fetch, `Some(Ok)` for an answer.
+pub fn drawer_view(
+    state: Option<Result<Vec<StashEntry>, String>>,
+    write_gate: WriteGate,
+) -> DrawerView {
+    match state {
+        None => DrawerView::Loading,
+        Some(Err(e)) => DrawerView::Failed(format!("Couldn't read the stash list: {e}")),
+        Some(Ok(entries)) if entries.is_empty() => DrawerView::Empty,
+        Some(Ok(entries)) => {
+            DrawerView::Rows(entries.iter().map(|e| stash_row(e, write_gate)).collect())
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Which actions an entry offers, and which are refused with a reason
 // ---------------------------------------------------------------------------
@@ -229,6 +285,22 @@ pub enum WriteGate {
     Allowed,
     /// A read-only or visualize session. The drawer still lists.
     ReadOnly,
+}
+
+/// Map the Activity panel's `read_only` flag onto the gate.
+///
+/// A one-line mapping, and it lives here rather than at the call site for the
+/// reason every other decision in this file does: the call site is
+/// `#[cfg(target_arch = "wasm32")]`, so an inverted bool there would be caught
+/// by nothing. Inverted, every read-only session would be offered every
+/// destructive control — which is the failure a `bool` parameter invites and a
+/// named type does not.
+pub fn write_gate(read_only: bool) -> WriteGate {
+    if read_only {
+        WriteGate::ReadOnly
+    } else {
+        WriteGate::Allowed
+    }
 }
 
 /// Everything a stash entry can be asked to do.
@@ -289,12 +361,6 @@ pub struct ActionOffer {
 pub enum Availability {
     Offered,
     Refused(&'static str),
-}
-
-impl Availability {
-    pub fn offered(&self) -> bool {
-        matches!(self, Availability::Offered)
-    }
 }
 
 /// The reason every write is refused in a read-only session.
@@ -736,7 +802,10 @@ mod tests {
         // And the gate really does open when it should — otherwise the
         // assertions above would be satisfied by a gate that never opens.
         assert_eq!(
-            drop_gate(&ApplyOutcome::Applied, &ConflictScan::Read(Continuation::Clear)),
+            drop_gate(
+                &ApplyOutcome::Applied,
+                &ConflictScan::Read(Continuation::Clear)
+            ),
             DropGate::Run,
             "a clean apply with a clear scan must let the drop run"
         );
@@ -819,7 +888,10 @@ mod tests {
 
         // The success path still works, so the assertions above cannot be
         // satisfied by a `verdict_after_drop` that never reports completion.
-        assert_eq!(verdict_after_drop(&DropOutcome::Dropped), PopVerdict::Popped);
+        assert_eq!(
+            verdict_after_drop(&DropOutcome::Dropped),
+            PopVerdict::Popped
+        );
     }
 
     /// Exactly one of the five verdicts claims completion, and it is the one
@@ -916,7 +988,7 @@ mod tests {
 
         let inspect = position(StashAction::Inspect);
         assert_eq!(inspect, 0, "inspection must be the first thing on offer");
-        assert!(offers[inspect].availability.offered());
+        assert_eq!(offers[inspect].availability, Availability::Offered);
 
         for destructive in [StashAction::Drop, StashAction::Pop] {
             assert!(
@@ -931,7 +1003,11 @@ mod tests {
 
         // The non-destructive ones must NOT be classed destructive, or the
         // classification would be satisfied by marking everything dangerous.
-        for safe in [StashAction::Inspect, StashAction::Apply, StashAction::Branch] {
+        for safe in [
+            StashAction::Inspect,
+            StashAction::Apply,
+            StashAction::Branch,
+        ] {
             assert!(!safe.destructive(), "{safe:?} cannot lose the user's work");
         }
     }
@@ -950,8 +1026,9 @@ mod tests {
 
         for offer in &offers {
             match offer.action {
-                StashAction::Inspect => assert!(
-                    offer.availability.offered(),
+                StashAction::Inspect => assert_eq!(
+                    offer.availability,
+                    Availability::Offered,
                     "a read cannot be refused by a write gate"
                 ),
                 write => assert_eq!(
@@ -968,6 +1045,19 @@ mod tests {
             action_offers(WriteGate::Allowed).len(),
             "a read-only session must still be told what it cannot do"
         );
+    }
+
+    /// The `read_only` bool maps to the gate in one direction only.
+    ///
+    /// MUTATION 1: swap the two arms — red, and it is the swap that would offer
+    ///   every destructive control to a session that may not write. Verified
+    ///   by hand: red.
+    /// MUTATION 2: return `WriteGate::Allowed` unconditionally — red on the
+    ///   read-only case. Verified by hand: red.
+    #[test]
+    fn read_only_maps_to_the_refusing_gate() {
+        assert_eq!(write_gate(true), WriteGate::ReadOnly);
+        assert_eq!(write_gate(false), WriteGate::Allowed);
     }
 
     // -----------------------------------------------------------------------
@@ -1130,7 +1220,120 @@ mod tests {
              untracked file behind"
         );
         assert!(mixed.may_push());
-        assert!(!mixed.leaves_behind.is_empty(), "and it does leave one behind");
+        assert!(
+            !mixed.leaves_behind.is_empty(),
+            "and it does leave one behind"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The drawer's four states
+    // -----------------------------------------------------------------------
+
+    fn entry(selector: &str, oid: &str) -> StashEntry {
+        StashEntry {
+            entry: selector.to_string(),
+            index: 0,
+            oid: oid.to_string(),
+            message: "On main: work".to_string(),
+            time: 1_700_000_000,
+        }
+    }
+
+    /// A drawer that could not be read is never shown as a drawer that is
+    /// empty.
+    ///
+    /// `read_stashes` in `git-vista-git` and the server's own handler both go
+    /// out of their way to keep these apart — the handler refuses to serialise
+    /// a failure as `[]`. A client that merged them would undo both and tell a
+    /// user with stashes that they have none.
+    ///
+    /// MUTATION 1 (removes the mechanism): map `Some(Err(_))` to
+    ///   `DrawerView::Empty` — red, a failed read renders as "nothing
+    ///   stashed". Verified by hand: red.
+    /// MUTATION 2 (keeps the arm, loses the distinction): map `None` to
+    ///   `Empty` as well, so an unresolved fetch reads as an answered one —
+    ///   red on the Loading assertion. Verified by hand: red.
+    #[test]
+    fn a_drawer_that_could_not_be_read_is_never_shown_as_an_empty_drawer() {
+        // Unresolved: we have not asked yet.
+        assert_eq!(
+            drawer_view(None, WriteGate::Allowed),
+            DrawerView::Loading,
+            "an unresolved fetch is not an answer"
+        );
+
+        // Failed: we asked and could not look.
+        let failed = drawer_view(Some(Err("HTTP 500".to_string())), WriteGate::Allowed);
+        assert_eq!(
+            failed,
+            DrawerView::Failed("Couldn't read the stash list: HTTP 500".to_string()),
+            "a failed read must carry its reason, not become an empty list"
+        );
+
+        // Empty: we asked and there is genuinely nothing.
+        assert_eq!(
+            drawer_view(Some(Ok(vec![])), WriteGate::Allowed),
+            DrawerView::Empty
+        );
+
+        // And the three are mutually distinct, so none of the above can be
+        // satisfied by a classifier that returns one value for everything.
+        let all = [
+            drawer_view(None, WriteGate::Allowed),
+            drawer_view(Some(Err("x".to_string())), WriteGate::Allowed),
+            drawer_view(Some(Ok(vec![])), WriteGate::Allowed),
+            drawer_view(Some(Ok(vec![entry("stash@{0}", "aa")])), WriteGate::Allowed),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two different drawer states classified the same");
+            }
+        }
+
+        // The wording of the two "nothing to show" lines must differ, or the
+        // user cannot tell which one they are looking at.
+        assert_ne!(NO_STASHES, LOADING_STASHES);
+    }
+
+    /// The rows keep the server's order — newest first — and each carries the
+    /// write gate it was built under.
+    ///
+    /// MUTATION 1: reverse the row order — red, `stash@{0}` is no longer
+    ///   first and the newest stash sorts to the bottom. Verified: red.
+    /// MUTATION 2: build every row with `WriteGate::Allowed` regardless of the
+    ///   argument — red, a read-only session would be offered writes.
+    ///   Verified: red.
+    #[test]
+    fn rows_keep_the_servers_order_and_carry_the_write_gate() {
+        let entries = vec![
+            entry("stash@{0}", "aaaaaaaaaaaa"),
+            entry("stash@{1}", "bbbbbbbbbbbb"),
+        ];
+
+        let DrawerView::Rows(rows) = drawer_view(Some(Ok(entries.clone())), WriteGate::Allowed)
+        else {
+            panic!("a populated drawer must classify as Rows");
+        };
+        assert_eq!(
+            rows.iter().map(|r| r.selector.as_str()).collect::<Vec<_>>(),
+            ["stash@{0}", "stash@{1}"],
+            "the server returns newest first and the view must not resort"
+        );
+
+        let DrawerView::Rows(locked) = drawer_view(Some(Ok(entries)), WriteGate::ReadOnly) else {
+            panic!("a read-only session still sees its stashes");
+        };
+        let drop_offer = locked[0]
+            .actions
+            .iter()
+            .find(|o| o.action == StashAction::Drop)
+            .expect("the action must still be listed");
+        assert_eq!(
+            drop_offer.availability,
+            Availability::Refused(READ_ONLY_REFUSAL),
+            "a read-only drawer must not offer a drop"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1151,7 +1354,10 @@ mod tests {
         let wip = stash_subject("WIP on main: 1a2b3c4 tidy the parser");
         assert_eq!(wip.branch.as_deref(), Some("main"));
         assert_eq!(wip.subject, "tidy the parser");
-        assert!(wip.automatic, "this message was written by git, not the user");
+        assert!(
+            wip.automatic,
+            "this message was written by git, not the user"
+        );
 
         // The `-m` form: the user's own words, kept whole.
         let named = stash_subject("On feature/x: half-finished refactor");
@@ -1200,7 +1406,10 @@ mod tests {
         };
 
         let row = stash_row(&entry, WriteGate::Allowed);
-        assert_eq!(row.selector, "stash@{2}", "the selector came from the server");
+        assert_eq!(
+            row.selector, "stash@{2}",
+            "the selector came from the server"
+        );
         assert_eq!(
             row.oid, "0123456789abcdef0123456789abcdef01234567",
             "the full oid is what the compare-and-swap needs"

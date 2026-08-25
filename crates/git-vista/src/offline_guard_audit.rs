@@ -132,6 +132,8 @@ const API_SRC: &str = concat!(
     "\n",
     include_str!("api/staging.rs"),
     "\n",
+    include_str!("api/stash.rs"),
+    "\n",
     include_str!("api/status.rs"),
     "\n",
     include_str!("api/tags.rs"),
@@ -228,6 +230,18 @@ const OFFLINE_GUARDED: &[&str] = &[
     // forgotten `include_str!` cannot hide a write path again.
     "resolve_conflict_request",
     "resolve_conflict_content_request",
+    // M3.24 (#77). The stash drawer's four writes. All four are ref or
+    // working-tree mutations through the shared planner and all four call the
+    // guard first. `drop_stash_request` is the destructive one — the entry's
+    // commit becomes unreachable and only the recovery pin keeps it alive — and
+    // it is also the second half of a composed pop, sent only after
+    // features::stash::core::drop_gate returns Run. There is no
+    // `pop_stash_request` to classify: the server has no /api/stash/pop route,
+    // deliberately, so no client function can bypass that gate.
+    "push_stash_request",
+    "apply_stash_request",
+    "drop_stash_request",
+    "branch_from_stash_request",
     // M2.16 (#69). `POST /api/diff/spec` — the four explicit DiffSpec modes.
     // A pure read that mutates nothing, so it appears in this table for the
     // same reason `preview_push` does: it reaches the *write transport*

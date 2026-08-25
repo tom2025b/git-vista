@@ -11,3 +11,7 @@
 //! "is the panel open" to fall out of sync.
 
 pub mod core;
+#[cfg(target_arch = "wasm32")]
+pub mod signals;
+#[cfg(target_arch = "wasm32")]
+pub mod view;
