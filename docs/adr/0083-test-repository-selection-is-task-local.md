@@ -127,8 +127,16 @@ target tests were rerun green.
 
 The original stale-offer recovery test, the state selection-flow test, the
 foreign-worktree recovery test, and all three tag tests that install a current
-repository pass individually. One post-fix full server run passed all 934
-non-ignored tests at 16 threads in 69.08 seconds.
+repository pass individually. The post-fix reproduction campaign passed 12 of
+12 full server runs at 16 threads — 0 failures over 851 seconds. Each run
+executed all 934 non-ignored tests.
 
-The signed implementation report records the longer parallel campaign, both
-required mutations, and the final formatting, lint, and workspace-test gates.
+`buildlock cargo fmt --all` and
+`buildlock cargo clippy --all-targets -- -D warnings` are green. The first raw
+workspace run exposed unrelated host drift in the existing #469 shell fixture:
+its "no node" case inherited the host's newly upgraded `/usr/bin/node` v24 and
+ran past the assertion's intended boundary. With a `/tmp`-only `BASH_ENV` shim
+that hides the host node only inside that fixture's private
+`gv-browser-node-*` PATH, `buildlock cargo test --workspace` is green in 97
+seconds. The shim changed no repository file. The signed implementation report
+records both results rather than presenting the corrected rerun as the raw one.
