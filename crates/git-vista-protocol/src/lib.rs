@@ -87,8 +87,7 @@ pub use dto::{
     PushStashRequest, PushTagRequest, RebaseStatus, RemoteRefUpdate, RepoMode,
     RepositoryDescriptor, RepositoryKind, ResolveConflictContentRequest, ResolveConflictRequest,
     SelectRequest, SessionInfo, SessionRequest, SignTagError, SignTagFailureKind, SignatureStatus,
-    StashEntry, StashTarget, TagDetail, TagKind, WorktreePathsRequest,
-    CLONE_IN_PROGRESS_SENTINEL,
+    StashEntry, StashTarget, TagDetail, TagKind, WorktreePathsRequest, CLONE_IN_PROGRESS_SENTINEL,
 };
 pub use error::{ApiError, ApiErrorBody, ErrorCode, RequestId};
 pub use history::{HeadState, HistoryFrame, HistoryPage};

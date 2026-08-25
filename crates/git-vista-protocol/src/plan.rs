@@ -1659,10 +1659,7 @@ mod tests {
         let huge = StashSelector::new("stash@{99999999999999999999}").unwrap();
         assert_eq!(huge.index(), None);
         // A leading zero is admitted, because git resolves it.
-        assert_eq!(
-            StashSelector::new("stash@{007}").unwrap().index(),
-            Some(7)
-        );
+        assert_eq!(StashSelector::new("stash@{007}").unwrap().index(), Some(7));
     }
 
     #[test]

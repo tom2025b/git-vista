@@ -1600,10 +1600,7 @@ mod tests {
     ///   Verified: red.
     #[test]
     fn rows_keep_the_servers_order_and_carry_the_write_gate() {
-        let entries = vec![
-            entry("stash@{0}", 'a'),
-            entry("stash@{1}", 'b'),
-        ];
+        let entries = vec![entry("stash@{0}", 'a'), entry("stash@{1}", 'b')];
 
         let DrawerView::Rows(rows) = drawer_view(Some(Ok(entries.clone())), WriteGate::Allowed)
         else {

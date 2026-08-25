@@ -1282,9 +1282,10 @@ pub struct TagDetail {
 /// between the read that built the list and anything done with it.
 ///
 /// The position is not lost, and it is not the client's to re-derive by
-/// parsing: [`StashSelector::index`] answers it, next to
-/// [`StashSelector::at`], which is what the server builds this field with. One
-/// author for the mapping, in both directions.
+/// parsing: [`StashSelector::index`](crate::plan::StashSelector::index)
+/// answers it, next to [`StashSelector::at`](crate::plan::StashSelector::at),
+/// which is what the server builds this field with. One author for the
+/// mapping, in both directions.
 ///
 /// # No `deny_unknown_fields`, unlike the request bodies below
 ///
@@ -1547,7 +1548,8 @@ mod tests {
     ///   the "a bare ref name is refused" assertion below stops holding.
     #[test]
     fn the_stash_write_target_pins_both_halves_and_requires_both() {
-        let wire = r#"{"entry":"stash@{2}","expected_oid":"0123456789abcdef0123456789abcdef01234567"}"#;
+        let wire =
+            r#"{"entry":"stash@{2}","expected_oid":"0123456789abcdef0123456789abcdef01234567"}"#;
         let target: StashTarget = serde_json::from_str(wire).expect("the pair must parse");
         assert_eq!(target.entry.as_str(), "stash@{2}");
         assert_eq!(

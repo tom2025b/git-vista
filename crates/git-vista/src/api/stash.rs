@@ -166,12 +166,10 @@ pub async fn push_stash_request(
         None => None,
         // A blank is the one refusal worth its own sentence; the other
         // (16 KiB of "message") already says exactly what is wrong.
-        Some(m) => Some(
-            StashMessage::new(m).map_err(|e| match e {
-                PlanFieldError::Empty(_) => BLANK_STASH_MESSAGE.to_string(),
-                other => other.to_string(),
-            })?,
-        ),
+        Some(m) => Some(StashMessage::new(m).map_err(|e| match e {
+            PlanFieldError::Empty(_) => BLANK_STASH_MESSAGE.to_string(),
+            other => other.to_string(),
+        })?),
     };
     let body = PushStashRequest {
         message,
