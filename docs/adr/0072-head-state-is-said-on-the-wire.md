@@ -1,6 +1,6 @@
 # 0072 — HEAD's state is said on the wire, because an absent branch name means two opposite things
 
-**Status:** Accepted — implemented and tested
+**Status:** Accepted — implemented, tested, and driven in the live app
 **Date:** 2026-08-24
 **Issue:** [#473](https://github.com/tom2025b/Git-Vista/issues/473) · the gap [ADR 0071](0071-a-badge-is-a-claim-about-a-commit.md) recorded and deferred
 
@@ -46,6 +46,13 @@ When `.git/HEAD` itself will not read, `read_history_materials` fails the whole 
 ### D5 — Only the broken state earns a notice
 
 `Detached` is ordinary and deliberate and gets no label. A warning that fires on healthy repositories is a warning nobody reads, and labelling every branchless HEAD would have satisfied a naive test while making the app worse.
+
+**Reviewed in use and kept, 2026-08-25.** After driving the shipped build against a
+deliberately-broken repository, the owner was offered two alternatives to the
+silence — a neutral `detached` label, and a `detached at <short oid>` form that says
+where you actually are — and chose to keep it silent. The silence is therefore a
+**ratified decision, not an unfilled gap.** A later session finding a branchless
+HEAD that renders nothing should not read it as an oversight and helpfully close it.
 
 ### D6 — The decision is host-tested; the wiring is browser-tested
 
@@ -116,6 +123,7 @@ flowchart TD
 - One more field on a frame fetched once per view. It is a short enum string.
 - `Unreadable` remains unreportable in a frame (D3). If that request-level error is ever softened, this enum will need the variant — and that is the moment to add it, not before.
 - The notice is text in the topbar, not a guided explanation. #141's status-chip panel is where a fuller "here is what happened and what to do" belongs.
+- **The feature spans two build artifacts, so verifying one proves nothing.** The state is decided by the server and drawn by the wasm bundle. On the night this shipped, the bundle was rebuilt and confirmed to carry the notice text while `target/release/git-vista-server` — the binary the systemd unit actually runs — was two days old and contained no `head_state` at all. Every frame then decodes as `Unknown`, which by D4 correctly draws nothing, so the app is silent in exactly the way it is silent when everything is fine. A green gate says nothing about which binary is running: check both halves, or check the live API.
 
 ---
 
@@ -130,4 +138,6 @@ flowchart TD
 | `head_notice` returns the notice for `Detached` too | an ordinary state reported as a fault |
 
 - Browser: the notice appears on the broken fixture and is absent on the healthy one. The second assertion is the load-bearing one.
+- **Driven by a human, both cases, 2026-08-25 01:35.** A demo repository (four commits, a side branch, `main` intact, `.git/HEAD` holding a well-formed oid with no object behind it) showed the red notice while the graph below it still rendered every commit — the readable half surviving, which is the state the notice has to be legible against. Returning to a healthy repository, the notice was **absent**. That second observation is the one no amount of green CI settles.
+- Live API, same run: `POST /api/select` onto the broken repository, then `GET /api/frame`, returning `head_state = "unresolvable"` with `head_branch = null` — the two facts D1 exists to separate, observed together on the wire.
 - `./dev gate` green, all six legs.
