@@ -221,6 +221,7 @@ async fn frame_for_target(
         generation: snapshot.generation.clone(),
         refs: snapshot.refs.clone(),
         head_branch: snapshot.head_branch.clone(),
+        head_state: snapshot.head_state,
         branch_colors: ReplayClassifier::new(&snapshot.refs, snapshot.head_branch.as_deref())
             .branch_colors(),
         // A short non-path label, so the header can say *which* repo without

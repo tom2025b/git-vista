@@ -23,6 +23,7 @@
     }
   ],
   "head_branch": "main",
+  "head_state": "on_branch",
   "branch_colors": [
     [
       "main",

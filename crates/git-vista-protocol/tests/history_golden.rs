@@ -18,7 +18,7 @@
 
 use git_vista_core::model::{CommitSummary, Edge, FrameStub, GitRef, GraphRow, Oid, RefKind};
 use git_vista_protocol::plan::GenerationToken;
-use git_vista_protocol::{HistoryFrame, HistoryPage};
+use git_vista_protocol::{HeadState, HistoryFrame, HistoryPage};
 
 const FRAME_FIXTURE: &str = include_str!("fixtures/history_frame_v4.json");
 const FRAME_FIXTURE_PATH: &str = concat!(
@@ -61,6 +61,7 @@ fn golden_frame() -> HistoryFrame<GitRef> {
             },
         ],
         head_branch: Some("main".to_string()),
+        head_state: HeadState::OnBranch,
         branch_colors: vec![("main".to_string(), 0), ("origin/main".to_string(), 1)],
         repo_label: Some("git-vista-test".to_string()),
         repo_id: Some("repo-abc".to_string()),
