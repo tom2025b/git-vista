@@ -935,6 +935,12 @@ html .detail-panel.detail-panel--full .detail-body {
   white-space: nowrap;
 }
 .act-undo:hover { background: #21262d; }
+/* M3.24 (#77): the destructive stash actions (Pop, Drop). A colour variant of
+   .act-undo and nothing more — it declares no `cursor: pointer` (inherited from
+   .act-undo, which is already recorded in a11y::audit's INTERACTIVE_CENSUS as
+   44x44), adds no :hover rule (which would owe a :focus-visible twin), and sets
+   no font-size. The focus ring and the tap floor both come from .act-undo. */
+.act-undo.act-danger { color: #f85149; border-color: #f85149; }
 .act-summary { word-break: break-word; }
 .act-meta {
   display: flex;

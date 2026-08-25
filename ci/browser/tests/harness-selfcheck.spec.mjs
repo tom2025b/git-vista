@@ -65,6 +65,37 @@ async function openTwinRepo(page) {
   await expect(page.locator('.wip-group')).toHaveCount(2)
 }
 
+/** Open the #77 stash repository and its drawer. Duplicated rather than
+ *  imported from `helpers.mjs`, for the same reason `openTwinRepo` above is:
+ *  this file must be able to fail on its own terms, and a shared opener that
+ *  broke would silently turn these self-checks into "the page never loaded"
+ *  passes.
+ *
+ *  Opened in VISUALIZE, not full mode. The self-check only reads the drawer,
+ *  and a read-only session cannot mutate the fixture that
+ *  `stash-drawer.spec.mjs` — which runs after this file — depends on. */
+async function openStashDrawer(page) {
+  await forceOnline(page)
+  await page.goto(runtime().base)
+  await expect(page.getByRole('heading', { name: 'git-vista' })).toBeVisible()
+  const entry = page.getByRole('button', { name: /stash-repo/i }).first()
+  await expect(entry).toBeVisible()
+  await entry.click()
+  const visualize = page.getByRole('button', { name: /look only/ })
+  if (await visualize.isVisible().catch(() => false)) await visualize.click()
+  await expect(page.locator('p.status.repo')).toContainText(/stash-repo/i)
+  await page.getByRole('button', { name: /activity/i }).first().click()
+  const drawer = page.getByRole('region', { name: 'Stashes' })
+  await expect(drawer).toBeVisible()
+  // Wait on a ROW inside the drawer, not on the region: the region renders
+  // before the fetch resolves, so this would otherwise proceed against
+  // "Loading stashes…" and the mutation below would be applied to an empty
+  // drawer. Scoped, because the fixture's stash subject is also a commit
+  // subject and page-wide would resolve to several elements.
+  await expect(drawer.getByText('will not apply cleanly')).toBeVisible({ timeout: 20_000 })
+  return drawer
+}
+
 /**
  * Run `fn` and return the message it threw, or `null` if it did not throw.
  *
@@ -268,6 +299,55 @@ test.describe('harness self-check — every assertion must be able to go red', (
       ).toHaveLength(1)
     })
     expectFailedBecause(msg, /exactly one edge must run upward/, 'the #478 upward-edge assertion')
+  })
+
+  test('the #77 pop assertion fails when a conflicted pop claims success', async ({ page }) => {
+    // The load-bearing negative of the whole stash slice: a pop that conflicts
+    // has applied something and dropped nothing, so a UI reporting "Popped"
+    // there has lied about the user's data. `stash-drawer.spec.mjs` asserts
+    // that wording is ABSENT, and an absence assertion is the easiest kind to
+    // pass for the wrong reason -- it also passes when the notice never renders
+    // at all, or when the selector is wrong.
+    //
+    // The mutation injects the success wording into the live DOM and requires
+    // the absence assertion to notice. It deliberately does NOT drive a real
+    // pop: a pop mutates the stash repo, this file runs before
+    // stash-drawer.spec.mjs (workers: 1, fullyParallel: false, alphabetical),
+    // and consuming that fixture here is exactly what broke conflict-panes when
+    // the #432 editor shared conflict-repo.
+    const drawer = await openStashDrawer(page)
+
+    // The exact sentence `PopVerdict::Popped` produces, added to a drawer whose
+    // pop has NOT completed.
+    //
+    // Injected INSIDE the drawer's own section, not onto document.body. The
+    // real assertion in stash-drawer.spec.mjs is scoped to that region, so a
+    // mutation appended to the body would land outside the scope and the
+    // absence assertion would pass — this self-check would then report that a
+    // load-bearing assertion is load-bearing when it had never been tested.
+    // The mutation must live where the defect would live.
+    const injected = await page.evaluate(() => {
+      const section = document.querySelector('section.stash-drawer')
+      if (!section) return false
+      const p = document.createElement('p')
+      p.className = 'detail-status'
+      p.textContent = 'Popped the stash. It has been removed from your stash list.'
+      section.appendChild(p)
+      return true
+    })
+    expect(injected, 'the drawer section must exist for the mutation to land in it').toBe(true)
+
+    const msg = await failureMessage(async () => {
+      await expect(
+        drawer.getByText(/^Popped the stash/),
+        'a conflicted pop must never claim it completed',
+      ).toHaveCount(0)
+    })
+    expectFailedBecause(
+      msg,
+      /a conflicted pop must never claim it completed/,
+      'the #77 pop-completion assertion',
+    )
   })
 
   test('the #392 reload assertion fails when the tab does not reload', async ({ page }) => {

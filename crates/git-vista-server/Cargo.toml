@@ -75,6 +75,10 @@ tower-http = { version = "0.7.0", features = ["fs", "set-header", "catch-panic"]
 tempfile = "3"
 
 [dev-dependencies]
+# The exact crate axum's `Query` extractor parses with, so a test that says
+# "this is the query string the browser sends" is parsed by the same code the
+# handler will meet it with. Already in the lock as an axum dependency.
+serde_urlencoded = "0.7"
 # `ServiceExt::oneshot` drives the router in the contract-layer tests (protocol
 # negotiation, the error envelope, the no-path-based-selection guard) without a
 # live socket. Test-only: the release binary never pulls tower's `util` feature.
