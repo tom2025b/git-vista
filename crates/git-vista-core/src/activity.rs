@@ -598,10 +598,32 @@ fn names_a_local_branch(ref_name: Option<&str>, branches: &HashMap<String, Strin
 ///
 /// A run of one is returned untouched — a single-ref fetch already says the
 /// useful thing ("fetched ‘origin/main’ from origin") and rewriting it as
-/// "1 ref updated" would lose information to no purpose. That is also what
-/// keeps the "tips unknown — git could not be read" entry intact: it is
-/// journaled *instead of* per-ref entries, never alongside them, so it is
-/// always a run of one.
+/// "1 ref updated" would lose information to no purpose.
+///
+/// # Two known defects, measured 2026-08-25
+///
+/// Both are recorded with their evidence in
+/// `docs/investigations/2026-08-25-issue-329-fetch-feed-volume.md`. Neither is
+/// fixed here; do not read the paragraphs above as covering them.
+///
+/// 1. **The "tips unknown — git could not be read" entry is not safe here.**
+///    This comment used to claim the entry "is journaled *instead of* per-ref
+///    entries, never alongside them, so it is always a run of one". That
+///    accounts for the journal and forgets git's reflog — the same shape of
+///    mistake that got the first #329 attempt reverted. `journal_unobserved`
+///    fires when the fetch *succeeded* and only the re-read of the refs
+///    failed, so git wrote a reflog line for every ref it moved; the admission
+///    carries no `new_oid`, so it suppresses none of them and folds in with
+///    them instead. Measured: four refs moved renders as
+///    "fetch — 5 refs updated", with the admission gone and the count one too
+///    high. It is a run of one only when the fetch moved nothing at all.
+/// 2. **The count inflates at scale.** The app stamps one journal entry per
+///    ref, each performing a full ref capture, so entry *i* lands later and
+///    later after git's reflog lines. Past roughly 170 refs that drift exceeds
+///    [`JOURNAL_MATCH_SLACK`], the unmatched reflog lines survive attribution,
+///    and the fold counts both copies. Measured: 250 refs reported as 297,
+///    500 reported as 891. The feed stays at one row, so #329's symptom holds
+///    — but the number in it stops being true.
 ///
 /// **Safe for undo by construction, not by luck:** [`undo_hint`] has no arm for
 /// `Fetch` or `Pull`, so neither row has ever carried a hint and dropping the
