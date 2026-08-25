@@ -1074,7 +1074,17 @@ mod tests {
                 .unwrap()
                 .success());
         }
-        set_current(&success_repo, RepoMode::Active);
+        // Register the catalog entry as Visualize, then select the same
+        // worktree as Active only in this test's current-selection scope. The
+        // amend below runs through `plan_and_execute_tracked`'s real detached
+        // task. If the planner stops inheriting TEST_CURRENT, its sandbox
+        // policy falls back to the deliberately stale Visualize catalog mode
+        // and this genuine write cannot return 200.
+        let success_handle = set_current(&success_repo, RepoMode::Visualize)
+            .expect("the amend fixture registers in the catalog");
+        assert!(read_only_for_path(&success_repo));
+        assert!(select_registered(success_handle.worktree, RepoMode::Active));
+        assert!(!read_only_for_path(&success_repo));
         let tip_out = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(&success_repo)

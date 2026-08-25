@@ -119,6 +119,14 @@ removed and green with it. A second regression is red when the spawn wrapper is
 an identity function and green when it captures the parent selection before
 `tokio::spawn`.
 
+The production call site is pinned separately. The state selection-flow test
+registers its amend fixture as Visualize in the catalog, reselects it as Active
+only in `TEST_CURRENT`, and executes a real amend through
+`plan_and_execute_tracked`. Removing only the planner's propagation wrapper
+makes the sandbox fall back to the stale Visualize catalog mode: the amend is
+denied with 400 instead of succeeding with 200. Restoring the wrapper returns
+the same test to green.
+
 Both required mutations were exercised three times. Replacing the test scope
 with process-global writes failed 3 of 3 runs at the literal path/mode
 assertion. Removing only the stale-recovery test's wrapper failed 3 of 3 runs at
