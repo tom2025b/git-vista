@@ -4,7 +4,7 @@
 # It is a normal library rather than a `#[cfg(test)]` module because two
 # different consumers need the same shapes: the server's Rust suites depend on
 # it under `[dev-dependencies]`, and the browser harness shells out to the
-# `gv-fixture` binary. One implementation, two callers — see docs/adr/0074.
+# `gv-fixture` binary. One implementation, two callers — see docs/adr/0076.
 [package]
 name = "git-vista-fixtures"
 version.workspace = true
@@ -16,3 +16,11 @@ description = "Deliberately-broken git repositories, as named and documented sha
 
 [dependencies]
 tempfile = "3"
+
+[dev-dependencies]
+# The status parser the #365 floor test drives real git output through. A
+# DEV-dependency only, in both directions: nothing this crate ships knows about
+# the wire contract, and `git-vista-protocol` must stay pure and wasm-safe, so
+# it never learns about fixtures either. Cargo builds this only for this
+# crate's tests, so the frontend's WASM build never sees it.
+git-vista-protocol = { workspace = true }

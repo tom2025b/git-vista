@@ -35,6 +35,52 @@ undocumented once #66 lands.
   landing, on the same reasoning as documenting the number early: it costs
   nothing now and means the floor is already enforced the moment it becomes
   load-bearing rather than being remembered later.
+- **Exercised, not only enforced (#365):** enforcing "not older than 2.32"
+  is not the same as having run anything *at* 2.32, and until #365 nothing
+  had. The `core` job now builds a real 2.32 binary and runs the whole
+  working-tree status vocabulary through `parse_porcelain_v2_z` with both it
+  and the runner's git, holding each to a named expected value. The floor
+  number below is still the only place the version is written down — the job
+  parses this heading for the tag to build, so a change here moves the test.
+  See ADR 0082 for why the leg is mandatory and how that survives a transient
+  fetch failure.
+
+  **The finding: git 2.32.0 and git 2.43.0 parse identically**, on every shape
+  and under all three read modes. That is the expected result, and it is now
+  measured on every run rather than inferred from git's release notes.
+
+### Reproducing the floor leg locally
+
+`cargo test --workspace` runs the status battery against whatever git is on
+your `PATH`. To add the floor leg, build the floor once and point the test at
+it. About a minute on four cores; `msgfmt` and `tclsh` are not needed to run
+`git status`, so the build skips them:
+
+```sh
+floor=$(grep -oP '^## Git: \K[0-9]+\.[0-9]+' docs/SUPPORTED_VERSIONS.md)
+src=$(mktemp -d)
+git clone --depth 1 -b "v${floor}.0" https://github.com/git/git "$src/git"
+make -C "$src/git" -j"$(nproc)" prefix="$HOME/.cache/gv-git-floor" \
+  NO_GETTEXT=1 NO_TCLTK=1 NO_CURL=1 NO_EXPAT=1 NO_PERL=1 NO_PYTHON=1 install
+```
+
+Then, from the repository root:
+
+```sh
+GV_GIT_FLOOR="$HOME/.cache/gv-git-floor/bin/git" \
+GV_STATUS_FLOOR_REPORT=/tmp/gv-status-floor-report.txt \
+  cargo test -p git-vista-fixtures --test status_floor
+```
+
+The report names both binaries and every shape each one read. Without
+`GV_GIT_FLOOR` the test still runs and still checks the current git against the
+expectations — it records `floor=unrun`, and CI rejects that. The test never
+decides for itself whether the floor leg was required; that is asserted in
+shell over the report, per ADR 0082.
+
+A binary that is not the documented floor is refused before it is compared
+against anything, so pointing `GV_GIT_FLOOR` at a second copy of your ordinary
+git fails rather than comparing a version with itself.
 
 ## Safari: 16.4 or later (iOS/iPadOS 16.4, and the matching macOS Safari 16.4)
 
