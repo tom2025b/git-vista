@@ -179,14 +179,26 @@ export async function openStashRepo(page) {
   await expect(page.getByRole('region', { name: 'Commit history graph' })).toBeVisible()
 }
 
-/** Open the Activity panel and wait for the Stashes section to have rendered. */
+/**
+ * Open the Activity panel and return the drawer's own region.
+ *
+ * Returns the region rather than nothing, and every caller queries INSIDE it.
+ * A page-wide `getByText` cannot be used here: git copies a commit's subject
+ * verbatim into its `WIP on <branch>: <sha> <subject>` stash message, so the
+ * fixture's stash subject is also the seed commit's subject and the same string
+ * resolves in the graph's SVG `<title>`, in the activity feed, AND in the
+ * drawer — four elements, which Playwright refuses to guess between. That is a
+ * real failure this suite caught on its first run against a browser; the
+ * assertion was right and the reader was wrong.
+ */
 export async function openDrawer(page) {
   await page.getByRole('button', { name: /activity/i }).first().click()
-  await expect(page.getByText('Stashes', { exact: true })).toBeVisible()
-  // Wait on a ROW, not on the heading: the heading renders before the fetch
-  // resolves, so asserting on it would let a spec proceed against a drawer
-  // still showing "Loading stashes…" — and every assertion below would then
-  // fail for the wrong reason.
-  await expect(page.getByText(CONFLICTING_SUBJECT)).toBeVisible({ timeout: 20_000 })
+  const drawer = page.getByRole('region', { name: 'Stashes' })
+  await expect(drawer).toBeVisible()
+  // Wait on a ROW inside the drawer, not on the region: the region renders
+  // before the fetch resolves, so asserting on it alone would let a spec
+  // proceed against "Loading stashes…".
+  await expect(drawer.getByText(CONFLICTING_SUBJECT)).toBeVisible({ timeout: 20_000 })
+  return drawer
 }
 

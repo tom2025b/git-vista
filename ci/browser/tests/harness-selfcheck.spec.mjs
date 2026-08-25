@@ -88,10 +88,15 @@ async function openStashDrawer(page) {
   if (await visualize.isVisible().catch(() => false)) await visualize.click()
   await expect(page.locator('p.status.repo')).toContainText(/stash-repo/i)
   await page.getByRole('button', { name: /activity/i }).first().click()
-  // Wait on a ROW, not the heading: the heading renders before the fetch
-  // resolves, so this would otherwise proceed against "Loading stashes…" and
-  // the mutation below would be applied to an empty drawer.
-  await expect(page.getByText('will not apply cleanly')).toBeVisible({ timeout: 20_000 })
+  const drawer = page.getByRole('region', { name: 'Stashes' })
+  await expect(drawer).toBeVisible()
+  // Wait on a ROW inside the drawer, not on the region: the region renders
+  // before the fetch resolves, so this would otherwise proceed against
+  // "Loading stashes…" and the mutation below would be applied to an empty
+  // drawer. Scoped, because the fixture's stash subject is also a commit
+  // subject and page-wide would resolve to several elements.
+  await expect(drawer.getByText('will not apply cleanly')).toBeVisible({ timeout: 20_000 })
+  return drawer
 }
 
 /**
@@ -313,20 +318,31 @@ test.describe('harness self-check — every assertion must be able to go red', (
     // stash-drawer.spec.mjs (workers: 1, fullyParallel: false, alphabetical),
     // and consuming that fixture here is exactly what broke conflict-panes when
     // the #432 editor shared conflict-repo.
-    await openStashDrawer(page)
+    const drawer = await openStashDrawer(page)
 
     // The exact sentence `PopVerdict::Popped` produces, added to a drawer whose
     // pop has NOT completed.
-    await page.evaluate(() => {
+    //
+    // Injected INSIDE the drawer's own section, not onto document.body. The
+    // real assertion in stash-drawer.spec.mjs is scoped to that region, so a
+    // mutation appended to the body would land outside the scope and the
+    // absence assertion would pass — this self-check would then report that a
+    // load-bearing assertion is load-bearing when it had never been tested.
+    // The mutation must live where the defect would live.
+    const injected = await page.evaluate(() => {
+      const section = document.querySelector('section.stash-drawer')
+      if (!section) return false
       const p = document.createElement('p')
       p.className = 'detail-status'
       p.textContent = 'Popped the stash. It has been removed from your stash list.'
-      document.body.appendChild(p)
+      section.appendChild(p)
+      return true
     })
+    expect(injected, 'the drawer section must exist for the mutation to land in it').toBe(true)
 
     const msg = await failureMessage(async () => {
       await expect(
-        page.getByText(/^Popped the stash/),
+        drawer.getByText(/^Popped the stash/),
         'a conflicted pop must never claim it completed',
       ).toHaveCount(0)
     })

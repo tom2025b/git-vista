@@ -222,6 +222,24 @@ pub fn stash_row(entry: &StashEntry, write_gate: WriteGate) -> StashRow {
 /// empty panel that looks like a failed fetch.
 pub const NO_STASHES: &str = "Nothing stashed. Your working tree changes are all still here.";
 
+/// The drawer's accessible name, and the handle a browser spec scopes to.
+///
+/// # Why the section needs a name at all
+///
+/// Two reasons, and the second was found by a browser run rather than reasoned
+/// about. The first is ordinary: a bare `<div>` of rows is an anonymous
+/// container, so assistive tech announces the rows with no idea what list they
+/// belong to — the same argument `GRAPH_REGION_LABEL` makes for the graph.
+///
+/// The second: a stash's subject is frequently *also* a commit subject — git's
+/// own `WIP on <branch>: <sha> <subject>` copies it verbatim from the commit the
+/// stash sat on. So the same string legitimately appears in the graph's SVG
+/// `<title>`, in the activity feed, and in this drawer at once, and a page-wide
+/// text query cannot tell them apart. A named region gives a spec something to
+/// scope to, which is the difference between an assertion about the drawer and
+/// an assertion about the page.
+pub const DRAWER_REGION_LABEL: &str = "Stashes";
+
 /// The in-flight line. Distinct from [`NO_STASHES`] on purpose: "we have not
 /// asked yet" and "we asked and the drawer is empty" are different facts, and
 /// collapsing them would tell a user with stashes that they have none.

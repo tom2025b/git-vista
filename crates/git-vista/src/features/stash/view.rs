@@ -34,7 +34,7 @@ use crate::api::{fetch_stash_patch, fetch_stashes, push_stash_request};
 use crate::datetime::time_ago;
 use crate::features::stash::core::{
     drawer_view, push_preview, Availability, DrawerView, PushPreview, StashAction, StashRow,
-    LOADING_STASHES, NO_STASHES,
+    DRAWER_REGION_LABEL, LOADING_STASHES, NO_STASHES,
 };
 use crate::features::stash::signals::{compose_pop, StashDrawer, StashNotice, PUSH_KEY};
 use crate::features::status::core::StatusSections;
@@ -287,11 +287,19 @@ pub fn stash_section_view(
             .collect_view(),
     };
 
+    // A named landmark, not a bare div. Beyond the ordinary accessibility
+    // argument, it is what lets a browser spec assert about *this drawer*
+    // rather than about the page: a stash subject is often also a commit
+    // subject (git copies it verbatim into `WIP on <branch>: <sha> <subject>`),
+    // so the same string shows up in the graph's SVG titles and in the activity
+    // feed at the same time. See DRAWER_REGION_LABEL.
     view! {
-        <div class="detail-section-title act-feed-title">"Stashes"</div>
-        {push_control}
-        {notice_view}
-        {rows_view}
+        <section class="stash-drawer" aria-label=DRAWER_REGION_LABEL>
+            <div class="detail-section-title act-feed-title">{DRAWER_REGION_LABEL}</div>
+            {push_control}
+            {notice_view}
+            {rows_view}
+        </section>
     }
 }
 

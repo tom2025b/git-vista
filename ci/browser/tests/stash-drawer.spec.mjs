@@ -42,57 +42,61 @@ test.describe.serial('the stash drawer', () => {
     page,
   }) => {
     await openStashRepo(page)
-    await openDrawer(page)
+    const drawer = await openDrawer(page)
 
+    // Every query is scoped to the drawer. Page-wide would resolve to four
+    // elements for the WIP subject below — see openDrawer's comment.
     // The `-m` messages appear as the user typed them.
-    await expect(page.getByText(CONFLICTING_SUBJECT)).toBeVisible()
-    await expect(page.getByText('half-finished refactor')).toBeVisible()
+    await expect(drawer.getByText(CONFLICTING_SUBJECT)).toBeVisible()
+    await expect(drawer.getByText('half-finished refactor')).toBeVisible()
 
     // The bare `git stash` entry is git's own `WIP on main: <sha> <subject>`.
     // The subject survives and the sha does NOT — the row already shows the
     // stash's own oid, and a second unexplained hash beside it is noise.
-    await expect(page.getByText('seed: two tracked files')).toBeVisible()
+    // This is the string that appears FOUR times on the page — git copied the
+    // seed commit's subject into the stash message verbatim. Scoped, it is one.
+    await expect(drawer.getByText('seed: two tracked files')).toBeVisible()
 
     // Exactly one row is marked as git-authored rather than user-authored.
     // `toHaveCount(1)` and not `toBeVisible`: the pill existing on every row
     // would mean the automatic/typed distinction had collapsed, which is a
     // claim about whose words the user is reading.
-    await expect(page.getByText('auto', { exact: true })).toHaveCount(1)
+    await expect(drawer.getByText('auto', { exact: true })).toHaveCount(1)
   })
 
   test('A1: a stash can be read before it is applied or dropped', async ({ page }) => {
     await openStashRepo(page)
-    await openDrawer(page)
+    const drawer = await openDrawer(page)
 
-    const show = page.getByRole('button', { name: 'Show changes' }).first()
+    const show = drawer.getByRole('button', { name: 'Show changes' }).first()
     await expect(show).toBeVisible()
     await show.click()
 
     // The patch itself, from `GET /api/stash/show`. Asserting on a real diff
     // line rather than on the <pre> existing: the element appears before the
     // fetch resolves.
-    await expect(page.getByText(/^\+.*the stashed edit/m)).toBeVisible({ timeout: 20_000 })
+    await expect(drawer.getByText(/^\+.*the stashed edit/m)).toBeVisible({ timeout: 20_000 })
 
     // Tapping the open one closes it, so the control is its own undo.
     await show.click()
-    await expect(page.getByText(/^\+.*the stashed edit/m)).toHaveCount(0)
+    await expect(drawer.getByText(/^\+.*the stashed edit/m)).toHaveCount(0)
   })
 
   test('A2: an untracked file the push would leave behind is named first', async ({ page }) => {
     await openStashRepo(page)
-    await openDrawer(page)
+    const drawer = await openDrawer(page)
 
     // Default state: untracked files are NOT included, so the preview must say
     // so before the button is pressed. This is the whole of A2 — a flag that
     // merely exists satisfies the letter and misses the failure, which is a
     // user believing they stashed a new file that git left on disk.
-    await expect(page.getByText(`${UNTRACKED} — NOT stashed`)).toBeVisible()
+    await expect(drawer.getByText(`${UNTRACKED} — NOT stashed`)).toBeVisible()
 
     // Ticking the box moves it to the captured list. Without this half the
     // assertion above would pass against a preview that always warns.
-    await page.getByText('Include untracked files').click()
-    await expect(page.getByText(`${UNTRACKED} — NOT stashed`)).toHaveCount(0)
-    await expect(page.getByText(UNTRACKED, { exact: true })).toBeVisible()
+    await drawer.getByText('Include untracked files').click()
+    await expect(drawer.getByText(`${UNTRACKED} — NOT stashed`)).toHaveCount(0)
+    await expect(drawer.getByText(UNTRACKED, { exact: true })).toBeVisible()
   })
 
   // --- A4. Runs LAST because it mutates the fixture. ------------------------
@@ -104,41 +108,53 @@ test.describe.serial('the stash drawer', () => {
     // reports nothing about the assertion.
     test.setTimeout(90_000)
     await openStashRepo(page)
-    await openDrawer(page)
+    const drawer = await openDrawer(page)
 
     // The conflicting entry is the newest, so its row's Pop is the first one.
-    await page.getByRole('button', { name: 'Pop', exact: true }).first().click()
+    await drawer.getByRole('button', { name: 'Pop', exact: true }).first().click()
 
     // The notice. `git stash apply` on this entry exits 1 with the conflict
     // markers already written, so the composed pop halts at the gate and the
     // verdict is Conflicted — never Popped.
-    const notice = page.getByText(/NOT popped/)
+    const notice = drawer.getByText(/NOT popped/)
     await expect(notice).toBeVisible({ timeout: 45_000 })
 
     // The three claims that make this criterion, asserted positively rather
     // than by the absence of a success message:
     //   1. the entry survived,
-    await expect(page.getByText(/still in your list/)).toBeVisible()
+    await expect(drawer.getByText(/still in your list/)).toBeVisible()
     //   2. the working tree DID change (the markers are in it), and
     await expect(
-      page.getByText('Your working tree has changes from this stash.'),
+      drawer.getByText('Your working tree has changes from this stash.'),
     ).toBeVisible()
     //   3. A3 — the conflicted path routes into the SHARED conflict view.
-    const resolve = page.getByRole('button', { name: `${CONFLICTING_PATH} — resolve this conflict` })
+    const resolve = drawer.getByRole('button', {
+      name: `${CONFLICTING_PATH} — resolve this conflict`,
+    })
     await expect(resolve).toBeVisible()
 
     // And the word that must not appear. A `toHaveCount(0)` on the success
     // wording is the negative the whole slice exists for: it is what fails if
     // someone ever reports the pop from "the request returned" instead of from
     // PopVerdict::is_complete().
-    await expect(page.getByText(/^Popped the stash/)).toHaveCount(0)
+    await expect(drawer.getByText(/^Popped the stash/)).toHaveCount(0)
 
     // The entry is still listed, which is the drawer agreeing with the notice.
-    await expect(page.getByText(CONFLICTING_SUBJECT)).toBeVisible()
+    await expect(drawer.getByText(CONFLICTING_SUBJECT)).toBeVisible()
 
     // Following the route opens the four-pane conflict view (#428) — not a
     // second, stash-shaped conflict UI.
+    // NOT scoped to the drawer: the four-pane viewer opens outside it, which is
+    // the whole point of the route. Anchored to `.viewer-modal` / `.conflict-pane`
+    // — the same locators `conflict-panes.spec.mjs` uses, verified against
+    // `viewer.rs:319,662`. An earlier draft of this line guessed at
+    // `getByRole('region', { name: /conflict/i })`, which does not exist: the
+    // viewer is a modal div, not a named landmark. Asserting on the panes rather
+    // than on the path text also means it cannot be satisfied by the path still
+    // sitting in the drawer behind the modal.
     await resolve.click()
-    await expect(page.getByText(CONFLICTING_PATH).first()).toBeVisible()
+    const viewer = page.locator('.viewer-modal')
+    await expect(viewer).toBeVisible({ timeout: 20_000 })
+    await expect(viewer.locator('.conflict-pane')).toHaveCount(4)
   })
 })
